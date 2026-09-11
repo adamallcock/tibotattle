@@ -8,13 +8,13 @@ export const CODEX_PRIMARY_ALLOWANCE_UNRESOLVED_SCENARIOS = Object.freeze([
 ]);
 
 const CODEX_PRIMARY_ALLOWANCE_BASIS_FAMILY_ID =
-  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 
 // One local constructor owns the identity used to couple a weighted timeline
 // numerator with the weekly capacity fitted from the same speed scenario. The
-// current preference selects a scenario at read time; it is deliberately
-// absent from the stable identity so changing that preference does not force a
-// replay-cache rebuild.
+// scenario is a read-time sensitivity choice; it is deliberately absent from
+// the stable identity so selecting a scenario does not force a replay-cache
+// rebuild.
 export function codexPrimaryAllowanceBasis(unresolvedScenario) {
   if (!CODEX_PRIMARY_ALLOWANCE_UNRESOLVED_SCENARIOS.includes(
     unresolvedScenario,
@@ -22,8 +22,8 @@ export function codexPrimaryAllowanceBasis(unresolvedScenario) {
     throw new TypeError("Unknown Codex primary allowance scenario");
   }
   return Object.freeze({
-    metric: "quota_weighted_api_equivalent",
-    version: 1,
+    metric: "speed_priced_api_equivalent",
+    version: 3,
     multiplierRegistryRecordedAt: FAST_MODE_MULTIPLIER_SOURCE.recordedAt,
     priceEpochBasis: "event_time_when_registry_has_effective_evidence",
     speedResolutionPolicy: "observed_declared_preference_unknown_v1",

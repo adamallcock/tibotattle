@@ -29,11 +29,24 @@ export const TELEMETRY_BROWSER_MIRROR_FILE = join(
   "public",
   "telemetry-shared.generated.js",
 );
+// Public identity vocabulary only; the full telemetry/admin mirror remains
+// forbidden in public release assets.
+export const PUBLIC_MODEL_BROWSER_MIRROR_FILE = join(
+  REPO_ROOT, "apps", "web", "public", "model-catalog.generated.js",
+);
 
 const CANONICAL_MODULES = Object.freeze([
   Object.freeze({
-    basename: "constants.js",
+    basename: "model-catalog.js",
     expectedImports: Object.freeze([]),
+  }),
+  Object.freeze({
+    basename: "admin-model-history.js",
+    expectedImports: Object.freeze(["./model-catalog.js"]),
+  }),
+  Object.freeze({
+    basename: "constants.js",
+    expectedImports: Object.freeze(["./model-catalog.js"]),
   }),
   Object.freeze({
     basename: "errors.js",
@@ -51,6 +64,7 @@ const CANONICAL_MODULES = Object.freeze([
   Object.freeze({
     basename: "telemetry-v0.1.js",
     expectedImports: Object.freeze([
+      "./model-catalog.js",
       "./constants.js",
       "./errors.js",
       "./primitives.js",
@@ -79,6 +93,18 @@ const CANONICAL_MODULES = Object.freeze([
       "./constants.js",
       "./telemetry-v0.1.js",
       "./telemetry-v0.2.js",
+    ]),
+  }),
+  Object.freeze({
+    basename: "telemetry-v1.1.js",
+    expectedImports: Object.freeze([
+      "./constants.js", "./errors.js", "./primitives.js",
+    ]),
+  }),
+  Object.freeze({
+    basename: "telemetry-v1.1-domain.js",
+    expectedImports: Object.freeze([
+      "./errors.js", "./primitives.js", "./telemetry-v1.1.js",
     ]),
   }),
 ]);
@@ -133,8 +159,10 @@ function stripCanonicalImports(source, {
 
 export async function buildTelemetryBrowserMirror({
   sourceDirectory = TELEMETRY_SOURCE_DIRECTORY,
+  publicCatalogOnly = false,
 } = {}) {
-  const sources = await Promise.all(CANONICAL_MODULES.map(
+  const modules = publicCatalogOnly ? CANONICAL_MODULES.slice(0, 1) : CANONICAL_MODULES;
+  const sources = await Promise.all(modules.map(
     async (descriptor) => Object.freeze({
       descriptor,
       source: await readFile(
@@ -162,6 +190,10 @@ export async function buildTelemetryBrowserMirror({
     ...sections,
     "",
   ].join("\n");
+}
+
+export function buildPublicModelCatalogMirror(options = {}) {
+  return buildTelemetryBrowserMirror({ ...options, publicCatalogOnly: true });
 }
 
 export async function checkTelemetryBrowserMirror({
@@ -234,6 +266,7 @@ export async function readVerifiedTelemetryBrowserMirror({
 export async function writeTelemetryBrowserMirror({
   outputFile = TELEMETRY_BROWSER_MIRROR_FILE,
   sourceDirectory = TELEMETRY_SOURCE_DIRECTORY,
+  buildMirror = buildTelemetryBrowserMirror,
 } = {}) {
   const temporaryFile =
     `${outputFile}.${process.pid}.${randomUUID()}.tmp`;
@@ -241,7 +274,7 @@ export async function writeTelemetryBrowserMirror({
   try {
     handle = await open(temporaryFile, "wx", 0o644);
     await handle.writeFile(
-      await buildTelemetryBrowserMirror({ sourceDirectory }),
+      await buildMirror({ sourceDirectory }),
       "utf8",
     );
     await handle.sync();
@@ -266,9 +299,17 @@ async function main() {
   assert.deepEqual(unexpected, [], `unexpected arguments: ${unexpected.join(" ")}`);
   if (check) {
     await checkTelemetryBrowserMirror();
+    await readVerifiedTelemetryBrowserMirror({
+      outputFile: PUBLIC_MODEL_BROWSER_MIRROR_FILE,
+      buildMirror: buildPublicModelCatalogMirror,
+    });
     return;
   }
   await writeTelemetryBrowserMirror();
+  await writeTelemetryBrowserMirror({
+    outputFile: PUBLIC_MODEL_BROWSER_MIRROR_FILE,
+    buildMirror: buildPublicModelCatalogMirror,
+  });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === SCRIPT_FILE) {

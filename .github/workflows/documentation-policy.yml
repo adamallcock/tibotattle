@@ -1,0 +1,87 @@
+name: Documentation policy
+
+on:
+  pull_request:
+    paths:
+      - "*.md"
+      - "**/*.md"
+      - "apps/**"
+      - "config/**"
+      - "generated/**"
+      - "local-review/**"
+      - "native/**"
+      - "packages/**"
+      - "release-notes/**"
+      - "schemas/**"
+      - "scripts/**"
+      - "src/**"
+      - "test/**"
+      - "tools/**"
+      - ".github/workflows/documentation-policy.yml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+  push:
+    branches:
+      - main
+    paths:
+      - "*.md"
+      - "**/*.md"
+      - "apps/**"
+      - "config/**"
+      - "generated/**"
+      - "local-review/**"
+      - "native/**"
+      - "packages/**"
+      - "release-notes/**"
+      - "schemas/**"
+      - "scripts/**"
+      - "src/**"
+      - "test/**"
+      - "tools/**"
+      - ".github/workflows/documentation-policy.yml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: documentation-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Validate current documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Install locked test dependencies
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Validate documentation targets, lifecycle, and authority
+        run: npm run docs:check
+
+      - name: Test documentation and agent-guidance policy
+        run: node --test test/documentation-governance.test.js test/agent-guidance.test.js
+
+      - name: Test source-to-documentation parity
+        run: node --test test/api-surface-reference.test.js test/cli-reference.test.js test/public-documentation-contract.test.js test/macos-localization.test.js

@@ -1,0 +1,175 @@
+name: Signed Electron production update acceptance
+on:
+  push:
+    branches: [codex/electron-sparkle-transition-021]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Plan only, or accept the already activated production update
+        type: choice
+        options: [plan, execute]
+        default: plan
+        required: true
+      target:
+        description: Installed predecessor and successor architecture
+        type: choice
+        options: [darwin-arm64, darwin-x64]
+        default: darwin-arm64
+        required: true
+      runner_revision:
+        description: Exact reviewed acceptance runner commit
+        type: string
+        required: true
+      identity_json:
+        description: Exact 021 source/build/DMG/ASAR/ZIP/feed and 020 ASAR identity JSON; directory is supplied by the workflow
+        type: string
+        required: true
+      confirmation:
+        description: Execute requires RUN_DISPOSABLE_PRODUCTION_ELECTRON_UPDATE
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: electron-production-update-acceptance-${{ inputs.target }}
+  cancel-in-progress: false
+jobs:
+  registration:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Register without launching an installed update
+        run: echo "Only a reviewed dispatch after feed activation executes acceptance."
+  acceptance_arm64:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-arm64'
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_TARGET: ${{ inputs.target }}
+      SELECTED_RUNNER: ${{ inputs.runner_revision }}
+      SELECTED_IDENTITY: ${{ inputs.identity_json }}
+      SELECTED_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Check out exact qualification source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: arm64
+          package-manager-cache: false
+      - name: Install pinned inspection dependencies
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Validate intake and run only the selected acceptance mode
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { mkdir, realpath, writeFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          import { validateProductionUpdateIntake } from './scripts/smoke-electron-macos-production-update.mjs';
+          const env = process.env;
+          if (!/^[a-f0-9]{40}$/.test(env.SELECTED_RUNNER) || env.SELECTED_RUNNER !== env.GITHUB_SHA
+            || env.SELECTED_TARGET !== 'darwin-arm64' || !['plan', 'execute'].includes(env.SELECTED_MODE)
+            || (env.SELECTED_MODE === 'execute' ? env.SELECTED_CONFIRMATION !== 'RUN_DISPOSABLE_PRODUCTION_ELECTRON_UPDATE'
+              : Boolean(env.SELECTED_CONFIRMATION))) throw new Error('ACCEPTANCE_DISPATCH_REFUSED');
+          if (Buffer.byteLength(env.SELECTED_IDENTITY ?? '') > 8192) throw new Error('ACCEPTANCE_IDENTITY_REFUSED');
+          const identity = JSON.parse(env.SELECTED_IDENTITY);
+          if (Object.hasOwn(identity, 'directory') || identity.target !== env.SELECTED_TARGET) throw new Error('ACCEPTANCE_IDENTITY_REFUSED');
+          const directory = join(await realpath(env.RUNNER_TEMP), 'production-electron-update');
+          validateProductionUpdateIntake({ ...identity, directory });
+          await mkdir(directory, { mode: 0o700 });
+          const intakePath = join(directory, 'intake.json');
+          await writeFile(intakePath, JSON.stringify({ ...identity, directory }), { mode: 0o600, flag: 'wx' });
+          const args = ['scripts/smoke-electron-macos-production-update.mjs', '--' + env.SELECTED_MODE, '--intake', intakePath];
+          if (env.SELECTED_MODE === 'execute') args.push('--confirm', env.SELECTED_CONFIRMATION);
+          const result = spawnSync(process.execPath, args, { timeout: 22 * 60 * 1000, encoding: 'utf8', maxBuffer: 131072 });
+          const evidence = join(env.GITHUB_WORKSPACE, '.release-build', 'production-update-evidence');
+          await mkdir(evidence, { recursive: true });
+          let proof;
+          try { proof = JSON.parse(result.stdout); } catch { proof = { status: 'failed', failureStage: 'runner_execution' }; }
+          await writeFile(join(evidence, 'acceptance.json'), JSON.stringify(proof) + '\n', { mode: 0o600, flag: 'wx' });
+          if (result.status !== 0 || result.error || !['planned', 'passed'].includes(proof.status)) process.exitCode = 1;
+          NODE
+      - name: Preserve content-free acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-production-update-darwin-arm64-${{ github.run_id }}
+          path: .release-build/production-update-evidence/acceptance.json
+          if-no-files-found: error
+          retention-days: 30
+  acceptance_x64:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-x64'
+    runs-on: macos-26-intel
+    timeout-minutes: 25
+    env:
+      SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_TARGET: ${{ inputs.target }}
+      SELECTED_RUNNER: ${{ inputs.runner_revision }}
+      SELECTED_IDENTITY: ${{ inputs.identity_json }}
+      SELECTED_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Check out exact qualification source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          package-manager-cache: false
+      - name: Install pinned inspection dependencies
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Validate intake and run only the selected acceptance mode
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { mkdir, realpath, writeFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          import { validateProductionUpdateIntake } from './scripts/smoke-electron-macos-production-update.mjs';
+          const env = process.env;
+          if (!/^[a-f0-9]{40}$/.test(env.SELECTED_RUNNER) || env.SELECTED_RUNNER !== env.GITHUB_SHA
+            || env.SELECTED_TARGET !== 'darwin-x64' || !['plan', 'execute'].includes(env.SELECTED_MODE)
+            || (env.SELECTED_MODE === 'execute' ? env.SELECTED_CONFIRMATION !== 'RUN_DISPOSABLE_PRODUCTION_ELECTRON_UPDATE'
+              : Boolean(env.SELECTED_CONFIRMATION))) throw new Error('ACCEPTANCE_DISPATCH_REFUSED');
+          if (Buffer.byteLength(env.SELECTED_IDENTITY ?? '') > 8192) throw new Error('ACCEPTANCE_IDENTITY_REFUSED');
+          const identity = JSON.parse(env.SELECTED_IDENTITY);
+          if (Object.hasOwn(identity, 'directory') || identity.target !== env.SELECTED_TARGET) throw new Error('ACCEPTANCE_IDENTITY_REFUSED');
+          const directory = join(await realpath(env.RUNNER_TEMP), 'production-electron-update');
+          validateProductionUpdateIntake({ ...identity, directory });
+          await mkdir(directory, { mode: 0o700 });
+          const intakePath = join(directory, 'intake.json');
+          await writeFile(intakePath, JSON.stringify({ ...identity, directory }), { mode: 0o600, flag: 'wx' });
+          const args = ['scripts/smoke-electron-macos-production-update.mjs', '--' + env.SELECTED_MODE, '--intake', intakePath];
+          if (env.SELECTED_MODE === 'execute') args.push('--confirm', env.SELECTED_CONFIRMATION);
+          const result = spawnSync(process.execPath, args, { timeout: 22 * 60 * 1000, encoding: 'utf8', maxBuffer: 131072 });
+          const evidence = join(env.GITHUB_WORKSPACE, '.release-build', 'production-update-evidence');
+          await mkdir(evidence, { recursive: true });
+          let proof;
+          try { proof = JSON.parse(result.stdout); } catch { proof = { status: 'failed', failureStage: 'runner_execution' }; }
+          await writeFile(join(evidence, 'acceptance.json'), JSON.stringify(proof) + '\n', { mode: 0o600, flag: 'wx' });
+          if (result.status !== 0 || result.error || !['planned', 'passed'].includes(proof.status)) process.exitCode = 1;
+          NODE
+      - name: Preserve content-free acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-production-update-darwin-x64-${{ github.run_id }}
+          path: .release-build/production-update-evidence/acceptance.json
+          if-no-files-found: error
+          retention-days: 30

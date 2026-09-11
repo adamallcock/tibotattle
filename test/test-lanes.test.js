@@ -7,6 +7,7 @@ import {
   mergeChangedPaths,
   parseTestLaneArguments,
   selectTestLanes,
+  hostedLaneCommands,
 } from "../scripts/test-lanes.mjs";
 import {
   PORTABLE_TEST_FILES,
@@ -15,12 +16,23 @@ import {
 
 test("lane manifests include every executable macOS test target", () => {
   assert.deepEqual(MACOS_SOURCE_TEST_FILES, [
+    "test/release-agent.test.js",
+    "test/release-operation.test.js",
+    "test/macos-release-journal.test.js",
     "test/i18n-foundation.test.js",
     "test/macos-localization.test.js",
     "test/macos-app-bundle.test.js",
+    "test/macos-keychain-migration-artifact.test.js",
+    "test/macos-keychain-migration-runner.test.js",
+    "test/macos-keychain-migration-ui.test.js",
   ]);
   assert.deepEqual(MACOS_ARTIFACT_TEST_FILES, [
+    "test/release-operation.test.js",
+    "test/macos-release-journal.test.js",
     "test/macos-app-bundle.test.js",
+    "test/macos-keychain-migration-artifact.test.js",
+    "test/macos-keychain-migration-runner.test.js",
+    "test/macos-keychain-migration-ui.test.js",
     "test/macos-updater.test.js",
     "test/macos-updater-release.test.mjs",
   ]);
@@ -111,7 +123,7 @@ test("test-lane selection narrows only paths with complete executable coverage",
   );
   assert.deepEqual(
     selectTestLanes(["apps/macos/UsageMonitorApp.swift"], { full: true }).lanes,
-    ["macos-source", "macos-smoke", "macos-artifact"],
+    ["full"],
   );
   assert.deepEqual(
     selectTestLanes(["apps/macos/Assets/AppIcon.icns"]).lanes,
@@ -129,6 +141,14 @@ test("test-lane selection narrows only paths with complete executable coverage",
     selectTestLanes(["test/macos-app-bundle.test.js"]).lanes,
     ["macos-source", "macos-artifact"],
   );
+  for (const path of [
+    "test/macos-keychain-migration-artifact.test.js",
+    "test/macos-keychain-migration-runner.test.js",
+    "test/macos-keychain-migration-ui.test.js",
+  ]) {
+    assert.deepEqual(selectTestLanes([path]).lanes,
+      ["macos-source", "macos-artifact"], path);
+  }
   assert.deepEqual(
     selectTestLanes(["test/macos-updater.test.js"]).lanes,
     ["macos-artifact"],
@@ -162,4 +182,18 @@ test("test-lane selection narrows only paths with complete executable coverage",
     selectTestLanes(["docs/decisions/example.md"]).lanes,
     [],
   );
+});
+
+test("hosted lanes execute complete owning gates and unfamiliar or shared inputs stay broad", () => {
+  for (const path of ["apps/worker/src/index.ts", "apps/worker/test/health.test.ts", "apps/worker/migrations/0057_synthetic.sql", "apps/worker/wrangler.jsonc"])
+    assert.deepEqual(selectTestLanes([path]).lanes, ["worker"]);
+  assert.deepEqual(selectTestLanes(["scripts/build-public-release-site.js"]).lanes, ["public-site"]);
+  assert.deepEqual(selectTestLanes(["scripts/build-public-release-site.js", "apps/worker/src/index.ts"]).lanes, ["public-site"]);
+  for (const path of ["apps/worker/scripts/new-tool.mjs", "apps/worker/new-fixtures/source.json", "apps/web/public/community.js", "config/release-manifest.js"])
+    assert.deepEqual(selectTestLanes([path]).lanes, ["full"]);
+  assert.deepEqual(selectTestLanes(["apps/worker/src/index.ts"], { full: true }).lanes, ["full"]);
+  assert.deepEqual(selectTestLanes(["docs/example.md"], { full: true }).lanes, ["full"]);
+  assert.deepEqual(hostedLaneCommands("worker"), [["--prefix", "apps/worker", "run", "check"]]);
+  assert.deepEqual(hostedLaneCommands("public-site"), [["run", "product:ui:test"], ["run", "product:release-site:test"], ["--prefix", "apps/worker", "run", "check"]]);
+  assert.equal(hostedLaneCommands("not-a-lane"), null);
 });

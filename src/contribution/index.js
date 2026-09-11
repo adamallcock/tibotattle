@@ -1,9 +1,24 @@
 export {
   TELEMETRY_ACCOUNT_TRACK_VERSION,
+  TELEMETRY_ACCOUNT_TRACK_V2_VERSION,
   UNATTRIBUTED_ACCOUNT_TRACK_ID,
   deriveTelemetryAccountTrackId,
+  deriveTelemetryAccountTrackIdV2,
+  deriveTelemetryPlanEraIdV1,
+  sanitizeTelemetryAttributionBinding,
   isTelemetryAccountTrackId,
+  isTelemetryAccountTrackIdV2,
 } from "./account-track.js";
+export {
+  accountlessDeviceUnavailableCode,
+  accountlessLocalLaboratoryOrigin,
+  accountlessTransportOrigin,
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
+  ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+} from "./accountless-transport-contract.js";
 export {
   MAX_PREPARED_CONTRIBUTION_BATCHES,
   PREPARED_CONTRIBUTION_ELIGIBLE_SCHEMA,
@@ -34,23 +49,12 @@ export {
   validateTelemetryContributionV02,
 } from "./telemetry-v02-projection.js";
 export {
-  AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
-  AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS,
-  AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS,
-  AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION,
-  AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS,
-  AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION,
-  AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
-  AutomaticContributionError,
-  automaticContributionRequiredConsent,
-  applyAutomaticContributionScheduleDither,
-  claimAutomaticContributionRun,
-  completeAutomaticContributionRun,
-  createInitialAutomaticContributionState,
-  disableAutomaticContribution,
-  enableAutomaticContribution,
-  parseAutomaticContributionState,
-  projectAutomaticContributionStatus,
-  recordPreparedAutomaticContribution,
-  recordReviewedManualAcceptance,
-} from "./recurrence-policy.js";
+  createTelemetryV11Day,
+  deriveTelemetryV11Attribution,
+  deriveTelemetryV11QuotaOccurrenceId,
+  telemetryV11FieldInventory,
+} from "./telemetry-v11-chunks.js";
+export {
+  readTelemetryV11Capabilities,
+  runTelemetryV11Sync,
+} from "./telemetry-v11-sync.js";

@@ -69,11 +69,74 @@ enum TiboTattleLocalization {
     }
 
     enum Key: String, CaseIterable {
+        case trayMenuBar = "tray.menuBar"
+        case trayBeside = "tray.beside"
+        case trayOpened = "tray.opened"
+        case trayPreset = "tray.preset"
+        case trayAutomatic = "tray.automatic"
+        case trayFiveHour = "tray.five-hour"
+        case trayWeekly = "tray.weekly"
+        case trayBoth = "tray.both"
+        case trayIconOnly = "tray.icon-only"
+        case trayIconMode = "tray.iconMode"
+        case trayApp = "tray.app"
+        case trayMeter = "tray.meter"
+        case trayDualMeter = "tray.dual-meter"
+        case trayMeterWindow = "tray.meterWindow"
+        case trayBarMetric = "tray.barMetric"
+        case trayRemaining = "tray.remaining"
+        case trayReset = "tray.reset"
+        case trayRemainingReset = "tray.remaining-reset"
+        case trayResetFormat = "tray.resetFormat"
+        case trayCountdown = "tray.countdown"
+        case trayClock = "tray.clock"
+        case trayEmphasizeLow = "tray.emphasizeLow"
+        case trayExample = "tray.example"
+        case trayCurrent = "tray.current"
+        case trayRefreshing = "tray.refreshing"
+        case trayPartial = "tray.partial"
+        case trayStale = "tray.stale"
+        case trayOffline = "tray.offline"
+        case trayExhausted = "tray.exhausted"
+        case trayAllowances = "tray.allowances"
+        case trayPace = "tray.pace"
+        case trayUsage = "tray.usage"
+        case trayCache = "tray.cache"
+        case trayHistoryRange = "tray.historyRange"
+        case tray7d = "tray.7d"
+        case tray30d = "tray.30d"
+        case trayShowChart = "tray.showChart"
+        case trayMetricTokens = "tray.metric-tokens"
+        case trayMetricCost = "tray.metric-cost"
+        case trayMetricChanges = "tray.metric-changes"
+        case trayDensity = "tray.density"
+        case trayComfortable = "tray.comfortable"
+        case trayCompact = "tray.compact"
+        case trayUndo = "tray.undo"
+        case trayRestore = "tray.restore"
+        case trayMoveUp = "tray.moveUp"
+        case trayMoveDown = "tray.moveDown"
+        case trayEmpty = "tray.empty"
+        case trayAt = "tray.at"
+        case trayIn = "tray.in"
+        case trayProtected = "tray.protected"
+        case trayInvalid = "tray.invalid"
+        case traySaveFailed = "tray.saveFailed"
+        case trayCustomize = "tray.customize"
+        case trayLow = "tray.low"
+        case trayCacheUnavailable = "tray.cacheUnavailable"
+        case trayCacheEmpty = "tray.cacheEmpty"
+        case trayCacheCaption = "tray.cacheCaption"
+        case trayCacheIncomplete = "tray.cacheIncomplete"
+
         case accessibilityLocalDashboard = "accessibility.localDashboard"
         case accessibilityMenuBarStatus = "accessibility.menuBarStatus"
         case commonCancel = "common.cancel"
         case commonContinue = "common.continue"
         case commonOK = "common.ok"
+        case dialogApproveKeychainMigration = "dialog.approveKeychainMigration"
+        case dialogKeychainMigrationTitle = "dialog.keychainMigrationTitle"
+        case dialogKeychainMigrationDescription = "dialog.keychainMigrationDescription"
         case dialogChooseCodexHomeFolder = "dialog.chooseCodexHomeFolder"
         case dialogChooseCodexHomeFolderMessage = "dialog.chooseCodexHomeFolderMessage"
         case dialogCodexFolderDescription = "dialog.codexFolderDescription"
@@ -110,13 +173,18 @@ enum TiboTattleLocalization {
         case launcherCodexFolderUpdated = "launcher.codexFolderUpdated"
         case launcherDataDiagnostics = "launcher.dataDiagnostics"
         case launcherDashboardDidNotOpen = "launcher.dashboardDidNotOpen"
+        case launcherDashboardTakingLonger = "launcher.dashboardTakingLonger"
         case launcherDetailPreparingLocalDashboard = "launcher.detailPreparingLocalDashboard"
         case launcherErrorCompanionAlreadyRunning = "launcher.errorCompanionAlreadyRunning"
         case launcherErrorCompanionExited = "launcher.errorCompanionExited"
         case launcherErrorCompanionLaunch = "launcher.errorCompanionLaunch"
         case launcherErrorCompanionTimeout = "launcher.errorCompanionTimeout"
         case launcherErrorCodexHomeSettingsWrite = "launcher.errorCodexHomeSettingsWrite"
+        case launcherErrorDashboardContentProcessTerminated = "launcher.errorDashboardContentProcessTerminated"
         case launcherErrorDashboardDownloadFailed = "launcher.errorDashboardDownloadFailed"
+        case launcherErrorDashboardNavigationFailed = "launcher.errorDashboardNavigationFailed"
+        case launcherErrorDashboardReadinessTimeout = "launcher.errorDashboardReadinessTimeout"
+        case launcherErrorDashboardViewportUnavailable = "launcher.errorDashboardViewportUnavailable"
         case launcherErrorDashboardWebViewUnavailable = "launcher.errorDashboardWebViewUnavailable"
         case launcherErrorDataErase = "launcher.errorDataErase"
         case launcherErrorFirstRunStateWrite = "launcher.errorFirstRunStateWrite"
@@ -182,6 +250,17 @@ enum TiboTattleLocalization {
         case nativeDashboardLocalOnly = "nativeDashboard.localOnly"
         case nativeDashboardLocalOnlyTooltip = "nativeDashboard.localOnlyTooltip"
         case nativeDashboardOverview = "nativeDashboard.overview"
+        case nativeDashboardPerformance = "nativeDashboard.performance"
+        case nativeDashboardProgressAccounting = "nativeDashboard.progressAccounting"
+        case nativeDashboardProgressAnalyzing = "nativeDashboard.progressAnalyzing"
+        case nativeDashboardProgressAnalyzingFiles = "nativeDashboard.progressAnalyzingFiles"
+        case nativeDashboardProgressArchiveIndex = "nativeDashboard.progressArchiveIndex"
+        case nativeDashboardProgressDiscovering = "nativeDashboard.progressDiscovering"
+        case nativeDashboardProgressFinishing = "nativeDashboard.progressFinishing"
+        case nativeDashboardProgressProspective = "nativeDashboard.progressProspective"
+        case nativeDashboardProgressQuickResult = "nativeDashboard.progressQuickResult"
+        case nativeDashboardProgressQuotaRefresh = "nativeDashboard.progressQuotaRefresh"
+        case nativeDashboardProgressSaving = "nativeDashboard.progressSaving"
         case nativeDashboardRefreshUsage = "nativeDashboard.refreshUsage"
         case nativeDashboardRefreshUsageTooltip = "nativeDashboard.refreshUsageTooltip"
         case nativeDashboardShare = "nativeDashboard.share"
@@ -233,6 +312,72 @@ enum TiboTattleLocalization {
         case menuBarVerifiedAllowanceMany = "menuBar.verifiedAllowanceMany"
         case menuBarVerifiedAllowanceOne = "menuBar.verifiedAllowanceOne"
         case menuBarWaitingToAnalyze = "menuBar.waitingToAnalyze"
+        case menuBarPopupHeaderLive = "menuBarPopup.headerLive"
+        case menuBarPopupHeaderLiveUpdated = "menuBarPopup.headerLiveUpdated"
+        case menuBarPopupHeaderUpdating = "menuBarPopup.headerUpdating"
+        case menuBarPopupRemaining = "menuBarPopup.remaining"
+        case menuBarPopupResets = "menuBarPopup.resets"
+        case menuBarPopupResetUnavailable = "menuBarPopup.resetUnavailable"
+        case menuBarPopupWeeklyPosition = "menuBarPopup.weeklyPosition"
+        case menuBarPopupPositionElapsed = "menuBarPopup.positionElapsed"
+        case menuBarPopupPositionUsed = "menuBarPopup.positionUsed"
+        case menuBarPopupPositionBelow = "menuBarPopup.positionBelow"
+        case menuBarPopupPositionOn = "menuBarPopup.positionOn"
+        case menuBarPopupPositionAbove = "menuBarPopup.positionAbove"
+        case menuBarPopupPositionSummary = "menuBarPopup.positionSummary"
+        case menuBarPopupPositionDisclaimer = "menuBarPopup.positionDisclaimer"
+        case menuBarPopupWeeklyPace = "menuBarPopup.weeklyPace"
+        case menuBarPopupPaceCollecting = "menuBarPopup.paceCollecting"
+        case menuBarPopupPaceUnder = "menuBarPopup.paceUnder"
+        case menuBarPopupPaceOn = "menuBarPopup.paceOn"
+        case menuBarPopupPaceOver = "menuBarPopup.paceOver"
+        case menuBarPopupPaceCritical = "menuBarPopup.paceCritical"
+        case menuBarPopupPaceCollectingDetail = "menuBarPopup.paceCollectingDetail"
+        case menuBarPopupPaceRatioOutcome = "menuBarPopup.paceRatioOutcome"
+        case menuBarPopupPaceDryBeforeReset = "menuBarPopup.paceDryBeforeReset"
+        case menuBarPopupPaceSpareAtReset = "menuBarPopup.paceSpareAtReset"
+        case menuBarPopupPaceReachesReset = "menuBarPopup.paceReachesReset"
+        case menuBarPopupPaceNow = "menuBarPopup.paceNow"
+        case menuBarPopupPaceResetIn = "menuBarPopup.paceResetIn"
+        case menuBarPopupPaceEvidenceOne = "menuBarPopup.paceEvidenceOne"
+        case menuBarPopupPaceEvidenceMany = "menuBarPopup.paceEvidenceMany"
+        case menuBarPopupPaceEarlyEstimate = "menuBarPopup.paceEarlyEstimate"
+        case menuBarPopupPaceActiveMarker = "menuBarPopup.paceActiveMarker"
+        case menuBarPopupLocalUsage = "menuBarPopup.localUsage"
+        case menuBarPopupPeriodLastSevenDays = "menuBarPopup.periodLastSevenDays"
+        case menuBarPopupPeriodLastThirtyDays = "menuBarPopup.periodLastThirtyDays"
+        case menuBarPopupTokenCount = "menuBarPopup.tokenCount"
+        case menuBarPopupUsageChangeOne = "menuBarPopup.usageChangeOne"
+        case menuBarPopupUsageChangesMany = "menuBarPopup.usageChangesMany"
+        case menuBarPopupUsageSummary = "menuBarPopup.usageSummary"
+        case menuBarPopupAPIPriceEquivalent = "menuBarPopup.apiPriceEquivalent"
+        case menuBarPopupAPIPriceEquivalentPartial = "menuBarPopup.apiPriceEquivalentPartial"
+        case menuBarPopupPartialPricing = "menuBarPopup.partialPricing"
+        case menuBarPopupAPIPriceEquivalentUnavailable = "menuBarPopup.apiPriceEquivalentUnavailable"
+        case menuBarPopupAPIPriceEquivalentRecalculating = "menuBarPopup.apiPriceEquivalentRecalculating"
+        case menuBarPopupPartialPricingDetail = "menuBarPopup.partialPricingDetail"
+        case menuBarPopupPartialPricingCaption = "menuBarPopup.partialPricingCaption"
+        case menuBarPopupCoverageMixed = "menuBarPopup.coverageMixed"
+        case menuBarPopupCoverageAccessible = "menuBarPopup.coverageAccessible"
+        case menuBarPopupNotSubscriptionBill = "menuBarPopup.notSubscriptionBill"
+        case menuBarPopupAccountingUnavailableTitle = "menuBarPopup.accountingUnavailableTitle"
+        case menuBarPopupAccountingUnavailableBody = "menuBarPopup.accountingUnavailableBody"
+        case menuBarPopupRetainedHistory = "menuBarPopup.retainedHistory"
+        case menuBarPopupNoUsageObserved = "menuBarPopup.noUsageObserved"
+        case menuBarPopupStartingTitle = "menuBarPopup.startingTitle"
+        case menuBarPopupStartingBody = "menuBarPopup.startingBody"
+        case menuBarPopupUpdatingTitle = "menuBarPopup.updatingTitle"
+        case menuBarPopupUpdatingBody = "menuBarPopup.updatingBody"
+        case menuBarPopupStaleTitle = "menuBarPopup.staleTitle"
+        case menuBarPopupStaleBody = "menuBarPopup.staleBody"
+        case menuBarPopupErrorTitle = "menuBarPopup.errorTitle"
+        case menuBarPopupErrorBody = "menuBarPopup.errorBody"
+        case menuBarPopupOpenProduct = "menuBarPopup.openProduct"
+        case menuBarPopupRefresh = "menuBarPopup.refresh"
+        case menuBarPopupMore = "menuBarPopup.more"
+        case menuBarPopupAccessibilityOpenProduct = "menuBarPopup.accessibilityOpenProduct"
+        case menuBarPopupAccessibilityRefresh = "menuBarPopup.accessibilityRefresh"
+        case menuBarPopupAccessibilityMore = "menuBarPopup.accessibilityMore"
         case menuQuitProduct = "menu.quitProduct"
         case menuSelectAll = "menu.selectAll"
         case menuSettings = "menu.settings"
@@ -243,6 +388,12 @@ enum TiboTattleLocalization {
         case settingsAboutProduct = "settings.aboutProduct"
         case settingsAboutTab = "settings.aboutTab"
         case settingsAboutSummary = "settings.aboutSummary"
+        case settingsAppearance = "settings.appearance"
+        case settingsAppearanceDark = "settings.appearanceDark"
+        case settingsAppearanceLight = "settings.appearanceLight"
+        case settingsAppearancePickerHint = "settings.appearancePickerHint"
+        case settingsAppearanceSummary = "settings.appearanceSummary"
+        case settingsAppearanceSystem = "settings.appearanceSystem"
         case settingsAutomaticUpdates = "settings.automaticUpdates"
         case settingsAutomaticUpdatesOff = "settings.automaticUpdatesOff"
         case settingsAutomaticUpdatesOn = "settings.automaticUpdatesOn"
@@ -258,6 +409,13 @@ enum TiboTattleLocalization {
         case settingsGeneral = "settings.general"
         case settingsGeneralSummary = "settings.generalSummary"
         case settingsGitHub = "settings.github"
+        case settingsKeychainMigrationTitle = "settings.keychainMigrationTitle"
+        case settingsKeychainMigrationSummary = "settings.keychainMigrationSummary"
+        case settingsKeychainMigrationRetrying = "settings.keychainMigrationRetrying"
+        case settingsKeychainMigrationApproving = "settings.keychainMigrationApproving"
+        case settingsKeychainMigrationDeferred = "settings.keychainMigrationDeferred"
+        case settingsKeychainMigrationReview = "settings.keychainMigrationReview"
+        case settingsKeychainMigrationMenu = "settings.keychainMigrationMenu"
         case settingsLanguage = "settings.language"
         case settingsLanguageEnglish = "settings.languageEnglish"
         case settingsLanguagePickerHint = "settings.languagePickerHint"
@@ -297,9 +455,6 @@ enum TiboTattleLocalization {
         case settingsNotificationsResetDetail = "settings.notificationsResetDetail"
         case settingsOpenDashboard = "settings.openDashboard"
         case settingsOpenNotifications = "settings.openNotifications"
-        case settingsPreviewUpdatesPending = "settings.previewUpdatesPending"
-        case settingsPreviewUpdatesPendingMessage = "settings.previewUpdatesPendingMessage"
-        case settingsPreviewUpdatesPendingTitle = "settings.previewUpdatesPendingTitle"
         case firstRunLoginItemDisclosure = "firstRun.loginItemDisclosure"
         case settingsContinue = "settings.continue"
         case settingsContinueWithoutLogin = "settings.continueWithoutLogin"
@@ -332,6 +487,8 @@ enum TiboTattleLocalization {
         case settingsRefreshIntervalFifteenMinutes = "settings.refreshIntervalFifteenMinutes"
         case settingsRefreshIntervalThirtyMinutes = "settings.refreshIntervalThirtyMinutes"
         case settingsUseDefault = "settings.useDefault"
+        case settingsUpdateCheckUnavailableMessage = "settings.updateCheckUnavailableMessage"
+        case settingsUpdateCheckUnavailableTitle = "settings.updateCheckUnavailableTitle"
         case settingsUpdateDisclosureAutomaticOff = "settings.updateDisclosureAutomaticOff"
         case settingsUpdateDisclosureAutomaticOn = "settings.updateDisclosureAutomaticOn"
         case settingsUpdateDisclosureDevelopment = "settings.updateDisclosureDevelopment"
@@ -345,6 +502,66 @@ enum TiboTattleLocalization {
         /// without resources or a future translation misses one key.
         var fallbackValue: String {
             switch self {
+            case .trayMenuBar: "Menu bar"
+            case .trayBeside: "Beside the icon"
+            case .trayOpened: "When opened"
+            case .trayPreset: "Display"
+            case .trayAutomatic: "Current default"
+            case .trayFiveHour: "5-hour remaining"
+            case .trayWeekly: "7-day remaining"
+            case .trayBoth: "Both windows"
+            case .trayIconOnly: "Icon only"
+            case .trayIconMode: "Icon appearance"
+            case .trayApp: "App icon"
+            case .trayMeter: "App icon with meter"
+            case .trayDualMeter: "Two meters: top 5h, bottom 7d"
+            case .trayMeterWindow: "Meter window"
+            case .trayBarMetric: "Beside the icon"
+            case .trayRemaining: "Remaining allowance"
+            case .trayReset: "Reset time"
+            case .trayRemainingReset: "Remaining and reset"
+            case .trayResetFormat: "Reset format"
+            case .trayCountdown: "Countdown"
+            case .trayClock: "Local clock"
+            case .trayEmphasizeLow: "Emphasize low allowance (10% or less)"
+            case .trayExample: "Example"
+            case .trayCurrent: "Current"
+            case .trayRefreshing: "Updating"
+            case .trayPartial: "Partly unavailable"
+            case .trayStale: "Stale"
+            case .trayOffline: "Offline"
+            case .trayExhausted: "Exhausted"
+            case .trayAllowances: "Allowances"
+            case .trayPace: "Weekly pace"
+            case .trayUsage: "Local usage"
+            case .trayCache: "Cache reuse"
+            case .trayHistoryRange: "History range"
+            case .tray7d: "7 days"
+            case .tray30d: "30 days"
+            case .trayShowChart: "Show history chart"
+            case .trayMetricTokens: "Total tokens"
+            case .trayMetricCost: "API equivalent"
+            case .trayMetricChanges: "Usage changes"
+            case .trayDensity: "Popup detail"
+            case .trayComfortable: "Detailed"
+            case .trayCompact: "Compact"
+            case .trayUndo: "Undo last change"
+            case .trayRestore: "Restore tray defaults"
+            case .trayMoveUp: "Move up"
+            case .trayMoveDown: "Move down"
+            case .trayEmpty: "Header and actions only"
+            case .trayAt: "at"
+            case .trayIn: "in"
+            case .trayProtected: "Settings cannot be changed: an unreadable or newer preference file is preserved."
+            case .trayInvalid: "Keep a chart or at least one total when Local usage is enabled."
+            case .traySaveFailed: "Could not save. Your previous settings remain active."
+            case .trayCustomize: "Customize menu bar…"
+            case .trayLow: "Low allowance"
+            case .trayCacheUnavailable: "Cache reuse unavailable"
+            case .trayCacheEmpty: "No comparable follow-ups"
+            case .trayCacheCaption: "of comparable follow-ups reused more than half"
+            case .trayCacheIncomplete: "Coverage is incomplete"
+
             case .accessibilityLocalDashboard:
                 "Local dashboard"
             case .accessibilityMenuBarStatus:
@@ -355,12 +572,18 @@ enum TiboTattleLocalization {
                 "Continue"
             case .commonOK:
                 "OK"
+            case .dialogApproveKeychainMigration:
+                "Approve migration"
+            case .dialogKeychainMigrationTitle:
+                "Approve secure Keychain migration?"
+            case .dialogKeychainMigrationDescription:
+                "Saved Keychain keys keep local account matching and your existing contribution identity consistent. This update moves them to app-owned Keychain items without changing their values.\n\nSilent migration could not finish. macOS may ask for your login Keychain password. Enter it only in the macOS dialog; TiboTattle does not receive the password.\n\nApproving this migration does not reset anything or upload data. Existing history is kept. Cancel leaves migration pending."
             case .dialogChooseCodexHomeFolder:
                 "Choose your Codex home folder"
             case .dialogChooseCodexHomeFolderMessage:
                 "Choose the folder that contains Codex sessions or archived_sessions."
             case .dialogCodexFolderDescription:
-                "Current: %@\n\n%@ stores a custom folder only in owner-only app settings. Diagnostics never copy its path. The local companion reads only the sessions and archived_sessions folders beneath the selected Codex home."
+                "Current: %@\n\n%@ stores a custom folder only in owner-only app settings. Diagnostics never copy its path. This choice controls the sessions and archived_sessions source only; other local refresh sources are disclosed at first run and in the privacy guide."
             case .dialogCopyDiagnostics:
                 "Copy Diagnostics"
             case .dialogCustomCodexFolder:
@@ -382,9 +605,9 @@ enum TiboTattleLocalization {
             case .dialogIdentityDeviceResetComplete:
                 "Local identity and device reset"
             case .dialogIdentityDeviceResetCompleteDescription:
-                "App state: retained, except the targeted local device-binding marker and retired identity residue.\n\nKeychain: the %@ export identity and paired-device credential are now absent. Secure erasure is not claimed.\n\nHosted service: no device was revoked and no data was deleted. Pair this app again before a future contribution and use the hosted privacy workflow separately for hosted deletion."
+                "App state: retained, except the targeted local device-binding marker and retired identity residue.\n\nKeychain: the %@ export identity and paired-device credential are now absent. Secure erasure is not claimed.\n\nHosted service: no device was revoked and no data was deleted. Hosted history is kept. Pair this app again before a future contribution. See project support guidance for information about separate owner-handled erasure."
             case .dialogIdentityDeviceResetDescription:
-                "This is a targeted local security-recovery action, not uninstall or hosted deletion.\n\nApp state: indexes, cached analysis, prepared contributions, settings, and Codex logs remain. Only the local device-binding marker and any retired file identity residue are removed.\n\nKeychain: the %@ export identity and paired-device credential are removed. Account-observation and Claude-session pseudonym keys are not targeted.\n\nHosted service: no registered device is revoked and no hosted contribution or result is deleted. Use the hosted privacy workflow separately. Secure erasure is not claimed."
+                "This is a targeted local security-recovery action, not uninstall or hosted deletion.\n\nApp state: indexes, cached analysis, prepared contributions, settings, and Codex logs remain. Only the local device-binding marker and any retired file identity residue are removed.\n\nKeychain: the %@ export identity and paired-device credential are removed. Account-observation and Claude-session pseudonym keys are not targeted.\n\nHosted service: no registered device is revoked and no hosted contribution or result is deleted. Hosted history is kept. See project support guidance for information about separate owner-handled erasure. Secure erasure is not claimed."
             case .dialogLocalAppData:
                 "Local app data"
             case .dialogLocalAppDataDescription:
@@ -427,6 +650,8 @@ enum TiboTattleLocalization {
                 "Data & Diagnostics…"
             case .launcherDashboardDidNotOpen:
                 "Dashboard didn’t open"
+            case .launcherDashboardTakingLonger:
+                "Dashboard is taking longer than expected"
             case .launcherDetailPreparingLocalDashboard:
                 "Preparing the private local dashboard and its bounded foreground update."
             case .launcherErrorCompanionAlreadyRunning:
@@ -439,8 +664,16 @@ enum TiboTattleLocalization {
                 "The local companion did not become ready in time."
             case .launcherErrorCodexHomeSettingsWrite:
                 "The selected Codex folder could not be saved privately."
+            case .launcherErrorDashboardContentProcessTerminated:
+                "The macOS web content process stopped while opening the local dashboard."
             case .launcherErrorDashboardDownloadFailed:
                 "The dashboard could not save that file to your Downloads folder."
+            case .launcherErrorDashboardNavigationFailed:
+                "The in-app dashboard could not load its local page."
+            case .launcherErrorDashboardReadinessTimeout:
+                "The local dashboard page loaded, but it did not become ready during the initial wait."
+            case .launcherErrorDashboardViewportUnavailable:
+                "The in-app dashboard did not receive a usable window size."
             case .launcherErrorDashboardWebViewUnavailable:
                 "The in-app dashboard view could not be displayed."
             case .launcherErrorDataErase:
@@ -474,7 +707,7 @@ enum TiboTattleLocalization {
             case .launcherFailureDetails:
                 "%@ Code: %@. %@"
             case .launcherFirstRunDisclosure:
-                "%@ updates local %@ metadata while the app is open. The first pass starts after setup; later checks reuse the same bounded local companion.\n\nReads: timestamps, model and speed labels, token counters, tool categories, and quota snapshots from the selected %@ sessions folders.\n\nStores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only %@ app-data folder.\n\nCommunity contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.\n\n%@\n\nNever contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.\n\nKeep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints. You can choose whether the app opens at login. TiboTattle installs no LaunchAgent or daemon."
+                "%@ updates local %@ usage and quota evidence while the app is open. The first pass starts after setup; later checks reuse the same bounded local companion.\n\nReads locally: usage metadata from the selected %@ sessions and archived_sessions folders; state_5.sqlite for rollout lineage; config.toml for service-tier settings; and the installed Codex app-server account/read, account/rateLimits/read, and account/usage/read methods. Source records are processed locally; prompt and response text is never retained in TiboTattle's derived state.\n\nStores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only %@ app-data folder. Existing pseudonymous identities and device credentials remain in the macOS Keychain.\n\nCommunity contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.\n\nLocal allowance notifications are also off by default. If enabled in Settings → Notifications, they use only fresh provider-reported quota evidence from foreground refreshes; they add no background polling.\n\n%@\n\nNever contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.\n\nKeep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints.\n\n%@"
             case .launcherGetStarted:
                 "Get Started"
             case .launcherLoadingPrivateDashboard:
@@ -514,7 +747,7 @@ enum TiboTattleLocalization {
             case .launcherRecoveryDashboardDownload:
                 "Check access to your Downloads folder, then save the file again."
             case .launcherRecoveryDashboardWebView:
-                "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser."
+                "Choose Open Dashboard to try the local view again. If it still does not open, choose Retry."
             case .launcherRecoveryDataErase:
                 "Quit other processes using %@ data, then try the erase again."
             case .launcherRecoveryExistingWindow:
@@ -571,10 +804,32 @@ enum TiboTattleLocalization {
                 "Analysis and cached results stay on this Mac. Community contribution is optional."
             case .nativeDashboardOverview:
                 "Overview"
+            case .nativeDashboardPerformance:
+                "Model performance"
+            case .nativeDashboardProgressAccounting:
+                "Calculating accounting…"
+            case .nativeDashboardProgressAnalyzing:
+                "Analyzing local history…"
+            case .nativeDashboardProgressAnalyzingFiles:
+                "Analyzing %@ of %@ files…"
+            case .nativeDashboardProgressArchiveIndex:
+                "Updating older history…"
+            case .nativeDashboardProgressDiscovering:
+                "Finding local history…"
+            case .nativeDashboardProgressFinishing:
+                "Finishing analysis…"
+            case .nativeDashboardProgressProspective:
+                "Preparing ongoing tracking…"
+            case .nativeDashboardProgressQuickResult:
+                "Local summary updated · checking full history…"
+            case .nativeDashboardProgressQuotaRefresh:
+                "Refreshing allowance…"
+            case .nativeDashboardProgressSaving:
+                "Saving analysis progress…"
             case .nativeDashboardRefreshUsage:
                 "Refresh"
             case .nativeDashboardRefreshUsageTooltip:
-                "Update local usage now. This reads only the selected Codex folders on this Mac."
+                "Refresh the current allowance, local history, and detailed accounting. Reuses valid cached results; all processing stays on this Mac."
             case .nativeDashboardShare:
                 "Share"
             case .nativeDashboardShareTooltip:
@@ -673,6 +928,138 @@ enum TiboTattleLocalization {
                 "1 verified Codex allowance"
             case .menuBarWaitingToAnalyze:
                 "Waiting to Analyze Local Usage"
+            case .menuBarPopupHeaderLive:
+                "Live"
+            case .menuBarPopupHeaderLiveUpdated:
+                "Live · updated %@"
+            case .menuBarPopupHeaderUpdating:
+                "Updating…"
+            case .menuBarPopupRemaining:
+                "%@ remaining"
+            case .menuBarPopupResets:
+                "Resets %@"
+            case .menuBarPopupResetUnavailable:
+                "Reset time unavailable"
+            case .menuBarPopupWeeklyPosition:
+                "Weekly position"
+            case .menuBarPopupPositionElapsed:
+                "Elapsed"
+            case .menuBarPopupPositionUsed:
+                "Used"
+            case .menuBarPopupPositionBelow:
+                "Below even pace"
+            case .menuBarPopupPositionOn:
+                "On even pace"
+            case .menuBarPopupPositionAbove:
+                "Above even pace"
+            case .menuBarPopupPositionSummary:
+                "%@ used · %@ of the window elapsed"
+            case .menuBarPopupPositionDisclaimer:
+                "Compares use with time elapsed · not a forecast"
+            case .menuBarPopupWeeklyPace:
+                "Weekly pace"
+            case .menuBarPopupPaceCollecting:
+                "Collecting pace"
+            case .menuBarPopupPaceUnder:
+                "Under sustainable pace"
+            case .menuBarPopupPaceOn:
+                "Near sustainable pace"
+            case .menuBarPopupPaceOver:
+                "Over sustainable pace"
+            case .menuBarPopupPaceCritical:
+                "Well over sustainable pace"
+            case .menuBarPopupPaceCollectingDetail:
+                "One compatible local observation; a trend needs another."
+            case .menuBarPopupPaceRatioOutcome:
+                "%@× sustainable · %@"
+            case .menuBarPopupPaceDryBeforeReset:
+                "about %@ before reset with none left"
+            case .menuBarPopupPaceSpareAtReset:
+                "about %@ left at reset"
+            case .menuBarPopupPaceReachesReset:
+                "projected to reach reset"
+            case .menuBarPopupPaceNow:
+                "Now"
+            case .menuBarPopupPaceResetIn:
+                "Reset in %@"
+            case .menuBarPopupPaceEvidenceOne:
+                "1 compatible local observation · waiting for another"
+            case .menuBarPopupPaceEvidenceMany:
+                "%@ compatible local observations · estimate can change"
+            case .menuBarPopupPaceEarlyEstimate:
+                "Early estimate · %@"
+            case .menuBarPopupPaceActiveMarker:
+                "%@ · marker shows recent active-use pace"
+            case .menuBarPopupLocalUsage:
+                "Local usage"
+            case .menuBarPopupPeriodLastSevenDays:
+                "Last 7 days"
+            case .menuBarPopupPeriodLastThirtyDays:
+                "Last 30 days"
+            case .menuBarPopupTokenCount:
+                "%@ tokens"
+            case .menuBarPopupUsageChangeOne:
+                "1 local usage change"
+            case .menuBarPopupUsageChangesMany:
+                "%@ local usage changes"
+            case .menuBarPopupUsageSummary:
+                "%@ · %@"
+            case .menuBarPopupAPIPriceEquivalent:
+                "API-price equivalent"
+            case .menuBarPopupAPIPriceEquivalentPartial:
+                "Known API-price equivalent"
+            case .menuBarPopupPartialPricing:
+                "Partial pricing"
+            case .menuBarPopupAPIPriceEquivalentUnavailable:
+                "API-price equivalent is unavailable for this period."
+            case .menuBarPopupAPIPriceEquivalentRecalculating:
+                "Recalculating API-price equivalent…"
+            case .menuBarPopupPartialPricingDetail:
+                "%@ fully priced · %@ partially priced · %@ unpriced"
+            case .menuBarPopupPartialPricingCaption:
+                "Chart heights show known priced portions only."
+            case .menuBarPopupCoverageMixed:
+                "Coverage: %@ complete · %@ partial · %@ unavailable"
+            case .menuBarPopupCoverageAccessible:
+                "%@. %@ complete days, %@ partial days, %@ unavailable days. %@ known tokens."
+            case .menuBarPopupNotSubscriptionBill:
+                "Not a subscription bill"
+            case .menuBarPopupAccountingUnavailableTitle:
+                "Local usage history is not available yet"
+            case .menuBarPopupAccountingUnavailableBody:
+                "Run a local analysis to build 7-day and 30-day API-price-equivalent history from this Mac."
+            case .menuBarPopupRetainedHistory:
+                "Showing the last completed analysis."
+            case .menuBarPopupNoUsageObserved:
+                "No local usage observed in %@."
+            case .menuBarPopupStartingTitle:
+                "Preparing local usage"
+            case .menuBarPopupStartingBody:
+                "TiboTattle will show values only after a fresh local observation."
+            case .menuBarPopupUpdatingTitle:
+                "Reading current local usage…"
+            case .menuBarPopupUpdatingBody:
+                "TiboTattle will show values only after a fresh local observation."
+            case .menuBarPopupStaleTitle:
+                "Current usage needs an update"
+            case .menuBarPopupStaleBody:
+                "Last observed %@. Allowance values are hidden until a fresh local observation."
+            case .menuBarPopupErrorTitle:
+                "Couldn’t read current usage"
+            case .menuBarPopupErrorBody:
+                "TiboTattle could not reach its local companion. No earlier values are shown as current."
+            case .menuBarPopupOpenProduct:
+                "Open %@"
+            case .menuBarPopupRefresh:
+                "Refresh"
+            case .menuBarPopupMore:
+                "More"
+            case .menuBarPopupAccessibilityOpenProduct:
+                "Open the full %@ window"
+            case .menuBarPopupAccessibilityRefresh:
+                "Refresh local usage"
+            case .menuBarPopupAccessibilityMore:
+                "More %@ actions"
             case .menuQuitProduct:
                 "Quit %@"
             case .menuSelectAll:
@@ -693,6 +1080,18 @@ enum TiboTattleLocalization {
                 "About"
             case .settingsAboutSummary:
                 "Local Codex allowance, measured on your Mac."
+            case .settingsAppearance:
+                "Appearance"
+            case .settingsAppearanceDark:
+                "Dark"
+            case .settingsAppearanceLight:
+                "Light"
+            case .settingsAppearancePickerHint:
+                "Choose how TiboTattle looks."
+            case .settingsAppearanceSummary:
+                "Uses your Mac appearance by default."
+            case .settingsAppearanceSystem:
+                "System"
             case .settingsAutomaticUpdates:
                 "Automatic updates"
             case .settingsAutomaticUpdatesOff:
@@ -716,13 +1115,27 @@ enum TiboTattleLocalization {
             case .settingsCodexFolderDefaultLocation:
                 "Default location (~/.codex)"
             case .settingsCodexFolderSummary:
-                "TiboTattle reads only the sessions and archived_sessions folders below this location. Use the default unless your Codex data lives somewhere else."
+                "This setting controls the sessions and archived_sessions source only. Refresh also uses the local Codex account, quota, configuration, and rollout-lineage sources disclosed at first run."
             case .settingsGeneral:
                 "General"
             case .settingsGeneralSummary:
                 "Local usage refreshes while TiboTattle is open. Raw logs stay on this Mac."
             case .settingsGitHub:
                 "GitHub"
+            case .settingsKeychainMigrationTitle:
+                "Secure upgrade"
+            case .settingsKeychainMigrationSummary:
+                "Saved Keychain access needs one-time approval to finish this upgrade. Your history is kept; review when you’re ready."
+            case .settingsKeychainMigrationRetrying:
+                "Preparing secure access automatically. No password is needed while these checks run."
+            case .settingsKeychainMigrationApproving:
+                "Finishing the approved Keychain migration… Your existing key values and history are kept."
+            case .settingsKeychainMigrationDeferred:
+                "Migration is still pending for the remaining keys. Nothing has been reset, and local history is kept. You can review again when ready."
+            case .settingsKeychainMigrationReview:
+                "Review migration…"
+            case .settingsKeychainMigrationMenu:
+                "Finish secure upgrade…"
             case .settingsLanguage:
                 "Language"
             case .settingsLanguageEnglish:
@@ -801,14 +1214,8 @@ enum TiboTattleLocalization {
                 "Open Dashboard"
             case .settingsOpenNotifications:
                 "Open Notification Settings"
-            case .settingsPreviewUpdatesPending:
-                "This preview uses the live TiboTattle update feed. The first signed release has not been published yet, so updates cannot be discovered."
-            case .settingsPreviewUpdatesPendingMessage:
-                "This preview is connected to the live TiboTattle service, but the signed update feed has not been published yet. Local analysis is unaffected. Check again after a signed release is available."
-            case .settingsPreviewUpdatesPendingTitle:
-                "Updates aren't published yet"
             case .firstRunLoginItemDisclosure:
-                "By default, first-run setup preselects Start TiboTattle at login. TiboTattle adds a macOS login item only after you click Get Started; it uses no LaunchAgent, daemon, privileged helper, or hidden persistent process."
+                "By default, first-run setup preselects Start TiboTattle at login. TiboTattle adds a macOS login item only after you click Get Started; it uses no LaunchAgent or daemon and no privileged helper or hidden persistent process."
             case .settingsContinue:
                 "Continue"
             case .settingsContinueWithoutLogin:
@@ -860,7 +1267,7 @@ enum TiboTattleLocalization {
             case .settingsRefreshInterval:
                 "Refresh interval"
             case .settingsRefreshIntervalDetail:
-                "Saved on this Mac and used while TiboTattle is open."
+                "Checks current allowance while TiboTattle is open. Detailed accounting updates automatically at most hourly; choose Refresh to update everything now."
             case .settingsRefreshIntervalOneMinute:
                 "Every minute"
             case .settingsRefreshIntervalFiveMinutes:
@@ -871,10 +1278,14 @@ enum TiboTattleLocalization {
                 "Every 30 minutes"
             case .settingsUseDefault:
                 "Use Default"
+            case .settingsUpdateCheckUnavailableMessage:
+                "TiboTattle couldn't complete the update check. Check your internet connection and try again."
+            case .settingsUpdateCheckUnavailableTitle:
+                "Couldn't check for updates"
             case .settingsUpdateDisclosureAutomaticOff:
-                "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → General when available."
+                "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → About when available."
             case .settingsUpdateDisclosureAutomaticOn:
-                "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → General."
+                "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → About."
             case .settingsUpdateDisclosureDevelopment:
                 "This development build does not include update checks. Signed releases installed in Applications can check for updates from About."
             case .settingsUpdateDisclosurePreview:
@@ -1050,6 +1461,11 @@ enum TiboTattleLocalization {
         return formatter.string(
             from: NSNumber(value: Double(value) / 100)
         ) ?? "\(value)%"
+    }
+
+    static func integerString(_ value: Int) -> String {
+        decimalNumberFormatter(maximumFractionDigits: 0)
+            .string(from: NSNumber(value: value)) ?? String(value)
     }
 
     static func dateFormatter(

@@ -1,0 +1,3545 @@
+#!/usr/bin/env node
+
+/**
+ * Candidate-only normal Windows Electron journey.
+ *
+ * This executes an exact unpacked stable-metadata candidate in a fresh hosted
+ * runner profile. It is deliberately separate from the development NSIS
+ * lifecycle proof: no installer is exercised here, and no qualification
+ * marker, test lane, or private smoke IPC reaches the app. The candidate's
+ * one temporary, app-scoped outbound firewall rule prevents hosted reach while
+ * its loopback dashboard remains the rendered journey under test.
+ */
+
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { createServer } from "node:net";
+import { dirname, join, resolve, win32 } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import {
+  createWindowsFilesystemAdapter,
+  createWindowsProtectedStateStore,
+  isWindowsProtectedStateStoreError,
+} from "../src/platform/index.js";
+import {
+  createDesktopFirstRunReceiptBackend,
+  DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+  validateDesktopFirstRunReceipt,
+} from "../apps/electron/desktop-first-run.js";
+import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC } from "../apps/electron/errors.js";
+import {
+  createDesktopSharingBackend,
+  createDesktopSharingCoordinator,
+} from "../apps/electron/desktop-sharing.js";
+import { isDesktopSettingsBackendError } from "../apps/electron/desktop-settings-backends.js";
+import { validateProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
+import {
+  buildWindowsNormalCandidateLaunchSpec,
+  prepareWindowsDevelopmentProfile,
+  WINDOWS_ELECTRON_BINDING_RELATIVE_PATH,
+  WINDOWS_ELECTRON_KEYTAR_RELATIVE_PATH,
+  WINDOWS_NORMAL_CANDIDATE_APP_NAME,
+} from "./launch-electron-windows-development.mjs";
+import {
+  classifyAutomaticStartupRefreshReceipt,
+  createLinuxCompanionProcessDiagnostics,
+  createLinuxDashboardFailureDiagnostics,
+  ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES,
+  validateLinuxCompanionProcessDiagnostics,
+  validateLinuxDashboardFailureDiagnostic,
+} from "./smoke-electron-linux.mjs";
+import {
+  assertWindowsProcessTreeExited,
+  buildWindowsExactExecutableProcessQueryArguments,
+  buildWindowsOwnedProcessSnapshotQueryArguments,
+  ownedWindowsProcessTree,
+  parseWindowsProcessSnapshot,
+  runWindowsNsisLifecycleProgram,
+} from "./smoke-electron-windows-nsis-lifecycle.mjs";
+
+const require = createRequire(import.meta.url);
+const SCRIPT_FILE = fileURLToPath(import.meta.url);
+const PREFIX = "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_";
+const TARGET = "win32-x64";
+const RECEIPT_SCHEMA = "tibotattle-electron-windows-normal-candidate-smoke-v1";
+const SOURCE_CANDIDATE_SCHEMA = "tibotattle-electron-production-source-candidate-v1";
+const SOURCE_CANDIDATE_STAGE = ".release-build/electron-production/win32-x64/app";
+const SOURCE_CANDIDATE_BUILDER = "apps/electron/electron-builder.production.config.cjs";
+const FIRST_RUN_ACKNOWLEDGEMENT = validateDesktopFirstRunReceipt({
+  schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+  acknowledged: true,
+});
+const SYNTHETIC_CODEX_SESSION_FILE =
+  "rollout-2026-09-08T00-00-00-70000000-0000-4000-8000-000000000001.jsonl";
+const SYNTHETIC_CODEX_SESSION_ID = "70000000-0000-4000-8000-000000000001";
+// This fixed source contains no user content, account identity, or real usage.
+// Its filename and event shape are the smallest accepted by both Codex rollout
+// discovery and the unified local-index refresh path.
+const SYNTHETIC_CODEX_SESSION = `${[
+  {
+    timestamp: "2026-09-08T00:00:00.000Z",
+    type: "session_meta",
+    payload: { id: SYNTHETIC_CODEX_SESSION_ID },
+  },
+  {
+    timestamp: "2026-09-08T00:00:01.000Z",
+    type: "turn_context",
+    payload: { model: "gpt-5.6-sol" },
+  },
+  {
+    timestamp: "2026-09-08T00:01:00.000Z",
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: {
+          input_tokens: 100,
+          cached_input_tokens: 40,
+          cache_write_input_tokens: 0,
+          output_tokens: 20,
+          reasoning_output_tokens: 8,
+          total_tokens: 120,
+        },
+        last_token_usage: {
+          input_tokens: 100,
+          cached_input_tokens: 40,
+          cache_write_input_tokens: 0,
+          output_tokens: 20,
+          reasoning_output_tokens: 8,
+          total_tokens: 120,
+        },
+      },
+    },
+  },
+].map((record) => JSON.stringify(record)).join("\n")}\n`;
+// The closed fixture is intentionally small enough to make its ingestion
+// contract auditable without retaining source rows or account data in a CI
+// receipt. These values are asserted from the app's existing loopback API.
+const SYNTHETIC_INGESTION_EXPECTATION = Object.freeze({
+  events: 1,
+  totalTokens: 120,
+  sourceCount: 1,
+});
+const SOURCE_REVISION = /^[0-9a-f]{40}$/u;
+const SHA256 = /^[0-9a-f]{64}$/u;
+const FIREWALL_RULE_PREFIX = "tibotattle-normal-candidate-";
+const FIREWALL_RULE_NAME = new RegExp(`^${FIREWALL_RULE_PREFIX}[0-9a-f-]{36}$`, "u");
+const NORMAL_CANDIDATE_QUIT_REQUEST = Object.freeze({
+  type: "tibotattle-electron-smoke-quit-v1",
+});
+const NORMAL_CANDIDATE_QUIT_ACCEPTED = "tibotattle-electron-smoke-quit-accepted-v1";
+const MAXIMUM_JSON_BYTES = 1024 * 1024;
+const MAXIMUM_PROGRAM_OUTPUT_BYTES = 1024;
+const STARTUP_TIMEOUT_MS = 30_000;
+const OPERATION_TIMEOUT_MS = 20_000;
+// A one-shot diagnostic must not extend the existing startup acceptance
+// deadline. It only classifies the already-failed loopback endpoint.
+const STARTUP_CDP_DIAGNOSTIC_TIMEOUT_MS = 1_000;
+// This probe runs only after the ordinary 30-second CDP acceptance path has
+// already failed. It records fixed native observations before cleanup without
+// extending or relaxing that acceptance condition.
+const STARTUP_CDP_NATIVE_DIAGNOSTIC_TIMEOUT_MS = 10_000;
+const PROCESS_EXIT_TIMEOUT_MS = 15_000;
+const POWERSHELL_TIMEOUT_MS = 20_000;
+// Firewall setup/readback has an independent bounded preparation budget. The
+// candidate remains ineligible to launch until this command verifies its rule.
+export const WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS = 60_000;
+const CLEANUP_TIMEOUT_MS = 10_000;
+const NORMAL_CANDIDATE_STARTUP_PHASES = new Set([
+  "port_allocation",
+  "process_spawn",
+  "cdp_version",
+  "dashboard_target",
+  "cdp_connection",
+  "dashboard_gate",
+  "dashboard_ready",
+  "dashboard_health",
+  "startup_refresh_acceptance",
+  "startup_refresh_completion",
+  "explicit_refresh_acceptance",
+  "explicit_refresh_completion",
+  "sharing_opt_out",
+  "process_proof",
+  "settings_target",
+  "settings_ready",
+  "settings_panel",
+  "settings_persist",
+  "clean_quit",
+  "process_absence",
+]);
+const STARTUP_CDP_CHILD_STATES = new Set([
+  "alive",
+  "exited_zero",
+  "exited_nonzero",
+  "signaled",
+  "unavailable",
+]);
+const STARTUP_CDP_ENDPOINT_STATES = new Set([
+  "version_available",
+  "transport_unavailable",
+  "timed_out",
+  "response_rejected",
+  "response_invalid",
+  "unavailable",
+]);
+const STARTUP_CDP_ENTRY_MARKER_STATES = new Set([
+  "entry_failure_marked",
+  "marker_absent",
+  "stream_unavailable",
+]);
+const STARTUP_CDP_NATIVE_ROOT_IDENTITY_STATES = new Set([
+  "matched",
+  "absent",
+  "changed",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_LISTENER_STATES = new Set([
+  "owned",
+  "foreign",
+  "absent",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_DESKTOP_STATES = new Set([
+  "observed",
+  "unobserved",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_OWNED_WINDOW_STATES = new Set([
+  "present",
+  "absent",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_DIALOG_STATES = new Set([
+  "js_main_error",
+  "other_owned_window",
+  "none",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_DIALOG_CAUSE_STATES = new Set([
+  "module_not_found",
+  "native_load",
+  "unknown_file_extension",
+  "named_export",
+  "syntax_error",
+  "other",
+  "none",
+  "unavailable",
+]);
+const PROTECTED_OPT_OUT_STAGES = new Set([
+  "PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE",
+  "PROTECTED_OPT_OUT_STORE_UNAVAILABLE",
+  "PROTECTED_OPT_OUT_INITIAL_READ_UNAVAILABLE",
+  "PROTECTED_OPT_OUT_FIRST_RUN_UNAVAILABLE",
+  "PROTECTED_OPT_OUT_SHARING_UNAVAILABLE",
+]);
+const WINDOWS_FILESYSTEM_SEED_CAUSES = new Set([
+  "WINDOWS_FILESYSTEM_BINDING_INTEGRITY_MISMATCH",
+  "WINDOWS_FILESYSTEM_BINDING_UNAVAILABLE",
+  "WINDOWS_FILESYSTEM_INVALID_BINDING",
+  "WINDOWS_FILESYSTEM_INVALID_BINDING_BYTES",
+  "WINDOWS_FILESYSTEM_INVALID_BINDING_PATH",
+  "WINDOWS_FILESYSTEM_INVALID_CONFIGURATION",
+  "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  "WINDOWS_FILESYSTEM_MANIFEST_BINDING_MISMATCH",
+  "WINDOWS_FILESYSTEM_MANIFEST_UNAVAILABLE",
+  "WINDOWS_FILESYSTEM_UNSUPPORTED_ARCHITECTURE",
+  "WINDOWS_FILESYSTEM_UNSUPPORTED_PLATFORM",
+]);
+const WINDOWS_PROTECTED_STATE_SEED_CAUSES = new Set([
+  "WINDOWS_PROTECTED_STATE_STORE_INVALID_ADAPTER",
+  "WINDOWS_PROTECTED_STATE_STORE_INVALID_CONFIGURATION",
+  "WINDOWS_PROTECTED_STATE_STORE_INVALID_IDENTITY",
+  "WINDOWS_PROTECTED_STATE_STORE_INVALID_ROOT",
+  "WINDOWS_PROTECTED_STATE_STORE_SECURITY_POLICY",
+  "WINDOWS_PROTECTED_STATE_STORE_UNAVAILABLE",
+]);
+const DESKTOP_SETTINGS_SEED_CAUSES = new Set([
+  "DESKTOP_SETTINGS_BACKEND_CORRUPT",
+  "DESKTOP_SETTINGS_BACKEND_STORE_INVALID",
+  "DESKTOP_SETTINGS_BACKEND_STORE_UNSAFE",
+  "DESKTOP_SETTINGS_BACKEND_TOO_LARGE",
+  "DESKTOP_SETTINGS_BACKEND_UNAVAILABLE",
+  "DESKTOP_SETTINGS_BACKEND_WRITE_FAILED",
+]);
+const PROTECTED_OPT_OUT_CAUSES = new Set([
+  ...WINDOWS_FILESYSTEM_SEED_CAUSES,
+  ...WINDOWS_PROTECTED_STATE_SEED_CAUSES,
+  ...DESKTOP_SETTINGS_SEED_CAUSES,
+]);
+const FAILURE_CODES = new Set([
+  "ARGUMENT_INVALID",
+  "WINDOWS_X64_REQUIRED",
+  "DISPOSABLE_CI_REQUIRED",
+  "RUNNER_TEMP_INVALID",
+  "RECEIPT_INVALID",
+  "SOURCE_CANDIDATE_INVALID",
+  "PACKAGE_IDENTITY_INVALID",
+  "PACKAGE_PATHS_INVALID",
+  "PACKAGE_STAGED_MANIFEST_INVALID",
+  "PACKAGE_ARCHIVE_MANIFEST_INVALID",
+  "PACKAGE_METADATA_INVALID",
+  "PACKAGE_RUNTIME_CLOSURE_INVALID",
+  "PACKAGE_NATIVE_MEMBERS_INVALID",
+  "NATIVE_PAIR_INVALID",
+  "ASAR_UNAVAILABLE",
+  "PROFILE_INVALID",
+  "PROFILE_NOT_ABSENT",
+  "SYNTHETIC_FIXTURE_UNAVAILABLE",
+  "PROTECTED_OPT_OUT_UNAVAILABLE",
+  "FIREWALL_UNAVAILABLE",
+  "FIREWALL_RULE_DIRTY",
+  "FIREWALL_RULE_INVALID",
+  "FIREWALL_CLEANUP_UNCONFIRMED",
+  "APPLICATION_LAUNCH_UNAVAILABLE",
+  "PROCESS_PROOF_UNAVAILABLE",
+  "OWNED_PROCESS_REMAINS",
+  "CDP_UNAVAILABLE",
+  "DASHBOARD_UNAVAILABLE",
+  "DASHBOARD_INVALID",
+  "LOCAL_REFRESH_UNAVAILABLE",
+  "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
+  "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_ACTIVE_GATE_ABSENT",
+  "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_MATCH_BRIDGE_ABSENT",
+  "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_NOT_MATCHED",
+  "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_CONTEXT_UNAVAILABLE",
+  "LOCAL_STARTUP_REFRESH_GATE_ALREADY_RELEASED",
+  "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED",
+  "LOCAL_STARTUP_REFRESH_UNAVAILABLE",
+  "LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE",
+  "LOCAL_EXPLICIT_REFRESH_BUTTON_UNAVAILABLE",
+  "LOCAL_EXPLICIT_REFRESH_REQUEST_UNOBSERVED",
+  "LOCAL_EXPLICIT_REFRESH_ACCEPTANCE_UNAVAILABLE",
+  "LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE",
+  "LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE",
+  "SETTINGS_UNAVAILABLE",
+  "SETTINGS_PERSISTENCE_INVALID",
+  "CLEAN_QUIT_INVALID",
+  "PROFILE_CLEANUP_UNCONFIRMED",
+  "UNEXPECTED",
+]);
+
+function protectedOptOutFailureCode(code) {
+  if (typeof code !== "string") return false;
+  for (const stage of PROTECTED_OPT_OUT_STAGES) {
+    const prefix = `${stage}_`;
+    if (code.startsWith(prefix) && PROTECTED_OPT_OUT_CAUSES.has(code.slice(prefix.length))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function knownFailureCode(code) {
+  return FAILURE_CODES.has(code)
+    || PROTECTED_OPT_OUT_STAGES.has(code)
+    || protectedOptOutFailureCode(code);
+}
+
+function failure(code) {
+  const selected = knownFailureCode(code) ? code : "UNEXPECTED";
+  const error = new Error(`${PREFIX}${selected}`);
+  error.code = error.message;
+  return error;
+}
+
+function fail(code) {
+  throw failure(code);
+}
+
+function fixedCode(error) {
+  const value = String(error?.code ?? "");
+  return knownFailureCode(value.replace(PREFIX, "")) ? value : `${PREFIX}UNEXPECTED`;
+}
+
+function exactWindowsPath(value) {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")
+      || !win32.isAbsolute(value)) return null;
+  try {
+    return win32.resolve(value);
+  } catch {
+    return null;
+  }
+}
+
+function sameWindowsPath(left, right) {
+  const selectedLeft = exactWindowsPath(left);
+  const selectedRight = exactWindowsPath(right);
+  return selectedLeft !== null && selectedRight !== null
+    && selectedLeft.toLowerCase() === selectedRight.toLowerCase();
+}
+
+function validRegularMetadata(value) {
+  return value?.isFile?.() === true && value.isSymbolicLink?.() === false
+    && value.nlink === 1 && Number.isSafeInteger(value.size) && value.size > 0;
+}
+
+async function regularFile(path, code = "PACKAGE_IDENTITY_INVALID") {
+  try {
+    const metadata = await lstat(path);
+    if (!validRegularMetadata(metadata)) fail(code);
+    return metadata;
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail(code);
+  }
+}
+
+async function regularDirectory(path, code = "PACKAGE_IDENTITY_INVALID") {
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isDirectory?.() || metadata.isSymbolicLink?.()) fail(code);
+    return metadata;
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail(code);
+  }
+}
+
+async function digestRegularFile(path, code = "PACKAGE_IDENTITY_INVALID") {
+  const metadata = await regularFile(path, code);
+  let bytes;
+  try {
+    bytes = await readFile(path);
+  } catch {
+    fail(code);
+  }
+  if (!Buffer.isBuffer(bytes) || bytes.byteLength !== metadata.size) fail(code);
+  return Object.freeze({
+    bytes: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+}
+
+function valueAfter(argv, index) {
+  const value = argv[index + 1];
+  if (typeof value !== "string" || value.length === 0 || value.startsWith("--")
+      || value.includes("\0")) {
+    fail("ARGUMENT_INVALID");
+  }
+  return value;
+}
+
+/** Accept exactly one runner-only unpacked candidate invocation. */
+export function parseWindowsNormalCandidateSmokeArguments(argv) {
+  if (!Array.isArray(argv)) fail("ARGUMENT_INVALID");
+  const fields = new Map([
+    ["--app", "appPath"],
+    ["--staged-app", "stagedAppPath"],
+    ["--source-candidate", "sourceCandidatePath"],
+    ["--source-revision", "sourceRevision"],
+    ["--receipt", "receiptPath"],
+  ]);
+  const result = {};
+  const seen = new Set();
+  for (let index = 0; index < argv.length; index += 1) {
+    const field = fields.get(argv[index]);
+    if (!field || seen.has(field)) fail("ARGUMENT_INVALID");
+    seen.add(field);
+    result[field] = valueAfter(argv, index);
+    index += 1;
+  }
+  if (seen.size !== fields.size || !SOURCE_REVISION.test(result.sourceRevision ?? "")) {
+    fail("ARGUMENT_INVALID");
+  }
+  for (const field of ["appPath", "stagedAppPath", "sourceCandidatePath", "receiptPath"]) {
+    const normalized = exactWindowsPath(result[field]);
+    if (normalized === null) fail("ARGUMENT_INVALID");
+    result[field] = normalized;
+  }
+  const candidateRoot = win32.dirname(result.sourceCandidatePath);
+  if (!sameWindowsPath(result.appPath, win32.join(
+    candidateRoot,
+    "artifacts",
+    "win-unpacked",
+    WINDOWS_NORMAL_CANDIDATE_APP_NAME,
+  )) || !sameWindowsPath(result.stagedAppPath, win32.join(candidateRoot, "app"))) {
+    fail("ARGUMENT_INVALID");
+  }
+  return Object.freeze(result);
+}
+
+function exactObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function sourceCandidateValid(value, sourceRevision) {
+  return exactObject(value)
+    && value.schemaVersion === SOURCE_CANDIDATE_SCHEMA
+    && value.status === "production_source_staged"
+    && value.target === TARGET
+    && value.sourceRevision === sourceRevision
+    && value.stagingDirectory === SOURCE_CANDIDATE_STAGE
+    && value.builderConfiguration === SOURCE_CANDIDATE_BUILDER
+    && value.updaterEnabled === true
+    && value.signingRequired === true
+    && value.signingPerformed === false
+    && value.publishingPerformed === false
+    && value.windowsRuntimeQualification === "required";
+}
+
+function stableMetadata(value, sourceRevision) {
+  let metadata;
+  try {
+    metadata = validateProductionDistributionMetadata(value, {
+      platform: "win32",
+      architecture: "x64",
+    });
+  } catch {
+    fail("PACKAGE_METADATA_INVALID");
+  }
+  if (metadata.target !== TARGET || metadata.channel !== "stable"
+      || metadata.sourceRevision !== sourceRevision) {
+    fail("PACKAGE_METADATA_INVALID");
+  }
+  return metadata;
+}
+
+/** Bind source-plan, staged app, and ASAR metadata to one stable candidate. */
+export function validateWindowsNormalCandidateSmokeMetadata({
+  sourceCandidate,
+  stagedManifest,
+  archiveManifest,
+  sourceRevision,
+} = {}) {
+  if (!SOURCE_REVISION.test(sourceRevision ?? "")) fail("ARGUMENT_INVALID");
+  if (!sourceCandidateValid(sourceCandidate, sourceRevision)) fail("SOURCE_CANDIDATE_INVALID");
+  const staged = stableMetadata(stagedManifest?.tibotattleDistribution, sourceRevision);
+  const archived = stableMetadata(archiveManifest?.tibotattleDistribution, sourceRevision);
+  if (JSON.stringify(staged) !== JSON.stringify(archived)
+      || stagedManifest?.version !== sourceCandidate.version
+      || archiveManifest?.version !== sourceCandidate.version) {
+    fail("PACKAGE_METADATA_INVALID");
+  }
+  return Object.freeze({ sourceRevision, target: TARGET, distribution: staged });
+}
+
+async function readSafeJson(path, code) {
+  await regularFile(path, code);
+  let text;
+  try {
+    text = await readFile(path, "utf8");
+  } catch {
+    fail(code);
+  }
+  if (Buffer.byteLength(text, "utf8") > MAXIMUM_JSON_BYTES) fail(code);
+  try {
+    const value = JSON.parse(text);
+    if (!exactObject(value)) fail(code);
+    return value;
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail(code);
+  }
+}
+
+function loadAsar() {
+  try {
+    const builderRequire = createRequire(require.resolve("electron-builder"));
+    const asar = builderRequire("@electron/asar");
+    const selected = asar.default ?? asar;
+    if (typeof selected?.extractFile !== "function") fail("ASAR_UNAVAILABLE");
+    return selected;
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("ASAR_UNAVAILABLE");
+  }
+}
+
+/** Electron's ASAR reader indexes members with the packager host's separator. */
+function archiveMemberPath(member, platform = process.platform) {
+  return platform === "win32" ? member.replaceAll("/", win32.sep) : member;
+}
+
+function readArchiveFile(
+  archivePath,
+  member,
+  asar = loadAsar(),
+  code = "PACKAGE_IDENTITY_INVALID",
+  platform = process.platform,
+) {
+  let bytes;
+  try {
+    bytes = asar.extractFile(archivePath, archiveMemberPath(member, platform));
+  } catch {
+    fail(code);
+  }
+  if (!(Buffer.isBuffer(bytes) || bytes instanceof Uint8Array)
+      || bytes.byteLength < 1 || bytes.byteLength > MAXIMUM_JSON_BYTES) {
+    fail(code);
+  }
+  return Buffer.from(bytes);
+}
+
+function readArchiveJson(
+  archivePath,
+  member,
+  asar = loadAsar(),
+  code = "PACKAGE_IDENTITY_INVALID",
+  platform = process.platform,
+) {
+  try {
+    const value = JSON.parse(readArchiveFile(archivePath, member, asar, code, platform).toString("utf8"));
+    if (!exactObject(value)) fail(code);
+    return value;
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail(code);
+  }
+}
+
+function sameDigest(left, right) {
+  return left?.bytes === right?.bytes && left?.sha256 === right?.sha256;
+}
+
+async function digestArchiveMember(
+  archivePath,
+  member,
+  { asar = loadAsar(), code = "PACKAGE_IDENTITY_INVALID", platform = process.platform } = {},
+) {
+  const bytes = readArchiveFile(archivePath, member, asar, code, platform);
+  return Object.freeze({
+    bytes: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+}
+
+async function validateNativePair({
+  stagedAppPath,
+  asarPath,
+  unpackedPath,
+  asar = loadAsar(),
+  digest = digestRegularFile,
+  failureCode = "PACKAGE_NATIVE_MEMBERS_INVALID",
+  platform = process.platform,
+} = {}) {
+  const relativeBinding = WINDOWS_ELECTRON_BINDING_RELATIVE_PATH;
+  const relativeManifest = `${relativeBinding}.manifest.json`;
+  const relativeKeytar = WINDOWS_ELECTRON_KEYTAR_RELATIVE_PATH;
+  const [stagedBinding, packagedBinding, stagedKeytar, packagedKeytar, stagedManifest, archivedManifest] =
+    await Promise.all([
+      digest(join(stagedAppPath, ...relativeBinding.split("/")), failureCode),
+      digest(join(unpackedPath, ...relativeBinding.split("/")), failureCode),
+      digest(join(stagedAppPath, ...relativeKeytar.split("/")), failureCode),
+      digest(join(unpackedPath, ...relativeKeytar.split("/")), failureCode),
+      digest(join(stagedAppPath, ...relativeManifest.split("/")), failureCode),
+      digestArchiveMember(asarPath, relativeManifest, { asar, code: failureCode, platform }),
+    ]);
+  if (!sameDigest(stagedBinding, packagedBinding)
+      || !sameDigest(stagedKeytar, packagedKeytar)
+      || !sameDigest(stagedManifest, archivedManifest)) {
+    fail(failureCode);
+  }
+  return Object.freeze({
+    windowsFilesystemSha256: packagedBinding.sha256,
+    keytarSha256: packagedKeytar.sha256,
+  });
+}
+
+const WINDOWS_NORMAL_RUNTIME_MANIFEST = "electron-runtime-manifest.json";
+const WINDOWS_NORMAL_PRELOAD_MEMBER = "apps/electron/preload.cjs";
+
+/**
+ * The runtime manifest names the preload that Electron executes. Bind both
+ * staged bytes to their ASAR members before launch, then bind the preload
+ * bytes to the reviewed manifest row. Hashes stay inside package validation.
+ */
+async function validateWindowsNormalCandidateRuntimeClosure({
+  stagedAppPath,
+  asarPath,
+  readJsonFile = readSafeJson,
+  digest = digestRegularFile,
+  asar = loadAsar(),
+  failureCode = "PACKAGE_RUNTIME_CLOSURE_INVALID",
+  platform = process.platform,
+} = {}) {
+  const stagedManifestPath = join(stagedAppPath, WINDOWS_NORMAL_RUNTIME_MANIFEST);
+  const stagedPreloadPath = join(stagedAppPath, ...WINDOWS_NORMAL_PRELOAD_MEMBER.split("/"));
+  const [manifest, stagedManifest, archivedManifest, stagedPreload, archivedPreload] = await Promise.all([
+    readJsonFile(stagedManifestPath, failureCode),
+    digest(stagedManifestPath, failureCode),
+    digestArchiveMember(asarPath, WINDOWS_NORMAL_RUNTIME_MANIFEST, { asar, code: failureCode, platform }),
+    digest(stagedPreloadPath, failureCode),
+    digestArchiveMember(asarPath, WINDOWS_NORMAL_PRELOAD_MEMBER, { asar, code: failureCode, platform }),
+  ]);
+  const row = Array.isArray(manifest?.files)
+    ? manifest.files.find((entry) => entry?.path === WINDOWS_NORMAL_PRELOAD_MEMBER) : null;
+  if (!sameDigest(stagedManifest, archivedManifest)
+      || !sameDigest(stagedPreload, archivedPreload)
+      || !Number.isSafeInteger(row?.bytes) || row.bytes !== stagedPreload.bytes
+      || typeof row?.sha256 !== "string" || row.sha256 !== stagedPreload.sha256) {
+    fail(failureCode);
+  }
+}
+
+async function verifyWindowsNormalCandidateSmokePackagePaths({
+  appPath,
+  stagedAppPath,
+  resourcesPath,
+  asarPath,
+  unpackedPath,
+} = {}) {
+  await Promise.all([
+    regularFile(appPath, "PACKAGE_PATHS_INVALID"),
+    regularDirectory(stagedAppPath, "PACKAGE_PATHS_INVALID"),
+    regularDirectory(resourcesPath, "PACKAGE_PATHS_INVALID"),
+    regularFile(asarPath, "PACKAGE_PATHS_INVALID"),
+    regularDirectory(unpackedPath, "PACKAGE_PATHS_INVALID"),
+  ]);
+}
+
+/** Verify the exact staged app, ASAR runtime closure, stable metadata, and native pair. */
+export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
+  platform = process.platform,
+  architecture = process.arch,
+  readJsonFile = readSafeJson,
+  digest = digestRegularFile,
+  asar = loadAsar(),
+  validateNative = validateNativePair,
+  validateRuntimeClosure = validateWindowsNormalCandidateRuntimeClosure,
+  verifyPaths = verifyWindowsNormalCandidateSmokePackagePaths,
+} = {}) {
+  if (platform !== "win32" || architecture !== "x64"
+      || !exactWindowsPath(options.appPath) || !exactWindowsPath(options.stagedAppPath)
+      || !exactWindowsPath(options.sourceCandidatePath)
+      || !SOURCE_REVISION.test(options.sourceRevision ?? "")) {
+    fail("ARGUMENT_INVALID");
+  }
+  const appPath = options.appPath;
+  if (win32.basename(appPath).toLowerCase() !== WINDOWS_NORMAL_CANDIDATE_APP_NAME.toLowerCase()) {
+    fail("PACKAGE_IDENTITY_INVALID");
+  }
+  const resourcesPath = win32.join(win32.dirname(appPath), "resources");
+  const asarPath = win32.join(resourcesPath, "app.asar");
+  const unpackedPath = `${asarPath}.unpacked`;
+  await verifyPaths({
+    appPath,
+    stagedAppPath: options.stagedAppPath,
+    resourcesPath,
+    asarPath,
+    unpackedPath,
+  });
+  const sourceCandidate = await readJsonFile(options.sourceCandidatePath, "SOURCE_CANDIDATE_INVALID");
+  const stagedManifest = await readJsonFile(
+    win32.join(options.stagedAppPath, "package.json"),
+    "PACKAGE_STAGED_MANIFEST_INVALID",
+  );
+  const [executable, artifact] = await Promise.all([
+    digest(appPath, "PACKAGE_PATHS_INVALID"),
+    digest(asarPath, "PACKAGE_PATHS_INVALID"),
+  ]);
+  const archiveManifest = readArchiveJson(
+    asarPath,
+    "package.json",
+    asar,
+    "PACKAGE_ARCHIVE_MANIFEST_INVALID",
+    platform,
+  );
+  const metadata = validateWindowsNormalCandidateSmokeMetadata({
+    sourceCandidate, stagedManifest, archiveManifest, sourceRevision: options.sourceRevision,
+  });
+  const [native] = await Promise.all([
+    validateNative({
+      stagedAppPath: options.stagedAppPath,
+      asarPath,
+      unpackedPath,
+      asar,
+      digest,
+      failureCode: "PACKAGE_NATIVE_MEMBERS_INVALID",
+      platform,
+    }),
+    validateRuntimeClosure({
+      stagedAppPath: options.stagedAppPath,
+      asarPath,
+      readJsonFile,
+      asar,
+      digest,
+      failureCode: "PACKAGE_RUNTIME_CLOSURE_INVALID",
+      platform,
+    }),
+  ]);
+  return Object.freeze({
+    sourceRevision: metadata.sourceRevision,
+    target: metadata.target,
+    artifactSha256: artifact.sha256,
+    executableSha256: executable.sha256,
+    native,
+  });
+}
+
+async function pathAbsent(path) {
+  try {
+    await lstat(path);
+    return false;
+  } catch (error) {
+    if (error?.code === "ENOENT") return true;
+    fail("PROFILE_INVALID");
+  }
+}
+
+function createStagedWindowsAdapter(stagedAppPath, {
+  createAdapter = createWindowsFilesystemAdapter,
+} = {}) {
+  const bindingPath = win32.join(stagedAppPath, ...WINDOWS_ELECTRON_BINDING_RELATIVE_PATH.split("/"));
+  const adapter = createAdapter({
+    platform: "win32",
+    architecture: "x64",
+    bindingPath,
+    resolveBinding: (path) => path,
+    requireBinding: (path) => require(path),
+    readManifest: (path) => readFileSync(path, "utf8"),
+    readBindingBytes: (path) => readFileSync(path),
+  });
+  if (adapter === null || typeof adapter !== "object" || adapter.productionSafe !== false) {
+    fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+  }
+  return adapter;
+}
+
+function sharingCoordinator(backend, {
+  createCoordinator = createDesktopSharingCoordinator,
+} = {}) {
+  try {
+    return createCoordinator({
+      backend,
+      installationState: "fresh",
+      destinationOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+    });
+  } catch {
+    fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+  }
+}
+
+function protectedOptOutCause(error) {
+  let code = "";
+  try { code = typeof error?.code === "string" ? error.code : ""; }
+  catch { return null; }
+  if (WINDOWS_FILESYSTEM_SEED_CAUSES.has(code)) return code;
+  if (isWindowsProtectedStateStoreError(error)) {
+    const normalized = code.toUpperCase();
+    return WINDOWS_PROTECTED_STATE_SEED_CAUSES.has(normalized) ? normalized : null;
+  }
+  if (isDesktopSettingsBackendError(error)) {
+    const normalized = code.toUpperCase();
+    return DESKTOP_SETTINGS_SEED_CAUSES.has(normalized) ? normalized : null;
+  }
+  return null;
+}
+
+async function protectedOptOutStage(stage, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    const code = String(error?.code ?? "");
+    if (code.startsWith(PREFIX) && code !== `${PREFIX}PROTECTED_OPT_OUT_UNAVAILABLE`) {
+      throw error;
+    }
+    const cause = protectedOptOutCause(error);
+    fail(cause === null ? stage : `${stage}_${cause}`);
+  }
+}
+
+/**
+ * Supply the normal candidate's fresh, owned Codex root with one content-free
+ * rollout-shaped source. The dashboard refuses a refresh until its ordinary
+ * onboarding preflight sees a readable JSONL source, so an empty profile
+ * would only exercise that preflight rather than the local refresh journey.
+ */
+export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
+  createDirectory = mkdir,
+  metadata = lstat,
+  writeFixture = writeFile,
+} = {}) {
+  const home = exactWindowsPath(profile?.home);
+  if (home === null || typeof createDirectory !== "function"
+      || typeof metadata !== "function" || typeof writeFixture !== "function") {
+    fail("PROFILE_INVALID");
+  }
+  // The normal app's default-root settings select HOME/.codex before spawning
+  // its companion. Seed that actual root, not the development override.
+  const codexHome = win32.join(home, ".codex");
+  const sessions = win32.join(codexHome, "sessions");
+  const fixture = win32.join(sessions, SYNTHETIC_CODEX_SESSION_FILE);
+  try {
+    await createDirectory(sessions, { recursive: true, mode: 0o700 });
+    const directory = await metadata(sessions);
+    if (!directory?.isDirectory?.() || directory.isSymbolicLink?.()) {
+      fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
+    }
+    await writeFixture(fixture, SYNTHETIC_CODEX_SESSION, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    const file = await metadata(fixture);
+    if (!file?.isFile?.() || file.isSymbolicLink?.() || file.nlink !== 1
+        || file.size !== Buffer.byteLength(SYNTHETIC_CODEX_SESSION)) {
+      fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
+    }
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
+  }
+  return Object.freeze({ codexHome, fixture, sessions });
+}
+
+/** Seed only the fixed acknowledgement and durable contribution opt-out. */
+export async function prepareWindowsNormalCandidateProfile({
+  profile,
+  stagedAppPath,
+} = {}, {
+  createAdapter = createStagedWindowsAdapter,
+  createStore = createWindowsProtectedStateStore,
+  createReceiptBackend = createDesktopFirstRunReceiptBackend,
+  createSharingBackend = createDesktopSharingBackend,
+  createCoordinator = createDesktopSharingCoordinator,
+} = {}) {
+  if (!profile || typeof profile !== "object" || !exactWindowsPath(profile.userData)
+      || !exactWindowsPath(stagedAppPath)) {
+    fail("PROFILE_INVALID");
+  }
+  const settingsRoot = win32.join(profile.userData, "desktop-settings");
+  if (!await pathAbsent(settingsRoot)) fail("PROFILE_NOT_ABSENT");
+  let adapter;
+  let store;
+  let receiptBackend;
+  let shareBackend;
+  try {
+    adapter = await protectedOptOutStage("PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE", () =>
+      createAdapter(stagedAppPath));
+    ({ store, receiptBackend, shareBackend } = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_STORE_UNAVAILABLE",
+      () => {
+        const selectedStore = createStore({ adapter, rootPath: settingsRoot });
+        return {
+          store: selectedStore,
+          receiptBackend: createReceiptBackend({
+            platform: "win32",
+            windowsProtectedStateStore: selectedStore,
+          }),
+          shareBackend: createSharingBackend({
+            platform: "win32",
+            rootPath: settingsRoot,
+            windowsProtectedStateStore: selectedStore,
+          }),
+        };
+      },
+    ));
+    const initialReceipt = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_INITIAL_READ_UNAVAILABLE",
+      () => receiptBackend.load(),
+    );
+    const initialSharing = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_INITIAL_READ_UNAVAILABLE",
+      () => shareBackend.load(),
+    );
+    if (initialReceipt !== null || initialSharing !== null) {
+      fail("PROFILE_NOT_ABSENT");
+    }
+    await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_FIRST_RUN_UNAVAILABLE",
+      () => receiptBackend.save(FIRST_RUN_ACKNOWLEDGEMENT),
+    );
+    const receipt = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_FIRST_RUN_UNAVAILABLE",
+      async () => validateDesktopFirstRunReceipt(await receiptBackend.load()),
+    );
+    if (receipt.acknowledged !== true) fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+    const coordinator = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_SHARING_UNAVAILABLE",
+      () => sharingCoordinator(shareBackend, { createCoordinator }),
+    );
+    try {
+      const { selection, authorization, inspection } = await protectedOptOutStage(
+        "PROTECTED_OPT_OUT_SHARING_UNAVAILABLE",
+        async () => {
+          await coordinator.initialize();
+          return {
+            selection: await coordinator.setEnabled(false),
+            authorization: await coordinator.readAuthorization(),
+            inspection: await coordinator.inspect(),
+          };
+        },
+      );
+      // readAuthorization intentionally returns the raw policy projection. Its
+      // `current` result binds the durable record to this fixed destination;
+      // inspect exposes Electron's transport-state projection separately.
+      if (selection?.enabled !== false || authorization?.available !== true
+          || authorization?.current !== true || authorization?.enabled !== false
+          || inspection?.enabled !== false || inspection?.transportStatus !== "off") {
+        fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+      }
+    } finally {
+      coordinator.dispose();
+    }
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+  }
+  return Object.freeze({
+    adapter,
+    settingsRoot,
+    store,
+    shareBackend,
+  });
+}
+
+/** Re-read the fixed durable opt-out after the second ordinary app launch. */
+export async function verifyWindowsNormalCandidateOptOut(seed, {
+  createCoordinator = createDesktopSharingCoordinator,
+} = {}) {
+  if (!seed?.shareBackend || typeof createCoordinator !== "function") {
+    fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+  }
+  const coordinator = sharingCoordinator(seed.shareBackend, { createCoordinator });
+  try {
+    await coordinator.initialize();
+    const authorization = await coordinator.readAuthorization();
+    const inspection = await coordinator.inspect();
+    if (authorization?.available !== true || authorization?.current !== true
+        || authorization?.enabled !== false || inspection?.enabled !== false
+        || inspection?.transportStatus !== "off") {
+      fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+    }
+    return true;
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+  } finally {
+    coordinator.dispose();
+  }
+}
+
+function systemPowerShell(environment) {
+  const root = exactWindowsPath(environment?.SystemRoot);
+  if (root === null) fail("FIREWALL_UNAVAILABLE");
+  return win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+function fixedPowerShellEnvironment(environment, values = {}) {
+  const selected = {};
+  for (const key of [
+    "PATH", "PATHEXT", "SystemRoot", "WINDIR", "COMSPEC", "OS",
+    "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432", "NUMBER_OF_PROCESSORS",
+    "ProgramData", "ProgramFiles", "ProgramW6432", "CommonProgramFiles", "CommonProgramW6432",
+  ]) {
+    const value = environment?.[key];
+    if (typeof value === "string" && value.length > 0 && !value.includes("\0")) selected[key] = value;
+  }
+  if (!exactWindowsPath(selected.SystemRoot)) fail("FIREWALL_UNAVAILABLE");
+  selected.PSModulePath = win32.join(
+    selected.SystemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "Modules",
+  );
+  for (const [key, value] of Object.entries(values)) {
+    if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+      fail("FIREWALL_UNAVAILABLE");
+    }
+    selected[key] = value;
+  }
+  return selected;
+}
+
+async function runFixedPowerShell(command, args, {
+  environment,
+  values,
+  spawnProgram = spawn,
+  timeoutMs = POWERSHELL_TIMEOUT_MS,
+} = {}) {
+  if (!exactWindowsPath(command) || !Array.isArray(args)
+      || args.some((value) => typeof value !== "string" || value.includes("\0"))
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || typeof spawnProgram !== "function") {
+    fail("FIREWALL_UNAVAILABLE");
+  }
+  return new Promise((resolveRun) => {
+    let child;
+    try {
+      child = spawnProgram(command, args, {
+        cwd: win32.dirname(command),
+        env: fixedPowerShellEnvironment(environment, values),
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      resolveRun(Object.freeze({ settled: true, timedOut: false, exitCode: null, output: "" }));
+      return;
+    }
+    let output = "";
+    let overflow = false;
+    child.stdout?.setEncoding?.("utf8");
+    child.stdout?.on?.("data", (chunk) => {
+      if (overflow) return;
+      output += chunk;
+      if (output.length > MAXIMUM_PROGRAM_OUTPUT_BYTES) {
+        output = "";
+        overflow = true;
+      }
+    });
+    let settled = false;
+    const finish = (exitCode, timedOut) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveRun(Object.freeze({
+        settled: !timedOut,
+        timedOut,
+        exitCode: Number.isInteger(exitCode) ? exitCode : null,
+        output: overflow ? "" : output,
+      }));
+    };
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* bounded fixed result below */ }
+      finish(null, true);
+    }, timeoutMs);
+    child.once?.("error", () => finish(null, false));
+    child.once?.("close", (code) => finish(code, false));
+  });
+}
+
+const EXPECTED_APP_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_NORMAL_CANDIDATE_APP";
+const FIREWALL_NAME_ENVIRONMENT = "USAGE_MONITOR_WINDOWS_NORMAL_CANDIDATE_FIREWALL_RULE";
+
+function expectedAppPrelude() {
+  return `$expectedRaw=[Environment]::GetEnvironmentVariable('${EXPECTED_APP_ENVIRONMENT}','Process');if($expectedRaw -isnot [string] -or [string]::IsNullOrWhiteSpace($expectedRaw) -or -not [System.IO.Path]::IsPathRooted($expectedRaw)){throw 'candidate'};$expected=[System.IO.Path]::GetFullPath($expectedRaw);`;
+}
+
+function firewallRulePrelude() {
+  return `${expectedAppPrelude()}$name=[Environment]::GetEnvironmentVariable('${FIREWALL_NAME_ENVIRONMENT}','Process');if($name -isnot [string] -or $name -notmatch '^${FIREWALL_RULE_PREFIX}[0-9a-f-]{36}$'){throw 'rule'};`;
+}
+
+// NetSecurity cmdlets use a CIM-backed provider. Use the public firewall COM
+// policy surface directly so the temporary candidate block does not depend on
+// that provider's startup path.
+function firewallPolicyPrelude() {
+  return `$policy=New-Object -ComObject HNetCfg.FwPolicy2;$rules=$policy.Rules;`;
+}
+
+function firewallRuleMatches() {
+  return `$ownedRules=@();foreach($candidate in $rules){if([string]::Equals([string]$candidate.Name,$name,[System.StringComparison]::Ordinal)){$ownedRules+=,$candidate}};`;
+}
+
+function firewallRuleOwnershipAssertion() {
+  return `${firewallRuleMatches()}if($ownedRules.Count -ne 1){throw 'rule'};$rule=$ownedRules[0];$program=[string]$rule.ApplicationName;if(-not [string]::Equals([string]$rule.Name,$name,[System.StringComparison]::Ordinal) -or [int]$rule.Direction -ne 2 -or [int]$rule.Action -ne 0 -or $rule.Enabled -ne $true -or [int64]$rule.Profiles -ne 2147483647 -or [int]$rule.Protocol -ne 256 -or [string]::IsNullOrWhiteSpace($program) -or -not [string]::Equals([System.IO.Path]::GetFullPath($program),$expected,[System.StringComparison]::OrdinalIgnoreCase)){throw 'rule'};`;
+}
+
+/** Build a fixed PowerShell command that creates and reads back one app-scoped outbound block. */
+export function buildWindowsNormalCandidateFirewallCreateArguments() {
+  const script = `$ErrorActionPreference='Stop';${firewallRulePrelude()}${firewallPolicyPrelude()}${firewallRuleMatches()}if($ownedRules.Count -ne 0){throw 'dirty'};$rule=New-Object -ComObject HNetCfg.FWRule;$rule.Name=$name;$rule.Description=$name;$rule.ApplicationName=$expected;$rule.Direction=2;$rule.Action=0;$rule.Protocol=256;$rule.Profiles=2147483647;$rule.Enabled=$true;$rules.Add($rule);${firewallRuleOwnershipAssertion()}[Console]::Out.Write('verified')`;
+  return Object.freeze(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]);
+}
+
+/** Build a fixed PowerShell command that removes and rechecks only this runner's firewall rule. */
+export function buildWindowsNormalCandidateFirewallRemoveArguments() {
+  const script = `$ErrorActionPreference='Stop';${firewallRulePrelude()}${firewallPolicyPrelude()}${firewallRuleOwnershipAssertion()}$rules.Remove($name);${firewallRuleMatches()}if($ownedRules.Count -ne 0){throw 'rule'};[Console]::Out.Write('removed')`;
+  return Object.freeze(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]);
+}
+
+function validPowerShellSuccess(value, expected) {
+  return value?.settled === true && value.timedOut === false && value.exitCode === 0
+    && value.output === expected;
+}
+
+export async function installOutboundFirewallBlock({
+  appPath,
+  environment,
+  name = `${FIREWALL_RULE_PREFIX}${randomUUID()}`,
+  runProgram = runFixedPowerShell,
+} = {}) {
+  if (!exactWindowsPath(appPath) || !FIREWALL_RULE_NAME.test(name) || typeof runProgram !== "function") {
+    fail("FIREWALL_UNAVAILABLE");
+  }
+  const result = await runProgram(systemPowerShell(environment), buildWindowsNormalCandidateFirewallCreateArguments(), {
+    environment,
+    values: { [EXPECTED_APP_ENVIRONMENT]: appPath, [FIREWALL_NAME_ENVIRONMENT]: name },
+    timeoutMs: WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
+  });
+  if (validPowerShellSuccess(result, "verified")) return name;
+  if (result?.settled === true && result?.timedOut === false && result?.exitCode !== 0) {
+    fail("FIREWALL_RULE_INVALID");
+  }
+  fail("FIREWALL_UNAVAILABLE");
+}
+
+export async function removeOutboundFirewallBlock({ appPath, environment, name, runProgram = runFixedPowerShell } = {}) {
+  if (!exactWindowsPath(appPath) || !FIREWALL_RULE_NAME.test(name) || typeof runProgram !== "function") {
+    return false;
+  }
+  try {
+    const result = await runProgram(systemPowerShell(environment), buildWindowsNormalCandidateFirewallRemoveArguments(), {
+      environment,
+      values: { [EXPECTED_APP_ENVIRONMENT]: appPath, [FIREWALL_NAME_ENVIRONMENT]: name },
+      timeoutMs: WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
+    });
+    return validPowerShellSuccess(result, "removed");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reuse the reviewed Toolhelp snapshot/query path from the NSIS lifecycle
+ * runner. WMI/CIM hangs in hosted Windows cleanup, so this runner never uses
+ * either API. The query output contains only PID, parent PID, and creation
+ * metadata; exact executable paths remain inside the fixed child process.
+ */
+async function readNormalCandidateExactProcesses({
+  appPath,
+  environment,
+  runProgram = runWindowsNsisLifecycleProgram,
+  timeoutMs = POWERSHELL_TIMEOUT_MS,
+} = {}) {
+  if (!exactWindowsPath(appPath) || typeof runProgram !== "function"
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    fail("PROCESS_PROOF_UNAVAILABLE");
+  }
+  let result;
+  try {
+    result = await runProgram(
+      systemPowerShell(environment),
+      buildWindowsExactExecutableProcessQueryArguments(appPath, {
+        executableName: WINDOWS_NORMAL_CANDIDATE_APP_NAME,
+      }),
+      {
+        timeoutMs,
+        captureOutput: true,
+        environment,
+        fixedProbePath: appPath,
+        fixedPowerShellUtilityModules: true,
+      },
+    );
+    if (result?.settled !== true || result?.timedOut !== false || result?.exitCode !== 0) {
+      fail("PROCESS_PROOF_UNAVAILABLE");
+    }
+    return parseWindowsProcessSnapshot(result.stdout);
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("PROCESS_PROOF_UNAVAILABLE");
+  }
+}
+
+async function readNormalCandidateProcessSnapshot({
+  rootProcessId = null,
+  retainedProcessIds = null,
+  environment,
+  runProgram = runWindowsNsisLifecycleProgram,
+} = {}) {
+  if (typeof runProgram !== "function") fail("PROCESS_PROOF_UNAVAILABLE");
+  let result;
+  try {
+    result = await runProgram(
+      systemPowerShell(environment),
+      buildWindowsOwnedProcessSnapshotQueryArguments({ rootProcessId, retainedProcessIds }),
+      {
+        timeoutMs: POWERSHELL_TIMEOUT_MS,
+        captureOutput: true,
+        environment,
+        fixedPowerShellUtilityModules: true,
+      },
+    );
+    if (result?.settled !== true || result?.timedOut !== false || result?.exitCode !== 0) {
+      fail("PROCESS_PROOF_UNAVAILABLE");
+    }
+    return parseWindowsProcessSnapshot(result.stdout);
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("PROCESS_PROOF_UNAVAILABLE");
+  }
+}
+
+async function assertCandidateProcessProof({
+  appPath,
+  rootPid,
+  environment,
+  runProgram = runWindowsNsisLifecycleProgram,
+} = {}) {
+  if (!Number.isSafeInteger(rootPid) || rootPid < 1) fail("PROCESS_PROOF_UNAVAILABLE");
+  const [exactProcesses, snapshot] = await Promise.all([
+    readNormalCandidateExactProcesses({ appPath, environment, runProgram }),
+    readNormalCandidateProcessSnapshot({ rootProcessId: rootPid, environment, runProgram }),
+  ]);
+  const tracked = ownedWindowsProcessTree(snapshot, rootPid);
+  const root = exactProcesses.filter((entry) => entry.pid === rootPid);
+  if (root.length !== 1 || tracked.length < 2
+      || !tracked.some((entry) => entry.pid !== rootPid
+        && exactProcesses.some((exact) => exact.pid === entry.pid && exact.creation === entry.creation))) {
+    fail("PROCESS_PROOF_UNAVAILABLE");
+  }
+  return tracked;
+}
+
+async function assertCandidateProcessAbsence({
+  appPath,
+  environment,
+  tracked = null,
+  runProgram = runWindowsNsisLifecycleProgram,
+} = {}) {
+  try {
+    if (tracked !== null) {
+      const snapshot = await readNormalCandidateProcessSnapshot({
+        rootProcessId: null,
+        retainedProcessIds: tracked.map(({ pid }) => pid),
+        environment,
+        runProgram,
+      });
+      assertWindowsProcessTreeExited(tracked, snapshot);
+    }
+    if ((await readNormalCandidateExactProcesses({ appPath, environment, runProgram })).length !== 0) {
+      fail("OWNED_PROCESS_REMAINS");
+    }
+    return true;
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("OWNED_PROCESS_REMAINS");
+  }
+}
+
+function wait(milliseconds) {
+  return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+}
+
+async function waitFor(operation, timeoutMs, intervalMs = 150) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      const value = await operation();
+      if (value !== null && value !== undefined && value !== false) return value;
+    } catch {
+      // The caller converts a bounded missing condition to its own fixed code.
+    }
+    if (Date.now() >= deadline) return null;
+    await wait(intervalMs);
+  }
+}
+
+async function freeLoopbackPort({ createLoopbackServer = createServer } = {}) {
+  const server = createLoopbackServer();
+  try {
+    await new Promise((resolveListen, rejectListen) => {
+      server.once("error", rejectListen);
+      server.listen(0, "127.0.0.1", resolveListen);
+    });
+    const port = server.address()?.port;
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) fail("CDP_UNAVAILABLE");
+    return port;
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("CDP_UNAVAILABLE");
+  } finally {
+    await new Promise((resolveClose) => server.close(() => resolveClose())).catch(() => {});
+  }
+}
+
+export async function jsonFetch(url, {
+  fetchImpl = fetch,
+  timeoutMs = OPERATION_TIMEOUT_MS,
+} = {}) {
+  if (typeof fetchImpl !== "function" || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    throw new Error("loopback response unavailable");
+  }
+  const controller = new AbortController();
+  let timer = null;
+  const timeout = new Promise((_, rejectTimeout) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      rejectTimeout(new Error("loopback response unavailable"));
+    }, timeoutMs);
+  });
+  try {
+    const response = await Promise.race([
+      fetchImpl(url, { signal: controller.signal, redirect: "error" }),
+      timeout,
+    ]);
+    if (!response?.ok || response.redirected === true || typeof response.json !== "function") {
+      throw new Error("loopback response unavailable");
+    }
+    return await Promise.race([response.json(), timeout]);
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+
+/** Keep a failed CDP startup receipt content-free while distinguishing a
+ * launched process that exited from a process whose listener never appeared. */
+export function classifyWindowsNormalCandidateStartupCdpChild(child) {
+  if (child === null || typeof child !== "object") return "unavailable";
+  if (typeof child.signalCode === "string" && child.signalCode.length > 0) return "signaled";
+  if (Number.isInteger(child.exitCode)) return child.exitCode === 0 ? "exited_zero" : "exited_nonzero";
+  return child.exitCode === null && child.signalCode === null
+      && Number.isSafeInteger(child.pid) && child.pid >= 1
+    ? "alive" : "unavailable";
+}
+
+/** A closed receipt shape: no exit number, signal value, endpoint, or process
+ * output can cross this boundary. */
+export function normalizeStartupCdpDiagnostic(value) {
+  if (!exactObject(value) || Object.keys(value).length !== 3
+      || !STARTUP_CDP_CHILD_STATES.has(value.child)
+      || !STARTUP_CDP_ENDPOINT_STATES.has(value.endpoint)
+      || !STARTUP_CDP_ENTRY_MARKER_STATES.has(value.entryMarker)) return null;
+  return Object.freeze({
+    child: value.child,
+    endpoint: value.endpoint,
+    entryMarker: value.entryMarker,
+  });
+}
+
+function startupCdpDiagnostic({ child, endpoint, entryMarker }) {
+  return normalizeStartupCdpDiagnostic({
+    // This is called only after spawn returned an owned child with a valid PID.
+    child: classifyWindowsNormalCandidateStartupCdpChild(child),
+    endpoint: STARTUP_CDP_ENDPOINT_STATES.has(endpoint) ? endpoint : "unavailable",
+    entryMarker: STARTUP_CDP_ENTRY_MARKER_STATES.has(entryMarker) ? entryMarker : "stream_unavailable",
+  }) ?? Object.freeze({ child: "unavailable", endpoint: "unavailable", entryMarker: "stream_unavailable" });
+}
+
+function unavailableStartupCdpNativeDiagnostic(rootIdentity = "unavailable") {
+  return Object.freeze({
+    rootIdentity: STARTUP_CDP_NATIVE_ROOT_IDENTITY_STATES.has(rootIdentity)
+      ? rootIdentity : "unavailable",
+    listener: "unavailable",
+    desktop: "unavailable",
+    ownedWindow: "unavailable",
+    dialog: "unavailable",
+    dialogCause: "unavailable",
+  });
+}
+
+/**
+ * Keep a failed normal-candidate launch receipt content-free while separating
+ * an owned Chromium listener from a native dialog that can block Electron
+ * before the application entry module runs. No window text, path, PID, port,
+ * or exception detail crosses this boundary.
+ */
+export function normalizeStartupCdpNativeDiagnostic(value) {
+  if (!exactObject(value) || Object.keys(value).length !== 6
+      || !STARTUP_CDP_NATIVE_ROOT_IDENTITY_STATES.has(value.rootIdentity)
+      || !STARTUP_CDP_NATIVE_LISTENER_STATES.has(value.listener)
+      || !STARTUP_CDP_NATIVE_DESKTOP_STATES.has(value.desktop)
+      || !STARTUP_CDP_NATIVE_OWNED_WINDOW_STATES.has(value.ownedWindow)
+      || !STARTUP_CDP_NATIVE_DIALOG_STATES.has(value.dialog)
+      || !STARTUP_CDP_NATIVE_DIALOG_CAUSE_STATES.has(value.dialogCause)) return null;
+  if (value.rootIdentity !== "matched"
+      && [value.listener, value.desktop, value.ownedWindow, value.dialog, value.dialogCause]
+        .some((entry) => entry !== "unavailable")) return null;
+  if (value.desktop !== "observed"
+      && [value.ownedWindow, value.dialog, value.dialogCause]
+        .some((entry) => entry !== "unavailable")) return null;
+  if (value.desktop === "observed" && value.ownedWindow === "absent"
+      && (value.dialog !== "none" || value.dialogCause !== "none")) return null;
+  if (value.desktop === "observed" && value.ownedWindow === "unavailable"
+      && (value.dialog !== "unavailable" || value.dialogCause !== "unavailable")) return null;
+  if (value.desktop === "observed" && value.ownedWindow === "present") {
+    if (value.dialog === "js_main_error"
+        && ["none", "unavailable"].includes(value.dialogCause)) return null;
+    if (value.dialog === "other_owned_window" && value.dialogCause !== "none") return null;
+    if (value.dialog === "unavailable" && value.dialogCause !== "unavailable") return null;
+    if (value.dialog === "none") return null;
+  }
+  return Object.freeze({
+    rootIdentity: value.rootIdentity,
+    listener: value.listener,
+    desktop: value.desktop,
+    ownedWindow: value.ownedWindow,
+    dialog: value.dialog,
+    dialogCause: value.dialogCause,
+  });
+}
+
+/**
+ * Build one fixed, encoded Windows PowerShell observation. Numeric launch
+ * values are validated before they enter this source-defined command; all
+ * native observations are reduced to the closed JSON shape above before the
+ * process writes stdout.
+ */
+export function buildWindowsNormalCandidateStartupNativeProbeArguments({
+  rootPid,
+  remoteDebuggingPort,
+} = {}) {
+  if (!Number.isSafeInteger(rootPid) || rootPid < 1 || rootPid > 0xffff_ffff
+      || !Number.isSafeInteger(remoteDebuggingPort)
+      || remoteDebuggingPort < 1 || remoteDebuggingPort > 65_535) {
+    fail("ARGUMENT_INVALID");
+  }
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$rootPid = [uint32]${rootPid}
+$debugPort = [uint16]${remoteDebuggingPort}
+$result = [ordered]@{
+  listener = 'unavailable'
+  desktop = 'unavailable'
+  ownedWindow = 'unavailable'
+  dialog = 'unavailable'
+  dialogCause = 'unavailable'
+}
+try {
+  Import-Module NetTCPIP -ErrorAction Stop
+  $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+    Where-Object { [int]$_.LocalPort -eq $debugPort -and [string]$_.LocalAddress -eq '127.0.0.1' })
+  if ($listeners.Count -eq 0) {
+    $result.listener = 'absent'
+  } elseif ($listeners.Count -eq 1 -and [uint32]$listeners[0].OwningProcess -eq $rootPid) {
+    $result.listener = 'owned'
+  } else {
+    $result.listener = 'foreign'
+  }
+} catch {}
+try {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TiboTattleNormalCandidateStartupProbe {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+  [DllImport("user32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool CloseDesktop(IntPtr desktop);
+  [DllImport("user32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool EnumDesktopWindows(IntPtr desktop, EnumWindowsProc callback, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+  [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool IsWindowVisible(IntPtr window);
+}
+'@ -ErrorAction Stop
+  # EnumDesktopWindows requires both DESKTOP_READOBJECTS and DESKTOP_ENUMERATE.
+  $desktop = [TiboTattleNormalCandidateStartupProbe]::OpenInputDesktop(0, $false, 0x41)
+  if ($desktop -eq [IntPtr]::Zero) {
+    $result.desktop = 'unobserved'
+  } else {
+    try {
+      $result.desktop = 'observed'
+      $script:ownedWindows = @()
+      $script:windowEnumerationComplete = $true
+      $callback = [TiboTattleNormalCandidateStartupProbe+EnumWindowsProc]{
+        param([IntPtr]$window, [IntPtr]$unused)
+        try {
+          [uint32]$owner = 0
+          [void][TiboTattleNormalCandidateStartupProbe]::GetWindowThreadProcessId($window, [ref]$owner)
+          if ($owner -eq $rootPid -and [TiboTattleNormalCandidateStartupProbe]::IsWindowVisible($window)) {
+            if ($script:ownedWindows.Count -ge 16) {
+              $script:windowEnumerationComplete = $false
+              return $false
+            }
+            $script:ownedWindows += ,$window
+          }
+          return $true
+        } catch {
+          $script:windowEnumerationComplete = $false
+          return $false
+        }
+      }
+      $enumerated = [TiboTattleNormalCandidateStartupProbe]::EnumDesktopWindows(
+        $desktop, $callback, [IntPtr]::Zero
+      )
+      if (-not $enumerated -and $script:windowEnumerationComplete) {
+        $script:windowEnumerationComplete = $false
+      }
+      if (-not $script:windowEnumerationComplete) {
+        $result.ownedWindow = 'unavailable'
+      } elseif ($script:ownedWindows.Count -eq 0) {
+        $result.ownedWindow = 'absent'
+        $result.dialog = 'none'
+        $result.dialogCause = 'none'
+      } else {
+        $result.ownedWindow = 'present'
+        $scanComplete = $true
+        $headingSeen = $false
+        $cause = $null
+        try {
+          Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+          $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
+          $nodeCount = 0
+          foreach ($handle in $script:ownedWindows) {
+            $element = [Windows.Automation.AutomationElement]::FromHandle($handle)
+            if ($null -eq $element) { throw [System.InvalidOperationException]::new() }
+            $queue = New-Object System.Collections.Queue
+            $queue.Enqueue([pscustomobject]@{ Element = $element; Depth = 0 })
+            while ($queue.Count -gt 0) {
+              $node = $queue.Dequeue()
+              $nodeCount += 1
+              if ($nodeCount -gt 128) { $scanComplete = $false; break }
+              [uint32]$providerProcessId = $node.Element.Current.ProcessId
+              if ($providerProcessId -ne $rootPid) { throw [System.InvalidOperationException]::new() }
+              $name = [string]$node.Element.Current.Name
+              if ([string]::Equals($name, 'A JavaScript error occurred in the main process', [System.StringComparison]::Ordinal)) {
+                $headingSeen = $true
+              }
+              if ($null -eq $cause) {
+                if ($name.IndexOf('ERR_MODULE_NOT_FOUND', [System.StringComparison]::Ordinal) -ge 0 -or
+                    $name.IndexOf('Cannot find module ', [System.StringComparison]::Ordinal) -ge 0 -or
+                    $name.IndexOf('Cannot find package ', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'module_not_found' }
+                elseif ($name.IndexOf('ERR_DLOPEN_FAILED', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'native_load' }
+                elseif ($name.IndexOf('ERR_UNKNOWN_FILE_EXTENSION', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'unknown_file_extension' }
+                elseif ($name.IndexOf('does not provide an export named', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'named_export' }
+                elseif ($name.IndexOf('SyntaxError', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'syntax_error' }
+              }
+              $child = $walker.GetFirstChild($node.Element)
+              if ($null -ne $child) {
+                if ($node.Depth -ge 8) { $scanComplete = $false; break }
+                while ($null -ne $child) {
+                  if (($nodeCount + $queue.Count) -ge 128) { $scanComplete = $false; break }
+                  $queue.Enqueue([pscustomobject]@{ Element = $child; Depth = ($node.Depth + 1) })
+                  $child = $walker.GetNextSibling($child)
+                }
+              }
+              if (-not $scanComplete) { break }
+            }
+            if (-not $scanComplete) { break }
+          }
+        } catch {
+          $scanComplete = $false
+        }
+        if (-not $scanComplete) {
+          $result.dialog = 'unavailable'
+          $result.dialogCause = 'unavailable'
+        } elseif ($headingSeen) {
+          $result.dialog = 'js_main_error'
+          if ($null -eq $cause) { $result.dialogCause = 'other' } else { $result.dialogCause = $cause }
+        } else {
+          $result.dialog = 'other_owned_window'
+          $result.dialogCause = 'none'
+        }
+      }
+    } finally {
+      [void][TiboTattleNormalCandidateStartupProbe]::CloseDesktop($desktop)
+    }
+  }
+} catch {}
+[Console]::Out.Write((ConvertTo-Json -InputObject ([pscustomobject]$result) -Compress -Depth 2))
+`;
+
+  return Object.freeze([
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-EncodedCommand",
+    Buffer.from(script, "utf16le").toString("base64"),
+  ]);
+}
+
+function sameNormalCandidateProcessIdentity(entries, rootPid, creation) {
+  return Array.isArray(entries) && entries.some((entry) => entry?.pid === rootPid
+    && entry?.creation === creation);
+}
+
+/**
+ * Inspect the exact pre-cleanup root only after the ordinary CDP acceptance
+ * path has failed. The exact-path/creation query wraps both native calls so a
+ * recycled PID or an unrelated window cannot become receipt evidence.
+ */
+export async function inspectWindowsNormalCandidateStartupNativeDiagnostic({
+  appPath,
+  rootPid,
+  remoteDebuggingPort,
+  environment,
+  readExactProcesses = readNormalCandidateExactProcesses,
+  runProgram = runWindowsNsisLifecycleProgram,
+} = {}) {
+  if (!exactWindowsPath(appPath) || !Number.isSafeInteger(rootPid) || rootPid < 1
+      || rootPid > 0xffff_ffff
+      || !Number.isSafeInteger(remoteDebuggingPort) || remoteDebuggingPort < 1
+      || remoteDebuggingPort > 65_535 || typeof readExactProcesses !== "function"
+      || typeof runProgram !== "function") {
+    return unavailableStartupCdpNativeDiagnostic();
+  }
+  const deadline = Date.now() + STARTUP_CDP_NATIVE_DIAGNOSTIC_TIMEOUT_MS;
+  const remainingBudget = () => Math.max(0, deadline - Date.now());
+  const readBeforeDeadline = async () => {
+    const timeoutMs = remainingBudget();
+    if (timeoutMs < 1) throw new Error("native diagnostic budget elapsed");
+    return readExactProcesses({ appPath, environment, runProgram, timeoutMs });
+  };
+  let before;
+  try {
+    before = await readBeforeDeadline();
+  } catch {
+    return unavailableStartupCdpNativeDiagnostic();
+  }
+  if (!Array.isArray(before)) return unavailableStartupCdpNativeDiagnostic();
+  const root = before.filter((entry) => entry?.pid === rootPid);
+  if (root.length === 0) return unavailableStartupCdpNativeDiagnostic("absent");
+  if (root.length !== 1) return unavailableStartupCdpNativeDiagnostic();
+  const creation = root[0].creation;
+  if (typeof creation !== "string" || creation.length === 0 || creation.length > 256) {
+    return unavailableStartupCdpNativeDiagnostic();
+  }
+  let result;
+  try {
+    const timeoutMs = remainingBudget();
+    if (timeoutMs < 1) throw new Error("native diagnostic budget elapsed");
+    result = await runProgram(
+      systemPowerShell(environment),
+      buildWindowsNormalCandidateStartupNativeProbeArguments({ rootPid, remoteDebuggingPort }),
+      {
+        timeoutMs,
+        captureOutput: true,
+        environment,
+        fixedProbePath: appPath,
+        fixedPowerShellUtilityModules: true,
+      },
+    );
+  } catch {
+    result = null;
+  }
+  let after;
+  try {
+    after = await readBeforeDeadline();
+  } catch {
+    return unavailableStartupCdpNativeDiagnostic();
+  }
+  if (!Array.isArray(after)) return unavailableStartupCdpNativeDiagnostic();
+  const sameIdentity = sameNormalCandidateProcessIdentity(after, rootPid, creation);
+  if (!sameIdentity) {
+    return unavailableStartupCdpNativeDiagnostic(after.some((entry) => entry?.pid === rootPid)
+      ? "changed" : "absent");
+  }
+  if (result?.settled !== true || result?.timedOut !== false || result?.exitCode !== 0
+      || typeof result.stdout !== "string" || result.stdout.length === 0
+      || result.stdout.length > MAXIMUM_PROGRAM_OUTPUT_BYTES) {
+    return unavailableStartupCdpNativeDiagnostic("matched");
+  }
+  try {
+    const parsed = JSON.parse(result.stdout);
+    const fields = ["listener", "desktop", "ownedWindow", "dialog", "dialogCause"];
+    if (!exactObject(parsed) || Object.keys(parsed).length !== fields.length
+        || !fields.every((field) => Object.hasOwn(parsed, field))) {
+      return unavailableStartupCdpNativeDiagnostic("matched");
+    }
+    return normalizeStartupCdpNativeDiagnostic({
+      rootIdentity: "matched",
+      listener: parsed.listener,
+      desktop: parsed.desktop,
+      ownedWindow: parsed.ownedWindow,
+      dialog: parsed.dialog,
+      dialogCause: parsed.dialogCause,
+    })
+      ?? unavailableStartupCdpNativeDiagnostic("matched");
+  } catch {
+    return unavailableStartupCdpNativeDiagnostic("matched");
+  }
+}
+
+/** Scan only the one exact, source-defined entry failure marker. The bounded
+ * cross-chunk suffix is never retained or emitted after classification. */
+export function createWindowsNormalCandidateStartupStderrObserver(stream) {
+  const marker = Buffer.from(ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, "utf8");
+  const suffixLength = Math.max(marker.length - 1, 0);
+  let markerSeen = false;
+  let suffix = Buffer.alloc(0);
+  if (stream === null || typeof stream !== "object" || typeof stream.on !== "function") {
+    return Object.freeze({ state: () => "stream_unavailable", dispose: () => {} });
+  }
+  const onData = (chunk) => {
+    if (markerSeen || !Buffer.isBuffer(chunk)) return;
+    if (chunk.includes(marker)) {
+      markerSeen = true;
+      suffix = Buffer.alloc(0);
+      return;
+    }
+    const prefix = chunk.subarray(0, Math.min(chunk.length, suffixLength));
+    if (suffix.length > 0 && Buffer.concat([suffix, prefix]).includes(marker)) {
+      markerSeen = true;
+      suffix = Buffer.alloc(0);
+      return;
+    }
+    const retained = chunk.length >= suffixLength
+      ? chunk.subarray(chunk.length - suffixLength)
+      : Buffer.concat([suffix, chunk]).subarray(-suffixLength);
+    suffix = Buffer.from(retained);
+  };
+  stream.on("data", onData);
+  return Object.freeze({
+    state: () => markerSeen ? "entry_failure_marked" : "marker_absent",
+    dispose: () => {
+      try { stream.off?.("data", onData) ?? stream.removeListener?.("data", onData); } catch {}
+      suffix = Buffer.alloc(0);
+    },
+  });
+}
+
+/**
+ * Consume only the existing closed main-process dashboard and companion
+ * markers. Every other child stderr byte is discarded by the shared bounded
+ * readers; this observer has no lifecycle or renderer effect.
+ */
+export function createWindowsNormalCandidateProductFailureDiagnostics(stream) {
+  const companion = createLinuxCompanionProcessDiagnostics();
+  const dashboard = createLinuxDashboardFailureDiagnostics();
+  if (stream === null || typeof stream !== "object" || typeof stream.on !== "function") {
+    return Object.freeze({
+      snapshot: () => Object.freeze({ companionProcessDiagnostics: null, dashboardLoadFailure: null }),
+      dispose: () => {},
+    });
+  }
+  const onData = (chunk) => {
+    try {
+      companion.feed(chunk);
+      dashboard.feed(chunk);
+    } catch {
+      // Child stderr must never affect lifecycle cleanup or the original failure.
+    }
+  };
+  stream.on("data", onData);
+  return Object.freeze({
+    snapshot: () => Object.freeze({
+      companionProcessDiagnostics: validateLinuxCompanionProcessDiagnostics(companion.snapshot()),
+      dashboardLoadFailure: validateLinuxDashboardFailureDiagnostic(dashboard.snapshot()),
+    }),
+    dispose: () => {
+      try { stream.off?.("data", onData) ?? stream.removeListener?.("data", onData); } catch {}
+    },
+  });
+}
+
+async function readWindowsNormalCandidateCdpVersion(endpoint, {
+  fetchImpl = fetch,
+  timeoutMs = OPERATION_TIMEOUT_MS,
+} = {}) {
+  if (exactLoopbackOrigin(endpoint) === null || typeof fetchImpl !== "function"
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    return Object.freeze({ state: "unavailable", value: null });
+  }
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer = null;
+  const timeout = new Promise((_, rejectTimeout) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      rejectTimeout(new Error("loopback response unavailable"));
+    }, timeoutMs);
+  });
+  try {
+    let response;
+    try {
+      response = await Promise.race([
+        fetchImpl(`${endpoint}/json/version`, { signal: controller.signal, redirect: "error" }),
+        timeout,
+      ]);
+    } catch {
+      return Object.freeze({ state: timedOut ? "timed_out" : "transport_unavailable", value: null });
+    }
+    if (!response?.ok || response.redirected === true) {
+      return Object.freeze({ state: "response_rejected", value: null });
+    }
+    if (typeof response.json !== "function") {
+      return Object.freeze({ state: "response_invalid", value: null });
+    }
+    let value;
+    try { value = await Promise.race([response.json(), timeout]); }
+    catch {
+      return Object.freeze({ state: timedOut ? "timed_out" : "response_invalid", value: null });
+    }
+    return exactObject(value)
+      ? Object.freeze({ state: "version_available", value })
+      : Object.freeze({ state: "response_invalid", value: null });
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+
+/** Execute one bounded, loopback-only observation after the normal startup
+ * path has already failed. It has no effect on startup acceptance. */
+export async function inspectWindowsNormalCandidateCdpEndpoint(endpoint, options = {}) {
+  const value = await readWindowsNormalCandidateCdpVersion(endpoint, {
+    ...options,
+    timeoutMs: options?.timeoutMs ?? STARTUP_CDP_DIAGNOSTIC_TIMEOUT_MS,
+  });
+  return value.state;
+}
+
+function exactLoopbackOrigin(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = new URL(value);
+    const port = Number(parsed.port);
+    return parsed.protocol === "http:" && parsed.hostname === "127.0.0.1"
+      && Number.isSafeInteger(port) && port >= 1 && port <= 65_535
+      && parsed.origin === value
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function exactLoopbackRootPage(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = new URL(value);
+    return exactLoopbackOrigin(parsed.origin) !== null
+      && parsed.pathname === "/" && parsed.search === "" && parsed.hash === ""
+      && parsed.username === "" && parsed.password === "" && parsed.href === value
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function exactDebuggerWebSocket(value, port) {
+  if (typeof value !== "string" || !Number.isSafeInteger(port)) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "ws:" && parsed.hostname === "127.0.0.1"
+      && parsed.port === String(port) && /^\/devtools\/page\/[^/]+$/u.test(parsed.pathname)
+      && parsed.search === "" && parsed.hash === "" && parsed.username === ""
+      && parsed.password === "";
+  } catch {
+    return false;
+  }
+}
+
+/** Select only the exact loopback dashboard page exposed by this CDP endpoint. */
+export function selectWindowsNormalCandidateDashboardTarget(targets, debugPort) {
+  if (!Array.isArray(targets) || !Number.isSafeInteger(debugPort)) return undefined;
+  return targets.find((target) => {
+    if (target?.type !== "page" || typeof target.url !== "string") return false;
+    const page = exactLoopbackRootPage(target.url);
+    return page !== null && exactDebuggerWebSocket(target.webSocketDebuggerUrl, debugPort);
+  });
+}
+
+/** Select only the Settings page from the exact already-bound dashboard origin. */
+export function selectWindowsNormalCandidateSettingsTarget(targets, dashboardOrigin, debugPort) {
+  const dashboard = exactLoopbackOrigin(dashboardOrigin);
+  if (!Array.isArray(targets) || dashboard === null || !Number.isSafeInteger(debugPort)) return undefined;
+  return targets.find((target) => {
+    if (target?.type !== "page" || typeof target.url !== "string") return false;
+    try {
+      const page = new URL(target.url);
+      return page.protocol === "http:" && page.hostname === "127.0.0.1"
+        && page.origin === dashboard.origin && page.pathname === "/electron-settings.html"
+        // The fixed dashboard action always asks the lifecycle for its
+        // general Settings section. The lifecycle encodes that fixed section
+        // in the fragment, so require it rather than accepting another
+        // Settings destination or waiting forever for a fragment-free page.
+        && page.search === "" && page.hash === "#general" && page.username === "" && page.password === ""
+        && exactDebuggerWebSocket(target.webSocketDebuggerUrl, debugPort);
+    } catch {
+      return false;
+    }
+  });
+}
+
+async function connectCdp(target, {
+  WebSocketConstructor = WebSocket,
+} = {}) {
+  const socket = new WebSocketConstructor(target.webSocketDebuggerUrl);
+  await Promise.race([
+    new Promise((resolveOpen, rejectOpen) => {
+      socket.addEventListener("open", resolveOpen, { once: true });
+      socket.addEventListener("error", () => rejectOpen(new Error("CDP websocket unavailable")), { once: true });
+    }),
+    wait(OPERATION_TIMEOUT_MS).then(() => Promise.reject(new Error("CDP timeout"))),
+  ]);
+  let nextId = 1;
+  const pending = new Map();
+  const handlers = new Map();
+  const onMessage = (event) => {
+    let message;
+    try { message = JSON.parse(String(event.data)); } catch { return; }
+    if (!Number.isInteger(message.id)) {
+      for (const handler of handlers.get(message.method) ?? []) handler(message.params ?? {});
+      return;
+    }
+    const pendingRequest = pending.get(message.id);
+    if (!pendingRequest) return;
+    pending.delete(message.id);
+    if (message.error) pendingRequest.reject(new Error("CDP request unavailable"));
+    else pendingRequest.resolve(message.result ?? {});
+  };
+  socket.addEventListener("message", onMessage);
+  const request = (method, params = {}) => {
+    const id = nextId++;
+    const response = new Promise((resolveRequest, rejectRequest) => {
+      pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
+    });
+    try { socket.send(JSON.stringify({ id, method, params })); }
+    catch (error) { pending.delete(id); throw error; }
+    return Promise.race([
+      response,
+      wait(OPERATION_TIMEOUT_MS).then(() => Promise.reject(new Error("CDP timeout"))),
+    ]);
+  };
+  return Object.freeze({
+    request,
+    async evaluate(expression) {
+      const value = await request("Runtime.evaluate", {
+        expression,
+        awaitPromise: true,
+        returnByValue: true,
+      });
+      if (value.exceptionDetails) throw new Error("renderer unavailable");
+      return value.result?.value;
+    },
+    on(method, handler) {
+      if (typeof method !== "string" || typeof handler !== "function") throw new TypeError("invalid CDP handler");
+      const registered = handlers.get(method) ?? new Set();
+      registered.add(handler);
+      handlers.set(method, registered);
+      return () => {
+        registered.delete(handler);
+        if (registered.size === 0) handlers.delete(method);
+      };
+    },
+    close() {
+      try { socket.close(); } catch { /* best-effort local DevTools cleanup */ }
+      for (const pendingRequest of pending.values()) pendingRequest.reject(new Error("CDP closed"));
+      pending.clear();
+      handlers.clear();
+    },
+  });
+}
+
+export function localNetworkObserver(cdp, dashboardOrigin) {
+  let invalid = false;
+  let refreshes = 0;
+  const inspect = (url, method = null) => {
+    if (typeof url !== "string" || url.length === 0 || url.length > 2048) {
+      invalid = true;
+      return;
+    }
+    let parsed;
+    try { parsed = new URL(url); } catch { invalid = true; return; }
+    if ((parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "ws:" || parsed.protocol === "wss:")
+        && parsed.origin !== dashboardOrigin) {
+      invalid = true;
+    }
+    // Returning profiles use the quick route once a validated projection is
+    // available. Both routes share the same guarded controller and receipt.
+    if (method === "POST" && parsed.origin === dashboardOrigin
+        && ["/api/local/refresh", "/api/local/refresh/quick"].includes(parsed.pathname)) {
+      refreshes += 1;
+    }
+  };
+  const removeRequest = cdp.on("Network.requestWillBeSent", ({ request } = {}) => inspect(request?.url, request?.method));
+  const removeSocket = cdp.on("Network.webSocketCreated", ({ url } = {}) => inspect(url));
+  return Object.freeze({
+    resetRefreshes() { refreshes = 0; },
+    refreshCount() { return refreshes; },
+    refreshObserved() { return refreshes > 0; },
+    valid() { return !invalid; },
+    dispose() { removeRequest(); removeSocket(); },
+  });
+}
+
+/**
+ * Release only the preload's one-shot startup-refresh barrier after CDP has
+ * enabled its exact dashboard-origin network observer. The ordinary Windows
+ * candidate receives this bridge only under its existing quit-only smoke
+ * control; production and Windows qualification use disjoint environment
+ * gates. This does not start, complete, or otherwise fabricate a refresh.
+ */
+export async function inspectWindowsNormalCandidateStartupRefreshGate(cdp) {
+  if (cdp === null || typeof cdp !== "object" || typeof cdp.evaluate !== "function") {
+    return "unavailable";
+  }
+  try {
+    const result = await cdp.evaluate(`(() => {
+      const bridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
+      if (!bridge || bridge.version !== "v1" || typeof bridge.releaseStartupRefresh !== "function") {
+        // This is an existing, ordinary preload bridge. It gives the receipt
+        // one content-free distinction: preload/contextBridge ran, but the
+        // normal smoke-gate branch did not expose its bridge. No environment,
+        // credential, status, or renderer data crosses this boundary.
+        return globalThis.tibotattleDesktop?.version === "v1"
+          ? "preload_active_gate_absent" : "unavailable";
+      }
+      try {
+        return bridge.releaseStartupRefresh() === true ? "released" : "already_released";
+      } catch {
+        return "evaluation_failed";
+      }
+    })()`);
+    return result === "released" || result === "already_released" || result === "unavailable"
+      || result === "preload_active_gate_absent" || result === "evaluation_failed"
+      ? result
+      : "evaluation_failed";
+  } catch {
+    return "evaluation_failed";
+  }
+}
+
+const WINDOWS_NORMAL_PRELOAD_CONTEXT_STATES = new Set([
+  "normal_environment_match",
+  "platform_other",
+  "control_other_or_absent",
+  "qualification_or_test_marker_present",
+  "process_unavailable",
+  "evaluation_failed",
+]);
+
+/**
+ * Keep only a bounded normal-environment observation from an isolated CDP
+ * context. Electron does not guarantee that CDP exposes preload's lexical
+ * `process` binding as a global, so this is evidence, never a claim that the
+ * preload gate itself was eligible. It returns no environment values,
+ * credentials, context identifiers, or renderer content.
+ */
+export function classifyWindowsNormalCandidatePreloadContext(value) {
+  return typeof value === "string" && WINDOWS_NORMAL_PRELOAD_CONTEXT_STATES.has(value)
+    ? value : "evaluation_failed";
+}
+
+const WINDOWS_NORMAL_PRELOAD_CONTEXT_EXPRESSION = `(() => {
+  const processRef = typeof process !== "undefined" ? process : null;
+  if (!processRef) return "process_unavailable";
+  if (processRef.platform !== "win32") return "platform_other";
+  if (processRef.env?.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL !== "quit-v1") {
+    return "control_other_or_absent";
+  }
+  return processRef.env?.USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION === undefined
+      && processRef.env?.USAGE_MONITOR_TEST_LANE === undefined
+    ? "normal_environment_match" : "qualification_or_test_marker_present";
+})()`;
+
+/** Observe only isolated execution contexts exposed by the existing CDP target. */
+export function observeWindowsNormalCandidatePreloadContexts(cdp) {
+  if (cdp === null || typeof cdp !== "object" || typeof cdp.on !== "function"
+      || typeof cdp.request !== "function") return null;
+  const contextIds = new Set();
+  const remove = cdp.on("Runtime.executionContextCreated", ({ context } = {}) => {
+    if (context?.auxData?.type === "isolated" && Number.isInteger(context.id) && context.id >= 1) {
+      contextIds.add(context.id);
+    }
+  });
+  return Object.freeze({
+    async inspect() {
+      const states = new Set();
+      for (const contextId of contextIds) {
+        try {
+          const response = await cdp.request("Runtime.evaluate", {
+            expression: WINDOWS_NORMAL_PRELOAD_CONTEXT_EXPRESSION,
+            contextId,
+            awaitPromise: true,
+            returnByValue: true,
+          });
+          states.add(classifyWindowsNormalCandidatePreloadContext(response?.result?.value));
+        } catch {
+          states.add("evaluation_failed");
+        }
+      }
+      return Object.freeze([...states].sort());
+    },
+    dispose() {
+      try { remove?.(); } catch { /* CDP diagnostic cleanup cannot alter the smoke result. */ }
+    },
+  });
+}
+
+export function classifyWindowsNormalCandidateStartupRefreshGateFailure(gate, preloadContexts = []) {
+  if (gate?.failureCode !== "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE") {
+    return gate?.failureCode ?? "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE";
+  }
+  if (!Array.isArray(preloadContexts) || preloadContexts.length === 0) {
+    return "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_CONTEXT_UNAVAILABLE";
+  }
+  return preloadContexts.includes("normal_environment_match")
+    ? "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_MATCH_BRIDGE_ABSENT"
+    : "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_NOT_MATCHED";
+}
+
+export async function releaseWindowsNormalCandidateStartupRefreshGate(cdp) {
+  return await inspectWindowsNormalCandidateStartupRefreshGate(cdp) === "released";
+}
+
+/**
+ * Wait for the page's preload context to finish installing the exact
+ * normal-candidate barrier, then release it once. CDP may advertise the
+ * loopback navigation before that context is available; the renderer cannot
+ * issue its startup refresh until this barrier is released.
+ */
+export async function waitForWindowsNormalCandidateStartupRefreshGate(cdp, {
+  clock = () => Date.now(),
+  sleep = wait,
+  timeoutMs = STARTUP_TIMEOUT_MS,
+} = {}) {
+  if (typeof clock !== "function" || typeof sleep !== "function"
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    return Object.freeze({ released: false, failureCode: "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE" });
+  }
+  const deadline = clock() + timeoutMs;
+  let latest = "unavailable";
+  while (true) {
+    latest = await inspectWindowsNormalCandidateStartupRefreshGate(cdp);
+    if (latest === "released") return Object.freeze({ released: true, failureCode: null });
+    if (latest === "already_released") {
+      return Object.freeze({ released: false, failureCode: "LOCAL_STARTUP_REFRESH_GATE_ALREADY_RELEASED" });
+    }
+    if (clock() >= deadline) {
+      return Object.freeze({
+        released: false,
+        failureCode: latest === "evaluation_failed"
+          ? "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED"
+          : latest === "preload_active_gate_absent"
+            ? "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_ACTIVE_GATE_ABSENT"
+            : "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
+      });
+    }
+    await sleep(Math.min(150, Math.max(1, deadline - clock())));
+  }
+}
+
+/**
+ * The normal candidate has one inherited-IPC capability: request the same
+ * desktop-lifecycle.quit path as the tray. It accepts no credential, status,
+ * storage, or renderer messages and is never exposed to a preload bridge.
+ */
+export function createWindowsNormalCandidateQuitProtocol(child, {
+  timeoutMs = PROCESS_EXIT_TIMEOUT_MS,
+} = {}) {
+  if (!child || child.connected !== true || typeof child.send !== "function"
+      || typeof child.on !== "function" || typeof child.off !== "function"
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    fail("CLEAN_QUIT_INVALID");
+  }
+  let active = true;
+  let pending = null;
+  const clean = () => {
+    if (!active) return;
+    active = false;
+    child.off("message", onMessage);
+    child.off("disconnect", onDisconnect);
+    child.off("error", onError);
+  };
+  const rejectPending = () => {
+    if (pending === null) return;
+    clearTimeout(pending.timer);
+    const current = pending;
+    pending = null;
+    current.reject(failure("CLEAN_QUIT_INVALID"));
+  };
+  const onMessage = (message) => {
+    if (pending === null || message === null || typeof message !== "object"
+        || Array.isArray(message) || Reflect.ownKeys(message).length !== 1
+        || message.type !== NORMAL_CANDIDATE_QUIT_ACCEPTED) return;
+    clearTimeout(pending.timer);
+    const current = pending;
+    pending = null;
+    current.resolve(true);
+  };
+  const onDisconnect = () => rejectPending();
+  const onError = () => rejectPending();
+  child.on("message", onMessage);
+  child.on("disconnect", onDisconnect);
+  child.on("error", onError);
+  return Object.freeze({
+    requestQuit() {
+      if (!active || pending !== null || child.connected !== true) fail("CLEAN_QUIT_INVALID");
+      return new Promise((resolveRequest, rejectRequest) => {
+        const timer = setTimeout(() => {
+          if (pending === null) return;
+          pending = null;
+          rejectRequest(failure("CLEAN_QUIT_INVALID"));
+        }, timeoutMs);
+        pending = { resolve: resolveRequest, reject: rejectRequest, timer };
+        try {
+          child.send(NORMAL_CANDIDATE_QUIT_REQUEST, (error) => {
+            if (error) rejectPending();
+          });
+        } catch {
+          rejectPending();
+        }
+      });
+    },
+    close() {
+      rejectPending();
+      clean();
+    },
+  });
+}
+
+function waitForChildExit(child, timeoutMs = PROCESS_EXIT_TIMEOUT_MS) {
+  if (child?.exitCode !== null || child?.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolveExit) => {
+    let timer;
+    const finish = (value) => {
+      clearTimeout(timer);
+      child?.off?.("exit", onExit);
+      child?.off?.("error", onError);
+      resolveExit(value);
+    };
+    const onExit = () => finish(true);
+    const onError = () => finish(false);
+    timer = setTimeout(() => finish(false), timeoutMs);
+    child?.once?.("exit", onExit);
+    child?.once?.("error", onError);
+  });
+}
+
+export async function stopOwnedCandidate(child, {
+  environment,
+  spawnProgram = spawn,
+} = {}) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return true;
+  if (!Number.isSafeInteger(child.pid) || child.pid < 1) return false;
+  const root = exactWindowsPath(environment?.SystemRoot);
+  if (root === null) return false;
+  try {
+    const killer = spawnProgram(win32.join(root, "System32", "taskkill.exe"), [
+      "/PID", String(child.pid), "/T", "/F",
+    ], {
+      cwd: root,
+      env: fixedPowerShellEnvironment(environment),
+      shell: false,
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    if (!killer || typeof killer !== "object") return false;
+    killer.once?.("error", () => {});
+    if (!await waitForChildExit(killer, CLEANUP_TIMEOUT_MS)
+        || killer.signalCode !== null || killer.exitCode !== 0) return false;
+  } catch {
+    return false;
+  }
+  return waitForChildExit(child, CLEANUP_TIMEOUT_MS);
+}
+
+async function connectDashboard({ port, fetchImpl, WebSocketConstructor, onPhase = () => {} }) {
+  const endpoint = `http://127.0.0.1:${port}`;
+  onPhase("cdp_version");
+  let endpointState = "unavailable";
+  const version = await waitFor(async () => {
+    const observed = await readWindowsNormalCandidateCdpVersion(endpoint, { fetchImpl });
+    endpointState = observed.state;
+    return observed.value;
+  }, STARTUP_TIMEOUT_MS);
+  if (!exactObject(version)) {
+    const error = failure("CDP_UNAVAILABLE");
+    error.startupCdpEndpoint = endpointState;
+    throw error;
+  }
+  onPhase("dashboard_target");
+  const target = await waitFor(async () => {
+    const targets = await jsonFetch(`${endpoint}/json`, { fetchImpl });
+    return selectWindowsNormalCandidateDashboardTarget(targets, port);
+  }, STARTUP_TIMEOUT_MS);
+  if (!target) fail("DASHBOARD_UNAVAILABLE");
+  onPhase("cdp_connection");
+  let cdp;
+  try { cdp = await connectCdp(target, { WebSocketConstructor }); }
+  catch {
+    const error = failure("CDP_UNAVAILABLE");
+    error.startupCdpEndpoint = "version_available";
+    throw error;
+  }
+  return Object.freeze({ cdp, endpoint, target });
+}
+
+export function normalizeStartupPhase(value) {
+  return NORMAL_CANDIDATE_STARTUP_PHASES.has(value) ? value : null;
+}
+
+function normalizeStartupFailureCode(value) {
+  if (typeof value !== "string" || !value.startsWith(PREFIX)) return null;
+  return FAILURE_CODES.has(value.slice(PREFIX.length)) ? value : null;
+}
+
+export function normalizeStartupFailureDiagnostic(value) {
+  if (!exactObject(value) || Object.keys(value).length !== 9
+      || !["first", "restart"].includes(value.launch)
+      || !["zero", "one", "multiple"].includes(value.requests)
+      || !["idle", "running", "succeeded", "degraded", "failed", "cancelled", "other"].includes(value.refreshStatus)
+      || !["ready", "needs_attention", "other"].includes(value.onboarding)
+      || !["electronMarked", "refreshDisabled", "sourceReadable", "rolloutPresent", "stateWritable"].every((key) => typeof value[key] === "boolean")) return null;
+  return Object.freeze({ launch: value.launch, requests: value.requests,
+    refreshStatus: value.refreshStatus, onboarding: value.onboarding,
+    electronMarked: value.electronMarked, refreshDisabled: value.refreshDisabled,
+    sourceReadable: value.sourceReadable, rolloutPresent: value.rolloutPresent,
+    stateWritable: value.stateWritable });
+}
+
+const STARTUP_COMPLETION_REQUEST_COUNTS = new Set(["zero", "one", "multiple", "invalid"]);
+const STARTUP_COMPLETION_REFRESH_STATUSES = new Set([
+  "not_observed", "missing", "idle", "running", "succeeded", "degraded", "failed", "cancelled",
+  "other", "unavailable",
+]);
+const STARTUP_COMPLETION_OBSERVED_REFRESH_STATUSES = new Set([
+  "idle", "running", "succeeded", "degraded", "failed", "cancelled",
+]);
+const STARTUP_COMPLETION_CLASSIFIER_STATUSES = new Set(["pending", "completed", "failed"]);
+const STARTUP_COMPLETION_CLASSIFIER_REASONS = new Set([
+  "none", "duplicate", "invalid_receipt", "changed_receipt", "degraded_invalid", "failed", "cancelled", "other",
+]);
+const STARTUP_COMPLETION_FAILED_STEPS = new Set([
+  "none", "collector", "accounting", "archive_index", "unified_index", "assemble", "other",
+]);
+const STARTUP_COMPLETION_CONTROLLER_ERRORS = new Set([
+  "none", "refresh_failed", "refresh_resource_limited", "refresh_timed_out", "refresh_cancelled",
+  "refresh_degraded", "other",
+]);
+// This is the reviewed public unified-index vocabulary from
+// src/local-companion-refresh.js, plus its fail-closed default.  The receipt
+// must never preserve an arbitrary controller failure string.
+const STARTUP_COMPLETION_UNIFIED_INDEX_FAILURE_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+  "local_unified_index_aborted",
+  "local_unified_index_directory_sync_failed",
+  "local_unified_index_file_changed",
+  "local_unified_index_file_invalid",
+  "local_unified_index_generation_invalid",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_integrity_failed",
+  "local_unified_index_journal_mode_refused",
+  "local_unified_index_meta_invalid",
+  "local_unified_index_missing",
+  "local_unified_index_publication_durability_uncertain",
+  "local_unified_index_refresh_failed",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_schema_newer",
+  "local_unified_index_secondary_indexes_failed",
+  "local_unified_index_secondary_indexes_missing",
+  "local_unified_index_secret_invalid",
+  "local_unified_index_secret_unavailable",
+  "local_unified_index_unavailable",
+  "local_unified_index_worker_failed",
+]);
+const STARTUP_COMPLETION_DEGRADED_FAILURE_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+]);
+const STARTUP_COMPLETION_FAILURE_CODES = new Set([
+  "none", "other", ...STARTUP_COMPLETION_UNIFIED_INDEX_FAILURE_CODES,
+]);
+const STARTUP_COMPLETION_INDEX_STATUSES = new Set([
+  "failed", "ingested", "missing", "other",
+]);
+const STARTUP_COMPLETION_DEGRADED_CONTRACT_CHECKS = Object.freeze([
+  "refresh_degraded",
+  "unified_index_step",
+  "quarantine_failure_code",
+  "unified_index_ingested",
+  "generation_partial",
+  "quarantine_block_reason",
+  "skipped_sources_positive",
+  "skipped_threads_positive",
+  "failure_reason_count_positive",
+  "discovery_complete",
+  "diagnostics_complete",
+  "usage_provenance_complete",
+  "source_order_complete",
+  "quota_provenance_complete",
+  "accounting_replay_safe",
+  "accounting_unified",
+  "accounting_partial_coverage",
+  "accounting_generation_matched",
+  "accounting_zero_fallback",
+  "accounting_diagnostics_available",
+]);
+const STARTUP_COMPLETION_CLASSIFIER_REASON_BY_ERROR_CODE = new Map([
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.duplicate, "duplicate"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.invalidReceipt, "invalid_receipt"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.changedReceipt, "changed_receipt"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.degradedInvalid, "degraded_invalid"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.failed, "failed"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.cancelled, "cancelled"],
+]);
+
+function startupCompletionRequestCount(requestCount) {
+  if (!Number.isInteger(requestCount) || requestCount < 0) return "invalid";
+  return requestCount === 0 ? "zero" : requestCount === 1 ? "one" : "multiple";
+}
+
+function startupCompletionRefreshStatus({ requestCount, refresh, unavailable = false } = {}) {
+  const requestCountCategory = startupCompletionRequestCount(requestCount);
+  if (requestCountCategory === "zero") return "not_observed";
+  if (unavailable === true) return "unavailable";
+  if (refresh === null || refresh === undefined) return "missing";
+  return STARTUP_COMPLETION_OBSERVED_REFRESH_STATUSES.has(refresh?.status)
+    ? refresh.status
+    : "other";
+}
+
+function startupCompletionControllerError(refresh) {
+  if (refresh?.errorCode === null || refresh?.errorCode === undefined) return "none";
+  return STARTUP_COMPLETION_CONTROLLER_ERRORS.has(refresh.errorCode) ? refresh.errorCode : "other";
+}
+
+function startupCompletionFailedStep(refresh) {
+  if (refresh?.failedStep === null || refresh?.failedStep === undefined) return "none";
+  return STARTUP_COMPLETION_FAILED_STEPS.has(refresh.failedStep) ? refresh.failedStep : "other";
+}
+
+function startupCompletionFailureCode(refresh) {
+  if (refresh?.failureCode === null || refresh?.failureCode === undefined) return "none";
+  return STARTUP_COMPLETION_UNIFIED_INDEX_FAILURE_CODES.has(refresh.failureCode)
+    ? refresh.failureCode
+    : "other";
+}
+
+function startupCompletionIndexStatus(refresh) {
+  const status = refresh?.result?.unifiedIndex?.status;
+  if (status === null || status === undefined) return "missing";
+  return STARTUP_COMPLETION_INDEX_STATUSES.has(status) && status !== "missing" && status !== "other"
+    ? status
+    : "other";
+}
+
+function startupCompletionDegradedContractUnmet(refresh) {
+  if (refresh?.status !== "degraded") return Object.freeze([]);
+  const unifiedIndex = refresh?.result?.unifiedIndex;
+  const generation = unifiedIndex?.generation;
+  const accounting = refresh?.result?.accounting;
+  const failureCode = refresh?.failureCode;
+  const unmet = [];
+  if (refresh?.errorCode !== "refresh_degraded") unmet.push("refresh_degraded");
+  if (refresh?.failedStep !== "unified_index") unmet.push("unified_index_step");
+  if (!STARTUP_COMPLETION_DEGRADED_FAILURE_CODES.has(failureCode)) {
+    unmet.push("quarantine_failure_code");
+  }
+  if (unifiedIndex?.status !== "ingested") unmet.push("unified_index_ingested");
+  if (generation?.status !== "partial") unmet.push("generation_partial");
+  if (generation?.blockReason !== "codex_rollout_sources_quarantined") {
+    unmet.push("quarantine_block_reason");
+  }
+  if (!Number.isSafeInteger(generation?.skippedSourceCount)
+      || generation.skippedSourceCount <= 0) {
+    unmet.push("skipped_sources_positive");
+  }
+  if (!Number.isSafeInteger(generation?.skippedThreadCount)
+      || generation.skippedThreadCount <= 0) {
+    unmet.push("skipped_threads_positive");
+  }
+  if (!STARTUP_COMPLETION_DEGRADED_FAILURE_CODES.has(failureCode)
+      || !Number.isSafeInteger(generation?.reasonCounts?.[failureCode])
+      || generation.reasonCounts[failureCode] <= 0) {
+    unmet.push("failure_reason_count_positive");
+  }
+  if (generation?.discoveryComplete !== true) unmet.push("discovery_complete");
+  if (generation?.diagnosticsComplete !== true) unmet.push("diagnostics_complete");
+  if (generation?.usageProvenanceComplete !== true) {
+    unmet.push("usage_provenance_complete");
+  }
+  if (generation?.sourceOrderComplete !== true) unmet.push("source_order_complete");
+  if (generation?.quotaProvenanceComplete !== true) {
+    unmet.push("quota_provenance_complete");
+  }
+  if (accounting?.status !== "replay_safe") unmet.push("accounting_replay_safe");
+  if (accounting?.sourceMode !== "unified") unmet.push("accounting_unified");
+  if (accounting?.coverageStatus !== "partial") {
+    unmet.push("accounting_partial_coverage");
+  }
+  if (accounting?.generationMatched !== true) {
+    unmet.push("accounting_generation_matched");
+  }
+  if (accounting?.fallbackCount !== 0) unmet.push("accounting_zero_fallback");
+  if (accounting?.diagnosticsAvailable !== true) {
+    unmet.push("accounting_diagnostics_available");
+  }
+  return Object.freeze(unmet);
+}
+
+function startupCompletionClassifierReason(decision) {
+  if (decision?.status !== "failed") return "none";
+  return STARTUP_COMPLETION_CLASSIFIER_REASON_BY_ERROR_CODE.get(decision.errorCode) ?? "other";
+}
+
+/**
+ * Retain the completion boundary as fixed categories only.  The unified-index
+ * failure and degraded-contract fields use reviewed enums and booleans only;
+ * provider/controller text cannot cross into the receipt.
+ */
+export function normalizeStartupCompletionDiagnostic(value) {
+  const unmet = value?.degradedContractUnmet;
+  const selectedChecks = Array.isArray(unmet)
+    ? STARTUP_COMPLETION_DEGRADED_CONTRACT_CHECKS
+      .filter((check) => unmet.includes(check))
+    : null;
+  const canonicalUnmet = Array.isArray(unmet)
+    && unmet.length === new Set(unmet).size
+    && unmet.every((check) => STARTUP_COMPLETION_DEGRADED_CONTRACT_CHECKS.includes(check))
+    && selectedChecks.length === unmet.length
+    && selectedChecks.every((check, index) => check === unmet[index]);
+  if (!exactObject(value) || Object.keys(value).length !== 10
+      || value.phase !== "completion"
+      || !STARTUP_COMPLETION_REQUEST_COUNTS.has(value.requestCount)
+      || !STARTUP_COMPLETION_REFRESH_STATUSES.has(value.refreshStatus)
+      || !STARTUP_COMPLETION_CLASSIFIER_STATUSES.has(value.classifierStatus)
+      || !STARTUP_COMPLETION_CLASSIFIER_REASONS.has(value.classifierReason)
+      || !STARTUP_COMPLETION_FAILED_STEPS.has(value.failedStep)
+      || !STARTUP_COMPLETION_CONTROLLER_ERRORS.has(value.controllerError)
+      || !STARTUP_COMPLETION_FAILURE_CODES.has(value.failureCode)
+      || !STARTUP_COMPLETION_INDEX_STATUSES.has(value.indexStatus)
+      || !canonicalUnmet
+      || value.requestCount === "zero" && value.refreshStatus !== "not_observed"
+      || value.requestCount !== "zero" && value.refreshStatus === "not_observed"
+      || value.classifierStatus === "failed" && value.classifierReason === "none"
+      || value.classifierStatus !== "failed" && value.classifierReason !== "none"
+      || value.classifierReason === "degraded_invalid" && unmet.length === 0
+      || value.refreshStatus !== "degraded" && unmet.length !== 0) return null;
+  return Object.freeze({
+    phase: value.phase,
+    requestCount: value.requestCount,
+    refreshStatus: value.refreshStatus,
+    classifierStatus: value.classifierStatus,
+    classifierReason: value.classifierReason,
+    failedStep: value.failedStep,
+    controllerError: value.controllerError,
+    failureCode: value.failureCode,
+    indexStatus: value.indexStatus,
+    degradedContractUnmet: Object.freeze([...unmet]),
+  });
+}
+
+/**
+ * Classify one completion observation and project only fixed receipt fields.
+ * A loopback read failure is still a bounded pending condition; malformed
+ * successful reads remain classifier failures.
+ */
+export function inspectWindowsNormalCandidateStartupRefreshCompletion({
+  requestCount,
+  refresh = null,
+  expectedRefreshId = null,
+  unavailable = false,
+} = {}) {
+  const decision = unavailable === true
+    ? Object.freeze({ status: "pending" })
+    : classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount,
+      refresh,
+      expectedRefreshId,
+    });
+  const diagnostic = normalizeStartupCompletionDiagnostic({
+    phase: "completion",
+    requestCount: startupCompletionRequestCount(requestCount),
+    refreshStatus: startupCompletionRefreshStatus({ requestCount, refresh, unavailable }),
+    classifierStatus: STARTUP_COMPLETION_CLASSIFIER_STATUSES.has(decision.status)
+      ? decision.status
+      : "failed",
+    classifierReason: startupCompletionClassifierReason(decision),
+    failedStep: startupCompletionFailedStep(refresh),
+    controllerError: startupCompletionControllerError(refresh),
+    failureCode: startupCompletionFailureCode(refresh),
+    indexStatus: startupCompletionIndexStatus(refresh),
+    degradedContractUnmet: startupCompletionDegradedContractUnmet(refresh),
+  });
+  return Object.freeze({ decision, diagnostic });
+}
+
+function startupCompletionFailure(diagnostic) {
+  const error = failure("LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE");
+  const selected = normalizeStartupCompletionDiagnostic(diagnostic);
+  if (selected !== null) error.startupCompletionDiagnostic = selected;
+  return error;
+}
+
+/**
+ * Poll the startup completion receipt without allowing a failed classifier
+ * result to be swallowed by the generic retry helper.
+ */
+export async function waitForWindowsNormalCandidateStartupRefreshCompletion({
+  refreshCount,
+  readRefresh,
+  expectedRefreshId,
+  waitForPoll = waitFor,
+  timeoutMs = STARTUP_TIMEOUT_MS,
+} = {}) {
+  let diagnostic = normalizeStartupCompletionDiagnostic({
+    phase: "completion",
+    requestCount: "invalid",
+    refreshStatus: "missing",
+    classifierStatus: "pending",
+    classifierReason: "none",
+    failedStep: "none",
+    controllerError: "none",
+    failureCode: "none",
+    indexStatus: "missing",
+    degradedContractUnmet: [],
+  });
+  const terminal = await waitForPoll(async () => {
+    const requestCount = refreshCount();
+    if (requestCount !== 1) {
+      const observed = inspectWindowsNormalCandidateStartupRefreshCompletion({
+        requestCount,
+        expectedRefreshId,
+      });
+      diagnostic = observed.diagnostic;
+      return observed.decision.status === "pending" ? null : observed;
+    }
+    let refresh = null;
+    let unavailable = false;
+    try {
+      refresh = await readRefresh();
+    } catch {
+      unavailable = true;
+    }
+    const observed = inspectWindowsNormalCandidateStartupRefreshCompletion({
+      requestCount,
+      refresh,
+      expectedRefreshId,
+      unavailable,
+    });
+    diagnostic = observed.diagnostic;
+    return observed.decision.status === "pending" ? null : observed;
+  }, timeoutMs);
+  if (terminal?.decision?.status !== "completed") throw startupCompletionFailure(diagnostic);
+  return terminal.decision;
+}
+
+/**
+ * Confirm that the exact content-free rollout fixture reached the ordinary
+ * unified index and presentation model. This deliberately observes only
+ * fixed counts and totals through the same loopback routes the dashboard
+ * consumes; it never copies source rows, paths, or account data into a
+ * receipt. The restart pass must add no duplicate record.
+ */
+export function verifyWindowsNormalCandidateSyntheticIngestion({
+  refresh,
+  overview,
+  launch,
+  expectedRefreshId,
+} = {}) {
+  if (!['first', 'restart'].includes(launch)
+      || typeof expectedRefreshId !== 'string' || expectedRefreshId.length === 0
+      || refresh?.status !== 'succeeded' || refresh.refreshId !== expectedRefreshId) {
+    return false;
+  }
+  const index = refresh.result?.unifiedIndex;
+  const refreshAccounting = refresh.result?.accounting;
+  const accounting = overview?.accounting;
+  const coverage = accounting?.historyCoverage;
+  const all = Array.isArray(overview?.usage)
+    ? overview.usage.find((period) => period?.id === 'all')
+    : null;
+  const history = Array.isArray(accounting?.periods)
+    ? accounting.periods.find((period) => period?.periodId === 'history')
+    : null;
+  const expected = SYNTHETIC_INGESTION_EXPECTATION;
+  const freshOrReused = launch === 'first'
+    ? Number.isSafeInteger(index?.insertedUsageEvents)
+      && [0, expected.events].includes(index.insertedUsageEvents)
+      && typeof index?.unchanged === 'boolean'
+    : index?.insertedUsageEvents === 0 && index?.unchanged === true;
+  return index?.status === 'ingested'
+    && index.totalUsageEvents === expected.events
+    && freshOrReused
+    && refreshAccounting?.status === 'replay_safe'
+    && refreshAccounting.sourceMode === 'unified'
+    && refreshAccounting.coverageStatus === 'complete'
+    && refreshAccounting.generationMatched === true
+    && refreshAccounting.fallbackCount === 0
+    && refreshAccounting.diagnosticsAvailable === true
+    && refreshAccounting.events === expected.events
+    && overview?.mode === 'real_local_evidence'
+    && accounting?.sourceMode === 'unified'
+    && accounting.generationMatched === true
+    && accounting.events === expected.events
+    && accounting.totalTokens === expected.totalTokens
+    && coverage?.status === 'complete'
+    && coverage.phase === 'complete'
+    && coverage.sourceCount === expected.sourceCount
+    && coverage.indexedSourceCount === expected.sourceCount
+    && overview?.timeline?.history?.status === 'complete'
+    && overview.timeline.history.usageEvents === expected.events
+    && all?.events === expected.events
+    && all.totalTokens === expected.totalTokens
+    && history?.events === expected.events
+    && history.totalTokens === expected.totalTokens;
+}
+
+async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () => {} }) {
+  const dashboard = exactLoopbackRootPage(target.url);
+  if (dashboard === null) fail("DASHBOARD_INVALID");
+  const observer = localNetworkObserver(cdp, dashboard.origin);
+  const preloadContexts = observeWindowsNormalCandidatePreloadContexts(cdp);
+  try {
+    await cdp.request("Page.enable");
+    await cdp.request("Network.enable");
+    await cdp.request("Runtime.enable");
+    // The exact normal-candidate preload is now holding automatic refresh at
+    // its existing smoke gate. Releasing only after Network.enable closes the
+    // fast-renderer race without accepting an unobserved startup POST.
+    onPhase("dashboard_gate");
+    const startupGate = await waitForWindowsNormalCandidateStartupRefreshGate(cdp);
+    if (startupGate.released !== true) {
+      const contexts = await preloadContexts?.inspect?.() ?? [];
+      fail(classifyWindowsNormalCandidateStartupRefreshGateFailure(startupGate, contexts));
+    }
+    onPhase("dashboard_ready");
+    const ready = await waitFor(async () => {
+      const value = await cdp.evaluate(`(() => ({
+        ready: document.documentElement?.dataset?.localDashboardReady === "true",
+        title: document.title,
+        heading: document.querySelector("#overview-title")?.textContent?.trim() ?? "",
+        location: location.href,
+      }))()`);
+      return value?.ready === true && value.title === "TiboTattle" && typeof value.heading === "string"
+        && value.heading.length > 0 && value.location === dashboard.href ? value : null;
+    }, STARTUP_TIMEOUT_MS);
+    if (ready === null) fail("DASHBOARD_UNAVAILABLE");
+    onPhase("dashboard_health");
+    const health = await jsonFetch(new URL("/api/local/health", dashboard), { fetchImpl });
+    if (health?.status !== "ready") fail("DASHBOARD_UNAVAILABLE");
+    const refreshEndpoint = new URL("/api/local/refresh", dashboard);
+    // Ordinary Electron runs one launch-time refresh and holds manual Refresh
+    // disabled while it is active. The observer is attached before dashboard
+    // readiness, so require its exact one local POST instead of clicking a
+    // second operation into that intentional busy state.
+    onPhase("startup_refresh_acceptance");
+    const accepted = await waitFor(async () => {
+      if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
+      const decision = classifyAutomaticStartupRefreshReceipt({
+        phase: "acceptance",
+        requestCount: observer.refreshCount(),
+        refresh: (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
+        previousRefreshId: null,
+      });
+      return decision.status === "accepted" ? decision : null;
+    }, STARTUP_TIMEOUT_MS);
+    if (accepted === null) {
+      let diagnostic = null;
+      try {
+        const [onboarding, status, renderer] = await Promise.all([
+          jsonFetch(new URL("/api/local/onboarding", dashboard), { fetchImpl }),
+          jsonFetch(refreshEndpoint, { fetchImpl }),
+          cdp.evaluate(`(() => ({
+            electronMarked: document.documentElement.classList.contains("electron-dashboard")
+              || document.body?.classList.contains("electron-dashboard") === true,
+            refreshDisabled: document.querySelector("#refresh-button")?.disabled === true
+          }))()`),
+        ]);
+        diagnostic = normalizeStartupFailureDiagnostic({
+          launch, requests: observer.refreshCount() === 0 ? "zero" : observer.refreshCount() === 1 ? "one" : "multiple",
+          refreshStatus: ["idle", "running", "succeeded", "degraded", "failed", "cancelled"].includes(status?.refresh?.status) ? status.refresh.status : "other",
+          onboarding: ["ready", "needs_attention"].includes(onboarding?.status) ? onboarding.status : "other",
+          electronMarked: renderer?.electronMarked === true,
+          refreshDisabled: renderer?.refreshDisabled === true,
+          sourceReadable: onboarding?.source?.sessionsReadable === true || onboarding?.source?.archivedSessionsReadable === true,
+          rolloutPresent: onboarding?.source?.rolloutFilesPresent === true,
+          stateWritable: onboarding?.state?.writable === true,
+        });
+      } catch { /* A failed diagnostic must preserve the original failure. */ }
+      throw Object.assign(new Error(`${PREFIX}LOCAL_STARTUP_REFRESH_UNAVAILABLE`), {
+        code: `${PREFIX}LOCAL_STARTUP_REFRESH_UNAVAILABLE`, startupDiagnostic: diagnostic,
+      });
+    }
+    onPhase("startup_refresh_completion");
+    const terminal = await waitForWindowsNormalCandidateStartupRefreshCompletion({
+      refreshCount: () => observer.refreshCount(),
+      readRefresh: async () => (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
+      expectedRefreshId: accepted.refreshId,
+    });
+    // The startup pass is terminal now, so ordinary user interaction must be
+    // restored. Reset the observer only after preserving that proof: the next
+    // one local POST is the user-requested detailed refresh, not a duplicate
+    // startup operation.
+    observer.resetRefreshes();
+    const clicked = await waitFor(() => cdp.evaluate(`(() => {
+      const button = document.querySelector("#refresh-button");
+      if (!button || button.disabled) return false;
+      button.click();
+      return true;
+    })()`), OPERATION_TIMEOUT_MS);
+    if (clicked !== true) fail("LOCAL_EXPLICIT_REFRESH_BUTTON_UNAVAILABLE");
+    if (await waitFor(() => observer.refreshObserved(), OPERATION_TIMEOUT_MS) !== true) {
+      fail("LOCAL_EXPLICIT_REFRESH_REQUEST_UNOBSERVED");
+    }
+    onPhase("explicit_refresh_acceptance");
+    const explicitAccepted = await waitFor(async () => {
+      if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
+      const decision = classifyAutomaticStartupRefreshReceipt({
+        phase: "acceptance",
+        requestCount: observer.refreshCount(),
+        refresh: (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
+        previousRefreshId: accepted.refreshId,
+      });
+      return decision.status === "accepted" ? decision : null;
+    }, STARTUP_TIMEOUT_MS);
+    if (explicitAccepted === null) fail("LOCAL_EXPLICIT_REFRESH_ACCEPTANCE_UNAVAILABLE");
+    onPhase("explicit_refresh_completion");
+    const explicitTerminal = await waitFor(async () => {
+      if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
+      const decision = classifyAutomaticStartupRefreshReceipt({
+        phase: "completion",
+        requestCount: observer.refreshCount(),
+        refresh: (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
+        expectedRefreshId: explicitAccepted.refreshId,
+      });
+      return decision.status === "completed" ? decision : null;
+    }, STARTUP_TIMEOUT_MS);
+    if (explicitTerminal === null) fail("LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE");
+    const explicitRefresh = (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh;
+    const overview = await jsonFetch(new URL("/api/local/overview", dashboard), { fetchImpl });
+    if (!verifyWindowsNormalCandidateSyntheticIngestion({
+      refresh: explicitRefresh,
+      overview,
+      launch,
+      expectedRefreshId: explicitAccepted.refreshId,
+    })) {
+      fail("LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE");
+    }
+    if (!observer.valid()) fail("DASHBOARD_INVALID");
+    preloadContexts?.dispose?.();
+    return Object.freeze({
+      dashboardOrigin: dashboard.origin,
+      observer,
+      refreshTerminalStatus: explicitTerminal.terminalStatus,
+      syntheticIngestionVerified: true,
+    });
+  } catch (error) {
+    observer.dispose();
+    preloadContexts?.dispose?.();
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("DASHBOARD_UNAVAILABLE");
+  }
+}
+
+async function assertRenderedSharingOptOut(cdp) {
+  let retained = false;
+  try {
+    retained = await cdp.evaluate(`(async () => {
+      const preference = await globalThis.tibotattleDesktop?.getSharingPreference?.();
+      return preference?.enabled === false && preference?.transportStatus === "off";
+    })()`);
+  } catch {
+    retained = false;
+  }
+  if (retained !== true) fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+  return true;
+}
+
+async function findSettingsTarget(endpoint, dashboardOrigin, port, fetchImpl) {
+  return waitFor(async () => selectWindowsNormalCandidateSettingsTarget(
+    await jsonFetch(`${endpoint}/json`, { fetchImpl }),
+    dashboardOrigin,
+    port,
+  ), STARTUP_TIMEOUT_MS);
+}
+
+async function openSettings({ dashboardCdp, endpoint, dashboardOrigin, port, fetchImpl, WebSocketConstructor, onPhase = () => {} }) {
+  const opened = await dashboardCdp.evaluate(`(() => {
+    const button = document.querySelector("#electron-settings-button");
+    if (!button || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (opened !== true) fail("SETTINGS_UNAVAILABLE");
+  onPhase("settings_target");
+  const target = await findSettingsTarget(endpoint, dashboardOrigin, port, fetchImpl);
+  if (!target) fail("SETTINGS_UNAVAILABLE");
+  try {
+    const cdp = await connectCdp(target, { WebSocketConstructor });
+    await cdp.request("Page.enable");
+    return cdp;
+  } catch {
+    fail("SETTINGS_UNAVAILABLE");
+  }
+}
+
+async function readSettingsRefreshInterval(cdp) {
+  return cdp.evaluate(`(async () => {
+    const snapshot = await globalThis.tibotattleDesktop?.getSettings?.();
+    const value = snapshot?.settings?.refreshIntervalSeconds ?? snapshot?.refreshIntervalSeconds;
+    return Number.isSafeInteger(value) ? value : null;
+  })()`).catch(() => null);
+}
+
+async function waitForSettingsReady(cdp) {
+  const ready = await waitFor(async () => {
+    const value = await cdp.evaluate(`(() => ({
+      title: document.title,
+      bridge: document.querySelector("#settings-bridge-status")?.classList.contains("is-ready") === true,
+      refresh: document.querySelector("#settings-refresh-interval"),
+    }))()`);
+    return value?.title === "TiboTattle Settings" && value.bridge === true && value.refresh ? true : null;
+  }, STARTUP_TIMEOUT_MS);
+  if (ready !== true) fail("SETTINGS_UNAVAILABLE");
+}
+
+/**
+ * Use the same tab a person uses before operating the data controls. The
+ * refresh selector begins inside a hidden panel, so a synthetic change event
+ * on the inactive control would not prove the rendered settings journey.
+ */
+async function activateSettingsDataPanel(cdp) {
+  const active = await waitFor(async () => cdp.evaluate(`(() => {
+    const tab = document.querySelector("#settings-tab-data");
+    const panel = document.querySelector("#settings-panel-data");
+    const select = document.querySelector("#settings-refresh-interval");
+    if (!tab || !panel || !select) return false;
+    if (tab.getAttribute("aria-selected") !== "true" || panel.hidden) tab.click();
+    const style = globalThis.getComputedStyle?.(panel);
+    return tab.getAttribute("aria-selected") === "true"
+      && panel.hidden === false
+      && panel.getClientRects().length > 0
+      && style?.display !== "none"
+      && style?.visibility !== "hidden"
+      && select.disabled === false;
+  })()`).catch(() => false), STARTUP_TIMEOUT_MS);
+  if (active !== true) fail("SETTINGS_UNAVAILABLE");
+}
+
+async function setSettingsRefreshInterval(cdp, seconds) {
+  const changed = await cdp.evaluate(`(() => {
+    const tab = document.querySelector("#settings-tab-data");
+    const panel = document.querySelector("#settings-panel-data");
+    const select = document.querySelector("#settings-refresh-interval");
+    const style = panel ? globalThis.getComputedStyle?.(panel) : null;
+    if (!tab || !panel || !select || tab.getAttribute("aria-selected") !== "true"
+        || panel.hidden || panel.getClientRects().length === 0 || style?.display === "none"
+        || style?.visibility === "hidden" || select.disabled) return false;
+    select.value = ${JSON.stringify(String(seconds))};
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    return select.value === ${JSON.stringify(String(seconds))};
+  })()`);
+  if (changed !== true) fail("SETTINGS_UNAVAILABLE");
+  if (await waitFor(async () => (await readSettingsRefreshInterval(cdp)) === seconds, OPERATION_TIMEOUT_MS) !== true) {
+    fail("SETTINGS_UNAVAILABLE");
+  }
+}
+
+async function assertFirstSettingsPersistence(input) {
+  const settings = await openSettings(input);
+  try {
+    input.onPhase?.("settings_ready");
+    await waitForSettingsReady(settings);
+    input.onPhase?.("settings_panel");
+    await activateSettingsDataPanel(settings);
+    if (await readSettingsRefreshInterval(settings) !== 300) fail("SETTINGS_PERSISTENCE_INVALID");
+    input.onPhase?.("settings_persist");
+    await setSettingsRefreshInterval(settings, 900);
+    return true;
+  } finally {
+    settings.close();
+  }
+}
+
+async function assertSecondSettingsPersistence(input) {
+  const settings = await openSettings(input);
+  try {
+    input.onPhase?.("settings_ready");
+    await waitForSettingsReady(settings);
+    input.onPhase?.("settings_panel");
+    await activateSettingsDataPanel(settings);
+    if (await readSettingsRefreshInterval(settings) !== 900) fail("SETTINGS_PERSISTENCE_INVALID");
+    return true;
+  } finally {
+    settings.close();
+  }
+}
+
+async function closeCandidate(child, quitProtocol) {
+  try { await quitProtocol.requestQuit(); }
+  catch { fail("CLEAN_QUIT_INVALID"); }
+  if (!await waitForChildExit(child) || child.signalCode !== null || child.exitCode !== 0) {
+    fail("CLEAN_QUIT_INVALID");
+  }
+  return true;
+}
+
+export async function launchAndRenderCandidate({
+  appPath,
+  profile,
+  environment,
+  changeSettings,
+  candidateState = null,
+  spawnApplication = spawn,
+  fetchImpl = fetch,
+  WebSocketConstructor = WebSocket,
+  freePort = freeLoopbackPort,
+  processProof = assertCandidateProcessProof,
+  processAbsence = assertCandidateProcessAbsence,
+  stopChild = stopOwnedCandidate,
+  processRunProgram = runWindowsNsisLifecycleProgram,
+  inspectStartupNativeDiagnostic = inspectWindowsNormalCandidateStartupNativeDiagnostic,
+  createQuitProtocol = createWindowsNormalCandidateQuitProtocol,
+} = {}) {
+  if (candidateState !== null && (typeof candidateState !== "object" || Array.isArray(candidateState))) {
+    fail("PROCESS_PROOF_UNAVAILABLE");
+  }
+  const onPhase = (phase) => {
+    if (candidateState !== null && NORMAL_CANDIDATE_STARTUP_PHASES.has(phase)) {
+      candidateState.startupPhase = phase;
+    }
+  };
+  onPhase("port_allocation");
+  const port = await freePort();
+  const spec = buildWindowsNormalCandidateLaunchSpec({
+    appPath,
+    profile,
+    remoteDebuggingPort: port,
+    environment,
+  });
+  let child = null;
+  let cdp = null;
+  let observer = null;
+  let stdoutObserver = null;
+  let stderrObserver = null;
+  let productFailureDiagnostics = null;
+  let quitProtocol = null;
+  let clean = false;
+  let tracked = null;
+  try {
+    try {
+      onPhase("process_spawn");
+      child = spawnApplication(spec.command, spec.args, {
+        ...spec.options,
+        stdio: ["ignore", "pipe", "pipe", "ipc"],
+      });
+      child.once?.("error", () => {});
+    } catch {
+      fail("APPLICATION_LAUNCH_UNAVAILABLE");
+    }
+    if (!Number.isSafeInteger(child?.pid) || child.pid < 1) fail("APPLICATION_LAUNCH_UNAVAILABLE");
+    stdoutObserver = createWindowsNormalCandidateStartupStderrObserver(child.stdout);
+    stderrObserver = createWindowsNormalCandidateStartupStderrObserver(child.stderr);
+    productFailureDiagnostics = createWindowsNormalCandidateProductFailureDiagnostics(child.stderr);
+    if (candidateState !== null) candidateState.quiescent = false;
+    quitProtocol = createQuitProtocol(child);
+    let connected;
+    try {
+      connected = await connectDashboard({ port, fetchImpl, WebSocketConstructor, onPhase });
+    } catch (error) {
+      const entryMarker = stdoutObserver.state() === "entry_failure_marked"
+        || stderrObserver.state() === "entry_failure_marked"
+        ? "entry_failure_marked"
+        : stdoutObserver.state() === "stream_unavailable" && stderrObserver.state() === "stream_unavailable"
+          ? "stream_unavailable" : "marker_absent";
+      if (error?.code === `${PREFIX}CDP_UNAVAILABLE`
+          || error?.code === `${PREFIX}DASHBOARD_UNAVAILABLE`) {
+        error.startupCdpDiagnostic = startupCdpDiagnostic({
+          child,
+          endpoint: error?.code === `${PREFIX}DASHBOARD_UNAVAILABLE`
+            ? "version_available" : error.startupCdpEndpoint,
+          entryMarker,
+        });
+      }
+      if (error?.code === `${PREFIX}DASHBOARD_UNAVAILABLE`) {
+        const diagnostics = productFailureDiagnostics?.snapshot?.()
+          ?? { companionProcessDiagnostics: null, dashboardLoadFailure: null };
+        error.startupCompanionProcessDiagnostics = validateLinuxCompanionProcessDiagnostics(
+          diagnostics.companionProcessDiagnostics,
+        );
+        error.startupDashboardLoadFailure = validateLinuxDashboardFailureDiagnostic(
+          diagnostics.dashboardLoadFailure,
+        );
+      }
+      if (error?.code === `${PREFIX}CDP_UNAVAILABLE`) {
+        try {
+          error.startupCdpNativeDiagnostic = await inspectStartupNativeDiagnostic({
+            appPath,
+            rootPid: child.pid,
+            remoteDebuggingPort: port,
+            environment,
+            runProgram: processRunProgram,
+          });
+        } catch {
+          error.startupCdpNativeDiagnostic = unavailableStartupCdpNativeDiagnostic();
+        }
+        error.startupCdpNativeDiagnostic = normalizeStartupCdpNativeDiagnostic(
+          error.startupCdpNativeDiagnostic,
+        ) ?? unavailableStartupCdpNativeDiagnostic();
+      }
+      throw error;
+    }
+    cdp = connected.cdp;
+    const dashboard = await assertDashboard({ cdp, target: connected.target, fetchImpl,
+      launch: changeSettings ? "first" : "restart", onPhase });
+    observer = dashboard.observer;
+    // Preserve only completed, closed dashboard proof before the separate
+    // Settings journey. A later Settings failure must not erase evidence that
+    // its ordinary refresh and rendered dashboard already passed.
+    if (candidateState !== null) {
+      candidateState.dashboardRendered = true;
+      candidateState.localRefreshObserved = true;
+      candidateState.localRefreshTerminal = dashboard.refreshTerminalStatus;
+    }
+    onPhase("sharing_opt_out");
+    const sharingOptOutRetained = await assertRenderedSharingOptOut(cdp);
+    onPhase("process_proof");
+    tracked = await processProof({
+      appPath,
+      rootPid: child.pid,
+      environment,
+      runProgram: processRunProgram,
+    });
+    if (candidateState !== null) candidateState.tracked = tracked;
+    const input = {
+      dashboardCdp: cdp,
+      endpoint: connected.endpoint,
+      dashboardOrigin: dashboard.dashboardOrigin,
+      port,
+      fetchImpl,
+      WebSocketConstructor,
+      onPhase,
+    };
+    if (changeSettings) await assertFirstSettingsPersistence(input);
+    else await assertSecondSettingsPersistence(input);
+    if (!observer.valid()) fail("DASHBOARD_INVALID");
+    onPhase("clean_quit");
+    await closeCandidate(child, quitProtocol);
+    onPhase("process_absence");
+    await processAbsence({
+      appPath,
+      environment,
+      tracked,
+      runProgram: processRunProgram,
+    });
+    if (candidateState !== null) candidateState.quiescent = true;
+    clean = true;
+    return Object.freeze({
+      dashboardRendered: true,
+      localRefreshObserved: true,
+      localRefreshTerminal: dashboard.refreshTerminalStatus,
+      syntheticIngestionVerified: dashboard.syntheticIngestionVerified === true,
+      sharingOptOutRetained,
+      settingsPersisted: true,
+      cleanQuit: true,
+    });
+  } finally {
+    stdoutObserver?.dispose?.();
+    stderrObserver?.dispose?.();
+    productFailureDiagnostics?.dispose?.();
+    observer?.dispose?.();
+    cdp?.close?.();
+    quitProtocol?.close?.();
+    if (!clean) {
+      let stopped = false;
+      try { stopped = await stopChild(child, { environment, spawnProgram: spawnApplication }); }
+      catch { stopped = false; }
+      if (stopped) {
+        try {
+          await processAbsence({
+            appPath,
+            environment,
+            tracked,
+            runProgram: processRunProgram,
+          });
+          if (candidateState !== null) candidateState.quiescent = true;
+        } catch {
+          // The outer teardown retains the firewall rule and profile below.
+        }
+      }
+      if (candidateState === null || candidateState.quiescent !== true) {
+        fail("OWNED_PROCESS_REMAINS");
+      }
+    }
+  }
+}
+
+async function createOwnedRoot(runnerTemp) {
+  const base = exactWindowsPath(runnerTemp);
+  if (base === null) fail("RUNNER_TEMP_INVALID");
+  await regularDirectory(base, "RUNNER_TEMP_INVALID");
+  let root;
+  try {
+    root = await mkdtemp(win32.join(base, "tibotattle-windows-normal-candidate-"));
+  } catch {
+    fail("RUNNER_TEMP_INVALID");
+  }
+  if (!sameWindowsPath(win32.dirname(root), base)) fail("RUNNER_TEMP_INVALID");
+  await regularDirectory(root, "RUNNER_TEMP_INVALID");
+  return root;
+}
+
+async function ensureWindowsNormalCandidateReceiptParent(receiptPath) {
+  const selected = exactWindowsPath(receiptPath);
+  const parent = selected === null ? null : win32.dirname(selected);
+  const staging = parent === null ? null : win32.dirname(parent);
+  if (selected === null
+      || win32.basename(selected) !== "normal-candidate-smoke.json"
+      || win32.basename(parent) !== "electron-windows-normal-candidate"
+      || win32.basename(staging) !== ".release-build") {
+    fail("RECEIPT_INVALID");
+  }
+  const parsed = win32.parse(parent);
+  const parts = win32.relative(parsed.root, parent).split("\\").filter(Boolean);
+  let current = parsed.root;
+  for (const part of parts) {
+    current = win32.join(current, part);
+    try {
+      const metadata = await lstat(current);
+      if (!metadata.isDirectory?.() || metadata.isSymbolicLink?.()) fail("RECEIPT_INVALID");
+    } catch (error) {
+      if (String(error?.code ?? "") !== "ENOENT") {
+        if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+        fail("RECEIPT_INVALID");
+      }
+      try { await mkdir(current, { mode: 0o700 }); }
+      catch { fail("RECEIPT_INVALID"); }
+      try {
+        const metadata = await lstat(current);
+        if (!metadata.isDirectory?.() || metadata.isSymbolicLink?.()) fail("RECEIPT_INVALID");
+      } catch (error) {
+        if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+        fail("RECEIPT_INVALID");
+      }
+    }
+  }
+  return parent;
+}
+
+function candidateReceipt({
+  sourceRevision,
+  identity = null,
+  journey = null,
+  progress = null,
+  errorCode = null,
+  cleanup = {},
+  startupDiagnostic = null,
+  startupCdpDiagnostic = null,
+  startupCdpNativeDiagnostic = null,
+  startupCompanionProcessDiagnostics = null,
+  startupDashboardLoadFailure = null,
+  startupCompletionDiagnostic = null,
+  startupFailureCode = null,
+  startupPhase = null,
+} = {}) {
+  const terminal = ["succeeded", "degraded"].includes(journey?.localRefreshTerminal)
+    ? journey.localRefreshTerminal
+    : ["succeeded", "degraded"].includes(progress?.localRefreshTerminal)
+      ? progress.localRefreshTerminal
+      : null;
+  const selectedStartupFailureCode = normalizeStartupFailureCode(startupFailureCode);
+  const selectedStartupPhase = normalizeStartupPhase(startupPhase);
+  return Object.freeze({
+    schemaVersion: RECEIPT_SCHEMA,
+    status: errorCode === null ? "passed" : "failed",
+    scope: "candidate_only",
+    target: TARGET,
+    sourceRevision,
+    artifactSha256: identity?.artifactSha256 ?? null,
+    executableSha256: identity?.executableSha256 ?? null,
+    packageArtifactVerified: identity !== null,
+    packagedElectronExecutionVerified: journey !== null,
+    dashboardRendered: journey?.dashboardRendered === true || progress?.dashboardRendered === true,
+    localRefreshObserved: journey?.localRefreshObserved === true || progress?.localRefreshObserved === true,
+    localRefreshTerminal: terminal,
+    syntheticFixtureIngestionVerified: journey?.syntheticIngestionVerified === true,
+    syntheticFixtureTotalsRetainedAcrossRestart:
+      journey?.syntheticTotalsRetainedAcrossRestart === true,
+    settingsPersistedAcrossRestart: journey?.settingsPersisted === true,
+    durableContributionOptOutRetained: journey?.optOutRetained === true,
+    loopbackJourneyVerified: journey?.loopbackJourneyVerified === true,
+    outboundFirewallRuleVerified: cleanup.firewallInstalled === true,
+    outboundFirewallRuleRemoved: cleanup.firewallRemoved === true,
+    ownedProfileRemoved: cleanup.profileRemoved === true,
+    errorCode,
+    ...(selectedStartupFailureCode !== null && selectedStartupFailureCode !== errorCode ? {
+      startupFailureCode: selectedStartupFailureCode,
+    } : {}),
+    ...(selectedStartupPhase === null ? {} : { startupPhase: selectedStartupPhase }),
+    ...(normalizeStartupFailureDiagnostic(startupDiagnostic) === null ? {} : {
+      startupDiagnostic: normalizeStartupFailureDiagnostic(startupDiagnostic),
+    }),
+    ...(normalizeStartupCdpDiagnostic(startupCdpDiagnostic) === null ? {} : {
+      startupCdpDiagnostic: normalizeStartupCdpDiagnostic(startupCdpDiagnostic),
+    }),
+    ...(normalizeStartupCdpNativeDiagnostic(startupCdpNativeDiagnostic) === null ? {} : {
+      startupCdpNativeDiagnostic: normalizeStartupCdpNativeDiagnostic(startupCdpNativeDiagnostic),
+    }),
+    ...(validateLinuxCompanionProcessDiagnostics(startupCompanionProcessDiagnostics) === null ? {} : {
+      startupCompanionProcessDiagnostics:
+        validateLinuxCompanionProcessDiagnostics(startupCompanionProcessDiagnostics),
+    }),
+    ...(validateLinuxDashboardFailureDiagnostic(startupDashboardLoadFailure) === null ? {} : {
+      startupDashboardLoadFailure:
+        validateLinuxDashboardFailureDiagnostic(startupDashboardLoadFailure),
+    }),
+    ...(normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic) === null ? {} : {
+      startupCompletionDiagnostic: normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic),
+    }),
+    productionReady: false,
+  });
+}
+
+function assertHost({ platform, architecture, environment }) {
+  if (platform !== "win32" || architecture !== "x64") fail("WINDOWS_X64_REQUIRED");
+  if (environment?.GITHUB_ACTIONS !== "true") fail("DISPOSABLE_CI_REQUIRED");
+  return true;
+}
+
+/** Execute the normal unpacked journey on a fresh hosted Windows runner account only. */
+export async function runWindowsNormalCandidateSmoke(options, {
+  platform = process.platform,
+  architecture = process.arch,
+  environment = process.env,
+  verifyPackage = verifyWindowsNormalCandidateSmokePackage,
+  createRoot = createOwnedRoot,
+  prepareProfile = prepareWindowsDevelopmentProfile,
+  seedCodexFixture = seedWindowsNormalCandidateCodexFixture,
+  seedProfile = prepareWindowsNormalCandidateProfile,
+  launchJourney = launchAndRenderCandidate,
+  verifyOptOut = verifyWindowsNormalCandidateOptOut,
+  installFirewall = installOutboundFirewallBlock,
+  removeFirewall = removeOutboundFirewallBlock,
+  assertProcessAbsence = assertCandidateProcessAbsence,
+  ensureReceiptParent = ensureWindowsNormalCandidateReceiptParent,
+  reserveReceipt = (path) => open(path, "wx", 0o600),
+  removeProfile = (path) => rm(path, { recursive: true, force: false }),
+} = {}) {
+  assertHost({ platform, architecture, environment });
+  if (!options || typeof verifyPackage !== "function" || typeof createRoot !== "function"
+      || typeof prepareProfile !== "function" || typeof seedCodexFixture !== "function"
+      || typeof seedProfile !== "function"
+      || typeof launchJourney !== "function" || typeof verifyOptOut !== "function"
+      || typeof installFirewall !== "function" || typeof removeFirewall !== "function"
+      || typeof assertProcessAbsence !== "function" || typeof ensureReceiptParent !== "function"
+      || typeof reserveReceipt !== "function" || typeof removeProfile !== "function") {
+    fail("ARGUMENT_INVALID");
+  }
+  let receiptHandle;
+  try {
+    await ensureReceiptParent(options.receiptPath);
+    receiptHandle = await reserveReceipt(options.receiptPath);
+  }
+  catch { fail("RECEIPT_INVALID"); }
+  let identity = null;
+  let root = null;
+  let firewallName = null;
+  let journey = null;
+  let errorCode = null;
+  let startupFailureCode = null;
+  let startupDiagnostic = null;
+  let startupCdpDetail = null;
+  let startupCdpNativeDetail = null;
+  let startupCompanionProcessDiagnostics = null;
+  let startupDashboardLoadFailure = null;
+  let startupCompletionDiagnostic = null;
+  const cleanup = { firewallInstalled: false, firewallRemoved: false, profileRemoved: false };
+  const candidateState = {
+    quiescent: false,
+    tracked: null,
+    startupPhase: null,
+    dashboardRendered: false,
+    localRefreshObserved: false,
+    localRefreshTerminal: null,
+  };
+  try {
+    identity = await verifyPackage(options);
+    root = await createRoot(environment.RUNNER_TEMP);
+    const profile = await prepareProfile({ appPath: options.appPath, profilePath: win32.join(root, "profile") });
+    await seedCodexFixture({ profile });
+    const seed = await seedProfile({ profile, stagedAppPath: options.stagedAppPath });
+    await assertProcessAbsence({ appPath: options.appPath, environment });
+    candidateState.quiescent = true;
+    firewallName = await installFirewall({ appPath: options.appPath, environment });
+    cleanup.firewallInstalled = true;
+    const first = await launchJourney({
+      appPath: options.appPath,
+      profile,
+      environment,
+      changeSettings: true,
+      candidateState,
+    });
+    const second = await launchJourney({
+      appPath: options.appPath,
+      profile,
+      environment,
+      changeSettings: false,
+      candidateState,
+    });
+    if (first?.dashboardRendered !== true || first?.localRefreshObserved !== true
+        || first?.settingsPersisted !== true || first?.cleanQuit !== true
+        || !["succeeded", "degraded"].includes(first?.localRefreshTerminal)
+        || first?.syntheticIngestionVerified !== true
+        || first?.sharingOptOutRetained !== true || second?.dashboardRendered !== true
+        || second?.syntheticIngestionVerified !== true
+        || second?.sharingOptOutRetained !== true || second?.settingsPersisted !== true
+        || second?.cleanQuit !== true || candidateState.quiescent !== true) {
+      fail("DASHBOARD_INVALID");
+    }
+    const optOutRetained = await verifyOptOut(seed);
+    if (optOutRetained !== true) fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+    journey = Object.freeze({
+      dashboardRendered: first.dashboardRendered === true && second.dashboardRendered === true,
+      localRefreshObserved: first.localRefreshObserved === true,
+      localRefreshTerminal: first.localRefreshTerminal,
+      syntheticIngestionVerified: first.syntheticIngestionVerified === true
+        && second.syntheticIngestionVerified === true,
+      syntheticTotalsRetainedAcrossRestart: first.syntheticIngestionVerified === true
+        && second.syntheticIngestionVerified === true,
+      settingsPersisted: first.settingsPersisted === true && second.settingsPersisted === true,
+      optOutRetained: optOutRetained === true
+        && first.sharingOptOutRetained === true && second.sharingOptOutRetained === true,
+      loopbackJourneyVerified: first.cleanQuit === true && second.cleanQuit === true,
+    });
+  } catch (error) {
+    errorCode = fixedCode(error);
+    startupFailureCode = normalizeStartupFailureCode(errorCode);
+    startupDiagnostic = normalizeStartupFailureDiagnostic(error?.startupDiagnostic);
+    startupCdpDetail = normalizeStartupCdpDiagnostic(error?.startupCdpDiagnostic);
+    startupCdpNativeDetail = normalizeStartupCdpNativeDiagnostic(
+      error?.startupCdpNativeDiagnostic,
+    );
+    startupCompanionProcessDiagnostics = validateLinuxCompanionProcessDiagnostics(
+      error?.startupCompanionProcessDiagnostics,
+    );
+    startupDashboardLoadFailure = validateLinuxDashboardFailureDiagnostic(
+      error?.startupDashboardLoadFailure,
+    );
+    startupCompletionDiagnostic = normalizeStartupCompletionDiagnostic(
+      error?.startupCompletionDiagnostic,
+    );
+  } finally {
+    if (firewallName !== null && candidateState.quiescent === true) {
+      cleanup.firewallRemoved = await removeFirewall({
+        appPath: options.appPath,
+        environment,
+        name: firewallName,
+      });
+      if (!cleanup.firewallRemoved && errorCode === null) errorCode = `${PREFIX}FIREWALL_CLEANUP_UNCONFIRMED`;
+    }
+    if (firewallName !== null && candidateState.quiescent !== true) {
+      errorCode = `${PREFIX}OWNED_PROCESS_REMAINS`;
+    }
+    if (root !== null && cleanup.firewallRemoved) {
+      try {
+        await removeProfile(root);
+        cleanup.profileRemoved = true;
+      } catch {
+        if (errorCode === null) errorCode = `${PREFIX}PROFILE_CLEANUP_UNCONFIRMED`;
+      }
+    }
+    const receipt = candidateReceipt({
+      sourceRevision: options?.sourceRevision ?? null,
+      identity,
+      journey,
+      progress: candidateState,
+      errorCode,
+      cleanup,
+      startupDiagnostic,
+      startupCdpDiagnostic: startupCdpDetail,
+      startupCdpNativeDiagnostic: startupCdpNativeDetail,
+      startupCompanionProcessDiagnostics,
+      startupDashboardLoadFailure,
+      startupCompletionDiagnostic,
+      startupFailureCode,
+      startupPhase: candidateState.startupPhase,
+    });
+    try {
+      await receiptHandle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`);
+      await receiptHandle.sync();
+    } finally {
+      await receiptHandle.close();
+    }
+  }
+  if (errorCode !== null) throw Object.assign(new Error(errorCode), { code: errorCode });
+  return Object.freeze({ status: "passed", ...identity });
+}
+
+if (resolve(process.argv[1] ?? "") === SCRIPT_FILE) {
+  try {
+    process.stdout.write(`${JSON.stringify(await runWindowsNormalCandidateSmoke(
+      parseWindowsNormalCandidateSmokeArguments(process.argv.slice(2)),
+    ))}\n`);
+  } catch (error) {
+    process.stderr.write(`${fixedCode(error)}\n`);
+    process.exitCode = 1;
+  }
+}

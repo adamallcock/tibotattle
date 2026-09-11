@@ -7,6 +7,61 @@ import WebKit
 import Sparkle
 #endif
 
+private enum MacOSUpdaterFeedPolicy {
+    #if arch(x86_64)
+    static let architecture = "x64"
+    static let stableURL = "https://updates.tibotattle.com/intel/appcast.xml"
+    static let stablePath = "/intel/appcast.xml"
+    static let dogfoodURL = "https://dogfood-updates.tibotattle.com/internal-dogfood/intel/appcast.xml"
+    static let dogfoodPath = "/internal-dogfood/intel/appcast.xml"
+    static let previewPath = "/preview/intel/appcast.xml"
+    #else
+    static let architecture = "arm64"
+    static let stableURL = "https://updates.tibotattle.com/appcast.xml"
+    static let stablePath = "/appcast.xml"
+    static let dogfoodURL = "https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml"
+    static let dogfoodPath = "/internal-dogfood/appcast.xml"
+    static let previewPath = "/preview/appcast.xml"
+    #endif
+
+    static func accepts(_ appcast: String, expectedURL: String?, requiredPath: String) -> Bool {
+        guard let components = URLComponents(string: appcast),
+              components.scheme?.lowercased() == "https",
+              let host = components.host?.lowercased(),
+              !host.isEmpty,
+              !["127.0.0.1", "localhost", "::1"].contains(host),
+              components.user == nil,
+              components.password == nil,
+              components.percentEncodedPath == requiredPath,
+              components.query == nil,
+              components.fragment == nil,
+              components.url?.absoluteString == appcast,
+              expectedURL == nil || appcast == expectedURL
+        else { return false }
+        return true
+    }
+
+    static func runContractSmokeTest() -> Int32 {
+        let cases: [(String, String, String?)] = [
+            (stableURL, stablePath, stableURL),
+            (dogfoodURL, dogfoodPath, dogfoodURL),
+            ("https://preview.example.test" + previewPath, previewPath, nil),
+        ]
+        for (url, path, expected) in cases {
+            let otherPath = architecture == "x64"
+                ? path.replacingOccurrences(of: "/intel/", with: "/")
+                : path.replacingOccurrences(of: "/appcast.xml", with: "/intel/appcast.xml")
+            let otherURL = url.replacingOccurrences(of: path, with: otherPath)
+            guard accepts(url, expectedURL: expected, requiredPath: path),
+                  !accepts(otherURL, expectedURL: expected, requiredPath: path),
+                  !accepts(url + "?architecture=other", expectedURL: expected, requiredPath: path)
+            else { return 1 }
+        }
+        print("USAGE_MONITOR_MACOS_UPDATER_ARCHITECTURE_CONTRACT architecture=\(architecture) cross_architecture=rejected")
+        return 0
+    }
+}
+
 private enum BundledProduct {
     private static func requiredString(_ key: String) -> String {
         guard let value = Bundle.main.object(
@@ -33,6 +88,15 @@ private enum BundledProduct {
         return value
     }
 
+    private static func requiredBool(_ key: String) -> Bool {
+        guard let value = Bundle.main.object(
+            forInfoDictionaryKey: key
+        ) as? Bool else {
+            fatalError("Missing or invalid bundled product setting: \(key)")
+        }
+        return value
+    }
+
     private static func requiredHTTPSOrigin(_ key: String) -> String {
         let value = requiredString(key)
         guard let components = URLComponents(string: value),
@@ -50,6 +114,7 @@ private enum BundledProduct {
     }
 
     static let displayName = requiredString("CFBundleDisplayName")
+    static let bundleIdentifier = requiredString("CFBundleIdentifier")
     static let bundleName = requiredString("UsageMonitorBundleName")
     static let appOpenScheme =
         requiredString("UsageMonitorAppOpenScheme").lowercased()
@@ -64,6 +129,32 @@ private enum BundledProduct {
     }()
     static let stateDirectoryName =
         requiredDirectoryName("UsageMonitorStateDirectoryName")
+    static let buildChannel = requiredString("UsageMonitorBuildChannel")
+    static let releaseChannel = requiredString("UsageMonitorReleaseChannel")
+    static let isPreviewDistribution =
+        requiredBool("UsageMonitorPreviewDistribution")
+    static let updaterEnabled = requiredBool("UsageMonitorUpdaterEnabled")
+    private static let keychainIdentity: (namespace: String, account: String) = {
+        let namespace = requiredString("UsageMonitorKeychainNamespace")
+        let account = requiredString("UsageMonitorKeychainAccount")
+        let expected: (namespace: String, account: String)
+        switch bundleIdentifier {
+        case "com.usagemonitor.local":
+            expected = ("app-usagemonitor", "installation")
+        case "com.usagemonitor.local.preview":
+            expected = ("app-usagemonitor.preview", "preview-installation")
+        default:
+            fatalError("Invalid bundled product Keychain identity")
+        }
+        guard namespace == expected.namespace,
+              account == expected.account
+        else {
+            fatalError("Invalid bundled product Keychain identity")
+        }
+        return expected
+    }()
+    static let keychainNamespace = keychainIdentity.namespace
+    static let keychainAccount = keychainIdentity.account
     static let monitoredAppDisplayName =
         requiredString("UsageMonitorMonitoredAppDisplayName")
     static let monitoredAppBundleIdentifier =
@@ -71,6 +162,195 @@ private enum BundledProduct {
     static let nodeRuntimeMode = requiredString("UsageMonitorNodeRuntimeMode")
     static let publicWebsiteOrigin =
         requiredHTTPSOrigin("UsageMonitorPublicWebsiteOrigin")
+
+    /// Bundle signatures seal Info.plist, but launch still treats the plist as
+    /// an input rather than allowing individually well-formed settings to be
+    /// recombined into an unreviewed runtime. In particular, a Preview bundle
+    /// must never select stable state, semantic-open registration, Keychain
+    /// items, or updater behavior.
+    private static let runtimeIdentityValidated: Void = {
+        let expectedIdentity: (
+            displayName: String,
+            bundleName: String,
+            appOpenScheme: String,
+            appOpenHost: String,
+            appOpenURL: String,
+            stateDirectoryName: String,
+            keychainNamespace: String,
+            keychainAccount: String
+        )
+        switch bundleIdentifier {
+        case "com.usagemonitor.local":
+            expectedIdentity = (
+                "TiboTattle",
+                "TiboTattle.app",
+                "usagemonitor",
+                "open",
+                "usagemonitor://open",
+                "Usage Monitor",
+                "app-usagemonitor",
+                "installation"
+            )
+        case "com.usagemonitor.local.preview":
+            expectedIdentity = (
+                "TiboTattle Preview",
+                "TiboTattle Preview.app",
+                "usagemonitor-preview",
+                "open",
+                "usagemonitor-preview://open",
+                "Usage Monitor Preview",
+                "app-usagemonitor.preview",
+                "preview-installation"
+            )
+        default:
+            fatalError("Invalid bundled runtime identity")
+        }
+
+        guard displayName == expectedIdentity.displayName,
+              bundleName == expectedIdentity.bundleName,
+              appOpenScheme == expectedIdentity.appOpenScheme,
+              appOpenHost == expectedIdentity.appOpenHost,
+              appOpenURL == expectedIdentity.appOpenURL,
+              stateDirectoryName == expectedIdentity.stateDirectoryName,
+              keychainNamespace == expectedIdentity.keychainNamespace,
+              keychainAccount == expectedIdentity.keychainAccount
+        else {
+            fatalError("Invalid bundled runtime identity")
+        }
+        validateSemanticOpenRegistration()
+
+
+        switch (
+            bundleIdentifier,
+            buildChannel,
+            releaseChannel,
+            isPreviewDistribution
+        ) {
+        case (
+            "com.usagemonitor.local",
+            "development",
+            "development",
+            false
+        ):
+            validateDevelopmentUpdaterPolicy()
+        case (
+            "com.usagemonitor.local",
+            "production",
+            "stable",
+            false
+        ):
+            validateDistributionUpdaterPolicy(
+                expectedAppcastURL: MacOSUpdaterFeedPolicy.stableURL,
+                requiredAppcastPath: MacOSUpdaterFeedPolicy.stablePath,
+                automaticUpdates: true
+            )
+        case (
+            "com.usagemonitor.local",
+            "internal-dogfood",
+            "internal-dogfood",
+            false
+        ):
+            validateDistributionUpdaterPolicy(
+                expectedAppcastURL: MacOSUpdaterFeedPolicy.dogfoodURL,
+                requiredAppcastPath: MacOSUpdaterFeedPolicy.dogfoodPath,
+                automaticUpdates: true
+            )
+        case (
+            "com.usagemonitor.local.preview",
+            "preview_distribution",
+            "preview_distribution",
+            true
+        ):
+            // Preview may target another deliberately reviewed deployment,
+            // so its host is not compiled in. Its canonical feed path and
+            // manual-only behavior remain an invariant of the bundle ID.
+            validateDistributionUpdaterPolicy(
+                expectedAppcastURL: nil,
+                requiredAppcastPath: MacOSUpdaterFeedPolicy.previewPath,
+                automaticUpdates: false
+            )
+        default:
+            fatalError("Invalid bundled runtime identity")
+        }
+    }()
+
+    private static func validateSemanticOpenRegistration() {
+        guard let urlTypes = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleURLTypes"
+        ) as? [[String: Any]],
+              urlTypes.count == 1,
+              let urlType = urlTypes.first,
+              Set(urlType.keys) == Set([
+                  "CFBundleTypeRole",
+                  "CFBundleURLName",
+                  "CFBundleURLSchemes",
+              ]),
+              urlType["CFBundleTypeRole"] as? String == "Viewer",
+              urlType["CFBundleURLName"] as? String
+                == "\(bundleIdentifier).\(appOpenHost)",
+              let registeredSchemes =
+                urlType["CFBundleURLSchemes"] as? [String],
+              registeredSchemes == [appOpenScheme]
+        else {
+            fatalError("Invalid bundled runtime identity")
+        }
+    }
+
+    private static func validateDevelopmentUpdaterPolicy() {
+        guard !updaterEnabled else {
+            fatalError("Invalid bundled runtime identity")
+        }
+        for key in [
+            "SUEnableAutomaticChecks",
+            "SUAllowsAutomaticUpdates",
+            "SUAutomaticallyUpdate",
+            "SUFeedURL",
+            "SUPublicEDKey",
+            "SURequireSignedFeed",
+            "SUVerifyUpdateBeforeExtraction",
+            "UsageMonitorUpdaterFrameworkVersion",
+        ] where Bundle.main.object(forInfoDictionaryKey: key) != nil {
+            fatalError("Invalid bundled runtime identity")
+        }
+    }
+
+    private static func validateDistributionUpdaterPolicy(
+        expectedAppcastURL: String?,
+        requiredAppcastPath: String,
+        automaticUpdates: Bool
+    ) {
+        guard updaterEnabled,
+              requiredBool("SUEnableAutomaticChecks") == automaticUpdates,
+              requiredBool("SUAllowsAutomaticUpdates") == automaticUpdates,
+              requiredBool("SUAutomaticallyUpdate") == automaticUpdates,
+              requiredBool("SURequireSignedFeed"),
+              requiredBool("SUVerifyUpdateBeforeExtraction"),
+              requiredString("UsageMonitorUpdaterFrameworkVersion") == "2.9.3"
+        else {
+            fatalError("Invalid bundled runtime identity")
+        }
+
+        let appcast = requiredString("SUFeedURL")
+        guard MacOSUpdaterFeedPolicy.accepts(
+            appcast,
+            expectedURL: expectedAppcastURL,
+            requiredPath: requiredAppcastPath
+        ) else {
+            fatalError("Invalid bundled runtime identity")
+        }
+
+        let publicKey = requiredString("SUPublicEDKey")
+        guard let publicKeyBytes = Data(base64Encoded: publicKey),
+              publicKeyBytes.count == 32,
+              publicKeyBytes.base64EncodedString() == publicKey
+        else {
+            fatalError("Invalid bundled runtime identity")
+        }
+    }
+
+    static func validateRuntimeIdentity() {
+        _ = runtimeIdentityValidated
+    }
 }
 
 private let loopbackHost = "127.0.0.1"
@@ -133,6 +413,9 @@ private enum NativeDashboardEvidenceState: Equatable {
 private struct NativeHistoryIndexingCoverage: Equatable {
     let indexedSourceCount: Int
     let sourceCount: Int
+    let skippedSourceCount: Int
+    let skippedThreadCount: Int
+    let partialTerminal: Bool
 
     var isComplete: Bool {
         indexedSourceCount >= sourceCount
@@ -155,10 +438,17 @@ private enum NativeHistoryIndexingObservation: Equatable {
 /// free-form failure text.
 private struct NativeRefreshFailure: Equatable {
     let failedStep: String?
+    let failureCode: String?
+
+    var suppressesAutomaticRetry: Bool {
+        guard let failureCode else { return false }
+        return LocalCompanionEvidenceReader.rolloutIntegrityFailureCodes
+            .contains(failureCode)
+    }
 }
 
 private enum NativeRefreshTerminalObservation: Equatable {
-    case failed(step: String?)
+    case failed(step: String?, code: String?)
     case notFailed
 }
 
@@ -186,6 +476,11 @@ private enum NativeToolbarStatusText {
         guard let step else { return "Refresh failed" }
         return "Refresh failed: \(step)"
     }
+
+    static func historyPartial(skippedSourceCount: Int) -> String {
+        let sourceNoun = skippedSourceCount == 1 ? "source" : "sources"
+        return "History coverage · \(skippedSourceCount) \(sourceNoun) unavailable"
+    }
 }
 
 /// Toolbar-pill facts the shared menu-bar projection intentionally leaves
@@ -202,6 +497,14 @@ private extension LocalCompanionEvidenceReader {
         "archive_index",
         "unified_index",
         "assemble",
+    ]
+    static let rolloutIntegrityFailureCodes: Set<String> = [
+        "codex_rollout_compression_unsupported",
+        "codex_rollout_filename_identity_mismatch",
+        "codex_rollout_generation_ambiguous",
+        "codex_rollout_lineage_invalid",
+        "codex_rollout_content_invalid",
+        "codex_rollout_tail_incomplete",
     ]
 
     func readHistoryIndexingCoverage(
@@ -267,9 +570,17 @@ private extension LocalCompanionEvidenceReader {
         else {
             return .notIndexing
         }
+        let skippedSources = (history["skippedSourceCount"] as? NSNumber)?
+            .intValue ?? 0
+        let skippedThreads = (history["skippedThreadCount"] as? NSNumber)?
+            .intValue ?? 0
         return .indexing(NativeHistoryIndexingCoverage(
             indexedSourceCount: indexed,
-            sourceCount: total
+            sourceCount: total,
+            skippedSourceCount: max(0, skippedSources),
+            skippedThreadCount: max(0, skippedThreads),
+            partialTerminal: history["phase"] as? String
+                == "partial_terminal"
         ))
     }
 
@@ -283,11 +594,17 @@ private extension LocalCompanionEvidenceReader {
         else {
             return nil
         }
-        guard status == "failed" else { return .notFailed }
+        guard ["failed", "degraded"].contains(status) else {
+            return .notFailed
+        }
         let step = refresh["failedStep"] as? String
+        let rawCode = refresh["failureCode"] as? String
         return .failed(
             step: step.flatMap {
                 Self.refreshFailureSteps.contains($0) ? $0 : nil
+            },
+            code: rawCode.flatMap {
+                Self.rolloutIntegrityFailureCodes.contains($0) ? $0 : nil
             }
         )
     }
@@ -314,6 +631,65 @@ private enum NativeRefreshIntervalPreference {
     static func setSeconds(_ value: Int, in defaults: UserDefaults) {
         guard allowedSeconds.contains(value) else { return }
         defaults.set(value, forKey: defaultsKey)
+    }
+}
+
+/// One persisted appearance choice owns both AppKit and the embedded report.
+/// `system` stores an explicit preference, but leaves `NSApp.appearance` nil so
+/// scheduled and user-driven macOS appearance changes continue to flow
+/// through without the app guessing at the system setting.
+private enum NativeAppearancePreference: String, CaseIterable {
+    case system
+    case light
+    case dark
+
+    static let defaultsKey = "tibotattle.appearance.v1"
+
+    static var current: NativeAppearancePreference {
+        current(in: .standard)
+    }
+
+    static func current(
+        in defaults: UserDefaults
+    ) -> NativeAppearancePreference {
+        guard let rawValue = defaults.string(forKey: defaultsKey),
+              let preference = NativeAppearancePreference(rawValue: rawValue)
+        else {
+            return .system
+        }
+        return preference
+    }
+
+    static func set(
+        _ preference: NativeAppearancePreference,
+        in defaults: UserDefaults = .standard
+    ) {
+        defaults.set(preference.rawValue, forKey: defaultsKey)
+    }
+
+    var applicationAppearance: NSAppearance? {
+        switch self {
+        case .system:
+            nil
+        case .light:
+            NSAppearance(named: .aqua)
+        case .dark:
+            NSAppearance(named: .darkAqua)
+        }
+    }
+
+    func resolvedTheme(for systemAppearance: NSAppearance) -> String {
+        switch self {
+        case .light:
+            return "light"
+        case .dark:
+            return "dark"
+        case .system:
+            return systemAppearance.bestMatch(from: [.darkAqua, .aqua])
+                == .darkAqua
+                ? "dark"
+                : "light"
+        }
     }
 }
 
@@ -355,6 +731,148 @@ private struct NativeForegroundRefreshSchedule: Equatable {
     }
 }
 
+/// Detailed accounting is deliberately attempt-based and rate-limited across
+/// launches. Recording before a request starts prevents a failed, cancelled,
+/// or interrupted pass from becoming a tight automatic retry loop. A missing
+/// or malformed value is seeded with `now`, making the first launch pass quick.
+enum NativeDetailedRefreshCadence {
+    static let defaultsKey = "tibotattle.detailed-refresh-last-attempt.v1"
+    static let reservationKey = "tibotattle.detailed-refresh-reservation.v1"
+    static let minimumInterval: TimeInterval = 60 * 60
+
+    struct Reservation {
+        let stampedAt: Double
+        let token: String
+        let previousAttempt: Double?
+        let previousToken: String?
+    }
+
+    static func automaticMode(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) -> LocalAnalysisMode {
+        let nowInterval = now.timeIntervalSince1970
+        guard nowInterval.isFinite, nowInterval >= 0 else { return .quick }
+        guard let stored = defaults.object(forKey: defaultsKey) as? NSNumber,
+              stored.doubleValue.isFinite,
+              stored.doubleValue >= 0,
+              stored.doubleValue <= nowInterval
+        else {
+            defaults.set(nowInterval, forKey: defaultsKey)
+            return .quick
+        }
+        guard nowInterval - stored.doubleValue >= minimumInterval else {
+            return .quick
+        }
+        return .detailed
+    }
+
+    static func seedIfMissing(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) {
+        guard defaults.object(forKey: defaultsKey) == nil else { return }
+        recordDetailedAttempt(now: now, defaults: defaults)
+    }
+
+    @discardableResult
+    static func recordDetailedAttempt(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) -> Reservation? {
+        let value = now.timeIntervalSince1970
+        guard value.isFinite, value >= 0 else { return nil }
+        let reservation = Reservation(
+            stampedAt: value,
+            token: UUID().uuidString,
+            previousAttempt: (defaults.object(forKey: defaultsKey) as? NSNumber)
+                .map(\.doubleValue),
+            previousToken: defaults.string(forKey: reservationKey)
+        )
+        defaults.set(value, forKey: defaultsKey)
+        defaults.set(reservation.token, forKey: reservationKey)
+        return reservation
+    }
+
+    /// Only a confirmed conflict with a quick run proves that this detailed
+    /// request did no work. Unknown/rejected/interrupted responses retain the
+    /// optimistic stamp. Compare the token as well as time so a later attempt
+    /// at the same timestamp cannot be rolled back by an old callback.
+    static func restoreAfterQuickJoin(
+        _ reservation: Reservation?,
+        attempt: LocalAnalysisAttempt?,
+        defaults: UserDefaults = .standard
+    ) {
+        guard attempt?.mode == .quick, let reservation,
+              defaults.double(forKey: defaultsKey) == reservation.stampedAt,
+              defaults.string(forKey: reservationKey) == reservation.token
+        else { return }
+        if let previous = reservation.previousAttempt {
+            defaults.set(previous, forKey: defaultsKey)
+        } else {
+            defaults.removeObject(forKey: defaultsKey)
+        }
+        if let previousToken = reservation.previousToken {
+            defaults.set(previousToken, forKey: reservationKey)
+        } else {
+            defaults.removeObject(forKey: reservationKey)
+        }
+    }
+
+    /// Every native reader observes the same controller receipt, including
+    /// browser-started runs and terminal failures. Record its actual start
+    /// once, never `now` on every poll and never move a newer attempt backward.
+    static func observe(
+        _ attempt: LocalAnalysisAttempt?,
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) {
+        guard let attempt, attempt.mode == .detailed else { return }
+        let started = attempt.startedAt.timeIntervalSince1970
+        let current = now.timeIntervalSince1970
+        guard started.isFinite, started >= 0,
+              current.isFinite, started <= current
+        else { return }
+        if let stored = defaults.object(forKey: defaultsKey) as? NSNumber,
+           stored.doubleValue.isFinite, stored.doubleValue >= started {
+            return
+        }
+        recordDetailedAttempt(now: attempt.startedAt, defaults: defaults)
+    }
+}
+
+/// A GET issued before a POST reply may still describe the previous idle
+/// controller. Its terminal result cannot settle the new request, even if
+/// that GET callback arrives after the POST's 202 callback.
+private struct NativeRefreshStartFence {
+    struct Observation {
+        let generation: UInt64
+        let startResolved: Bool
+    }
+
+    private var generation: UInt64 = 0
+    private var awaitingResponse = false
+
+    mutating func begin() {
+        generation &+= 1
+        awaitingResponse = true
+    }
+
+    mutating func resolve() {
+        generation &+= 1
+        awaitingResponse = false
+    }
+
+    func observation() -> Observation {
+        Observation(generation: generation, startResolved: !awaitingResponse)
+    }
+
+    func allowsTerminal(_ observation: Observation) -> Bool {
+        !awaitingResponse && observation.startResolved
+            && observation.generation == generation
+    }
+}
+
 private enum NativeForegroundRefreshScheduler {
     /// This scheduler is deliberately an in-process main-queue work item. It
     /// is cancelled when the app quits or when a refresh starts, and it never
@@ -379,9 +897,7 @@ private enum NativeForegroundRefreshScheduler {
 @MainActor
 private final class AppUpdater: NSObject {
     private static var bundledUpdaterEnabled: Bool {
-        Bundle.main.object(
-            forInfoDictionaryKey: "UsageMonitorUpdaterEnabled"
-        ) as? Bool == true
+        BundledProduct.updaterEnabled
     }
 
     private(set) var state: AppUpdaterState
@@ -398,12 +914,7 @@ private final class AppUpdater: NSObject {
     /// still requires this bundle's enabled flag and fresh feed evidence; no
     /// channel name is treated as proof that an endpoint is safe to use.
     static var isPreviewDistribution: Bool {
-        Bundle.main.object(
-            forInfoDictionaryKey: "UsageMonitorPreviewDistribution"
-        ) as? Bool == true
-        || Bundle.main.object(
-            forInfoDictionaryKey: "UsageMonitorBuildChannel"
-        ) as? String == "preview_distribution"
+        BundledProduct.isPreviewDistribution
     }
 
     private static var appcastURL: URL? {
@@ -441,18 +952,24 @@ private final class AppUpdater: NSObject {
     }
 
     var allowsAutomaticUpdateOptIn: Bool {
-        controller?.updater.allowsAutomaticUpdates == true
+        !Self.isPreviewDistribution
+            && controller?.updater.allowsAutomaticUpdates == true
     }
 
     var automaticUpdatesEnabled: Bool {
-        controller?.updater.automaticallyDownloadsUpdates == true
+        !Self.isPreviewDistribution
+            && controller?.updater.automaticallyDownloadsUpdates == true
     }
 
     /// Automatic-update controls remain disabled until the endpoint and the
-    /// latest check both have a truthful state. This prevents a configured
-    /// but unavailable feed from looking ready merely because Sparkle exists.
+    /// latest check both have a truthful state, and until this build's sealed
+    /// Sparkle policy actually permits the preference. This prevents preview
+    /// builds from presenting a switch whose setter must refuse the change.
     var canConfigureAutomaticUpdates: Bool {
-        guard isAvailable, feedIsReachable else { return false }
+        guard isAvailable,
+              feedIsReachable,
+              allowsAutomaticUpdateOptIn
+        else { return false }
         return ![.checking, .failed].contains(state)
     }
 
@@ -467,6 +984,15 @@ private final class AppUpdater: NSObject {
     }
 
     var settingsSummary: String {
+        if isAvailable && !allowsAutomaticUpdateOptIn {
+            return Self.isPreviewDistribution
+                ? TiboTattleLocalization.string(
+                    .settingsUpdateDisclosurePreview
+                )
+                : TiboTattleLocalization.string(
+                    .settingsAutomaticUpdatesUnavailable
+                )
+        }
         switch state {
         case .unavailable:
             return TiboTattleLocalization.string(
@@ -556,7 +1082,10 @@ private final class AppUpdater: NSObject {
             feedIsReachable = false
             setState(.failed)
             if userInitiated {
-                showFeedFailureAlert()
+                showUpdateFailureAlert(
+                    messageKey: .launcherUpdateUnavailable,
+                    informativeTextKey: .settingsAutomaticUpdatesUnavailable
+                )
             }
             return
         }
@@ -580,7 +1109,10 @@ private final class AppUpdater: NSObject {
                     self.feedIsReachable = false
                     self.setState(.failed)
                     if userInitiated {
-                        self.showFeedFailureAlert()
+                        self.showUpdateFailureAlert(
+                            messageKey: .settingsUpdateCheckUnavailableTitle,
+                            informativeTextKey: .settingsUpdateCheckUnavailableMessage
+                        )
                     }
                     return
                 }
@@ -590,15 +1122,14 @@ private final class AppUpdater: NSObject {
         }.resume()
     }
 
-    private func showFeedFailureAlert() {
+    private func showUpdateFailureAlert(
+        messageKey: TiboTattleLocalization.Key,
+        informativeTextKey: TiboTattleLocalization.Key
+    ) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = TiboTattleLocalization.string(
-            .launcherUpdateUnavailable
-        )
-        alert.informativeText = TiboTattleLocalization.string(
-            .settingsAutomaticUpdatesUnavailable
-        )
+        alert.messageText = TiboTattleLocalization.string(messageKey)
+        alert.informativeText = TiboTattleLocalization.string(informativeTextKey)
         alert.addButton(withTitle: TiboTattleLocalization.string(.launcherRetry))
         alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
         if alert.runModal() == .alertFirstButtonReturn {
@@ -607,7 +1138,8 @@ private final class AppUpdater: NSObject {
     }
 
     func setAutomaticUpdatesEnabled(_ enabled: Bool) {
-        guard let updater = controller?.updater,
+        guard !Self.isPreviewDistribution,
+              let updater = controller?.updater,
               updater.allowsAutomaticUpdates,
               feedIsReachable
         else {
@@ -828,7 +1360,11 @@ private enum LauncherError: LocalizedError {
     case companionLaunch(String)
     case companionTimeout
     case codexHomeSettingsWrite
+    case dashboardContentProcessTerminated
     case dashboardDownloadFailed
+    case dashboardNavigationFailed
+    case dashboardReadinessTimeout
+    case dashboardViewportUnavailable
     case dashboardWebViewUnavailable
     case dataErase
     case firstRunStateWrite
@@ -876,9 +1412,25 @@ private enum LauncherError: LocalizedError {
             return TiboTattleLocalization.string(
                 .launcherErrorCodexHomeSettingsWrite
             )
+        case .dashboardContentProcessTerminated:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardContentProcessTerminated
+            )
         case .dashboardDownloadFailed:
             return TiboTattleLocalization.string(
                 .launcherErrorDashboardDownloadFailed
+            )
+        case .dashboardNavigationFailed:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardNavigationFailed
+            )
+        case .dashboardReadinessTimeout:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardReadinessTimeout
+            )
+        case .dashboardViewportUnavailable:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardViewportUnavailable
             )
         case .dashboardWebViewUnavailable:
             return TiboTattleLocalization.string(
@@ -932,8 +1484,16 @@ private enum LauncherError: LocalizedError {
             return "UM_MACOS_COMPANION_START_TIMEOUT"
         case .codexHomeSettingsWrite:
             return "UM_MACOS_CODEX_HOME_SETTINGS_WRITE_FAILED"
+        case .dashboardContentProcessTerminated:
+            return "UM_MACOS_DASHBOARD_WEB_PROCESS_TERMINATED"
         case .dashboardDownloadFailed:
             return "UM_MACOS_DASHBOARD_DOWNLOAD_FAILED"
+        case .dashboardNavigationFailed:
+            return "UM_MACOS_DASHBOARD_NAVIGATION_FAILED"
+        case .dashboardReadinessTimeout:
+            return "UM_MACOS_DASHBOARD_READY_TIMEOUT"
+        case .dashboardViewportUnavailable:
+            return "UM_MACOS_DASHBOARD_VIEWPORT_UNAVAILABLE"
         case .dashboardWebViewUnavailable:
             return "UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE"
         case .dataErase:
@@ -976,7 +1536,9 @@ private enum LauncherError: LocalizedError {
             return TiboTattleLocalization.string(
                 .launcherRecoveryDashboardDownload
             )
-        case .dashboardWebViewUnavailable:
+        case .dashboardContentProcessTerminated, .dashboardNavigationFailed,
+             .dashboardReadinessTimeout, .dashboardViewportUnavailable,
+             .dashboardWebViewUnavailable:
             return TiboTattleLocalization.string(
                 .launcherRecoveryDashboardWebView
             )
@@ -1571,6 +2133,10 @@ private struct CompanionResources {
 }
 
 private final class CompanionProcess {
+    private static let activeInstanceErrorCodes: Set<String> = [
+        "automatic_contribution_instance_active",
+        "automatic_contribution_retirement_instance_active",
+    ]
     private let centralService: CentralServiceConfiguration?
     private let codexHome: URL
     private let lock = NSLock()
@@ -1581,7 +2147,13 @@ private final class CompanionProcess {
     private var keychainBroker: ContributionDeviceKeychainBroker?
     private var stopCompletions: [() -> Void] = []
     private var stopped = false
+    private var terminationInProgress = false
+    private var terminationComplete = false
+    // A caller may detach the companion immediately after requesting stop.
+    // Keep it alive through OS exit and the broker's asynchronous writer barrier.
+    private var stopRetention: CompanionProcess?
     private let nodeRuntimeModeOverride: BundledNodeRuntimeMode?
+    private let onMigrationStatus: (KeychainMigrationStatus) -> Void
     private let onExit: (Bool, Bool) -> Void
     private let onReady: (URL) -> Void
 
@@ -1589,12 +2161,14 @@ private final class CompanionProcess {
         centralService: CentralServiceConfiguration?,
         codexHome: URL,
         nodeRuntimeModeOverride: BundledNodeRuntimeMode? = nil,
+        onMigrationStatus: @escaping (KeychainMigrationStatus) -> Void = { _ in },
         onReady: @escaping (URL) -> Void,
         onExit: @escaping (Bool, Bool) -> Void
     ) {
         self.centralService = centralService
         self.codexHome = codexHome
         self.nodeRuntimeModeOverride = nodeRuntimeModeOverride
+        self.onMigrationStatus = onMigrationStatus
         self.onReady = onReady
         self.onExit = onExit
     }
@@ -1612,7 +2186,44 @@ private final class CompanionProcess {
         return process.processIdentifier
     }
 
-    func launch() throws {
+    /// Only the native confirmation action reaches this seam. There is no
+    /// matching companion message, URL, or web-view operation for approval.
+    func approvePendingMigrations(completion: @escaping (Bool) -> Void) {
+        lock.lock()
+        let broker = keychainBroker
+        let canApprove = !stopped && process?.isRunning == true
+        lock.unlock()
+        guard canApprove, let broker else {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+        broker.approvePendingMigrations(completion: completion)
+    }
+
+    func launch(
+        makeBroker: () throws -> ContributionDeviceKeychainBroker = {
+            try ContributionDeviceKeychainBroker(
+                namespace: BundledProduct.keychainNamespace,
+                account: BundledProduct.keychainAccount
+            )
+        }
+    ) throws {
+        // Require the private channel before resource access or child creation.
+        // The factory seam lets the native contract probe reject setup failures
+        // without exhausting descriptors or touching real credentials.
+        let broker: ContributionDeviceKeychainBroker
+        do {
+            broker = try makeBroker()
+        } catch {
+            throw LauncherError.companionLaunch("keychain")
+        }
+        var brokerOwnedByCompanion = false
+        defer {
+            if !brokerOwnedByCompanion { broker.shutdown() }
+        }
+        guard let childEndpoint = broker.childEndpoint else {
+            throw LauncherError.companionLaunch("keychain")
+        }
         let resources = try CompanionResources.bundled()
         let stateRoot = try ownerOnlyStateRoot()
         let homeDirectory = try currentUserHomeDirectory()
@@ -1625,17 +2236,11 @@ private final class CompanionProcess {
             nodeRuntimeModeOverride ?? resources.nodeRuntimeMode
         ).arguments(entrypoint: resources.entrypoint)
         child.currentDirectoryURL = resources.resourceRoot
-        // The companion's standard input is the app's Keychain broker
-        // channel: fresh contribution-device credentials are minted and read
-        // by this signed app, never by the companion's own Keychain access,
-        // which is what raised the first-pairing dialog. The environment
-        // names only the descriptor — the socketpair itself is the
+        // Every native credential operation uses the app's private broker.
+        // The environment names only the descriptor; the socketpair is the
         // authority, so no token or secret crosses argv or the environment.
-        // If the broker cannot be created (descriptor exhaustion), the
-        // companion runs without one and its own explained pairing path
-        // remains the net.
-        let broker = try? ContributionDeviceKeychainBroker()
-        child.standardInput = broker?.childEndpoint ?? FileHandle.nullDevice
+        broker.setMigrationStatusObserver(onMigrationStatus)
+        child.standardInput = childEndpoint
         child.standardOutput = standardOutput
         child.standardError = standardError
 
@@ -1646,15 +2251,17 @@ private final class CompanionProcess {
             "NODE_ENV": "production",
             "USAGE_MONITOR_PARENT_PID": String(getpid()),
             "USAGE_MONITOR_PORT": "0",
+            "USAGE_MONITOR_APP_OPEN_URL": BundledProduct.appOpenURL,
+            "USAGE_MONITOR_KEYCHAIN_NAMESPACE":
+                BundledProduct.keychainNamespace,
+            "USAGE_MONITOR_KEYCHAIN_ACCOUNT": BundledProduct.keychainAccount,
             "USAGE_MONITOR_RESOURCE_ROOT": resources.resourceRoot.path,
             "USAGE_MONITOR_STATE_ROOT": stateRoot.path,
             "CODEX_HOME": codexHome.path,
         ]
-        if broker?.childEndpoint != nil {
-            environment[
-                ContributionDeviceKeychainBroker.environmentVariable
-            ] = "0"
-        }
+        environment[
+            ContributionDeviceKeychainBroker.environmentVariable
+        ] = "0"
         for name in ["LANG", "LC_ALL", "TMPDIR"] {
             if let value = inherited[name], !value.contains("\0") {
                 environment[name] = value
@@ -1685,26 +2292,31 @@ private final class CompanionProcess {
         }
 
         lock.lock()
+        guard !stopped, process == nil, !terminationInProgress, !terminationComplete else {
+            lock.unlock()
+            throw LauncherError.companionLaunch("stopped")
+        }
         process = child
         keychainBroker = broker
-        stopped = false
+        brokerOwnedByCompanion = true
         pendingOutput = ""
         pendingStandardError = ""
         activeInstanceDetected = false
-        lock.unlock()
         do {
+            // Keep stop from observing an assigned but not-yet-started child.
+            // This is process creation only; no shutdown/Keychain wait is on main.
             try child.run()
-        } catch {
-            lock.lock()
-            process = nil
-            keychainBroker = nil
             lock.unlock()
-            broker?.shutdown()
+        } catch {
+            lock.unlock()
+            standardOutput.fileHandleForReading.readabilityHandler = nil
+            standardError.fileHandleForReading.readabilityHandler = nil
+            didTerminate(success: false, notifyExit: false)
             throw LauncherError.companionLaunch("run")
         }
         // The child holds its dup2'd copy; dropping ours is what turns a
         // companion exit into end-of-file on the broker channel.
-        broker?.closeChildEndpoint()
+        broker.closeChildEndpoint()
     }
 
     private func consumeStandardOutput(_ data: Data) {
@@ -1750,40 +2362,94 @@ private final class CompanionProcess {
         if pendingStandardError.utf8.count > 8_192 {
             pendingStandardError = String(pendingStandardError.suffix(4_096))
         }
-        if pendingStandardError.contains("automatic_contribution_instance_active") {
+        let diagnosticTokens = pendingStandardError.split { character in
+            !character.isLetter && !character.isNumber && character != "_"
+        }
+        if diagnosticTokens.contains(where: {
+            Self.activeInstanceErrorCodes.contains(String($0))
+        }) {
             activeInstanceDetected = true
         }
         lock.unlock()
     }
 
-    private func didTerminate(success: Bool) {
+    private func didTerminate(success: Bool, notifyExit: Bool = true) {
         lock.lock()
+        guard !terminationInProgress, !terminationComplete else {
+            lock.unlock()
+            return
+        }
+        terminationInProgress = true
         process = nil
         let broker = keychainBroker
         keychainBroker = nil
+        let anotherInstanceIsActive = activeInstanceDetected
+        lock.unlock()
+        let finish = { [self] in
+            finishTermination(
+                success: success,
+                notifyExit: notifyExit,
+                anotherInstanceIsActive: anotherInstanceIsActive
+            )
+        }
+        if let broker {
+            broker.shutdown(completion: finish)
+        } else {
+            finish()
+        }
+    }
+
+    private func finishTermination(
+        success: Bool,
+        notifyExit: Bool,
+        anotherInstanceIsActive: Bool
+    ) {
+        lock.lock()
+        guard terminationInProgress, !terminationComplete else {
+            lock.unlock()
+            return
+        }
+        terminationInProgress = false
+        terminationComplete = true
         let completions = stopCompletions
         stopCompletions.removeAll()
         let wasStopped = stopped
-        let anotherInstanceIsActive = activeInstanceDetected
+        stopRetention = nil
         lock.unlock()
-        broker?.shutdown()
         for completion in completions {
             completion()
         }
-        onExit(success && wasStopped, anotherInstanceIsActive)
+        if notifyExit {
+            onExit(success && wasStopped, anotherInstanceIsActive)
+        }
     }
 
     func stop(completion: @escaping () -> Void) {
         lock.lock()
+        let firstStop = !stopped
         stopped = true
-        guard let child = process, child.isRunning else {
+        if terminationComplete {
             lock.unlock()
             completion()
             return
         }
         stopCompletions.append(completion)
-        child.terminate()
+        stopRetention = self
+        guard !terminationInProgress else {
+            lock.unlock()
+            return
+        }
+        guard let child = process else {
+            lock.unlock()
+            didTerminate(success: true, notifyExit: false)
+            return
+        }
+        let shouldTerminate = firstStop && child.isRunning
         lock.unlock()
+        // A stopped child may still have its Foundation termination handler
+        // pending. That handler and the broker barrier own the completions.
+        guard shouldTerminate else { return }
+        child.terminate()
 
         DispatchQueue.global(qos: .utility).asyncAfter(
             deadline: .now() + 2
@@ -1796,6 +2462,110 @@ private final class CompanionProcess {
                 _ = kill(child.processIdentifier, SIGKILL)
             }
         }
+    }
+
+    /// Deterministic pre-spawn failures through the real launch entrypoint.
+    /// A newly created broker has an endpoint; closing that endpoint models
+    /// the other setup failure without exhausting process-wide descriptors.
+    static func verifyKeychainLaunchContract() -> Bool {
+        enum Failure: CaseIterable { case construction, missingEndpoint }
+        for failure in Failure.allCases {
+            var factoryCalls = 0
+            var healthyEndpointObserved = false
+            var readyCalls = 0
+            var exitCalls = 0
+            let companion = CompanionProcess(
+                centralService: nil,
+                codexHome: URL(fileURLWithPath: "/synthetic-home-not-opened"),
+                onReady: { _ in readyCalls += 1 },
+                onExit: { _, _ in exitCalls += 1 }
+            )
+            do {
+                try companion.launch(makeBroker: {
+                    factoryCalls += 1
+                    if failure == .construction {
+                        throw ContributionDeviceKeychainBrokerUnavailable()
+                    }
+                    let broker = try ContributionDeviceKeychainBroker(
+                        namespace: BundledProduct.keychainNamespace,
+                        account: BundledProduct.keychainAccount
+                    )
+                    healthyEndpointObserved = broker.childEndpoint != nil
+                    broker.closeChildEndpoint()
+                    return broker
+                })
+                return false
+            } catch LauncherError.companionLaunch(let reason) {
+                guard reason == "keychain", factoryCalls == 1,
+                      failure == .construction || healthyEndpointObserved,
+                      companion.process == nil, companion.keychainBroker == nil,
+                      !companion.isRunning, companion.processIdentifier == nil,
+                      readyCalls == 0, exitCalls == 0
+                else { return false }
+            } catch {
+                return false
+            }
+            var stoppedCalls = 0
+            companion.stop { stoppedCalls += 1 }
+            companion.stop { stoppedCalls += 1 }
+            guard stoppedCalls == 2, readyCalls == 0, exitCalls == 0 else { return false }
+        }
+        return true
+    }
+
+    /// Memory-only composition probe: use the actual stop and termination
+    /// methods with an injected broker, never launch a companion or reset helper.
+    static func verifyKeychainShutdownContract() -> Bool {
+        enum Phase: CaseIterable { case alreadyAbsent, handlerPending, brokerDraining }
+        for phase in Phase.allCases {
+            let resultLock = NSLock()
+            var callbackCount = 0
+            var exitCount = 0
+            weak var retainedCompanion: CompanionProcess?
+            let passed = ContributionDeviceKeychainBroker.verifyExternalResetOrder { broker, reset in
+                let companion = CompanionProcess(
+                    centralService: nil,
+                    codexHome: URL(fileURLWithPath: "/synthetic-home-not-opened"),
+                    onReady: { _ in },
+                    onExit: { _, _ in
+                        resultLock.lock(); exitCount += 1; resultLock.unlock()
+                    }
+                )
+                retainedCompanion = companion
+                companion.keychainBroker = broker
+                if phase == .handlerPending {
+                    // A non-running Process models the interval before the
+                    // real Foundation termination handler has been delivered.
+                    companion.process = Process()
+                } else if phase == .brokerDraining {
+                    companion.didTerminate(success: true)
+                }
+                companion.stop {
+                    resultLock.lock(); callbackCount += 1; resultLock.unlock()
+                    reset()
+                }
+                companion.stop {
+                    resultLock.lock(); callbackCount += 1; resultLock.unlock()
+                }
+                if phase == .handlerPending { companion.didTerminate(success: true) }
+                // Drop the caller's reference while the broker is paused.
+                // Pending termination must retain it only through the barrier.
+            }
+            resultLock.lock()
+            let completedOnce = callbackCount == 2
+                && exitCount == (phase == .alreadyAbsent ? 0 : 1)
+            resultLock.unlock()
+            guard passed, completedOnce, retainedCompanion == nil else { return false }
+        }
+        let idle = CompanionProcess(
+            centralService: nil,
+            codexHome: URL(fileURLWithPath: "/synthetic-home-not-opened"),
+            onReady: { _ in }, onExit: { _, _ in }
+        )
+        var completedCount = 0
+        idle.stop { completedCount += 1 }
+        idle.stop { completedCount += 1 }
+        return completedCount == 2
     }
 }
 
@@ -1864,6 +2634,159 @@ private struct LocalKeychainResetResult: Decodable {
     }
 }
 
+/// A local dashboard click may open one Codex thread, never an arbitrary
+/// custom-scheme operation. No identifier is logged or persisted by the shell.
+private enum CodexThreadOpenTarget {
+    static func accepts(_ url: URL) -> Bool {
+        guard url.absoluteString.range(
+            of: "^codex://threads/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            options: .regularExpression
+        ) != nil,
+              let parts = URLComponents(
+            url: url, resolvingAgainstBaseURL: false
+        ),
+              parts.scheme == "codex",
+              parts.host == "threads",
+              parts.user == nil,
+              parts.password == nil,
+              parts.port == nil,
+              parts.query == nil,
+              parts.fragment == nil,
+              parts.path.hasPrefix("/"),
+              let identifier = UUID(uuidString: String(parts.path.dropFirst()))
+        else {
+            return false
+        }
+        // Also reject encodings, empty ports/query/fragment, extra path
+        // components, and other URL normalizations at the original boundary.
+        return url.absoluteString
+            == "codex://threads/\(identifier.uuidString.lowercased())"
+    }
+
+    static func acceptsNavigation(
+        to url: URL,
+        userActivated: Bool,
+        sourceIsMainFrame: Bool,
+        sourceURL: URL?,
+        sourceOrigin: (scheme: String, host: String, port: Int),
+        companionPort: Int?
+    ) -> Bool {
+        guard accepts(url), userActivated, sourceIsMainFrame,
+              let sourceURL, let companionPort
+        else {
+            return false
+        }
+        return sourceURL.scheme == "http"
+            && sourceURL.host == loopbackHost
+            && sourceURL.port == companionPort
+            && sourceURL.user == nil
+            && sourceURL.password == nil
+            && sourceOrigin.scheme == "http"
+            && sourceOrigin.host == loopbackHost
+            && sourceOrigin.port == companionPort
+    }
+}
+
+/// Removes browser commands that do not belong in TiboTattle's single-page
+/// dashboard while preserving useful page commands such as Reload, Copy, and
+/// Open Link. WKWebView does not expose a public context-menu delegate on
+/// macOS, but it does identify the NSMenuItems it supplies. Filtering those
+/// identifiers here avoids localized-title matching and leaves the rest of
+/// WebKit's menu behavior intact.
+@MainActor
+private final class NativeDashboardWebView: WKWebView {
+    private static let unsupportedContextMenuIdentifiers: Set<
+        NSUserInterfaceItemIdentifier
+    > = [
+        NSUserInterfaceItemIdentifier("WKMenuItemIdentifierGoBack"),
+        NSUserInterfaceItemIdentifier("WKMenuItemIdentifierGoForward"),
+        NSUserInterfaceItemIdentifier(
+            "WKMenuItemIdentifierDownloadLinkedFile"
+        ),
+    ]
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        Self.stripUnsupportedContextMenuItems(from: menu)
+    }
+
+    static func stripUnsupportedContextMenuItems(from menu: NSMenu) {
+        for item in menu.items {
+            guard let identifier = item.identifier,
+                  unsupportedContextMenuIdentifiers.contains(identifier)
+            else {
+                continue
+            }
+            menu.removeItem(item)
+        }
+    }
+}
+
+/// One document's bounded readiness observation. The monotonic clock and
+/// generation are supplied by the host, so delayed JavaScript completions can
+/// never ready or fail a replacement document.
+private struct NativeDashboardReadiness {
+    enum Observation: Equatable {
+        case waiting(TimeInterval)
+        case takingLonger
+        case ready
+        case timedOut
+        case ignored
+    }
+
+    static let slowThreshold: TimeInterval = 20
+    static let hardDeadline: TimeInterval = 120
+    private(set) var generation: UInt64 = 0
+    private var beganAt: TimeInterval?
+    private var delayReported = false
+    private var finished = false
+
+    @discardableResult
+    mutating func invalidate() -> UInt64 {
+        generation &+= 1
+        beganAt = nil
+        delayReported = false
+        finished = false
+        return generation
+    }
+
+    mutating func start(generation expected: UInt64, at now: TimeInterval) -> Bool {
+        guard expected == generation, beganAt == nil, now.isFinite else {
+            return false
+        }
+        beganAt = now
+        return true
+    }
+
+    func isObserving(_ expected: UInt64) -> Bool {
+        expected == generation && beganAt != nil && !finished
+    }
+
+    mutating func observe(
+        generation expected: UInt64,
+        at now: TimeInterval,
+        ready: Bool
+    ) -> Observation {
+        guard isObserving(expected), let beganAt, now.isFinite else {
+            return .ignored
+        }
+        let elapsed = max(0, now - beganAt)
+        if elapsed >= Self.hardDeadline {
+            finished = true
+            return .timedOut
+        }
+        if ready {
+            finished = true
+            return .ready
+        }
+        if elapsed >= Self.slowThreshold, !delayReported {
+            delayReported = true
+            return .takingLonger
+        }
+        return .waiting(elapsed < Self.slowThreshold ? 0.25 : 1)
+    }
+}
+
 /// The dashboard is hosted inside the app, so this web view is the product's
 /// primary surface. It is deliberately the narrowest possible browser: it may
 /// load exactly one origin — the loopback companion this launcher started —
@@ -1874,8 +2797,12 @@ private struct LocalKeychainResetResult: Decodable {
 @MainActor
 private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelegate,
     WKDownloadDelegate, WKScriptMessageHandler {
+    private static let codexThreadLinkWorld = WKContentWorld.world(
+        name: "TiboTattleTrustedThreadLinks"
+    )
     private let onLoaded: () -> Void
-    private let onFailure: (String) -> Void
+    private let onFailure: (LauncherError) -> Void
+    private let onReadinessDelay: () -> Void
     private let onDownloadFailure: () -> Void
     private let openExternally: (URL) -> Void
     private let onNavigation: (String) -> Void
@@ -1888,6 +2815,14 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     private var pendingDownloadDestination: URL?
     private var latestCompletedDownload: URL?
     private var viewportPreparationAttempts = 0
+    private var dashboardReadiness = NativeDashboardReadiness()
+    private var dashboardContentPoll: DispatchWorkItem?
+    private var dashboardContentEvaluationInFlight = false
+    private var activeDashboardNavigation: WKNavigation?
+    private let navigationGenerations = NSMapTable<WKNavigation, NSNumber>(
+        keyOptions: .weakMemory,
+        valueOptions: .strongMemory
+    )
     /// False while the view holds no dashboard, so the blank page loaded on
     /// teardown can never be reported as a dashboard that opened.
     private var hasDashboardTarget = false
@@ -1903,16 +2838,18 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
 
     init(
         onLoaded: @escaping () -> Void,
-        onFailure: @escaping (String) -> Void,
+        onFailure: @escaping (LauncherError) -> Void,
         onDownloadFailure: @escaping () -> Void,
         openExternally: @escaping (URL) -> Void,
         onNavigation: @escaping (String) -> Void,
         onLanguagePreferenceChange: @escaping (
             TiboTattleLocalization.LanguagePreference
-        ) -> Void
+        ) -> Void,
+        onReadinessDelay: @escaping () -> Void = {}
     ) {
         self.onLoaded = onLoaded
         self.onFailure = onFailure
+        self.onReadinessDelay = onReadinessDelay
         self.onDownloadFailure = onDownloadFailure
         self.openExternally = openExternally
         self.onNavigation = onNavigation
@@ -1935,7 +2872,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         Self.addDocumentStartScripts(
             to: configuration.userContentController
         )
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = NativeDashboardWebView(
+            frame: .zero,
+            configuration: configuration
+        )
         super.init()
         configuration.userContentController.add(
             self,
@@ -1949,9 +2889,15 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             self,
             name: "tibotattleHostedSignIn"
         )
+        configuration.userContentController.add(
+            self,
+            contentWorld: Self.codexThreadLinkWorld,
+            name: "tibotattleCodexThreadLink"
+        )
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = false
+        webView.allowsLinkPreview = false
         webView.setAccessibilityLabel(
             TiboTattleLocalization.string(.accessibilityLocalDashboard)
         )
@@ -1980,6 +2926,48 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         return "window.__TIBOTATTLE_LOCALIZATION__ = \(json);"
     }
 
+    /// Paint the report in the native appearance before its stylesheet gets a
+    /// first frame. The preference and its resolved light/dark value are both
+    /// handed over: the former is useful context, while the latter is the only
+    /// bounded value the page is permitted to render.
+    private static func appearanceHandoffScript() -> String {
+        let preference = NativeAppearancePreference.current
+        let resolvedTheme = preference.resolvedTheme(
+            for: NSApp.effectiveAppearance
+        )
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "host": "native",
+            "preference": preference.rawValue,
+            "resolvedTheme": resolvedTheme,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else {
+            return "window.__TIBOTATTLE_APPEARANCE__ = null;"
+        }
+        return """
+        window.__TIBOTATTLE_APPEARANCE__ = \(json);
+        (function () {
+          function applyNativeAppearance() {
+            const handoff = window.__TIBOTATTLE_APPEARANCE__;
+            const theme = handoff?.resolvedTheme;
+            if (theme !== 'light' && theme !== 'dark') return;
+            if (document.documentElement) {
+              document.documentElement.dataset.theme = theme;
+              document.documentElement.style.colorScheme = theme;
+            }
+            const themeColor = document.querySelector?.('meta[name="theme-color"]');
+            if (themeColor) {
+              themeColor.content = theme === 'dark' ? '#141a17' : '#f5f1e8';
+            }
+          }
+          applyNativeAppearance();
+          document.addEventListener('DOMContentLoaded', applyNativeAppearance, { once: true });
+        })();
+        """
+    }
+
     /// The AppKit frame owns navigation and refresh in the installed app.
     /// Install this fixed marker before any dashboard script runs so the
     /// public-web header cannot flash, or remain visible if WebKit delays a
@@ -2006,6 +2994,13 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     ) {
         controller.addUserScript(
             WKUserScript(
+                source: appearanceHandoffScript(),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
+        controller.addUserScript(
+            WKUserScript(
                 source: localizationHandoffScript(),
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: true
@@ -2018,6 +3013,35 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
                 forMainFrameOnly: true
             )
         )
+        controller.addUserScript(
+            WKUserScript(
+                source: trustedCodexThreadLinkScript(),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true,
+                in: codexThreadLinkWorld
+            )
+        )
+    }
+
+    /// A page cannot forge this handler: both the listener and its message
+    /// endpoint live in a non-page content world. Keyboard activation emits a
+    /// trusted click too; script-created clicks never open an external app.
+    private static func trustedCodexThreadLinkScript() -> String {
+        """
+        (function () {
+          document.addEventListener('click', function (event) {
+            if (!event.isTrusted) return;
+            const anchor = event.target instanceof Element
+              ? event.target.closest('a[href]') : null;
+            const href = anchor?.getAttribute('href');
+            if (typeof href !== 'string' ||
+                !/^codex:\\/\\/threads\\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(href)) return;
+            event.preventDefault();
+            window.webkit.messageHandlers.tibotattleCodexThreadLink
+              .postMessage({ threadId: href.slice('codex://threads/'.length) });
+          }, true);
+        })();
+        """
     }
 
     /// User scripts are copied into each document when it starts loading.
@@ -2032,26 +3056,33 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     }
 
     func load(_ url: URL) {
+        let generation = invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
+        hasDashboardTarget = false
+        pendingDashboardURL = nil
         guard url.scheme?.lowercased() == "http",
               url.host == loopbackHost,
               let port = url.port
         else {
-            onFailure(LauncherError.healthCheck.failureCode)
+            onFailure(.healthCheck)
             return
         }
         allowedPort = port
         hasDashboardTarget = true
         pendingDashboardURL = url
         viewportPreparationAttempts = 0
-        loadWhenViewportIsReady()
+        loadWhenViewportIsReady(generation: generation)
     }
 
     /// WKWebView can commit a document before AppKit has given its split pane a
     /// usable size. On a cold launch that produces a loaded, but white,
     /// dashboard until the user manually resizes the window. Defer the first
     /// request for a few main-loop passes until the embedded viewport exists.
-    private func loadWhenViewportIsReady() {
-        guard hasDashboardTarget, let url = pendingDashboardURL else { return }
+    private func loadWhenViewportIsReady(generation: UInt64) {
+        guard hasDashboardTarget,
+              generation == dashboardReadiness.generation,
+              let url = pendingDashboardURL
+        else { return }
         webView.superview?.layoutSubtreeIfNeeded()
         webView.layoutSubtreeIfNeeded()
         let viewport = webView.bounds.integral
@@ -2059,13 +3090,14 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             guard viewportPreparationAttempts < 20 else {
                 pendingDashboardURL = nil
                 hasDashboardTarget = false
-                onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+                invalidateDashboardContentObservation()
+                onFailure(.dashboardViewportUnavailable)
                 return
             }
             viewportPreparationAttempts += 1
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                 [weak self] in
-                self?.loadWhenViewportIsReady()
+                self?.loadWhenViewportIsReady(generation: generation)
             }
             return
         }
@@ -2073,10 +3105,17 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         refreshDocumentStartScripts()
-        webView.load(request)
+        activeDashboardNavigation = webView.load(request)
+        if let navigation = activeDashboardNavigation {
+            navigationGenerations.setObject(
+                NSNumber(value: generation), forKey: navigation
+            )
+        }
     }
 
     func stop() {
+        invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
         allowedPort = nil
         hasDashboardTarget = false
         // The page this flag described is being discarded, so the flag it set
@@ -2185,6 +3224,43 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         """)
     }
 
+    /// Change the live document without reloading it. The native shell has
+    /// already applied this appearance to AppKit; the resolved value makes the
+    /// report follow the same effective appearance when the stored choice is
+    /// `system`.
+    func notifyAppearancePreferenceChange(
+        _ preference: NativeAppearancePreference
+    ) {
+        guard hasDashboardTarget else { return }
+        // The live event below updates the current document, but WebKit's
+        // context-menu Reload creates a new document without passing through
+        // loadWhenViewportIsReady(). Refresh the document-start snapshot now
+        // so that later manual reload starts in the same resolved appearance
+        // instead of replaying whichever theme was current when this host was
+        // first constructed.
+        refreshDocumentStartScripts()
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "host": "native",
+            "preference": preference.rawValue,
+            "resolvedTheme": preference.resolvedTheme(
+                for: NSApp.effectiveAppearance
+            ),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        webView.evaluateJavaScript("""
+        window.__TIBOTATTLE_APPEARANCE__ = \(json);
+        window.dispatchEvent(new CustomEvent('tibotattle:appearance-override', {
+          detail: window.__TIBOTATTLE_APPEARANCE__
+        }));
+        window.requestAnimationFrame?.(() => {
+          window.dispatchEvent(new Event('resize'));
+        });
+        """)
+    }
+
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
@@ -2192,6 +3268,28 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         guard message.frameInfo.isMainFrame,
               let payload = message.body as? [String: Any]
         else {
+            return
+        }
+        if message.name == "tibotattleCodexThreadLink" {
+            let frame = message.frameInfo
+            let origin = frame.securityOrigin
+            guard message.world === Self.codexThreadLinkWorld,
+                  payload.count == 1,
+                  let threadId = payload["threadId"] as? String,
+                  threadId.count == 36,
+                  let url = URL(string: "codex://threads/\(threadId)"),
+                  CodexThreadOpenTarget.acceptsNavigation(
+                    to: url,
+                    userActivated: true,
+                    sourceIsMainFrame: frame.isMainFrame,
+                    sourceURL: frame.request.url,
+                    sourceOrigin: (origin.protocol, origin.host, origin.port),
+                    companionPort: allowedPort
+                  )
+            else {
+                return
+            }
+            openExternally(url)
             return
         }
         if message.name == "tibotattleDownloads" {
@@ -2233,6 +3331,18 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             && url.password == nil
     }
 
+    private func openExternalNavigation(
+        _ navigationAction: WKNavigationAction,
+        url: URL
+    ) {
+        if url.scheme?.lowercased() == "codex" {
+            // WKNavigationType.linkActivated does not attest a trusted user
+            // event. Only the isolated click handler may open Codex.
+            return
+        }
+        openExternally(url)
+    }
+
     // MARK: - Navigation policy
 
     func webView(
@@ -2242,6 +3352,12 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     ) {
         guard let url = navigationAction.request.url else {
             decisionHandler(.cancel)
+            return
+        }
+        if url.scheme?.lowercased() == "codex" {
+            // A Codex target never loads or downloads inside WebKit.
+            decisionHandler(.cancel)
+            openExternalNavigation(navigationAction, url: url)
             return
         }
         if navigationAction.shouldPerformDownload {
@@ -2259,7 +3375,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             return
         }
         decisionHandler(.cancel)
-        openExternally(url)
+        openExternalNavigation(navigationAction, url: url)
     }
 
     func webView(
@@ -2270,24 +3386,42 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
     }
 
-    /// How long the document is given to render something before the view is
-    /// declared unavailable, and how often it is asked.
-    ///
-    /// `didFinish` only reports that the *document* finished loading. This
-    /// dashboard then fetches its evidence from the loopback companion and
-    /// renders afterwards, so `#main` is legitimately near-empty at that
-    /// instant. Sampling it once there judged an asynchronous condition at a
-    /// single moment and reported a perfectly working view as broken - which
-    /// is why a right-click Reload failed with
-    /// `UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE` while retrying moments later
-    /// succeeded. The deadline still fails closed: a document that never
-    /// renders is still reported, just not one that is merely slower than a
-    /// single turn of the run loop.
-    private static let dashboardContentDeadline: TimeInterval = 20
-    private static let dashboardContentPollInterval: TimeInterval = 0.25
+    @discardableResult
+    private func invalidateDashboardContentObservation() -> UInt64 {
+        dashboardContentPoll?.cancel()
+        dashboardContentPoll = nil
+        dashboardContentEvaluationInFlight = false
+        return dashboardReadiness.invalidate()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didStartProvisionalNavigation navigation: WKNavigation!
+    ) {
+        guard hasDashboardTarget, let navigation else { return }
+        if let generation = navigationGenerations.object(forKey: navigation) {
+            guard generation.uint64Value == dashboardReadiness.generation else {
+                return
+            }
+        } else {
+            // WebKit's own Reload does not pass through load(_:). It still
+            // owns a fresh generation and invalidates the prior page's work.
+            let generation = invalidateDashboardContentObservation()
+            navigationGenerations.setObject(
+                NSNumber(value: generation), forKey: navigation
+            )
+        }
+        activeDashboardNavigation = navigation
+    }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard hasDashboardTarget else { return }
+        guard hasDashboardTarget, let navigation,
+              navigation === activeDashboardNavigation
+        else { return }
+        let generation = dashboardReadiness.generation
+        guard dashboardReadiness.start(
+            generation: generation, at: ProcessInfo.processInfo.systemUptime
+        ) else { return }
         // A freshly loaded document has no sign-in in flight until it says so,
         // so a stale flag from a prior page never blocks teardown after a
         // reload.
@@ -2302,31 +3436,79 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         )
         awaitDashboardContent(
             in: webView,
-            deadline: Date().addingTimeInterval(Self.dashboardContentDeadline)
+            generation: generation
         )
     }
 
-    private func awaitDashboardContent(in webView: WKWebView, deadline: Date) {
-        guard hasDashboardTarget else { return }
+    /// One bounded heartbeat continues independently of a JavaScript reply.
+    /// A hung renderer therefore cannot evade the hard deadline, and at most
+    /// one evaluation is in flight. The slow threshold keeps the visible page
+    /// and its startup-refresh intent; it is not a terminal failure.
+    private func awaitDashboardContent(in webView: WKWebView, generation: UInt64) {
+        guard hasDashboardTarget, dashboardReadiness.isObserving(generation) else {
+            return
+        }
+        let observation = dashboardReadiness.observe(
+            generation: generation,
+            at: ProcessInfo.processInfo.systemUptime,
+            ready: false
+        )
+        let interval: TimeInterval
+        switch observation {
+        case .waiting(let nextInterval):
+            interval = nextInterval
+        case .takingLonger:
+            onReadinessDelay()
+            interval = 1
+        case .timedOut:
+            finishDashboardContentObservation(ready: false)
+            return
+        case .ready, .ignored:
+            return
+        }
+        let poll = DispatchWorkItem { [weak self, weak webView] in
+            guard let self, let webView,
+                  self.dashboardReadiness.isObserving(generation)
+            else { return }
+            self.dashboardContentPoll = nil
+            self.awaitDashboardContent(in: webView, generation: generation)
+        }
+        dashboardContentPoll = poll
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: poll)
+        guard !dashboardContentEvaluationInFlight else { return }
+        dashboardContentEvaluationInFlight = true
         webView.evaluateJavaScript(
             "document.documentElement?.dataset.localDashboardReady === 'true';"
         ) { [weak self] value, error in
-            guard let self, self.hasDashboardTarget else { return }
+            guard let self, self.hasDashboardTarget,
+                  self.dashboardReadiness.isObserving(generation)
+            else { return }
+            self.dashboardContentEvaluationInFlight = false
             let localDashboardReady = (value as? NSNumber)?.boolValue ?? false
             if error == nil, localDashboardReady {
-                self.onLoaded()
-                return
+                let outcome = self.dashboardReadiness.observe(
+                    generation: generation,
+                    at: ProcessInfo.processInfo.systemUptime,
+                    ready: true
+                )
+                if outcome == .ready {
+                    self.finishDashboardContentObservation(ready: true)
+                } else if outcome == .timedOut {
+                    self.finishDashboardContentObservation(ready: false)
+                }
             }
-            guard Date() < deadline else {
-                self.hasDashboardTarget = false
-                self.onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
-                return
-            }
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + Self.dashboardContentPollInterval
-            ) { [weak self] in
-                self?.awaitDashboardContent(in: webView, deadline: deadline)
-            }
+        }
+    }
+
+    private func finishDashboardContentObservation(ready: Bool) {
+        dashboardContentPoll?.cancel()
+        dashboardContentPoll = nil
+        dashboardContentEvaluationInFlight = false
+        if ready {
+            onLoaded()
+        } else {
+            hasDashboardTarget = false
+            onFailure(.dashboardReadinessTimeout)
         }
     }
 
@@ -2335,7 +3517,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         didFail navigation: WKNavigation!,
         withError error: Error
     ) {
-        reportNavigationFailure(error)
+        reportNavigationFailure(error, navigation: navigation)
     }
 
     func webView(
@@ -2343,26 +3525,31 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
-        reportNavigationFailure(error)
+        reportNavigationFailure(error, navigation: navigation)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard hasDashboardTarget else { return }
+        invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
         hasDashboardTarget = false
-        onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+        onFailure(.dashboardContentProcessTerminated)
     }
 
-    private func reportNavigationFailure(_ error: Error) {
+    private func reportNavigationFailure(_ error: Error, navigation: WKNavigation?) {
         // A navigation this delegate cancelled on purpose is not a failure.
         let failure = error as NSError
         guard hasDashboardTarget,
+              navigation == nil || navigation === activeDashboardNavigation,
               failure.domain != NSURLErrorDomain
                 || failure.code != NSURLErrorCancelled
         else {
             return
         }
+        invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
         hasDashboardTarget = false
-        onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+        onFailure(.dashboardNavigationFailed)
     }
 
     // MARK: - Window, dialog, and file affordances
@@ -2374,10 +3561,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         // A provider may request a new browser window. The app never embeds
-        // remote origins, so hand it straight to the user's default browser
-        // without a second native confirmation dialog.
+        // remote origins. Codex links use the same source-frame and gesture
+        // policy as same-window links; HTTPS/auth behavior remains unchanged.
         if let url = navigationAction.request.url {
-            openExternally(url)
+            openExternalNavigation(navigationAction, url: url)
         }
         return nil
     }
@@ -2537,6 +3724,7 @@ private enum NativeDashboardDestination: String, CaseIterable {
     case overview
     case weekly
     case trends
+    case performance
     case method
     case community
 
@@ -2548,6 +3736,8 @@ private enum NativeDashboardDestination: String, CaseIterable {
             return TiboTattleLocalization.string(.nativeDashboardAllowance)
         case .trends:
             return TiboTattleLocalization.string(.nativeDashboardTrends)
+        case .performance:
+            return TiboTattleLocalization.string(.nativeDashboardPerformance)
         case .method:
             return TiboTattleLocalization.string(.nativeDashboardHowItWorks)
         case .community:
@@ -2560,6 +3750,7 @@ private enum NativeDashboardDestination: String, CaseIterable {
         case .overview: return "rectangle.grid.1x2"
         case .weekly: return "chart.bar.xaxis"
         case .trends: return "chart.xyaxis.line"
+        case .performance: return "speedometer"
         case .method: return "function"
         case .community: return "person.3"
         }
@@ -2580,24 +3771,16 @@ private enum NativeDashboardDestination: String, CaseIterable {
 /// that has, twice, resolved to zero before the window existed.
 @MainActor
 private final class NativeDashboardReportPane: NSView {
-    /// `--paper` from the dashboard stylesheet. The report document has no
-    /// dark variant, so a fixed value is the honest match. Painting it here
-    /// means no system grey is ever visible in the strip the title bar
-    /// reserves, or in the instant before WebKit has drawn.
-    private static let paper = NSColor(
-        srgbRed: 0xF5 / 255,
-        green: 0xF1 / 255,
-        blue: 0xE8 / 255,
-        alpha: 1
-    )
-
     private let webView: WKWebView
+    var onAppearanceChange: (() -> Void)?
+
+    override var wantsUpdateLayer: Bool { true }
 
     init(webView: WKWebView) {
         self.webView = webView
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = Self.paper.cgColor
+        layer?.backgroundColor = NativeBrandPalette.reportPaper.cgColor
         webView.translatesAutoresizingMaskIntoConstraints = true
         // Deliberately no autoresizing mask.  The pane now insets WebKit by
         // its own safe area, and a mask would spring the view back to the full
@@ -2609,6 +3792,19 @@ private final class NativeDashboardReportPane: NSView {
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    /// Match the report's `--paper` token during the gap before WebKit paints
+    /// and in the titlebar safe-area strip. Dynamic colors must be re-resolved
+    /// here because a CALayer does not track appearance changes on its own.
+    override func updateLayer() {
+        layer?.backgroundColor = NativeBrandPalette.reportPaper.cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+        onAppearanceChange?()
     }
 
     override func layout() {
@@ -2687,49 +3883,6 @@ private struct NativeDashboardChromeMetrics {
     /// divider itself.
     var paneGap: CGFloat {
         abs(reportPane.minX - sidebarPane.maxX)
-    }
-}
-
-/// The product's brand palette as native dynamic colors. Values mirror the
-/// web report's tokens (`--paper: #f5f1e8` and `--green: #174f45` in
-/// apps/web/public/styles.css) so the native chrome and the embedded report
-/// read as one surface. The dark appearance keeps the same family: the
-/// accent is lifted for contrast and the paper wash becomes a deep-green
-/// cast rather than a glaring cream sheet.
-private enum NativeBrandPalette {
-    /// Web accent #174f45, lifted for dark backgrounds.
-    static let accent = NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(
-                srgbRed: 122 / 255,
-                green: 184 / 255,
-                blue: 170 / 255,
-                alpha: 1
-            )
-            : NSColor(
-                srgbRed: 23 / 255,
-                green: 79 / 255,
-                blue: 69 / 255,
-                alpha: 1
-            )
-    }
-
-    /// Web background #f5f1e8, washed over the system sidebar material so
-    /// vibrancy still reads through it.
-    static let sidebarWash = NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(
-                srgbRed: 23 / 255,
-                green: 79 / 255,
-                blue: 69 / 255,
-                alpha: 0.22
-            )
-            : NSColor(
-                srgbRed: 245 / 255,
-                green: 241 / 255,
-                blue: 232 / 255,
-                alpha: 0.55
-            )
     }
 }
 
@@ -2981,6 +4134,11 @@ private final class NativeDashboardChrome: NSSplitViewController {
     private var restingWidthSeeded = false
 
     var onNavigate: ((NativeDashboardDestination) -> Void)?
+    var onAppearanceChange: (() -> Void)? {
+        didSet {
+            reportPane.onAppearanceChange = onAppearanceChange
+        }
+    }
 
     init(webView: WKWebView) {
         reportPane = NativeDashboardReportPane(webView: webView)
@@ -3258,6 +4416,202 @@ private final class NativeDashboardChrome: NSSplitViewController {
     }
 }
 
+/// Stable, non-localized identifiers for the three Settings pages. A page is
+/// reachable only through its toolbar tab, so all three are mandatory.
+private enum NativeSettingsToolbarPolicy {
+    static let generalIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.settings-general"
+    )
+    static let notificationsIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.settings-notifications"
+    )
+    static let aboutIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.settings-about"
+    )
+    static let mandatoryTabIdentifiers: Set<NSToolbarItem.Identifier> = [
+        generalIdentifier,
+        notificationsIdentifier,
+        aboutIdentifier,
+    ]
+}
+
+/// NSTabViewController supplies the Settings toolbar items, while this proxy
+/// adds the removal policy AppKit's generated delegate does not expose. Every
+/// item-building and selection query still forwards to the tab controller, so
+/// tab behavior remains owned by AppKit.
+@MainActor
+private final class NativeSettingsToolbarDelegate: NSObject,
+    NSToolbarDelegate {
+    private weak var tabController: NSTabViewController?
+
+    init(tabController: NSTabViewController) {
+        self.tabController = tabController
+        super.init()
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        tabController?.toolbar(
+            toolbar,
+            itemForItemIdentifier: itemIdentifier,
+            willBeInsertedIntoToolbar: flag
+        )
+    }
+
+    func toolbarDefaultItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        tabController?.toolbarDefaultItemIdentifiers(toolbar) ?? []
+    }
+
+    func toolbarAllowedItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        tabController?.toolbarAllowedItemIdentifiers(toolbar) ?? []
+    }
+
+    func toolbarSelectableItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        tabController?.toolbarSelectableItemIdentifiers(toolbar) ?? []
+    }
+
+    func toolbarImmovableItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> Set<NSToolbarItem.Identifier> {
+        NativeSettingsToolbarPolicy.mandatoryTabIdentifiers
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemIdentifier: NSToolbarItem.Identifier,
+        canBeInsertedAt index: Int
+    ) -> Bool {
+        index != NSNotFound
+            || !NativeSettingsToolbarPolicy.mandatoryTabIdentifiers
+                .contains(itemIdentifier)
+    }
+}
+
+/// Native presentation only: the broker owns the app-process retry budget and
+/// the saved keys. Observing status, opening Settings, and cancelling a review
+/// cannot authorize Keychain interaction or restart the silent retry budget.
+@MainActor
+private final class NativeKeychainMigrationApproval {
+    private(set) var status: KeychainMigrationStatus = .idle
+    private(set) var isReviewing = false
+    private(set) var approvalInFlight = false
+    private(set) var lastApprovalDeferred = false
+    private var reviewGeneration = 0
+    var onPresentationChange: (() -> Void)?
+    private let approve: (@escaping (Bool) -> Void) -> Void
+    private let onMigrationCompleted: () -> Void
+
+    init(
+        approve: @escaping (@escaping (Bool) -> Void) -> Void,
+        onMigrationCompleted: @escaping () -> Void
+    ) {
+        self.approve = approve
+        self.onMigrationCompleted = onMigrationCompleted
+    }
+
+    var showsSettings: Bool {
+        status.pendingCount > 0 || status.isRetrying || status.isApproving
+            || approvalInFlight
+    }
+
+    var showsMenuItem: Bool {
+        status.needsApproval || status.isApproving || approvalInFlight
+    }
+
+    var canReview: Bool {
+        status.needsApproval && !isReviewing && !approvalInFlight
+    }
+
+    var summaryKey: TiboTattleLocalization.Key {
+        if status.isApproving || approvalInFlight {
+            return .settingsKeychainMigrationApproving
+        }
+        if status.isRetrying { return .settingsKeychainMigrationRetrying }
+        if lastApprovalDeferred { return .settingsKeychainMigrationDeferred }
+        return .settingsKeychainMigrationSummary
+    }
+
+    func observe(_ next: KeychainMigrationStatus) {
+        let wasPending = status.pendingCount > 0
+            || status.isRetrying || status.isApproving
+        status = next
+        let completed = wasPending && next.pendingCount == 0
+            && !next.isRetrying && !next.isApproving
+        if completed { lastApprovalDeferred = false }
+        onPresentationChange?()
+        // Initial/current idle observations are not completion receipts and
+        // must never start an extra local refresh.
+        if completed { onMigrationCompleted() }
+    }
+
+    /// The confirmation callback is supplied only by the native review action.
+    /// Its one-shot guard also ignores duplicate sheet completions or a second
+    /// click while either the explanation or system approval is still open.
+    func review(confirm: (@escaping (Bool) -> Void) -> Void) {
+        guard canReview else { return }
+        reviewGeneration += 1
+        let selectedReviewGeneration = reviewGeneration
+        isReviewing = true
+        onPresentationChange?()
+        confirm { [weak self] approved in
+            guard let self, self.isReviewing,
+                  self.reviewGeneration == selectedReviewGeneration
+            else { return }
+            self.isReviewing = false
+            guard approved, self.status.needsApproval,
+                  !self.approvalInFlight
+            else {
+                self.onPresentationChange?()
+                return
+            }
+            self.approvalInFlight = true
+            self.lastApprovalDeferred = false
+            self.onPresentationChange?()
+            self.approve { [weak self] success in
+                guard let self, self.approvalInFlight,
+                      self.reviewGeneration == selectedReviewGeneration
+                else { return }
+                self.approvalInFlight = false
+                self.lastApprovalDeferred = !success
+                self.onPresentationChange?()
+            }
+        }
+    }
+
+    static func makeExplanation() -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = TiboTattleLocalization.string(
+            .dialogKeychainMigrationTitle
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .dialogKeychainMigrationDescription
+        )
+        // Cancel is the safe default. A Return key that merely opened Settings
+        // must not turn into permission for a system password dialog.
+        let cancel = alert.addButton(
+            withTitle: TiboTattleLocalization.string(.commonCancel)
+        )
+        cancel.keyEquivalent = "\r"
+        let approve = alert.addButton(
+            withTitle: TiboTattleLocalization.string(
+                .dialogApproveKeychainMigration
+            )
+        )
+        approve.keyEquivalent = ""
+        return alert
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate,
     NSWindowDelegate, NSToolbarDelegate {
@@ -3267,9 +4621,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var centralServiceMode: CentralServiceMode?
     private var codexHomeConfiguration: CodexHomeConfiguration?
     private var companion: CompanionProcess?
+    private var retiringCompanions = [ObjectIdentifier: CompanionProcess]()
     private var dashboardURL: URL?
     private var firstRunAcknowledged = false
     private var keychainResetProcess: Process?
+    private var keychainResetGeneration: Int?
     private var launchGeneration = 0
     private var pendingDashboardOpen = false
     private var quitting = false
@@ -3286,6 +4642,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var menuBarStatus: MenuBarStatusController?
     private var settingsWindow: NSWindow?
     private var settingsTabs: NSTabViewController?
+    private var settingsToolbarDelegate: NativeSettingsToolbarDelegate?
     private var settingsPages: [SettingsPage] = []
     private weak var settingsCodexHomeLabel: NSTextField?
     private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
@@ -3300,7 +4657,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var settingsQuotaNotificationsSwitch: NSSwitch?
     private weak var settingsQuotaNotificationThresholds: NSSegmentedControl?
     private weak var settingsQuotaNotificationStatusLabel: NSTextField?
+    private weak var settingsAppearancePicker: NSPopUpButton?
     private weak var settingsRefreshIntervalPicker: NSPopUpButton?
+    private weak var settingsKeychainMigrationSection: NSView?
+    private weak var settingsKeychainMigrationLabel: NSTextField?
+    private weak var settingsKeychainMigrationButton: NSButton?
+    private weak var keychainMigrationMenuItem: NSMenuItem?
+    private var keychainMigrationRefreshPending = false
+    private lazy var keychainMigrationApproval = NativeKeychainMigrationApproval(
+        approve: { [weak self] completion in
+            guard let self, !self.quitting, let companion = self.companion
+            else {
+                completion(false)
+                return
+            }
+            companion.approvePendingMigrations(completion: completion)
+        },
+        onMigrationCompleted: { [weak self] in
+            self?.refreshAfterKeychainMigration()
+        }
+    )
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
     private var nativeDashboardChrome: NativeDashboardChrome?
@@ -3312,8 +4688,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var nativeShareToolbarItem: NSToolbarItem?
     private weak var nativeSettingsToolbarItem: NSToolbarItem?
     private var nativeRefreshPoll: DispatchWorkItem?
+    private var nativeRefreshStartWatchdog: DispatchWorkItem?
+    private var nativeRefreshReadWatchdog: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
+    private var nativeRefreshStartFence = NativeRefreshStartFence()
+    private var nativeRefreshProgress: LocalAnalysisProgress?
+    private var nativeRefreshSequence: UInt64 = 0
+    private var nativeRefreshReadEpoch: UInt64 = 0
+    private var workspaceWakeObserver: NSObjectProtocol?
     /// One launch-only refresh waits until the page has rendered its first
     /// local result. This prevents the heavy collector from winning the
     /// loopback race against the dashboard's own initial reads.
@@ -3329,6 +4712,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     /// Opaque companion token for the particular refresh this surface started
     /// or joined. It is never persisted or exposed in UI/notification text.
     private var nativeRefreshID: String?
+    /// Notification evaluation belongs only to a refresh this native surface
+    /// explicitly started or joined. Reconciliation may adopt an external run
+    /// for UI liveness without claiming notification ownership.
+    private var nativeRefreshNotificationID: String?
+    // A fresh unified index or an authoritatively selected full accounting
+    // rebuild receives the companion's bounded four-hour cold-work window.
+    // Keep native progress attached through that same window plus one minute
+    // for cooperative worker shutdown and the terminal read;
+    // the former 120 polls stopped after about 90 seconds and could label a
+    // still-running first build as finished.
+    private static let nativeRefreshPollIntervalMilliseconds = 750
+    private static let nativeRefreshStartWatchdogMilliseconds = 12_000
+    private static let nativeRefreshReadWatchdogMilliseconds = 12_000
+    /// Once the companion's own maximum work window has elapsed, stay
+    /// attached until its terminal receipt without keeping the ordinary
+    /// sub-second progress cadence alive indefinitely.
+    private static let nativeRefreshSettlementPollIntervalMilliseconds = 5_000
+    private static let nativeRefreshMaximumPollSeconds = 4 * 60 * 60 + 60
+    private static let nativeRefreshMaximumPollAttempts =
+        nativeRefreshMaximumPollSeconds * 1_000
+        / nativeRefreshPollIntervalMilliseconds
     static let toolbarStatusRefreshIdentifier = NSToolbarItem.Identifier(
         "com.usagemonitor.local.dashboard-status-refresh"
     )
@@ -3338,6 +4742,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     static let toolbarSettingsIdentifier = NSToolbarItem.Identifier(
         "com.usagemonitor.local.dashboard-settings"
     )
+    static let mandatoryDashboardToolbarItemIdentifiers: Set<
+        NSToolbarItem.Identifier
+    > = [
+        .toggleSidebar,
+        toolbarStatusRefreshIdentifier,
+        toolbarShareIdentifier,
+        toolbarSettingsIdentifier,
+    ]
     private let statusLabel = NSTextField(labelWithString:
         TiboTattleLocalization.string(.launcherStartingLocally))
     private let detailLabel = NSTextField(
@@ -3405,6 +4817,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         self.semanticOpenTarget = semanticOpenTarget
         self.loginItemManager = loginItemManager
         super.init()
+        keychainMigrationApproval.onPresentationChange = { [weak self] in
+            self?.updateKeychainMigrationPresentation()
+        }
         updater.onStateChange = { [weak self] in
             self?.updateUpdaterPresentation()
         }
@@ -3412,10 +4827,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = umask(0o077)
+        workspaceWakeObserver = NSWorkspace.shared.notificationCenter
+            .addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.reconcileNativeRefreshStatus()
+            }
+        applyAppearancePreference(notifyDashboard: false)
         installApplicationMenu()
         createWindow()
         // Installed before any early return below so a launch that fails still
         // leaves a visible, quittable presence in the menu bar.
+        if let root = try? ownerOnlyStateRoot() {
+            TrayPreferenceStore.shared.configure(
+                directory: root,
+                existingInstall: (try? hasCompletedFirstRun(stateRoot: root)) ?? true,
+                legacy: UserDefaults.standard.string(forKey: "tibotattle.menu-bar-allowance.v1")
+                    ?? UserDefaults.standard.string(forKey: "menuBarDisplayMode")
+            )
+        }
         installMenuBarStatus()
         do {
             centralService = try CentralServiceConfiguration.bundled()
@@ -3478,6 +4910,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // Read-only resynchronization after a user changes notification
         // permission in System Settings. This path cannot prompt by itself.
         quotaNotificationCoordinator?.refreshAuthorization()
+        // System appearance can change while TiboTattle is inactive. AppKit
+        // already updates native dynamic colors; this keeps the live report's
+        // explicit document theme synchronized when the window returns.
+        synchronizeResolvedAppearance()
+        reconcileNativeRefreshStatus()
     }
 
     private func showFirstRunDisclosure() -> Bool {
@@ -3486,25 +4923,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             .launcherWelcome,
             BundledProduct.displayName
         )
-        alert.informativeText = """
-        \(BundledProduct.displayName) updates local \(BundledProduct.monitoredAppDisplayName) metadata while the app is open. The first pass starts after setup; later checks reuse the same bounded local companion.
-
-        Reads: timestamps, model and speed labels, token counters, tool categories, and quota snapshots from the selected \(BundledProduct.monitoredAppDisplayName) sessions folders.
-
-        Stores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only \(BundledProduct.displayName) app-data folder.
-
-        Community contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.
-
-        Local allowance notifications are also off by default. If you later enable them in Settings, threshold and reset alerts stay on this Mac and evaluate only fresh provider-reported quota observations from the existing foreground refresh. A reset alert uses the provider-reported reset time and fires once when the next refresh arrives at or after it; an observed reset identity strengthens dedupe when available. They do not add a timer, daemon, login item, or background network polling.
-
-        \(updater.firstRunUpdatesDisclosure)
-
-        Never contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.
-
-        Keep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints.
-
-        \(TiboTattleLocalization.string(.firstRunLoginItemDisclosure))
-        """
+        alert.informativeText = TiboTattleLocalization.format(
+            .launcherFirstRunDisclosure,
+            BundledProduct.displayName,
+            BundledProduct.monitoredAppDisplayName,
+            BundledProduct.monitoredAppDisplayName,
+            BundledProduct.displayName,
+            updater.firstRunUpdatesDisclosure,
+            TiboTattleLocalization.string(.firstRunLoginItemDisclosure)
+        )
         let startAtLogin = NSButton(
             checkboxWithTitle: TiboTattleLocalization.string(
                 .settingsStartAtLogin
@@ -3581,8 +5008,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         return true
     }
 
+    /// Main-thread ownership includes detached generations until their broker
+    /// writer barriers finish. A later destructive reset must await them too.
+    private func retireCompanion(
+        _ previous: CompanionProcess,
+        completion: @escaping () -> Void = {}
+    ) {
+        let identifier = ObjectIdentifier(previous)
+        retiringCompanions[identifier] = previous
+        previous.stop { [weak self, weak previous] in
+            DispatchQueue.main.async {
+                if let self, let previous, self.retiringCompanions[identifier] === previous {
+                    self.retiringCompanions.removeValue(forKey: identifier)
+                }
+                completion()
+            }
+        }
+    }
+
     private func startCompanion() {
         guard !quitting, retryAllowed, firstRunAcknowledged,
+              keychainResetGeneration == nil, keychainResetProcess == nil,
+              companion == nil,
               let codexHomeConfiguration
         else { return }
         startupTimeout?.cancel()
@@ -3609,6 +5056,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let process = CompanionProcess(
             centralService: centralService,
             codexHome: codexHomeConfiguration.url,
+            onMigrationStatus: { [weak self] status in
+                DispatchQueue.main.async {
+                    guard let self, !self.quitting,
+                          selectedGeneration == self.launchGeneration
+                    else { return }
+                    self.keychainMigrationApproval.observe(status)
+                }
+            },
             onReady: { [weak self] url in
                 DispatchQueue.main.async {
                     self?.companionReady(
@@ -3642,7 +5097,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 }
                 self.launchGeneration += 1
                 self.companion = nil
-                process.stop {}
+                self.retireCompanion(process)
                 self.showFailure(LauncherError.companionTimeout)
             }
             startupTimeout = timeout
@@ -3654,6 +5109,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
         } catch {
             companion = nil
+            retireCompanion(process)
             showFailure(error)
         }
     }
@@ -3933,6 +5389,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         ]
     }
 
+    /// These controls are the native shell's only routes to navigation,
+    /// refresh, sharing, and Settings. AppKit's accessibility actions can
+    /// otherwise offer "Remove from Toolbar" even though customization and
+    /// configuration persistence are disabled. Declaring the product controls
+    /// immovable prevents user-initiated dragging or removal while leaving the
+    /// flexible spacer free to do its normal layout work.
+    func toolbarImmovableItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> Set<NSToolbarItem.Identifier> {
+        Self.mandatoryDashboardToolbarItemIdentifiers
+    }
+
     func toolbar(
         _ toolbar: NSToolbar,
         itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
@@ -4007,11 +5475,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             nativeStatusPill = pill
             nativeStatusToolbarItem = item
             updateNativeToolbar(
-                title: nativeToolbarEvidenceTitle(
-                    fallback: TiboTattleLocalization.string(
-                        .launcherStartingLocally
-                    )
-                ),
+                title: nativeRefreshInFlight
+                    ? nativeRefreshProgress?.nativeToolbarTitle()
+                        ?? TiboTattleLocalization.string(
+                            .nativeDashboardUpdating
+                        )
+                    : nativeToolbarEvidenceTitle(
+                        fallback: TiboTattleLocalization.string(
+                            .launcherStartingLocally
+                        )
+                    ),
                 isRefreshing: nativeRefreshInFlight,
                 refreshEnabled: dashboardURL != nil
             )
@@ -4057,18 +5530,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         refreshEnabled: Bool
     ) {
         let statusTitle = isRefreshing
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? title
             : nativeToolbarEvidenceTitle(fallback: title)
         nativeStatusRefreshButton?.title = statusTitle
         nativeStatusRefreshButton?.toolTip = isRefreshing
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? statusTitle
             : nativeRefreshToolbarTooltip()
         nativeStatusRefreshButton?.image = NSImage(
             systemSymbolName: isRefreshing
                 ? "arrow.triangle.2.circlepath.circle.fill"
                 : "arrow.clockwise",
             accessibilityDescription: isRefreshing
-                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                ? statusTitle
                 : TiboTattleLocalization.string(
                     .nativeDashboardRefreshUsage
                 )
@@ -4082,13 +5555,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     /// The pill's colorway follows nativeToolbarEvidenceTitle's own
-    /// precedence — a running refresh, then a terminal failure, then an
-    /// incomplete history index, and only then the evidence state — so the
-    /// color never claims a state the words do not.
+    /// precedence — a running refresh, an attested partial-coverage result,
+    /// then a hard terminal failure, an incomplete history index, and only
+    /// then the evidence state — so the color never claims a state the words
+    /// do not.
     private func nativeToolbarStatusColor(
         isRefreshing: Bool
     ) -> NativeToolbarStatusColor {
         if isRefreshing {
+            return .busy
+        }
+        if nativeRefreshFailure?.suppressesAutomaticRetry == true,
+           let coverage = nativeHistoryIndexingCoverage,
+           coverage.partialTerminal {
             return .busy
         }
         if nativeRefreshFailure != nil {
@@ -4108,7 +5587,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func refreshNativeToolbarLocalization() {
         let statusTitle = nativeRefreshInFlight
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? nativeRefreshProgress?.nativeToolbarTitle()
+                ?? TiboTattleLocalization.string(.nativeDashboardUpdating)
             : nativeToolbarEvidenceTitle(
                 fallback: TiboTattleLocalization.string(
                     .nativeDashboardStatus
@@ -4116,14 +5596,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
         nativeStatusRefreshButton?.title = statusTitle
         nativeStatusRefreshButton?.toolTip = nativeRefreshInFlight
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? statusTitle
             : nativeRefreshToolbarTooltip()
         nativeStatusRefreshButton?.image = NSImage(
             systemSymbolName: nativeRefreshInFlight
                 ? "arrow.triangle.2.circlepath.circle.fill"
                 : "arrow.clockwise",
             accessibilityDescription: nativeRefreshInFlight
-                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                ? statusTitle
                 : TiboTattleLocalization.string(
                     .nativeDashboardRefreshUsage
                 )
@@ -4161,7 +5641,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc private func refreshDashboardFromToolbar() {
         // This reuses the existing foreground-only Node companion path. The
         // toolbar never starts a helper, daemon, or separate background task.
-        refreshLocalUsage(automatic: false)
+        refreshLocalUsage(automatic: false, mode: .detailed)
     }
 
     @objc private func showShareCardFromToolbar() {
@@ -4170,22 +5650,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         else {
             return
         }
-        nativeDashboardChrome?.select(.overview)
+        nativeDashboardChrome?.select(.weekly)
         // This is a closed local navigation: it exposes the report's already
         // rendered, privacy-reviewed share card and does not generate a new
         // process, read path, or native-to-JavaScript capability.
         webView.evaluateJavaScript("""
-        if (window.location.hash !== '#overview') {
-          window.location.hash = '#overview';
-        } else {
-          window.dispatchEvent(new HashChangeEvent('hashchange'));
-        }
-        window.setTimeout(function () {
-          document.getElementById('share-panel')?.scrollIntoView({
-            behavior: 'smooth',
-            block: 'start'
-          });
-        }, 0);
+        (function () {
+          function focusShareCard() {
+            window.requestAnimationFrame(function () {
+              document.getElementById('share-panel')?.scrollIntoView({
+                behavior: 'smooth',
+                block: 'start'
+              });
+            });
+          }
+          if (window.location.hash !== '#weekly') {
+            window.addEventListener('hashchange', focusShareCard, { once: true });
+            window.location.hash = '#weekly';
+          } else {
+            window.dispatchEvent(new HashChangeEvent('hashchange'));
+            focusShareCard();
+          }
+        }());
         """)
     }
 
@@ -4197,6 +5683,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         webView: WKWebView
     ) -> NativeDashboardChrome {
         let chrome = NativeDashboardChrome(webView: webView)
+        chrome.onAppearanceChange = { [weak self] in
+            self?.synchronizeResolvedAppearance()
+        }
         dashboardContentController?.addChild(chrome)
         let chromeView = chrome.view
         chromeView.translatesAutoresizingMaskIntoConstraints = false
@@ -4260,8 +5749,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let host = dashboardWebHost ?? {
             let created = DashboardWebHost(
                 onLoaded: { [weak self] in self?.dashboardWebViewLoaded() },
-                onFailure: { [weak self] code in
-                    self?.dashboardWebViewFailed(code: code)
+                onFailure: { [weak self] failure in
+                    self?.dashboardWebViewFailed(failure)
                 },
                 onDownloadFailure: { [weak self] in
                     self?.reportDashboardDownloadFailure()
@@ -4274,6 +5763,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 },
                 onLanguagePreferenceChange: { [weak self] preference in
                     self?.changeLanguagePreference(preference)
+                },
+                onReadinessDelay: { [weak self] in
+                    self?.dashboardWebViewTakingLonger()
                 }
             )
             let chrome = installDashboardChrome(webView: created.webView)
@@ -4290,7 +5782,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             TiboTattleLocalization.string(.launcherLoadingPrivateDashboard)
         updateNativeToolbar(
             title: nativeRefreshInFlight
-                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                ? nativeRefreshProgress?.nativeToolbarTitle()
+                    ?? TiboTattleLocalization.string(
+                        .nativeDashboardUpdating
+                    )
                 : TiboTattleLocalization.string(.nativeDashboardStarting),
             isRefreshing: nativeRefreshInFlight,
             refreshEnabled: dashboardURL != nil
@@ -4310,7 +5805,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         host.load(url)
     }
 
+    private func dashboardWebViewTakingLonger() {
+        // The document is still loading honest local evidence. Keep it visible
+        // and keep the one pending startup refresh; no failure/reset is implied.
+        lastLifecycleStatus = "Dashboard loading slowly"
+        updateNativeToolbar(
+            title: TiboTattleLocalization.string(.nativeDashboardStarting),
+            isRefreshing: nativeRefreshInFlight,
+            refreshEnabled: dashboardURL != nil
+        )
+    }
+
     private func dashboardWebViewLoaded() {
+        if lastFailureCode == LauncherError.dashboardReadinessTimeout.failureCode {
+            lastFailureCode = nil
+            lastRecoverySuggestion = nil
+        }
         dashboardWebViewShowing = true
         dashboardContainer.isHidden = false
         statusStack.isHidden = true
@@ -4319,7 +5829,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         openInBrowserButton.isEnabled = true
         updateNativeToolbar(
             title: nativeRefreshInFlight
-                ? "Updating local usage…"
+                ? nativeRefreshProgress?.nativeToolbarTitle()
+                    ?? TiboTattleLocalization.string(
+                        .nativeDashboardUpdating
+                    )
                 : "Local report ready",
             isRefreshing: nativeRefreshInFlight,
             refreshEnabled: dashboardURL != nil
@@ -4332,7 +5845,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         if startupAutomaticRefreshPending {
             startupAutomaticRefreshPending = false
-            refreshLocalUsage(automatic: true)
+            refreshLocalUsage(automatic: true, mode: .quick)
         }
     }
 
@@ -4363,19 +5876,85 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     /// Updates are automatic only while the ordinary app is open. A login
     /// item (if enabled) launches that same foreground app; it never starts a
-    /// separate worker, daemon, or background URL session. The same bounded
-    /// loopback refresh route remains the only reader, so a manual click and
-    /// the foreground cadence cannot start two scans at once.
-    private func refreshLocalUsage(automatic: Bool) {
+    /// separate worker, daemon, or background URL session. Both explicit
+    /// loopback refresh modes share one companion controller, so a manual
+    /// click and the foreground cadence cannot start two scans at once.
+    private func refreshLocalUsage(
+        automatic: Bool,
+        mode requestedMode: LocalAnalysisMode,
+        allowAutomaticDetailed: Bool = false,
+        cadenceStatusChecked: Bool = false
+    ) {
         guard !quitting,
               !nativeRefreshInFlight,
+              !(automatic
+                && nativeRefreshFailure?.suppressesAutomaticRetry == true),
               let dashboardURL
         else {
             return
         }
+        if automatic, allowAutomaticDetailed, !cadenceStatusChecked {
+            // A browser-started detailed run can finish between native polls.
+            // Reconcile its actual-start receipt before spending the hourly
+            // allowance; unavailable or running state permits only a quick
+            // request (which may join the one controller-owned active run).
+            let observedSequence = nativeRefreshSequence
+            var resolved = false
+            let fallback = DispatchWorkItem { [weak self] in
+                guard let self, !resolved, !self.quitting,
+                      !self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == observedSequence
+                else { return }
+                resolved = true
+                self.refreshLocalUsage(automatic: true, mode: .quick)
+            }
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(
+                    Self.nativeRefreshStartWatchdogMilliseconds
+                ),
+                execute: fallback
+            )
+            nativeEvidenceReader.readAnalysisActivity(base: dashboardURL) {
+                [weak self] activity in
+                guard let self, !resolved, !self.quitting,
+                      !self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == observedSequence
+                else { return }
+                resolved = true
+                fallback.cancel()
+                let controllerIdle: Bool
+                if case .idle = activity { controllerIdle = true }
+                else { controllerIdle = false }
+                self.refreshLocalUsage(
+                    automatic: true,
+                    mode: .quick,
+                    allowAutomaticDetailed: controllerIdle,
+                    cadenceStatusChecked: true
+                )
+            }
+            return
+        }
+        let mode: LocalAnalysisMode
+        if automatic, allowAutomaticDetailed {
+            mode = NativeDetailedRefreshCadence.automaticMode()
+        } else {
+            if automatic {
+                NativeDetailedRefreshCadence.seedIfMissing()
+            }
+            mode = requestedMode
+        }
+        let detailedReservation = mode == .detailed
+            ? NativeDetailedRefreshCadence.recordDetailedAttempt()
+            : nil
+        keychainMigrationRefreshPending = false
         cancelNativeRefreshSchedule()
         cancelNativeIndexingCoveragePoll()
         nativeRefreshInFlight = true
+        nativeRefreshStartFence.begin()
+        nativeRefreshSequence &+= 1
+        let refreshSequence = nativeRefreshSequence
+        nativeRefreshNotificationID = nil
+        nativeRefreshProgress = nil
         updateNativeToolbar(
             title: automatic
                 ? TiboTattleLocalization.string(.launcherUpdatingAutomatically)
@@ -4383,12 +5962,49 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             isRefreshing: true,
             refreshEnabled: false
         )
-        nativeEvidenceReader.startAnalysis(base: dashboardURL) { [weak self] result in
-            guard let self, !self.quitting else { return }
+        let startWatchdog = DispatchWorkItem { [weak self] in
+            guard let self, !self.quitting, self.nativeRefreshInFlight,
+                  self.nativeRefreshSequence == refreshSequence
+            else { return }
+            self.nativeRefreshNotificationID = nil
+            self.pollNativeRefresh(
+                base: dashboardURL,
+                remainingAttempts: Self.nativeRefreshMaximumPollAttempts,
+                sequence: refreshSequence
+            )
+        }
+        nativeRefreshStartWatchdog = startWatchdog
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(
+                Self.nativeRefreshStartWatchdogMilliseconds
+            ),
+            execute: startWatchdog
+        )
+        nativeEvidenceReader.startAnalysis(
+            base: dashboardURL,
+            mode: mode
+        ) { [weak self] result in
+            guard let self, !self.quitting,
+                  self.nativeRefreshSequence == refreshSequence
+            else { return }
+            self.nativeRefreshStartWatchdog?.cancel()
+            self.nativeRefreshStartWatchdog = nil
+            self.nativeRefreshStartFence.resolve()
+            if case let .alreadyRunning(_, attempt) = result {
+                NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+                    detailedReservation,
+                    attempt: attempt
+                )
+            }
             switch result {
-            case let .started(refreshID), let .alreadyRunning(refreshID):
+            case let .started(refreshID, _), let .alreadyRunning(refreshID, _):
                 self.nativeRefreshID = refreshID
-                self.pollNativeRefresh(base: dashboardURL, remainingAttempts: 120)
+                self.nativeRefreshNotificationID = refreshID
+                self.pollNativeRefresh(
+                    base: dashboardURL,
+                    remainingAttempts: Self.nativeRefreshMaximumPollAttempts,
+                    sequence: refreshSequence
+                )
             case .rejected:
                 self.nativeEvidenceState = .readFailed
                 self.quotaNotificationCoordinator?.recordIneligible(
@@ -4418,97 +6034,287 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
     }
 
-    private func pollNativeRefresh(base: URL, remainingAttempts: Int) {
+    private func pollNativeRefresh(
+        base: URL,
+        remainingAttempts: Int,
+        sequence: UInt64
+    ) {
         cancelNativeRefreshPoll()
+        let pollIntervalMilliseconds = remainingAttempts > 0
+            ? Self.nativeRefreshPollIntervalMilliseconds
+            : Self.nativeRefreshSettlementPollIntervalMilliseconds
         let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.quitting, self.nativeRefreshInFlight else {
+            guard let self, !self.quitting, self.nativeRefreshInFlight,
+                  self.nativeRefreshSequence == sequence
+            else {
                 return
             }
+            self.nativeRefreshReadEpoch &+= 1
+            let readEpoch = self.nativeRefreshReadEpoch
+            let startObservation = self.nativeRefreshStartFence.observation()
+            let watchdog = DispatchWorkItem { [weak self] in
+                guard let self, !self.quitting, self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == sequence,
+                      self.nativeRefreshReadEpoch == readEpoch
+                else { return }
+                self.pollNativeRefresh(
+                    base: base,
+                    remainingAttempts: max(0, remainingAttempts - 1),
+                    sequence: sequence
+                )
+            }
+            self.nativeRefreshReadWatchdog = watchdog
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(
+                    Self.nativeRefreshReadWatchdogMilliseconds
+                ),
+                execute: watchdog
+            )
             self.nativeEvidenceReader.readAnalysisActivity(base: base) { [weak self] activity in
-                guard let self, !self.quitting, self.nativeRefreshInFlight else {
+                guard let self, !self.quitting, self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == sequence,
+                      self.nativeRefreshReadEpoch == readEpoch
+                else {
                     return
                 }
-                let terminalRefreshID: String?
+                self.nativeRefreshReadWatchdog?.cancel()
+                self.nativeRefreshReadWatchdog = nil
                 switch activity {
-                case .running:
-                    terminalRefreshID = nil
-                    if remainingAttempts > 0 {
+                case let .running(refreshID, progress, _):
+                    if let refreshID {
+                        if self.nativeRefreshNotificationID != refreshID {
+                            self.nativeRefreshNotificationID = nil
+                        }
+                        self.nativeRefreshID = refreshID
+                    }
+                    self.nativeRefreshProgress = progress
+                    self.updateNativeToolbar(
+                        // The refresh receipt has not supplied a matched
+                        // numeric overview snapshot. In particular,
+                        // `quick_result` is only a collector checkpoint, so it
+                        // must use neutral continuation copy here. The
+                        // allowlisted unified-index receipt below supersedes it
+                        // with bounded file counts as soon as deep work starts.
+                        title: progress?.nativeToolbarTitle(
+                            hasUsableHeadlineEvidence: false
+                        )
+                            ?? TiboTattleLocalization.string(
+                                .nativeDashboardUpdating
+                            ),
+                        isRefreshing: true,
+                        refreshEnabled: false
+                    )
+                    if remainingAttempts <= 0 {
+                        // Exhausting this surface's progress budget is not a
+                        // terminal companion receipt. Keep the refresh locked
+                        // and visibly unsettled until the controller reports
+                        // idle; otherwise a still-running cold build could be
+                        // mislabeled "Up to date" and a second pass enabled.
+                        self.updateNativeToolbar(
+                            title: TiboTattleLocalization.string(
+                                .launcherDashboardTakingLonger
+                            ),
+                            isRefreshing: true,
+                            refreshEnabled: false
+                        )
                         self.pollNativeRefresh(
                             base: base,
-                            remainingAttempts: remainingAttempts - 1
+                            remainingAttempts: 0,
+                            sequence: sequence
                         )
                         return
                     }
-                case let .idle(refreshID):
-                    terminalRefreshID = refreshID
-                case .none:
-                    terminalRefreshID = nil
-                }
-                self.nativeEvidenceReader.readOverview(base: base) { [weak self] overview in
-                    guard let self, !self.quitting else { return }
-                    if let overview {
-                        self.nativeEvidenceObservedAt = overview.observedAt
-                        switch LocalCompanionOverviewProjection.evidence(
-                            for: overview
-                        ) {
-                        case .live:
-                            self.nativeEvidenceState = .live
-                        case .stale:
-                            self.nativeEvidenceState = .stale
-                        case .none:
-                            self.nativeEvidenceState = .unknown
-                        }
-                    } else {
-                        // Keep any last observed timestamp for honest age
-                        // context, but distinguish a transient read failure
-                        // from a dead companion process.
-                        self.nativeEvidenceState = .readFailed
-                    }
-                    let title: String
-                    if let overview,
-                       LocalCompanionOverviewProjection.evidence(
-                        for: overview
-                       ) == .live {
-                        title = TiboTattleLocalization.string(.launcherUpToDate)
-                    } else if overview?.lanes.isEmpty == false {
-                        title = TiboTattleLocalization.string(
-                            .launcherNeedsAttention
-                        )
-                    } else {
-                        title = TiboTattleLocalization.string(
-                            .launcherNoAllowanceObserved
-                        )
-                    }
-                    let expectedRefreshID = terminalRefreshID == self.nativeRefreshID
-                        ? self.nativeRefreshID
-                        : nil
-                    self.evaluateQuotaNotificationsAfterRefresh(
+                    self.pollNativeRefresh(
                         base: base,
-                        expectedRefreshID: expectedRefreshID
+                        remainingAttempts: remainingAttempts - 1,
+                        sequence: sequence
                     )
-                    // The pill's terminal state is decided only after the
-                    // companion's own coverage counts and refresh receipt
-                    // have been re-read; a failed pass or a still-building
-                    // index then takes the title over the evidence prose.
-                    self.readNativeToolbarStatusFacts(base: base) { [weak self] in
-                        self?.finishNativeRefresh(
-                            title: title,
-                            refreshEnabled: true
+                    return
+                case let .idle(refreshID, _, _):
+                    guard self.nativeRefreshStartFence.allowsTerminal(
+                        startObservation
+                    ) else {
+                        self.pollNativeRefresh(
+                            base: base,
+                            remainingAttempts: max(0, remainingAttempts - 1),
+                            sequence: sequence
                         )
+                        return
                     }
+                    self.handleNativeRefreshTerminal(
+                        base: base,
+                        terminalRefreshID: refreshID,
+                        sequence: sequence,
+                        startObservation: startObservation
+                    )
+                    return
+                case .none:
+                    // A failed or future-schema activity read is not evidence
+                    // that the accepted refresh stopped. Keep the control
+                    // locked and retry; companion exit/teardown owns the
+                    // separate unavailable lifecycle.
+                    self.nativeEvidenceState = .readFailed
+                    self.updateNativeToolbar(
+                        title: TiboTattleLocalization.string(
+                            .menuBarQuotaEvidenceUnavailable
+                        ),
+                        isRefreshing: true,
+                        refreshEnabled: false
+                    )
+                    self.pollNativeRefresh(
+                        base: base,
+                        remainingAttempts: max(0, remainingAttempts - 1),
+                        sequence: sequence
+                    )
+                    return
                 }
             }
         }
         nativeRefreshPoll = work
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + .milliseconds(750),
+            deadline: .now() + .milliseconds(
+                pollIntervalMilliseconds
+            ),
             execute: work
         )
     }
 
+    /// The companion's terminal receipt is authoritative for whether work is
+    /// still running. Clear the busy latch before any optional overview or
+    /// coverage read: those reads may fail or lose a callback, but cannot turn
+    /// an already-terminal refresh back into an endless spinner.
+    private func handleNativeRefreshTerminal(
+        base: URL,
+        terminalRefreshID: String?,
+        sequence: UInt64,
+        startObservation: NativeRefreshStartFence.Observation
+    ) {
+        guard nativeRefreshInFlight, nativeRefreshSequence == sequence,
+              nativeRefreshStartFence.allowsTerminal(startObservation)
+        else {
+            return
+        }
+        let expectedRefreshID = terminalRefreshID == nativeRefreshNotificationID
+            ? nativeRefreshNotificationID
+            : nil
+        settleNativeRefresh(
+            title: TiboTattleLocalization.string(.nativeDashboardStatus),
+            refreshEnabled: true
+        )
+        let presentationSequence = nativeRefreshSequence
+        evaluateQuotaNotificationsAfterRefresh(
+            base: base,
+            expectedRefreshID: expectedRefreshID
+        )
+        nativeEvidenceReader.readOverview(base: base) { [weak self] overview in
+            guard let self, !self.quitting,
+                  !self.nativeRefreshInFlight,
+                  self.nativeRefreshSequence == presentationSequence
+            else { return }
+            if let overview {
+                self.nativeEvidenceObservedAt = overview.observedAt
+                switch LocalCompanionOverviewProjection.evidence(for: overview) {
+                case .live:
+                    self.nativeEvidenceState = .live
+                case .stale:
+                    self.nativeEvidenceState = .stale
+                case .none:
+                    self.nativeEvidenceState = .unknown
+                }
+            } else {
+                self.nativeEvidenceState = .readFailed
+            }
+            let title: String
+            if let overview,
+               LocalCompanionOverviewProjection.evidence(for: overview) == .live {
+                title = TiboTattleLocalization.string(.launcherUpToDate)
+            } else if overview?.lanes.isEmpty == false {
+                title = TiboTattleLocalization.string(.launcherNeedsAttention)
+            } else {
+                title = TiboTattleLocalization.string(
+                    .launcherNoAllowanceObserved
+                )
+            }
+            self.readNativeToolbarStatusFacts(base: base) { [weak self] in
+                guard let self, !self.quitting,
+                      !self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == presentationSequence
+                else { return }
+                self.updateNativeToolbar(
+                    title: title,
+                    isRefreshing: false,
+                    refreshEnabled: true
+                )
+            }
+        }
+    }
+
+    /// Re-adopt a companion run after activation or wake, and clear only from
+    /// an explicit terminal receipt. An unreadable or future-schema response
+    /// is deliberately a no-op because it is not evidence that work stopped.
+    private func reconcileNativeRefreshStatus() {
+        guard !quitting, let base = dashboardURL else { return }
+        let observedSequence = nativeRefreshSequence
+        let startObservation = nativeRefreshStartFence.observation()
+        nativeEvidenceReader.readAnalysisActivity(base: base) { [weak self] activity in
+            guard let self, !self.quitting,
+                  self.nativeRefreshSequence == observedSequence
+            else { return }
+            switch activity {
+            case let .running(refreshID, progress, _):
+                if !self.nativeRefreshInFlight {
+                    self.cancelNativeRefreshSchedule()
+                    self.cancelNativeIndexingCoveragePoll()
+                    self.nativeRefreshInFlight = true
+                    self.nativeRefreshSequence &+= 1
+                    self.nativeRefreshNotificationID = nil
+                }
+                let sequence = self.nativeRefreshSequence
+                if let refreshID {
+                    if self.nativeRefreshNotificationID != refreshID {
+                        self.nativeRefreshNotificationID = nil
+                    }
+                    self.nativeRefreshID = refreshID
+                }
+                self.nativeRefreshProgress = progress
+                self.updateNativeToolbar(
+                    title: progress?.nativeToolbarTitle()
+                        ?? TiboTattleLocalization.string(
+                            .nativeDashboardUpdating
+                        ),
+                    isRefreshing: true,
+                    refreshEnabled: false
+                )
+                self.pollNativeRefresh(
+                    base: base,
+                    remainingAttempts: Self.nativeRefreshMaximumPollAttempts,
+                    sequence: sequence
+                )
+            case let .idle(refreshID, _, _):
+                guard self.nativeRefreshInFlight else { return }
+                self.handleNativeRefreshTerminal(
+                    base: base,
+                    terminalRefreshID: refreshID,
+                    sequence: observedSequence,
+                    startObservation: startObservation
+                )
+            case .none:
+                return
+            }
+        }
+    }
+
     private func finishNativeRefresh(title: String, refreshEnabled: Bool) {
+        settleNativeRefresh(title: title, refreshEnabled: refreshEnabled)
+    }
+
+    private func settleNativeRefresh(title: String, refreshEnabled: Bool) {
+        nativeRefreshSequence &+= 1
         nativeRefreshInFlight = false
+        nativeRefreshStartFence.resolve()
+        nativeRefreshProgress = nil
         nativeRefreshID = nil
+        nativeRefreshNotificationID = nil
         cancelNativeRefreshPoll()
         updateNativeToolbar(
             title: title,
@@ -4521,6 +6327,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // refresh still leaves the page asserting a freshness this window can
         // no longer vouch for.
         dashboardWebHost?.notifyLocalEvidenceUpdated()
+        if keychainMigrationRefreshPending {
+            refreshAfterKeychainMigration()
+            return
+        }
         scheduleNativeRefresh()
         scheduleNativeIndexingCoveragePoll()
     }
@@ -4546,9 +6356,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             self.nativeEvidenceReader.readRefreshTerminalObservation(base: base) { [weak self] terminal in
                 guard let self, !self.quitting else { return }
                 switch terminal {
-                case let .failed(step):
+                case let .failed(step, code):
                     self.nativeRefreshFailure = NativeRefreshFailure(
-                        failedStep: step
+                        failedStep: step,
+                        failureCode: code
                     )
                 case .notFailed:
                     self.nativeRefreshFailure = nil
@@ -4585,8 +6396,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func cancelNativeRefreshPoll() {
+        nativeRefreshStartWatchdog?.cancel()
+        nativeRefreshStartWatchdog = nil
         nativeRefreshPoll?.cancel()
         nativeRefreshPoll = nil
+        nativeRefreshReadWatchdog?.cancel()
+        nativeRefreshReadWatchdog = nil
+        nativeRefreshReadEpoch &+= 1
     }
 
     /// The foreground app keeps its own local evidence current while a
@@ -4595,9 +6411,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     /// background worker or keeps the app alive after quit.
     private func scheduleNativeRefresh() {
         cancelNativeRefreshSchedule()
-        guard !quitting, dashboardURL != nil else { return }
+        guard !quitting,
+              dashboardURL != nil,
+              nativeRefreshFailure?.suppressesAutomaticRetry != true
+        else {
+            return
+        }
         let work = NativeForegroundRefreshScheduler.schedule { [weak self] in
-            self?.refreshLocalUsage(automatic: true)
+            self?.refreshLocalUsage(
+                automatic: true,
+                mode: .quick,
+                allowAutomaticDetailed: true
+            )
         }
         nativeRefreshSchedule = work
     }
@@ -4621,7 +6446,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         guard !quitting,
               dashboardURL != nil,
               let coverage = nativeHistoryIndexingCoverage,
-              !coverage.isComplete
+              !coverage.isComplete,
+              !coverage.partialTerminal
         else {
             return
         }
@@ -4682,6 +6508,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         settings.target = self
         appMenu.addItem(settings)
+        let migration = NSMenuItem(
+            title: TiboTattleLocalization.string(.settingsKeychainMigrationMenu),
+            action: #selector(showKeychainMigrationSettings),
+            keyEquivalent: ""
+        )
+        migration.target = self
+        migration.isHidden = !keychainMigrationApproval.showsMenuItem
+        keychainMigrationMenuItem = migration
+        appMenu.addItem(migration)
         appMenu.addItem(.separator())
         let quit = NSMenuItem(
             title: TiboTattleLocalization.format(
@@ -4768,21 +6603,42 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         alert.runModal()
     }
 
-    private func dashboardWebViewFailed(code: String) {
+    private func dashboardWebViewFailed(_ failure: LauncherError) {
         cancelNativeRefreshSchedule()
-        startupAutomaticRefreshPending = false
+        // A hard readiness deadline stops observation, not the still-unspent
+        // initial refresh. An explicit Open Dashboard can load a new document
+        // and consume it once. Genuine navigation/renderer failures cancel it.
+        if case .dashboardReadinessTimeout = failure {
+            // Preserved until a valid ready result or explicit teardown.
+        } else {
+            startupAutomaticRefreshPending = false
+        }
         nativeEvidenceState = .readFailed
         dashboardWebViewShowing = false
         dashboardContainer.isHidden = true
         statusStack.isHidden = false
         actionRow.isHidden = false
-        let failure = LauncherError.dashboardWebViewUnavailable
-        lastLifecycleStatus = "Dashboard unavailable"
+        let headline: TiboTattleLocalization.Key
+        switch failure {
+        case .dashboardContentProcessTerminated:
+            lastLifecycleStatus = "Dashboard web process terminated"
+            headline = .launcherDashboardDidNotOpen
+        case .dashboardNavigationFailed:
+            lastLifecycleStatus = "Dashboard navigation failed"
+            headline = .launcherDashboardDidNotOpen
+        case .dashboardReadinessTimeout:
+            lastLifecycleStatus = "Dashboard readiness timed out"
+            headline = .launcherDashboardTakingLonger
+        case .dashboardViewportUnavailable:
+            lastLifecycleStatus = "Dashboard viewport unavailable"
+            headline = .launcherDashboardDidNotOpen
+        default:
+            lastLifecycleStatus = "Dashboard unavailable"
+            headline = .launcherDashboardDidNotOpen
+        }
         lastFailureCode = failure.failureCode
         lastRecoverySuggestion = failure.recoverySuggestion
-        statusLabel.stringValue = TiboTattleLocalization.string(
-            .launcherDashboardDidNotOpen
-        )
+        statusLabel.stringValue = TiboTattleLocalization.string(headline)
         detailLabel.stringValue = TiboTattleLocalization.format(
             .launcherFailureDetails,
             failure.errorDescription ?? "",
@@ -4829,6 +6685,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         nativeHistoryIndexingCoverage = nil
         nativeRefreshFailure = nil
         nativeRefreshInFlight = false
+        nativeRefreshStartFence.resolve()
+        nativeRefreshProgress = nil
         nativeRefreshID = nil
         dashboardWebHost?.stop()
         updateNativeToolbar(
@@ -4839,8 +6697,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     /// A link the embedded dashboard cannot load itself. Only credential-free
-    /// public HTTPS is handed to the user's browser; the app opens nothing
-    /// else, and loads nothing remote itself.
+    /// public HTTPS is handed to the user's browser. User-activated, canonical
+    /// Codex thread links are handed to Codex after the WebHost's origin gate;
+    /// nothing remote loads inside the app.
     private func openExternalDashboardLink(_ url: URL) {
         // The completed hosted-sign-in callback can use only this fixed custom
         // URL to bring the already-running dashboard back to the foreground.
@@ -4850,6 +6709,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             dashboardWebHost?.notifyHostedSignInReturn()
             window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        if CodexThreadOpenTarget.accepts(url) {
+            NSWorkspace.shared.open(url)
             return
         }
         guard url.scheme?.lowercased() == "https",
@@ -4887,6 +6750,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     self?.evaluateQuotaNotificationsAfterRefresh(
                         expectedRefreshID: refreshID
                     )
+                },
+                openUsageAndCosts: { [weak self] in
+                    self?.openTiboTattle()
+                    self?.navigateNativeDashboard(to: .method)
                 }
             )
         )
@@ -4921,6 +6788,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         dashboardURL = url
+        updateKeychainMigrationPresentation()
         nativeEvidenceState = .unknown
         nativeEvidenceObservedAt = nil
         // A restarted companion invalidates any earlier coverage counts and
@@ -4969,6 +6837,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         startupTimeout?.cancel()
         startupTimeout = nil
         startupAutomaticRefreshPending = false
+        updateKeychainMigrationPresentation()
         if quitting || requested { return }
         dashboardURL = nil
         companion = nil
@@ -5052,18 +6921,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc private func retryCompanion() {
-        guard !quitting, retryAllowed, firstRunAcknowledged else { return }
+        guard !quitting, retryAllowed, firstRunAcknowledged,
+              keychainResetGeneration == nil, keychainResetProcess == nil else { return }
         automaticCompanionRecoveryUsed = false
-        if let previous = companion, previous.isRunning {
+        launchGeneration += 1
+        let retryGeneration = launchGeneration
+        let previous = companion
+        companion = nil
+        if let previous {
             retryButton.isEnabled = false
-            previous.stop { [weak self] in
-                DispatchQueue.main.async {
-                    self?.companion = nil
-                    self?.startCompanion()
-                }
+            retireCompanion(previous) { [weak self] in
+                guard let self, !self.quitting, self.launchGeneration == retryGeneration else { return }
+                self.startCompanion()
             }
         } else {
-            companion = nil
             startCompanion()
         }
     }
@@ -5203,6 +7074,47 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         refitSettingsWindowToContent()
     }
 
+    private func updateKeychainMigrationPresentation() {
+        let presentation = keychainMigrationApproval
+        settingsKeychainMigrationSection?.isHidden =
+            !presentation.showsSettings
+        settingsKeychainMigrationLabel?.stringValue =
+            TiboTattleLocalization.string(presentation.summaryKey)
+        settingsKeychainMigrationButton?.isEnabled =
+            presentation.canReview && !quitting && companion?.isRunning == true
+        keychainMigrationMenuItem?.isHidden = !presentation.showsMenuItem
+        // A status observation is deliberately non-modal and never opens
+        // Settings. Local quota/accounting presentation keeps its own truth.
+        refitSettingsWindowToContent()
+    }
+
+    private func refreshAfterKeychainMigration() {
+        guard !quitting else { return }
+        keychainMigrationRefreshPending = true
+        guard dashboardURL != nil, !nativeRefreshInFlight else { return }
+        // One repair refresh uses the existing local-only analysis route. It
+        // neither grants contribution consent nor starts a second scan while
+        // the current pass is still running.
+        refreshLocalUsage(automatic: false, mode: .detailed)
+    }
+
+    @objc private func showKeychainMigrationSettings() {
+        showSettings(selecting: 0)
+    }
+
+    @objc private func reviewKeychainMigration(_ sender: NSButton) {
+        guard sender === settingsKeychainMigrationButton,
+              !quitting, companion?.isRunning == true,
+              let settingsWindow
+        else { return }
+        keychainMigrationApproval.review { complete in
+            let explanation = NativeKeychainMigrationApproval.makeExplanation()
+            explanation.beginSheetModal(for: settingsWindow) { response in
+                complete(response == .alertSecondButtonReturn)
+            }
+        }
+    }
+
     private func automaticUpdatesSettingsSummary() -> String {
         updater.settingsSummary
     }
@@ -5234,16 +7146,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // index that is still building must narrate its real progress rather
         // than hiding behind a bare "Status". Once coverage is complete and
         // the last refresh succeeded, the existing vocabulary returns.
+        if nativeRefreshFailure?.suppressesAutomaticRetry == true,
+           let coverage = nativeHistoryIndexingCoverage,
+           coverage.partialTerminal {
+            return NativeToolbarStatusText.historyPartial(
+                skippedSourceCount: coverage.skippedSourceCount
+            )
+        }
         if let failure = nativeRefreshFailure {
             return NativeToolbarStatusText.refreshFailed(
                 step: failure.failedStep
             )
         }
         if let coverage = nativeHistoryIndexingCoverage, !coverage.isComplete {
-            return NativeToolbarStatusText.indexing(
-                indexedSourceCount: coverage.indexedSourceCount,
-                sourceCount: coverage.sourceCount
-            )
+            return coverage.partialTerminal
+                ? NativeToolbarStatusText.historyPartial(
+                    skippedSourceCount: coverage.skippedSourceCount
+                )
+                : NativeToolbarStatusText.indexing(
+                    indexedSourceCount: coverage.indexedSourceCount,
+                    sourceCount: coverage.sourceCount
+                )
         }
         switch nativeEvidenceState {
         case .live:
@@ -5302,6 +7225,39 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsStartAtLoginRefreshButton?.isEnabled =
             !loginItemOperationInFlight
         refitSettingsWindowToContent()
+    }
+
+    private func updateAppearanceSettingsControl() {
+        guard let picker = settingsAppearancePicker else { return }
+        let preference = NativeAppearancePreference.current
+        if let index = picker.itemArray.firstIndex(where: {
+            ($0.representedObject as? String) == preference.rawValue
+        }) {
+            picker.selectItem(at: index)
+        }
+    }
+
+    private func applyAppearancePreference(
+        notifyDashboard: Bool = true
+    ) {
+        let preference = NativeAppearancePreference.current
+        NSApp.appearance = preference.applicationAppearance
+        updateAppearanceSettingsControl()
+        window?.contentView?.needsDisplay = true
+        if notifyDashboard {
+            dashboardWebHost?.notifyAppearancePreferenceChange(preference)
+        }
+    }
+
+    private func synchronizeResolvedAppearance() {
+        let preference = NativeAppearancePreference.current
+        updateAppearanceSettingsControl()
+        window?.contentView?.needsDisplay = true
+        // Explicit Light and Dark are intentionally insulated from later
+        // system changes. Only System follows the effective AppKit appearance;
+        // selecting any preference already sends its own immediate update.
+        guard preference == .system else { return }
+        dashboardWebHost?.notifyAppearancePreferenceChange(preference)
     }
 
     private func updateRefreshIntervalSettingsControl() {
@@ -5667,12 +7623,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         updateQuotaNotificationSettingsControls()
     }
 
+    @objc private func customizeTray() { TrayCustomizationController.shared.open() }
+
     @objc private func showSettingsWindow() {
         showSettings(selecting: 0)
     }
 
     @objc private func showAbout() {
         showSettings(selecting: 2)
+    }
+
+    @objc private func selectAppearancePreference(
+        _ sender: NSPopUpButton
+    ) {
+        guard let rawPreference = sender.selectedItem?.representedObject
+            as? String,
+              let preference = NativeAppearancePreference(
+                  rawValue: rawPreference
+              )
+        else {
+            updateAppearanceSettingsControl()
+            return
+        }
+        NativeAppearancePreference.set(preference)
+        applyAppearancePreference()
     }
 
     @objc private func selectLanguagePreference(_ sender: NSPopUpButton) {
@@ -5740,12 +7714,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsWindow?.close()
         settingsWindow = nil
         settingsTabs = nil
+        settingsToolbarDelegate = nil
         settingsPages = []
         settingsCodexHomeLabel = nil
         settingsAutomaticUpdatesSwitch = nil
         settingsAboutAutomaticUpdatesDetailLabel = nil
         settingsCheckForUpdatesButton = nil
+        settingsAppearancePicker = nil
         settingsRefreshIntervalPicker = nil
+        settingsKeychainMigrationSection = nil
+        settingsKeychainMigrationLabel = nil
+        settingsKeychainMigrationButton = nil
         if shouldRestoreSettings {
             showSettings(selecting: selectedSettingsTab)
         }
@@ -5781,8 +7760,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             settingsTabs.selectedTabViewItemIndex = index
             updateSettingsCodexHomeSummary()
             updateAutomaticUpdatesSettingsControl()
+            updateAppearanceSettingsControl()
             updateRefreshIntervalSettingsControl()
             updateStartAtLoginSettingsControl()
+            updateKeychainMigrationPresentation()
             quotaNotificationCoordinator?.refreshAuthorization()
             updateQuotaNotificationSettingsControls()
             refitSettingsWindowToContent()
@@ -5808,6 +7789,74 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             action: #selector(useDefaultCodexHome)
         )
         let sourceActions = settingsControlRow([chooseSource, useDefaultSource])
+        let migrationStatus = settingsLabel(
+            TiboTattleLocalization.string(keychainMigrationApproval.summaryKey),
+            font: .systemFont(ofSize: 12),
+            color: .secondaryLabelColor
+        )
+        settingsKeychainMigrationLabel = migrationStatus
+        let reviewMigration = NSButton(
+            title: TiboTattleLocalization.string(.settingsKeychainMigrationReview),
+            target: self,
+            action: #selector(reviewKeychainMigration(_:))
+        )
+        reviewMigration.bezelStyle = .rounded
+        reviewMigration.isEnabled = keychainMigrationApproval.canReview
+            && !quitting && companion?.isRunning == true
+        reviewMigration.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsKeychainMigrationReview)
+        )
+        settingsKeychainMigrationButton = reviewMigration
+        let migrationSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsKeychainMigrationTitle),
+            symbolName: "key",
+            views: [migrationStatus, settingsControlRow([reviewMigration])]
+        )
+        migrationSection.isHidden = !keychainMigrationApproval.showsSettings
+        settingsKeychainMigrationSection = migrationSection
+        let appearancePicker = NSPopUpButton(
+            frame: .zero,
+            pullsDown: false
+        )
+        let appearanceChoices: [(
+            NativeAppearancePreference,
+            TiboTattleLocalization.Key
+        )] = [
+            (.system, .settingsAppearanceSystem),
+            (.light, .settingsAppearanceLight),
+            (.dark, .settingsAppearanceDark),
+        ]
+        for (preference, key) in appearanceChoices {
+            appearancePicker.addItem(
+                withTitle: TiboTattleLocalization.string(key)
+            )
+            appearancePicker.lastItem?.representedObject = preference.rawValue
+        }
+        appearancePicker.target = self
+        appearancePicker.action = #selector(selectAppearancePreference(_:))
+        appearancePicker.toolTip = TiboTattleLocalization.string(
+            .settingsAppearancePickerHint
+        )
+        appearancePicker.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsAppearance)
+        )
+        settingsAppearancePicker = appearancePicker
+        updateAppearanceSettingsControl()
+        let appearanceRow = NSStackView(views: [appearancePicker])
+        appearanceRow.orientation = .horizontal
+        appearanceRow.alignment = .centerY
+        let appearanceSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsAppearance),
+            symbolName: "circle.lefthalf.filled",
+            views: [
+                appearanceRow,
+                settingsLabel(
+                    TiboTattleLocalization.string(.settingsAppearanceSummary),
+                    font: .systemFont(ofSize: 12),
+                    color: .secondaryLabelColor
+                ),
+            ]
+        )
         let languagePicker = NSPopUpButton(
             frame: .zero,
             pullsDown: false
@@ -6101,6 +8150,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             title: TiboTattleLocalization.string(.settingsGeneral),
             summary: TiboTattleLocalization.string(.settingsGeneralSummary),
             views: [
+                migrationSection,
+                appearanceSection,
+                settingsGroup(title: trayText("menuBar"), symbolName: "menubar.rectangle", views: [
+                    NSButton(title: trayText("customize"), target: self, action: #selector(customizeTray))
+                ]),
                 languageSection,
                 sourceSection,
                 refreshIntervalSection,
@@ -6212,24 +8266,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
         let tabs = NSTabViewController()
         tabs.tabStyle = .toolbar
-        for (label, symbol, controller) in [
+        for (identifier, label, symbol, controller) in [
             (
+                NativeSettingsToolbarPolicy.generalIdentifier,
                 TiboTattleLocalization.string(.settingsGeneral),
                 "gearshape",
                 general.controller
             ),
             (
+                NativeSettingsToolbarPolicy.notificationsIdentifier,
                 TiboTattleLocalization.string(.settingsNotifications),
                 "bell",
                 notifications.controller
             ),
             (
+                NativeSettingsToolbarPolicy.aboutIdentifier,
                 TiboTattleLocalization.string(.settingsAboutTab),
                 "info.circle",
                 about.controller
             ),
         ] {
-            let item = NSTabViewItem(identifier: label)
+            let item = NSTabViewItem(identifier: identifier)
             item.label = label
             item.image = NSImage(
                 systemSymbolName: symbol,
@@ -6240,6 +8297,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         tabs.selectedTabViewItemIndex = index
         let newWindow = NSWindow(contentViewController: tabs)
+        let toolbarDelegate = NativeSettingsToolbarDelegate(
+            tabController: tabs
+        )
+        if let toolbar = newWindow.toolbar {
+            toolbar.allowsUserCustomization = false
+            toolbar.autosavesConfiguration = false
+            toolbar.delegate = toolbarDelegate
+        }
         newWindow.title = TiboTattleLocalization.string(.settingsWindowTitle)
         newWindow.styleMask = [.titled, .closable, .miniaturizable]
         // The window is as tall as the page it is showing. A hard-coded height
@@ -6265,6 +8330,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         newWindow.center()
         settingsWindow = newWindow
         settingsTabs = tabs
+        settingsToolbarDelegate = toolbarDelegate
+        updateKeychainMigrationPresentation()
         updateQuotaNotificationSettingsControls()
         newWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -6542,13 +8609,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         hideDashboardWebView()
         startupTimeout?.cancel()
         launchGeneration += 1
+        let restartGeneration = launchGeneration
         let previous = companion
         companion = nil
-        if let previous, previous.isRunning {
-            previous.stop { [weak self] in
-                DispatchQueue.main.async {
-                    self?.startCompanion()
-                }
+        if let previous {
+            retireCompanion(previous) { [weak self] in
+                guard let self, !self.quitting, self.launchGeneration == restartGeneration else { return }
+                self.startCompanion()
             }
         } else {
             startCompanion()
@@ -6614,7 +8681,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func performLocalKeychainReset() {
-        guard keychainResetProcess == nil else { return }
+        guard !quitting, keychainResetGeneration == nil, keychainResetProcess == nil else { return }
         lastLifecycleStatus = "Resetting local identity"
         statusLabel.stringValue = TiboTattleLocalization.string(
             .launcherResettingLocalIdentity
@@ -6628,21 +8695,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         hideDashboardWebView()
         startupTimeout?.cancel()
         launchGeneration += 1
+        let resetGeneration = launchGeneration
+        // Claim the whole operation, including the asynchronous stop barrier.
+        // A second Reset action must not bypass it after companion is detached.
+        keychainResetGeneration = resetGeneration
         let previous = companion
         companion = nil
+        var pendingCompanions = retiringCompanions
+        if let previous { pendingCompanions[ObjectIdentifier(previous)] = previous }
         let runReset = { [weak self] in
             DispatchQueue.main.async {
-                self?.launchLocalKeychainResetHelper()
+                guard let self, self.keychainResetGeneration == resetGeneration else { return }
+                guard !self.quitting, self.launchGeneration == resetGeneration else {
+                    self.keychainResetGeneration = nil
+                    return
+                }
+                self.launchLocalKeychainResetHelper(generation: resetGeneration)
             }
         }
-        if let previous, previous.isRunning {
-            previous.stop(completion: runReset)
-        } else {
-            runReset()
+        let stopped = DispatchGroup()
+        for previous in pendingCompanions.values {
+            stopped.enter()
+            retireCompanion(previous) { stopped.leave() }
         }
+        stopped.notify(queue: .main, execute: runReset)
     }
 
-    private func launchLocalKeychainResetHelper() {
+    private func launchLocalKeychainResetHelper(generation: Int) {
+        guard keychainResetGeneration == generation, launchGeneration == generation, !quitting else { return }
         do {
             let resources = try CompanionResources.bundled()
             let stateRoot = try ownerOnlyStateRoot()
@@ -6664,6 +8744,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 "HOME": homeDirectory.path,
                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                 "NODE_ENV": "production",
+                "USAGE_MONITOR_KEYCHAIN_NAMESPACE":
+                    BundledProduct.keychainNamespace,
+                "USAGE_MONITOR_KEYCHAIN_ACCOUNT":
+                    BundledProduct.keychainAccount,
                 "USAGE_MONITOR_STATE_ROOT": stateRoot.path,
             ]
             for name in ["LANG", "LC_ALL", "TMPDIR"] {
@@ -6678,11 +8762,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 let errorOutput = standardError.fileHandleForReading
                     .readDataToEndOfFile()
                 DispatchQueue.main.async {
-                    self?.keychainResetProcess = nil
-                    self?.finishLocalKeychainReset(
+                    guard let self, self.keychainResetProcess === terminated else { return }
+                    self.keychainResetProcess = nil
+                    guard self.keychainResetGeneration == generation else { return }
+                    self.keychainResetGeneration = nil
+                    guard !self.quitting, self.launchGeneration == generation else { return }
+                    self.finishLocalKeychainReset(
                         status: terminated.terminationStatus,
                         output: output,
-                        errorOutput: errorOutput
+                        errorOutput: errorOutput,
+                        generation: generation
                     )
                 }
             }
@@ -6690,6 +8779,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             try child.run()
         } catch {
             keychainResetProcess = nil
+            if keychainResetGeneration == generation { keychainResetGeneration = nil }
             showFailure(LauncherError.keychainReset)
         }
     }
@@ -6697,7 +8787,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func finishLocalKeychainReset(
         status: Int32,
         output: Data,
-        errorOutput: Data
+        errorOutput: Data,
+        generation: Int
     ) {
         let decoded = try? JSONDecoder().decode(
             LocalKeychainResetResult.self,
@@ -6714,6 +8805,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
             result.addButton(withTitle: TiboTattleLocalization.string(.dialogDone))
             result.runModal()
+            guard !quitting, launchGeneration == generation else { return }
             retryAllowed = true
             startCompanion()
             return
@@ -6756,9 +8848,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         dashboardWebHost?.stop()
         hideDashboardWebView()
         launchGeneration += 1
+        let eraseGeneration = launchGeneration
         let previous = companion
         companion = nil
         let erase = { [weak self] in
+            guard let self, !self.quitting, self.launchGeneration == eraseGeneration else { return }
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let stateRoot = try ownerOnlyStateRoot()
@@ -6768,7 +8862,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     )
                     DispatchQueue.main.async {
                         DashboardWebHost.clearPersistentWebsiteData {
-                            guard let self, !self.quitting else { return }
+                            guard !self.quitting, self.launchGeneration == eraseGeneration else { return }
                             do {
                                 self.codexHomeConfiguration =
                                     CodexHomeConfiguration(
@@ -6793,13 +8887,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     }
                 } catch {
                     DispatchQueue.main.async {
-                        self?.showFailure(LauncherError.dataErase)
+                        guard !self.quitting, self.launchGeneration == eraseGeneration else { return }
+                        self.showFailure(LauncherError.dataErase)
                     }
                 }
             }
         }
-        if let previous, previous.isRunning {
-            previous.stop(completion: erase)
+        if let previous {
+            retireCompanion(previous, completion: erase)
         } else {
             erase()
         }
@@ -6897,6 +8992,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func applicationWillTerminate(_ notification: Notification) {
         startupTimeout?.cancel()
+        if let workspaceWakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(
+                workspaceWakeObserver
+            )
+            self.workspaceWakeObserver = nil
+        }
         cancelNativeRefreshPoll()
         cancelNativeRefreshSchedule()
         cancelNativeIndexingCoveragePoll()
@@ -6922,7 +9023,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 // the one-time result, so no provider host is ever asked of this web view and
 // no browser tab has to be kept open to finish.
 
-private func endpointReportsReady(_ url: URL) -> Bool {
+private func endpointReportsHealthy(_ url: URL) -> Bool {
     let completed = DispatchSemaphore(value: 0)
     let stateLock = NSLock()
     var passed = false
@@ -6937,7 +9038,7 @@ private func endpointReportsReady(_ url: URL) -> Bool {
            let data,
            let object = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any],
-           object["status"] as? String == "ready" {
+           object["status"] as? String == "ok" {
             passed = true
         }
         stateLock.unlock()
@@ -7056,8 +9157,8 @@ private enum SmokeTest {
         _ = health.wait(timeout: .now() + .seconds(7))
         session.invalidateAndCancel()
 
-        let centralWasReady = !requireCentralService || endpointReportsReady(
-            selectedURL.appendingPathComponent("api/ready")
+        let centralWasHealthy = !requireCentralService || endpointReportsHealthy(
+            selectedURL.appendingPathComponent("api/health")
         )
         companion.stop { stopped.signal() }
         let stoppedCleanly =
@@ -7071,15 +9172,15 @@ private enum SmokeTest {
             )
             return 1
         }
-        guard centralWasReady else {
+        guard centralWasHealthy else {
             FileHandle.standardError.write(
-                Data("macOS smoke: central readiness check failed\n".utf8)
+                Data("macOS smoke: central health check failed\n".utf8)
             )
             return 1
         }
         if requireCentralService {
             print(
-                "USAGE_MONITOR_MACOS_CENTRAL_SMOKE_READY "
+                "USAGE_MONITOR_MACOS_CENTRAL_SMOKE_HEALTHY "
                     + "host=\(loopbackHost) "
                     + "port=\(selectedURL.port ?? 0) "
                     + "central=\(centralService?.mode.rawValue ?? "invalid")"
@@ -7297,6 +9398,7 @@ private enum LifecycleContractSmokeTest {
     }
 
     static func keychainResetContract() -> Int32 {
+        guard CompanionProcess.verifyKeychainShutdownContract() else { return 1 }
         let completePayload = Data(
             """
             {
@@ -7363,7 +9465,8 @@ private enum LifecycleContractSmokeTest {
         print(
             "USAGE_MONITOR_MACOS_KEYCHAIN_RESET_CONTRACT "
                 + "targets=2 app_state=targeted hosted_mutation=false "
-                + "secure_erasure=false confirmations=2"
+                + "secure_erasure=false confirmations=2 writer_barrier=drained "
+                + "callbacks=once reset_resurrection=false keychain_access=0"
         )
         return 0
     }
@@ -7489,12 +9592,322 @@ private enum NativeRefreshSettingsContractSmokeTest {
         else {
             return 1
         }
+        let cadenceStart = Date(timeIntervalSince1970: 10_000)
+        guard NativeDetailedRefreshCadence.automaticMode(
+            now: cadenceStart,
+            defaults: reloaded
+        ) == .quick,
+              reloaded.double(
+                forKey: NativeDetailedRefreshCadence.defaultsKey
+              ) == cadenceStart.timeIntervalSince1970,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: cadenceStart.addingTimeInterval(3_599),
+                defaults: reloaded
+              ) == .quick,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: cadenceStart.addingTimeInterval(3_600),
+                defaults: reloaded
+              ) == .detailed,
+              reloaded.double(
+                forKey: NativeDetailedRefreshCadence.defaultsKey
+              ) == cadenceStart.timeIntervalSince1970
+        else {
+            return 1
+        }
+        let attemptedAt = cadenceStart.addingTimeInterval(3_600)
+        let reservation = NativeDetailedRefreshCadence.recordDetailedAttempt(
+            now: attemptedAt, defaults: reloaded
+        )
+        NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+            reservation, attempt: nil, defaults: reloaded
+        )
+        guard NativeDetailedRefreshCadence.automaticMode(
+            now: attemptedAt.addingTimeInterval(1), defaults: reloaded
+        ) == .quick else { return 1 }
+        let quickJoin = LocalAnalysisAttempt(mode: .quick, startedAt: attemptedAt)
+        NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+            reservation, attempt: quickJoin, defaults: reloaded
+        )
+        guard reloaded.double(forKey: NativeDetailedRefreshCadence.defaultsKey)
+                == cadenceStart.timeIntervalSince1970,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: attemptedAt, defaults: reloaded
+              ) == .detailed
+        else { return 1 }
+        let earlier = NativeDetailedRefreshCadence.recordDetailedAttempt(
+            now: attemptedAt, defaults: reloaded
+        )
+        let later = NativeDetailedRefreshCadence.recordDetailedAttempt(
+            now: attemptedAt, defaults: reloaded
+        )
+        NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+            earlier, attempt: quickJoin, defaults: reloaded
+        )
+        guard reloaded.string(forKey: NativeDetailedRefreshCadence.reservationKey)
+                == later?.token,
+              reloaded.double(forKey: NativeDetailedRefreshCadence.defaultsKey)
+                == attemptedAt.timeIntervalSince1970
+        else { return 1 }
+        NativeDetailedRefreshCadence.seedIfMissing(
+            now: cadenceStart.addingTimeInterval(9_000),
+            defaults: reloaded
+        )
+        guard reloaded.double(
+            forKey: NativeDetailedRefreshCadence.defaultsKey
+        ) == cadenceStart.addingTimeInterval(3_600).timeIntervalSince1970
+        else {
+            return 1
+        }
+        let externalStart = cadenceStart.addingTimeInterval(10_000)
+        let external = LocalAnalysisAttempt(mode: .detailed, startedAt: externalStart)
+        NativeDetailedRefreshCadence.observe(
+            external, now: externalStart.addingTimeInterval(5), defaults: reloaded
+        )
+        NativeDetailedRefreshCadence.observe(
+            external, now: externalStart.addingTimeInterval(3_599), defaults: reloaded
+        )
+        guard reloaded.double(forKey: NativeDetailedRefreshCadence.defaultsKey)
+                == externalStart.timeIntervalSince1970,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: externalStart.addingTimeInterval(3_599), defaults: reloaded
+              ) == .quick,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: externalStart.addingTimeInterval(3_600), defaults: reloaded
+              ) == .detailed
+        else { return 1 }
+        var startFence = NativeRefreshStartFence()
+        startFence.begin()
+        let oldIdleRead = startFence.observation()
+        guard !startFence.allowsTerminal(oldIdleRead) else { return 1 }
+        // The delayed POST now returns 202/running. The earlier idle GET is
+        // still stale even if its callback arrives after this resolution.
+        startFence.resolve()
+        guard !startFence.allowsTerminal(oldIdleRead),
+              startFence.allowsTerminal(startFence.observation())
+        else { return 1 }
+        let previousRunRead = startFence.observation()
+        startFence.begin()
+        guard !startFence.allowsTerminal(previousRunRead) else { return 1 }
         print(
             "USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT "
                 + "default=300 persisted=900 reloaded=900 "
                 + "picker_action=true picker_persisted=true "
                 + "scheduler=300->900 "
+                + "detailed_attempt_cadence=3600 startup=quick "
+                + "quick_join=restored newer_attempt=preserved "
+                + "external_attempt=actual-start stale_idle=ignored "
                 + "invalid_ignored=true"
+        )
+        return 0
+    }
+}
+
+/// Exercises the shipped native approval state machine and the real NSAlert
+/// configuration with synthetic completion callbacks. It neither presents a
+/// system permission dialog nor constructs a companion or Keychain broker.
+@MainActor
+private enum NativeKeychainMigrationUIContractSmokeTest {
+    static func run() -> Int32 {
+        _ = NSApplication.shared
+        let explanation = NativeKeychainMigrationApproval.makeExplanation()
+        guard explanation.alertStyle == .informational,
+              explanation.buttons.count == 2,
+              explanation.buttons[0].title ==
+                TiboTattleLocalization.string(.commonCancel),
+              explanation.buttons[0].keyEquivalent == "\r",
+              explanation.buttons[1].title == TiboTattleLocalization.string(
+                .dialogApproveKeychainMigration
+              ),
+              explanation.buttons[1].keyEquivalent.isEmpty,
+              explanation.informativeText == TiboTattleLocalization.string(
+                .dialogKeychainMigrationDescription
+              )
+        else { return 1 }
+
+        var approvalCalls = 0
+        var refreshCalls = 0
+        var confirmationCalls = 0
+        var finishApproval: ((Bool) -> Void)?
+        let state = NativeKeychainMigrationApproval(
+            approve: { completion in
+                approvalCalls += 1
+                finishApproval = completion
+            },
+            onMigrationCompleted: { refreshCalls += 1 }
+        )
+        state.observe(.idle)
+        guard !state.showsSettings, !state.showsMenuItem,
+              !state.canReview, refreshCalls == 0
+        else { return 1 }
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: true, isApproving: false
+        ))
+        state.review { complete in
+            confirmationCalls += 1
+            complete(true)
+        }
+        guard state.showsSettings, !state.showsMenuItem,
+              !state.canReview, confirmationCalls == 0, approvalCalls == 0,
+              state.summaryKey == .settingsKeychainMigrationRetrying
+        else { return 1 }
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: false, isApproving: false
+        ))
+        guard state.showsMenuItem, state.canReview else { return 1 }
+
+        var cancelledReview: ((Bool) -> Void)?
+        state.review { complete in
+            confirmationCalls += 1
+            cancelledReview = complete
+            complete(false)
+            // A late/duplicate callback may not turn cancellation into approval.
+            complete(true)
+        }
+        guard approvalCalls == 0, refreshCalls == 0,
+              state.canReview, !state.lastApprovalDeferred
+        else { return 1 }
+
+        var staleReviewIgnored = false
+        state.review { complete in
+            cancelledReview?(true)
+            staleReviewIgnored = approvalCalls == 0 && state.isReviewing
+            complete(true)
+        }
+        state.review { complete in
+            confirmationCalls += 1
+            complete(true)
+        }
+        guard approvalCalls == 1, confirmationCalls == 1, staleReviewIgnored,
+              state.approvalInFlight, !state.canReview,
+              state.summaryKey == .settingsKeychainMigrationApproving
+        else { return 1 }
+        finishApproval?(false)
+        finishApproval?(true)
+        guard state.canReview, state.lastApprovalDeferred,
+              state.summaryKey == .settingsKeychainMigrationDeferred,
+              refreshCalls == 0
+        else { return 1 }
+
+        let staleApprovalCompletion = finishApproval
+        state.review { complete in complete(true) }
+        staleApprovalCompletion?(true)
+        guard state.approvalInFlight else { return 1 }
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: false, isApproving: true
+        ))
+        state.observe(.idle)
+        finishApproval?(true)
+        state.observe(.idle)
+        guard approvalCalls == 2, refreshCalls == 1,
+              !state.showsSettings, !state.showsMenuItem,
+              !state.canReview, !state.lastApprovalDeferred
+        else { return 1 }
+
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: true, isApproving: false
+        ))
+        state.observe(.idle)
+        state.observe(.idle)
+        guard refreshCalls == 2, approvalCalls == 2 else { return 1 }
+
+        var finishReview: ((Bool) -> Void)?
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: false, isApproving: false
+        ))
+        state.review { finishReview = $0 }
+        state.observe(.idle)
+        finishReview?(true)
+        guard approvalCalls == 2, refreshCalls == 3,
+              !state.isReviewing, !state.approvalInFlight
+        else { return 1 }
+        print(
+            "USAGE_MONITOR_MACOS_KEYCHAIN_MIGRATION_UI_CONTRACT "
+                + "automatic_prompt=false retrying=quiet "
+                + "cancel=preserved denial=preserved "
+                + "approval=explicit duplicate_ignored=true "
+                + "refresh=transition_only keychain_access=false"
+        )
+        return 0
+    }
+}
+
+/// Exercises the complete persisted appearance contract in an isolated
+/// defaults suite. This proves that explicit choices never depend on AppKit
+/// timing, while System follows both light and dark effective appearances.
+/// It does not mutate the developer's normal TiboTattle preference.
+private enum NativeAppearanceSettingsContractSmokeTest {
+    private static let suiteName =
+        "com.usagemonitor.local.native-appearance-settings-contract"
+
+    static func run() -> Int32 {
+        guard let defaults = UserDefaults(suiteName: suiteName),
+              let aqua = NSAppearance(named: .aqua),
+              let darkAqua = NSAppearance(named: .darkAqua)
+        else {
+            return 1
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        guard NativeAppearancePreference.current(in: defaults) == .system,
+              NativeAppearancePreference.system.applicationAppearance == nil,
+              NativeAppearancePreference.system.resolvedTheme(for: aqua)
+                == "light",
+              NativeAppearancePreference.system.resolvedTheme(for: darkAqua)
+                == "dark"
+        else {
+            return 1
+        }
+
+        NativeAppearancePreference.set(.light, in: defaults)
+        defaults.synchronize()
+        guard let reloaded = UserDefaults(suiteName: suiteName),
+              NativeAppearancePreference.current(in: reloaded) == .light,
+              NativeAppearancePreference.light.applicationAppearance?.name
+                == .aqua,
+              NativeAppearancePreference.light.resolvedTheme(for: darkAqua)
+                == "light"
+        else {
+            return 1
+        }
+
+        NativeAppearancePreference.set(.dark, in: reloaded)
+        reloaded.synchronize()
+        guard let darkReloaded = UserDefaults(suiteName: suiteName),
+              NativeAppearancePreference.current(in: darkReloaded) == .dark,
+              NativeAppearancePreference.dark.applicationAppearance?.name
+                == .darkAqua,
+              NativeAppearancePreference.dark.resolvedTheme(for: aqua)
+                == "dark"
+        else {
+            return 1
+        }
+
+        NativeAppearancePreference.set(.system, in: darkReloaded)
+        darkReloaded.synchronize()
+        guard let systemReloaded = UserDefaults(suiteName: suiteName),
+              NativeAppearancePreference.current(in: systemReloaded) == .system
+        else {
+            return 1
+        }
+
+        systemReloaded.set(
+            "unsupported",
+            forKey: NativeAppearancePreference.defaultsKey
+        )
+        guard NativeAppearancePreference.current(in: systemReloaded) == .system
+        else {
+            return 1
+        }
+
+        print(
+            "USAGE_MONITOR_MACOS_APPEARANCE_SETTINGS_CONTRACT "
+                + "default=system persisted=light,dark,system "
+                + "invalid=system system_resolution=light,dark "
+                + "explicit_resolution=light,dark "
+                + "appkit=system,aqua,darkAqua"
         )
         return 0
     }
@@ -7740,21 +10153,1322 @@ private enum LoginItemContractSmokeTest {
     }
 }
 
-/// Exercises the real AppKit status item without starting the local companion
-/// or reading any local evidence. This catches the class of regression where a
-/// custom menu view has no measured frame and leaves an apparently empty menu
-/// header in an installed build.
+/// Exercises the closed refresh-progress projection without contacting the
+/// companion. This proves that only allowlisted phases and bounded counts can
+/// reach native presentation, while the existing idle/running contract remains
+/// intact for unknown or forged fields.
+private enum NativeAnalysisProgressContractSmokeTest {
+    private static let refreshID = "123e4567-e89b-42d3-a456-426614174000"
+
+    private static func decode(
+        progress: [String: Any],
+        status: String = "running"
+    ) -> LocalAnalysisActivity? {
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "refresh": [
+                "status": status,
+                "refreshId": refreshID,
+                "progress": progress,
+            ],
+        ]) else {
+            return nil
+        }
+        return LocalCompanionEvidenceReader.decodeActivity(data)
+    }
+
+    static func run() -> Int32 {
+        let phases: [(String, LocalAnalysisProgress.Phase)] = [
+            ("discovering", .discovering),
+            ("rollout_index", .rolloutIndex),
+            ("quota_refresh", .quotaRefresh),
+            ("quick_result", .quickResult),
+            ("complete", .complete),
+            ("paused", .paused),
+            ("prospective", .prospective),
+        ]
+        for (rawPhase, expectedPhase) in phases {
+            guard case let .running(decodedRefreshID, progress, _) = decode(
+                progress: ["phase": rawPhase]
+            ),
+                decodedRefreshID == refreshID,
+                progress?.phase == expectedPhase,
+                progress?.nativeToolbarTitle().isEmpty == false
+            else {
+                return failure("phase \(rawPhase)")
+            }
+        }
+
+        guard case let .running(_, quickProgress, _) = decode(
+            progress: ["phase": "quick_result"]
+        ),
+              quickProgress?.nativeToolbarTitle(
+                hasUsableHeadlineEvidence: false
+              ) == TiboTattleLocalization.string(
+                .nativeDashboardProgressAnalyzing
+              ),
+              quickProgress?.nativeToolbarTitle(
+                hasUsableHeadlineEvidence: true
+              ) == TiboTattleLocalization.string(
+                .nativeDashboardProgressQuickResult
+              )
+        else {
+            return failure("quick result evidence gate")
+        }
+
+        let counted = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": 180,
+            "filesProcessed": 42,
+            "message": "/Users/private/repository",
+        ])
+        let expectedCountedTitle = TiboTattleLocalization.format(
+            .nativeDashboardProgressAnalyzingFiles,
+            TiboTattleLocalization.integerString(42),
+            TiboTattleLocalization.integerString(180)
+        )
+        guard case let .running(_, countedProgress, _) = counted,
+              countedProgress == LocalAnalysisProgress(
+                phase: .rolloutIndex,
+                filesSelected: 180,
+                filesProcessed: 42
+              ),
+              countedProgress?.nativeToolbarTitle() == expectedCountedTitle
+        else {
+            return failure("bounded counts")
+        }
+
+        let unified = decode(progress: [
+            "kind": "unified_index",
+            "status": "scanning",
+            "phase": "rollout_index",
+            "filesDiscovered": 240,
+            "filesSelected": 180,
+            "filesProcessed": 42,
+            "recordsWritten": 9_000,
+        ])
+        guard case let .running(_, unifiedProgress, _) = unified,
+              unifiedProgress == LocalAnalysisProgress(
+                phase: .rolloutIndex,
+                filesSelected: 180,
+                filesProcessed: 42
+              ),
+              unifiedProgress?.nativeToolbarTitle() == expectedCountedTitle
+        else {
+            return failure("unified index counts")
+        }
+
+        let accountingMarker: [String: Any] = [
+            "kind": "accounting",
+            "status": "calculating",
+        ]
+        guard case let .running(_, accountingProgress, _) = decode(
+            progress: accountingMarker
+        ),
+              accountingProgress == LocalAnalysisProgress(
+                phase: .accounting,
+                filesSelected: nil,
+                filesProcessed: nil
+              ),
+              accountingProgress?.nativeToolbarTitle()
+                == TiboTattleLocalization.string(
+                    .nativeDashboardProgressAccounting
+                ),
+              accountingProgress?.nativeToolbarTitle(
+                hasUsableHeadlineEvidence: true
+              ) == accountingProgress?.nativeToolbarTitle()
+        else {
+            return failure("accounting work stage")
+        }
+        let invalidAccounting: [[String: Any]] = [
+            ["kind": "accounting"],
+            ["kind": "accounting", "status": "complete"],
+            ["kind": "accounting", "status": "calculating", "phase": "quick_result"],
+            ["kind": "accounting", "status": "calculating", "filesProcessed": 7, "filesSelected": 7_215],
+            ["kind": "accounting", "status": "calculating", "message": "unreviewed prose"],
+            ["phase": "accounting"],
+        ]
+        for invalid in invalidAccounting {
+            guard case let .running(_, progress, _) = decode(progress: invalid),
+                  progress == nil
+            else {
+                return failure("accounting exact-key boundary")
+            }
+        }
+        for outcome in ["succeeded", "degraded", "failed", "cancelled"] {
+            guard let terminal = LocalAnalysisTerminalOutcome(rawValue: outcome),
+                  decode(progress: accountingMarker, status: outcome)
+                    == .idle(refreshID: refreshID, outcome: terminal)
+            else {
+                return failure("accounting terminal boundary")
+            }
+        }
+
+        let unifiedZero = decode(progress: [
+            "kind": "unified_index",
+            "status": "scanning",
+            "phase": "rollout_index",
+            "filesDiscovered": 0,
+            "filesSelected": 0,
+            "filesProcessed": 0,
+            "recordsWritten": 0,
+        ])
+        guard case let .running(_, unifiedZeroProgress, _) = unifiedZero,
+              unifiedZeroProgress?.nativeToolbarTitle()
+                == TiboTattleLocalization.string(
+                    .nativeDashboardProgressAnalyzing
+                )
+        else {
+            return failure("unified index initial state")
+        }
+
+        let invalidUnified = decode(progress: [
+            "kind": "unified_index",
+            "status": "scanning",
+            "phase": "rollout_index",
+            "filesDiscovered": 100,
+            "filesSelected": 101,
+            "filesProcessed": 42,
+            "recordsWritten": 9_000,
+        ])
+        let forgedUnified = decode(progress: [
+            "kind": "unified_index",
+            "status": "scanning",
+            "phase": "rollout_index",
+            "filesDiscovered": 240,
+            "filesSelected": 180,
+            "filesProcessed": 42,
+            "recordsWritten": 9_000,
+            "path": "/Users/private/repository",
+        ])
+        guard case let .running(_, invalidUnifiedProgress, _) = invalidUnified,
+              invalidUnifiedProgress == nil,
+              case let .running(_, forgedUnifiedProgress, _) = forgedUnified,
+              forgedUnifiedProgress == nil
+        else {
+            return failure("unified index closed contract")
+        }
+
+        let unsafe = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": 1_000_000_001,
+            "filesProcessed": -1,
+        ])
+        guard case let .running(_, unsafeProgress, _) = unsafe,
+              unsafeProgress?.filesSelected == nil,
+              unsafeProgress?.filesProcessed == nil
+        else {
+            return failure("unsafe counts")
+        }
+
+        let malformed = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": true,
+            "filesProcessed": 4.5,
+        ])
+        guard case let .running(_, malformedProgress, _) = malformed,
+              malformedProgress?.filesSelected == nil,
+              malformedProgress?.filesProcessed == nil
+        else {
+            return failure("malformed counts")
+        }
+
+        let contradictory = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": 2,
+            "filesProcessed": 3,
+        ])
+        guard case let .running(_, contradictoryProgress, _) = contradictory,
+              contradictoryProgress?.nativeToolbarTitle()
+                == TiboTattleLocalization.string(
+                    .nativeDashboardProgressAnalyzing
+                )
+        else {
+            return failure("contradictory counts")
+        }
+
+        let archive = decode(progress: [
+            "kind": "archive_index",
+            "status": "scanning",
+        ])
+        guard case let .running(_, archiveProgress, _) = archive,
+              archiveProgress?.phase == .archiveIndex
+        else {
+            return failure("archive phase")
+        }
+
+        let unknown = decode(progress: [
+            "phase": "server_supplied_unreviewed_phase",
+            "message": "server supplied prose",
+        ])
+        guard case let .running(_, unknownProgress, _) = unknown,
+              unknownProgress == nil
+        else {
+            return failure("unknown phase")
+        }
+
+        guard decode(
+            progress: ["phase": "discovering"],
+            status: "succeeded"
+        ) == .idle(refreshID: refreshID, outcome: .succeeded),
+              LocalAnalysisTerminalOutcome.idle
+                .automaticRefreshSuppressed == nil,
+              LocalAnalysisTerminalOutcome.succeeded
+                .automaticRefreshSuppressed == false,
+              LocalAnalysisTerminalOutcome.degraded
+                .automaticRefreshSuppressed == true,
+              LocalAnalysisTerminalOutcome.cancelled
+                .automaticRefreshSuppressed == true,
+              LocalAnalysisTerminalOutcome.failed
+                .automaticRefreshSuppressed == true,
+              decode(
+                progress: ["phase": "discovering"],
+                status: "unreviewed_terminal"
+              ) == nil
+        else {
+            return failure("idle contract")
+        }
+
+        let startedAt = "2026-09-01T12:00:00.000Z"
+        let receiptDate = Date(timeIntervalSince1970: 1_788_264_000)
+        for mode in ["quick", "detailed"] {
+            for status in ["running", "succeeded", "failed", "cancelled"] {
+                let payload: [String: Any] = ["refresh": [
+                    "status": status,
+                    "refreshId": refreshID,
+                    "mode": mode,
+                    "startedAt": startedAt,
+                ]]
+                guard let data = try? JSONSerialization.data(withJSONObject: payload),
+                      let activity = LocalCompanionEvidenceReader.decodeActivity(data),
+                      activity.attempt == LocalAnalysisAttempt(
+                        mode: LocalAnalysisMode(rawValue: mode)!,
+                        startedAt: receiptDate
+                      )
+                else { return failure("mode/start receipt") }
+            }
+        }
+        let invalidReceipts: [[String: Any]] = [
+            ["mode": "automatic", "startedAt": startedAt],
+            ["mode": true, "startedAt": startedAt],
+            ["mode": "detailed", "startedAt": "2026-09-01T12:00:00Z"],
+            ["mode": "detailed", "startedAt": "not a timestamp"],
+            ["mode": "detailed", "startedAt": 1_788_264_000],
+            ["mode": "detailed"],
+            ["startedAt": startedAt],
+        ]
+        for invalid in invalidReceipts {
+            var refresh: [String: Any] = ["status": "running", "refreshId": refreshID]
+            refresh.merge(invalid) { _, replacement in replacement }
+            guard let data = try? JSONSerialization.data(withJSONObject: ["refresh": refresh]),
+                  let activity = LocalCompanionEvidenceReader.decodeActivity(data),
+                  activity.attempt == nil
+            else { return failure("invalid mode/start receipt") }
+        }
+
+        print(
+            "USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT "
+                + "phases=allowlisted archive=scanning unified=scanning "
+                + "accounting=calculating "
+                + "counts=bounded quick_result=evidence-gated "
+                + "contradictory=generic unknown=generic free_text=ignored "
+                + "idle=unchanged terminal=automatic-backoff "
+                + "attempt=mode-and-actual-start "
+                + "percent=false eta=false"
+        )
+        return 0
+    }
+
+    private static func failure(_ detail: String) -> Int32 {
+        FileHandle.standardError.write(
+            Data("macOS analysis progress contract failed: \(detail)\n".utf8)
+        )
+        return 1
+    }
+}
+
+/// Feeds the production JavaScript weekly-pace DTO into the exact native
+/// decoder. The argument is accepted only by a development-channel bundle;
+/// release and Preview bundles cannot turn an arbitrary file into app input.
+private enum NativeWeeklyPaceProjectionContractSmokeTest {
+    private static let maximumFixtureBytes = 64 * 1_024
+
+    static func run(fixturePath: String) -> Int32 {
+        guard BundledProduct.buildChannel == "development" else {
+            return failure("development channel required")
+        }
+        guard !fixturePath.isEmpty,
+              fixturePath.utf8.count <= 4_096,
+              let handle = try? FileHandle(
+                  forReadingFrom: URL(fileURLWithPath: fixturePath)
+              )
+        else {
+            return failure("fixture unavailable")
+        }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(
+                  upToCount: maximumFixtureBytes + 1
+              ),
+              !data.isEmpty,
+              data.count <= maximumFixtureBytes,
+              let outlook = MenuBarWeeklyPaceOutlookProjection.decode(data),
+              outlook.status == .available,
+              outlook.standing == .over,
+              !outlook.critical,
+              outlook.observationCount == 3,
+              let hoursToReset = outlook.projection.hoursToReset,
+              abs(hoursToReset - 100) <= 0.000_001,
+              let ratio = outlook.rates.ratio,
+              abs(ratio - 1.5) <= 0.000_001
+        else {
+            return failure("projection rejected")
+        }
+
+        let now = outlook.resetsAt.addingTimeInterval(
+            -hoursToReset * 3_600
+        )
+        let exactLane = ObservedQuotaLane(
+            label: "Seven-day allowance",
+            remainingPercent: outlook.remainingPercent,
+            durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+            resetAt: outlook.resetsAt,
+            observedAt: now,
+            isPrimary: false
+        )
+        let mismatchedRemainingLane = ObservedQuotaLane(
+            label: exactLane.label,
+            remainingPercent: exactLane.remainingPercent - 1,
+            durationMinutes: exactLane.durationMinutes,
+            resetAt: exactLane.resetAt,
+            observedAt: exactLane.observedAt,
+            isPrimary: exactLane.isPrimary
+        )
+        let mismatchedDurationLane = ObservedQuotaLane(
+            label: exactLane.label,
+            remainingPercent: exactLane.remainingPercent,
+            durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+            resetAt: exactLane.resetAt,
+            observedAt: exactLane.observedAt,
+            isPrimary: exactLane.isPrimary
+        )
+        guard outlook.isBound(to: exactLane, now: now),
+              !outlook.isBound(to: mismatchedRemainingLane, now: now),
+              !outlook.isBound(to: mismatchedDurationLane, now: now),
+              rejectsSchemaMutation(data)
+        else {
+            return failure("binding contract rejected")
+        }
+
+        print(
+            "USAGE_MONITOR_MACOS_WEEKLY_PACE_PROJECTION_CONTRACT "
+                + "schema=exact-v0.1 status=available standing=over "
+                + "binding=exact mismatch=rejected "
+                + "schema_mismatch=rejected"
+        )
+        return 0
+    }
+
+    private static func rejectsSchemaMutation(_ data: Data) -> Bool {
+        guard var root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              var weekly = root["weekly"] as? [String: Any],
+              var outlook = weekly["paceOutlook"] as? [String: Any]
+        else {
+            return false
+        }
+        outlook["schemaVersion"] = "local-weekly-pace-outlook-v999"
+        weekly["paceOutlook"] = outlook
+        root["weekly"] = weekly
+        guard let mutated = try? JSONSerialization.data(withJSONObject: root)
+        else {
+            return false
+        }
+        return MenuBarWeeklyPaceOutlookProjection.decode(mutated) == nil
+    }
+
+    private static func failure(_ detail: String) -> Int32 {
+        FileHandle.standardError.write(Data(
+            "macOS weekly pace projection contract failed: \(detail)\n".utf8
+        ))
+        return 1
+    }
+}
+
+/// Exercises the real AppKit status item, popover, and native action menu
+/// without starting the local companion or reading any private evidence.
 @MainActor
 private enum MenuBarContractSmokeTest {
+    private static func iso8601(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds,
+        ]
+        return formatter.string(from: date)
+    }
+
+    private static func nullableNumber(_ value: Double?) -> Any {
+        if let value { return NSNumber(value: value) }
+        return NSNull()
+    }
+
+    private static func nullableString(_ value: String?) -> Any {
+        if let value { return value }
+        return NSNull()
+    }
+
+    private static func pricingCoverage(
+        fully: Int = 0,
+        partially: Int = 0,
+        unpriced: Int = 0
+    ) -> [String: Any] {
+        [
+            "fullyPricedEvents": fully,
+            "partiallyPricedEvents": partially,
+            "unpricedEvents": unpriced,
+        ]
+    }
+
+    private static func periodRow(_ identifier: String) -> [String: Any] {
+        [
+            "periodId": identifier,
+            "events": 0,
+            "totalTokens": 0,
+            "apiPriceEquivalentUsd": 0,
+            "pricingCoverage": pricingCoverage(),
+        ]
+    }
+
+    private static func quotaWindow(
+        durationMinutes: Int,
+        slot: String,
+        usedPercent: Double,
+        observedAt: Date,
+        resetAt: Date
+    ) -> [String: Any] {
+        [
+            "limitId": "codex",
+            "slot": slot,
+            "usedPercent": usedPercent,
+            "remainingPercent": 100 - usedPercent,
+            "durationMinutes": durationMinutes,
+            "observedAt": iso8601(observedAt),
+            "resetAt": iso8601(resetAt),
+        ]
+    }
+
+    private static func availablePaceOutlook(
+        now: Date,
+        remainingPercent: Double,
+        resetsAt: Date,
+        headlineRate: Double,
+        activeRate: Double? = nil,
+        observationCount: Int = 8,
+        earlyEstimate: Bool = false
+    ) -> [String: Any] {
+        let hoursToReset = resetsAt.timeIntervalSince(now) / 3_600
+        let sustainableRate = remainingPercent / hoursToReset
+        let ratio = headlineRate / sustainableRate
+        let standing = ratio > 1.15 ? "over" : ratio < 0.85 ? "under" : "on"
+        let coveredHours = min(
+            hoursToReset,
+            remainingPercent / headlineRate
+        )
+        let dryHours = max(0, hoursToReset - coveredHours)
+        let sparePercent = max(
+            0,
+            remainingPercent - headlineRate * hoursToReset
+        )
+        let activeHours = activeRate.map { remainingPercent / $0 }
+        let activeFraction = activeHours.flatMap { hours -> Double? in
+            hours < coveredHours * 0.95
+                ? max(0, min(1, hours / hoursToReset))
+                : nil
+        }
+        return [
+            "schemaVersion": "local-weekly-pace-outlook-v0.1",
+            "status": "available",
+            "standing": standing,
+            "critical": standing == "over" && ratio >= 2,
+            "earlyEstimate": earlyEstimate,
+            "remainingPercent": remainingPercent,
+            "resetsAt": iso8601(resetsAt),
+            "observationCount": observationCount,
+            "elapsedHours": 24.0,
+            "rates": [
+                "activePercentagePointsPerHour": nullableNumber(activeRate),
+                "overallPercentagePointsPerHour": headlineRate,
+                "headlinePercentagePointsPerHour": headlineRate,
+                "sustainablePercentagePointsPerHour": sustainableRate,
+                "ratio": ratio,
+            ],
+            "projection": [
+                "hoursToReset": hoursToReset,
+                "coveredHours": coveredHours,
+                "dryHours": dryHours,
+                "sparePercent": sparePercent,
+                "projectedExhaustionAt": nullableString(
+                    standing == "over"
+                        ? iso8601(
+                            now.addingTimeInterval(coveredHours * 3_600)
+                        )
+                        : nil
+                ),
+            ],
+            "track": [
+                "coveredFraction": coveredHours / hoursToReset,
+                "activeExhaustionFraction": nullableNumber(activeFraction),
+            ],
+        ]
+    }
+
+    private static func collectingPaceOutlook(
+        now: Date,
+        remainingPercent: Double,
+        resetsAt: Date
+    ) -> [String: Any] {
+        let hoursToReset = resetsAt.timeIntervalSince(now) / 3_600
+        return [
+            "schemaVersion": "local-weekly-pace-outlook-v0.1",
+            "status": "collecting",
+            "standing": NSNull(),
+            "critical": false,
+            "earlyEstimate": false,
+            "remainingPercent": remainingPercent,
+            "resetsAt": iso8601(resetsAt),
+            "observationCount": 1,
+            "elapsedHours": 0.0,
+            "rates": [
+                "activePercentagePointsPerHour": NSNull(),
+                "overallPercentagePointsPerHour": NSNull(),
+                "headlinePercentagePointsPerHour": NSNull(),
+                "sustainablePercentagePointsPerHour": NSNull(),
+                "ratio": NSNull(),
+            ],
+            "projection": [
+                "hoursToReset": hoursToReset,
+                "coveredHours": NSNull(),
+                "dryHours": NSNull(),
+                "sparePercent": NSNull(),
+                "projectedExhaustionAt": NSNull(),
+            ],
+            "track": [
+                "coveredFraction": NSNull(),
+                "activeExhaustionFraction": NSNull(),
+            ],
+        ]
+    }
+
+    private static func decodePaceOutlook(
+        _ value: [String: Any]
+    ) -> MenuBarWeeklyPaceOutlook? {
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "weekly": ["paceOutlook": value],
+        ]) else {
+            return nil
+        }
+        return MenuBarWeeklyPaceOutlookProjection.decode(data)
+    }
+
+    private static func paceOutlookProjectionContract(
+        now: Date,
+        weeklyLane: ObservedQuotaLane
+    ) -> Bool {
+        guard let resetsAt = weeklyLane.resetAt else { return false }
+        let remaining = weeklyLane.remainingPercent
+        let hoursToReset = resetsAt.timeIntervalSince(now) / 3_600
+        let sustainable = remaining / hoursToReset
+        let collecting = decodePaceOutlook(collectingPaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt
+        ))
+        let under = decodePaceOutlook(availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable * 0.7
+        ))
+        let on = decodePaceOutlook(availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable
+        ))
+        let over = decodePaceOutlook(availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable * 1.5,
+            activeRate: sustainable * 2
+        ))
+        let critical = decodePaceOutlook(availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable * 2.2
+        ))
+        var malformed = availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable
+        )
+        malformed["account"] = "must-never-cross-this-projection"
+        var zeroActive = availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable,
+            activeRate: 0
+        )
+        if var rates = zeroActive["rates"] as? [String: Any] {
+            rates["activePercentagePointsPerHour"] = 0.0
+            zeroActive["rates"] = rates
+        }
+        var mismatchedLane = weeklyLane
+        mismatchedLane = ObservedQuotaLane(
+            label: mismatchedLane.label,
+            remainingPercent: mismatchedLane.remainingPercent - 1,
+            durationMinutes: mismatchedLane.durationMinutes,
+            resetAt: mismatchedLane.resetAt,
+            observedAt: mismatchedLane.observedAt,
+            isPrimary: mismatchedLane.isPrimary
+        )
+        return collecting?.status == .collecting
+            && collecting?.elapsedHours == 0
+            && collecting?.isBound(to: weeklyLane, now: now) == true
+            && under?.standing == .under
+            && on?.standing == .on
+            && over?.standing == .over
+            && over?.critical == false
+            && over?.track.activeExhaustionFraction != nil
+            && critical?.standing == .over
+            && critical?.critical == true
+            && critical?.isBound(to: mismatchedLane, now: now) == false
+            && decodePaceOutlook(malformed) == nil
+            && decodePaceOutlook(zeroActive) == nil
+    }
+
+    private static func timelineBucket(
+        startAt: Date,
+        endAt: Date
+    ) -> [String: Any] {
+        [
+            "startAt": iso8601(startAt),
+            "endAt": iso8601(endAt),
+            "usageEvents": 0,
+            "totalTokens": 0,
+            "apiPriceEquivalentUsd": 0,
+            "pricingCoverage": pricingCoverage(),
+        ]
+    }
+
+    private static func overviewFixture(
+        now: Date,
+        calendar: Calendar,
+        quotaWindows: [[String: Any]]? = nil,
+        accountingSource: String = "legacy",
+        generationMatched: Bool = true,
+        timelineUsage: [[String: Any]] = []
+    ) -> [String: Any] {
+        let observedAt = now.addingTimeInterval(-60)
+        let today = calendar.startOfDay(for: now)
+        let coverageStart = calendar.date(
+            byAdding: .day,
+            value: -29,
+            to: today
+        )!
+        var accounting: [String: Any] = [
+            "sourceMode": accountingSource,
+            "periods": [
+                periodRow("24h"),
+                periodRow("7d"),
+                periodRow("30d"),
+            ],
+        ]
+        if accountingSource == "unified" {
+            accounting["generationMatched"] = generationMatched
+        }
+        return [
+            "status": "live",
+            "evidenceStatus": "available",
+            "freshness": [
+                "status": "live",
+                "staleAfterSeconds": 30 * 60,
+                "accountingStatus": "available",
+            ],
+            "quotaWindows": quotaWindows ?? [
+                quotaWindow(
+                    durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                    slot: "secondary",
+                    usedPercent: 29,
+                    observedAt: observedAt,
+                    resetAt: observedAt.addingTimeInterval(5 * 24 * 60 * 60)
+                ),
+                quotaWindow(
+                    durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                    slot: "primary",
+                    usedPercent: 37,
+                    observedAt: observedAt,
+                    resetAt: observedAt.addingTimeInterval(2 * 60 * 60)
+                ),
+                quotaWindow(
+                    durationMinutes: 30 * 24 * 60,
+                    slot: "primary",
+                    usedPercent: 12,
+                    observedAt: observedAt,
+                    resetAt: observedAt.addingTimeInterval(10 * 24 * 60 * 60)
+                ),
+                quotaWindow(
+                    durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                    slot: "secondary",
+                    usedPercent: 38,
+                    observedAt: observedAt.addingTimeInterval(-60),
+                    resetAt: observedAt.addingTimeInterval(90 * 60)
+                ),
+            ],
+            "accounting": accounting,
+            "timeline": [
+                "source": "replay_safe_cache",
+                "bucketMinutes": 15,
+                "coveredAt": [
+                    "startAt": iso8601(coverageStart),
+                    "endAt": iso8601(now),
+                ],
+                "usage": timelineUsage,
+                "history": ["status": "complete"],
+            ],
+        ]
+    }
+
+    private static func decodeOverview(
+        _ root: [String: Any],
+        now: Date,
+        calendar: Calendar
+    ) -> LocalCompanionOverview? {
+        guard let data = try? JSONSerialization.data(withJSONObject: root) else {
+            return nil
+        }
+        return LocalCompanionOverviewProjection.decode(
+            data,
+            now: now,
+            calendar: calendar
+        )
+    }
+
+    private static func retainedHistoryProjectionContract() -> Bool {
+        var calendar = Calendar(identifier: .gregorian)
+        guard let timeZone = TimeZone(identifier: "America/Los_Angeles") else {
+            return false
+        }
+        calendar.timeZone = timeZone
+        let parser = ISO8601DateFormatter()
+        // Re-read two days later, across both midnight and the spring DST
+        // transition. Retained rolling periods must keep their original bars.
+        guard let retainedAt = parser.date(from: "2026-03-08T08:10:00Z"),
+              let now = parser.date(from: "2026-03-10T19:00:00Z")
+        else { return false }
+        var bucket = timelineBucket(
+            startAt: retainedAt.addingTimeInterval(-70 * 60),
+            endAt: retainedAt.addingTimeInterval(-55 * 60)
+        )
+        let coverage = pricingCoverage(fully: 1, partially: 1, unpriced: 1)
+        bucket["usageEvents"] = 3
+        bucket["totalTokens"] = 3_000
+        bucket["apiPriceEquivalentUsd"] = 0.50
+        bucket["pricingCoverage"] = coverage
+        var previous = overviewFixture(
+            now: retainedAt,
+            calendar: calendar,
+            accountingSource: "unified",
+            timelineUsage: [bucket]
+        )
+        guard var accounting = previous["accounting"] as? [String: Any],
+              let timeline = previous["timeline"] as? [String: Any]
+        else { return false }
+        accounting["periods"] = ["24h", "7d", "30d"].map { identifier in
+            var row = periodRow(identifier)
+            row["events"] = 3
+            row["totalTokens"] = 3_000
+            row["apiPriceEquivalentUsd"] = 0.50
+            row["pricingCoverage"] = coverage
+            return row
+        }
+        previous["accounting"] = accounting
+        guard let verified = decodeOverview(
+            previous, now: retainedAt, calendar: calendar
+        ), verified.history.accountingStatus == .current else { return false }
+
+        var retained = previous
+        retained["freshness"] = ["accountingStatus": "unavailable"]
+        accounting["generationMatched"] = false
+        let projection: [String: Any] = [
+            "status": "retained",
+            "reason": "local_unified_index_deferred",
+            "terminal": false,
+            "retainedAt": iso8601(retainedAt),
+            "coveredAt": timeline["coveredAt"]!,
+        ]
+        accounting["projection"] = projection
+        retained["accounting"] = accounting
+        let expected = verified.history.retainingLastVerified()
+        guard let held = decodeOverview(retained, now: now, calendar: calendar),
+              held.history == expected,
+              held.history.lastSevenDays?.totalTokens == 3_000,
+              held.history.lastThirtyDays?.knownAPIPriceEquivalentUSD == 0.50,
+              held.history.lastSevenDays?.pricingCoverage.isComplete == false,
+              held.history.sevenDayHistory.contains(where: {
+                $0.totalTokens == 3_000
+              })
+        else { return false }
+
+        func withProjection(_ value: Any) -> [String: Any] {
+            var root = retained
+            var valueAccounting = accounting
+            valueAccounting["projection"] = value
+            root["accounting"] = valueAccounting
+            return root
+        }
+        var terminal = projection
+        terminal["terminal"] = true
+        guard decodeOverview(
+            withProjection(terminal), now: now, calendar: calendar
+        )?.history == expected else { return false }
+
+        // A marker never overrides malformed provenance, chronology, periods,
+        // or timeline coverage. No generation mismatch alone admits history.
+        var invalidRoots = [withProjection(NSNull())]
+        let invalidFields: [(String, Any)] = [
+            ("status", "unavailable"),
+            ("terminal", "false"),
+            ("terminal", 1),
+            ("retainedAt", NSNull()),
+            ("retainedAt", "not-a-date"),
+            ("retainedAt", iso8601(now.addingTimeInterval(60))),
+            ("coveredAt", ["startAt": NSNull(), "endAt": NSNull()]),
+            ("coveredAt", [
+                "startAt": iso8601(retainedAt),
+                "endAt": iso8601(retainedAt.addingTimeInterval(60)),
+            ]),
+            ("coveredAt", [
+                "startAt": iso8601(retainedAt),
+                "endAt": iso8601(retainedAt.addingTimeInterval(-60)),
+            ]),
+        ]
+        for (key, value) in invalidFields {
+            var invalid = projection
+            invalid[key] = value
+            invalidRoots.append(withProjection(invalid))
+        }
+        for (key, value) in [
+            ("generationMatched", true as Any),
+            ("generationMatched", "false" as Any),
+            ("sourceMode", "legacy" as Any),
+            ("periods", [periodRow("24h")] as Any),
+        ] {
+            var invalid = retained
+            var invalidAccounting = accounting
+            invalidAccounting[key] = value
+            invalid["accounting"] = invalidAccounting
+            invalidRoots.append(invalid)
+        }
+        var missingTimelineCoverage = retained
+        var invalidTimeline = timeline
+        invalidTimeline["coveredAt"] = ["startAt": NSNull(), "endAt": NSNull()]
+        missingTimelineCoverage["timeline"] = invalidTimeline
+        invalidRoots.append(missingTimelineCoverage)
+        return invalidRoots.allSatisfy { root in
+            guard let decoded = decodeOverview(root, now: now, calendar: calendar)
+            else { return false }
+            return decoded.history.accountingStatus == .unavailable
+                && decoded.history.lastSevenDays == nil
+                && decoded.history.lastThirtyDays == nil
+        }
+    }
+
+    private static func mouseDismissalContract() -> Bool {
+        let targets: [MenuBarMouseTarget] = [
+            .popover, .statusItem, .applicationWindow, .outside,
+        ]
+        let cases: [(menu: Bool, popover: Bool, expected: [Bool])] = [
+            (false, false, [false, false, false, false]),
+            (true, false, [false, false, true, false]),
+            (false, true, [false, false, true, true]),
+            (true, true, [false, false, true, true]),
+        ]
+        return cases.allSatisfy { state in
+            zip(targets, state.expected).allSatisfy { target, expected in
+                menuBarShouldDismissForMouse(
+                    target: target,
+                    isMenuTracking: state.menu,
+                    isPopoverShown: state.popover
+                ) == expected
+            }
+        }
+    }
+
+    private static func semanticProjectionContract() -> Bool {
+        var calendar = Calendar(identifier: .gregorian)
+        guard let timeZone = TimeZone(identifier: "America/Los_Angeles") else {
+            return false
+        }
+        calendar.timeZone = timeZone
+        let parser = ISO8601DateFormatter()
+        guard let now = parser.date(from: "2026-03-10T19:00:00Z"),
+              let overview = decodeOverview(
+                overviewFixture(now: now, calendar: calendar),
+                now: now,
+                calendar: calendar
+              )
+        else {
+            return false
+        }
+        let laneDurations = overview.lanes.map(\.durationMinutes)
+        let currentDay = overview.history.thirtyDayHistory.last
+        let hasSpringForwardDay = overview.history.thirtyDayHistory.contains {
+            abs($0.endAt.timeIntervalSince($0.startAt) - 23 * 60 * 60) < 0.1
+        }
+        guard laneDurations == [
+                CodexQuotaWindowDuration.sevenDayMinutes,
+                CodexQuotaWindowDuration.fiveHourMinutes,
+              ],
+              overview.lanes.count == 2,
+              LocalCompanionOverviewProjection.evidence(
+                for: overview,
+                now: now
+              ) == .live,
+              overview.history.accountingStatus == .current,
+              overview.history.sevenDayHistory.count == 7,
+              overview.history.thirtyDayHistory.count == 30,
+              currentDay?.evidence == .partial,
+              currentDay?.totalTokens == nil,
+              overview.history.thirtyDayHistory.dropLast().allSatisfy({
+                $0.evidence == .available && $0.totalTokens == 0
+              }),
+              hasSpringForwardDay
+        else {
+            return false
+        }
+
+        let observedAt = now.addingTimeInterval(-60)
+        let staleFiveHourObservation = now.addingTimeInterval(-60 * 60)
+        let mixedAgeWindows = [
+            quotaWindow(
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                slot: "secondary",
+                usedPercent: 29,
+                observedAt: observedAt,
+                resetAt: observedAt.addingTimeInterval(5 * 24 * 60 * 60)
+            ),
+            quotaWindow(
+                durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                slot: "primary",
+                usedPercent: 37,
+                observedAt: staleFiveHourObservation,
+                resetAt: staleFiveHourObservation.addingTimeInterval(2 * 60 * 60)
+            ),
+        ]
+        guard let mixedAgeOverview = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                quotaWindows: mixedAgeWindows
+            ),
+            now: now,
+            calendar: calendar
+        ) else { return false }
+        var mixedAgeSnapshot = MenuBarStatusSnapshot()
+        mixedAgeSnapshot.phase = .ready
+        mixedAgeSnapshot.evidence = LocalCompanionOverviewProjection.evidence(
+            for: mixedAgeOverview,
+            now: now
+        )
+        mixedAgeSnapshot.lanes = mixedAgeOverview.lanes
+        mixedAgeSnapshot.observedAt = mixedAgeOverview.observedAt
+        mixedAgeSnapshot.staleAfterSeconds = mixedAgeOverview.staleAfterSeconds
+        guard mixedAgeSnapshot.currentLanes(now: now).map(\.durationMinutes) == [
+            CodexQuotaWindowDuration.sevenDayMinutes,
+        ] else { return false }
+
+        // During the historical secondary -> primary slot transition the
+        // companion can briefly expose both representations. The canonical
+        // JS pace forecast chooses primary, so the overview lane must make the
+        // same choice or exact reset/remaining binding would hide the card.
+        let primaryWeeklyReset = now.addingTimeInterval(4 * 24 * 60 * 60)
+        let dualWeeklyWindows = [
+            quotaWindow(
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                slot: "secondary",
+                usedPercent: 29,
+                observedAt: observedAt.addingTimeInterval(30),
+                resetAt: now.addingTimeInterval(5 * 24 * 60 * 60)
+            ),
+            quotaWindow(
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                slot: "primary",
+                usedPercent: 31,
+                observedAt: observedAt,
+                resetAt: primaryWeeklyReset
+            ),
+        ]
+        guard let dualWeeklyOverview = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                quotaWindows: dualWeeklyWindows
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        dualWeeklyOverview.lanes.count == 1,
+        let dualWeeklyLane = dualWeeklyOverview.lanes.first,
+        dualWeeklyLane.remainingPercent == 69,
+        dualWeeklyLane.resetAt == primaryWeeklyReset
+        else { return false }
+        var dualWeeklySnapshot = MenuBarStatusSnapshot()
+        dualWeeklySnapshot.phase = .ready
+        dualWeeklySnapshot.evidence = .live
+        dualWeeklySnapshot.lanes = dualWeeklyOverview.lanes
+        dualWeeklySnapshot.staleAfterSeconds = 30 * 60
+        dualWeeklySnapshot.weeklyPaceOutlook = decodePaceOutlook(
+            availablePaceOutlook(
+                now: now,
+                remainingPercent: 69,
+                resetsAt: primaryWeeklyReset,
+                headlineRate: 1
+            )
+        )
+        guard dualWeeklySnapshot.currentWeeklyPaceOutlook(now: now) != nil
+        else { return false }
+
+        var futureWindows = mixedAgeWindows
+        let futureObservedAt = now.addingTimeInterval(60)
+        futureWindows[0] = quotaWindow(
+            durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+            slot: "secondary",
+            usedPercent: 29,
+            observedAt: futureObservedAt,
+            resetAt: futureObservedAt.addingTimeInterval(24 * 60 * 60)
+        )
+        futureWindows[1] = quotaWindow(
+            durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+            slot: "primary",
+            usedPercent: 37,
+            observedAt: futureObservedAt,
+            resetAt: futureObservedAt.addingTimeInterval(2 * 60 * 60)
+        )
+        guard let futureOverview = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                quotaWindows: futureWindows
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        LocalCompanionOverviewProjection.evidence(
+            for: futureOverview,
+            now: now
+        ) != .live else { return false }
+
+        var invalidComplement = mixedAgeWindows[0]
+        invalidComplement["remainingPercent"] = 72
+        guard let complementOverview = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                quotaWindows: [invalidComplement, mixedAgeWindows[1]]
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        complementOverview.lanes.map(\.durationMinutes) == [
+            CodexQuotaWindowDuration.fiveHourMinutes,
+        ] else { return false }
+
+        guard let unmatchedUnified = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                accountingSource: "unified",
+                generationMatched: false
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        unmatchedUnified.history.accountingStatus == .unavailable,
+        unmatchedUnified.history.lastSevenDays == nil else { return false }
+
+        let bucketStart = calendar.startOfDay(for: now)
+        let bucketEnd = bucketStart.addingTimeInterval(15 * 60)
+        let duplicateBucket = timelineBucket(
+            startAt: bucketStart,
+            endAt: bucketEnd
+        )
+        guard let overlappingTimeline = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                timelineUsage: [duplicateBucket, duplicateBucket]
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        overlappingTimeline.history.accountingStatus == .unavailable,
+        overlappingTimeline.history.lastSevenDays == nil else { return false }
+
+        func historyFailsClosed(_ root: [String: Any]) -> Bool {
+            guard let decoded = decodeOverview(
+                root,
+                now: now,
+                calendar: calendar
+            ) else { return false }
+            return decoded.history.accountingStatus == .unavailable
+                && decoded.history.lastSevenDays == nil
+                && decoded.history.lastThirtyDays == nil
+        }
+        var missingPeriodRoot = overviewFixture(now: now, calendar: calendar)
+        guard var missingPeriodAccounting = missingPeriodRoot["accounting"]
+            as? [String: Any]
+        else { return false }
+        missingPeriodAccounting["periods"] = [
+            periodRow("24h"),
+            periodRow("7d"),
+        ]
+        missingPeriodRoot["accounting"] = missingPeriodAccounting
+
+        var invalidCoverageRoot = overviewFixture(now: now, calendar: calendar)
+        guard var invalidCoverageAccounting = invalidCoverageRoot["accounting"]
+            as? [String: Any]
+        else { return false }
+        var invalidCoveragePeriod = periodRow("7d")
+        invalidCoveragePeriod["events"] = 1
+        invalidCoveragePeriod["totalTokens"] = 1_000
+        invalidCoveragePeriod["apiPriceEquivalentUsd"] = 0.01
+        // The coverage sum deliberately disagrees with the one event.
+        invalidCoveragePeriod["pricingCoverage"] = pricingCoverage()
+        invalidCoverageAccounting["periods"] = [
+            periodRow("24h"),
+            invalidCoveragePeriod,
+            periodRow("30d"),
+        ]
+        invalidCoverageRoot["accounting"] = invalidCoverageAccounting
+
+        func timelineRoot(
+            source: String = "replay_safe_cache",
+            bucketMinutes: Int
+        ) -> [String: Any]? {
+            var root = overviewFixture(now: now, calendar: calendar)
+            guard var timeline = root["timeline"] as? [String: Any] else {
+                return nil
+            }
+            timeline["source"] = source
+            timeline["bucketMinutes"] = bucketMinutes
+            root["timeline"] = timeline
+            return root
+        }
+        guard let zeroBucketRoot = timelineRoot(bucketMinutes: 0),
+              let oversizedBucketRoot = timelineRoot(
+                bucketMinutes: 24 * 60 + 1
+              ),
+              let insufficientEvidenceRoot = timelineRoot(
+                source: "insufficient_evidence",
+                bucketMinutes: 15
+              ),
+              historyFailsClosed(missingPeriodRoot),
+              historyFailsClosed(invalidCoverageRoot),
+              historyFailsClosed(zeroBucketRoot),
+              historyFailsClosed(oversizedBucketRoot),
+              historyFailsClosed(insufficientEvidenceRoot)
+        else { return false }
+
+        let weeklyReset = now.addingTimeInterval(5 * 24 * 60 * 60)
+        let fiveHourReset = now.addingTimeInterval(2 * 60 * 60)
+        let boundaryLanes = [
+            ObservedQuotaLane(
+                label: "weekly",
+                remainingPercent: 70,
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                resetAt: weeklyReset,
+                observedAt: now,
+                isPrimary: true
+            ),
+            ObservedQuotaLane(
+                label: "five-hour",
+                remainingPercent: 70,
+                durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                resetAt: fiveHourReset,
+                observedAt: now,
+                isPrimary: false
+            ),
+        ]
+        guard let expiringOutlook = decodePaceOutlook(
+            availablePaceOutlook(
+                now: now,
+                remainingPercent: 70,
+                resetsAt: weeklyReset,
+                headlineRate: 70
+            )
+        ),
+        let projectedExhaustion = expiringOutlook.projection
+            .projectedExhaustionAt,
+        let collectingOutlook = decodePaceOutlook(
+            collectingPaceOutlook(
+                now: now,
+                remainingPercent: 70,
+                resetsAt: weeklyReset
+            )
+        )
+        else { return false }
+        return nextEvidencePresentationBoundary(
+            lanes: boundaryLanes,
+            staleAfterSeconds: 10 * 24 * 60 * 60,
+            now: now
+        ) == fiveHourReset
+            && nextEvidencePresentationBoundary(
+                lanes: boundaryLanes,
+                staleAfterSeconds: 10 * 24 * 60 * 60,
+                weeklyPaceOutlook: expiringOutlook,
+                now: now
+            ) == projectedExhaustion
+            && nextEvidencePresentationBoundary(
+                lanes: [boundaryLanes[0]],
+                staleAfterSeconds: 10 * 24 * 60 * 60,
+                weeklyPaceOutlook: collectingOutlook,
+                now: now
+            ) == weeklyReset
+            && menuBarStatusActivationIntent(
+                eventType: .leftMouseUp,
+                modifierFlags: []
+            ) == .popover
+            && menuBarStatusActivationIntent(
+                eventType: .rightMouseUp,
+                modifierFlags: []
+            ) == .actionMenu
+            && menuBarStatusActivationIntent(
+                eventType: .leftMouseUp,
+                modifierFlags: [.control]
+            ) == .actionMenu
+            && menuBarShouldDismissForEscape(
+                keyCode: 53,
+                isMenuTracking: false,
+                isPopoverShown: true
+            )
+    }
+
     static func run() -> Int32 {
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
         let durationSeconds = TimeInterval(
             CodexQuotaWindowDuration.sevenDayMinutes * 60
         )
-        let resetAt = Date(timeIntervalSince1970: 1_800_000_000)
-        let observedAt = resetAt.addingTimeInterval(
-            -durationSeconds * 0.76
+        // The compact title intentionally checks freshness against the real
+        // presentation clock. Anchor this compiled smoke to one captured now
+        // instead of a fixed epoch, while retaining the exact 24%-elapsed
+        // weekly position used by the assertions below.
+        let observedAt = Date()
+        let resetAt = observedAt.addingTimeInterval(
+            durationSeconds * 0.76
         )
         let weeklyLane = ObservedQuotaLane(
             label: TiboTattleLocalization.string(.menuBarSevenDayAllowance),
@@ -7764,12 +11478,98 @@ private enum MenuBarContractSmokeTest {
             observedAt: observedAt,
             isPrimary: true
         )
+        let fiveHourLane = ObservedQuotaLane(
+            label: TiboTattleLocalization.string(.menuBarFiveHourAllowance),
+            remainingPercent: 63,
+            durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+            resetAt: observedAt.addingTimeInterval(2 * 60 * 60),
+            observedAt: observedAt,
+            isPrimary: false
+        )
         let weeklyPosition = weeklyWindowPosition(weeklyLane)
         var liveSnapshot = MenuBarStatusSnapshot()
         liveSnapshot.phase = .ready
         liveSnapshot.evidence = .live
-        liveSnapshot.lanes = [weeklyLane]
+        liveSnapshot.lanes = [weeklyLane, fiveHourLane]
         liveSnapshot.observedAt = observedAt
+        liveSnapshot.staleAfterSeconds = 30 * 60
+        liveSnapshot.analysisAvailable = true
+        liveSnapshot.weeklyPaceOutlook = decodePaceOutlook(
+            availablePaceOutlook(
+                now: observedAt,
+                remainingPercent: weeklyLane.remainingPercent,
+                resetsAt: resetAt,
+                headlineRate: 0.9,
+                activeRate: 1.2
+            )
+        )
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let today = calendar.startOfDay(for: observedAt)
+        let historyDays = (0..<30).compactMap { index -> MenuBarHistoryDay? in
+            guard let startAt = calendar.date(
+                byAdding: .day,
+                value: index - 29,
+                to: today
+            ), let endAt = calendar.date(
+                byAdding: .day,
+                value: 1,
+                to: startAt
+            ) else { return nil }
+            let events = Int64(index + 1)
+            return MenuBarHistoryDay(
+                startAt: startAt,
+                endAt: endAt,
+                evidence: index == 29 ? .partial : .available,
+                usageEvents: events,
+                totalTokens: events * 1_000_000,
+                knownAPIPriceEquivalentUSD: Double(events) * 0.25,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: events,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            )
+        }
+        let sevenDayPeriod = MenuBarRollingPeriod(
+            window: .lastSevenDays,
+            events: 189,
+            totalTokens: 189_000_000,
+            knownAPIPriceEquivalentUSD: 47.25,
+            pricingCoverage: MenuBarPricingCoverage(
+                fullyPricedEvents: 189,
+                partiallyPricedEvents: 0,
+                unpricedEvents: 0
+            )
+        )
+        liveSnapshot.history = MenuBarHistorySnapshot(
+            accountingStatus: .current,
+            last24Hours: MenuBarRollingPeriod(
+                window: .last24Hours,
+                events: 30,
+                totalTokens: 30_000_000,
+                knownAPIPriceEquivalentUSD: 7.50,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: 30,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            ),
+            lastSevenDays: sevenDayPeriod,
+            lastThirtyDays: MenuBarRollingPeriod(
+                window: .lastThirtyDays,
+                events: 465,
+                totalTokens: 465_000_000,
+                knownAPIPriceEquivalentUSD: 116.25,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: 465,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            ),
+            sevenDayHistory: Array(historyDays.suffix(7)),
+            thirtyDayHistory: historyDays
+        )
         let liveSummary = liveSnapshot.laneSummary(
             weeklyLane,
             now: observedAt
@@ -7780,7 +11580,14 @@ private enum MenuBarContractSmokeTest {
             weeklyLane,
             now: observedAt
         )
+        var analyzingLiveSnapshot = liveSnapshot
+        analyzingLiveSnapshot.phase = .analyzing
+        var analyzingWithoutLiveEvidence = MenuBarStatusSnapshot()
+        analyzingWithoutLiveEvidence.phase = .analyzing
+        var unavailableLiveSnapshot = liveSnapshot
+        unavailableLiveSnapshot.phase = .unavailable
         let reset = resetCountdown(resetAt, now: observedAt)
+        let expectedLiveTitle = TiboTattleLocalization.percentString(71)
         let expectedLiveSummary = reset.map {
             TiboTattleLocalization.format(
                 .menuBarQuotaWeeklyPositionResets,
@@ -7808,7 +11615,219 @@ private enum MenuBarContractSmokeTest {
             summary: "The local companion is unavailable for this smoke test."
         )
         let unavailable = controller.nativePresentationContract()
+        // The normal app runs its event loop before any status-button click.
+        // This synchronous smoke must let AppKit attach the real status item
+        // first; a missing or unshowable item still fails the bounded check.
+        application.finishLaunching()
+        let openDeadline = Date().addingTimeInterval(2)
+        var didShowPopover = controller.showPopoverForSmokeTest()
+        while !didShowPopover && Date() < openDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            didShowPopover = controller.showPopoverForSmokeTest()
+        }
+        let shown = controller.nativePresentationContract()
         controller.shutDown()
+        let stopped = controller.nativePresentationContract()
+        let reopenedAfterShutdown = controller.showPopoverForSmokeTest()
+        let dismissalLifecycleChecks = [
+            ("initial-monitor-absent", !starting.outsideClickAwayMonitorInstalled),
+            ("popover-opened", didShowPopover && shown.popoverIsShown),
+            ("open-monitor-installed", shown.outsideClickAwayMonitorInstalled),
+            ("shutdown-outside-monitor-removed", !stopped.outsideClickAwayMonitorInstalled),
+            ("shutdown-local-monitor-removed", !stopped.sameAppClickAwayMonitorInstalled),
+            ("shutdown-escape-monitor-removed", !stopped.escapeDismissalMonitorInstalled),
+            ("shutdown-observer-removed", !stopped.appDeactivationDismissalObserverInstalled),
+            ("shutdown-cannot-reopen", !reopenedAfterShutdown),
+        ]
+        if let failed = dismissalLifecycleChecks.first(where: { !$0.1 }) {
+            FileHandle.standardError.write(Data(
+                "macOS menu bar dismissal smoke failed: \(failed.0)\n".utf8
+            ))
+            return 1
+        }
+        let popup = MenuBarPopoverViewController(
+            productName: BundledProduct.displayName,
+            brandImage: NSApp.applicationIconImage,
+            actions: MenuBarPopoverViewController.Actions(
+                openTiboTattle: {},
+                refresh: {},
+                showMore: { _ in }
+            )
+        )
+        popup.update(snapshot: liveSnapshot, now: observedAt)
+        let sevenDayPopup = popup.nativePresentationContract()
+        let overflowPopup = MenuBarPopoverViewController(
+            productName: BundledProduct.displayName,
+            brandImage: NSApp.applicationIconImage,
+            actions: MenuBarPopoverViewController.Actions(
+                openTiboTattle: {},
+                refresh: {},
+                showMore: { _ in }
+            )
+        )
+        var oneLaneSnapshot = liveSnapshot
+        oneLaneSnapshot.lanes = [weeklyLane]
+        let syntheticVisibleFrame = NSRect(
+            x: 0,
+            y: 40,
+            width: 1_440,
+            height: 800
+        )
+        let syntheticAnchorMinY: CGFloat = 428
+        overflowPopup.update(snapshot: oneLaneSnapshot, now: observedAt)
+        let oneLaneViewportCap = overflowPopup.prepareForPresentationForSmokeTest(
+            anchorMinY: syntheticAnchorMinY,
+            visibleFrame: syntheticVisibleFrame
+        )
+        let oneLaneOverflowAtTop = overflowPopup.nativePresentationContract()
+        overflowPopup.scrollToVerticalOffsetForSmokeTest(72)
+        let oneLaneOverflowScrolled = overflowPopup.nativePresentationContract()
+        overflowPopup.update(snapshot: liveSnapshot, now: observedAt)
+        let twoLaneOverflowPreserved = overflowPopup.nativePresentationContract()
+        overflowPopup.scrollToBottomForSmokeTest()
+        let twoLaneOverflowAtBottom = overflowPopup.nativePresentationContract()
+        let twoLaneViewportCap = overflowPopup.prepareForPresentationForSmokeTest(
+            anchorMinY: syntheticAnchorMinY,
+            visibleFrame: syntheticVisibleFrame
+        )
+        let twoLaneOverflowAtTop = overflowPopup.nativePresentationContract()
+        popup.selectHistoryRangeForSmokeTest(.thirtyDays)
+        let thirtyDayPopup = popup.nativePresentationContract()
+        popup.update(snapshot: analyzingLiveSnapshot, now: observedAt)
+        let updatingThirtyDayPopup = popup.nativePresentationContract()
+        popup.selectHistoryRangeForSmokeTest(.sevenDays)
+        let updatingSevenDayPopup = popup.nativePresentationContract()
+        popup.selectHistoryRangeForSmokeTest(.thirtyDays)
+        var readFailureSnapshot = liveSnapshot
+        readFailureSnapshot.invalidateObservedEvidence(keepingHistory: true)
+        readFailureSnapshot.phase = .unavailable
+        popup.update(snapshot: readFailureSnapshot, now: observedAt)
+        let readFailurePopup = popup.nativePresentationContract()
+        let retainedHistory = readFailureSnapshot.history
+        readFailureSnapshot.invalidateObservedEvidence(keepingHistory: true)
+        let repeatedFailurePreservesHistory = readFailureSnapshot.history == retainedHistory
+        popup.update(snapshot: liveSnapshot, now: observedAt)
+        let recoveredPopup = popup.nativePresentationContract()
+        var restartedSnapshot = liveSnapshot
+        restartedSnapshot.invalidateObservedEvidence()
+        popup.update(snapshot: restartedSnapshot, now: observedAt)
+        let restartedPopup = popup.nativePresentationContract()
+        var failedFirstRunSnapshot = MenuBarStatusSnapshot()
+        failedFirstRunSnapshot.invalidateObservedEvidence(keepingHistory: true)
+        func historyWithSevenDayCoverage(
+            _ coverage: MenuBarPricingCoverage,
+            knownCost: Double
+        ) -> MenuBarHistorySnapshot {
+            MenuBarHistorySnapshot(
+                accountingStatus: .current,
+                last24Hours: liveSnapshot.history.last24Hours,
+                lastSevenDays: MenuBarRollingPeriod(
+                    window: .lastSevenDays,
+                    events: coverage.fullyPricedEvents
+                        + coverage.partiallyPricedEvents
+                        + coverage.unpricedEvents,
+                    totalTokens: 12_000_000,
+                    knownAPIPriceEquivalentUSD: knownCost,
+                    pricingCoverage: coverage
+                ),
+                lastThirtyDays: liveSnapshot.history.lastThirtyDays,
+                sevenDayHistory: liveSnapshot.history.sevenDayHistory,
+                thirtyDayHistory: liveSnapshot.history.thirtyDayHistory
+            )
+        }
+        popup.selectHistoryRangeForSmokeTest(.sevenDays)
+        var partialPricingSnapshot = liveSnapshot
+        partialPricingSnapshot.history = historyWithSevenDayCoverage(
+            MenuBarPricingCoverage(
+                fullyPricedEvents: 4,
+                partiallyPricedEvents: 1,
+                unpricedEvents: 1
+            ),
+            knownCost: 2.50
+        )
+        popup.update(snapshot: partialPricingSnapshot, now: observedAt)
+        let partialPricingPopup = popup.nativePresentationContract()
+        var unpricedSnapshot = liveSnapshot
+        unpricedSnapshot.history = historyWithSevenDayCoverage(
+            MenuBarPricingCoverage(
+                fullyPricedEvents: 0,
+                partiallyPricedEvents: 0,
+                unpricedEvents: 6
+            ),
+            knownCost: 0
+        )
+        popup.update(snapshot: unpricedSnapshot, now: observedAt)
+        let unpricedPopup = popup.nativePresentationContract()
+        var noCompanionSnapshot = MenuBarStatusSnapshot()
+        noCompanionSnapshot.phase = .unavailable
+        popup.update(snapshot: noCompanionSnapshot, now: observedAt)
+        let noCompanionPopup = popup.nativePresentationContract()
+        let overflowGeometryChecks: [(String, Bool)] = [
+            ("natural-two-lane-fits-without-cap", !sevenDayPopup.verticalScrollingRequired),
+            ("natural-two-lane-starts-at-top", sevenDayPopup.contentStartsAtTop),
+            ("one-lane-count", oneLaneOverflowAtTop.visibleAllowanceLaneCount == 1),
+            ("one-lane-overflows", oneLaneOverflowAtTop.verticalScrollingRequired),
+            ("one-lane-vertical-only", !oneLaneOverflowAtTop.horizontalScrollingEnabled),
+            ("one-lane-starts-at-top", oneLaneOverflowAtTop.contentStartsAtTop),
+            ("one-lane-header-visible", oneLaneOverflowAtTop.headerVisible),
+            ("synthetic-cap-exact", oneLaneViewportCap == 360),
+            (
+                "forced-viewport-height",
+                oneLaneOverflowAtTop.viewportHeight == oneLaneViewportCap
+            ),
+            (
+                "one-lane-document-exceeds-viewport",
+                oneLaneOverflowAtTop.documentHeight > oneLaneOverflowAtTop.viewportHeight
+            ),
+            ("smoke-scroll-moves", !oneLaneOverflowScrolled.contentStartsAtTop),
+            ("smoke-scroll-positive", oneLaneOverflowScrolled.verticalScrollOffset > 0),
+            ("two-lane-count", twoLaneOverflowPreserved.visibleAllowanceLaneCount == 2),
+            ("two-lane-overflows", twoLaneOverflowPreserved.verticalScrollingRequired),
+            ("two-lane-vertical-only", !twoLaneOverflowPreserved.horizontalScrollingEnabled),
+            (
+                "poll-preserves-scroll",
+                abs(
+                    twoLaneOverflowPreserved.verticalScrollOffset
+                        - oneLaneOverflowScrolled.verticalScrollOffset
+                ) <= 0.5
+            ),
+            (
+                "two-lanes-grow-document",
+                twoLaneOverflowPreserved.documentHeight
+                    > oneLaneOverflowAtTop.documentHeight
+            ),
+            (
+                "bottom-offset-reached",
+                abs(
+                    twoLaneOverflowAtBottom.verticalScrollOffset
+                        - twoLaneOverflowAtBottom.maximumVerticalScrollOffset
+                ) <= 0.5
+            ),
+            ("bottom-offset-positive", twoLaneOverflowAtBottom.maximumVerticalScrollOffset > 0),
+            ("bottom-footer-actions-visible", twoLaneOverflowAtBottom.footerActionsVisible),
+            ("bottom-header-hidden", !twoLaneOverflowAtBottom.headerVisible),
+            ("reopen-synthetic-cap-exact", twoLaneViewportCap == 360),
+            ("reopen-two-lane-count", twoLaneOverflowAtTop.visibleAllowanceLaneCount == 2),
+            ("reopen-two-lane-overflows", twoLaneOverflowAtTop.verticalScrollingRequired),
+            ("reopen-two-lane-vertical-only", !twoLaneOverflowAtTop.horizontalScrollingEnabled),
+            ("reopen-starts-at-top", twoLaneOverflowAtTop.contentStartsAtTop),
+            ("reopen-zero-offset", twoLaneOverflowAtTop.verticalScrollOffset == 0),
+            ("reopen-header-visible", twoLaneOverflowAtTop.headerVisible),
+            ("reopen-footer-actions-below-fold", !twoLaneOverflowAtTop.footerActionsVisible),
+        ]
+        if let failed = overflowGeometryChecks.first(where: { !$0.1 }) {
+            FileHandle.standardError.write(Data(
+                ("macOS menu bar overflow smoke failed: \(failed.0) "
+                    + "one_document=\(oneLaneOverflowAtTop.documentHeight) "
+                    + "two_document=\(twoLaneOverflowAtTop.documentHeight) "
+                    + "viewport=\(twoLaneOverflowAtTop.viewportHeight) "
+                    + "one_offset=\(oneLaneOverflowScrolled.verticalScrollOffset) "
+                    + "two_offset=\(twoLaneOverflowPreserved.verticalScrollOffset) "
+                    + "bottom_offset=\(twoLaneOverflowAtBottom.verticalScrollOffset) "
+                    + "maximum_offset=\(twoLaneOverflowAtBottom.maximumVerticalScrollOffset)\n").utf8
+            ))
+            return 1
+        }
         guard starting.informationRowsAreNative,
               starting.informationRowsHaveTitles,
               unavailable.informationRowsAreNative,
@@ -7816,7 +11835,11 @@ private enum MenuBarContractSmokeTest {
               starting.analyzeShortcut == "r",
               starting.settingsShortcut == ",",
               starting.quitShortcut == "q",
-              starting.usesNativeStatusItemMenu,
+              !starting.usesNativeStatusItemMenu,
+              starting.statusItemButtonRoutesClicks,
+              starting.popoverIsTransient,
+              starting.popoverContentWidth == 400,
+              starting.popoverContainsScrollView,
               starting.escapeDismissalMonitorInstalled,
               starting.sameAppClickAwayMonitorInstalled,
               starting.appDeactivationDismissalObserverInstalled,
@@ -7824,8 +11847,73 @@ private enum MenuBarContractSmokeTest {
                   elapsedPercent: 24,
                   usedPercent: 29
               ),
+              liveSnapshot.title == expectedLiveTitle,
+              analyzingLiveSnapshot.title == expectedLiveTitle,
+              analyzingWithoutLiveEvidence.title == "…",
+              staleSnapshot.title == "–",
+              unavailableLiveSnapshot.title == "–",
               liveSummary == expectedLiveSummary,
-              staleSummary == expectedStaleSummary
+              staleSummary == expectedStaleSummary,
+              sevenDayPopup.contentWidth == 400,
+              sevenDayPopup.containsScrollView,
+              !sevenDayPopup.horizontalScrollingEnabled,
+              sevenDayPopup.visibleAllowanceLaneCount == 2,
+              sevenDayPopup.weeklyPaceVisible,
+              sevenDayPopup.weeklyPaceState == .over,
+              sevenDayPopup.selectedHistoryRange == .sevenDays,
+              sevenDayPopup.dailyBarCount == 7,
+              sevenDayPopup.historyVisible,
+              thirtyDayPopup.selectedHistoryRange == .thirtyDays,
+              thirtyDayPopup.dailyBarCount == 30,
+              thirtyDayPopup.historyVisible,
+              !sevenDayPopup.retainedHistoryDisclosed,
+              updatingThirtyDayPopup.selectedHistoryRange == .thirtyDays,
+              updatingThirtyDayPopup.dailyBarCount == 30,
+              updatingThirtyDayPopup.historyVisible,
+              updatingThirtyDayPopup.retainedHistoryDisclosed,
+              !updatingThirtyDayPopup.refreshActionEnabled,
+              updatingSevenDayPopup.dailyBarCount == 7,
+              updatingSevenDayPopup.historyVisible,
+              updatingSevenDayPopup.retainedHistoryDisclosed,
+              readFailurePopup.selectedHistoryRange == .thirtyDays,
+              readFailurePopup.dailyBarCount == 30,
+              readFailurePopup.historyVisible,
+              readFailurePopup.retainedHistoryDisclosed,
+              readFailurePopup.visibleAllowanceLaneCount == 0,
+              !readFailurePopup.weeklyPaceVisible,
+              readFailurePopup.refreshActionEnabled,
+              retainedHistory == liveSnapshot.history.retainingLastVerified(),
+              readFailureSnapshot.lanes.isEmpty,
+              readFailureSnapshot.observedAt == nil,
+              readFailureSnapshot.evidence == .none,
+              readFailureSnapshot.weeklyPaceOutlook == nil,
+              readFailureSnapshot.staleAfterSeconds == nil,
+              repeatedFailurePreservesHistory,
+              recoveredPopup.selectedHistoryRange == .thirtyDays,
+              recoveredPopup.historyVisible,
+              !recoveredPopup.retainedHistoryDisclosed,
+              restartedSnapshot.history == .unavailable,
+              !restartedPopup.historyVisible,
+              !restartedPopup.retainedHistoryDisclosed,
+              failedFirstRunSnapshot.history == .unavailable,
+              sevenDayPopup.pricingState == .completeEquivalent,
+              sevenDayPopup.historyCoverageState == .mixed,
+              sevenDayPopup.historyCoverageNamed,
+              sevenDayPopup.refreshActionEnabled,
+              partialPricingPopup.pricingState == .knownSubtotal,
+              partialPricingPopup.partialPricingDisclosed,
+              unpricedPopup.pricingState == .unavailable,
+              unpricedPopup.partialPricingDisclosed,
+              !noCompanionPopup.historyVisible,
+              !noCompanionPopup.weeklyPaceVisible,
+              !noCompanionPopup.refreshActionEnabled,
+              paceOutlookProjectionContract(
+                  now: observedAt,
+                  weeklyLane: weeklyLane
+              ),
+              semanticProjectionContract(),
+              retainedHistoryProjectionContract(),
+              mouseDismissalContract()
         else {
             FileHandle.standardError.write(
                 Data("macOS menu bar contract smoke failed\\n".utf8)
@@ -7834,10 +11922,506 @@ private enum MenuBarContractSmokeTest {
         }
         print(
             "USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT "
-                + "native_rows=true titles=true states=starting,unavailable "
+                + "popover=true width=400 bars=7,30 pace=canonical-outlook "
+                + "native_actions=true states=live,starting,unavailable "
                 + "shortcuts=cmd-r,cmd-comma,cmd-q "
-                + "dismissal=native,escape,same-app,deactivation "
-                + "weekly_position=fresh-only"
+                + "routing=left-popover,right-menu,control-menu "
+                + "dismissal=escape,transient,same-app,outside,deactivation "
+                + "weekly_position=factual-menu-only "
+                + "pace_outlook=collecting,under,on,over,critical,fail-closed "
+                + "history=authoritative,coverage-named,fail-closed "
+                + "pricing=complete,partial,unavailable model=dst,overlap,future,per-lane "
+                + "reset_credits=absent analysis_title=live-fallback "
+                + "history_retention=refresh,failure,source-reset"
+                + " overflow=screen-capped,vertical-only,top-reset,poll-preserved"
+        )
+        return 0
+    }
+
+    @MainActor
+    private final class InteractionHarnessActions: NSObject {
+        let controller: MenuBarStatusController
+
+        init(controller: MenuBarStatusController) { self.controller = controller }
+
+        @objc func showPopover(_ sender: Any?) {
+            _ = controller.showPopoverForSmokeTest()
+        }
+    }
+
+    /// Data-free, development-only interactive QA. No app delegate, companion,
+    /// user defaults, source files, credentials, or refresh are initialized.
+    static func runInteractionHarness() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let controller = MenuBarStatusController(
+            productName: "Menu-bar dismissal test",
+            actions: .init(
+                openTiboTattle: {}, showSettings: {}, showAbout: {},
+                quit: { application.terminate(nil) }
+            )
+        )
+        let target = InteractionHarnessActions(controller: controller)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 180),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.title = "Menu-bar dismissal test — no live data"
+        let showButton = NSButton(
+            title: "Open test popover", target: target,
+            action: #selector(InteractionHarnessActions.showPopover(_:))
+        )
+        let exitButton = NSButton(
+            title: "Finish test", target: application,
+            action: #selector(NSApplication.terminate(_:))
+        )
+        let content = NSStackView(views: [
+            NSTextField(labelWithString: "Temporary native test. No companion or usage data."),
+            showButton, exitButton,
+        ])
+        content.orientation = .vertical
+        content.spacing = 18
+        content.translatesAutoresizingMaskIntoConstraints = false
+        if let root = window.contentView {
+            root.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+                content.centerYAnchor.constraint(equalTo: root.centerYAnchor),
+            ])
+        }
+        window.center()
+        window.orderFrontRegardless()
+        var previous: String?
+        let deadline = Date().addingTimeInterval(180)
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                let state = controller.nativePresentationContract()
+                let line = "MENU_BAR_INTERACTION shown=\(state.popoverIsShown) outside_monitor=\(state.outsideClickAwayMonitorInstalled) active=\(application.isActive)"
+                if line != previous {
+                    FileHandle.standardOutput.write(Data("\(line)\n".utf8))
+                    previous = line
+                }
+                if Date() >= deadline {
+                    controller.shutDown()
+                    window.orderOut(nil)
+                    application.terminate(nil)
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            _ = controller.showPopoverForSmokeTest()
+        }
+        application.run()
+        timer.invalidate()
+        controller.shutDown()
+        window.orderOut(nil)
+        withExtendedLifetime(target) {}
+        return 0
+    }
+
+    /// Development-only, read-only handoff from the companion projection to
+    /// the actual native view. The input is a derived overview, never raw logs;
+    /// stdout reports layout/state facts rather than any private usage values.
+    static func renderOverview(inputPath: String, outputDirectory: String) -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        do {
+            let input = try FileHandle(forReadingFrom: URL(fileURLWithPath: inputPath))
+            defer { try? input.close() }
+            let maximumBytes = 8 * 1_024 * 1_024
+            let now = Date()
+            guard let data = try input.read(upToCount: maximumBytes + 1),
+                  data.count <= maximumBytes,
+                  let overview = LocalCompanionOverviewProjection.decode(data, now: now),
+                  overview.history.accountingStatus != .unavailable
+            else { return 1 }
+            let output = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+            var snapshot = MenuBarStatusSnapshot()
+            snapshot.evidence = LocalCompanionOverviewProjection.evidence(for: overview, now: now)
+            snapshot.lanes = overview.lanes
+            snapshot.observedAt = overview.observedAt
+            snapshot.staleAfterSeconds = overview.staleAfterSeconds
+            snapshot.history = overview.history
+            snapshot.analysisAvailable = true
+            let popup = MenuBarPopoverViewController(
+                productName: BundledProduct.displayName,
+                brandImage: NSApp.applicationIconImage,
+                actions: MenuBarPopoverViewController.Actions(
+                    openTiboTattle: {}, refresh: {}, showMore: { _ in }
+                )
+            )
+            for (phase, name) in [
+                (MenuBarStatusSnapshot.Phase.ready, "ready"),
+                (.analyzing, "updating"),
+                (.unavailable, "read-failure"),
+            ] {
+                snapshot.phase = phase
+                if phase == .unavailable {
+                    snapshot.invalidateObservedEvidence(keepingHistory: true)
+                }
+                popup.update(snapshot: snapshot, now: now)
+                for range in MenuBarHistoryRange.allCases {
+                    popup.selectHistoryRangeForSmokeTest(range)
+                    let presentation = popup.nativePresentationContract()
+                    guard presentation.historyVisible,
+                          presentation.dailyBarCount == range.dayCount,
+                          presentation.retainedHistoryDisclosed
+                            == (phase != .ready || snapshot.history.accountingStatus == .retained),
+                          phase != .unavailable || presentation.visibleAllowanceLaneCount == 0,
+                          snapshot.history.period(for: range) == overview.history.period(for: range),
+                          snapshot.history.history(for: range) == overview.history.history(for: range)
+                    else { return 1 }
+                    try popup.renderPNG(
+                        to: output.appendingPathComponent("\(name)-\(range.rawValue).png"),
+                        appearance: .aqua
+                    )
+                }
+            }
+            print("USAGE_MONITOR_MACOS_MENU_BAR_OVERVIEW_RENDER ranges=7d,30d states=ready,updating,read-failure history=preserved freshness=labelled current_quota=cleared-on-failure")
+            return 0
+        } catch {
+            FileHandle.standardError.write(Data("macOS menu bar overview render failed\n".utf8))
+            return 1
+        }
+    }
+
+    static func render(outputDirectory: String) -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let output = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: output,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            return 1
+        }
+
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let weeklyReset = observedAt.addingTimeInterval(5.25 * 24 * 60 * 60)
+        var snapshot = MenuBarStatusSnapshot()
+        snapshot.phase = .ready
+        snapshot.evidence = .live
+        snapshot.observedAt = observedAt
+        snapshot.staleAfterSeconds = 30 * 60
+        snapshot.analysisAvailable = true
+        snapshot.lanes = [
+            ObservedQuotaLane(
+                label: TiboTattleLocalization.string(.menuBarSevenDayAllowance),
+                remainingPercent: 62,
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                resetAt: weeklyReset,
+                observedAt: observedAt,
+                isPrimary: true
+            ),
+            ObservedQuotaLane(
+                label: TiboTattleLocalization.string(.menuBarFiveHourAllowance),
+                remainingPercent: 84,
+                durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                resetAt: observedAt.addingTimeInterval(2.2 * 60 * 60),
+                observedAt: observedAt,
+                isPrimary: false
+            ),
+        ]
+        snapshot.weeklyPaceOutlook = decodePaceOutlook(
+            availablePaceOutlook(
+                now: observedAt,
+                remainingPercent: 62,
+                resetsAt: weeklyReset,
+                headlineRate: 0.82,
+                activeRate: 1.05
+            )
+        )
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let today = calendar.startOfDay(for: observedAt)
+        let days = (0..<30).compactMap { index -> MenuBarHistoryDay? in
+            guard let startAt = calendar.date(
+                byAdding: .day,
+                value: index - 29,
+                to: today
+            ), let endAt = calendar.date(
+                byAdding: .day,
+                value: 1,
+                to: startAt
+            ) else { return nil }
+            let events = Int64([3, 8, 6, 12, 17, 9, 22][index % 7])
+            let tokens = events * Int64(6_500_000 + index * 125_000)
+            return MenuBarHistoryDay(
+                startAt: startAt,
+                endAt: endAt,
+                evidence: index == 29 ? .partial : .available,
+                usageEvents: events,
+                totalTokens: tokens,
+                knownAPIPriceEquivalentUSD: Double(events) * 0.43,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: events,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            )
+        }
+        func period(
+            _ window: MenuBarRollingPeriod.Window,
+            events: Int64,
+            tokens: Int64,
+            cost: Double
+        ) -> MenuBarRollingPeriod {
+            MenuBarRollingPeriod(
+                window: window,
+                events: events,
+                totalTokens: tokens,
+                knownAPIPriceEquivalentUSD: cost,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: events,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            )
+        }
+        snapshot.history = MenuBarHistorySnapshot(
+            accountingStatus: .current,
+            last24Hours: period(
+                .last24Hours,
+                events: 22,
+                tokens: 181_000_000,
+                cost: 9.46
+            ),
+            lastSevenDays: period(
+                .lastSevenDays,
+                events: 96,
+                tokens: 748_000_000,
+                cost: 41.28
+            ),
+            lastThirtyDays: period(
+                .lastThirtyDays,
+                events: 388,
+                tokens: 2_870_000_000,
+                cost: 166.84
+            ),
+            sevenDayHistory: Array(days.suffix(7)),
+            thirtyDayHistory: days
+        )
+
+        let originalLanguage = TiboTattleLocalization.languagePreference
+        defer { TiboTattleLocalization.setLanguagePreference(originalLanguage) }
+        let languages: [(TiboTattleLocalization.LanguagePreference, String)] = [
+            (.english, "en"),
+            (.spanish, "es"),
+            (.simplifiedChinese, "zh-Hans"),
+        ]
+        let appearances: [(NSAppearance.Name, String)] = [
+            (.aqua, "light"),
+            (.darkAqua, "dark"),
+        ]
+        do {
+            for (language, languageName) in languages {
+                TiboTattleLocalization.setLanguagePreference(language)
+                let popup = MenuBarPopoverViewController(
+                    productName: BundledProduct.displayName,
+                    brandImage: NSApp.applicationIconImage,
+                    actions: MenuBarPopoverViewController.Actions(
+                        openTiboTattle: {},
+                        refresh: {},
+                        showMore: { _ in }
+                    )
+                )
+                popup.update(snapshot: snapshot, now: observedAt)
+                popup.refreshLocalization()
+                for (appearance, appearanceName) in appearances {
+                    let destination = output.appendingPathComponent(
+                        "menu-bar-popover-\(languageName)-\(appearanceName).png"
+                    )
+                    try popup.renderPNG(to: destination, appearance: appearance)
+                }
+                if language == .english {
+                    popup.selectHistoryRangeForSmokeTest(.thirtyDays)
+                    for (appearance, appearanceName) in appearances {
+                        let destination = output.appendingPathComponent(
+                            "menu-bar-popover-en-30d-\(appearanceName).png"
+                        )
+                        try popup.renderPNG(
+                            to: destination,
+                            appearance: appearance
+                        )
+                    }
+                    var updatingSnapshot = snapshot
+                    updatingSnapshot.phase = .analyzing
+                    updatingSnapshot.history = snapshot.history.retainingLastVerified()
+                    popup.update(snapshot: updatingSnapshot, now: observedAt)
+                    for range in [MenuBarHistoryRange.sevenDays, .thirtyDays] {
+                        popup.selectHistoryRangeForSmokeTest(range)
+                        try popup.renderPNG(
+                            to: output.appendingPathComponent(
+                                "menu-bar-popover-en-updating-\(range.rawValue)-light.png"
+                            ),
+                            appearance: .aqua
+                        )
+                    }
+                    updatingSnapshot.invalidateObservedEvidence(keepingHistory: true)
+                    updatingSnapshot.phase = .unavailable
+                    popup.update(snapshot: updatingSnapshot, now: observedAt)
+                    try popup.renderPNG(
+                        to: output.appendingPathComponent(
+                            "menu-bar-popover-en-read-failure-30d-light.png"
+                        ),
+                        appearance: .aqua
+                    )
+                }
+            }
+
+            let sustainableRate = 62.0 / (
+                weeklyReset.timeIntervalSince(observedAt) / 3_600
+            )
+            let paceStateFixtures: [([String: Any], String)] = [
+                (
+                    collectingPaceOutlook(
+                        now: observedAt,
+                        remainingPercent: 62,
+                        resetsAt: weeklyReset
+                    ),
+                    "collecting"
+                ),
+                (
+                    availablePaceOutlook(
+                        now: observedAt,
+                        remainingPercent: 62,
+                        resetsAt: weeklyReset,
+                        headlineRate: sustainableRate * 0.7
+                    ),
+                    "under"
+                ),
+                (
+                    availablePaceOutlook(
+                        now: observedAt,
+                        remainingPercent: 62,
+                        resetsAt: weeklyReset,
+                        headlineRate: sustainableRate
+                    ),
+                    "on"
+                ),
+                (
+                    availablePaceOutlook(
+                        now: observedAt,
+                        remainingPercent: 62,
+                        resetsAt: weeklyReset,
+                        headlineRate: sustainableRate * 2.2
+                    ),
+                    "critical"
+                ),
+            ]
+            TiboTattleLocalization.setLanguagePreference(.english)
+            for (paceValue, paceName) in paceStateFixtures {
+                guard let paceOutlook = decodePaceOutlook(paceValue) else {
+                    return 1
+                }
+                var paceSnapshot = snapshot
+                paceSnapshot.weeklyPaceOutlook = paceOutlook
+                let popup = MenuBarPopoverViewController(
+                    productName: BundledProduct.displayName,
+                    brandImage: NSApp.applicationIconImage,
+                    actions: MenuBarPopoverViewController.Actions(
+                        openTiboTattle: {},
+                        refresh: {},
+                        showMore: { _ in }
+                    )
+                )
+                popup.update(snapshot: paceSnapshot, now: observedAt)
+                popup.refreshLocalization()
+                try popup.renderPNG(
+                    to: output.appendingPathComponent(
+                        "menu-bar-popover-en-pace-\(paceName)-light.png"
+                    ),
+                    appearance: .aqua
+                )
+            }
+
+            func historyWithPricingCoverage(
+                _ coverage: MenuBarPricingCoverage,
+                knownCost: Double
+            ) -> MenuBarHistorySnapshot {
+                MenuBarHistorySnapshot(
+                    accountingStatus: .current,
+                    last24Hours: snapshot.history.last24Hours,
+                    lastSevenDays: MenuBarRollingPeriod(
+                        window: .lastSevenDays,
+                        events: coverage.fullyPricedEvents
+                            + coverage.partiallyPricedEvents
+                            + coverage.unpricedEvents,
+                        totalTokens: 748_000_000,
+                        knownAPIPriceEquivalentUSD: knownCost,
+                        pricingCoverage: coverage
+                    ),
+                    lastThirtyDays: snapshot.history.lastThirtyDays,
+                    sevenDayHistory: snapshot.history.sevenDayHistory,
+                    thirtyDayHistory: snapshot.history.thirtyDayHistory
+                )
+            }
+            func renderSpanishState(
+                _ stateSnapshot: MenuBarStatusSnapshot,
+                name: String
+            ) throws {
+                TiboTattleLocalization.setLanguagePreference(.spanish)
+                let popup = MenuBarPopoverViewController(
+                    productName: BundledProduct.displayName,
+                    brandImage: NSApp.applicationIconImage,
+                    actions: MenuBarPopoverViewController.Actions(
+                        openTiboTattle: {},
+                        refresh: {},
+                        showMore: { _ in }
+                    )
+                )
+                popup.update(snapshot: stateSnapshot, now: observedAt)
+                popup.refreshLocalization()
+                try popup.renderPNG(
+                    to: output.appendingPathComponent(
+                        "menu-bar-popover-es-\(name)-light.png"
+                    ),
+                    appearance: .aqua
+                )
+            }
+            var partialPricingSnapshot = snapshot
+            partialPricingSnapshot.history = historyWithPricingCoverage(
+                MenuBarPricingCoverage(
+                    fullyPricedEvents: 82,
+                    partiallyPricedEvents: 8,
+                    unpricedEvents: 6
+                ),
+                knownCost: 34.10
+            )
+            try renderSpanishState(
+                partialPricingSnapshot,
+                name: "partial-pricing"
+            )
+            var unpricedSnapshot = snapshot
+            unpricedSnapshot.history = historyWithPricingCoverage(
+                MenuBarPricingCoverage(
+                    fullyPricedEvents: 0,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 96
+                ),
+                knownCost: 0
+            )
+            try renderSpanishState(unpricedSnapshot, name: "unpriced")
+            var unavailableSnapshot = MenuBarStatusSnapshot()
+            unavailableSnapshot.phase = .unavailable
+            try renderSpanishState(unavailableSnapshot, name: "unavailable")
+        } catch {
+            FileHandle.standardError.write(
+                Data("macOS menu bar popover render smoke failed\n".utf8)
+            )
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_MENU_BAR_POPOVER_RENDER "
+                + "locales=en,es,zh-Hans appearances=light,dark "
+                + "ranges=7d,30d "
+                + "states=live,pace-collecting,pace-under,pace-on,"
+                + "pace-over,pace-critical,partial-pricing,unpriced,unavailable,"
+                + "updating-7d,updating-30d,read-failure-30d "
+                + "width=400 source=synthetic-content-free"
         )
         return 0
     }
@@ -8518,7 +13102,67 @@ private enum NativeSettingsLayoutSmokeTest {
 /// loopback server is healthy but WebKit receives no usable display frame.
 @MainActor
 private enum NativeDashboardLayoutSmokeTest {
+    /// Executes the same clock/generation policy used by the real WebKit host.
+    /// No sleeps, page loads, companion, credentials or user data are involved.
+    private static func readinessContract() -> Bool {
+        var state = NativeDashboardReadiness()
+        let initial = state.invalidate()
+        guard state.observe(generation: initial, at: 0, ready: true) == .ignored,
+              state.start(generation: initial, at: 0),
+              !state.start(generation: initial, at: 1),
+              state.observe(generation: initial, at: 0, ready: false) == .waiting(0.25),
+              state.observe(generation: initial, at: 19.9, ready: false) == .waiting(0.25),
+              state.observe(generation: initial, at: 20, ready: false) == .takingLonger,
+              state.observe(generation: initial, at: 21, ready: false) == .waiting(1),
+              state.observe(generation: initial, at: 35, ready: true) == .ready,
+              state.observe(generation: initial, at: 36, ready: true) == .ignored,
+              !state.isObserving(initial)
+        else { return false }
+
+        let replacement = state.invalidate()
+        guard replacement != initial,
+              state.start(generation: replacement, at: 40),
+              // Both a late success and the old deadline are inert.
+              state.observe(generation: initial, at: 45, ready: true) == .ignored,
+              state.observe(generation: initial, at: 125, ready: false) == .ignored,
+              state.observe(generation: replacement, at: 45, ready: false) == .waiting(0.25),
+              state.observe(generation: replacement, at: 60, ready: false) == .takingLonger,
+              // The watchdog still expires if JavaScript never answers.
+              state.observe(generation: replacement, at: 159.9, ready: false) == .waiting(1),
+              state.observe(generation: replacement, at: 160, ready: false) == .timedOut,
+              state.observe(generation: replacement, at: 161, ready: true) == .ignored,
+              !state.isObserving(replacement)
+        else { return false }
+
+        let stopped = state.invalidate()
+        guard state.start(generation: stopped, at: 200) else { return false }
+        let next = state.invalidate()
+        guard state.observe(generation: stopped, at: 201, ready: true) == .ignored,
+              !state.isObserving(next),
+              state.start(generation: next, at: 201),
+              state.observe(generation: next, at: 202, ready: true) == .ready,
+              state.observe(generation: next, at: 203, ready: true) == .ignored
+        else { return false }
+
+        let tooLate = state.invalidate()
+        guard state.start(generation: tooLate, at: 300),
+              state.observe(generation: tooLate, at: 420, ready: true) == .timedOut
+        else { return false }
+        return true
+    }
+
     static func run() -> Int32 {
+        guard readinessContract() else {
+            FileHandle.standardError.write(Data(
+                "macOS dashboard readiness lifecycle smoke failed\n".utf8
+            ))
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_DASHBOARD_READINESS "
+                + "early=true late=true once=true stale_callbacks=ignored "
+                + "cancelled=true hung_renderer=bounded hard_deadline=120"
+        )
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
         let host = DashboardWebHost(
@@ -8729,6 +13373,211 @@ private enum NativeDashboardSidebarRecoverySmokeTest {
                 + "respects_choice=true"
         )
         return 0
+    }
+}
+
+/// Exercises the product-policy layer on top of WebKit and AppKit. The real
+/// framework objects matter here: source assertions alone cannot show that the
+/// context-menu filter operates on NSMenu identifiers or that link previews
+/// are disabled on the web view the dashboard actually constructs.
+@MainActor
+private enum NativeDashboardInteractionSafetySmokeTest {
+    private static let backIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierGoBack"
+    )
+    private static let forwardIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierGoForward"
+    )
+    private static let reloadIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierReload"
+    )
+    private static let downloadIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierDownloadLinkedFile"
+    )
+    private static let openLinkIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierOpenLink"
+    )
+
+    private static func codexThreadPolicyIsSafe() -> Bool {
+        let identifier = "11111111-1111-4111-8111-111111111111"
+        let canonical = "codex://threads/\(identifier)"
+        guard let target = URL(string: canonical),
+              CodexThreadOpenTarget.accepts(target)
+        else { return false }
+        let rejected = [
+            "https://threads/\(identifier)",
+            "codex://other/\(identifier)",
+            "codex://threads/not-a-thread",
+            "codex://threads/11111111-1111-0111-8111-111111111111",
+            "codex://threads/11111111-1111-4111-1111-111111111111",
+            "codex://user@threads/\(identifier)",
+            "codex://user:password@threads/\(identifier)",
+            "codex://threads:1234/\(identifier)",
+            "codex://threads:/\(identifier)",
+            canonical + "?next=other", canonical + "?",
+            canonical + "#other", canonical + "#",
+            canonical + "/", canonical + "/other",
+            "codex://threads//\(identifier)",
+            "codex://threads/./\(identifier)",
+            "codex://%74hreads/\(identifier)",
+            "codex://threads/%31" + String(identifier.dropFirst()),
+            "codex://threads\\\(identifier)",
+        ]
+        guard rejected.allSatisfy({ candidate in
+            guard let url = URL(string: candidate) else { return true }
+            return !CodexThreadOpenTarget.accepts(url)
+        }) else { return false }
+
+        func allowed(
+            source: String? = "http://127.0.0.1:41234/#accounting",
+            activated: Bool = true,
+            mainFrame: Bool = true,
+            origin: (String, String, Int) = ("http", "127.0.0.1", 41234),
+            port: Int? = 41234
+        ) -> Bool {
+            CodexThreadOpenTarget.acceptsNavigation(
+                to: target,
+                userActivated: activated,
+                sourceIsMainFrame: mainFrame,
+                sourceURL: source.flatMap { URL(string: $0) },
+                sourceOrigin: origin,
+                companionPort: port
+            )
+        }
+        return allowed()
+            && !allowed(activated: false)
+            && !allowed(mainFrame: false)
+            && !allowed(source: nil)
+            && !allowed(source: "about:blank")
+            && !allowed(source: "blob:http://127.0.0.1:41234/opaque")
+            && !allowed(source: "https://example.invalid/")
+            && !allowed(source: "http://127.0.0.1:41235/")
+            && !allowed(source: "http://user@127.0.0.1:41234/")
+            && !allowed(origin: ("https", "127.0.0.1", 41234))
+            && !allowed(origin: ("http", "example.invalid", 41234))
+            && !allowed(origin: ("http", "127.0.0.1", 41235))
+            && !allowed(port: nil)
+    }
+
+    static func run() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let host = DashboardWebHost(
+            onLoaded: {},
+            onFailure: { _ in },
+            onDownloadFailure: {},
+            openExternally: { _ in },
+            onNavigation: { _ in },
+            onLanguagePreferenceChange: { _ in }
+        )
+        let menu = NSMenu(title: "dashboard-context-menu")
+        addItem(backIdentifier, to: menu)
+        addItem(forwardIdentifier, to: menu)
+        addItem(reloadIdentifier, to: menu)
+        addItem(downloadIdentifier, to: menu)
+        addItem(openLinkIdentifier, to: menu)
+
+        NativeDashboardWebView.stripUnsupportedContextMenuItems(from: menu)
+        let remaining = Set(menu.items.compactMap(\.identifier))
+        let mandatoryToolbarItems =
+            AppDelegate.mandatoryDashboardToolbarItemIdentifiers
+        let expectedToolbarItems: Set<NSToolbarItem.Identifier> = [
+            .toggleSidebar,
+            AppDelegate.toolbarStatusRefreshIdentifier,
+            AppDelegate.toolbarShareIdentifier,
+            AppDelegate.toolbarSettingsIdentifier,
+        ]
+
+        let backRemoved = !remaining.contains(backIdentifier)
+        let forwardRemoved = !remaining.contains(forwardIdentifier)
+        let reloadPreserved = remaining.contains(reloadIdentifier)
+        let downloadRemoved = !remaining.contains(downloadIdentifier)
+        let openLinkPreserved = remaining.contains(openLinkIdentifier)
+        let usesSubclass = host.webView is NativeDashboardWebView
+        let linkPreviewDisabled = !host.webView.allowsLinkPreview
+        let toolbarItemsImmovable = mandatoryToolbarItems
+            == expectedToolbarItems
+        let settingsTabs = NSTabViewController()
+        settingsTabs.tabStyle = .toolbar
+        for identifier in NativeSettingsToolbarPolicy
+            .mandatoryTabIdentifiers {
+            let item = NSTabViewItem(identifier: identifier)
+            item.label = identifier.rawValue
+            item.viewController = NSViewController()
+            settingsTabs.addTabViewItem(item)
+        }
+        let settingsWindow = NSWindow(
+            contentViewController: settingsTabs
+        )
+        guard let settingsToolbar = settingsWindow.toolbar else { return 1 }
+        let settingsDelegate = NativeSettingsToolbarDelegate(
+            tabController: settingsTabs
+        )
+        settingsToolbar.delegate = settingsDelegate
+        let expectedSettingsItems =
+            NativeSettingsToolbarPolicy.mandatoryTabIdentifiers
+        let settingsDelegateInstalled = settingsToolbar.delegate
+            === settingsDelegate
+        let settingsTabsImmovable = expectedSettingsItems.count == 3
+            && settingsDelegate.toolbarImmovableItemIdentifiers(settingsToolbar)
+                .isSuperset(of: expectedSettingsItems)
+            && Set(settingsDelegate.toolbarDefaultItemIdentifiers(
+                settingsToolbar
+            )) == expectedSettingsItems
+        let codexThreadLinksSafe = codexThreadPolicyIsSafe()
+
+        guard backRemoved,
+              forwardRemoved,
+              reloadPreserved,
+              downloadRemoved,
+              openLinkPreserved,
+              usesSubclass,
+              linkPreviewDisabled,
+              toolbarItemsImmovable,
+              settingsTabsImmovable,
+              settingsDelegateInstalled,
+              codexThreadLinksSafe
+        else {
+            FileHandle.standardError.write(Data(
+                ("macOS native interaction safety smoke failed "
+                    + "back_removed=\(backRemoved) "
+                    + "forward_removed=\(forwardRemoved) "
+                    + "reload_preserved=\(reloadPreserved) "
+                    + "download_removed=\(downloadRemoved) "
+                    + "open_link_preserved=\(openLinkPreserved) "
+                    + "subclass=\(usesSubclass) "
+                    + "link_preview_disabled=\(linkPreviewDisabled) "
+                    + "toolbar_immovable=\(toolbarItemsImmovable) "
+                    + "settings_tabs_immovable="
+                    + "\(settingsTabsImmovable) "
+                    + "settings_delegate="
+                    + "\(settingsDelegateInstalled) "
+                    + "codex_thread_links_safe=\(codexThreadLinksSafe)\n").utf8
+            ))
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_NATIVE_INTERACTION_SAFETY "
+                + "back=false forward=false reload=true "
+                + "download_link=false open_link=true "
+                + "link_preview=false toolbar_immovable=true "
+                + "settings_tabs_immovable=true settings_delegate=true "
+                + "codex_thread_links_safe=true"
+        )
+        return 0
+    }
+
+    private static func addItem(
+        _ identifier: NSUserInterfaceItemIdentifier,
+        to menu: NSMenu
+    ) {
+        let item = NSMenuItem(
+            title: identifier.rawValue,
+            action: nil,
+            keyEquivalent: ""
+        )
+        item.identifier = identifier
+        menu.addItem(item)
     }
 }
 
@@ -9032,12 +13881,29 @@ private enum NativeDashboardChromeLayoutSmokeTest {
 @main
 private struct UsageMonitorMain {
     static func main() {
+        // TiboTattle has no document-style multi-window workflow. Opt out
+        // before AppKit creates the application or any windows so it does not
+        // expose a browser-style tab bar with no product meaning.
+        NSWindow.allowsAutomaticWindowTabbing = false
         let arguments = Array(CommandLine.arguments.dropFirst())
         // This isolated seam smoke intentionally runs before bundle branding
         // is resolved, so it can execute as a plain launcher binary without
         // constructing the production login-item adapter.
         if arguments.contains("--login-item-contract-smoke-test") {
             exit(LoginItemContractSmokeTest.run())
+        }
+        if arguments.contains("--updater-architecture-contract-smoke-test") {
+            exit(MacOSUpdaterFeedPolicy.runContractSmokeTest())
+        }
+        BundledProduct.validateRuntimeIdentity()
+        if arguments.contains("--keychain-broker-contract-smoke-test") {
+            guard CompanionProcess.verifyKeychainLaunchContract() else { exit(1) }
+            print(
+                "USAGE_MONITOR_MACOS_KEYCHAIN_LAUNCH_CONTRACT "
+                    + "required=true failures=construction,endpoint "
+                    + "child_started=false stop_callbacks=once keychain_access=0"
+            )
+            exit(ContributionDeviceKeychainBroker.runContractSmokeTest())
         }
         let semanticOpenTarget = SemanticOpenTarget(
             scheme: BundledProduct.appOpenScheme,
@@ -9119,9 +13985,80 @@ private struct UsageMonitorMain {
         if arguments.contains("--native-refresh-settings-contract-smoke-test") {
             exit(NativeRefreshSettingsContractSmokeTest.run())
         }
+        if arguments.contains(
+            "--native-keychain-migration-ui-contract-smoke-test"
+        ) {
+            guard BundledProduct.buildChannel == "development" else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                NativeKeychainMigrationUIContractSmokeTest.run()
+            })
+        }
+        if arguments.contains(
+            "--native-appearance-settings-contract-smoke-test"
+        ) {
+            exit(NativeAppearanceSettingsContractSmokeTest.run())
+        }
+        if arguments.contains("--native-analysis-progress-contract-smoke-test") {
+            exit(NativeAnalysisProgressContractSmokeTest.run())
+        }
+        if let paceIndex = arguments.firstIndex(
+            of: "--native-weekly-pace-projection-contract-smoke-test"
+        ) {
+            guard paceIndex + 1 < arguments.count,
+                  BundledProduct.buildChannel == "development"
+            else {
+                exit(2)
+            }
+            exit(NativeWeeklyPaceProjectionContractSmokeTest.run(
+                fixturePath: arguments[paceIndex + 1]
+            ))
+        }
+        if let index = arguments.firstIndex(of: "--tray-customization-render-smoke-test"), index + 1 < arguments.count {
+            guard BundledProduct.buildChannel == "development" else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                let application = NSApplication.shared
+                application.setActivationPolicy(.regular)
+                do {
+                    try TrayCustomizationController.shared.renderExample(to: URL(fileURLWithPath: arguments[index + 1], isDirectory: true))
+                    return Int32(0)
+                } catch { return Int32(1) }
+            })
+        }
+        if arguments.contains("--tray-customization-smoke-test") {
+            exit(MainActor.assumeIsolated { TrayCustomizationSmoke.run() })
+        }
         if arguments.contains("--menu-bar-contract-smoke-test") {
             exit(MainActor.assumeIsolated {
                 MenuBarContractSmokeTest.run()
+            })
+        }
+        if arguments.contains("--menu-bar-interaction-smoke-test") {
+            guard BundledProduct.buildChannel == "development" else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                MenuBarContractSmokeTest.runInteractionHarness()
+            })
+        }
+        if let overviewRenderIndex = arguments.firstIndex(
+            of: "--menu-bar-overview-render-smoke-test"
+        ) {
+            guard overviewRenderIndex + 2 < arguments.count,
+                  BundledProduct.buildChannel == "development"
+            else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                MenuBarContractSmokeTest.renderOverview(
+                    inputPath: arguments[overviewRenderIndex + 1],
+                    outputDirectory: arguments[overviewRenderIndex + 2]
+                )
+            })
+        }
+        if let renderIndex = arguments.firstIndex(
+            of: "--menu-bar-popover-render-smoke-test"
+        ) {
+            guard renderIndex + 1 < arguments.count else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                MenuBarContractSmokeTest.render(
+                    outputDirectory: arguments[renderIndex + 1]
+                )
             })
         }
         if arguments.contains("--quota-notification-contract-smoke-test") {
@@ -9143,6 +14080,11 @@ private struct UsageMonitorMain {
         if arguments.contains("--native-dashboard-sidebar-recovery-smoke-test") {
             exit(MainActor.assumeIsolated {
                 NativeDashboardSidebarRecoverySmokeTest.run()
+            })
+        }
+        if arguments.contains("--native-dashboard-interaction-safety-smoke-test") {
+            exit(MainActor.assumeIsolated {
+                NativeDashboardInteractionSafetySmokeTest.run()
             })
         }
         let application = NSApplication.shared

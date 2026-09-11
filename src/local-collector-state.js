@@ -17,6 +17,7 @@ import {
   unlinkDurably,
 } from "./storage.js";
 import { readBoundedUtf8LineEntries } from "./platform/index.js";
+import { validAbortSignal } from "./valid-abort-signal.js";
 
 // This database is deliberately the one durable owner-controlled store for
 // local collector facts, cursors, quota observations and derived accounting.
@@ -61,6 +62,13 @@ function fixedError(code) {
   return error;
 }
 
+function throwIfAccountingCachePublicationAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = fixedError("accounting_refresh_aborted");
+  error.name = "AbortError";
+  throw error;
+}
+
 function ownerOnlyRegularFile(metadata) {
   return metadata?.isFile?.()
     && !metadata.isSymbolicLink()
@@ -74,6 +82,28 @@ function sameFileIdentity(left, right) {
     && right !== null
     && left.dev === right.dev
     && left.ino === right.ino;
+}
+
+function validStateFileIdentity(value) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).sort().join("\0") === "dev\0ino"
+    && Number.isSafeInteger(value.dev)
+    && value.dev >= 0
+    && Number.isSafeInteger(value.ino)
+    && value.ino >= 0;
+}
+
+function stateFileIdentity(metadata) {
+  const identity = {
+    dev: metadata?.dev,
+    ino: metadata?.ino,
+  };
+  if (!validStateFileIdentity(identity)) {
+    throw fixedError("local_collector_state_unavailable");
+  }
+  return Object.freeze(identity);
 }
 
 function delay(milliseconds) {
@@ -233,6 +263,25 @@ async function assertSafeStateFile(path, { allowMissing = false } = {}) {
       || metadata.nlink !== 1
       || (typeof process.getuid === "function" && metadata.uid !== process.getuid())
       || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+    throw fixedError("local_collector_state_unavailable");
+  }
+  return metadata;
+}
+
+async function assertExpectedStateFileIdentity(stateFile, expectedIdentity) {
+  let metadata;
+  try {
+    metadata = await assertSafeStateFile(stateFile);
+  } catch (error) {
+    // A session that just committed state cannot treat a vanished or replaced
+    // path as a successful integrity proof. Keep this boundary content-free
+    // and within the established unavailable state category.
+    if (error?.code === "local_collector_state_missing") {
+      throw fixedError("local_collector_state_unavailable");
+    }
+    throw error;
+  }
+  if (!sameFileIdentity(metadata, expectedIdentity)) {
     throw fixedError("local_collector_state_unavailable");
   }
   return metadata;
@@ -1258,6 +1307,40 @@ export async function commitLocalCollectorState({
 }
 
 /**
+ * Verify the exact owner-only state file selected by a live write session.
+ *
+ * This is deliberately separate from session mutation: callers retain the
+ * session's lock, transactions, replay handling and durable close ordering.
+ * The expected identity detects a changed path before, during, or after the
+ * scan. It does not certify an already-closed SQLite descriptor; the writer's
+ * existing owner-only path and lock policy remains authoritative.
+ */
+export async function verifyLocalCollectorStateIntegrity({
+  stateFile = defaultLocalCollectorStatePath(),
+  expectedIdentity,
+} = {}) {
+  if (typeof stateFile !== "string" || stateFile.length < 1
+      || !validStateFileIdentity(expectedIdentity)) {
+    throw new TypeError("Local collector state integrity request is invalid");
+  }
+  await assertExpectedStateFileIdentity(stateFile, expectedIdentity);
+  let database;
+  try {
+    database = openDatabase(stateFile, { readOnly: true });
+    // The path was safe before opening. Check it again while the SQLite handle
+    // is live so a replacement cannot be certified by a later path lookup.
+    await assertExpectedStateFileIdentity(stateFile, expectedIdentity);
+    const quickCheck = database.prepare("PRAGMA quick_check").get();
+    if (quickCheck?.quick_check !== "ok") {
+      throw fixedError("local_collector_state_integrity_failed");
+    }
+  } finally {
+    database?.close();
+  }
+  await assertExpectedStateFileIdentity(stateFile, expectedIdentity);
+}
+
+/**
  * A multi-batch write session over one open connection.
  *
  * `PRAGMA quick_check` reads every page in the database, so its cost scales
@@ -1276,13 +1359,27 @@ export async function commitLocalCollectorState({
 export async function openLocalCollectorStateSession({
   stateFile = defaultLocalCollectorStatePath(),
   clock = () => Date.now(),
+  integrityVerifier = null,
 } = {}) {
   if (typeof stateFile !== "string" || stateFile.length < 1
-      || typeof clock !== "function") {
+      || typeof clock !== "function"
+      || (integrityVerifier !== null && typeof integrityVerifier !== "function")) {
     throw new TypeError("Local collector state session options are invalid");
   }
   await ensureDatabase(stateFile);
-  const database = openDatabase(stateFile, { readOnly: false });
+  const expectedIntegrityIdentity = stateFileIdentity(
+    await assertSafeStateFile(stateFile),
+  );
+  let database;
+  try {
+    database = openDatabase(stateFile, { readOnly: false });
+    // Preserve the selected identity so a later worker scan can detect a
+    // changed path rather than treating a same-name replacement as verified.
+    await assertExpectedStateFileIdentity(stateFile, expectedIntegrityIdentity);
+  } catch (error) {
+    database?.close();
+    throw error;
+  }
   const insert = recordInsertStatement(database);
   let batches = 0;
   let inserted = 0;
@@ -1316,7 +1413,7 @@ export async function openLocalCollectorStateSession({
         // before this point.
         if (inserted > 0) {
           database.exec("PRAGMA optimize");
-          if (verifyIntegrity) {
+          if (verifyIntegrity && integrityVerifier === null) {
             const quickCheck = database.prepare("PRAGMA quick_check").get();
             if (quickCheck?.quick_check !== "ok") {
               throw fixedError("local_collector_state_integrity_failed");
@@ -1326,6 +1423,17 @@ export async function openLocalCollectorStateSession({
         }
       } finally {
         database.close();
+      }
+      if (inserted > 0 && verifyIntegrity && integrityVerifier !== null) {
+        // The verifier rechecks the selected path identity in a worker while
+        // this caller retains the collector lock. It keeps the loopback control
+        // plane responsive without weakening the close contract: no result is
+        // returned until the same integrity check succeeds.
+        await integrityVerifier({
+          stateFile,
+          expectedIdentity: expectedIntegrityIdentity,
+        });
+        verified = true;
       }
       await chmod(stateFile, 0o600);
       await syncStateFile(stateFile);
@@ -1366,14 +1474,28 @@ export async function saveLocalCollectorCheckpoint({
 export async function writeLocalCollectorAccountingCache({
   stateFile = defaultLocalCollectorStatePath(),
   cache,
+  signal = null,
 } = {}) {
-  if (!cache || typeof cache !== "object" || Array.isArray(cache)) {
+  if (!cache
+      || typeof cache !== "object"
+      || Array.isArray(cache)
+      || !validAbortSignal(signal)) {
     throw new TypeError("Local collector accounting cache is invalid");
   }
+  throwIfAccountingCachePublicationAborted(signal);
   await ensureDatabase(stateFile);
+  // Database preparation crosses asynchronous filesystem boundaries. A
+  // refresh can be cancelled while those owner-only durability checks are in
+  // flight, so preparation must not imply permission to replace the retained
+  // accounting row.
+  throwIfAccountingCachePublicationAborted(signal);
   let database;
   try {
     database = openDatabase(stateFile, { readOnly: false });
+    // From this check through COMMIT the operation is deliberately
+    // synchronous, so no later abort event can interleave with the atomic row
+    // replacement. Keep the check adjacent to that boundary.
+    throwIfAccountingCachePublicationAborted(signal);
     transaction(database, () => {
       writeMeta(database, "accounting_cache", cache);
     });

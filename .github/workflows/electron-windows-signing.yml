@@ -1,0 +1,359 @@
+name: Electron Windows production signing
+run-name: Windows signing (${{ inputs.source-revision }})
+
+on:
+  # GitHub registers this manual signer after the integration branch observes
+  # this harmless job. The protected signing job below remains dispatch-only.
+  push:
+    branches: [codex/unified-desktop-accountless]
+  workflow_dispatch:
+    inputs:
+      source-revision:
+        description: Exact immutable source revision to sign
+        required: true
+        type: string
+      build-number:
+        description: Approved positive Windows build number
+        required: true
+        type: string
+      diagnostic-public-key-base64:
+        description: Canonical base64 of the owner RSA-4096 PUBLIC KEY PEM for encrypted builder failure capture
+        required: true
+        type: string
+      diagnostic-public-key-sha256:
+        description: SHA-256 of the exact owner public-key PEM bytes
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: electron-windows-production-signing
+  cancel-in-progress: false
+
+jobs:
+  registration:
+    if: github.event_name == 'push'
+    name: Register manual Windows signer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Record registration only
+        run: printf '%s\n' 'WINDOWS_SIGNING_WORKFLOW_REGISTERED'
+  sign:
+    if: github.event_name == 'workflow_dispatch'
+    name: Sign exact Windows x64 candidate
+    runs-on: windows-2025
+    timeout-minutes: 60
+    environment:
+      name: windows-production-signing
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      SOURCE_REVISION: ${{ inputs.source-revision }}
+      EXPECTED_DISPATCH_SHA: ${{ github.sha }}
+      BUILD_NUMBER: ${{ inputs.build-number }}
+      TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME: ${{ vars.AZURE_CODE_SIGNING_PUBLISHER_NAME }}
+      TIBOTATTLE_ELECTRON_AZURE_ENDPOINT: ${{ vars.AZURE_CODE_SIGNING_ENDPOINT }}
+      TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
+      TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME: ${{ vars.AZURE_CODE_SIGNING_PROFILE_NAME }}
+    steps:
+      - name: Check out this exact dispatch source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Bind the requested source and build number before preparing artifacts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_REVISION -notmatch '^[0-9a-f]{40}$') {
+            throw 'WINDOWS_SIGNING_SOURCE_REVISION_INVALID'
+          }
+          if ($env:BUILD_NUMBER -notmatch '^[1-9][0-9]{0,9}$') {
+            throw 'WINDOWS_SIGNING_BUILD_NUMBER_INVALID'
+          }
+          if ($env:EXPECTED_DISPATCH_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw 'WINDOWS_SIGNING_DISPATCH_SOURCE_INVALID'
+          }
+          $actualRevision = (git rev-parse HEAD).Trim()
+          if ($actualRevision -cne $env:SOURCE_REVISION -or $actualRevision -cne $env:EXPECTED_DISPATCH_SHA) {
+            throw 'WINDOWS_SIGNING_SOURCE_REVISION_MISMATCH'
+          }
+          if ((git status --porcelain=v1 --untracked-files=all).Length -ne 0) {
+            throw 'WINDOWS_SIGNING_SOURCE_NOT_CLEAN'
+          }
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_INSTALL_FAILED' }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_ENABLE_FAILED' }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'PNPM_PREPARE_FAILED' }
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='win32'||process.arch!=='x64')process.exit(1)"
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_SIGNING_HOST_INVALID' }
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
+      - name: Build the reviewed Windows filesystem binding
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $npmCommand = (Get-Command npm.cmd).Source
+          $nodeRoot = Split-Path $npmCommand -Parent
+          $nodeGypScript = Join-Path $nodeRoot 'node_modules/npm/node_modules/node-gyp/bin/node-gyp.js'
+          if (-not (Test-Path -LiteralPath $nodeGypScript -PathType Leaf)) { throw 'WINDOWS_BINDING_BUILDER_UNAVAILABLE' }
+          node $nodeGypScript rebuild --directory native/windows-filesystem
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_BUILD_FAILED' }
+          node scripts/build-windows-filesystem-manifest.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_MANIFEST_FAILED' }
+      - name: Stage the exact production Windows source candidate
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bindingPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem.node'
+          $manifestPath = "$bindingPath.manifest.json"
+          if (-not (Test-Path -LiteralPath $bindingPath -PathType Leaf) -or -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw 'WINDOWS_BINDING_STAGE_INPUT_UNAVAILABLE'
+          }
+          node scripts/package-electron-production.mjs --replace-staging --target win32-x64 --source-revision $env:SOURCE_REVISION --build-number $env:BUILD_NUMBER --windows-binding $bindingPath --windows-manifest $manifestPath
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_PRODUCTION_STAGE_FAILED' }
+      - name: Preflight the exact protected Azure resource selection
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
+          node scripts/finalize-electron-windows-signing.mjs --candidate-receipt $candidateReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_SIGNING_PREFLIGHT_FAILED' }
+      - name: Prepare the electron-builder signing host and module
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
+          node scripts/finalize-electron-windows-signing.mjs --prepare-builder-host --candidate-receipt $candidateReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BUILDER_HOST_MODULE_PREFLIGHT_FAILED' }
+      - name: Inspect and journal native module bytes before signing
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
+          node scripts/rebind-electron-windows-native-modules.mjs --candidate-receipt $candidateReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_INSPECTION_FAILED' }
+          node scripts/rebind-electron-windows-native-modules.mjs --prepare --candidate-receipt $candidateReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_PREPARATION_FAILED' }
+      - name: Execute the native Authenticode verifier before signing
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
+          node scripts/rebind-electron-windows-native-modules.mjs --probe-authenticode-pre-sign --candidate-receipt $candidateReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_PROBE_PRE_SIGN_FAILED' }
+      - name: Make the fixed signed native modules writable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $readOnly = [System.IO.FileAttributes]::ReadOnly
+          $nativeModules = @(
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/native/windows-filesystem/build/Release/windows_filesystem.node'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/node_modules/@github/keytar/prebuilds/win32-x64/keytar.node')
+          )
+          foreach ($path in $nativeModules) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item -or $item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw 'WINDOWS_NATIVE_SIGNING_INPUT_UNSAFE'
+            }
+            $attributes = [System.IO.FileAttributes]$item.Attributes
+            if (($attributes -band $readOnly) -eq 0) { throw 'WINDOWS_NATIVE_SIGNING_INPUT_READONLY_EXPECTED' }
+            $writableAttributes = [System.IO.FileAttributes](([int]$attributes) -band (-bnot ([int]$readOnly)))
+            [System.IO.File]::SetAttributes($path, $writableAttributes)
+            if (([System.IO.File]::GetAttributes($path) -band $readOnly) -ne 0) {
+              throw 'WINDOWS_NATIVE_SIGNING_INPUT_WRITABLE_UNAVAILABLE'
+            }
+          }
+      - name: Authenticate to Azure with protected OIDC inputs
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign only the staged native modules
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_CODE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_CODE_SIGNING_PROFILE_NAME }}
+          files: |
+            ${{ github.workspace }}\.release-build\electron-production\win32-x64\app\native\windows-filesystem\build\Release\windows_filesystem.node
+            ${{ github.workspace }}\.release-build\electron-production\win32-x64\app\node_modules\@github\keytar\prebuilds\win32-x64\keytar.node
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+          cache-dependencies: false
+      - name: Make the fixed rebinding metadata writable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $readOnly = [System.IO.FileAttributes]::ReadOnly
+          $rebindMetadata = @(
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/electron-runtime-manifest.json')
+          )
+          foreach ($path in $rebindMetadata) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item -or $item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw 'WINDOWS_REBIND_METADATA_UNSAFE'
+            }
+            $attributes = [System.IO.FileAttributes]$item.Attributes
+            if (($attributes -band $readOnly) -eq 0) { throw 'WINDOWS_REBIND_METADATA_READONLY_EXPECTED' }
+            $writableAttributes = [System.IO.FileAttributes](([int]$attributes) -band (-bnot ([int]$readOnly)))
+            [System.IO.File]::SetAttributes($path, $writableAttributes)
+            if (([System.IO.File]::GetAttributes($path) -band $readOnly) -ne 0) {
+              throw 'WINDOWS_REBIND_METADATA_WRITABLE_UNAVAILABLE'
+            }
+          }
+      - name: Rebind signed native modules to their manifest
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
+          node scripts/rebind-electron-windows-native-modules.mjs --rebind --candidate-receipt $candidateReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_FAILED' }
+      - name: Restore the fixed native modules and rebinding metadata read-only state
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $readOnly = [System.IO.FileAttributes]::ReadOnly
+          $stagedFiles = @(
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/native/windows-filesystem/build/Release/windows_filesystem.node'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/node_modules/@github/keytar/prebuilds/win32-x64/keytar.node'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/electron-runtime-manifest.json')
+          )
+          foreach ($path in $stagedFiles) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item -or $item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw 'WINDOWS_NATIVE_SIGNING_INPUT_UNSAFE'
+            }
+            $attributes = [System.IO.FileAttributes]$item.Attributes
+            [System.IO.File]::SetAttributes($path, [System.IO.FileAttributes](([int]$attributes) -bor ([int]$readOnly)))
+            if (([System.IO.File]::GetAttributes($path) -band $readOnly) -eq 0) {
+              throw 'WINDOWS_NATIVE_SIGNING_INPUT_READONLY_RESTORE_FAILED'
+            }
+          }
+      - name: Sign the reviewed installer without publishing
+        env:
+          TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_BASE64: ${{ inputs.diagnostic-public-key-base64 }}
+          TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_SHA256: ${{ inputs.diagnostic-public-key-sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
+          node scripts/finalize-electron-windows-signing.mjs --sign --confirm-azure-trusted-signing --capture-encrypted-builder-diagnostic --candidate-receipt $candidateReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_INSTALLER_SIGNING_FAILED' }
+      - name: Inspect the exact installer Authenticode state after signing-path failure
+        if: ${{ always() }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $summary = 'status=unavailable;publisher_match=none;timestamp_present=none'
+          try {
+            $candidateRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64'
+            $packagePath = Join-Path $candidateRoot 'app/package.json'
+            $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
+            if ($package.version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'PACKAGE_VERSION_INVALID' }
+            $installerPath = Join-Path $candidateRoot ("artifacts/TiboTattle-{0}-Windows-x64.exe" -f $package.version)
+            $item = Get-Item -LiteralPath $installerPath -Force -ErrorAction Stop
+            if ($item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'INSTALLER_UNAVAILABLE' }
+            $signature = Get-AuthenticodeSignature -LiteralPath $installerPath
+            $status = switch ([string]$signature.Status) {
+              'Valid' { 'valid'; break }
+              'NotSigned' { 'not_signed'; break }
+              'HashMismatch' { 'hash_mismatch'; break }
+              'NotTrusted' { 'not_trusted'; break }
+              'NotSupportedFileFormat' { 'not_supported_file_format'; break }
+              'Incompatible' { 'incompatible'; break }
+              'PublisherNotTrusted' { 'publisher_not_trusted'; break }
+              'Revoked' { 'revoked'; break }
+              'UnknownError' { 'unknown_error'; break }
+              default { 'other'; break }
+            }
+            $publisherMatch = $false
+            if ($null -ne $signature.SignerCertificate) {
+              $publisherMatch = $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -ceq $env:TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME
+            }
+            $timestampPresent = $null -ne $signature.TimeStamperCertificate
+            $summary = "status=$status;publisher_match=$($publisherMatch.ToString().ToLowerInvariant());timestamp_present=$($timestampPresent.ToString().ToLowerInvariant())"
+          } catch {}
+          Write-Host "WINDOWS_INSTALLER_FAILURE_PATH_AUTHENTICODE;$summary"
+      - name: Verify the signed final installer and retained signing evidence
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64'
+          $artifactRoot = Join-Path $candidateRoot 'artifacts'
+          $packagePath = Join-Path $candidateRoot 'app/package.json'
+          $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
+          if ($package.version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'WINDOWS_SIGNED_INSTALLER_PACKAGE_VERSION_INVALID'
+          }
+          $installerPath = Join-Path $artifactRoot ("TiboTattle-{0}-Windows-x64.exe" -f $package.version)
+          $rebindReceipt = Join-Path $candidateRoot 'windows-native-rebinding/rebound.json'
+          $ledgerPath = Join-Path $candidateRoot 'evidence/windows-signing-operation-ledger.json'
+          foreach ($path in @($installerPath, $rebindReceipt, $ledgerPath)) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item -or $item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw 'WINDOWS_SIGNED_INSTALLER_EVIDENCE_UNAVAILABLE'
+            }
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installerPath
+          if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $null -eq $signature.TimeStamperCertificate -or $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne 'Adam Allcock') {
+            throw 'WINDOWS_SIGNED_INSTALLER_SIGNATURE_INVALID'
+          }
+          $null = Get-FileHash -LiteralPath $installerPath -Algorithm SHA256
+          Write-Host 'WINDOWS_SIGNED_INSTALLER_VERIFIED'
+      - name: Qualify the signed installed Windows journey
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64'
+          $artifactRoot = Join-Path $candidateRoot 'artifacts'
+          $packagePath = Join-Path $candidateRoot 'app/package.json'
+          $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
+          if ($package.version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'WINDOWS_SIGNED_INSTALLED_PACKAGE_VERSION_INVALID'
+          }
+          $installerPath = Join-Path $artifactRoot ("TiboTattle-{0}-Windows-x64.exe" -f $package.version)
+          $installerSha256 = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $stagedAppPath = Join-Path $candidateRoot 'app'
+          $sourceCandidatePath = Join-Path $candidateRoot 'production-source-candidate.json'
+          $signedInstalledReceipt = Join-Path $candidateRoot 'evidence/windows-signed-installed.json'
+          node scripts/smoke-electron-windows-signed-installed.mjs --execute --installer $installerPath --installer-sha256 $installerSha256 --staged-app $stagedAppPath --source-candidate $sourceCandidatePath --source-revision $env:SOURCE_REVISION --receipt $signedInstalledReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_SIGNED_INSTALLED_QUALIFICATION_FAILED' }
+          Write-Host 'WINDOWS_SIGNED_INSTALLED_QUALIFIED'
+      - name: Retain the signed installer and content-free evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-windows-signed-${{ github.run_id }}
+          path: |
+            .release-build/electron-production/win32-x64/artifacts/TiboTattle-*-Windows-x64.exe
+            .release-build/electron-production/win32-x64/artifacts/TiboTattle-*-Windows-x64.exe.blockmap
+            .release-build/electron-production/win32-x64/artifacts/latest.yml
+            .release-build/electron-production/win32-x64/evidence/windows-signing-operation-ledger.json
+            .release-build/electron-production/win32-x64/evidence/windows-builder-failure.envelope.json
+            .release-build/electron-production/win32-x64/windows-native-rebinding/rebound.json
+            .release-build/electron-production/win32-x64/evidence/windows-signed-installed.json
+            .release-build/electron-windows-normal-candidate/normal-candidate-smoke.json
+          if-no-files-found: error
+          retention-days: 14

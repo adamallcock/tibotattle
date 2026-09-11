@@ -1,11 +1,58 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  assertOwnerErasureLifecycle,
   backendSmokeSourceArguments,
   localCompanionEnvironment,
   parseLocalBackendLabArguments,
   projectLocalBackendLabReceipt,
 } from "./start-local-backend-lab-lib.mjs";
+
+function erasedLifecycle() {
+  return {
+    database: {
+      activeParticipants: 0, deletingParticipants: 0, acceptedContributions: 0,
+      canonicalRecords: 0, contributionOccurrences: 0, retainedQuarantineReferences: 0,
+      activeSessions: 0, activeDevices: 0, publishedSnapshots: 0,
+      suppressedSnapshots: 0, withdrawnSnapshots: 1, withdrawnSuppressedSnapshots: 1,
+    },
+    deletionLedger: { tombstones: 21 },
+  };
+}
+
+test("owner cleanup proves prior suppression from an immutable withdrawn empty revision", () => {
+  assert.deepEqual(assertOwnerErasureLifecycle(erasedLifecycle(), 0), {
+    suppressionEvidence: "immutable_withdrawn_empty_snapshot",
+    suppressedRevisionsWithdrawn: 1,
+    publishedSnapshotsRemaining: 0,
+  });
+});
+
+test("terminal owner cleanup rejects surviving data, published snapshots or missing suppression evidence", () => {
+  for (const name of [
+    "activeParticipants", "deletingParticipants", "acceptedContributions", "canonicalRecords",
+    "contributionOccurrences", "retainedQuarantineReferences", "activeSessions", "activeDevices",
+    "publishedSnapshots",
+  ]) {
+    const storage = erasedLifecycle();
+    storage.database[name] = 1;
+    assert.throws(() => assertOwnerErasureLifecycle(storage, 0), new RegExp(name, "u"));
+  }
+  for (const invalid of [0, undefined, null, -1, 0.5, 2]) {
+    const storage = erasedLifecycle();
+    storage.database.withdrawnSuppressedSnapshots = invalid;
+    assert.throws(() => assertOwnerErasureLifecycle(storage, 0), /withdrawnSuppressedSnapshots/u);
+  }
+  const missingWithdrawal = erasedLifecycle();
+  missingWithdrawal.database.withdrawnSnapshots = 0;
+  assert.throws(() => assertOwnerErasureLifecycle(missingWithdrawal, 0), /withdrawnSnapshots/u);
+  for (const tombstones of [20, 22]) {
+    const storage = erasedLifecycle();
+    storage.deletionLedger.tombstones = tombstones;
+    assert.throws(() => assertOwnerErasureLifecycle(storage, 0), /tombstones/u);
+  }
+  assert.throws(() => assertOwnerErasureLifecycle(erasedLifecycle(), 1), /r2ObjectCount/u);
+});
 
 test("backend laboratory defaults to its generated content-free fixture", () => {
   const parsed = parseLocalBackendLabArguments([
@@ -98,7 +145,7 @@ test("backend laboratory isolates companion state from the installed app", () =>
 test("real-file laboratory receipt projection excludes private locations", () => {
   const receipt = projectLocalBackendLabReceipt({
     receipt: {
-      schemaVersion: "local-backend-lab-receipt-v0.3",
+      schemaVersion: "local-backend-lab-receipt-v0.4",
       status: "ready",
       smoke: { participants: 20 },
     },
@@ -106,6 +153,7 @@ test("real-file laboratory receipt projection excludes private locations", () =>
     locations: {
       stateDirectory: "/private/state",
       participantAccessFile: "/private/access",
+      ownerAccessFile: "/private/owner-access",
       redeemedInvitationDirectory: "/private/invites",
       redeemedInvitationFilesRetained: 20,
     },
@@ -115,5 +163,22 @@ test("real-file laboratory receipt projection excludes private locations", () =>
   assert.equal(receipt.cleanup.recoverableCleanupRequired, true);
   assert.equal(serialized.includes("/private/"), false);
   assert.equal(serialized.includes("participantAccessFile"), false);
+  assert.equal(serialized.includes("ownerAccessFile"), false);
   assert.equal(serialized.includes("stateDirectory"), false);
+});
+
+test("generated-fixture lab receipt identifies separate local owner authority", () => {
+  const receipt = projectLocalBackendLabReceipt({
+    receipt: { schemaVersion: "local-backend-lab-receipt-v0.4", status: "ready" },
+    sourceMode: "generated_content_free_fixture",
+    locations: {
+      stateDirectory: "/private/lab", participantAccessFile: "/private/lab/access",
+      ownerAccessFile: "/private/lab/owner/access", redeemedInvitationDirectory: "/private/lab/invites",
+      redeemedInvitationFilesRetained: 20,
+    },
+  });
+  assert.equal(receipt.ownerAccessFile, "/private/lab/owner/access");
+  assert.equal(receipt.ownerAccessFileContainsSecret, true);
+  assert.notEqual(receipt.participantAccessFile, receipt.ownerAccessFile);
+  assert.equal(receipt.cleanup.automaticOnShutdown, false);
 });

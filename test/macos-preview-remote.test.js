@@ -9,7 +9,7 @@ import {
   verifyMacOSPreviewRemote,
 } from "../scripts/verify-macos-preview-remote.js";
 
-const APP_PATH = "/tmp/TiboTattle.app";
+const APP_PATH = "/tmp/TiboTattle Preview.app";
 const CENTRAL_ORIGIN = "https://central.example.test";
 const APPCAST_URL = "https://updates.example.test/appcast.xml";
 const PUBLIC_ED_KEY = Buffer.alloc(32, 4).toString("base64");
@@ -77,7 +77,7 @@ function injectedDependencies(overrides = {}) {
     readBuildManifest: async () => MANIFEST,
     readInfoPlist: async () => PLIST,
     validatePreviewApp: async () => ({
-      bundleIdentifier: "com.usagemonitor.local",
+      bundleIdentifier: "com.usagemonitor.local.preview",
       bundleVersion: "42",
       channel: "preview_distribution",
       updaterEnabled: true,
@@ -97,7 +97,7 @@ test("CLI parsing is offline by default and bounds the opt-in timeout", () => {
   );
   assert.match(
     defaulted.appPath,
-    /\.release-build\/macos-preview\/current\/TiboTattle\.app$/u,
+    /\.release-build\/macos-preview\/current\/TiboTattle Preview\.app$/u,
   );
   assert.equal(defaulted.live, false);
   assert.deepEqual(
@@ -153,7 +153,7 @@ test("offline verification validates locally and never calls fetch", async () =>
         validatorCalls += 1;
         assert.equal(path, APP_PATH);
         return {
-          bundleIdentifier: "com.usagemonitor.local",
+          bundleIdentifier: "com.usagemonitor.local.preview",
           bundleVersion: "42",
           channel: "preview_distribution",
           updaterEnabled: true,
@@ -240,6 +240,36 @@ test("valid Sparkle RSS/XML is distinguished from malformed or empty appcast con
   assert.equal(result.remotePublicationReadback.passed, true);
   assert.equal(result.claim.requested, false);
   assert.equal(result.sparkleAcceptance.status, "not_verified");
+});
+
+test("legacy zero-first appcasts require an exact migration-source opt-in", () => {
+  const legacyVersion = "0.1.16";
+  const legacyArtifactURL =
+    `https://updates.example.test/releases/${legacyVersion}/`
+    + `${"a".repeat(64)}/TiboTattle.dmg`;
+  const appcast = `<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel><item><enclosure url="${legacyArtifactURL}" length="123"
+    sparkle:version="${legacyVersion}" sparkle:edSignature="${SPARKLE_SIGNATURE}" />
+  </item></channel>
+</rss>`;
+  const options = {
+    expectedArtifactOrigin: "https://updates.example.test",
+    expectedArtifactPrefix: "releases",
+    expectedBundleVersion: legacyVersion,
+    requireContentAddressed: true,
+    requireSingleFullDmg: true,
+  };
+  assert.equal(validateSparkleAppcastXML(appcast, options).valid, false);
+  assert.equal(validateSparkleAppcastXML(appcast, {
+    ...options,
+    allowLegacyZeroFirstBundleVersion: true,
+  }).valid, true);
+  assert.equal(validateSparkleAppcastXML(appcast, {
+    ...options,
+    allowLegacyZeroFirstBundleVersion: true,
+    expectedBundleVersion: "0.1.15",
+  }).valid, false);
 });
 
 test("a bounded timeout blocks remote feed preflight without leaking response content", async () => {

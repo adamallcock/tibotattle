@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { scanCodexLogEvents } from "../src/codex-log-scan.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { createIndexedCodexLogScan } from "../src/local-analysis-index.js";
+
+const { scanCodexLogEvents } = localCodexLogScanner;
 
 async function removeIndexedFixture(path) {
   try {

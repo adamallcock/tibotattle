@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   CLIENT_MANIFEST_FILE,
+  CLIENT_MACOS_FILES,
   CLIENT_REPOSITORY_NAME,
   CLIENT_SOURCE_FILES,
   createClientExport,
@@ -15,6 +16,17 @@ import {
   validateAllowlist,
   validateExportDirectory,
 } from "../scripts/export-tibotattle.mjs";
+
+test("client export includes the native menu-bar source closure", () => {
+  for (const path of [
+    "apps/macos/Sources/MenuBarPaceOutlook.swift",
+    "apps/macos/Sources/MenuBarPopover.swift",
+    "apps/macos/Sources/MenuBarPopupModel.swift",
+    "apps/macos/Sources/NativeBrandPalette.swift",
+  ]) {
+    assert.equal(CLIENT_MACOS_FILES.includes(path), true, path);
+  }
+});
 
 test("client exporter creates a history-free, verified allow-list artifact", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-export-test-"));
@@ -34,7 +46,6 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     assert.equal(verified.files.includes(CLIENT_MANIFEST_FILE), true);
     assert.equal(verified.files.some((path) => path === ".git" || path.startsWith(".git/")), false);
     assert.equal(verified.files.some((path) => path.startsWith("apps/worker/")), false);
-    assert.equal(verified.files.some((path) => path.startsWith("apps/cloud-run/")), false);
     assert.equal(verified.files.some((path) => path.startsWith("apps/web/public/admin")), false);
     assert.equal(verified.files.length, created.fileCount);
 
@@ -42,10 +53,54 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     // index/archive modules in the reviewed runtime inventory while rollback
     // remains supported; this test makes both halves of that boundary explicit.
     for (const path of [
+      "config/electron-production-distribution.cjs",
+      "config/macos-bundle-version-plan.cjs",
+      "src/platform/windows-native-unsigned-content.js",
+      "src/desktop-shell-status.js",
+      "scripts/lib/release-operation.mjs",
+      "scripts/macos-release-journal.js",
+      "scripts/validate-macos-login-item-release.js",
+      "src/local-cache-drop-thread-links.js",
+      "src/platform/local-codex-thread-store.js",
+      "test/local-cache-drop-thread-links.test.js",
+      "test/local-codex-thread-metadata.test.js",
+      "test/local-unified-cache-write-assumption.test.js",
+      "apps/web/test/cache-drop-thread-links-client.test.mjs",
+      "apps/web/test/cache-drop-thread-links-ui.test.mjs",
+      "apps/web/public/community-refresh.js",
+      "apps/web/test/community-refresh.test.mjs",
+      "src/application/work-usage.js",
+      "src/local-work-usage-source.js",
+      "src/platform/work-usage-projects.js",
+      "src/reporting/work-usage.js",
+      "apps/web/public/work-usage-view.js",
+      "apps/web/public/model-visuals.js",
+      "apps/web/test/model-display.test.mjs",
+      "apps/local/work-usage.test.mjs",
+      "apps/web/test/work-usage-view.test.mjs",
+      "test/work-usage-source.test.js",
+      "test/work-usage.test.js",
       "src/local-unified-accounting-source.js",
       "src/local-analysis-index.js",
+      "src/local-collector-projection.js",
+      "src/local-collector-projection-off-main.js",
+      "src/local-collector-projection-off-main-worker.js",
+      "src/local-collector-state-integrity-off-main.js",
+      "src/local-collector-state-integrity-off-main-worker.js",
+      "src/platform/linux-secret-service-broker.js",
+      "src/platform/linux-account-observation-broker.js",
+      "src/platform/windows-account-observation-broker.js",
+      "src/platform/account-observation-broker-ipc.js",
       "src/local-archive-accounting-index.js",
       "src/replay-safe-accounting-cache.js",
+      "src/local-unified-contribution-attribution.js",
+      "src/contribution/telemetry-v11-chunks.js",
+      "src/contribution/telemetry-v11-sync.js",
+      "src/platform/telemetry-v11-envelope.js",
+      "packages/quota-analysis/src/plan-attribution.js",
+      "packages/telemetry-contract/src/telemetry-v1.1.js",
+      "packages/telemetry-contract/src/telemetry-v1.1-domain.js",
+      "schemas/telemetry-contribution-v1.1/domain-manifest.schema.json",
     ]) {
       assert.equal(verified.files.includes(path), true, `export must include ${path}`);
     }
@@ -59,7 +114,7 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     );
     assert.match(
       osvWorkflow,
-      /google\/osv-scanner-action\/\.github\/workflows\/osv-scanner-reusable\.yml@8deb546fdb875b9996d27d4950be7312dac076a1/u,
+      /google\/osv-scanner-action\/\.github\/workflows\/osv-scanner-reusable\.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67/u,
     );
 
     // The pinned reusable workflow declares actions:read + contents:read +

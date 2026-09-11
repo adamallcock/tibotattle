@@ -5,17 +5,19 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
-import { createEmptyCodexCheckpointState } from "../src/export-checkpoint-state.js";
 import { deriveParticipantId } from "../src/export-identity.js";
 import { EXPORT_RESOURCE_POLICY_VERSION } from "../src/export-resource-policy.js";
 import { createCodexExportSourcePlan } from "../src/export-source-plan.js";
-import {
+import { localCodexCheckpointState, localExportWorkspace } from
+  "../src/local-node-runtime.js";
+const {
   buildExportWorkspaceDescriptor,
   createExportWorkspace,
   ExportWorkspaceError,
   openExportWorkspace,
   sourceCheckpointBatchSha256,
-} from "../src/export-workspace.js";
+} = localExportWorkspace;
+const { createEmptyCodexCheckpointState } = localCodexCheckpointState;
 
 const SECRET = Buffer.alloc(32, 73);
 
@@ -172,7 +174,7 @@ test("checkpoint workspace atomically persists an initial tier batch and rejects
       byteOffset: 0,
       lineOrdinal: 0,
       checkpointSeq: 0,
-      parserVersion: "codex-checkpoint-state-v0.1",
+      parserVersion: "codex-checkpoint-state-v0.2",
       parserState: createEmptyCodexCheckpointState(),
       lastBatchSha256: null,
       parentSourceKey: null,

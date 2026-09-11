@@ -67,7 +67,9 @@
     >
     <title>TiboTattle</title>
     <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./model-performance.css">
     <script type="module" src="./app.js"></script>
+    <script type="module" src="./desktop-shell.js"></script>
   </head>
   <body class="first-run" data-i18n-root>
     <a class="skip-link" href="#main" data-i18n-legacy-root>Skip to monitoring dashboard</a>
@@ -94,6 +96,23 @@
         <button class="button button-quiet compact" id="cancel-refresh" type="button" hidden>
           Cancel
         </button>
+        <button
+          class="button button-quiet compact electron-only-control"
+          id="electron-share-button"
+          type="button"
+          data-i18n="electron.shell.share"
+          aria-label="Share"
+          data-i18n-aria-label="electron.shell.share"
+          title="Share"
+          data-i18n-title="electron.shell.share"
+        >Share</button>
+        <button
+          class="button button-quiet compact electron-only-control electron-settings-control"
+          id="electron-settings-button"
+          type="button"
+          aria-label="Settings"
+          title="Settings"
+        >Settings</button>
       </div>
     </header>
 
@@ -103,12 +122,34 @@
           <a href="#overview" data-nav="overview" data-requires-evidence>Overview</a>
           <a href="#weekly" data-nav="weekly" data-requires-evidence>Allowance</a>
           <a href="#timeline" data-nav="trends" data-requires-evidence>Trends</a>
+          <a href="#performance" data-nav="performance" data-i18n="performance.title">Model performance</a>
           <a href="#accounting" data-nav="method" data-requires-evidence>Usage and costs</a>
+          <a href="#projects" data-nav="projects" data-i18n="workUsage.title">Projects &amp; threads</a>
           <a href="#community" data-nav="community" data-requires-evidence>Community</a>
         </nav>
       </aside>
       <div class="dashboard-content">
     <main id="main">
+      <section
+        class="dashboard-boot-state"
+        id="dashboard-boot-state"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        aria-busy="true"
+      >
+        <div class="dashboard-boot-card">
+          <span class="state-pill state-connecting">
+            <span class="state-dot" aria-hidden="true"></span>
+            Connecting
+          </span>
+          <strong class="dashboard-boot-title">Loading saved results…</strong>
+          <p class="dashboard-boot-copy">
+            Checking the summary on this Mac. Nothing is sent while you look at it.
+          </p>
+        </div>
+      </section>
+
       <div class="page-heading" data-dashboard-page="overview">
         <div>
           <p class="eyebrow">Local evidence dashboard</p>
@@ -138,6 +179,28 @@
           <button class="button button-quiet" id="demo-button" type="button">Explore labeled demo</button>
         </div>
       </div>
+
+      <section
+        class="notice notice-info electron-sharing-notice"
+        id="electron-sharing-notice"
+        role="region"
+        aria-labelledby="electron-sharing-notice-title"
+        data-dashboard-page="overview"
+        hidden
+      >
+        <div>
+          <p class="eyebrow" data-i18n="electron.sharing.notice.eyebrow">Community sharing</p>
+          <strong id="electron-sharing-notice-title" data-i18n="electron.sharing.notice.title">Share usage measurements</strong>
+          <p id="electron-sharing-notice-copy" data-i18n="electron.sharing.notice.copy">Community sharing will turn on automatically unless you choose Keep sharing off. This is notice {index} of 3. Shared measurements include token counts, model labels, quota measurements, and pseudonymous identifiers. Prompts, responses, credentials, private paths, and raw account identifiers stay on this device. No sign-in is needed.</p>
+          <p class="annotation" id="electron-sharing-notice-earliest" data-i18n="electron.sharing.notice.earliest">Earliest automatic sharing: {date}; activation also requires all three notices and at least 24 hours after the final notice.</p>
+          <p class="annotation" id="electron-sharing-notice-transport" role="status" aria-live="polite" data-i18n="electron.sharing.transport.unavailable">Uploads are not available in this build.</p>
+          <p class="participant-action-status" id="electron-sharing-notice-status" role="status" aria-live="polite" hidden></p>
+        </div>
+        <div class="notice-actions">
+          <button class="button button-primary" id="electron-sharing-share-now" type="button" data-i18n="electron.sharing.notice.shareNow">Share now</button>
+          <button class="button button-quiet" id="electron-sharing-keep-off" type="button" data-i18n="electron.sharing.notice.keepOff">Keep sharing off</button>
+        </div>
+      </section>
 
       <section class="companion-setup" id="companion-setup" aria-labelledby="companion-setup-title" data-dashboard-page="overview" hidden>
         <div class="companion-setup-copy">
@@ -259,13 +322,13 @@
           <article class="panel">
             <div class="panel-heading">
               <div>
-                <p class="panel-kicker" id="cost-metric-kicker">Quota-weighted API-price equivalent</p>
+                <p class="panel-kicker" id="cost-metric-kicker">Speed-priced API-price equivalent</p>
                 <h3>Replay-safe usage cost</h3>
               </div>
             </div>
             <p class="annotation" id="pricing-note">
               Standard-rate API prices applied to non-overlapping local token
-              increments, then multiplied by the published Fast credit rate for
+              increments, then multiplied by the published Priority (Fast) API price ratio for
               increments whose effective mode is Fast. It tracks relative quota
               consumption; it is not a subscription charge or a published dollar limit.
             </p>
@@ -317,6 +380,7 @@
               More observations are required before a useful comparison can be made.
             </p>
             <p class="annotation stale-serve-note" id="comparison-stale-note" hidden></p>
+            <p class="annotation" id="comparison-plan-note" hidden></p>
             <div class="comparison-visual" id="comparison-visual">
               <div class="comparison-row">
                 <span>Observed quota movement</span>
@@ -365,7 +429,7 @@
               <p class="annotation" id="calibration-model-shared" hidden></p>
             </details>
             <p class="annotation calibration-explanation" id="calibration-explanation">
-              This fit uses quota-weighted API prices as a measuring stick. It is not a
+              This fit uses speed-priced API prices as a measuring stick. It is not a
               provider-published dollar allowance.
             </p>
           </article>
@@ -379,11 +443,16 @@
             <p class="eyebrow">02 · Weekly allowance</p>
             <h2 id="weekly-title">Our best estimate of the seven-day limit</h2>
           </div>
+          <label class="language-picker" id="weekly-plan-control" for="weekly-plan-select" hidden>
+            <span data-i18n="weekly.plan.label">Plan</span>
+            <select id="weekly-plan-select" aria-label="Allowance history plan" data-i18n-aria-label="weekly.plan.aria"></select>
+          </label>
         </div>
+        <p class="annotation" id="weekly-plan-note" hidden></p>
 
         <div class="weekly-hero">
           <div>
-            <span id="weekly-estimate-label" data-i18n="weekly.headline.label">Quota-weighted all-data median</span>
+            <span id="weekly-estimate-label">Speed-priced all-data median</span>
             <strong id="weekly-estimate">—</strong>
             <small id="weekly-range">No evidence interval available</small>
           </div>
@@ -404,12 +473,13 @@
                 <button type="button" data-days="36500">All</button>
               </div>
               <label class="weekly-span-control" for="weekly-span-control">
-                <span>Minimum observed quota span</span>
+                <span id="weekly-span-label">Minimum observed quota span</span>
                 <input id="weekly-span-control" type="range" min="0" max="99" step="1" value="50">
                 <output id="weekly-span-value" for="weekly-span-control">50+ pp</output>
               </label>
             </div>
           </div>
+          <p id="weekly-span-note" class="small muted" hidden></p>
           <div class="legend weekly-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
             <span><i class="legend-dot weekly-center"></i>All-data median</span>
             <span><i class="legend-dot weekly-mature"></i><span id="weekly-span-legend">Observed across 50+ points</span></span>
@@ -560,11 +630,11 @@
           </div>
           <div class="legend calibration-legend" aria-label="Calibration chart legend" data-i18n-aria-label="aria.calibrationLegend">
             <span><i class="legend-dot observed"></i>Observed quota</span>
-            <span><i class="legend-dot expected"></i>Expected from quota-weighted API cost</span>
+            <span><i class="legend-dot expected"></i>Expected from speed-priced API cost</span>
             <span class="legend-group-sep" aria-hidden="true"></span>
             <span><i class="legend-dot area chart-status-missing"></i>Missing quota bracket</span>
             <span><i class="legend-dot area chart-status-reset"></i>Window boundary or track change</span>
-            <span><i class="legend-dot area chart-status-weighting"></i>Quota weighting unavailable</span>
+            <span><i class="legend-dot area chart-status-weighting"></i>Speed pricing unavailable</span>
             <span><i class="legend-dot area chart-status-ambiguous"></i>Movement needs context</span>
             <span><i class="legend-dot area chart-status-saturated"></i>Allowance exhausted</span>
           </div>
@@ -690,7 +760,7 @@
                 <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
               </div>
               <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
-                <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Quota-weighted API-equivalent usage</span></span>
+                <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Speed-priced API-equivalent usage</span></span>
                 <span id="usage-allowance-legend"><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
               </div>
             </div>
@@ -705,6 +775,9 @@
         </article>
 
       </section>
+
+      <section class="dashboard-section dashboard-page-inactive" id="projects" aria-labelledby="work-usage-title" data-dashboard-page="projects" aria-hidden="true" inert></section>
+      <section class="dashboard-section dashboard-page-inactive model-performance" id="performance" aria-labelledby="performance-title" data-dashboard-page="performance" aria-hidden="true" inert data-i18n-skip></section>
 
       <section class="dashboard-section dashboard-page-inactive" id="accounting" aria-labelledby="accounting-title" data-dashboard-page="method" data-requires-evidence aria-hidden="true" inert>
         <div class="section-heading split">
@@ -724,7 +797,7 @@
             <strong>API pricing is a measuring stick, not your bill.</strong>
             <p>
               Each local usage change uses the public API price that was in
-              effect when it occurred, with the published Fast multiplier when
+              effect when it occurred, with the published Priority (Fast) price ratio when
               applicable. It is an equivalent for comparison, not an invoice.
             </p>
           </div>
@@ -778,7 +851,7 @@
                     <th>Usage changes</th>
                     <th>Tokens</th>
                     <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
-                    <th>Standard API equivalent</th>
+                    <th data-i18n-title="accounting.apiEquivalent.standardRateBasis" title="Calculated at Standard API rates.">API equivalent</th>
                     <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
                   </tr>
                 </thead>
@@ -790,37 +863,21 @@
               <span class="table-pagination-status" id="accounting-model-page-status" role="status"></span>
               <button class="button button-quiet compact" id="accounting-model-page-next" type="button" aria-controls="accounting-models" data-i18n="table.pagination.next">Next</button>
             </div>
-            <p class="annotation" data-i18n="accounting.model.shareOfPeriod">
-              Both share columns are a share of the whole period, so components
-              add up to their model and models add up to the total.
-            </p>
             <p class="annotation" id="accounting-price-coverage" hidden></p>
             <!--
               The expansion of the marker each separately metered row carries.
               The asterisk itself is drawn by the stylesheet so this stays one
               translated sentence rather than a sentence plus a glyph.
             -->
-            <!--
-              The component rows' two withheld cells, explained where they can
-              be read rather than only in a hover title: a title is unreachable
-              on touch and easy to miss with a keyboard, and this table already
-              settles such things in a standing sentence under the rows.
-            -->
-            <p class="annotation" data-i18n="accounting.model.componentFootnote">
-              A component row shows no usage-change count, because one usage
-              change carries every component at once and cannot be divided
-              between them. Where a model states no API equivalent, its
-              components state none either.
-            </p>
             <p class="annotation model-allowance-footnote">
               A model on a separate allowance is listed on its own row and
               carries no API equivalent, because that figure cannot be compared
-              with the main allowance. Nothing unavailable is replaced with an
-              invented cost.
+              with the main allowance.
             </p>
         </article>
         <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details" id="cache-switch-details" hidden>
           <summary data-i18n="accounting.cacheSwitch.detailsSummary">See possible switch overhead</summary>
+          <p class="annotation cache-impact-sample" hidden></p>
           <p class="annotation" data-i18n="accounting.cacheSwitch.detailsExplanation">
             These recent rows pair an adjacent model or reasoning change with
             an observed material cache-read drop within five minutes. The
@@ -829,14 +886,14 @@
           </p>
           <div class="table-wrap">
             <table>
-              <caption class="sr-only" data-i18n="accounting.cacheSwitch.tableCaption">Recent possible switch-overhead evidence</caption>
+              <caption class="sr-only" data-i18n="accounting.cacheSwitch.tableCaption">Recent covered switch-overhead comparisons at Standard API rates; not a period total</caption>
               <thead>
                 <tr>
-                  <th data-i18n="accounting.cacheSwitch.column.localTime">Local time</th>
+                  <th data-i18n="accounting.cacheDropThread.column">Thread name</th>
                   <th data-i18n="accounting.cacheSwitch.column.change">Configuration change</th>
                   <th data-i18n="accounting.cacheSwitch.column.cacheRead">Cache read</th>
                   <th data-i18n="accounting.cacheSwitch.column.lostTokens">Est. lost reuse</th>
-                  <th data-i18n="accounting.cacheSwitch.column.apiEquivalent">API equivalent</th>
+                  <th data-i18n="accounting.cacheSwitch.column.apiEquivalent" data-i18n-title="accounting.apiEquivalent.standardRateBasis" title="Calculated at Standard API rates.">API equivalent</th>
                 </tr>
               </thead>
               <tbody id="cache-switch-rows"></tbody>
@@ -848,47 +905,69 @@
             <button class="button button-quiet compact" id="cache-switch-page-next" type="button" aria-controls="cache-switch-rows" data-i18n="table.pagination.next">Next</button>
           </div>
         </details>
+        <section class="cache-reuse-outcome" id="cache-reuse-outcome" aria-labelledby="cache-reuse-outcome-heading" hidden>
+          <div class="cache-reuse-real-data">
+            <span aria-hidden="true"></span>
+            <span data-i18n="accounting.cacheContinuity.outcome.realData">Using real local data</span>
+          </div>
+          <div class="cache-reuse-summary">
+            <header class="cache-reuse-title">
+              <p class="panel-kicker" data-i18n="accounting.cacheContinuity.outcome.eyebrow">Cache reuse between turns</p>
+              <h3 id="cache-reuse-outcome-heading" data-i18n="accounting.cacheContinuity.outcome.heading">Did the cache carry over?</h3>
+              <p data-i18n="accounting.cacheContinuity.outcome.subtitle">Follow-up turns with the same model and settings, grouped by time since the previous turn.</p>
+            </header>
+            <div class="cache-reuse-metrics">
+              <div class="cache-reuse-metric-more">
+                <strong id="cache-reuse-more-percent">0%</strong>
+                <span data-i18n="accounting.cacheContinuity.outcome.moreLabel">reused more than half</span>
+                <small id="cache-reuse-more-count"></small>
+              </div>
+              <div class="cache-reuse-metric-less">
+                <strong id="cache-reuse-less-percent">0%</strong>
+                <span data-i18n="accounting.cacheContinuity.outcome.lessLabel">reused half or less</span>
+                <small id="cache-reuse-less-count"></small>
+              </div>
+              <div class="cache-reuse-metric-overhead">
+                <strong id="cache-reuse-overhead">—</strong>
+                <span data-i18n="accounting.cacheContinuity.outcome.overheadLabel">estimated overhead from cache drops</span>
+                <small data-i18n="accounting.cacheContinuity.outcome.overheadBasis">Standard API equivalent</small>
+              </div>
+              <p class="cache-reuse-explanation" id="cache-reuse-explanation"></p>
+            </div>
+          </div>
+          <p class="cache-reuse-empty" id="cache-reuse-empty" data-i18n="accounting.cacheContinuity.outcome.noData" hidden>No eligible follow-up turns were found in this period.</p>
+          <p class="annotation" id="cache-reuse-coverage" hidden></p>
+          <div class="cache-reuse-raster" id="cache-reuse-raster">
+            <div class="cache-reuse-raster-scroll" id="cache-reuse-raster-scroll">
+              <div class="cache-reuse-raster-stage" id="cache-reuse-raster-stage">
+                <canvas id="cache-reuse-canvas" height="376" tabindex="0"></canvas>
+                <div class="cache-reuse-readout-rail" id="cache-reuse-readout-rail" hidden>
+                  <div class="cache-reuse-readout" id="cache-reuse-readout" aria-live="polite">
+                    <strong id="cache-reuse-readout-bucket"></strong>
+                    <span id="cache-reuse-readout-checked"></span>
+                    <span class="cache-reuse-readout-more" id="cache-reuse-readout-more"></span>
+                    <span class="cache-reuse-readout-less" id="cache-reuse-readout-less"></span>
+                    <small class="cache-reuse-readout-lost" id="cache-reuse-readout-lost"></small>
+                    <small class="cache-reuse-readout-api" id="cache-reuse-readout-api"></small>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
         <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details cache-continuity-details" id="cache-continuity-details" hidden>
-          <summary data-i18n="accounting.cacheContinuity.detailsSummary">See possible cache-continuity overhead</summary>
-          <p class="annotation" data-i18n="accounting.cacheContinuity.detailsExplanation">
-            The first table groups comparable adjacent user turns by elapsed
-            time; the recent rows below show qualifying material cache-read
-            drops while the effective model, reasoning, routing, and surface
-            remained unchanged. Time is evidence, not an eligibility rule;
-            compactions and contracted contexts stay out of the cost.
-          </p>
-          <h3 class="evidence-subheading" data-i18n="accounting.cacheContinuity.gapHeading">By time between turns</h3>
-          <div class="table-wrap">
-            <table class="cache-continuity-gap-table">
-              <caption class="sr-only" data-i18n="accounting.cacheContinuity.gapTableCaption">Possible cache-continuity overhead by time between turns</caption>
-              <thead>
-                <tr>
-                  <th data-i18n="accounting.cacheContinuity.column.gapBand">Time between turns</th>
-                  <th data-i18n="accounting.cacheContinuity.column.dropsComparable">Material drops / comparable returns</th>
-                  <th data-i18n="accounting.cacheContinuity.column.lostTokens">Estimated lost reuse</th>
-                  <th data-i18n="accounting.cacheContinuity.column.apiEquivalent">Standard API equivalent</th>
-                </tr>
-              </thead>
-              <tbody id="cache-continuity-gap-rows"></tbody>
-            </table>
-          </div>
-          <div class="table-pagination" id="cache-continuity-gap-pagination" hidden>
-            <button class="button button-quiet compact" id="cache-continuity-gap-page-prev" type="button" aria-controls="cache-continuity-gap-rows" data-i18n="table.pagination.previous">Previous</button>
-            <span class="table-pagination-status" id="cache-continuity-gap-page-status" role="status"></span>
-            <button class="button button-quiet compact" id="cache-continuity-gap-page-next" type="button" aria-controls="cache-continuity-gap-rows" data-i18n="table.pagination.next">Next</button>
-          </div>
-          <h3 class="evidence-subheading" data-i18n="accounting.cacheContinuity.recentHeading">Recent qualifying drops</h3>
+          <summary data-i18n="accounting.cacheContinuity.detailsSummary">See recent large cache drops</summary>
+          <p class="annotation cache-impact-sample" hidden></p>
           <div class="table-wrap">
             <table class="cache-continuity-recent-table">
-              <caption class="sr-only" data-i18n="accounting.cacheContinuity.tableCaption">Recent possible cache-continuity overhead evidence</caption>
+              <caption class="sr-only" data-i18n="accounting.cacheContinuity.tableCaption">Recent covered cache-continuity comparisons at Standard API rates; not a period total</caption>
               <thead>
                 <tr>
-                  <th data-i18n="accounting.cacheContinuity.column.localTime">Local time</th>
+                  <th data-i18n="accounting.cacheDropThread.column">Thread name</th>
                   <th data-i18n="accounting.cacheContinuity.column.gap">Time between turns</th>
-                  <th data-i18n="accounting.cacheContinuity.column.configuration">Unchanged configuration</th>
+                  <th data-i18n="accounting.cacheContinuity.column.configuration">Configuration</th>
                   <th data-i18n="accounting.cacheContinuity.column.cacheRead">Cache read</th>
-                  <th data-i18n="accounting.cacheContinuity.column.lostTokens">Estimated lost reuse</th>
-                  <th data-i18n="accounting.cacheContinuity.column.apiEquivalent">Standard API equivalent</th>
+                  <th data-i18n="accounting.cacheContinuity.column.apiEquivalent" data-i18n-title="accounting.apiEquivalent.standardRateBasis" title="Calculated at Standard API rates.">API equivalent</th>
                 </tr>
               </thead>
               <tbody id="cache-continuity-rows"></tbody>
@@ -962,6 +1041,22 @@
         aria-hidden="true"
         inert
       >
+        <section class="panel electron-accountless-community" id="electron-accountless-community" aria-labelledby="electron-accountless-community-title" hidden>
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker" data-i18n="electron.sharing.community.eyebrow">Community sharing</p>
+              <h2 id="electron-accountless-community-title" data-i18n="electron.sharing.community.title">Share usage measurements</h2>
+            </div>
+          </div>
+          <p id="electron-accountless-community-state" class="annotation" role="status" aria-live="polite" data-i18n="electron.sharing.state.unavailable">Community sharing preference unavailable; nothing will be shared.</p>
+          <p id="electron-accountless-community-transport" class="annotation" role="status" aria-live="polite" data-i18n="electron.sharing.transport.unavailable">Uploads are not available in this build.</p>
+          <p id="electron-accountless-sharing-description" class="annotation" data-i18n="electron.settings.sharing.description">Choose whether this installation may share content-free usage measurements. No sign-in is required. Shared measurements may include token counts, model labels, quota measurements, and pseudonymous continuity identifiers. Prompts, responses, credentials, private paths, and raw account identifiers stay on this device.</p>
+          <label class="electron-accountless-sharing-control">
+            <input id="electron-accountless-sharing-enabled" type="checkbox" role="switch" disabled aria-describedby="electron-accountless-sharing-description electron-accountless-community-state electron-accountless-community-transport electron-accountless-sharing-error">
+            <span data-i18n="electron.settings.sharing.label">Share usage measurements</span>
+          </label>
+          <p id="electron-accountless-sharing-error" class="annotation" role="status" aria-live="polite" hidden data-i18n="electron.sharing.notice.error">This sharing choice was not confirmed. Try again.</p>
+        </section>
         <!--
           The guided journey, stated as stages with visible state, rendered
           from measured facts. Trimmed to two boxes (owner-directed,
@@ -1065,8 +1160,8 @@
               </span>
               <span class="identity-account-copy">
                 <strong id="identity-account-provider">Signed in with Google</strong>
-                <small id="identity-account-detail">
-                  Signing out ends this app's contribution session.
+                <small id="identity-account-detail" data-i18n="contribution.signOutDetail">
+                  Signing out ends this app's hosted session. It does not stop this Mac's uploads; use Disconnect this Mac for that.
                 </small>
               </span>
               <!--
@@ -1177,29 +1272,24 @@
               destination asks again.
             </p>
             <!--
-              The connect step stores the upload credential in the login
-              keychain, and macOS raises its own password dialog for that with
-              zero context (observed live 2026-08-19, first pairing on a fresh
-              Mac). This prepares the reader before the click; the ceremony's
-              pairing step repeats the guidance at the moment it applies.
-
-              Exactly one of these two paragraphs is shown, or neither: a build
-              whose signed app brokers the Keychain raises no dialog at all,
-              and one that is only migrating a legacy credential meets it at
-              renewal rather than here. renderIncrementalConsent() picks from
-              the companion's reported keychainPrompt surface; the visible
-              default below is the unbrokered case, so a companion that never
-              answers renders exactly today's page.
+              These annotations describe connection storage or an older
+              credential's secure upgrade. Neither authorizes a Keychain
+              dialog. renderIncrementalConsent() retains the companion's
+              keychainPrompt classifier; missing or unknown broker state
+              gets neutral connection information, never prompt preparation.
+              Deliberate migration approval belongs to native Settings only.
             -->
             <p class="annotation" id="incremental-keychain-pairing-note">
               Connecting stores this Mac's upload credential in your login
-              keychain. If macOS asks for permission, choose Always Allow so
-              background uploads keep working.
+              keychain. Local reporting and history are unchanged.
             </p>
-            <p class="annotation" id="incremental-keychain-rotation-note" hidden>
-              This Mac's upload credential moves into TiboTattle's own keychain
-              storage at its next renewal. If macOS asks for permission then,
-              choose Always Allow so background uploads keep working.
+            <p class="annotation" id="incremental-keychain-migration-note" hidden>
+              This Mac has an upload credential from an older build. TiboTattle
+              first tries to move it to app-owned Keychain storage silently,
+              without changing its value or uploading anything. If Secure
+              upgrade appears in Settings, open Settings… → General and choose
+              Review migration… when you’re ready. The existing credential and
+              local history stay unchanged until migration finishes.
             </p>
             <p class="participant-action-status" id="incremental-consent-status" role="status" hidden></p>
             <!--
@@ -1223,21 +1313,49 @@
               </button>
             </div>
             <p class="annotation" id="incremental-sync-retry-note" role="status" hidden></p>
-            <!--
-              Deletion honesty (owner-directed 2026-08-08): the card used to
-              state "Deletion removes everything you contributed, always."
-              with no control behind it. The sentence is gone; in its place
-              is the working control — the service's participant deletion
-              (DELETE /api/v1/me) removes accepted chunks and stored uploads
-              and tombstones the account. The button appears only with a live
-              contribution session, because deletion requires one.
-            -->
-            <div class="contribution-cta-buttons incremental-delete-row">
-              <button class="button button-quiet" id="delete-contributions" type="button" hidden>
-                Delete my contributions
+            <section id="attribution-consent" aria-labelledby="attribution-consent-title" hidden>
+              <h4 id="attribution-consent-title" data-i18n="attributionConsent.title">Separate account and plan evidence</h4>
+              <p class="annotation" id="attribution-consent-description" data-i18n="attributionConsent.description">An optional contribution update can keep observed plans and pseudonymous account tracks separate. It needs a new review and approval.</p>
+              <button class="button button-quiet" id="attribution-review-open" type="button" data-i18n="attributionConsent.review">Review additional fields</button>
+              <div id="attribution-review" hidden>
+                <h4 id="attribution-review-title" tabindex="-1" data-i18n="attributionConsent.reviewTitle">Review account and plan contribution</h4>
+                <p class="annotation" id="attribution-review-destination"></p>
+                <p class="annotation" id="attribution-review-contract"></p>
+                <p class="annotation" id="attribution-review-sample"></p>
+                <dl id="attribution-review-inventory"></dl>
+                <p class="annotation" id="attribution-review-bases"></p>
+                <p class="annotation" data-i18n="attributionConsent.privacy">Account tracks can link eligible activity within this destination and enrollment. No raw account identifiers, prompts, responses or paths are sent. Missing historical identity stays unknown; observed plans are preserved.</p>
+                <label class="annotation"><input id="attribution-consent-confirm" type="checkbox"> <span data-i18n="attributionConsent.confirm">I approve ongoing upload of these fields, including pseudonymous account and plan linkage.</span></label>
+                <div class="contribution-cta-buttons">
+                  <button class="button button-primary" id="attribution-consent-approve" type="button" disabled data-i18n="attributionConsent.approve">Approve account and plan contribution</button>
+                  <button class="button button-quiet" id="attribution-review-cancel" type="button" data-i18n="attributionConsent.cancel">Not now</button>
+                </div>
+              </div>
+              <p class="annotation" id="attribution-consent-status" role="status" hidden></p>
+            </section>
+          </section>
+          <section class="contribution-device-controls" id="contribution-device-controls" aria-label="Disconnect this Mac" data-i18n-aria-label="contribution.disconnect.action" hidden>
+            <p class="annotation" id="disconnect-device-description" data-i18n="contribution.disconnect.description">
+              Stop this Mac's uploads without deleting hosted history or local analysis. Signing out does not disconnect this Mac.
+            </p>
+            <div class="contribution-cta-buttons">
+              <button class="button button-quiet" id="disconnect-device" type="button" aria-haspopup="dialog" aria-controls="disconnect-device-dialog" aria-describedby="disconnect-device-description" data-i18n="contribution.disconnect.action">
+                Disconnect this Mac
               </button>
             </div>
+            <p class="participant-action-status" id="disconnect-device-status" role="status" tabindex="-1" hidden></p>
           </section>
+          <dialog class="contribution-disconnect-dialog" id="disconnect-device-dialog" aria-labelledby="disconnect-device-title" aria-describedby="disconnect-device-confirmation">
+            <h2 id="disconnect-device-title" data-i18n="contribution.disconnect.title">Disconnect this Mac?</h2>
+            <p id="disconnect-device-confirmation" data-i18n="contribution.disconnect.confirmation">
+              This revokes this Mac's upload connection and pauses its delivery. Your hosted sign-in, previously contributed history, other devices, and local analysis are kept. Connecting again requires an explicit Review and approve action.
+            </p>
+            <p class="annotation" id="disconnect-device-check" role="status"></p>
+            <div class="contribution-cta-buttons">
+              <button class="button button-secondary" id="disconnect-device-cancel" type="button" data-i18n="contribution.disconnect.cancel" autofocus>Cancel</button>
+              <button class="button button-primary" id="disconnect-device-confirm" type="button" data-i18n="contribution.disconnect.action" disabled>Disconnect this Mac</button>
+            </div>
+          </dialog>
         </div>
 
           <!--

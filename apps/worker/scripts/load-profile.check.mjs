@@ -176,7 +176,7 @@ test("profile-only command is deterministic, content-free, and performs no reque
   assert.equal(run.stderr, "");
 });
 
-test("network run rejects unsafe admission and aggregate configurations before requests", () => {
+test("network run rejects unsafe admission before requests", () => {
   const unpaced = spawnSync(process.execPath, [
     scriptPath,
     "--participants", "21",
@@ -192,30 +192,28 @@ test("network run rejects unsafe admission and aggregate configurations before r
     "The backend load runner stopped at a fixed configuration or receipt boundary\n",
   );
   assert.equal(unpaced.stdout, "");
-
-  const ineligibleAggregate = spawnSync(process.execPath, [
-    scriptPath,
-    "--participants", "20",
-    "--attempts-per-participant", "1",
-    "--records-per-attempt", "1",
-    "--concurrency", "1",
-    "--hot-participant-count", "0",
-    "--hot-attempts-per-participant", "1",
-    "--exercise-aggregate",
-  ], { encoding: "utf8" });
-  assert.equal(ineligibleAggregate.status, 1);
-  assert.equal(
-    ineligibleAggregate.stderr,
-    "The backend load runner stopped at a fixed configuration or receipt boundary\n",
-  );
-  assert.equal(ineligibleAggregate.stdout, "");
 });
 
-test("runner source exposes only an aggregate receipt output path", () => {
+test("load run reports missing local owner configuration without claiming cleanup", () => {
+  const run = spawnSync(process.execPath, [scriptPath], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(run.status, 1, run.stderr);
+  const receipt = JSON.parse(run.stdout);
+  assert.equal(receipt.schemaVersion, "backend-load-receipt-v0.2");
+  assert.equal(receipt.status, "failed");
+  assert.deepEqual(receipt.failures, [{ code: "LOCAL_OWNER_ACCESS_REQUIRED", count: 1 }]);
+  assert.equal(receipt.counters.enrollments, 0);
+  assert.equal(receipt.counters.participantsErasedByOwner, 0);
+  assert.equal(receipt.counters.participantDeletionRefusalsVerified, 0);
+  assert.equal(receipt.latency.ownerErasure.count, 0);
+  assert.equal(receipt.fullProfileClaim, false);
+  assert.equal(run.stderr, "");
+});
+
+test("runner source exposes only a privacy-bounded receipt output path", () => {
   const source = readFileSync(scriptPath, "utf8");
   assert.doesNotMatch(source, /console\.(?:log|error|warn)/u);
   assert.doesNotMatch(source, /process\.(?:stdout|stderr)\.write\([^)]*(?:cookie|csrfToken|recoveryCode|uploadAuthorization|participantId)/u);
-  assert.match(source, /aggregateOnlyDiagnostics: true/u);
+  assert.match(source, /publicResultsOnly: true/u);
   assert.match(source, /credentialsPrinted: false/u);
   assert.match(source, /participantIdentifiersPrinted: false/u);
 });

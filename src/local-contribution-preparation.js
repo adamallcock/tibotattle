@@ -17,10 +17,7 @@ import {
   selectProductionParticipantIdentity,
 } from "./export-identity-production.js";
 import { createExportResourceGuard } from "./export-resource-policy.js";
-import {
-  buildLocalMetadataBundle,
-  writeLocalMetadataBundle,
-} from "./metadata-exporter.js";
+import { localMetadataExport } from "./local-node-runtime.js";
 import {
   preparedContributionContext,
   preparedContributionStorage,
@@ -57,8 +54,8 @@ const preparationContext = createLocalContributionPreparationContext({
   readActivityMarkers: readBoundedJsonLines,
   selectIdentity: selectProductionParticipantIdentity,
   withIdentityLease: withParticipantSecretLease,
-  buildBundle: buildLocalMetadataBundle,
-  writeBundle: writeLocalMetadataBundle,
+  buildBundle: localMetadataExport.buildLocalMetadataBundle,
+  writeBundle: localMetadataExport.writeLocalMetadataBundle,
   verifySource: loadVerifiedLocalMetadataBundleFiles,
   materialize: materializeTelemetryContributions,
   verifyPreparedSet:

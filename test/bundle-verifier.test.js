@@ -15,9 +15,14 @@ import {
   createLocalMetadataBundleByteVerifier,
 } from "../src/export/bundle-verification.js";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
-import { buildLocalMetadataBundle, writeLocalMetadataBundle } from "../src/metadata-exporter.js";
+import { localMetadataExport } from "../src/local-node-runtime.js";
 import { verifyPrivacySafeBundle } from "../src/export-privacy.js";
 import { stableJson } from "../src/storage.js";
+
+const {
+  buildLocalMetadataBundle,
+  writeLocalMetadataBundle,
+} = localMetadataExport;
 
 const SECRET = Buffer.alloc(32, 23);
 const BUNDLE_ID = `bundle:v1:${"5".repeat(64)}`;

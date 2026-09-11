@@ -14,6 +14,7 @@ import {
 import {
   collectHistoricalSideChatGapProbe,
   collectSideChatEstimates,
+  SIDE_CHAT_ESTIMATE_ASSUMPTIONS,
 } from "../src/side-chat-estimates.js";
 import {
   writeLocalCollectorAccountingCache,
@@ -197,11 +198,11 @@ test("side-chat estimator detects only anchored children and prices warm then po
       result.timeline[0].usageEvents,
     );
     assert.equal(
-      result.timeline[0].declaredSpeedWeighting.fast["gpt-5.6"].events,
+      result.timeline[0].declaredSpeedWeighting.fast["gpt-5.6-sol"].events,
       1,
     );
     assert.equal(
-      result.timeline[0].declaredSpeedWeighting.fast["gpt-5.6"]
+      result.timeline[0].declaredSpeedWeighting.fast["gpt-5.6-sol"]
         .apiPriceEquivalentUsd,
       result.recent[0].estimatedApiPriceEquivalentUsd,
     );
@@ -433,6 +434,61 @@ test("cold sensitivity uses ordinary uncached input when an older model has no c
   }
 });
 
+test("Astra side-chat cold sensitivity uses dated cache-write cards without borrowing the Sol calibration", async () => {
+  for (const [day, activeContextTokens, priced] of [
+    ["2026-09-03", 100_000, true], ["2026-09-03", 300_000, true],
+    ["2026-09-02", 100_000, false],
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), "side-chat-astra-"));
+    const codexHome = join(root, ".codex");
+    const desktopRoot = join(root, "desktop-logs");
+    await mkdir(codexHome, { recursive: true });
+    await mkdir(desktopRoot, { recursive: true });
+    await writeFile(join(desktopRoot, "main.log"), [
+      `${day}T11:00:00.000Z method=thread/fork conversationId=${PARENT}`,
+      `${day}T11:00:01.000Z method=thread/inject_items conversationId=${CHILD}`,
+      `${day}T11:00:02.000Z IAB_LIFECYCLE captured session route conversationId=${CHILD} disposeAfterSessionActivity=false`,
+      "",
+    ].join("\n"));
+    const database = new DatabaseSync(join(codexHome, "logs_2.sqlite"));
+    database.exec(`CREATE TABLE logs (
+      id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, ts_nanos INTEGER NOT NULL,
+      target TEXT NOT NULL, feedback_log_body TEXT, thread_id TEXT
+    )`);
+    database.prepare(`INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?)`).run(
+      1, seconds(`${day}T11:01:00.000Z`), 0, "codex_core::session::turn",
+      samplingBody(TURN_ONE, activeContextTokens, "gpt-6-astra"), CHILD,
+    );
+    database.close();
+    try {
+      const result = await collectSideChatEstimates({
+        codexHome, desktopLogRoot: desktopRoot,
+        now: () => Date.parse(`${day}T12:00:00.000Z`),
+      });
+      const all = result.periods.find((period) => period.periodId === "all");
+      assert.equal(all.pricedCalls, priced ? 1 : 0);
+      assert.equal(all.unpricedCalls, priced ? 0 : 1);
+      assert.equal(result.recent[0].model, "gpt-6-astra");
+      assert.equal(result.methodology.includedInCalibrationTimeline, false);
+      if (priced) {
+        const providerTotal = Math.round(activeContextTokens / SIDE_CHAT_ESTIMATE_ASSUMPTIONS.activeToProviderTotal.upperCost);
+        const input = Math.round(providerTotal / (1 + SIDE_CHAT_ESTIMATE_ASSUMPTIONS.outputToInput.upperCost));
+        const output = providerTotal - input;
+        const long = input > 272_000;
+        const expected = (input * (long ? 25 : 12.5) + output * (long ? 75 : 50)) / 1_000_000;
+        assert.equal(all.estimatedRangeUsd.upper, expected);
+        assert.equal(result.recent[0].pricingBasis, "reviewed_model_card");
+        assert.equal(result.methodology.calibrationStatus, "withheld_cohort_mismatch");
+      } else {
+        assert.equal(all.estimatedRangeUsd, null);
+        assert.equal(result.recent[0].pricingBasis, "unavailable");
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("historical side-chat gap probe keeps exact usage separate from its quota-residual backcast", async () => {
   const root = await mkdtemp(join(tmpdir(), "side-chat-historical-gap-"));
   const indexFile = join(root, "unified.sqlite");
@@ -577,7 +633,7 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
     );
     assert.equal(
       result.exactUsage.allowanceWeighting.scenarios
-        .unresolved_as_standard.coverage.assumedFromPreferenceEvents,
+        .unresolved_as_standard.coverage.assumedEvents,
       1,
     );
     assert.equal(result.estimate.allowanceComparison.status, "complete");
@@ -589,7 +645,8 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
       result.estimate.exactCostImpliedMedianRangePercentagePoints.lower,
       result.estimate.exactCostImpliedMedianRangePercentagePoints.upper,
     );
-    assert.equal(result.estimate.fastQuotaMultiplier, 2.5);
+    assert.equal(result.estimate.fastQuotaMultiplier, 2);
+    assert.equal(result.estimate.fastQuotaMultiplierSource, "assumed_missing_event_context");
     assert.equal(result.estimate.includedInExactUsage, false);
     assert.equal(result.estimate.includedInCalibrationTimeline, false);
     assert.equal(result.estimate.independentlyObserved, false);
@@ -600,31 +657,13 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
         .medianWeeklyCapacityUsd,
       250,
     );
-    const fast = await collectHistoricalSideChatGapProbe({
-      unifiedIndexFile: indexFile,
-      collectorStateFile: stateFile,
-      date: "2026-07-13",
-      fastModePreference: "fast",
-    });
-    assert.equal(fast.status, "available");
-    assert.equal(
-      fast.exactUsage.allowanceWeighting.selectedScenario,
-      "unresolved_as_fast",
-    );
+    // The unresolved-as-Fast sensitivity stays visible beside the selected
+    // Standard scenario rather than being selectable by a preference.
     assert.ok(
-      fast.exactUsage.allowanceWeighting.selectedUsd
+      result.exactUsage.allowanceWeighting.scenarios.unresolved_as_fast
+        .quotaWeightedUsd
         > result.exactUsage.allowanceWeighting.selectedUsd,
     );
-    const mixed = await collectHistoricalSideChatGapProbe({
-      unifiedIndexFile: indexFile,
-      collectorStateFile: stateFile,
-      date: "2026-07-13",
-      fastModePreference: "mixed_unknown",
-    });
-    assert.equal(mixed.status, "available");
-    assert.equal(mixed.exactUsage.allowanceWeighting.status, "range");
-    assert.equal(mixed.exactUsage.allowanceWeighting.selectedUsd, null);
-    assert.equal(mixed.estimate.allowanceComparison.status, "range");
     const declared = await collectHistoricalSideChatGapProbe({
       unifiedIndexFile: indexFile,
       collectorStateFile: stateFile,
@@ -643,7 +682,7 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
     );
     assert.equal(
       declared.exactUsage.allowanceWeighting.scenarios
-        .unresolved_as_standard.coverage.assumedFromPreferenceEvents,
+        .unresolved_as_standard.coverage.assumedEvents,
       0,
     );
     const serialized = JSON.stringify(result);

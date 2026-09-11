@@ -4,7 +4,11 @@ import type { D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { clearAdminAccessJwksCacheForTests } from "../src/admin-access";
-import { adminHostname } from "../src/admin-ui";
+import {
+  warmAdminCommunityAllowancePreviewCache,
+} from "../src/admin-community-allowance";
+import { ADMIN_SURFACE_PATHS, adminHostname } from "../src/admin-ui";
+import { ADMIN_UI_ASSETS } from "../src/admin-ui.generated";
 import { handleRequest } from "../src/index";
 
 interface TestBindings extends Env {
@@ -168,13 +172,8 @@ describe("admin hostname derivation", () => {
 describe("admin surface hostname gating", () => {
   it("keeps the public origin's deliberate 404 for every admin path", async () => {
     const runtimeEnv = adminSurfaceBindings();
-    for (const path of [
-      "/admin",
-      "/admin.html",
-      "/admin.js",
-      "/admin-client.js",
-      "/admin.css",
-    ]) {
+    expect(ADMIN_SURFACE_PATHS).toContain("/telemetry-shared.generated.js");
+    for (const path of ADMIN_SURFACE_PATHS) {
       const response = await handleRequest(
         new Request(`${PUBLIC_ORIGIN}${path}`),
         runtimeEnv,
@@ -182,14 +181,21 @@ describe("admin surface hostname gating", () => {
       expect(response.status, path).toBe(404);
     }
 
-    const adminApi = await handleRequest(
-      new Request(`${PUBLIC_ORIGIN}/api/v1/admin/overview`),
-      runtimeEnv,
-    );
-    expect(adminApi.status).toBe(404);
-    await expect(adminApi.json()).resolves.toMatchObject({
-      error: { code: "NOT_FOUND" },
-    });
+    for (const path of [
+      "/api/v1/admin/overview",
+      "/api/v1/admin/metrics/history",
+      "/api/v1/admin/community/allowance-preview",
+      "/api/v1/admin/reconstruction-progress",
+    ]) {
+      const adminApi = await handleRequest(
+        new Request(`${PUBLIC_ORIGIN}${path}`),
+        runtimeEnv,
+      );
+      expect(adminApi.status, path).toBe(404);
+      await expect(adminApi.json()).resolves.toMatchObject({
+        error: { code: "NOT_FOUND" },
+      });
+    }
     const adminAction = await handleRequest(
       new Request(`${PUBLIC_ORIGIN}/api/v1/admin/action`, {
         method: "POST",
@@ -225,15 +231,17 @@ describe("admin surface hostname gating", () => {
   });
 
   it("rejects admin-host requests without an Access assertion", async () => {
-    const response = await handleRequest(
-      new Request(`${ADMIN_ORIGIN}/admin.html`),
-      adminSurfaceBindings(),
-    );
-    expect(response.status).toBe(403);
-    expect(response.headers.get("cache-control")).toBe("no-store");
-    await expect(response.json()).resolves.toMatchObject({
-      error: { code: "ACCESS_REQUIRED" },
-    });
+    for (const path of ADMIN_SURFACE_PATHS) {
+      const response = await handleRequest(
+        new Request(`${ADMIN_ORIGIN}${path}`),
+        adminSurfaceBindings(),
+      );
+      expect(response.status, path).toBe(403);
+      expect(response.headers.get("cache-control"), path).toBe("no-store");
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "ACCESS_REQUIRED" },
+      });
+    }
   });
 
   it("rejects invalid Access assertions with 403 and no detail", async () => {
@@ -295,6 +303,11 @@ describe("admin surface hostname gating", () => {
         /projectAdminOverview|adminResponseError/u,
       ],
       ["/admin.css", "text/css; charset=utf-8", /admin/u],
+      [
+        "/telemetry-shared.generated.js",
+        "text/javascript; charset=utf-8",
+        /ADMIN_MODEL_CONFIG/u,
+      ],
     ];
     for (const [path, contentType, marker] of expectations) {
       const response = await handleRequest(
@@ -310,6 +323,69 @@ describe("admin surface hostname gating", () => {
         .toBe("noindex, nofollow");
       expect(await response.text(), path).toMatch(marker);
     }
+    for (const [path, asset] of Object.entries(ADMIN_UI_ASSETS)) {
+      for (const method of ["GET", "HEAD"]) {
+        const response = await handleRequest(
+          new Request(`${ADMIN_ORIGIN}${path}`, {
+            method,
+            headers: { "cf-access-jwt-assertion": token },
+          }),
+          runtimeEnv,
+        );
+        expect(response.status, `${method} ${path}`).toBe(200);
+        expect(response.headers.get("content-type"), path).toBe(asset.contentType);
+        expect(response.headers.get("cache-control"), path).toBe("no-store");
+        expect(await response.text(), `${method} ${path}`).toBe(
+          method === "HEAD" ? "" : asset.content,
+        );
+      }
+    }
+  });
+
+  it("adds failure-isolated reconstruction progress only behind the owner overview gate", async () => {
+    const runtimeEnv = adminSurfaceBindings({ ALLOWANCE_RECONSTRUCTION_MODE: "resumable" });
+    const token = await signedAccessJwt();
+    const overview = () => handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/overview`, {
+      headers: { "cf-access-jwt-assertion": token },
+    }), runtimeEnv);
+    const available = await overview();
+    expect(available.status).toBe(200);
+    expect(available.headers.get("cache-control")).toBe("no-store");
+    await expect(available.json()).resolves.toMatchObject({
+      schemaVersion: "admin-overview-v0.3",
+      reconstruction: { schemaVersion: "admin-reconstruction-progress-v0.1", status: "available",
+        mode: "resumable", calculations: { trackedAccounts: 0, completedAccounts: 0 } },
+    });
+    await env.USAGE_MONITOR_DB.prepare("DROP TABLE community_analysis_work_stage").run();
+    await env.USAGE_MONITOR_DB.prepare("DROP TABLE community_analysis_work_parts").run();
+    await env.USAGE_MONITOR_DB.prepare("DROP TABLE community_analysis_work").run();
+    const unavailable = await overview();
+    expect(unavailable.status).toBe(200);
+    await expect(unavailable.json()).resolves.toMatchObject({
+      schemaVersion: "admin-overview-v0.3",
+      reconstruction: { status: "unavailable", mode: "resumable" },
+      dailyPublication: { pendingRebuilds: 0 },
+    });
+  });
+
+  it.each([
+    ["/api/v1/admin/reconstruction-progress","ADMIN_RECONSTRUCTION_PROGRESS_UNAVAILABLE"],
+    ["/api/v1/admin/community/allowance-preview","ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE"],
+    ["/api/v1/admin/metrics/history","ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE"],
+  ])("keeps unavailable read-only %s out of the database diagnostic-write path",async(path,code)=>{
+    const statements:string[]=[];
+    const database=new Proxy(env.USAGE_MONITOR_DB,{get(target,key){
+      if(key==="prepare")return(sql:string)=>{statements.push(sql);throw new Error("synthetic storage outage");};
+      const value=Reflect.get(target,key,target);return typeof value==="function"?value.bind(target):value;
+    }});
+    const response=await handleRequest(new Request(`${ADMIN_ORIGIN}${path}`,{
+      headers:{"cf-access-jwt-assertion":await signedAccessJwt()},
+    }),adminSurfaceBindings({USAGE_MONITOR_DB:database,ALLOWANCE_RECONSTRUCTION_MODE:"resumable"}));
+    expect(response.status).toBe(503);expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toMatchObject({error:{code}});
+    expect(statements).toHaveLength(1);
+    expect(statements[0]!.trimStart()).toMatch(/^SELECT/u);
+    expect(statements[0]).not.toMatch(/\b(?:INSERT|UPDATE|DELETE|REPLACE)\b/u);
   });
 
   it("accepts a plain string audience claim from Access", async () => {
@@ -361,6 +437,63 @@ describe("admin surface hostname gating", () => {
     await expect(response.json()).resolves.toMatchObject({
       schemaVersion: "admin-overview-v0.3",
     });
+  });
+
+  it("serves the allowance merge preview only through the authenticated admin host", async () => {
+    expect((await warmAdminCommunityAllowancePreviewCache(
+      testBindings().USAGE_MONITOR_DB,
+      Date.now(),
+    )).code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
+
+    const response = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/api/v1/admin/community/allowance-preview`, {
+        headers: { "cf-access-jwt-assertion": await signedAccessJwt() },
+      }),
+      adminSurfaceBindings(),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({
+      schemaVersion: "admin-community-allowance-preview-v0.3",
+      referencePlanType: "pro",
+      plans: [
+        { planType: "pro", multiplier: 1 },
+        { planType: "prolite", multiplier: 4 },
+        { planType: "plus", multiplier: 20 },
+      ],
+    });
+  });
+
+  it("serves closed read-only progress only to the Access owner and negotiates exact preparation detail", async () => {
+    const token = await signedAccessJwt();
+    const response = await handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/reconstruction-progress`, {
+      headers: { "cf-access-jwt-assertion": token },
+    }), adminSurfaceBindings());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ schemaVersion: 1,
+      publication: { publishedGeneration: null }, history: { resolvedDays: 0 } });
+    const detail = await handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/reconstruction-progress?detail=preparation`, {
+      headers: { "cf-access-jwt-assertion": token },
+    }), adminSurfaceBindings());
+    expect(detail.status).toBe(200);
+    expect(detail.headers.get("cache-control")).toBe("no-store");
+    await expect(detail.json()).resolves.toMatchObject({ schemaVersion: 2, preparation: {
+      trackedDays: 0, completeDays: 0, buildingDays: 0, retiringDays: 0, checkpointSteps: 0,
+      quotaObservations: 0, usageEvents: 0,
+    } });
+    for (const query of ["participantId=private", "detail=raw", "detail=preparation&extra=1", "detail=preparation&detail=preparation"]) {
+      const badQuery = await handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/reconstruction-progress?${query}`, {
+        headers: { "cf-access-jwt-assertion": token },
+      }), adminSurfaceBindings());
+      expect(badQuery.status, query).toBe(400);
+    }
+    expect((await handleRequest(new Request(`${PUBLIC_ORIGIN}/api/v1/admin/reconstruction-progress?detail=preparation`),
+      adminSurfaceBindings())).status).toBe(404);
+    const wrongOwner = await handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/reconstruction-progress`, {
+      headers: { "cf-access-jwt-assertion": await signedAccessJwt({ email: "other@example.test" }) },
+    }), adminSurfaceBindings());
+    expect(wrongOwner.status).toBe(403);
   });
 
   it("refuses a verified Access identity that is not the configured owner", async () => {

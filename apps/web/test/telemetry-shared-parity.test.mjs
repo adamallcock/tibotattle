@@ -13,6 +13,8 @@ import * as canonicalTelemetry
   from "../../../packages/telemetry-contract/index.js";
 import {
   TELEMETRY_BROWSER_MIRROR_FILE,
+  PUBLIC_MODEL_BROWSER_MIRROR_FILE,
+  buildPublicModelCatalogMirror,
   buildTelemetryBrowserMirror,
   checkTelemetryBrowserMirror,
   readVerifiedTelemetryBrowserMirror,
@@ -191,6 +193,16 @@ test("the browser telemetry mirror verifier returns a frozen captured string rec
   assert.equal(direct.sourceText, sourceText);
   assert.equal(captured.sha256, direct.sha256);
   assert.equal(captured.byteLength, Buffer.byteLength(sourceText, "utf8"));
+});
+
+test("the public model mirror contains only the canonical identity vocabulary", async () => {
+  const text = await readFile(PUBLIC_MODEL_BROWSER_MIRROR_FILE, "utf8");
+  assert.equal(text, await buildPublicModelCatalogMirror());
+  assert.ok(Buffer.byteLength(text) < 10 * 1024);
+  assert.doesNotMatch(text, /admin-model-history|ADMIN_MODEL|validateTelemetry|participant_id|contribution|envelope/iu);
+  const module = await import("../public/model-catalog.generated.js");
+  assert.deepEqual(module.REVIEWED_MODEL_CATALOG, canonicalTelemetry.REVIEWED_MODEL_CATALOG);
+  assert.equal(module.reviewedModelIdentity("raw-private-model"), null);
 });
 
 test("the browser telemetry mirror writer publishes one complete durable file", async (t) => {

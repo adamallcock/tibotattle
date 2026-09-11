@@ -2,7 +2,7 @@
 title: Web-only production release lane
 date: 2026-08-17
 type: runbook
-status: active
+status: maintained
 ---
 
 # Web-only production release lane
@@ -112,6 +112,13 @@ This is the only web-only deploy entry point. It validates the receipt, repeat
 checks the candidate scope, and invokes the production immutable-snapshot and
 migration safeguards. It is still a Worker deployment, so it requires the
 normal production credentials and explicit authorization.
+
+The receipt's exact `baseCommit` is forwarded as the reviewed production
+predecessor. Under the shared deployment lock, live health must still name that
+base before Wrangler starts. A newer deployment makes this receipt stale: merge
+the intended changes onto the new base and requalify, never auto-adopt live
+source or bypass the guard. Interrupted outcomes use the production operation
+journal and [explicit recovery procedure](production-operations.md#guarded-deployment-wrapper).
 
 ```bash
 npm run product:web-release:deploy -- \

@@ -311,44 +311,16 @@ export function contributionBatchAdmission({
   });
 }
 
-export async function runReviewedContributionGate({
-  reviewToken,
-  hasPendingAutomaticConsent,
-  runReviewedSend,
-  enableAutomaticContribution,
-} = {}) {
-  if (typeof reviewToken !== "string"
-      || reviewToken.length === 0
-      || typeof hasPendingAutomaticConsent !== "boolean"
-      || typeof runReviewedSend !== "function"
-      || typeof enableAutomaticContribution !== "function") {
-    throw new TypeError("Reviewed contribution gate inputs are invalid.");
-  }
-  const result = await runReviewedSend(reviewToken);
-  const accepted =
-    result?.status === "completed"
-    && Number.isSafeInteger(result.accepted)
-    && result.accepted > 0;
-  let automatic = null;
-  let automaticError = null;
-  if (accepted && hasPendingAutomaticConsent) {
-    try {
-      automatic = await enableAutomaticContribution();
-    } catch (error) {
-      automaticError = error;
-    }
-  }
-  return Object.freeze({
-    accepted,
-    automatic,
-    automaticError,
-    result,
-  });
-}
+// A fresh index or an authoritatively selected full accounting rebuild has a
+// four-hour server-side cold-work bound. Keep the browser attached for that
+// bound plus one minute so progress and Cancel stay usable; this does not
+// extend the companion's own deadline, and ordinary cache-hit refreshes still
+// settle at their five-minute server bound.
+export const LOCAL_REFRESH_POLLING_WINDOW_MS = 241 * 60 * 1_000;
 
 export function createRefreshPollingBudget({
   now = () => Date.now(),
-  windowMs = 6 * 60 * 1_000,
+  windowMs = LOCAL_REFRESH_POLLING_WINDOW_MS,
   settlementGraceMs = 30 * 1_000,
   maximumContinuations = 2
 } = {}) {
@@ -385,6 +357,46 @@ export function createRefreshPollingBudget({
   });
 }
 
+/**
+ * Describe the quick-result phase without claiming that the loaded overview
+ * contains a numeric headline. A successful overview response can still be a
+ * truthful unavailable/withheld state, so transport success alone must never
+ * become "headline ready" or "verified numbers" copy.
+ */
+export function refreshQuickResultStatus({
+  dashboardLoaded = false,
+  elapsedLabel = "",
+} = {}) {
+  const boundedElapsedLabel = typeof elapsedLabel === "string"
+    ? elapsedLabel.trim()
+    : "";
+  if (dashboardLoaded) {
+    return boundedElapsedLabel.length > 0
+      ? `Local summary updated · checking full history… ${boundedElapsedLabel}`
+      : "Local summary updated · checking full history…";
+  }
+  return boundedElapsedLabel.length > 0
+    ? `Preparing local summary… ${boundedElapsedLabel}`
+    : "Preparing local summary…";
+}
+
+/** A count-free work stage, never proof of fresh or completed accounting. */
+export function refreshAccountingStatus({ progress, elapsedLabel = "" } = {}) {
+  if (progress === null || typeof progress !== "object"
+      || Array.isArray(progress)
+      || Object.keys(progress).length !== 2
+      || !Object.hasOwn(progress, "kind")
+      || !Object.hasOwn(progress, "status")
+      || progress.kind !== "accounting"
+      || progress.status !== "calculating") return null;
+  const boundedElapsedLabel = typeof elapsedLabel === "string"
+    ? elapsedLabel.trim()
+    : "";
+  return boundedElapsedLabel.length > 0
+    ? `Calculating accounting… ${boundedElapsedLabel}`
+    : "Calculating accounting…";
+}
+
 export function refreshNeedsContinuation({
   outcome,
   errorCode = null,
@@ -393,6 +405,103 @@ export function refreshNeedsContinuation({
   if (progress?.status !== "bounded_pause") return false;
   return outcome === "succeeded"
     || (outcome === "failed" && errorCode === "refresh_timed_out");
+}
+
+function historyProgressNumber(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function historyProgressToken(value) {
+  if (Number.isSafeInteger(value) && value >= 0) return value;
+  return typeof value === "string" && /^[A-Za-z0-9._:-]{1,128}$/u.test(value)
+    ? value
+    : null;
+}
+
+export const HISTORY_INFORMATIONAL_GAP_MAX_SHARE = 0.01;
+
+/**
+ * A terminal history gap may use the quiet informational treatment only when
+ * the published receipt is coherent, current accounting is available, and
+ * the excluded share is immaterial. Everything else remains a warning.
+ */
+export function historyCoverageNoticeKind({
+  history = null,
+  accountingProjection = null,
+} = {}) {
+  const sourceCount = historyProgressNumber(history?.sourceCount);
+  const indexedSourceCount = historyProgressNumber(
+    history?.indexedSourceCount,
+  );
+  const pendingSourceCount = historyProgressNumber(
+    history?.pendingSourceCount,
+  );
+  const skippedSourceCount = historyProgressNumber(
+    history?.skippedSourceCount,
+  );
+  const informational = history?.status === "partial"
+    && history?.phase === "partial_terminal"
+    && accountingProjection?.status === "available"
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && indexedSourceCount > 0
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && skippedSourceCount > 0
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedSourceCount / sourceCount
+      <= HISTORY_INFORMATIONAL_GAP_MAX_SHARE;
+  return informational ? "info" : "warning";
+}
+
+/**
+ * Decide whether the browser may automatically start another archive-index
+ * pass. A terminal partial generation is useful verified evidence, but never
+ * advancing work. An incomplete pass may continue only when its closed,
+ * content-free receipt differs from the receipt visible before the last pass.
+ */
+export function historyIndexContinuationDecision({
+  history = null,
+  generation = null,
+  generationFingerprint = null,
+  previousReceipt = null,
+} = {}) {
+  const safeHistory = history !== null
+      && typeof history === "object"
+      && !Array.isArray(history)
+    ? history
+    : null;
+  const indexedSourceCount = historyProgressNumber(
+    safeHistory?.indexedSourceCount,
+  );
+  const sourceCount = historyProgressNumber(safeHistory?.sourceCount);
+  const receipt = safeHistory === null
+    ? null
+    : JSON.stringify([
+      typeof safeHistory.phase === "string" ? safeHistory.phase : null,
+      indexedSourceCount,
+      historyProgressNumber(safeHistory.indexedBytes),
+      sourceCount,
+      historyProgressNumber(safeHistory.sourceBytes),
+      historyProgressToken(generation),
+      historyProgressToken(generationFingerprint),
+    ]);
+  const terminalGap = safeHistory?.status === "partial"
+    && safeHistory?.phase === "partial_terminal";
+  const incomplete = safeHistory?.status !== "complete"
+    && !terminalGap
+    && safeHistory?.phase !== "aggregate_unavailable"
+    && indexedSourceCount !== null
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount < sourceCount;
+  return Object.freeze({
+    incomplete,
+    receipt,
+    terminalGap,
+    shouldContinue: incomplete && receipt !== previousReceipt,
+  });
 }
 
 export function formatTokenTotal(usage) {
@@ -436,13 +545,11 @@ export const DIAGNOSTIC_SURFACES = Object.freeze([
   "contribution_prepare",
   "contribution_send",
   "device_credential_reset",
-  "fast_mode_preference",
   "hosted_identity",
   "hosted_privacy",
   "local_refresh",
-  // 2026-08-08 (deletion honesty): the "Delete my contributions" action files
-  // its failures like every other journey. The companion accepts the same
-  // fixed name.
+  // Retained for diagnostics from older app versions, not a current
+  // self-service hosted deletion action. The companion accepts the same name.
   "participant_deletion"
 ]);
 const DIAGNOSTIC_SURFACE_SET = new Set(DIAGNOSTIC_SURFACES);

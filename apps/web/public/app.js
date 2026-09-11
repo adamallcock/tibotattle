@@ -1,3 +1,6 @@
+import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { mountWorkUsageView } from "./work-usage-view.js";
+import { mountModelPerformance } from "./model-performance.js";
 import {
   CommunityClient,
   isPrimaryCodexQuotaWindow,
@@ -7,9 +10,11 @@ import {
   CODEX_PRIMARY_LIMIT_ID,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
+  cacheDropThreadLookupKey,
   demoDashboard,
   isValidQuotaWindowDuration,
   normalizeIncrementalContributionSyncStatus,
+  selectAllowancePlanPopulation,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
@@ -24,7 +29,11 @@ import {
   diagnosticErrorCode,
   diagnosticReferenceSentence,
   diagnosticSurface,
+  historyCoverageNoticeKind,
+  historyIndexContinuationDecision,
   isContributionReviewableQueueState,
+  refreshAccountingStatus,
+  refreshQuickResultStatus,
   refreshNeedsContinuation,
   serviceRequestId,
   withContributionReviewDeadline,
@@ -41,10 +50,15 @@ import {
   createBrowserLocalization,
 } from "./localization.js";
 import {
+  TELEMETRY_PLAN_DISPLAY_NAMES,
   TELEMETRY_PLAN_TYPES,
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
 } from "./telemetry-shared.generated.js";
 import {
   compact,
+  formatCodexThreadParts,
+  formatApiMoney,
+  formatSharePercent,
   adaptiveChartTickCount,
   classifyTimelineEvidence,
   createDomHelpers,
@@ -66,20 +80,135 @@ import {
   USER_TIME_ZONE,
 } from "./ui-format.js";
 
+const NATIVE_APPEARANCE_THEMES = new Set(["light", "dark"]);
+
+function applyNativeAppearanceTheme(theme) {
+  if (!NATIVE_APPEARANCE_THEMES.has(theme)) return false;
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme;
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  if (themeColor) {
+    themeColor.content = theme === "dark" ? "#141a17" : "#f5f1e8";
+  }
+  return true;
+}
+
+// WKWebView installs this handoff at document start, before the stylesheet can
+// paint. Reapplying it here owns live Settings changes and keeps the browser
+// metadata in step without reloading a dashboard or losing in-memory state.
+applyNativeAppearanceTheme(
+  globalThis.__TIBOTATTLE_APPEARANCE__?.resolvedTheme,
+);
+window.addEventListener("tibotattle:appearance-override", (event) => {
+  applyNativeAppearanceTheme(event.detail?.resolvedTheme);
+});
+
 const localization = createBrowserLocalization();
 setFormattingLocale(localization.formatLocale());
 setMessageLocale(localization.locale());
 const t = localization.t;
 const tPlural = localization.tPlural;
 
+// Accountless sharing is an Electron-only presentation surface. The Electron
+// main/application controller remains the policy owner; this page receives only
+// its bounded projection through the versioned preload bridge. A missing or malformed
+// projection keeps the legacy hosted contribution controls unavailable in the
+// new Electron composition and never becomes an implied permission.
+const ELECTRON_SHARING_API_VERSION = "v1";
+const ELECTRON_SHARING_BASES = new Set([
+  "default_on",
+  "default_off",
+  "migration_default_on",
+  "user_choice",
+  "legacy_preserved",
+]);
+const ELECTRON_SHARING_STATES = new Set([
+  "pending_notices",
+  "enabled",
+  "disabled",
+  "legacy_preserved",
+]);
+const ELECTRON_SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off", "uploading", "pending", "up_to_date", "retry_wait", "paused", "recovery_required"]);
+
+function electronSharingBridge(windowRef = globalThis.window) {
+  const bridge = windowRef?.tibotattleDesktop;
+  if (bridge?.version !== ELECTRON_SHARING_API_VERSION
+      || typeof bridge.getSharingPreference !== "function"
+      || typeof bridge.setSharingEnabled !== "function"
+      || typeof bridge.sharingNoticePresented !== "function") {
+    return null;
+  }
+  return bridge;
+}
+
+function validSharingTimestamp(value) {
+  if (value === null) return true;
+  if (typeof value !== "string" || value.length !== 24) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+    && new Date(milliseconds).toISOString() === value;
+}
+
+function normalizeElectronSharingPreference(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const available = raw.available === true;
+  const current = raw.current === true;
+  const state = ELECTRON_SHARING_STATES.has(raw.state) ? raw.state : null;
+  const basis = ELECTRON_SHARING_BASES.has(raw.basis) ? raw.basis : null;
+  const noticeCount = Number.isInteger(raw.noticeCount)
+    && raw.noticeCount >= 0 && raw.noticeCount <= 3
+    ? raw.noticeCount
+    : 0;
+  const nextNoticeIndex = raw.nextNoticeIndex === null
+    ? null
+    : Number.isInteger(raw.nextNoticeIndex)
+      && raw.nextNoticeIndex >= 1 && raw.nextNoticeIndex <= 3
+      ? raw.nextNoticeIndex
+      : null;
+  const nextNoticeAt = validSharingTimestamp(raw.nextNoticeAt) ? raw.nextNoticeAt : null;
+  const earliestActivationAt = validSharingTimestamp(raw.earliestActivationAt)
+    ? raw.earliestActivationAt
+    : validSharingTimestamp(raw.activatesAt) ? raw.activatesAt : null;
+  const transportStatus = ELECTRON_SHARING_TRANSPORT_STATUSES.has(raw.transportStatus)
+    ? raw.transportStatus
+    : raw.enabled === true ? "unavailable" : "off";
+  if (raw.nextNoticeAt !== undefined && !validSharingTimestamp(raw.nextNoticeAt)) return null;
+  if (raw.earliestActivationAt !== undefined && !validSharingTimestamp(raw.earliestActivationAt)) return null;
+  if (raw.activatesAt !== undefined && !validSharingTimestamp(raw.activatesAt)) return null;
+  return Object.freeze({
+    available,
+    current,
+    enabled: available && current && raw.enabled === true,
+    state,
+    basis,
+    noticeCount,
+    nextNoticeIndex,
+    noticeDue: raw.noticeDue === true,
+    nextNoticeAt,
+    earliestActivationAt,
+    transportStatus,
+  });
+}
+
 const localClient = new LocalCompanionClient();
 let communitySession = null;
 const communityClient = new CommunityClient({
-  getCsrfToken: () => communitySession?.csrfToken ?? null,
-  getParticipantId: () => communitySession?.participantId ?? null
+  getCsrfToken: () => communitySession?.csrfToken ?? null
 });
 
 let dashboard = null;
+// Private, local-only display enrichment. Thread names never become part of
+// an accounting/dashboard DTO, share card, contribution, or browser storage.
+const cacheDropThreadLinks = {
+  dashboard: null,
+  generation: null,
+  generationFingerprint: null,
+  requestToken: 0,
+  loadToken: 0,
+  requested: false,
+  entries: new Map(),
+  cells: { switch: [], continuity: [] },
+};
 // Owner decision 2026-08-06: the calibration rolling comparison window is
 // fixed at three hours. The 15-minute and 1-hour widths the old segmented
 // control offered proved inaccurate, so the chart, its summary tiles, the
@@ -97,6 +226,9 @@ let activeAccountingPeriod = "7d";
 // visible reason, which is the inconsistency this settles.
 let activeWeeklyRangeDays = 30;
 let activeWeeklyMinimumObservedSpanPp = 50;
+// Null follows the latest observed plan, including an insufficient one. An
+// explicit choice stays in memory across refreshes, ranges and locale changes.
+let activeWeeklyPlanType = null;
 let timelineViewport = null;
 let usageTimelineViewport = null;
 let timelinePointerStart = null;
@@ -121,7 +253,6 @@ const accountingModelsTablePagination = { page: 0, signature: "" };
 // background refresh redraws the table without collapsing a row mid-read.
 const accountingExpandedModels = new Set();
 const cacheSwitchTablePagination = { page: 0, signature: "" };
-const cacheContinuityGapTablePagination = { page: 0, signature: "" };
 const cacheContinuityTablePagination = { page: 0, signature: "" };
 const sideChatTablePagination = { page: 0, signature: "" };
 
@@ -159,6 +290,15 @@ function paginateCacheImpactRows(rows, state, signature) {
 // read that loses the race lands as null. Both latch every capability gate
 // below into "this build has no v1.0 transport" for the life of the page.
 let localCompanionHealth = null;
+// Accountless sharing is deliberately page-local presentation state. Durable
+// choice, transition receipts, and transport authority stay in the companion.
+let electronSharingPreference = null;
+let electronSharingBusy = false;
+let electronSharingNoticeAcked = new Set();
+let electronSharingNoticeReceiptIndex = null;
+let electronSharingNoticeAckScheduled = null;
+let electronSharingNoticeAckCleanup = null;
+let electronSharingNoticeAckError = false;
 // The last refresh run's accounting-rebuild deferral, read from the local
 // refresh status alongside each dashboard load. A rebuild that keeps missing
 // its memory budget is otherwise invisible here: the refresh SUCCEEDS, the
@@ -193,6 +333,9 @@ let contributionSyncAutoReviewedKey = null;
 let incrementalConsentApproved = false;
 let incrementalConsentBusy = false;
 let incrementalSyncStatus = null;
+let attributionContributionReview = null;
+let attributionContributionBusy = false;
+let attributionContributionNotice = null;
 // The optional lastOutcome.detail.code the 0.1.2 companion records beside the
 // bare outcome code, so "Last error: device credential unavailable" can be
 // stated instead of an anonymous "run_failed". The bounded normalizer keeps
@@ -232,15 +375,21 @@ let reindexAutoContinuations = 0;
 const REINDEX_AUTO_CONTINUE_LIMIT = 40;
 const REINDEX_AUTO_CONTINUE_DELAY_MS = 1_500;
 let reindexAutoContinueTimer = null;
+let lastReindexProgressReceipt = null;
 // The short read-only polling loop behind the live first-pass status line.
 // setTimeout-chained (never an interval), bounded, and it only ever performs
 // the same GET the page performs on load.
 let incrementalSyncPollTimer = null;
 let incrementalSyncPollCount = 0;
-let fastModePreference = null;
-let fastModePreferenceBusy = false;
 let localOnboarding = null;
 let communityConnectBusy = false;
+let contributionDisconnectBusy = false;
+let contributionDisconnectChecking = false;
+let contributionDisconnectAbsent = false;
+let contributionDisconnectCheckGeneration = 0;
+// Only a validated receipt confirms completion. Pending cleanup preserves the
+// earlier remote revocation fact even if a later retry cannot reach the Mac.
+let contributionDisconnectOutcome = null;
 // True once this Mac has actually been paired as an upload-only device in
 // this session.
 let communityDevicePaired = false;
@@ -275,6 +424,9 @@ let hostedSignInCancellationInFlight = false;
 let appleSignInUnavailable = false;
 let googleSignInUnavailable = false;
 let localActionBusy = false;
+// Overlapping primary reads share the original busy owner. Publication uses
+// the same load token as quick reloads and cache-drop links below.
+let activeLocalDashboardLoad = null;
 let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
 // Archive indexing progress is intentionally transient: the durable dashboard
@@ -284,6 +436,17 @@ let localRefreshCancelRequested = false;
 let archiveHistoryScanActive = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
+// Electron's main process owns the recurring cadence. A renderer refresh must
+// hand it a bounded lease after the companion accepts the POST, otherwise a
+// one-shot timer can fire again while the same accounting pass is still
+// running. The controller watchdog remains the outer safety bound.
+const ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS = 1_000;
+let electronStartupRefreshTriggered = false;
+// A qualified startup observer can release while the first local-dashboard
+// load still owns the action lock. Keep that one launch pass pending until the
+// owner clears the lock instead of treating its harmless early return as the
+// completed Electron refresh.
+let electronStartupRefreshDeferred = false;
 let globalState = null;
 let visibleConnectionNotice = null;
 let dashboardUnavailableState = null;
@@ -414,6 +577,8 @@ function rerenderLocalizedDashboard() {
   // writes populate. Nothing has to be named here for it to be covered.
   retranslateLocalizedNodes();
   localization.localizeTree();
+  renderElectronAccountlessCommunity();
+  renderElectronSharingNotice();
 }
 
 window.addEventListener("tibotattle:locale-change", (event) => {
@@ -491,13 +656,37 @@ function localAnalysisLabel() {
     : "Analyze local usage";
 }
 
+// Keep phase, count and elapsed time in stable slots across refresh updates.
+function renderRefreshProgress(button, phase, { processed = null, selected = null, elapsedSeconds = null } = {}) {
+  button.classList.add("refresh-progress");
+  const label = node("span", "refresh-progress-phase", phase);
+  const count = node("span", "refresh-progress-count");
+  if (processed !== null && selected !== null) {
+    const current = node("span", "refresh-progress-current", String(processed));
+    current.style.minWidth = `${String(selected).length}ch`;
+    count.append(current, document.createTextNode(`/${selected}`));
+  }
+  const elapsed = elapsedSeconds === null ? "" :
+    `${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+  const timer = node("span", "refresh-progress-time", elapsed);
+  const description = [phase, count.textContent, elapsed].filter(Boolean).join(" · ");
+  button.title = description;
+  button.setAttribute("aria-label", description);
+  button.replaceChildren(label, count, timer);
+}
+
 function updateLocalActionButtons() {
   const allowed = localAnalysisAllowed();
   const label = localAnalysisLabel();
   for (const selector of ["#refresh-button", "#setup-refresh"]) {
     const button = $(selector);
     button.disabled = localActionBusy || !allowed;
-    if (!localActionBusy) button.textContent = label;
+    if (!localActionBusy) {
+      button.textContent = label;
+      button.classList.remove("refresh-progress");
+      button.removeAttribute("aria-label");
+      button.removeAttribute("title");
+    }
   }
   const setupCheck = $("#setup-check-again");
   if (setupCheck) setupCheck.disabled = localActionBusy;
@@ -536,25 +725,6 @@ function formatMoney(value, digits = 0) {
     });
 }
 
-function formatApiMoney(value) {
-  const number = finite(value);
-  if (number === null) return "—";
-  if (number > 0 && number < .01) {
-    return `<${formatNumber(.01, {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`;
-  }
-  return formatNumber(number, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
 /**
  * A percentage near an end of the scale must not be printed as if it were at
  * that end. `Intl` rounds 99.96 to "100%" and 0.04 to "0%", and on this
@@ -589,37 +759,6 @@ function formatPercent(value, digits = 0) {
   const rendered = format(number);
   if (number > 0 && rendered === format(0)) return `<${format(step)}`;
   if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
-  return rendered;
-}
-
-/**
- * A share for a table column, always at one decimal place.
- *
- * `formatPercent` drops to whole numbers whenever the value happens to be an
- * integer, which is right for a sentence and wrong for a column: it renders
- * "20%" directly above "20.9%", so the decimal point moves down the page and
- * two figures that exist to be compared have to be read digit by digit. Here
- * the precision is fixed, and the same bounded "<" idiom keeps a sliver from
- * rendering as an exact zero it is not.
- *
- * Returns `null` when the denominator cannot carry a share at all, so callers
- * withhold the cell rather than printing a share of nothing.
- */
-function formatSharePercent(part, whole) {
-  const numerator = finite(part);
-  const denominator = finite(whole);
-  if (numerator === null || denominator === null || denominator <= 0) return null;
-  if (numerator < 0) return null;
-  const percentFormatter = numberFormatter({
-    maximumFractionDigits: 1,
-    minimumFractionDigits: 1,
-    style: "percent",
-  });
-  const format = (amount) => percentFormatter.format(amount / 100);
-  const value = numerator / denominator * 100;
-  const rendered = format(value);
-  if (value > 0 && rendered === format(0)) return `<${format(.1)}`;
-  if (value < 100 && rendered === format(100)) return `>${format(99.9)}`;
   return rendered;
 }
 
@@ -775,16 +914,23 @@ function renderHistoryIndexBadge(data) {
   const total = finite(history?.sourceCount, null);
   const complete = history?.status === "complete"
     || (indexed !== null && total !== null && total > 0 && indexed >= total);
+  const partialTerminal = history?.phase === "partial_terminal"
+    || (history?.phase === "aggregate_unavailable"
+      && finite(history?.skippedSourceCount, 0) > 0);
   if (data?.mode === "demo" || complete
       || indexed === null || total === null || total <= 0) {
     badge.hidden = true;
     return;
   }
   badge.hidden = false;
-  setRawText(badge, t("status.indexingHistory", {
-    indexed: compact(indexed),
-    total: compact(total),
-  }));
+  setRawText(badge, partialTerminal
+    ? t("status.historyPartial", {
+      skipped: compact(history?.skippedSourceCount ?? 0),
+    })
+    : t("status.indexingHistory", {
+      indexed: compact(indexed),
+      total: compact(total),
+    }));
 }
 
 function renderGlobalState() {
@@ -863,7 +1009,343 @@ function hideConnectionNotice() {
   $("#connection-notice").hidden = true;
 }
 
+function electronSharingStateMessageKey(preference) {
+  if (!preference?.available || !preference.current) {
+    return "electron.sharing.state.unavailable";
+  }
+  if (preference.state === "pending_notices") {
+    return "electron.sharing.state.pending";
+  }
+  if (preference.enabled && ["default_on", "migration_default_on"].includes(preference.basis)) {
+    return "electron.sharing.state.defaultOn";
+  }
+  if (preference.enabled) return "electron.sharing.state.enabled";
+  return preference.state === "legacy_preserved"
+    ? "electron.sharing.state.legacy"
+    : "electron.sharing.state.off";
+}
+
+function electronSharingTransportMessageKey(preference) {
+  switch (preference?.transportStatus) {
+    case "uploading": case "pending": case "up_to_date": case "retry_wait": case "paused": case "recovery_required":
+      return `electron.sharing.transport.${preference.transportStatus}`;
+    case "off":
+      return "electron.sharing.transport.off";
+    case "unavailable":
+    default:
+      return "electron.sharing.transport.unavailable";
+  }
+}
+
+function applyElectronAccountlessContributionMode() {
+  const electronMode = electronSharingBridge() !== null;
+  document.documentElement.classList.toggle(
+    "electron-accountless-sharing",
+    electronMode,
+  );
+  const community = document.querySelector("#community");
+  if (community) {
+    community.setAttribute(
+      "aria-labelledby",
+      electronMode ? "electron-accountless-community-title" : "contribution-cta-title",
+    );
+  }
+  const legacySurfaces = [
+    document.querySelector("#community-journey"),
+    document.querySelector("#community .contribution-cta-copy"),
+    document.querySelector("#community .contribution-cta-action"),
+  ];
+  for (const surface of legacySurfaces) {
+    if (surface) surface.hidden = electronMode;
+  }
+  const accountlessCommunity = $("#electron-accountless-community");
+  if (accountlessCommunity) accountlessCommunity.hidden = !electronMode;
+  return electronMode;
+}
+
+function clearElectronSharingNoticeAckSchedule() {
+  const cleanup = electronSharingNoticeAckCleanup;
+  electronSharingNoticeAckCleanup = null;
+  electronSharingNoticeAckScheduled = null;
+  cleanup?.();
+}
+
+function electronSharingSurfaceIsVisible() {
+  if (document.visibilityState !== "visible") return false;
+  const notice = $("#electron-sharing-notice");
+  if (!notice || notice.hidden || notice.isConnected === false) return false;
+  for (let element = notice; element; element = element.parentElement) {
+    if (element.hidden || element.inert || element.getAttribute?.("aria-hidden") === "true") {
+      return false;
+    }
+  }
+  if (typeof notice.getBoundingClientRect !== "function") return false;
+  const rectangle = notice.getBoundingClientRect();
+  const viewportWidth = Number(globalThis.window?.innerWidth);
+  const viewportHeight = Number(globalThis.window?.innerHeight);
+  const left = Number(rectangle?.left);
+  const right = Number(rectangle?.right);
+  const top = Number(rectangle?.top);
+  const bottom = Number(rectangle?.bottom);
+  const width = Number(rectangle?.width ?? right - left);
+  const height = Number(rectangle?.height ?? bottom - top);
+  if (![viewportWidth, viewportHeight, left, right, top, bottom, width, height]
+    .every(Number.isFinite)
+    || viewportWidth <= 0 || viewportHeight <= 0 || width <= 0 || height <= 0) {
+    return false;
+  }
+  const visibleWidth = Math.min(right, viewportWidth) - Math.max(left, 0);
+  const visibleHeight = Math.min(bottom, viewportHeight) - Math.max(top, 0);
+  const requiredWidth = Math.min(width, viewportWidth) / 2;
+  const requiredHeight = Math.min(height, viewportHeight) / 2;
+  return visibleWidth >= requiredWidth && visibleHeight >= requiredHeight;
+}
+
+function scheduleElectronSharingNoticeAck(index) {
+  if (electronSharingNoticeAcked.has(index)
+      || electronSharingNoticeAckScheduled === index) return;
+  const bridge = electronSharingBridge();
+  if (!bridge) return;
+  electronSharingNoticeAckScheduled = index;
+  let finished = false;
+  let framePending = false;
+  const removers = [];
+  const listen = (target, type, handler) => {
+    if (typeof target?.addEventListener !== "function") return;
+    target.addEventListener(type, handler);
+    removers.push(() => target.removeEventListener?.(type, handler));
+  };
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    for (const remove of removers.splice(0)) remove();
+    if (electronSharingNoticeAckCleanup === finish) {
+      electronSharingNoticeAckCleanup = null;
+      electronSharingNoticeAckScheduled = null;
+    }
+  };
+  electronSharingNoticeAckCleanup = finish;
+  const scheduleFrame = (callback) => {
+    const raf = globalThis.window?.requestAnimationFrame;
+    if (typeof raf === "function") {
+      raf.call(globalThis.window, callback);
+      return;
+    }
+    const schedule = globalThis.window?.setTimeout ?? globalThis.setTimeout;
+    if (typeof schedule === "function") schedule(callback, 0);
+  };
+  const attempt = () => {
+    if (finished || framePending) return;
+    const preference = electronSharingPreference;
+    if (!preference || preference.state !== "pending_notices"
+        || preference.nextNoticeIndex !== index || !preference.noticeDue) {
+      finish();
+      return;
+    }
+    // A hidden Electron renderer can run JavaScript while its BrowserWindow is
+    // backgrounded. Do not count a notice until the two-frame paint has landed
+    // while the document is visible. Visibility/focus listeners retry it.
+    if (!electronSharingSurfaceIsVisible()) return;
+    framePending = true;
+    scheduleFrame(() => scheduleFrame(async () => {
+      framePending = false;
+      if (finished || !electronSharingSurfaceIsVisible()) return;
+      const current = electronSharingPreference;
+      if (!current || current.state !== "pending_notices"
+          || current.nextNoticeIndex !== index || !current.noticeDue) {
+        finish();
+        return;
+      }
+      electronSharingNoticeAckError = false;
+      try {
+        const result = await bridge.sharingNoticePresented(index);
+        const next = normalizeElectronSharingPreference(result);
+        if (next === null) throw new Error("Sharing notice response was invalid");
+        electronSharingPreference = next;
+        electronSharingNoticeAcked.add(index);
+        electronSharingNoticeReceiptIndex = index;
+        finish();
+        renderElectronAccountlessCommunity();
+        renderElectronSharingNotice();
+      } catch {
+        // Keep the visible notice and its retry listeners. A transient bridge
+        // failure must not be turned into a false displayed receipt.
+        electronSharingNoticeAckError = true;
+        renderElectronSharingNotice();
+      }
+    }));
+  };
+  const retry = () => {
+    if (electronSharingSurfaceIsVisible()) attempt();
+  };
+  listen(document, "visibilitychange", retry);
+  listen(globalThis.window, "focus", retry);
+  listen(globalThis.window, "hashchange", retry);
+  listen(globalThis.window, "popstate", retry);
+  listen(document, "scroll", retry);
+  listen(globalThis.window, "scroll", retry);
+  listen(globalThis.window, "resize", retry);
+  attempt();
+}
+
+function renderElectronSharingNotice() {
+  const notice = $("#electron-sharing-notice");
+  if (!notice) return;
+  const bridge = electronSharingBridge();
+  const preference = electronSharingPreference;
+  const receiptIndex = electronSharingNoticeReceiptIndex;
+  const receiptStillCurrent = Number.isInteger(receiptIndex)
+    && preference?.available === true
+    && preference.current === true
+    && preference.state === "pending_notices"
+    && preference.noticeCount === receiptIndex
+    && preference.nextNoticeIndex === (receiptIndex < 3 ? receiptIndex + 1 : null)
+    && !(preference.noticeDue === true
+      && preference.nextNoticeIndex === (receiptIndex < 3 ? receiptIndex + 1 : null));
+  if (Number.isInteger(receiptIndex) && !receiptStillCurrent) {
+    electronSharingNoticeReceiptIndex = null;
+  }
+  const heldIndex = receiptStillCurrent ? receiptIndex : null;
+  const index = heldIndex ?? preference?.nextNoticeIndex;
+  const projectedNoticeEligible = preference?.noticeDue === true
+    && Number.isInteger(preference?.nextNoticeIndex)
+    && preference.noticeCount === preference.nextNoticeIndex - 1;
+  const eligible = bridge !== null
+    && dashboard !== null
+    && document.documentElement.dataset.localDashboardReady === "true"
+    && preference?.available === true
+    && preference.current === true
+    && preference.state === "pending_notices"
+    && Number.isInteger(index)
+    && index >= 1 && index <= 3
+    && (heldIndex !== null || projectedNoticeEligible);
+  if (!eligible) {
+    notice.hidden = true;
+    clearElectronSharingNoticeAckSchedule();
+    return;
+  }
+  notice.hidden = false;
+  notice.dataset.noticeIndex = String(index);
+  setLocalizedText(
+    $("#electron-sharing-notice-copy"),
+    "electron.sharing.notice.copy",
+    { index },
+  );
+  const earliest = $("#electron-sharing-notice-earliest");
+  if (earliest) {
+    if (preference.earliestActivationAt) {
+      setLocalizedText(
+        earliest,
+        "electron.sharing.notice.earliest",
+        { date: formatLocal(preference.earliestActivationAt, { dateOnly: true }) },
+      );
+      earliest.hidden = false;
+    } else {
+      earliest.hidden = true;
+    }
+  }
+  setLocalizedText(
+    $("#electron-sharing-notice-transport"),
+    electronSharingTransportMessageKey(preference),
+  );
+  const shareNow = $("#electron-sharing-share-now");
+  const keepOff = $("#electron-sharing-keep-off");
+  if (shareNow) shareNow.disabled = electronSharingBusy;
+  if (keepOff) keepOff.disabled = electronSharingBusy;
+  const status = $("#electron-sharing-notice-status");
+  if (status) {
+    status.hidden = !electronSharingNoticeAckError;
+    if (electronSharingNoticeAckError) {
+      setLocalizedText(status, "electron.sharing.notice.error");
+    }
+  }
+  if (!electronSharingNoticeAckError) scheduleElectronSharingNoticeAck(index);
+}
+
+function renderElectronAccountlessCommunity() {
+  const surface = $("#electron-accountless-community");
+  if (!surface) return;
+  const bridge = electronSharingBridge();
+  if (!bridge) {
+    surface.hidden = true;
+    return;
+  }
+  surface.hidden = false;
+  setLocalizedText(
+    $("#electron-accountless-community-state"),
+    electronSharingStateMessageKey(electronSharingPreference),
+  );
+  setLocalizedText(
+    $("#electron-accountless-community-transport"),
+    electronSharingTransportMessageKey(electronSharingPreference),
+  );
+  const enabled = $("#electron-accountless-sharing-enabled");
+  const usable = electronSharingPreference?.available === true
+    && electronSharingPreference.current === true;
+  if (enabled) {
+    enabled.checked = usable && electronSharingPreference.enabled === true;
+    enabled.disabled = !usable || electronSharingBusy;
+  }
+  const error = $("#electron-accountless-sharing-error");
+  if (error) error.hidden = !electronSharingNoticeAckError;
+}
+
+async function loadElectronSharingPreference({ dashboardReady = false } = {}) {
+  applyElectronAccountlessContributionMode();
+  const bridge = electronSharingBridge();
+  if (!bridge || !dashboardReady || dashboard === null) {
+    electronSharingPreference = null;
+    electronSharingNoticeAckError = false;
+    renderElectronAccountlessCommunity();
+    renderElectronSharingNotice();
+    return null;
+  }
+  try {
+    const next = normalizeElectronSharingPreference(
+      await bridge.getSharingPreference(),
+    );
+    electronSharingPreference = next;
+    electronSharingNoticeAckError = false;
+  } catch {
+    electronSharingPreference = null;
+    electronSharingNoticeAckError = false;
+  }
+  renderElectronAccountlessCommunity();
+  renderElectronSharingNotice();
+  return electronSharingPreference;
+}
+
+async function setElectronSharingEnabled(enabled) {
+  if (typeof enabled !== "boolean" || electronSharingBusy) return false;
+  const bridge = electronSharingBridge();
+  if (!bridge) return false;
+  electronSharingBusy = true;
+  electronSharingNoticeAckError = false;
+  renderElectronAccountlessCommunity();
+  renderElectronSharingNotice();
+  try {
+    const next = normalizeElectronSharingPreference(
+      await bridge.setSharingEnabled(enabled),
+    );
+    if (next === null) throw new Error("Sharing preference response was invalid");
+    electronSharingPreference = next;
+    renderElectronAccountlessCommunity();
+    renderElectronSharingNotice();
+    return true;
+  } catch {
+    electronSharingNoticeAckError = true;
+    renderElectronSharingNotice();
+    return false;
+  } finally {
+    electronSharingBusy = false;
+    renderElectronAccountlessCommunity();
+    renderElectronSharingNotice();
+  }
+}
+
 function renderDashboardUnavailableState(kind) {
+  // The last accounting rows remain visible during a failed refresh.
+  resetCacheDropThreadLinks(cacheDropThreadLinks.dashboard);
   const companionCopy = isLoopbackDashboard()
     ? "dashboard.unavailable.companionInAppCopy"
     : "dashboard.unavailable.companionCopy";
@@ -1041,6 +1523,13 @@ function renderLocalOnboarding(value) {
 function renderDashboard(data) {
   dashboardUnavailableState = null;
   dashboard = data;
+  if (!isCacheDropThreadDashboard(data) || !data?.accounting?.cacheDiagnosticsSource
+      || cacheDropThreadLinks.dashboard !== data
+      || cacheDropThreadLinks.generation !== data?.accounting?.cacheDiagnosticsSource?.generation
+      || cacheDropThreadLinks.generationFingerprint
+        !== data?.accounting?.cacheDiagnosticsSource?.generationFingerprint) {
+    resetCacheDropThreadLinks(data);
+  }
   if (data.mode === "demo") {
     setJourneyState("demo-mode");
     $("#setup-card").hidden = true;
@@ -1110,6 +1599,9 @@ function renderDashboard(data) {
   renderWeekly(data);
   renderAccounting(data);
   renderCommunityJourney();
+  // This optional lookup must never delay the native readiness marker or the
+  // accounting render. Only the first-column cells are updated when it lands.
+  void loadCacheDropThreadLinks(data);
 }
 
 function renderQuotaCards(data) {
@@ -1118,6 +1610,11 @@ function renderQuotaCards(data) {
   const normalWindows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
   const sparkWindows = data.quotaWindows.filter((window) => (
     isSparkQuotaLimitId(window?.limitId)
+      && isValidQuotaWindowDuration(finite(window?.durationMinutes))
+  ));
+  const otherWindows = data.quotaWindows.filter((window) => (
+    !isPrimaryCodexQuotaWindow(window)
+      && !isSparkQuotaLimitId(window?.limitId)
       && isValidQuotaWindowDuration(finite(window?.durationMinutes))
   ));
   const primaryWindow = selectPrimaryCodexQuotaWindow(normalWindows);
@@ -1135,7 +1632,19 @@ function renderQuotaCards(data) {
   const sparkOrderedWindows = [...sparkWindows].sort((left, right) => (
     finite(left.durationMinutes) - finite(right.durationMinutes)
   ));
-  const windows = [...sparkOrderedWindows, ...normalOrderedWindows];
+  // Unknown pools stay out of both headline selection and calibration, but a
+  // bounded local observation should not disappear. Technical ids only keep
+  // separate future pools distinct; they are never rendered as copy.
+  const otherOrderedWindows = [...otherWindows].sort((left, right) => (
+    String(left.limitId).localeCompare(String(right.limitId))
+      || finite(left.durationMinutes) - finite(right.durationMinutes)
+      || String(left.slot).localeCompare(String(right.slot))
+  ));
+  const windows = [
+    ...sparkOrderedWindows,
+    ...normalOrderedWindows,
+    ...otherOrderedWindows,
+  ];
   if (!windows.length) {
     const card = node("article", "metric-card insufficient");
     const header = node("div", "metric-card-header");
@@ -1263,14 +1772,85 @@ function localizedQuotaWindowLabel(window) {
       duration: localizedQuotaWindowDuration(duration),
     });
   }
+  if (isValidQuotaWindowDuration(duration)) {
+    const localizedDuration = localizedQuotaWindowDuration(duration);
+    if (window?.limitName) {
+      return t("dashboard.quota.windowNamedObserved", {
+        name: window.limitName,
+        duration: localizedDuration,
+      });
+    }
+    return t("dashboard.quota.windowOtherDuration", {
+      duration: localizedDuration,
+    });
+  }
   return t("dashboard.quota.windowOther");
+}
+
+function dashboardAccountingProjection(data) {
+  return data?.accounting?.projection ?? {
+    status: "available",
+    reason: null,
+    terminal: false,
+  };
+}
+
+function accountingRequiresNewerBuild(data) {
+  return dashboardAccountingProjection(data).reason
+    === "local_unified_index_schema_newer";
+}
+
+function accountingIsUnavailable(data) {
+  return dashboardAccountingProjection(data).status === "unavailable";
+}
+
+function projectionUnavailableCopyKey(data) {
+  return accountingRequiresNewerBuild(data)
+    ? "accounting.projection.newerBuild"
+    : "accounting.projection.unavailable";
 }
 
 function renderPricing(data) {
   const pricing = data.pricing;
+  const projection = dashboardAccountingProjection(data);
+  const retainedPeriod = projection.status === "retained"
+    ? staleAccountingServePeriod(data) ?? data.accounting
+    : null;
+  const retainedEvidence = retainedPeriod !== null
+    && finite(retainedPeriod.apiPriceEquivalentUsd, 0) > 0;
+  if (projection.status !== "available") {
+    setLocalizedText(
+      $("#cost-period"),
+      retainedEvidence
+        ? "accounting.projection.lastVerifiedPeriod"
+        : "accounting.projection.periodUnavailable",
+      retainedEvidence ? { period: retainedPeriod.periodLabel } : {},
+    );
+    setLocalizedText(
+      $("#cost-metric-kicker"),
+      retainedEvidence
+        ? "accounting.projection.lastVerifiedMetric"
+        : "accounting.projection.metricUnavailable",
+    );
+    $("#cost-metric-kicker").title = t(projectionUnavailableCopyKey(data));
+    $("#cost-total").textContent = retainedEvidence
+      ? formatApiMoney(retainedPeriod.apiPriceEquivalentUsd)
+      : "—";
+    renderHistoryProgress(data);
+    const list = $("#cost-components");
+    clear(list);
+    list.append(node(
+      "p",
+      "empty-inline",
+      t(retainedEvidence
+        ? "accounting.projection.retainedComponents"
+        : projectionUnavailableCopyKey(data)),
+    ));
+    return;
+  }
   const fastMode = pricing.fastMode;
   setRawText($("#cost-period"), pricing.periodLabel);
-  // The headline is the quota-weighted figure whenever a weighting exists;
+  // The headline is the speed-priced figure whenever a weighting exists;
   // when nothing can be weighted legitimately the label falls back to the
   // Standard-rate name rather than presenting an unweighted number under a
   // weighted heading.
@@ -1362,8 +1942,8 @@ function formatBytes(value) {
  * sources it discovered and how many it has indexed, and the share is that
  * division. Nothing estimates a finish time, because none is known — a
  * progress bar that implied one would be the same invention this product
- * refuses everywhere else. The block is absent entirely once the index is
- * complete, and absent when there is no denominator to divide by.
+ * refuses everywhere else. The block is absent once both indexed history and
+ * its accounting summary are available, or there is no measured denominator.
  *
  * It sits with the API-price-equivalent total because that total, and every
  * figure derived from it, covers only the indexed share.
@@ -1376,43 +1956,88 @@ function renderHistoryProgress(data) {
     ?? null;
   const total = finite(history?.sourceCount, 0);
   const indexed = finite(history?.indexedSourceCount, 0);
+  const partialTerminal = history?.phase === "partial_terminal";
+  const aggregateUnavailable = history?.phase === "aggregate_unavailable";
   if (history === null || history.status === "complete" || total <= 0) {
     container.hidden = true;
     return false;
   }
   container.hidden = false;
   const percent = (indexed / total) * 100;
-  setLocalizedText(
-    $("#history-progress-headline"),
-    archiveHistoryScanActive
+  const skippedSourceCount = finite(history?.skippedSourceCount, 0);
+  const skippedSources = tPlural(
+    "format.rolloutSourceCount",
+    skippedSourceCount,
+    { count: formatNumber(skippedSourceCount) },
+  );
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-headline"),
+      "dashboard.history.scanFinished",
+    );
+  } else if (partialTerminal) {
+    setRawText(
+      $("#history-progress-headline"),
+      t("dashboard.history.partialHeadline", {
+        sources: skippedSources,
+      }),
+    );
+  } else {
+    setLocalizedText(
+      $("#history-progress-headline"),
+      archiveHistoryScanActive
       ? "dashboard.history.indexingActive"
       : history.phase === "not_started"
         ? "dashboard.history.indexingNotStarted"
         : "dashboard.history.indexingPaused",
-    { percent: formatPercent(percent, 1) },
+      { percent: formatPercent(percent, 1) },
+    );
+  }
+  container.classList.toggle(
+    "active", archiveHistoryScanActive && !aggregateUnavailable,
   );
-  container.classList.toggle("active", archiveHistoryScanActive);
   const track = $("#history-progress-track");
   track.setAttribute("aria-valuenow", String(Math.round(percent)));
-  // The bar alone would announce a bare percentage. The counted sources are
-  // the fact worth hearing, so they are what it reports.
-  track.setAttribute("aria-valuetext", t("dashboard.history.indexingSources", {
+  const coverageKey = partialTerminal
+      || (aggregateUnavailable && skippedSourceCount > 0)
+    ? "dashboard.history.partialSources"
+    : aggregateUnavailable
+      ? "dashboard.history.indexedSources"
+      : "dashboard.history.indexingSources";
+  const coverageValues = {
     bytesIndexed: formatBytes(history.indexedBytes),
     bytesTotal: formatBytes(history.sourceBytes),
     indexed: formatNumber(indexed),
     total: formatNumber(total),
-  }));
+    sources: skippedSources,
+  };
+  // The bar alone would announce a bare percentage. The counted sources are
+  // the fact worth hearing, so they are what it reports.
+  track.setAttribute("aria-valuetext", t(coverageKey, coverageValues));
   // A started-but-tiny index must still be visibly non-empty, or 2.7% reads as
   // "nothing has happened".
   $("#history-progress-fill").style.width =
     `${indexed > 0 ? Math.max(1.5, percent) : 0}%`;
-  setLocalizedText($("#history-progress-detail"), "dashboard.history.indexingSources", {
-    bytesIndexed: formatBytes(history.indexedBytes),
-    bytesTotal: formatBytes(history.sourceBytes),
-    indexed: formatNumber(indexed),
-    total: formatNumber(total),
-  });
-  setLocalizedText($("#history-progress-note"), "dashboard.history.indexingResumes");
+  setLocalizedText($("#history-progress-detail"), coverageKey, coverageValues);
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-note"),
+      "dashboard.history.summaryUnavailable",
+    );
+  } else if (partialTerminal) {
+    const affectedThreads = finite(history?.skippedThreadCount, 0);
+    setRawText(
+      $("#history-progress-note"),
+      tPlural("dashboard.history.partialNote", affectedThreads, {
+        count: formatNumber(affectedThreads),
+      }),
+    );
+  } else {
+    setLocalizedText(
+      $("#history-progress-note"),
+      "dashboard.history.indexingResumes",
+    );
+  }
   return true;
 }
 
@@ -1454,7 +2079,7 @@ const EVIDENCE_WARNING_PROGRESS =
 // sentences and their vocabulary — that state is being replaced wholesale by
 // serve-stale-while-recalculating, and its rendering is owned there.
 const EVIDENCE_WARNING_INFORMATIONAL =
-  /\b(?:loading|started fresh)\b/iu;
+  /\b(?:loading|started fresh|limited history coverage)\b/iu;
 
 function evidenceWarningTarget(message) {
   return EVIDENCE_WARNING_ROUTES
@@ -1469,6 +2094,7 @@ function renderEvidenceWarnings(data) {
   ]);
   for (const message of Array.isArray(data?.warnings) ? data.warnings : []) {
     if (typeof message !== "string" || message === "") continue;
+    if (/^Quota tracking started fresh on this Mac, so its retained records begin /u.test(message)) continue;
     grouped.get(evidenceWarningTarget(message)).push(message);
   }
   for (const [selector, messages] of grouped) {
@@ -1498,7 +2124,7 @@ function humanize(value) {
 }
 
 function matchedRollingPairs(data) {
-  if (data.timeline?.usage?.length) {
+  if (allowanceTimelineUsage(data).length) {
     return liveTimelinePoints(data, {
       windowHours: CALIBRATION_WINDOW_HOURS,
       rangeDays: activeUsageRangeDays,
@@ -1511,7 +2137,21 @@ function matchedRollingPairs(data) {
   return [];
 }
 
+function allowanceTimelineUsage(data) {
+  return data.allowancePlanSelection
+    ? data.timeline?.selectedPlanUsage ?? []
+    : data.timeline?.usage ?? [];
+}
+
 function renderComparison(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
+  const planNote = $("#comparison-plan-note");
+  if (planNote) {
+    planNote.hidden = data.allowancePlanSelection?.comparisonAvailable !== true;
+    if (!planNote.hidden) setLocalizedText(planNote,
+      "weekly.plan.comparisonConditional",
+      { plan: shareCardPlanLabel(data.weekly.planType) || t("weekly.plan.unknown") });
+  }
   // The observed-versus-calculated comparison depends on the calibration
   // capacity; when that capacity is served from the previous version's cache
   // during a recalculation, the comparison says so, quietly.
@@ -1523,7 +2163,7 @@ function renderComparison(data) {
   const pair = matchedPairs.at(-1) ?? null;
   const summary = data.gradient.summary ?? {};
   const weeklySummary = data.weekly.summary ?? {};
-  const legacyDemo = data.mode === "demo";
+  const legacyDemo = data.mode === "demo" && !data.allowancePlanSelection;
   const mae = matchedPairs.length > 0
     ? matchedPairs.reduce(
       (sum, row) => sum + Math.abs(row.observed - row.expected),
@@ -1585,11 +2225,20 @@ function renderComparison(data) {
     modelCostShares,
   });
   if (!pair || pair.observed === null || pair.expected === null) {
+    // A new population must not retain the previous plan's visible bars.
+    for (const row of $("#comparison-visual").querySelectorAll(".comparison-row")) {
+      row.querySelector("i").style.width = "0%";
+      row.querySelector("strong").textContent = "—";
+    }
     setProductText(chip, "Insufficient");
-    setProductText(
-      $("#comparison-result"),
-      "There is not yet a matched quota-and-cost window to compare.",
-    );
+    if (data.allowancePlanSelection?.comparisonAvailable === false) {
+      setLocalizedText($("#comparison-result"), "weekly.plan.comparisonPending");
+    } else {
+      setProductText(
+        $("#comparison-result"),
+        "There is not yet a matched quota-and-cost window to compare.",
+      );
+    }
     return;
   }
   const max = Math.max(Math.abs(pair.observed), Math.abs(pair.expected), 1);
@@ -1853,16 +2502,9 @@ const SHARE_CARD_WINDOW_KEYS = Object.freeze({
 // "unknown" is Codex's sentinel for an unnamed plan and is deliberately
 // absent, so it — like any unmapped or empty reading — draws no chip.
 const SHARE_CARD_PLAN_LABELS = Object.freeze({
-  free: "Free",
-  go: "Go",
-  plus: "Plus",
-  pro: "Pro (20×)",
-  prolite: "Pro Lite (5×)",
-  business: "Business",
-  enterprise: "Enterprise",
-  ent26: "Enterprise",
-  team: "Team",
-  edu: "Edu",
+  ...TELEMETRY_PLAN_DISPLAY_NAMES,
+  pro: `${TELEMETRY_PLAN_DISPLAY_NAMES.pro} (20×)`,
+  prolite: `${TELEMETRY_PLAN_DISPLAY_NAMES.prolite} (5×)`,
   self_serve_business_prolite: "Business · Pro Lite (5×)",
   self_serve_business_usage_based: "Business · usage-based",
   enterprise_cbp_automation: "Enterprise · automation",
@@ -2118,29 +2760,41 @@ function buildShareCard(data, {
   const isDemo = data?.mode === "demo";
   const headlineDate = shareCardHeadlineDate(data, history);
   const pricing = data?.pricing ?? {};
+  const projection = dashboardAccountingProjection(data);
+  const accountingEvidenceAvailable = projection.status === "available"
+    || (projection.status === "retained" && activity !== null);
   // The activity figure follows the usage chart's selected date range
   // (owner-directed, 2026-08-10) whenever the accounting periods carry that
   // range; the pricing fallback preserves the old 7-day-selected behavior
   // for payloads without per-period accounting (the demo fixture among them).
-  const fastMode = activity?.fastMode ?? pricing.fastMode ?? {};
+  const fastMode = accountingEvidenceAvailable
+    ? activity?.fastMode ?? pricing.fastMode ?? {}
+    : {};
   // The share card's third figure is specifically the weekly reset fit. Do
   // not substitute the older general-gradient summary here: both are API-price
   // equivalents, but their evidence source and denominator are different.
   const summary = data?.weekly?.summary ?? {};
 
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
-  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
+  const isWeeklyWindow = data.allowancePlanSelection !== undefined
+    || shareCardWindowKind(allowanceWindow) === "seven_day";
   const remaining = finite(allowanceWindow?.remainingPercent);
   const windowLabel = shareCardWindowLabel(allowanceWindow);
   // The reader's most-recent plan, read from the same bounded plan_type enum
   // the quota cards use. "" leaves the header chip off entirely.
-  const planLabel = shareCardPlan(data?.quotaWindows ?? []);
+  const planLabel = data.allowancePlanSelection
+    ? shareCardPlanLabel(data?.weekly?.planType) || t("weekly.plan.unknown")
+    : shareCardPlan(data?.quotaWindows ?? []);
 
-  const weighted = activity !== null
-    ? activity.quotaWeightedTotalCostUsd
-    : finite(pricing.quotaWeightedTotalCostUsd);
+  const weighted = !accountingEvidenceAvailable
+    ? null
+    : activity !== null
+      ? activity.quotaWeightedTotalCostUsd
+      : finite(pricing.quotaWeightedTotalCostUsd);
   const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
-  const spend = useWeighted
+  const spend = !accountingEvidenceAvailable
+    ? null
+    : useWeighted
     ? weighted
     : activity !== null
       ? activity.totalCostUsd
@@ -2195,12 +2849,26 @@ function buildShareCard(data, {
       // allowance. The label must make the different denominator clear on the
       // image itself: an activity total can legitimately exceed one estimated
       // allowance without being a billing error or an allowance overrun.
-      label: t("share.stat.recordedActivity"),
+      label: t(data.allowancePlanSelection
+        ? "share.stat.recordedActivityAllPlans" : "share.stat.recordedActivity"),
       value: spend === null ? t("share.value.notAvailable") : formatMoney(spend, 0),
       // The "event-time API equivalent" caption is gone (owner-directed,
       // 2026-08-10): the detail line states the selected range and nothing
       // else.
-      detail: spend === null ? t("share.detail.noPricedUsage") : period,
+      detail: spend !== null
+        ? projection.status === "retained"
+          ? t(
+            projection.reason === "local_unified_index_schema_newer"
+              ? "share.detail.lastVerifiedNewerBuild"
+              : "share.detail.lastVerifiedPeriod",
+            { period },
+          )
+          : period
+        : projection.reason === "local_unified_index_schema_newer"
+          ? t("share.detail.newerBuildRequired")
+          : projection.status !== "available"
+            ? t("share.detail.accountingUnavailable")
+            : t("share.detail.noPricedUsage"),
     },
   ];
 
@@ -2212,19 +2880,24 @@ function buildShareCard(data, {
   if (isDemo) {
     caveats.push(t("share.caveat.demo"));
   }
-  if (excluded > 0) {
+  if (data.allowancePlanSelection) {
+    caveats.push(t("share.caveat.planConditional"));
+  }
+  if (spend !== null && excluded > 0) {
     caveats.push(t("share.caveat.unweighted", {
       amount: formatMoney(excluded, 2),
     }));
   }
-  if (fastMode.weightingStatus === "unknown") {
+  if (spend !== null && fastMode.weightingStatus === "unknown") {
     caveats.push(t("share.caveat.noWeighted"));
-  } else if (fastMode.weightingStatus !== "complete") {
+  } else if (spend !== null && fastMode.weightingStatus !== "complete") {
     caveats.push(t("share.caveat.fastPartial"));
   }
   // The caveat qualifies the figure actually printed, so it reads the same
   // selected range the activity stat does.
-  const coverage = activity !== null
+  const coverage = spend === null
+    ? null
+    : activity !== null
     ? activity.coveragePercent
     : finite(pricing.coveragePercent);
   if (coverage !== null && coverage < 100) {
@@ -2255,7 +2928,10 @@ function buildShareCard(data, {
     // The Codex plan name is presented as-is; only the surrounding word is
     // localized (share.plan). "" when no window named a plan, so a card that
     // cannot name a plan carries no chip and no empty wrapper.
-    plan: planLabel === "" ? "" : t("share.plan", { plan: planLabel }),
+    plan: planLabel === "" ? "" : t(
+      data.allowancePlanSelection ? "share.planAllowance" : "share.plan",
+      { plan: planLabel },
+    ),
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
     // Reset-fit history is an explicitly seven-day model. It is never drawn
     // behind a five-hour or provider-reported generic allowance window.
@@ -2968,6 +3644,8 @@ const SHARE_CARD_RANGE_PERIODS = Object.freeze({
 });
 
 function shareCardActivitySelection(data, rangeDays) {
+  const projection = dashboardAccountingProjection(data);
+  if (projection.status === "unavailable") return null;
   const selected = SHARE_CARD_RANGE_PERIODS[rangeDays]
     ?? { id: "all", labelKey: "share.period.allRecorded" };
   const period = (Array.isArray(data?.accounting?.periods)
@@ -2975,13 +3653,19 @@ function shareCardActivitySelection(data, rangeDays) {
     : []).find((row) => row?.periodId === selected.id) ?? null;
   if (period === null) return null;
   const events = finite(period.events, 0);
+  const totalCostUsd = finite(period.apiPriceEquivalentUsd);
+  const quotaWeightedTotalCostUsd = finite(
+    period.quotaWeightedApiPriceEquivalentUsd,
+  );
+  if (projection.status === "retained"
+      && finite(totalCostUsd, 0) <= 0
+      && finite(quotaWeightedTotalCostUsd, 0) <= 0) return null;
   const priced = finite(period.pricingCoverage?.fullyPricedEvents, 0)
     + finite(period.pricingCoverage?.partiallyPricedEvents, 0);
   return {
     labelKey: selected.labelKey,
-    totalCostUsd: finite(period.apiPriceEquivalentUsd),
-    quotaWeightedTotalCostUsd:
-      finite(period.quotaWeightedApiPriceEquivalentUsd),
+    totalCostUsd,
+    quotaWeightedTotalCostUsd,
     fastMode: period.fastMode ?? {},
     coveragePercent: events > 0
       ? Number(((priced / events) * 100).toFixed(6))
@@ -2992,7 +3676,8 @@ function shareCardActivitySelection(data, rangeDays) {
 function renderShareCard(data, { history: sharedHistory = null } = {}) {
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
-  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
+  const isWeeklyWindow = data.allowancePlanSelection !== undefined
+    || shareCardWindowKind(allowanceWindow) === "seven_day";
   const history = isWeeklyWindow
     ? sharedHistory ?? allowanceHistoryChartModel(data)
     : null;
@@ -3008,6 +3693,7 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     finite(allowanceWindow?.durationMinutes),
     finite(allowanceWindow?.remainingPercent),
     shareCardPlan(data?.quotaWindows ?? []),
+    data.allowancePlanSelection ?? null,
     finite(data?.pricing?.quotaWeightedTotalCostUsd),
     finite(data?.pricing?.totalCostUsd),
     finite(data?.pricing?.coveragePercent),
@@ -3039,6 +3725,10 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
   // The header's reference chip is gone (owner-directed, 2026-08-08): the
   // reference still exists — the saved file name carries it — but the panel
   // header no longer prints a code the reader cannot act on.
+  // This generated transcript replaces the initial placeholder. The static
+  // localizer must not overwrite the selected-plan figures after a language
+  // change; renderWeekly rebuilds the transcript in the new language.
+  canvas.removeAttribute("data-i18n-aria-label");
   canvas.setAttribute("aria-label", shareCardText(shareCard));
   if (!drawShareCard(canvas, shareCard)) {
     shareCard = null;
@@ -3185,7 +3875,7 @@ function groupRolling(rows, hours) {
 }
 
 function latestTimelineObservationMs(data) {
-  const latest = data.timeline.usage.at(-1)?.endAt
+  const latest = allowanceTimelineUsage(data).at(-1)?.endAt
     ?? mainWeeklyQuotaTrack(data.timeline.quota).at(-1)?.observedAt
     ?? data.freshness.latestObservedAt;
   const latestMs = Date.parse(latest);
@@ -3594,12 +4284,28 @@ function timelineAllowanceWeightedCost(row, capacitySelection) {
     : null;
 }
 
+function timelineComparisonInterval(data, startMs, endMs) {
+  // Legacy DTOs have no plan-selection contract. A selected-plan view must
+  // positively cover the entire span; absence is not evidence of continuity.
+  if (!data.allowancePlanSelection) return null;
+  const intervals = data.timeline.comparisonIntervals ?? [];
+  let low = 0;
+  let high = intervals.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (intervals[middle][0] <= startMs) low = middle + 1;
+    else high = middle;
+  }
+  const interval = intervals[low - 1];
+  return interval && endMs <= interval[1] ? interval : false;
+}
+
 function liveTimelinePoints(
   data,
   {
     windowHours = CALIBRATION_WINDOW_HOURS,
     rangeDays = activeCalibrationRangeDays,
-    usage = data.timeline.usage,
+    usage = allowanceTimelineUsage(data),
   } = {},
 ) {
   const capacitySelection = timelineCalibrationCapacity(data);
@@ -3646,10 +4352,17 @@ function liveTimelinePoints(
   let driftCostUsd = 0;
   let comparisonSegment = 0;
   let previousComparable = false;
+  let previousPlanInterval = null;
   for (let index = 0; index < usage.length; index += 1) {
     const current = usage[index];
     const endMs = Date.parse(current.endAt);
     const currentWeightedCost = weightedCosts[index];
+    const planInterval = timelineComparisonInterval(data, Date.parse(current.startAt), endMs);
+    if (planInterval === false || planInterval !== previousPlanInterval) {
+      driftAnchor = null;
+      driftCostUsd = 0;
+    }
+    previousPlanInterval = planInterval;
     if (currentWeightedCost === null) rollingWeightingGaps += 1;
     else rollingCost += currentWeightedCost;
     rollingEvents += current.usageEvents;
@@ -3707,7 +4420,11 @@ function liveTimelinePoints(
     }
     const before = startMatch?.row ?? null;
     const after = afterMatch?.row ?? null;
+    const planComparable = timelineComparisonInterval(data,
+      Math.min(spanStartMs, startMatch?.timestampMs ?? spanStartMs),
+      Math.max(spanEndMs, afterMatch?.timestampMs ?? spanEndMs)) !== false;
     const bracketed = before && after
+      && planComparable
       && spanStartMs - startMatch.timestampMs <= maximumBracketGapMs
       && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
     const sameReset = Boolean(bracketed)
@@ -3765,6 +4482,7 @@ function liveTimelinePoints(
       windowEvents = Math.max(0, eventsPrefix[top] - eventsPrefix[lower]);
     }
     const expected = !poolSaturated
+        && planComparable
         && capacity !== null && capacity > 0
         && windowWeightingGaps === 0
       ? windowCostUsd / capacity * 100
@@ -3778,9 +4496,10 @@ function liveTimelinePoints(
       apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : 0,
       poolSaturated,
     });
-    const evidence = windowWeightingGaps === 0
-      ? classifiedEvidence
-      : { status: "quota_weighting_unavailable", residual: null };
+    const evidence = !planComparable
+      ? { status: "reset_or_track_change", residual: null }
+      : windowWeightingGaps === 0 ? classifiedEvidence
+        : { status: "quota_weighting_unavailable", residual: null };
     let cumulativeResidual = null;
     // A re-anchor marks the first drift observation of a new reset or track:
     // the deviation-period detector splits its runs here, so a sustained drift
@@ -3790,6 +4509,8 @@ function liveTimelinePoints(
     if (capacity !== null && capacity > 0
         && currentWeightedCost !== null
         && after !== null
+        && timelineComparisonInterval(data,
+          Math.min(Date.parse(current.startAt), afterMatch.timestampMs), endMs) !== false
         && Number.isFinite(finite(after.usedPercent))
         && endMs - afterMatch.timestampMs <= maximumBracketGapMs) {
       // A used_percent DECREASE beyond display jitter inside one boundary is
@@ -3870,10 +4591,10 @@ function liveTimelinePoints(
       cumulativeResidual,
       driftReanchor,
       // Kept under the legacy internal key for downstream chart diagnostics,
-      // but this is now the selected quota-weighted amount, never Standard
+      // but this is now the selected speed-priced amount, never Standard
       // dollars paired with a Fast-adjusted capacity.
-      apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : null,
-      allowanceWeightedUsd: windowWeightingGaps === 0
+      apiCostUsd: planComparable && windowWeightingGaps === 0 ? windowCostUsd : null,
+      allowanceWeightedUsd: planComparable && windowWeightingGaps === 0
         ? windowCostUsd
         : null,
       allowanceBasisId: capacitySelection?.basisId ?? null,
@@ -3894,7 +4615,7 @@ function groupedUsageTimeline(data) {
   const hourMs = 60 * 60 * 1_000;
   const cutoff = timelineCutoffMs(data, activeUsageRangeDays);
   const groups = new Map();
-  for (const row of data.timeline.usage) {
+  for (const row of allowanceTimelineUsage(data)) {
     const timestamp = Date.parse(row.startAt);
     if (!Number.isFinite(timestamp) || timestamp < cutoff) continue;
     let key;
@@ -4116,6 +4837,7 @@ function renderUsageTimeline(data) {
   const unit = t(usageGroupingUnitKey());
   const quotaComparable = timelineCalibrationCapacity(data) !== null;
   const axisLabels = usageChartAxisLabels(activeUsageGrouping, quotaComparable);
+  const unavailable = accountingIsUnavailable(data);
   setLocalizedText(
     $("#usage-cost-legend-label"),
     quotaComparable
@@ -4136,6 +4858,14 @@ function renderUsageTimeline(data) {
   if (!visiblePoints.length) {
     shell.hidden = true;
     empty.hidden = false;
+    empty.querySelector("strong").textContent = unavailable
+      ? t(accountingRequiresNewerBuild(data)
+        ? "chart.usage.newerBuildTitle"
+        : "chart.usage.unavailableTitle")
+      : t("chart.usage.emptyTitle");
+    empty.querySelector("p").textContent = unavailable
+      ? t(projectionUnavailableCopyKey(data))
+      : t("chart.usage.emptyCopy");
   } else {
     shell.hidden = false;
     empty.hidden = true;
@@ -4194,24 +4924,28 @@ function renderUsageTimeline(data) {
   // The plotted weighted series already renders a missing interval as a gap.
   // Its summary must do the same: adding only finite points would publish a
   // deceptively partial allowance-facing aggregate.
-  const total = completeUsageTimelineTotal(
-    visiblePoints,
-    quotaComparable ? "quotaWeightedCostUsd" : "standardApiCostUsd",
-  );
+  const total = unavailable && visiblePoints.length === 0
+    ? null
+    : completeUsageTimelineTotal(
+      visiblePoints,
+      quotaComparable ? "quotaWeightedCostUsd" : "standardApiCostUsd",
+    );
   for (const [name, explanation, value] of [
     [
       "Time intervals",
       "The number of displayed hour, day, or week intervals.",
-      compact(visiblePoints.length)
+      unavailable && visiblePoints.length === 0
+        ? "—"
+        : compact(visiblePoints.length)
     ],
     [
       quotaComparable
-        ? "Quota-weighted API equivalent"
+        ? "Speed-priced API equivalent"
         : "Standard-rate API-price equivalent",
       quotaComparable
-        ? "Standard API prices adjusted by the observed or selected Codex speed mode, compared only with a capacity fitted on the same basis. It is not a bill."
+        ? "Standard API prices with Fast increments priced at the published Priority (Fast) API rate, compared only with a capacity fitted on the same basis. It is not a bill."
         : "A Standard-rate accounting series. Provider allowance is hidden because no matching weighted capacity is available.",
-      total === null ? "Unavailable" : formatApiMoney(total)
+      total === null ? "—" : formatApiMoney(total)
     ]
   ]) {
     const item = node("div");
@@ -4336,13 +5070,18 @@ function selectedTimelinePoints(data) {
       && timelineSeriesMemo.rangeDays === activeCalibrationRangeDays) {
     return timelineSeriesMemo.selection;
   }
-  const sideChatAdjusted = data.accounting?.sideChatEstimates?.status
+  const scopedUsage = allowanceTimelineUsage(data);
+  // Side-chat estimates predate plan-era attribution. They remain visible in
+  // all-plan accounting, but cannot enter a current-plan numerator until they
+  // carry the same plan/generation scope as the exact usage timeline.
+  const sideChatAdjusted = !data.allowancePlanSelection
+    && data.accounting?.sideChatEstimates?.status
       === "available"
     && data.accounting.sideChatEstimates.methodology
       ?.includedInCalibrationTimeline === true
     && Array.isArray(data.timeline.calibrationUsage)
     && data.timeline.calibrationUsage.length > 0;
-  const exactByBucket = new Map(data.timeline.usage.map((row) => [
+  const exactByBucket = new Map(scopedUsage.map((row) => [
     `${row.startAt}|${row.endAt}`,
     row,
   ]));
@@ -4378,7 +5117,7 @@ function selectedTimelinePoints(data) {
               totalEvents: 0,
               observedEvents: 0,
               declaredFromConfigEvents: 0,
-              assumedFromPreferenceEvents: 0,
+              assumedEvents: 0,
               inferredEvents: 0,
               unknownEvents: 0,
               observedSharePercent: null,
@@ -4398,11 +5137,11 @@ function selectedTimelinePoints(data) {
   const livePoints = liveTimelinePoints(data, {
     usage: sideChatAdjusted
       ? data.timeline.calibrationUsage
-      : data.timeline.usage,
+      : scopedUsage,
   });
   // Retained gradient artifacts carry only Standard-rate rolling cost. They
   // can remain historical evidence elsewhere, but may never replace the
-  // quota-weighted allowance comparison. An unavailable weighted live series
+  // speed-priced allowance comparison. An unavailable weighted live series
   // therefore stays unavailable instead of silently drawing the old red line.
   const selection = {
     points: livePoints,
@@ -4419,6 +5158,7 @@ function selectedTimelinePoints(data) {
 }
 
 function renderTimeline(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   const {
     points,
     baselinePoints,
@@ -4453,15 +5193,24 @@ function renderTimeline(data) {
     });
   const empty = $("#timeline-empty");
   const shell = $("#timeline-chart");
+  const unavailable = accountingIsUnavailable(data);
   if (!visiblePoints.length || (usingLive && matchedVisible.length === 0)) {
     shell.hidden = true;
     empty.hidden = false;
-    empty.querySelector("strong").textContent = visiblePoints.length
-      ? t("dashboard.timeline.notComparableYet")
-      : tPlural("dashboard.timeline.series", 0, { window: windowLabel });
-    empty.querySelector("p").textContent = visiblePoints.length
-      ? t("dashboard.timeline.noBracket", { window: windowLabel })
-      : t("dashboard.timeline.missingData");
+    empty.querySelector("strong").textContent = unavailable
+      ? t(accountingRequiresNewerBuild(data)
+        ? "dashboard.timeline.newerBuildTitle"
+        : "dashboard.timeline.unavailableTitle")
+      : visiblePoints.length
+        ? t("dashboard.timeline.notComparableYet")
+        : tPlural("dashboard.timeline.series", 0, { window: windowLabel });
+    empty.querySelector("p").textContent = unavailable
+      ? t(projectionUnavailableCopyKey(data))
+      : data.allowancePlanSelection?.comparisonAvailable === false
+        ? t("weekly.plan.comparisonPending")
+      : visiblePoints.length
+        ? t("dashboard.timeline.noBracket", { window: windowLabel })
+        : t("dashboard.timeline.missingData");
   } else {
     empty.hidden = true;
     shell.hidden = false;
@@ -4507,7 +5256,7 @@ function renderTimeline(data) {
     activeCalibrationRangeDays,
   );
   renderTimelineSummary(data, visiblePoints, visibleBaselinePoints, usingLive);
-  renderTimelineConfidence(points, visiblePoints, usingLive, viewport);
+  renderTimelineConfidence(data, points, visiblePoints, usingLive, viewport);
   renderResiduals(data, visiblePoints, viewport);
   // The divergence panel reads the whole selected calibration range, not the
   // zoomed viewport: it answers "across this range, where did observed and
@@ -4539,8 +5288,24 @@ function describeTimelineExclusions(activePoints) {
   return described === "" ? t("dashboard.timeline.noExclusions") : described;
 }
 
-function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport) {
+function renderTimelineConfidence(
+  data,
+  allPoints,
+  visiblePoints,
+  usingLive,
+  viewport,
+) {
   const element = $("#timeline-confidence");
+  if (accountingIsUnavailable(data)) {
+    element.classList.add("low");
+    setLocalizedText(element, projectionUnavailableCopyKey(data));
+    return;
+  }
+  if (data.allowancePlanSelection?.comparisonAvailable === false) {
+    element.classList.add("low");
+    setLocalizedText(element, "weekly.plan.comparisonPending");
+    return;
+  }
   const activePoints = visiblePoints.filter((point) => point.status !== "inactive");
   const matched = activePoints.filter((point) => point.observed !== null && point.expected !== null).length;
   const excluded = activePoints.length - matched;
@@ -4708,6 +5473,7 @@ function renderTimelineSummary(
   const activePoints = points.filter((row) => row.status !== "inactive");
   const matched = activePoints.filter((row) => row.observed !== null && row.expected !== null);
   const live = usingLive;
+  const unavailable = accountingIsUnavailable(data) && activePoints.length === 0;
   const liveMae = matched.length
     ? matched.reduce((sum, row) => sum + Math.abs(row.observed - row.expected), 0) / matched.length
     : null;
@@ -4738,7 +5504,7 @@ function renderTimelineSummary(
     [
       "Matched windows",
       "Windows with both observed quota movement and a comparable cost-implied movement.",
-      compact(matched.length),
+      unavailable ? "—" : compact(matched.length),
     ],
     [
       "Mean absolute error",
@@ -5059,6 +5825,55 @@ function renderResidualInspectionTable() {
 // panel has a stable target for its toggle's `aria-controls`.
 let nextDivergenceBreakdownId = 0;
 
+// Display-only state for the detector's bounded set of visible windows. Index
+// revisions refresh details without changing a window's identity; a changed
+// population or contributor mix cannot inherit another window's answer.
+const divergenceDetails = new Map();
+const MAX_DIVERGENCE_DETAILS = 20;
+
+function divergenceDetailScope(data) {
+  const scope = data?.timeline?.planScoped?.planScope;
+  return JSON.stringify([
+    data?.mode,
+    data?.allowancePlanSelection?.planType ?? null,
+    scope?.planType ?? null,
+    scope?.methodVersion ?? null,
+    scope?.basisFamilyId ?? null,
+    scope?.cohortId ?? null,
+  ]);
+}
+
+function divergenceDetailKey(period, scope) {
+  return JSON.stringify([scope, period.startMs, period.endMs, period.contributors]);
+}
+
+function prepareDivergenceDetails(data, periods) {
+  const scope = divergenceDetailScope(data);
+  const generation = data?.accounting?.generation;
+  const planScope = data?.timeline?.planScoped?.planScope;
+  const revision = generation == null && !planScope?.sourceGeneration
+    ? data
+    : JSON.stringify([generation, data?.accounting?.generationFingerprint,
+      planScope?.sourceGeneration, planScope?.sourceGenerationFingerprint]);
+  const retained = new Set();
+  for (const period of periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+    const key = divergenceDetailKey(period, scope);
+    retained.add(key);
+    let state = divergenceDetails.get(key);
+    if (!state) {
+      state = { key, expanded: false, breakdown: null, loadedRevision: null,
+        pending: false, render: null, load: null };
+      divergenceDetails.set(key, state);
+    }
+    state.revision = revision;
+    state.local = ["local", "real_local_evidence"].includes(data?.mode);
+  }
+  for (const key of divergenceDetails.keys()) {
+    if (!retained.has(key)) divergenceDetails.delete(key);
+  }
+  return scope;
+}
+
 function divergenceRangeContext(data) {
   const accounting = accountingPeriod(data);
   if (!accounting) return null;
@@ -5067,9 +5882,11 @@ function divergenceRangeContext(data) {
     ?? models[0]
     ?? null;
   const modelLabel = topModel === null ? null
-    : topModel.model === "unknown" || topModel.pricingStatus === "unrecognized"
-      ? t("accounting.model.unrecognized")
-      : formatModelName(topModel.model) || topModel.model;
+    : topModel.model === "unknown"
+      ? t("accounting.model.identityUnavailable")
+      : topModel.pricingStatus === "unrecognized"
+        ? t("accounting.model.unrecognized")
+        : formatModelName(topModel.model) || topModel.model;
   const bySpeed = accounting.bySpeed ?? {};
   const rankedSpeed = ["fast", "standard", "unknown"]
     .map((key) => [key, finite(bySpeed?.[key]?.events, 0)])
@@ -5097,7 +5914,7 @@ function divergenceSpeedLabel(key) {
  * magnitude, and the contributor mix (exact per-period totals plus range-level
  * model/speed context).
  */
-function divergencePeriodItem(period, rangeContext) {
+function divergencePeriodItem(period, rangeContext, state) {
   const item = node(
     "li",
     `divergence-period ${period.direction === "under_costed"
@@ -5174,27 +5991,49 @@ function divergencePeriodItem(period, rangeContext) {
   panel.id = breakdownId;
   panel.hidden = true;
 
-  let loadState = "idle";
+  const renderBreakdown = () => {
+    if (state.breakdown !== null || !state.pending) {
+      renderDivergenceBreakdown(panel, state.breakdown, rangeContext);
+    } else {
+      clear(panel);
+      panel.append(localizedNode(
+        "p",
+        "divergence-breakdown-status",
+        "divergence.breakdown.loading",
+      ));
+    }
+  };
+  state.render = renderBreakdown;
   const loadBreakdown = async () => {
-    if (loadState === "loaded" || loadState === "loading") return;
-    loadState = "loading";
-    clear(panel);
-    panel.append(localizedNode(
-      "p",
-      "divergence-breakdown-status",
-      "divergence.breakdown.loading",
-    ));
+    if (!state.local || state.pending
+        || state.loadedRevision === state.revision) return;
+    const revision = state.revision;
+    state.pending = true;
+    renderBreakdown();
     let breakdown = null;
     try {
       breakdown = await localClient.windowBreakdown(period.startMs, period.endMs);
     } catch {
       breakdown = null;
     }
-    loadState = "loaded";
-    renderDivergenceBreakdown(panel, breakdown, rangeContext);
+    state.pending = false;
+    if (divergenceDetails.get(state.key) !== state) return;
+    if (state.revision !== revision) {
+      if (state.expanded) state.load();
+      return;
+    }
+    if (breakdown?.status === "available") {
+      state.breakdown = breakdown;
+      state.loadedRevision = revision;
+    }
+    // Failed refreshes never erase a successful answer or mark failure as
+    // loaded. Reopening or the next dashboard refresh can try again.
+    state.render();
   };
+  state.load = loadBreakdown;
   toggle.addEventListener("click", () => {
     const open = toggle.getAttribute("aria-expanded") === "true";
+    state.expanded = !open;
     toggle.setAttribute("aria-expanded", open ? "false" : "true");
     setLocalizedText(
       toggle,
@@ -5203,7 +6042,14 @@ function divergencePeriodItem(period, rangeContext) {
     panel.hidden = open;
     if (!open) loadBreakdown();
   });
+  toggle.setAttribute("aria-expanded", String(state.expanded));
+  setLocalizedText(toggle, state.expanded
+    ? "divergence.breakdown.hide" : "divergence.breakdown.show");
+  panel.hidden = !state.expanded;
+  renderBreakdown();
+  if (state.expanded) loadBreakdown();
 
+  state.toggle = toggle;
   item.append(toggle, panel);
   return item;
 }
@@ -5213,7 +6059,7 @@ function divergencePeriodItem(period, rangeContext) {
 // exists to supply; an unavailable breakdown falls back to the range-level
 // context rather than pretending this window had none.
 function divergenceModelLabel(model) {
-  if (model === "unknown") return t("accounting.model.unrecognized");
+  if (model === "unknown") return t("accounting.model.identityUnavailable");
   return formatModelName(model) || model;
 }
 
@@ -5318,11 +6164,14 @@ function renderDivergencePeriods(data, points) {
   const summary = $("#divergence-summary");
   const caveat = $("#divergence-caveat");
   if (!list || !empty || !summary) return;
+  const focusedKey = [...divergenceDetails.values()]
+    .find((state) => state.toggle === document.activeElement)?.key;
   clear(list);
 
   const result = detectDeviationPeriods(points, {
     usageBuckets: data?.timeline?.usage ?? [],
   });
+  const detailScope = prepareDivergenceDetails(data, result.periods);
 
   if (!result.periods.length) {
     list.hidden = true;
@@ -5369,8 +6218,11 @@ function renderDivergencePeriods(data, points) {
   }
 
   const rangeContext = divergenceRangeContext(data);
-  for (const period of result.periods) {
-    list.append(divergencePeriodItem(period, rangeContext));
+  for (const period of result.periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+    const key = divergenceDetailKey(period, detailScope);
+    const state = divergenceDetails.get(key);
+    list.append(divergencePeriodItem(period, rangeContext, state));
+    if (key === focusedKey) state.toggle.focus({ preventScroll: true });
   }
 }
 
@@ -6182,6 +7034,10 @@ function lineChart({
     {
       const format = item.format ?? formatMoney;
       points.forEach((point, index) => {
+        // A classified series must not leave an invisible hover target over
+        // a point belonging to another series. Marker visibility alone is
+        // separate: dense timelines intentionally retain hover-only points.
+        if (typeof item.pointFilter === "function" && !item.pointFilter(point)) return;
         const value = finite(point[item.key]);
         if (value === null) return;
         // Both coordinates are used three times each — the attribute, the
@@ -6293,6 +7149,10 @@ function lineChart({
     {
       const format = item.format ?? ((value) => formatPercent(value, 1));
       points.forEach((point, index) => {
+        // A classified series must not leave an invisible hover target over
+        // a point belonging to another series. Marker visibility alone is
+        // separate: dense timelines intentionally retain hover-only points.
+        if (typeof item.pointFilter === "function" && !item.pointFilter(point)) return;
         const value = finite(point[item.key]);
         if (value === null) return;
         const markerX = x(index, point);
@@ -6607,6 +7467,7 @@ function renderAllowanceHistoryChart(history) {
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        pointFilter: (point) => point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
       },
       {
@@ -6617,6 +7478,7 @@ function renderAllowanceHistoryChart(history) {
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        pointFilter: (point) => !point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
     ],
@@ -7141,7 +8003,44 @@ function renderWeeklyPaceForecast(data) {
   card.hidden = false;
 }
 
+function renderWeeklyPlanControl(data) {
+  const control = $("#weekly-plan-control");
+  const select = $("#weekly-plan-select");
+  const note = $("#weekly-plan-note");
+  if (!control || !select || !note) return;
+  const selection = data.allowancePlanSelection;
+  control.hidden = !selection;
+  note.hidden = !selection;
+  if (!selection) return;
+  const populations = data.weekly.planPopulations ?? [];
+  const signature = JSON.stringify([
+    populations.map((row) => row.planType),
+    selection.currentPlanType,
+    localization.locale(),
+  ]);
+  if (select.dataset.populationSignature !== signature) {
+    select.replaceChildren(...populations.map((row) => {
+      const option = node("option");
+      option.value = row.planType;
+      option.textContent = t(row.planType === selection.currentPlanType
+        ? "weekly.plan.latestOption" : "weekly.plan.historyOption", {
+        plan: shareCardPlanLabel(row.planType) || t("weekly.plan.unknown"),
+      });
+      return option;
+    }));
+    select.dataset.populationSignature = signature;
+  }
+  select.value = selection.planType;
+  select.disabled = populations.length < 2;
+  setLocalizedText(note, selection.isCurrentPlan
+    ? "weekly.plan.conditional" : "weekly.plan.historicalConditional", {
+    plan: shareCardPlanLabel(selection.planType) || t("weekly.plan.unknown"),
+  });
+}
+
 function renderWeekly(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
+  renderWeeklyPlanControl(data);
   renderWeeklyPaceForecast(data);
   // A weekly estimate carried over from the previous app version while the
   // recalculation runs announces itself here, quietly.
@@ -7166,13 +8065,17 @@ function renderWeekly(data) {
   // underneath reports how much of that population the chart is drawing. The
   // headline is deliberately not made to follow the filter — a figure people
   // quote should not move when they adjust a chart control.
-  setLocalizedText($("#weekly-estimate-label"), "weekly.headline.label");
+  const planLabel = shareCardPlanLabel(data.weekly.planType) || t("weekly.plan.unknown");
+  setLocalizedText($("#weekly-estimate-label"), data.allowancePlanSelection
+    ? "weekly.headline.planLabel" : "weekly.headline.label", { plan: planLabel });
   $("#weekly-estimate").textContent = estimate === null
     ? t("weekly.headline.insufficient")
     : t("weekly.headline.value", { amount: formatMoney(estimate) });
   $("#weekly-range").textContent = lower === null || upper === null
     ? t("weekly.headline.rangeUnavailable")
-    : t("weekly.headline.range", {
+    : t(data.allowancePlanSelection
+      ? "weekly.headline.planRange" : "weekly.headline.range", {
+      plan: planLabel,
       lower: formatMoney(lower),
       upper: formatMoney(upper),
     });
@@ -7195,6 +8098,14 @@ function renderWeekly(data) {
   setLocalizedText($("#weekly-chart-timezone"), "chart.timeZoneNote", {
     timeZone: formatTimeZoneLabel(),
   });
+  // Short ranges include every fit; here the slider only classifies markers.
+  // Name that role explicitly instead of presenting an inactive minimum filter.
+  const shortRange = history.rangeDays !== null && history.rangeDays <= 7;
+  setLocalizedText($("#weekly-span-label"), shortRange
+    ? "weekly.controls.observedSpan" : "weekly.controls.minimumSpan");
+  const spanNote = $("#weekly-span-note");
+  spanNote.hidden = !shortRange;
+  setLocalizedText(spanNote, "weekly.controls.shortRangeNote");
   $("#weekly-span-value").textContent = weeklySpanLabel();
   $("#weekly-span-legend").textContent = chartText(weeklyObservedSeriesLabel());
   $("#weekly-partial-legend").hidden = !chartValues.some((row) => !row.wellObserved);
@@ -7539,20 +8450,130 @@ function renderAccountingComponentBars(containerSelector, rows, {
 }
 
 function cacheSwitchMetricValue(impact) {
-  if (impact?.status !== "available") return "—";
-  const weighting = impact.allowanceWeighting;
+  const cost = cacheImpactCostView(impact);
+  if (cost === null) return "—";
+  const weighting = cost.allowanceWeighting;
+  const display = (value) => value;
   if (weighting?.status === "complete") {
     const premium = finite(weighting.selectedPremiumUsd, null);
-    return premium === null ? "—" : formatApiMoney(premium);
+    return premium === null ? "—" : display(formatApiMoney(premium));
   }
   if (weighting?.status === "range") {
     const lower = finite(weighting.rangePremiumUsd?.lower, null);
     const upper = finite(weighting.rangePremiumUsd?.upper, null);
     return lower === null || upper === null
       ? "—"
-      : `${formatApiMoney(lower)}–${formatApiMoney(upper)}`;
+      : display(`${formatApiMoney(lower)}–${formatApiMoney(upper)}`);
+  }
+  if (cost.isSubtotal && cost.standardApiPremiumUsd !== null) {
+    return display(formatApiMoney(cost.standardApiPremiumUsd));
   }
   return "—";
+}
+
+function cacheContinuityStandardMetricValue(impact) {
+  const cost = cacheImpactCostView(impact);
+  if (cost === null || cost.standardApiPremiumUsd === null) return "—";
+  const amount = formatApiMoney(cost.standardApiPremiumUsd);
+  return amount;
+}
+
+function cacheContinuityMetricValue(impact) {
+  const weighted = cacheSwitchMetricValue(impact);
+  return weighted === "—"
+    ? cacheContinuityStandardMetricValue(impact)
+    : weighted;
+}
+
+function cacheContinuityUsesStandardFallback(impact) {
+  const cost = cacheImpactCostView(impact);
+  return cost !== null && cost.standardApiPremiumUsd !== null
+    && !["complete", "range"].includes(cost.allowanceWeighting?.status);
+}
+
+function cacheImpactCostView(impact) {
+  if (impact?.status !== "available") return null;
+  // No compared requests is not an observed zero-dollar overhead.
+  if (impact.cacheReadDrops === 0
+      && (impact.proximateConfigurationChanges ?? impact.comparableReturns) === 0) {
+    return null;
+  }
+  const isSubtotal = impact.coverageStatus === "incomplete"
+    || impact.unpricedDrops > 0;
+  const selected = isSubtotal ? impact.coveredSubtotal : impact;
+  if (!selected || (isSubtotal
+      && (selected.scope !== "covered_priced_drops"
+        || !Number.isSafeInteger(selected.pricedDrops)
+        || selected.pricedDrops <= 0
+        || selected.pricedDrops !== impact.pricedDrops))) return null;
+  return {
+    isSubtotal,
+    pricedDrops: selected.pricedDrops,
+    standardApiPremiumUsd: finite(selected.standardApiPremiumUsd, null),
+    allowanceWeighting: selected.allowanceWeighting,
+  };
+}
+
+function appendCacheImpactSubtotalNote(container, impact) {
+  const cost = cacheImpactCostView(impact);
+  if (cost === null || !cost.isSubtotal) return false;
+  container.append(
+    document.createTextNode(" "),
+    localizedNode("span", "", "accounting.cacheImpact.subtotalScope", {
+      priced: formatCount(cost.pricedDrops),
+    }),
+  );
+  if (cost.standardApiPremiumUsd !== null) {
+    container.append(
+      document.createTextNode(" "),
+      localizedNode("span", "", cacheContinuityUsesStandardFallback(impact)
+        ? "accounting.cacheImpact.subtotalStandardOnly"
+        : "accounting.cacheImpact.subtotalStandard", {
+        amount: formatApiMoney(cost.standardApiPremiumUsd),
+      }),
+    );
+  }
+  if (finite(impact.unpricedDrops, 0) > 0) {
+    container.append(
+      document.createTextNode(" "),
+      localizedNode("span", "", "accounting.cacheImpact.subtotalUnpriced", {
+        unpriced: formatCount(impact.unpricedDrops),
+      }),
+    );
+  }
+  return true;
+}
+
+function cacheImpactMetricBullets(impact, appendDetails) {
+  const details = node("span");
+  appendDetails(details, impact);
+  const list = node("ul", "cache-impact-bullets");
+  // Keep the full evidence explanation reachable without crowding the card.
+  list.title = details.textContent;
+  const cost = cacheImpactCostView(impact);
+  if (cost === null) {
+    list.append(node("li", "", details.textContent));
+    return list;
+  }
+  list.append(localizedNode("li", "", cost.isSubtotal
+    ? "accounting.cacheImpact.bulletPartial" : "accounting.cacheImpact.bulletPriced", {
+    priced: formatCount(cost.pricedDrops ?? impact.pricedDrops),
+  }));
+  if (cost.standardApiPremiumUsd !== null) {
+    list.append(localizedNode("li", "", "accounting.cacheImpact.bulletStandard", {
+      amount: formatApiMoney(cost.standardApiPremiumUsd),
+    }));
+  }
+  const excluded = [];
+  for (const [count, key] of [
+    [impact.orderingCoverageGaps, "accounting.cacheImpact.bulletOrdering"],
+    [impact.unpricedDrops, "accounting.cacheImpact.bulletUnpriced"],
+    [impact.uncoveredConfigurationChanges ?? impact.uncoveredReturns, "accounting.cacheImpact.bulletUncovered"],
+  ]) {
+    if (finite(count, 0) > 0) excluded.push(t(key, { count: formatCount(count) }));
+  }
+  if (excluded.length) list.append(node("li", "", excluded.join(" · ")));
+  return list;
 }
 
 function formatCacheSwitchPercentagePoints(value) {
@@ -7587,6 +8608,7 @@ function appendCacheSwitchMetricNote(container, impact) {
         ordering: formatCount(ordering),
       },
     ));
+    appendCacheImpactSubtotalNote(container, impact);
     return;
   }
   const drops = finite(impact.cacheReadDrops, 0);
@@ -7625,6 +8647,8 @@ function appendCacheSwitchMetricNote(container, impact) {
       );
     }
   }
+  if (appendCacheImpactSubtotalNote(container, impact)) return;
+  if (cacheImpactCostView(impact) === null) return;
   if (finite(impact.standardApiPremiumUsd, null) !== null) {
     container.append(
       document.createTextNode(" "),
@@ -7727,10 +8751,214 @@ function cacheSwitchDataCell(className, value, labelKey) {
   return cell;
 }
 
+function isCacheDropThreadDashboard(data) {
+  return ["local", "real_local_evidence"].includes(data?.mode);
+}
+
+const CACHE_DROP_AUTO_REVIEW_LABEL = "Auto review";
+
+function cacheDropThreadParts(thread) {
+  return formatCodexThreadParts(thread, t);
+}
+
+function fillCacheDropThreadCell(cell, thread, observedAt) {
+  const focused = cell.contains(document.activeElement)
+    ? document.activeElement
+    : null;
+  const focusedHref = focused?.getAttribute("href") ?? null;
+  clear(cell);
+  cell.setAttribute("data-label", t("accounting.cacheDropThread.column"));
+  const time = t("accounting.cacheDropThread.localTime", {
+    time: formatLocal(observedAt),
+  });
+  cell.setAttribute("title", time);
+  const content = rawNode("span", "cache-drop-thread-content", "");
+  const parts = cacheDropThreadParts(thread);
+  if (parts.length === 0) {
+    const unavailable = rawNode("span", "cache-drop-thread-unavailable",
+      t("accounting.cacheDropThread.unavailable"));
+    unavailable.tabIndex = 0;
+    unavailable.setAttribute("title", time);
+    unavailable.setAttribute("aria-label",
+      `${t("accounting.cacheDropThread.unavailable")}. ${time}`);
+    content.append(unavailable);
+  }
+  for (const part of parts) {
+    if (part.href === null) {
+      const unavailableText = `${part.name}: ${t("accounting.cacheDropThread.unavailable")}`;
+      const unavailable = rawNode("span", "cache-drop-thread-unavailable", unavailableText);
+      unavailable.tabIndex = 0;
+      unavailable.setAttribute("title", time);
+      unavailable.setAttribute("aria-label", `${unavailableText}. ${time}`);
+      content.append(unavailable);
+      continue;
+    }
+    const link = rawNode("a", "cache-drop-thread-link", part.name);
+    link.href = part.href;
+    link.setAttribute("title", time);
+    link.setAttribute("aria-label", t("accounting.cacheDropThread.open", {
+      name: part.name,
+      time,
+    }));
+    // Suppress any page URL as a referrer when the operating system opens
+    // Codex. No arbitrary upstream URL is ever accepted by this renderer.
+    link.setAttribute("rel", "noreferrer");
+    if (part.worker) {
+      const worker = rawNode("span", "cache-drop-subworker", "");
+      worker.append(document.createTextNode("["), link, document.createTextNode("]"));
+      content.append(document.createTextNode(parts.length > 1 ? " " : ""), worker);
+    } else {
+      content.append(link);
+      if (part.autoReview) {
+        const origin = rawNode("span", "cache-drop-subworker", "");
+        origin.append(document.createTextNode(" ["),
+          document.createTextNode(CACHE_DROP_AUTO_REVIEW_LABEL),
+          document.createTextNode("]"));
+        content.append(origin);
+      }
+    }
+  }
+  cell.append(content);
+  if (focused) {
+    const links = [...content.querySelectorAll("a")];
+    const target = links.find((link) => link.getAttribute("href") === focusedHref)
+      ?? links[0]
+      ?? content.querySelector(".cache-drop-thread-unavailable");
+    target?.focus({ preventScroll: true });
+  }
+}
+
+function cacheDropThreadCell(kind, item) {
+  const cell = rawNode("td", "cache-drop-thread-cell", "");
+  fillCacheDropThreadCell(cell,
+    cacheDropThreadLinks.entries.get(cacheDropThreadLookupKey(kind, item)),
+    item.observedAt);
+  cacheDropThreadLinks.cells[kind].push({ cell, item });
+  return cell;
+}
+
+function updateCacheDropThreadCells() {
+  for (const [kind, cells] of Object.entries(cacheDropThreadLinks.cells)) {
+    for (const { cell, item } of cells) {
+      if (!cell.isConnected) continue;
+      fillCacheDropThreadCell(cell,
+        cacheDropThreadLinks.entries.get(cacheDropThreadLookupKey(kind, item)),
+        item.observedAt);
+    }
+  }
+}
+
+function cacheDropThreadKeys(data) {
+  const keys = new Set();
+  if (!isCacheDropThreadDashboard(data) || !isLoopbackDashboard()) return keys;
+  for (const [kind, impact] of [
+    ["switch", data.accounting?.cacheSwitchImpact],
+    ["continuity", data.accounting?.cacheContinuityImpact],
+  ]) {
+    if (impact?.status !== "available") continue;
+    const periods = Array.isArray(impact.periods) ? impact.periods.slice(0, 4) : [];
+    for (const period of [impact, ...periods]) {
+      const recent = Array.isArray(period?.recent) ? period.recent.slice(0, 20) : [];
+      for (const row of recent) {
+        const key = cacheDropThreadLookupKey(kind, row);
+        if (key !== null) keys.add(key);
+        if (keys.size === 160) return keys;
+      }
+    }
+  }
+  return keys;
+}
+
+function resetCacheDropThreadLinks(data = null) {
+  const sameDashboard = cacheDropThreadLinks.dashboard === data;
+  const previousGeneration = cacheDropThreadLinks.generation;
+  const previousFingerprint = cacheDropThreadLinks.generationFingerprint;
+  cacheDropThreadLinks.requestToken += 1;
+  cacheDropThreadLinks.dashboard = data;
+  cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
+      && typeof data.accounting?.cacheDiagnosticsSource?.generation === "string"
+    ? data.accounting.cacheDiagnosticsSource.generation
+    : null;
+  cacheDropThreadLinks.generationFingerprint =
+    data?.accounting?.cacheDiagnosticsSource?.generationFingerprint ?? null;
+  cacheDropThreadLinks.requested = false;
+  // An unchanged tuple can become ambiguous when another source is indexed.
+  // Reuse navigation only within the same attested diagnostic publication;
+  // a changed or missing proof requires a new successful identity lookup.
+  if (previousGeneration !== cacheDropThreadLinks.generation
+      || previousFingerprint !== cacheDropThreadLinks.generationFingerprint) {
+    cacheDropThreadLinks.entries.clear();
+  }
+  const retainedKeys = cacheDropThreadKeys(data);
+  for (const key of cacheDropThreadLinks.entries.keys()) {
+    if (!retainedKeys.has(key)) cacheDropThreadLinks.entries.delete(key);
+  }
+  updateCacheDropThreadCells();
+  if (!sameDashboard) cacheDropThreadLinks.cells = { switch: [], continuity: [] };
+}
+
+async function loadCacheDropThreadLinks(data) {
+  const generation = cacheDropThreadLinks.generation;
+  const fingerprint = cacheDropThreadLinks.generationFingerprint;
+  if (data !== dashboard || data !== cacheDropThreadLinks.dashboard
+      || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
+      || generation === null || generation === ""
+      || fingerprint === null
+      || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+      || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
+      || cacheDropThreadLinks.requested
+      || typeof localClient.cacheDropThreadLinks !== "function") return;
+  cacheDropThreadLinks.requested = true;
+  const token = ++cacheDropThreadLinks.requestToken;
+  const loadToken = cacheDropThreadLinks.loadToken;
+  let completed = false;
+  try {
+    const result = await localClient.cacheDropThreadLinks();
+    if (token !== cacheDropThreadLinks.requestToken
+        || loadToken !== cacheDropThreadLinks.loadToken
+        || data !== dashboard || data !== cacheDropThreadLinks.dashboard
+        || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
+        || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+        || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
+        || result?.status !== "available"
+        || result.generation !== generation) return;
+    const selectedKeys = cacheDropThreadKeys(data);
+    const resolvedEntries = new Map();
+    for (const { key, thread } of result.entries) {
+      if (!selectedKeys.has(key)) continue;
+      const previous = cacheDropThreadLinks.entries.get(key);
+      // Optional name-store failures must not erase details already known for
+      // this UUID. A newly resolved identity replaces the old entry outright.
+      resolvedEntries.set(key, previous?.id === thread.id ? {
+        ...thread,
+        name: thread.name ?? previous.name,
+        nickname: thread.nickname ?? previous.nickname,
+        parent: thread.parent === null ? previous.parent : {
+          ...thread.parent,
+          name: thread.parent.name ?? (thread.parent.id === previous.parent?.id
+            ? previous.parent.name : null),
+        },
+      } : thread);
+    }
+    // A qualified empty/partial result withdraws unresolved identities. It is
+    // different from a failed lookup, which leaves same-publication UI intact.
+    cacheDropThreadLinks.entries = resolvedEntries;
+    completed = true;
+    updateCacheDropThreadCells();
+  } catch {
+    // Keep resolved details usable through temporary local lookup failures.
+  } finally {
+    if (!completed && token === cacheDropThreadLinks.requestToken) {
+      cacheDropThreadLinks.requested = false;
+    }
+  }
+}
+
 function renderAccountingCacheSwitchDetails(impact) {
   const disclosure = $("#cache-switch-details");
   const rows = $("#cache-switch-rows");
   if (!disclosure || !rows) return;
+  cacheDropThreadLinks.cells.switch = [];
   clear(rows);
   const available = impact?.status === "available";
   disclosure.hidden = !available;
@@ -7748,6 +8976,13 @@ function renderAccountingCacheSwitchDetails(impact) {
     return;
   }
   const recent = Array.isArray(impact.recent) ? impact.recent : [];
+  const sampleNote = disclosure.querySelector(".cache-impact-sample");
+  if (sampleNote) {
+    sampleNote.hidden = impact.cacheReadDrops <= recent.length;
+    setLocalizedText(sampleNote, "accounting.cacheImpact.bulletSample", {
+      shown: formatCount(recent.length), total: formatCount(impact.cacheReadDrops),
+    });
+  }
   const page = paginateCacheImpactRows(
     recent,
     cacheSwitchTablePagination,
@@ -7769,11 +9004,7 @@ function renderAccountingCacheSwitchDetails(impact) {
   for (const item of page.rows) {
     const row = node("tr");
     row.append(
-      cacheSwitchDataCell(
-        "",
-        formatLocal(item.observedAt),
-        "accounting.cacheSwitch.column.localTime",
-      ),
+      cacheDropThreadCell("switch", item),
       cacheSwitchDataCell(
         "cache-switch-change",
         cacheSwitchChangeDescription(item),
@@ -7801,8 +9032,11 @@ function renderAccountingCacheSwitchDetails(impact) {
   }
 }
 
-function appendCacheContinuityAllowance(container, impact) {
-  if (finite(impact?.standardApiPremiumUsd, null) !== null) {
+function appendCacheContinuityAllowance(container, impact, {
+  includeStandardPremium = true,
+} = {}) {
+  if (includeStandardPremium
+      && finite(impact?.standardApiPremiumUsd, null) !== null) {
     container.append(
       document.createTextNode(" "),
       localizedNode(
@@ -7907,9 +9141,24 @@ function appendCacheContinuityMetricNote(container, impact) {
       ),
     );
   }
+  if (appendCacheImpactSubtotalNote(container, impact)) return;
+  if (cacheImpactCostView(impact) === null) return;
   if (impact.coverageStatus === "complete"
       && finite(impact.unpricedDrops, 0) === 0) {
-    appendCacheContinuityAllowance(container, impact);
+    const standardFallback = cacheContinuityUsesStandardFallback(impact);
+    if (standardFallback) {
+      container.append(
+        document.createTextNode(" "),
+        localizedNode(
+          "span",
+          "",
+          "accounting.cacheContinuity.noteStandardFallback",
+        ),
+      );
+    }
+    appendCacheContinuityAllowance(container, impact, {
+      includeStandardPremium: !standardFallback,
+    });
   }
 }
 
@@ -7939,59 +9188,136 @@ function cacheContinuityConfigurationDescription(row) {
   });
 }
 
-const CACHE_CONTINUITY_GAP_BAND_UI = Object.freeze([
+const CACHE_REUSE_OUTCOME_BUCKET_UI = Object.freeze([
   Object.freeze({
     id: "under_one_minute",
-    labelKey: "accounting.cacheContinuity.gapBand.underOneMinute",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.underOneMinute",
+    startSeconds: 0,
+    endSeconds: 60,
   }),
   Object.freeze({
-    id: "one_to_five_minutes",
-    labelKey: "accounting.cacheContinuity.gapBand.oneToFiveMinutes",
+    id: "one_to_two_minutes",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.oneToTwoMinutes",
+    startSeconds: 60,
+    endSeconds: 120,
   }),
   Object.freeze({
-    id: "five_to_thirty_minutes",
-    labelKey: "accounting.cacheContinuity.gapBand.fiveToThirtyMinutes",
+    id: "two_to_five_minutes",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.twoToFiveMinutes",
+    startSeconds: 120,
+    endSeconds: 300,
+  }),
+  Object.freeze({
+    id: "five_to_ten_minutes",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.fiveToTenMinutes",
+    startSeconds: 300,
+    endSeconds: 600,
+  }),
+  Object.freeze({
+    id: "ten_to_thirty_minutes",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.tenToThirtyMinutes",
+    startSeconds: 600,
+    endSeconds: 1_800,
   }),
   Object.freeze({
     id: "thirty_minutes_to_one_hour",
-    labelKey: "accounting.cacheContinuity.gapBand.thirtyMinutesToOneHour",
+    labelKey:
+      "accounting.cacheContinuity.outcome.bucket.thirtyMinutesToOneHour",
+    startSeconds: 1_800,
+    endSeconds: 3_600,
   }),
   Object.freeze({
     id: "one_to_six_hours",
-    labelKey: "accounting.cacheContinuity.gapBand.oneToSixHours",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.oneToSixHours",
+    startSeconds: 3_600,
+    endSeconds: 21_600,
   }),
   Object.freeze({
     id: "six_to_twenty_four_hours",
-    labelKey: "accounting.cacheContinuity.gapBand.sixToTwentyFourHours",
+    labelKey:
+      "accounting.cacheContinuity.outcome.bucket.sixToTwentyFourHours",
+    startSeconds: 21_600,
+    endSeconds: 86_400,
   }),
   Object.freeze({
-    id: "over_twenty_four_hours",
-    labelKey: "accounting.cacheContinuity.gapBand.overTwentyFourHours",
+    id: "one_to_three_days",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.oneToThreeDays",
+    startSeconds: 86_400,
+    endSeconds: 259_200,
+  }),
+  Object.freeze({
+    id: "over_three_days",
+    labelKey: "accounting.cacheContinuity.outcome.bucket.overThreeDays",
+    startSeconds: 259_200,
+    endSeconds: null,
   }),
 ]);
+const CACHE_REUSE_RASTER_HEIGHT = 376;
+const CACHE_REUSE_DEFAULT_BUCKET_INDEX = 2;
+const CACHE_REUSE_X_TICKS = Object.freeze([
+  60,
+  300,
+  1_800,
+  3_600,
+  21_600,
+  86_400,
+  604_800,
+]);
+let cacheReuseSelectedBucketIndex = CACHE_REUSE_DEFAULT_BUCKET_INDEX;
+let cacheReuseRenderedPeriodId = null;
+let cacheReuseCurrentImpact = null;
+let cacheReuseRasterLayout = null;
+let cacheReuseResizeObserver = null;
+let cacheReuseObservedWidth = 0;
+let cacheReuseReadoutVisible = false;
 
-function cacheContinuityGapBandSummaries(impact) {
+function cacheReuseOutcomeBuckets(impact) {
   if (impact?.status !== "available"
-      || (impact.coverageStatus !== "complete"
-        && impact.coverageStatus !== "incomplete")
-      || typeof impact.byGapBand !== "object"
-      || impact.byGapBand === null
-      || Array.isArray(impact.byGapBand)) return null;
+      || !Number.isSafeInteger(impact.comparableReturns)
+      || !Number.isSafeInteger(impact.reusedMoreThanHalfReturns)
+      || !Number.isSafeInteger(impact.reusedHalfOrLessReturns)
+      || !Number.isSafeInteger(impact.matchedOrExceededReturns)
+      || !Number.isSafeInteger(impact.reusedBetweenHalfAndPreviousReturns)
+      || impact.comparableReturns < 0
+      || impact.reusedMoreThanHalfReturns < 0
+      || impact.reusedHalfOrLessReturns < 0
+      || impact.matchedOrExceededReturns < 0
+      || impact.reusedBetweenHalfAndPreviousReturns < 0
+      || impact.reusedMoreThanHalfReturns + impact.reusedHalfOrLessReturns
+        !== impact.comparableReturns
+      || impact.matchedOrExceededReturns
+        + impact.reusedBetweenHalfAndPreviousReturns
+          !== impact.reusedMoreThanHalfReturns
+      || typeof impact.byOutcomeBucket !== "object"
+      || impact.byOutcomeBucket === null
+      || Array.isArray(impact.byOutcomeBucket)
+      || impact.outcomeDisplayMaximumGapSeconds !== 604_800) return null;
   const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
-  const summaries = [];
-  for (const band of CACHE_CONTINUITY_GAP_BAND_UI) {
-    if (!Object.hasOwn(impact.byGapBand, band.id)) return null;
-    const summary = impact.byGapBand[band.id];
+  const buckets = [];
+  for (const definition of CACHE_REUSE_OUTCOME_BUCKET_UI) {
+    if (!Object.hasOwn(impact.byOutcomeBucket, definition.id)) return null;
+    const summary = impact.byOutcomeBucket[definition.id];
     const premium = summary?.estimatedPremiumUsd;
     if (typeof summary !== "object"
         || summary === null
         || Array.isArray(summary)
-        || !validCount(summary.cacheReadDrops)
+        || summary.startSeconds !== definition.startSeconds
+        || summary.endSeconds !== definition.endSeconds
         || !validCount(summary.comparableReturns)
+        || !validCount(summary.reusedMoreThanHalfReturns)
+        || !validCount(summary.reusedHalfOrLessReturns)
+        || !validCount(summary.matchedOrExceededReturns)
+        || !validCount(summary.reusedBetweenHalfAndPreviousReturns)
+        || !validCount(summary.cacheReadDrops)
         || !validCount(summary.lostCacheTokens)
         || !validCount(summary.pricedDrops)
         || !validCount(summary.unpricedDrops)
-        || summary.cacheReadDrops > summary.comparableReturns
+        || summary.reusedMoreThanHalfReturns
+          + summary.reusedHalfOrLessReturns !== summary.comparableReturns
+        || summary.matchedOrExceededReturns
+          + summary.reusedBetweenHalfAndPreviousReturns
+            !== summary.reusedMoreThanHalfReturns
+        || summary.cacheReadDrops !== summary.reusedHalfOrLessReturns
         || summary.pricedDrops + summary.unpricedDrops
           !== summary.cacheReadDrops
         || (summary.cacheReadDrops === 0 && summary.lostCacheTokens !== 0)
@@ -8011,93 +9337,599 @@ function cacheContinuityGapBandSummaries(impact) {
         || (premium !== null
           && (summary.coverageStatus !== "complete"
             || summary.unpricedDrops > 0))) return null;
-    summaries.push({ ...band, summary });
+    buckets.push({ ...definition, ...summary });
   }
-  return summaries;
+  for (const field of [
+    "comparableReturns",
+    "reusedMoreThanHalfReturns",
+    "reusedHalfOrLessReturns",
+    "matchedOrExceededReturns",
+    "reusedBetweenHalfAndPreviousReturns",
+    "cacheReadDrops",
+    "lostCacheTokens",
+    "pricedDrops",
+    "unpricedDrops",
+  ]) {
+    if (buckets.reduce((sum, bucket) => sum + bucket[field], 0)
+        !== impact[field]) return null;
+  }
+  return buckets;
 }
 
-function renderAccountingCacheContinuityGapRows(impact, rows) {
-  clear(rows);
-  const summaries = cacheContinuityGapBandSummaries(impact);
-  if (summaries === null) {
-    const page = paginateCacheImpactRows(
-      [],
-      cacheContinuityGapTablePagination,
-      cacheImpactTableSignature("continuity-gap-unavailable", impact, []),
+function cacheReusePercent(count, total) {
+  return formatPercent(total === 0 ? 0 : count / total * 100, 1);
+}
+
+function chooseCacheReuseMarkUnit(total) {
+  const raw = Math.max(1, total / 600);
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const scaled = raw / magnitude;
+  const nice = scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10;
+  return Math.max(1, nice * magnitude);
+}
+
+function cacheReuseHexagonPath(context, x, y, radius) {
+  context.beginPath();
+  for (let point = 0; point < 6; point += 1) {
+    const angle = Math.PI / 3 * point;
+    const pointX = x + radius * Math.cos(angle);
+    const pointY = y + radius * Math.sin(angle);
+    if (point === 0) context.moveTo(pointX, pointY);
+    else context.lineTo(pointX, pointY);
+  }
+  context.closePath();
+}
+
+function drawCacheReuseHexagon(context, x, y, radius, color, fraction = 1) {
+  context.save();
+  cacheReuseHexagonPath(context, x, y, radius);
+  context.fillStyle = color;
+  context.globalAlpha = .1;
+  context.fill();
+  context.globalAlpha = .2;
+  context.lineWidth = .7;
+  context.strokeStyle = color;
+  context.stroke();
+  context.restore();
+
+  context.save();
+  cacheReuseHexagonPath(context, x, y, radius);
+  context.clip();
+  context.fillStyle = color;
+  context.globalAlpha = .8;
+  context.fillRect(
+    x - radius,
+    y - radius,
+    radius * 2 * Math.max(0, Math.min(1, fraction)),
+    radius * 2,
+  );
+  context.restore();
+}
+
+function drawCacheReuseBucketMarks(context, {
+  count,
+  unit,
+  x,
+  width,
+  centerY,
+  areaHeight,
+  color,
+}) {
+  if (count <= 0) return;
+  const fullMarks = Math.floor(count / unit);
+  const remainder = count % unit;
+  const markCount = fullMarks + (remainder > 0 ? 1 : 0);
+  const availableWidth = Math.max(8, width - 7);
+  let radius = 4.6;
+  let columns;
+  let rows;
+  do {
+    columns = Math.max(1, Math.floor(availableWidth / (radius * 1.75)));
+    rows = Math.ceil(markCount / columns);
+    if ((rows - 1) * radius * 1.55 + radius * 2 <= areaHeight
+        || radius <= 1.4) break;
+    radius -= .2;
+  } while (radius > 1.3);
+  const horizontalStep = columns === 1
+    ? 0
+    : Math.min(
+      radius * 1.75,
+      (availableWidth - radius * 2) / (columns - 1),
     );
-    renderCacheImpactPagination(
-      "cache-continuity-gap",
-      cacheContinuityGapTablePagination,
-      page,
+  const verticalStep = radius * 1.55;
+  const renderedRows = Math.ceil(markCount / columns);
+  const totalHeight = (renderedRows - 1) * verticalStep + radius * 2;
+  const startY = centerY - totalHeight / 2 + radius;
+  for (let mark = 0; mark < markCount; mark += 1) {
+    const row = Math.floor(mark / columns);
+    const column = mark % columns;
+    const rowCount = Math.min(columns, markCount - row * columns);
+    const rowWidth = (rowCount - 1) * horizontalStep;
+    const markX = x + width / 2 - rowWidth / 2 + column * horizontalStep;
+    const markY = startY + row * verticalStep
+      + (column % 2 ? radius * .12 : 0);
+    drawCacheReuseHexagon(
+      context,
+      markX,
+      markY,
+      radius,
+      color,
+      mark < fullMarks ? 1 : remainder / unit,
     );
-    const row = node("tr");
-    const cell = localizedNode(
-      "td",
-      "empty-cell",
-      "accounting.cacheContinuity.gapBreakdownUnavailable",
-    );
-    cell.colSpan = 4;
-    row.append(cell);
-    rows.append(row);
+  }
+}
+
+function cacheReuseWrappedLines(context, text, maximumWidth) {
+  const words = String(text).split(/\s+/u).filter(Boolean);
+  if (words.length <= 1 && context.measureText(text).width > maximumWidth) {
+    return [...String(text)].reduce((lines, character) => {
+      const last = lines.at(-1) ?? "";
+      if (last && context.measureText(last + character).width > maximumWidth) {
+        lines.push(character);
+      } else if (lines.length === 0) {
+        lines.push(character);
+      } else {
+        lines[lines.length - 1] = last + character;
+      }
+      return lines;
+    }, []);
+  }
+  return words.reduce((lines, word) => {
+    const last = lines.at(-1) ?? "";
+    const next = last ? `${last} ${word}` : word;
+    if (last && context.measureText(next).width > maximumWidth) {
+      lines.push(word);
+    } else if (lines.length === 0) {
+      lines.push(word);
+    } else {
+      lines[lines.length - 1] = next;
+    }
+    return lines;
+  }, []);
+}
+
+function drawCacheReuseLaneLabel(context, text, percentText, centerY, color,
+  maximumWidth) {
+  context.save();
+  context.fillStyle = color;
+  context.textAlign = "start";
+  context.textBaseline = "top";
+  context.font = `700 12px ${getComputedStyle(document.documentElement)
+    .getPropertyValue("--sans")}`;
+  const lines = cacheReuseWrappedLines(context, text, maximumWidth).slice(0, 3);
+  const startY = centerY - 34;
+  lines.forEach((line, index) => context.fillText(line, 4, startY + index * 14));
+  context.font = `600 11px ${getComputedStyle(document.documentElement)
+    .getPropertyValue("--sans")}`;
+  context.fillText(percentText, 4, centerY + 20);
+  context.restore();
+}
+
+function drawCacheReuseLegend(context, width, markUnit, color, muted, font) {
+  const text = t("accounting.cacheContinuity.outcome.legendInline", {
+    count: formatCount(markUnit),
+  });
+  context.save();
+  context.font = `500 10px ${font}`;
+  const textWidth = context.measureText(text).width;
+  const startX = Math.max(5, width - textWidth - 22);
+  drawCacheReuseHexagon(context, startX + 5, 15, 4.5, color);
+  context.fillStyle = muted;
+  context.textAlign = "start";
+  context.textBaseline = "middle";
+  context.fillText(text, startX + 14, 15);
+  context.restore();
+}
+
+function renderCacheReuseReadout(bucket, width, selectedRange,
+  completeCoverage) {
+  const total = bucket.comparableReturns;
+  const morePercent = cacheReusePercent(bucket.reusedMoreThanHalfReturns, total);
+  const lessPercent = cacheReusePercent(bucket.reusedHalfOrLessReturns, total);
+  setLocalizedText($("#cache-reuse-readout-bucket"), bucket.labelKey);
+  setLocalizedText(
+    $("#cache-reuse-readout-checked"),
+    "accounting.cacheContinuity.outcome.readoutChecked",
+    { count: formatCount(total) },
+  );
+  setLocalizedText(
+    $("#cache-reuse-readout-more"),
+    "accounting.cacheContinuity.outcome.readoutMore",
+    {
+      count: formatCount(bucket.reusedMoreThanHalfReturns),
+      percent: morePercent,
+    },
+  );
+  setLocalizedText(
+    $("#cache-reuse-readout-less"),
+    "accounting.cacheContinuity.outcome.readoutLess",
+    {
+      count: formatCount(bucket.reusedHalfOrLessReturns),
+      percent: lessPercent,
+    },
+  );
+  setLocalizedText(
+    $("#cache-reuse-readout-lost"),
+    "accounting.cacheContinuity.outcome.readoutLost",
+    { tokens: formatCount(bucket.lostCacheTokens) },
+  );
+  const subtotalScope = !completeCoverage
+    || bucket.coverageStatus !== "complete" || bucket.unpricedDrops > 0;
+  // A global ordering gap has no honest bucket assignment. It withholds the
+  // period total, not the independently admitted comparisons in this bucket.
+  const premium = bucket.comparableReturns === 0 ? null
+    : subtotalScope
+      ? bucket.coveredSubtotal?.standardApiPremiumUsd
+        ?? (bucket.coverageStatus === "complete" && bucket.unpricedDrops === 0
+          ? bucket.estimatedPremiumUsd : null)
+      : bucket.estimatedPremiumUsd;
+  setLocalizedText(
+    $("#cache-reuse-readout-api"),
+    subtotalScope
+      ? bucket.unpricedDrops > 0
+        ? "accounting.cacheContinuity.outcome.readoutSubtotalUnpriced"
+        : "accounting.cacheContinuity.outcome.readoutSubtotal"
+      : "accounting.cacheContinuity.outcome.readoutApi",
+    {
+      amount: premium === null || premium === undefined
+        ? t("accounting.cacheContinuity.premiumUnavailable")
+        : formatApiMoney(premium),
+      priced: formatCount(bucket.pricedDrops),
+      unpriced: formatCount(bucket.unpricedDrops),
+    },
+  );
+  const stage = $("#cache-reuse-raster-stage");
+  if (!stage) return;
+  const cardHalfWidth = Math.min(130, Math.max(90, (width - 16) / 2));
+  const selectedCenter = selectedRange.start
+    + (selectedRange.end - selectedRange.start) / 2;
+  const desiredCenter = selectedCenter <= width / 2
+    ? selectedRange.end + cardHalfWidth + 10
+    : selectedRange.start - cardHalfWidth - 10;
+  stage.style.setProperty(
+    "--cache-reuse-card-x",
+    `${Math.max(
+      cardHalfWidth + 8,
+      Math.min(width - cardHalfWidth - 8, desiredCenter),
+    )}px`,
+  );
+}
+
+function setCacheReuseReadoutVisible(visible) {
+  cacheReuseReadoutVisible = visible;
+  const rail = $("#cache-reuse-readout-rail");
+  if (rail) rail.hidden = !visible;
+}
+
+function drawCacheReuseRaster(impact, buckets, markUnit) {
+  const scroll = $("#cache-reuse-raster-scroll");
+  const stage = $("#cache-reuse-raster-stage");
+  const canvas = $("#cache-reuse-canvas");
+  if (!scroll || !stage || !canvas || typeof canvas.getContext !== "function") {
     return;
   }
-  const page = paginateCacheImpactRows(
-    summaries,
-    cacheContinuityGapTablePagination,
-    cacheImpactTableSignature("continuity-gap", impact, summaries),
+  const measuredWidth = Math.round(scroll.clientWidth || stage.clientWidth || 0);
+  const width = measuredWidth > 0 ? measuredWidth : 680;
+  cacheReuseObservedWidth = Math.round(scroll.clientWidth || 0);
+  stage.style.width = `${width}px`;
+  const pixelRatio = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  canvas.width = Math.round(width * pixelRatio);
+  canvas.height = Math.round(CACHE_REUSE_RASTER_HEIGHT * pixelRatio);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${CACHE_REUSE_RASTER_HEIGHT}px`;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+  context.clearRect(0, 0, width, CACHE_REUSE_RASTER_HEIGHT);
+  const styles = getComputedStyle(document.documentElement);
+  const color = (name, fallback) => styles.getPropertyValue(name).trim()
+    || fallback;
+  const green = color("--green", "#174f45");
+  const greenSoft = color("--chart-accent", "#3e8577");
+  const rust = color("--rust", "#97402a");
+  const rustSoft = "#c9826f";
+  const ink = color("--ink", "#17211e");
+  const muted = color("--muted", "#57625c");
+  const line = color("--line", "rgba(23,33,30,.14)");
+  const plotLeft = width < 520 ? 104 : width < 700 ? 118 : width < 860 ? 154 : 184;
+  const plotRight = width < 700 ? 12 : 22;
+  const plotWidth = width - plotLeft - plotRight;
+  const plotTop = 34;
+  const plotBottom = 307;
+  const axisY = 324;
+  const topCenter = 111;
+  const bottomCenter = 246;
+  const laneHeight = 92;
+  const displayMaximum = impact.outcomeDisplayMaximumGapSeconds;
+  const xPosition = (seconds) => plotLeft
+    + Math.log1p(Math.min(seconds, displayMaximum))
+      / Math.log1p(displayMaximum) * plotWidth;
+  const bucketRanges = buckets.map((bucket) => ({
+    start: xPosition(bucket.startSeconds),
+    end: xPosition(bucket.endSeconds ?? displayMaximum),
+  }));
+  cacheReuseSelectedBucketIndex = Math.max(
+    0,
+    Math.min(buckets.length - 1, cacheReuseSelectedBucketIndex),
   );
-  renderCacheImpactPagination(
-    "cache-continuity-gap",
-    cacheContinuityGapTablePagination,
-    page,
+  cacheReuseRasterLayout = { bucketRanges, plotLeft, plotWidth };
+  const selectedRange = bucketRanges[cacheReuseSelectedBucketIndex];
+  const selectedX = selectedRange.start;
+  const selectedWidth = selectedRange.end - selectedRange.start;
+  context.save();
+  context.globalAlpha = .62;
+  context.fillStyle = color("--green-soft", "#dfece6");
+  context.fillRect(
+    selectedX + 1,
+    plotTop,
+    Math.max(1, selectedWidth - 2),
+    plotBottom - plotTop,
   );
-  for (const { labelKey, summary } of page.rows) {
-    const row = node("tr");
-    row.append(
-      localizedNode("td", "", labelKey),
-      rawNode(
-        "td",
-        "numeric-cell",
-        `${formatCount(summary.cacheReadDrops)} / ${formatCount(summary.comparableReturns)}`,
-      ),
-      rawNode("td", "numeric-cell", formatCount(summary.lostCacheTokens)),
-      impact.coverageStatus !== "complete"
-        || summary.estimatedPremiumUsd === null
-        ? localizedNode(
-          "td",
-          "cache-continuity-premium-unavailable",
-          "accounting.cacheContinuity.premiumUnavailable",
-        )
-        : rawNode(
-          "td",
-          "model-api-equivalent",
-          formatApiMoney(summary.estimatedPremiumUsd),
-        ),
-    );
-    rows.append(row);
+  context.restore();
+  context.strokeStyle = green;
+  context.lineWidth = 1.2;
+  context.strokeRect(
+    selectedX + .5,
+    plotTop + .5,
+    Math.max(1, selectedWidth - 1),
+    plotBottom - plotTop - 1,
+  );
+  context.strokeStyle = line;
+  context.lineWidth = .8;
+  for (const range of bucketRanges.slice(0, -1)) {
+    context.beginPath();
+    context.moveTo(range.end, plotTop + 12);
+    context.lineTo(range.end, plotBottom);
+    context.stroke();
   }
+  context.save();
+  context.setLineDash([2, 3]);
+  context.strokeStyle = line;
+  context.lineWidth = 1;
+  context.textAlign = "center";
+  context.textBaseline = "top";
+  context.fillStyle = ink;
+  const tickFontSize = width < 700 ? 10 : 12;
+  context.font = `600 ${tickFontSize}px ${styles.getPropertyValue("--sans")}`;
+  CACHE_REUSE_X_TICKS.forEach((seconds, index) => {
+    const tickX = xPosition(seconds);
+    let labelX = tickX;
+    context.beginPath();
+    context.moveTo(tickX, plotTop + 12);
+    context.lineTo(tickX, plotBottom);
+    context.stroke();
+    if (width < 700 && seconds === 1_800) {
+      context.textAlign = "end";
+      labelX -= 4;
+    } else if (width < 700 && seconds === 3_600) {
+      context.textAlign = "start";
+      labelX += 4;
+    } else {
+      context.textAlign = index === CACHE_REUSE_X_TICKS.length - 1
+        ? "end"
+        : "center";
+    }
+    const tickLabel = seconds === displayMaximum
+      ? `${formatCacheContinuityGap(seconds)}+`
+      : formatCacheContinuityGap(seconds);
+    context.fillText(tickLabel, labelX, axisY);
+  });
+  context.restore();
+  drawCacheReuseLegend(
+    context,
+    width,
+    markUnit,
+    greenSoft,
+    muted,
+    styles.getPropertyValue("--sans"),
+  );
+  const total = impact.comparableReturns;
+  drawCacheReuseLaneLabel(
+    context,
+    t("accounting.cacheContinuity.outcome.laneMore"),
+    t("accounting.cacheContinuity.outcome.lanePercent", {
+      percent: cacheReusePercent(impact.reusedMoreThanHalfReturns, total),
+    }),
+    topCenter,
+    green,
+    plotLeft - 18,
+  );
+  drawCacheReuseLaneLabel(
+    context,
+    t("accounting.cacheContinuity.outcome.laneLess"),
+    t("accounting.cacheContinuity.outcome.lanePercent", {
+      percent: cacheReusePercent(impact.reusedHalfOrLessReturns, total),
+    }),
+    bottomCenter,
+    rust,
+    plotLeft - 18,
+  );
+  buckets.forEach((bucket, index) => {
+    const range = bucketRanges[index];
+    const isSelected = index === cacheReuseSelectedBucketIndex;
+    drawCacheReuseBucketMarks(context, {
+      count: bucket.reusedMoreThanHalfReturns,
+      unit: markUnit,
+      x: range.start,
+      width: Math.max(2, range.end - range.start),
+      centerY: topCenter,
+      areaHeight: laneHeight,
+      color: isSelected ? green : greenSoft,
+    });
+    drawCacheReuseBucketMarks(context, {
+      count: bucket.reusedHalfOrLessReturns,
+      unit: markUnit,
+      x: range.start,
+      width: Math.max(2, range.end - range.start),
+      centerY: bottomCenter,
+      areaHeight: laneHeight,
+      color: isSelected ? rust : rustSoft,
+    });
+  });
+  context.textAlign = "center";
+  context.textBaseline = "top";
+  context.fillStyle = muted;
+  context.font = `500 11px ${styles.getPropertyValue("--sans")}`;
+  context.fillText(
+    t("accounting.cacheContinuity.outcome.axisLabel"),
+    plotLeft + plotWidth / 2,
+    351,
+  );
+  canvas.setAttribute("role", "img");
+  canvas.setAttribute(
+    "aria-label",
+    t("accounting.cacheContinuity.outcome.canvasLabel", {
+      more: formatCount(impact.reusedMoreThanHalfReturns),
+      less: formatCount(impact.reusedHalfOrLessReturns),
+      unit: formatCount(markUnit),
+    }),
+  );
+  renderCacheReuseReadout(
+    buckets[cacheReuseSelectedBucketIndex],
+    width,
+    selectedRange,
+    impact.coverageStatus === "complete",
+  );
+  setCacheReuseReadoutVisible(cacheReuseReadoutVisible);
+}
+
+function ensureCacheReuseResizeObserver() {
+  const scroll = $("#cache-reuse-raster-scroll");
+  if (!scroll || cacheReuseResizeObserver !== null
+      || typeof ResizeObserver !== "function") return;
+  cacheReuseResizeObserver = new ResizeObserver((entries) => {
+    const width = Math.round(entries[0]?.contentRect?.width ?? 0);
+    if (width <= 0 || width === cacheReuseObservedWidth
+        || cacheReuseCurrentImpact === null) return;
+    renderAccountingCacheReuseOutcome(cacheReuseCurrentImpact);
+  });
+  cacheReuseResizeObserver.observe(scroll);
+}
+
+function cacheReuseCoverageNote(impact) {
+  if (impact?.status !== "available") return "";
+  const exclusions = [
+    [impact.orderingCoverageGaps, "ordering"],
+    [impact.uncoveredReturns, "boundary"],
+    [impact.unpricedDrops, "pricing"],
+  ].filter(([count]) => count > 0);
+  if (impact.coverageStatus === "complete" && exclusions.length === 0) return "";
+  return [
+    t("accounting.cacheContinuity.outcome.coverage.partial"),
+    ...exclusions.map(([count, kind]) => t(
+      `accounting.cacheContinuity.outcome.coverage.${kind}`,
+      { count: formatCount(count) },
+    )),
+  ].join(" ");
+}
+
+function renderAccountingCacheReuseOutcome(impact) {
+  const outcome = $("#cache-reuse-outcome");
+  const raster = $("#cache-reuse-raster");
+  const empty = $("#cache-reuse-empty");
+  if (!outcome || !raster || !empty) return;
+  const buckets = cacheReuseOutcomeBuckets(impact);
+  outcome.hidden = buckets === null;
+  const coverage = $("#cache-reuse-coverage");
+  if (coverage) {
+    const note = buckets === null ? "" : cacheReuseCoverageNote(impact);
+    setRawText(coverage, note);
+    coverage.hidden = note === "";
+  }
+  if (buckets === null) {
+    cacheReuseCurrentImpact = null;
+    return;
+  }
+  cacheReuseCurrentImpact = impact;
+  if (cacheReuseRenderedPeriodId !== impact.periodId) {
+    cacheReuseRenderedPeriodId = impact.periodId;
+    cacheReuseSelectedBucketIndex = CACHE_REUSE_DEFAULT_BUCKET_INDEX;
+  }
+  const total = impact.comparableReturns;
+  // A known empty denominator is neither zero reuse nor unavailable data. The
+  // companion has evaluated the period, but no eligible follow-up can support
+  // a percentage. Keep the explicit empty state and withhold the percentage
+  // cards and their denominator-dependent interpretation.
+  const metrics = outcome.querySelector(".cache-reuse-metrics");
+  if (metrics) metrics.hidden = total === 0;
+  empty.hidden = total !== 0;
+  raster.hidden = total === 0;
+  if (total === 0) return;
+  const morePercent = cacheReusePercent(impact.reusedMoreThanHalfReturns, total);
+  const lessPercent = cacheReusePercent(impact.reusedHalfOrLessReturns, total);
+  setRawText($("#cache-reuse-more-percent"), morePercent);
+  setRawText($("#cache-reuse-less-percent"), lessPercent);
+  setRawText(
+    $("#cache-reuse-overhead"),
+    cacheContinuityStandardMetricValue(impact),
+  );
+  setLocalizedText(
+    $("#cache-reuse-more-count"),
+    "accounting.cacheContinuity.outcome.followUps",
+    { count: formatCount(impact.reusedMoreThanHalfReturns) },
+  );
+  setLocalizedText(
+    $("#cache-reuse-less-count"),
+    "accounting.cacheContinuity.outcome.followUps",
+    { count: formatCount(impact.reusedHalfOrLessReturns) },
+  );
+  setLocalizedText(
+    $("#cache-reuse-explanation"),
+    "accounting.cacheContinuity.outcome.howToRead",
+    {
+      percent: morePercent,
+      matched: formatCount(impact.matchedOrExceededReturns),
+      between: formatCount(impact.reusedBetweenHalfAndPreviousReturns),
+    },
+  );
+  const markUnit = chooseCacheReuseMarkUnit(total);
+  drawCacheReuseRaster(impact, buckets, markUnit);
+  ensureCacheReuseResizeObserver();
+}
+
+function selectCacheReuseBucketFromPointer(event) {
+  if (event.type === "pointermove" && event.pointerType === "touch") return;
+  setCacheReuseReadoutVisible(true);
+  const canvas = $("#cache-reuse-canvas");
+  if (!canvas || cacheReuseRasterLayout === null
+      || cacheReuseCurrentImpact === null) return;
+  const bounds = canvas.getBoundingClientRect();
+  const pointerX = event.clientX - bounds.left;
+  const next = cacheReuseRasterLayout.bucketRanges.findIndex(
+    (range, index) => pointerX >= range.start
+      && (pointerX < range.end
+        || index === cacheReuseRasterLayout.bucketRanges.length - 1),
+  );
+  if (next < 0 || next === cacheReuseSelectedBucketIndex) return;
+  cacheReuseSelectedBucketIndex = next;
+  renderAccountingCacheReuseOutcome(cacheReuseCurrentImpact);
+}
+
+function moveCacheReuseBucketSelection(direction) {
+  if (cacheReuseCurrentImpact === null) return;
+  const next = Math.max(
+    0,
+    Math.min(
+      CACHE_REUSE_OUTCOME_BUCKET_UI.length - 1,
+      cacheReuseSelectedBucketIndex + direction,
+    ),
+  );
+  if (next === cacheReuseSelectedBucketIndex) return;
+  cacheReuseSelectedBucketIndex = next;
+  renderAccountingCacheReuseOutcome(cacheReuseCurrentImpact);
 }
 
 function renderAccountingCacheContinuityDetails(impact) {
   const disclosure = $("#cache-continuity-details");
-  const gapRows = $("#cache-continuity-gap-rows");
   const rows = $("#cache-continuity-rows");
-  if (!disclosure || !gapRows || !rows) return;
-  clear(gapRows);
+  if (!disclosure || !rows) return;
+  cacheDropThreadLinks.cells.continuity = [];
   clear(rows);
   const available = impact?.status === "available";
   disclosure.hidden = !available;
+  renderAccountingCacheReuseOutcome(available ? impact : null);
   if (!available) {
     disclosure.open = false;
-    renderCacheImpactPagination(
-      "cache-continuity-gap",
-      cacheContinuityGapTablePagination,
-      paginateCacheImpactRows(
-        [],
-        cacheContinuityGapTablePagination,
-        "continuity-gap:unavailable",
-      ),
-    );
     renderCacheImpactPagination(
       "cache-continuity",
       cacheContinuityTablePagination,
@@ -8109,8 +9941,14 @@ function renderAccountingCacheContinuityDetails(impact) {
     );
     return;
   }
-  renderAccountingCacheContinuityGapRows(impact, gapRows);
   const recent = Array.isArray(impact.recent) ? impact.recent : [];
+  const sampleNote = disclosure.querySelector(".cache-impact-sample");
+  if (sampleNote) {
+    sampleNote.hidden = impact.cacheReadDrops <= recent.length;
+    setLocalizedText(sampleNote, "accounting.cacheImpact.bulletSample", {
+      shown: formatCount(recent.length), total: formatCount(impact.cacheReadDrops),
+    });
+  }
   const page = paginateCacheImpactRows(
     recent,
     cacheContinuityTablePagination,
@@ -8128,7 +9966,7 @@ function renderAccountingCacheContinuityDetails(impact) {
       "empty-cell",
       "accounting.cacheContinuity.detailsEmpty",
     );
-    cell.colSpan = 6;
+    cell.colSpan = 5;
     row.append(cell);
     rows.append(row);
     return;
@@ -8136,25 +9974,27 @@ function renderAccountingCacheContinuityDetails(impact) {
   for (const item of page.rows) {
     const row = node("tr");
     row.append(
-      rawNode("td", "", formatLocal(item.observedAt)),
-      rawNode("td", "numeric-cell", formatCacheContinuityGap(item.gapSeconds)),
-      rawNode(
-        "td",
+      cacheDropThreadCell("continuity", item),
+      cacheSwitchDataCell(
+        "numeric-cell", formatCacheContinuityGap(item.gapSeconds),
+        "accounting.cacheContinuity.column.gap",
+      ),
+      cacheSwitchDataCell(
         "cache-switch-change",
         cacheContinuityConfigurationDescription(item),
+        "accounting.cacheContinuity.column.configuration",
       ),
-      rawNode(
-        "td",
+      cacheSwitchDataCell(
         "numeric-cell",
         `${formatCount(item.previousCacheReadTokens)} → ${formatCount(item.currentCacheReadTokens)}`,
+        "accounting.cacheContinuity.column.cacheRead",
       ),
-      rawNode("td", "numeric-cell", formatCount(item.lostCacheTokens)),
-      rawNode(
-        "td",
+      cacheSwitchDataCell(
         "model-api-equivalent",
         item.estimatedPremiumUsd === null
           ? "—"
           : formatApiMoney(item.estimatedPremiumUsd),
+        "accounting.cacheContinuity.column.apiEquivalent",
       ),
     );
     rows.append(row);
@@ -8678,7 +10518,7 @@ function staleAccountingServePeriod(data) {
  * alert — the replaced red withheld-cache banner over-alarmed a routine
  * update recalculation.
  */
-function renderStaleServeNote(element, active) {
+function renderStaleServeNote(element, active, reason = null) {
   if (!element) return;
   if (!active) {
     element.hidden = true;
@@ -8688,9 +10528,13 @@ function renderStaleServeNote(element, active) {
   element.hidden = false;
   setLocalizedText(
     element,
-    accountingRebuildRetrying()
-      ? "accounting.staleServe.retrying"
-      : "accounting.staleServe.recalculating",
+    reason === "local_unified_index_schema_newer"
+      ? "accounting.staleServe.newerBuild"
+      : reason === "current_projection_unavailable"
+        ? "accounting.staleServe.lastVerified"
+        : accountingRebuildRetrying()
+          ? "accounting.staleServe.retrying"
+          : "accounting.staleServe.recalculating",
   );
 }
 
@@ -8705,7 +10549,8 @@ function renderAccountingRebuildDeferral(data, { staleServeShown = false } = {})
   // likewise not an empty view — its own label already folds the retry state
   // in — so the deferral banner stays down rather than doubling the message.
   const cacheMissing = data?.accounting?.accountingCacheStatus === "unavailable";
-  if (!persistent || !cacheMissing || staleServeShown) {
+  const terminalProjection = dashboardAccountingProjection(data).terminal === true;
+  if (!persistent || !cacheMissing || staleServeShown || terminalProjection) {
     element.hidden = true;
     setRawText(element, "");
     return;
@@ -8716,27 +10561,86 @@ function renderAccountingRebuildDeferral(data, { staleServeShown = false } = {})
   });
 }
 
+function accountingPriceHeadline(accounting) {
+  const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
+  const explanation = [t("accounting.apiEquivalent.explanation")];
+  if (weighted !== null) {
+    explanation.push(t("accounting.apiEquivalent.standardRateDetail", {
+      amount: formatApiMoney(accounting.apiPriceEquivalentUsd),
+    }));
+  }
+  return [
+    accounting.fastMode.metricShortLabel,
+    explanation.join(" "),
+    weighted === null ? "—" : formatApiMoney(weighted),
+    weighted === null
+      ? t("accounting.apiEquivalent.noWeightedUsage")
+      : accounting.periodLabel,
+  ];
+}
+
 function renderAccounting(data) {
   syncAccountingPeriodControls(data);
+  const projection = dashboardAccountingProjection(data);
   // The prior-version figures stand in only while the current channels are
   // genuinely empty: no current cache AND no events from any live source for
   // the selected period. The moment a current source serves (unified index or
   // a fresh cache), it wins and the stale label leaves this section.
   const livePeriod = accountingPeriod(data);
-  const staleRow = data?.accounting?.accountingCacheStatus === "unavailable"
-      && (livePeriod === null || livePeriod.events === 0)
+  const staleRow = projection.status !== "available"
+      && data?.accounting?.accountingCacheStatus === "unavailable"
+      && (livePeriod === null || finite(livePeriod.events, 0) === 0)
     ? staleAccountingServePeriod(data)
     : null;
-  renderStaleServeNote($("#accounting-stale-serve"), staleRow !== null);
+  const retainedEvidence = projection.status === "retained"
+    && ((staleRow !== null
+      && (finite(staleRow.events, 0) > 0
+        || finite(staleRow.totalTokens, 0) > 0
+        || finite(staleRow.apiPriceEquivalentUsd, 0) > 0))
+      || (livePeriod !== null
+        && (finite(livePeriod.events, 0) > 0
+          || finite(livePeriod.totalTokens, 0) > 0
+          || finite(livePeriod.apiPriceEquivalentUsd, 0) > 0)));
+  renderStaleServeNote(
+    $("#accounting-stale-serve"),
+    retainedEvidence,
+    projection.reason,
+  );
   renderAccountingRebuildDeferral(data, {
-    staleServeShown: staleRow !== null,
+    staleServeShown: retainedEvidence,
   });
   const accounting = livePeriod;
-  if (accounting === null) {
-    clear($("#accounting-summary"));
-    clear($("#accounting-component-counts"));
-    clear($("#accounting-component-costs"));
-    clear($("#accounting-models"));
+  if (accounting === null || (projection.status !== "available" && !retainedEvidence)) {
+    const summary = $("#accounting-summary");
+    clear(summary);
+    for (const [label, explanation] of [
+      [
+        t("accounting.projection.metricUnavailable"),
+        t(projectionUnavailableCopyKey(data)),
+      ],
+      ["Tokens", t(projectionUnavailableCopyKey(data))],
+    ]) {
+      const card = node("article", "metric-card compact-metric");
+      const metricLabel = node("span", "metric-name");
+      metricLabel.append(informationLabel(label, explanation));
+      card.append(
+        metricLabel,
+        node("strong", "metric-value", "—"),
+        node("p", "", t(projectionUnavailableCopyKey(data))),
+      );
+      summary.append(card);
+    }
+    renderAccountingComponentBars("#accounting-component-counts", [], {
+      emptyMessage: t("accounting.projection.componentsUnavailable"),
+      valueFor: () => 0,
+      displayValue: () => "—",
+    });
+    renderAccountingComponentBars("#accounting-component-costs", [], {
+      emptyMessage: t("accounting.projection.componentsUnavailable"),
+      valueFor: () => 0,
+      displayValue: () => "—",
+    });
+    renderAccountingModels(data.accounting, { unavailable: true });
     renderAccountingCacheSwitchDetails(null);
     renderAccountingCacheContinuityDetails(null);
     renderAccountingSideChatDetails(null);
@@ -8750,34 +10654,34 @@ function renderAccounting(data) {
   // reassurance rather than a number worth a card, and when it is not complete
   // the rows that lack a price are the useful thing to be standing next to.
   const fastMode = accounting.fastMode;
-  const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
   // Stale substitution serves the version-stable Standard-price scalar and
   // labels itself as previous-version output; quota weighting belongs to the
   // current pipeline and is not reconstructed from an old artifact.
-  const headlineRows = staleRow !== null
+  const headlineRows = projection.status === "retained"
     ? [
       [
         t("accounting.staleServe.metricLabel"),
         "A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.",
-        formatApiMoney(staleRow.apiPriceEquivalentUsd),
-        staleRow.periodLabel,
+        finite((staleRow ?? accounting).apiPriceEquivalentUsd, 0) > 0
+          ? formatApiMoney((staleRow ?? accounting).apiPriceEquivalentUsd)
+          : "—",
+        t("accounting.projection.lastVerifiedPeriod", {
+          period: (staleRow ?? accounting).periodLabel,
+        }),
       ],
       [
         "Tokens",
         "The tokens attached to those usage changes during the selected time period.",
-        compact(staleRow.totalTokens),
-        staleRow.periodLabel,
+        finite((staleRow ?? accounting).totalTokens, 0) > 0
+          ? compact((staleRow ?? accounting).totalTokens)
+          : "—",
+        t("accounting.projection.lastVerifiedPeriod", {
+          period: (staleRow ?? accounting).periodLabel,
+        }),
       ],
     ]
     : [
-      [
-        fastMode.metricShortLabel,
-        "A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.",
-        weighted === null ? "—" : formatApiMoney(weighted),
-        weighted === null
-          ? "No increment in this period could be weighted"
-          : `${formatApiMoney(accounting.apiPriceEquivalentUsd)} at Standard rates before Fast weighting`
-      ],
+      accountingPriceHeadline(accounting),
       [
         "Tokens",
         "The tokens attached to those usage changes during the selected time period.",
@@ -8796,15 +10700,34 @@ function renderAccounting(data) {
     );
     summary.append(card);
   }
+  // Speed-mode attribution disclosure. The former preference control is gone
+  // (the speed mode is Codex's own toggle), so the coverage split and the
+  // diagnostic inference verdict live directly beside the number they explain,
+  // together with any assumed-ratio share.
+  if (staleRow === null) {
+    const attributionNote = node("p", "annotation accounting-speed-coverage");
+    const sentences = [
+      fastModeCoverageSentence(fastMode),
+      fastModeInferenceSentence(fastMode),
+    ];
+    if (fastMode.assumedRatioStandardApiPriceEquivalentUsd > 0) {
+      sentences.push(t("accounting.fastMode.assumedRatio", {
+        amount: formatApiMoney(
+          fastMode.assumedRatioStandardApiPriceEquivalentUsd,
+        ),
+      }));
+    }
+    attributionNote.textContent = sentences.join(" ");
+    summary.append(attributionNote);
+  }
   const cacheSwitchImpact = accounting.cacheSwitchImpact;
-  const cacheSwitchCard = node("article", "metric-card compact-metric");
+  const cacheSwitchCard = node("article", "metric-card compact-metric cache-impact-card");
   const cacheSwitchLabel = node("span", "metric-name");
   cacheSwitchLabel.append(informationLabel(
     t("accounting.cacheSwitch.metricLabel"),
     t("accounting.cacheSwitch.metricExplanation"),
   ));
-  const cacheSwitchNote = node("p");
-  appendCacheSwitchMetricNote(cacheSwitchNote, cacheSwitchImpact);
+  const cacheSwitchNote = cacheImpactMetricBullets(cacheSwitchImpact, appendCacheSwitchMetricNote);
   cacheSwitchCard.append(
     cacheSwitchLabel,
     rawNode("strong", "metric-value", cacheSwitchMetricValue(cacheSwitchImpact)),
@@ -8813,23 +10736,19 @@ function renderAccounting(data) {
   summary.append(cacheSwitchCard);
 
   const cacheContinuityImpact = accounting.cacheContinuityImpact;
-  const cacheContinuityCard = node("article", "metric-card compact-metric");
+  const cacheContinuityCard = node("article", "metric-card compact-metric cache-impact-card");
   const cacheContinuityLabel = node("span", "metric-name");
   cacheContinuityLabel.append(informationLabel(
     t("accounting.cacheContinuity.metricLabel"),
     t("accounting.cacheContinuity.metricExplanation"),
   ));
-  const cacheContinuityNote = node("p");
-  appendCacheContinuityMetricNote(
-    cacheContinuityNote,
-    cacheContinuityImpact,
-  );
+  const cacheContinuityNote = cacheImpactMetricBullets(cacheContinuityImpact, appendCacheContinuityMetricNote);
   cacheContinuityCard.append(
     cacheContinuityLabel,
     rawNode(
       "strong",
       "metric-value",
-      cacheSwitchMetricValue(cacheContinuityImpact),
+      cacheContinuityMetricValue(cacheContinuityImpact),
     ),
     cacheContinuityNote,
   );
@@ -8869,7 +10788,9 @@ function renderAccounting(data) {
     .map(([key, tokens]) => ({ key, tokens }))
     .sort((left, right) => right.tokens - left.tokens);
   renderAccountingComponentBars("#accounting-component-counts", componentCountRows, {
-    emptyMessage: "No token-component accounting in this period.",
+    emptyMessage: projection.status === "retained" && staleRow !== null
+      ? t("accounting.projection.retainedComponents")
+      : "No token-component accounting in this period.",
     valueFor: (row) => row.tokens,
     displayValue: (row) => compact(row.tokens)
   });
@@ -8883,7 +10804,9 @@ function renderAccounting(data) {
     .filter((row) => row.tokens > 0 || row.costUsd > 0)
     .sort((left, right) => right.costUsd - left.costUsd || right.tokens - left.tokens);
   renderAccountingComponentBars("#accounting-component-costs", componentCostRows, {
-    emptyMessage: "No component costs were priced in this period.",
+    emptyMessage: projection.status === "retained" && staleRow !== null
+      ? t("accounting.projection.retainedComponents")
+      : "No component costs were priced in this period.",
     valueFor: (row) => row.costUsd,
     displayValue: (row) => row.costUsd > 0
       ? formatApiMoney(row.costUsd)
@@ -8891,7 +10814,9 @@ function renderAccounting(data) {
     titleFor: (row) => `${compact(row.tokens)} tokens`,
   });
 
-  renderAccountingModels(accounting);
+  renderAccountingModels(accounting, {
+    unavailable: projection.status === "retained" && staleRow !== null,
+  });
   renderAccountingCacheSwitchDetails(cacheSwitchImpact);
   renderAccountingCacheContinuityDetails(cacheContinuityImpact);
   renderAccountingSideChatDetails(sideChatEstimates);
@@ -8979,7 +10904,9 @@ function modelApiEquivalentCell(row) {
     // guessed one would be worse than none. Printing "$0.00" here read as a
     // priced zero, which is a different and untrue claim.
     setLocalizedText(cell, "accounting.model.notPricedUnknown");
-    cell.title = t("accounting.model.notPricedUnknownTitle");
+    cell.title = t(row.model === "unknown"
+      ? "accounting.model.identityUnavailableTitle"
+      : "accounting.model.notPricedUnknownTitle");
     return cell;
   }
   const amount = finite(row?.apiPriceEquivalentUsd);
@@ -9002,7 +10929,7 @@ function pricingCoverageNote(accounting) {
   const events = finite(accounting?.events, 0);
   if (events <= 0) return null;
   if (finite(accounting?.pricingCoverage?.unpricedEvents, 0) <= 0) {
-    return t("accounting.pricing.coverageReviewed");
+    return null;
   }
   const priced = finite(accounting?.pricingCoverage?.fullyPricedEvents, 0)
     + finite(accounting?.pricingCoverage?.partiallyPricedEvents, 0);
@@ -9081,7 +11008,9 @@ function modelComponentRow(model, key, labelKey, totals) {
         : model.pricingStatus === "known_unpriced"
           ? "accounting.model.noPublishedPriceTitle"
           : model.pricingStatus === "unrecognized"
-            ? "accounting.model.notPricedUnknownTitle"
+            ? model.model === "unknown"
+              ? "accounting.model.identityUnavailableTitle"
+              : "accounting.model.notPricedUnknownTitle"
             : "accounting.model.componentCostWithheldTitle",
     );
     costShareCell = localizedNode(
@@ -9107,7 +11036,7 @@ function modelComponentRow(model, key, labelKey, totals) {
   return row;
 }
 
-function renderAccountingModels(accounting) {
+function renderAccountingModels(accounting, { unavailable = false } = {}) {
   const models = $("#accounting-models");
   if (!models) return;
   clear(models);
@@ -9130,7 +11059,13 @@ function renderAccountingModels(accounting) {
   );
   if (!modelRows.length) {
     const row = node("tr");
-    const cell = localizedNode("td", "empty-cell", "accounting.model.noneInPeriod");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      unavailable
+        ? "accounting.model.unavailable"
+        : "accounting.model.noneInPeriod",
+    );
     cell.colSpan = 6;
     row.append(cell);
     models.append(row);
@@ -9147,9 +11082,21 @@ function renderAccountingModels(accounting) {
   for (const model of page.rows) {
     const row = node("tr");
     const identity = node("td", "model-identity");
-    // "Unrecognized model" now means exactly one thing: an identifier this
-    // build has never reviewed, so it is withheld rather than printed.
-    if (model.model === "unknown" || model.pricingStatus === "unrecognized") {
+    const presentation = modelUsagePresentation(
+      model.pricingStatus === "unrecognized" ? "unknown" : model.model,
+    );
+    const icon = modelThemeIcon(document, presentation.theme);
+    if (icon) {
+      icon.classList.add("model-usage-icon", presentation.className);
+      identity.append(icon);
+    }
+    // The unknown aggregate combines missing attribution and unreviewed
+    // identifiers. Its label must not claim either cause as established.
+    if (model.model === "unknown") {
+      const label = localizedNode("span", "", "accounting.model.identityUnavailable");
+      label.title = t("accounting.model.identityUnavailableTitle");
+      identity.append(label);
+    } else if (model.pricingStatus === "unrecognized") {
       identity.append(localizedNode("span", "", "accounting.model.unrecognized"));
     } else {
       // The wire identifier is what the provider reported and what any
@@ -9207,7 +11154,11 @@ function renderAccountingModels(accounting) {
             row.getAttribute("aria-expanded") === "true"
               ? "accounting.model.collapse"
               : "accounting.model.expand",
-            { model: formatModelName(model.model) },
+            { model: model.model === "unknown"
+              ? t("accounting.model.identityUnavailable")
+              : model.pricingStatus === "unrecognized"
+                ? t("accounting.model.unrecognized")
+                : formatModelName(model.model) },
           ),
         );
       };
@@ -9261,8 +11212,11 @@ function fastModeCoverageSentence(fastMode) {
     t("accounting.fastMode.observed", {
       count: compact(coverage.observedEvents),
     }),
+    t("accounting.fastMode.declaredFromConfig", {
+      count: compact(coverage.declaredFromConfigEvents),
+    }),
     t("accounting.fastMode.stated", {
-      count: compact(coverage.assumedFromPreferenceEvents),
+      count: compact(coverage.assumedEvents),
     }),
     t("accounting.fastMode.inferred", {
       count: compact(coverage.inferredEvents),
@@ -9307,56 +11261,6 @@ function fastModeInferenceSentence(fastMode) {
   });
 }
 
-function renderFastModePreference() {
-  const controls = $("#fast-mode-preference-controls");
-  const coverage = $("#fast-mode-coverage");
-  if (!controls || !coverage) return;
-  const accounting = dashboard === null ? null : accountingPeriod(dashboard);
-  const stated = fastModePreference?.mode
-    ?? accounting?.fastMode?.preference
-    ?? "standard";
-  for (const control of controls.querySelectorAll("[data-fast-mode]")) {
-    const active = control.dataset.fastMode === stated;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-    control.disabled = fastModePreferenceBusy;
-  }
-  if (accounting === null) {
-    setProductText(coverage, "Awaiting local evidence.");
-    return;
-  }
-  coverage.textContent = [
-    fastModeCoverageSentence(accounting.fastMode),
-    fastModeInferenceSentence(accounting.fastMode),
-  ].join(" ");
-}
-
-async function selectFastModePreference(mode) {
-  if (fastModePreferenceBusy) return;
-  const status = $("#fast-mode-preference-status");
-  fastModePreferenceBusy = true;
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Saving your Codex speed mode…";
-  renderFastModePreference();
-  try {
-    fastModePreference = await localClient.selectFastModePreference(mode);
-    status.textContent = fastModePreference.mode === "mixed_unknown"
-      ? "Saved. Increments with an observed tier keep it; the rest stay unknown unless residual inference can label their calibration window."
-      : `Saved. Increments with an observed tier keep it; the rest are now weighted as ${fastModePreference.mode === "fast" ? "Fast" : "Standard"}.`;
-    await refreshDashboardAfterFastModeChange();
-  } catch (error) {
-    await showFailure(status, {
-      surface: "fast_mode_preference",
-      error,
-      fallback:
-        "Your Codex speed mode could not be saved. Nothing was assumed; check the local companion and try again."
-    });
-  } finally {
-    fastModePreferenceBusy = false;
-    renderFastModePreference();
-  }
-}
 
 function renderContributionSyncStatus(status) {
   const value = status ?? {
@@ -9399,6 +11303,7 @@ function contributionServiceConfigured() {
  * guess here is exactly what produced "connecting fails anyway -> no send".
  */
 function communityUploadAuthorityEvidence() {
+  if (contributionDeviceDisconnectPaused()) return false;
   return communityDevicePaired
     || finite(contributionSyncStatus?.counts?.accepted, 0) > 0
     || Boolean(contributionSyncStatus?.lastAcceptedAt);
@@ -9413,6 +11318,7 @@ function communityUploadAuthorityEvidence() {
 // journey strip. It also gives the silent authorization repair its chance —
 // the repair is guarded to run at most once per page load.
 function renderContributionActionState() {
+  renderContributionDisconnect();
   renderIncrementalConsent();
   renderCommunityJourney();
   maybeRepairIncrementalAuthorization();
@@ -9706,6 +11612,8 @@ async function prepareIncrementalReviewInstance() {
 // Fixed sentences for the silent preparation's own failure codes. They speak
 // on the approve card, so each names the reader's actual next action there.
 const INCREMENTAL_PREPARATION_ERROR_COPY = {
+  identity_migration_required:
+    "Your existing local identity and history are unchanged. In TiboTattle, open Settings… → General and choose Review migration… under Secure upgrade when you’re ready. No upload occurred. Do not reset, delete, or rotate the identity.",
   identity_unavailable:
     "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then choose Check again. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
   coverage_unavailable:
@@ -9941,6 +11849,58 @@ async function copyContributionDiagnostics() {
   }
 }
 
+async function loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable }) {
+  const read = async (request, publish = () => {}) => {
+    const value = await Promise.resolve().then(request).catch(() => null);
+    if (isCurrent()) publish(value);
+    return value;
+  };
+  const health = read(() => localClient.health(), (localHealth) => {
+    // A failed read says nothing about the companion. Never replace a health
+    // answer that landed with one that did not.
+    if (localHealth === null) return;
+    localCompanionHealth = localHealth;
+    renderHostedIdentity();
+    if (!primaryAvailable && dashboard === null) {
+      renderDashboardUnavailableState("dashboard-unavailable");
+    }
+  });
+  const onboarding = read(() => localClient.onboarding(), (value) => {
+    if (value === null) return;
+    renderLocalOnboarding(value);
+    // Bootstrap may have finished before this verdict arrived. Electron's
+    // launch pass is gated on this readiness verdict, so retry it here before
+    // preserving the browser's return-visit cadence.
+    startElectronStartupRefresh();
+    scheduleReturningUserRefresh();
+  });
+  const refresh = read(() => localClient.refreshStatus(), (refreshState) => {
+    if (refreshState === null) return;
+    accountingRebuildDeferral =
+      refreshState?.refresh?.result?.accountingRebuildDeferred ?? null;
+    if (dashboard) renderAccounting(dashboard);
+  });
+  const status = read(
+    () => localClient.contributionSyncStatus(),
+    (value) => renderContributionSyncStatus(primaryAvailable ? value : null),
+  );
+  const preview = read(() => localClient.contributionSyncPreview());
+  const consentAndPreview = (async () => {
+    // These settled answers prevent duplicate recovery reads. Consent must
+    // still precede preview publication: an approved Mac must not re-prepare
+    // a review merely because its usage data was ready first.
+    await Promise.all([health, onboarding]);
+    if (!isCurrent()) return;
+    await loadIncrementalSyncStatus({ isCurrent });
+    if (!isCurrent()) return;
+    scheduleReturningUserRefresh();
+    const value = await preview;
+    if (!isCurrent()) return;
+    renderContributionSyncPreview(primaryAvailable ? value : null);
+  })();
+  await Promise.all([refresh, status, consentAndPreview]);
+}
+
 /** Mark the first real local-dashboard render for the native shell. */
 function markLocalDashboardReady() {
   // The native shell uses this app-owned marker instead of mistaking static
@@ -9951,24 +11911,29 @@ function markLocalDashboardReady() {
 }
 
 async function loadLocalDashboard() {
-  const previousBusy = localActionBusy;
+  const loadToken = ++cacheDropThreadLinks.loadToken;
+  const load = {
+    previousBusy: activeLocalDashboardLoad?.pending
+      ? activeLocalDashboardLoad.previousBusy
+      : localActionBusy,
+    pending: true,
+  };
+  activeLocalDashboardLoad = load;
+  const isCurrent = () => cacheDropThreadLinks.loadToken === loadToken;
+  let primaryAvailable = false;
   localActionBusy = true;
   const button = $("#refresh-button");
-  button.textContent = "Connecting…";
+  if (localRefreshInProgress) renderRefreshProgress(button, "Loading evidence…");
+  else button.textContent = "Connecting…";
   updateLocalActionButtons();
   try {
-    const syncState = (async () => {
-      const [preview, status] = await Promise.all([
-        localClient.contributionSyncPreview().catch(() => null),
-        localClient.contributionSyncStatus().catch(() => null)
-      ]);
-      return { preview, status };
-    })();
     const loadDashboardData = async () => {
       try {
         return await localClient.load();
       } catch (firstError) {
+        if (!isCurrent()) throw firstError;
         await new Promise((resolve) => window.setTimeout(resolve, 250));
+        if (!isCurrent()) throw firstError;
         try {
           return await localClient.load();
         } catch {
@@ -9976,67 +11941,50 @@ async function loadLocalDashboard() {
         }
       }
     };
-    const [data, sync, localHealth, onboarding, speedPreference, refreshState] = await Promise.all([
-      loadDashboardData(),
-      syncState,
-      localClient.health().catch(() => null),
-      localClient.onboarding().catch(() => null),
-      localClient.fastModePreference().catch(() => null),
-      localClient.refreshStatus().catch(() => null)
-    ]);
-    // A read that did not land says nothing about the companion, so it may not
-    // replace one that did: the same rule the accounting-rebuild note above
-    // follows. Only the unavailable-state decision below reads THIS load's
-    // answer, because that is the one it is reporting on.
-    if (localHealth !== null) localCompanionHealth = localHealth;
-    fastModePreference = speedPreference;
-    if (refreshState !== null) {
-      accountingRebuildDeferral =
-        refreshState?.refresh?.result?.accountingRebuildDeferred ?? null;
-    }
+    const data = await loadDashboardData();
+    if (!isCurrent()) return;
     renderDashboard(data);
-    // Health arrives after the first paint, and the sign-in controls are gated
-    // on a capability it carries. Without this re-render they keep the
-    // disabled state bootstrap gave them when the capability was still unknown.
-    renderHostedIdentity();
-    renderContributionSyncStatus(sync.status);
-    // Before the consent read, because that read now also recovers whichever
-    // companion answers are still unsettled — and an onboarding verdict this
-    // load already holds is not one of them.
-    renderLocalOnboarding(onboarding);
-    // Consent state is read from the companion before the queue renders, so
-    // an already-approved Mac never re-prepares a review instance it no
-    // longer needs.
-    await loadIncrementalSyncStatus();
-    renderContributionSyncPreview(sync.preview);
+    // Clear the first-run evidence curtain using the result we actually have,
+    // even while the next optional onboarding verdict is still pending.
+    renderLocalOnboarding(localOnboarding);
     markLocalDashboardReady();
+    primaryAvailable = true;
   } catch {
-    const [localHealth, onboarding] = await Promise.all([
-      localClient.health().catch(() => null),
-      localClient.onboarding().catch(() => null),
-    ]);
-    if (localHealth !== null) localCompanionHealth = localHealth;
+    if (!isCurrent()) return;
     dashboard = null;
-    renderHostedIdentity();
-    renderContributionSyncStatus(null);
-    renderLocalOnboarding(onboarding);
-    await loadIncrementalSyncStatus();
-    renderContributionSyncPreview(null);
+    renderLocalOnboarding(localOnboarding);
     renderDashboardUnavailableState(
-      localHealth ? "dashboard-unavailable" : "companion-unavailable",
+      localCompanionHealth ? "dashboard-unavailable" : "companion-unavailable",
     );
     markLocalDashboardReady();
   } finally {
-    localActionBusy = previousBusy;
-    updateLocalActionButtons();
+    if (activeLocalDashboardLoad === load) {
+      load.pending = false;
+      localActionBusy = load.previousBusy;
+      updateLocalActionButtons();
+      if (electronStartupRefreshDeferred) {
+        electronStartupRefreshDeferred = false;
+        startElectronStartupRefresh();
+      }
+    }
+  }
+  if (isCurrent()) {
+    // The dashboard has painted a real local result before the accountless
+    // preference is read. This ordering is also the authorization boundary for
+    // a notice receipt: unavailable/hidden startup never counts as displayed.
+    void loadElectronSharingPreference({ dashboardReady: primaryAvailable }).catch(() => {});
+    // Optional reads never own primary readiness or the action's busy state.
+    void loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable }).catch(() => {
+      if (isCurrent()) scheduleIncrementalSyncStatusPoll();
+    });
   }
 }
 
 // The "preparation identity" Keychain notice left with the prepare surface it
 // annotated (owner-directed, 2026-08-08). The one case that still matters —
 // the login Keychain is unreachable, so the silent review bootstrap will
-// fail — speaks through that bootstrap's own identity_unavailable sentence
-// on the approve card.
+// fail — speaks through that bootstrap's own identity_unavailable or
+// identity_migration_required sentence on the approve card.
 
 function renderDashboardSkeleton() {
   const container = $("#quota-cards");
@@ -10056,22 +12004,35 @@ function renderDashboardSkeleton() {
 }
 
 async function loadQuickResultDashboard() {
-  const data = await localClient.load();
-  renderDashboard(data);
-  if (localOnboarding) renderLocalOnboarding(localOnboarding);
+  const loadToken = ++cacheDropThreadLinks.loadToken;
+  const isCurrent = () => cacheDropThreadLinks.loadToken === loadToken;
+  try {
+    const data = await localClient.load();
+    if (!isCurrent()) return;
+    renderDashboard(data);
+    renderLocalOnboarding(localOnboarding);
+  } finally {
+    // This generation replaces any pending startup reads too. Keep optional
+    // recovery alive without making native evidence reloads wait for it.
+    if (isCurrent()) {
+      void loadLocalDashboardSecondaryState({
+        isCurrent,
+        primaryAvailable: dashboard !== null && dashboard.mode !== "demo",
+      }).catch(() => {
+        if (isCurrent()) scheduleIncrementalSyncStatusPoll();
+      });
+    }
+  }
 }
 
-/**
- * The accounting projection is derived from the stated speed mode, so the
- * overview is re-read after it changes. A failed re-read leaves the previous
- * numbers on screen rather than blanking them.
- */
-async function refreshDashboardAfterFastModeChange() {
-  try {
-    renderDashboard(await localClient.load());
-  } catch {
-    renderFastModePreference();
+function showDemoDashboard() {
+  cacheDropThreadLinks.loadToken += 1;
+  if (activeLocalDashboardLoad?.pending) {
+    localActionBusy = activeLocalDashboardLoad.previousBusy;
   }
+  activeLocalDashboardLoad = null;
+  renderDashboard(demoDashboard());
+  updateLocalActionButtons();
 }
 
 /**
@@ -10081,17 +12042,28 @@ async function refreshDashboardAfterFastModeChange() {
  */
 function historyIndexIncomplete() {
   if (!dashboard || dashboard.mode === "demo") return false;
+  return currentHistoryContinuationDecision().incomplete;
+}
+
+function currentHistoryContinuationDecision() {
   const history = dashboard?.pricing?.historyCoverage
     ?? dashboard?.accounting?.historyCoverage
     ?? null;
-  const indexed = finite(history?.indexedSourceCount, null);
-  const total = finite(history?.sourceCount, null);
-  if (history?.status === "complete") return false;
-  return indexed !== null && total !== null && total > 0 && indexed < total;
+  return historyIndexContinuationDecision({
+    history,
+    generation: dashboard?.accounting?.generation ?? null,
+    generationFingerprint:
+      dashboard?.accounting?.generationFingerprint ?? null,
+    previousReceipt: lastReindexProgressReceipt,
+  });
+}
+
+function historyProgressReceipt() {
+  return currentHistoryContinuationDecision().receipt;
 }
 
 /**
- * After a successful refresh that left the history index incomplete, run the
+ * After an explicit detailed refresh that left the history index incomplete, run the
  * next pass promptly instead of waiting for the sparse auto-cadence, bounded
  * by REINDEX_AUTO_CONTINUE_LIMIT. Stops the moment coverage completes, the
  * user interacts, or the bound is reached (the ordinary cadence then carries
@@ -10102,10 +12074,14 @@ function scheduleReindexAutoContinuation() {
     clearTimeout(reindexAutoContinueTimer);
     reindexAutoContinueTimer = null;
   }
-  if (!historyIndexIncomplete()) {
+  const decision = currentHistoryContinuationDecision();
+  if (!decision.incomplete) {
     reindexAutoContinuations = 0;
+    lastReindexProgressReceipt = null;
     return;
   }
+  if (!decision.shouldContinue) return;
+  lastReindexProgressReceipt = decision.receipt;
   if (reindexAutoContinuations >= REINDEX_AUTO_CONTINUE_LIMIT) return;
   reindexAutoContinueTimer = setTimeout(() => {
     reindexAutoContinueTimer = null;
@@ -10114,12 +12090,72 @@ function scheduleReindexAutoContinuation() {
       return;
     }
     reindexAutoContinuations += 1;
-    void requestRefresh({ autoContinue: true });
+    void requestRefresh({ autoContinue: true, detailed: true });
   }, REINDEX_AUTO_CONTINUE_DELAY_MS);
 }
 
-async function requestRefresh({ autoContinue = false } = {}) {
+/**
+ * Notify Electron main that a renderer-owned refresh has crossed its accepted
+ * POST boundary, or that the leased pass reached a terminal state. The
+ * renderer never waits indefinitely for cadence bookkeeping: a delayed start
+ * response is settled after the renderer finishes through the late-value
+ * callback below.
+ */
+function signalElectronRefreshLifecycle(action, args = [], options = {}) {
+  if (!runsInsideElectronDashboard()) return Promise.resolve(null);
+  const bridge = globalThis.tibotattleDesktop;
+  if (typeof bridge?.[action] !== "function" || !Array.isArray(args)) {
+    return Promise.resolve(null);
+  }
+  const onLateValue = typeof options?.onLateValue === "function"
+    ? options.onLateValue
+    : null;
+  let call;
+  try {
+    call = Promise.resolve(bridge[action](...args));
+  } catch {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    const reportLateValue = (value) => {
+      if (!onLateValue) return;
+      try {
+        onLateValue(value);
+      } catch {
+        // Cadence cleanup is best effort and must not affect the refresh.
+      }
+    };
+    const timer = setTimeout(() => {
+      settled = true;
+      timedOut = true;
+      resolve(null);
+    }, ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS);
+    call.then((value) => {
+      if (settled) {
+        if (timedOut) reportLateValue(value);
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    }, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(null);
+    });
+  });
+}
+
+async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   if (localActionBusy) return;
+  // Fence continuation against the exact coverage visible before this pass.
+  // If the terminal reload presents the same generation/count/byte receipt,
+  // scheduleReindexAutoContinuation stops immediately instead of spending the
+  // rest of its 40-pass budget on identical work.
+  lastReindexProgressReceipt = historyProgressReceipt();
   // A person pressing Refresh restarts the auto-continuation budget; a chained
   // reindex pass keeps counting toward the bound set when it began.
   if (!autoContinue) reindexAutoContinuations = 0;
@@ -10135,20 +12171,47 @@ async function requestRefresh({ autoContinue = false } = {}) {
     return;
   }
   const button = $("#refresh-button");
+  const electronRefresh = runsInsideElectronDashboard();
   let refreshAccepted = false;
   let cancelled = false;
   let quickResultLoaded = false;
   let continuationLimitReached = false;
+  let refreshStartSignal = Promise.resolve(null);
+  let lateRefreshLease = null;
+  let refreshLifecycleFinished = false;
+  const handleLateRefreshLease = (lease) => {
+    if (!Number.isSafeInteger(lease) || lease <= 0) return;
+    if (!refreshLifecycleFinished) {
+      lateRefreshLease = lease;
+      return;
+    }
+    // The renderer may finish while the main-process start reply is still
+    // crossing its bounded bridge timeout. Settle that late lease directly.
+    void signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+  };
   localActionBusy = true;
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = "Starting local analysis…";
+  renderRefreshProgress(button, detailed
+    ? "Starting detailed accounting…"
+    : "Starting local analysis…");
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
-    await localClient.refresh();
+    await (detailed
+      ? localClient.recalculateDetailedAccounting()
+      : localClient.refresh());
     refreshAccepted = true;
+    if (electronRefresh) {
+      // Do not delay status polling on cadence bookkeeping. A late lease is
+      // settled from the finally block or its callback above.
+      refreshStartSignal = signalElectronRefreshLifecycle(
+        "refreshStarted",
+        [],
+        { onLateValue: handleLateRefreshLease },
+      );
+    }
     let activePassStartedMs = Date.now();
     const pollingBudget = createRefreshPollingBudget();
     let consecutiveStatusFailures = 0;
@@ -10156,6 +12219,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
     let finalErrorCode = null;
     let finalFailedStep = null;
     let finalFailureCode = null;
+    let finalUnifiedIndex = null;
     let pollCount = 0;
     let timeoutSettlementNoted = false;
     while (pollingBudget.hasTime()
@@ -10168,7 +12232,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
         consecutiveStatusFailures = 0;
       } catch (error) {
         consecutiveStatusFailures += 1;
-        button.textContent = "Update running; reconnecting…";
+        renderRefreshProgress(button, "Update running; reconnecting…");
         if (consecutiveStatusFailures >= 8) throw error;
         continue;
       }
@@ -10177,13 +12241,19 @@ async function requestRefresh({ autoContinue = false } = {}) {
       finalErrorCode = refresh.errorCode ?? null;
       finalFailedStep = refresh.failedStep ?? finalFailedStep;
       finalFailureCode = refresh.failureCode ?? finalFailureCode;
+      finalUnifiedIndex = refresh.result?.unifiedIndex ?? finalUnifiedIndex;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
+      const collectorProgress = progress?.kind === undefined;
       const archiveScanning = progress?.kind === "archive_index";
+      const unifiedIndexScanning = progress?.kind === "unified_index"
+        && progress?.status === "scanning"
+        && progress?.phase === "rollout_index";
       if (archiveScanning && !archiveHistoryScanActive) {
         archiveHistoryScanActive = true;
         if (dashboard) renderPricing(dashboard);
       }
-      if (progress?.phase === "quick_result" && !quickResultLoaded) {
+      if (collectorProgress
+          && progress?.phase === "quick_result" && !quickResultLoaded) {
         try {
           await loadQuickResultDashboard();
           quickResultLoaded = true;
@@ -10196,24 +12266,34 @@ async function requestRefresh({ autoContinue = false } = {}) {
         0,
         Math.floor((Date.now() - activePassStartedMs) / 1_000),
       );
-      const elapsedLabel = elapsedSeconds >= 60
-        ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
-        : `${elapsedSeconds}s`;
-      const processed = Number.isSafeInteger(progress?.filesProcessed)
+      const accountingStatus = outcome === "running"
+        ? refreshAccountingStatus({ progress })
+        : null;
+      const countedProgress = collectorProgress || unifiedIndexScanning;
+      const processed = countedProgress
+          && Number.isSafeInteger(progress?.filesProcessed)
         ? progress.filesProcessed : null;
-      const selected = Number.isSafeInteger(progress?.filesSelected)
+      const selected = countedProgress
+          && Number.isSafeInteger(progress?.filesSelected)
         ? progress.filesSelected : null;
-      button.textContent = outcome === "cancelling"
+      const phase = outcome === "cancelling"
         ? "Stopping safely…"
+        : accountingStatus !== null
+          ? accountingStatus
         : archiveScanning
-          ? `Indexing archive history… ${elapsedLabel}`
-        : progress?.phase === "quick_result"
-          ? `Headline ready; finishing deeper accounting… ${elapsedLabel}`
+          ? "Indexing archive history…"
+        : collectorProgress && progress?.phase === "quick_result"
+          ? refreshQuickResultStatus({
+              dashboardLoaded: quickResultLoaded,
+            })
+        : unifiedIndexScanning && (selected === null || selected === 0)
+          ? "Scanning local history…"
         : processed !== null && selected !== null
         ? selected > 0 && processed >= selected
-          ? `Calculating usage and allowance… ${elapsedLabel}`
-          : `Analyzing ${processed}/${selected} files…`
-        : pollCount < 3 ? "Analyzing local evidence…" : `Analyzing… ${elapsedLabel}`;
+          ? "Calculating usage and allowance…"
+          : "Analyzing files…"
+        : pollCount < 3 ? "Analyzing local evidence…" : "Analyzing…";
+      renderRefreshProgress(button, phase, { processed, selected, elapsedSeconds });
       if (refreshNeedsContinuation({
         outcome,
         errorCode: refresh.errorCode,
@@ -10224,11 +12304,13 @@ async function requestRefresh({ autoContinue = false } = {}) {
           throw new Error("The bounded continuation limit was reached.");
         }
         try {
-          await localClient.refresh();
+          await (detailed
+            ? localClient.recalculateDetailedAccounting()
+            : localClient.refresh());
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
-          button.textContent = "Continuing local analysis…";
+          renderRefreshProgress(button, "Continuing local analysis…");
         } catch (error) {
           // A 409 means a timed-out pass is still finishing its durable
           // checkpoint. Keep polling until it becomes resumable.
@@ -10243,7 +12325,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
       }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        button.textContent = "Finalizing bounded pause…";
+        renderRefreshProgress(button, "Finalizing bounded pause…");
         if (!timeoutSettlementNoted) {
           pollingBudget.noteSettling();
           timeoutSettlementNoted = true;
@@ -10253,7 +12335,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
     }
     cancelled = outcome === "cancelled";
     if (cancelled) {
-      button.textContent = "Loading saved results…";
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "Local analysis cancelled",
@@ -10264,12 +12346,48 @@ async function requestRefresh({ autoContinue = false } = {}) {
     }
     if (outcome === "failed"
         && finalErrorCode === "refresh_resource_limited") {
-      button.textContent = "Loading saved results…";
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "This scan paused to protect your Mac",
         copy: "Your last verified results are still shown. This unusually large history reached TiboTattle’s fixed local safety limit, so it paused before exceeding it. No partial result replaced your existing results, and nothing left this Mac.",
         kind: "warning",
+      });
+      return;
+    }
+    if (outcome === "degraded") {
+      renderRefreshProgress(button, t("refresh.degradedLoading"));
+      await loadLocalDashboard();
+      lastReindexProgressReceipt = historyProgressReceipt();
+      const history = dashboard?.pricing?.historyCoverage
+        ?? dashboard?.accounting?.historyCoverage
+        ?? null;
+      const skipped = finite(
+        finalUnifiedIndex?.generation?.skippedSourceCount,
+        0,
+      );
+      const threads = finite(
+        finalUnifiedIndex?.generation?.skippedThreadCount,
+        0,
+      );
+      showConnectionNotice({
+        title: t("refresh.degradedTitle"),
+        copy: skipped > 0
+          ? t("refresh.degradedCopy", {
+            sources: tPlural("format.rolloutSourceCount", skipped, {
+              count: formatNumber(skipped),
+            }),
+            threads: tPlural("format.affectedThreadCount", threads, {
+              count: formatNumber(threads),
+            }),
+          })
+          : t("refresh.degradedGenericCopy", {
+            code: finalFailureCode ?? "unified_index",
+          }),
+        kind: historyCoverageNoticeKind({
+          history,
+          accountingProjection: dashboard?.accounting?.projection,
+        }),
       });
       return;
     }
@@ -10287,14 +12405,25 @@ async function requestRefresh({ autoContinue = false } = {}) {
       throw failure;
     }
     archiveHistoryScanActive = false;
-    button.textContent = "Loading updated evidence…";
+    renderRefreshProgress(button, "Loading updated evidence…");
     await loadLocalDashboard();
-    scheduleReindexAutoContinuation();
+    if (detailed) scheduleReindexAutoContinuation();
   } catch (error) {
     if (dashboard) {
       setGlobalState(dashboard.state, {
         companionReachable: dashboard.mode !== "demo",
       });
+    }
+    if (!refreshAccepted && error?.status === 409) {
+      // Another surface owns the shared controller. In particular, a quick
+      // run is not proof that this request's detailed work was accepted. Do
+      // not enqueue an escalation or turn a safe conflict into a failure.
+      showConnectionNotice({
+        title: t("refresh.alreadyRunningTitle"),
+        copy: t("refresh.alreadyRunningCopy"),
+        kind: "info",
+      });
+      return;
     }
     // This was a bare `catch {}`: it printed one of three sentences for every
     // possible cause and discarded the only evidence of which one occurred.
@@ -10327,6 +12456,14 @@ async function requestRefresh({ autoContinue = false } = {}) {
       showDemo: !dashboard
     });
   } finally {
+    if (electronRefresh && refreshAccepted) {
+      let lease = await refreshStartSignal;
+      if (!Number.isSafeInteger(lease) || lease <= 0) lease = lateRefreshLease;
+      if (Number.isSafeInteger(lease) && lease > 0) {
+        await signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+      }
+      refreshLifecycleFinished = true;
+    }
     const wasArchiveScanning = archiveHistoryScanActive;
     archiveHistoryScanActive = false;
     if (wasArchiveScanning && dashboard) renderPricing(dashboard);
@@ -10412,6 +12549,71 @@ async function reloadLocalEvidenceAfterNativeRefresh() {
   }
 }
 
+/**
+ * Start Electron's one launch-time refresh after the local onboarding verdict
+ * is available. The qualified smoke preload may hold this call behind its
+ * CDP observation barrier; ordinary Electron renderers have no such bridge.
+ */
+function startElectronStartupRefresh() {
+  if (electronStartupRefreshTriggered
+      || !runsInsideElectronDashboard()
+      || !localAnalysisAllowed()) {
+    return false;
+  }
+  electronStartupRefreshTriggered = true;
+  // The companion's launch snapshot intentionally defers the unified history
+  // projection. A cold install therefore needs one detailed pass before the
+  // dashboard can claim retained history or accounting. Once a validated
+  // detailed projection is already present, the normal startup observation is
+  // the cheaper quick pass and the Electron controller owns later cadence.
+  const projection = dashboard?.accounting?.projection;
+  const startupRefreshOptions = projection?.status === "available"
+    && projection.reason === null
+    && projection.terminal === false
+    ? {}
+    : { detailed: true };
+  const runStartupRefresh = () => {
+    if (localActionBusy) {
+      // Only the bootstrap owner is guaranteed to call us again after it
+      // clears its lock. Preserve the established one-shot suppression for
+      // every other busy owner rather than leaving a deferred launch stuck.
+      if (activeLocalDashboardLoad?.pending) {
+        electronStartupRefreshTriggered = false;
+        electronStartupRefreshDeferred = true;
+      }
+      return;
+    }
+    void requestRefresh(startupRefreshOptions);
+  };
+  const macSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
+  const windowsSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
+  // A mixed or stale preload must not choose one platform barrier silently.
+  const smokeBridge = macSmokeBridge !== undefined
+    && windowsSmokeBridge !== undefined
+    ? null
+    : windowsSmokeBridge !== undefined
+      ? windowsSmokeBridge
+      : macSmokeBridge;
+  if (smokeBridge !== undefined) {
+    if (smokeBridge === null
+        || smokeBridge.version !== "v1"
+        || typeof smokeBridge.waitForStartupRefresh !== "function") {
+      return true;
+    }
+    let gate;
+    try {
+      gate = smokeBridge.waitForStartupRefresh();
+    } catch {
+      return true;
+    }
+    if (!gate || typeof gate.then !== "function") return true;
+    void Promise.resolve(gate).then(runStartupRefresh).catch(() => {});
+    return true;
+  }
+  runStartupRefresh();
+  return true;
+}
+
 function scheduleReturningUserRefresh() {
   // The native macOS shell owns the foreground cadence. Running both the web
   // return-visit timer and the native timer races the same bounded companion
@@ -10419,15 +12621,19 @@ function scheduleReturningUserRefresh() {
   // What the shell owes in return is a signal when its refresh finished, which
   // `tibotattle:local-evidence-updated` carries.
   if (runsInsideNativeDashboard()) return;
+  if (runsInsideElectronDashboard()
+      && (electronStartupRefreshTriggered || electronStartupRefreshDeferred)) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
       dashboard?.activity?.lastScanAt
       || dashboard?.collector?.lastScanAt
       || dashboard?.freshness?.latestObservedAt
     );
+  const terminalHistoryGap = currentHistoryContinuationDecision().terminalGap;
   if (returnRefreshScheduled
       || !priorEvidence
       || !localAnalysisAllowed()
+      || terminalHistoryGap
       || localRefreshInProgress) {
     return;
   }
@@ -10447,6 +12653,23 @@ function scheduleReturningUserRefresh() {
     });
     void requestRefresh();
   }, 750);
+}
+
+/**
+ * Consume only the closed automatic refresh mode sent by the Electron main
+ * process. Manual dashboard controls continue to request detailed accounting;
+ * this event keeps the host-owned foreground cadence explicit in the page.
+ */
+function handleElectronAutomaticRefresh(event) {
+  const detail = event?.detail;
+  if (detail === null
+      || typeof detail !== "object"
+      || Array.isArray(detail)
+      || Object.getPrototypeOf(detail) !== Object.prototype
+      || Reflect.ownKeys(detail).length !== 1
+      || !Object.hasOwn(detail, "mode")
+      || (detail.mode !== "quick" && detail.mode !== "detailed")) return;
+  void requestRefresh({ detailed: detail.mode === "detailed" });
 }
 
 const HOSTED_IDENTITY_ERROR_COPY = {
@@ -10484,7 +12707,7 @@ const CONTRIBUTION_DEVICE_CONFLICT_COPY =
 // situation: nothing here is leftover, broken, or in need of clearing. The
 // sentence must say what is true (uploads are paused) and name the one action
 // that changes it (unlock), because the recovery copy above would send the
-// user to a destructive reset for a condition their login password fixes.
+// user to a destructive reset while the intact credential is unavailable.
 const CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY =
   "Your Mac's login keychain is locked, so TiboTattle cannot reach this Mac's upload credential. Nothing is wrong with the credential and nothing was uploaded — uploads stay paused until you unlock it. Open Keychain Access, unlock the login keychain, then try again. Do not reset or delete the entry.";
 
@@ -10525,8 +12748,6 @@ const SERVICE_ERROR_COPY = {
     "The contribution service is not accepting new participants right now. Nothing was uploaded, and local reporting is unaffected.",
   CONTRIBUTION_LIMIT_REACHED:
     "This participant has used its community batch allowance for the current window. Nothing was uploaded; the allowance renews on its fixed schedule.",
-  CONTRIBUTION_DELETE_CONFLICT:
-    "A deletion for this contribution is already in progress. Wait for it to finish, then check the history again.",
   PARTICIPANT_DELETING:
     "A deletion is still running for this participant. Wait for it to finish, then try again. Nothing was uploaded.",
   DEVICE_AUTH_INVALID:
@@ -10589,8 +12810,9 @@ const SERVICE_ERROR_COPY = {
     "The contribution service has no usable upload key configured, so it cannot accept encrypted evidence. Nothing was uploaded; try again later.",
   KEY_ID_INVALID:
     "The upload key this build used is not one the contribution service recognizes. Nothing was uploaded; install the current signed build.",
-  LIFECYCLE_BOUNDS_EXCEEDED:
-    "This account already has its maximum of connected Macs, so this Mac was not connected. Sign out a Mac you no longer use from its own TiboTattle, then connect this one again. Nothing was uploaded.",
+  get LIFECYCLE_BOUNDS_EXCEEDED() {
+    return t("contribution.deviceLimit");
+  },
   LIFECYCLE_STATE_CONFLICT:
     "The contribution service is in a different state than this page expected. Nothing was uploaded; reload TiboTattle and try again.",
   TELEMETRY_REQUIRED:
@@ -10631,11 +12853,13 @@ const LOCAL_COMPANION_ERROR_COPY = {
   contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_keychain_access_denied:
-    "macOS did not let TiboTattle read the upload credential it just stored for this Mac — this happens when Deny is chosen in the macOS keychain dialog. Nothing was uploaded. Clear the credential below, choose Review and approve again, and choose Always Allow when macOS asks.",
+    "Uploads are paused because TiboTattle could not access this Mac's upload credential. The existing credential and local history are unchanged. Nothing was uploaded. You can try again later.",
   // Locked is NOT a defect and must never read like one: the credential and
   // its local record are both intact and become readable the moment the
   // keychain is unlocked. Uploads pause; nothing needs clearing or re-pairing.
   contribution_device_keychain_locked: CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY,
+  contribution_device_keychain_migration_required:
+    "This Mac's existing upload credential and local history are unchanged. In TiboTattle, open Settings… → General and choose Review migration… under Secure upgrade when you’re ready. Nothing was uploaded. Do not reset or delete the credential.",
   unsupported_media_type:
     "The local companion rejected this request format. Nothing was uploaded; reload TiboTattle and try again.",
   request_too_large:
@@ -10654,12 +12878,6 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "The local companion could not complete the contribution pass. Anything not accepted stays queued locally.",
   refresh_in_progress:
     "A local analysis is already running. Wait for it to finish before starting another.",
-  fast_mode_preference_unavailable:
-    "The local companion could not read or write your Codex speed mode. No mode was assumed and the accounting is unchanged.",
-  fast_mode_preference_invalid:
-    "That Codex speed mode is not one this build accepts. Nothing was stored.",
-  fast_mode_preference_not_authorized:
-    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was stored.",
   // Codes the local app can return that previously had no sentence here.
   // Everything below describes this Mac, so none of it sends the reader
   // looking at the network or at the contribution service.
@@ -10710,24 +12928,12 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "TiboTattle refused to disconnect this Mac because the request did not come from the local dashboard. This Mac is unchanged.",
   contribution_device_disconnect_not_configured:
     "This build has no contribution service configured, so there is no device to disconnect. Local reporting is unaffected.",
-  contribution_device_disconnect_failed:
-    "This Mac could not be disconnected. It may still be able to upload; try again, or reopen TiboTattle first.",
-  contribution_device_disconnect_cleanup_pending:
-    "This Mac stopped uploading, but clearing its local credential has not finished. Reopen TiboTattle and check again.",
-  automatic_contribution_not_authorized:
-    "TiboTattle refused this automatic contribution change because it did not come from the local dashboard. Nothing was changed.",
-  automatic_contribution_not_configured:
-    "This build has no automatic contribution to configure. Local reporting is unaffected.",
-  automatic_contribution_first_review_required:
-    "Automatic contribution cannot start until you have reviewed and sent one contribution by hand. Nothing was uploaded.",
-  automatic_contribution_consent_binding_mismatch:
-    "The stored automatic contribution consent no longer matches this build, so nothing runs automatically. Nothing was uploaded; consent again to resume.",
-  automatic_contribution_settings_unavailable:
-    "TiboTattle could not read the automatic contribution setting. Nothing runs automatically until it can, and nothing was uploaded.",
-  automatic_contribution_bootstrap_persist_failed:
-    "TiboTattle could not store the automatic contribution setting, so it stays off. Nothing was uploaded.",
-  automatic_contribution_lock_release_failed:
-    "A background contribution pass did not release its lock cleanly. Reopen TiboTattle before trying again; nothing was uploaded.",
+  get contribution_device_disconnect_failed() {
+    return t("contribution.disconnect.failed");
+  },
+  get contribution_device_disconnect_cleanup_pending() {
+    return t("contribution.disconnect.cleanupPending");
+  },
   loopback_required:
     "This request has to come from the local dashboard on this Mac. Nothing was changed. Open TiboTattle and try again.",
   host_not_allowed:
@@ -10776,6 +12982,19 @@ const LOCAL_COMPANION_ERROR_COPY = {
   central_participant_method_not_allowed:
     "The local relay does not forward that participant action. Nothing was uploaded; install the current signed build."
 };
+
+const LOCALIZED_KEYCHAIN_RECOVERY_CODES = new Set([
+  "identity_migration_required",
+  "contribution_device_keychain_migration_required",
+  "contribution_device_keychain_access_denied",
+]);
+
+function localizedKeychainRecoveryExplanation(explanation, code) {
+  return LOCALIZED_KEYCHAIN_RECOVERY_CODES.has(code)
+    && typeof explanation === "string"
+    ? localization.translateText(explanation)
+    : explanation;
+}
 
 /**
  * Turn one failure into honest copy plus a quotable reference.
@@ -10831,10 +13050,17 @@ async function describeFailure({ surface, error, messages = {}, fallback }) {
       `Diagnostic note ${reference} was refused by the local companion.`
     );
   }
-  const explanation = fixedCopy(messages, code)
+  const fixedExplanation = fixedCopy(messages, code)
     ?? fixedCopy(SERVICE_ERROR_COPY, code)
-    ?? fixedCopy(LOCAL_COMPANION_ERROR_COPY, code)
-    ?? fallback;
+    ?? fixedCopy(LOCAL_COMPANION_ERROR_COPY, code);
+  // These fixed Keychain sentences explain a pause or native recovery.
+  // Translate the product-owned sentence before the diagnostic reference is added;
+  // translating the combined text would miss the exact catalog entry. No raw
+  // error, reference, request ID, or unrelated failure passes through here.
+  const explanation = localizedKeychainRecoveryExplanation(
+    fixedExplanation,
+    code,
+  ) ?? fallback;
   const trailer = diagnosticReferenceSentence({
     reference,
     requestId,
@@ -10981,11 +13207,9 @@ function renderHostedIdentity() {
   if (provider !== null) {
     $("#identity-account-mark").setAttribute("href", provider.mark);
   }
-  setProductText(
+  setLocalizedText(
     $("#identity-account-detail"),
-    provider !== null
-      ? "Signing out ends this app's contribution session."
-      : "This app already has a contribution session. Signing out ends it.",
+    "contribution.signOutDetail",
   );
   // One honest, five-state identity status (owner-reported contradictions,
   // 2026-08-08/10). A single flat "Signed in"/"Not signed in" chip could not
@@ -11001,7 +13225,8 @@ function renderHostedIdentity() {
       || pendingHostedSignInResumeInFlight,
     signedIn,
     hasServerSession,
-    repairPending: incrementalConsentApproved && incrementalUploadAuthorityLost(),
+    repairPending: incrementalConsentApproved && incrementalUploadAuthorityLost()
+      && !contributionDisconnectBlocksRepair(),
   });
   setLocalizedText(chip, IDENTITY_STATE_CHIP_KEYS[identityState]);
   chip.className = identityState === "connected"
@@ -11147,6 +13372,15 @@ function isTransientSignInRelayError(error) {
 function runsInsideNativeDashboard() {
   return document.documentElement.classList.contains("native-dashboard")
     || document.body?.classList.contains("native-dashboard");
+}
+
+// Electron's preload stamps this marker before the dashboard module runs. It
+// is separate from the native macOS marker because Electron's main process
+// owns refresh cadence and the browser/native return scheduler must stand down
+// for it as well.
+function runsInsideElectronDashboard() {
+  return document.documentElement.classList.contains("electron-dashboard")
+    || document.body?.classList.contains("electron-dashboard");
 }
 
 function openHostedSignInInBrowser(authorizeUrl) {
@@ -11644,6 +13878,10 @@ function renderCommunityJourney() {
       : "journey.community.noHealthAnswer");
   } else if (!contributionServiceConfigured()) {
     stage("community", "waiting", "journey.community.noService");
+  } else if (contributionDeviceDisconnectPaused()) {
+    stage("community", "waiting", contributionDisconnectOutcome === "cleanup_pending"
+      ? "contribution.disconnect.cleanupPending"
+      : "contribution.disconnect.paused");
   } else if (!incrementalSyncCapabilityAdvertised()) {
     // Here the index IS the blocker and the line may say so: the companion
     // answered, reports a contribution service, and derives this flag from
@@ -11656,6 +13894,8 @@ function renderCommunityJourney() {
     } else {
       stage("community", "waiting", "journey.community.waitingIndex");
     }
+  } else if (incrementalConsentApproved && incrementalSyncStatus?.pausedReason === "device_repair_required") {
+    stage("community", "action", "consent.repairConnection");
   } else if (incrementalConsentApproved && incrementalUploadAuthorityLost()) {
     // The transparent re-pair is pending, so this stage must not claim
     // "done · syncing" while the approve card is asking for a sign-in
@@ -11684,6 +13924,164 @@ function renderCommunityJourney() {
 // that transport exists the surface stays out of the document entirely, so
 // the page never claims an automatic upload that cannot happen.
 const INCREMENTAL_SYNC_CONTRACT = "telemetry-contribution-v1.0";
+
+function attributionContributionSelected() {
+  return incrementalSyncStatus?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+}
+
+function renderAttributionContribution() {
+  const surface = $("#attribution-consent");
+  if (!surface) return;
+  const selected = attributionContributionSelected();
+  const approved = selected && incrementalSyncStatus?.consent?.approved === true
+    && incrementalSyncStatus.consent.current === true;
+  surface.hidden = !selected && incrementalSyncStatus?.attributionUpgradeAvailable !== true;
+  if (surface.hidden) return;
+  const busy = attributionContributionBusy || incrementalConsentBusy || communityConnectBusy
+    || contributionDisconnectBusy || contributionDisconnectDialogOpen();
+  const repair = incrementalUploadAuthorityLost() || contributionDeviceDisconnectPaused();
+  const repairRequired = approved && incrementalSyncStatus?.pausedReason === "device_repair_required";
+  const button = $("#attribution-review-open");
+  button.hidden = approved && !repair;
+  button.disabled = busy || contributionDisconnectOutcome === "cleanup_pending";
+  setLocalizedText(button, repairRequired ? "consent.repairConnection" : "attributionConsent.review");
+  setLocalizedText($("#attribution-consent-description"), repairRequired
+    ? "consent.repairRequired" : approved ? "attributionConsent.approved" : "attributionConsent.description");
+  const review = attributionContributionReview;
+  const details = $("#attribution-review");
+  details.hidden = review === null;
+  if (review !== null) {
+    setLocalizedText($("#attribution-review-destination"), "attributionConsent.destination", {
+      destination: review.consent.destinationOrigin,
+    });
+    setRawText($("#attribution-review-contract"), [review.consent.telemetrySchemaVersion,
+      review.consent.fieldDictionaryVersion, review.consent.privacyContractVersion].join(" · "));
+    setLocalizedText($("#attribution-review-sample"), "attributionConsent.sample", {
+      day: review.sample.day, usage: formatNumber(review.sample.recordCounts.usage),
+      quota: formatNumber(review.sample.recordCounts.quota), sessions: formatNumber(review.sample.recordCounts.session),
+    });
+    const inventory = $("#attribution-review-inventory");
+    inventory.replaceChildren();
+    for (const [stream, fields] of Object.entries(review.inventory.fields)) {
+      const row = document.createElement("div");
+      const label = document.createElement("dt");
+      label.textContent = t(`attributionConsent.fields.${stream}`);
+      const values = document.createElement("dd");
+      values.textContent = fields.join(", ");
+      row.append(label, values);
+      inventory.append(row);
+    }
+    setLocalizedText($("#attribution-review-bases"), "attributionConsent.bases", {
+      accounts: review.inventory.accountBases.join(", "), plans: review.inventory.planBases.join(", "),
+      nullable: review.inventory.nullableQuotaMeasurements.join(", "),
+    });
+  }
+  $("#attribution-consent-confirm").disabled = busy;
+  $("#attribution-consent-approve").disabled = busy || review === null
+    || !$("#attribution-consent-confirm").checked || hostedSignInRequired();
+  $("#attribution-review-cancel").disabled = busy;
+  const note = $("#attribution-consent-status");
+  const key = attributionContributionNotice ?? (review && hostedSignInRequired() ? "consent.signInFirst" : null);
+  note.hidden = key === null;
+  if (key !== null) setLocalizedText(note, key);
+}
+
+async function ensureAttributionHostedSession() {
+  if (hostedIdentity !== null) {
+    const enrollment = await communityClient.enroll(null, "telemetry-contribution-v0.1", {
+      deviceBootstrap: false, identity: hostedIdentity,
+    });
+    if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1" || typeof enrollment.csrfToken !== "string") {
+      throw new Error("Hosted session is unavailable.");
+    }
+    setCommunitySession({ csrfToken: enrollment.csrfToken, participantId: enrollment.participantId ?? null,
+      consentVersion: "privacy-safe-telemetry-v0.1" });
+    await clearPendingHostedSignIn().catch(() => {});
+    hostedIdentity = null;
+    communitySessionMintedAt = Date.now();
+  }
+  if (!hasCommunitySession()) throw new Error("Hosted sign-in is required.");
+}
+
+async function openAttributionContributionReview() {
+  if (attributionContributionBusy || incrementalConsentBusy || communityConnectBusy
+      || contributionDisconnectBusy || contributionDisconnectDialogOpen()) return;
+  if (!attributionContributionSelected() && incrementalSyncStatus?.attributionUpgradeAvailable !== true) return;
+  const repairNeeded = ["device_unavailable", "device_repair_required"].includes(incrementalSyncStatus?.pausedReason)
+    || contributionDeviceDisconnectPaused();
+  if (!attributionContributionSelected() && repairNeeded) {
+    // The existing-format repair may resume an upload immediately. Keep it
+    // separate from new-format review instead of racing that credential use.
+    attributionContributionNotice = "attributionConsent.repairBeforeReview";
+    renderAttributionContribution();
+    return;
+  }
+  const repairing = attributionContributionSelected() && repairNeeded;
+  const alreadyApproved = attributionContributionSelected() && incrementalSyncStatus?.consent?.approved === true
+    && incrementalSyncStatus.consent.current === true;
+  attributionContributionBusy = true;
+  attributionContributionReview = null;
+  attributionContributionNotice = repairing ? "consent.syncRefreshingAuthority" : "attributionConsent.reviewing";
+  $("#attribution-consent-confirm").checked = false;
+  renderAttributionContribution();
+  try {
+    if (repairing) {
+      // Clear the repair pause first. Only current exact successor consent
+      // can resume an upload; stale consent still needs the fresh review.
+      await ensureAttributionHostedSession();
+      const pairing = await mintDevicePairingWithCookieCommitRetry();
+      await localClient.pairContributionDevice(pairing.pairingCode);
+      contributionDisconnectOutcome = null;
+      if (alreadyApproved) {
+        await loadIncrementalSyncStatus().catch(() => {});
+        scheduleIncrementalSyncStatusPoll({ reset: true });
+        attributionContributionNotice = "consent.authorityRefreshed";
+        return;
+      }
+    }
+    attributionContributionReview = await localClient.reviewAttributionContribution();
+    attributionContributionNotice = null;
+    $("#attribution-review").hidden = false;
+    $("#attribution-review-title").focus();
+  } catch {
+    attributionContributionNotice = repairing ? "consent.repairIncomplete" : "attributionConsent.reviewUnavailable";
+  } finally {
+    attributionContributionBusy = false;
+    renderAttributionContribution();
+  }
+}
+
+async function approveAttributionContribution() {
+  const review = attributionContributionReview;
+  if (review === null || attributionContributionBusy || incrementalConsentBusy || communityConnectBusy
+      || contributionDisconnectBusy || contributionDisconnectDialogOpen()
+      || !$("#attribution-consent-confirm").checked || hostedSignInRequired()) return;
+  attributionContributionBusy = true;
+  attributionContributionNotice = "attributionConsent.approving";
+  renderAttributionContribution();
+  try {
+    await ensureAttributionHostedSession();
+    // Distinct authority: this call carries the hosted session + CSRF, never
+    // the upload device credential. The local approval verifies the grant.
+    await communityClient.grantAttributionContribution(review);
+    const result = await localClient.approveAttributionContribution(review);
+    if (result?.status !== "approved" || result.contractVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+      throw new Error("Attribution approval did not finish.");
+    }
+    attributionContributionReview = null;
+    attributionContributionNotice = "attributionConsent.approved";
+    await loadIncrementalSyncStatus();
+    scheduleIncrementalSyncStatusPoll({ reset: true });
+  } catch {
+    // A grant may have landed while local approval lost its response. Never
+    // claim no hosted change, auto-approve, or fall back to the older format.
+    attributionContributionReview = null;
+    attributionContributionNotice = "attributionConsent.approvalIncomplete";
+  } finally {
+    attributionContributionBusy = false;
+    renderContributionActionState();
+  }
+}
 
 function incrementalSyncCapabilityAdvertised() {
   return localCompanionHealth?.capabilities?.incrementalContributionSync
@@ -11740,18 +14138,19 @@ function incrementalGrantRejected() {
 
 /**
  * Whether this Mac's upload authority is lost and only the connect ceremony
- * can restore it. Two paused reasons qualify: consent_rejected (the service
+ * can restore it. Paused reasons include consent_rejected (the service
  * refused the grant) and device_unavailable (no readable device credential —
  * after a credential reset or a broken Keychain binding). Gating repair on
  * consent_rejected alone was a designed-in deadlock: with no credential,
  * every pass dies at device_unavailable before any upload can be refused,
  * so the only state that re-opened the ceremony was unreachable from the
- * state that needed it.
+ * state that needed it. An uncertain credential rotation is separately
+ * device_repair_required: only an explicit repair may resume that pause.
  */
 function incrementalUploadAuthorityLost() {
   return incrementalGrantRejected()
     || (incrementalSyncStatus?.status === "available"
-      && incrementalSyncStatus.pausedReason === "device_unavailable");
+      && ["device_unavailable", "device_repair_required"].includes(incrementalSyncStatus.pausedReason));
 }
 
 /**
@@ -11773,13 +14172,17 @@ function renderIncrementalConsent() {
   const gate = $("#incremental-consent-gate");
   const chip = $("#incremental-consent-state");
   const reviewVerified = contributionSyncExactReview?.state === "ready";
-  const busy = incrementalConsentBusy || communityConnectBusy;
+  const busy = incrementalConsentBusy || communityConnectBusy
+    || contributionDisconnectBusy || contributionDisconnectDialogOpen() || attributionContributionBusy;
   // A recorded approval whose upload authority is lost — a claim that
   // carried the v0.1 consent, or a missing device credential — re-opens the
   // same single action (the transparent re-pair). The chip stays "Approved":
   // the user's approval stands; only the transport authorization re-runs.
+  const disconnected = contributionDeviceDisconnectPaused();
   const repairNeeded = incrementalConsentApproved
-    && incrementalUploadAuthorityLost();
+    && (incrementalUploadAuthorityLost() || disconnected);
+  const repairRequired = incrementalSyncStatus?.pausedReason === "device_repair_required";
+  setLocalizedText(approve, repairRequired ? "consent.repairConnection" : "consent.reviewAndApprove");
   setLocalizedText(chip, incrementalConsentApproved
     ? "consent.stateApproved"
     : "consent.stateNotApproved");
@@ -11787,23 +14190,18 @@ function renderIncrementalConsent() {
     ? "evidence-chip"
     : "evidence-chip neutral";
   approve.disabled = busy
+    || contributionDisconnectOutcome === "cleanup_pending"
     || (incrementalConsentApproved && !repairNeeded)
     || (!incrementalConsentApproved && !reviewVerified)
     || hostedSignInRequired();
-  const remove = $("#delete-contributions");
-  if (remove) {
-    remove.hidden = !hasCommunitySession();
-    remove.disabled = busy;
-  }
-  // Keychain guidance is shown only where a dialog can be raised: at the
-  // connect step for an unbrokered companion, at the migrating credential's
-  // next renewal for a brokered one, and nowhere at all for a fresh brokered
-  // install (S3, red-team review of PR #34).
+  // The retained surface classifier selects neutral connection information or
+  // native migration guidance. It never authorizes an OS dialog; unknown or
+  // missing broker state must not turn into password-prompt preparation.
   const keychainSurface = keychainPromptSurface();
   const pairingNote = $("#incremental-keychain-pairing-note");
-  const rotationNote = $("#incremental-keychain-rotation-note");
+  const migrationNote = $("#incremental-keychain-migration-note");
   if (pairingNote) pairingNote.hidden = keychainSurface !== "pairing";
-  if (rotationNote) rotationNote.hidden = keychainSurface !== "rotation";
+  if (migrationNote) migrationNote.hidden = keychainSurface !== "migration";
   // The review the approve gate requires, on screen: the verified prepared
   // instance's own facts. They come from the same queue item the one-use
   // token was minted for, and they leave with approval — the card then
@@ -11828,7 +14226,17 @@ function renderIncrementalConsent() {
       );
     }
   }
-  if (incrementalConsentApproved && !(repairNeeded && hostedSignInRequired())) {
+  if (disconnected) {
+    gate.hidden = false;
+    setLocalizedText(gate, contributionDisconnectOutcome === "cleanup_pending"
+      ? "contribution.disconnect.reviewCleanup"
+      : hostedSignInRequired()
+        ? "contribution.disconnect.signInToReconnect"
+        : "contribution.disconnect.paused");
+  } else if (repairRequired && hostedSignInRequired()) {
+    gate.hidden = false;
+    setLocalizedText(gate, "consent.signInFirst");
+  } else if (incrementalConsentApproved && !(repairNeeded && hostedSignInRequired())) {
     forgetLocalizedNode(gate);
     gate.textContent = "";
     gate.hidden = true;
@@ -11850,6 +14258,7 @@ function renderIncrementalConsent() {
   }
   renderIncrementalSyncStatusLine();
   renderIncrementalSyncRetry();
+  renderAttributionContribution();
 }
 
 /**
@@ -11867,11 +14276,17 @@ function renderIncrementalSyncStatusLine() {
   const line = $("#incremental-sync-status");
   if (!line) return;
   if (!incrementalSyncCapabilityAdvertised()
+      || contributionDeviceDisconnectPaused()
       || !incrementalConsentApproved
       || incrementalSyncStatus?.status !== "available") {
     forgetLocalizedNode(line);
     line.textContent = "";
     line.hidden = true;
+    return;
+  }
+  if (incrementalSyncStatus.pausedReason === "device_repair_required") {
+    setLocalizedText(line, "consent.repairRequired");
+    line.hidden = false;
     return;
   }
   // The transparent re-pair state renders as the routine it is — an
@@ -11942,19 +14357,17 @@ function boundedOutcomeDetailCode(payload) {
 }
 
 /**
- * Where this install can still meet a macOS Keychain dialog, as the companion
- * reports it: "pairing" (the companion mints its own credential, so the
- * connect step can raise one), "rotation" (the app brokers the Keychain but a
- * legacy credential still has to migrate, and that is when a dialog appears),
- * or "none" (brokered with nothing to migrate — no dialog exists).
+ * The companion's retained Keychain information uses "pairing" for
+ * connection information, "migration" for an older credential's secure
+ * upgrade, or "none" when no Keychain annotation applies.
  *
  * "pairing" is the default before the first projection lands and whenever the
- * companion cannot answer, so guidance is only ever withheld on a positive
- * statement that it cannot apply.
+ * companion cannot answer. That default is neutral information, not evidence
+ * that an authorization dialog is expected or permission to trigger one.
  */
 function keychainPromptSurface() {
   const reported = incrementalSyncStatus?.keychainPrompt;
-  return reported === "rotation" || reported === "none" ? reported : "pairing";
+  return reported === "migration" || reported === "none" ? reported : "pairing";
 }
 
 /**
@@ -11972,13 +14385,16 @@ function renderIncrementalSyncRetry() {
   const visible = incrementalSyncCapabilityAdvertised()
     && incrementalConsentApproved
     && status?.status === "available"
-    && !incrementalGrantRejected();
+    && !incrementalGrantRejected()
+    && status.pausedReason !== "device_repair_required"
+    && !contributionDeviceDisconnectPaused();
   button.hidden = !visible;
   if (!visible) {
     hideIncrementalSyncRetryNote();
     return;
   }
-  button.disabled = status.running === true || incrementalSyncRetryBusy;
+  button.disabled = status.running === true || incrementalSyncRetryBusy
+    || contributionDisconnectBusy || contributionDisconnectDialogOpen();
 }
 
 function hideIncrementalSyncRetryNote() {
@@ -11990,7 +14406,9 @@ function hideIncrementalSyncRetryNote() {
 }
 
 async function runIncrementalSyncNow() {
-  if (incrementalSyncRetryBusy) return;
+  if (incrementalSyncRetryBusy || contributionDisconnectBusy
+      || contributionDisconnectDialogOpen() || contributionDeviceDisconnectPaused()
+      || incrementalSyncStatus?.pausedReason === "device_repair_required") return;
   incrementalSyncRetryBusy = true;
   hideIncrementalSyncRetryNote();
   renderIncrementalSyncRetry();
@@ -12001,6 +14419,7 @@ async function runIncrementalSyncNow() {
       await localClient.localContributionMutation("incremental-run");
     incrementalSyncStatus =
       normalizeIncrementalContributionSyncStatus(payload);
+    observeContributionDisconnectPause(incrementalSyncStatus);
     incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
     if (incrementalSyncStatus?.status === "available") {
       incrementalConsentApproved =
@@ -12101,7 +14520,7 @@ function scheduleIncrementalSyncStatusPoll({ reset = false } = {}) {
  * landed — a transient loopback failure must not un-advertise a transport the
  * companion confirmed.
  */
-async function recoverLocalCompanionReads() {
+async function recoverLocalCompanionReads({ isCurrent = () => true } = {}) {
   const [localHealth, onboarding] = await Promise.all([
     incrementalSyncCapabilitySettled()
       ? null
@@ -12110,6 +14529,7 @@ async function recoverLocalCompanionReads() {
       ? localClient.onboarding().catch(() => null)
       : null,
   ]);
+  if (!isCurrent()) return;
   let recovered = false;
   if (localHealth !== null) {
     const wasAdvertised = incrementalSyncCapabilityAdvertised();
@@ -12141,8 +14561,14 @@ async function recoverLocalCompanionReads() {
  * consent verdict — so an approved Mac renders as approved after a reload —
  * and the progress facts the status line prints.
  */
-async function loadIncrementalSyncStatus() {
-  await recoverLocalCompanionReads();
+async function loadIncrementalSyncStatus({ isCurrent } = {}) {
+  // Polls and consent actions also cross dashboard loads. A response begun
+  // before a newer primary/quick result or demo selection may not replace it.
+  const loadToken = cacheDropThreadLinks.loadToken;
+  const readIsCurrent = isCurrent
+    ?? (() => cacheDropThreadLinks.loadToken === loadToken);
+  await recoverLocalCompanionReads({ isCurrent: readIsCurrent });
+  if (!readIsCurrent()) return;
   if (!incrementalSyncCapabilityAdvertised()) {
     incrementalSyncStatus = null;
     incrementalConsentApproved = false;
@@ -12167,7 +14593,9 @@ async function loadIncrementalSyncStatus() {
   } catch {
     payload = null;
   }
+  if (!readIsCurrent()) return;
   incrementalSyncStatus = normalizeIncrementalContributionSyncStatus(payload);
+  observeContributionDisconnectPause(incrementalSyncStatus);
   incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
   // Only an available projection may change the consent verdict: a transient
   // read failure normalizes to a fail-closed shape whose false consent must
@@ -12243,7 +14671,13 @@ async function recordFreshLocalContributionApproval(
  * failure, because nothing the user did failed.
  */
 async function approveIncrementalContribution() {
+  if (attributionContributionSelected()) {
+    await openAttributionContributionReview();
+    return;
+  }
   if (incrementalConsentBusy || communityConnectBusy
+      || contributionDisconnectBusy || contributionDisconnectDialogOpen()
+      || contributionDisconnectOutcome === "cleanup_pending"
       || !incrementalSyncCapabilityAdvertised()) {
     return;
   }
@@ -12268,6 +14702,12 @@ async function approveIncrementalContribution() {
     return;
   }
   incrementalConsentBusy = true;
+  if (contributionDeviceDisconnectPaused() || incrementalSyncStatus?.pausedReason === "device_repair_required") {
+    // Explicit reconnect must replace any remembered pairing. Silent repair
+    // entrypoints refuse both disconnect and uncertain-rotation pauses.
+    communityDevicePaired = false;
+    communityDevicePairedV1 = false;
+  }
   const reviewGeneration = contributionReviewFence.begin();
   const expectedSummaryIdentity = contributionSyncExactReview?.summaryIdentity
     ?? null;
@@ -12404,7 +14844,8 @@ async function approveIncrementalContribution() {
       await renderContributionSessionSignInGate(status, error);
     } else if (contributionConnectStepOf(error) !== null
         || contributionDeviceRecoveryIsRequired(error)
-        || contributionDeviceKeychainIsLocked(error)) {
+        || contributionDeviceKeychainIsLocked(error)
+        || contributionDeviceKeychainAccessIsDenied(error)) {
       await reportContributionConnectFailure(status, error, {
         enrollmentAttemptedWithHostedIdentity,
         enrollmentEstablished,
@@ -12477,6 +14918,9 @@ async function mintDevicePairingWithCookieCommitRetry() {
  * failure or ask again.
  */
 function maybeRepairIncrementalAuthorization() {
+  if (attributionContributionSelected()) return;
+  if (incrementalSyncStatus?.pausedReason === "device_repair_required") return;
+  if (contributionDisconnectBlocksRepair()) return;
   if (incrementalRepairAttempted) return;
   if (incrementalConsentBusy || communityConnectBusy) return;
   if (!incrementalSyncCapabilityAdvertised()) return;
@@ -12496,6 +14940,12 @@ function maybeRepairIncrementalAuthorization() {
  * Review-and-approve action.
  */
 function resumeContributionCeremonyAfterSignIn() {
+  if (attributionContributionSelected()) {
+    renderAttributionContribution();
+    return;
+  }
+  if (incrementalSyncStatus?.pausedReason === "device_repair_required") return;
+  if (contributionDisconnectBlocksRepair()) return;
   if (!incrementalSyncCapabilityAdvertised()) return;
   if (!incrementalConsentApproved || !incrementalUploadAuthorityLost()) return;
   if (incrementalConsentBusy || communityConnectBusy) return;
@@ -12513,57 +14963,152 @@ function resumeContributionCeremonyAfterSignIn() {
   void approveIncrementalContribution();
 }
 
-// Deletion honesty (owner-directed, 2026-08-08): the card no longer states a
-// deletion promise without a control behind it. This is the control — the
-// service's participant deletion (DELETE /api/v1/me), which purges accepted
-// chunks and stored uploads and tombstones the account. It needs the live
-// session, asks for explicit confirmation, and touches nothing local.
-const CONTRIBUTION_DELETION_CONFIRMATION =
-  "Delete everything you contributed?\n\nThe service deletes your contributed usage data and this account's records, and this Mac's upload authority stops working. Local reporting on this Mac is unchanged. This cannot be undone.";
+function contributionDisconnectDialogOpen() {
+  return $("#disconnect-device-dialog")?.open === true;
+}
 
-async function deleteCommunityContributions() {
-  if (incrementalConsentBusy || communityConnectBusy) return;
-  if (!hasCommunitySession()) return;
-  if (!window.confirm(CONTRIBUTION_DELETION_CONFIRMATION)) return;
-  const status = $("#incremental-consent-status");
-  incrementalConsentBusy = true;
+function contributionDeviceDisconnectPaused() {
+  return contributionDisconnectOutcome === "disconnected"
+    || contributionDisconnectOutcome === "cleanup_pending"
+    || contributionDisconnectOutcome === "paused"
+    || (incrementalSyncStatus?.status === "available"
+      && incrementalSyncStatus.paused === true
+      && incrementalSyncStatus.pausedReason === "device_disconnected");
+}
+
+function observeContributionDisconnectPause(status) {
+  if (status?.status !== "available") return;
+  const paused = status.paused === true && status.pausedReason === "device_disconnected";
+  if (paused && [null, "unconfirmed"].includes(contributionDisconnectOutcome)) {
+    contributionDisconnectOutcome = "paused";
+  } else if (!paused && contributionDisconnectOutcome === "paused") {
+    contributionDisconnectOutcome = null;
+  }
+  // A transient unreadable status cannot erase an observed durable pause.
+  // A successful disconnect receipt is stronger and stays until reconnection.
+}
+
+function contributionDisconnectBlocksRepair() {
+  return contributionDisconnectBusy || contributionDisconnectDialogOpen()
+    || contributionDisconnectOutcome !== null || contributionDeviceDisconnectPaused();
+}
+
+function renderContributionDisconnect() {
+  const controls = $("#contribution-device-controls");
+  if (!controls) return;
+  // The device capability, not a browser session or historical upload count,
+  // decides availability. A signed-out Mac can still have a live device.
+  controls.hidden = localCompanionHealth?.capabilities?.contributionDeviceDisconnect !== true;
+  const busy = contributionDisconnectBusy || incrementalConsentBusy
+    || communityConnectBusy || incrementalSyncRetryBusy;
+  $("#disconnect-device").disabled = busy
+    || contributionDisconnectOutcome === "disconnected";
+  $("#disconnect-device-confirm").disabled = controls.hidden || busy
+    || contributionDisconnectChecking || contributionDisconnectAbsent;
+}
+
+async function openContributionDisconnectDialog() {
+  if (localCompanionHealth?.capabilities?.contributionDeviceDisconnect !== true
+      || $("#disconnect-device").disabled || contributionDisconnectDialogOpen()) return;
+  const generation = ++contributionDisconnectCheckGeneration;
+  contributionDisconnectChecking = true;
+  contributionDisconnectAbsent = false;
+  const dialog = $("#disconnect-device-dialog");
+  dialog.showModal();
+  setLocalizedText($("#disconnect-device-check"), "contribution.disconnect.checking");
   renderContributionActionState();
+  $("#disconnect-device-cancel").focus();
+  // Diagnostics may read the Keychain, so this check is user-triggered, never
+  // a new background probe. Unknown is not absence and must allow a retry.
+  const diagnostics = await withContributionReviewDeadline(
+    localClient.contributionDiagnostics(),
+    { timeoutMilliseconds: 10_000 },
+  ).catch(() => null);
+  if (generation !== contributionDisconnectCheckGeneration || !dialog.open) return;
+  contributionDisconnectChecking = false;
+  const observed = diagnostics?.status === "available"
+    && diagnostics.pairing.observed === true;
+  contributionDisconnectAbsent = observed && diagnostics.pairing.paired === false
+    && contributionDisconnectOutcome !== "cleanup_pending";
+  setLocalizedText($("#disconnect-device-check"), contributionDisconnectAbsent
+    ? "contribution.disconnect.absent"
+    : observed && diagnostics.pairing.paired
+      ? "contribution.disconnect.ready"
+      : "contribution.disconnect.unknown");
+  renderContributionDisconnect();
+}
+
+function closeContributionDisconnectDialog() {
+  if (!contributionDisconnectDialogOpen()) return;
+  contributionDisconnectCheckGeneration += 1;
+  contributionDisconnectChecking = false;
+  $("#disconnect-device-dialog").close();
+  renderContributionActionState();
+  $("#disconnect-device").focus();
+}
+
+async function disconnectCommunityDevice() {
+  if (!contributionDisconnectDialogOpen()
+      || $("#disconnect-device-confirm").disabled) return;
+  const previousOutcome = contributionDisconnectOutcome;
+  contributionDisconnectBusy = true;
+  contributionDisconnectOutcome = "unconfirmed";
+  incrementalRepairAttempted = true;
+  contributionDisconnectCheckGeneration += 1;
+  $("#disconnect-device-dialog").close();
+  const status = $("#disconnect-device-status");
   status.hidden = false;
   status.className = "participant-action-status";
-  setProductText(status, "Deleting your contributed data from the service…");
+  setLocalizedText(status, "contribution.disconnect.starting");
+  renderContributionActionState();
+  // The trigger is disabled during the request and after success. Keep focus
+  // on the live result rather than losing it to the document body.
+  status.focus();
   try {
-    await communityClient.deleteParticipant();
-    // The account is tombstoned server-side: the session, the sign-in proof
-    // and this Mac's pairing evidence are all dead with it.
-    hostedIdentity = null;
-    setCommunitySession(null);
+    const result = await localClient.disconnectContributionDevice();
+    if (result?.status !== "disconnected" || result.deliveryPaused !== true) {
+      throw new Error("Device disconnect was not confirmed.");
+    }
+    contributionDisconnectOutcome = "disconnected";
+    communityDevicePaired = false;
     communityDevicePairedV1 = false;
-    status.hidden = false;
-    status.className = "participant-action-status";
-    setProductText(
-      status,
-      "Deleted. The service removed your contributed data and this account's records. Local reporting on this Mac is unchanged.",
-    );
-    renderHostedIdentity();
-    await loadIncrementalSyncStatus().catch(() => {});
+    setLocalizedText(status, "contribution.disconnect.completed");
   } catch (error) {
-    await showFailure(status, {
-      surface: "participant_deletion",
-      error,
-      fallback:
-        "The service did not confirm the deletion, so nothing is assumed deleted. Try again."
-    });
+    const cleanupPending = error?.code === "contribution_device_disconnect_cleanup_pending"
+      || previousOutcome === "cleanup_pending";
+    if (cleanupPending) {
+      contributionDisconnectOutcome = "cleanup_pending";
+      communityDevicePaired = false;
+      communityDevicePairedV1 = false;
+    }
+    status.classList.add("error");
+    setLocalizedText(status, cleanupPending
+      ? "contribution.disconnect.cleanupPending"
+      : "contribution.disconnect.failed");
   } finally {
-    incrementalConsentBusy = false;
+    contributionDisconnectBusy = false;
     renderContributionActionState();
   }
+  // A failed status read cannot overwrite a confirmed disconnect receipt or
+  // restore upload authority. Hosted session and history are never cleared.
+  await loadIncrementalSyncStatus().catch(() => {});
 }
 
 function contributionDeviceRecoveryIsRequired(error) {
   try {
     return error?.code === "contribution_device_recovery_required"
-      || error?.code === "contribution_device_credential_conflict"
-      || error?.code === "contribution_device_keychain_access_denied";
+      || error?.code === "contribution_device_credential_conflict";
+  } catch {
+    return false;
+  }
+}
+
+// Denied access does not establish an unusable credential. Preserve it and
+// keep this pause outside the destructive reset family, including when the
+// error was not tagged with a connection step.
+function contributionDeviceKeychainAccessIsDenied(error) {
+  try {
+    return error?.code === "contribution_device_keychain_access_denied";
   } catch {
     return false;
   }
@@ -12750,7 +15295,7 @@ async function resetContributionDeviceCredential() {
  * Deliberately offers no reset button. The credential is fine; the keychain is
  * locked. The only action that changes anything is unlocking it, so that is
  * the only action named — offering the destructive clear here would cost a
- * needless re-pair for a condition the user's login password fixes. Both
+ * needless re-pair while an intact credential is unavailable. Both
  * sentences take the localized path: a reader in Chinese or Spanish is exactly
  * as likely to meet a locked keychain as anyone else.
  */
@@ -12802,6 +15347,9 @@ async function finishCommunityDevicePairing(pairing, status) {
     throw error;
   }
   communityDevicePaired = true;
+  contributionDisconnectOutcome = null;
+  const disconnectStatus = $("#disconnect-device-status");
+  if (disconnectStatus) disconnectStatus.hidden = true;
   status.textContent =
     `This Mac is connected through ${formatLocal(paired.expiresAt)}. Nothing was uploaded.`;
   return paired;
@@ -12839,21 +15387,9 @@ const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
   }),
   device_pairing: Object.freeze({
     connects: true,
-    // This step is the one that stores the upload credential in the login
-    // keychain, so the macOS access dialog — a password prompt naming the
-    // bundled helper, node, with zero context of its own — can appear the
-    // moment it runs (observed live 2026-08-19, first pairing on a fresh
-    // Mac). The preparation must already be on screen when that happens:
-    // what asks, why, and that Always Allow is the answer that keeps
-    // background passes running instead of re-prompting every six hours.
-    progress: "Connecting this Mac as an upload-only device… macOS may ask for your login password to protect this Mac's upload credential; the request comes from TiboTattle's bundled helper, which macOS lists as node. Choose Always Allow so background uploads keep working.",
-    // The line above is for installs whose companion still mints the
-    // credential itself. When the signed app brokers the Keychain no dialog
-    // is reachable at this step at all, so naming a process the reader will
-    // never see would be a warning about nothing (S3, red-team review of
-    // PR #34). The remaining case — a legacy item migrating — meets its
-    // dialog at rotation, and the approve card's own annotation carries it.
-    brokeredProgress: "Connecting this Mac as an upload-only device…",
+    // Connection progress never prepares or authorizes a Keychain prompt.
+    // Deliberate secure-upgrade approval belongs to native Settings only.
+    progress: "Connecting this Mac as an upload-only device…",
     stopped: "Connecting stopped at step 3 of 3, pairing this Mac as an upload-only device.",
     failure:
       "The pairing was not completed, so this Mac is not connected. Nothing was uploaded; retrying is safe.",
@@ -12874,12 +15410,7 @@ async function contributionConnectStep(stepId, status, run) {
   const step = CONTRIBUTION_CONNECT_STEPS[stepId];
   status.hidden = false;
   status.className = "participant-action-status";
-  // A step keeps its dialog-preparing copy only where a dialog can actually
-  // be raised; "pairing" is the default the companion reports when it cannot
-  // tell, so an unanswering companion behaves exactly as before.
-  setProductText(status, keychainPromptSurface() === "pairing"
-    ? step.progress
-    : step.brokeredProgress ?? step.progress);
+  setProductText(status, step.progress);
   try {
     return await run();
   } catch (error) {
@@ -12914,8 +15445,24 @@ async function reportContributionConnectFailure(status, error, {
   enrollmentAttemptedWithHostedIdentity,
   enrollmentEstablished,
 }) {
-  // Locked is checked first and separately: it is the one member of the 409
-  // family whose cure is not the reset ceremony.
+  // Access denial is a pause, not proof that anything needs clearing. The
+  // existing retry controls remain available; this branch adds no recovery
+  // action and cannot invoke native approval or discard the credential.
+  if (contributionDeviceKeychainAccessIsDenied(error)) {
+    const described = await describeFailure({
+      surface: "contribution_connect",
+      error,
+      fallback: "Uploads are paused. Nothing was uploaded; you can try again later.",
+    });
+    status.hidden = false;
+    status.className = "participant-action-status";
+    // Retire the earlier progress translation so a later language update
+    // cannot resurrect "Connecting…" over the completed pause and reference.
+    setRawText(status, described.text);
+    return;
+  }
+  // A locked Keychain also stays outside the explicit unusable-credential
+  // reset ceremony.
   if (contributionDeviceKeychainIsLocked(error)) {
     await renderContributionDeviceKeychainLocked(status, { error });
     return;
@@ -12999,8 +15546,12 @@ async function restoreCommunitySession() {
   }
 }
 
-$("#refresh-button").addEventListener("click", requestRefresh);
-$("#setup-refresh").addEventListener("click", requestRefresh);
+$("#refresh-button").addEventListener("click", () => {
+  void requestRefresh({ detailed: true });
+});
+$("#setup-refresh").addEventListener("click", () => {
+  void requestRefresh({ detailed: true });
+});
 $("#cancel-refresh").addEventListener("click", cancelLocalAnalysis);
 $("#open-installed-app").addEventListener("click", openInstalledApp);
 $("#connection-check").addEventListener("click", checkLocalSetup);
@@ -13018,6 +15569,7 @@ $("#identity-signout").addEventListener("click", () => {
 $("#identity-signin-check").addEventListener("click", checkHostedSignInNow);
 $("#identity-signin-cancel").addEventListener("click", cancelHostedSignIn);
 window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow);
+window.addEventListener("tibotattle:automatic-refresh", handleElectronAutomaticRefresh);
 // Reactivation hooks for the persisted handoff (owner-reported orphaned
 // proof, 2026-08-08): the deep-link return, the page becoming visible again,
 // and the window regaining focus each try to collect a pending sign-in this
@@ -13031,6 +15583,18 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("focus", () => {
   void resumePendingHostedSignIn();
+  if (electronSharingBridge() !== null && dashboard !== null) {
+    void loadElectronSharingPreference({ dashboardReady: true }).catch(() => {});
+  }
+});
+$("#electron-sharing-share-now")?.addEventListener("click", () => {
+  void setElectronSharingEnabled(true);
+});
+$("#electron-sharing-keep-off")?.addEventListener("click", () => {
+  void setElectronSharingEnabled(false);
+});
+$("#electron-accountless-sharing-enabled")?.addEventListener("change", (event) => {
+  void setElectronSharingEnabled(event.target.checked === true);
 });
 window.addEventListener("tibotattle:local-evidence-updated", () => {
   void reloadLocalEvidenceAfterNativeRefresh();
@@ -13039,7 +15603,7 @@ window.addEventListener("tibotattle:local-evidence-updated", () => {
 // the two-card flow (owner-directed, 2026-08-08): after sign-in, the single
 // Review-and-approve button below is the one contribution action, and its
 // explicit approval is the consent.
-$("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
+$("#demo-button").addEventListener("click", showDemoDashboard);
 // The prepare, lookback, and send controls left with the legacy prepare flow
 // (owner-directed, 2026-08-08). The approve card's only companion control is
 // the error-recovery re-check for its invisible review bootstrap.
@@ -13052,11 +15616,36 @@ $("#incremental-copy-diagnostics").addEventListener("click", () => {
 $("#incremental-consent-approve").addEventListener("click", () => {
   void approveIncrementalContribution();
 });
+$("#attribution-review-open")?.addEventListener("click", () => { void openAttributionContributionReview(); });
+$("#attribution-consent-confirm")?.addEventListener("change", renderAttributionContribution);
+$("#attribution-consent-approve")?.addEventListener("click", () => { void approveAttributionContribution(); });
+$("#attribution-review-cancel")?.addEventListener("click", () => {
+  if (attributionContributionBusy) return;
+  attributionContributionReview = null;
+  attributionContributionNotice = null;
+  $("#attribution-consent-confirm").checked = false;
+  renderAttributionContribution();
+  $("#attribution-review-open").focus();
+});
 $("#incremental-sync-retry").addEventListener("click", () => {
   void runIncrementalSyncNow();
 });
-$("#delete-contributions").addEventListener("click", () => {
-  void deleteCommunityContributions();
+$("#disconnect-device").addEventListener("click", () => {
+  void openContributionDisconnectDialog();
+});
+$("#disconnect-device-cancel").addEventListener("click", closeContributionDisconnectDialog);
+$("#disconnect-device-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeContributionDisconnectDialog();
+});
+// Some embedded hosts forward Escape keydown without a native dialog cancel.
+$("#disconnect-device-dialog").addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  closeContributionDisconnectDialog();
+});
+$("#disconnect-device-confirm").addEventListener("click", () => {
+  void disconnectCommunityDevice();
 });
 $("#range-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-days]");
@@ -13176,22 +15765,6 @@ $("#cache-switch-page-next").addEventListener("click", () => {
     dashboard === null ? null : accountingPeriod(dashboard)?.cacheSwitchImpact,
   );
 });
-$("#cache-continuity-gap-page-prev").addEventListener("click", () => {
-  cacheContinuityGapTablePagination.page -= 1;
-  renderAccountingCacheContinuityDetails(
-    dashboard === null
-      ? null
-      : accountingPeriod(dashboard)?.cacheContinuityImpact,
-  );
-});
-$("#cache-continuity-gap-page-next").addEventListener("click", () => {
-  cacheContinuityGapTablePagination.page += 1;
-  renderAccountingCacheContinuityDetails(
-    dashboard === null
-      ? null
-      : accountingPeriod(dashboard)?.cacheContinuityImpact,
-  );
-});
 $("#cache-continuity-page-prev").addEventListener("click", () => {
   cacheContinuityTablePagination.page -= 1;
   renderAccountingCacheContinuityDetails(
@@ -13207,6 +15780,29 @@ $("#cache-continuity-page-next").addEventListener("click", () => {
       ? null
       : accountingPeriod(dashboard)?.cacheContinuityImpact,
   );
+});
+const cacheReuseCanvas = $("#cache-reuse-canvas");
+cacheReuseCanvas?.addEventListener("pointermove", selectCacheReuseBucketFromPointer);
+cacheReuseCanvas?.addEventListener("click", selectCacheReuseBucketFromPointer);
+cacheReuseCanvas?.addEventListener("pointerleave", () => {
+  setCacheReuseReadoutVisible(false);
+});
+cacheReuseCanvas?.addEventListener("focus", () => {
+  setCacheReuseReadoutVisible(true);
+});
+cacheReuseCanvas?.addEventListener("blur", () => {
+  setCacheReuseReadoutVisible(false);
+});
+cacheReuseCanvas?.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    setCacheReuseReadoutVisible(true);
+    moveCacheReuseBucketSelection(-1);
+  } else if (event.key === "ArrowRight") {
+    event.preventDefault();
+    setCacheReuseReadoutVisible(true);
+    moveCacheReuseBucketSelection(1);
+  }
 });
 $("#side-chat-page-prev").addEventListener("click", () => {
   sideChatTablePagination.page -= 1;
@@ -13272,6 +15868,16 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
   // chart while leaving the card on the previous filters.
   renderWeekly(dashboard);
 });
+$("#weekly-plan-select")?.addEventListener("change", (event) => {
+  if (!dashboard || !dashboard.weekly.planPopulations.some(
+    (population) => population.planType === event.target.value,
+  )) return;
+  activeWeeklyPlanType = event.target.value;
+  timelineSeriesMemo = null;
+  renderComparison(dashboard);
+  renderTimeline(dashboard);
+  renderWeekly(dashboard);
+});
 $("#weekly-span-control").addEventListener("input", (event) => {
   if (!dashboard) return;
   activeWeeklyMinimumObservedSpanPp = Math.min(99, Math.max(0, Number(event.target.value)));
@@ -13313,6 +15919,13 @@ document.addEventListener("scroll", () => {
   if (current) positionInformationPopover(current.popover, current.button);
 }, true);
 
+mountWorkUsageView({ root: document.querySelector("#projects"), t });
+const modelPerformance = mountModelPerformance({
+  root: document.querySelector("#performance"), client: localClient,
+  t, locale: () => localization.formatLocale(),
+});
+window.addEventListener("tibotattle:locale-change", () => modelPerformance.render());
+
 mountDashboardNavigation({
   documentRef: document,
   windowRef: window,
@@ -13323,9 +15936,11 @@ async function bootstrapDashboard() {
     formatLocale: getFormattingLocale(),
     translateMessage: t,
   });
+  applyElectronAccountlessContributionMode();
   renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();
+  startElectronStartupRefresh();
   if (
     localCompanionHealth === null
     || localCompanionHealth?.capabilities?.centralServiceProxy === true

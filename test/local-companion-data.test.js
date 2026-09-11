@@ -13,13 +13,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
+  INFORMATIONAL_HISTORY_GAP_MAX_SHARE,
   LocalCompanionDataStore,
   RETAINED_EVIDENCE_REFRESH_WARNING,
   RETAINED_EVIDENCE_RELABELED_WARNINGS,
   RETAINED_PROJECTION_SURFACE_PATHS,
   buildLocalCompanionSnapshot,
+  isInformationalTerminalHistoryGap,
 } from "../src/local-companion-data.js";
 import {
+  createAccountingPricer,
   refreshReplaySafeAccountingCache,
 } from "../src/replay-safe-accounting-cache.js";
 import {
@@ -29,7 +32,7 @@ import {
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
-import { emptySpeedWeightingCrossing } from "@app-usagemonitor/accounting";
+import { emptySpeedWeightingCrossing, FAST_MODE_QUOTA_MULTIPLIERS } from "@app-usagemonitor/accounting";
 import {
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
@@ -37,6 +40,12 @@ import {
 import {
   readLocalUnifiedCompanionProjection,
 } from "../src/local-unified-companion-source.js";
+import { usageProjection } from "../src/local-companion-usage-model.js";
+import {
+  isAuthoritativeDashboardSnapshot,
+  readAuthoritativeDashboardSnapshot,
+  writeAuthoritativeDashboardSnapshot,
+} from "../src/local-authoritative-dashboard-snapshot.js";
 
 const ARTIFACT_FILES = {
   gradient: "2026-07-24-simple-quota-gradient-artifact.json",
@@ -130,6 +139,37 @@ function rolloutToken(timestamp, total, last, usedPercent) {
     },
   });
 }
+
+test("usage projection preserves explicit context and absent-field pricing at 272k", () => {
+  const pricer = createAccountingPricer();
+  const cases = [
+    { input: 272_000, context: {}, cost: "2.7209" },
+    { input: 271_999, context: {}, cost: "1.360595" },
+    { input: 272_000, context: { totalInputContextTokens: 0 }, cost: "1.3606" },
+    { input: 272_000, context: { totalInputContextTokens: 271_999 }, cost: "1.3606" },
+    { input: 271_999, context: { totalInputContextTokens: 272_000 }, cost: "2.72089" },
+    ...[undefined, null, -1, 1.5, "0", Number.NaN, Number.POSITIVE_INFINITY]
+      .map((value) => ({
+        input: 272_000,
+        context: { totalInputContextTokens: value },
+        cost: "2.7209",
+      })),
+  ];
+  for (const { input, context, cost } of cases) {
+    const record = {
+      observedAt: "2026-07-25T12:00:00.000Z",
+      model: "gpt-5.6-sol",
+      components: { input_uncached_tokens: input, output_text_tokens: 20 },
+      ...context,
+    };
+    for (const price of [null, pricer]) {
+      const projection = usageProjection(record, "unknown", price);
+      assert.equal(projection.totalTokens, input + 20);
+      assert.equal(projection.apiPriceEquivalentUsdExact, cost);
+      assert.equal(projection.pricingCoverageStatus, "fully_priced");
+    }
+  }
+});
 
 test("local companion builds a closed real-data projection without identifiers or paths", async () => {
   const root = await fixtureRoot();
@@ -316,31 +356,28 @@ test("local companion builds a closed real-data projection without identifiers o
       /only when it is applied or changed, never at session start/u,
     );
     const fastMode = snapshot.overview.accounting.fastMode;
-    assert.equal(fastMode.preference, "standard");
+    assert.equal(fastMode.unresolvedScenario, "unresolved_as_standard");
     assert.equal(fastMode.logObservability.sessionBaselineRecorded, false);
-    assert.equal(fastMode.metricLabel, "Quota-weighted API-price equivalent");
-    assert.deepEqual(fastMode.multipliers, {
-      "gpt-5.6": 2.5,
-      "gpt-5.5": 2.5,
-      "gpt-5.4": 2,
-    });
-    assert.equal(fastMode.multiplierSource.recordedAt, "2026-08-01");
+    assert.equal(fastMode.metricLabel, "Speed-priced API-price equivalent");
+    assert.deepEqual(fastMode.multipliers, { ...FAST_MODE_QUOTA_MULTIPLIERS });
+    assert.equal(fastMode.multiplierSource.recordedAt, "2026-08-30");
     assert.deepEqual(fastMode.coverage, {
       totalEvents: 2,
       observedEvents: 1,
       declaredFromConfigEvents: 0,
-      assumedFromPreferenceEvents: 1,
+      assumedEvents: 1,
       inferredEvents: 0,
       unknownEvents: 0,
       observedSharePercent: 50,
       unknownSharePercent: 0,
     });
     // The only priced event was observed Fast on a GPT-5.6 model, so the
-    // weighted total is exactly the published 2.5x of the Standard total.
+    // weighted total is exactly the published 2x Priority ratio of the
+    // Standard total.
     assert.equal(
       Math.abs(
         snapshot.overview.accounting.quotaWeightedApiPriceEquivalentUsd
-          - snapshot.overview.accounting.apiPriceEquivalentUsd * 2.5,
+          - snapshot.overview.accounting.apiPriceEquivalentUsd * 2,
       ) < 1e-12,
       true,
     );
@@ -412,7 +449,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
     const now = () => Date.parse("2026-07-25T12:00:00.000Z");
     const exact = await buildLocalCompanionSnapshot({
       root,
-      fastModePreference: "fast",
       now,
     });
     assert.equal(
@@ -431,7 +467,7 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       lastSeenAt: "2026-07-25T12:00:00.000Z",
     }];
     const estimatedSpeedWeighting = emptySpeedWeightingCrossing();
-    estimatedSpeedWeighting.unknown["gpt-5.6"] = {
+    estimatedSpeedWeighting.unknown["gpt-5.6-sol"] = {
       events: 2,
       apiPriceEquivalentUsd: 1.25,
     };
@@ -469,7 +505,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       root,
       codexHome,
       includeDevelopmentSideChatEstimates: true,
-      fastModePreference: "fast",
       codexSpeedBaselines,
       sideChatEstimateCollector: async (options) => {
         receivedCodexHome = options.codexHome;
@@ -505,18 +540,18 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       {
         schemaVersion: "quota-weighted-timeline-v0.1",
         basisFamilyId:
-          "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario",
+          "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario",
         scenarioOrder: [
           "unresolved_as_standard",
           "unresolved_as_fast",
         ],
-        selectedScenario: "unresolved_as_fast",
+        selectedScenario: "unresolved_as_standard",
       },
     );
     assert.equal(calibrationBucket.allowanceWeighting.length, 16);
     assert.equal(
       calibrationBucket.allowanceWeighting[9],
-      exactBucket.allowanceWeighting[9] + 3.125,
+      exactBucket.allowanceWeighting[9] + 2.5,
     );
     // Fast scenario block: status, weighted USD, covered USD, observed,
     // declared, preference-assumed, inferred, unresolved.
@@ -530,7 +565,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       root,
       codexHome,
       includeDevelopmentSideChatEstimates: true,
-      fastModePreference: "fast",
       sideChatEstimateCollector: async () => ({
         ...sideChatEstimates,
         methodology: {
@@ -558,7 +592,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       root,
       codexHome,
       includeDevelopmentSideChatEstimates: true,
-      fastModePreference: "fast",
       codexSpeedBaselines,
       developmentSideChatHistoricalGapDate: "2026-07-13",
       sideChatEstimateCollector: async () => ({
@@ -572,7 +605,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       },
       now,
     });
-    assert.equal(historicalGapOptions.fastModePreference, "fast");
     assert.deepEqual(
       historicalGapOptions.declaredSpeedBaselines,
       codexSpeedBaselines,
@@ -597,9 +629,9 @@ test("raw rollout history reaches the companion through the archive projection w
     "local-archive-accounting-index-v1-secret",
   );
   const oldTerraCard =
-    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01";
+    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30";
   const newTerraCard =
-    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01";
+    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30";
   try {
     await mkdir(sessions, { recursive: true });
     await writeFile(
@@ -742,6 +774,24 @@ test("local companion relays bounded durations and selects a deterministic prima
             resetsAt: 1_784_980_800,
           },
           {
+            limitId: "future_alpha",
+            limitName: "Future Alpha",
+            slot: "primary",
+            planType: "plus",
+            usedPercent: 61,
+            windowDurationMins: 1_440,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "future_beta",
+            limitName: "Account alice@example.com",
+            slot: "primary",
+            planType: "plus",
+            usedPercent: 62,
+            windowDurationMins: 43_200,
+            resetsAt: 1_784_980_800,
+          },
+          {
             limitId: "codex",
             slot: "primary",
             planType: "pro",
@@ -780,8 +830,16 @@ test("local companion relays bounded durations and selects a deterministic prima
         ["codex", "primary", 300, "prolite"],
         ["codex", "secondary", 10_080, "pro"],
         ["codex_bengalfox", "primary", 43_200, "edu"],
+        ["future_alpha", "primary", 1_440, "plus"],
+        ["future_beta", "primary", 43_200, "plus"],
       ],
     );
+    assert.equal(windows.find((window) => window.limitId === "future_alpha").limitName, "Future Alpha");
+    assert.equal(
+      Object.hasOwn(windows.find((window) => window.limitId === "future_beta"), "limitName"),
+      false,
+    );
+    assert.equal(new Set(windows.map((window) => window.limitId)).has("unknown"), false);
     assert.equal(snapshot.overview.quotaWindows[0].durationMinutes, 43_200);
     assert.equal(
       JSON.stringify(snapshot).includes("monthly"),
@@ -884,97 +942,47 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
       ].map((line) => `${line}\n`).join(""),
       { mode: 0o600 },
     );
-    const build = (fastModePreference) => buildLocalCompanionSnapshot({
+    const snapshot = await buildLocalCompanionSnapshot({
       root,
-      fastModePreference,
       now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
 
-    // Each event prices to $5 of Standard-rate API equivalent. Stating
-    // Standard leaves the total exactly where it was before weighting existed.
-    const standard = await build("standard");
-    assert.equal(standard.overview.accounting.apiPriceEquivalentUsd, 10);
+    // Each event prices to $5 of Standard-rate API equivalent. The
+    // unrecorded event is attributed to Standard as a visible assumption, so
+    // the selected total stays at the Standard figure while the
+    // unresolved-as-Fast sensitivity stays visible in the timeline encoding.
+    assert.equal(snapshot.overview.accounting.apiPriceEquivalentUsd, 10);
     assert.equal(
-      standard.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
+      snapshot.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
       10,
     );
-    assert.equal(
-      standard.overview.timeline.usage[0].allowanceWeighting[1],
-      10,
-    );
-    assert.equal(
-      standard.overview.timeline.allowanceWeightingEncoding.selectedScenario,
-      "unresolved_as_standard",
-    );
-
-    // Stating Fast weights only the event whose mode was not recorded; the
-    // observed Standard event keeps its observed weight of one. GPT-5.4's
-    // published Fast rate is 2x, so $5 + $5 x 2 = $15.
-    const fast = await build("fast");
-    assert.equal(
-      fast.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
-      15,
-    );
-    assert.deepEqual(fast.overview.accounting.fastMode.coverage, {
+    assert.deepEqual(snapshot.overview.accounting.fastMode.coverage, {
       totalEvents: 2,
       observedEvents: 1,
       declaredFromConfigEvents: 0,
-      assumedFromPreferenceEvents: 1,
+      assumedEvents: 1,
       inferredEvents: 0,
       unknownEvents: 0,
       observedSharePercent: 50,
       unknownSharePercent: 0,
     });
-    assert.deepEqual(fast.overview.accounting.fastMode.appliedMultipliers, {
-      "gpt-5.4": 2,
-    });
     assert.equal(
-      fast.overview.timeline.usage[0].allowanceWeighting[9],
-      15,
+      snapshot.overview.accounting.fastMode.unresolvedScenario,
+      "unresolved_as_standard",
     );
     assert.equal(
-      fast.overview.timeline.usage[0].allowanceWeighting[11],
-      1,
+      snapshot.overview.timeline.allowanceWeightingEncoding.selectedScenario,
+      "unresolved_as_standard",
     );
+    // Standard-scenario column: both dollars at 1x. Fast-scenario column:
+    // the observed Standard event keeps its observed weight of one while the
+    // assumed event is re-attributed at GPT-5.4's published 2x Priority
+    // ratio, so $5 + $5 x 2 = $15.
+    assert.equal(snapshot.overview.timeline.usage[0].allowanceWeighting[1], 10);
+    assert.equal(snapshot.overview.timeline.usage[0].allowanceWeighting[9], 15);
     assert.equal(
-      fast.overview.timeline.usage[0].allowanceWeighting[13],
-      1,
-    );
-
-    // Stating "not sure" leaves the unrecorded event explicitly unweighted
-    // instead of quietly counting it at the Standard rate.
-    const mixed = await build("mixed_unknown");
-    assert.equal(
-      mixed.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
-      5,
-    );
-    assert.equal(
-      mixed.overview.accounting.fastMode.unweightedUnknownApiPriceEquivalentUsd,
-      5,
-    );
-    assert.equal(mixed.overview.accounting.fastMode.weightingStatus, "partial");
-    assert.equal(
-      mixed.overview.timeline.allowanceWeightingEncoding.selectedScenario,
-      null,
-    );
-    assert.equal(mixed.overview.timeline.usage[0].allowanceWeighting[1], 10);
-    assert.equal(mixed.overview.timeline.usage[0].allowanceWeighting[9], 15);
-    assert.equal(mixed.overview.accounting.fastMode.coverage.unknownEvents, 1);
-    assert.equal(
-      mixed.overview.accounting.fastMode.coverage.unknownSharePercent,
-      50,
-    );
-    assert.equal(
-      mixed.overview.monitoringGaps.find((row) => row.id === "fast_mode").status,
+      snapshot.overview.monitoringGaps.find((row) => row.id === "fast_mode").status,
       "partial",
-    );
-
-    // An unrecognised statement is never treated as Fast.
-    const hostile = await build("turbo");
-    assert.equal(hostile.overview.accounting.fastMode.preference, "standard");
-    assert.equal(
-      hostile.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
-      10,
     );
   } finally {
     await rm(root, { recursive: true });
@@ -1101,9 +1109,9 @@ test("collector fallback keeps mixed event-time price provenance while an old re
   const root = await fixtureRoot();
   const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
   const olderTerraCard =
-    "openai:gpt-5.6-terra:standard:long-through-2026-07-29:official-observed-2026-08-01";
+    "openai:gpt-5.6-terra:standard:long-through-2026-07-29:official-observed-2026-08-30";
   const lowerTerraCard =
-    "openai:gpt-5.6-terra:standard:long-from-2026-07-30:official-observed-2026-08-01";
+    "openai:gpt-5.6-terra:standard:long-from-2026-07-30:official-observed-2026-08-30";
   try {
     const usage = (observedAt) => JSON.stringify({
       schemaVersion: "0.3",
@@ -1234,9 +1242,6 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
 
     const snapshot = await buildLocalCompanionSnapshot({
       root,
-      // "not sure" removes the stated preference as an attribution route, so
-      // anything attributed here came from the declaration alone.
-      fastModePreference: "mixed_unknown",
       codexSpeedBaselines: [{
         mode: "fast",
         firstSeenAt: "2026-07-26T10:00:00.000Z",
@@ -1249,18 +1254,18 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
     assert.equal(fastMode.coverage.totalEvents, 4);
     assert.equal(fastMode.coverage.observedEvents, 1);
     assert.equal(fastMode.coverage.declaredFromConfigEvents, 1);
-    assert.equal(fastMode.coverage.assumedFromPreferenceEvents, 0);
-    assert.equal(fastMode.coverage.unknownEvents, 2);
+    assert.equal(fastMode.coverage.assumedEvents, 2);
+    assert.equal(fastMode.coverage.unknownEvents, 0);
     // Each event prices to $5 of Standard-rate API equivalent: $5 observed
     // Standard plus $5 declared Fast at GPT-5.4's published 2x, with the two
-    // uncovered events left explicitly unweighted rather than counted at 1x.
+    // uncovered events attributed to Standard as a visible assumption.
     assert.equal(snapshot.overview.accounting.apiPriceEquivalentUsd, 20);
     assert.equal(
       snapshot.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
-      15,
+      25,
     );
-    assert.equal(fastMode.unweightedUnknownApiPriceEquivalentUsd, 10);
-    assert.equal(fastMode.weightingStatus, "partial");
+    assert.equal(fastMode.unweightedUnknownApiPriceEquivalentUsd, 0);
+    assert.equal(fastMode.weightingStatus, "complete");
     assert.equal(fastMode.declarationSource.neverBackfillsHistory, true);
     assert.deepEqual(
       [...fastMode.declarationSource.retainedKeys],
@@ -1270,7 +1275,6 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
     // With no declarations at all the same ledger attributes nothing extra.
     const undeclared = await buildLocalCompanionSnapshot({
       root,
-      fastModePreference: "mixed_unknown",
       now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
     assert.equal(
@@ -1278,7 +1282,7 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
       0,
     );
     assert.equal(
-      undeclared.overview.accounting.fastMode.coverage.unknownEvents,
+      undeclared.overview.accounting.fastMode.coverage.assumedEvents,
       3,
     );
   } finally {
@@ -1388,7 +1392,7 @@ test("missing and malformed artifacts fail closed while collector evidence remai
       snapshot.weekly.errorCode,
       "allowance_capacity_cache_unavailable",
     );
-    assert.equal(snapshot.reports.every((report) => report.status === "unavailable"), true);
+    assert.equal(Object.hasOwn(snapshot, "reports"), false);
     assert.equal(snapshot.overview.collector.indexingState, "not_started");
   } finally {
     await rm(root, { recursive: true });
@@ -1524,7 +1528,7 @@ test("live weekly cache replaces the repo artifact and labels historical account
 });
 
 // The diagnostic weekly fit remains Standard-priced. Until composition is
-// fitted independently on the selected quota-weighted basis, its vector must
+// fitted independently on the selected speed-priced basis, its vector must
 // not leak into an allowance-facing card whose scalar uses Fast weighting.
 test("the Standard diagnostic fitted mix does not leak into the weighted allowance card", async () => {
   const root = await fixtureRoot();
@@ -1565,7 +1569,14 @@ test("the Standard diagnostic fitted mix does not leak into the weighted allowan
       recentMixDays: 14,
     };
     const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;
-    cache.weeklyCalibration.composition = composition;
+    cache.weeklyCalibration.composition = {
+      ...composition,
+      planType: cache.weeklyCalibration.planType,
+      attributionExcludedBins: 0,
+    };
+    cache.weeklyCalibration.planPopulations.find((population) => (
+      population.planType === cache.weeklyCalibration.selectedPlanType
+    )).composition = cache.weeklyCalibration.composition;
     await writeLocalCollectorAccountingCache({ stateFile, cache });
 
     const snapshot = await buildLocalCompanionSnapshot({
@@ -1599,6 +1610,8 @@ test("an out-of-range fitted-mix share fails closed like any other cache defect"
     });
     const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;
     cache.weeklyCalibration.composition = {
+      planType: cache.weeklyCalibration.planType,
+      attributionExcludedBins: 0,
       status: "fitted",
       grainHours: 2,
       observationCount: 120,
@@ -1610,6 +1623,9 @@ test("an out-of-range fitted-mix share fails closed like any other cache defect"
       blendedRecentMixUsd: 2_050,
       recentMixDays: 14,
     };
+    cache.weeklyCalibration.planPopulations.find((population) => (
+      population.planType === cache.weeklyCalibration.selectedPlanType
+    )).composition = cache.weeklyCalibration.composition;
     await writeLocalCollectorAccountingCache({ stateFile, cache });
 
     const snapshot = await buildLocalCompanionSnapshot({
@@ -1684,6 +1700,163 @@ test("data store retains its last good snapshot when a reload fails", async () =
   assert.equal(store.getOverview().marker, "last-good");
 });
 
+test("desktop shell display evidence is a cached bounded projection of current normal Codex lanes", async () => {
+  const observedAt = "2026-09-05T11:59:00.000Z";
+  const store = new LocalCompanionDataStore({
+    builder: async () => ({
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      mode: "real_local_evidence",
+      generatedAt: "2026-09-05T12:00:00.000Z",
+      overview: {
+        evidenceStatus: "available",
+        freshness: { status: "live", staleAfterSeconds: 1_800 },
+        quotaWindows: [
+          // Another provider pool cannot become a compact-shell fallback.
+          {
+            limitId: "codex_bengalfox",
+            slot: "primary",
+            usedPercent: 1,
+            remainingPercent: 99,
+            durationMinutes: 10_080,
+            observedAt,
+            resetAt: "2026-09-05T14:00:00.000Z",
+          },
+          // The native selection prefers a primary slot when both report the
+          // same normal Codex duration, even at exactly 0% remaining.
+          {
+            limitId: "codex",
+            slot: "secondary",
+            usedPercent: 25,
+            remainingPercent: 75,
+            durationMinutes: 10_080,
+            observedAt,
+            resetAt: "2026-09-05T14:00:00.000Z",
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            usedPercent: 100,
+            remainingPercent: 0,
+            durationMinutes: 10_080,
+            observedAt,
+            resetAt: "2026-09-05T14:00:00.000Z",
+          },
+          {
+            limitId: "codex",
+            slot: "secondary",
+            usedPercent: 58,
+            remainingPercent: 42,
+            durationMinutes: 300,
+            observedAt,
+            resetAt: "2026-09-05T12:30:00.000Z",
+          },
+          // A malformed complement must not make the cache or the shell lie.
+          {
+            limitId: "codex",
+            slot: "primary",
+            usedPercent: 25,
+            remainingPercent: 76,
+            durationMinutes: 300,
+            observedAt,
+            resetAt: "2026-09-05T12:30:00.000Z",
+          },
+        ],
+        accounting: {
+          projection: { status: "retained" },
+          privateDiagnostic: "/Users/private/retained-history.json",
+        },
+        timeline: { usage: [{ private: "not projected" }] },
+      },
+      gradient: {},
+      weekly: {},
+      quality: {},
+      reports: [],
+    }),
+  });
+
+  // `reload` would normally return the full cloned overview. Suppress that
+  // response, then make any accidental accessor call fail, proving this path
+  // serves the cached small projection instead.
+  await store.reload({ returnOverview: false });
+  store.getOverview = () => {
+    throw new Error("full overview clone is forbidden in the shell poll path");
+  };
+  const evidence = store.getDesktopShellDisplayEvidence();
+
+  assert.deepEqual(evidence, {
+    evidenceStatus: "available",
+    freshness: { status: "live", staleAfterSeconds: 1_800 },
+    windows: [
+      {
+        durationMinutes: 300,
+        slot: "secondary",
+        usedPercent: 58,
+        remainingPercent: 42,
+        observedAt,
+        resetAt: "2026-09-05T12:30:00.000Z",
+      },
+      {
+        durationMinutes: 10_080,
+        slot: "primary",
+        usedPercent: 100,
+        remainingPercent: 0,
+        observedAt,
+        resetAt: "2026-09-05T14:00:00.000Z",
+      },
+    ],
+  });
+  assert.equal(Object.isFrozen(evidence), true);
+  assert.equal(Object.isFrozen(evidence.freshness), true);
+  assert.equal(Object.isFrozen(evidence.windows), true);
+  assert.equal(JSON.stringify(evidence).includes("private"), false);
+  assert.equal(JSON.stringify(evidence).includes("bengalfox"), false);
+});
+
+test("an aborted candidate cannot publish after its projection completes", async () => {
+  let calls = 0;
+  let releaseCandidate;
+  let candidateStarted;
+  const candidateGate = new Promise((resolve) => {
+    releaseCandidate = resolve;
+  });
+  const candidateEntered = new Promise((resolve) => {
+    candidateStarted = resolve;
+  });
+  const snapshot = (marker) => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt: "2026-07-25T12:00:00.000Z",
+    overview: { marker },
+    gradient: {},
+    weekly: {},
+    quality: {},
+    reports: [],
+  });
+  const store = new LocalCompanionDataStore({
+    builder: async () => {
+      calls += 1;
+      if (calls === 1) return snapshot("last-good");
+      candidateStarted();
+      await candidateGate;
+      return snapshot("must-not-publish");
+    },
+  });
+  await store.reload();
+  const controller = new AbortController();
+  const reload = store.reload({
+    purpose: "full",
+    signal: controller.signal,
+  });
+  await candidateEntered;
+  controller.abort();
+  releaseCandidate();
+  await assert.rejects(
+    reload,
+    (error) => error?.code === "local_companion_snapshot_reload_aborted",
+  );
+  assert.equal(store.getOverview().marker, "last-good");
+});
+
 test("a deferred quick reload keeps the projection surfaces it cannot rebuild", async () => {
   // A quick reload is answered with a DEFERRED unified projection, whose
   // gradient/weekly datasets come back as empty arrays rather than absent.
@@ -1734,6 +1907,67 @@ test("a deferred quick reload keeps the projection surfaces it cannot rebuild", 
   await emptying.reload({ purpose: "full" });
   assert.equal(emptying.getGradient().datasets.rolling.length, 0);
   assert.equal(emptying.getWeekly().datasets.weekly_values.length, 0);
+});
+
+test("weekly pace reads re-project the strict forecast at request time", async () => {
+  const nowMs = Date.parse("2026-08-03T12:00:00.000Z");
+  const resetsAt = new Date(nowMs + 100 * 60 * 60_000).toISOString();
+  const forecast = {
+    schemaVersion: "local-weekly-pace-forecast-v0.2",
+    status: "will_reach_reset_first",
+    currentUsedPercent: 50,
+    remainingPercent: 50,
+    resetsAt,
+    pace: {
+      method: "median_adjacent_quota_slope",
+      sampleCount: 2,
+      elapsedHours: 2,
+      movementPp: 0.4,
+      activePercentagePointsPerHour: 0.2,
+      overallPercentagePointsPerHour: 0.2,
+    },
+    observationCount: 3,
+    etaAt: null,
+    hoursToExhaustion: null,
+    hoursToReset: 100,
+  };
+  let builds = 0;
+  const store = new LocalCompanionDataStore({
+    builder: async () => {
+      builds += 1;
+      return {
+        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+        mode: "real_local_evidence",
+        generatedAt: new Date(nowMs).toISOString(),
+        overview: {},
+        gradient: {},
+        weekly: {
+          datasets: {},
+          paceForecast: forecast,
+          paceOutlook: { marker: "must-not-be-served" },
+        },
+        quality: {},
+        reports: [],
+      };
+    },
+  });
+  await store.reload();
+
+  const initial = store.getWeeklyPaceOutlook({ nowMs });
+  const oneHourLater = store.getWeeklyPaceOutlook({
+    nowMs: nowMs + 60 * 60_000,
+  });
+  assert.equal(builds, 1);
+  assert.equal(initial.status, "available");
+  assert.equal(initial.standing, "under");
+  assert.equal(initial.projection.hoursToReset, 100);
+  assert.equal(oneHourLater.projection.hoursToReset, 99);
+  assert.ok(oneHourLater.projection.sparePercent > initial.projection.sparePercent);
+  assert.deepEqual(
+    store.getWeekly({ nowMs: nowMs + 60 * 60_000 }).paceOutlook,
+    oneHourLater,
+  );
+  assert.doesNotMatch(JSON.stringify(oneHourLater), /marker|account|path/iu);
 });
 
 test("the unified index removes the 31-day ceiling and keeps fork replay out of the headline", async () => {
@@ -1845,11 +2079,18 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
     assert.equal(partialSnapshot.overview.timeline.history.status, "partial");
+    assert.equal(partialSnapshot.overview.accounting.cacheDiagnosticsSource, null,
+      "an incomplete diagnostic generation cannot authorize thread lookup");
     assert.equal(
       partialSnapshot.overview.timeline.history.reason,
       "unified_index_partial",
     );
     assert.equal(partialSnapshot.overview.timeline.source, "insufficient_evidence");
+    assert.notEqual(
+      partialSnapshot.overview.accounting.historyCoverage.phase,
+      "aggregate_unavailable",
+      "indexed counts alone do not prove a validated generation is complete",
+    );
     assert.equal(
       partialSnapshot.overview.accounting.accountingSource,
       "insufficient_evidence",
@@ -1935,6 +2176,21 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       snapshot.overview.accounting.cacheContinuityImpact.minimumGapSeconds,
       0,
     );
+    assert.equal(snapshot.overview.accounting.trayCacheSummary.schemaVersion, 1);
+    assert.deepEqual(snapshot.overview.accounting.trayCacheSummary.periods.map(row => row.periodId), ["7d", "30d"]);
+    assert.ok(snapshot.overview.accounting.trayCacheSummary.periods.every(row => row.status === "available"));
+
+    assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact
+        .outcomeDisplayMaximumGapSeconds,
+      604_800,
+    );
+    assert.equal(
+      Object.keys(
+        snapshot.overview.accounting.cacheContinuityImpact.byOutcomeBucket,
+      ).length,
+      10,
+    );
     assert.equal(
       snapshot.overview.accounting.cacheContinuityImpact.cacheReadDrops,
       0,
@@ -1980,6 +2236,32 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
     );
     await writeFile(archiveIndexFile, "rollback-sentinel", { mode: 0o600 });
     const archiveBefore = await stat(archiveIndexFile);
+    const beforeSummary = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      archiveIndexFile,
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const pendingHistory = beforeSummary.overview.accounting.historyCoverage;
+    assert.equal(pendingHistory.phase, "aggregate_unavailable");
+    assert.equal(pendingHistory.status, "partial");
+    assert.equal(pendingHistory.errorCode, "cache_missing");
+    assert.equal(pendingHistory.indexedSourceCount, pendingHistory.sourceCount);
+    assert.equal(pendingHistory.indexedBytes, pendingHistory.sourceBytes);
+    assert.equal(beforeSummary.overview.accounting.generationMatched, false);
+    assert.equal(beforeSummary.overview.accounting.historyPeriodStatus, "unavailable");
+    assert.equal(beforeSummary.overview.accounting.projection.status, "available");
+    assert.equal(beforeSummary.overview.usage.find((period) => period.id === "all").events, 3);
+    assert.ok(beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("history scan is complete")
+      && warning.includes("accounting summary is unavailable")
+    )));
+    assert.ok(!beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("History indexing is still advancing")
+      || warning.includes("Complete historical totals stay hidden")
+    )));
     await refreshReplaySafeAccountingCache({
       stateFile: collectorStateFile,
       sourceMode: "unified",
@@ -2065,6 +2347,22 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       toolPartialDatabase,
     );
     toolPartialDatabase.close();
+    // The current diagnostic projection remains independently attested while
+    // the prior replay cache no longer matches the changed generation proof.
+    const beforeReplayRebuild = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      archiveIndexFile,
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(beforeReplayRebuild.overview.accounting.generationMatched, false);
+    assert.equal(beforeReplayRebuild.overview.accounting.cacheSwitchImpact.status, "available");
+    assert.deepEqual(beforeReplayRebuild.overview.accounting.cacheDiagnosticsSource, {
+      generation: toolPartialGeneration.id,
+      generationFingerprint: toolPartialGeneration.fingerprint,
+    });
     await refreshReplaySafeAccountingCache({
       stateFile: collectorStateFile,
       sourceMode: "unified",
@@ -2087,7 +2385,16 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
         .events,
       3,
     );
-    assert.equal(toolPartialSnapshot.overview.tools.total, 0);
+    assert.equal(toolPartialSnapshot.overview.tools.status, "unavailable");
+    assert.equal(
+      toolPartialSnapshot.overview.tools.reason,
+      "typed_tool_history_partial",
+    );
+    assert.equal(toolPartialSnapshot.overview.tools.total, null);
+    assert.equal(toolPartialSnapshot.overview.activity.toolEvents, null);
+    assert.ok(Object.values(toolPartialSnapshot.overview.tools.counts).every(
+      (value) => value === null,
+    ));
     assert.ok(toolPartialSnapshot.overview.warnings.some((warning) => (
       warning.includes("typed tool history is partial")
     )));
@@ -2154,6 +2461,147 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
   }
 });
 
+test("full unified snapshot prices stored context like the same-generation replay cache", async () => {
+  const root = await fixtureRoot();
+  const nowMs = Date.parse("2026-08-30T00:00:00.000Z");
+  const cases = [
+    { at: "2026-07-01T12:00:00.000Z", input: 272_000, context: null, cost: 1.3606 },
+    { at: "2026-07-02T12:00:00.000Z", input: 300_000, context: null, cost: 1.5006 },
+    { at: "2026-08-29T11:00:00.000Z", input: 271_999, context: null, cost: 1.088396 },
+    { at: "2026-08-29T12:00:00.000Z", input: 272_000, context: 271_999, cost: 1.0884 },
+    { at: "2026-08-29T13:00:00.000Z", input: 271_999, context: 272_000, cost: 2.176592 },
+  ];
+  try {
+    const stateDirectory = join(root, ".usage-monitor");
+    const indexFile = join(stateDirectory, "local-unified-index-v1.sqlite");
+    const stateFile = join(stateDirectory, "local-collector-state-v1.sqlite");
+    const sessions = join(root, "sessions");
+    await mkdir(sessions);
+    let totalInput = 0;
+    let totalOutput = 0;
+    await writeFile(join(sessions, "rollout-2026-07-01T12-00-00-context.jsonl"), `${[
+      JSON.stringify({
+        timestamp: cases[0].at,
+        type: "session_meta",
+        payload: { id: "synthetic-context-session", thread_source: "user" },
+      }),
+      JSON.stringify({
+        timestamp: cases[0].at,
+        type: "turn_context",
+        payload: { model: "gpt-5.6-sol", effort: "high" },
+      }),
+      ...cases.map(({ at, input }) => {
+        totalInput += input;
+        totalOutput += 20;
+        return rolloutToken(
+          at,
+          rolloutUsage(totalInput, totalOutput),
+          rolloutUsage(input, 20),
+          10,
+        );
+      }),
+    ].join("\n")}\n`);
+    const { rebuildLocalUnifiedIndex } = await import("../src/local-unified-index-build.js");
+    const built = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile,
+      secretFile: join(stateDirectory, "local-unified-index-device-salt-v1"),
+      contractVersion: "companion-context-test-v1",
+    });
+    assert.equal(built.usageEvents, cases.length);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      // The current Codex parser reports no context. Seed the two observed
+      // contexts only in this synthetic index to exercise the typed read
+      // contract; the legacy NULL rows must remain NULL on disk.
+      for (const { at, context } of cases.filter((row) => row.context !== null)) {
+        database.prepare(`
+          UPDATE usage_event SET total_input_context = ? WHERE observed_at_ms = ?
+        `).run(context, Date.parse(at));
+      }
+      assert.deepEqual(
+        database.prepare(`
+          SELECT total_input_context AS context FROM usage_event ORDER BY observed_at_ms
+        `).all().map((row) => row.context),
+        cases.map((row) => row.context),
+      );
+    } finally {
+      database.close();
+    }
+    const cache = await refreshReplaySafeAccountingCache({
+      stateFile,
+      sourceMode: "unified",
+      unifiedIndexFile: indexFile,
+      expectedGeneration: built.generation,
+      contextBehavior: "legacy_zero",
+      codexHome: root,
+      now: () => nowMs,
+    });
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      unifiedIndexFile: indexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => nowMs,
+    });
+    const { accounting, timeline, usage } = snapshot.overview;
+    assert.equal(accounting.accountingCacheStatus, "available");
+    assert.equal(accounting.generationMatched, true);
+    assert.equal(accounting.generationFingerprint, built.generation.fingerprint);
+    assert.equal(accounting.compatibilityBehavior, "legacy_zero");
+    assert.equal(timeline.source, "unified_local_index");
+    assert.equal(timeline.history.status, "complete");
+    // Exercise the production builder, not a hand-shaped fixture: requiring
+    // a retired top-level report field previously rejected every real save.
+    assert.equal(isAuthoritativeDashboardSnapshot(snapshot), true);
+    const snapshotFile = join(stateDirectory, "private", "last-authoritative-dashboard.json");
+    assert.equal(await writeAuthoritativeDashboardSnapshot({
+      snapshotFile, snapshot, now: () => nowMs,
+    }), true);
+    const restored = await readAuthoritativeDashboardSnapshot({ snapshotFile });
+    assert.notEqual(restored, null);
+    assert.deepEqual(restored.snapshot, JSON.parse(JSON.stringify(snapshot)),
+      "the production JSON projection survives durable persistence exactly");
+    const all = usage.find((period) => period.id === "all");
+    const history = accounting.periods.find((period) => period.periodId === "history");
+    assert.equal(all.events, cases.length);
+    assert.equal(all.totalTokens, 1_388_098);
+    assert.equal(all.apiPriceEquivalentUsd, 7.214588);
+    for (const field of [
+      "events", "totalTokens", "apiPriceEquivalentUsd", "priceCardIds", "priceCardBreakdown",
+    ]) {
+      assert.deepEqual(all[field], cache.history.period[field], field);
+      assert.deepEqual(all[field], history[field], field);
+    }
+    assert.deepEqual(all.componentCosts, cache.history.period.componentCosts);
+    for (const id of ["24h", "7d", "30d"]) {
+      const displayed = usage.find((period) => period.id === id);
+      const cached = cache.periods.find((period) => period.id === id);
+      assert.equal(displayed.events, 3);
+      assert.equal(displayed.apiPriceEquivalentUsd, cached.apiPriceEquivalentUsd);
+      assert.equal(displayed.totalTokens, cached.totalTokens);
+    }
+    const timelineTotals = (rows) => rows.map((row) => ({
+      startAt: row.startAt,
+      usageEvents: row.usageEvents,
+      totalTokens: row.totalTokens,
+      apiPriceEquivalentUsd: row.apiPriceEquivalentUsd,
+    }));
+    assert.deepEqual(timelineTotals(timeline.usage), cases.map(({ at, input, cost }) => ({
+      startAt: at,
+      usageEvents: 1,
+      totalTokens: input + 20,
+      apiPriceEquivalentUsd: cost,
+    })));
+    assert.deepEqual(
+      timelineTotals(timeline.usage.filter((row) => row.startAt >= cache.coveredAt.startAt)),
+      timelineTotals(cache.timeline),
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("a missing unified index keeps the bounded window and says so in the payload", async () => {
   const root = await fixtureRoot();
   try {
@@ -2213,6 +2661,218 @@ test("a deferred unified projection publishes a loading history receipt", async 
   }
 });
 
+test("snapshot construction delegates the selected unified projection mode", async () => {
+  const root = await fixtureRoot();
+  const calls = [];
+  const controller = new AbortController();
+  try {
+    await buildLocalCompanionSnapshot({
+      root,
+      unifiedProjectionMode: "deferred",
+      unifiedProjectionReader: async (options, controls) => {
+        calls.push({ options, controls });
+        return readLocalUnifiedCompanionProjection(options);
+      },
+      signal: controller.signal,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.mode, "deferred");
+    assert.equal(
+      calls[0].options.nowMs,
+      Date.parse("2026-07-25T12:00:00.000Z"),
+    );
+    assert.equal(calls[0].controls.signal, controller.signal);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an attested rollout quarantine publishes verified totals as a terminal gap, never as zero", async () => {
+  const root = await fixtureRoot();
+  const sessions = join(root, "sessions", "2026", "07", "25");
+  const threadGap = "11111111-1111-4111-8111-111111111111";
+  const threadValid = "22222222-2222-4222-8222-222222222222";
+  const name = (timestamp, threadId) => (
+    `rollout-${timestamp}-${threadId}.jsonl`
+  );
+  try {
+    await mkdir(sessions, { recursive: true });
+    const meta = (id) => JSON.stringify({
+      timestamp: "2026-07-25T11:00:00.000Z",
+      type: "session_meta",
+      payload: { id, session_id: id, thread_source: "user" },
+    });
+    const turn = (model) => JSON.stringify({
+      timestamp: "2026-07-25T11:00:01.000Z",
+      type: "turn_context",
+      payload: { model, effort: "high" },
+    });
+    const writeLines = (filename, lines) => writeFile(
+      join(sessions, filename),
+      `${lines.join("\n")}\n`,
+      { mode: 0o600 },
+    );
+    await writeLines(name("2026-07-25T10-00-00", threadGap), [
+      meta(threadGap),
+    ]);
+    await writeLines(name("2026-07-25T10-00-01", threadGap), [
+      meta(threadGap),
+      turn("gpt-5.6-terra"),
+    ]);
+    await writeLines(name("2026-07-25T11-00-00", threadValid), [
+      meta(threadValid),
+      turn("gpt-5.6-sol"),
+      rolloutToken(
+        "2026-07-25T11:00:02.000Z",
+        rolloutUsage(100, 10),
+        rolloutUsage(100, 10),
+        12,
+      ),
+    ]);
+
+    const { rebuildLocalUnifiedIndex } = await import(
+      "../src/local-unified-index-build.js"
+    );
+    const unifiedIndexFile = join(
+      root,
+      ".usage-monitor",
+      "local-unified-index-v1.sqlite",
+    );
+    const built = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: unifiedIndexFile,
+      secretFile: join(
+        root,
+        ".usage-monitor",
+        "local-unified-index-device-salt-v1",
+      ),
+      contractVersion: "companion-test-v1",
+    });
+    assert.equal(built.generation.status, "partial");
+    assert.equal(built.generation.skippedSourceCount, 2);
+
+    const beforeSummary = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const pendingHistory = beforeSummary.overview.accounting.historyCoverage;
+    assert.equal(pendingHistory.phase, "aggregate_unavailable");
+    assert.equal(pendingHistory.status, "partial");
+    assert.equal(pendingHistory.pendingSourceCount, 0);
+    assert.equal(pendingHistory.indexedSourceCount, 1);
+    assert.equal(pendingHistory.skippedSourceCount, 2);
+    assert.equal(pendingHistory.skippedThreadCount, 1);
+    assert.equal(beforeSummary.overview.accounting.historyPeriodStatus, "unavailable");
+    assert.equal(beforeSummary.overview.usage.find((period) => period.id === "all").events, 1);
+    assert.ok(beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("2 sources across 1 thread")
+      && warning.includes("did not pass local validation")
+    )));
+    assert.ok(!beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("History indexing is still advancing")
+    )));
+
+    await refreshReplaySafeAccountingCache({
+      stateFile: join(
+        root,
+        ".usage-monitor",
+        "local-collector-state-v1.sqlite",
+      ),
+      sourceMode: "unified",
+      unifiedIndexFile,
+      expectedGeneration: built.generation,
+      contextBehavior: "legacy_zero",
+      codexHome: root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(snapshot.overview.timeline.history.status, "partial");
+    assert.equal(snapshot.overview.timeline.history.usageEvents, 1);
+    assert.deepEqual(snapshot.overview.accounting.historyCoverage, {
+      status: "partial",
+      phase: "partial_terminal",
+      errorCode: null,
+      generatedAt: snapshot.overview.accounting.historyCoverage.generatedAt,
+      coveredAt: snapshot.overview.accounting.historyCoverage.coveredAt,
+      sourceCount: 3,
+      indexedSourceCount: 1,
+      pendingSourceCount: 0,
+      skippedSourceCount: 2,
+      skippedSourceBytes: built.generation.skippedSourceBytes,
+      skippedThreadCount: 1,
+      sourceBytes: built.generation.discoveredSourceBytes,
+      indexedBytes: built.generation.indexedSourceBytes,
+      sourceMode: "unified",
+      generationMatched: true,
+    });
+    assert.equal(
+      snapshot.overview.accounting.historyCoverage.phase,
+      "partial_terminal",
+    );
+    assert.equal(snapshot.overview.accounting.historyPeriodStatus, "available");
+    assert.equal(
+      snapshot.overview.accounting.periods.find((period) => (
+        period.periodId === "history"
+      )).events,
+      1,
+    );
+    assert.equal(
+      snapshot.overview.usage.find((period) => period.id === "all").events,
+      1,
+    );
+    const coverageWarning = snapshot.overview.warnings.find((warning) => (
+      warning.includes("Indexed-history totals include")
+    ));
+    assert.match(coverageWarning, /material coverage gap/u);
+    assert.match(coverageWarning, /unavailable rather than zero/u);
+    assert.doesNotMatch(coverageWarning, /quarantined|known gap/iu);
+    assert.equal(JSON.stringify(snapshot).includes(threadGap), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("only coherent terminal history gaps at or below one percent are informational", () => {
+  const coverage = {
+    status: "partial",
+    phase: "partial_terminal",
+    sourceCount: 100,
+    indexedSourceCount: 99,
+    pendingSourceCount: 0,
+    skippedSourceCount: 1,
+  };
+  assert.equal(INFORMATIONAL_HISTORY_GAP_MAX_SHARE, 0.01);
+  assert.equal(isInformationalTerminalHistoryGap(coverage), true);
+  assert.equal(isInformationalTerminalHistoryGap({
+    ...coverage,
+    indexedSourceCount: 98,
+    skippedSourceCount: 2,
+  }), false);
+  assert.equal(isInformationalTerminalHistoryGap({
+    ...coverage,
+    indexedSourceCount: 0,
+    skippedSourceCount: 100,
+  }), false);
+  assert.equal(isInformationalTerminalHistoryGap({
+    ...coverage,
+    pendingSourceCount: 1,
+  }), false);
+  assert.equal(isInformationalTerminalHistoryGap({
+    ...coverage,
+    indexedSourceCount: 98,
+  }), false);
+});
+
 test("unified mode with no valid generation withholds the provisional collector projection", async () => {
   const root = await fixtureRoot();
   try {
@@ -2246,7 +2906,9 @@ test("unified mode with no valid generation withholds the provisional collector 
     );
     assert.equal(snapshot.overview.pricing.totalCostUsd, 0);
     assert.equal(snapshot.overview.pricing.eventCount, 0);
-    assert.equal(snapshot.overview.tools.total, 0);
+    assert.equal(snapshot.overview.tools.status, "unavailable");
+    assert.equal(snapshot.overview.tools.total, null);
+    assert.equal(snapshot.overview.activity.toolEvents, null);
     assert.deepEqual(snapshot.overview.collector.exportableCoveredAt, {
       startAt: null,
       endAt: null,
@@ -2348,6 +3010,174 @@ test("a deferred quick reload keeps the usage figures and both usage timelines",
     assert.equal(emptying.getOverview().usage[0].events, 0);
     assert.equal(emptying.getOverview().timeline.usage.length, 0);
   })();
+});
+
+test("usage timeline retention keeps its matching metadata without retaining current quota lanes", async (t) => {
+  const metadataKeys = [
+    "source", "coveredAt", "bucketMinutes", "history", "allowanceWeightingEncoding",
+  ];
+  const snapshot = ({ generation, matched, populated }) => {
+    const generatedAt = generation === 1
+      ? "2026-08-28T12:00:00.000Z"
+      : "2026-08-28T12:15:00.000Z";
+    const coveredAt = populated
+      ? { startAt: "2026-08-28T00:00:00.000Z", endAt: generatedAt }
+      : { startAt: null, endAt: null };
+    return {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      mode: "real_local_evidence",
+      generatedAt,
+      overview: {
+        quota: { observedAt: generatedAt, windows: [{ remainingPercent: 90 - generation }] },
+        accounting: {
+          sourceMode: "unified",
+          generation,
+          generationMatched: matched,
+          generationFingerprint: `synthetic-generation-${generation}`,
+          accountingCacheStatus: matched ? "available" : "unavailable",
+          generatedAt,
+          coveredAt,
+          events: populated ? generation : 0,
+          projection: {
+            status: matched ? "current" : "loading",
+            reason: matched ? null : "unified_index_deferred",
+            terminal: matched,
+          },
+        },
+        usage: [{ id: "7d", events: populated ? generation : 0 }],
+        timeline: {
+          source: populated ? "unified_local_index" : "insufficient_evidence",
+          coveredAt,
+          bucketMinutes: generation === 1 ? 15 : 30,
+          history: { status: populated ? "complete" : "loading", coveredAt, generatedAt },
+          allowanceWeightingEncoding: {
+            schemaVersion: "quota-weighted-timeline-v0.1",
+            scenarioOrder: generation === 1
+              ? ["unresolved_as_standard", "unresolved_as_fast"]
+              : ["unresolved_as_fast", "unresolved_as_standard"],
+            selectedScenario: "unresolved_as_standard",
+          },
+          usage: populated ? [{ at: generatedAt, totalTokens: generation * 100 }] : [],
+          quota: [{ at: generatedAt, usedPercent: generation }],
+          sparkQuota: [{ at: generatedAt, usedPercent: generation * 2 }],
+          sparkUsage: [{ at: generatedAt, totalTokens: generation * 10 }],
+          calibrationUsage: [{ at: generatedAt, totalTokens: generation * 20 }],
+          allowanceCapacity: { status: "available", marker: generation },
+          marker: generation,
+        },
+      },
+      gradient: { datasets: {} },
+      weekly: { datasets: {} },
+      quality: {},
+    };
+  };
+  const storeWith = (snapshots) => {
+    let call = 0;
+    return new LocalCompanionDataStore({
+      builder: async () => snapshots[Math.min(call++, snapshots.length - 1)],
+    });
+  };
+
+  for (const purpose of ["startup", "quick", "full"]) {
+    await t.test(`${purpose} retains usage and metadata as one projection`, async () => {
+      const previous = snapshot({ generation: 1, matched: true, populated: true });
+      const incoming = snapshot({ generation: 2, matched: false, populated: false });
+      const unmodified = structuredClone([previous, incoming]);
+      const store = storeWith([previous, incoming]);
+      await store.reload({ purpose: "full" });
+      await store.reload({ purpose });
+      const held = store.getOverview();
+      const expectedTimeline = { ...incoming.overview.timeline, usage: previous.overview.timeline.usage };
+      for (const key of metadataKeys) expectedTimeline[key] = previous.overview.timeline[key];
+      assert.deepEqual(held.timeline, expectedTimeline,
+        "retained usage needs its old metadata; quota, Spark, and other incoming lanes stay fresh");
+      assert.deepEqual(held.quota, incoming.overview.quota);
+      assert.equal(held.generatedAt, incoming.generatedAt);
+      assert.equal(held.accounting.generation, 2);
+      assert.equal(held.accounting.generationMatched, false);
+      assert.equal(held.accounting.generationFingerprint, "synthetic-generation-2");
+      assert.equal(held.accounting.accountingCacheStatus, "unavailable");
+      assert.deepEqual(held.accounting.projection, {
+        ...incoming.overview.accounting.projection,
+        status: "retained",
+        retainedAt: previous.generatedAt,
+        coveredAt: previous.overview.accounting.coveredAt,
+      });
+      assert.deepEqual([previous, incoming], unmodified, "retention must not mutate builder snapshots");
+    });
+  }
+
+  await t.test("missing old metadata is not borrowed from the incoming projection", async () => {
+    const previous = snapshot({ generation: 1, matched: true, populated: true });
+    for (const key of metadataKeys) delete previous.overview.timeline[key];
+    const incoming = snapshot({ generation: 2, matched: false, populated: false });
+    const store = storeWith([previous, incoming]);
+    await store.reload({ purpose: "full" });
+    await store.reload({ purpose: "quick" });
+    const held = store.getOverview();
+    assert.deepEqual(held.timeline.usage, previous.overview.timeline.usage);
+    for (const key of metadataKeys) {
+      assert.equal(Object.hasOwn(held.timeline, key), false, `${key} cannot be invented for old rows`);
+    }
+    assert.deepEqual(held.timeline.quota, incoming.overview.timeline.quota);
+  });
+
+  await t.test("malformed old coverage stays unavailable rather than being repaired from accounting dates", async () => {
+    const previous = snapshot({ generation: 1, matched: true, populated: true });
+    const malformedMetadata = {
+      source: null,
+      coveredAt: { startAt: "not-a-date", endAt: null },
+      bucketMinutes: -1,
+      history: null,
+      allowanceWeightingEncoding: null,
+    };
+    Object.assign(previous.overview.timeline, malformedMetadata);
+    const incoming = snapshot({ generation: 2, matched: false, populated: false });
+    const store = storeWith([previous, incoming]);
+    await store.reload({ purpose: "full" });
+    await store.reload({ purpose: "full" });
+    const held = store.getOverview();
+    assert.deepEqual(held.timeline.usage, previous.overview.timeline.usage);
+    for (const key of metadataKeys) assert.deepEqual(held.timeline[key], malformedMetadata[key]);
+    assert.deepEqual(held.accounting.projection.coveredAt, previous.overview.accounting.coveredAt);
+    assert.notDeepEqual(held.timeline.coveredAt, held.accounting.projection.coveredAt);
+  });
+
+  for (const [name, matched, populated] of [
+    ["authoritative empty", true, false],
+    ["authoritative populated", true, true],
+    ["non-authoritative populated", false, true],
+  ]) {
+    await t.test(`${name} replaces both usage and its metadata`, async () => {
+      const previous = snapshot({ generation: 1, matched: true, populated: true });
+      const incoming = snapshot({ generation: 2, matched, populated });
+      const store = storeWith([previous, incoming]);
+      await store.reload({ purpose: "full" });
+      await store.reload({ purpose: "full" });
+      assert.deepEqual(store.getOverview().timeline, incoming.overview.timeline);
+      assert.deepEqual(store.getOverview().accounting, incoming.overview.accounting);
+    });
+  }
+
+  await t.test("an omitted usage surface does not trigger metadata retention", async () => {
+    const previous = snapshot({ generation: 1, matched: true, populated: true });
+    const incoming = snapshot({ generation: 2, matched: false, populated: false });
+    delete incoming.overview.timeline.usage;
+    const store = storeWith([previous, incoming]);
+    await store.reload({ purpose: "full" });
+    await store.reload({ purpose: "quick" });
+    assert.deepEqual(store.getOverview().timeline, incoming.overview.timeline);
+  });
+
+  await t.test("a first refresh without previous usage cannot manufacture timeline metadata", async () => {
+    const previous = snapshot({ generation: 1, matched: true, populated: false });
+    const incoming = snapshot({ generation: 2, matched: false, populated: false });
+    const store = storeWith([previous, incoming]);
+    await store.reload({ purpose: "startup" });
+    assert.deepEqual(store.getOverview().timeline, previous.overview.timeline);
+    await store.reload({ purpose: "quick" });
+    assert.deepEqual(store.getOverview().timeline, incoming.overview.timeline);
+  });
 });
 
 test("a non-authoritative FULL build keeps the evidence it could not rebuild", async () => {
@@ -2690,9 +3520,10 @@ test("every surface a withheld projection empties is registered for retention", 
   // values, so enumerating its substitution sites enumerates the class.
   //
   // Two of the eight sites yield real data surfaces as bare empty arrays and
-  // one yields the zeroed placeholder periods; the remaining five yield a
-  // coverage window or a source LABEL, which carry no rows and are meant to
-  // change on a deferred pass. If a new evidence-bearing substitution appears,
+  // one yields the zeroed placeholder periods; the remaining five yield
+  // metadata rather than rows. Usage coverage/source metadata is retained with
+  // the exact usage rows it describes; accounting truth fields remain current.
+  // If a new evidence-bearing substitution appears,
   // this fails until it is registered in PROJECTION_SURFACES — which is the
   // point, because reviewing the retention list is not something anyone
   // remembers to do when adding a surface.
@@ -2728,5 +3559,90 @@ test("every surface a withheld projection empties is registered for retention", 
     "overview.timeline.sparkUsage",
     "overview.timeline.calibrationUsage",
     "overview.timeline.allowanceCapacity",
+    "overview.timeline.planScoped",
   ]);
+});
+
+
+test("Trends retains plan-scoped history through refresh only with its matching capacity", async (t) => {
+  const scope = {
+    methodVersion: "plan-era-v1", planType: "pro", basisFamilyId: "synthetic-basis",
+    cohortId: "a".repeat(64), sourceGeneration: 35,
+    sourceGenerationFingerprint: "synthetic-generation-35",
+  };
+  const available = {
+    schemaVersion: "local-plan-scoped-accounting-timeline-v1",
+    status: "available", reason: null, encoding: "plan_bucket_v1", planScope: scope,
+    usage: [[Date.parse("2026-09-07T11:45:00.000Z"), 1,
+      1000, 0, 0, 0, 0, 0, 4, 4, 8, 0, 0, 1, 0, 1000]],
+    quota: [[Date.parse("2026-09-07T11:45:00.000Z"),
+      Date.parse("2026-09-08T00:00:00.000Z") / 1000, 30]],
+    comparisonIntervals: [[Date.parse("2026-09-07T11:45:00.000Z"),
+      Date.parse("2026-09-07T12:00:00.000Z")]],
+  };
+  const unavailable = {
+    schemaVersion: available.schemaVersion, status: "unavailable",
+    reason: "plan_scoped_timeline_unavailable", planScope: null,
+    usage: [], quota: [], comparisonIntervals: [],
+  };
+  const snapshot = (matched, planScoped, capacity = { status: "unavailable" }) => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence", generatedAt: "2026-09-07T12:00:00.000Z",
+    overview: {
+      accounting: { sourceMode: "unified", generationMatched: matched },
+      timeline: { usage: [1], planScoped, allowanceCapacity: capacity, quota: ["current quota"] },
+    },
+    gradient: { datasets: {} }, weekly: { datasets: {} }, quality: {}, reports: [],
+  });
+  const initial = snapshot(true, available, { status: "available", planScope: scope });
+  async function reload(next, purpose = "full") {
+    const originals = structuredClone([initial, next]);
+    let call = 0;
+    const store = new LocalCompanionDataStore({ builder: async () => call++ === 0 ? initial : next });
+    await store.reload({ purpose: "full" });
+    await store.reload({ purpose });
+    assert.deepEqual([initial, next], originals, "builder snapshots remain immutable");
+    return store.getOverview();
+  }
+  for (const purpose of ["full", "quick", "startup"]) {
+    await t.test(`${purpose} reuses the scoped history and capacity together`, async () => {
+      const result = await reload(snapshot(false, unavailable), purpose);
+      assert.deepEqual(result.timeline.planScoped, available);
+      assert.deepEqual(result.timeline.allowanceCapacity.planScope, scope);
+      assert.deepEqual(result.timeline.quota, ["current quota"]);
+      assert.equal(result.accounting.generationMatched, false);
+      const { selectAllowancePlanPopulation } = await import("../apps/web/public/data-client.js");
+      const selected = selectAllowancePlanPopulation({ ...result, weekly: {
+        planAttribution: { methodVersion: "plan-era-v1" }, selectedPlanType: "pro",
+        planPopulations: [{ planType: "pro", status: "available" }],
+      } });
+      assert.equal(selected.allowancePlanSelection.comparisonAvailable, true,
+        "the actual Trends selector still accepts the retained comparison");
+      assert.deepEqual(selected.timeline.selectedPlanUsage, available.usage);
+      assert.deepEqual(selected.timeline.comparisonIntervals, available.comparisonIntervals);
+    });
+  }
+  for (const key of Object.keys(scope)) {
+    await t.test(`changed capacity ${key} cannot borrow previous scoped history`, async () => {
+      const changed = { ...scope, [key]: key === "sourceGeneration" ? 36 : "different" };
+      const result = await reload(snapshot(false, unavailable, { status: "available", planScope: changed }));
+      assert.deepEqual(result.timeline.planScoped, unavailable);
+      assert.deepEqual(result.timeline.allowanceCapacity.planScope, changed);
+    });
+  }
+  await t.test("authoritative empty and fresh scoped history replace retained data", async () => {
+    assert.deepEqual((await reload(snapshot(true, unavailable))).timeline.planScoped, unavailable);
+    const fresh = { ...available, usage: [[6, 7]], comparisonIntervals: [[6, 8]] };
+    assert.deepEqual((await reload(snapshot(false, fresh))).timeline.planScoped, fresh);
+  });
+  await t.test("cold start, absent capacity scope and omitted surface do not manufacture history", async () => {
+    const incoming = snapshot(false, unavailable);
+    const cold = new LocalCompanionDataStore({ builder: async () => incoming });
+    await cold.reload({ purpose: "quick" });
+    assert.deepEqual(cold.getOverview().timeline.planScoped, unavailable);
+    const noScope = await reload(snapshot(false, unavailable, { status: "available" }));
+    assert.deepEqual(noScope.timeline.planScoped, unavailable);
+    delete incoming.overview.timeline.planScoped;
+    assert.equal(Object.hasOwn((await reload(incoming)).timeline, "planScoped"), false);
+  });
 });

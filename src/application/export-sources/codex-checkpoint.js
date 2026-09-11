@@ -1,7 +1,8 @@
 import {
   canonicalComponentAvailability,
   canonicalComponents,
-  canonicalRateLimitWindows,
+  canonicalRateLimitSnapshot,
+  codexSessionMetaIdentity,
   cumulativeSnapshotKey,
   deltaComponentPresence,
   extractToolObservations,
@@ -41,13 +42,39 @@ const { ExportWorkspaceError, sourceCheckpointBatchSha256 } = workspace;
 
 const DEFAULT_CHECKPOINT_LINES_PER_BATCH = 8_192;
 
+// Match the provider scanner's legacy-only accounting contract. Top-level
+// token_usage_record and compacted checkpoint copies overlap token_count;
+// they must not be charged once more during checkpoint/resume scans.
 const RELEVANT_NEEDLES = Object.freeze([
-  '"type":"turn_context"', '"type":"thread_settings_applied"', '"type":"token_count"',
+  '"type":"session_meta"', '"type":"turn_context"',
+  '"type":"thread_settings_applied"', '"type":"token_count"',
   '"type":"task_started"', '"type":"task_complete"', '"type":"custom_tool_call"',
   '"type":"function_call"', '"type":"web_search_call"', '"type":"file_search_call"',
   '"type":"code_interpreter_call"', '"type":"shell_call"', '"type":"computer_call"',
   '"type":"mcp_call"', '"type":"apply_patch_call"', '"type":"local_shell_call"',
 ]);
+const ACCOUNTING_NEEDLES = Object.freeze([
+  '"type":"session_meta"',
+  '"type":"turn_context"',
+  '"type":"thread_settings_applied"',
+  '"type":"token_count"',
+]);
+
+function accountingLine(line) {
+  return ACCOUNTING_NEEDLES.some((needle) => line.includes(needle));
+}
+
+function accountingRecord(record) {
+  return record?.type === "session_meta"
+    || record?.type === "turn_context"
+    || (record?.type === "event_msg"
+      && ["thread_settings_applied", "token_count"]
+        .includes(record?.payload?.type));
+}
+
+function contentInvalid() {
+  throw new ExportSourcePlanError("codex_rollout_content_invalid");
+}
 
 function safeKey(secret, domain, subject) {
   return createHmac("sha256", secret)
@@ -189,7 +216,9 @@ async function scanTierPhase({ workspace, source, checkpoint, resourceGuard, fai
         try {
           const record = JSON.parse(entry.line);
           if (record.type === "event_msg" && record.payload?.type === "thread_settings_applied") {
-            const timestampMs = Date.parse(record.timestamp);
+            const timestampMs = typeof record?.timestamp === "string"
+              ? Date.parse(record.timestamp)
+              : Number.NaN;
             const rawTier = record.payload?.thread_settings?.service_tier;
             if (Number.isFinite(timestampMs) && (rawTier === null || typeof rawTier === "string")) {
               const normalized = normalizeProviderTier(rawTier, {
@@ -263,10 +292,18 @@ function toolSnapshotKey(secret, line) {
 
 async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, resourceGuard, failpoint, maximumLinesPerBatch }) {
   const handle = await openVerifiedCodexExportSource(source, { resourceGuard });
+  const expectedSessionId = source.rolloutInfo?.lineage?.sessionId ?? null;
   const sourceScopeId = deriveSessionScopeId(
     secret,
     source.rolloutInfo?.lineage?.sessionId ?? source.rolloutInfo?.rolloutKey ?? source.sourceKey,
   );
+  // Frozen rollout metadata proves this physical generation. Do not persist
+  // its identity in parser state or conflate it with the logical session.
+  const sourceOccurrenceScopeId = source.rolloutInfo?.lineage?.historyMode === "paginated"
+    ? deriveSessionScopeId(secret, `codex-rollout-occurrence/v1\0${
+      source.rolloutInfo.sourceIdentity ?? source.rolloutInfo.rolloutId ?? source.rolloutInfo.rolloutKey
+    }`)
+    : null;
   try {
     let current = checkpoint;
     let state = cloneState(current.parserState);
@@ -278,6 +315,15 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
     const openTasks = new Set(workspace.sourceOpenTaskKeys(source.sourceKey));
     const pendingTaskAdds = new Set();
     const pendingTaskDeletes = new Set();
+
+    function rebaseTotals(total, presence) {
+      if (state.previousTotals !== null
+          && total.total_tokens < state.previousTotals.total_tokens) {
+        state.reAnchored = true;
+      }
+      state.previousTotals = total;
+      state.previousTotalsPresence = presence;
+    }
 
     async function flush() {
       batch.openTaskAdds = [...pendingTaskAdds].sort();
@@ -315,22 +361,43 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
         record = JSON.parse(entry.line);
       } catch {
         batch.diagnostics.add("malformed_lines");
+        if (accountingLine(entry.line)) contentInvalid();
         if (lineCounts.lines >= maximumLinesPerBatch) await flush();
         continue;
       }
-      const timestampMs = Date.parse(record?.timestamp);
+      const timestampMs = typeof record?.timestamp === "string"
+        ? Date.parse(record.timestamp)
+        : Number.NaN;
       if (!Number.isFinite(timestampMs)) {
         batch.diagnostics.add("malformed_timestamps");
+        if (accountingRecord(record)) contentInvalid();
         if (lineCounts.lines >= maximumLinesPerBatch) await flush();
         continue;
       }
 
-      if (record.type === "turn_context") {
+      if (record.type === "session_meta") {
+        const sessionMetaId = codexSessionMetaIdentity(record.payload);
+        if (sessionMetaId === null
+            || (!state.sessionMetaSeen && expectedSessionId !== null
+              && sessionMetaId !== expectedSessionId)) {
+          contentInvalid();
+        }
+        state.sessionMetaSeen = true;
+      } else if (record.type === "turn_context") {
         if (typeof record.payload?.model === "string") {
           state.currentModel = safeExportModelDeclaration(secret, record.payload.model);
         }
       } else if (record.type === "event_msg" && record.payload?.type === "thread_settings_applied") {
-        // Persisted tier prepass owns this line.
+        // Persisted tier prepass owns valid values. Reject an explicitly
+        // malformed setting here so the checkpoint cannot complete with a
+        // silently missing speed declaration.
+        const settings = record.payload?.thread_settings;
+        if (!settings || typeof settings !== "object" || Array.isArray(settings)
+            || (Object.hasOwn(settings, "service_tier")
+              && settings.service_tier !== null
+              && typeof settings.service_tier !== "string")) {
+          contentInvalid();
+        }
       } else if (record.type === "event_msg"
           && (record.payload?.type === "task_started" || record.payload?.type === "task_complete")) {
         if (timestampMs <= bounds.endMs) {
@@ -370,37 +437,43 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
         const lastPresence = tokenComponentPresence(info?.last_token_usage);
         const total = normalizeTokenUsage(info?.total_token_usage);
         const last = normalizeTokenUsage(info?.last_token_usage);
-        if ((info?.total_token_usage && !total) || (info?.last_token_usage && !last)) {
+        const malformedInfo = info !== null && info !== undefined
+          && (typeof info !== "object" || Array.isArray(info));
+        if (malformedInfo
+            || (info?.total_token_usage !== null
+              && info?.total_token_usage !== undefined && total === null)
+            || (info?.last_token_usage !== null
+              && info?.last_token_usage !== undefined && last === null)) {
           batch.diagnostics.add("malformed_usage_records");
+          contentInvalid();
         }
         const cumulativeKey = snapshotKey(secret, total, last);
         if (cumulativeKey) batch.localSnapshots.push({ kind: "cumulative_usage", snapshotKey: cumulativeKey });
         if (source.parentSourceKey !== null && cumulativeKey
             && workspace.hasInheritedSnapshot(source.sourceKey, "cumulative_usage", cumulativeKey)) {
           if (total) {
-            state.previousTotals = total;
-            state.previousTotalsPresence = totalPresence;
+            rebaseTotals(total, totalPresence);
           }
           if (timestampMs >= bounds.startMs && timestampMs <= bounds.endMs) {
             batch.diagnostics.add("fork_replay_events_skipped");
           }
         } else if (timestampMs < bounds.startMs || timestampMs > bounds.endMs) {
           if (total) {
-            state.previousTotals = total;
-            state.previousTotalsPresence = totalPresence;
+            rebaseTotals(total, totalPresence);
           }
         } else if (source.isFork && state.currentModel === null) {
           if (total) {
-            state.previousTotals = total;
-            state.previousTotalsPresence = totalPresence;
+            rebaseTotals(total, totalPresence);
           }
           batch.diagnostics.add("unattributed_fork_replay_events_skipped");
         } else {
-          const windows = canonicalRateLimitWindows(record.payload?.rate_limits);
+          const rateLimitSnapshot = canonicalRateLimitSnapshot(record.payload?.rate_limits);
+          const windows = rateLimitSnapshot?.windows ?? [];
           if (record.payload?.rate_limits === null || record.payload?.rate_limits === undefined) {
             batch.diagnostics.add("missing_rate_limit_records");
-          } else if (windows.length === 0) {
+          } else if (rateLimitSnapshot === null) {
             batch.diagnostics.add("malformed_rate_limit_records");
+            contentInvalid();
           }
           for (const window of windows) {
             addRecord(batch, "quotaSnapshot", normalizeCodexQuotaSnapshot(secret, {
@@ -409,30 +482,45 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
               window,
               surfaceClassification: source.rolloutInfo.lineage.surfaceClassification,
               sourceScopeId,
+              ...(sourceOccurrenceScopeId === null ? {} : { sourceOccurrenceScopeId }),
               sourceRecordOrdinal: entry.lineOrdinal,
             }), resourceGuard);
           }
           let usage = null;
           let usagePresence = null;
           if (total) {
+            const first = state.previousTotals === null;
+            const regressed = !first
+              && total.total_tokens < state.previousTotals.total_tokens;
             const delta = subtractUsage(total, state.previousTotals);
             const deltaPresence = deltaComponentPresence(totalPresence, state.previousTotalsPresence);
-            const first = state.previousTotals === null;
+            const chargePerTurnOnly = state.reAnchored;
             state.previousTotals = total;
             state.previousTotalsPresence = totalPresence;
-            if (first) {
+            if (regressed) {
+              state.reAnchored = true;
+              if (last && last.total_tokens > 0) {
+                usage = last;
+                usagePresence = lastPresence;
+              }
+            } else if (first) {
               usage = last ?? delta;
               usagePresence = last ? lastPresence : deltaPresence;
             } else if (delta.total_tokens > 0) {
               if (last && sameUsage(last, delta)) {
                 usage = last;
                 usagePresence = lastPresence;
+              } else if (last && (chargePerTurnOnly
+                  || delta.total_tokens > last.total_tokens + 16)) {
+                usage = last;
+                usagePresence = lastPresence;
               } else {
                 usage = delta;
                 usagePresence = deltaPresence;
                 // Retained in parser arithmetic but not part of the reviewed
-                // export diagnostic registry in telemetry v0.1.
+                  // export diagnostic registry in telemetry v0.1.
               }
+              state.reAnchored = false;
             } else if (last && last.total_tokens > 0) {
               // Legacy safe export does not publish this internal diagnostic.
             }
@@ -457,6 +545,7 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
               tierSemantics: tierSemantics(tier),
               surfaceClassification: source.rolloutInfo.lineage.surfaceClassification,
               sourceScopeId,
+              ...(sourceOccurrenceScopeId === null ? {} : { sourceOccurrenceScopeId }),
               sourceRecordOrdinal: entry.lineOrdinal,
             }, state.pendingToolCounts), resourceGuard);
             state.pendingToolCounts = createEmptySafeToolClassCounts();

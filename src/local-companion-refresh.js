@@ -1,6 +1,7 @@
 import { randomInt, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import {
   isValidQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
@@ -20,22 +21,6 @@ const PUBLIC_REFRESH_ERROR_CODES = new Set([
   "app_server_unavailable",
   "malformed_output",
   "temporary_disconnect",
-]);
-const CLAUDE_QUOTA_PROVIDER = "anthropic_claude_code";
-const CLAUDE_QUOTA_AUTHORITY = "claude_desktop_plan_history";
-const CLAUDE_QUOTA_STATUSES = new Set(["available", "stale", "unavailable"]);
-const CLAUDE_QUOTA_SOURCE_STATUSES = new Set([
-  "present",
-  "missing_suspected",
-  "inaccessible",
-  "partial",
-]);
-const CLAUDE_QUOTA_FRESHNESS = new Set(["fresh", "stale"]);
-const CLAUDE_QUOTA_COVERAGE = new Set(["complete", "partial", "unavailable"]);
-const CLAUDE_QUOTA_METERS = new Set([
-  "five_hour",
-  "seven_day_all_models",
-  "extra_usage",
 ]);
 const RECENT_INDEX_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
 const EARLY_HEADLINE_RECENT_RUN_BYTES = 128 * 1024 * 1024;
@@ -81,6 +66,7 @@ const INDEXING_PHASES = new Set([
   "paused",
   "prospective",
 ]);
+const LOCAL_REFRESH_MODES = new Set(["quick", "detailed"]);
 const ACCOUNTING_REFRESH_STATUSES = new Set(["reused", "rebuilt", "deferred"]);
 const GENERATION_TOKEN_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/u;
 // Accounting reader failures are deliberately closed over a fixed vocabulary.
@@ -99,6 +85,7 @@ const ACCOUNTING_UNAVAILABLE_CODES = new Set([
   "accounting_unified_generation_unavailable",
   "accounting_unified_index_incompatible",
   "accounting_unified_index_invalid",
+  "local_unified_index_schema_newer",
   "accounting_unified_read_failed",
   "accounting_unified_callback_failed",
   "accounting_unified_history_unavailable",
@@ -126,6 +113,12 @@ const ACCOUNTING_TERMINAL_FAILURE_CODES = new Set([
 // arbitrary internal string can still be well formed while carrying an
 // unreviewed diagnostic promise.
 const UNIFIED_INDEX_PUBLIC_ERROR_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
   "local_unified_index_aborted",
   "local_unified_index_directory_sync_failed",
   "local_unified_index_file_changed",
@@ -138,6 +131,7 @@ const UNIFIED_INDEX_PUBLIC_ERROR_CODES = new Set([
   "local_unified_index_missing",
   "local_unified_index_publication_durability_uncertain",
   "local_unified_index_schema_invalid",
+  "local_unified_index_schema_newer",
   "local_unified_index_secondary_indexes_failed",
   "local_unified_index_secondary_indexes_missing",
   "local_unified_index_secret_invalid",
@@ -147,6 +141,14 @@ const UNIFIED_INDEX_PUBLIC_ERROR_CODES = new Set([
 ]);
 const DEFAULT_UNIFIED_INDEX_PUBLIC_ERROR_CODE =
   "local_unified_index_refresh_failed";
+const ROLLOUT_QUARANTINE_CODES = Object.freeze([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+]);
 const ARCHIVE_INDEX_STATUSES = new Set(["complete", "partial"]);
 const ARCHIVE_INDEX_PHASES = new Set(["complete", "awaiting_resume"]);
 const ARCHIVE_INDEX_ERROR_CODES = new Set([
@@ -159,6 +161,9 @@ const ARCHIVE_INDEX_ERROR_CODES = new Set([
   "archive_index_unavailable",
 ]);
 const ARCHIVE_INDEX_PROGRESS_KIND = "archive_index";
+const UNIFIED_INDEX_PROGRESS_KIND = "unified_index";
+const ACCOUNTING_PROGRESS_KIND = "accounting";
+const MACOS_ELECTRON_LOCAL_QA_TEST_LANE = "macos-electron-local-qa-v1";
 const REFRESH_FAILURE_STEPS = new Set([
   "collector",
   "accounting",
@@ -442,6 +447,17 @@ function publicUnifiedGeneration(value) {
     source.indexedSourceBytes ?? source.sourceBytes
       ?? source.discoveredSourceBytes,
   );
+  const skippedSourceCount = safeCount(source.skippedSourceCount);
+  const skippedSourceBytes = safeCount(source.skippedSourceBytes);
+  const skippedThreadCount = safeCount(source.skippedThreadCount);
+  const reasonCounts = {};
+  for (const code of ROLLOUT_QUARANTINE_CODES) {
+    const issue = source.issueCounts?.[code];
+    const count = safeCount(
+      issue?.threadCount ?? source.reasonCounts?.[code],
+    );
+    if (count > 0) reasonCounts[code] = count;
+  }
   return {
     id,
     fingerprint,
@@ -460,6 +476,10 @@ function publicUnifiedGeneration(value) {
     discoveredSourceBytes,
     indexedSourceCount,
     indexedSourceBytes,
+    skippedSourceCount,
+    skippedSourceBytes,
+    skippedThreadCount,
+    reasonCounts,
     usageEvents: safeCount(source.usageEvents),
     quotaOccurrences: safeCount(source.quotaOccurrences),
     toolFacts: safeCount(source.toolFacts),
@@ -477,8 +497,11 @@ function unifiedGenerationAuthoritative(value) {
   const generation = value?.generation;
   const accountingStatus = generation?.status === "complete"
     || (generation?.status === "partial"
-      && generation?.blockReason === "tool_provenance_incomplete"
-      && generation?.toolProvenanceComplete === false);
+      && ((generation?.blockReason === "tool_provenance_incomplete"
+          && generation?.toolProvenanceComplete === false)
+        || (generation?.blockReason === "codex_rollout_sources_quarantined"
+          && generation?.skippedSourceCount > 0
+          && generation?.skippedThreadCount > 0)));
   return value?.status === "ingested"
     && accountingStatus
     && generation.discoveryComplete === true
@@ -721,12 +744,77 @@ function publicArchiveIndexProgress(value) {
     : null;
 }
 
+// Unified ingestion reports an internal diagnostics object after each source.
+// Project only bounded counts into refresh status: paths, source bytes,
+// quarantine details, and parser counters remain inside the companion.
+function publicUnifiedIndexProgress(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const publicKeys = [
+    "filesDiscovered",
+    "filesProcessed",
+    "filesSelected",
+    "kind",
+    "phase",
+    "recordsWritten",
+    "status",
+  ];
+  if (value.kind === UNIFIED_INDEX_PROGRESS_KIND) {
+    if (!hasExactKeys(value, publicKeys)
+        || value.status !== "scanning"
+        || value.phase !== "rollout_index"
+        || ![
+          value.filesDiscovered,
+          value.filesSelected,
+          value.filesProcessed,
+          value.recordsWritten,
+        ].every((count) => Number.isSafeInteger(count) && count >= 0)
+        || value.filesSelected > value.filesDiscovered
+        || value.filesProcessed > value.filesSelected) return null;
+    return {
+      kind: UNIFIED_INDEX_PROGRESS_KIND,
+      status: "scanning",
+      phase: "rollout_index",
+      filesDiscovered: value.filesDiscovered,
+      filesSelected: value.filesSelected,
+      filesProcessed: value.filesProcessed,
+      recordsWritten: value.recordsWritten,
+    };
+  }
+  if (![
+    "sources",
+    "sourcesScanned",
+    "usageEvents",
+    "insertedUsageEvents",
+  ].some((key) => Object.hasOwn(value, key))) return null;
+  const filesDiscovered = safeCount(value.sources);
+  const filesProcessed = safeCount(value.sourcesScanned);
+  if (filesProcessed > filesDiscovered) return null;
+  return {
+    kind: UNIFIED_INDEX_PROGRESS_KIND,
+    status: "scanning",
+    phase: "rollout_index",
+    filesDiscovered,
+    filesSelected: filesDiscovered,
+    filesProcessed,
+    recordsWritten: safeCount(value.usageEvents ?? value.insertedUsageEvents),
+  };
+}
+
 function publicRefreshProgress(value) {
-  return publicIndexingResult(value) ?? publicArchiveIndexProgress(value);
+  if (value?.kind === ACCOUNTING_PROGRESS_KIND) {
+    return hasExactKeys(value, ["kind", "status"])
+        && value.status === "calculating"
+      ? { kind: ACCOUNTING_PROGRESS_KIND, status: "calculating" }
+      : null;
+  }
+  return publicIndexingResult(value)
+    ?? publicArchiveIndexProgress(value)
+    ?? publicUnifiedIndexProgress(value);
 }
 
 function terminalRefreshProgress(value) {
-  return value?.kind === ARCHIVE_INDEX_PROGRESS_KIND ? null : value;
+  return [ARCHIVE_INDEX_PROGRESS_KIND, ACCOUNTING_PROGRESS_KIND]
+    .includes(value?.kind) ? null : value;
 }
 
 function mergeCollectorPasses(early, continued, now = Date.now()) {
@@ -766,42 +854,6 @@ function mergeCollectorPasses(early, continued, now = Date.now()) {
   };
 }
 
-function failedClaudeQuotaResult() {
-  return {
-    schemaVersion: "local-claude-quota-v0.1",
-    provider: CLAUDE_QUOTA_PROVIDER,
-    authority: CLAUDE_QUOTA_AUTHORITY,
-    status: "failed",
-    errorCode: "claude_quota_refresh_failed",
-    includesContent: false,
-    includesPaths: false,
-    includesIdentifiers: false,
-  };
-}
-
-function runClaudeQuotaRefresh(refreshClaudeQuota, signal) {
-  if (refreshClaudeQuota === null) return Promise.resolve(null);
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener?.("abort", abort);
-      resolve(value);
-    };
-    const abort = () => finish(failedClaudeQuotaResult());
-    if (signal?.aborted === true) {
-      abort();
-      return;
-    }
-    signal?.addEventListener?.("abort", abort, { once: true });
-    Promise.resolve()
-      .then(() => refreshClaudeQuota({ signal }))
-      .then((value) => finish(publicClaudeQuotaResult(value)))
-      .catch(() => finish(failedClaudeQuotaResult()));
-  });
-}
-
 // The Claude usage shadow is deliberately an internal side effect: it runs
 // beside the production refresh when explicitly injected, but contributes no
 // field to the loopback response and therefore cannot become an accidental UI
@@ -835,13 +887,11 @@ export function createLocalCollectorRefreshRunner({
   stateFile = null,
   accountObservationOperationLockFile = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
+  environment = process.env,
+  readAccountAttributionBinding = null,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
   refreshAccounting = null,
-  // Native Claude plan quota is a separate source and store. Start it beside
-  // the Codex collector so either provider can advance without feeding paths,
-  // transcripts, or identities into the other callback.
-  refreshClaudeQuota = null,
   // Disabled unless an explicit production-shaped shadow controller is
   // injected. Its result is intentionally not part of the public refresh
   // projection; only its provider-isolated local stores are advanced.
@@ -874,15 +924,19 @@ export function createLocalCollectorRefreshRunner({
   if (typeof selectAccountObservationSecret !== "function") {
     throw new TypeError("selectAccountObservationSecret must be a function");
   }
+  if (environment === null || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    throw new TypeError("environment must be an object");
+  }
+  if (readAccountAttributionBinding !== null && typeof readAccountAttributionBinding !== "function") {
+    throw new TypeError("readAccountAttributionBinding must be a function or null");
+  }
   if (typeof runCollector !== "function") throw new TypeError("runCollector must be a function");
   if (typeof readAccountingCache !== "function") {
     throw new TypeError("readAccountingCache must be a function");
   }
   if (refreshAccounting !== null && typeof refreshAccounting !== "function") {
     throw new TypeError("refreshAccounting must be a function or null");
-  }
-  if (refreshClaudeQuota !== null && typeof refreshClaudeQuota !== "function") {
-    throw new TypeError("refreshClaudeQuota must be a function or null");
   }
   if (refreshClaudeUsageShadow !== null
       && typeof refreshClaudeUsageShadow !== "function") {
@@ -921,6 +975,12 @@ export function createLocalCollectorRefreshRunner({
       || recentIndexWindowMs > 31 * 24 * 60 * 60 * 1_000) {
     throw new TypeError("recent index window is invalid");
   }
+  // The packaged macOS real-history QA lane runs against a copied profile and
+  // must not read or mint the account-observation Keychain secret. Keep the
+  // ordinary quota result but leave its account scope unavailable; the
+  // development export identity is deliberately not an account-scope secret.
+  const accountObservationSecretDisabled =
+    environment.USAGE_MONITOR_TEST_LANE === MACOS_ELECTRON_LOCAL_QA_TEST_LANE;
   // Cross-invocation backoff for a memory-budget miss. Held in the runner
   // closure so it survives between the external scheduler's ticks: once a
   // rebuild defers, the FULL rebuild is skipped (the retained cache is served)
@@ -935,6 +995,7 @@ export function createLocalCollectorRefreshRunner({
   return async function refreshLocalCollector({
     signal = null,
     onProgress = null,
+    mode = "detailed",
   } = {}) {
     if (onProgress !== null && typeof onProgress !== "function") {
       throw new TypeError("onProgress must be a function");
@@ -944,6 +1005,10 @@ export function createLocalCollectorRefreshRunner({
         || typeof signal.addEventListener !== "function")) {
       throw new TypeError("signal must be an AbortSignal or null");
     }
+    if (!LOCAL_REFRESH_MODES.has(mode)) {
+      throw new TypeError("mode must be quick or detailed");
+    }
+    const detailed = mode === "detailed";
     // A refresh failure that reaches the app collapses to one generic code,
     // and companion stderr is deliberately discarded. Stamp every escaping
     // error with the pipeline step it left from, so the refresh status can
@@ -962,7 +1027,7 @@ export function createLocalCollectorRefreshRunner({
     // the attempted use before any collector/accounting work so a later
     // failure still leaves a durable, bounded receipt in owner-only state.
     let legacyRefreshUse = null;
-    if (accountingSourceMode === "legacy" && stateFile !== null) {
+    if (detailed && accountingSourceMode === "legacy" && stateFile !== null) {
       try {
         legacyRefreshUse = await recordLocalCollectorLegacyRefreshAttempt({
           stateFile,
@@ -989,38 +1054,38 @@ export function createLocalCollectorRefreshRunner({
         declaredSpeedBaselines = [];
       }
     }
-    const claudeQuotaPromise = runClaudeQuotaRefresh(refreshClaudeQuota, signal);
     const claudeUsageShadowPromise = runClaudeUsageShadowRefresh(
       refreshClaudeUsageShadow,
       signal,
     );
-    let selection;
-    try {
-      selection = selectAccountObservationSecret(
-        accountObservationOperationLockFile === null
-          ? {}
-          : {
-            operationLockFile:
-              accountObservationOperationLockFile,
-          },
-      );
-    } catch {
-      selection = { loadAccountObservationSecret: null };
+    let selection = { loadAccountObservationSecret: null };
+    if (!accountObservationSecretDisabled) {
+      try {
+        selection = selectAccountObservationSecret(
+          accountObservationOperationLockFile === null
+            ? {}
+            : {
+              operationLockFile:
+                accountObservationOperationLockFile,
+            },
+        );
+      } catch {
+        selection = { loadAccountObservationSecret: null };
+      }
     }
     const collectorOptions = {
       codexHome,
       ...(stateFile === null ? {} : { stateFile }),
       staleAfterMs: 0,
       refreshStale: true,
-      // Usage facts are authoritative in the unified index. In that mode the
-      // collector remains responsible for the provider quota/quick headline,
-      // but must not resume an inherited legacy recent-7d rollout backfill.
-      // Legacy mode keeps the historical two-pass collector unchanged.
-      backfill: accountingSourceMode === "legacy",
-      ...(accountingSourceMode === "legacy"
+      // Quick refresh reads only provider quota/headline evidence regardless
+      // of storage authority. Unified detailed refresh also leaves usage facts
+      // to its index; only detailed legacy collection may backfill rollouts.
+      backfill: detailed && accountingSourceMode === "legacy",
+      ...(detailed && accountingSourceMode === "legacy"
         ? { backfillSinceAt: new Date(clock() - recentIndexWindowMs).toISOString() }
         : {}),
-      ...(accountingSourceMode === "unified"
+      ...(!detailed || accountingSourceMode === "unified"
         ? { skipRolloutIngestion: true }
         : {}),
       signal,
@@ -1032,6 +1097,7 @@ export function createLocalCollectorRefreshRunner({
       maximumRecordBatchSize: 500,
       maximumRecentEventKeys: 5_000,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      ...(readAccountAttributionBinding === null ? {} : { readAccountAttributionBinding }),
     };
     // The headline pass uses the collector's ordinary atomic SQLite state
     // transaction with a much smaller read budget. It therefore publishes
@@ -1062,11 +1128,11 @@ export function createLocalCollectorRefreshRunner({
     if (earlyIndex?.status === "bounded_pause"
         && signal?.aborted !== true) {
       const earlyLimit = collectorResourceLimit(result);
-      if (accountingSourceMode === "unified") {
+      if (!detailed || accountingSourceMode === "unified") {
         // A custom/injected collector may still report its own bounded pause
-        // even though unified production collection opts out of rollout
+        // even though quota-only production collection opts out of rollout
         // ingestion. Remember the fixed limit for the assemble decision, but
-        // never launch a second legacy continuation in unified mode.
+        // never launch a second legacy continuation from a quota-only pass.
         collectorResourceLimitDeferred = earlyLimit !== null;
       } else if (earlyLimit !== null
           && earlyLimit.dimension !== "source_bytes") {
@@ -1086,25 +1152,39 @@ export function createLocalCollectorRefreshRunner({
     }
     const completedIndex = publicIndexingResult(result?.indexing);
     await publishHeadline(completedIndex);
-    const accountingMayRun = accountingSourceMode === "unified"
-      ? completedIndex === null
-        || [
-          "recent_7d_complete",
-          "recent_7d_partial",
-          "prospective_only",
-          // Unified accounting reads the published index, not the bounded
-          // collector ledger, so a collector-only pause must not suppress a
-          // complete-generation accounting pass.
-          "bounded_pause",
-        ].includes(completedIndex.status)
-      : completedIndex === null
+    // Unified accounting reads the independently published unified index.
+    // The quota-only collector deliberately preserves its inherited legacy
+    // indexing descriptor, which may still say `recent_7d_indexing`; that
+    // retired checkpoint must not suppress an authoritative unified rebuild.
+    // `unifiedGenerationAuthoritative` remains the fail-closed source gate.
+    const accountingMayRun = detailed && (
+      accountingSourceMode === "unified"
+        || completedIndex === null
         || ["recent_7d_complete", "recent_7d_partial", "prospective_only"]
-          .includes(completedIndex.status);
+          .includes(completedIndex.status)
+    );
     let unifiedIndex = null;
     refreshStep = "unified_index";
-    if (accountingSourceMode === "unified"
+    if (detailed
+        && accountingSourceMode === "unified"
         && refreshUnifiedIndex !== null
         && signal?.aborted !== true) {
+      const publishUnifiedIndexProgress = onProgress === null
+        ? null
+        : async (value) => {
+          if (signal?.aborted === true) return;
+          const progress = publicUnifiedIndexProgress(value);
+          if (progress !== null) await onProgress(progress);
+        };
+      // Leave the misleading quick-result phase as soon as deep ingestion
+      // starts, even before discovery has produced its first measured count.
+      if (publishUnifiedIndexProgress !== null) {
+        await publishUnifiedIndexProgress({
+          sources: 0,
+          sourcesScanned: 0,
+          usageEvents: 0,
+        });
+      }
       // The unified index advances by its cursors, so this ordinarily reads
       // only appended bytes. It runs BEFORE accounting so the full-history
       // calibration corpus the accounting rebuild reads from the index
@@ -1118,6 +1198,9 @@ export function createLocalCollectorRefreshRunner({
           ...(unifiedIndexSecretFile === null
             ? {}
             : { secretFile: unifiedIndexSecretFile }),
+          ...(publishUnifiedIndexProgress === null
+            ? {}
+            : { onProgress: publishUnifiedIndexProgress }),
           signal,
         }));
       } catch (error) {
@@ -1132,7 +1215,8 @@ export function createLocalCollectorRefreshRunner({
     let accounting = null;
     let accountingRefreshStatus = null;
     let accountingRebuildDeferred = null;
-    let accountingUnavailableCode = accountingSourceMode === "unified"
+    let accountingUnavailableCode = detailed
+        && accountingSourceMode === "unified"
         && !unifiedAccountingReady
       ? unifiedIndex?.status === "failed"
         ? "accounting_unified_source_unavailable"
@@ -1193,6 +1277,19 @@ export function createLocalCollectorRefreshRunner({
         }
       }
       if (accounting === null && !withinRebuildBackoff) {
+        if (accountingSourceMode === "unified" && signal?.aborted !== true) {
+          // This exact count-free marker is emitted only after the current
+          // cache has failed the authoritative reuse check and immediately
+          // before a full replay-safe rebuild. The controller can therefore
+          // grant the bounded cold-work deadline without guessing from stale
+          // presentation state or extending an ordinary cache-hit refresh.
+          // Keep it through the controller's full snapshot reload; neither
+          // boundary is itself a completion claim.
+          await onProgress?.({
+            kind: ACCOUNTING_PROGRESS_KIND,
+            status: "calculating",
+          });
+        }
         let rebuilt = null;
         try {
           rebuilt = await refreshAccounting({
@@ -1315,7 +1412,8 @@ export function createLocalCollectorRefreshRunner({
     );
     let archiveIndex = null;
     refreshStep = "archive_index";
-    if (accountingSourceMode === "legacy"
+    if (detailed
+        && accountingSourceMode === "legacy"
         && refreshArchiveIndex !== null
         && signal?.aborted !== true) {
       // Archive coverage is independent of the recent collector's accounting
@@ -1339,7 +1437,6 @@ export function createLocalCollectorRefreshRunner({
       });
     }
     refreshStep = "assemble";
-    const claudeQuota = await claudeQuotaPromise;
     await claudeUsageShadowPromise;
     const unifiedCollectorPauseSoftened = accountingSourceMode === "unified"
       && unifiedAccountingReady
@@ -1389,7 +1486,7 @@ export function createLocalCollectorRefreshRunner({
               accounting.diagnostics?.forkReplayEventsExcluded ?? 0,
           },
         }
-        : accountingSourceMode === "unified"
+        : detailed && accountingSourceMode === "unified"
           ? {
             accounting: {
               status: "unavailable",
@@ -1415,7 +1512,6 @@ export function createLocalCollectorRefreshRunner({
         ? {}
         : { accountingRebuildDeferred }),
       ...(unifiedIndex === null ? {} : { unifiedIndex }),
-      ...(claudeQuota === null ? {} : { claudeQuota }),
       ...(publicIndexingResult(result?.indexing) === null
         ? {}
         : { indexing: publicIndexingResult(result.indexing) }),
@@ -1473,111 +1569,6 @@ function publicUnifiedIndexResult(value) {
   };
 }
 
-/**
- * Closed, content-free Claude quota projection for refresh receipts and the
- * loopback consumer route. Unknown native meters remain counted but their
- * keyed identities never cross this boundary.
- */
-export function publicClaudeQuotaResult(value) {
-  if (value?.schemaVersion === "local-claude-quota-v0.1"
-      && value.provider === CLAUDE_QUOTA_PROVIDER
-      && value.authority === CLAUDE_QUOTA_AUTHORITY
-      && value.status === "failed") {
-    return {
-      schemaVersion: "local-claude-quota-v0.1",
-      provider: CLAUDE_QUOTA_PROVIDER,
-      authority: CLAUDE_QUOTA_AUTHORITY,
-      status: "failed",
-      errorCode: value.errorCode === "claude_quota_refresh_failed"
-        ? value.errorCode : "claude_quota_projection_invalid",
-      includesContent: false,
-      includesPaths: false,
-      includesIdentifiers: false,
-    };
-  }
-  const projection = value?.projection ?? (
-    value?.schemaVersion === "local-claude-quota-v0.1"
-      ? {
-        ...value,
-        source: {
-          status: value.sourceStatus,
-          lastSuccessAtMs: value.lastSuccessAtMs,
-        },
-      }
-      : value
-  );
-  if (!projection || projection.provider !== CLAUDE_QUOTA_PROVIDER
-      || projection.authority !== CLAUDE_QUOTA_AUTHORITY
-      || !CLAUDE_QUOTA_STATUSES.has(projection.status)
-      || !CLAUDE_QUOTA_SOURCE_STATUSES.has(projection.source?.status)
-      || !CLAUDE_QUOTA_FRESHNESS.has(projection.freshness)
-      || !CLAUDE_QUOTA_COVERAGE.has(projection.coverage?.state)) {
-    return {
-      schemaVersion: "local-claude-quota-v0.1",
-      provider: CLAUDE_QUOTA_PROVIDER,
-      authority: CLAUDE_QUOTA_AUTHORITY,
-      status: "failed",
-      errorCode: "claude_quota_projection_invalid",
-      includesContent: false,
-      includesPaths: false,
-      includesIdentifiers: false,
-    };
-  }
-  const windows = [];
-  if (!Array.isArray(projection.windows)) {
-    return publicClaudeQuotaResult(null);
-  }
-  for (const window of projection.windows) {
-    if (!window || !CLAUDE_QUOTA_METERS.has(window.meterId)
-        || typeof window.utilizationPercent !== "number"
-        || !Number.isFinite(window.utilizationPercent)
-        || window.utilizationPercent < 0 || window.utilizationPercent > 100
-        || !Number.isSafeInteger(window.observedAtMs) || window.observedAtMs < 0
-        || (window.resetsAtMs !== null
-          && (!Number.isSafeInteger(window.resetsAtMs) || window.resetsAtMs < 0))) {
-      return publicClaudeQuotaResult(null);
-    }
-    windows.push({
-      meterId: window.meterId,
-      utilizationPercent: window.utilizationPercent,
-      remainingPercent: 100 - window.utilizationPercent,
-      observedAtMs: window.observedAtMs,
-      resetsAtMs: window.resetsAtMs,
-      windowDurationMinutes: Number.isSafeInteger(window.windowDurationMinutes)
-          && window.windowDurationMinutes > 0
-        ? window.windowDurationMinutes
-        : null,
-    });
-  }
-  return {
-    schemaVersion: "local-claude-quota-v0.1",
-    provider: CLAUDE_QUOTA_PROVIDER,
-    authority: CLAUDE_QUOTA_AUTHORITY,
-    status: projection.status,
-    sourceStatus: projection.source.status,
-    freshness: projection.freshness,
-    lastSuccessAtMs: Number.isSafeInteger(projection.source.lastSuccessAtMs)
-        && projection.source.lastSuccessAtMs >= 0
-      ? projection.source.lastSuccessAtMs
-      : null,
-    coverage: {
-      state: projection.coverage.state,
-      gapCount: safeCount(projection.coverage.gapCount),
-    },
-    counts: {
-      observations: safeCount(projection.counts?.observations),
-      points: safeCount(projection.counts?.points),
-      accounts: safeCount(projection.counts?.accounts),
-      meters: safeCount(projection.counts?.meters),
-      unknownMeters: safeCount(projection.counts?.unknownMeters),
-    },
-    windows,
-    includesContent: false,
-    includesPaths: false,
-    includesIdentifiers: false,
-  };
-}
-
 function publicRefreshResult(result, now = Date.now()) {
   const projected = {
     rolloutRecordsWritten: Number.isSafeInteger(result?.rolloutRecordsWritten)
@@ -1601,9 +1592,6 @@ function publicRefreshResult(result, now = Date.now()) {
   }
   const indexing = publicIndexingResult(result?.indexing);
   if (indexing !== null) projected.indexing = indexing;
-  if (result?.claudeQuota !== undefined) {
-    projected.claudeQuota = publicClaudeQuotaResult(result.claudeQuota);
-  }
   const legacyRefreshUse = publicLegacyRefreshUse(result?.legacyRefreshUse);
   if (legacyRefreshUse !== null) {
     projected.legacyRefreshUse = legacyRefreshUse;
@@ -1708,9 +1696,56 @@ function publicRefreshResult(result, now = Date.now()) {
   return projected;
 }
 
+function reusableUnifiedProjection(result) {
+  const unified = result?.unifiedIndex;
+  const fingerprint = unified?.generation?.fingerprint;
+  if (unified?.unchanged !== true
+      || typeof fingerprint !== "string"
+      || !/^generation-v2-[0-9a-f]{64}$/u.test(fingerprint)) return null;
+  return { generationFingerprint: fingerprint };
+}
+
+function unifiedIndexDegradation(result) {
+  const unified = result?.unifiedIndex;
+  if (unified?.status === "failed") {
+    return {
+      failedStep: "unified_index",
+      failureCode: safeUnifiedIndexPublicErrorCode(unified.errorCode),
+    };
+  }
+  const generation = unified?.generationDescriptor ?? unified?.generation;
+  if (generation?.status === "partial"
+      && generation?.blockReason === "codex_rollout_sources_quarantined") {
+    const reason = ROLLOUT_QUARANTINE_CODES.find((code) => (
+      safeCount(generation?.issueCounts?.[code]?.threadCount
+        ?? generation?.reasonCounts?.[code]) > 0
+    ));
+    return {
+      failedStep: "unified_index",
+      failureCode: reason ?? "codex_rollout_generation_ambiguous",
+    };
+  }
+  return null;
+}
+
+// A fresh unified index can require a full retained-history scan. Keep that
+// first publication bounded, but do not apply its four-hour recovery window to
+// ordinary cursor-based incremental refreshes.
+export const LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS =
+  4 * 60 * 60_000;
+export const LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS =
+  LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS;
+export const LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MS = 30_000;
+const LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MAX_MS = 60_000;
+const CANCEL_SETTLEMENT_EXPIRED = Symbol("cancel_settlement_expired");
+
 export class LocalCompanionRefreshController {
+  #accountingTimeoutMs;
   #abortController = null;
+  #beginCancellationSettlement = null;
+  #cancelSettlementMs;
   #cancelRequested = false;
+  #clearTimeoutImpl;
   #clock;
   #createRefreshId;
   #dataStore;
@@ -1720,14 +1755,23 @@ export class LocalCompanionRefreshController {
   #onDegradedOutcome;
   #onTerminalFailure;
   #runner;
+  #setTimeoutImpl;
   #state;
   #timeoutMs;
+  #timeoutMsForRun;
+  #monotonicClock;
 
   constructor({
     runner,
     dataStore,
     timeoutMs = 5 * 60_000,
+    timeoutMsForRun = null,
+    accountingTimeoutMs = LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
+    cancelSettlementMs = LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MS,
     clock = () => Date.now(),
+    monotonicClock = () => performance.now(),
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
     createRefreshId = randomUUID,
     // Observer for terminal refresh failures. Receives only the bounded
     // identity the failed state itself carries — errorCode, and failedStep /
@@ -1746,8 +1790,37 @@ export class LocalCompanionRefreshController {
     if (!dataStore || typeof dataStore.reload !== "function") {
       throw new TypeError("dataStore.reload must be a function");
     }
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 5 * 60_000) {
-      throw new TypeError("timeoutMs must be between 1,000 and 300,000");
+    if (!Number.isSafeInteger(timeoutMs)
+        || timeoutMs < 1_000
+        || timeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
+      throw new TypeError("timeoutMs must be between 1,000 and 14,400,000");
+    }
+    if (timeoutMsForRun !== null && typeof timeoutMsForRun !== "function") {
+      throw new TypeError("timeoutMsForRun must be a function or null");
+    }
+    if (!Number.isSafeInteger(accountingTimeoutMs)
+        || accountingTimeoutMs < 1_000
+        || accountingTimeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
+      throw new TypeError(
+        "accountingTimeoutMs must be between 1,000 and 14,400,000",
+      );
+    }
+    if (!Number.isSafeInteger(cancelSettlementMs)
+        || cancelSettlementMs < 1_000
+        || cancelSettlementMs
+          > LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MAX_MS) {
+      throw new TypeError(
+        "cancelSettlementMs must be between 1,000 and 60,000",
+      );
+    }
+    if (typeof monotonicClock !== "function") {
+      throw new TypeError("monotonicClock must be a function");
+    }
+    if (typeof setTimeoutImpl !== "function"
+        || typeof clearTimeoutImpl !== "function") {
+      throw new TypeError(
+        "setTimeoutImpl and clearTimeoutImpl must be functions",
+      );
     }
     if (typeof createRefreshId !== "function") {
       throw new TypeError("createRefreshId must be a function");
@@ -1761,13 +1834,20 @@ export class LocalCompanionRefreshController {
     this.#runner = runner;
     this.#dataStore = dataStore;
     this.#timeoutMs = timeoutMs;
+    this.#timeoutMsForRun = timeoutMsForRun;
+    this.#accountingTimeoutMs = accountingTimeoutMs;
+    this.#cancelSettlementMs = cancelSettlementMs;
     this.#clock = clock;
+    this.#monotonicClock = monotonicClock;
+    this.#setTimeoutImpl = setTimeoutImpl;
+    this.#clearTimeoutImpl = clearTimeoutImpl;
     this.#createRefreshId = createRefreshId;
     this.#onTerminalFailure = onTerminalFailure;
     this.#onDegradedOutcome = onDegradedOutcome;
     this.#state = {
       status: "idle",
       refreshId: null,
+      mode: null,
       startedAt: null,
       finishedAt: null,
       result: null,
@@ -1795,6 +1875,11 @@ export class LocalCompanionRefreshController {
       ...this.#state,
       status: "cancelling",
     };
+    // An explicit cancel supersedes the ordinary or extended work deadline.
+    // Bound settlement independently so an injected or defective runner that
+    // ignores AbortSignal cannot hold the foreground refresh lock for the
+    // remainder of a four-hour cold-accounting allowance.
+    this.#beginCancellationSettlement?.();
     this.#abortController.abort();
     return true;
   }
@@ -1840,8 +1925,21 @@ export class LocalCompanionRefreshController {
     }
   }
 
-  start() {
+  start({ mode = "detailed" } = {}) {
+    if (!LOCAL_REFRESH_MODES.has(mode)) {
+      throw new TypeError("mode must be quick or detailed");
+    }
     if (this.#inFlight !== null) return false;
+    const selectedTimeoutMs = this.#timeoutMsForRun === null
+      ? this.#timeoutMs
+      : this.#timeoutMsForRun();
+    if (!Number.isSafeInteger(selectedTimeoutMs)
+        || selectedTimeoutMs < 1_000
+        || selectedTimeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
+      throw new TypeError(
+        "timeoutMsForRun must return between 1,000 and 14,400,000",
+      );
+    }
     const startedAt = this.#clock();
     const refreshId = this.#createRefreshId();
     if (typeof refreshId !== "string"
@@ -1854,6 +1952,7 @@ export class LocalCompanionRefreshController {
     this.#state = {
       status: "running",
       refreshId,
+      mode,
       startedAt: new Date(startedAt).toISOString(),
       finishedAt: null,
       result: null,
@@ -1863,23 +1962,95 @@ export class LocalCompanionRefreshController {
     };
     let timedOut = false;
     let timeout;
+    let cancellationSettlementTimeout;
+    let accountingDeadlineApplied = false;
+    // A successful quick-result reload already publishes the complete quick
+    // snapshot for a quick-mode run. Remember that publication so terminal
+    // settlement does not rebuild the same snapshot again; a failed or absent
+    // progress reload deliberately leaves this false and gets a terminal retry.
+    let quickResultReloadPublished = false;
+    const timeoutStartedAt = this.#monotonicClock();
     const controller = new AbortController();
     this.#abortController = controller;
-    const work = Promise.resolve()
+    const expire = () => {
+      if (this.#state.refreshId !== refreshId
+          || this.#cancelRequested
+          || !["running", "cancelling"].includes(this.#state.status)) return;
+      timedOut = true;
+      controller.abort();
+      this.#state = {
+        status: "failed",
+        refreshId: this.#state.refreshId,
+        mode,
+        startedAt: this.#state.startedAt,
+        finishedAt: new Date(this.#clock()).toISOString(),
+        result: null,
+        progress: terminalRefreshProgress(this.#state.progress),
+        quickResultAt: this.#state.quickResultAt,
+        errorCode: "refresh_timed_out",
+      };
+      // The timeout IS the terminal failure the user sees, and a hung runner
+      // may never settle — file the trail entry now, not at settlement.
+      this.#notifyTerminalFailure();
+    };
+    const armTimeoutFromStart = (budgetMs) => {
+      this.#clearTimeoutImpl(timeout);
+      const elapsedMs = Math.max(
+        0,
+        this.#monotonicClock() - timeoutStartedAt,
+      );
+      const remainingMs = Math.max(1, Math.ceil(budgetMs - elapsedMs));
+      timeout = this.#setTimeoutImpl(expire, remainingMs);
+      timeout.unref?.();
+    };
+    let resolveCancellationSettlement;
+    const cancellationSettlement = new Promise((resolve) => {
+      resolveCancellationSettlement = resolve;
+    });
+    this.#beginCancellationSettlement = () => {
+      this.#clearTimeoutImpl(timeout);
+      if (cancellationSettlementTimeout !== undefined) return;
+      cancellationSettlementTimeout = this.#setTimeoutImpl(
+        () => resolveCancellationSettlement(CANCEL_SETTLEMENT_EXPIRED),
+        this.#cancelSettlementMs,
+      );
+      cancellationSettlementTimeout.unref?.();
+    };
+    const runnerWork = Promise.resolve()
       .then(() => this.#runner({
         signal: controller.signal,
+        mode,
         onProgress: async (progress) => {
-          if (timedOut
+          if (this.#state.refreshId !== refreshId
+              || timedOut
               || !["running", "cancelling"].includes(this.#state.status)) return;
           const projected = publicRefreshProgress(progress);
           if (projected === null) return;
+          if (!accountingDeadlineApplied
+              && !this.#cancelRequested
+              && this.#state.status === "running"
+              && projected.kind === ACCOUNTING_PROGRESS_KIND
+              && this.#accountingTimeoutMs > selectedTimeoutMs) {
+            // The runner emits this exact marker only for an actual full
+            // replay-safe rebuild. Extend once to the same four-hour total
+            // bound used by a fresh index; repeated or malformed progress
+            // cannot keep a run alive indefinitely.
+            accountingDeadlineApplied = true;
+            armTimeoutFromStart(this.#accountingTimeoutMs);
+          }
           let quickResultAt = this.#state.quickResultAt;
+          let quickResultReloaded = false;
           if (projected.kind !== ARCHIVE_INDEX_PROGRESS_KIND
               && projected.phase === "quick_result"
               && !this.#cancelRequested) {
             try {
-              await this.#dataStore.reload({ purpose: "quick" });
+              await this.#dataStore.reload({
+                purpose: "quick",
+                returnOverview: false,
+                signal: controller.signal,
+              });
               quickResultAt = new Date(this.#clock()).toISOString();
+              quickResultReloaded = true;
             } catch {
               // Keep the previous good dashboard. Deep accounting can still
               // complete and publish a fully verified replacement.
@@ -1891,59 +2062,71 @@ export class LocalCompanionRefreshController {
             progress: projected,
             quickResultAt,
           };
+          if (quickResultReloaded) quickResultReloadPublished = true;
         },
-      }))
+      }));
+    const work = Promise.race([runnerWork, cancellationSettlement])
       .then(async (result) => {
         if (this.#cancelRequested) {
-          try {
-            await this.#dataStore.reload({ purpose: "full" });
-          } catch {
-            // Cancellation preserves the last good dashboard snapshot.
-          }
+          // The data store already owns the last verified snapshot. A cancel
+          // becomes terminal as soon as worker shutdown is confirmed. If a
+          // defective runner ignores abort, the short settlement watchdog
+          // instead detaches it from the foreground generation; the runner's
+          // AbortSignal still fences durable accounting publication.
           this.#state = {
             status: "cancelled",
             refreshId: this.#state.refreshId,
+            mode,
             startedAt: this.#state.startedAt,
             finishedAt: new Date(this.#clock()).toISOString(),
-            result: publicRefreshResult(result, this.#clock()),
-            progress: publicIndexingResult(result?.indexing)
-              ?? (this.#state.progress?.kind === ARCHIVE_INDEX_PROGRESS_KIND
-                ? null
-                : this.#state.progress),
+            result: result === CANCEL_SETTLEMENT_EXPIRED
+              ? null
+              : publicRefreshResult(result, this.#clock()),
+            progress: result === CANCEL_SETTLEMENT_EXPIRED
+              ? terminalRefreshProgress(this.#state.progress)
+              : publicIndexingResult(result?.indexing)
+              ?? terminalRefreshProgress(this.#state.progress),
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_cancelled",
           };
           return;
         }
         if (timedOut) {
-          try {
-            await this.#dataStore.reload({ purpose: "full" });
-          } catch {
-            // The timeout remains authoritative; the last good dashboard
-            // snapshot is already retained by the data store.
-          }
+          // As with cancellation, retain the prior authoritative snapshot.
+          // The worker promise settles only after cooperative exit or hard
+          // termination, so no partial staged database is made readable here.
           this.#state = {
             status: "failed",
             refreshId: this.#state.refreshId,
+            mode,
             startedAt: this.#state.startedAt,
             finishedAt: this.#state.finishedAt
               ?? new Date(this.#clock()).toISOString(),
             result: publicRefreshResult(result, this.#clock()),
             progress: publicIndexingResult(result?.indexing)
-              ?? (this.#state.progress?.kind === ARCHIVE_INDEX_PROGRESS_KIND
-                ? null
-                : this.#state.progress),
+              ?? terminalRefreshProgress(this.#state.progress),
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_timed_out",
           };
           this.#notifyTerminalFailure();
           return;
         }
-        await this.#dataStore.reload({ purpose: "full" });
+        if (!(mode === "quick" && quickResultReloadPublished)) {
+          await this.#dataStore.reload({
+            purpose: mode === "quick" ? "quick" : "full",
+            returnOverview: false,
+            signal: controller.signal,
+            ...(mode === "detailed"
+              ? { unifiedProjectionReuse: reusableUnifiedProjection(result) }
+              : {}),
+          });
+        }
         const finalProgress = publicIndexingResult(result?.indexing);
+        const degradation = unifiedIndexDegradation(result);
         this.#state = {
-          status: "succeeded",
+          status: degradation === null ? "succeeded" : "degraded",
           refreshId: this.#state.refreshId,
+          mode,
           startedAt: this.#state.startedAt,
           finishedAt: new Date(this.#clock()).toISOString(),
           result: publicRefreshResult(result, this.#clock()),
@@ -1952,7 +2135,8 @@ export class LocalCompanionRefreshController {
             ? { ...finalProgress, phase: "quick_result" }
             : finalProgress,
           quickResultAt: this.#state.quickResultAt,
-          errorCode: null,
+          errorCode: degradation === null ? null : "refresh_degraded",
+          ...(degradation ?? {}),
         };
         // A budget miss is a SOFT outcome: the run succeeded serving the
         // retained cache. File the degraded-event note (kept from the incident)
@@ -1964,6 +2148,7 @@ export class LocalCompanionRefreshController {
           this.#state = {
             status: "cancelled",
             refreshId: this.#state.refreshId,
+            mode,
             startedAt: this.#state.startedAt,
             finishedAt: new Date(this.#clock()).toISOString(),
             result: null,
@@ -1980,7 +2165,11 @@ export class LocalCompanionRefreshController {
           // that content-free coverage receipt while retaining the previous
           // foreground result.
           try {
-            await this.#dataStore.reload({ purpose: "full" });
+            await this.#dataStore.reload({
+              purpose: "full",
+              returnOverview: false,
+              signal: controller.signal,
+            });
           } catch {
             // Keep the prior good dashboard if the receipt reload is unavailable.
           }
@@ -1988,6 +2177,7 @@ export class LocalCompanionRefreshController {
         this.#state = {
           status: "failed",
           refreshId: this.#state.refreshId,
+          mode,
           startedAt: this.#state.startedAt,
           finishedAt: new Date(this.#clock()).toISOString(),
           result: null,
@@ -2010,29 +2200,14 @@ export class LocalCompanionRefreshController {
         this.#notifyTerminalFailure();
       })
       .finally(() => {
-        clearTimeout(timeout);
+        this.#clearTimeoutImpl(timeout);
+        this.#clearTimeoutImpl(cancellationSettlementTimeout);
         this.#abortController = null;
+        this.#beginCancellationSettlement = null;
         this.#cancelRequested = false;
         this.#inFlight = null;
       });
-    timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-      this.#state = {
-        status: "failed",
-        refreshId: this.#state.refreshId,
-        startedAt: this.#state.startedAt,
-        finishedAt: new Date(this.#clock()).toISOString(),
-        result: null,
-        progress: terminalRefreshProgress(this.#state.progress),
-        quickResultAt: this.#state.quickResultAt,
-        errorCode: "refresh_timed_out",
-      };
-      // The timeout IS the terminal failure the user sees, and a hung runner
-      // may never settle — file the trail entry now, not at settlement.
-      this.#notifyTerminalFailure();
-    }, this.#timeoutMs);
-    timeout.unref?.();
+    armTimeoutFromStart(selectedTimeoutMs);
     this.#inFlight = work;
     return true;
   }

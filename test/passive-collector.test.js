@@ -165,6 +165,37 @@ async function readLines(path) {
   }
 }
 
+test("passive collection ignores response usage/checkpoint copies and withholds incomplete component vectors", async () => {
+  const response = { thread_id: "private-response-thread-canary", turn_id: "private-response-turn-canary",
+    session_id: "private-response-root-canary", root_turn_id: "private-root-turn-canary", response_id: "private-response-canary",
+    usage: usage(1000), turn_token_usage: usage(2000), thread_token_usage: usage(3000) };
+  const responseLine = JSON.stringify({ timestamp: "2026-07-23T00:00:01.000Z", type: "token_usage_record", payload: response });
+  const compactedLine = JSON.stringify({ timestamp: "2026-07-23T00:00:02.000Z", type: "compacted", payload: { latest_token_usage_record: response } });
+  const sparse = { input_tokens: 10, output_tokens: 0, total_tokens: 10 };
+  const fixture = await collectorFixture([responseLine, compactedLine, responseLine,
+    tokenRecord("2026-07-23T00:00:03.000Z", sparse, sparse),
+    tokenRecord("2026-07-23T00:00:04.000Z", usage(20), usage(10)),
+  ]);
+  try {
+    const options = { ...fixture, backfill: true, refreshStale: false,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z") };
+    await runCollectorOnce(options);
+    const records = (await readLines(fixture.dataFile)).filter((record) => record.kind === "codex_rollout_usage_snapshot");
+    assert.equal(records.length, 2);
+    assert.equal(records[0].components, null);
+    assert.equal(records[1].components.input_uncached_tokens, 10);
+    assert.equal(JSON.stringify(records).includes("private-response"), false);
+    await runCollectorOnce(options);
+    assert.equal((await readLines(fixture.dataFile)).filter((record) => record.kind === "codex_rollout_usage_snapshot").length, 2);
+    const onlyResponse = await collectorFixture([responseLine, compactedLine]);
+    try {
+      const result = await runCollectorOnce({ ...onlyResponse, backfill: true, refreshStale: false, clock: options.clock });
+      assert.equal(result.rolloutRecordsWritten, 0);
+      assert.deepEqual(await readLines(onlyResponse.dataFile), []);
+    } finally { await rm(onlyResponse.root, { recursive: true }); }
+  } finally { await rm(fixture.root, { recursive: true }); }
+});
+
 test("recursive rollout discovery stops promptly when its AbortSignal fires", async () => {
   const fixture = await collectorFixture();
   const controller = new AbortController();
@@ -371,6 +402,151 @@ test("unified quota-only collection does not resume an inherited rollout backfil
       1,
     );
   } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("pooled quota collection awaits its off-main integrity proof before success", async () => {
+  const fixture = await collectorFixture();
+  let startVerification;
+  const verificationStarted = new Promise((resolve) => {
+    startVerification = resolve;
+  });
+  let allowVerification;
+  const allow = new Promise((resolve) => {
+    allowVerification = resolve;
+  });
+  const calls = [];
+  class MinimalClient {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return null; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  try {
+    const collecting = runCollectorOnce({
+      ...fixture,
+      skipRolloutIngestion: true,
+      staleAfterMs: 0,
+      appServerFactory: () => new MinimalClient(),
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+      integrityVerifier: async ({ expectedIdentity }) => {
+        calls.push(Object.keys(expectedIdentity).sort());
+        startVerification();
+        await allow;
+      },
+    });
+    await verificationStarted;
+    let settled = false;
+    collecting.then(() => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    allowVerification();
+    const result = await collecting;
+    assert.equal(result.status, "complete");
+    assert.deepEqual(calls, [["dev", "ino"]]);
+    assert.equal(
+      (await readLocalCollectorState({ stateFile: fixture.stateFile })).records
+        .filter((row) => row.kind === "codex_quota_snapshot").length,
+      1,
+    );
+  } finally {
+    allowVerification?.();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling a committed pooled quota pass still waits for integrity before releasing its lock", async () => {
+  const fixture = await collectorFixture();
+  const controller = new AbortController();
+  let startVerification;
+  const verificationStarted = new Promise((resolve) => {
+    startVerification = resolve;
+  });
+  let allowVerification;
+  const allow = new Promise((resolve) => {
+    allowVerification = resolve;
+  });
+  class MinimalClient {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return null; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  const integrityVerifier = async () => {
+    startVerification();
+    await allow;
+  };
+  try {
+    const collecting = runCollectorOnce({
+      ...fixture,
+      skipRolloutIngestion: true,
+      staleAfterMs: 0,
+      signal: controller.signal,
+      appServerFactory: () => new MinimalClient(),
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+      integrityVerifier,
+    });
+    await verificationStarted;
+    controller.abort();
+    let settled = false;
+    collecting.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    await assert.rejects(
+      runCollectorOnce({
+        ...fixture,
+        refreshStale: false,
+        integrityVerifier,
+      }),
+      { code: "local_collector_state_lock_held" },
+    );
+    allowVerification();
+    const result = await collecting;
+    assert.equal(result.status, "bounded_pause");
+    assert.equal(result.pauseReason, "collector_aborted");
+  } finally {
+    allowVerification?.();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("cancellation during a normal pooled close is surfaced as a bounded pause", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const controller = new AbortController();
+  let startVerification;
+  const verificationStarted = new Promise((resolve) => {
+    startVerification = resolve;
+  });
+  let allowVerification;
+  const allow = new Promise((resolve) => {
+    allowVerification = resolve;
+  });
+  try {
+    const collecting = runCollectorOnce({
+      ...fixture,
+      backfill: true,
+      refreshStale: false,
+      signal: controller.signal,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+      integrityVerifier: async () => {
+        startVerification();
+        await allow;
+      },
+    });
+    await verificationStarted;
+    controller.abort();
+    allowVerification();
+    const result = await collecting;
+    assert.equal(result.status, "bounded_pause");
+    assert.equal(result.pauseReason, "collector_aborted");
+    assert.equal(result.rolloutRecordsWritten, 1);
+  } finally {
+    allowVerification?.();
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
@@ -1232,6 +1408,57 @@ test("notification event identity deduplicates repeated snapshots without retain
   assert.equal(JSON.stringify(first).includes("fixture"), false);
 });
 
+test("app-server records retain bounded local names without making them quota identity", () => {
+  const payload = (futureName) => ({
+    rateLimits: {
+      limitId: "codex",
+      limitName: null,
+      planType: "plus",
+      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1784854800 },
+      secondary: null,
+    },
+    rateLimitsByLimitId: {
+      future_alpha: {
+        limitId: "future_alpha",
+        limitName: futureName,
+        planType: "plus",
+        primary: { usedPercent: 10, windowDurationMins: 1_440, resetsAt: 1784854800 },
+        secondary: null,
+      },
+      future_beta: {
+        limitId: "future_beta",
+        limitName: "Account alice@example.com",
+        planType: "plus",
+        primary: { usedPercent: 20, windowDurationMins: 43_200, resetsAt: 1784854800 },
+        secondary: null,
+      },
+    },
+  });
+  const first = appServerSnapshotRecord(payload("Future Alpha"), {
+    source: "app_server_notification",
+    receivedAt: "2026-07-23T00:00:00.000Z",
+  });
+  const renamed = appServerSnapshotRecord(payload("Future Alpha Preview"), {
+    source: "app_server_notification",
+    receivedAt: "2026-07-23T00:00:10.000Z",
+  });
+
+  assert.deepEqual(
+    first.windows.map((window) => [
+      window.limitId,
+      window.limitName ?? null,
+      window.windowDurationMins,
+    ]),
+    [
+      ["codex", null, 300],
+      ["future_alpha", "Future Alpha", 1_440],
+      ["future_beta", null, 43_200],
+    ],
+  );
+  assert.equal(first.eventKey, renamed.eventKey);
+  assert.notEqual(first.windows[1].limitName, renamed.windows[1].limitName);
+});
+
 test("fresh direct app-server records expose a closed local notification projection", () => {
   assert.equal(notificationEvidenceFromAppServerRecord(null), null);
   const rateLimit = appPayload(84).rateLimits;
@@ -1459,6 +1686,175 @@ test("a fresh app-server account marker provisionally scopes only new nearby rol
     assert.equal((await readFile(fixture.checkpointFile, "utf8")).includes(accountSecret.toString("base64url")), false);
   } finally {
     await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("prospective marker binding is captured on both sides and never attached from later settings", async () => {
+  const binding = { destinationOrigin: "https://community.example.test", enrollmentNamespace: "synthetic_enrollment_marker" };
+  for (const mode of ["matching", "changed", "unbound", "failed", "extra_field"]) {
+    const fixture = await collectorFixture();
+    let epoch = Date.parse("2026-07-23T00:01:00.000Z");
+    let bindingReads = 0;
+    class BoundClient {
+      async start() {}
+      async readAccount() {
+        epoch += 1_000;
+        return { account: { email: "binding.fixture@example.test", planType: "pro" } };
+      }
+      async readRateLimits() { epoch += 1_000; return appPayload(2); }
+      async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+      close() {}
+    }
+    try {
+      await runCollectorOnce({
+        ...fixture, staleAfterMs: 0, skipRolloutIngestion: true, clock: () => epoch,
+        appServerFactory: () => new BoundClient(), loadAccountObservationSecret: async () => Buffer.alloc(32, 81),
+        readAccountAttributionBinding: async () => {
+          bindingReads += 1;
+          if (mode === "failed" && bindingReads === 2) throw new Error("private-binding-canary");
+          if (mode === "unbound") return null;
+          if (mode === "extra_field") return { ...binding, rawAccount: "private-binding-canary" };
+          return mode === "changed" && bindingReads === 2
+            ? { ...binding, enrollmentNamespace: "synthetic_repaired_enrollment" } : binding;
+        },
+      });
+      assert.equal(bindingReads, 2, mode);
+      const first = JSON.parse(await readFile(fixture.checkpointFile, "utf8")).accountScopeMarker;
+      assert.equal(first.accountScope.status, "available", mode);
+      assert.equal(first.capturedAt, "2026-07-23T00:01:00.000Z", mode);
+      assert.equal(first.receivedAt, "2026-07-23T00:01:03.000Z", mode);
+      assert.deepEqual(first.observationBinding, mode === "matching" ? binding : null, mode);
+      epoch += 10_000;
+      await runCollectorOnce({ ...fixture, refreshStale: false, skipRolloutIngestion: true, clock: () => epoch,
+        readAccountAttributionBinding: async () => assert.fail("later settings must not bind old evidence") });
+      const checkpoint = await readFile(fixture.checkpointFile, "utf8");
+      assert.deepEqual(JSON.parse(checkpoint).accountScopeMarker, first, mode);
+      assert.equal(checkpoint.includes("private-binding-canary"), false, mode);
+      assert.equal(checkpoint.includes("binding.fixture@example.test"), false, mode);
+    } finally {
+      await rm(fixture.root, { recursive: true });
+    }
+  }
+});
+
+async function seedCollectorAccountMarker(fixture) {
+  await runCollectorOnce({
+    ...fixture, refreshStale: false,
+    clock: () => Date.parse("2026-07-23T00:00:00.000Z"),
+  });
+  const calls = [];
+  class MatchingClient {
+    async start() {}
+    async readAccount() {
+      calls.push("account");
+      return { account: { email: "marker.fixture@example.test", planType: "pro" } };
+    }
+    async readRateLimits() { calls.push("quota"); return appPayload(2); }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  await runCollectorOnce({
+    ...fixture, staleAfterMs: 0, skipRolloutIngestion: true,
+    appServerFactory: () => new MatchingClient(),
+    loadAccountObservationSecret: async () => Buffer.alloc(32, 81),
+    clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+  });
+  assert.deepEqual(calls, ["account", "quota", "account"]);
+  const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+  assert.equal(checkpoint.accountScopeMarker.version, "provisional-account-marker-v2");
+}
+
+test("account markers never apply backward, across a clock rollback, to future events, or after expiration", async () => {
+  const cases = [
+    ["before marker", "2026-07-23T00:00:59.000Z", "2026-07-23T00:01:02.000Z", "unavailable"],
+    ["clock rollback", "2026-07-23T00:00:58.000Z", "2026-07-23T00:00:59.000Z", "unavailable"],
+    ["future event", "2026-07-23T00:01:03.000Z", "2026-07-23T00:01:02.000Z", "unavailable"],
+    ["expired", "2026-07-23T00:06:01.000Z", "2026-07-23T00:06:02.000Z", "unavailable"],
+    ["inclusive freshness boundary", "2026-07-23T00:01:00.000Z", "2026-07-23T00:06:00.000Z", "available"],
+  ];
+  for (const [label, observedAt, receivedAt, expected] of cases) {
+    const fixture = await collectorFixture();
+    try {
+      await seedCollectorAccountMarker(fixture);
+      await appendFile(fixture.rollout, `${tokenRecord(observedAt, usage(10), usage(10), 3)}\n`);
+      await runCollectorOnce({ ...fixture, refreshStale: false, clock: () => Date.parse(receivedAt) });
+      const record = (await readLines(fixture.dataFile)).find((row) => row.kind === "codex_rollout_usage_snapshot");
+      assert.ok(record, `${label}: raw usage must remain available`);
+      assert.equal(record.accountScope.status, expected, label);
+      assert.equal(record.accountScopeAttribution, expected === "available"
+        ? "provisional_fresh_app_server_marker" : "unavailable_no_fresh_contemporaneous_marker", label);
+      assert.equal(record.components.input_uncached_tokens, 10, label);
+    } finally {
+      await rm(fixture.root, { recursive: true });
+    }
+  }
+});
+
+test("a same-record plan conflict clears the marker without dropping usage or rewriting the observed plan", async () => {
+  const fixture = await collectorFixture();
+  try {
+    await seedCollectorAccountMarker(fixture);
+    const differentPlan = JSON.parse(tokenRecord("2026-07-23T00:01:01.000Z", usage(10), usage(10), 3));
+    differentPlan.payload.rate_limits.plan_type = "plus";
+    await appendFile(fixture.rollout, `${JSON.stringify(differentPlan)}\n${tokenRecord("2026-07-23T00:01:02.000Z", usage(20), usage(10), 4)}\n`);
+    await runCollectorOnce({ ...fixture, refreshStale: false, clock: () => Date.parse("2026-07-23T00:01:03.000Z") });
+    const records = (await readLines(fixture.dataFile)).filter((row) => row.kind === "codex_rollout_usage_snapshot");
+    assert.equal(records.length, 2);
+    assert.deepEqual(records.map((row) => row.accountScope.status), ["unavailable", "unavailable"]);
+    assert.deepEqual(records.map((row) => row.windows[0].planType), ["plus", "pro"]);
+    assert.deepEqual(records.map((row) => row.components.input_uncached_tokens), [10, 10]);
+    assert.equal(JSON.parse(await readFile(fixture.checkpointFile, "utf8")).accountScopeMarker, null);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("logout, failed account/quota reads and account/plan races durably invalidate an earlier marker", async () => {
+  for (const failure of ["logout", "account_read", "account_switch", "account_plan", "quota_plan", "quota_read", "start", "commit"]) {
+    const fixture = await collectorFixture();
+    let reads = 0;
+    class InvalidatingClient {
+      async start() { if (failure === "start") throw new CodexAppServerError("authentication_failure", "Synthetic failure"); }
+      async readAccount() {
+        reads += 1;
+        if (failure === "logout" && reads === 2) return null;
+        if (failure === "account_read" && reads === 2) throw new Error("DO-NOT-LEAK-account-failure");
+        return { account: {
+          email: failure === "account_switch" && reads === 2 ? "switched.fixture@example.test" : "marker.fixture@example.test",
+          planType: failure === "account_plan" && reads === 2 ? "plus" : "pro",
+        } };
+      }
+      async readRateLimits() {
+        if (failure === "quota_read") throw new CodexAppServerError("authentication_failure", "Synthetic failure");
+        const payload = appPayload(3);
+        if (failure === "quota_plan") payload.rateLimits.planType = "plus";
+        return payload;
+      }
+      async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+      close() {}
+    }
+    try {
+      await seedCollectorAccountMarker(fixture);
+      await runCollectorOnce({
+        ...fixture, staleAfterMs: 0, skipRolloutIngestion: true,
+        appServerFactory: () => new InvalidatingClient(),
+        loadAccountObservationSecret: async () => Buffer.alloc(32, 81),
+        clock: () => Date.parse("2026-07-23T00:01:01.000Z"),
+        ...(failure === "commit" ? { commitState: async () => { throw new Error("Synthetic commit failure"); } } : {}),
+      });
+      assert.equal(JSON.parse(await readFile(fixture.checkpointFile, "utf8")).accountScopeMarker, null, failure);
+      await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:02.000Z", usage(10), usage(10), 4)}\n`);
+      await runCollectorOnce({ ...fixture, refreshStale: false, clock: () => Date.parse("2026-07-23T00:01:03.000Z") });
+      const records = await readLines(fixture.dataFile);
+      const usageRecord = records.find((row) => row.kind === "codex_rollout_usage_snapshot");
+      assert.equal(usageRecord.accountScope.status, "unavailable", failure);
+      assert.equal(usageRecord.components.input_uncached_tokens, 10, failure);
+      assert.ok(records.some((row) => row.source === "app_server_read" && row.windows[0].usedPercent === 2), failure);
+      assert.equal(JSON.stringify(records).includes("fixture@example.test"), false, failure);
+      assert.equal(JSON.stringify(records).includes("DO-NOT-LEAK"), false, failure);
+    } finally {
+      await rm(fixture.root, { recursive: true });
+    }
   }
 });
 
@@ -1946,36 +2342,60 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
   let currentEmail = "first.owner@example.test";
   let credentialLoads = 0;
   let nowMs = Date.parse("2026-07-23T00:01:00.000Z");
+  let accountReads = 0;
+  let activeClient;
+  let foreground;
+  let hardStop;
+  let markInitialAccountRead;
+  const initialAccountRead = new Promise((resolve) => { markInitialAccountRead = resolve; });
+  let markNotificationAccountRead;
+  const notificationAccountRead = new Promise((resolve) => { markNotificationAccountRead = resolve; });
   class SwitchingClient extends EventEmitter {
-    async start() {
-      setTimeout(() => {
-        currentEmail = "second.owner@example.test";
-        nowMs = Date.parse("2026-07-23T00:01:02.000Z");
-        this.emit("rateLimitsUpdated", appPayload(3));
-        setTimeout(() => {
-          appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:02.000Z", usage(10), usage(10), 3)}\n`);
-        }, 5);
-      }, 10);
-    }
+    async start() {}
     async readRateLimits() { return appPayload(2); }
-    async readAccount() { return { account: { email: currentEmail, planType: "pro" } }; }
+    async readAccount() {
+      accountReads += 1;
+      const account = { account: { email: currentEmail, planType: "pro" } };
+      if (accountReads === 2) markInitialAccountRead();
+      if (accountReads === 4) markNotificationAccountRead();
+      return account;
+    }
     async readAccountUsage() { return { dailyUsageBuckets: [] }; }
     close() {}
   }
   try {
-    const hardStop = setTimeout(() => controller.abort(), 10_000);
-    const foreground = runCollectorForeground({
+    hardStop = setTimeout(() => controller.abort(), 10_000);
+    foreground = runCollectorForeground({
       ...fixture,
       signal: controller.signal,
       staleAfterMs: 0,
       reconciliationMs: 20,
-      appServerFactory: () => new SwitchingClient(),
+      appServerFactory: () => {
+        activeClient = new SwitchingClient();
+        return activeClient;
+      },
       loadAccountObservationSecret: async () => {
         credentialLoads += 1;
         return Buffer.from(secret);
       },
       clock: () => nowMs,
     });
+    await Promise.race([
+      initialAccountRead,
+      foreground.then(() => {
+        throw new Error("collector stopped before the initial account read");
+      }),
+    ]);
+    currentEmail = "second.owner@example.test";
+    nowMs = Date.parse("2026-07-23T00:01:02.000Z");
+    activeClient.emit("rateLimitsUpdated", appPayload(3));
+    await Promise.race([
+      notificationAccountRead,
+      foreground.then(() => {
+        throw new Error("collector stopped before the notification account re-read");
+      }),
+    ]);
+    await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:02.000Z", usage(10), usage(10), 3)}\n`);
     for (let attempt = 0; attempt < 500; attempt += 1) {
       const pending = await readLines(fixture.dataFile);
       if (pending.some((record) => record.kind === "codex_rollout_usage_snapshot")) break;
@@ -1994,7 +2414,128 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
     assert.ok(credentialLoads >= 2, "initial read and notification must independently reload the account capability");
     assert.equal(JSON.stringify(records).includes("owner@example.test"), false);
   } finally {
+    clearTimeout(hardStop);
+    controller.abort();
+    await foreground?.catch(() => {});
     await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a duplicate unavailable notification still clears a newer account marker", async () => {
+  const fixture = await collectorFixture();
+  const controller = new AbortController();
+  let loggedIn = true;
+  let activeClient;
+  let foreground;
+  let nowMs = Date.parse("2026-07-23T00:01:00.000Z");
+  const hardStop = setTimeout(() => controller.abort(), 10_000);
+  class AccountClient extends EventEmitter {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return loggedIn ? { account: { email: "duplicate.fixture@example.test", planType: "pro" } } : null; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  async function until(predicate, label) {
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      if (await predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail(label);
+  }
+  try {
+    foreground = runCollectorForeground({
+      ...fixture, signal: controller.signal, staleAfterMs: 0, reconciliationMs: 20,
+      appServerFactory: () => { activeClient = new AccountClient(); return activeClient; },
+      loadAccountObservationSecret: async () => Buffer.alloc(32, 87), clock: () => nowMs,
+    });
+    // Client construction follows state preparation, including owner-only
+    // permissions. Do not poll the database during its initial creation.
+    await until(async () => activeClient !== undefined, "collector state prepared");
+    await until(async () => (await readLines(fixture.dataFile)).some((row) => row.source === "app_server_read"), "initial quota record");
+    loggedIn = false;
+    nowMs += 1_000;
+    activeClient.emit("rateLimitsUpdated", appPayload(3));
+    await until(async () => (await readLines(fixture.dataFile)).some((row) => row.source === "app_server_notification" && row.windows[0].usedPercent === 3), "first unavailable notification");
+    loggedIn = true;
+    nowMs += 1_000;
+    activeClient.emit("rateLimitsUpdated", appPayload(4));
+    await until(async () => (await readLines(fixture.dataFile)).some((row) => row.source === "app_server_notification" && row.windows[0].usedPercent === 4), "new matching account marker");
+    assert.equal(JSON.parse(await readFile(fixture.checkpointFile, "utf8")).accountScopeMarker.accountScope.status, "available");
+    loggedIn = false;
+    nowMs += 1_000;
+    activeClient.emit("rateLimitsUpdated", appPayload(3));
+    await until(async () => {
+      const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+      return checkpoint.accountScopeMarker === null && checkpoint.diagnostics.duplicateEventsSkipped > 0;
+    }, "duplicate notification must durably invalidate the marker");
+    nowMs += 1_000;
+    await appendFile(fixture.rollout, `${tokenRecord(new Date(nowMs).toISOString(), usage(10), usage(10), 3)}\n`);
+    await until(async () => (await readLines(fixture.dataFile)).some((row) => row.kind === "codex_rollout_usage_snapshot"), "post-logout usage");
+    controller.abort();
+    await foreground;
+    const records = await readLines(fixture.dataFile);
+    assert.equal(records.filter((row) => row.source === "app_server_notification").length, 2);
+    const usageRecord = records.find((row) => row.kind === "codex_rollout_usage_snapshot");
+    assert.equal(usageRecord.accountScope.status, "unavailable");
+    assert.equal(usageRecord.components.input_uncached_tokens, 10);
+  } finally {
+    clearTimeout(hardStop);
+    controller.abort();
+    await foreground?.catch(() => {});
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("foreground account-change and disconnect signals invalidate the marker before queued usage", async () => {
+  for (const signalName of ["accountChanged", "disconnect"]) {
+    const fixture = await collectorFixture();
+    const controller = new AbortController();
+    let activeClient;
+    let foreground;
+    let nowMs = Date.parse("2026-07-23T00:01:00.000Z");
+    const hardStop = setTimeout(() => controller.abort(), 10_000);
+    class InvalidationClient extends EventEmitter {
+      async start() {}
+      async readRateLimits() { return appPayload(2); }
+      async readAccount() { return { account: { email: "invalidation.fixture@example.test", planType: "pro" } }; }
+      async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+      close() {}
+    }
+    try {
+      foreground = runCollectorForeground({
+        ...fixture, signal: controller.signal, staleAfterMs: 0, reconciliationMs: 20,
+        appServerFactory: () => { activeClient = new InvalidationClient(); return activeClient; },
+        loadAccountObservationSecret: async () => Buffer.alloc(32, 88), clock: () => nowMs,
+      });
+      for (let attempt = 0; attempt < 500; attempt += 1) {
+        if ((await readLines(fixture.dataFile)).some((row) => row.source === "app_server_read")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      nowMs = Date.parse("2026-07-23T00:01:03.000Z");
+      for (let index = 0; index < (signalName === "accountChanged" ? 100 : 1); index += 1) {
+        activeClient.emit(signalName);
+      }
+      await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:02.000Z", usage(10), usage(10), 3)}\n`);
+      for (let attempt = 0; attempt < 500; attempt += 1) {
+        if ((await readLines(fixture.dataFile)).some((row) => row.kind === "codex_rollout_usage_snapshot")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      controller.abort();
+      const result = await foreground;
+      if (signalName === "accountChanged") {
+        assert.ok(result.resourceActivity.checkpointWrites < 10, "an account-change burst must coalesce its durable invalidation");
+      }
+      const record = (await readLines(fixture.dataFile)).find((row) => row.kind === "codex_rollout_usage_snapshot");
+      assert.ok(record, signalName);
+      assert.equal(record.accountScope.status, "unavailable", signalName);
+      assert.equal(record.components.input_uncached_tokens, 10, signalName);
+    } finally {
+      clearTimeout(hardStop);
+      controller.abort();
+      await foreground?.catch(() => {});
+      await rm(fixture.root, { recursive: true });
+    }
   }
 });
 
@@ -2019,7 +2560,7 @@ test("foreground coalesces a notification burst to one pending payload and re-re
     async readAccount() {
       accountReads += 1;
       const observedEmail = currentEmail;
-      if (accountReads === 2) {
+      if (accountReads === 3) {
         markFirstNotificationReadStarted();
         await firstNotificationReadReleased;
       }
@@ -2080,6 +2621,8 @@ test("foreground coalesces a notification burst to one pending payload and re-re
     const records = await readLines(fixture.dataFile);
     const notifications = records.filter((record) => record.source === "app_server_notification");
     assert.deepEqual(notifications.map((record) => record.windows[0].usedPercent), [3, 100]);
+    assert.equal(notifications[0].accountScope.status, "unavailable", "a switch during the read bracket cannot be attributed");
+    assert.equal(notifications[1].accountScope.status, "unavailable", "a later account read cannot label a notification queued under another account marker");
     const rollout = records.find((record) => record.kind === "codex_rollout_usage_snapshot");
     const expected = deriveOpenAIAccountScope({ account: { email: currentEmail } }, { secret, planType: "pro" });
     assert.equal(rollout.accountScope.scopeId, expected.scopeId);
@@ -2098,9 +2641,14 @@ test("foreground coalesces a notification burst to one pending payload and re-re
   }
 });
 
-test("foreground notification processing preserves locked and unavailable credential reasons", async () => {
+test("foreground notification processing preserves credential recovery reasons", async () => {
   for (const [credentialCode, expectedReason, diagnostic] of [
     ["account_observation_credential_locked", "credential_locked", "accountCredentialLocked"],
+    [
+      "account_observation_credential_migration_required",
+      "credential_migration_required",
+      "accountCredentialMigrationRequired",
+    ],
     ["account_observation_credential_unavailable", "credential_unavailable", "accountCredentialUnavailable"],
   ]) {
     const fixture = await collectorFixture();
@@ -2108,6 +2656,11 @@ test("foreground notification processing preserves locked and unavailable creden
     let activeClient;
     let credentialLoads = 0;
     let foreground;
+    let hardStop;
+    let markClientStarted;
+    const clientStarted = new Promise((resolve) => {
+      markClientStarted = resolve;
+    });
     class CredentialStateClient extends EventEmitter {
       async start() {}
       async readRateLimits() { return appPayload(2); }
@@ -2116,6 +2669,7 @@ test("foreground notification processing preserves locked and unavailable creden
       close() {}
     }
     try {
+      hardStop = setTimeout(() => controller.abort(), 10_000);
       foreground = runCollectorForeground({
         ...fixture,
         signal: controller.signal,
@@ -2123,6 +2677,7 @@ test("foreground notification processing preserves locked and unavailable creden
         reconciliationMs: 60_000,
         appServerFactory: () => {
           activeClient = new CredentialStateClient();
+          markClientStarted();
           return activeClient;
         },
         loadAccountObservationSecret: async () => {
@@ -2134,6 +2689,12 @@ test("foreground notification processing preserves locked and unavailable creden
         },
         clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
       });
+      await Promise.race([
+        clientStarted,
+        foreground.then(() => {
+          throw new Error("collector stopped before the credential-state client started");
+        }),
+      ]);
       for (let attempt = 0; attempt < 500; attempt += 1) {
         const records = await readLines(fixture.dataFile);
         if (records.some((record) => record.source === "app_server_read")) break;
@@ -2156,6 +2717,7 @@ test("foreground notification processing preserves locked and unavailable creden
       assert.equal(JSON.stringify({ notification, diagnostics: result.diagnostics })
         .includes("DO-NOT-LEAK-foreground-credential"), false);
     } finally {
+      clearTimeout(hardStop);
       controller.abort();
       await foreground?.catch(() => {});
       await rm(fixture.root, { recursive: true });
@@ -2235,6 +2797,167 @@ test("idle reconciliation does not rewrite the full checkpoint every cycle", asy
     assert.ok(result.resourceActivity.reconciliationCycles >= 3);
     assert.ok(result.resourceActivity.ingestionRuns >= result.resourceActivity.reconciliationCycles);
     assert.ok(result.resourceActivity.checkpointWrites <= 3);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+
+test("inline fork replay stays out of the ledger and the baseline rebases across a resume", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:10:00.000Z");
+  const forkFile = join(fixture.sessions, "rollout-2026-07-23T00-05-00-fork.jsonl");
+  const meta = JSON.stringify({
+    timestamp: "2026-07-23T00:05:00.000Z",
+    type: "session_meta",
+    payload: { id: "fork-child", forked_from_id: "vanished-parent" },
+  });
+  const tool = JSON.stringify({
+    timestamp: "2026-07-23T00:05:00.500Z",
+    type: "response_item",
+    payload: { type: "custom_tool_call", name: "replayed-tool", call_id: "replayed-call-1" },
+  });
+  const turn = JSON.stringify({
+    timestamp: "2026-07-23T00:05:02.000Z",
+    type: "turn_context",
+    payload: { model: "gpt-test" },
+  });
+  try {
+    // Run 1 stops mid-replay: the checkpoint must persist the pre-boundary
+    // state so the resume cannot mistake the rest of the replay for spend.
+    await writeFile(forkFile, `${[
+      meta,
+      tokenRecord("2026-07-23T00:05:00.100Z", usage(100), usage(100), 2),
+      tool,
+      tokenRecord("2026-07-23T00:05:01.000Z", usage(300), usage(200), 3),
+    ].join("\n")}\n`);
+    const first = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(first.status, "complete");
+    const afterFirst = await readLines(fixture.dataFile);
+    assert.equal(
+      afterFirst.filter((row) => row.kind === "codex_rollout_usage_snapshot"
+        && row.components !== null
+        && row.components.input_uncached_tokens > 10).length,
+      0,
+    );
+
+    // The fork's first genuine turn arrives after a restart. Its delta must
+    // be measured from the replayed baseline (400 - 300 = its own 100), not
+    // charged the whole inherited total.
+    await appendFile(forkFile, `${[
+      turn,
+      tokenRecord("2026-07-23T00:05:03.000Z", usage(400), usage(100), 4),
+    ].join("\n")}\n`);
+    const second = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(second.status, "complete");
+
+    const records = await readLines(fixture.dataFile);
+    const usageRecords = records.filter((row) => row.kind === "codex_rollout_usage_snapshot"
+      && row.components !== null);
+    const forkUsage = usageRecords.filter((row) => row.model === "gpt-test");
+    assert.equal(forkUsage.length, 1);
+    assert.equal(forkUsage[0].components.input_uncached_tokens, 100);
+    assert.equal(
+      records.filter((row) => row.kind === "codex_tool_class_event"
+        && row.toolClass !== undefined
+        && row.observedAt === "2026-07-23T00:05:00.500Z").length,
+      0,
+    );
+
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.equal(checkpoint.diagnostics.forkReplayEventsSkipped, 2);
+    assert.equal(checkpoint.diagnostics.forkReplayToolCallsSkipped, 1);
+    const forkState = Object.values(checkpoint.files)
+      .find((state) => state.isInlineFork === true);
+    assert.ok(forkState);
+    assert.equal(forkState.ownTurnContextSeen, true);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a truncated fork file re-arms the replay boundary on rescan", async () => {
+  // Regression for the review finding: the truncation reset cleared every
+  // cursor field except ownTurnContextSeen, so a shrink-in-place rescan of a
+  // fork file walked the replayed prefix with both guards disabled and
+  // charged the inherited history as fresh spend.
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:10:00.000Z");
+  const forkFile = join(fixture.sessions, "rollout-2026-07-23T00-05-00-fork.jsonl");
+  const meta = JSON.stringify({
+    timestamp: "2026-07-23T00:05:00.000Z",
+    type: "session_meta",
+    payload: { id: "fork-child", forked_from_id: "vanished-parent" },
+  });
+  const turn = JSON.stringify({
+    timestamp: "2026-07-23T00:05:02.000Z",
+    type: "turn_context",
+    payload: { model: "gpt-test" },
+  });
+  try {
+    await writeFile(forkFile, `${[
+      meta,
+      tokenRecord("2026-07-23T00:05:00.100Z", usage(100), usage(100), 2),
+      tokenRecord("2026-07-23T00:05:01.000Z", usage(300), usage(200), 3),
+      turn,
+      tokenRecord("2026-07-23T00:05:03.000Z", usage(400), usage(100), 4),
+    ].join("\n")}\n`);
+    const first = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(first.status, "complete");
+
+    // Shrink in place: same inode, replay-only content shorter than the
+    // consumed cursor. The rescan must re-derive the boundary, not inherit a
+    // stale past-the-boundary flag.
+    await writeFile(forkFile, `${[
+      meta,
+      tokenRecord("2026-07-23T00:05:00.100Z", usage(100), usage(100), 2),
+      tokenRecord("2026-07-23T00:05:01.000Z", usage(300), usage(200), 3),
+    ].join("\n")}\n`);
+    const second = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(second.status, "complete");
+
+    const records = await readLines(fixture.dataFile);
+    const forkUsage = records.filter((row) => row.kind === "codex_rollout_usage_snapshot"
+      && row.components !== null
+      && row.components.input_uncached_tokens > 10);
+    assert.equal(forkUsage.length, 1);
+    assert.equal(forkUsage[0].components.input_uncached_tokens, 100);
+
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.equal(checkpoint.diagnostics.filesTruncated, 1);
+    assert.equal(checkpoint.diagnostics.forkReplayEventsSkipped, 4);
+    const forkState = Object.values(checkpoint.files)
+      .find((state) => state.isInlineFork === true);
+    assert.ok(forkState);
+    assert.equal(forkState.ownTurnContextSeen, false);
   } finally {
     await rm(fixture.root, { recursive: true });
   }

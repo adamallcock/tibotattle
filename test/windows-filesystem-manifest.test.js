@@ -39,6 +39,8 @@ function binding(overrides = {}) {
     replaceFile: () => IDENTITY,
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
+    acquireAccountlessInstallationCredentialMutex: () => ({ lease: {}, abandoned: false }),
+    releaseAccountlessInstallationCredentialMutex: () => {},
     acquireCredentialAuditFileGuard: () => ({ lease: {} }),
     releaseCredentialAuditFileGuard: () => {},
     ...overrides,
@@ -61,6 +63,11 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+    },
     requiredMethods: [
       "inspectPath",
       "ensureDirectory",
@@ -72,6 +79,8 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
       "releaseCredentialAuditFileGuard",
       "acquireCredentialMutex",
       "releaseCredentialMutex",
+      "acquireAccountlessInstallationCredentialMutex",
+      "releaseAccountlessInstallationCredentialMutex",
     ],
     nativeClaims: {
       productionSafe: false,

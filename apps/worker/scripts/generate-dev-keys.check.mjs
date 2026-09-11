@@ -36,3 +36,22 @@ test("key generation writes one owner-only pair and never overwrites it", async 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("staging generates an independent admission HMAC key with its encryption pair", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-staging-keygen-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const destination = join(root, ".dev.vars.staging");
+  assert.deepEqual(generateEnvelopeKeys(destination, { environment: "staging" }), { ok: true });
+  const contents = await readFile(destination, "utf8");
+  const lines = contents.trim().split("\n");
+  assert.equal(lines.length, 3);
+  const secret = /^IDENTITY_LINK_SECRET='([A-Za-z0-9_-]{43})'$/u.exec(lines[2])?.[1];
+  assert.equal(typeof secret, "string");
+  assert.equal(Buffer.from(secret, "base64url").length, 32);
+  assert.equal(lines.slice(0, 2).some((line) => line.includes(secret)), false);
+  assert.equal((await stat(destination)).mode & 0o777, 0o600);
+  assert.deepEqual(generateEnvelopeKeys(destination, { environment: "staging" }), {
+    ok: false, code: "DESTINATION_EXISTS",
+  });
+  assert.equal(await readFile(destination, "utf8"), contents);
+});

@@ -1,3 +1,4 @@
+import { codexCacheReasoningConfiguration } from "@app-usagemonitor/telemetry-contract";
 import {
   emptySpeedWeightingCrossing,
   fastModeModelFamilyKey,
@@ -7,6 +8,8 @@ import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import {
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
   reasoningEffortName,
 } from "./local-unified-index.js";
 import {
@@ -22,8 +25,16 @@ export const MAX_CACHE_SWITCH_RECENT_DETAILS = 20;
 // product show how the pattern changes with age without asserting a cache TTL.
 export const CACHE_CONTINUITY_MINIMUM_GAP_MS = 0;
 export const MAX_CACHE_CONTINUITY_RECENT_DETAILS = 20;
+export const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS =
+  7 * 24 * 60 * 60_000;
 
 const FUTURE_EVIDENCE_TOLERANCE_MS = 5 * 60_000;
+const COMPACTION_AWARE_PARSERS = new Set([
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+].flatMap((version) => [version, `${version}-cache-write-zero`]));
 const CHANGE_TYPES = Object.freeze([
   "reasoning_only",
   "model_only",
@@ -73,6 +84,71 @@ const CONTINUITY_GAP_BANDS = Object.freeze([
     endMs: Number.POSITIVE_INFINITY,
   }),
 ]);
+// The cost table keeps its established seven bands. The outcome raster uses a
+// finer, human-readable partition so the dense first few minutes remain
+// inspectable without data-derived boundaries such as "11–27 seconds".
+const CONTINUITY_OUTCOME_BUCKETS = Object.freeze([
+  Object.freeze({
+    id: "under_one_minute",
+    label: "Under 1 minute",
+    startMs: 0,
+    endMs: 60_000,
+  }),
+  Object.freeze({
+    id: "one_to_two_minutes",
+    label: "1 to 2 minutes",
+    startMs: 60_000,
+    endMs: 2 * 60_000,
+  }),
+  Object.freeze({
+    id: "two_to_five_minutes",
+    label: "2 to 5 minutes",
+    startMs: 2 * 60_000,
+    endMs: 5 * 60_000,
+  }),
+  Object.freeze({
+    id: "five_to_ten_minutes",
+    label: "5 to 10 minutes",
+    startMs: 5 * 60_000,
+    endMs: 10 * 60_000,
+  }),
+  Object.freeze({
+    id: "ten_to_thirty_minutes",
+    label: "10 to 30 minutes",
+    startMs: 10 * 60_000,
+    endMs: 30 * 60_000,
+  }),
+  Object.freeze({
+    id: "thirty_minutes_to_one_hour",
+    label: "30 minutes to 1 hour",
+    startMs: 30 * 60_000,
+    endMs: 60 * 60_000,
+  }),
+  Object.freeze({
+    id: "one_to_six_hours",
+    label: "1 to 6 hours",
+    startMs: 60 * 60_000,
+    endMs: 6 * 60 * 60_000,
+  }),
+  Object.freeze({
+    id: "six_to_twenty_four_hours",
+    label: "6 to 24 hours",
+    startMs: 6 * 60 * 60_000,
+    endMs: 24 * 60 * 60_000,
+  }),
+  Object.freeze({
+    id: "one_to_three_days",
+    label: "1 to 3 days",
+    startMs: 24 * 60 * 60_000,
+    endMs: 3 * 24 * 60 * 60_000,
+  }),
+  Object.freeze({
+    id: "over_three_days",
+    label: "3 days or more",
+    startMs: 3 * 24 * 60 * 60_000,
+    endMs: Number.POSITIVE_INFINITY,
+  }),
+]);
 const PERIODS = Object.freeze([
   Object.freeze({
     id: "24h",
@@ -106,14 +182,6 @@ function observedTokenCount(value) {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
-function effectiveReasoningEffort(value) {
-  // Codex Max and Ultra currently serialize to the same API effort. They are
-  // presentation choices inside one effective prompt-cache lineage, so a
-  // label-only Max <-> Ultra boundary is not an effort change.
-  if (value === "max" || value === "ultra") return "max";
-  return value;
-}
-
 function recognizedModel(model, recognition) {
   return recognition === "recognized"
     && typeof model === "string"
@@ -143,8 +211,12 @@ function configurationFor(row) {
     return null;
   }
   const modelChanged = previousModel !== currentModel;
-  const reasoningChanged = effectiveReasoningEffort(previousEffort)
-    !== effectiveReasoningEffort(currentEffort);
+  // Configuration aliases are model-specific (Astra Ultra also changes mode).
+  // This comparison is not proof
+  // that a configuration update was applied or that a cache reset occurred;
+  // the separate observed-token and compaction gates remain authoritative.
+  const reasoningChanged = codexCacheReasoningConfiguration(previousModel, previousEffort)
+    !== codexCacheReasoningConfiguration(currentModel, currentEffort);
   return {
     previousModel,
     currentModel,
@@ -190,8 +262,7 @@ function sameContinuityConfiguration(row) {
 }
 
 function compactionAwareParser(value) {
-  return value === LOCAL_UNIFIED_INDEX_PARSER_VERSION
-    || value === LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION;
+  return COMPACTION_AWARE_PARSERS.has(value);
 }
 
 function componentsFor(row) {
@@ -279,17 +350,31 @@ function declaredCodexSpeed(row, declaredSpeedBaselines) {
   return declaredSpeedModeAt(declaredSpeedBaselines, observedMs) ?? "unknown";
 }
 
-function addPremiumCrossing(summary, row, premiumNanos, declaredSpeedBaselines) {
+function premiumCrossingFor(row, premiumNanos, declaredSpeedBaselines) {
+  // Unpriced comparisons remain in the coverage counts, never as zero-dollar
+  // members of the priced subtotal or its speed-provenance denominator.
+  if (premiumNanos === null) return null;
   const observedSpeed = observedCodexSpeed(row);
-  const family = fastModeModelFamilyKey(row?.model_id);
-  const premiumUsd = premiumNanos === null
-    ? 0
-    : Number(nanosToUsdString(premiumNanos));
+  const family = fastModeModelFamilyKey(row?.model_id, {
+    eventTime: new Date(Number(row.observed_at_ms)).toISOString(),
+    totalInputContextTokens: currentInputTokens(row),
+  });
+  return {
+    observedSpeed,
+    family,
+    premiumUsd: Number(nanosToUsdString(premiumNanos)),
+    declaredSpeed: observedSpeed === "unknown"
+      ? declaredCodexSpeed(row, declaredSpeedBaselines)
+      : "unknown",
+  };
+}
+
+function addPremiumCrossing(summary, contribution) {
+  if (contribution === null) return;
+  const { observedSpeed, family, premiumUsd, declaredSpeed } = contribution;
   const observedCell = summary.speedWeighting[observedSpeed][family];
   observedCell.events += 1;
   observedCell.apiPriceEquivalentUsd += premiumUsd;
-  if (observedSpeed !== "unknown") return;
-  const declaredSpeed = declaredCodexSpeed(row, declaredSpeedBaselines);
   if (declaredSpeed === "unknown") return;
   const declaredCell = summary.declaredSpeedWeighting[declaredSpeed][family];
   declaredCell.events += 1;
@@ -327,11 +412,10 @@ function finalizePremiumScenario(summary, scenario, completeCoverage) {
       "price_coverage_incomplete",
     );
   }
-  const preference = scenario === "unresolved_as_fast" ? "fast" : "standard";
   const weighting = summarizeQuotaWeightedAccounting({
     speedWeighting: summary.speedWeighting,
     declaredSpeedWeighting: summary.declaredSpeedWeighting,
-    preference,
+    unresolvedScenario: scenario,
   });
   if (weighting.weightingStatus !== "complete"
       || !Number.isFinite(weighting.quotaWeightedApiPriceEquivalentUsd)) {
@@ -352,7 +436,7 @@ function finalizePremiumScenario(summary, scenario, completeCoverage) {
     pricedDrops: summary.pricedDrops,
     observedSpeedDrops: weighting.coverage.observedEvents,
     declaredSpeedDrops: weighting.coverage.declaredFromConfigEvents,
-    assumedSpeedDrops: weighting.coverage.assumedFromPreferenceEvents,
+    assumedSpeedDrops: weighting.coverage.assumedEvents,
     unknownSpeedDrops: weighting.coverage.unknownEvents,
   };
 }
@@ -374,6 +458,23 @@ function finalizePremiumWeighting(summary, completeCoverage) {
       "unresolved_as_standard",
     ).basisFamilyId,
     scenarios,
+  };
+}
+
+function finalizeCoveredSubtotal(summary) {
+  if (summary.pricedDrops === 0) return null;
+  const exact = nanosToUsdString(summary.premiumNanos);
+  return {
+    scope: "covered_priced_drops",
+    pricedDrops: summary.pricedDrops,
+    standardApiPremiumUsd: Number(exact),
+    standardApiPremiumUsdExact: exact,
+    // Crossings contain only priced drops. This is an explicit subset, not a
+    // way to grant complete coverage or an allowance share to the full period.
+    allowanceWeighting: finalizePremiumWeighting({
+      ...summary,
+      unpricedDrops: 0,
+    }, true),
   };
 }
 
@@ -487,6 +588,7 @@ function finalizeSummary(summary) {
     estimatedPremiumUsdExact: premiumExact,
     standardApiPremiumUsd: premiumExact === null ? null : Number(premiumExact),
     allowanceWeighting: finalizePremiumWeighting(summary, completeCoverage),
+    coveredSubtotal: finalizeCoveredSubtotal(summary),
   };
 }
 
@@ -532,6 +634,10 @@ function newContinuitySummary() {
     contextContractedReturns: 0,
     insufficientEvidenceReturns: 0,
     uncoveredReturns: 0,
+    reusedMoreThanHalfReturns: 0,
+    reusedHalfOrLessReturns: 0,
+    matchedOrExceededReturns: 0,
+    reusedBetweenHalfAndPreviousReturns: 0,
     cacheReadDrops: 0,
     lostCacheTokens: 0,
     pricedDrops: 0,
@@ -557,6 +663,15 @@ function newContinuityPeriod(period, nowMs) {
         summary: newContinuitySummary(),
       },
     ])),
+    byOutcomeBucket: Object.fromEntries(CONTINUITY_OUTCOME_BUCKETS.map(
+      (bucket) => [
+        bucket.id,
+        {
+          outcomeBucketLabel: bucket.label,
+          summary: newContinuitySummary(),
+        },
+      ],
+    )),
     postCompactionRequests: 0,
     postCompactionCacheReadDrops: 0,
     recent: [],
@@ -569,14 +684,32 @@ function gapBandFor(gapMs) {
   ) ?? null;
 }
 
+function outcomeBucketFor(gapMs) {
+  return CONTINUITY_OUTCOME_BUCKETS.find(
+    (bucket) => gapMs >= bucket.startMs && gapMs < bucket.endMs,
+  ) ?? null;
+}
+
 function addContinuityExclusion(summary, field) {
   summary.sameConfigurationReturns += 1;
   summary[field] += 1;
 }
 
-function addComparableReturn(summary) {
+function addComparableReturn(summary, row) {
   summary.sameConfigurationReturns += 1;
   summary.comparableReturns += 1;
+  const previous = row.previous_tokens_in_cache_read;
+  const current = row.tokens_in_cache_read;
+  if (current <= previous * CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO) {
+    summary.reusedHalfOrLessReturns += 1;
+    return;
+  }
+  summary.reusedMoreThanHalfReturns += 1;
+  if (current >= previous) {
+    summary.matchedOrExceededReturns += 1;
+  } else {
+    summary.reusedBetweenHalfAndPreviousReturns += 1;
+  }
 }
 
 function addContinuityDrop(summary, lostCacheTokens, premiumNanos) {
@@ -602,6 +735,11 @@ function finalizeContinuitySummary(summary) {
     contextContractedReturns: summary.contextContractedReturns,
     insufficientEvidenceReturns: summary.insufficientEvidenceReturns,
     uncoveredReturns: summary.uncoveredReturns,
+    reusedMoreThanHalfReturns: summary.reusedMoreThanHalfReturns,
+    reusedHalfOrLessReturns: summary.reusedHalfOrLessReturns,
+    matchedOrExceededReturns: summary.matchedOrExceededReturns,
+    reusedBetweenHalfAndPreviousReturns:
+      summary.reusedBetweenHalfAndPreviousReturns,
     coverageStatus: completeCoverage ? "complete" : "incomplete",
     cacheReadDrops: summary.cacheReadDrops,
     lostCacheTokens: summary.lostCacheTokens,
@@ -611,6 +749,7 @@ function finalizeContinuitySummary(summary) {
     estimatedPremiumUsdExact: premiumExact,
     standardApiPremiumUsd: premiumExact === null ? null : Number(premiumExact),
     allowanceWeighting: finalizePremiumWeighting(summary, completeCoverage),
+    coveredSubtotal: finalizeCoveredSubtotal(summary),
   };
 }
 
@@ -703,6 +842,7 @@ export function analyzeCacheSwitchRows(rows, {
       lostCacheTokens,
     } = drop;
     const premiumNanos = premiumFor(row, lostCacheTokens, pricer);
+    const premiumCrossing = premiumCrossingFor(row, premiumNanos, baselines);
     const detail = detailFor(
       row,
       changeType,
@@ -715,13 +855,8 @@ export function analyzeCacheSwitchRows(rows, {
     for (const period of applicablePeriods) {
       addDrop(period.summary, lostCacheTokens, premiumNanos);
       addDrop(period.byChangeType[changeType], lostCacheTokens, premiumNanos);
-      addPremiumCrossing(period.summary, row, premiumNanos, baselines);
-      addPremiumCrossing(
-        period.byChangeType[changeType],
-        row,
-        premiumNanos,
-        baselines,
-      );
+      addPremiumCrossing(period.summary, premiumCrossing);
+      addPremiumCrossing(period.byChangeType[changeType], premiumCrossing);
       retainRecent(period, detail);
     }
   }
@@ -796,11 +931,13 @@ export function analyzeCacheContinuityRows(rows, {
         || !sameContinuityConfiguration(row)) continue;
     const gapMs = observedMs - previousObservedMs;
     const gapBand = gapBandFor(gapMs);
-    if (gapBand === null) continue;
+    const outcomeBucket = outcomeBucketFor(gapMs);
+    if (gapBand === null || outcomeBucket === null) continue;
 
     const targets = applicablePeriods.flatMap((period) => [
       period.summary,
       period.byGapBand[gapBand.id].summary,
+      period.byOutcomeBucket[outcomeBucket.id].summary,
     ]);
     if (!compactionAwareParser(row.previous_parser_version)
         || !compactionAwareParser(row.parser_version)) {
@@ -828,10 +965,11 @@ export function analyzeCacheContinuityRows(rows, {
       }
       continue;
     }
-    for (const summary of targets) addComparableReturn(summary);
+    for (const summary of targets) addComparableReturn(summary, row);
     const drop = materialDropFor(row);
     if (drop === null) continue;
     const premiumNanos = premiumFor(row, drop.lostCacheTokens, pricer);
+    const premiumCrossing = premiumCrossingFor(row, premiumNanos, baselines);
     const detail = continuityDetailFor(
       row,
       gapBand,
@@ -841,7 +979,7 @@ export function analyzeCacheContinuityRows(rows, {
     );
     for (const summary of targets) {
       addContinuityDrop(summary, drop.lostCacheTokens, premiumNanos);
-      addPremiumCrossing(summary, row, premiumNanos, baselines);
+      addPremiumCrossing(summary, premiumCrossing);
     }
     for (const period of applicablePeriods) retainContinuityRecent(period, detail);
   }
@@ -850,6 +988,8 @@ export function analyzeCacheContinuityRows(rows, {
     errorCode: null,
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_MS / 1_000,
     maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    outcomeDisplayMaximumGapSeconds:
+      CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS / 1_000,
     recentDetailLimit: MAX_CACHE_CONTINUITY_RECENT_DETAILS,
     periods: periods.map((period) => ({
       periodId: period.periodId,
@@ -867,6 +1007,22 @@ export function analyzeCacheContinuityRows(rows, {
           ...finalizeContinuitySummary(period.byGapBand[band.id].summary),
         },
       ])),
+      byOutcomeBucket: Object.fromEntries(CONTINUITY_OUTCOME_BUCKETS.map(
+        (bucket) => [
+          bucket.id,
+          {
+            outcomeBucketLabel:
+              period.byOutcomeBucket[bucket.id].outcomeBucketLabel,
+            startSeconds: bucket.startMs / 1_000,
+            endSeconds: Number.isFinite(bucket.endMs)
+              ? bucket.endMs / 1_000
+              : null,
+            ...finalizeContinuitySummary(
+              period.byOutcomeBucket[bucket.id].summary,
+            ),
+          },
+        ],
+      )),
       recent: [...period.recent].reverse(),
     })),
   };
@@ -1129,6 +1285,8 @@ export function unavailableCacheContinuityImpact(errorCode) {
       : "local_unified_index_unavailable",
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_MS / 1_000,
     maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    outcomeDisplayMaximumGapSeconds:
+      CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS / 1_000,
     recentDetailLimit: MAX_CACHE_CONTINUITY_RECENT_DETAILS,
     periods: [],
   };

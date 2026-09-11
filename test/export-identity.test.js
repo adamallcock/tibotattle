@@ -860,6 +860,38 @@ test("adversarial backend failures and malformed values fail closed without cont
       },
     );
 
+    const migrationRequired = memoryParticipantSecretBackend(null, {
+      async read() {
+        const error = new Error(canary);
+        error.code = "export_identity_keychain_migration_required";
+        throw error;
+      },
+    });
+    await assert.rejects(
+      inspectParticipantSecret({
+        environmentSecret: null,
+        secretFile: canonical,
+        legacySecretFile: null,
+        participantSecretBackend: migrationRequired,
+        participantSecretCapability: TEST_BACKEND_CAPABILITY,
+      }),
+      (error) => {
+        assert.equal(
+          error.code,
+          "export_identity_keychain_migration_required",
+        );
+        assert.equal(
+          error.message,
+          "Participant identity backend operation failed",
+        );
+        assert.equal(
+          `${error.stack}\n${JSON.stringify(error)}`.includes(canary),
+          false,
+        );
+        return true;
+      },
+    );
+
     const malformedSecret = Buffer.alloc(31, 93);
     const malformed = memoryParticipantSecretBackend(null, {
       async read() { return malformedSecret; },

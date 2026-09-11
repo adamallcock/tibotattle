@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PRODUCT_BRAND } from "../config/product-brand.js";
+import {
+  PREVIEW_PRODUCT_BRAND,
+  PRODUCT_BRAND,
+} from "../config/product-brand.js";
 import { RELEASE_MANIFEST } from "../config/release-manifest.js";
 import { packageMacOSDMG } from "./macos-release-core.js";
+import { normalizeMacOSBuildArchitecture } from "./build-macos-app.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 
 export function parseArguments(argv) {
   let appPath = null;
+  let architecture = null;
   let output = null;
   let replace = false;
   let distribution = null;
@@ -16,6 +21,8 @@ export function parseArguments(argv) {
     const argument = argv[index];
     if (argument === "--app" && appPath === null && index + 1 < argv.length) {
       appPath = resolve(argv[++index]);
+    } else if (argument === "--architecture" && architecture === null && index + 1 < argv.length) {
+      architecture = normalizeMacOSBuildArchitecture(argv[++index]);
     } else if (argument === "--output"
         && output === null
         && index + 1 < argv.length) {
@@ -37,10 +44,15 @@ export function parseArguments(argv) {
       "one explicit non-release mode is required: --development or --preview",
     );
   }
-  const defaultFileName = `${PRODUCT_BRAND.displayName}-${RELEASE_MANIFEST.version}`
-    + `-macOS-arm64-${distribution}.dmg`;
+  const productBrand = distribution === "preview"
+    ? PREVIEW_PRODUCT_BRAND
+    : PRODUCT_BRAND;
+  architecture ??= "arm64";
+  const defaultFileName = `${productBrand.displayName}-${RELEASE_MANIFEST.version}`
+    + `-macOS-${architecture}-${distribution}.dmg`;
   return {
     appPath,
+    architecture,
     output: output ?? resolve(
       join(
         ".release-build",

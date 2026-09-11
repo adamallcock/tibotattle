@@ -76,7 +76,14 @@ import {
   SPARKLE_TOOLS_DIRECTORY_NAME,
   inspectPinnedSparkleTools,
 } from "./macos-updater-core.js";
-import { resolveReleaseChannel } from "../config/release-channels.js";
+import {
+  compareAppleMacOSBundleVersions,
+  isAppleMacOSBundleVersion,
+} from "./macos-bundle-version.js";
+import {
+  normalizeReleaseArchitecture,
+  resolveReleaseChannel,
+} from "../config/release-channels.js";
 import { validateCandidateAppcastShape } from "./publish-sparkle-update.js";
 import { validateSignedSparkleFeed } from "./sparkle-signed-feed-validation.js";
 
@@ -96,8 +103,6 @@ export const DEFAULT_MAX_DELTAS = 2;
 export const FULL_ENCLOSURE_CONTENT_TYPE = "application/x-apple-diskimage";
 export const DELTA_ENCLOSURE_CONTENT_TYPE = "application/octet-stream";
 
-const BUNDLE_VERSION_PATTERN =
-  /^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u;
 const SAFE_DMG_FILE_NAME_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.dmg$/u;
 const SAFE_DELTA_FILE_NAME_PATTERN =
@@ -135,13 +140,11 @@ function sha256(value) {
 }
 
 function compareBundleVersions(left, right) {
-  const leftParts = left.split(".").map(Number).concat([0, 0]).slice(0, 3);
-  const rightParts = right.split(".").map(Number).concat([0, 0]).slice(0, 3);
-  for (let index = 0; index < 3; index += 1) {
-    if (leftParts[index] < rightParts[index]) return -1;
-    if (leftParts[index] > rightParts[index]) return 1;
+  const comparison = compareAppleMacOSBundleVersions(left, right);
+  if (comparison === null) {
+    fail("Sparkle bundle version is not Apple-compatible");
   }
-  return 0;
+  return comparison;
 }
 
 function runTool(path, toolArguments, { label, timeout }) {
@@ -271,8 +274,7 @@ export async function readAppBundleVersion(appPath) {
   } catch {
     fail(`App bundle Info.plist is not readable: ${plistPath}`);
   }
-  if (typeof plist?.CFBundleVersion !== "string"
-      || !BUNDLE_VERSION_PATTERN.test(plist.CFBundleVersion)) {
+  if (!isAppleMacOSBundleVersion(plist?.CFBundleVersion)) {
     fail(`App bundle Info.plist has an invalid CFBundleVersion: ${plistPath}`);
   }
   return plist.CFBundleVersion;
@@ -383,10 +385,16 @@ async function readRetainedVersion(channelDirectory, name) {
 export async function discoverRetainedVersions({
   archiveRoot,
   channelName,
+  architecture = "arm64",
   candidateBundleVersion,
   maxDeltas,
 }) {
-  const channelDirectory = join(archiveRoot, channelName);
+  normalizeReleaseArchitecture(architecture);
+  // Keep legacy ARM archives in place; Intel can never prune or replace them.
+  const channelDirectory = join(
+    archiveRoot,
+    architecture === "x64" ? `${channelName}-x64` : channelName,
+  );
   const entries = await readdir(channelDirectory, { withFileTypes: true })
     .catch((error) => {
       if (error.code === "ENOENT") return null;
@@ -398,13 +406,18 @@ export async function discoverRetainedVersions({
   const versions = [];
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
-    if (!entry.isDirectory() || !BUNDLE_VERSION_PATTERN.test(entry.name)) {
+    if (!entry.isDirectory() || !isAppleMacOSBundleVersion(entry.name)) {
       fail(
         `Retained archive contains an unexpected entry: ${join(channelDirectory, entry.name)}; repair or delete it`,
         "SPARKLE_APPCAST_RETAINED_ARCHIVE_INVALID",
       );
     }
-    versions.push(await readRetainedVersion(channelDirectory, entry.name));
+    const retained = await readRetainedVersion(channelDirectory, entry.name);
+    if (normalizeReleaseArchitecture(retained.metadata.architecture) !== architecture
+        || retained.metadata.channel !== channelName) {
+      fail("Retained archive architecture/channel mismatch", "SPARKLE_APPCAST_RETAINED_ARCHIVE_INVALID");
+    }
+    versions.push(retained);
   }
   const priors = versions
     .filter((version) => compareBundleVersions(
@@ -428,11 +441,17 @@ export async function retainCandidateArchive({
   archiveRoot,
   bundleVersion,
   channelName,
+  architecture = "arm64",
   dmg,
   maxRetained,
   shortVersion,
 }) {
-  const channelDirectory = join(archiveRoot, channelName);
+  normalizeReleaseArchitecture(architecture);
+  // Keep legacy ARM archives in place; Intel can never prune or replace them.
+  const channelDirectory = join(
+    archiveRoot,
+    architecture === "x64" ? `${channelName}-x64` : channelName,
+  );
   const versionDirectory = join(channelDirectory, bundleVersion);
   const stagingDirectory = join(
     channelDirectory,
@@ -455,6 +474,7 @@ export async function retainCandidateArchive({
       appName,
       bundleVersion,
       channel: channelName,
+      architecture,
       dmg: { bytes: dmg.size, fileName: basename(dmg.path), sha256: dmg.sha256 },
       retainedAt: new Date().toISOString(),
       shortVersion: shortVersion ?? null,
@@ -466,7 +486,7 @@ export async function retainCandidateArchive({
   const entries = (await readdir(channelDirectory, { withFileTypes: true }))
     .filter((entry) => entry.isDirectory()
       && !entry.name.startsWith(".")
-      && BUNDLE_VERSION_PATTERN.test(entry.name))
+      && isAppleMacOSBundleVersion(entry.name))
     .map((entry) => entry.name)
     .sort((left, right) => compareBundleVersions(right, left));
   const pruned = entries.slice(maxRetained);
@@ -507,6 +527,29 @@ function defaultRunGenerateAppcastTool({
   ], { label: "generate_appcast", timeout: GENERATE_APPCAST_TIMEOUT_MS });
 }
 
+/** Sign an official generated Electron entry without changing the signed app. */
+export async function signElectronTransitionFeed({ appcastOutputPath, dmgPath, account = null,
+  edKeyFile = null, signUpdatePath, runSignUpdate = (path, args) => runTool(path, args,
+    { label: "sign_update transition", timeout: SIGN_TIMEOUT_MS }) }) {
+  const keys = edKeyFile !== null ? ["--ed-key-file", edKeyFile]
+    : account !== null ? ["--account", account] : [];
+  const signature = normalizeSignature(await runSignUpdate(signUpdatePath, [...keys, "-p", dmgPath]), "Transition archive");
+  const text = await readFile(appcastOutputPath, "utf8");
+  const enclosures = [...text.matchAll(/<enclosure\b([^>]*?)>/gu)];
+  if (enclosures.length !== 1 || /sparkle-signatures:|sparkle:edSignature/u.test(text)
+      || /<!DOCTYPE|<!ENTITY/u.test(text)) {
+    fail("Transition requires one unsigned official enclosure", "SPARKLE_TRANSITION_FEED_INVALID");
+  }
+  const enclosure = enclosures[0][0];
+  // The pinned tool emits a self-closing enclosure for unsigned Electron
+  // archives. Normalize it to the existing signed-feed validator's paired
+  // form before the official tool signs the resulting XML.
+  const ending = enclosure.endsWith("/>") ? "/>" : ">";
+  await writeFile(appcastOutputPath, text.replace(enclosure,
+    `${enclosure.slice(0, -ending.length)} sparkle:edSignature="${signature}">${ending === "/>" ? "</enclosure>" : ""}`));
+  await runSignUpdate(signUpdatePath, [...keys, appcastOutputPath]);
+}
+
 /**
  * Produce a named channel's feed-signed appcast by driving the pinned
  * official Sparkle generate_appcast binary, then validating its output
@@ -523,6 +566,7 @@ async function generateOfficialSignedAppcast({
   generateAppcastPath,
   options,
   runGenerateAppcastTool,
+  signUpdatePath,
 }) {
   const downloadURLPrefix = `${channel.sparkle.origin}/${channel.sparkle.objectPrefix}/${options.bundleVersion}/${dmg.sha256}/`;
   const workRoot = await mkdtemp(
@@ -543,6 +587,11 @@ async function generateOfficialSignedAppcast({
       generateAppcastPath,
       stagingDirectory,
     });
+    if (options.electronTransition) {
+      await signElectronTransitionFeed({ appcastOutputPath, dmgPath: join(stagingDirectory, dmgFileName),
+        account: options.account, edKeyFile: options.edKeyFile, signUpdatePath,
+        runSignUpdate: options.runSignUpdate });
+    }
     const bytes = await readFile(appcastOutputPath).catch(() => null);
     if (bytes === null) {
       fail(
@@ -555,6 +604,7 @@ async function generateOfficialSignedAppcast({
     // Ed25519 signature checks (feed envelope and DMG enclosure); named
     // failure codes explain exactly which property broke.
     const validated = validateSignedSparkleFeed({
+      architecture: channel.architecture,
       appcastText: text,
       dmg: {
         bytes: dmg.bytes,
@@ -593,7 +643,9 @@ async function generateOfficialSignedAppcast({
     }
     // Self-check with the exact validation the publisher applies, so a
     // generated appcast can never be shaped in a way the publisher rejects.
-    validateCandidateAppcastShape(text, channel.name);
+    if (!options.electronTransitionTestSource) {
+      validateCandidateAppcastShape(text, channel.name, { architecture: channel.architecture });
+    }
     return Object.freeze({ bytes, validated });
   } finally {
     await rm(workRoot, { recursive: true, force: true });
@@ -643,15 +695,28 @@ ${deltasBlock}</item></channel></rss>
 `;
 }
 
+function validateTransitionOptions(options) {
+  if (options.electronTransition && (options.channel !== "stable" || options.sparklePublicEdKey === null)) {
+    fail("Electron transition requires stable incoming key verification");
+  }
+  if (options.electronTransitionTestSource != null && (!options.electronTransition || !options.skipRetain
+      || !/^[a-f0-9]{40}$/u.test(options.electronTransitionTestSource))) {
+    fail("Transition rehearsal requires exact source, --electron-transition and --skip-retain");
+  }
+}
+
 export function parseGenerateSparkleAppcastArguments(argv) {
   const options = {
     account: null,
+    architecture: null,
     appPath: null,
     archiveRoot: null,
     bundleVersion: null,
     channel: null,
     dmgPath: null,
     edKeyFile: null,
+    electronTransition: false,
+    electronTransitionTestSource: null,
     maxDeltas: null,
     output: null,
     replace: false,
@@ -663,12 +728,14 @@ export function parseGenerateSparkleAppcastArguments(argv) {
   };
   const flags = new Map([
     ["--account", "account"],
+    ["--architecture", "architecture"],
     ["--app", "appPath"],
     ["--archive-root", "archiveRoot"],
     ["--bundle-version", "bundleVersion"],
     ["--channel", "channel"],
     ["--dmg", "dmgPath"],
     ["--ed-key-file", "edKeyFile"],
+    ["--electron-transition-test-source", "electronTransitionTestSource"],
     ["--max-deltas", "maxDeltas"],
     ["--output", "output"],
     ["--short-version", "shortVersion"],
@@ -683,6 +750,8 @@ export function parseGenerateSparkleAppcastArguments(argv) {
         fail(`${argument} must be supplied exactly once with a value`);
       }
       options[key] = argv[++index];
+    } else if (argument === "--electron-transition" && !options.electronTransition) {
+      options.electronTransition = true;
     } else if (argument === "--replace" && !options.replace) {
       options.replace = true;
     } else if (argument === "--skip-apply-check" && !options.skipApplyCheck) {
@@ -703,8 +772,10 @@ export function parseGenerateSparkleAppcastArguments(argv) {
       fail(`${flag} is required`);
     }
   }
-  if (!BUNDLE_VERSION_PATTERN.test(options.bundleVersion)) {
-    fail("--bundle-version must contain one to three decimal components");
+  validateTransitionOptions(options);
+  options.architecture = normalizeReleaseArchitecture(options.architecture ?? "arm64");
+  if (!isAppleMacOSBundleVersion(options.bundleVersion)) {
+    fail("--bundle-version must be an Apple-compatible CFBundleVersion");
   }
   if (options.shortVersion !== null
       && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(options.shortVersion)) {
@@ -741,7 +812,10 @@ export function parseGenerateSparkleAppcastArguments(argv) {
 }
 
 export async function generateSparkleAppcast(options) {
-  const channel = resolveReleaseChannel(options.channel);
+  validateTransitionOptions(options);
+  const channel = resolveReleaseChannel(options.channel, {
+    architecture: options.architecture,
+  });
   const publicKey = importPublicEdKey(options.sparklePublicEdKey);
   await assertRealDirectory(options.appPath, "--app");
   if (!basename(options.appPath).endsWith(".app")) {
@@ -797,9 +871,13 @@ export async function generateSparkleAppcast(options) {
       ]);
     }
     const official = await generateOfficialSignedAppcast({
-      channel,
+      channel: options.electronTransitionTestSource
+        ? { ...channel, sparkle: { ...channel.sparkle,
+          objectPrefix: `electron/test/native-sparkle/${options.electronTransitionTestSource}` } }
+        : channel,
       dmg,
       dmgFileName,
+      signUpdatePath: injectedGenerateAppcastTool === null ? toolPath("sign_update") : null,
       generateAppcastPath: injectedGenerateAppcastTool === null
         ? toolPath("generate_appcast")
         : null,
@@ -815,6 +893,7 @@ export async function generateSparkleAppcast(options) {
         archiveRoot: options.archiveRoot,
         bundleVersion: options.bundleVersion,
         channelName: channel.name,
+        architecture: channel.architecture,
         dmg,
         maxRetained: options.maxDeltas + 1,
         shortVersion: options.shortVersion,
@@ -823,6 +902,7 @@ export async function generateSparkleAppcast(options) {
     return Object.freeze({
       appcastPath: options.output,
       channel: channel.name,
+      architecture: channel.architecture,
       deltas: Object.freeze([]),
       feedSigned: true,
       full: Object.freeze({
@@ -864,6 +944,7 @@ export async function generateSparkleAppcast(options) {
     archiveRoot: options.archiveRoot,
     candidateBundleVersion: options.bundleVersion,
     channelName: channel.name,
+    architecture: channel.architecture,
     maxDeltas: options.maxDeltas,
   });
   if (!archiveState.available || archiveState.priors.length === 0) {
@@ -934,7 +1015,9 @@ export async function generateSparkleAppcast(options) {
   });
   // Self-check with the exact validation the publisher applies, so a
   // generated appcast can never be shaped in a way the publisher rejects.
-  validateCandidateAppcastShape(appcast, channel.name);
+  validateCandidateAppcastShape(appcast, channel.name, {
+    architecture: channel.architecture,
+  });
   await writeFile(options.output, appcast);
 
   let retained = null;
@@ -944,6 +1027,7 @@ export async function generateSparkleAppcast(options) {
       archiveRoot: options.archiveRoot,
       bundleVersion: options.bundleVersion,
       channelName: channel.name,
+      architecture: channel.architecture,
       dmg,
       maxRetained: options.maxDeltas + 1,
       shortVersion: options.shortVersion,

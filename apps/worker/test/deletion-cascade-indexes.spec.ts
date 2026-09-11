@@ -64,21 +64,36 @@ describe("deletion cascade child indexes (migration 0030)", () => {
     // (trigger bodies do not), so an unindexed child key surfaces here as a
     // `SCAN <child>` regardless of which future migration introduces it.
     const tables = await db().prepare(
-      `SELECT name FROM sqlite_master
+      `SELECT name, sql FROM sqlite_master
         WHERE type = 'table'
           AND name NOT LIKE 'sqlite_%'
           AND name NOT LIKE '_cf_%'
           AND name <> 'd1_migrations'
         ORDER BY name`,
-    ).all<{ name: string }>();
+    ).all<{ name: string; sql: string }>();
     expect(tables.results.length).toBeGreaterThan(20);
 
     const violations: string[] = [];
     let foreignKeyProbes = 0;
-    for (const { name: table } of tables.results) {
+    let withoutRowidProbes = 0;
+    const identifier = (value: string) => `"${value.replaceAll('"', '""')}"`;
+    for (const { name: table, sql } of tables.results) {
+      let predicate = "rowid = ?";
+      let values: (string | number)[] = [1];
+      if (/\bWITHOUT\s+ROWID\b/iu.test(sql)) {
+        // Migration 0047 adds a composite-primary-key WITHOUT ROWID table.
+        // Exercise its actual single-row key; never skip its child probes.
+        const columns = await db().prepare(`PRAGMA table_info(${identifier(table)})`)
+          .all<{ name: string; pk: number }>();
+        const keys = columns.results.filter(column => column.pk > 0).sort((a, b) => a.pk - b.pk);
+        expect(keys.length, table).toBeGreaterThan(0);
+        predicate = keys.map(key => `${identifier(key.name)} = ?`).join(" AND ");
+        values = keys.map(() => "synthetic-key");
+        withoutRowidProbes += 1;
+      }
       const plan = await db().prepare(
-        `EXPLAIN QUERY PLAN DELETE FROM ${table} WHERE rowid = ?`,
-      ).bind(1).all<{ detail: string }>();
+        `EXPLAIN QUERY PLAN DELETE FROM ${identifier(table)} WHERE ${predicate}`,
+      ).bind(...values).all<{ detail: string }>();
       const details = plan.results.map((row) => row.detail);
       foreignKeyProbes += Math.max(0, details.length - 1);
       for (const detail of details) {
@@ -86,10 +101,30 @@ describe("deletion cascade child indexes (migration 0030)", () => {
       }
     }
     expect(violations).toEqual([]);
+    expect(withoutRowidProbes).toBeGreaterThan(0);
     // The probes are what this test exists to inspect; if they stop being
     // planned, foreign-key enforcement is off and the assertion above is
     // vacuous.
     expect(foreignKeyProbes).toBeGreaterThan(10);
+  });
+
+  it("uses the three device-leading successor indexes for device foreign-key probes", async () => {
+    const plan = await db().prepare(
+      "EXPLAIN QUERY PLAN DELETE FROM device_credentials WHERE id = ?",
+    ).bind("synthetic-device").all<{ detail: string }>();
+    const details = plan.results.map((row) => row.detail);
+    for (const [table, index] of [
+      ["telemetry_v11_device_consents", "telemetry_v11_consents_device"],
+      ["telemetry_v11_day_manifests", "telemetry_v11_manifests_device"],
+      ["telemetry_v11_chunks", "telemetry_v11_chunks_device"],
+    ]) {
+      const columns = await db().prepare(`PRAGMA index_info('${index}')`)
+        .all<{ name: string }>();
+      expect(columns.results.map((row) => row.name), index).toEqual(["device_id"]);
+      expect(details.filter((detail) => detail.startsWith(`SEARCH ${table} `)))
+        .toEqual([`SEARCH ${table} USING COVERING INDEX ${index} (device_id=?)`]);
+    }
+    expect(details.filter((detail) => /^\s*SCAN\b/u.test(detail))).toEqual([]);
   });
 
   it("plans the participant and session cascades without scanning a child table", async () => {

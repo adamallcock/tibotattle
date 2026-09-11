@@ -87,6 +87,7 @@ test("qualification selection is fail-closed away from native Windows", async ()
     files: [],
     filesystemFiles: [],
     credentialFiles: [],
+    accountlessCredentialFiles: [],
   });
   assert.equal(FIXED_STATUS.unsupported, "WINDOWS_SECURITY_QUALIFICATION_NATIVE_WINDOWS_REQUIRED");
 });
@@ -102,6 +103,7 @@ test("qualification selection is the exact reviewed Windows test set", async () 
     "test/windows-credential-audit-file-guard.test.js",
     "test/windows-credential-manager.test.js",
     "test/windows-credential-mutex-native.test.js",
+    "test/windows-accountless-installation-credential-native.test.js",
     "test/windows-credential-mutex.test.js",
     "test/windows-credential-operation-audit.test.js",
     "test/windows-credential-operation-lease.test.js",
@@ -115,6 +117,15 @@ test("qualification selection is the exact reviewed Windows test set", async () 
     "test/windows-skip-ledger.test.js",
     "test/windows-test-manifest.test.js",
   ]);
+  assert.deepEqual(selected.accountlessCredentialFiles, [
+    "test/windows-accountless-installation-credential-native.test.js",
+  ]);
+  assert.equal(
+    selected.credentialFiles.includes(
+      "test/windows-accountless-installation-credential-native.test.js",
+    ),
+    true,
+  );
 });
 
 test("qualification receipts accept only fixed aggregate revision and cache metadata", () => {

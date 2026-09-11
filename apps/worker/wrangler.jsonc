@@ -152,6 +152,11 @@
       "vars": {
         "ENVIRONMENT": "staging",
         "ENROLLMENT_MODE": "disabled",
+        // Accountless admission stays explicitly closed in the checked-in
+        // staging target. A reviewed rehearsal deploy supplies its own
+        // one-time overrides without changing public enrollment.
+        "ACCOUNTLESS_ENROLLMENT_MODE": "disabled",
+        "ACCOUNTLESS_OWNERSHIP_MODE": "disabled",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
         "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
         "UPLOAD_INGRESS_MAX_CONCURRENT": "8",
@@ -161,12 +166,14 @@
         "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
         "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
         "SIGN_IN_START_MAX_PER_MINUTE": "5",
-        "IDENTITY_LINK_SECRET_VERSION": "staging-v1"
+        "IDENTITY_LINK_SECRET_VERSION": "staging-v1",
+        "PUBLIC_ORIGIN": "https://app-usagemonitor-staging.adamallcock.workers.dev"
       },
       "secrets": {
         "required": [
           "ENVELOPE_PRIVATE_JWK",
-          "ENVELOPE_PUBLIC_JWK"
+          "ENVELOPE_PUBLIC_JWK",
+          "IDENTITY_LINK_SECRET"
         ]
       },
       "ratelimits": [
@@ -223,13 +230,13 @@
         {
           "binding": "USAGE_MONITOR_DB",
           "database_name": "app-usagemonitor-staging",
-          "database_id": "00000000-0000-4000-8000-000000000010",
+          "database_id": "e06da65e-a20a-4acf-a3f8-8a0199610c2c",
           "migrations_dir": "migrations"
         },
         {
           "binding": "DELETION_LEDGER",
           "database_name": "app-usagemonitor-staging-deletion-ledger",
-          "database_id": "00000000-0000-4000-8000-000000000011",
+          "database_id": "0b79b775-62c1-4060-aa42-6af2c26c67bd",
           "migrations_dir": "deletion-ledger-migrations"
         }
       ],
@@ -282,6 +289,9 @@
       },
       "vars": {
         "ENVIRONMENT": "production",
+        // Owner-approved hosted recovery. Deploy only after migrations 0046/0047
+        // and the maintained Worker checks pass; paused remains the incident brake.
+        "ALLOWANCE_RECONSTRUCTION_MODE": "resumable",
         "PUBLIC_ORIGIN": "https://tibotattle.com",
         // Owner decision 2026-08-07: community enrollment is OPEN. The
         // containment-era "disabled" default was never a product choice, and

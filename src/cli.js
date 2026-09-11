@@ -5,6 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import { captureCodexObservation } from "./capture.js";
 import {
+  inspectCodexBinary,
   readCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,
 } from "./providers/codex/account.js";
@@ -15,7 +16,6 @@ import { inferCapacityFromTransitions, renderInferenceReport } from "./interval-
 import { runExperiment } from "./experiment-harness.js";
 import { analyzeContamination, renderContaminationReport } from "./contamination-analysis.js";
 import { scanAndPriceCodexLogs } from "./codex-local-usage-analysis.js";
-import { appendedRolloutSourcesAreAfterEnd, codexLogSourceFingerprint, scanCodexLogEvents } from "./codex-log-scan.js";
 import { analyzeToolMechanisms, renderToolMechanismReport, REQUIRED_TOOL_CLASSES } from "./tool-mechanism-analysis.js";
 import { planBaselineCorrectionMigration } from "./correction-migration.js";
 import { analyzeWeeklyLimitHistory, renderWeeklyLimitHistoryReport } from "./weekly-limit-history.js";
@@ -45,33 +45,18 @@ import {
   selectProductionParticipantIdentity,
 } from "./export-identity-production.js";
 import {
-  createLocalExportDeletion,
-  createLocalExportWorkspaceDiscard,
-} from "./application/index.js";
-import { buildLocalMetadataBundle, renderMetadataExportPreview, writeLocalMetadataBundle } from "./metadata-exporter.js";
-import { verifyLocalMetadataBundleFiles } from "./bundle-verifier.js";
-import {
-  createLocalExportWorkspace,
-  inspectLocalExportWorkspace,
-  resumeLocalExportWorkspace,
-} from "./export-set-controller.js";
-import { materializeLocalExportSet } from "./export-set-materializer.js";
-import { verifyLocalExportSet } from "./export-set-verifier.js";
-import {
-  EXPORT_WORKSPACE_DATABASE_BASENAME,
-  inspectExportWorkspaceDiscardState,
-  openExportWorkspace,
-} from "./export-workspace.js";
-import { LEGACY_EXPORT_WORKSPACE_LEASE_INTERNAL } from "./export-workspace-lock-compatibility-internal.js";
+  localCodexLogScanner,
+  localContributionSyncQueue,
+  localExportDeletion,
+  localExportSetMaterialization,
+  localExportSetVerification,
+  localExportSourcePipeline,
+  localExportWorkspaceDiscard,
+  localMetadataBundleVerification,
+  localMetadataExport,
+} from "./local-node-runtime.js";
 import { readBoundedJsonLines } from "./bounded-jsonl.js";
 import { createExportResourceGuard, DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
-import {
-  createOwnerOnlyExportDeletionPreflightInspector,
-  createOwnerOnlyExportDeletionStorage,
-  createOwnerOnlyExportWorkspaceDiscardPreflight,
-  createOwnerOnlyExportWorkspaceDiscardStorage,
-  readBoundedDirectoryEntries,
-} from "./platform/index.js";
 import {
   createProductionClaudeCallbackBackend,
   readClaudeCallbackCapability,
@@ -92,15 +77,6 @@ import {
   createProductionContributionDeviceBackend,
 } from "./contribution-device-capability.js";
 import { claimContributionDevicePairing } from "./contribution-device-client.js";
-import {
-  CONTRIBUTION_SYNC_QUEUE_LIMITS,
-  defaultContributionSyncQueueFile,
-  inspectContributionSyncQueue,
-  inspectNextContributionSyncUpload,
-  runContributionSyncQueueOnce,
-  runContributionSyncQueueWatch,
-  setContributionSyncPaused,
-} from "./contribution-sync-queue.js";
 import {
   defaultCollectorStateFile,
   runCollectorForeground,
@@ -150,33 +126,44 @@ import {
   withOwnerOnlyFileLock,
 } from "./storage.js";
 
-const LOCAL_EXPORT_DELETION = createLocalExportDeletion({
-  verifyExportSet: verifyLocalExportSet,
-  openExportWorkspace,
-  withExistingExportWorkspaceLease: LEGACY_EXPORT_WORKSPACE_LEASE_INTERNAL.withExistingExportWorkspaceLease,
-  isTrustedExportWorkspaceLockError: LEGACY_EXPORT_WORKSPACE_LEASE_INTERNAL.isTrustedExportWorkspaceLockError,
-  workspaceDatabaseBasename: EXPORT_WORKSPACE_DATABASE_BASENAME,
-  createPreflightInspector: createOwnerOnlyExportDeletionPreflightInspector,
-  createDeletionStorage: createOwnerOnlyExportDeletionStorage,
-});
+const {
+  appendedRolloutSourcesAreAfterEnd,
+  codexLogSourceFingerprint,
+  scanCodexLogEvents,
+} = localCodexLogScanner;
+const {
+  buildLocalMetadataBundle,
+  renderMetadataExportPreview,
+  writeLocalMetadataBundle,
+} = localMetadataExport;
+const { verifyLocalMetadataBundleFiles } =
+  localMetadataBundleVerification;
+const {
+  createLocalExportWorkspace,
+  inspectLocalExportWorkspace,
+  resumeLocalExportWorkspace,
+} = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
+const { verifyLocalExportSet } = localExportSetVerification;
 const {
   planLocalExportDeletion,
   deleteLocalExport,
   recoverLocalExportDeletion,
-} = LOCAL_EXPORT_DELETION;
-const LOCAL_EXPORT_WORKSPACE_DISCARD = createLocalExportWorkspaceDiscard({
-  workspaceDatabaseBasename: EXPORT_WORKSPACE_DATABASE_BASENAME,
-  inspectExportWorkspaceDiscardState,
-  readBoundedDirectoryEntries,
-  withExistingExportWorkspaceLease: LEGACY_EXPORT_WORKSPACE_LEASE_INTERNAL.withExistingExportWorkspaceLease,
-  createPreflight: createOwnerOnlyExportWorkspaceDiscardPreflight,
-  createStorage: createOwnerOnlyExportWorkspaceDiscardStorage,
-});
+} = localExportDeletion;
 const {
   planLocalExportWorkspaceDiscard,
   discardLocalExportWorkspace,
   recoverLocalExportWorkspaceDiscard,
-} = LOCAL_EXPORT_WORKSPACE_DISCARD;
+} = localExportWorkspaceDiscard;
+const {
+  CONTRIBUTION_SYNC_QUEUE_LIMITS,
+  defaultContributionSyncQueueFile,
+  inspectContributionSyncQueue,
+  inspectNextContributionSyncUpload,
+  runContributionSyncQueueOnce,
+  runContributionSyncQueueWatch,
+  setContributionSyncPaused,
+} = localContributionSyncQueue;
 
 function usage() {
   console.log(`Usage:
@@ -546,6 +533,7 @@ export async function run(
     rotateIdentity = rotateParticipantSecret,
     withIdentityLease = withParticipantSecretLease,
     selectAccountObservationSecret = selectProductionAccountObservationSecret,
+    inspectCodexBinaryDiagnostic = inspectCodexBinary,
     readAccountSnapshot = readCodexAccountSnapshot,
     sanitizeAccountSnapshot = sanitizeCodexAccountSnapshotWithSecretLoader,
     captureObservation = captureCodexObservation,
@@ -1115,6 +1103,14 @@ export async function run(
     return;
   }
   if (args.command === "doctor") {
+    const binary = await inspectCodexBinaryDiagnostic();
+    const binarySource = {
+      environment_override: "CODEX_BIN override",
+      chatgpt_bundled: "ChatGPT bundled",
+      codex_bundled: "Codex bundled",
+      path: "PATH",
+    }[binary.source] ?? "unknown source";
+    console.log(`Codex binary: ${binarySource} (${binary.versionStatus === "available" ? binary.version : "version unavailable"})`);
     const capturedAt = new Date().toISOString();
     const snapshot = await readSanitizedAccountSnapshot(capturedAt);
     console.log("Codex app-server: available");

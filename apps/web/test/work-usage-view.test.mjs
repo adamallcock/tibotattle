@@ -1,0 +1,1499 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  WORK_USAGE_COMPONENTS,
+  WORK_USAGE_SCHEMA,
+  createWorkUsageAccumulator,
+} from "../../../src/reporting/index.js";
+import { createWorkUsageService } from "../../../src/application/index.js";
+import { formatApiMoney, formatSharePercent } from "../public/ui-format.js";
+import { translate } from "../public/localization.js";
+import {
+  mountWorkUsageView,
+  validateWorkUsageResponse,
+} from "../public/work-usage-view.js";
+
+const NOW = 1_700_000_000_000;
+const SNAPSHOT = "snapshot-synthetic";
+const BASE_QUERY = Object.freeze({
+  schemaVersion: WORK_USAGE_SCHEMA,
+  period: "7d",
+  grouping: "project",
+  sort: "tokens",
+  pageSize: 25,
+});
+
+function completeComponents(values = {}) {
+  return Object.fromEntries(
+    WORK_USAGE_COMPONENTS.map((name) => [name, values[name] ?? null]),
+  );
+}
+
+function syntheticSource({
+  components = completeComponents(),
+  at = NOW - 1_000,
+} = {}) {
+  const accumulator = createWorkUsageAccumulator();
+  accumulator.add({
+    thread: "thread-synthetic",
+    project: "project-synthetic",
+    worktree: "worktree-synthetic",
+    model: "model-synthetic",
+    at,
+    components,
+    price: { amount: null, status: "unpriced" },
+  });
+  return {
+    status: "available",
+    generation: { id: 1, status: "complete" },
+    scope: "scope-synthetic",
+    scopes: [{ id: "scope-synthetic", status: "available", events: 1 }],
+    metadata: { observedAt: NOW },
+    pricing: { basis: "event_time", fingerprint: "pricing-synthetic" },
+    models: ["model-synthetic"],
+    threadLookup: {},
+    cells: accumulator.finish(),
+  };
+}
+
+async function availableResponse(options = {}) {
+  const service = createWorkUsageService({
+    build: async () => syntheticSource(options),
+    enrich: async ({ rows }) =>
+      Object.fromEntries(
+        rows.map((row) => [
+          row.id,
+          { name: "Synthetic project", method: "fixture" },
+        ]),
+      ),
+    clock: () => NOW,
+    newId: () => SNAPSHOT,
+  });
+  const preparing = await service.query(BASE_QUERY);
+  assert.equal(preparing.status, "preparing");
+  assert.equal(validateWorkUsageResponse(preparing), preparing);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+    const response = await service.query({
+      ...BASE_QUERY,
+      snapshotId: preparing.snapshotId,
+    });
+    if (response.status === "available") {
+      assert.equal(response.snapshotId, SNAPSHOT);
+      return response;
+    }
+  }
+  assert.fail(
+    "synthetic work-usage service did not produce an available response",
+  );
+}
+
+function cloneResponse(response) {
+  return structuredClone(response);
+}
+
+function assertInvalid(response, message) {
+  assert.throws(
+    () => validateWorkUsageResponse(response),
+    (error) => error?.message === "invalid_response",
+    message,
+  );
+}
+
+test("the browser boundary accepts the real service states and all-null components", async () => {
+  const available = await availableResponse();
+  assert.equal(validateWorkUsageResponse(available), available);
+  assert.deepEqual(available.totals.components, completeComponents());
+  assert.deepEqual(available.rows[0].components, completeComponents());
+
+  for (const status of ["missing", "unavailable"]) {
+    const response = {
+      schemaVersion: WORK_USAGE_SCHEMA,
+      status,
+      snapshotId: `${status}-snapshot`,
+    };
+    assert.equal(validateWorkUsageResponse(response), response, status);
+  }
+
+  const service = createWorkUsageService({
+    build: async () => syntheticSource(),
+    clock: () => NOW,
+    newId: () => SNAPSHOT,
+  });
+  const preparing = await service.query(BASE_QUERY);
+  const cancelled = await service.query({
+    ...BASE_QUERY,
+    action: "cancel",
+    snapshotId: preparing.snapshotId,
+  });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(validateWorkUsageResponse(cancelled), cancelled);
+});
+
+test("the browser boundary rejects malformed nullable component values", async () => {
+  const valid = await availableResponse();
+  for (const component of WORK_USAGE_COMPONENTS) {
+    const response = cloneResponse(valid);
+    response.rows[0].components[component] = -1;
+    assertInvalid(response, `${component} cannot be negative`);
+  }
+  for (const component of WORK_USAGE_COMPONENTS) {
+    const response = cloneResponse(valid);
+    response.totals.components[component] = "0";
+    assertInvalid(response, `${component} must be an integer or null`);
+  }
+
+  const nullTokens = cloneResponse(valid);
+  nullTokens.rows[0].tokens = null;
+  nullTokens.totals.tokens = null;
+  assert.equal(validateWorkUsageResponse(nullTokens), nullTokens);
+});
+
+test("the browser boundary rejects invalid timestamps before rendering", async () => {
+  const valid = await availableResponse();
+  const cases = [
+    [
+      "fromMs",
+      (response) => {
+        response.fromMs = -1;
+      },
+    ],
+    [
+      "toMs",
+      (response) => {
+        response.toMs = response.fromMs - 1;
+      },
+    ],
+    [
+      "observedAt",
+      (response) => {
+        response.metadata.observedAt = "not-a-timestamp";
+      },
+    ],
+    [
+      "row lastAt",
+      (response) => {
+        response.rows[0].lastAt = "not-a-timestamp";
+      },
+    ],
+  ];
+  for (const [name, mutate] of cases) {
+    const response = cloneResponse(valid);
+    mutate(response);
+    assertInvalid(response, `${name} must remain a renderable timestamp`);
+  }
+});
+
+test("the browser boundary rejects malformed transient display and scope records", async () => {
+  const valid = await availableResponse();
+
+  const displayContainer = cloneResponse(valid);
+  displayContainer.display = [];
+  assertInvalid(displayContainer, "display must be a bounded object");
+
+  const displayEntry = cloneResponse(valid);
+  displayEntry.display[displayEntry.rows[0].id] = { name: 42 };
+  assertInvalid(displayEntry, "display names must be strings or null");
+
+  const scopesContainer = cloneResponse(valid);
+  scopesContainer.scopes = ["scope-synthetic"];
+  assertInvalid(
+    scopesContainer,
+    "scope entries must retain their object shape",
+  );
+
+  const scopeId = cloneResponse(valid);
+  scopeId.scopes[0].id = "";
+  assertInvalid(scopeId, "scope ids must be bounded non-empty strings");
+});
+
+/*
+ * The work-usage view is intentionally a browser module without a framework
+ * runtime. This small DOM double covers the actual element operations used by
+ * mountWorkUsageView, so these tests exercise the mounted interaction and
+ * request fencing rather than duplicating its rendering implementation.
+ */
+class MountedElement {
+  constructor(tagName, ownerDocument) {
+    this.tagName = tagName.toUpperCase();
+    this.ownerDocument = ownerDocument;
+    this.children = [];
+    this.parentNode = null;
+    this.attributes = new Map();
+    this.dataset = Object.create(null);
+    this.style = Object.create(null);
+    this.listeners = new Map();
+    this._text = "";
+    this.className = "";
+    this.hidden = false;
+    this.inert = false;
+    this.disabled = false;
+    this.isConnected = true;
+  }
+
+  get textContent() {
+    return (
+      this._text +
+      this.children.map((child) => child.textContent ?? "").join("")
+    );
+  }
+
+  set textContent(value) {
+    for (const child of this.children) child.parentNode = null;
+    this.children = [];
+    this._text = String(value ?? "");
+  }
+
+  get firstChild() {
+    return this.children[0] ?? null;
+  }
+
+  get lastChild() {
+    return this.children.at(-1) ?? null;
+  }
+
+  get options() {
+    return this.children.filter((child) => child.tagName === "OPTION");
+  }
+
+  get classList() {
+    return {
+      add: (...names) => {
+        const values = new Set(this.className.split(/\s+/u).filter(Boolean));
+        names.forEach((name) => values.add(name));
+        this.className = [...values].join(" ");
+      },
+      remove: (...names) => {
+        const values = new Set(this.className.split(/\s+/u).filter(Boolean));
+        names.forEach((name) => values.delete(name));
+        this.className = [...values].join(" ");
+      },
+      contains: (name) => this.className.split(/\s+/u).includes(name),
+    };
+  }
+
+  append(...nodes) {
+    for (const node of nodes) this.#appendOne(node);
+  }
+
+  prepend(...nodes) {
+    const old = this.children;
+    this.children = [];
+    for (const node of nodes) this.#appendOne(node);
+    for (const node of old) this.#appendOne(node);
+  }
+
+  replaceChildren(...nodes) {
+    for (const child of this.children) child.parentNode = null;
+    this.children = [];
+    this._text = "";
+    this.append(...nodes);
+  }
+
+  #appendOne(node) {
+    if (node === null || node === undefined) return;
+    if (typeof node === "string" || typeof node === "number") {
+      this._text += String(node);
+      return;
+    }
+    if (node.parentNode) {
+      node.parentNode.children = node.parentNode.children.filter(
+        (child) => child !== node,
+      );
+    }
+    node.parentNode = this;
+    this.children.push(node);
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+    if (name === "id") this.id = String(value);
+    if (name === "class") this.className = String(value);
+  }
+
+  getAttribute(name) {
+    return this.attributes.get(name) ?? null;
+  }
+
+  removeAttribute(name) {
+    this.attributes.delete(name);
+    if (name === "id") delete this.id;
+  }
+
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type, listener) {
+    this.listeners.set(
+      type,
+      (this.listeners.get(type) ?? []).filter(
+        (candidate) => candidate !== listener,
+      ),
+    );
+  }
+
+  dispatchEvent(event) {
+    const dispatched = event ?? { type: "" };
+    if (!dispatched.type) throw new Error("test event needs a type");
+    if (!dispatched.preventDefault)
+      dispatched.preventDefault = () => {
+        dispatched.defaultPrevented = true;
+      };
+    dispatched.target ??= this;
+    dispatched.currentTarget = this;
+    for (const listener of this.listeners.get(dispatched.type) ?? [])
+      listener(dispatched);
+    return !dispatched.defaultPrevented;
+  }
+
+  click() {
+    return this.dispatchEvent({ type: "click" });
+  }
+
+  focus(options) {
+    this.ownerDocument.activeElement = this;
+    this.focusOptions = options;
+  }
+
+  contains(candidate) {
+    return (
+      candidate === this ||
+      this.children.some((child) => child.contains?.(candidate))
+    );
+  }
+
+  querySelectorAll(selector) {
+    const matches = (node) => {
+      if (selector.startsWith("."))
+        return node.classList.contains(selector.slice(1));
+      if (selector.startsWith("#")) return node.id === selector.slice(1);
+      const attribute = selector.match(/^\[([^=\]]+)(?:="([^"]*)")?\]$/u);
+      if (attribute) {
+        const value = node.getAttribute(attribute[1]);
+        return (
+          value !== null &&
+          (attribute[2] === undefined || value === attribute[2])
+        );
+      }
+      return node.tagName === selector.toUpperCase();
+    };
+    return this.children.flatMap((child) => [
+      ...(matches(child) ? [child] : []),
+      ...child.querySelectorAll(selector),
+    ]);
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+}
+
+class MountedDocument {
+  constructor() {
+    this.activeElement = null;
+  }
+
+  createElement(tagName) {
+    return new MountedElement(tagName, this);
+  }
+
+  createElementNS(_namespace, tagName) {
+    return new MountedElement(tagName, this);
+  }
+
+  createTextNode(text) {
+    const node = new MountedElement("#text", this);
+    node._text = String(text);
+    return node;
+  }
+}
+
+class MountedWindow {
+  constructor() {
+    this.listeners = new Map();
+    this.MutationObserver = class {
+      observe() {}
+      disconnect() {}
+    };
+  }
+
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type, listener) {
+    this.listeners.set(
+      type,
+      (this.listeners.get(type) ?? []).filter(
+        (candidate) => candidate !== listener,
+      ),
+    );
+  }
+}
+
+function mountedRoot() {
+  const documentRef = new MountedDocument();
+  const root = documentRef.createElement("section");
+  root.id = "projects";
+  root.inert = false;
+  return { documentRef, root, windowRef: new MountedWindow() };
+}
+
+function mountedLeaseRoot() {
+  const mounted = mountedRoot();
+  const { documentRef, windowRef } = mounted;
+  const timers = new Map();
+  const observers = [];
+  let nextTimer = 0;
+  windowRef.setTimeout = (callback, delay) => {
+    const id = ++nextTimer;
+    timers.set(id, { callback, delay });
+    return id;
+  };
+  windowRef.clearTimeout = id => timers.delete(id);
+  windowRef.MutationObserver = class {
+    constructor(callback) { this.callback = callback; observers.push(this); }
+    observe() { this.connected = true; }
+    disconnect() { this.connected = false; }
+  };
+  documentRef.visibilityState = "visible";
+  documentRef.listeners = new Map();
+  documentRef.addEventListener = MountedWindow.prototype.addEventListener;
+  documentRef.removeEventListener = MountedWindow.prototype.removeEventListener;
+  const dispatch = (target, type) => {
+    for (const listener of target.listeners.get(type) ?? []) listener({ type });
+  };
+  return {
+    ...mounted, timers, observers,
+    dispatch,
+    changed: () => observers.filter(observer => observer.connected).forEach(observer => observer.callback()),
+    runTimer(delay) {
+      const next = [...timers].find(([, timer]) => timer.delay === delay);
+      assert.ok(next, `expected a ${delay}ms timer`);
+      timers.delete(next[0]);
+      return next[1].callback();
+    },
+  };
+}
+
+function findMounted(root, predicate, seen = new Set()) {
+  if (seen.size > 1000)
+    throw new Error(`mounted tree too large near ${root.tagName}`);
+  if (seen.has(root)) return [];
+  seen.add(root);
+  return root.children.flatMap((child) => [
+    ...(predicate(child) ? [child] : []),
+    ...findMounted(child, predicate, seen),
+  ]);
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
+function mountedRow({
+  id,
+  kind,
+  tokens,
+  cost,
+  events,
+  share,
+  lastAt = NOW - 1_000,
+  activeThreads = 1,
+  activeProjects = 1,
+}) {
+  return {
+    id,
+    kind,
+    tokens,
+    events,
+    lastAt,
+    incompleteEvents: 0,
+    priceStatus: cost === null ? "unpriced" : "complete",
+    share,
+    costUsdExact: cost,
+    activeThreads,
+    activeProjects,
+    components: completeComponents({ input_uncached_tokens: tokens }),
+  };
+}
+
+function mountedResponse({
+  rows,
+  display,
+  totalTokens = 100,
+  totalCost = "10.00",
+  snapshotId = "snapshot-mounted",
+}) {
+  return {
+    schemaVersion: WORK_USAGE_SCHEMA,
+    status: "available",
+    snapshotId,
+    scope: "scope-mounted",
+    fromMs: NOW - 86_400_000,
+    toMs: NOW,
+    metadata: { observedAt: NOW },
+    offset: 0,
+    rowCount: rows.length,
+    nextCursor: null,
+    models: ["model-mounted"],
+    scopes: [{ id: "scope-mounted", status: "available", events: 3 }],
+    display,
+    totals: mountedRow({
+      id: "total",
+      kind: "total",
+      tokens: totalTokens,
+      cost: totalCost,
+      events: 3,
+      share: 1,
+      lastAt: NOW,
+    }),
+    rows,
+  };
+}
+
+function httpResponse(value) {
+  return { ok: true, json: async () => value };
+}
+
+function mountedTranslator(key, values) {
+  return translate(key, values, "en-US");
+}
+
+const PROJECT_A = mountedRow({
+  id: "project-a",
+  kind: "project",
+  tokens: 60,
+  cost: "6.00",
+  events: 2,
+  share: 0.6,
+});
+const PROJECT_B = mountedRow({
+  id: "project-b",
+  kind: "project",
+  tokens: 40,
+  cost: "4.00",
+  events: 1,
+  share: 0.4,
+});
+const PROJECT_ROWS_RESPONSE = mountedResponse({
+  rows: [PROJECT_A, PROJECT_B],
+  display: {
+    "project-a": { name: "Project A" },
+    "project-b": { name: "Project B" },
+  },
+});
+const THREAD_A = mountedRow({
+  id: "thread-a",
+  kind: "thread",
+  tokens: 25,
+  cost: "2.50",
+  events: 1,
+  share: 25 / 60,
+});
+const THREAD_B = mountedRow({
+  id: "thread-b",
+  kind: "thread",
+  tokens: 35,
+  cost: "3.50",
+  events: 1,
+  share: 35 / 60,
+});
+const THREAD_A_RESPONSE = mountedResponse({
+  rows: [THREAD_A, THREAD_B],
+  display: {
+    "thread-a": {
+      name: "Thread A",
+      shortId: "thread-a",
+      codexUrl: "codex://threads/11111111-1111-4111-8111-111111111111",
+    },
+    "thread-b": {
+      name: "Thread B",
+      shortId: "thread-b",
+      codexUrl: "codex://threads/22222222-2222-4222-8222-222222222222",
+    },
+  },
+  totalTokens: 60,
+  totalCost: "6.00",
+});
+const THREAD_B_RESPONSE = mountedResponse({
+  rows: [THREAD_B],
+  display: {
+    "thread-b": {
+      name: "Thread B",
+      shortId: "thread-b",
+      codexUrl: "codex://threads/22222222-2222-4222-8222-222222222222",
+    },
+  },
+  totalTokens: 40,
+  totalCost: "4.00",
+});
+
+async function settleMountedView() {
+  for (let turn = 0; turn < 4; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+    await Promise.resolve();
+  }
+}
+
+test("mounted project expansion pins the snapshot/model and renders linked child values against global totals", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const fetchRef = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    return httpResponse(
+      body.grouping === "thread" ? THREAD_A_RESPONSE : PROJECT_ROWS_RESPONSE,
+    );
+  };
+  const view = mountWorkUsageView({
+    root,
+    t: mountedTranslator,
+    windowRef,
+    fetchRef,
+  });
+  await settleMountedView();
+
+  const table = findMounted(root, (node) => node.tagName === "TABLE")[0];
+  assert.ok(table);
+  const header = findMounted(table, (node) => node.tagName === "TH");
+  assert.equal(header.length, 6);
+  const model = findMounted(
+    root,
+    (node) =>
+      node.tagName === "SELECT" &&
+      node.options.some((option) => option.value === "model-mounted"),
+  )[0];
+  assert.ok(model);
+  model.value = "model-mounted";
+  model.dispatchEvent({ type: "change" });
+  await settleMountedView();
+
+  const projectButton = findMounted(
+    root,
+    (node) =>
+      node.classList.contains("work-usage-project-toggle") &&
+      node.textContent.includes("Project A"),
+  )[0];
+  assert.ok(projectButton);
+  projectButton.click();
+  await settleMountedView();
+
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].snapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+  assert.equal(calls[2].model, "model-mounted");
+  assert.equal(calls[2].grouping, "thread");
+  assert.equal(calls[2].project, "project-a");
+
+  const childGroup = findMounted(root, (node) =>
+    node.classList.contains("work-usage-children"),
+  )[0];
+  assert.ok(childGroup);
+  assert.strictEqual(
+    findMounted(root, (node) => node.tagName === "TABLE").length,
+    1,
+  );
+  assert.equal(childGroup.parentNode?.tagName, "TABLE");
+  const childRows = findMounted(childGroup, (node) =>
+    node.classList.contains("work-usage-thread-row"),
+  );
+  assert.equal(childRows.length, 2);
+  assert.deepEqual(
+    childRows.map((row) => row.children.length),
+    [6, 6],
+  );
+  const links = findMounted(childGroup, (node) =>
+    node.classList.contains("cache-drop-thread-link"),
+  );
+  assert.deepEqual(
+    links.map((link) => [link.textContent, link.href]),
+    [
+      ["Thread A", "codex://threads/11111111-1111-4111-8111-111111111111"],
+      ["Thread B", "codex://threads/22222222-2222-4222-8222-222222222222"],
+    ],
+  );
+  assert.deepEqual(
+    childRows.map((row) => [
+      row.children[1].textContent,
+      row.children[2].textContent,
+      row.children[3].textContent,
+      row.children[4].textContent,
+      row.children[5].textContent,
+    ]),
+    [
+      [
+        "1",
+        "25",
+        formatSharePercent(25, 100),
+        formatApiMoney("2.50"),
+        formatSharePercent(2.5, 10),
+      ],
+      [
+        "1",
+        "35",
+        formatSharePercent(35, 100),
+        formatApiMoney("3.50"),
+        formatSharePercent(3.5, 10),
+      ],
+    ],
+  );
+  assert.equal(
+    findMounted(
+      root,
+      (node) =>
+        node.classList.contains("work-usage-project-toggle") &&
+        node.textContent.includes("Project A"),
+    )[0].getAttribute("aria-expanded"),
+    "true",
+  );
+  view.destroy();
+});
+
+test("mounted project expansion keeps one group open, ignores stale children, and collapses cleanly", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const pendingA = deferred();
+  const pendingB = deferred();
+  const fetchRef = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    if (calls.length === 1) return httpResponse(PROJECT_ROWS_RESPONSE);
+    if (body.project === "project-a") return pendingA.promise;
+    if (body.project === "project-b") return pendingB.promise;
+    throw new Error(`unexpected mounted request: ${body.project}`);
+  };
+  const view = mountWorkUsageView({
+    root,
+    t: mountedTranslator,
+    windowRef,
+    fetchRef,
+  });
+  await settleMountedView();
+
+  const projectButton = (name) =>
+    findMounted(
+      root,
+      (node) =>
+        node.classList.contains("work-usage-project-toggle") &&
+        node.textContent.includes(name),
+    )[0];
+  projectButton("Project A").click();
+  projectButton("Project B").click();
+  assert.equal(calls.length, 3);
+  assert.deepEqual(
+    calls.slice(1).map((request) => request.project),
+    ["project-a", "project-b"],
+  );
+  assert.equal(
+    findMounted(root, (node) => node.classList.contains("work-usage-children"))
+      .length,
+    1,
+  );
+
+  pendingB.resolve(httpResponse(THREAD_B_RESPONSE));
+  await settleMountedView();
+  const childGroup = findMounted(root, (node) =>
+    node.classList.contains("work-usage-children"),
+  )[0];
+  assert.equal(
+    findMounted(childGroup, (node) =>
+      node.classList.contains("work-usage-thread-row"),
+    ).length,
+    1,
+  );
+  assert.equal(
+    findMounted(childGroup, (node) =>
+      node.classList.contains("cache-drop-thread-link"),
+    )[0].textContent,
+    "Thread B",
+  );
+
+  pendingA.resolve(httpResponse(THREAD_A_RESPONSE));
+  await settleMountedView();
+  assert.equal(
+    findMounted(root, (node) => node.classList.contains("work-usage-children"))
+      .length,
+    1,
+  );
+  assert.equal(
+    findMounted(
+      root,
+      (node) =>
+        node.classList.contains("cache-drop-thread-link") &&
+        node.textContent === "Thread A",
+    ).length,
+    0,
+  );
+
+  projectButton("Project B").click();
+  assert.equal(
+    findMounted(root, (node) => node.classList.contains("work-usage-children"))
+      .length,
+    0,
+  );
+  assert.equal(
+    projectButton("Project B").getAttribute("aria-expanded"),
+    "false",
+  );
+  view.destroy();
+});
+
+test("nested workers reuse parent and bracketed subworker links without a further drill-down", async () => {
+  const children = structuredClone(THREAD_A_RESPONSE);
+  children.display["thread-a"].thread = {
+    id: "11111111-1111-4111-8111-111111111111",
+    name: "Worker task",
+    nickname: "Luna",
+    parent: {
+      id: "33333333-3333-4333-8333-333333333333",
+      name: "Parent project task",
+    },
+  };
+  const { root, windowRef } = mountedRoot();
+  const view = mountWorkUsageView({
+    root,
+    windowRef,
+    t: mountedTranslator,
+    fetchRef: async (_url, init) =>
+      httpResponse(
+        JSON.parse(init.body).grouping === "thread"
+          ? children
+          : PROJECT_ROWS_RESPONSE,
+      ),
+  });
+  await settleMountedView();
+  findMounted(root, (n) =>
+    n.classList.contains("work-usage-project-toggle"),
+  )[0].click();
+  await settleMountedView();
+  const rows = findMounted(root, (n) =>
+    n.classList.contains("work-usage-thread-row"),
+  );
+  const links = findMounted(rows[0], (n) => n.tagName === "A");
+  assert.deepEqual(
+    links.map((n) => [n.textContent, n.href]),
+    [
+      [
+        "Parent project task",
+        "codex://threads/33333333-3333-4333-8333-333333333333",
+      ],
+      [
+        "Luna subworker",
+        "codex://threads/11111111-1111-4111-8111-111111111111",
+      ],
+    ],
+  );
+  assert.equal(
+    rows[0].children[0].textContent,
+    "Parent project task [Luna subworker]",
+  );
+  assert.equal(findMounted(rows[0], (n) => n.tagName === "BUTTON").length, 0);
+  assert.equal(findMounted(rows[1], (n) => n.tagName === "BUTTON").length, 0);
+  assert.equal(rows[0].children.length, 6);
+  view.destroy();
+});
+
+test("thread ancestry rejects invalid, mismatched and self-linked identities", () => {
+  const valid = structuredClone(THREAD_A_RESPONSE);
+  valid.display["thread-a"].thread = {
+    id: "11111111-1111-4111-8111-111111111111",
+    name: "Task",
+    nickname: "Luna",
+    parent: { id: "33333333-3333-4333-8333-333333333333", name: "Parent" },
+  };
+  assert.equal(validateWorkUsageResponse(valid), valid);
+  for (const mutate of [
+    (t) => {
+      t.parent.id = "https://example.test";
+    },
+    (t) => {
+      t.parent.id = t.id;
+    },
+    (t) => {
+      t.id = "44444444-4444-4444-8444-444444444444";
+    },
+    (t) => {
+      t.nickname = "x".repeat(81);
+    },
+    (t) => {
+      t.parent.name = "bad\nname";
+    },
+  ]) {
+    const invalid = structuredClone(valid);
+    mutate(invalid.display["thread-a"].thread);
+    assertInvalid(invalid, "untrusted ancestry must not become a link");
+  }
+});
+
+test("threads expand model components inline without fetching or changing totals and collapse on project changes", async () => {
+  const children=structuredClone(THREAD_A_RESPONSE);
+  const model=mountedRow({id:'gpt-5',kind:'model',tokens:25,cost:'2.50',events:1,share:1});
+  model.components=completeComponents({input_uncached_tokens:10,input_cache_read_tokens:8,input_cache_write_tokens:2,output_text_tokens:null,output_reasoning_tokens:null,output_combined_tokens:5});
+  // This fixture deliberately uses combined output: no invented split.
+  model.components.output_text_tokens=null; model.components.output_reasoning_tokens=null;
+  children.rows[0].modelBreakdown=[model];
+  const {root,windowRef}=mountedRoot();let calls=0;
+  const view=mountWorkUsageView({root,windowRef,t:mountedTranslator,fetchRef:async(_url,init)=>{calls++;return httpResponse(JSON.parse(init.body).grouping==='thread'?children:PROJECT_ROWS_RESPONSE);}});
+  await settleMountedView();
+  findMounted(root,n=>n.classList.contains('work-usage-project-toggle'))[0].click();await settleMountedView();
+  const before=calls;
+  const toggle=findMounted(root,n=>n.classList.contains('work-usage-model-toggle'))[0];
+  toggle.click();
+  assert.equal(calls,before,'model expansion uses the same immutable response');
+  const detail=findMounted(root,n=>n.classList.contains('work-usage-model-detail'))[0];
+  assert.ok(detail);
+  assert.match(detail.textContent,/Cache write/u);
+  assert.match(detail.textContent,/Combined output/u);
+  const data=findMounted(detail,n=>n.tagName==='TBODY')[0].children[0];
+  assert.deepEqual(data.children.slice(1,-1).map(n=>n.textContent),['8','10','2','—','—','5']);
+  assert.equal(data.children.at(-1).textContent,formatApiMoney('2.50'));
+  const thread=findMounted(root,n=>n.classList.contains('work-usage-thread-row'))[0];
+  assert.equal(thread.children[2].textContent,'25');
+  assert.equal(findMounted(thread,n=>n.tagName==='A')[0].href,children.display['thread-a'].codexUrl);
+  findMounted(root,n=>n.classList.contains('work-usage-model-toggle'))[0].click();
+  assert.equal(findMounted(root,n=>n.classList.contains('work-usage-model-detail')).length,0);
+  findMounted(root,n=>n.classList.contains('work-usage-model-toggle'))[0].click();
+  findMounted(root,n=>n.classList.contains('work-usage-project-toggle')&&!n.classList.contains('work-usage-model-toggle'))[0].click();
+  assert.equal(findMounted(root,n=>n.classList.contains('work-usage-model-detail')).length,0);
+  view.destroy();
+});
+
+test("a grouped family displays included workers and a conserved contributor breakdown inline", async () => {
+  const children=structuredClone(THREAD_A_RESPONSE);
+  children.rows=[children.rows[0]];children.rowCount=1;
+  const row=children.rows[0];row.subworkerCount=3;
+  row.modelBreakdown=[mountedRow({id:'gpt-5',kind:'model',tokens:25,cost:'2.50',events:4,share:1})];
+  row.contributions=[
+    mountedRow({id:'primary',kind:'contribution',tokens:10,cost:'1.00',events:1,share:.4}),
+    mountedRow({id:'subworkers',kind:'contribution',tokens:15,cost:'1.50',events:3,share:.6}),
+  ];
+  const {root,windowRef}=mountedRoot();
+  const view=mountWorkUsageView({root,windowRef,t:mountedTranslator,fetchRef:async(_url,init)=>httpResponse(JSON.parse(init.body).grouping==='thread'?children:PROJECT_ROWS_RESPONSE)});
+  await settleMountedView();findMounted(root,n=>n.classList.contains('work-usage-project-toggle'))[0].click();await settleMountedView();
+  assert.equal(findMounted(root,n=>n.classList.contains('work-usage-thread-row')).length,1);
+  assert.equal(findMounted(root,n=>n.classList.contains('work-usage-family-count'))[0].textContent,'Includes 3 subworkers');
+  findMounted(root,n=>n.classList.contains('work-usage-model-toggle'))[0].click();
+  const parts=findMounted(root,n=>n.classList.contains('work-usage-contributions'))[0];
+  const data=findMounted(parts,n=>n.tagName==='TBODY')[0].children;
+  assert.deepEqual(data.map(n=>n.children.map(c=>c.textContent)),[['Primary thread','10',formatApiMoney('1')],['Subworkers','15',formatApiMoney('1.5')]]);
+  view.destroy();
+});
+
+
+test("mounted auto review rows link only the parent or remain non-linkable", async () => {
+  const { root, windowRef } = mountedRoot();
+  const response = structuredClone(THREAD_A_RESPONSE);
+  const parentId = "33333333-3333-4333-8333-333333333333";
+  for (const [index, decoration] of Object.values(response.display).entries()) {
+    decoration.thread = {
+      id: decoration.codexUrl.split("/").at(-1),
+      name: "Internal review session",
+      nickname: null,
+      origin: "auto_review",
+      parent: index === 0 ? { id: parentId, name: "Synthetic parent" } : null,
+    };
+  }
+  const view = mountWorkUsageView({
+    root, t: mountedTranslator, windowRef,
+    fetchRef: async (_url, init) => httpResponse(
+      JSON.parse(init.body).grouping === "thread" ? response : PROJECT_ROWS_RESPONSE,
+    ),
+  });
+  await settleMountedView();
+  findMounted(root, node => node.classList.contains("work-usage-project-toggle"))[0].click();
+  await settleMountedView();
+  const rows = findMounted(root, node => node.classList.contains("work-usage-thread-row"));
+  assert.equal(rows.length, 2);
+  const links = findMounted(rows[0], node => node.classList.contains("cache-drop-thread-link"));
+  assert.deepEqual(links.map(link => [link.textContent, link.href]), [
+    ["Synthetic parent", `codex://threads/${parentId}`],
+  ]);
+  assert.match(rows[0].textContent, /Synthetic parent \[Auto review\]/u);
+  assert.equal(findMounted(rows[1], node => node.tagName === "A").length, 0);
+  assert.match(rows[1].textContent, /Auto review: Thread unavailable/u);
+  assert.equal(rows.some(row => row.textContent.includes("Internal review session")), false);
+  view.destroy();
+});
+
+test("period switches reuse the available report anchor, polling drops it, and refresh starts fresh", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const body = JSON.parse(init.body); calls.push(body);
+      if (calls.length === 2) return httpResponse({ schemaVersion: WORK_USAGE_SCHEMA, status: "preparing", snapshotId: "related-report" });
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: calls.length > 1 ? "related-report" : PROJECT_ROWS_RESPONSE.snapshotId });
+    },
+  });
+  try {
+    await settleMountedView();
+    findMounted(root, node => node.dataset?.period === "all")[0].click();
+    await settleMountedView();
+    assert.equal(calls[1].sourceSnapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+    assert.equal(calls[1].snapshotId, undefined);
+    await new Promise(resolve => setTimeout(resolve, 800));
+    assert.equal(calls[2].snapshotId, "related-report");
+    assert.equal(calls[2].sourceSnapshotId, undefined);
+    view.refresh();
+    await settleMountedView();
+    assert.equal(calls.at(-1).snapshotId, undefined);
+    assert.equal(calls.at(-1).sourceSnapshotId, undefined);
+  } finally { view.destroy(); }
+});
+
+
+test("assumptions stay distinct from missing data and the non-project bucket is localized", async () => {
+  const response = structuredClone(PROJECT_ROWS_RESPONSE);
+  response.rows[0].id = "non-project";
+  response.rows[0].assumedEvents = 1;
+  response.totals.assumedEvents = 1;
+  response.totals.incompleteEvents = 1;
+  assert.equal(validateWorkUsageResponse(response), response);
+  const malformed = structuredClone(response);
+  malformed.rows[0].assumedEvents = -1;
+  assertInvalid(malformed, "negative assumption count");
+  const { root, windowRef } = mountedRoot();
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async () => httpResponse(response) });
+  await settleMountedView();
+  assert.match(root.textContent, /Non-project tasks/);
+  assert.match(root.textContent, /Includes assumed counts/);
+  assert.doesNotMatch(root.textContent, /Missing cache-write counts are assumed/);
+  assert.doesNotMatch(root.textContent, /Token counts are missing or incomplete/);
+  assert.doesNotMatch(root.textContent, /Repository groups use|Mappings are read-only|API-equivalent estimates use/);
+  view.destroy();
+});
+
+test("name search keeps the report snapshot and nested filter, and clearing restores project view", async () => {
+  const clock = mountedLeaseRoot();
+  const { root, windowRef } = clock; const requests = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); requests.push(query);
+      return httpResponse(query.grouping === "thread" ? THREAD_A_RESPONSE : PROJECT_ROWS_RESPONSE);
+    } });
+  try {
+    await settleMountedView();
+    const input = findMounted(root, n => n.tagName === "INPUT")[0];
+    const form = findMounted(root, n => n.tagName === "FORM")[0];
+    input.value = "  Build café  "; form.dispatchEvent({type:"submit"});
+    await settleMountedView();
+    assert.equal(requests.at(-1).search, "Build café");
+    assert.equal(requests.at(-1).snapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+    assert.equal(requests.at(-1).grouping, "project");
+    assert.equal(requests.at(-1).findThread, undefined);
+    assert.match(root.textContent, /Rows show matching work/);
+    findMounted(root, n => n.classList.contains("work-usage-project-toggle"))[0].click();
+    await settleMountedView();
+    assert.equal(requests.at(-1).search, "Build café");
+    assert.equal(requests.at(-1).project, "project-a");
+    input.value = ""; input.dispatchEvent({type:"input"});
+    clock.runTimer(300); await settleMountedView();
+    assert.equal(requests.at(-1).search, undefined);
+    assert.equal(requests.at(-1).project, undefined);
+    assert.equal(input.value, "");
+    assert.equal(findMounted(root, n => n.tagName === "BUTTON" && ["Search", "Clear search"].includes(n.textContent)).length, 0);
+    input.value = "codex://threads/not-a-thread";
+    const before = requests.length; form.dispatchEvent({type:"submit"});
+    await settleMountedView(); assert.equal(requests.length, before);
+    input.value = "11111111-1111-4111-8111-111111111111";
+    form.dispatchEvent({type:"submit"}); await settleMountedView();
+    assert.equal(requests.at(-1).findThread, input.value);
+    assert.equal(requests.at(-1).search, undefined);
+  } finally { view.destroy(); }
+});
+
+test("token mix and share bars preserve amounts and omit unknown or empty visuals", async () => {
+  const report = structuredClone(PROJECT_ROWS_RESPONSE);
+  report.totals.components = completeComponents({input_cache_read_tokens:70, input_uncached_tokens:20, output_combined_tokens:10});
+  const {root,windowRef} = mountedRoot();
+  const view=mountWorkUsageView({root,windowRef,t:mountedTranslator,fetchRef:async()=>httpResponse(report)});
+  try {
+    await settleMountedView();
+    const mix=findMounted(root,n=>n.classList.contains("work-usage-mix-strip"))[0];
+    assert.equal(mix.getAttribute("aria-hidden"),"true");
+    assert.deepEqual(mix.children.map(n=>n.style.width),["70%","20%","10%"]);
+    const legends=findMounted(root,n=>n.classList.contains("work-usage-mix-legend"))[0];
+    assert.match(legends.textContent,/Combined output/);
+    assert.doesNotMatch(legends.textContent,/Reasoning output/);
+    const bars=findMounted(root,n=>n.classList.contains("work-usage-bar"));
+    assert.equal(bars[0].children[0].style.width,"60%");
+    assert.ok(bars.every(n=>n.getAttribute("aria-hidden")==="true"));
+    report.totals.tokens=null; report.totals.costUsdExact=null;
+    report.totals.components=completeComponents();
+    view.refresh(); await settleMountedView();
+    assert.equal(findMounted(root,n=>n.classList.contains("work-usage-mix-strip")).length,0);
+    assert.equal(findMounted(root,n=>n.classList.contains("work-usage-bar")).length,0);
+  } finally {view.destroy();}
+});
+
+test("primary and expanded model names reuse decorative model icons without extra requests", async () => {
+  const children=structuredClone(THREAD_A_RESPONSE);
+  children.rows[0].modelBreakdown=[mountedRow({id:"gpt-5.6-sol",kind:"model",tokens:25,cost:"2.50",events:1,share:1})];
+  const {root,windowRef}=mountedRoot();let calls=0;
+  const view=mountWorkUsageView({root,windowRef,t:mountedTranslator,fetchRef:async(_url,init)=>{calls++;return httpResponse(JSON.parse(init.body).grouping==="thread"?children:PROJECT_ROWS_RESPONSE);}});
+  try {
+    await settleMountedView(); findMounted(root,n=>n.classList.contains("work-usage-project-toggle"))[0].click(); await settleMountedView();
+    const primary=findMounted(root,n=>n.classList.contains("work-usage-primary-model"))[0];
+    assert.equal(primary.children[0].getAttribute("aria-hidden"),"true");
+    assert.ok(primary.children[0].classList.contains("allowance-model-sol"));
+    const before=calls;findMounted(root,n=>n.classList.contains("work-usage-model-toggle"))[0].click();
+    assert.equal(calls,before);
+    const detail=findMounted(root,n=>n.classList.contains("work-usage-model-detail"))[0];
+    assert.equal(findMounted(detail,n=>n.classList.contains("allowance-model-sol")).length,1);
+  } finally {view.destroy();}
+});
+
+test("visible reports renew their lease without redrawing expanded rows and resume after hidden or inert periods", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef, documentRef } = harness;
+  const requests = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      if (body.action === "touch") return httpResponse({ status: "available" });
+      return httpResponse(body.grouping === "thread" ? THREAD_A_RESPONSE : PROJECT_ROWS_RESPONSE);
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  findMounted(root, node => node.classList.contains("work-usage-project-toggle"))[0].click();
+  await settleMountedView();
+  const children = findMounted(root, node => node.classList.contains("work-usage-children"))[0];
+  const before = requests.length;
+  await harness.runTimer(60_000);
+  assert.deepEqual(requests.at(-1), {
+    schemaVersion: WORK_USAGE_SCHEMA, action: "touch", snapshotId: PROJECT_ROWS_RESPONSE.snapshotId,
+  });
+  assert.equal(requests.length, before + 1);
+  assert.strictEqual(findMounted(root, node => node.classList.contains("work-usage-children"))[0], children);
+  assert.equal(findMounted(root, node => node.classList.contains("work-usage-project-toggle"))[0].getAttribute("aria-expanded"), "true");
+  documentRef.visibilityState = "hidden";
+  harness.dispatch(documentRef, "visibilitychange");
+  assert.equal(harness.timers.size, 0);
+  harness.dispatch(windowRef, "pageshow");
+  assert.equal(requests.length, before + 1, "hidden documents do not renew");
+  documentRef.visibilityState = "visible";
+  harness.dispatch(documentRef, "visibilitychange");
+  await settleMountedView();
+  assert.equal(requests.length, before + 2);
+  root.inert = true;
+  harness.changed();
+  assert.equal(harness.timers.size, 0);
+  harness.dispatch(windowRef, "pageshow");
+  assert.equal(requests.length, before + 2, "inactive dashboard panels do not renew");
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.equal(requests.length, before + 3);
+  harness.dispatch(windowRef, "pageshow");
+  await settleMountedView();
+  assert.equal(requests.length, before + 4);
+  assert.strictEqual(findMounted(root, node => node.classList.contains("work-usage-children"))[0], children);
+});
+
+test("transient touch failures preserve the report and an expired touch refreshes once", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const requests = [];
+  let expire = false;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      if (body.action === "touch") {
+        if (!expire) throw new Error("temporary connection failure");
+        return { ok: false, status: 409, json: async () => ({ error: { code: "work_usage_snapshot_expired" } }) };
+      }
+      return httpResponse(PROJECT_ROWS_RESPONSE);
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const table = findMounted(root, node => node.tagName === "TABLE")[0];
+  const text = root.textContent;
+  await harness.runTimer(60_000);
+  assert.strictEqual(findMounted(root, node => node.tagName === "TABLE")[0], table);
+  assert.equal(root.textContent, text);
+  assert.equal(requests.length, 2);
+  expire = true;
+  await harness.runTimer(60_000);
+  await settleMountedView();
+  assert.equal(requests.length, 4, "one touch and one fresh query follow the transient failure");
+  assert.equal(requests[2].action, "touch");
+  assert.equal(requests[3].snapshotId, undefined);
+  assert.equal(requests[3].sourceSnapshotId, undefined);
+  assert.equal(requests[3].action, undefined);
+  assert.match(root.textContent, /Project A/);
+});
+
+test("destroy aborts an in-flight touch and removes timers, observers and lifecycle listeners", async () => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef, documentRef } = harness;
+  let calls = 0;
+  let touchSignal;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      calls += 1;
+      if (JSON.parse(init.body).action !== "touch") return httpResponse(PROJECT_ROWS_RESPONSE);
+      touchSignal = init.signal;
+      return new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => {
+        const error = new Error("aborted"); error.name = "AbortError"; reject(error);
+      }, { once: true }));
+    },
+  });
+  await settleMountedView();
+  const pending = harness.runTimer(60_000);
+  assert.equal(touchSignal.aborted, false);
+  view.destroy();
+  await pending;
+  assert.equal(touchSignal.aborted, true);
+  assert.equal(harness.timers.size, 0);
+  assert.ok(harness.observers.every(observer => !observer.connected));
+  assert.equal(documentRef.listeners.get("visibilitychange").length, 0);
+  assert.equal(windowRef.listeners.get("pageshow").length, 0);
+  harness.dispatch(windowRef, "pageshow");
+  harness.dispatch(documentRef, "visibilitychange");
+  harness.changed();
+  assert.equal(calls, 2);
+});
+
+test("expired searched pages retry once with selected filters and without the old snapshot or cursor", async (t) => {
+  for (const code of ["work_usage_snapshot_expired", "work_usage_snapshot_changed"]) {
+    await t.test(code, async (t) => {
+      const harness = mountedLeaseRoot();
+      const { root, windowRef } = harness;
+      const requests = [];
+      let fail = false;
+      const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+        fetchRef: async (_url, init) => {
+          const body = JSON.parse(init.body); requests.push(body);
+          if (fail) return { ok: false, status: 409, json: async () => ({ error: { code } }) };
+          return httpResponse({ ...PROJECT_ROWS_RESPONSE, rowCount: 50, nextCursor: "next-page" });
+        },
+      });
+      t.after(() => view.destroy());
+      await settleMountedView();
+      findMounted(root, node => node.dataset?.period === "all")[0].click();
+      await settleMountedView();
+      const model = findMounted(root, node => node.tagName === "SELECT" && node.options.some(option => option.value === "model-mounted"))[0];
+      model.value = "model-mounted";
+      model.dispatchEvent({ type: "change" });
+      await settleMountedView();
+      findMounted(root, node => node.tagName === "INPUT")[0].value = "Project name";
+      findMounted(root, node => node.tagName === "FORM")[0].dispatchEvent({ type: "submit" });
+      await settleMountedView();
+      fail = true;
+      const before = requests.length;
+      findMounted(root, node => node.tagName === "BUTTON" && node.textContent === "Next")[0].click();
+      await settleMountedView();
+      assert.equal(requests[before].cursor, "next-page");
+      assert.equal(requests[before].snapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+      assert.equal(requests.length, before + (code === "work_usage_snapshot_expired" ? 2 : 1));
+      if (code === "work_usage_snapshot_expired") {
+        const retried = requests.at(-1);
+        assert.equal(retried.snapshotId, undefined);
+        assert.equal(retried.sourceSnapshotId, undefined);
+        assert.equal(retried.cursor, undefined);
+        assert.equal(retried.search, "Project name");
+        assert.equal(retried.model, "model-mounted");
+        assert.equal(retried.period, "all");
+      }
+      assert.match(root.textContent, /report expired/i, "a failed request remains explicit instead of looping");
+    });
+  }
+});
+
+test("nested expired reports refresh the overview while changed snapshots require explicit recovery", async (t) => {
+  for (const code of ["work_usage_snapshot_expired", "work_usage_snapshot_changed"]) {
+    await t.test(code, async (t) => {
+      const { root, windowRef } = mountedLeaseRoot();
+      const requests = [];
+      const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+        fetchRef: async (_url, init) => {
+          const body = JSON.parse(init.body); requests.push(body);
+          if (body.grouping === "thread") return { ok: false, status: 409, json: async () => ({ error: { code } }) };
+          return httpResponse(PROJECT_ROWS_RESPONSE);
+        },
+      });
+      t.after(() => view.destroy());
+      await settleMountedView();
+      findMounted(root, node => node.classList.contains("work-usage-project-toggle"))[0].click();
+      await settleMountedView();
+      assert.equal(requests[1].project, "project-a");
+      if (code === "work_usage_snapshot_expired") {
+        assert.equal(requests.length, 3);
+        assert.equal(requests[2].snapshotId, undefined);
+        assert.equal(requests[2].project, undefined);
+        assert.equal(requests[2].grouping, "project");
+      } else {
+        assert.equal(requests.length, 2);
+        assert.match(root.textContent, /report expired/i);
+      }
+    });
+  }
+});
+
+
+test("live search debounces edits, enforces the minimum, and flushes with filter changes", async () => {
+  const clock = mountedLeaseRoot(); const requests = [];
+  const view = mountWorkUsageView({ ...clock, t: mountedTranslator,
+    fetchRef: async (_url, init) => { requests.push(JSON.parse(init.body)); return httpResponse(PROJECT_ROWS_RESPONSE); } });
+  try {
+    await settleMountedView();
+    const input = findMounted(clock.root, n => n.tagName === "INPUT")[0];
+    const type = value => { input.value = value; input.dispatchEvent({type:"input"}); };
+    type("a");
+    assert.equal([...clock.timers.values()].filter(t => t.delay === 300).length, 0);
+    type("ap"); type("app"); type("application");
+    assert.equal(requests.length, 1);
+    assert.equal([...clock.timers.values()].filter(t => t.delay === 300).length, 1);
+    clock.runTimer(300); await settleMountedView();
+    assert.equal(requests.at(-1).search, "application");
+    assert.equal(requests.at(-1).snapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+    type("edited");
+    findMounted(clock.root, n => n.dataset?.period === "all")[0].click();
+    await settleMountedView();
+    assert.equal(requests.at(-1).search, "edited");
+    assert.equal(requests.at(-1).period, "all");
+    assert.equal([...clock.timers.values()].filter(t => t.delay === 300).length, 0);
+    type("e"); clock.runTimer(300); await settleMountedView();
+    assert.equal(requests.at(-1).search, undefined);
+    assert.equal(requests.at(-1).grouping, "project");
+    type("queued"); view.destroy();
+    assert.equal(clock.timers.size, 0);
+  } finally { view.destroy(); }
+});
+
+test("live search fences old responses during debounce and waits for composed text", async () => {
+  const clock = mountedLeaseRoot(); const requests = []; const stale = deferred();
+  const view = mountWorkUsageView({ ...clock, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); requests.push({query, signal:init.signal});
+      return query.search === "old" ? stale.promise : httpResponse(PROJECT_ROWS_RESPONSE);
+    } });
+  try {
+    await settleMountedView();
+    const input = findMounted(clock.root, n => n.tagName === "INPUT")[0];
+    input.value = "old"; input.dispatchEvent({type:"input"}); clock.runTimer(300);
+    await settleMountedView();
+    input.value = "new"; input.dispatchEvent({type:"input"});
+    assert.equal(requests.at(-1).signal.aborted, true);
+    const staleReport = structuredClone(PROJECT_ROWS_RESPONSE); staleReport.snapshotId = "stale-report";
+    stale.resolve(httpResponse(staleReport)); await settleMountedView();
+    clock.runTimer(300); await settleMountedView();
+    assert.equal(requests.at(-1).query.search, "new");
+    assert.equal(requests.at(-1).query.snapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+    input.dispatchEvent({type:"compositionstart"});
+    input.value = "项目"; input.dispatchEvent({type:"input", isComposing:true});
+    assert.equal([...clock.timers.values()].filter(t => t.delay === 300).length, 0);
+    const before = requests.length;
+    findMounted(clock.root, n => n.tagName === "FORM")[0].dispatchEvent({type:"submit"});
+    assert.equal(requests.length, before);
+    input.dispatchEvent({type:"compositionend"}); clock.runTimer(300); await settleMountedView();
+    assert.equal(requests.at(-1).query.search, "项目");
+  } finally { view.destroy(); }
+});
+
+
+test("returning to an expired report keeps the exact query visible during bounded rebuild", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const pending = deferred();
+  let queries = 0;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      if (JSON.parse(init.body).action === "touch") return {
+        ok: false, status: 409, json: async () => ({ error: { code: "work_usage_snapshot_expired" } }),
+      };
+      return ++queries === 1 ? httpResponse(PROJECT_ROWS_RESPONSE) : pending.promise;
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = root.children.at(-1);
+  const table = findMounted(body, node => node.tagName === "TABLE")[0];
+  root.inert = true; harness.changed();
+  root.inert = false; harness.changed();
+  await settleMountedView();
+  assert.equal(queries, 2);
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true, "old snapshot drilldowns cannot be used during rebuild");
+  assert.strictEqual(findMounted(body, node => node.tagName === "TABLE")[0], table);
+  pending.resolve(httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: "replacement-report" }));
+  await settleMountedView();
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, false);
+});
+
+test("refresh failures retain exact-query values while changed filters and authoritative invalidation hide them", async (t) => {
+  const { root, windowRef } = mountedRoot();
+  let reply = httpResponse(PROJECT_ROWS_RESPONSE);
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async () => { if (reply instanceof Error) throw reply; return reply; },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = root.children.at(-1);
+  reply = new Error("temporary failure"); view.refresh();
+  await settleMountedView();
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.match(body.textContent, /Project A/);
+  const pending = deferred(); reply = pending.promise;
+  findMounted(root, node => node.dataset?.grouping === "thread")[0].click();
+  assert.equal(body.hidden, true, "thread grouping cannot display project rows as current results");
+  pending.resolve(httpResponse(PROJECT_ROWS_RESPONSE));
+  await settleMountedView();
+  reply = { ok: false, status: 409, json: async () => ({ error: { code: "work_usage_snapshot_changed" } }) };
+  view.refresh(); await settleMountedView();
+  assert.equal(body.hidden, true);
+  reply = new Error("still unavailable"); view.refresh(); await settleMountedView();
+  assert.equal(body.hidden, true, "invalidated source data cannot be resurrected on retry");
+});
+
+test("late invalidation from an older request cannot hide a newer query result", async (t) => {
+  const { root, windowRef } = mountedRoot();
+  const old = deferred(); let count = 0;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async () => ++count === 2 ? old.promise : httpResponse(PROJECT_ROWS_RESPONSE),
+  });
+  t.after(() => view.destroy());
+  await settleMountedView(); view.refresh(); view.refresh(); await settleMountedView();
+  old.resolve({ ok: false, status: 403, json: async () => ({}) });
+  await settleMountedView();
+  assert.equal(root.children.at(-1).hidden, false);
+  assert.equal(root.children.at(-1).inert, false);
+});
+
+
+test("cancelling revalidation preserves read-only values and fences its late response", async (t) => {
+  const { root, windowRef } = mountedRoot();
+  const pending = deferred(); let calls = 0;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async () => ++calls === 1 ? httpResponse(PROJECT_ROWS_RESPONSE) : pending.promise,
+  });
+  t.after(() => view.destroy());
+  await settleMountedView(); view.refresh();
+  const body = root.children.at(-1);
+  findMounted(root, node => node.tagName === "BUTTON" && node.textContent === "Cancel")[0].click();
+  await settleMountedView();
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  const previous = body.textContent;
+  pending.resolve(httpResponse({ ...PROJECT_ROWS_RESPONSE, rows: [], rowCount: 0 }));
+  await settleMountedView();
+  assert.equal(body.textContent, previous);
+  assert.match(root.textContent, /cancelled/i);
+});

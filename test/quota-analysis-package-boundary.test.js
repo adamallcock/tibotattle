@@ -6,7 +6,6 @@ import test from "node:test";
 import * as quotaAnalysis from "@app-usagemonitor/quota-analysis";
 
 const TRACK_EXPORTS = Object.freeze([
-  "QUOTA_TRACK_POLICY",
   "buildResetEvidence",
   "continuityKey",
   "resetKey",
@@ -15,34 +14,49 @@ const CALIBRATION_EXPORTS = Object.freeze([
   "QUOTA_CALIBRATION_POLICY",
   "analyzeQuotaCalibration",
   "fitResetCapacity",
-  "forecastCapacityFromPriorResets",
 ]);
 const ROLLING_EXPORTS = Object.freeze([
-  "QUOTA_ROLLING_POLICY",
   "buildRollingQuotaComparisons",
 ]);
 const PACE_EXPORTS = Object.freeze([
-  "QUOTA_PACE_POLICY",
   "analyzeQuotaPace",
 ]);
 const COMPOSITION_EXPORTS = Object.freeze([
   "MODEL_COMPOSITION_POLICY",
   "blendedCompositionCapacityUsd",
   "buildCompositionObservations",
+  "buildCompositionObservationsFromOrderedUsage",
   "calibrateCompositionCapacities",
   "compositionExpectedPp",
-  "solveNonNegativeLeastSquares",
+]);
+const PLAN_ATTRIBUTION_EXPORTS = Object.freeze([
+  "PLAN_ATTRIBUTION_POLICY",
+  "buildPlanAttributionIndex",
+  "classifyUsageAttribution",
+  "planAttributionContextKey",
+  "planAttributionObservationFromSnapshot",
+  "planEraForInterval",
 ]);
 const WINDOW_EXPORTS = Object.freeze([
+  "classifyQuotaWindowKind",
+  "CODEX_PRIMARY_LIMIT_ID",
+  "CODEX_SPARK_LIMIT_ID",
+  "CODEX_SPARK_LIMIT_IDS",
+  "CODEX_SPARK_RESERVED_LIMIT_ID",
   "FIVE_HOUR_WINDOW_MINUTES",
   "formatQuotaWindowDuration",
+  "isSparkQuotaLimitId",
   "MAX_QUOTA_WINDOW_DURATION_MINUTES",
+  "MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH",
+  "QUOTA_LIMIT_DISPLAY_ALIASES",
+  "QUOTA_WINDOW_KINDS",
+  "quotaLimitDisplayAlias",
   "quotaWindowLabel",
+  "sanitizeQuotaLimitDisplayName",
+  "sanitizeQuotaLimitId",
   "SEVEN_DAY_WINDOW_MINUTES",
-  "SUPPORTED_QUOTA_WINDOW_DURATIONS",
   "isValidQuotaWindowDuration",
   "isSupportedQuotaWindowDuration",
-  "selectPrimaryQuotaWindow",
 ]);
 const SOURCE_HASHES = Object.freeze({
   "quota-calibration.js":
@@ -55,7 +69,10 @@ const SOURCE_HASHES = Object.freeze({
     // this byte-identity receipt remained on the pre-correction digest.
     "d15a78931e10c8bccf82ea262f722ea84b5fd02d0cb3c9fd37b18dbd169fa3f0",
   "quota-windows.js":
-    "fbf4bdcfb8417efcc2cdf3d7e3e92f1302048e523d6722b06eb9c47b44861366",
+    // Re-pinned for the reviewed local-only quota display-name contract:
+    // bounded provider copy cannot affect identity, calibration, or export,
+    // and an invalid duration cannot inherit a known limit's display kind.
+    "a5bb5c759351892f101e0e69fe71f9391b4b22ed533d75f74ce41f6de71e9597",
   // Re-pinned with the slot-identity change: `slot` left TRACK_KEYS because
   // track compatibility is judged by (limit, duration) — the provider's
   // primary/secondary slots are UI roles that flipped for the weekly window
@@ -84,7 +101,11 @@ const SOURCE_HASHES = Object.freeze({
     // suppressing the whole per-model fit. The executable kernel changed in
     // b8f43f0 (#45) while this byte-identity receipt stayed on the
     // pre-correction digest.
-    "a948dbf22e813e7bb3042cd7715c8573ebe26934a17dfda54500df53d894b035",
+    // Re-pinned 2026-09-06 for the additive ordered-usage entrypoint and
+    // interval-union storage. Both entrypoints retain the existing fit and
+    // refusal semantics; package parity tests and the independent bounded
+    // legacy-Set oracle cover ordering, invalid rows, and gap boundaries.
+    "9f33f8f128ffda704cbf2ea587e11b0b801470bde229275f43890e8b166e86fd",
 });
 
 test("quota analysis exposes one exact runtime-neutral package root", async () => {
@@ -112,6 +133,7 @@ test("quota analysis exposes one exact runtime-neutral package root", async () =
       ...ROLLING_EXPORTS,
       ...PACE_EXPORTS,
       ...COMPOSITION_EXPORTS,
+      ...PLAN_ATTRIBUTION_EXPORTS,
       ...WINDOW_EXPORTS,
     ].sort(),
   );

@@ -3,6 +3,7 @@ import {
   apiPriceResolutionSummary,
   aggregateLocalApiPriceResults,
   costWarningCodes,
+  fastModeModelFamilyKey,
   priceCodexProviderToolUnits,
   priceCodexUsageEvent,
 } from "@app-usagemonitor/accounting";
@@ -32,6 +33,7 @@ export async function scanAndPriceCodexLogs({
   const priceResolution = apiPriceResolutionSummary({ priceCards });
   const totals = {};
   const byModel = {};
+  const speedWeightingByModel = {};
   const bySurface = {};
   const byDay = {};
   const usageBearingRollouts = new Set();
@@ -74,6 +76,13 @@ export async function scanAndPriceCodexLogs({
 
     const priced = priceCodexUsageEvent(event, { priceCards });
     const cost = Number(priced.totalUsd);
+    const family = fastModeModelFamilyKey(event.model, {
+      eventTime: event.timestamp, standardPriceCardIds: priced.selectedPriceCardIds,
+    });
+    const speedCrossing = speedWeightingByModel[event.model] ??= { unknown: {} };
+    const speedCell = speedCrossing.unknown[family] ??= { events: 0, apiPriceEquivalentUsd: 0 };
+    speedCell.events += 1;
+    speedCell.apiPriceEquivalentUsd += cost;
     tokenCostUsdExact = addUsdStrings(tokenCostUsdExact, priced.totalUsd);
     modelSummary.costUsd += cost;
     modelSummary.costUsdExact = addUsdStrings(modelSummary.costUsdExact, priced.totalUsd);
@@ -158,7 +167,9 @@ export async function scanAndPriceCodexLogs({
     onToolCall: onProviderToolObservation,
     excludeSessionIds,
   });
-  const tokenSubscriptionSpeedSensitivity = subscriptionSpeedSensitivity(byModel);
+  const tokenSubscriptionSpeedSensitivity = subscriptionSpeedSensitivity(byModel, "unknown", {
+    speedWeightingByModel,
+  });
   const providerToolPricedGroups = [...providerToolGroups.values()].map((group) => ({
     group,
     priced: priceCodexProviderToolUnits(group.serverBillableUnits, {

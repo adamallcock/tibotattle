@@ -17,6 +17,7 @@ import {
   translatePlural,
   translateLegacyText,
 } from "../apps/web/public/localization.js";
+import { CATALOGS } from "../packages/i18n/index.js";
 
 function placeholders(value) {
   return [...String(value).matchAll(/\{([A-Za-z][A-Za-z0-9_.-]*)\}/gu)]
@@ -203,6 +204,48 @@ test("browser catalogs preserve placeholders, plural forms, and legacy text has 
   assert.ok(pseudo.length > "Version {version} is available".length);
 });
 
+test("Electron settings references resolve through the canonical catalogs", async () => {
+  const [settingsHtml, settingsScript] = await Promise.all([
+    readFile(new URL("../apps/web/public/electron-settings.html", import.meta.url), "utf8"),
+    readFile(new URL("../apps/web/public/electron-settings.js", import.meta.url), "utf8"),
+  ]);
+  const references = new Set();
+  for (const [, key] of settingsHtml.matchAll(
+    /data-i18n(?:-(?:aria-label|title|placeholder))?="([^"]+)"/gu,
+  )) {
+    references.add(key);
+  }
+  for (const [, key] of settingsScript.matchAll(
+    /"(?:((?:electron|appearance|language)\.[A-Za-z0-9_.-]+))"/gu,
+  )) {
+    references.add(key);
+  }
+
+  const referencedKeys = [...references].sort();
+  assert.ok(
+    referencedKeys.some((key) => key.startsWith("electron.")),
+    "settings surface must exercise Electron semantic messages",
+  );
+  assert.ok(
+    referencedKeys.some((key) => key.startsWith("appearance.")),
+    "settings surface must exercise appearance semantic messages",
+  );
+  for (const key of referencedKeys) {
+    assert.equal(
+      Object.hasOwn(WEB_MESSAGES, key),
+      true,
+      "settings references a missing browser message " + key,
+    );
+    for (const [locale, catalog] of Object.entries(CATALOGS)) {
+      assert.equal(
+        typeof catalog[key],
+        "string",
+        locale + " canonical catalog contains " + key,
+      );
+    }
+  }
+});
+
 test("shipped static web copy has a complete translated inventory and localizable accessibility labels", async () => {
   const staticPages = ["index.html", "community.html"];
   const sourceFiles = await Promise.all(staticPages.map((file) => readFile(
@@ -230,9 +273,9 @@ test("shipped static web copy has a complete translated inventory and localizabl
         continue;
       }
       assert.equal(
-        Object.hasOwn(LEGACY_TEXT_CATALOG, text),
+        hasEnglishCatalogValue(text),
         true,
-        `${staticPages[index]} is missing a zh-Hans/es legacy translation for ${JSON.stringify(text)}`,
+        `${staticPages[index]} is missing a complete zh-Hans/es translation for ${JSON.stringify(text)}`,
       );
     }
 

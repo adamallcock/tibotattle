@@ -76,6 +76,7 @@ export async function deployWebRelease({
     confirmation,
     confirmedMigrations,
     expectedSourceCommit: verification.scope.sourceCommit,
+    expectedPreviousSourceCommit: verification.scope.baseCommit,
     workerDirectory,
     wrangler,
   });

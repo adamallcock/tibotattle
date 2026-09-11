@@ -2,7 +2,7 @@
 title: Side-chat accounting observability research
 date: 2026-08-16
 type: research
-status: completed
+status: complete
 ---
 
 # Side-chat accounting observability research

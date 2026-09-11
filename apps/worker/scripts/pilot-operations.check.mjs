@@ -31,7 +31,7 @@ import {
   runRemotePilotSql,
 } from "./pilot-operations-lib.mjs";
 import {
-  checkedInConfig,
+  unprovisionedConfig,
   provisionedConfig,
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
@@ -274,6 +274,7 @@ function fakeRemote({
         status: 0,
         stdout: JSON.stringify([
           { name: "ENVELOPE_PRIVATE_JWK", type: "secret_text" },
+          { name: "IDENTITY_LINK_SECRET", type: "secret_text" },
           ...(!missingRequiredSecrets
             ? [{ name: "ENVELOPE_PUBLIC_JWK", type: "secret_text" }]
             : []),
@@ -312,6 +313,10 @@ function fakeRemote({
           admission_counter: 1,
           quarantine_reconciliation: 1,
           lifecycle_status: 1,
+          attribution_objects: 1,
+          attribution_columns: 1,
+          scale_objects: 1,
+          scale_columns: 1,
           primary_cooldown_table: 1,
           primary_participant_cooldown_digest: 1,
           primary_cooldown_digest: 1,
@@ -421,7 +426,7 @@ function fakeRemote({
       },
       capabilities: {
         encryptedUpload: active,
-        delayedAggregateStats: false,
+        communityDaily: false,
         ongoingDeviceUploadRegistration: active,
       },
     };
@@ -566,7 +571,7 @@ test("local path and configured-resource gates fail before remote inspection", a
     const unprovisioned = await runRemoteInvitationOperation({
       action: "issue",
       confirmation: INVITATION_CONFIRMATIONS.issue,
-      config: checkedInConfig,
+      config: unprovisionedConfig(),
       invitationFile: join(root, "unprovisioned.secret"),
       receiptFile: join(root, "unprovisioned.receipt.json"),
       origin: STAGING_ORIGIN,
@@ -1303,7 +1308,7 @@ test("inspection rejects D1 and live-runtime control disagreement", async () => 
         },
         capabilities: {
           encryptedUpload: false,
-          delayedAggregateStats: false,
+          communityDaily: false,
           ongoingDeviceUploadRegistration: false,
         },
       });

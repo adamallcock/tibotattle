@@ -19,6 +19,7 @@ const EXPECTED_EXPORTS = Object.freeze([
   "KEYTAR_DARWIN_ARM64_SHA256",
   "KEYTAR_SIGNING_CODE_IDENTIFIER",
   "KEYTAR_SIGNING_TEAM_IDENTIFIER",
+  "MACOS_APP_KEYCHAIN_CAPABILITIES",
   "contributionDeviceDurableAddArguments",
   "contributionDeviceReaderRequirement",
   "contributionDeviceReaderRequirementVerificationArguments",
@@ -26,6 +27,7 @@ const EXPECTED_EXPORTS = Object.freeze([
   "deleteExportIdentityKeychainItemByAttributes",
   "exportIdentityKeychainAttributeDeleteArguments",
   "exportIdentityKeychainAttributeProbeArguments",
+  "exportIdentityKeychainCapabilitiesForEnvironment",
   "exportIdentityKeychainItemPresenceByAttributes",
   "keytarSignedBindingRequirement",
   "keytarSignedBindingVerificationArguments",
@@ -40,7 +42,7 @@ test("legacy Keychain exports are exact identities of the platform owner", () =>
   }
 });
 
-test("the legacy path is implementation-free and macOS packaging follows the platform owner", async () => {
+test("the legacy path is implementation-free and macOS packaging excludes keytar", async () => {
   const legacySource = await readFile(
     resolve(REPOSITORY_ROOT, "src/export-identity-keychain.js"),
     "utf8",
@@ -58,12 +60,43 @@ test("the legacy path is implementation-free and macOS packaging follows the pla
     resolve(REPOSITORY_ROOT, "scripts/build-macos-app.js"),
     "utf8",
   );
-  assert.match(
-    buildSource,
-    /"src\/platform\/export-identity-keychain\.js": "@github\/keytar"/u,
-  );
   assert.doesNotMatch(
     buildSource,
-    /"src\/export-identity-keychain\.js": "@github\/keytar"/u,
+    /DYNAMIC_EXTERNAL_BY_FILE|"@github\/keytar": "7\.10\.6"/u,
+  );
+  const currentNormalizationStart = buildSource.indexOf(
+    "const NORMALIZED_MACH_O_PATHS",
+  );
+  const retiredCompatibilityStart = buildSource.indexOf(
+    "const RETIRED_PREVIEW_NORMALIZED_MACH_O_PATHS",
+  );
+  const noCompatibilityStart = buildSource.indexOf(
+    "const NO_COMPATIBILITY_NORMALIZED_MACH_O_PATHS",
+  );
+  assert.notEqual(currentNormalizationStart, -1);
+  assert.notEqual(retiredCompatibilityStart, -1);
+  assert.notEqual(noCompatibilityStart, -1);
+  assert.ok(retiredCompatibilityStart > currentNormalizationStart);
+  assert.ok(noCompatibilityStart > retiredCompatibilityStart);
+  const currentNormalizationSource = buildSource.slice(
+    currentNormalizationStart,
+    retiredCompatibilityStart,
+  );
+  assert.doesNotMatch(currentNormalizationSource, /@github\/keytar|keytar\.node/u);
+  const retiredCompatibilitySource = buildSource.slice(
+    retiredCompatibilityStart,
+    noCompatibilityStart,
+  );
+  assert.match(
+    retiredCompatibilitySource,
+    /Contents\/Resources\/app\/node_modules\/@github\/keytar\/prebuilds\/darwin-arm64\/keytar\.node/u,
+  );
+  assert.equal(buildSource.match(/keytar\.node/gu)?.length, 1);
+  assert.doesNotMatch(
+    buildSource.slice(
+      buildSource.indexOf("const EXPECTED_EXTERNAL_SPECIFIERS"),
+      buildSource.indexOf("const WORKSPACE_RUNTIME_PACKAGE_EXTERNALS"),
+    ),
+    /@github\/keytar/u,
   );
 });

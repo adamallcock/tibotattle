@@ -2,18 +2,22 @@ import {
   TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
   telemetryV1RequiredConsent,
 } from "../contribution/telemetry-v1-chunks.js";
+import {
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  telemetryV11RequiredConsent,
+} from "@app-usagemonitor/telemetry-contract";
 
 // The incremental full-history sync controller: consent-once, then sync
-// passes run on the automatic-contribution cadence (6 hours with bounded
+// passes run on a six-hour cadence with bounded
 // dither — daily-or-finer by construction) without further user action. A
 // pass that leaves work pending reschedules within a minute; an exhausted
 // chunk-admission budget backs off to the service's next window; a device
 // the service no longer recognises pauses the schedule exactly as the v0.1
 // queue pauses, until the device is paired again.
 //
-// This is additive beside the v0.1 prepared-set scheduler, not a change to
-// it: the v0.1 consent record, settings schema and recurrence policy are
-// untouched, and the two consents are independent by design.
+// The legacy prepared-set scheduler is retired. Its settings are replaced by
+// a content-free downgrade tombstone before this controller can start; this
+// v1 consent and schedule are the sole automatic contribution authority.
 
 export const INCREMENTAL_CONTRIBUTION_SETTINGS_SCHEMA_VERSION =
   "incremental-contribution-sync-settings-v1.0";
@@ -75,6 +79,8 @@ const OUTCOME_STATUSES = new Set(["succeeded", "partial", "failed", "paused"]);
 // one anonymous collision inflated the gap toward an hour).
 const COORDINATION_RETRY_CODES = new Set(["sync_in_progress", "index_busy"]);
 const PAUSED_REASONS = new Set([
+  "device_disconnected",
+  "device_repair_required",
   "device_unavailable",
   "consent_rejected",
   "authorization_rejected",
@@ -87,6 +93,7 @@ const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 
 const ERROR_CODES = new Set([
   "configuration_invalid",
+  "device_repair_required",
   "settings_unavailable",
   "not_configured",
   "consent_unavailable",
@@ -160,8 +167,12 @@ function normalizedDestinationOrigin(value) {
 
 export function incrementalContributionRequiredConsent({
   destinationOrigin = null,
+  telemetrySchemaVersion = TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
 } = {}) {
-  const required = telemetryV1RequiredConsent();
+  if (![TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION]
+    .includes(telemetrySchemaVersion)) fail("configuration_invalid");
+  const required = telemetrySchemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+    ? telemetryV11RequiredConsent() : telemetryV1RequiredConsent();
   return Object.freeze({
     ...required,
     destinationOrigin: normalizedDestinationOrigin(destinationOrigin),
@@ -290,6 +301,10 @@ class IncrementalContributionSyncController {
   // later start() call must never defeat a ladder a live process is walking.
   #startupClampConsidered = false;
   #settingsAvailable = true;
+  // Only a failed write of this controller's known-good delivery pause may
+  // be retried in place. An unreadable settings file must never be replaced
+  // with the initial settings and lose its consent or history.
+  #devicePausePendingReason = null;
   #started = false;
   #timer = null;
   #running = false;
@@ -357,7 +372,14 @@ class IncrementalContributionSyncController {
 
   #consentCurrent() {
     return this.#destinationOrigin !== null
-      && sameRequiredConsent(this.#settings.consent, this.#requiredConsent);
+      && sameRequiredConsent(this.#settings.consent, this.#selectedRequiredConsent());
+  }
+
+  #selectedRequiredConsent() {
+    return this.#settings.consent?.telemetrySchemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      ? incrementalContributionRequiredConsent({ destinationOrigin: this.#destinationOrigin,
+        telemetrySchemaVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION })
+      : this.#requiredConsent;
   }
 
   #retryDelayMilliseconds(retryAfterMilliseconds) {
@@ -526,6 +548,41 @@ class IncrementalContributionSyncController {
     return this.#serialize(async () => this.#project());
   }
 
+  async pauseForDeviceDisconnect() {
+    return this.#pauseForDeviceOperation("device_disconnected");
+  }
+
+  // Persist BEFORE any credential rotation. An uncertain remote commit or
+  // local CAS failure must survive restart without retrying the old bearer.
+  async pauseForDeviceRepair() {
+    return this.#pauseForDeviceOperation("device_repair_required");
+  }
+
+  async #pauseForDeviceOperation(reason) {
+    if (!this.#initialized) await this.initialize();
+    return this.#serialize(async () => {
+      if (this.#settings.pausedReason === "device_repair_required"
+          && reason !== "device_repair_required") fail("device_repair_required");
+      this.#generation += 1;
+      this.#clearScheduledTimer();
+      this.#runAbortController?.abort();
+      if (!this.#settingsAvailable && this.#devicePausePendingReason !== reason) {
+        fail("settings_unavailable");
+      }
+      // This is user intent, not an auto-healable missing credential. Keep
+      // consent and every measured outcome/progress field intact; only an
+      // explicit approval or resume may arm delivery again.
+      this.#settings.paused = true;
+      this.#settings.pausedReason = reason;
+      this.#settings.nextAttemptAt = null;
+      this.#devicePausePendingReason = reason;
+      await this.#persist();
+      this.#settingsAvailable = true;
+      this.#devicePausePendingReason = null;
+      return this.#project();
+    });
+  }
+
   /**
    * The consent-once approval. Records the required v1.0 identifiers with
    * the moment of approval and starts the schedule immediately: after this,
@@ -543,17 +600,32 @@ class IncrementalContributionSyncController {
    * device_unavailable pause one minute later, so the repair path that keys
    * on that pause never becomes unreachable.
    */
-  async approve({ awaitingDevicePairing = false } = {}) {
+  async approve({ awaitingDevicePairing = false, consent = null } = {}) {
     if (!this.#initialized) await this.initialize();
     return this.#serialize(async () => {
       if (this.#destinationOrigin === null) fail("not_configured");
       if (!this.#settingsAvailable) fail("settings_unavailable");
+      if (this.#settings.pausedReason === "device_repair_required") fail("device_repair_required");
+      const required = consent === null ? this.#requiredConsent : incrementalContributionRequiredConsent({
+        destinationOrigin: this.#destinationOrigin, telemetrySchemaVersion: consent.telemetrySchemaVersion,
+      });
+      if (consent !== null && (!exactKeys(consent, CONSENT_KEYS.filter((key) => key !== "consentedAt"))
+          || !sameRequiredConsent(consent, required))) fail("consent_unavailable");
+      if (this.#settings.consent?.telemetrySchemaVersion !== required.telemetrySchemaVersion) {
+        // A v1 receipt is not evidence that v1.1 has activated. Fence an old
+        // in-flight run and reset only its projection, never retained data.
+        this.#generation += 1;
+        this.#runAbortController?.abort();
+        this.#settings.progress = null;
+        this.#settings.lastAttemptAt = null;
+        this.#settings.lastOutcome = null;
+      }
       this.#settings.consent = {
         consentedAt: this.#nowIso(),
-        destinationOrigin: this.#requiredConsent.destinationOrigin,
-        telemetrySchemaVersion: this.#requiredConsent.telemetrySchemaVersion,
-        fieldDictionaryVersion: this.#requiredConsent.fieldDictionaryVersion,
-        privacyContractVersion: this.#requiredConsent.privacyContractVersion,
+        destinationOrigin: required.destinationOrigin,
+        telemetrySchemaVersion: required.telemetrySchemaVersion,
+        fieldDictionaryVersion: required.fieldDictionaryVersion,
+        privacyContractVersion: required.privacyContractVersion,
       };
       this.#settings.paused = false;
       this.#settings.pausedReason = null;
@@ -585,9 +657,21 @@ class IncrementalContributionSyncController {
    * the schedule gate still requires current consent before anything runs.
    */
   async resume() {
+    return this.#resume(false);
+  }
+
+  // Composition-only completion port: call only after a validated remote
+  // pairing/rotation receipt AND the local credential compare-and-swap.
+  async resumeAfterDeviceRepair() {
+    return this.#resume(true);
+  }
+
+  async #resume(deviceRepairCompleted) {
     if (!this.#initialized) await this.initialize();
     return this.#serialize(async () => {
       if (!this.#settingsAvailable) fail("settings_unavailable");
+      if (this.#settings.pausedReason === "device_repair_required"
+          && !deviceRepairCompleted) fail("device_repair_required");
       if (!this.#settings.paused) {
         if (this.#consentCurrent() && this.#settings.nextAttemptAt !== null) {
           this.#settings.retryCount = 0;
@@ -641,21 +725,39 @@ class IncrementalContributionSyncController {
         this.#schedule();
         return null;
       }
+      const claim = {
+        generation: this.#generation,
+        abortController: new AbortController(),
+        consent: Object.freeze({ ...this.#selectedRequiredConsent() }),
+      };
       this.#running = true;
+      this.#runAbortController = claim.abortController;
       this.#clearScheduledTimer();
       this.#settings.lastAttemptAt = this.#nowIso();
       try {
         await this.#persist();
       } catch (error) {
         this.#running = false;
+        this.#runAbortController = null;
         throw error;
       }
-      return { generation: this.#generation };
+      return claim;
     });
     if (claim === null) return this.inspect();
 
-    const abortController = new AbortController();
-    this.#runAbortController = abortController;
+    const { abortController } = claim;
+    // A disconnect can serialize immediately after the claim, before the
+    // runner is entered. Its abort authority must already exist at claim time.
+    if (abortController.signal.aborted) {
+      return this.#serialize(async () => {
+        this.#running = false;
+        if (this.#runAbortController === abortController) {
+          this.#runAbortController = null;
+        }
+        this.#schedule();
+        return this.#project();
+      });
+    }
     let timedOut = false;
     let timeout = null;
     // The pass deadline is a hard watchdog, not merely a cooperative abort. A
@@ -683,7 +785,7 @@ class IncrementalContributionSyncController {
       try {
         return {
           kind: "outcome",
-          value: await this.#runner({ signal: abortController.signal }),
+          value: await this.#runner({ signal: abortController.signal, consent: claim.consent }),
         };
       } catch (error) {
         return { kind: "error", value: error };
@@ -862,7 +964,7 @@ class IncrementalContributionSyncController {
     const consent = this.#settings.consent;
     return Object.freeze({
       schemaVersion: INCREMENTAL_CONTRIBUTION_STATUS_SCHEMA_VERSION,
-      contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+      contractVersion: this.#selectedRequiredConsent().telemetrySchemaVersion,
       configured: this.#destinationOrigin !== null,
       settingsAvailable: this.#settingsAvailable,
       consent: Object.freeze({

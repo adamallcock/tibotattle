@@ -303,12 +303,52 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 78: scripts/generate-social-preview.js entered with the 0.1.15
-  // social-card generation (98fe9c9) but was never inventoried — the sixth
-  // instance of the merged-change-with-stale-pin class this week.
-  assert.equal(result.records, 78);
-  assert.equal(result.candidates.length, 80);
+  // 156 records / 157 executable paths: release-documentation, Codex contract,
+  // documentation governance, repository-layout, macOS bundle-version, and
+  // local index-recovery gates are reviewed repository operations invoked by
+  // CI, release runbooks, or supported internal product tooling.
+  // Keep these exact so any future executable still requires an ownership
+  // decision.
+  // Includes the restored Electron development packaging/verifier tools, the
+  // normal Linux and Windows package proofs, macOS page-parity QA, and the
+  // protected handover-feed publisher (which defaults to a local dry run), and
+  // the native-to-Electron collector reconciliation tool (which defaults to
+  // private-copy inspection).
+  // Includes the reviewed exact-output accounting child benchmark and eight
+  // protected PR94 qualification entrypoints/helpers; neither is a product API.
+  // Also includes the bounded Windows signing preflight/caller, the pinned
+  // Linux AppImage updater adapter proof, Windows native rebinding, the
+  // read-only release doctor, private release helpers,
+  // publication reconciliation, admission reuse, and the main-branch
+  // purchased-credit drawdown analyzer. The five retained 0.1.21 release tools
+  // cover incoming Sparkle validation, three disposable Mac replacement/update
+  // journeys, and qualification of an already signed Windows installer.
+  assert.equal(result.records, 156);
+  assert.equal(result.candidates.length, 157);
   assert.ok(result.aliases >= 25);
+});
+
+test("the eight PR94 qualifier paths retain explicit ownership without product command aliases", async () => {
+  const inventory = JSON.parse(await readFile(join(REPOSITORY_ROOT, "tools/tool-inventory.json"), "utf8"));
+  const records = inventory.records.filter(({ canonicalPath }) => canonicalPath.includes("pr94"));
+  assert.deepEqual(records.map(({ canonicalPath }) => canonicalPath).sort(), [
+    "scripts/lib/pr94-analysis-worker.mjs",
+    "scripts/lib/pr94-calibration-evidence.mjs",
+    "scripts/lib/pr94-ledger-evidence.mjs",
+    "scripts/lib/pr94-population-evidence.mjs",
+    "scripts/lib/pr94-production-resource-worker.mjs",
+    "scripts/lib/pr94-receipt-validation.mjs",
+    "scripts/lib/pr94-revision-loader.mjs",
+    "scripts/qualify-pr94-attribution.mjs",
+  ]);
+  for (const record of records) {
+    assert.equal(record.classification, "reusable_benchmark");
+    assert.equal(record.owner, "local_analysis");
+    assert.equal(record.stableAlias, null);
+    assert.deepEqual(record.additionalAliases, []);
+    assert.equal(record.provenance, "docs/plans/2026-09-03-public-0.1.17-release.md");
+    assert.ok(record.callers.some((path) => path.startsWith("test/pr94-")));
+  }
 });
 
 test("the inventory names every static ESM caller of a classified tool", async () => {
@@ -444,7 +484,7 @@ test("the inventory checker fails closed for every required ownership condition"
   }
 });
 
-test("docs-link aliases target the canonical tool and the legacy shim is behavior-identical", async () => {
+test("the docs fixer alias targets its canonical tool and the legacy shim is behavior-identical", async () => {
   const packageManifest = JSON.parse(
     await readFile(join(REPOSITORY_ROOT, "package.json"), "utf8"),
   );
@@ -452,11 +492,6 @@ test("docs-link aliases target the canonical tool and the legacy shim is behavio
     packageManifest.scripts["docs:links:fix"],
     "node ./tools/operations/fix-doc-links.mjs",
   );
-  assert.equal(
-    packageManifest.scripts["docs:links:check"],
-    "node ./tools/operations/fix-doc-links.mjs --check",
-  );
-
   const canonicalRoot = await mkdtemp(
     join(tmpdir(), "usage-monitor-doc-links-canonical-"),
   );

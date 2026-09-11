@@ -15,6 +15,7 @@ import {
   ARCHITECTURE_BOUNDARY_CATEGORIES,
   CURRENT_ARCHITECTURE_BOUNDARY_BASELINE,
   RETIRED_PRODUCTION_SOURCE_PATHS,
+  RETIRED_PRODUCTION_TREE_PATHS,
   checkArchitectureBoundaries,
   formatArchitectureBoundaryReport,
 } from "../scripts/check-architecture-boundaries.mjs";
@@ -426,6 +427,102 @@ test("rejects CommonJS production modules instead of missing literal, computed, 
   );
 });
 
+test("allows only the exact sandboxed Electron preload shape", async () => {
+  const exactPreloadSource = [
+    'const { contextBridge, ipcRenderer } = require("electron");',
+    "contextBridge.exposeInMainWorld('bounded', { invoke: () => ipcRenderer.invoke('fixed') });",
+    "",
+  ].join("\n");
+  await withFixtureTree(
+    { "apps/electron/preload.cjs": exactPreloadSource },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({
+        baseline: [],
+        rootDirectory,
+      });
+      assert.equal(result.ok, true, formatArchitectureBoundaryReport(result));
+    },
+  );
+  await withFixtureTree(
+    { "apps/electron/tray-popover-preload.cjs": exactPreloadSource },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({
+        baseline: [],
+        rootDirectory,
+      });
+      assert.equal(result.ok, true, formatArchitectureBoundaryReport(result));
+    },
+  );
+
+  await withFixtureTree(
+    {
+      "apps/electron/not-a-preload.cjs":
+        'const { contextBridge, ipcRenderer } = require("electron");',
+    },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({
+        baseline: [],
+        rootDirectory,
+      });
+      assert.deepEqual(
+        result.violations.map(({ category, importer }) => ({ category, importer })),
+        [{
+          category: "commonjs_production_source",
+          importer: "apps/electron/not-a-preload.cjs",
+        }],
+      );
+    },
+  );
+
+  for (const unsafeSource of [
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'import "./extra-static.js";',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const extra = import("./extra-dynamic.js");',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      "const extra = import(runtimePath);",
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const { createRequire } = require("node:module");',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const fs = require("node:fs");',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const target = "node:fs"; const fs = require(target);',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const load = require; load("node:fs");',
+    ].join("\n"),
+  ]) {
+    await withFixtureTree(
+      { "apps/electron/preload.cjs": unsafeSource },
+      async (rootDirectory) => {
+        const result = await checkArchitectureBoundaries({
+          baseline: [],
+          rootDirectory,
+        });
+        assert.deepEqual(
+          result.violations.map(({ category, importer }) => ({ category, importer })),
+          [{
+            category: "commonjs_production_source",
+            importer: "apps/electron/preload.cjs",
+          }],
+        );
+      },
+    );
+  }
+});
+
 test("rejects ESM CommonJS loaders before they can hide cross-app dependencies", async () => {
   await withFixtureTree(
     {
@@ -740,6 +837,66 @@ test("imports into retired paths fail even after the target has been removed", a
           category: "retired_production_source_path",
           importer: "src/client.js",
           target: "shared/quota-rolling.js",
+        }],
+      );
+    },
+  );
+});
+
+test("retired production trees reject every descendant path", async () => {
+  await withFixtureTree(
+    {
+      "apps/cloud-run/src/reintroduced-under-a-new-name.js":
+        "export const retired = true;",
+    },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({
+        baseline: [],
+        rootDirectory,
+      });
+
+      assert.equal(result.ok, false);
+      assert.deepEqual(
+        result.violations.map(({ category, importer, target }) => ({
+          category,
+          importer,
+          target,
+        })),
+        [{
+          category: "retired_production_source_path",
+          importer: "apps/cloud-run",
+          target: "apps/cloud-run",
+        }],
+      );
+    },
+  );
+});
+
+test("imports into a retired production tree fail while it is absent", async () => {
+  await withFixtureTree(
+    {
+      "src/client.js": [
+        'import { retired } from "../apps/cloud-run/src/server.js";',
+        "export { retired };",
+      ].join("\n"),
+    },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({
+        baseline: [],
+        rootDirectory,
+      });
+
+      assert.equal(result.ok, false);
+      assert.deepEqual(
+        result.violations.map(({ category, importer, target }) => ({
+          category,
+          importer,
+          target,
+        })),
+        [{
+          category: "retired_production_source_path",
+          importer: "src/client.js",
+          target: "apps/cloud-run",
         }],
       );
     },
@@ -1184,11 +1341,9 @@ test("cycles wholly inside local-review are structural failures", async () => {
   );
 });
 
-test("local, Worker, and Cloud Run apps may use only their reviewed package roots", async () => {
+test("local and Worker apps may use only their reviewed package roots", async () => {
   await withFixtureTree(
     {
-      "apps/cloud-run/src/server.js":
-        'import "@fixture/telemetry-contract";',
       "apps/local/server.js": [
         'import "@fixture/accounting";',
         'import "@fixture/quota-analysis";',
@@ -1243,11 +1398,6 @@ test("local, Worker, and Cloud Run apps may use only their reviewed package root
 
 for (const fixture of [
   {
-    app: "cloud-run",
-    packageDirectory: "accounting",
-    packageName: "@fixture/accounting",
-  },
-  {
     app: "macos",
     packageDirectory: "telemetry-contract",
     packageName: "@fixture/telemetry-contract",
@@ -1257,11 +1407,17 @@ for (const fixture of [
     packageDirectory: "accounting",
     packageName: "@fixture/accounting",
   },
+  {
+    app: "local-review",
+    packageDirectory: "identity-core",
+    packageName: "@fixture/identity-core",
+    source: "local-review/cli.js",
+  },
 ]) {
   test(`rejects an unapproved package root from the ${fixture.app} app`, async () => {
     await withFixtureTree(
       {
-        [`apps/${fixture.app}/src/index.js`]:
+        [fixture.source ?? `apps/${fixture.app}/src/index.js`]:
           `import "${fixture.packageName}";`,
         [`packages/${fixture.packageDirectory}/index.js`]:
           "export const dependency = true;",
@@ -1286,30 +1442,28 @@ for (const fixture of [
   });
 }
 
-for (const app of ["cloud-run", "macos"]) {
-  test(`rejects ${app} imports into an owned root source area`, async () => {
-    await withFixtureTree(
-      {
-        [`apps/${app}/src/index.js`]:
-          'import "../../../src/application/index.js";',
-        "src/application/index.js":
-          "export const application = true;",
-      },
-      async (rootDirectory) => {
-        const result = await checkArchitectureBoundaries({
-          baseline: [],
-          rootDirectory,
-        });
+test("rejects macos imports into an owned root source area", async () => {
+  await withFixtureTree(
+    {
+      "apps/macos/src/index.js":
+        'import "../../../src/application/index.js";',
+      "src/application/index.js":
+        "export const application = true;",
+    },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({
+        baseline: [],
+        rootDirectory,
+      });
 
-        assert.equal(result.ok, false);
-        assert.deepEqual(
-          result.violations.map(({ category }) => category),
-          ["source_owner_dependency_direction"],
-        );
-      },
-    );
-  });
-}
+      assert.equal(result.ok, false);
+      assert.deepEqual(
+        result.violations.map(({ category }) => category),
+        ["source_owner_dependency_direction"],
+      );
+    },
+  );
+});
 
 test("permits every reviewed source-owner dependency row through exact public facades", async () => {
   await withFixtureTree(
@@ -1727,12 +1881,34 @@ test("the retired source ledger remains exact and normalized", () => {
     "shared/quota-calibration.js",
     "shared/quota-rolling.js",
     "shared/quota-tracks.js",
+    "src/application/local-automatic-contribution.js",
+    "src/automatic-contribution.js",
+    "src/claude-desktop-quota-refresh.js",
+    "src/claude-desktop-quota-state.js",
+    "src/codex-log-scan.js",
+    "src/contribution/recurrence-policy.js",
+    "src/contribution-sync-queue.js",
     "src/cost-ledger.js",
+    "src/export-checkpoint-state.js",
+    "src/export-deletion-compatibility-internal.js",
+    "src/export-deletion-schema.js",
     "src/export-registries.js",
+    "src/export-safe-records.js",
+    "src/export-set-materializer.js",
+    "src/export-source-pipeline-compatibility-internal.js",
     "src/export-versions.js",
+    "src/export-workspace-compatibility-internal.js",
+    "src/export-workspace-discard-compatibility-internal.js",
+    "src/export-workspace-lock-compatibility-internal.js",
+    "src/export-workspace-lock.js",
+    "src/export-workspace.js",
     "src/local-api-pricing.js",
+    "src/metadata-exporter.js",
     "src/price-registry.js",
     "src/tier-semantics.js",
+  ]);
+  assert.deepEqual(RETIRED_PRODUCTION_TREE_PATHS, [
+    "apps/cloud-run",
   ]);
 });
 

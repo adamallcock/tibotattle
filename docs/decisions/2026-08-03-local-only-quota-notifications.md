@@ -2,7 +2,7 @@
 title: TiboTattle local-only quota notifications
 date: 2026-08-03
 type: decision-record
-status: implemented-foundation
+status: complete
 ---
 
 # TiboTattle local-only quota notifications

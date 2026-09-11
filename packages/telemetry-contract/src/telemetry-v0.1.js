@@ -1,3 +1,5 @@
+import { REVIEWED_CODEX_MODEL_IDS, REVIEWED_CLAUDE_MODEL_IDS } from "./model-catalog.js";
+
 import {
   MAX_TELEMETRY_BROWSER_BYTES,
   TELEMETRY_MODEL_IDS,
@@ -23,16 +25,8 @@ import {
 } from "./primitives.js";
 
 const MODEL_IDS = new Set(TELEMETRY_MODEL_IDS);
-const OPENAI_MODELS = new Set(
-  TELEMETRY_MODEL_IDS.filter((value) => (
-    value === "unknown" || value.startsWith("gpt-")
-  )),
-);
-const CLAUDE_MODELS = new Set(
-  TELEMETRY_MODEL_IDS.filter((value) => (
-    value === "unknown" || value.startsWith("claude-")
-  )),
-);
+const OPENAI_MODELS = new Set(["unknown", ...REVIEWED_CODEX_MODEL_IDS]);
+const CLAUDE_MODELS = new Set(["unknown", ...REVIEWED_CLAUDE_MODEL_IDS]);
 const ACTIVITY_SURFACES = new Set([
   "chatgpt_chat",
   "chatgpt_web",

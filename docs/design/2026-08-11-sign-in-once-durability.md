@@ -1,7 +1,16 @@
-# Design: sign in once, stay signed in — credential durability
+---
+title: Sign in once, stay signed in credential durability
+date: 2026-08-11
+type: design
+status: complete
+---
 
-Date: 2026-08-11. Status: owner-approved (all three parts), pending the
-in-flight structural sign-in ceremony fix landing first.
+# Sign in once, stay signed in — credential durability
+
+The durable Keychain broker, device-credential renewal route, local renewal
+controller, and persistent WebKit store are implemented. A real signed update
+remains an artifact-level release gate; source implementation alone does not
+prove cross-version Keychain continuity on an installed Mac.
 
 ## Problem
 

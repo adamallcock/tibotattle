@@ -74,6 +74,7 @@ const CODEX_FILESYSTEM_FUNCTION_KEYS = Object.freeze([
   "defaultCodexHome",
   "joinPath",
   "currentUid",
+  "readSelectedRolloutNames",
   "openDirectory",
   "statPath",
   "lstatPath",
@@ -134,7 +135,8 @@ function snapshotCodexLogPorts(codexLogPorts, isProxy) {
     ),
     lineReader: snapshotCallableOwner(
       descriptors.lineReader.value,
-      ["readBoundedUtf8Lines"],
+      ["readBoundedUtf8Lines", "compressedRolloutHandle", "inspectCompressedRollout",
+        "readCompressedRolloutBytes", "supportsCompressedRollouts"],
       isProxy,
     ),
   });
@@ -314,6 +316,7 @@ export function createLocalExportSourcePipelineContext(proxyDetector, sourcePort
   });
   const sourcePlanBundle = createSourcePlanBundleContext({
     ...runtimeSourcePorts,
+    isProxy,
     claudeStatusExport,
     claudeStatusWorkspace,
     claudeTranscriptExport,

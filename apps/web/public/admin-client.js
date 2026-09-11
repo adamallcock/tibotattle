@@ -1,5 +1,38 @@
+import {
+  ADMIN_MODEL_CONFIG,
+  expandAdminModelHistoryDay,
+} from "./telemetry-shared.generated.js";
+
 const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
+const ADMIN_RECONSTRUCTION_SCHEMA_VERSION = "admin-reconstruction-progress-v0.1";
+const ADMIN_RECONSTRUCTION_STATUSES = new Set(["available", "unavailable"]);
+const ADMIN_RECONSTRUCTION_MODES = new Set([
+  "resumable", "synchronous", "paused", "unknown",
+]);
+const ADMIN_RECONSTRUCTION_PUBLICATION_STATES = new Set([
+  "updating", "ready", "unknown",
+]);
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
+const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
+  "admin-community-allowance-preview-v0.3";
+const ADMIN_ALLOWANCE_PREVIEW_BASIS =
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
+const ADMIN_ALLOWANCE_PREVIEW_DAYS = 70;
+const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.2";
+const ADMIN_METRICS_HISTORY_MAX_DAYS = 30;
+const ADMIN_METRICS_HISTORY_MAX_SNAPSHOTS = 400;
+const ADMIN_METRICS_HISTORY_MAX_GAUGES = 128;
+const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
+  Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
+  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
+  Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+]);
+const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;
+const ADMIN_ALLOWANCE_MODELS_BASIS =
+  "seven_day_codex_pro20x_equivalent_per_model_composition";
+const ADMIN_ALLOWANCE_MODELS_GATE =
+  "shared_composition_kernel_identification";
+const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const ADMIN_ACTIONS = new Set([
   "set_collection_controls",
   "run_maintenance",
@@ -24,12 +57,75 @@ const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,79}$/u;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 export class AdminResponseError extends Error {
-  constructor(code, requestId = null) {
+  constructor(code, requestId = null, httpStatus = null) {
     super(code);
     this.name = "AdminResponseError";
     this.code = code;
     this.requestId = requestId;
+    this.httpStatus = Number.isSafeInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599
+      ? httpStatus : null;
   }
+}
+
+/** One bounded read per resource. Invalidating a lane fences even a fetch or
+ * body reader that ignores abort, so a revoked page cannot be repopulated by
+ * an older in-flight response. Mutating actions do not use this retry lane. */
+export function createAdminReadLane({
+  read, publish, failed, timeoutMs = 15_000,
+  schedule = globalThis.setTimeout, cancel = globalThis.clearTimeout,
+}) {
+  let active = null;
+  return {
+    run() {
+      if (active !== null) return active.promise;
+      const operation = { controller: new AbortController(), promise: null, timer: null };
+      active = operation;
+      const cancelled = new Promise((_, reject) => {
+        operation.controller.signal.addEventListener("abort", () => {
+          reject(new AdminResponseError("ADMIN_READ_CANCELLED"));
+        }, { once: true });
+      });
+      const timedOut = new Promise((_, reject) => {
+        operation.timer = schedule(() => {
+          reject(new AdminResponseError("ADMIN_READ_TIMEOUT"));
+          operation.controller.abort();
+        }, timeoutMs);
+      });
+      operation.promise = Promise.race([
+        Promise.resolve().then(() => read({ signal: operation.controller.signal })),
+        timedOut, cancelled,
+      ]).then(value => {
+        if (active === operation) publish(value);
+      }, error => {
+        if (active === operation) failed(error);
+      }).finally(() => {
+        cancel(operation.timer);
+        if (active === operation) active = null;
+      });
+      return operation.promise;
+    },
+    invalidate() {
+      const operation = active;
+      active = null;
+      if (operation !== null) {
+        cancel(operation.timer);
+        operation.controller.abort();
+      }
+    },
+  };
+}
+
+export function isTransientAdminReadError(error) {
+  if (!(error instanceof AdminResponseError)) return false;
+  if (error.httpStatus === null) return [
+    "ADMIN_NETWORK_ERROR", "ADMIN_READ_TIMEOUT", "ADMIN_RESPONSE_INVALID",
+  ].includes(error.code);
+  // An absent/invalid cache is authoritative, unlike an unsuccessful read.
+  return error.httpStatus >= 500 && error.httpStatus <= 599 && [
+    "INTERNAL_ERROR", "BACKEND_STORAGE_UNAVAILABLE",
+    "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE", "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE",
+    `HTTP_${error.httpStatus}`,
+  ].includes(error.code);
 }
 
 function invalid(code) {
@@ -67,6 +163,13 @@ function positiveInteger(value, code) {
   return value;
 }
 
+function positiveNumber(value, code) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    invalid(code);
+  }
+  return value;
+}
+
 function array(value, code) {
   if (!Array.isArray(value)) invalid(code);
   return value;
@@ -75,6 +178,442 @@ function array(value, code) {
 function enumValue(value, values, code) {
   if (typeof value !== "string" || !values.has(value)) invalid(code);
   return value;
+}
+
+function calendarDay(value, code) {
+  if (typeof value !== "string" || !DAY_PATTERN.test(value)) invalid(code);
+  const epoch = Date.parse(`${value}T00:00:00.000Z`);
+  if (!Number.isFinite(epoch)
+      || new Date(epoch).toISOString().slice(0, 10) !== value) {
+    invalid(code);
+  }
+  return value;
+}
+
+function isoTimestamp(value, code) {
+  const timestamp = string(value, code);
+  const epoch = Date.parse(timestamp);
+  if (!Number.isFinite(epoch)) invalid(code);
+  return timestamp;
+}
+
+/** Closed, aggregate-only owner progress. It describes recorded work and
+ * publication generations, never estimates remaining time or missing counts. */
+export function projectAdminReconstructionProgress(value) {
+  const code = "ADMIN_RECONSTRUCTION_PROGRESS_INVALID";
+  const closed = (candidate, keys) => {
+    const result = record(candidate, code);
+    const actual = Object.keys(result);
+    if (actual.length !== keys.length || actual.some(key => !keys.includes(key))) invalid(code);
+    return result;
+  };
+  const timestamp = value => {
+    const result = isoTimestamp(value, code);
+    if (new Date(result).toISOString() !== result) invalid(code);
+    return result;
+  };
+  const nullableTime = value => value === null ? null : timestamp(value);
+  const nullableCount = value => value === null ? null : count(value, code);
+  const nullableEnum = (value, values) => value === null ? null : enumValue(value, new Set(values), code);
+  const candidate = record(value, code);
+  if (candidate.schemaVersion !== 1 && candidate.schemaVersion !== 2) invalid(code);
+  const progress = closed(candidate, [
+    "schemaVersion", "generatedAt", "publication", "work", "history",
+    ...(candidate.schemaVersion === 2 ? ["preparation"] : []),
+  ]);
+  const publication = closed(progress.publication, [
+    "state", "requestedGeneration", "preparedGeneration", "publishedGeneration", "publishedAt",
+  ]);
+  const work = closed(progress.work, ["state", "phase", "updatedAt", "trigger", "restartReason"]);
+  const history = closed(progress.history, [
+    "resolvedDays", "requiredDays", "activeDay", "completeAccounts", "requiredAccounts",
+  ]);
+  const projectedPublication = Object.freeze({
+    state: enumValue(publication.state, new Set(["ready", "empty", "invalidated"]), code),
+    requestedGeneration: nullableCount(publication.requestedGeneration),
+    preparedGeneration: nullableCount(publication.preparedGeneration),
+    publishedGeneration: nullableCount(publication.publishedGeneration),
+    publishedAt: nullableTime(publication.publishedAt),
+  });
+  if (projectedPublication.requestedGeneration !== null
+      && [projectedPublication.preparedGeneration, projectedPublication.publishedGeneration]
+        .some(value => value !== null && value > projectedPublication.requestedGeneration)) invalid(code);
+  const projectedHistory = Object.freeze({
+    resolvedDays: count(history.resolvedDays, code),
+    requiredDays: count(history.requiredDays, code),
+    activeDay: history.activeDay === null ? null : calendarDay(history.activeDay, code),
+    completeAccounts: nullableCount(history.completeAccounts),
+    requiredAccounts: nullableCount(history.requiredAccounts),
+  });
+  if (projectedHistory.requiredDays > 70
+      || projectedHistory.resolvedDays > projectedHistory.requiredDays
+      || (projectedHistory.completeAccounts !== null && projectedHistory.requiredAccounts !== null
+        && projectedHistory.completeAccounts > projectedHistory.requiredAccounts)) invalid(code);
+  let preparation = null;
+  if (progress.schemaVersion === 2 && progress.preparation !== null) {
+    const source = closed(progress.preparation, [
+      "trackedDays", "completeDays", "buildingDays", "retiringDays", "checkpointSteps",
+      "quotaObservations", "usageEvents",
+    ]);
+    preparation = Object.freeze({
+      trackedDays: count(source.trackedDays, code),
+      completeDays: count(source.completeDays, code),
+      buildingDays: count(source.buildingDays, code),
+      retiringDays: count(source.retiringDays, code),
+      checkpointSteps: count(source.checkpointSteps, code),
+      quotaObservations: count(source.quotaObservations, code),
+      usageEvents: count(source.usageEvents, code),
+    });
+    if (preparation.completeDays + preparation.buildingDays + preparation.retiringDays
+          !== preparation.trackedDays) invalid(code);
+  }
+  return Object.freeze({
+    schemaVersion: progress.schemaVersion,
+    generatedAt: timestamp(progress.generatedAt),
+    publication: projectedPublication,
+    work: Object.freeze({
+      state: enumValue(work.state, new Set(["idle", "queued", "building", "paused", "unavailable"]), code),
+      phase: nullableEnum(work.phase, ["current", "history", "daily", "publication"]),
+      updatedAt: nullableTime(work.updatedAt),
+      trigger: nullableEnum(work.trigger, ["contribution", "correction", "day_boundary", "method_change", "reconciliation", "privacy"]),
+      restartReason: nullableEnum(work.restartReason, ["input_changed", "lease_expired", "method_changed", "retry"]),
+    }),
+    history: projectedHistory,
+    ...(progress.schemaVersion === 2 ? { preparation } : {}),
+  });
+}
+
+function boundedArray(value, maximum, code) {
+  const values = array(value, code);
+  if (values.length > maximum) invalid(code);
+  return values;
+}
+
+function projectAllowancePreviewCoverage(value) {
+  if (value === undefined || value === null) return null;
+  const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
+  const coverage = record(value, code);
+  const projected = Object.freeze({
+    uploadingParticipantCount: count(coverage.uploadingParticipantCount, code),
+    cachedParticipantCount: count(coverage.cachedParticipantCount, code),
+    recentFittedParticipantCount: count(coverage.recentFittedParticipantCount, code),
+    mergeEligibleParticipantCount: count(coverage.mergeEligibleParticipantCount, code),
+    noQualifyingFitParticipantCount: count(
+      coverage.noQualifyingFitParticipantCount,
+      code,
+    ),
+    noRecentFitParticipantCount: count(coverage.noRecentFitParticipantCount, code),
+    unsupportedPlanParticipantCount: count(
+      coverage.unsupportedPlanParticipantCount,
+      code,
+    ),
+  });
+  const gapCount = projected.noQualifyingFitParticipantCount
+    + projected.noRecentFitParticipantCount
+    + projected.unsupportedPlanParticipantCount;
+  if (projected.cachedParticipantCount > projected.uploadingParticipantCount
+      || projected.recentFittedParticipantCount > projected.cachedParticipantCount
+      || projected.mergeEligibleParticipantCount > projected.recentFittedParticipantCount
+      || gapCount !== projected.uploadingParticipantCount
+        - projected.mergeEligibleParticipantCount) {
+    invalid(code);
+  }
+  return projected;
+}
+
+function projectAllowancePreviewSummary(value) {
+  const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
+  const summary = record(value, code);
+  const fitCount = count(summary.fitCount, code);
+  const participantCount = count(summary.participantCount, code);
+  if ((fitCount === 0) !== (participantCount === 0)
+      || participantCount > fitCount) {
+    invalid(code);
+  }
+  if (fitCount === 0) {
+    if (summary.centralUsd !== null || summary.band80Usd !== null) invalid(code);
+    return Object.freeze({
+      fitCount,
+      participantCount,
+      centralUsd: null,
+      band80Usd: null,
+    });
+  }
+  const centralUsd = positiveNumber(summary.centralUsd, code);
+  let band80Usd = null;
+  if (summary.band80Usd !== null) {
+    const band = record(summary.band80Usd, code);
+    const lowerUsd = positiveNumber(band.lowerUsd, code);
+    const upperUsd = positiveNumber(band.upperUsd, code);
+    if (upperUsd < lowerUsd
+        || centralUsd < lowerUsd
+        || centralUsd > upperUsd) {
+      invalid(code);
+    }
+    band80Usd = Object.freeze({ lowerUsd, upperUsd });
+  }
+  if ((fitCount >= 3) !== (band80Usd !== null)) invalid(code);
+  return Object.freeze({
+    fitCount,
+    participantCount,
+    centralUsd,
+    band80Usd,
+  });
+}
+
+function projectAllowanceModels(value, latestAllowedDay) {
+  const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
+  const models = record(value, code);
+  if (models.basis !== ADMIN_ALLOWANCE_MODELS_BASIS
+      || models.gate !== ADMIN_ALLOWANCE_MODELS_GATE) {
+    invalid(code);
+  }
+  const modelConfig = array(models.modelConfig, code).map((entry, index) => {
+    const model = record(entry, code);
+    const expected = ADMIN_ALLOWANCE_PREVIEW_MODELS[index];
+    if (!expected
+        || model.modelId !== expected.modelId
+        || typeof model.label !== "string" || model.label.length === 0 || model.label.length > 80
+        || model.allowanceTrack !== expected.allowanceTrack
+        || model.pricingStatus !== expected.pricingStatus) {
+      invalid(code);
+    }
+    // Display copy is not an analytical version. Render the current reviewed
+    // catalog label without discarding otherwise compatible results.
+    return expected;
+  });
+  if (modelConfig.length !== ADMIN_ALLOWANCE_PREVIEW_MODELS.length) invalid(code);
+  let previousDay = "";
+  const days = boundedArray(models.days, ADMIN_ALLOWANCE_PREVIEW_DAYS, code).map((entry) => {
+    const day = record(entry, code);
+    const dayValue = calendarDay(day.day, code);
+    if (dayValue <= previousDay || dayValue > latestAllowedDay) invalid(code);
+    previousDay = dayValue;
+    if (day.catalogVersion === undefined) invalid(code);
+    const projected = expandAdminModelHistoryDay(day);
+    if (projected === null) invalid(code);
+    return projected;
+  });
+  if (days.length > ADMIN_ALLOWANCE_PREVIEW_DAYS) invalid(code);
+  return Object.freeze({
+    modelConfig: Object.freeze(modelConfig),
+    basis: ADMIN_ALLOWANCE_MODELS_BASIS,
+    gate: ADMIN_ALLOWANCE_MODELS_GATE,
+    days: Object.freeze(days),
+  });
+}
+
+/**
+ * Fail-closed projection for the owner-only merge trial. The public client does
+ * not understand this schema and remains pinned to the published Pro cohort.
+ */
+export function projectAdminAllowancePreview(value) {
+  const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
+  const preview = record(value, code);
+  if (preview.schemaVersion !== ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION
+      || preview.basis !== ADMIN_ALLOWANCE_PREVIEW_BASIS
+      || preview.referencePlanType !== "pro"
+      || preview.trailingDays !== 30
+      || preview.qualification !== "shared_reset_fit_gates_40pp_span_floor"
+      || preview.spanFloorPp !== 40) {
+    invalid(code);
+  }
+  const from = calendarDay(preview.from, code);
+  const to = calendarDay(preview.to, code);
+  const plans = array(preview.plans, code).map((value, index) => {
+    const plan = record(value, code);
+    const expected = ADMIN_ALLOWANCE_PREVIEW_PLANS[index];
+    if (!expected
+        || plan.planType !== expected.planType
+        || plan.label !== expected.label
+        || plan.multiplier !== expected.multiplier) {
+      invalid(code);
+    }
+    return expected;
+  });
+  if (plans.length !== ADMIN_ALLOWANCE_PREVIEW_PLANS.length) invalid(code);
+  const expectedPlanKeys = ADMIN_ALLOWANCE_PREVIEW_PLANS
+    .map((plan) => plan.planType)
+    .sort();
+  const days = array(preview.days, code).map((value, index) => {
+    const day = record(value, code);
+    const dayValue = calendarDay(day.day, code);
+    const expectedDay = new Date(
+      Date.parse(`${from}T00:00:00.000Z`) + index * 24 * 60 * 60 * 1000,
+    ).toISOString().slice(0, 10);
+    if (dayValue !== expectedDay) invalid(code);
+    const byPlanType = record(day.byPlanType, code);
+    if (Object.keys(byPlanType).sort().join("|") !== expectedPlanKeys.join("|")) {
+      invalid(code);
+    }
+    return Object.freeze({
+      day: dayValue,
+      combined: projectAllowancePreviewSummary(day.combined),
+      byPlanType: Object.freeze(Object.fromEntries(
+        ADMIN_ALLOWANCE_PREVIEW_PLANS.map((plan) => [
+          plan.planType,
+          projectAllowancePreviewSummary(byPlanType[plan.planType]),
+        ]),
+      )),
+    });
+  });
+  if (days.length !== ADMIN_ALLOWANCE_PREVIEW_DAYS
+      || days[0]?.day !== from
+      || days.at(-1)?.day !== to) {
+    invalid(code);
+  }
+  return Object.freeze({
+    schemaVersion: ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
+    generatedAt: string(preview.generatedAt, code),
+    from,
+    to,
+    basis: ADMIN_ALLOWANCE_PREVIEW_BASIS,
+    referencePlanType: "pro",
+    trailingDays: 30,
+    qualification: preview.qualification,
+    spanFloorPp: 40,
+    plans: Object.freeze(plans),
+    days: Object.freeze(days),
+    coverage: projectAllowancePreviewCoverage(preview.coverage),
+    models: projectAllowanceModels(preview.models, to),
+  });
+}
+
+function projectAdminEventSeries(value, generatedDay, expectedStartsAt) {
+  const code = "ADMIN_METRICS_HISTORY_INVALID";
+  const series = record(value, code);
+  const byDayStartsAt = calendarDay(series.byDayStartsAt, code);
+  if (byDayStartsAt !== expectedStartsAt) invalid(code);
+  const byDay = boundedArray(series.byDay, ADMIN_METRICS_HISTORY_MAX_DAYS, code)
+    .map((candidate) => {
+      const row = record(candidate, code);
+      return Object.freeze({
+        day: calendarDay(row.day, code),
+        count: count(row.count, code),
+      });
+    });
+  let previousDay = null;
+  for (const row of byDay) {
+    if ((previousDay !== null && row.day <= previousDay)
+        || row.day < byDayStartsAt
+        || row.day > generatedDay) {
+      invalid(code);
+    }
+    previousDay = row.day;
+  }
+  const total = count(series.total, code);
+  const last24Hours = count(series.last24Hours, code);
+  const previous24Hours = count(series.previous24Hours, code);
+  if (last24Hours > total || previous24Hours > total) invalid(code);
+  return Object.freeze({
+    total,
+    last24Hours,
+    previous24Hours,
+    byDayStartsAt,
+    byDay: Object.freeze(byDay),
+  });
+}
+
+/**
+ * Fail-closed projection for the single aggregate history payload. New gauge
+ * names are additive: the projector accepts only bounded, non-negative safe
+ * integer values, while the renderer decides which known metric each key can
+ * support. Missing new gauges remain an explicit history gap.
+ */
+export function projectAdminMetricsHistory(value) {
+  const code = "ADMIN_METRICS_HISTORY_INVALID";
+  const history = record(value, code);
+  if (history.schemaVersion !== ADMIN_METRICS_HISTORY_SCHEMA_VERSION) invalid(code);
+  const generatedAt = isoTimestamp(history.generatedAt, code);
+  const generatedEpoch = Date.parse(generatedAt);
+  const generatedDay = generatedAt.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(generatedDay)) invalid(code);
+  const expectedStartsAtDate = new Date(`${generatedDay}T00:00:00.000Z`);
+  expectedStartsAtDate.setUTCDate(expectedStartsAtDate.getUTCDate() - 29);
+  const expectedStartsAt = expectedStartsAtDate.toISOString().slice(0, 10);
+  const events = record(history.events, code);
+  const eventNames = [
+    "participants",
+    "webSessions",
+    "devicePairings",
+    "deviceCredentials",
+    "deviceConsents",
+    "uploadedChunks",
+    "acceptedUploads",
+    "uploadedRecords",
+    "uploadingParticipants",
+  ];
+  const projectedEvents = Object.fromEntries(eventNames.map((name) => [
+    name,
+    projectAdminEventSeries(events[name], generatedDay, expectedStartsAt),
+  ]));
+  const downloads = record(history.downloads, code);
+  const downloadStartsAt = calendarDay(downloads.byDayStartsAt, code);
+  if (downloadStartsAt !== expectedStartsAt) invalid(code);
+  const downloadRows = boundedArray(
+    downloads.byDay,
+    ADMIN_METRICS_HISTORY_MAX_DAYS,
+    code,
+  ).map((candidate) => {
+    const row = record(candidate, code);
+    return Object.freeze({
+      day: calendarDay(row.day, code),
+      cumulativeDmgDownloads: count(row.cumulativeDmgDownloads, code),
+    });
+  });
+  let previousDownloadDay = null;
+  for (const row of downloadRows) {
+    if ((previousDownloadDay !== null && row.day <= previousDownloadDay)
+        || row.day < downloadStartsAt
+        || row.day > generatedDay) {
+      invalid(code);
+    }
+    previousDownloadDay = row.day;
+  }
+  const downloadsAvailable = boolean(downloads.available, code);
+  if (!downloadsAvailable && downloadRows.length !== 0) invalid(code);
+
+  const gauges = record(history.gauges, code);
+  const gaugeKeyPattern = /^[A-Za-z][A-Za-z0-9_]{0,79}$/u;
+  const snapshots = boundedArray(
+    gauges.snapshots,
+    ADMIN_METRICS_HISTORY_MAX_SNAPSHOTS,
+    code,
+  ).map((candidate) => {
+    const snapshot = record(candidate, code);
+    const capturedAt = isoTimestamp(snapshot.capturedAt, code);
+    const rawMetrics = record(snapshot.metrics, code);
+    const entries = Object.entries(rawMetrics);
+    if (entries.length > ADMIN_METRICS_HISTORY_MAX_GAUGES) invalid(code);
+    const metrics = {};
+    for (const [key, metricValue] of entries) {
+      if (!gaugeKeyPattern.test(key)) invalid(code);
+      const projected = count(metricValue, code);
+      if (key.endsWith("Bounded") && projected > 1) invalid(code);
+      metrics[key] = projected;
+    }
+    return Object.freeze({ capturedAt, metrics: Object.freeze(metrics) });
+  });
+  let previousCapturedAt = -Infinity;
+  const earliestSnapshotAt = generatedEpoch - 30 * 24 * 60 * 60 * 1_000;
+  for (const snapshot of snapshots) {
+    const capturedAt = Date.parse(snapshot.capturedAt);
+    if (capturedAt < earliestSnapshotAt
+        || capturedAt <= previousCapturedAt
+        || capturedAt > generatedEpoch) invalid(code);
+    previousCapturedAt = capturedAt;
+  }
+  return Object.freeze({
+    schemaVersion: ADMIN_METRICS_HISTORY_SCHEMA_VERSION,
+    generatedAt,
+    events: Object.freeze(projectedEvents),
+    downloads: Object.freeze({
+      available: downloadsAvailable,
+      byDayStartsAt: downloadStartsAt,
+      byDay: Object.freeze(downloadRows),
+    }),
+    gauges: Object.freeze({ snapshots: Object.freeze(snapshots) }),
+  });
 }
 
 function projectCollection(value, code = "ADMIN_OVERVIEW_INVALID") {
@@ -326,6 +865,44 @@ function projectDistribution(value) {
       ),
     });
   });
+  const bySegment = boundedArray(
+    cloudflare.bySegment ?? [],
+    32,
+    "ADMIN_OVERVIEW_INVALID",
+  ).map((value) => {
+    const segment = record(value, "ADMIN_OVERVIEW_INVALID");
+    const startsAt = isoTimestamp(segment.startsAt, "ADMIN_OVERVIEW_INVALID");
+    const endsAt = isoTimestamp(segment.endsAt, "ADMIN_OVERVIEW_INVALID");
+    if (Date.parse(endsAt) <= Date.parse(startsAt)) invalid("ADMIN_OVERVIEW_INVALID");
+    return Object.freeze({
+      startsAt,
+      endsAt,
+      activeSourceAddresses: count(
+        segment.activeSourceAddresses,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      preflightRequests: count(segment.preflightRequests, "ADMIN_OVERVIEW_INVALID"),
+      sparkleCheckRequests: count(
+        segment.sparkleCheckRequests,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      sparkleDownloadRequests: count(
+        segment.sparkleDownloadRequests,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      currentVersionSourceAddresses: segment.currentVersionSourceAddresses === null
+        ? null
+        : count(
+          segment.currentVersionSourceAddresses,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+    });
+  });
+  for (let index = 1; index < bySegment.length; index += 1) {
+    if (bySegment[index].startsAt < bySegment[index - 1].endsAt) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+  }
   let cloudflareWindow = null;
   let activeSourceAddresses = null;
   let preflight = null;
@@ -354,6 +931,7 @@ function projectDistribution(value) {
       || cloudflare.currentVersion !== null
       || cloudflare.currentVersionSourceAddresses !== null
       || observedVersions.length !== 0
+      || bySegment.length !== 0
       || cloudflare.observedVersionsBounded !== false
       || typeof cloudflare.reasonCode !== "string") {
     invalid("ADMIN_OVERVIEW_INVALID");
@@ -367,6 +945,11 @@ function projectDistribution(value) {
     ? null
     : projectDistributionWindow(cloudflare.currentVersionSourceAddresses);
   if ((currentVersion === null) !== (currentVersionSourceAddresses === null)) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
+  if (bySegment.some((segment) => (
+    (segment.currentVersionSourceAddresses === null) !== (currentVersion === null)
+  ))) {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
 
@@ -576,6 +1159,7 @@ function projectDistribution(value) {
       currentVersion,
       currentVersionSourceAddresses,
       observedVersions: Object.freeze(observedVersions),
+      bySegment: Object.freeze(bySegment),
       observedVersionsBounded: boolean(
         cloudflare.observedVersionsBounded,
         "ADMIN_OVERVIEW_INVALID",
@@ -693,13 +1277,103 @@ function projectIngress(value) {
   });
 }
 
+/**
+ * Reconstruction is additive operational evidence, not a prerequisite for the
+ * existing overview. Omit invalid evidence without concealing other sections.
+ */
+function projectReconstruction(value) {
+  if (value === null || value === undefined) return null;
+  const code = "ADMIN_RECONSTRUCTION_INVALID";
+  const timestamp = (value) => {
+    const result = isoTimestamp(value, code);
+    if (new Date(result).toISOString() !== result) invalid(code);
+    return result;
+  };
+  const nullableTimestamp = (value) => value === null ? null : timestamp(value);
+  try {
+    const reconstruction = record(value, code);
+    if (reconstruction.schemaVersion !== ADMIN_RECONSTRUCTION_SCHEMA_VERSION) {
+      invalid(code);
+    }
+    const base = {
+      schemaVersion: ADMIN_RECONSTRUCTION_SCHEMA_VERSION,
+      status: enumValue(reconstruction.status, ADMIN_RECONSTRUCTION_STATUSES, code),
+      observedAt: timestamp(reconstruction.observedAt),
+      mode: enumValue(reconstruction.mode, ADMIN_RECONSTRUCTION_MODES, code),
+    };
+    if (base.status === "unavailable") return Object.freeze(base);
+
+    const lookup = record(reconstruction.lookup, code);
+    const calculations = record(reconstruction.calculations, code);
+    const maintenance = record(reconstruction.maintenance, code);
+    const publication = record(reconstruction.publication, code);
+    const projectedLookup = Object.freeze({
+      complete: boolean(lookup.complete, code),
+      lastRecordId: count(lookup.lastRecordId, code),
+      throughRecordId: count(lookup.throughRecordId, code),
+    });
+    if (projectedLookup.lastRecordId > projectedLookup.throughRecordId
+        || (projectedLookup.complete
+          && projectedLookup.lastRecordId !== projectedLookup.throughRecordId)) invalid(code);
+    const projectedCalculations = Object.freeze({
+      trackedAccounts: count(calculations.trackedAccounts, code),
+      completedAccounts: count(calculations.completedAccounts, code),
+      preparingAccounts: count(calculations.preparingAccounts, code),
+      scanningAccounts: count(calculations.scanningAccounts, code),
+      finalizingAccounts: count(calculations.finalizingAccounts, code),
+      sourceChangedAccounts: count(calculations.sourceChangedAccounts, code),
+      checkpointsWritten: count(calculations.checkpointsWritten, code),
+      bounded: boolean(calculations.bounded, code),
+      newestResultAt: nullableTimestamp(calculations.newestResultAt),
+    });
+    const phaseCount = projectedCalculations.completedAccounts
+      + projectedCalculations.preparingAccounts
+      + projectedCalculations.scanningAccounts
+      + projectedCalculations.finalizingAccounts
+      + projectedCalculations.sourceChangedAccounts;
+    if (!Number.isSafeInteger(phaseCount)
+        || phaseCount !== projectedCalculations.trackedAccounts) invalid(code);
+    const publishedDays = count(publication.publishedDays, code);
+    const pricedDays = count(publication.pricedDays, code);
+    if (pricedDays > publishedDays) invalid(code);
+
+    return Object.freeze({
+      ...base,
+      lookup: projectedLookup,
+      calculations: projectedCalculations,
+      maintenance: Object.freeze({
+        running: boolean(maintenance.running, code),
+        lastRunAt: nullableTimestamp(maintenance.lastRunAt),
+        leaseExpiresAt: nullableTimestamp(maintenance.leaseExpiresAt),
+      }),
+      publication: Object.freeze({
+        state: enumValue(publication.state, ADMIN_RECONSTRUCTION_PUBLICATION_STATES, code),
+        pendingDays: count(publication.pendingDays, code),
+        pendingDaysBounded: boolean(publication.pendingDaysBounded, code),
+        publishedDays,
+        pricedDays,
+        latestPublishedAt: nullableTimestamp(publication.latestPublishedAt),
+      }),
+    });
+  } catch (error) {
+    if (error instanceof AdminResponseError && error.code === code) return null;
+    throw error;
+  }
+}
+
 function projectErrors(value) {
   const errors = record(value, "ADMIN_OVERVIEW_INVALID");
   const groups = array(errors.groups, "ADMIN_OVERVIEW_INVALID").map((value) => {
     const group = record(value, "ADMIN_OVERVIEW_INVALID");
+    if (!Number.isSafeInteger(group.status)
+        || group.status < 500
+        || group.status > 599) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
     return Object.freeze({
       routeClass: string(group.routeClass, "ADMIN_OVERVIEW_INVALID"),
       errorCode: string(group.errorCode, "ADMIN_OVERVIEW_INVALID"),
+      status: group.status,
       occurrences: count(group.occurrences, "ADMIN_OVERVIEW_INVALID"),
       ratePerDay: typeof group.ratePerDay === "number" && Number.isFinite(group.ratePerDay)
         ? group.ratePerDay
@@ -710,11 +1384,17 @@ function projectErrors(value) {
   const projectLookup = (value) => {
     if (value === null) return null;
     const lookup = record(value, "ADMIN_OVERVIEW_INVALID");
+    if (!Number.isSafeInteger(lookup.status)
+        || lookup.status < 500
+        || lookup.status > 599) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
     return Object.freeze({
       requestId: string(lookup.requestId, "ADMIN_OVERVIEW_INVALID"),
       errorCode: string(lookup.errorCode, "ADMIN_OVERVIEW_INVALID"),
       routeClass: string(lookup.routeClass, "ADMIN_OVERVIEW_INVALID"),
       occurredAt: string(lookup.occurredAt, "ADMIN_OVERVIEW_INVALID"),
+      status: lookup.status,
     });
   };
   const recentDiagnostics = array(
@@ -736,6 +1416,9 @@ function projectErrors(value) {
     });
   });
   return Object.freeze({
+    retentionDays: positiveInteger(errors.retentionDays, "ADMIN_OVERVIEW_INVALID"),
+    sampled: boolean(errors.sampled, "ADMIN_OVERVIEW_INVALID"),
+    capacity: positiveInteger(errors.capacity, "ADMIN_OVERVIEW_INVALID"),
     groups: Object.freeze(groups),
     recentDiagnostics: Object.freeze(recentDiagnostics),
     lookup: projectLookup(errors.lookup),
@@ -787,6 +1470,7 @@ export function projectAdminOverview(value) {
     lifecycle: projectLifecycle(overview.lifecycle),
     reconciliation: projectReconciliation(overview.reconciliation),
     ingress: projectIngress(overview.ingress),
+    reconstruction: projectReconstruction(overview.reconstruction),
     distribution: projectDistribution(overview.distribution),
     snapshots: Object.freeze(snapshots),
     dailyPublication: projectDailyPublication(overview.dailyPublication),
@@ -835,7 +1519,7 @@ export function adminResponseError(status, value) {
       && REQUEST_ID_PATTERN.test(details.requestId)
     ? details.requestId
     : null;
-  return new AdminResponseError(code, requestId);
+  return new AdminResponseError(code, requestId, status);
 }
 
 export function adminActionErrorMessage(error) {

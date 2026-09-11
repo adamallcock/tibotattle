@@ -2,7 +2,7 @@
 title: Event-Time API-Price-Equivalent Accounting Decision
 date: 2026-08-03
 type: decision-record
-status: implemented
+status: complete
 ---
 
 # Event-time API-price-equivalent accounting decision

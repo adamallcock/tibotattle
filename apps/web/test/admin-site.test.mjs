@@ -3,11 +3,32 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
 import { formatReportingTime } from "../public/ui-format.js";
+import { createAdminAllowancePreviewPayload } from "./fixtures/admin-allowance.js";
 
 const fixture = async (name) => JSON.parse(await readFile(
   new URL(`./fixtures/${name}`, import.meta.url),
   "utf8",
 ));
+const ADMIN_READ_PATHS = [
+  "/api/v1/admin/overview", "/api/v1/admin/community/allowance-preview",
+  "/api/v1/admin/metrics/history", "/api/v1/admin/reconstruction-progress?detail=preparation",
+];
+
+function metricsHistoryPayload() {
+  return {
+    schemaVersion: "admin-metrics-history-v0.2",
+    generatedAt: "2026-09-07T12:00:00.000Z",
+    events: Object.fromEntries([
+      "participants", "webSessions", "devicePairings", "deviceCredentials", "deviceConsents",
+      "uploadedChunks", "uploadedRecords", "uploadingParticipants", "acceptedUploads",
+    ].map(name => [name, {
+      total: 6, last24Hours: 3, previous24Hours: 2, byDayStartsAt: "2026-08-09",
+      byDay: [{ day: "2026-09-05", count: 1 }, { day: "2026-09-06", count: 2 }, { day: "2026-09-07", count: 3 }],
+    }])),
+    downloads: { available: false, byDayStartsAt: "2026-08-09", byDay: [] },
+    gauges: { snapshots: [] },
+  };
+}
 
 class FakeNode {
   constructor(tag) {
@@ -28,14 +49,30 @@ class FakeNode {
     this.value = "";
     this.checked = false;
     this.attributes = new Map();
+    this.dataset = {};
+    this.parentNode = null;
+    this.ownerDocument = null;
+    this.classList = {
+      contains: (name) => this.className.split(/\s+/u).includes(name),
+      add: (...names) => { this.className = [...new Set([...this.className.split(/\s+/u).filter(Boolean), ...names])].join(" "); },
+      remove: (...names) => { this.className = this.className.split(/\s+/u).filter((name) => !names.includes(name)).join(" "); },
+      toggle: (name, force) => {
+        const active = force ?? !this.classList.contains(name);
+        this.classList[active ? "add" : "remove"](name);
+        return active;
+      },
+    };
   }
 
   append(...nodes) {
+    for (const node of nodes) node.parentNode = this;
     this.children.push(...nodes);
   }
 
   replaceChildren(...nodes) {
-    this.children = nodes;
+    for (const node of this.children) node.parentNode = null;
+    this.children = [];
+    this.append(...nodes);
   }
 
   addEventListener(type, listener) {
@@ -46,15 +83,76 @@ class FakeNode {
     const copy = String(value);
     this.attributes.set(name, copy);
     if (name === "id") this.id = copy;
+    if (name === "class") this.className = copy;
+    if (name.startsWith("data-")) this.dataset[dataKey(name)] = copy;
   }
 
   getAttribute(name) {
+    if (name === "class") return this.className;
+    if (name.startsWith("data-")) return this.dataset[dataKey(name)] ?? null;
     return this.attributes.get(name) ?? null;
   }
 
   getBoundingClientRect() {
     return this.rect;
   }
+
+  querySelectorAll(selector) {
+    return this.children.flatMap(descendantNodes).filter((node) => matchesSelector(node, selector));
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+
+  closest(selector) {
+    for (let node = this; node; node = node.parentNode) {
+      if (matchesSelector(node, selector)) return node;
+    }
+    return null;
+  }
+
+  focus() {
+    if (this.disabled) return;
+    this.ownerDocument.activeElement = this;
+    this.listeners.get("focus")?.({ target: this });
+  }
+}
+
+function dataKey(name) {
+  return name.slice(5).replace(/-([a-z])/gu, (_, letter) => letter.toUpperCase());
+}
+
+// Only the tag/class/data selectors used by the real admin allowance renderer
+// and these interaction checks; this is not a general browser replacement.
+function matchesSimpleSelector(node, selector) {
+  const attributes = [...selector.matchAll(/\[([\w-]+)(?:="([^"]*)")?\]/gu)];
+  const bare = selector.replace(/\[[^\]]*\]/gu, "");
+  const tag = bare.match(/^[\w-]+/u)?.[0];
+  if (tag && node.tag !== tag) return false;
+  for (const [, className] of bare.matchAll(/\.([\w-]+)/gu)) {
+    if (!node.classList.contains(className)) return false;
+  }
+  for (const [, name, value] of attributes) {
+    const actual = node.getAttribute(name);
+    if (actual === null || (value !== undefined && value !== actual)) return false;
+  }
+  return true;
+}
+
+function matchesSelector(node, selector) {
+  return selector.split(",").some((choice) => {
+    const parts = choice.trim().split(/\s+(?![^\[]*\])/u);
+    if (!matchesSimpleSelector(node, parts.pop())) return false;
+    let ancestor = node.parentNode;
+    while (parts.length > 0) {
+      const part = parts.pop();
+      while (ancestor && !matchesSimpleSelector(ancestor, part)) ancestor = ancestor.parentNode;
+      if (!ancestor) return false;
+      ancestor = ancestor.parentNode;
+    }
+    return true;
+  });
 }
 
 function fakeDocument() {
@@ -84,8 +182,13 @@ function fakeDocument() {
     "recent-diagnostic-empty",
     "diagnostic-lookup",
     "diagnostic-reference",
+    "diagnostic-retention-summary",
     "audit-rows",
     "audit-empty",
+    "audit-pagination",
+    "audit-previous",
+    "audit-next",
+    "audit-page-status",
     "last-refresh",
     "refresh",
     "diagnostic-form",
@@ -102,25 +205,37 @@ function fakeDocument() {
     "publication",
   ].map((name) => [name, new FakeNode("input")]));
 
-  return {
+  const documentRef = {
     byId,
+    activeElement: null,
     createElement(tag) {
-      return new FakeNode(tag);
+      const node = new FakeNode(tag);
+      node.ownerDocument = documentRef;
+      return node;
+    },
+    createElementNS(_namespace, tag) {
+      return this.createElement(tag);
     },
     createTextNode(value) {
-      const node = new FakeNode("#text");
+      const node = this.createElement("#text");
       node.textContent = value;
       return node;
     },
     querySelector(selector) {
       const control = selector.match(/^input\[name="([^"]+)"\]$/u);
       if (control) return controls.get(control[1]);
+      if (!selector.startsWith("#")) {
+        return [...byId.values()].flatMap(descendantNodes)
+          .find((node) => matchesSelector(node, selector)) ?? null;
+      }
       assert.match(selector, /^#[\w-]+$/u);
       const node = byId.get(selector.slice(1));
       assert.ok(node, `unexpected selector: ${selector}`);
       return node;
     },
   };
+  for (const node of [...byId.values(), ...controls.values()]) node.ownerDocument = documentRef;
+  return documentRef;
 }
 
 function response(body) {
@@ -136,6 +251,15 @@ function response(body) {
 function tableTexts(documentRef, id) {
   return documentRef.byId.get(id).children.map((row) =>
     row.children.map((cell) => cell.textContent));
+}
+
+function descendantNodes(node) {
+  return [node, ...node.children.flatMap(descendantNodes)];
+}
+
+function reconstructionText(documentRef) {
+  return descendantNodes(documentRef.byId.get("admin-reconstruction-details"))
+    .map((node) => node.textContent).filter(Boolean).join(" ");
 }
 
 function metricTexts(documentRef, id) {
@@ -176,6 +300,517 @@ async function waitFor(predicate) {
   }
   assert.fail("timed out waiting for the admin view to render");
 }
+
+async function withAdminPage(fetchResponse, check) {
+  const documentRef = fakeDocument();
+  const html = await readFile(new URL("../public/admin.html", import.meta.url), "utf8");
+  for (const [, id] of html.matchAll(/\bid="([\w-]+)"/gu)) {
+    if (!documentRef.byId.has(id)) documentRef.byId.set(id, documentRef.createElement("div"));
+  }
+  for (const [, attributes, kind, label] of html.matchAll(/<button\b([^>]*data-(allowance-mode|range-days)[^>]*)>([^<]*)<\/button>/gu)) {
+    const button = documentRef.createElement("button");
+    for (const [, name, value] of attributes.matchAll(/([\w-]+)="([^"]*)"/gu)) button.setAttribute(name, value);
+    button.textContent = label;
+    documentRef.byId.get(kind === "allowance-mode" ? "admin-community-mode-controls" : "admin-community-range-controls").append(button);
+  }
+  documentRef.body = { classList: { contains: (name) => name === "admin-operator-page" } };
+  documentRef.addEventListener = () => {};
+  documentRef.querySelectorAll = () => [];
+  documentRef.byId.get("notice").hidden = true;
+  documentRef.byId.get("service-state").textContent = "Checking session…";
+  const storedPreferences = new Map([
+    ["tibotattle-admin-auto-refresh-minutes-v1", "0"],
+  ]);
+  const windowListeners = new Map();
+  const replacements = {
+    document: documentRef,
+    fetch: fetchResponse,
+    window: { innerHeight: 844, innerWidth: 390, addEventListener(name, listener) { windowListeners.set(name, listener); } },
+    localStorage: {
+      getItem: (key) => storedPreferences.get(key) ?? null,
+      setItem: (key, value) => storedPreferences.set(key, value),
+    },
+    // Keep actual load/refresh execution while preventing background timers
+    // from outliving the isolated page and touching a later test's globals.
+    setInterval: () => 0,
+  };
+  const descriptors = new Map(Object.keys(replacements).map((key) => [
+    key, Object.getOwnPropertyDescriptor(globalThis, key),
+  ]));
+  for (const [key, value] of Object.entries(replacements)) {
+    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+  }
+  try {
+    const moduleUrl = new URL("../public/admin.js", import.meta.url);
+    moduleUrl.search = `?admin-refresh-test=${process.hrtime.bigint()}`;
+    await import(moduleUrl.href);
+    await new Promise(resolve => setImmediate(resolve));
+    await check(documentRef, storedPreferences);
+  } finally {
+    windowListeners.get("pagehide")?.();
+    await new Promise(resolve => setImmediate(resolve));
+    for (const [key, descriptor] of descriptors) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+  }
+}
+
+function unavailableResponse() {
+  return {
+    ok: false,
+    status: 500,
+    async json() {
+      return { error: { code: "INTERNAL_ERROR" } };
+    },
+  };
+}
+
+test("graphs and generation progress render independently while the overview is stalled", async () => {
+  const progress = await fixture("admin-reconstruction-progress-valid.json");
+  let finishOverview;
+  const requests = [];
+  await withAdminPage(async path => {
+    requests.push(path);
+    if (path === ADMIN_READ_PATHS[0]) return new Promise(resolve => { finishOverview = resolve; });
+    if (path === ADMIN_READ_PATHS[1]) return response(createAdminAllowancePreviewPayload());
+    if (path === ADMIN_READ_PATHS[2]) return response(metricsHistoryPayload());
+    assert.equal(path, ADMIN_READ_PATHS[3]);
+    return response(progress);
+  }, async documentRef => {
+    await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Admin preview available");
+    assert.equal(documentRef.byId.get("growth-cards").querySelectorAll("svg.admin-sparkline").length, 8);
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Graph available · updating");
+    const text = reconstructionText(documentRef);
+    assert.match(text, /51 of 69 days resolved/u);
+    assert.match(text, /8 of 15 account calculations complete/u);
+    assert.match(text, /Active history day: 2026-09-02/u);
+    assert.match(text, /Requested generation: 42 · prepared: not recorded · published: 40/u);
+    assert.match(text, /Update trigger Contribution correction/u);
+    assert.match(text, /Restart reason: Inputs changed/u);
+    assert.doesNotMatch(text, /last good|\d+%|ETA/u);
+    const meter = documentRef.byId.get("admin-reconstruction-details").querySelector("progress");
+    assert.equal(meter.getAttribute("max"), "69");
+    assert.equal(meter.getAttribute("value"), "51");
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.deepEqual(requests, ADMIN_READ_PATHS, "manual refresh joins the pending pass instead of overlapping it");
+    finishOverview(unavailableResponse());
+    await waitFor(() => !documentRef.byId.get("refresh").disabled);
+    assert.equal(documentRef.byId.get("admin-community-status").textContent, "Admin preview available");
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Graph available · updating");
+  });
+});
+
+test("ordinary overview reload and temporary history failures preserve the exact dated growth graphs", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const history = metricsHistoryPayload();
+  let historyResponse = () => response(history);
+  await withAdminPage(async path => {
+    if (path === ADMIN_READ_PATHS[0]) return response(overview);
+    if (path === ADMIN_READ_PATHS[2]) return historyResponse();
+    return unavailableResponse();
+  }, async documentRef => {
+    const container = documentRef.byId.get("growth-cards");
+    const initial = [...container.children];
+    assert.equal(initial.length, 8);
+    assert.match(documentRef.byId.get("growth-status").textContent, /History through/u);
+    assert.ok(documentRef.byId.get("growth-status").textContent.includes(formatReportingTime(history.generatedAt)));
+    for (const next of [
+      () => response(history),
+      () => unavailableResponse(),
+      () => ({ ok: false, status: 503, json: async () => ({ error: { code: "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE" } }) }),
+      () => { throw new Error("synthetic network failure"); },
+    ]) {
+      historyResponse = next;
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      assert.deepEqual(container.children, initial);
+      assert.equal(container.querySelectorAll("svg.admin-sparkline").length, 8);
+    }
+    historyResponse = () => ({ ok: false, status: 503, json: async () => ({ error: { code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE" } }) });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(documentRef.byId.get("growth-status").textContent, "History unavailable");
+    assert.equal(container.querySelectorAll("svg.admin-sparkline").length, 0);
+  });
+});
+
+test("progress refreshes remain independent, retain observed work on errors, and never invent unknown counters", async () => {
+  const progress = await fixture("admin-reconstruction-progress-valid.json");
+  progress.history.completeAccounts = null;
+  progress.history.requiredAccounts = null;
+  progress.work.restartReason = null;
+  let progressReply = () => response(progress);
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? progressReply() : unavailableResponse(), async documentRef => {
+    assert.match(reconstructionText(documentRef), /Account progress not recorded/u);
+    assert.match(reconstructionText(documentRef), /Restart reason: Not recorded/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /0 of 0 account/u);
+    progressReply = () => unavailableResponse();
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.match(reconstructionText(documentRef), /Progress refresh unavailable/u);
+    assert.match(reconstructionText(documentRef), /51 of 69 days resolved/u);
+    assert.ok(reconstructionText(documentRef).includes(formatReportingTime(progress.generatedAt)));
+    progress.history.resolvedDays = 52;
+    progress.publication.preparedGeneration = 42;
+    progressReply = () => response(progress);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.match(reconstructionText(documentRef), /52 of 69 days resolved/u);
+    assert.match(reconstructionText(documentRef), /prepared: 42/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /Progress refresh unavailable/u);
+  });
+});
+
+test("reusable source preparation advances before account completion without changing the selected refresh cadence", async () => {
+  const progress = await fixture("admin-reconstruction-preparation-valid.json");
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  await withAdminPage(async path => {
+    if (path === ADMIN_READ_PATHS[0]) return response(overview);
+    if (path === ADMIN_READ_PATHS[1]) return response(preview);
+    if (path === ADMIN_READ_PATHS[3]) return response(structuredClone(progress));
+    return unavailableResponse();
+  }, async (documentRef, preferences) => {
+    const graph = documentRef.byId.get("admin-community-allowance-result").querySelector('svg[role="img"]');
+    assert.ok(graph);
+    const refresh = documentRef.byId.get("auto-refresh-minutes");
+    refresh.value = "5";
+    refresh.listeners.get("change")();
+    const text = reconstructionText(documentRef);
+    assert.match(text, /Reusable source preparation 12 of 16 tracked source days complete/u);
+    assert.match(text, /3 building · 1 retiring/u);
+    assert.match(text, /432 saved checkpoint steps · 72,040 quota observations processed · 31,980 usage events processed/u);
+    assert.match(text, /Source days span retained work, not the remaining historical window/u);
+    assert.match(text, /Preparation can advance before account completion/u);
+    assert.match(text, /Counts can change when work is replaced or retired/u);
+    progress.preparation.completeDays = 13;
+    progress.preparation.buildingDays = 2;
+    progress.preparation.checkpointSteps = 512;
+    progress.preparation.quotaObservations = 75104;
+    progress.preparation.usageEvents = 32300;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    const updated = reconstructionText(documentRef);
+    assert.match(updated, /13 of 16 tracked source days complete/u);
+    assert.match(updated, /512 saved checkpoint steps · 75,104 quota observations processed · 32,300 usage events processed/u);
+    assert.match(updated, /51 of 69 days resolved/u);
+    assert.match(updated, /8 of 15 account calculations complete/u);
+    assert.doesNotMatch(updated, /ETA|\d+%|15 seconds/u);
+    assert.equal(refresh.value, "5");
+    assert.equal(preferences.get("tibotattle-admin-auto-refresh-minutes-v1"), "5");
+    assert.equal(documentRef.byId.get("admin-community-allowance-result").querySelector('svg[role="img"]'), graph);
+  });
+});
+
+test("failed or malformed preparation reads retain observed progress and the published graph", async () => {
+  const progress = await fixture("admin-reconstruction-preparation-valid.json");
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let progressReply = () => response(progress);
+  await withAdminPage(async path => {
+    if (path === ADMIN_READ_PATHS[0]) return response(overview);
+    if (path === ADMIN_READ_PATHS[1]) return response(preview);
+    if (path === ADMIN_READ_PATHS[3]) return progressReply();
+    return unavailableResponse();
+  }, async documentRef => {
+    const graph = documentRef.byId.get("admin-community-allowance-result").querySelector('svg[role="img"]');
+    const malformed = structuredClone(progress);
+    malformed.preparation.retiringDays = -1;
+    for (const next of [() => unavailableResponse(), () => response(malformed)]) {
+      progressReply = next;
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      assert.match(reconstructionText(documentRef), /Progress refresh unavailable/u);
+      assert.match(reconstructionText(documentRef), /12 of 16 tracked source days complete/u);
+      assert.match(reconstructionText(documentRef), /432 saved checkpoint steps/u);
+      assert.ok(reconstructionText(documentRef).includes(formatReportingTime(progress.generatedAt)));
+      assert.equal(documentRef.byId.get("admin-community-allowance-result").querySelector('svg[role="img"]'), graph);
+    }
+    progressReply = () => response(progress);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.doesNotMatch(reconstructionText(documentRef), /Progress refresh unavailable/u);
+  });
+});
+
+test("bounded or unavailable preparation counts stay unknown and legacy progress needs no preparation section", async () => {
+  const progress = await fixture("admin-reconstruction-preparation-valid.json");
+  progress.preparation = null;
+  let progressReply = () => response(progress);
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? progressReply() : unavailableResponse(), async documentRef => {
+    assert.match(reconstructionText(documentRef), /Reusable source preparation Preparation counters unavailable/u);
+    assert.match(reconstructionText(documentRef), /unavailable or exceed the display limit; they are not zero/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /tracked source days complete|saved checkpoint steps|0 of 0/u);
+    const legacy = await fixture("admin-reconstruction-progress-valid.json");
+    progressReply = () => response(legacy);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.match(reconstructionText(documentRef), /51 of 69 days resolved/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /Reusable source preparation|Preparation counters/u);
+  });
+});
+
+test("only confirmed progress invalidation clears the graph and fences an older preview response", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const progress = await fixture("admin-reconstruction-progress-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let nextPreview = () => response(preview);
+  let resolveOlderPreview;
+  await withAdminPage(async path => {
+    if (path === ADMIN_READ_PATHS[0]) return response(overview);
+    if (path === ADMIN_READ_PATHS[1]) return nextPreview();
+    if (path === ADMIN_READ_PATHS[3]) return response(structuredClone(progress));
+    return unavailableResponse();
+  }, async documentRef => {
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const badge = documentRef.byId.get("admin-community-status");
+    const graph = container.querySelector('svg[role="img"]');
+    assert.ok(graph);
+    for (const publicationState of ["ready", "empty"]) {
+      progress.publication.state = publicationState;
+      progress.work.state = "queued";
+      nextPreview = () => ({ ok: false, status: 503, json: async () => ({ error: { code: "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE" } }) });
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(container.querySelector('svg[role="img"]'), graph, publicationState);
+    }
+    nextPreview = () => new Promise(resolve => { resolveOlderPreview = resolve; });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => typeof resolveOlderPreview === "function");
+    progress.publication.state = "invalidated";
+    progress.publication.publishedGeneration = null;
+    progress.publication.publishedAt = null;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(badge.textContent, "Preview unavailable");
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 0);
+    resolveOlderPreview(response(preview));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 0, "pre-invalidation read cannot restore withdrawn data");
+    progress.publication.state = "ready";
+    progress.publication.publishedGeneration = 42;
+    progress.publication.publishedAt = progress.generatedAt;
+    nextPreview = () => response(preview);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => badge.textContent === "Admin preview available");
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 1, "a new post-invalidation confirmed read can restore the graph");
+  });
+});
+
+test("an initial overview failure marks operations unavailable without inventing a successful snapshot", async () => {
+  const requests = [];
+  await withAdminPage(async (path) => {
+    requests.push(path);
+    return unavailableResponse();
+  }, async (documentRef) => {
+    await waitFor(() => !documentRef.byId.get("notice").hidden && !documentRef.byId.get("refresh").disabled);
+    assert.deepEqual(requests, ADMIN_READ_PATHS);
+    assert.equal(documentRef.byId.get("last-refresh").textContent, "Not loaded");
+    assert.equal(documentRef.byId.get("service-state").textContent,
+      "Refresh unavailable · no successful data loaded");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent,
+      "Unavailable · not loaded");
+    assert.equal(documentRef.byId.get("operator-attention-badge").className,
+      "admin-source-badge admin-source-partial");
+    assert.equal(documentRef.byId.get("counts").children.length, 0);
+    assert.equal(documentRef.byId.get("refresh").disabled, false);
+    assert.equal(documentRef.title, "• TiboTattle operations");
+    assert.equal(documentRef.byId.get("notice").textContent,
+      "Operations view unavailable: INTERNAL_ERROR.");
+  });
+});
+
+test("overview success, failed refresh, and recovery preserve then replace the last successful data", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+  const recovered = structuredClone(overview);
+  recovered.generatedAt = "2026-08-18T12:00:00.000Z";
+  recovered.counts.contributions.acceptedLast24Hours += 1;
+  recovered.reconstruction.observedAt = "2026-09-06T12:05:00.000Z";
+  recovered.reconstruction.calculations.completedAccounts += 1;
+  recovered.reconstruction.calculations.scanningAccounts -= 1;
+  recovered.reconstruction.calculations.checkpointsWritten = 21;
+  const overviewResponses = [response(overview), unavailableResponse(), response(recovered)];
+  let overviewRequests = 0;
+  await withAdminPage(async (path) => path === "/api/v1/admin/overview"
+    ? overviewResponses[overviewRequests++]
+    : unavailableResponse(), async (documentRef, storedPreferences) => {
+    await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Preview unavailable"
+      && documentRef.byId.get("growth-status").textContent === "History unavailable");
+    const counts = metricTexts(documentRef, "counts");
+    const lastRefresh = documentRef.byId.get("last-refresh").textContent;
+    const preferences = [...storedPreferences];
+    assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+    assert.match(reconstructionText(documentRef), /3 of 8 tracked accounts/u);
+
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(overviewRequests, 2);
+    assert.equal(documentRef.byId.get("service-state").textContent,
+      "Refresh unavailable · showing last successful data");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent,
+      "Stale · refresh unavailable");
+    assert.equal(documentRef.byId.get("operator-attention-badge").className,
+      "admin-source-badge admin-source-partial");
+    assert.equal(documentRef.byId.get("last-refresh").textContent, lastRefresh);
+    assert.deepEqual(metricTexts(documentRef, "counts"), counts);
+    assert.deepEqual([...storedPreferences], preferences);
+    assert.equal(documentRef.byId.get("notice").hidden, false);
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Stale · last known progress");
+    assert.match(documentRef.byId.get("admin-reconstruction-progress").className, /admin-reconstruction-stale/u);
+    assert.match(reconstructionText(documentRef), /3 of 8 tracked accounts/u);
+    assert.match(reconstructionText(documentRef), /Refresh failed; showing the last available observation/u);
+    assert.ok(reconstructionText(documentRef).includes(formatReportingTime(overview.reconstruction.observedAt)));
+
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(overviewRequests, 3);
+    assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+    assert.equal(documentRef.byId.get("operator-attention-badge").className,
+      "admin-source-badge admin-source-available");
+    assert.equal(documentRef.byId.get("last-refresh").textContent, formatReportingTime(recovered.generatedAt));
+    assert.notEqual(documentRef.byId.get("last-refresh").textContent, lastRefresh);
+    assert.deepEqual(metricTexts(documentRef, "counts").find(([label]) => label === "Accepted uploads last 24h"),
+      ["Accepted uploads last 24h", "6", "14 in the last 7 days"]);
+    assert.equal(documentRef.byId.get("notice").hidden, true);
+    assert.equal(documentRef.title, "TiboTattle operations");
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Resumable calculation");
+    assert.doesNotMatch(documentRef.byId.get("admin-reconstruction-progress").className, /stale/u);
+    assert.match(reconstructionText(documentRef), /4 of 8 tracked accounts/u);
+    assert.match(reconstructionText(documentRef), /21 checkpoint steps saved in current runs/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /42 checkpoint steps/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /Refresh failed/u);
+    assert.ok(reconstructionText(documentRef).includes(formatReportingTime(recovered.reconstruction.observedAt)));
+  });
+});
+
+test("an independent allowance-preview failure does not mark a successful overview stale", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+  const requests = [];
+  await withAdminPage(async (path) => {
+    requests.push(path);
+    return path === "/api/v1/admin/overview" ? response(overview) : unavailableResponse();
+  }, async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Preview unavailable"
+      && documentRef.byId.get("growth-status").textContent === "History unavailable");
+    assert.deepEqual(requests, ADMIN_READ_PATHS);
+    assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+    assert.equal(documentRef.byId.get("operator-attention-badge").className,
+      "admin-source-badge admin-source-available");
+    assert.equal(documentRef.byId.get("notice").hidden, true);
+    assert.equal(documentRef.byId.get("last-refresh").textContent, formatReportingTime(overview.generatedAt));
+    assert.equal(documentRef.title, "TiboTattle operations");
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Resumable calculation");
+    assert.match(reconstructionText(documentRef), /3 of 8 tracked accounts/u);
+    assert.equal(documentRef.byId.get("admin-reconstruction-progress").hidden, false);
+  });
+});
+
+test("reconstruction shows checkpoint acquisition separately from daily publication without new requests", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+  const requests = [];
+  await withAdminPage(async (path) => {
+    requests.push(path);
+    return path === "/api/v1/admin/overview" ? response(overview) : unavailableResponse();
+  }, async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("growth-status").textContent === "History unavailable");
+    const text = reconstructionText(documentRef);
+    assert.match(text, /Daily publication waits for account calculations/u);
+    assert.match(text, /Acquired checkpoints are saved calculation inputs, not ready allowance estimates/u);
+    assert.match(text, /Record lookup Complete/u);
+    assert.match(text, /3 of 8 tracked accounts/u);
+    assert.match(text, /Preparing 1 · scanning 2 · finalizing 1 · source, window or method changed 1/u);
+    assert.match(text, /42 checkpoint steps saved in current runs/u);
+    assert.ok(text.includes(`Latest cached result: ${formatReportingTime(overview.reconstruction.calculations.newestResultAt)} (may be outdated)`));
+    assert.doesNotMatch(text, /Lookup position/u);
+    assert.match(text, /Daily publication Updating/u);
+    assert.match(text, /5 pending days across all history/u);
+    assert.match(text, /Last 366 days: 10 published · 7 with price data \(may be partial\)/u);
+    assert.match(text, /maintenance lock held/u);
+    assert.doesNotMatch(text, /maintenance running/u);
+    assert.match(text, /no time estimate is available/u);
+    assert.doesNotMatch(text, /\d+%|ETA/u);
+    const meters = descendantNodes(documentRef.byId.get("admin-reconstruction-details"))
+      .filter((node) => node.tag === "progress");
+    assert.equal(meters.length, 1);
+    assert.equal(meters[0].getAttribute("max"), "8");
+    assert.equal(meters[0].getAttribute("value"), "3");
+    assert.equal(meters[0].getAttribute("aria-label"), "Account checkpoint acquisition");
+    assert.equal(meters[0].getAttribute("aria-valuetext"), "3 of 8 tracked accounts have acquired checkpoints");
+    assert.equal(meters[0].getAttribute("aria-describedby"), "admin-reconstruction-explanation");
+    assert.deepEqual(requests, ADMIN_READ_PATHS);
+  });
+});
+
+test("unavailable, legacy missing and malformed reconstruction stay isolated from a valid overview", async () => {
+  for (const kind of ["unavailable", "missing", "malformed"]) {
+    const overview = await fixture("admin-overview-valid.json");
+    if (kind === "unavailable") overview.reconstruction = {
+      schemaVersion: "admin-reconstruction-progress-v0.1", status: "unavailable",
+      observedAt: "2026-09-06T12:00:00.000Z", mode: "unknown",
+    };
+    if (kind === "malformed") {
+      overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+      overview.reconstruction.calculations.completedAccounts = 100;
+    }
+    await withAdminPage(async (path) => path === "/api/v1/admin/overview"
+      ? response(overview) : unavailableResponse(), async (documentRef) => {
+      await waitFor(() => documentRef.byId.get("growth-status").textContent === "History unavailable");
+      assert.equal(documentRef.byId.get("service-state").textContent, "production · operational", kind);
+      assert.equal(documentRef.byId.get("notice").hidden, true, kind);
+      assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Progress unavailable", kind);
+      assert.match(reconstructionText(documentRef), /Missing progress does not mean there is no work remaining/u, kind);
+      assert.doesNotMatch(reconstructionText(documentRef), /0 tracked|0 pending|0 published/u, kind);
+      assert.equal(descendantNodes(documentRef.byId.get("admin-reconstruction-details"))
+        .some((node) => node.tag === "progress"), false, kind);
+    });
+  }
+});
+
+test("paused and bounded reconstruction qualifies account and daily counts", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+  overview.reconstruction.mode = "paused";
+  overview.reconstruction.lookup.complete = false;
+  overview.reconstruction.lookup.lastRecordId = 600;
+  overview.reconstruction.calculations.bounded = true;
+  overview.reconstruction.maintenance.running = false;
+  overview.reconstruction.publication.pendingDaysBounded = true;
+  await withAdminPage(async (path) => path === "/api/v1/admin/overview"
+    ? response(overview) : unavailableResponse(), async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("growth-status").textContent === "History unavailable");
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Paused");
+    assert.match(reconstructionText(documentRef), /Record lookup In progress/u);
+    assert.match(reconstructionText(documentRef), /Lookup position: 600 \/ 1,200\. Positions may have gaps; not a processed-record count/u);
+    assert.match(reconstructionText(documentRef), /3 of 8 shown tracked accounts/u);
+    assert.match(reconstructionText(documentRef), /At least 8 tracked accounts; the meter covers only those shown, not overall completion/u);
+    assert.match(reconstructionText(documentRef), /At least 5 pending days/u);
+    assert.match(reconstructionText(documentRef), /Paused · maintenance idle/u);
+  });
+});
+
+test("zero tracked reconstruction accounts show recorded zeros without an indeterminate completion meter", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+  for (const key of ["trackedAccounts", "completedAccounts", "preparingAccounts", "scanningAccounts", "finalizingAccounts", "sourceChangedAccounts", "checkpointsWritten"]) {
+    overview.reconstruction.calculations[key] = 0;
+  }
+  overview.reconstruction.calculations.newestResultAt = null;
+  overview.reconstruction.maintenance = { running: false, lastRunAt: null, leaseExpiresAt: null };
+  overview.reconstruction.publication = {
+    state: "unknown", pendingDays: 0, pendingDaysBounded: false, publishedDays: 0,
+    pricedDays: 0, latestPublishedAt: null,
+  };
+  await withAdminPage(async (path) => path === "/api/v1/admin/overview"
+    ? response(overview) : unavailableResponse(), async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("growth-status").textContent === "History unavailable");
+    assert.match(reconstructionText(documentRef), /0 of 0 tracked accounts/u);
+    assert.match(reconstructionText(documentRef), /0 pending days across all history/u);
+    assert.match(reconstructionText(documentRef), /Last 366 days: 0 published/u);
+    assert.match(reconstructionText(documentRef), /State unknown/u);
+    assert.match(reconstructionText(documentRef), /Latest cached result: not recorded/u);
+    assert.match(reconstructionText(documentRef), /last run not recorded · latest publication not recorded/u);
+    assert.equal(descendantNodes(documentRef.byId.get("admin-reconstruction-details"))
+      .some((node) => node.tag === "progress"), false);
+  });
+});
 
 test("admin tables preserve row order, text rendering, and empty states", async () => {
   const overview = await fixture("admin-overview-valid.json");
@@ -307,6 +942,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     assert.deepEqual(tableTexts(documentRef, "error-groups"), [[
       "<route-class>",
       errorGroup.errorCode,
+      String(errorGroup.status),
       `${errorGroup.occurrences} (${errorGroup.ratePerDay}/day)`,
       formatReportingTime(errorGroup.latestAt),
     ]]);
@@ -348,6 +984,8 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     for (const id of ["counts", "quarantine-counts", "distribution-counts"]) {
       for (const card of documentRef.byId.get(id).children) {
         assertInfoHint(card.children[0], card.children[0].children[0].textContent);
+        assert.equal(card.children.length, 4, `${id} card is missing recent history`);
+        assert.match(card.children[3].className, /admin-sparkline-shell/u);
       }
     }
     const narrowHint = documentRef.byId.get("counts").children[0].children[0]
@@ -576,18 +1214,346 @@ test("admin tables preserve row order, text rendering, and empty states", async 
   }
 });
 
-test("the owner dashboard imports the public community graph rather than copying it", async () => {
-  const source = await readFile(
-    new URL("../public/admin.js", import.meta.url),
-    "utf8",
-  );
+test("the owner dashboard keeps the merge trial private and separate from the public graph", async () => {
+  const [source, html] = await Promise.all([
+    readFile(new URL("../public/admin.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/admin.html", import.meta.url), "utf8"),
+  ]);
   assert.match(
     source,
-    /import \{ PublicCommunityClient \} from "\.\/community-data\.js";/u,
+    /request\("\/api\/v1\/admin\/community\/allowance-preview", \{ signal \}\)/u,
   );
-  assert.match(
-    source,
-    /import \{ renderCommunityAllowanceSection \} from "\.\/community-view\.js";/u,
-  );
-  assert.doesNotMatch(source, /from "\.\/community\.js"/u);
+  assert.match(source, /projectAdminAllowancePreview/u);
+  assert.doesNotMatch(source, /PublicCommunityClient/u);
+  assert.doesNotMatch(source, /renderCommunityAllowanceSection/u);
+  assert.match(html, /data-allowance-mode="combined"[^>]*>Combined</u);
+  assert.match(html, /data-allowance-mode="plans"[^>]*>By plan</u);
+  assert.match(html, /data-allowance-mode="models"[^>]*>By model</u);
+  assert.match(html, /class="community-allowance">[\s\S]*id="admin-reconstruction-progress"[\s\S]*id="admin-community-allowance-result"/u);
+  assert.match(html, /id="admin-reconstruction-progress" aria-labelledby="admin-reconstruction-title"/u);
+  assert.match(html, /id="admin-reconstruction-status" role="status"/u);
+  assert.doesNotMatch(html, /same published community graph/u);
+});
+
+async function withAllowancePage(preview, check) {
+  const overview = await fixture("admin-overview-valid.json");
+  const requests = [];
+  await withAdminPage(async (path, options) => {
+    assert.equal(options?.method ?? "GET", "GET", "allowance UI interactions must remain read-only");
+    requests.push(path);
+    if (path === "/api/v1/admin/overview") return response(overview);
+    if (path === "/api/v1/admin/community/allowance-preview") return response(preview);
+    assert.ok(ADMIN_READ_PATHS.slice(2).includes(path), "never call a public or unapproved endpoint");
+    return unavailableResponse();
+  }, async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Admin preview available"
+      && documentRef.byId.get("growth-status").textContent === "History unavailable");
+    await check(documentRef);
+    assert.deepEqual(requests, ADMIN_READ_PATHS);
+  });
+}
+
+function selectAllowanceControl(documentRef, id, selector) {
+  const group = documentRef.byId.get(id);
+  const button = group.querySelector(selector);
+  assert.ok(button, `control exists: ${selector}`);
+  group.listeners.get("click")({ target: button });
+  return button;
+}
+
+function allowanceNodes(documentRef, selector) {
+  return documentRef.byId.get("admin-community-allowance-result").querySelectorAll(selector);
+}
+
+test("admin refresh preserves the exact allowance DOM on transport failures and replaces it on recovery", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let nextPreview = async () => response(preview);
+  let previewRequests = 0;
+  await withAdminPage(async (path, options) => {
+    assert.equal(options.method ?? "GET", "GET");
+    if (path === "/api/v1/admin/overview") return response(overview);
+    if (path === "/api/v1/admin/community/allowance-preview") {
+      previewRequests += 1;
+      return nextPreview();
+    }
+    assert.ok(ADMIN_READ_PATHS.slice(2).includes(path));
+    return unavailableResponse();
+  }, async documentRef => {
+    const badge = documentRef.byId.get("admin-community-status");
+    await waitFor(() => badge.textContent === "Admin preview available");
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const plan = container.querySelector('button[data-allowance-plan="prolite"]');
+    container.listeners.get("click")({ target: plan });
+    const focused = documentRef.activeElement;
+    const graph = container.querySelector('svg[role="img"]');
+    const children = [...container.children];
+    const text = descendantNodes(container).map(node => node.textContent).join(" ");
+    let expectedRequests = 1;
+    for (const failure of [
+      async () => { throw new TypeError("fixture-private-transport-detail"); },
+      async () => unavailableResponse(),
+      async () => ({ ok: false, status: 503, json: async () => ({ error: { code: "BACKEND_STORAGE_UNAVAILABLE" } }) }),
+      async () => ({ ok: false, status: 503, json: async () => ({ error: { code: "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE" } }) }),
+      async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("fixture-malformed-payload"); } }),
+      async () => ({ ok: false, status: 502, json: async () => { throw new SyntaxError("fixture-proxy-html"); } }),
+      async () => ({ ok: false, status: 504, json: async () => null }),
+    ]) {
+      nextPreview = failure;
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(previewRequests, ++expectedRequests);
+      assert.equal(badge.textContent, "Admin preview available");
+      assert.equal(container.querySelector('svg[role="img"]'), graph);
+      assert.deepEqual(container.children, children);
+      assert.equal(documentRef.activeElement, focused);
+      assert.equal(focused.getAttribute("aria-pressed"), "true");
+      assert.equal(descendantNodes(container).map(node => node.textContent).join(" "), text);
+      assert.doesNotMatch(text, /last good|updating|fixture-private-transport-detail|fixture-proxy-html/iu);
+    }
+    const recovered = structuredClone(preview);
+    recovered.days.at(-1).byPlanType.pro.centralUsd += 10;
+    nextPreview = async () => response(recovered);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => container.querySelector('svg[role="img"]') !== graph);
+    assert.equal(badge.textContent, "Admin preview available");
+    assert.equal(container.querySelector('button[data-allowance-plan="prolite"]').getAttribute("aria-pressed"), "true");
+    assert.equal(container.querySelector(".allowance-summary-value").textContent, "$2,129");
+  });
+});
+
+test("admin refresh removes allowance graphs on authoritative refusals, unavailable states and malformed payloads", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let nextPreview = async () => response(preview);
+  await withAdminPage(async path => {
+    if (path === "/api/v1/admin/overview") return response(overview);
+    if (path === "/api/v1/admin/community/allowance-preview") return nextPreview();
+    assert.ok(ADMIN_READ_PATHS.slice(2).includes(path));
+    return unavailableResponse();
+  }, async documentRef => {
+    const badge = documentRef.byId.get("admin-community-status");
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const refresh = async () => {
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      await new Promise(resolve => setImmediate(resolve));
+    };
+    await waitFor(() => badge.textContent === "Admin preview available");
+    const errorResponse = (status, code) => async () => ({
+      ok: false, status, json: async () => ({ error: { code, httpStatus: 503 } }),
+    });
+    for (const refusal of [
+      errorResponse(401, "AUTH_REQUIRED"),
+      errorResponse(403, "INTERNAL_ERROR"),
+      errorResponse(404, "NOT_FOUND"),
+      errorResponse(503, "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE"),
+      errorResponse(503, "PUBLICATION_DISABLED"),
+      errorResponse(503, "ADMIN_NOT_CONFIGURED"),
+      errorResponse(503, "UNREVIEWED_SERVER_REFUSAL"),
+      async () => response({ status: "updating" }),
+      async () => response({ status: "unavailable" }),
+      async () => response({ ...preview, days: "malformed" }),
+    ]) {
+      assert.equal(badge.textContent, "Admin preview available");
+      assert.equal(container.querySelectorAll('svg[role="img"]').length, 1);
+      nextPreview = refusal;
+      await refresh();
+      assert.equal(badge.textContent, "Preview unavailable");
+      assert.equal(container.querySelectorAll('svg[role="img"]').length, 0);
+      nextPreview = async () => unavailableResponse();
+      await refresh();
+      assert.equal(badge.textContent, "Preview unavailable", "a later transport failure cannot resurrect invalidated data");
+      nextPreview = async () => response(preview);
+      await refresh();
+    }
+  });
+});
+
+test("overview access refusal clears the allowance graph and a delayed older preview cannot restore it", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let nextOverview = async () => response(overview);
+  let nextPreview = async () => response(preview);
+  let resolveOlderPreview;
+  await withAdminPage(async path => {
+    if (path === "/api/v1/admin/overview") return nextOverview();
+    if (path === "/api/v1/admin/community/allowance-preview") return nextPreview();
+    assert.ok(ADMIN_READ_PATHS.slice(2).includes(path));
+    return unavailableResponse();
+  }, async documentRef => {
+    const badge = documentRef.byId.get("admin-community-status");
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    await waitFor(() => badge.textContent === "Admin preview available");
+    const graph = container.querySelector('svg[role="img"]');
+    nextOverview = async () => unavailableResponse();
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(container.querySelector('svg[role="img"]'), graph, "temporary overview failures preserve the graph too");
+    nextOverview = async () => response(overview);
+    nextPreview = () => new Promise(resolve => { resolveOlderPreview = resolve; });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => typeof resolveOlderPreview === "function");
+    nextOverview = async () => ({ ok: false, status: 403, json: async () => ({ error: { code: "ADMIN_REQUIRED" } }) });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(badge.textContent, "Preview unavailable");
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 0);
+    resolveOlderPreview(response(preview));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(badge.textContent, "Preview unavailable");
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 0);
+  });
+});
+
+test("rendered plan cards keep normalized headlines and show correctly rounded actual-plan weeks", async () => {
+  await withAllowancePage(createAdminAllowancePreviewPayload(), async (documentRef) => {
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+    assert.equal(cards.length, 3);
+    assert.deepEqual(cards.map((card) => card.querySelector("h3").textContent), ["Pro 20×", "Pro 5×", "Plus"]);
+    assert.deepEqual(cards.map((card) => card.querySelector(".allowance-summary-value").textContent), ["$2,119", "$1,918", "$1,900"]);
+    assert.deepEqual(cards.map((card) => card.querySelector(".allowance-plan-value").textContent), [
+      "This plan: $2,119/week at API prices",
+      "This plan: $479/week at API prices",
+      "This plan: $95/week at API prices",
+    ]);
+    assert.equal(allowanceNodes(documentRef, ".allowance-summary-caption")[0].textContent,
+      "API-equivalent USD / Pro 20× week");
+    assert.match(descendantNodes(cards[1]).map((node) => node.textContent).join(" "), /1 account · 2 fits/u);
+
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const legend = container.querySelector('button[data-allowance-plan="prolite"]');
+    container.listeners.get("click")({ target: legend.children[1] });
+    const focused = container.querySelector('button[data-allowance-plan="prolite"]');
+    assert.equal(focused.getAttribute("aria-pressed"), "true");
+    assert.equal(documentRef.activeElement, focused);
+    assert.equal(allowanceNodes(documentRef, ".allowance-plan-value").length, 3);
+  });
+});
+
+test("a plan without qualifying evidence retains its unavailable card and has no fabricated actual value", async () => {
+  const preview = createAdminAllowancePreviewPayload();
+  for (const day of preview.days) {
+    day.byPlanType.plus = { fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null };
+  }
+  await withAllowancePage(preview, async (documentRef) => {
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const plus = allowanceNodes(documentRef, ".admin-allowance-plan-summary").at(-1);
+    assert.equal(plus.querySelector("h3").textContent, "Plus");
+    assert.equal(plus.querySelector(".allowance-summary-value").textContent, "—");
+    assert.equal(plus.querySelector(".allowance-plan-value"), null);
+    const text = descendantNodes(plus).map((node) => node.textContent).join(" ");
+    assert.match(text, /No qualifying fits/u);
+    assert.doesNotMatch(text, /This plan:|\$0/u);
+  });
+});
+
+test("rendered model cards, icons and native legend buttons share order and preserve focus and dropdown state", async () => {
+  await withAllowancePage(createAdminAllowancePreviewPayload(), async (documentRef) => {
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="models"]');
+    selectAllowanceControl(documentRef, "admin-community-range-controls", 'button[data-range-days="all"]');
+    const ids = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+    const themes = ["astra", "sol", "terra", "luna", "classic"];
+    const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+    assert.deepEqual(cards.map((card) => card.querySelector("h3").textContent), [
+      "GPT-6 Astra", "GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna", "GPT-5.5",
+    ]);
+    cards.forEach((card, index) => {
+      assert.equal(card.classList.contains(`allowance-model-${themes[index]}`), true);
+      assert.equal(card.querySelector(".allowance-model-icon").getAttribute("aria-hidden"), "true");
+      assert.equal(card.querySelector(".admin-allowance-value"), null, "cards do not inherit the large combined headline");
+    });
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const buttons = container.querySelectorAll("button[data-allowance-model-focus]");
+    assert.deepEqual(buttons.map((button) => button.dataset.allowanceModelFocus), ids);
+    assert.ok(buttons.every((button) => button.type === "button" && button.getAttribute("aria-pressed") === "false" && !button.disabled));
+    buttons.forEach((button, index) => {
+      assert.equal(button.children[0].classList.contains(`allowance-model-${themes[index]}`), true);
+    });
+    const axes = container.querySelectorAll(".chart-axis-label").map((node) => [node.textContent, node.getAttribute("x"), node.getAttribute("y")]);
+    container.listeners.get("click")({ target: buttons[0].children[1] });
+    let focused = container.querySelector('button[data-allowance-model-focus="gpt-6-astra"]');
+    assert.equal(focused.getAttribute("aria-pressed"), "true");
+    assert.equal(documentRef.activeElement, focused);
+    assert.equal(container.querySelector(".admin-allowance-model-filter select").value, "observed");
+    assert.deepEqual(container.querySelectorAll(".chart-axis-label").map((node) => [node.textContent, node.getAttribute("x"), node.getAttribute("y")]), axes);
+    assert.equal(container.querySelectorAll(".admin-allowance-dot").length, 10);
+    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, 5);
+    container.listeners.get("click")({ target: focused });
+    focused = container.querySelector('button[data-allowance-model-focus="gpt-6-astra"]');
+    assert.equal(focused.getAttribute("aria-pressed"), "false");
+    assert.equal(documentRef.activeElement, focused);
+    assert.equal(container.querySelectorAll(".admin-allowance-dot").length, 290);
+
+    const dropdown = container.querySelector(".admin-allowance-model-filter select");
+    dropdown.value = "all";
+    dropdown.listeners.get("change")();
+    assert.equal(container.querySelector(".admin-allowance-model-filter select").value, "all");
+    assert.equal(documentRef.activeElement, container.querySelector(".admin-allowance-model-filter select"));
+    const unavailable = container.querySelector('button[data-allowance-model-focus="gpt-5.4-mini"]');
+    assert.equal(unavailable.disabled, true);
+    assert.equal(unavailable.getAttribute("aria-pressed"), "false");
+    assert.equal(unavailable.title, "No qualifying fits in this range");
+    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, 39);
+    const specific = container.querySelector(".admin-allowance-model-filter select");
+    specific.value = "gpt-5.4-mini";
+    specific.listeners.get("change")();
+    assert.equal(container.querySelectorAll(".admin-allowance-dot").length, 0);
+    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, 1);
+    assert.match(descendantNodes(container).map((node) => node.textContent).join(" "), /No qualifying fits in this range/u);
+  });
+});
+
+test("the chart has one tab stop and keyboard inspection reaches every point hidden by dense marker thinning", async () => {
+  const preview = createAdminAllowancePreviewPayload();
+  await withAllowancePage(preview, async (documentRef) => {
+    selectAllowanceControl(documentRef, "admin-community-range-controls", 'button[data-range-days="all"]');
+    const svg = allowanceNodes(documentRef, 'svg[role="img"]')[0];
+    const dots = svg.querySelectorAll(".admin-allowance-dot");
+    const inspection = allowanceNodes(documentRef, ".admin-allowance-inspection")[0];
+    assert.equal(svg.getAttribute("tabindex"), "0");
+    assert.equal(dots.length, 70);
+    assert.ok(dots.every((dot) => dot.getAttribute("tabindex") === "-1"));
+    assert.equal(dots.filter((dot) => dot.getAttribute("data-permanent-marker") === "true").length, 2);
+    assert.equal(inspection.getAttribute("aria-live"), "polite");
+    let prevented = 0;
+    const key = (value) => svg.listeners.get("keydown")({
+      key: value, target: documentRef.activeElement ?? svg, preventDefault: () => { prevented += 1; },
+    });
+    key("Home");
+    for (const [index, dot] of dots.entries()) {
+      if (index > 0) key("ArrowRight");
+      assert.equal(documentRef.activeElement, dot, `day ${index + 1} remains inspectable`);
+      assert.equal(inspection.textContent, dot.getAttribute("aria-label"));
+      assert.ok(inspection.textContent.includes(preview.days[index].day));
+    }
+    assert.equal(prevented, 70);
+    key("ArrowDown");
+    assert.equal(documentRef.activeElement, dots.at(-1), "inspection clamps at the last fitted point");
+    key("Home");
+    key("ArrowUp");
+    assert.equal(documentRef.activeElement, dots[0], "inspection clamps at the first fitted point");
+    key("End");
+    key("ArrowLeft");
+    assert.equal(documentRef.activeElement, dots.at(-2));
+    assert.equal(dots.at(-2).getAttribute("data-permanent-marker"), "false");
+    const priorPrevented = prevented;
+    key("PageDown");
+    assert.equal(prevented, priorPrevented, "unrelated keyboard controls keep their default behavior");
+    dots[1].listeners.get("pointerenter")();
+    assert.equal(inspection.textContent, dots[1].getAttribute("aria-label"));
+    dots[2].listeners.get("click")();
+    assert.equal(inspection.textContent, dots[2].getAttribute("aria-label"));
+  });
+});
+
+test("rendered admin charts size their coordinate system to the container instead of shrinking desktop labels", async () => {
+  await withAllowancePage(createAdminAllowancePreviewPayload(), async (documentRef) => {
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    for (const [availableWidth, expectedWidth, mode] of [[350, 320, "plans"], [250, 280, "models"], [1_400, 960, "combined"]]) {
+      container.rect.width = availableWidth;
+      selectAllowanceControl(documentRef, "admin-community-mode-controls", `button[data-allowance-mode="${mode}"]`);
+      assert.equal(container.querySelector('svg[role="img"]').getAttribute("viewBox"), `0 0 ${expectedWidth} 300`);
+      assert.ok(container.querySelectorAll(".chart-axis-label").length > 0);
+    }
+  });
 });

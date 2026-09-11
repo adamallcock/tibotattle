@@ -96,6 +96,19 @@ test("legacy accounting rollback paths stay explicit and state-scoped", () => {
   );
 });
 
+test("last-authoritative dashboard state stays inside the owner-only private root", () => {
+  const stateRoot = join(tmpdir(), "local-installation-dashboard-state");
+  const paths = localCompanionStatePaths(stateRoot);
+  assert.equal(
+    paths.authoritativeDashboardSnapshotFile,
+    join(
+      stateRoot,
+      "private",
+      "authoritative-dashboard-snapshot-v1.json",
+    ),
+  );
+});
+
 test("installation roots reject relative, overlapping, symlink, and open state directories", async () => {
   const files = await fixture();
   const symlinkTarget = join(files.root, "symlink-target");

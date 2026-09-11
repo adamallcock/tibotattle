@@ -1,30 +1,30 @@
 /**
  * Browser data boundary.
  *
- * Preferred local companion contract:
- *   GET  /api/local/v1/status
- *   GET  /api/local/v1/dashboard
- *   POST /api/local/refresh
+ * Local companion contract:
+ *   GET  /api/local/{onboarding,overview,gradient,weekly,quality}
+ *   POST /api/local/refresh/quick (automatic/lightweight observation refresh)
+ *   POST /api/local/refresh       (explicit detailed-accounting rebuild)
  *
- * Split endpoint aliases are supported while the local server evolves:
- *   /api/local/{onboarding,overview,gradient,weekly,quality,reports}
- *
- * Central contribution contract:
- *   POST /api/v1/contributions
- *   POST /api/v1/me/contributions/read
- *   POST /api/v1/me/contributions/delete
- *   GET  /api/v1/me
- *   GET  /api/v1/me/stats
- *   GET  /api/v1/stats/aggregate
+ * Hosted browser-session contract:
+ *   GET  /api/v1/session
+ *   POST /api/v1/enroll and /api/v1/logout
+ *   POST /api/v1/identity/{google,apple}/{start,result}
  *   POST /api/v1/me/device-pairings
- *   GET  /api/v1/me/devices
- *   POST /api/v1/me/devices/revoke
  *
  * The normalizers below accept complete, partial, stale, and insufficient
  * responses, but never silently turn a failure into real-looking data.
  */
 
-import { TELEMETRY_PLAN_TYPES } from "./telemetry-shared.generated.js";
+import {
+  codexCacheReasoningConfiguration,
+  REVIEWED_CODEX_MODEL_IDS,
+  TELEMETRY_PLAN_TYPES,
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V11_ACCOUNT_BASES,
+  TELEMETRY_V11_PLAN_BASES,
+  telemetryV11RequiredConsent,
+} from "./telemetry-shared.generated.js";
 
 export {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
@@ -34,6 +34,10 @@ export {
 
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
+// The dashboard has no tool-activity view. Keep this diagnostic in the raw
+// companion payload and retained snapshots, but omit it from display warnings.
+const INTERNAL_TOOL_HISTORY_WARNING =
+  "Usage accounting is complete, but typed tool history is partial. Tool totals are withheld rather than reported as zero.";
 // Provider quota identifiers are protocol values, not display copy. Keep the
 // normal Codex allowance selection bound to the exact technical identifier so
 // a translated UI label (or another product's weekly-looking window) can never
@@ -53,10 +57,21 @@ export const CODEX_SPARK_LIMIT_IDS = Object.freeze([
 export const CODEX_FIVE_HOUR_ALLOWANCE_MINUTES = 300;
 export const CODEX_WEEKLY_ALLOWANCE_MINUTES = 10_080;
 export const MAX_QUOTA_WINDOW_DURATION_MINUTES = 525_600;
+export const MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH = 80;
+export const QUOTA_LIMIT_DISPLAY_ALIASES = Object.freeze({
+  [CODEX_PRIMARY_LIMIT_ID]: "Codex",
+  [CODEX_SPARK_LIMIT_ID]: "Spark",
+  [CODEX_SPARK_RESERVED_LIMIT_ID]: "Spark",
+});
+const SAFE_QUOTA_LIMIT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/u;
+const SAFE_QUOTA_LIMIT_DISPLAY_NAME =
+  /^[\p{L}\p{N}][\p{L}\p{N}\p{M}\p{Pd} ._()+:]{0,79}$/u;
 
 export function isSparkQuotaLimitId(value) {
   return CODEX_SPARK_LIMIT_IDS.includes(value);
 }
+// Parse-only compatibility for historical readiness fixtures. The public
+// browser relay no longer forwards /api/ready.
 const BACKEND_LIFECYCLE_STATES = new Set([
   "never_run",
   "running",
@@ -92,8 +107,6 @@ export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION =
   "contribution-sync-preview-v0.1";
 export const CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION =
   "contribution-sync-run-v0.1";
-export const AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION =
-  "automatic-contribution-status-v0.1";
 export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
   "local-contribution-preparation-result-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_PAIRING_VERSION =
@@ -112,10 +125,10 @@ const PARTICIPANT_COMPARISON_METRIC_UNITS = Object.freeze({
   outputCombinedTokens: "tokens",
   toolUnits: "units"
 });
+// Parse-only compatibility for historical deletion receipts. No current
+// browser method calls the retired granular contribution-delete endpoint.
 const CONTRIBUTION_ID_PATTERN =
   /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const PARTICIPANT_ID_PATTERN =
-  /^participant:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 // The Worker returns one of these in every error body. It identifies a server
 // request, never a participant, so it is safe to show next to the local
 // reference the page mints for the same failure.
@@ -236,6 +249,7 @@ const LOCAL_PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
   "identity_unavailable",
+  "identity_migration_required",
   "no_safe_records",
   "export_too_large",
   "privacy_verification_failed",
@@ -296,10 +310,36 @@ function canonicalInstant(value) {
 }
 
 function normalizeQuotaLimitId(value) {
-  const candidate = text(value, "");
-  return candidate === CODEX_PRIMARY_LIMIT_ID || isSparkQuotaLimitId(candidate)
-    ? candidate
+  return sanitizeQuotaLimitId(value);
+}
+
+export function sanitizeQuotaLimitId(value) {
+  return typeof value === "string" && SAFE_QUOTA_LIMIT_ID.test(value)
+    ? value
     : "unknown";
+}
+
+export function sanitizeQuotaLimitDisplayName(value) {
+  if (typeof value !== "string") return null;
+  let normalized;
+  try {
+    normalized = value.normalize("NFKC").trim();
+  } catch {
+    return null;
+  }
+  if (normalized.length === 0
+      || Array.from(normalized).length > MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH
+      || !SAFE_QUOTA_LIMIT_DISPLAY_NAME.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+export function quotaLimitDisplayAlias(limitId) {
+  const normalized = sanitizeQuotaLimitId(limitId);
+  return Object.hasOwn(QUOTA_LIMIT_DISPLAY_ALIASES, normalized)
+    ? QUOTA_LIMIT_DISPLAY_ALIASES[normalized]
+    : null;
 }
 
 /**
@@ -370,24 +410,24 @@ export const QUOTA_WINDOW_KINDS = Object.freeze([
 
 export function classifyQuotaWindowKind(limitId, durationMinutes) {
   const duration = finite(durationMinutes, null);
+  if (!isValidQuotaWindowDuration(duration)) return "other";
   if (limitId === CODEX_PRIMARY_LIMIT_ID) {
     if (duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return "codex_five_hour";
     if (duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) return "codex_seven_day";
-    if (isValidQuotaWindowDuration(duration)) return "codex_provider_reported";
-    return "other";
+    return "codex_provider_reported";
   }
   if (isSparkQuotaLimitId(limitId)) {
     if (duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return "spark_five_hour";
     if (duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) return "spark_seven_day";
-    // The limit identity is certain even when the duration is novel or
-    // unparseable, so the window keeps the generic Spark name rather than
-    // being promoted to a named duration or demoted to "other".
+    // The limit identity is certain even when a valid duration is novel, so
+    // the window keeps the generic Spark name rather than borrowing a named
+    // duration.
     return "spark_other";
   }
   return "other";
 }
 
-export function quotaWindowLabel(limitId, durationMinutes) {
+export function quotaWindowLabel(limitId, durationMinutes, limitName = null) {
   const duration = finite(durationMinutes, null);
   switch (classifyQuotaWindowKind(limitId, duration)) {
     case "codex_five_hour":
@@ -403,8 +443,18 @@ export function quotaWindowLabel(limitId, durationMinutes) {
     case "spark_other":
       return "Spark allowance";
     default:
-      return "Other observed allowance";
+      break;
   }
+  const durationLabel = formatQuotaWindowDuration(duration);
+  const providerName = sanitizeQuotaLimitDisplayName(limitName);
+  if (durationLabel === "") {
+    return providerName === null
+      ? "Other observed allowance"
+      : `${providerName} allowance`;
+  }
+  return providerName === null
+    ? `Other observed ${durationLabel} allowance`
+    : `${providerName} · ${durationLabel} allowance`;
 }
 
 function count(value, fallback = null) {
@@ -683,22 +733,6 @@ export function normalizeContributionDeletionReceipt(payload, expectedContributi
   });
 }
 
-export function normalizeParticipantDeletionReceipt(payload, expectedParticipantId = null) {
-  if (!hasExactKeys(payload, ["deleted", "participantId", "contributionsDeleted"])
-      || payload.deleted !== true
-      || !PARTICIPANT_ID_PATTERN.test(payload.participantId)
-      || (expectedParticipantId !== null && payload.participantId !== expectedParticipantId)
-      || !Number.isSafeInteger(payload.contributionsDeleted)
-      || payload.contributionsDeleted < 0) {
-    throw new Error("The service returned an invalid participant deletion receipt.");
-  }
-  return Object.freeze({
-    deleted: true,
-    participantId: payload.participantId,
-    contributionsDeleted: payload.contributionsDeleted
-  });
-}
-
 export function normalizeContributionSyncStatus(payload) {
   const unavailable = {
     state: "unavailable",
@@ -762,7 +796,7 @@ const INCREMENTAL_SYNC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 // Where a macOS Keychain dialog is still reachable for this install. An
 // unreadable or absent answer means "pairing" — today's guidance, shown to
 // everyone — so a companion that cannot say never silently withholds it.
-const INCREMENTAL_SYNC_KEYCHAIN_PROMPTS = ["pairing", "rotation", "none"];
+const INCREMENTAL_SYNC_KEYCHAIN_PROMPTS = ["pairing", "migration", "none"];
 
 export function normalizeIncrementalContributionSyncStatus(payload) {
   const keychainPrompt =
@@ -840,6 +874,11 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
   return Object.freeze({
     status: "available",
     keychainPrompt,
+    ...(payload.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      ? { contractVersion: payload.contractVersion } : {}),
+    ...(payload.attributionUpgrade?.available === true
+      && payload.attributionUpgrade?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      ? { attributionUpgradeAvailable: true } : {}),
     consent: Object.freeze({
       approved: payload.consent.approved,
       current: payload.consent.current,
@@ -858,220 +897,49 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
   });
 }
 
-export function normalizeAutomaticContributionStatus(payload) {
-  const unavailable = Object.freeze({
-    state: "unavailable",
-    enabled: false,
-    intervalHours: 6,
-    consentCurrent: false,
-    firstReviewComplete: false,
-    firstReviewedAcceptedAt: "",
-    requiredConsent: null,
-    consentedAt: "",
-    lastAttemptAt: "",
-    lastSuccessAt: "",
-    nextAttemptAt: "",
-    lastOutcome: null,
-    foregroundOnly: true,
-    daemonInstalled: false
-  });
-  const exactKeys = [
-    "schemaVersion",
-    "status",
-    "enabled",
-    "intervalHours",
-    "consentCurrent",
-    "firstReviewComplete",
-    "firstReviewedAcceptedAt",
-    "requiredConsent",
-    "consentedAt",
-    "lastAttemptAt",
-    "lastSuccessAt",
-    "nextAttemptAt",
-    "lastOutcome",
-    "foregroundOnly",
-    "daemonInstalled",
-    "networkActivity",
-    "includesContent",
-    "includesPaths",
-    "includesIdentifiers",
-    "includesCredentials"
-  ];
-  const states = new Set([
-    "not_configured",
-    "disabled",
-    "first_review_required",
-    "scheduled",
-    "running",
-    "paused",
-    "consent_required",
-    "failed"
-  ]);
-  if (!hasExactKeys(payload, exactKeys)
-      || payload.schemaVersion !== AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION
-      || !states.has(payload.status)
-      || typeof payload.enabled !== "boolean"
-      || payload.intervalHours !== 6
-      || typeof payload.consentCurrent !== "boolean"
-      || typeof payload.firstReviewComplete !== "boolean"
-      || payload.foregroundOnly !== true
-      || payload.daemonInstalled !== false
-      || payload.networkActivity !== false
-      || payload.includesContent !== false
-      || payload.includesPaths !== false
-      || payload.includesIdentifiers !== false
-      || payload.includesCredentials !== false) {
-    return unavailable;
-  }
-
-  const requiredConsentKeys = [
-    "telemetrySchemaVersion",
-    "fieldDictionaryVersion",
-    "privacyContractVersion",
-    "destinationOrigin"
-  ];
-  const requiredConsent = payload.requiredConsent;
-  const destination = text(requiredConsent?.destinationOrigin, "");
-  let validDestination = requiredConsent?.destinationOrigin === null;
-  if (destination) {
-    try {
-      const origin = new URL(destination);
-      const production = origin.protocol === "https:"
-        && !origin.port
-        && origin.hostname !== "localhost"
-        && origin.hostname !== "127.0.0.1";
-      const localDevelopment = origin.protocol === "http:"
-        && origin.hostname === "127.0.0.1"
-        && /^[1-9][0-9]{0,4}$/u.test(origin.port)
-        && Number(origin.port) <= 65_535;
-      validDestination = (production || localDevelopment)
-        && !origin.username
-        && !origin.password
-        && origin.pathname === "/"
-        && !origin.search
-        && !origin.hash
-        && origin.origin === destination;
-    } catch {
-      validDestination = false;
-    }
-  }
-  if (!hasExactKeys(requiredConsent, requiredConsentKeys)
-      || requiredConsent.telemetrySchemaVersion !== "telemetry-contribution-v0.1"
-      || requiredConsent.fieldDictionaryVersion
-        !== "telemetry-v0.1-registry-2026-08-06.1"
-      || requiredConsent.privacyContractVersion
-        !== "ongoing-privacy-safe-telemetry-v0.1"
-      || !validDestination
-      || (payload.status === "not_configured"
-        ? requiredConsent.destinationOrigin !== null
-        : requiredConsent.destinationOrigin === null)) {
-    return unavailable;
-  }
-
-  const alwaysEnabledStates = new Set(["scheduled", "running", "paused"]);
-  const neverEnabledStates = new Set([
-    "not_configured",
-    "disabled",
-    "first_review_required",
-    "consent_required"
-  ]);
-  if (payload.enabled !== payload.consentCurrent
-      || (alwaysEnabledStates.has(payload.status) && !payload.enabled)
-      || (neverEnabledStates.has(payload.status) && payload.enabled)) {
-    return unavailable;
-  }
-
-  const timestamp = (value) => {
-    if (value === null) return "";
-    const selected = text(value, "");
-    return selected
-      && Number.isFinite(Date.parse(selected))
-      && new Date(Date.parse(selected)).toISOString() === selected
-      ? selected
-      : null;
-  };
-  const consentedAt = timestamp(payload.consentedAt);
-  const firstReviewedAcceptedAt = timestamp(payload.firstReviewedAcceptedAt);
-  const lastAttemptAt = timestamp(payload.lastAttemptAt);
-  const lastSuccessAt = timestamp(payload.lastSuccessAt);
-  const nextAttemptAt = timestamp(payload.nextAttemptAt);
-  if ([
-    consentedAt,
-    firstReviewedAcceptedAt,
-    lastAttemptAt,
-    lastSuccessAt,
-    nextAttemptAt
-  ]
-    .some((value) => value === null)) {
-    return unavailable;
-  }
-  const statusMayLackFirstReview = new Set([
-    "not_configured",
-    "failed",
-    "first_review_required"
-  ]);
-  if (payload.firstReviewComplete !== Boolean(firstReviewedAcceptedAt)
-      || (payload.firstReviewComplete
-        && ["not_configured", "first_review_required"].includes(payload.status))
-      || (!payload.firstReviewComplete
-        && !statusMayLackFirstReview.has(payload.status))) {
-    return unavailable;
-  }
-
-  let lastOutcome = null;
-  if (payload.lastOutcome !== null) {
-    const outcomeCodesByStatus = new Map([
-      ["succeeded", new Set(["accepted", "completed"])],
-      ["skipped", new Set(["no_new_evidence"])],
-      ["failed", new Set([
-        "retry_scheduled",
-        "delivery_rejected",
-        "preparation_failed",
-        "publication_incomplete",
-        "upload_failed",
-        "run_timeout"
-      ])],
-      ["paused", new Set([
-        "queue_paused",
-        "privacy_verification_failed",
-        "identity_unavailable"
-      ])]
-    ]);
-    const at = timestamp(payload.lastOutcome?.at);
-    if (!hasExactKeys(payload.lastOutcome, ["status", "code", "at"])
-        || !outcomeCodesByStatus
-          .get(payload.lastOutcome.status)
-          ?.has(payload.lastOutcome.code)
-        || !at) {
-      return unavailable;
-    }
-    lastOutcome = Object.freeze({
-      status: payload.lastOutcome.status,
-      code: payload.lastOutcome.code,
-      at
-    });
-  }
-
+export function normalizeAttributionContributionReview(payload) {
+  const required = telemetryV11RequiredConsent();
+  const consent = payload?.consent;
+  const inventory = payload?.inventory;
+  const fields = inventory?.fields;
+  let destination;
+  try { destination = new URL(consent?.destinationOrigin); } catch { return null; }
+  const loopback = destination.protocol === "http:"
+    && ["localhost", "127.0.0.1", "[::1]"].includes(destination.hostname);
+  if (payload?.schemaVersion !== "local-incremental-contribution-review-v1.1" || payload.status !== "ready"
+      || payload.includesContent !== false || payload.includesPaths !== false
+      || payload.includesAccountIdentifiers !== false || payload.includesCredentials !== false
+      || !/^[A-Za-z0-9_-]{43}$/u.test(payload.reviewToken ?? "")
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(payload.grantDeviceId ?? "")
+      || (destination.protocol !== "https:" && !loopback) || destination.origin !== consent.destinationOrigin
+      || !consent || Object.keys(consent).length !== 4
+      || Object.entries(required).some(([key, value]) => consent[key] !== value || inventory?.consent?.[key] !== value)
+      || inventory?.schemaVersion !== "telemetry-field-inventory-v1.1"
+      || !/^[0-9a-f]{64}$/u.test(inventory.inventoryDigest ?? "")
+      || !fields || Object.keys(fields).length !== 4
+      || ["usage", "quota", "session", "accountPlanAttribution"].some((stream) =>
+        !Array.isArray(fields[stream]) || fields[stream].length < 1 || fields[stream].length > 40
+        || fields[stream].some((field) => typeof field !== "string" || !/^[A-Za-z][A-Za-z0-9]{0,63}$/u.test(field)))
+      || JSON.stringify(inventory.accountBases) !== JSON.stringify(TELEMETRY_V11_ACCOUNT_BASES)
+      || JSON.stringify(inventory.planBases) !== JSON.stringify(TELEMETRY_V11_PLAN_BASES)
+      || JSON.stringify(inventory.nullableQuotaMeasurements) !== JSON.stringify(["usedPercent", "windowDurationMinutes", "resetsAt"])
+      || !INCREMENTAL_SYNC_DAY_PATTERN.test(payload.sample?.day ?? "")
+      || !/^[0-9a-f]{64}$/u.test(payload.sample?.manifestDigest ?? "")
+      || ["usage", "quota", "session"].some((stream) => count(payload.sample?.recordCounts?.[stream], null) === null)
+      || typeof payload.hostedConsentCurrent !== "boolean") return null;
   return Object.freeze({
-    state: payload.status,
-    enabled: payload.enabled,
-    intervalHours: 6,
-    consentCurrent: payload.consentCurrent,
-    firstReviewComplete: payload.firstReviewComplete,
-    firstReviewedAcceptedAt,
-    requiredConsent: Object.freeze({
-      telemetrySchemaVersion: requiredConsent.telemetrySchemaVersion,
-      fieldDictionaryVersion: requiredConsent.fieldDictionaryVersion,
-      privacyContractVersion: requiredConsent.privacyContractVersion,
-      destinationOrigin: requiredConsent.destinationOrigin
+    reviewToken: payload.reviewToken, grantDeviceId: payload.grantDeviceId,
+    consent: Object.freeze({ ...required, destinationOrigin: destination.origin }),
+    inventory: Object.freeze({ inventoryDigest: inventory.inventoryDigest,
+      fields: Object.freeze(Object.fromEntries(["usage", "quota", "session", "accountPlanAttribution"]
+        .map((stream) => [stream, Object.freeze([...fields[stream]])]))),
+      accountBases: Object.freeze([...inventory.accountBases]), planBases: Object.freeze([...inventory.planBases]),
+      nullableQuotaMeasurements: Object.freeze([...inventory.nullableQuotaMeasurements]),
     }),
-    consentedAt,
-    lastAttemptAt,
-    lastSuccessAt,
-    nextAttemptAt,
-    lastOutcome,
-    foregroundOnly: true,
-    daemonInstalled: false
+    sample: Object.freeze({ day: payload.sample.day, manifestDigest: payload.sample.manifestDigest,
+      recordCounts: Object.freeze(Object.fromEntries(["usage", "quota", "session"]
+        .map((stream) => [stream, payload.sample.recordCounts[stream]]))) }),
+    hostedConsentCurrent: payload.hostedConsentCurrent,
   });
 }
 
@@ -1612,7 +1480,11 @@ export function normalizeLocalContributionDeviceDisconnect(payload) {
     localCredential: "unknown",
     localBinding: "unknown",
   };
-  if (payload?.schemaVersion !== LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION
+  if (!hasExactKeys(payload, [
+    "schemaVersion", "status", "deliveryPaused", "localCredential",
+    "localBinding", "hostedDataDeleted", "includesIdentifiers", "includesCredentials",
+  ])
+      || payload?.schemaVersion !== LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION
       || payload?.status !== "disconnected"
       || payload?.deliveryPaused !== true
       || !["deleted", "already_missing"].includes(payload?.localCredential)
@@ -2270,25 +2142,7 @@ const LOCAL_COMPONENT_KEYS = Object.freeze([
   "output_reasoning_tokens",
   "output_combined_tokens"
 ]);
-const LOCAL_MODELS = new Set([
-  "gpt-5.6-sol",
-  "gpt-5.6-sol-wm",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.5-codex",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5",
-  "gpt-4.1",
-  // Recognised identities that carry no published API price card. They were
-  // missing here, so the local report's rows for them were discarded at this
-  // boundary and their usage silently reappeared as "unknown".
-  "codex-auto-review",
-  // Metered against its own subscription allowance, never the primary pool.
-  "gpt-5.3-codex-spark",
-  "unknown"
-]);
+const LOCAL_MODELS = new Set([...REVIEWED_CODEX_MODEL_IDS, "unknown"]);
 const LOCAL_MODEL_PRICING_STATUSES = new Set([
   "priced",
   "known_unpriced",
@@ -2317,6 +2171,7 @@ const CACHE_SWITCH_RECENT_LIMIT = 20;
 const CACHE_SWITCH_PROXIMITY_CEILING_SECONDS = 300;
 const CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO = 0.5;
 const CACHE_CONTINUITY_MINIMUM_GAP_SECONDS = 0;
+const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS = 7 * 24 * 60 * 60;
 const CACHE_CONTINUITY_GAP_BANDS = Object.freeze({
   under_one_minute: [0, 60],
   one_to_five_minutes: [60, 300],
@@ -2329,12 +2184,43 @@ const CACHE_CONTINUITY_GAP_BANDS = Object.freeze({
 const CACHE_CONTINUITY_GAP_BAND_IDS = Object.freeze(
   Object.keys(CACHE_CONTINUITY_GAP_BANDS)
 );
+const CACHE_CONTINUITY_OUTCOME_BUCKETS = Object.freeze({
+  under_one_minute: [0, 60],
+  one_to_two_minutes: [60, 120],
+  two_to_five_minutes: [120, 300],
+  five_to_ten_minutes: [300, 600],
+  ten_to_thirty_minutes: [600, 1_800],
+  thirty_minutes_to_one_hour: [1_800, 3_600],
+  one_to_six_hours: [3_600, 21_600],
+  six_to_twenty_four_hours: [21_600, 86_400],
+  one_to_three_days: [86_400, 259_200],
+  over_three_days: [259_200, null]
+});
+const CACHE_CONTINUITY_OUTCOME_BUCKET_IDS = Object.freeze(
+  Object.keys(CACHE_CONTINUITY_OUTCOME_BUCKETS)
+);
+const CACHE_CONTINUITY_BREAKDOWN_FIELDS = Object.freeze([
+  "sameConfigurationReturns",
+  "comparableReturns",
+  "compactionConfoundedReturns",
+  "contextContractedReturns",
+  "insufficientEvidenceReturns",
+  "uncoveredReturns",
+  "reusedMoreThanHalfReturns",
+  "reusedHalfOrLessReturns",
+  "matchedOrExceededReturns",
+  "reusedBetweenHalfAndPreviousReturns",
+  "cacheReadDrops",
+  "lostCacheTokens",
+  "pricedDrops",
+  "unpricedDrops"
+]);
 const SIDE_CHAT_ESTIMATE_SCHEMA_VERSION =
   "development-side-chat-estimate-v0.4";
 const SIDE_CHAT_ESTIMATE_PARSER_VERSION =
   "desktop-fork-logs2-active-context-v0.3";
 const SIDE_CHAT_HISTORICAL_GAP_SCHEMA_VERSION =
-  "development-side-chat-historical-gap-v0.2";
+  "development-side-chat-historical-gap-v0.3";
 const SIDE_CHAT_RECENT_LIMIT = 500;
 const SIDE_CHAT_PERIOD_IDS = new Set(["24h", "7d", "30d", "all"]);
 const SIDE_CHAT_CACHE_ASSUMPTIONS = new Set([
@@ -2399,7 +2285,7 @@ const CACHE_SWITCH_ALLOWANCE_INTERPRETATION =
 const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
-  fast_mode: ["Fast-mode accounting", "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. An observed tier always wins; a timestamp-covered config declaration comes next, then your stated mode. Window-level inference is diagnostic only and never changes the money. Only an explicit mixed/unknown choice can leave the remainder unknown."],
+  fast_mode: ["Fast-mode accounting", "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. An observed tier always wins; a timestamp-covered config declaration comes next, and anything neither covers is attributed to Standard as a visible assumption. Fast increments are priced at the published Priority (Fast) API rate for the model. Window-level inference is diagnostic only and never changes the money."],
   subagents: ["Subagents and child rollouts", "Lineage-aware accounting excludes inherited parent snapshots before attributing genuine child-rollout increments; ambiguous lineage remains unknown."],
   shared_pool_surfaces: ["Work, Workspace Agents, Excel and connected Voice", "These shared-pool surfaces may not write complete local Codex evidence."],
   third_party_auth: ["Third-party ChatGPT-authenticated apps", "No complete local accounting source is available for third-party authenticated apps."],
@@ -2668,6 +2554,48 @@ function normalizeCachePremiumWeighting(value, pricedDrops, standardPremium) {
   };
 }
 
+function normalizeCacheCoveredSubtotal(value, pricedDrops, completePremium) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.scope !== "covered_priced_drops"
+      || !Number.isSafeInteger(pricedDrops) || pricedDrops <= 0
+      || value.pricedDrops !== pricedDrops
+      || typeof value.standardApiPremiumUsd !== "number"
+      || !Number.isFinite(value.standardApiPremiumUsd)
+      || value.standardApiPremiumUsd < 0
+      || typeof value.standardApiPremiumUsdExact !== "string"
+      || value.standardApiPremiumUsdExact.length > 64
+      || !/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u.test(value.standardApiPremiumUsdExact)
+      || Number(value.standardApiPremiumUsdExact) !== value.standardApiPremiumUsd
+      || (completePremium !== null
+        && Math.abs(completePremium - value.standardApiPremiumUsd) > 1e-9)) return null;
+  const allowanceWeighting = normalizeCachePremiumWeighting(
+    value.allowanceWeighting, pricedDrops, value.standardApiPremiumUsd
+  );
+  if (allowanceWeighting === null) return null;
+  return {
+    scope: "covered_priced_drops",
+    pricedDrops,
+    standardApiPremiumUsd: value.standardApiPremiumUsd,
+    standardApiPremiumUsdExact: value.standardApiPremiumUsdExact,
+    allowanceWeighting
+  };
+}
+
+function cacheCoveredSubtotalsMatch(total, rows) {
+  if (total.coveredSubtotal === null) return true;
+  if (rows.some((row) => row.pricedDrops > 0 && row.coveredSubtotal === null)) return false;
+  // These strings have already passed the closed, nine-decimal validator.
+  // Compare exact sums, including for amounts that exceed float precision.
+  const nanos = (subtotal) => {
+    const [whole, fraction = ""] = subtotal.standardApiPremiumUsdExact.split(".");
+    return BigInt(whole) * 1_000_000_000n + BigInt(fraction.padEnd(9, "0"));
+  };
+  const sum = rows.reduce((amount, row) => amount + (
+    row.coveredSubtotal === null ? 0n : nanos(row.coveredSubtotal)
+  ), 0n);
+  return sum === nanos(total.coveredSubtotal);
+}
+
 function normalizeCacheSwitchBreakdown(value, includeOrderingCoverage = false) {
   const configurationChanges = count(value?.configurationChanges, null);
   const proximateConfigurationChanges = count(
@@ -2709,15 +2637,18 @@ function normalizeCacheSwitchBreakdown(value, includeOrderingCoverage = false) {
       || (cacheReadDrops === 0 && lostCacheTokens !== 0)
       || (cacheReadDrops > 0 && lostCacheTokens === 0)
       || (cacheReadDrops === 0 && premium !== 0 && premium !== null)
-      // One unpriced drop makes the aggregate premium incomplete, so the
-      // companion withholds the entire money sum instead of presenting the
-      // priced subset as the answer.
+      // Unpriced drops withhold the full-period amount. Any covered/priced
+      // subtotal has its own explicit scope and cannot replace this field.
       || ((unpricedDrops > 0 || coverageStatus === "incomplete")
         && premium !== null)
       || (unpricedDrops === 0 && coverageStatus === "complete"
         && premium === null)) {
     return null;
   }
+  const coveredSubtotal = normalizeCacheCoveredSubtotal(
+    value?.coveredSubtotal, pricedDrops, premium
+  );
+  if (value?.coveredSubtotal != null && coveredSubtotal === null) return null;
   return {
     configurationChanges,
     proximateConfigurationChanges,
@@ -2727,6 +2658,7 @@ function normalizeCacheSwitchBreakdown(value, includeOrderingCoverage = false) {
     cacheReadDrops,
     lostCacheTokens,
     estimatedPremiumUsd: premium,
+    coveredSubtotal,
     pricedDrops,
     unpricedDrops
   };
@@ -2740,8 +2672,128 @@ function normalizeCacheSwitchState(value) {
   return { model, reasoningEffort };
 }
 
-function effectiveCacheSwitchEffort(value) {
-  return value === "ultra" ? "max" : value;
+// This separate contract is only for interactive local navigation. Never add
+// its names or raw thread identifiers to normalized accounting/report DTOs.
+const LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA = "local-cache-drop-thread-links-v1";
+const CACHE_DROP_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const MAX_CACHE_DROP_THREAD_LINKS = 160;
+
+function normalizeAccountingGeneration(value) {
+  if (typeof value !== "number"
+      && (typeof value !== "string" || value.length > 32
+        || !/^[1-9]\d*(?:\.0+)?$/u.test(value))) return null;
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0 ? String(numeric) : null;
+}
+
+function normalizeCacheDiagnosticsSource(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "generation,generationFingerprint"
+      || typeof value.generationFingerprint !== "string"
+      || !/^generation-v2-[a-f0-9]{64}$/u.test(value.generationFingerprint)) return null;
+  const generation = normalizeAccountingGeneration(value.generation);
+  return generation === null ? null : {
+    generation, generationFingerprint: value.generationFingerprint
+  };
+}
+
+/** Mirrors the companion's content-free event-pair key, never an identity. */
+export function cacheDropThreadLookupKey(kind, row) {
+  if (!["switch", "continuity"].includes(kind)
+      || !row || typeof row !== "object" || Array.isArray(row)) return null;
+  const previous = kind === "switch" ? row.previous : row.configuration;
+  const current = kind === "switch" ? row.current : row.configuration;
+  for (const configuration of [previous, current]) {
+    if (!configuration || typeof configuration.model !== "string"
+        || configuration.model.length > 200
+        || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/u.test(configuration.model)
+        || configuration.reasoningEffort === "unknown"
+        || !LOCAL_REASONING_EFFORTS.has(configuration.reasoningEffort)) return null;
+  }
+  if (typeof row.observedAt !== "string" || row.observedAt.length !== 24
+      || canonicalInstant(row.observedAt) === null
+      || typeof row.gapSeconds !== "number" || !Number.isFinite(row.gapSeconds)
+      || row.gapSeconds < 0
+      || ![row.previousCacheReadTokens, row.currentCacheReadTokens, row.lostCacheTokens]
+        .every((value) => Number.isSafeInteger(value) && value >= 0)
+      || row.lostCacheTokens < 1
+      || row.currentCacheReadTokens > row.previousCacheReadTokens / 2
+      || row.lostCacheTokens > row.previousCacheReadTokens - row.currentCacheReadTokens) return null;
+  const observedMs = Date.parse(row.observedAt);
+  const gapMs = Math.round(row.gapSeconds * 1_000);
+  if (!Number.isSafeInteger(gapMs) || gapMs < 0
+      || gapMs / 1_000 !== row.gapSeconds || observedMs < gapMs) return null;
+  return JSON.stringify([
+    kind, row.observedAt, row.gapSeconds,
+    previous.model, previous.reasoningEffort,
+    current.model, current.reasoningEffort,
+    row.previousCacheReadTokens, row.currentCacheReadTokens, row.lostCacheTokens
+  ]);
+}
+
+function validCacheDropThreadKey(kind, key) {
+  if (typeof key !== "string" || key.length > 2048) return false;
+  let tuple;
+  try { tuple = JSON.parse(key); } catch { return false; }
+  if (!Array.isArray(tuple) || tuple.length !== 10 || tuple[0] !== kind) return false;
+  const previous = { model: tuple[3], reasoningEffort: tuple[4] };
+  const current = { model: tuple[5], reasoningEffort: tuple[6] };
+  return cacheDropThreadLookupKey(kind, {
+    observedAt: tuple[1], gapSeconds: tuple[2], previous, current,
+    configuration: current,
+    previousCacheReadTokens: tuple[7], currentCacheReadTokens: tuple[8],
+    lostCacheTokens: tuple[9]
+  }) === key;
+}
+
+function validLocalThreadName(value, maximum = 512) {
+  return value === null || (typeof value === "string"
+    && value.length > 0 && value.length <= maximum
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value));
+}
+
+export function normalizeCacheDropThreadLinks(value) {
+  const unavailable = {
+    schemaVersion: LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA,
+    status: "unavailable", generation: null, entries: []
+  };
+  if (!hasExactKeys(value, ["schemaVersion", "status", "generation", "entries"])
+      || value.schemaVersion !== LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA
+      || value.status !== "available"
+      || !Array.isArray(value.entries)
+      || value.entries.length > MAX_CACHE_DROP_THREAD_LINKS) return unavailable;
+  const generation = normalizeAccountingGeneration(value.generation);
+  if (generation === null) return unavailable;
+  const seen = new Set();
+  const entries = [];
+  for (const entry of value.entries) {
+    const thread = entry?.thread;
+    const autoReview = hasExactKeys(thread, ["id", "name", "nickname", "parent", "origin"])
+      && thread.origin === "auto_review";
+    if (!hasExactKeys(entry, ["kind", "key", "thread"])
+        || !validCacheDropThreadKey(entry.kind, entry.key)
+        || seen.has(entry.key)
+        || (!autoReview && !hasExactKeys(thread, ["id", "name", "nickname", "parent"]))
+        || typeof thread.id !== "string" || !CACHE_DROP_THREAD_ID.test(thread.id)
+        || !validLocalThreadName(thread.name)
+        || !validLocalThreadName(thread.nickname, 80)) return unavailable;
+    const parent = thread.parent;
+    if (parent !== null && (!hasExactKeys(parent, ["id", "name"])
+        || typeof parent.id !== "string" || !CACHE_DROP_THREAD_ID.test(parent.id)
+        || parent.id === thread.id || !validLocalThreadName(parent.name))) return unavailable;
+    seen.add(entry.key);
+    const normalizedThread = {
+      id: thread.id, name: thread.name, nickname: thread.nickname,
+      parent: parent === null ? null : { id: parent.id, name: parent.name }
+    };
+    if (autoReview) normalizedThread.origin = "auto_review";
+    entries.push({
+      kind: entry.kind,
+      key: entry.key,
+      thread: normalizedThread
+    });
+  }
+  return { schemaVersion: LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA, status: "available", generation, entries };
 }
 
 function normalizeCacheSwitchRecent(rows, maximumRows) {
@@ -2767,14 +2819,15 @@ function normalizeCacheSwitchRecent(rows, maximumRows) {
         && previous.model !== current.model;
       const reasoningChanged = previous.reasoningEffort !== "unknown"
         && current.reasoningEffort !== "unknown"
-        && effectiveCacheSwitchEffort(previous.reasoningEffort)
-          !== effectiveCacheSwitchEffort(current.reasoningEffort);
+        && codexCacheReasoningConfiguration(previous.model, previous.reasoningEffort)
+          !== codexCacheReasoningConfiguration(current.model, current.reasoningEffort);
       const changeMatches = changeType === "model_only"
         ? modelChanged && !reasoningChanged
         : changeType === "reasoning_only"
           ? !modelChanged && reasoningChanged
           : modelChanged && reasoningChanged;
       if (observedAt === null
+          || previous.model === "unknown" || current.model === "unknown"
           || !changeMatches
           || previousCacheReadTokens === null
           || currentCacheReadTokens === null
@@ -2792,6 +2845,7 @@ function normalizeCacheSwitchRecent(rows, maximumRows) {
       // session, event, path, or rollout fields on a hostile row are dropped.
       return [{
         observedAt,
+        gapSeconds,
         changeType,
         previous,
         current,
@@ -2813,12 +2867,15 @@ function normalizeCacheSwitchSummary(value) {
     totals.pricedDrops,
     totals.estimatedPremiumUsd
   );
-  if (allowanceWeighting === null) return null;
+  if (allowanceWeighting === null
+      || (totals.estimatedPremiumUsd === null
+        && allowanceWeighting.status !== "unavailable")) return null;
   const breakdownRows = CACHE_SWITCH_CHANGE_TYPES.map((key) => (
     [key, normalizeCacheSwitchBreakdown(value?.byChangeType?.[key])]
   ));
   if (breakdownRows.some(([, row]) => row === null)) return null;
   const byChangeType = Object.fromEntries(breakdownRows);
+  if (!cacheCoveredSubtotalsMatch(totals, Object.values(byChangeType))) return null;
   for (const field of [
     "configurationChanges",
     "proximateConfigurationChanges",
@@ -2846,7 +2903,9 @@ function normalizeCacheSwitchSummary(value) {
     allowanceWeighting,
     byChangeType,
     recent: normalizeCacheSwitchRecent(value?.recent, totals.cacheReadDrops),
-    allowanceImpact: normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
+    allowanceImpact: totals.estimatedPremiumUsd === null
+      ? unavailableAllowanceImpact("weighting_evidence_incomplete")
+      : normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
   };
 }
 
@@ -2868,6 +2927,7 @@ function unavailableCacheSwitchImpact(errorCode = null) {
     estimatedPremiumUsd: null,
     standardApiPremiumUsd: null,
     allowanceWeighting: null,
+    coveredSubtotal: null,
     pricedDrops: 0,
     unpricedDrops: 0,
     byChangeType: Object.fromEntries(CACHE_SWITCH_CHANGE_TYPES.map((key) => [key, {
@@ -2945,23 +3005,15 @@ function normalizeCacheSwitchImpact(value) {
 }
 
 function normalizeCacheContinuityBreakdown(value, includeOrderingCoverage = false) {
-  const fields = [
-    "sameConfigurationReturns",
-    "comparableReturns",
-    "compactionConfoundedReturns",
-    "contextContractedReturns",
-    "insufficientEvidenceReturns",
-    "uncoveredReturns",
-    "cacheReadDrops",
-    "lostCacheTokens",
-    "pricedDrops",
-    "unpricedDrops"
-  ];
-  const normalized = Object.fromEntries(fields.map((field) => [
-    field,
-    count(value?.[field], null)
-  ]));
-  if (fields.some((field) => normalized[field] === null)) return null;
+  const normalized = Object.fromEntries(
+    CACHE_CONTINUITY_BREAKDOWN_FIELDS.map((field) => [
+      field,
+      count(value?.[field], null)
+    ])
+  );
+  if (CACHE_CONTINUITY_BREAKDOWN_FIELDS.some(
+    (field) => normalized[field] === null
+  )) return null;
   const orderingCoverageGaps = includeOrderingCoverage
     ? count(value?.orderingCoverageGaps, 0)
     : 0;
@@ -2978,6 +3030,12 @@ function normalizeCacheContinuityBreakdown(value, includeOrderingCoverage = fals
   if (!new Set(["complete", "incomplete"]).has(coverageStatus)
       || partition !== normalized.sameConfigurationReturns
       || normalized.cacheReadDrops > normalized.comparableReturns
+      || normalized.reusedMoreThanHalfReturns
+        + normalized.reusedHalfOrLessReturns !== normalized.comparableReturns
+      || normalized.matchedOrExceededReturns
+        + normalized.reusedBetweenHalfAndPreviousReturns
+          !== normalized.reusedMoreThanHalfReturns
+      || normalized.cacheReadDrops !== normalized.reusedHalfOrLessReturns
       || normalized.pricedDrops + normalized.unpricedDrops
         !== normalized.cacheReadDrops
       || (normalized.cacheReadDrops === 0 && normalized.lostCacheTokens !== 0)
@@ -2993,11 +3051,16 @@ function normalizeCacheContinuityBreakdown(value, includeOrderingCoverage = fals
         && premium === null)) {
     return null;
   }
+  const coveredSubtotal = normalizeCacheCoveredSubtotal(
+    value?.coveredSubtotal, normalized.pricedDrops, premium
+  );
+  if (value?.coveredSubtotal != null && coveredSubtotal === null) return null;
   return {
     ...normalized,
     ...(includeOrderingCoverage ? { orderingCoverageGaps } : {}),
     coverageStatus,
-    estimatedPremiumUsd: premium
+    estimatedPremiumUsd: premium,
+    coveredSubtotal
   };
 }
 
@@ -3058,25 +3121,17 @@ function normalizeCacheContinuitySummary(value) {
     totals.pricedDrops,
     totals.estimatedPremiumUsd
   );
-  if (allowanceWeighting === null) return null;
+  if (allowanceWeighting === null
+      || (totals.estimatedPremiumUsd === null
+        && allowanceWeighting.status !== "unavailable")) return null;
   const byGapBandRows = CACHE_CONTINUITY_GAP_BAND_IDS.map((key) => [
     key,
     normalizeCacheContinuityBreakdown(value?.byGapBand?.[key])
   ]);
   if (byGapBandRows.some(([, row]) => row === null)) return null;
   const byGapBand = Object.fromEntries(byGapBandRows);
-  for (const field of [
-    "sameConfigurationReturns",
-    "comparableReturns",
-    "compactionConfoundedReturns",
-    "contextContractedReturns",
-    "insufficientEvidenceReturns",
-    "uncoveredReturns",
-    "cacheReadDrops",
-    "lostCacheTokens",
-    "pricedDrops",
-    "unpricedDrops"
-  ]) {
+  if (!cacheCoveredSubtotalsMatch(totals, Object.values(byGapBand))) return null;
+  for (const field of CACHE_CONTINUITY_BREAKDOWN_FIELDS) {
     if (CACHE_CONTINUITY_GAP_BAND_IDS.reduce(
       (sum, key) => sum + byGapBand[key][field],
       0
@@ -3085,6 +3140,35 @@ function normalizeCacheContinuitySummary(value) {
   if (totals.estimatedPremiumUsd !== null) {
     const premiumSum = CACHE_CONTINUITY_GAP_BAND_IDS.reduce(
       (sum, key) => sum + byGapBand[key].estimatedPremiumUsd,
+      0
+    );
+    if (Math.abs(premiumSum - totals.estimatedPremiumUsd) > 1e-9) return null;
+  }
+  const byOutcomeBucketRows = CACHE_CONTINUITY_OUTCOME_BUCKET_IDS.map((key) => {
+    const bounds = CACHE_CONTINUITY_OUTCOME_BUCKETS[key];
+    const valueBucket = value?.byOutcomeBucket?.[key];
+    const summary = normalizeCacheContinuityBreakdown(valueBucket);
+    const startSeconds = finite(valueBucket?.startSeconds, null);
+    const endSeconds = valueBucket?.endSeconds === null
+      ? null
+      : finite(valueBucket?.endSeconds, null);
+    if (summary === null
+        || startSeconds !== bounds[0]
+        || endSeconds !== bounds[1]) return [key, null];
+    return [key, { startSeconds, endSeconds, ...summary }];
+  });
+  if (byOutcomeBucketRows.some(([, row]) => row === null)) return null;
+  const byOutcomeBucket = Object.fromEntries(byOutcomeBucketRows);
+  if (!cacheCoveredSubtotalsMatch(totals, Object.values(byOutcomeBucket))) return null;
+  for (const field of CACHE_CONTINUITY_BREAKDOWN_FIELDS) {
+    if (CACHE_CONTINUITY_OUTCOME_BUCKET_IDS.reduce(
+      (sum, key) => sum + byOutcomeBucket[key][field],
+      0
+    ) !== totals[field]) return null;
+  }
+  if (totals.estimatedPremiumUsd !== null) {
+    const premiumSum = CACHE_CONTINUITY_OUTCOME_BUCKET_IDS.reduce(
+      (sum, key) => sum + byOutcomeBucket[key].estimatedPremiumUsd,
       0
     );
     if (Math.abs(premiumSum - totals.estimatedPremiumUsd) > 1e-9) return null;
@@ -3104,8 +3188,11 @@ function normalizeCacheContinuitySummary(value) {
     postCompactionRequests,
     postCompactionCacheReadDrops,
     byGapBand,
+    byOutcomeBucket,
     recent: normalizeCacheContinuityRecent(value?.recent, totals.cacheReadDrops),
-    allowanceImpact: normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
+    allowanceImpact: totals.estimatedPremiumUsd === null
+      ? unavailableAllowanceImpact("weighting_evidence_incomplete")
+      : normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
   };
 }
 
@@ -3123,6 +3210,10 @@ function unavailableCacheContinuityImpact(errorCode = null) {
     contextContractedReturns: 0,
     insufficientEvidenceReturns: 0,
     uncoveredReturns: 0,
+    reusedMoreThanHalfReturns: 0,
+    reusedHalfOrLessReturns: 0,
+    matchedOrExceededReturns: 0,
+    reusedBetweenHalfAndPreviousReturns: 0,
     orderingCoverageGaps: 0,
     coverageStatus: "incomplete",
     cacheReadDrops: 0,
@@ -3130,17 +3221,60 @@ function unavailableCacheContinuityImpact(errorCode = null) {
     estimatedPremiumUsd: null,
     standardApiPremiumUsd: null,
     allowanceWeighting: null,
+    coveredSubtotal: null,
     pricedDrops: 0,
     unpricedDrops: 0,
     postCompactionRequests: 0,
     postCompactionCacheReadDrops: 0,
     byGapBand: {},
+    byOutcomeBucket: {},
     recent: [],
     allowanceImpact: unavailableAllowanceImpact(),
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
     maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    outcomeDisplayMaximumGapSeconds:
+      CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS,
     recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
     periods: []
+  };
+}
+
+// This summary uses the companion's existing follow-up denominator. It does
+// not infer token cache-hit rate or assign freshness independently of accounting.
+export function normalizeTrayCacheSummary(value) {
+  const exact = (row, keys) => row !== null && typeof row === "object"
+    && !Array.isArray(row) && Object.keys(row).length === keys.length
+    && keys.every((key) => Object.hasOwn(row, key));
+  const validRoot = exact(value, ["schemaVersion", "periods"])
+    && value.schemaVersion === 1 && Array.isArray(value.periods)
+    && value.periods.length === 2;
+  const keys = ["periodId", "status", "comparableReturns", "reusedMoreThanHalfReturns",
+    "reusePercent", "coverageStatus"];
+  return {
+    schemaVersion: 1,
+    periods: ["7d", "30d"].map((periodId) => {
+      const unavailable = {
+        periodId, status: "unavailable", comparableReturns: null,
+        reusedMoreThanHalfReturns: null, reusePercent: null, coverageStatus: "unavailable"
+      };
+      if (!validRoot) return unavailable;
+      const matches = value.periods.filter((row) => row?.periodId === periodId);
+      if (matches.length !== 1 || !exact(matches[0], keys)) return unavailable;
+      const row = matches[0];
+      if (row.status !== "available"
+          || !["complete", "incomplete"].includes(row.coverageStatus)
+          || ![row.comparableReturns, row.reusedMoreThanHalfReturns]
+            .every((n) => Number.isSafeInteger(n) && n >= 0)
+          || row.reusedMoreThanHalfReturns > row.comparableReturns) return unavailable;
+      const expected = row.comparableReturns === 0 ? null
+        : row.reusedMoreThanHalfReturns / row.comparableReturns * 100;
+      if (expected === null ? row.reusePercent !== null
+        : typeof row.reusePercent !== "number" || !Number.isFinite(row.reusePercent)
+          || Math.abs(row.reusePercent - expected) > 1e-9) return unavailable;
+      return { periodId, status: "available", comparableReturns: row.comparableReturns,
+        reusedMoreThanHalfReturns: row.reusedMoreThanHalfReturns,
+        reusePercent: expected, coverageStatus: row.coverageStatus };
+    })
   };
 }
 
@@ -3152,6 +3286,8 @@ function normalizeCacheContinuityImpact(value) {
       !== CACHE_CONTINUITY_MINIMUM_GAP_SECONDS
       || finite(value.maximumRetainedCacheRatio, null)
         !== CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO
+      || finite(value.outcomeDisplayMaximumGapSeconds, null)
+        !== CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS
       || count(value.recentDetailLimit, null) !== CACHE_SWITCH_RECENT_LIMIT) {
     return unavailableCacheContinuityImpact("methodology_mismatch");
   }
@@ -3171,6 +3307,8 @@ function normalizeCacheContinuityImpact(value) {
           : unavailableAllowanceImpact("period_denominator_mismatch"),
         minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
         maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+        outcomeDisplayMaximumGapSeconds:
+          CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS,
         recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
         periods: []
       }];
@@ -3193,34 +3331,56 @@ function normalizeCacheContinuityImpact(value) {
       : unavailableAllowanceImpact("period_denominator_mismatch"),
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
     maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    outcomeDisplayMaximumGapSeconds:
+      CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS,
     recentDetailLimit: CACHE_SWITCH_RECENT_LIMIT,
     periods
   };
 }
 
-const FAST_MODE_PREFERENCES = Object.freeze(["standard", "fast", "mixed_unknown"]);
-const FAST_MODE_FAMILY_KEYS = Object.freeze(["gpt-5.6", "gpt-5.5", "gpt-5.4", "unsupported"]);
 const OBSERVED_SPEED_KEYS = Object.freeze(["standard", "fast", "unknown"]);
-// Published Fast credit rates, mirrored so the dashboard never has to trust a
-// server-supplied number to explain its own arithmetic.
+// Published Priority (Fast) API price ratios over Standard, mirrored so the
+// dashboard never has to trust a server-supplied number to explain its own
+// arithmetic. Keys are canonical registered models; uncovered model/context/
+// date evidence occupies the separate disclosed assumed-2x bucket.
 const FAST_MODE_MULTIPLIERS = Object.freeze({
-  "gpt-5.6": 2.5,
+  "gpt-4.1": 1.75,
+  "gpt-4.1-mini": 1.75,
+  "gpt-4.1-nano": 2,
+  "gpt-4o": 1.7,
+  "gpt-5": 2,
+  "gpt-5-mini": 1.8,
+  "gpt-5.1": 2,
+  "gpt-5.1-codex": 2,
+  "gpt-5.2": 2,
+  "gpt-5.4": 2,
+  "gpt-5.4-mini": 2,
   "gpt-5.5": 2.5,
-  "gpt-5.4": 2
+  "gpt-5.6-luna": 2,
+  "gpt-5.6-sol": 2,
+  "gpt-5.6-terra": 2,
+  "gpt-6-astra": 2
 });
-const FAST_MODE_METRIC_LABEL = "Quota-weighted API-price equivalent";
-const FAST_MODE_METRIC_SHORT_LABEL = "Quota-weighted API equivalent";
+const FAST_MODE_FAMILY_KEYS = Object.freeze([
+  ...Object.keys(FAST_MODE_MULTIPLIERS), "unsupported"
+]);
+const FAST_MODE_ASSUMED_MULTIPLIER = 2;
+const FAST_MODE_METRIC_LABEL = "Speed-priced API-price equivalent";
+const FAST_MODE_METRIC_SHORT_LABEL = "Speed-priced API equivalent";
 const FAST_MODE_STANDARD_METRIC_LABEL = "Standard-rate API-price equivalent";
 const FAST_MODE_METRIC_EXPLAINER =
-  "Standard-rate API prices, multiplied by the published Fast credit rate for events in Fast mode: 2.5x for GPT-5.6 and GPT-5.5, 2x for GPT-5.4. It tracks relative quota consumption, not a bill.";
+  "Standard-rate API prices, with Fast increments priced at the published Priority API rate for the exact model, context, and date. Where no eligible Priority rate exists, a disclosed assumed 2x Standard is used. This is a comparison, not a bill.";
 const ALLOWANCE_SCENARIOS = Object.freeze([
   "unresolved_as_standard",
   "unresolved_as_fast"
 ]);
 const ALLOWANCE_BASIS_FAMILY_ID =
-  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 const TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION =
   "quota-weighted-timeline-v0.1";
+const PLAN_SCOPED_TIMELINE_SCHEMA_VERSION =
+  "local-plan-scoped-accounting-timeline-v1";
+const PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION = "plan-era-v1";
 const TIMELINE_WEIGHTING_STATUS_BY_CODE = Object.freeze([
   "complete",
   "partial",
@@ -3239,8 +3399,8 @@ function normalizeAllowanceCoverage(value, usageEvents) {
       value?.declaredFromConfigEvents,
       null
     ),
-    assumedFromPreferenceEvents: count(
-      value?.assumedFromPreferenceEvents,
+    assumedEvents: count(
+      value?.assumedEvents,
       null
     ),
     inferredEvents: count(value?.inferredEvents, null),
@@ -3251,7 +3411,7 @@ function normalizeAllowanceCoverage(value, usageEvents) {
       || coverage.inferredEvents > coverage.unknownEvents
       || coverage.observedEvents
         + coverage.declaredFromConfigEvents
-        + coverage.assumedFromPreferenceEvents
+        + coverage.assumedEvents
         + coverage.unknownEvents !== usageEvents) return null;
   return {
     ...coverage,
@@ -3384,7 +3544,7 @@ function normalizeCompactTimelineAllowanceScenario(
       totalEvents: usageEvents,
       observedEvents: tuple[offset + 3],
       declaredFromConfigEvents: tuple[offset + 4],
-      assumedFromPreferenceEvents: tuple[offset + 5],
+      assumedEvents: tuple[offset + 5],
       inferredEvents: tuple[offset + 6],
       unknownEvents: tuple[offset + 7]
     }
@@ -3455,16 +3615,14 @@ function normalizeFastMode(value) {
   const coverage = value?.coverage ?? {};
   const inference = value?.inference ?? {};
   return {
-    preference: FAST_MODE_PREFERENCES.includes(value?.preference)
-      ? value.preference
-      : "standard",
-    defaultPreference: "standard",
+    unresolvedScenario: value?.unresolvedScenario === "unresolved_as_fast"
+      ? "unresolved_as_fast"
+      : "unresolved_as_standard",
     // Codex records a tier only when the setting is applied or changed, never
     // at session start, so turns before the first change in a session carry no
     // recorded tier. The dashboard states this itself rather than reflecting a
     // server claim.
     logRecordsTierChangesOnly: true,
-    preferenceAppliesTo: "turns_with_no_observed_tier_only",
     metricLabel: FAST_MODE_METRIC_LABEL,
     metricShortLabel: FAST_MODE_METRIC_SHORT_LABEL,
     metricExplainer: FAST_MODE_METRIC_EXPLAINER,
@@ -3485,15 +3643,25 @@ function normalizeFastMode(value) {
     weightingStatus: ["complete", "partial", "unknown"].includes(value?.weightingStatus)
       ? value.weightingStatus
       : "unknown",
-    appliedMultipliers: Object.fromEntries(
-      Object.keys(FAST_MODE_MULTIPLIERS)
-        .filter((family) => finite(value?.appliedMultipliers?.[family], null) !== null)
-        .map((family) => [family, FAST_MODE_MULTIPLIERS[family]])
+    assumedRatioStandardApiPriceEquivalentUsd: nonNegative(
+      value?.assumedRatioStandardApiPriceEquivalentUsd,
+      0
     ),
+    appliedMultipliers: {
+      ...Object.fromEntries(
+        Object.keys(FAST_MODE_MULTIPLIERS)
+          .filter((family) => finite(value?.appliedMultipliers?.[family], null) !== null)
+          .map((family) => [family, FAST_MODE_MULTIPLIERS[family]])
+      ),
+      ...(finite(value?.appliedMultipliers?.unsupported, null) !== null
+        ? { unsupported: FAST_MODE_ASSUMED_MULTIPLIER }
+        : {})
+    },
     coverage: {
       totalEvents: count(coverage.totalEvents, 0),
       observedEvents: count(coverage.observedEvents, 0),
-      assumedFromPreferenceEvents: count(coverage.assumedFromPreferenceEvents, 0),
+      declaredFromConfigEvents: count(coverage.declaredFromConfigEvents, 0),
+      assumedEvents: count(coverage.assumedEvents, 0),
       inferredEvents: count(coverage.inferredEvents, 0),
       unknownEvents: count(coverage.unknownEvents, 0),
       observedSharePercent: nonNegative(coverage.observedSharePercent, null),
@@ -3514,26 +3682,6 @@ function normalizeFastMode(value) {
   };
 }
 
-function normalizeFastModePreference(value) {
-  const mode = FAST_MODE_PREFERENCES.includes(value?.mode)
-    ? value.mode
-    : "standard";
-  return {
-    mode,
-    defaultMode: "standard",
-    availableModes: [...FAST_MODE_PREFERENCES],
-    // "stated" only when the server confirms a stored statement of this exact
-    // shape; anything else reads as the untouched default.
-    source: value?.source === "stated"
-      && value?.schemaVersion === "fast-mode-preference-v0.1"
-      ? "stated"
-      : "default",
-    recordedAt: text(value?.recordedAt, ""),
-    logRecordsTierChangesOnly: true,
-    appliesTo: "turns_with_no_observed_tier_only",
-    multipliers: { ...FAST_MODE_MULTIPLIERS }
-  };
-}
 
 function normalizeAccountingDimension(value, allowedKeys) {
   return Object.fromEntries([...allowedKeys].map((key) => {
@@ -3546,10 +3694,10 @@ function normalizeAccountingDimension(value, allowedKeys) {
   }));
 }
 
-function normalizeLocalUsageTimeline(value, weightingEncoding = undefined) {
+function normalizeLocalUsageTimeline(value, weightingEncoding = undefined, maximumRows = 3_000) {
   if (weightingEncoding === null) return [];
   const rows = [];
-  for (const row of array(value).slice(-3_000)) {
+  for (const row of array(value).slice(-maximumRows)) {
     const startAt = text(row?.startAt, "");
     const endAt = text(row?.endAt, "");
     const startMs = Date.parse(startAt);
@@ -3608,11 +3756,58 @@ function unavailableAllowanceCapacity(reason = "allowance_capacity_unavailable")
       unresolved_as_standard: null,
       unresolved_as_fast: null
     },
+    planScope: null,
+    stale: null,
     accountAttribution: {
       status: "historical_unattributed",
       maySpanMultipleAccounts: true
     }
   };
+}
+
+function normalizePlanScope(value) {
+  const planType = normalizePlanType(value?.planType);
+  const cohortId = typeof value?.cohortId === "string"
+      && /^[0-9a-f]{64}$/u.test(value.cohortId)
+    ? value.cohortId
+    : null;
+  const rawGeneration = value?.sourceGeneration;
+  const sourceGeneration = Number.isSafeInteger(rawGeneration)
+      && rawGeneration >= 0
+    ? String(rawGeneration)
+    : typeof rawGeneration === "string"
+        && /^[A-Za-z0-9._:-]{1,256}$/u.test(rawGeneration)
+      ? rawGeneration
+      : "";
+  const sourceGenerationFingerprint = text(
+    value?.sourceGenerationFingerprint,
+    ""
+  );
+  if (value?.methodVersion !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+      || planType === "unknown"
+      || value?.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
+      || cohortId === null
+      || sourceGeneration === ""
+      || sourceGenerationFingerprint === "") return null;
+  return {
+    methodVersion: PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION,
+    planType,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    cohortId,
+    sourceGeneration,
+    sourceGenerationFingerprint
+  };
+}
+
+function matchingPlanScope(left, right) {
+  return left !== null && right !== null
+    && left.methodVersion === right.methodVersion
+    && left.planType === right.planType
+    && left.basisFamilyId === right.basisFamilyId
+    && left.cohortId === right.cohortId
+    && left.sourceGeneration === right.sourceGeneration
+    && left.sourceGenerationFingerprint
+      === right.sourceGenerationFingerprint;
 }
 
 function normalizeAllowanceCapacityScenario(value, scenario) {
@@ -3663,9 +3858,95 @@ function normalizeAllowanceCapacityScenario(value, scenario) {
   };
 }
 
+const LOCAL_ACCOUNTING_PROJECTION_REASONS = new Set([
+  "cache_accounting_semantics_outdated",
+  "current_projection_unavailable",
+  "local_unified_index_deferred",
+  "local_unified_index_generation_invalid",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_missing",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_schema_newer",
+  "local_unified_index_unavailable",
+  "typed_tool_history_partial",
+  "unified_index_generation_incomplete",
+  "unified_index_partial"
+]);
+
+function safeLocalProjectionReason(value, fallback) {
+  return LOCAL_ACCOUNTING_PROJECTION_REASONS.has(value) ? value : fallback;
+}
+
+function normalizeAccountingProjection(value, {
+  allowImplicitDemoProjection = false
+} = {}) {
+  // Only the synthetic demo contract may omit this attestation. Real local
+  // evidence must fail closed: otherwise a mixed-version or truncated
+  // response can turn placeholder zeroes into apparently measured usage.
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    if (!allowImplicitDemoProjection) {
+      return {
+        status: "unavailable",
+        reason: "local_unified_index_unavailable",
+        terminal: true,
+        retainedAt: null,
+        coveredAt: null
+      };
+    }
+    return {
+      status: "available",
+      reason: null,
+      terminal: false,
+      retainedAt: null,
+      coveredAt: null
+    };
+  }
+  const status = ["available", "retained", "unavailable"].includes(value.status)
+    ? value.status
+    : "unavailable";
+  if (status === "available"
+      && value.reason === null
+      && value.terminal === false) {
+    return {
+      status,
+      reason: null,
+      terminal: false,
+      retainedAt: null,
+      coveredAt: null
+    };
+  }
+  // `available` is an attestation, not a display preference. A contradictory
+  // or incomplete attestation must not make placeholder zeroes look like
+  // measured evidence merely because its status string survived validation.
+  if (status === "available") {
+    return {
+      status: "unavailable",
+      reason: "local_unified_index_unavailable",
+      terminal: true,
+      retainedAt: null,
+      coveredAt: null
+    };
+  }
+  const startAt = canonicalInstant(value?.coveredAt?.startAt);
+  const endAt = canonicalInstant(value?.coveredAt?.endAt);
+  return {
+    status,
+    reason: safeLocalProjectionReason(
+      value.reason,
+      "local_unified_index_unavailable"
+    ),
+    terminal: value.terminal === true,
+    retainedAt: canonicalInstant(value.retainedAt),
+    coveredAt: startAt !== null && endAt !== null
+        && Date.parse(startAt) <= Date.parse(endAt)
+      ? { startAt, endAt }
+      : null
+  };
+}
+
 // Staleness provenance attached to projections served from the previous app
 // version's cache while the current rebuild runs. Normalized as a closed
-// shape (flag, semantic version, computed-at, covered span) or null; a block
+// shape (flag, reason, semantic version, computed-at, covered span) or null; a block
 // missing its identity is dropped rather than shown as an unlabeled serve.
 function normalizeStaleProvenance(value) {
   if (value?.stale !== true) return null;
@@ -3674,12 +3955,50 @@ function normalizeStaleProvenance(value) {
   if (schemaVersion === "" || computedAt === "") return null;
   return {
     stale: true,
+    reason: safeLocalProjectionReason(
+      value.reason,
+      "cache_accounting_semantics_outdated"
+    ),
     schemaVersion,
     computedAt,
     coveredAt: {
       startAt: text(value.coveredAt?.startAt, ""),
       endAt: text(value.coveredAt?.endAt, "")
     }
+  };
+}
+
+function normalizeTimelineHistory(value) {
+  const status = ["complete", "partial", "loading", "unavailable"]
+    .includes(value?.status)
+    ? value.status
+    : "unavailable";
+  const reason = status === "complete"
+    ? null
+    : safeLocalProjectionReason(
+      value?.reason,
+      status === "loading"
+        ? "local_unified_index_deferred"
+        : "local_unified_index_unavailable"
+    );
+  const startAt = canonicalInstant(value?.coveredAt?.startAt);
+  const endAt = canonicalInstant(value?.coveredAt?.endAt);
+  const evidenceAvailable = ["complete", "partial"].includes(status);
+  return {
+    status,
+    reason,
+    source: text(value?.source, ""),
+    coveredAt: startAt !== null && endAt !== null
+        && Date.parse(startAt) <= Date.parse(endAt)
+      ? { startAt, endAt }
+      : null,
+    generatedAt: canonicalInstant(value?.generatedAt),
+    usageEvents: evidenceAvailable ? count(value?.usageEvents, null) : null,
+    sourceCount: evidenceAvailable ? count(value?.sourceCount, null) : null,
+    indexBytes: evidenceAvailable ? count(value?.indexBytes, null) : null,
+    boundedDays: status === "unavailable"
+      ? count(value?.boundedDays, null)
+      : null
   };
 }
 
@@ -3698,11 +4017,18 @@ function normalizeAllowanceCapacity(value) {
   const selectedScenario = ALLOWANCE_SCENARIOS.includes(value.selectedScenario)
     ? value.selectedScenario
     : null;
+  const planScope = normalizePlanScope(value.planScope);
+  const stale = normalizeStaleProvenance(value.stale);
+  // Prior cache formats predate plan-scoped timelines. Retain their explicitly
+  // stale scalar for historical display, never as a current plan numerator.
+  const legacyStale = value.planScope == null && stale !== null;
   if (value.status === "available") {
-    if (selectedScenario === null || scenarios[selectedScenario] === null) {
+    if (selectedScenario === null || scenarios[selectedScenario] === null
+        || (!legacyStale && (planScope === null
+          || planScope.cohortId !== scenarios[selectedScenario].cohortId))) {
       return unavailableAllowanceCapacity("allowance_capacity_invalid");
     }
-  } else if (selectedScenario !== null) {
+  } else if (selectedScenario !== null || planScope !== null) {
     return unavailableAllowanceCapacity("allowance_capacity_invalid");
   }
   if (value.status === "range"
@@ -3721,11 +4047,134 @@ function normalizeAllowanceCapacity(value) {
     basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
     selectedScenario,
     scenarios,
-    stale: normalizeStaleProvenance(value.stale),
+    planScope,
+    stale,
     accountAttribution: {
       status: "historical_unattributed",
       maySpanMultipleAccounts: true
     }
+  };
+}
+
+function unavailablePlanScopedTimeline(reason = "plan_scoped_timeline_unavailable") {
+  return {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    status: "unavailable",
+    reason,
+    planScope: null,
+    usage: [],
+    quota: [],
+    comparisonIntervals: []
+  };
+}
+
+function normalizePlanScopedTimeline(value, weightingEncoding, capacity) {
+  if (value?.schemaVersion !== PLAN_SCOPED_TIMELINE_SCHEMA_VERSION
+      || value?.status !== "available" || value.reason !== null
+      || value.encoding !== "plan_bucket_v1") {
+    return unavailablePlanScopedTimeline();
+  }
+  const planScope = normalizePlanScope(value.planScope);
+  const capacityScope = capacity?.status === "available"
+    ? capacity.planScope : null;
+  if (planScope === null || capacityScope === null
+      || !matchingPlanScope(planScope, capacityScope)) {
+    return unavailablePlanScopedTimeline("plan_scoped_timeline_scope_mismatch");
+  }
+  if (!Array.isArray(value.usage) || value.usage.length > 100_000
+      || !Array.isArray(value.quota) || value.quota.length > 100_000
+      || !Array.isArray(value.comparisonIntervals) || value.comparisonIntervals.length > 100_000) {
+    return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+  }
+  const comparisonIntervals = [];
+  let priorEnd = -Infinity;
+  for (const interval of value.comparisonIntervals) {
+    if (!Array.isArray(interval) || interval.length !== 2
+        || !interval.every((ms) => Number.isSafeInteger(ms)
+          && ms % 900_000 === 0 && Number.isFinite(new Date(ms).getTime()))
+        || interval[0] < priorEnd || interval[1] <= interval[0]) {
+      return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    }
+    comparisonIntervals.push([...interval]);
+    priorEnd = interval[1];
+  }
+  const decodedUsage = value.usage.map(decodePlanTimelineUsage);
+  if (decodedUsage.includes(null)) return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+  const usage = normalizeLocalUsageTimeline(decodedUsage, weightingEncoding, 100_000);
+  const decodedQuota = [];
+  for (const row of value.quota) {
+    if (!Array.isArray(row) || row.length !== 3
+        || !row.every((n) => typeof n === "number" && Number.isFinite(n))
+        || !Number.isSafeInteger(row[0]) || !Number.isFinite(new Date(row[0]).getTime())
+        || !Number.isFinite(new Date(row[1] * 1000).getTime())
+        || row[2] < 0 || row[2] > 100) return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    decodedQuota.push({ observedAt: new Date(row[0]).toISOString(), resetAt: new Date(row[1] * 1000).toISOString(),
+      usedPercent: row[2], remainingPercent: 100 - row[2], limitId: "codex", durationMinutes: 10_080,
+      slot: "unknown", planType: planScope.planType, accountAttribution: "unattributed" });
+  }
+  const quota = normalizeLocalQuotaTimeline(decodedQuota, 100_000);
+  if (usage.length !== value.usage.length || quota.length !== value.quota.length
+      || quota.some((row) => row.planType !== planScope.planType)) {
+    return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+  }
+  let intervalAt = 0;
+  priorEnd = -Infinity;
+  for (const row of usage) {
+    const start = Date.parse(row.startAt);
+    const end = Date.parse(row.endAt);
+    while (intervalAt < comparisonIntervals.length
+        && comparisonIntervals[intervalAt][1] <= start) intervalAt += 1;
+    const interval = comparisonIntervals[intervalAt];
+    if (start < priorEnd || !interval || start < interval[0] || end > interval[1]) {
+      return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    }
+    priorEnd = end;
+  }
+  intervalAt = 0;
+  priorEnd = -Infinity;
+  for (const row of quota) {
+    const at = Date.parse(row.observedAt);
+    while (intervalAt < comparisonIntervals.length
+        && comparisonIntervals[intervalAt][1] <= at) intervalAt += 1;
+    const interval = comparisonIntervals[intervalAt];
+    if (at <= priorEnd || !interval || at < interval[0] || at >= interval[1]) {
+      return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    }
+    priorEnd = at;
+  }
+  return {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    status: "available",
+    reason: null,
+    planScope,
+    usage,
+    quota,
+    comparisonIntervals
+  };
+}
+
+function decodePlanTimelineUsage(row) {
+  if (!Array.isArray(row) || row.length !== 16
+      || row.some((n) => typeof n !== "number" || !Number.isFinite(n))
+      || !Number.isSafeInteger(row[0]) || row[0] % 900_000 !== 0
+      || !Number.isFinite(new Date(row[0] + 900_000).getTime())
+      || row.slice(1).some((n) => n < 0)
+      || [1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15].some((i) => !Number.isSafeInteger(row[i]))
+      || row[1] < 1 || row[11] + row[12] > row[1] || row[13] + row[14] > row[1]) return null;
+  const priced = row[13] + row[14] === row[1];
+  return {
+    startAt: new Date(row[0]).toISOString(), endAt: new Date(row[0] + 900_000).toISOString(),
+    usageEvents: row[1], totalTokens: row[15], apiPriceEquivalentUsd: row[8],
+    components: Object.fromEntries(LOCAL_COMPONENT_KEYS.map((key, i) => [key, row[i + 2]])),
+    pricingCoverage: { fullyPricedEvents: row[13], partiallyPricedEvents: row[14],
+      unpricedEvents: row[1] - row[13] - row[14] },
+    // Existing weighting encoding: complete=0, unknown=2; unpriced events
+    // withhold the whole bucket, while unresolved speed remains a scenario.
+    allowanceWeighting: [row[9], row[10]].flatMap((usd) => [
+      priced ? 0 : 2, priced ? usd : null, priced ? usd : 0,
+      priced ? row[11] : 0, priced ? row[12] : 0,
+      priced ? row[1] - row[11] - row[12] : 0, 0, priced ? 0 : row[1],
+    ]),
   };
 }
 
@@ -3744,7 +4193,33 @@ function normalizeLocalTimeline(value = {}) {
     value.calibrationUsage,
     weightingEncoding
   );
-  const quota = array(value.quota).slice(-10_000).flatMap((row) => {
+  const allowanceCapacity = normalizeAllowanceCapacity(value.allowanceCapacity);
+  const planScoped = normalizePlanScopedTimeline(
+    value.planScoped,
+    weightingEncoding,
+    allowanceCapacity
+  );
+  const quota = normalizeLocalQuotaTimeline(value.quota);
+  return {
+    bucketMinutes: count(value.bucketMinutes, 15),
+    coveredAt: {
+      startAt: text(value?.coveredAt?.startAt, ""),
+      endAt: text(value?.coveredAt?.endAt, "")
+    },
+    usage,
+    calibrationUsage,
+    allowanceCapacity,
+    planScoped,
+    quota,
+    history: normalizeTimelineHistory({
+      ...value.history,
+      source: value.history?.source ?? value.source,
+    })
+  };
+}
+
+function normalizeLocalQuotaTimeline(value, maximumRows = 10_000) {
+  return array(value).slice(-maximumRows).flatMap((row) => {
     const observedAt = text(row?.observedAt, "");
     const usedPercent = finite(row?.usedPercent, null);
     const remainingPercent = finite(row?.remainingPercent, null);
@@ -3773,17 +4248,6 @@ function normalizeLocalTimeline(value = {}) {
         : "unattributed"
     }];
   });
-  return {
-    bucketMinutes: count(value.bucketMinutes, 15),
-    coveredAt: {
-      startAt: text(value?.coveredAt?.startAt, ""),
-      endAt: text(value?.coveredAt?.endAt, "")
-    },
-    usage,
-    calibrationUsage,
-    allowanceCapacity: normalizeAllowanceCapacity(value.allowanceCapacity),
-    quota
-  };
 }
 
 /**
@@ -3850,12 +4314,6 @@ function unavailableSideChatHistoricalGap(errorCode = null) {
 function closeNumber(left, right, tolerance = 1e-6) {
   return Number.isFinite(left) && Number.isFinite(right)
     && Math.abs(left - right) <= tolerance;
-}
-
-function historicalGapFastMultiplier(model) {
-  if (model?.startsWith("gpt-5.6-") || model === "gpt-5.5") return 2.5;
-  if (model?.startsWith("gpt-5.4")) return 2;
-  return null;
 }
 
 function normalizeSideChatHistoricalGap(value) {
@@ -4221,7 +4679,8 @@ function normalizeSideChatHistoricalGap(value) {
       || assumedMissingModel === null
       || assumedMissingModel !== observedModels[0]
       || estimate?.modelAssumption !== "only_exact_model_observed_that_day"
-      || fastMultiplier !== historicalGapFastMultiplier(assumedMissingModel)
+      || fastMultiplier !== FAST_MODE_ASSUMED_MULTIPLIER
+      || estimate?.fastQuotaMultiplierSource !== "assumed_missing_event_context"
       || comparison?.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
       || comparisonStatus === null
       || comparisonStatus !== allowanceWeighting.status
@@ -4328,6 +4787,7 @@ function normalizeSideChatHistoricalGap(value) {
       assumedMissingModel,
       modelAssumption: "only_exact_model_observed_that_day",
       fastQuotaMultiplier: fastMultiplier,
+      fastQuotaMultiplierSource: "assumed_missing_event_context",
       allowanceComparison: {
         status: comparisonStatus,
         basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
@@ -4725,7 +5185,9 @@ function normalizeStaleAccountingServe(value) {
   return { ...provenance, periods };
 }
 
-function normalizeLocalAccounting(value = {}) {
+function normalizeLocalAccounting(value = {}, {
+  allowImplicitDemoProjection = false
+} = {}) {
   const models = normalizeLocalModelUsage(value.byModel);
   // Both allowance tracks in one list, each row stating which track it belongs
   // to. The local report already publishes this; dropping it here is what left
@@ -4734,6 +5196,12 @@ function normalizeLocalAccounting(value = {}) {
     ? normalizeLocalModelUsage(value.modelUsage)
     : [...models, ...normalizeLocalModelUsage(value?.spark?.byModel)];
   const normalized = {
+    generation: normalizeAccountingGeneration(value.generation),
+    generationMatched: value.generationMatched === true,
+    cacheDiagnosticsSource: normalizeCacheDiagnosticsSource(value.cacheDiagnosticsSource),
+    projection: normalizeAccountingProjection(value.projection, {
+      allowImplicitDemoProjection
+    }),
     periodId: ["24h", "7d", "30d", "all", "history"].includes(value.periodId)
       ? value.periodId
       : "all",
@@ -4772,6 +5240,7 @@ function normalizeLocalAccounting(value = {}) {
     cacheContinuityImpact: normalizeCacheContinuityImpact(
       value.cacheContinuityImpact
     ),
+    trayCacheSummary: normalizeTrayCacheSummary(value.trayCacheSummary),
     sideChatEstimates: normalizeSideChatEstimates(value.sideChatEstimates),
     byModel: models,
     modelUsage,
@@ -4806,13 +5275,27 @@ function normalizeLocalAccounting(value = {}) {
       ),
       unattributedEvents: count(value?.accountAttribution?.unattributedEvents, 0)
     },
-    toolClasses: {
-      total: count(value?.toolClasses?.total, 0),
-      counts: Object.fromEntries(
-        ["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]
-          .map((key) => [key, count(value?.toolClasses?.counts?.[key], 0)])
-      )
-    },
+    toolClasses: value?.toolClasses?.status === "unavailable"
+      ? {
+        status: "unavailable",
+        reason: value.toolClasses.reason === "typed_tool_history_partial"
+          ? "typed_tool_history_partial"
+          : "unified_usage_projection_unavailable",
+        total: null,
+        counts: Object.fromEntries(
+          ["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]
+            .map((key) => [key, null])
+        )
+      }
+      : {
+        status: "available",
+        reason: null,
+        total: count(value?.toolClasses?.total, 0),
+        counts: Object.fromEntries(
+          ["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]
+            .map((key) => [key, count(value?.toolClasses?.counts?.[key], 0)])
+        )
+      },
     apiPriceCounterfactualTier: value.apiPriceCounterfactualTier === "standard"
       ? "standard"
       : "unknown",
@@ -4900,13 +5383,17 @@ function normalizeQuota(window, index) {
     ? durationCandidate
     : null;
   const limitId = normalizeQuotaLimitId(window?.limitId);
+  const limitName = sanitizeQuotaLimitDisplayName(
+    window?.limitName ?? window?.limit_name,
+  );
   return {
     id: text(window?.id ?? limitId, `quota-${index}`),
     limitId,
     slot: text(window?.slot, "unknown"),
     // Labels are fixed product copy. The raw label can be localized or
     // provider-controlled, so it is never used to name or select a window.
-    label: quotaWindowLabel(limitId, durationMinutes),
+    label: quotaWindowLabel(limitId, durationMinutes, limitName),
+    limitName,
     durationMinutes,
     usedPercent: used,
     remainingPercent: remaining,
@@ -4920,7 +5407,7 @@ function normalizeQuota(window, index) {
 }
 
 function normalizeHistoryCoverage(value = {}) {
-  const phase = [
+  const admittedPhase = [
     "complete",
     "idle",
     "awaiting_resume",
@@ -4932,8 +5419,11 @@ function normalizeHistoryCoverage(value = {}) {
   const sourceCount = count(value?.sourceCount, null);
   const indexedSourceCount = count(value?.indexedSourceCount, null);
   const pendingSourceCount = count(value?.pendingSourceCount, null);
+  const skippedSourceCount = count(value?.skippedSourceCount, null);
+  const skippedThreadCount = count(value?.skippedThreadCount, null);
   const sourceBytes = count(value?.sourceBytes, null);
   const indexedBytes = count(value?.indexedBytes, null);
+  const skippedSourceBytes = count(value?.skippedSourceBytes, null);
   const generatedAt = canonicalInstant(value?.generatedAt);
   const coveredStartAt = canonicalInstant(value?.coveredAt?.startAt);
   const coveredEndAt = canonicalInstant(value?.coveredAt?.endAt);
@@ -4945,9 +5435,72 @@ function normalizeHistoryCoverage(value = {}) {
     "archive_disk_space",
     "archive_storage_unavailable",
     "archive_index_unavailable",
+    "local_unified_index_generation_invalid",
+    "local_unified_index_missing",
+    "local_unified_index_schema_invalid",
+    "local_unified_index_schema_newer",
+    "local_unified_index_unavailable",
+    "accounting_unified_history_unavailable",
+    "cache_missing",
+    "cache_unavailable",
+    "cache_generation_unavailable",
+    "cache_generation_mismatch",
+    "cache_fallback_disallowed",
+    "cache_source_mode_mismatch",
+    "cache_context_behavior_mismatch",
+    "cache_accounting_semantics_outdated",
+    "cache_price_registry_outdated",
+    "cache_invalid",
+    "cache_from_future",
+    "cache_stale",
   ].includes(value?.errorCode)
     ? value.errorCode
     : null;
+  // `partial_terminal` keeps excluded sources visible alongside available
+  // accounting. Admit it only with a coherent quarantine
+  // receipt: otherwise an arbitrary partial payload could turn off automatic
+  // refreshes or manufacture a skipped-source explanation in the browser.
+  const terminalGap = value?.status === "partial"
+    && value?.phase === "partial_terminal"
+    && errorCode === null
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && skippedSourceCount > 0
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedThreadCount !== null
+    && skippedThreadCount > 0
+    && skippedThreadCount <= skippedSourceCount
+    && sourceBytes !== null
+    && indexedBytes !== null
+    && skippedSourceBytes !== null
+    && indexedBytes + skippedSourceBytes === sourceBytes;
+  // A finished source scan can precede the separate accounting summary. Keep
+  // that unavailable summary distinct from both an unstarted scan and an
+  // available aggregate. As for terminal gaps, the counts must balance.
+  const aggregateUnavailable = value?.status === "partial"
+    && value?.phase === "aggregate_unavailable"
+    && value?.sourceMode === "unified"
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedThreadCount !== null
+    && (skippedSourceCount === 0
+      ? skippedThreadCount === 0
+      : skippedThreadCount > 0 && skippedThreadCount <= skippedSourceCount)
+    && sourceBytes !== null
+    && indexedBytes !== null
+    && skippedSourceBytes !== null
+    && indexedBytes + skippedSourceBytes === sourceBytes;
+  const phase = terminalGap
+    ? "partial_terminal"
+    : aggregateUnavailable ? "aggregate_unavailable" : admittedPhase;
+  const explainedSkippedSources = terminalGap || aggregateUnavailable;
   const coherent = sourceCount !== null
     && indexedSourceCount !== null
     && pendingSourceCount !== null
@@ -4978,6 +5531,9 @@ function normalizeHistoryCoverage(value = {}) {
     pendingSourceCount: sourceCount === null || pendingSourceCount === null
       ? 0
       : Math.min(pendingSourceCount, sourceCount),
+    skippedSourceCount: explainedSkippedSources ? skippedSourceCount : 0,
+    skippedSourceBytes: explainedSkippedSources ? skippedSourceBytes : 0,
+    skippedThreadCount: explainedSkippedSources ? skippedThreadCount : 0,
     sourceBytes: sourceBytes ?? 0,
     indexedBytes: sourceBytes === null || indexedBytes === null
       ? 0
@@ -5211,30 +5767,163 @@ function normalizeWeeklyPaceForecast(value) {
   };
 }
 
-function normalizeWeekly(payload = {}) {
-  const envelope = payload?.weekly ?? payload;
-  const source = artifactData(envelope);
-  const weeklyValues = array(source.weeklyValues ?? source.weekly_values)
-    .map((row) => ({
-      ...row,
-      priceCardIds: array(row?.priceCardIds ?? row?.price_card_ids)
-        .filter((id) => typeof id === "string" && id.length > 0)
-        .slice(0, 32),
-      priceCardBreakdown: array(row?.priceCardBreakdown ?? row?.price_card_breakdown)
-        .flatMap((item) => {
-          if (typeof item?.priceCardId !== "string"
-              || !/^\d+(?:\.\d+)?$/u.test(item?.costUsd ?? "")
-              || !Number.isSafeInteger(item?.events)
-              || item.events < 0) return [];
-          return [{
-            priceCardId: item.priceCardId,
-            events: item.events,
-            costUsd: item.costUsd,
-          }];
-        })
-        .slice(0, 32),
-    }));
+// The companion owns pace classification and geometry. Retain its newer
+// native-menu-bar DTO without recalculating a second forecast in the browser.
+function normalizeWeeklyPaceOutlook(value) {
+  const approximatelyEqual = (left, right) => Number.isFinite(left)
+    && Number.isFinite(right)
+    && Math.abs(left - right) <= 0.000_001 * Math.max(1, Math.abs(left), Math.abs(right));
+  const rateKeys = ["activePercentagePointsPerHour", "overallPercentagePointsPerHour",
+    "headlinePercentagePointsPerHour", "sustainablePercentagePointsPerHour", "ratio"];
+  const projectionKeys = ["hoursToReset", "coveredHours", "dryHours", "sparePercent", "projectedExhaustionAt"];
+  const trackKeys = ["coveredFraction", "activeExhaustionFraction"];
+  if (!hasExactKeys(value, ["schemaVersion", "status", "standing", "critical", "earlyEstimate",
+    "remainingPercent", "resetsAt", "observationCount", "elapsedHours", "rates", "projection", "track"])
+      || value.schemaVersion !== "local-weekly-pace-outlook-v0.1"
+      || !["unavailable", "collecting", "available"].includes(value.status)
+      || typeof value.critical !== "boolean" || typeof value.earlyEstimate !== "boolean"
+      || !Number.isSafeInteger(value.observationCount)
+      || value.observationCount < 0 || value.observationCount > 8_192
+      || !hasExactKeys(value.rates, rateKeys)
+      || !hasExactKeys(value.projection, projectionKeys)
+      || !hasExactKeys(value.track, trackKeys)) return null;
+  const remainingPercent = weeklyPaceNumber(value.remainingPercent, { minimum: 0, maximum: 100 });
+  const elapsedHours = weeklyPaceNumber(value.elapsedHours, { minimum: 0 });
+  const resetsAt = value.resetsAt === null ? null : canonicalInstant(value.resetsAt);
+  const projectedExhaustionAt = value.projection.projectedExhaustionAt === null
+    ? null : canonicalInstant(value.projection.projectedExhaustionAt);
+  const rates = Object.fromEntries(rateKeys.map((key) => [key, weeklyPaceNumber(value.rates[key], {
+    minimum: 0, maximum: key === "ratio" || key === "sustainablePercentagePointsPerHour" ? Infinity : 100,
+  })]));
+  const projection = Object.fromEntries(projectionKeys.slice(0, -1).map((key) => [key,
+    weeklyPaceNumber(value.projection[key], { minimum: 0, maximum: key === "sparePercent" ? 100 : Infinity })]));
+  projection.projectedExhaustionAt = projectedExhaustionAt;
+  const track = Object.fromEntries(trackKeys.map((key) => [key,
+    weeklyPaceNumber(value.track[key], { minimum: 0, maximum: 1 })]));
+  const numbers = [remainingPercent, elapsedHours, ...Object.values(rates),
+    ...Object.values(projection), ...Object.values(track)];
+  if (numbers.includes(undefined)
+      || (value.resetsAt !== null && resetsAt === null)
+      || (value.projection.projectedExhaustionAt !== null && projectedExhaustionAt === null)) return null;
+  if (value.status === "unavailable") {
+    if (value.standing !== null || value.critical || value.earlyEstimate
+        || value.observationCount !== 0 || resetsAt !== null
+        || numbers.some((number) => number !== null)) return null;
+  } else {
+    if (remainingPercent === null || resetsAt === null || elapsedHours === null
+        || !(projection.hoursToReset > 0)) return null;
+    if (value.status === "collecting") {
+      if (value.standing !== null || value.critical || value.earlyEstimate
+          || value.observationCount !== 1
+          || [...Object.values(rates), ...Object.values(track), projection.coveredHours,
+            projection.dryHours, projection.sparePercent, projectedExhaustionAt]
+            .some((number) => number !== null)) return null;
+    } else {
+      if (!["under", "on", "over"].includes(value.standing)
+          || value.observationCount < 2 || !(elapsedHours > 0) || !(remainingPercent > 0)
+          || !(rates.headlinePercentagePointsPerHour > 0)
+          || !(rates.sustainablePercentagePointsPerHour > 0) || !(rates.ratio > 0)
+          || (rates.activePercentagePointsPerHour !== null && !(rates.activePercentagePointsPerHour > 0))
+          || (rates.overallPercentagePointsPerHour !== null && !(rates.overallPercentagePointsPerHour > 0))
+          || !approximatelyEqual(rates.headlinePercentagePointsPerHour,
+            rates.overallPercentagePointsPerHour ?? rates.activePercentagePointsPerHour)
+          || projection.coveredHours === null || projection.dryHours === null
+          || projection.sparePercent === null || track.coveredFraction === null
+          || !approximatelyEqual(rates.sustainablePercentagePointsPerHour,
+            remainingPercent / projection.hoursToReset)
+          || !approximatelyEqual(rates.ratio,
+            rates.headlinePercentagePointsPerHour / rates.sustainablePercentagePointsPerHour)
+          || !approximatelyEqual(projection.coveredHours + projection.dryHours, projection.hoursToReset)
+          || !approximatelyEqual(projection.coveredHours,
+            Math.min(projection.hoursToReset, remainingPercent / rates.headlinePercentagePointsPerHour))
+          || !approximatelyEqual(projection.sparePercent,
+            Math.max(0, remainingPercent - rates.headlinePercentagePointsPerHour * projection.hoursToReset))
+          || !approximatelyEqual(track.coveredFraction, projection.coveredHours / projection.hoursToReset)
+          || !(value.standing === "under" ? rates.ratio < 0.85
+            : value.standing === "on" ? rates.ratio >= 0.85 && rates.ratio <= 1.15 : rates.ratio > 1.15)
+          || value.critical !== (value.standing === "over" && rates.ratio >= 2)
+          || (value.earlyEstimate && value.observationCount > 2 && elapsedHours >= 1)
+          || (value.standing === "over"
+            ? projectedExhaustionAt === null || Date.parse(projectedExhaustionAt) >= Date.parse(resetsAt)
+            : projectedExhaustionAt !== null)) return null;
+      const activeHours = rates.activePercentagePointsPerHour === null
+        ? null : remainingPercent / rates.activePercentagePointsPerHour;
+      const expectedActiveFraction = activeHours !== null && activeHours < projection.coveredHours * 0.95
+        ? Math.max(0, Math.min(1, activeHours / projection.hoursToReset)) : null;
+      if (expectedActiveFraction === null
+        ? track.activeExhaustionFraction !== null
+        : !approximatelyEqual(track.activeExhaustionFraction, expectedActiveFraction)) return null;
+      if (value.standing === "over"
+          && Math.abs(Date.parse(projectedExhaustionAt)
+            - (Date.parse(resetsAt) - projection.dryHours * 3_600_000)) > 10) return null;
+    }
+  }
   return {
+    schemaVersion: value.schemaVersion, status: value.status, standing: value.standing,
+    critical: value.critical, earlyEstimate: value.earlyEstimate, remainingPercent,
+    resetsAt, observationCount: value.observationCount, elapsedHours, rates, projection, track,
+  };
+}
+
+function normalizeWeeklyPlanAttribution(value) {
+  if (value?.methodVersion !== "plan-era-v1"
+      || value?.status !== "historical_plan_conditional"
+      || value?.accountVerified !== false) return null;
+  return {
+    methodVersion: "plan-era-v1",
+    status: "historical_plan_conditional",
+    accountVerified: false,
+    comparisonEligibility: value.comparisonEligibility === "single_plan_conditional"
+      ? "single_plan_conditional" : "unavailable",
+  };
+}
+
+function normalizeWeeklyPopulation(envelope = {}) {
+  const source = artifactData(envelope);
+  const weeklyValueColumns = new Set([
+    "sequence", "first_observed_at", "last_observed_at", "reset_due_at",
+    "resetAt", "slot", "displayed_span_pp", "value_usd", "value",
+    "pairwise_p10_usd", "pairwise_p90_usd", "lower", "upper",
+    "holdout_mae_pp", "known_speed_fraction", "eligible_transitions",
+    "unique_percentage_boundaries",
+  ]);
+  const weeklyValues = array(source.weeklyValues ?? source.weekly_values)
+    .map((row) => {
+      // A local era key can encode account context. It has no presentation
+      // purpose. Carry only the displayed fit columns, never opaque context.
+      const columns = Object.fromEntries(Object.entries(row ?? {})
+        .filter(([key]) => weeklyValueColumns.has(key)));
+      return {
+        ...columns,
+        planType: normalizePlanType(row?.planType ?? row?.plan_type),
+        planVariant: typeof (row?.planVariant ?? row?.plan_variant) === "string"
+            && /^[a-z][a-z0-9_-]{0,31}$/u.test(row.planVariant ?? row.plan_variant)
+          ? row.planVariant ?? row.plan_variant : "unknown",
+        aggregationEligibility: ["primary_conditional", "primary_scoped", "diagnostic_only"]
+          .includes(row?.aggregationEligibility ?? row?.aggregation_eligibility)
+          ? row.aggregationEligibility ?? row.aggregation_eligibility : null,
+        priceCardIds: array(row?.priceCardIds ?? row?.price_card_ids)
+          .filter((id) => typeof id === "string" && id.length > 0)
+          .slice(0, 32),
+        priceCardBreakdown: array(row?.priceCardBreakdown ?? row?.price_card_breakdown)
+          .flatMap((item) => {
+            if (typeof item?.priceCardId !== "string"
+                || !/^\d+(?:\.\d+)?$/u.test(item?.costUsd ?? "")
+                || !Number.isSafeInteger(item?.events)
+                || item.events < 0) return [];
+            return [{
+              priceCardId: item.priceCardId,
+              events: item.events,
+              costUsd: item.costUsd,
+            }];
+          })
+          .slice(0, 32),
+      };
+    });
+  return {
+    status: text(envelope?.status, "unavailable"),
+    planType: normalizePlanType(envelope?.planType),
+    planAttribution: normalizeWeeklyPlanAttribution(envelope?.planAttribution),
     summary: array(source.summary)[0] ?? source.summary ?? {},
     weeklyValues,
     valueSeries: array(source.valueSeries ?? source.value_series),
@@ -5244,6 +5933,7 @@ function normalizeWeekly(payload = {}) {
     dataClass: text(envelope?.dataClass, ""),
     stale: normalizeStaleProvenance(envelope?.stale),
     paceForecast: normalizeWeeklyPaceForecast(envelope?.paceForecast),
+    paceOutlook: normalizeWeeklyPaceOutlook(envelope?.paceOutlook),
     accountAttribution: {
       status: text(envelope?.accountAttribution?.status, ""),
       maySpanMultipleAccounts:
@@ -5251,6 +5941,113 @@ function normalizeWeekly(payload = {}) {
       label: text(envelope?.accountAttribution?.label, "")
     }
   };
+}
+
+function normalizeWeekly(payload = {}) {
+  const envelope = payload?.weekly ?? payload;
+  const weekly = normalizeWeeklyPopulation(envelope);
+  const planPopulations = [];
+  const candidates = array(envelope?.planPopulations).slice(0, 16);
+  const planCounts = new Map();
+  for (const row of candidates) {
+    planCounts.set(row?.planType, (planCounts.get(row?.planType) ?? 0) + 1);
+  }
+  for (const population of candidates) {
+    const planType = population?.planType;
+    if (!TELEMETRY_PLAN_TYPES.includes(planType) || planCounts.get(planType) !== 1) continue;
+    const normalized = normalizeWeeklyPopulation(population);
+    if (normalized.planAttribution === null) continue;
+    planPopulations.push({
+      ...normalized,
+      // The envelope is the selected population, not a license to relabel a
+      // positively different plan's historical fit.
+      weeklyValues: normalized.weeklyValues.filter((row) => row.planType === planType),
+    });
+  }
+  return {
+    ...weekly,
+    selectedPlanType: normalizePlanType(envelope?.selectedPlanType ?? envelope?.planType),
+    planPopulations,
+  };
+}
+
+const allowancePlanViews = new WeakMap();
+const allowancePlanViewRoots = new WeakMap();
+
+/**
+ * One selected population for every allowance-facing surface. Selection never
+ * changes the all-plan usage ledger or manufactures historical current pace.
+ * The root DTO names the latest observed plan, even when it has no fitted value.
+ */
+export function selectAllowancePlanPopulation(data, requestedPlanType = null) {
+  const root = allowancePlanViewRoots.get(data) ?? data;
+  const weekly = root?.weekly;
+  if (!weekly || weekly.planAttribution?.methodVersion !== "plan-era-v1") return root;
+  const populations = array(weekly.planPopulations);
+  const currentPlanType = normalizePlanType(weekly.selectedPlanType ?? weekly.planType);
+  const selectedPlanType = populations.some((row) => row.planType === requestedPlanType)
+    ? requestedPlanType : currentPlanType;
+  let views = allowancePlanViews.get(root);
+  if (views?.has(selectedPlanType)) return views.get(selectedPlanType);
+  const population = populations.find((row) => row.planType === selectedPlanType)
+    ?? normalizeWeeklyPopulation({ planType: selectedPlanType });
+  const isCurrentPlan = selectedPlanType === currentPlanType;
+  const allowanceCapacity = root.timeline?.allowanceCapacity ?? null;
+  const planScoped = root.timeline?.planScoped ?? null;
+  // The old gate asked whether the whole retained history contained one plan.
+  // That made a perfectly coherent current-plan fit unusable as soon as an
+  // earlier plan existed, then paired the selected capacity with all-plan
+  // usage anyway. The new gate is stricter where it matters: the scoped usage
+  // and fitted capacity must name the same current plan, method, basis, reset
+  // cohort and unified-index generation. Historical selections remain
+  // unavailable because no historical scoped numerator is published.
+  const comparisonAvailable = isCurrentPlan
+    && population.status === "available"
+    && allowanceCapacity?.status === "available"
+    && planScoped?.status === "available"
+    && planScoped.planScope?.planType === selectedPlanType
+    && matchingPlanScope(
+      planScoped.planScope,
+      allowanceCapacity.planScope
+    );
+  const selected = {
+    ...root,
+    weekly: {
+      ...population,
+      selectedPlanType: currentPlanType,
+      planPopulations: populations,
+      stale: weekly.stale,
+      paceForecast: isCurrentPlan ? weekly.paceForecast : null,
+      paceOutlook: isCurrentPlan ? weekly.paceOutlook : null,
+    },
+    quotaWindows: isCurrentPlan
+      ? array(root.quotaWindows).filter((window) => window.planType === selectedPlanType)
+      : [],
+    timeline: {
+      ...root.timeline,
+      // Keep `usage` and `calibrationUsage` as the conserved all-plan ledger.
+      // Trends consumes this explicit selected-plan lane; Usage & costs and
+      // every all-plan total continue to read the established fields.
+      selectedPlanUsage: comparisonAvailable ? planScoped.usage : [],
+      selectedPlanCalibrationUsage: comparisonAvailable ? planScoped.usage : [],
+      // The scoped quota lane was built before the generic cross-plan collapse.
+      // Keep the original root DTO untouched for all-plan consumers.
+      quota: comparisonAvailable ? planScoped.quota : [],
+      comparisonIntervals: comparisonAvailable ? planScoped.comparisonIntervals : [],
+      allowanceCapacity: comparisonAvailable ? allowanceCapacity : null,
+    },
+    allowancePlanSelection: {
+      planType: selectedPlanType,
+      currentPlanType,
+      isCurrentPlan,
+      comparisonAvailable,
+    },
+  };
+  views ??= new Map();
+  views.set(selectedPlanType, selected);
+  allowancePlanViews.set(root, views);
+  allowancePlanViewRoots.set(selected, root);
+  return selected;
 }
 
 function normalizeQuality(payload = {}) {
@@ -5279,7 +6076,6 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
   const state = mode === "demo"
     ? "demo"
     : safeState(freshness?.status ?? overview?.status ?? overview?.evidenceStatus ?? payload?.status, "insufficient");
-  const reportsPayload = payload?.reports ?? fragments.reports ?? {};
   const quotaWindows = quotaRows.map((window, index) => normalizeQuota({
     ...window,
     observedAt: window?.observedAt ?? quota?.observedAt,
@@ -5330,7 +6126,9 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       components: pricing?.components ?? selectedUsage?.components
     }),
     coverage: overview?.coverage ?? {},
-    warnings: array(overview?.warnings).map((warning) => text(warning?.message ?? warning, "")).filter(Boolean),
+    warnings: array(overview?.warnings)
+      .map((warning) => text(warning?.message ?? warning, ""))
+      .filter((warning) => warning && warning !== INTERNAL_TOOL_HISTORY_WARNING),
     collector: {
       status: text(overview?.collector?.status, "unavailable"),
       records: count(overview?.collector?.records, 0),
@@ -5380,7 +6178,9 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       }
     },
     timeline: normalizeLocalTimeline(overview?.timeline),
-    accounting: normalizeLocalAccounting(overview?.accounting),
+    accounting: normalizeLocalAccounting(overview?.accounting, {
+      allowImplicitDemoProjection: mode === "demo"
+    }),
     monitoringGaps: normalizeMonitoringGaps(overview?.monitoringGaps),
     artifactStatus: {
       gradient: {
@@ -5401,14 +6201,7 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
     },
     gradient: normalizeGradient(payload?.gradient ?? fragments.gradient),
     weekly: normalizeWeekly(payload?.weekly ?? fragments.weekly),
-    quality: normalizeQuality(payload?.quality ?? fragments.quality),
-    reports: array(reportsPayload?.reports ?? reportsPayload).slice(0, 20).map((report) => ({
-      id: text(report?.id, ""),
-      title: text(report?.title, "Detailed report"),
-      href: text(report?.href, ""),
-      updatedAt: text(report?.updatedAt ?? report?.modifiedAt, ""),
-      status: safeState(report?.status, "live")
-    })).filter((report) => report.href.startsWith("/") && !report.href.startsWith("//"))
+    quality: normalizeQuality(payload?.quality ?? fragments.quality)
   };
 }
 
@@ -5510,34 +6303,10 @@ export class LocalCompanionClient {
     // page. Hold a detached wrapper so every method may call
     // this.fetchImpl(...) directly.
     this.fetchImpl = (...args) => fetchImpl(...args);
-    // Set once the companion has answered 404/405 for the consolidated
-    // endpoint, so the negotiation is not repeated on every later load.
-    this.consolidatedUnavailable = false;
   }
 
   async load() {
-    // The consolidated endpoint is a supported companion capability, not dead
-    // code, so the probe stays. What does not need to stay is re-asking on
-    // every single load: a companion that serves only the split fragments
-    // answered 404 the first time and will answer 404 every time, and each
-    // repeat cost two round-trips and put two errors in the console where they
-    // masked real ones. The answer is remembered for the life of this client,
-    // which is a page load - a companion that gains the endpoint is picked up
-    // on the next one.
-    if (!this.consolidatedUnavailable) {
-      try {
-        const [status, dashboard] = await Promise.all([
-          fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/status`).catch(() => null),
-          fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/dashboard`)
-        ]);
-        return normalizeDashboardPayload({ ...dashboard, status: dashboard?.status ?? status?.status });
-      } catch (error) {
-        if (![404, 405].includes(error.status)) throw error;
-        this.consolidatedUnavailable = true;
-      }
-    }
-
-    const paths = ["overview", "gradient", "weekly", "quality", "reports"];
+    const paths = ["overview", "gradient", "weekly", "quality"];
     const settled = await Promise.allSettled(paths.map((path) => fetchJson(this.fetchImpl, `${LOCAL_ROOT}/${path}`)));
     const fragments = Object.fromEntries(settled.map((result, index) => [
       paths[index],
@@ -5547,8 +6316,29 @@ export class LocalCompanionClient {
     return normalizeDashboardPayload({}, fragments);
   }
 
+  modelPerformance(period = "all", { signal } = {}) {
+    if (!["7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/model-performance?period=${period}`, {
+      cache: "no-store", signal, headers: { "X-Usage-Monitor-Local": "1" },
+    });
+  }
+
   health() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/health`);
+  }
+
+  async cacheDropThreadLinks() {
+    try {
+      return normalizeCacheDropThreadLinks(await fetchJson(
+        this.fetchImpl, `${LOCAL_ROOT}/cache-drop-thread-links`, {
+          cache: "no-store",
+          headers: { "X-Usage-Monitor-Local": "1" }
+        }
+      ));
+    } catch {
+      // Older companions and missing optional metadata do not fail refresh.
+      return normalizeCacheDropThreadLinks(null);
+    }
   }
 
   async onboarding() {
@@ -5562,6 +6352,17 @@ export class LocalCompanionClient {
   }
 
   async refresh() {
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh/quick`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1"
+      },
+      body: JSON.stringify({})
+    });
+  }
+
+  async recalculateDetailedAccounting() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`, {
       method: "POST",
       headers: {
@@ -5697,116 +6498,6 @@ export class LocalCompanionClient {
     return normalized;
   }
 
-  async automaticContributionStatus() {
-    try {
-      return normalizeAutomaticContributionStatus(
-        await fetchJson(
-          this.fetchImpl,
-          `${LOCAL_ROOT}/contribution/automatic-settings`
-        )
-      );
-    } catch {
-      return normalizeAutomaticContributionStatus(null);
-    }
-  }
-
-  async enableAutomaticContribution(requiredConsent) {
-    const normalized = normalizeAutomaticContributionStatus({
-      schemaVersion: AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
-      status: "first_review_required",
-      enabled: false,
-      intervalHours: 6,
-      consentCurrent: false,
-      firstReviewComplete: false,
-      firstReviewedAcceptedAt: null,
-      requiredConsent,
-      consentedAt: null,
-      lastAttemptAt: null,
-      lastSuccessAt: null,
-      nextAttemptAt: null,
-      lastOutcome: null,
-      foregroundOnly: true,
-      daemonInstalled: false,
-      networkActivity: false,
-      includesContent: false,
-      includesPaths: false,
-      includesIdentifiers: false,
-      includesCredentials: false
-    });
-    if (normalized.state === "unavailable"
-        || normalized.requiredConsent?.destinationOrigin === null) {
-      throw new TypeError("Automatic contribution consent is invalid.");
-    }
-    const response = await this.fetchImpl(
-      `${LOCAL_ROOT}/contribution/automatic-enable`,
-      {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-Usage-Monitor-Local": "1"
-        },
-        body: JSON.stringify({
-          intervalHours: 6,
-          consent: normalized.requiredConsent
-        })
-      }
-    );
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      throw localCompanionRequestError(response, payload);
-    }
-    return normalizeAutomaticContributionStatus(payload);
-  }
-
-  async disableAutomaticContribution() {
-    return normalizeAutomaticContributionStatus(
-      await this.localContributionMutation("automatic-disable", {
-        reason: "user_request"
-      })
-    );
-  }
-
-  /**
-   * The owner's stated Codex speed mode. Codex records no speed field, so an
-   * unreadable statement reads back as the Standard default rather than an
-   * invented Fast attribution.
-   */
-  async fastModePreference() {
-    try {
-      const response = await this.fetchImpl(
-        `${LOCAL_ROOT}/accounting/fast-mode-preference`,
-        { headers: { Accept: "application/json" } }
-      );
-      if (!response.ok) return normalizeFastModePreference(null);
-      return normalizeFastModePreference(
-        await response.json().catch(() => null)
-      );
-    } catch {
-      return normalizeFastModePreference(null);
-    }
-  }
-
-  async selectFastModePreference(mode) {
-    if (!FAST_MODE_PREFERENCES.includes(mode)) {
-      throw new TypeError("Unsupported Fast-mode preference.");
-    }
-    const response = await this.fetchImpl(
-      `${LOCAL_ROOT}/accounting/fast-mode-preference`,
-      {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-Usage-Monitor-Local": "1"
-        },
-        body: JSON.stringify({ mode })
-      }
-    );
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) throw localCompanionRequestError(response, payload);
-    return normalizeFastModePreference(payload);
-  }
 
   async contributionSyncPreview() {
     try {
@@ -5973,6 +6664,21 @@ export class LocalCompanionClient {
     });
   }
 
+  async reviewAttributionContribution() {
+    const review = normalizeAttributionContributionReview(
+      await this.localContributionMutation("incremental-review-v11"),
+    );
+    if (review === null) throw new Error("Attribution review is unavailable.");
+    return review;
+  }
+
+  approveAttributionContribution(review) {
+    return this.localContributionMutation("incremental-approve", {
+      reviewToken: review.reviewToken, consent: review.consent,
+      fieldInventoryDigest: review.inventory.inventoryDigest,
+    });
+  }
+
   localContributionMutation(path, body = {}) {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/contribution/${path}`, {
       method: "POST",
@@ -5982,12 +6688,6 @@ export class LocalCompanionClient {
       },
       body: JSON.stringify(body)
     });
-  }
-
-  async runContributionSyncOnce(reviewToken) {
-    return normalizeContributionSyncRun(
-      await this.localContributionMutation("sync-once", { reviewToken })
-    );
   }
 
   async prepareContribution(options = {}) {
@@ -6034,27 +6734,17 @@ export class LocalCompanionClient {
     return normalizeLocalContributionPreparation(payload);
   }
 
-  async setContributionSyncPaused(paused) {
-    return normalizeContributionSyncStatus(
-      await this.localContributionMutation(
-        paused ? "sync-pause" : "sync-resume"
-      )
-    );
-  }
 }
 
 export class CommunityClient {
   constructor({
     fetchImpl = globalThis.fetch,
-    getCsrfToken = () => null,
-    getParticipantId = () => null
+    getCsrfToken = () => null
   } = {}) {
     // Detached for the same reason as LocalCompanionClient: browser-native
     // fetch throws when invoked with this client as its receiver.
     this.fetchImpl = (...args) => fetchImpl(...args);
     this.getCsrfToken = getCsrfToken;
-    this.getParticipantId = getParticipantId;
-    this.pendingRecovery = null;
   }
 
   sessionOptions(options = {}) {
@@ -6077,18 +6767,6 @@ export class CommunityClient {
 
   health() {
     return fetchJson(this.fetchImpl, "/api/health");
-  }
-
-  async readiness() {
-    const response = await this.fetchImpl("/api/ready", {
-      headers: { Accept: "application/json" }
-    });
-    if (![200, 503].includes(response.status)) {
-      const error = new Error(`Request failed (${response.status}).`);
-      error.status = response.status;
-      throw error;
-    }
-    return normalizeBackendReadiness(await response.json().catch(() => null));
   }
 
   session() {
@@ -6163,136 +6841,6 @@ export class CommunityClient {
     return readHostedSignInResult(this.fetchImpl, "apple", state, verifier);
   }
 
-  async recover(recoveryCode) {
-    if (this.pendingRecovery?.recoveryCode !== recoveryCode) {
-      const bytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
-      const secret = btoa(String.fromCharCode(...bytes))
-        .replaceAll("+", "-")
-        .replaceAll("/", "_")
-        .replace(/=+$/u, "");
-      this.pendingRecovery = {
-        recoveryCode,
-        recoveryAttemptId: `um_recovery_attempt_${secret}`
-      };
-    }
-    try {
-      const result = await fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/recover`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(this.pendingRecovery)
-      });
-      this.pendingRecovery = null;
-      return result;
-    } catch (error) {
-      if (Number.isInteger(error?.status) && error.status < 500) {
-        this.pendingRecovery = null;
-      }
-      throw error;
-    }
-  }
-
-  envelopeKey() {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/envelope-key`);
-  }
-
-  registerUpload({ envelopeDigest, contentLengthBytes, contentType = "application/json" }) {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/upload-authorizations`, this.mutationOptions({
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ envelopeDigest, contentLengthBytes, contentType })
-    }));
-  }
-
-  contributeSerialized(serializedEnvelope, uploadAuthorization) {
-    if (typeof uploadAuthorization !== "string" || uploadAuthorization.length === 0) {
-      throw new Error("A one-use upload authorization is required.");
-    }
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/contributions`, {
-      method: "POST",
-      credentials: "omit",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Upload ${uploadAuthorization}`
-      },
-      body: serializedEnvelope
-    });
-  }
-
-  contribution(contributionId) {
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/contributions/read`,
-      this.mutationOptions({
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contributionId })
-      })
-    );
-  }
-
-  deleteContribution(contributionId) {
-    if (typeof contributionId !== "string"
-        || !CONTRIBUTION_ID_PATTERN.test(contributionId)) {
-      throw new Error("Choose a valid contribution.");
-    }
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/contributions/delete`,
-      this.mutationOptions({
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contributionId })
-      })
-    ).then((payload) => normalizeContributionDeletionReceipt(payload, contributionId));
-  }
-
-  async personalStats() {
-    try {
-      return await fetchJson(
-        this.fetchImpl,
-        `${CENTRAL_ROOT}/me/stats`,
-        this.sessionOptions()
-      );
-    } catch (error) {
-      if (error.status !== 404) throw error;
-      return fetchJson(
-        this.fetchImpl,
-        `${CENTRAL_ROOT}/me/insights`,
-        this.sessionOptions()
-      );
-    }
-  }
-
-  participantProfile() {
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me`,
-      this.sessionOptions()
-    );
-  }
-
-  async communityStats() {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/stats/aggregate`);
-  }
-
-  participantExport() {
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/export`,
-      this.sessionOptions()
-    );
-  }
-
-  async deleteParticipant() {
-    const payload = await fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me`,
-      this.mutationOptions({ method: "DELETE" })
-    );
-    return normalizeParticipantDeletionReceipt(payload, this.getParticipantId());
-  }
-
   createDevicePairing(accountScoped = false) {
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-pairings`, this.mutationOptions({
       method: "POST",
@@ -6314,27 +6862,16 @@ export class CommunityClient {
     }));
   }
 
-  devices() {
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/devices`,
-      this.sessionOptions()
-    );
-  }
-
-  revokeDevice(deviceId) {
-    if (typeof deviceId !== "string" || !/^[0-9a-f-]{36}$/u.test(deviceId)) {
-      throw new Error("Choose a valid paired device.");
+  grantAttributionContribution(review) {
+    const consent = telemetryV11RequiredConsent();
+    if (!review || Object.entries(consent).some(([key, value]) => review.consent?.[key] !== value)
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(review.grantDeviceId ?? "")) {
+      throw new TypeError("Attribution consent requires a reviewed device target.");
     }
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/devices/revoke`,
-      this.mutationOptions({
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceId })
-      })
-    );
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-telemetry-consents`, this.mutationOptions({
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: review.grantDeviceId, consent, ongoingUpload: true }),
+    }));
   }
 
   logout() {
@@ -6345,13 +6882,6 @@ export class CommunityClient {
     }));
   }
 
-  securityReset() {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/security-reset`, this.mutationOptions({
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}"
-    }));
-  }
 }
 
 export function demoDashboard({ now = new Date().toISOString() } = {}) {
@@ -6377,7 +6907,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       });
       rolling.push({
         timestamp,
-        series: "Expected from quota-weighted API cost",
+        series: "Expected from speed-priced API cost",
         quota_change_pp: Number((observed * .82 + Math.cos(index / 4) * .8 * scale).toFixed(2)),
         smoothing_hours: smoothingHours
       });
@@ -6461,7 +6991,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
               totalEvents: usageEvents,
               observedEvents: 0,
               declaredFromConfigEvents: 0,
-              assumedFromPreferenceEvents: usageEvents,
+              assumedEvents: usageEvents,
               inferredEvents: 0,
               unknownEvents: 0
             }
@@ -6475,7 +7005,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
               totalEvents: usageEvents,
               observedEvents: 0,
               declaredFromConfigEvents: 0,
-              assumedFromPreferenceEvents: usageEvents,
+              assumedEvents: usageEvents,
               inferredEvents: 0,
               unknownEvents: 0
             }
@@ -6735,13 +7265,6 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
         { priority: "P0", title: "Integer quota display", evidence: "Quota observations are rounded to whole percentage points." },
         { priority: "P1", title: "Shared agentic surfaces", evidence: "Work, Workspace Agents, and Voice task work may draw from the same pool." },
         { priority: "P1", title: "Fast-mode attribution", evidence: "Historical records do not always identify the subscription speed tier." }
-      ]
-    },
-    reports: {
-      reports: [
-        { id: "gradient", title: "Full gradient report", href: "/reports/simple-quota-gradient", status: "demo" },
-        { id: "weekly", title: "Weekly calibration report", href: "/reports/weekly-calibration", status: "demo" },
-        { id: "quality", title: "Monitoring quality report", href: "/reports/monitoring-quality", status: "demo" }
       ]
     }
   });

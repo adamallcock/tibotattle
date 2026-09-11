@@ -5,7 +5,15 @@ import {
   extractRolloutUsage,
   inheritedTierSeed,
   ownObservedTier,
+  resolveLogicalRolloutHeads,
+  rolloutContentQuarantineReason,
 } from "./local-unified-index-extract.js";
+import {
+  createHistoryBaseSeedResolver,
+  createParentModelResolver,
+  selectRolloutUsageSeed,
+} from "./local-unified-index-history.js";
+import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 
 // One lane of a parallel rebuild.
 //
@@ -21,8 +29,6 @@ import {
 // buffer from a rollout file is ever posted; the batch below carries integers,
 // a model identifier and a tier classification, nothing that can hold content.
 
-const BATCH_EVENTS = 5_000;
-
 function validSource(value) {
   return value !== null
     && typeof value === "object"
@@ -33,6 +39,50 @@ function validSource(value) {
     && typeof value.rolloutKey === "string";
 }
 
+const WORKER_BATCH_CREDITS = 0;
+const WORKER_BATCH_OUTSTANDING = 1;
+const WORKER_BATCH_PEAK_OUTSTANDING = 2;
+const WORKER_BATCH_WAIT_COUNT = 3;
+const WORKER_BATCH_WINDOW = 4;
+const WORKER_BATCH_CONTROL_LENGTH = 5;
+
+function updateMaximum(control, index, candidate) {
+  let current = Atomics.load(control, index);
+  while (candidate > current) {
+    const previous = Atomics.compareExchange(control, index, current, candidate);
+    if (previous === current) return;
+    current = previous;
+  }
+}
+
+function acquireBatchCredit(control) {
+  while (true) {
+    const credits = Atomics.load(control, WORKER_BATCH_CREDITS);
+    if (credits > 0 && Atomics.compareExchange(
+      control,
+      WORKER_BATCH_CREDITS,
+      credits,
+      credits - 1,
+    ) === credits) {
+      const outstanding = Atomics.add(
+        control,
+        WORKER_BATCH_OUTSTANDING,
+        1,
+      ) + 1;
+      updateMaximum(control, WORKER_BATCH_PEAK_OUTSTANDING, outstanding);
+      return;
+    }
+    Atomics.add(control, WORKER_BATCH_WAIT_COUNT, 1);
+    Atomics.wait(control, WORKER_BATCH_CREDITS, 0);
+  }
+}
+
+function releaseBatchCredit(control) {
+  Atomics.sub(control, WORKER_BATCH_OUTSTANDING, 1);
+  Atomics.add(control, WORKER_BATCH_CREDITS, 1);
+  Atomics.notify(control, WORKER_BATCH_CREDITS, 1);
+}
+
 async function run() {
   if (parentPort === null) throw new Error("unified index worker requires a parent port");
   const components = workerData?.components;
@@ -41,6 +91,36 @@ async function run() {
     throw new Error("unified index worker input is invalid");
   }
   const maximumLineBytes = workerData?.maximumLineBytes;
+  const batchEvents = workerData?.batchEvents;
+  if (!Number.isSafeInteger(batchEvents)
+      || batchEvents < 1
+      || batchEvents > 500) {
+    throw new Error("unified index worker batch bound is invalid");
+  }
+  const batchControlBuffer = workerData?.batchControl;
+  const batchWindow = workerData?.batchWindow;
+  if (!(batchControlBuffer instanceof SharedArrayBuffer)
+      || batchControlBuffer.byteLength
+        !== Int32Array.BYTES_PER_ELEMENT * WORKER_BATCH_CONTROL_LENGTH
+      || !Number.isSafeInteger(batchWindow)
+      || batchWindow < 1) {
+    throw new Error("unified index worker batch control is invalid");
+  }
+  const batchControl = new Int32Array(batchControlBuffer);
+  if (Atomics.load(batchControl, WORKER_BATCH_WINDOW) !== batchWindow
+      || Atomics.load(batchControl, WORKER_BATCH_CREDITS) < 0
+      || Atomics.load(batchControl, WORKER_BATCH_CREDITS) > batchWindow) {
+    throw new Error("unified index worker batch control is invalid");
+  }
+  const postBatch = (message) => {
+    acquireBatchCredit(batchControl);
+    try {
+      parentPort.postMessage(message);
+    } catch (error) {
+      releaseBatchCredit(batchControl);
+      throw error;
+    }
+  };
 
   for (const members of components) {
     // `createLineageSnapshots` wants lineage-shaped members; the wire form is
@@ -51,21 +131,91 @@ async function run() {
         sessionId: source.sessionId,
         parentId: source.parentId,
         isFork: source.isFork === true,
+        isInlineFork: source.isInlineFork === true,
+        historyMode: source.historyMode,
+        historyBase: source.historyBase,
+        startOrdinal: source.startOrdinal,
       },
     }));
     const snapshots = createLineageSnapshots(shaped);
+    const logicalHeads = resolveLogicalRolloutHeads(shaped);
     const finalBySessionId = new Map();
+    const parentModels = createParentModelResolver(shaped, { maximumLineBytes });
+    const historySeeds = createHistoryBaseSeedResolver(shaped, {
+      maximumLineBytes,
+    });
+    const invalidRolloutIds = new Set();
+    const invalidSessionIds = new Set();
+    const dependencyUnavailable = (source) => {
+      const baseId = source.historyBase?.rolloutId ?? null;
+      if (baseId !== null && invalidRolloutIds.has(baseId)) return true;
+      return source.isInlineFork === true
+        && typeof source.parentId === "string"
+        && invalidSessionIds.has(source.parentId);
+    };
+    const markUnavailable = (source) => {
+      if (typeof source.rolloutId === "string") {
+        invalidRolloutIds.add(source.rolloutId);
+      }
+      if (typeof source.sessionId === "string") {
+        invalidSessionIds.add(source.sessionId);
+      }
+    };
     try {
       for (const source of shaped) {
-        const seed = source.parentId === null || source.parentId === undefined
+        const logicalSeed = source.historyMode === "paginated"
+          || source.parentId === null || source.parentId === undefined
           ? null
           : finalBySessionId.get(source.parentId) ?? null;
+        if (dependencyUnavailable(source)) {
+          markUnavailable(source);
+          postBatch({
+            type: "batch",
+            rolloutKey: source.rolloutKey,
+            events: [],
+            boundaries: [],
+            tools: [],
+            snapshotKeys: [],
+            snapshotReset: false,
+            snapshotSeedKeys: [],
+            final: true,
+            diagnostics: {},
+            cursor: null,
+            quarantineReason: "codex_rollout_lineage_invalid",
+          });
+          continue;
+        }
+        const collector = snapshots.collectorFor(source);
+        const historySeed = await historySeeds.resolveSeed(source, {
+          includeSnapshots: collector !== null,
+        });
+        const selectedSeed = selectRolloutUsageSeed(source, {
+          historySeed,
+          logicalSeed: logicalSeed === null ? null : {
+            seedModel: logicalSeed.model,
+            seedEffort: logicalSeed.effort,
+            seedTier: inheritedTierSeed(logicalSeed.tier),
+          },
+        });
+        const snapshotReset = collector !== null
+          && snapshots.replaceFor(source, historySeed?.seedSnapshots ?? []);
+        let snapshotResetPending = snapshotReset;
+        let snapshotSeedKeys = snapshotReset
+          ? [...(historySeed?.seedSnapshots ?? [])]
+          : [];
         let events = [];
         let boundaries = [];
         let tools = [];
         let snapshotKeys = [];
-        const flush = (rolloutKey, final, diagnostics, cursor = null) => {
-          parentPort.postMessage({
+        const flush = (
+          rolloutKey,
+          final,
+          diagnostics,
+          cursor = null,
+          quarantineReason = null,
+        ) => {
+          const seedKeys = snapshotSeedKeys.splice(0, batchEvents);
+          postBatch({
             type: "batch",
             rolloutKey,
             events,
@@ -75,52 +225,68 @@ async function run() {
             // counters, nothing that can hold content. The host persists them
             // so a later incremental ingest can answer for this ancestor.
             snapshotKeys,
+            snapshotReset: snapshotResetPending,
+            snapshotSeedKeys: seedKeys,
             final,
             diagnostics,
             cursor,
+            quarantineReason,
           });
           events = [];
           boundaries = [];
           tools = [];
           snapshotKeys = [];
+          snapshotResetPending = false;
         };
-        const collector = snapshots.collectorFor(source);
-        const outcome = await extractRolloutUsage(source.path, {
+        while (snapshotSeedKeys.length > batchEvents) {
+          flush(source.rolloutKey, false, null);
+        }
+        const parentModelAt = selectedSeed.seedModel === null
+          ? await parentModels.forSource(source) : null;
+        const outcome = await withStableRolloutSource(source, (stableSource) => (
+          extractRolloutUsage(stableSource, {
+          parentModelAt,
           size: source.size,
-          isFork: source.isFork === true,
-          inheritedSnapshots: snapshots.inheritedFor(source),
+          isFork: source.isInlineFork === true,
+          inheritedSnapshots: source.isInlineFork === true
+            ? snapshots.inheritedFor(source)
+            : null,
           collectSnapshots: collector === null ? null : {
             add(key) {
               collector.add(key);
               snapshotKeys.push(key);
+              if (events.length + boundaries.length + tools.length
+                  + snapshotKeys.length >= batchEvents) {
+                flush(source.rolloutKey, false, null);
+              }
             },
           },
-          seedModel: seed?.model ?? null,
-          seedEffort: seed?.effort ?? null,
-          // Lineage speed carry-forward: the parent's final tier already folds
-          // in its own seed, so a direct-parent lookup spans the whole chain.
-          seedTier: inheritedTierSeed(seed?.tier ?? null),
+          ...selectedSeed,
           ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
           onEvent: (event) => {
             events.push(event);
-            if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
+            if (events.length + boundaries.length + tools.length >= batchEvents) {
               flush(source.rolloutKey, false, null);
             }
           },
           onBoundary: (event) => {
             boundaries.push(event);
-            if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
+            if (events.length + boundaries.length + tools.length >= batchEvents) {
               flush(source.rolloutKey, false, null);
             }
           },
-          onTool: (event) => {
+            onTool: (event) => {
             tools.push(event);
-            if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
+            if (events.length + boundaries.length + tools.length >= batchEvents) {
               flush(source.rolloutKey, false, null);
             }
-          },
-        });
-        if (source.sessionId) {
+            },
+          })
+        ));
+        const quarantineReason = rolloutContentQuarantineReason(outcome);
+        if (quarantineReason !== null) markUnavailable(source);
+        if (source.sessionId && quarantineReason === null
+            && logicalHeads.get(source.sessionId) === source) {
           finalBySessionId.set(source.sessionId, {
             model: outcome.finalModel,
             effort: outcome.finalEffort,
@@ -130,6 +296,11 @@ async function run() {
         flush(source.rolloutKey, true, {
           relevantLines: outcome.diagnostics.relevantLines,
           malformedLines: outcome.diagnostics.malformedLines,
+          malformedAccountingRecords:
+            outcome.diagnostics.malformedAccountingRecords,
+          malformedUsageRecords: outcome.diagnostics.malformedUsageRecords,
+          malformedRateLimitRecords:
+            outcome.diagnostics.malformedRateLimitRecords,
           partialLines: outcome.diagnostics.partialLines,
           salvagedRecords: outcome.diagnostics.salvagedRecords,
           compactionEvents: outcome.diagnostics.compactionEvents,
@@ -141,13 +312,14 @@ async function run() {
           toolRecordsSkipped: outcome.diagnostics.toolRecordsSkipped,
           oversizedLines: outcome.read.oversizedLines,
           retainedSnapshotKeys: snapshots.retainedKeys,
-          seeded: seed?.model != null,
-        }, {
+          seeded: selectedSeed.seedModel !== null,
+        }, quarantineReason === null ? {
           nextOffset: outcome.read.nextOffset,
           finalModel: outcome.finalModel,
           finalEffort: outcome.finalEffort,
           // Own-file declarations only: an inherited seed is re-derived from
-          // the ancestor chain on the next pass, keeping its provenance.
+          // the exact physical base or legacy inline ancestor chain on the
+          // next pass, keeping its provenance.
           finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
           finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
           finalTotals: outcome.finalTotals,
@@ -155,7 +327,7 @@ async function run() {
           finalTurnContextPending: outcome.finalTurnContextPending,
           turnContextSeen: outcome.finalTurnContextSeen,
           snapshotsPersisted: collector !== null,
-        });
+        } : null, quarantineReason);
       }
     } finally {
       snapshots.release();

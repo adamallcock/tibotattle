@@ -334,6 +334,7 @@ test("preparation contains and rechecks an initialized pending target before bot
         stdout: JSON.stringify([
           { name: "ENVELOPE_PRIVATE_JWK" },
           { name: "ENVELOPE_PUBLIC_JWK" },
+          { name: "IDENTITY_LINK_SECRET" },
         ]),
         stderr: "",
       };
@@ -375,6 +376,10 @@ test("preparation contains and rechecks an initialized pending target before bot
             admission_counter: 1,
             quarantine_reconciliation: 1,
             lifecycle_status: 1,
+            attribution_objects: 1,
+            attribution_columns: 1,
+            scale_objects: 1,
+            scale_columns: 1,
             primary_cooldown_table: 1,
             primary_participant_cooldown_digest: 1,
             primary_cooldown_digest: 1,
@@ -479,6 +484,7 @@ test("preparation contains and rechecks an initialized pending target before bot
     migrationInventoryCurrent: true,
     migrationsCurrent: true,
     pilotSchemaCurrent: true,
+    attributionSchemaCurrent: true,
     primaryReenrollmentSchemaCurrent: true,
     deletionLedgerSchemaCurrent: true,
     identityProtectionSchemaCurrent: true,

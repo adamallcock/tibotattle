@@ -85,18 +85,12 @@ function finiteNonNegative(value) {
  *   cost. Saturated spans produce no observations by construction: a pegged
  *   pool has no envelope crossings, so post-peg cost never trains the fit.
  */
-export function buildCompositionObservations({
-  usageRows = [],
-  quotaRows = [],
-} = {}, {
+function buildCompositionTopology(quotaRows, {
   grainMs = MODEL_COMPOSITION_POLICY.grainMs,
   poolToleranceMs = MODEL_COMPOSITION_POLICY.poolToleranceMs,
   resetDropPp = MODEL_COMPOSITION_POLICY.resetDropPp,
   maxCrossingElapsedMs = MODEL_COMPOSITION_POLICY.maxCrossingElapsedMs,
 } = {}) {
-  if (!Array.isArray(usageRows) || !Array.isArray(quotaRows)) {
-    throw new TypeError("usageRows and quotaRows must be arrays");
-  }
   const readings = quotaRows
     .filter((row) => row
       && Number.isFinite(row.observedAtMs)
@@ -187,35 +181,27 @@ export function buildCompositionObservations({
     }
   }
 
-  // Per-model cost per bin.
-  const binCosts = new Map();
-  for (const row of usageRows) {
-    if (!row
-        || !Number.isFinite(row.observedAtMs)
-        || typeof row.model !== "string"
-        || row.model.length === 0
-        || !finiteNonNegative(row.costUsd)) continue;
-    const bin = Math.floor(row.observedAtMs / grainMs) * grainMs;
-    let costs = binCosts.get(bin);
-    if (costs === undefined) {
-      costs = new Map();
-      binCosts.set(bin, costs);
-    }
-    costs.set(row.model, (costs.get(row.model) ?? 0) + row.costUsd);
-  }
-
   // Crossings -> bins, voiding smeared crossings and ambiguous bins.
   const entries = new Map();
-  const voidedBins = new Set();
+  // Integer-grain stepping is exact over safe integer bin endpoints. Store
+  // inclusive intervals instead of allocating one Set entry per elapsed bin:
+  // admitted timestamps can be far apart, independent of the quota row cap.
+  // Fractional/custom unsafe arithmetic retains the established += loop.
+  let minimumBinIndex = Infinity, maximumBinIndex = -Infinity;
+  const integerBins = Number.isSafeInteger(grainMs) && grainMs > 0 && readings.every(row => {
+    const index = Math.floor(row.observedAtMs / grainMs), bin = index * grainMs;
+    minimumBinIndex = Math.min(minimumBinIndex, index); maximumBinIndex = Math.max(maximumBinIndex, index);
+    return Number.isSafeInteger(index) && Number.isSafeInteger(bin);
+  }) && (readings.length === 0 || Number.isSafeInteger(maximumBinIndex - minimumBinIndex + 1));
+  const voidedBins = new Set(), voidedRanges = [];
   for (const pool of pools.values()) {
     for (const [segmentIndex, segment] of pool.segments.entries()) {
       for (const crossing of segment.crossings) {
         const firstBin = Math.floor(crossing.priorMs / grainMs) * grainMs;
         const lastBin = Math.floor(crossing.atMs / grainMs) * grainMs;
         if (crossing.atMs - crossing.priorMs > maxCrossingElapsedMs) {
-          for (let bin = firstBin; bin <= lastBin; bin += grainMs) {
-            voidedBins.add(bin);
-          }
+          if (integerBins) voidedRanges.push([firstBin / grainMs, lastBin / grainMs]);
+          else for (let bin = firstBin; bin <= lastBin; bin += grainMs) voidedBins.add(bin);
           continue;
         }
         const key = `${pool.key}\0${segmentIndex}\0${lastBin}`;
@@ -247,22 +233,106 @@ export function buildCompositionObservations({
     // copy the bin's FULL cost and the corpus would train on double-counted
     // dollars. Void the bin — the same refusal the reset-grain calibration
     // makes for overlapping observation windows.
-    if (count > 1) voidedBins.add(bin);
+    if (count > 1) {
+      if (integerBins) voidedRanges.push([bin / grainMs, bin / grainMs]);
+      else voidedBins.add(bin);
+    }
   }
-  const observations = [...entries.values()]
-    .filter((entry) => !voidedBins.has(entry.binStartMs) && entry.ppDelta > 0)
-    .map((entry) => ({
-      ...entry,
-      costByModel: Object.fromEntries(binCosts.get(entry.binStartMs) ?? []),
-    }))
-    .filter((entry) => Object.values(entry.costByModel)
-      .reduce((sum, value) => sum + value, 0) > 0)
+  voidedRanges.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  const mergedRanges = [];
+  for (const range of voidedRanges) {
+    const previous = mergedRanges.at(-1);
+    if (previous && range[0] <= previous[1] + 1) previous[1] = Math.max(previous[1], range[1]);
+    else mergedRanges.push(range);
+  }
+  const voidedBinCount = integerBins
+    ? mergedRanges.reduce((sum, range) => sum + (range[1] - range[0] + 1), 0) : voidedBins.size;
+  const isVoided = bin => {
+    if (!integerBins) return voidedBins.has(bin);
+    const index = bin / grainMs;
+    let low = 0, high = mergedRanges.length;
+    while (low < high) {
+      const middle = low + Math.floor((high - low) / 2), range = mergedRanges[middle];
+      if (index < range[0]) high = middle;
+      else if (index > range[1]) low = middle + 1;
+      else return true;
+    }
+    return false;
+  };
+  // No cost-dependent eligibility or arithmetic happens here. The caller can
+  // now release readings, pools and crossings BEFORE consuming a large usage
+  // iterator. Both public entrypoints use this one exact quota topology.
+  const eligibleEntries = [...entries.values()]
+    .filter((entry) => !isVoided(entry.binStartMs) && entry.ppDelta > 0)
     .sort((left, right) => left.binStartMs - right.binStartMs);
   return {
-    observations,
-    voidedBinCount: voidedBins.size,
+    entries: eligibleEntries,
+    voidedBinCount,
     poolCount: pools.size,
   };
+}
+
+function validCompositionUsage(row) {
+  return row && Number.isFinite(row.observedAtMs)
+    && typeof row.model === "string" && row.model.length > 0
+    && finiteNonNegative(row.costUsd);
+}
+
+/** Existing unordered-array API. Input order within each model/bin remains
+ * the floating-point addition order; no presorting or policy changes. */
+export function buildCompositionObservations({ usageRows = [], quotaRows = [] } = {}, policy = {}) {
+  if (!Array.isArray(usageRows) || !Array.isArray(quotaRows)) {
+    throw new TypeError("usageRows and quotaRows must be arrays");
+  }
+  const { grainMs = MODEL_COMPOSITION_POLICY.grainMs } = policy;
+  const topology = buildCompositionTopology(quotaRows, policy);
+  const binCosts = new Map();
+  for (const row of usageRows) {
+    if (!validCompositionUsage(row)) continue;
+    const bin = Math.floor(row.observedAtMs / grainMs) * grainMs;
+    let costs = binCosts.get(bin);
+    if (costs === undefined) { costs = new Map(); binCosts.set(bin, costs); }
+    costs.set(row.model, (costs.get(row.model) ?? 0) + row.costUsd);
+  }
+  const observations = topology.entries.map(entry => ({ ...entry,
+    costByModel: Object.fromEntries(binCosts.get(entry.binStartMs) ?? []),
+  })).filter(entry => Object.values(entry.costByModel).reduce((sum, value) => sum + value, 0) > 0);
+  return { observations, voidedBinCount: topology.voidedBinCount, poolCount: topology.poolCount };
+}
+
+/** Additive one-pass API for nondecreasing valid usage bins. Each bin keeps
+ * exactly the array API's row-addition and model-insertion order. Invalid rows
+ * have the same DROP behavior. Descending valid bins are a contract error,
+ * never silently reordered. Only one bin's Map coexists with final outputs. */
+export function buildCompositionObservationsFromOrderedUsage({ usageRows = [], quotaRows = [] } = {}, policy = {}) {
+  if (!usageRows || typeof usageRows[Symbol.iterator] !== "function" || !Array.isArray(quotaRows)) {
+    throw new TypeError("usageRows must be iterable and quotaRows must be an array");
+  }
+  const { grainMs = MODEL_COMPOSITION_POLICY.grainMs } = policy;
+  const topology = buildCompositionTopology(quotaRows, policy);
+  const observations = [], costs = new Map();
+  let currentBin = null, entryIndex = 0;
+  function flush() {
+    if (currentBin === null) return;
+    while (entryIndex < topology.entries.length && topology.entries[entryIndex].binStartMs < currentBin) entryIndex += 1;
+    const entry = topology.entries[entryIndex];
+    if (entry?.binStartMs === currentBin) {
+      const costByModel = Object.fromEntries(costs);
+      if (Object.values(costByModel).reduce((sum, value) => sum + value, 0) > 0) {
+        observations.push({ ...entry, costByModel });
+      }
+    }
+    costs.clear();
+  }
+  for (const row of usageRows) {
+    if (!validCompositionUsage(row)) continue;
+    const bin = Math.floor(row.observedAtMs / grainMs) * grainMs;
+    if (currentBin !== null && bin < currentBin) throw new TypeError("usageRows bins must be nondecreasing");
+    if (currentBin !== bin) { flush(); currentBin = bin; }
+    costs.set(row.model, (costs.get(row.model) ?? 0) + row.costUsd);
+  }
+  flush();
+  return { observations, voidedBinCount: topology.voidedBinCount, poolCount: topology.poolCount };
 }
 
 function solveLinearSystem(matrix, vector) {

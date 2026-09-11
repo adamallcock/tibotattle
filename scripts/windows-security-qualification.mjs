@@ -6,8 +6,9 @@
  * The regular lane runner is intentionally verbose for local development. A
  * native security qualification must be safe to attach to an issue or a CI
  * receipt, so this wrapper captures the child test process and emits only
- * fixed status classes. The tests themselves use synthetic roots and
- * disposable credentials; no caller-owned state is selected here.
+ * fixed status classes. The tests themselves use synthetic roots, synthetic
+ * fixed accountless-record bytes, and disposable credential fixtures; no
+ * caller-owned credential or state is selected here.
  */
 
 import { readFile } from "node:fs/promises";
@@ -26,12 +27,14 @@ const BINDING_MANIFEST_PATH = join(
   "windows_filesystem.node.manifest.json",
 );
 const FILESYSTEM_SECURITY_TEST_FILE = /^windows-(?:filesystem|security)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
-const CREDENTIAL_TEST_FILE = /^windows-(?:credential|production-credential)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
+const CREDENTIAL_TEST_FILE = /^windows-(?:credential|production-credential|accountless-installation-credential)(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
+const ACCOUNTLESS_CREDENTIAL_TEST_FILE = /^windows-accountless-installation-credential(?:-[a-z0-9-]+)?\.test\.(?:js|mjs)$/u;
 const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-credential-manager-probe.test.js",
   "test/windows-credential-audit-file-guard.test.js",
   "test/windows-credential-manager.test.js",
   "test/windows-credential-mutex-native.test.js",
+  "test/windows-accountless-installation-credential-native.test.js",
   "test/windows-credential-mutex.test.js",
   "test/windows-credential-operation-audit.test.js",
   "test/windows-credential-operation-lease.test.js",
@@ -55,6 +58,7 @@ export const FIXED_STATUS = Object.freeze({
   unsupported: "WINDOWS_SECURITY_QUALIFICATION_NATIVE_WINDOWS_REQUIRED",
   missingFilesystemTests: "WINDOWS_SECURITY_QUALIFICATION_FILESYSTEM_TESTS_MISSING",
   missingCredentialTests: "WINDOWS_SECURITY_QUALIFICATION_CREDENTIAL_TESTS_MISSING",
+  missingAccountlessCredentialTests: "WINDOWS_SECURITY_QUALIFICATION_ACCOUNTLESS_CREDENTIAL_TESTS_MISSING",
   failed: "WINDOWS_SECURITY_QUALIFICATION_FAILED",
   manifestMissing: "WINDOWS_SECURITY_QUALIFICATION_MANIFEST_MISSING",
   manifestInvalid: "WINDOWS_SECURITY_QUALIFICATION_MANIFEST_INVALID",
@@ -138,6 +142,7 @@ export async function qualificationTestFiles({
       files: Object.freeze([]),
       filesystemFiles: Object.freeze([]),
       credentialFiles: Object.freeze([]),
+      accountlessCredentialFiles: Object.freeze([]),
     });
   }
 
@@ -148,11 +153,17 @@ export async function qualificationTestFiles({
   const credentialFiles = Object.freeze(
     nativeFiles.filter((file) => CREDENTIAL_TEST_FILE.test(file.slice("test/".length))),
   );
+  const accountlessCredentialFiles = Object.freeze(
+    nativeFiles.filter((file) => ACCOUNTLESS_CREDENTIAL_TEST_FILE.test(file.slice("test/".length))),
+  );
   if (filesystemFiles.length === 0) {
     throw fixedError(FIXED_STATUS.missingFilesystemTests);
   }
   if (credentialFiles.length === 0) {
     throw fixedError(FIXED_STATUS.missingCredentialTests);
+  }
+  if (accountlessCredentialFiles.length === 0) {
+    throw fixedError(FIXED_STATUS.missingAccountlessCredentialTests);
   }
 
   // The portable lane runs separately in CI. This gate adds only the explicit
@@ -163,6 +174,7 @@ export async function qualificationTestFiles({
     files,
     filesystemFiles,
     credentialFiles,
+    accountlessCredentialFiles,
   });
 }
 
@@ -255,6 +267,7 @@ export async function runWindowsSecurityQualification(options = {}) {
     testFileCount: selected.files.length,
     filesystemTestFileCount: selected.filesystemFiles.length,
     credentialTestFileCount: selected.credentialFiles.length,
+    accountlessCredentialTestFileCount: selected.accountlessCredentialFiles.length,
     revision: metadata.revision,
     cacheMode: metadata.cacheMode,
     bindingBytes: manifest.bytes,
@@ -275,6 +288,7 @@ export async function main() {
       `files=${receipt.testFileCount}`,
       `filesystem=${receipt.filesystemTestFileCount}`,
       `credentials=${receipt.credentialTestFileCount}`,
+      `accountless_credentials=${receipt.accountlessCredentialTestFileCount}`,
       `revision=${receipt.revision ?? "unavailable"}`,
       `cache=${receipt.cacheMode ?? "unavailable"}`,
       `binding_bytes=${receipt.bindingBytes}`,

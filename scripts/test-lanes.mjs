@@ -21,13 +21,24 @@ const SUPPORTED_TEST_REPORTERS = new Set(["dot", "spec", "tap"]);
 // with macOSArtifactTest. The source lane activates that tag's source scope,
 // so a future title edit cannot silently change which test bodies run.
 export const MACOS_SOURCE_TEST_FILES = Object.freeze([
+  "test/release-agent.test.js",
+  "test/release-operation.test.js",
+  "test/macos-release-journal.test.js",
   "test/i18n-foundation.test.js",
   "test/macos-localization.test.js",
   "test/macos-app-bundle.test.js",
+  "test/macos-keychain-migration-artifact.test.js",
+  "test/macos-keychain-migration-runner.test.js",
+  "test/macos-keychain-migration-ui.test.js",
 ]);
 
 export const MACOS_ARTIFACT_TEST_FILES = Object.freeze([
+  "test/release-operation.test.js",
+  "test/macos-release-journal.test.js",
   "test/macos-app-bundle.test.js",
+  "test/macos-keychain-migration-artifact.test.js",
+  "test/macos-keychain-migration-runner.test.js",
+  "test/macos-keychain-migration-ui.test.js",
   "test/macos-updater.test.js",
   "test/macos-updater-release.test.mjs",
 ]);
@@ -52,6 +63,8 @@ const ALL_EXPLICIT_TEST_FILES = Object.freeze([
 ]);
 
 const LANE_ORDER = Object.freeze([
+  "public-site",
+  "worker",
   "macos-source",
   "i18n",
   "macos-smoke",
@@ -68,7 +81,28 @@ const VALID_COMMANDS = new Set([
   "macos-source",
   "macos-smoke",
   "macos-artifact",
+  "public-site",
+  "worker",
 ]);
+
+// These paths belong only to the hosted/public build boundary. Shared browser
+// assets remain broad because the native app embeds them as well. Unknown
+// Worker tools also remain broad: scripts:check is an explicit ownership list.
+const PUBLIC_SITE_TOOL_PATHS = new Set([
+  "scripts/build-public-release-site.js", "scripts/preview-public-release-site.js",
+  "scripts/prepare-web-release.js", "scripts/public-release-provenance.js",
+  "test/public-release-site.test.js", "test/public-release-site-preview.test.js",
+]);
+const WORKER_CONFIG_PATHS = new Set([
+  "apps/worker/package.json", "apps/worker/package-lock.json", "apps/worker/wrangler.jsonc",
+  "apps/worker/tsconfig.json", "apps/worker/vitest.config.ts", "apps/worker/worker-configuration.d.ts",
+]);
+export function hostedLaneCommands(lane) {
+  if (lane === "worker") return [["--prefix", "apps/worker", "run", "check"]];
+  if (lane === "public-site") return [["run", "product:ui:test"], ["run", "product:release-site:test"],
+    ["--prefix", "apps/worker", "run", "check"]];
+  return null;
+}
 
 function normalizePath(path) {
   return path.split(sep).join("/").replace(/^\.\//u, "");
@@ -123,6 +157,9 @@ function nativePathNeedsArtifactLane(path) {
 }
 
 function classifyKnownPath(path, lanes) {
+  if (PUBLIC_SITE_TOOL_PATHS.has(path)) { lanes.add("public-site"); return true; }
+  if (WORKER_CONFIG_PATHS.has(path) || ["apps/worker/src/", "apps/worker/test/", "apps/worker/migrations/", "apps/worker/deletion-ledger-migrations/"]
+    .some((prefix) => path.startsWith(prefix))) { lanes.add("worker"); return true; }
   if (isNativeAppPath(path)) {
     lanes.add("macos-source");
     lanes.add("macos-smoke");
@@ -134,6 +171,13 @@ function classifyKnownPath(path, lanes) {
     return true;
   }
   if (path === "test/macos-app-bundle.test.js") {
+    lanes.add("macos-source");
+    lanes.add("macos-artifact");
+    return true;
+  }
+  if (path === "test/macos-keychain-migration-artifact.test.js"
+      || path === "test/macos-keychain-migration-runner.test.js"
+      || path === "test/macos-keychain-migration-ui.test.js") {
     lanes.add("macos-source");
     lanes.add("macos-artifact");
     return true;
@@ -192,6 +236,9 @@ export function selectTestLanes(paths, { full = false } = {}) {
       unknownPaths: Object.freeze(unknownPaths),
     });
   }
+  // --full is an actual final integrated gate, never a renamed cached/scoped pass.
+  if (full) return Object.freeze({ lanes: Object.freeze(["full"]), paths: Object.freeze(normalizedPaths), unknownPaths: Object.freeze([]) });
+  if (lanes.has("public-site")) lanes.delete("worker");
   return Object.freeze({
     lanes: Object.freeze(LANE_ORDER.filter((lane) => lanes.has(lane))),
     paths: Object.freeze(normalizedPaths),
@@ -355,8 +402,11 @@ export async function runPreflight() {
   await runCommand("git", ["diff", "--cached", "--check"]);
   await checkUntrackedWhitespace();
   await runCommand(process.execPath, [
-    "./tools/operations/fix-doc-links.mjs",
-    "--check",
+    "./tools/operations/validate-documentation.mjs",
+  ]);
+  await runNodeTests([
+    "test/documentation-governance.test.js",
+    "test/agent-guidance.test.js",
   ]);
 }
 
@@ -379,6 +429,11 @@ function assertMacOSSmokeBuildSupported() {
 }
 
 async function runLane(lane) {
+  const hosted = hostedLaneCommands(lane);
+  if (hosted) {
+    for (const args of hosted) await runCommand(NPM_COMMAND, args);
+    return;
+  }
   if (lane === "portable") {
     const files = process.platform === "win32"
       ? WINDOWS_PORTABLE_TEST_FILES
@@ -392,6 +447,8 @@ async function runLane(lane) {
     return;
   }
   if (lane === "macos-source") {
+    await runNodeTests(["--test-concurrency=1", "test/release-agent.test.js",
+      "test/release-operation.test.js", "test/macos-release-journal.test.js"]);
     await runNodeTests([
       "--test-concurrency=1",
       "test/i18n-foundation.test.js",
@@ -400,6 +457,9 @@ async function runLane(lane) {
     await runNodeTests([
       "--test-concurrency=1",
       "test/macos-app-bundle.test.js",
+      "test/macos-keychain-migration-artifact.test.js",
+      "test/macos-keychain-migration-runner.test.js",
+      "test/macos-keychain-migration-ui.test.js",
     ], {
       environment: {
         ...process.env,
@@ -415,10 +475,15 @@ async function runLane(lane) {
     return;
   }
   if (lane === "macos-artifact") {
+    await runNodeTests(["--test-concurrency=1", "test/release-operation.test.js",
+      "test/macos-release-journal.test.js"]);
     await runCommand(NPM_COMMAND, ["run", "product:macos:updater:prepare"]);
     await runNodeTests([
       "--test-concurrency=1",
       "test/macos-app-bundle.test.js",
+      "test/macos-keychain-migration-artifact.test.js",
+      "test/macos-keychain-migration-runner.test.js",
+      "test/macos-keychain-migration-ui.test.js",
     ], {
       environment: {
         ...process.env,
@@ -478,7 +543,7 @@ function usage() {
   console.log(`Usage: node scripts/test-lanes.mjs <lane> [options]
 
 Lanes:
-  preflight       Validate selected test files, tracked/untracked whitespace, and docs links.
+  preflight       Validate selected tests, whitespace, docs governance, and agent guidance.
   portable        Run the explicit platform-neutral Node, web, and companion manifest.
   fast            Run fast macOS source/configuration checks.
   changed         Select conservative lanes from branch plus active-worktree paths.
@@ -486,11 +551,13 @@ Lanes:
   macos-source    Run only source/configuration assertions from the macOS suite.
   macos-smoke     Build one test-profile development app and smoke it (pinned builder only).
   macos-artifact  Prepare Sparkle and run the native artifact and updater tests.
+  worker          Run the complete Worker owning gate, including dry builds.
+  public-site     Run public-site/UI and Worker owning gates without native signing.
 
 Options for changed and plan:
   --base <rev>    Include <rev>...HEAD plus staged, unstaged, and untracked paths.
   --path <path>   Supply a repository-relative changed path (repeatable).
-  --full          Escalate selected native source changes to the artifact lane.
+  --full          Run the final integrated check without evidence-cache reuse.
 `);
 }
 

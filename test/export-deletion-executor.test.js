@@ -18,8 +18,10 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createLocalExportWorkspace } from "../src/export-set-controller.js";
-import { materializeLocalExportSet } from "../src/export-set-materializer.js";
+import {
+  localExportSetMaterialization,
+  localExportSourcePipeline,
+} from "../src/local-node-runtime.js";
 import { exportSetChunkBasenames } from "../src/export-set-schema.js";
 import { buildLocalExportDeletionPlan, planLocalExportDeletion } from "../src/export-deletion.js";
 import {
@@ -28,6 +30,9 @@ import {
   recoverLocalExportDeletion,
 } from "../src/export-deletion-executor.js";
 import { stableJson } from "../src/storage.js";
+
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
 
 const PRIVATE_CANARY = "PRIVATE_DELETE_EXECUTOR_CANARY";
 

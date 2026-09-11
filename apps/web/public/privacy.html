@@ -42,7 +42,7 @@
     <main class="resource-main" id="main" tabindex="-1">
       <header class="resource-heading">
         <p class="eyebrow">Privacy overview</p>
-        <h1>Your dashboard belongs on your Mac.</h1>
+        <h1>Your dashboard belongs on your device.</h1>
         <p class="resource-lede">
           TiboTattle separates personal analysis from public community evidence.
           Local usage remains useful without an account or contribution.
@@ -60,30 +60,170 @@
           </p>
         </article>
         <article class="resource-card" id="app">
-          <h2>Mac app</h2>
+          <h2>Local source inventory</h2>
           <p>
-            TiboTattle reads content-free usage and quota metadata locally.
-            Personal scans, API-equivalent pricing, and dashboard history stay
-            on the Mac that calculated them.
+            TiboTattle processes metadata in the selected Codex
+            <code>sessions</code> and <code>archived_sessions</code> folders. It
+            also reads Codex <code>state_5.sqlite</code> for rollout lineage,
+            <code>config.toml</code> for service-tier settings, the installed
+            Codex app-server <code>account/read</code>,
+            <code>account/rateLimits/read</code>, and
+            <code>account/usage/read</code> methods.
+          </p>
+        </article>
+        <article class="resource-card" id="local-processing">
+          <h2>Local processing and storage</h2>
+          <p>
+            Source records are parsed on your Mac. Prompts and response text may
+            exist in Codex's own rollout files, but TiboTattle does not retain
+            them in derived state. It stores content-free indexes, settings,
+            cached calculations, checkpoints, and prepared contributions in the
+            owner-only <code>Usage Monitor</code> Application Support root.
+            Pseudonymous identity and device credentials use the macOS Keychain.
+          </p>
+        </article>
+        <article class="resource-card" id="network">
+          <h2>Processes and network</h2>
+          <p>
+            The app starts a loopback-only local companion and the installed
+            Codex binary's local <code>app-server</code> subprocess. Local
+            analysis works offline. Network access is limited to explicit
+            capabilities such as signed update checks, hosted sign-in,
+            contribution, device disconnect, and public aggregate reads; the website
+            cannot reach the loopback dashboard.
           </p>
         </article>
         <article class="resource-card" id="contribution">
           <h2>Optional contribution</h2>
           <p>
-            Nothing is contributed unless you review and opt in. The public
-            website has no enrollment or upload control. Any contribution
-            starts from an explicit app flow and contains bounded, content-free
-            observations rather than prompts, responses, file contents, or
-            personal dashboard history.
+            In the Electron app, fresh installations enable sharing
+            automatically. No social sign-in is required. You can turn sharing
+            off in Settings or Community; that choice persists across restarts
+            and upgrades that preserve your app profile. Local analysis keeps
+            working with sharing off.
+          </p>
+          <ul>
+            <li>Saved sharing choices are preserved. Known off, paused, or
+              disconnected installations stay off.</li>
+            <li>An existing installation with no prior choice receives three
+              visible notices while sharing stays off. Activation requires all
+              three notices, at least seven days from the transition's start,
+              and at least one day after the final notice.</li>
+            <li>Choosing Share now or Keep sharing off cancels the remaining
+              reminders. Unreadable or uncertain preference state does not
+              enable sharing.</li>
+          </ul>
+          <p>
+            Shared measurements can include token counts, model labels, quota
+            observations, and pseudonymous continuity identifiers. They exclude
+            prompts, responses, credentials, private paths, and raw account
+            identifiers. The public website has no enrollment or upload control.
+            Older native Mac releases retain their review-and-approve flow.
+          </p>
+        </article>
+        <article class="resource-card" id="hosted-identity">
+          <h2>Hosted identity and data</h2>
+          <p>
+            Accountless sharing uses an installation credential to authenticate
+            one contribution source. It does not prove a unique person, a
+            unique provider account, or the truth of a measurement. A separate
+            device or reinstall without retained state can become another
+            source. Retries within one retained installation are deduplicated;
+            independently created installations can submit overlapping history.
+          </p>
+          <p>
+            The older Google or Apple sign-in flow proves control of that login,
+            not one unique person. It stores a keyed identity hash rather than
+            the provider's name or email. Accepted contributions are closed,
+            content-free telemetry. Validated closed metadata is stored in
+            Cloudflare D1, while R2 holds only bounded encrypted quarantine
+            objects. Admin operations are exposed only on the Access-protected
+            admin host.
+          </p>
+          <p>
+            Shared measurements can include opaque account and plan-era
+            pseudonyms, evidence categories, and plan labels. These can link
+            observations within the same enrollment and destination. Accountless
+            sharing uses the installation's current sharing policy; older
+            review-and-approve flows retain their consent requirements. The
+            measurements exclude raw provider account identifiers and do not
+            make uncertain history verified. These pseudonyms are not published
+            in community figures.
           </p>
         </article>
         <article class="resource-card" id="publication">
           <h2>Community publication</h2>
           <p>
-            Public figures are delayed, capped per eligible contribution
-            account, rounded, and withheld unless enough eligible provider
-            accounts pass privacy and quality review. Failed or weak evidence
-            stays unavailable.
+            Accountless contributions are currently excluded from public
+            community figures. Receiving an upload does not publish it. Public
+            inclusion requires a separate eligibility decision.
+          </p>
+          <p>
+            The daily view publishes activity totals and API-price-equivalent
+            allowance estimates, including comparisons by plan and model.
+            Estimates and visible sample counts may be based on a single
+            account. Small samples are uncertain and can reveal that
+            contributor's estimated capacity, even though no account
+            identifiers are published. This is not a guarantee of anonymity.
+          </p>
+          <p>
+            Daily publication has no minimum account count or per-account cap.
+            Plan and model comparisons use closed UTC dates and omit stale,
+            incomplete, or unstable estimates. Previously released sealed
+            weekly snapshots have their own delay, account thresholds,
+            per-account caps, and rounding rules; those rules do not apply
+            to the daily view.
+          </p>
+        </article>
+        <article class="resource-card" id="retention-deletion">
+          <h2>Retention and deletion</h2>
+          <p>
+            The local display window is not a retention limit: accumulated
+            owner-only evidence remains until you run an explicit local erase.
+            Local erase and Keychain identity reset have separate consequences.
+            Turning sharing off stops future automatic delivery; a request
+            already sent may have reached the service. It does not delete
+            previously accepted hosted history or local analysis. In the older
+            sign-in flow, Disconnect this Mac stops that device's uploads;
+            signing out only ends the hosted session and does not disconnect
+            the upload device.
+          </p>
+          <p>
+            Accepted hosted contributions and aggregates have no blanket short
+            retention limit. Hosted erasure is handled by the service owner,
+            not an in-app deletion control. A deletion record is retained to
+            prevent erased participant data from returning after a backup
+            restore.
+          </p>
+          <p>
+            For privacy, rights, or erasure requests, see
+            <a href="https://github.com/adamallcock/tibotattle/blob/main/SUPPORT.md">project support guidance</a>.
+            A dedicated private privacy-request intake channel is not
+            documented there.
+            Do not post account identifiers, credentials, or private records
+            in public issues.
+          </p>
+        </article>
+        <article class="resource-card" id="uninstall">
+          <h2>Uninstall boundaries</h2>
+          <p>
+            Ordinary app or Homebrew uninstall preserves local analysis state.
+            Homebrew <code>--zap</code> removes the app's Application Support,
+            cache, WebKit, and preference state, but not <code>~/.codex</code>,
+            Keychain identities, or data already contributed. Use the explicit
+            local identity controls for Keychain state, and see the support
+            guidance above for hosted erasure requests. Uninstalling or disconnecting
+            does not erase hosted history.
+          </p>
+        </article>
+        <article class="resource-card wide" id="excluded-content">
+          <h2>What never enters a contribution</h2>
+          <p>
+            Contributions exclude prompts, responses, commands, repository and
+            file paths, URLs, credentials, emails, account names, raw account
+            identifiers, and arbitrary metadata. Unknown fields are omitted by
+            closed schemas. If validation cannot prove a record safe, upload is
+            refused rather than partially redacted or guessed.
           </p>
         </article>
       </div>

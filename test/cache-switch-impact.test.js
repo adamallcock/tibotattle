@@ -11,6 +11,7 @@ import {
 import {
   analyzeCacheContinuityRows,
   analyzeCacheSwitchRows,
+  CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS,
   CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
   MAX_CACHE_SWITCH_RECENT_DETAILS,
 } from "../src/cache-switch-impact.js";
@@ -173,7 +174,7 @@ test("analyzer classifies effective changes and prices the conservative warm cou
   assert.equal(
     period.allowanceWeighting.scenarios.unresolved_as_fast
       .quotaWeightedPremiumUsd,
-    0.0000235,
+    0.0000188,
   );
   assert.equal(
     period.allowanceWeighting.scenarios.unresolved_as_standard
@@ -241,8 +242,11 @@ test("cache premiums preserve observed speed, then declarations, then scenario f
   const fast = period.allowanceWeighting.scenarios.unresolved_as_fast;
 
   assert.equal(period.standardApiPremiumUsd, 0.0000376);
-  assert.equal(standard.quotaWeightedPremiumUsd, 0.0000658);
-  assert.equal(fast.quotaWeightedPremiumUsd, 0.0000799);
+  // 1x observed Standard + 2x observed Fast + 2x declared Fast + the
+  // scenario-attributed drop: x6 of one drop under the Standard scenario and
+  // x7 under the Fast scenario, at the published GPT-5.6 ratio of 2.
+  assert.equal(standard.quotaWeightedPremiumUsd, 0.0000564);
+  assert.equal(fast.quotaWeightedPremiumUsd, 0.0000658);
   assert.deepEqual([
     standard.observedSpeedDrops,
     standard.declaredSpeedDrops,
@@ -314,6 +318,33 @@ test("Max and Ultra share one effective effort while model and combined changes 
   assert.equal(period.byChangeType.model_only.configurationChanges, 1);
   assert.equal(period.byChangeType.model_and_reasoning.configurationChanges, 1);
   assert.equal(period.byChangeType.reasoning_only.configurationChanges, 0);
+});
+
+test("Astra effort aliases retain observed-cache gates and do not imply a reset", () => {
+  const astra = (previous, current, overrides = {}) => row({
+    model_id: "gpt-6-astra", previous_model_id: "gpt-6-astra",
+    previous_reasoning_effort: reasoningEffortOrdinal(previous),
+    reasoning_effort: reasoningEffortOrdinal(current), ...overrides,
+  });
+  const all = (rows) => analyzeCacheSwitchRows(rows, {
+    nowMs: NOW_MS, pricer: fullyPriced,
+  }).periods.find((period) => period.periodId === "all");
+  // Same API effort, different delegation configuration; do not call it continuity.
+  assert.equal(all([astra("xhigh", "ultra")]).configurationChanges, 1);
+  assert.equal(all([astra("ultra", "xhigh")]).configurationChanges, 1);
+  const changed = all([astra("max", "ultra")]);
+  assert.equal(changed.byChangeType.reasoning_only.configurationChanges, 1);
+  assert.equal(changed.cacheReadDrops, 1);
+  assert.equal(changed.recent[0].previous.reasoningEffort, "max");
+  assert.equal(changed.recent[0].current.reasoningEffort, "ultra");
+  for (const overrides of [
+    { tokens_in_cache_read: 1_000 },
+    { tokens_in_cache_read: null },
+    { tokens_in_cache_write: null },
+    { compaction_between: 1 },
+  ]) {
+    assert.equal(all([astra("low", "high", overrides)]).cacheReadDrops, 0);
+  }
 });
 
 test("long gaps, missing prior cache, malformed dimensions, and unpriced drops fail closed", () => {
@@ -464,6 +495,83 @@ test("continuity gap bands use exact half-open boundaries without an age floor",
   }
 });
 
+test("continuity outcome raster uses ten fixed human time buckets", () => {
+  const boundaries = [
+    ["under_one_minute", 0, 0, 60],
+    ["one_to_two_minutes", 60_000, 60, 120],
+    ["two_to_five_minutes", 2 * 60_000, 120, 300],
+    ["five_to_ten_minutes", 5 * 60_000, 300, 600],
+    ["ten_to_thirty_minutes", 10 * 60_000, 600, 1_800],
+    ["thirty_minutes_to_one_hour", 30 * 60_000, 1_800, 3_600],
+    ["one_to_six_hours", 60 * 60_000, 3_600, 21_600],
+    ["six_to_twenty_four_hours", 6 * 60 * 60_000, 21_600, 86_400],
+    ["one_to_three_days", 24 * 60 * 60_000, 86_400, 259_200],
+    ["over_three_days", 3 * 24 * 60 * 60_000, 259_200, null],
+  ];
+  const rows = boundaries.map(([, gapMs], index) => {
+    const observedAt = NOW_MS - index * 1_000;
+    return continuityRow({
+      observed_at_ms: observedAt,
+      previous_observed_at_ms: observedAt - gapMs,
+    });
+  });
+  const projection = analyzeCacheContinuityRows(rows, {
+    nowMs: NOW_MS,
+    pricer: fullyPriced,
+  });
+  const period = projection.periods.find(
+    (candidate) => candidate.periodId === "24h",
+  );
+
+  assert.equal(
+    projection.outcomeDisplayMaximumGapSeconds,
+    CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS / 1_000,
+  );
+  assert.deepEqual(Object.keys(period.byOutcomeBucket), boundaries.map(
+    ([id]) => id,
+  ));
+  for (const [id, , startSeconds, endSeconds] of boundaries) {
+    assert.equal(period.byOutcomeBucket[id].startSeconds, startSeconds, id);
+    assert.equal(period.byOutcomeBucket[id].endSeconds, endSeconds, id);
+    assert.equal(period.byOutcomeBucket[id].comparableReturns, 1, id);
+    assert.equal(period.byOutcomeBucket[id].reusedHalfOrLessReturns, 1, id);
+  }
+});
+
+test("continuity outcomes partition checked follow-ups at the exact half boundary", () => {
+  const outcomes = [
+    { cacheRead: 1_200, uncached: 0 },
+    { cacheRead: 1_000, uncached: 0 },
+    { cacheRead: 750, uncached: 250 },
+    { cacheRead: 500, uncached: 500 },
+    { cacheRead: 0, uncached: 1_000 },
+  ];
+  const rows = outcomes.map(({ cacheRead, uncached }, index) => {
+    const observedAt = NOW_MS - index * 1_000;
+    return continuityRow({
+      observed_at_ms: observedAt,
+      previous_observed_at_ms: observedAt - 2 * 60_000,
+      tokens_in_cache_read: cacheRead,
+      tokens_in_uncached: uncached,
+    });
+  });
+  const period = analyzeCacheContinuityRows(rows, {
+    nowMs: NOW_MS,
+    pricer: fullyPriced,
+  }).periods.find((candidate) => candidate.periodId === "24h");
+  const bucket = period.byOutcomeBucket.two_to_five_minutes;
+
+  assert.equal(period.comparableReturns, 5);
+  assert.equal(period.reusedMoreThanHalfReturns, 3);
+  assert.equal(period.reusedHalfOrLessReturns, 2);
+  assert.equal(period.matchedOrExceededReturns, 2);
+  assert.equal(period.reusedBetweenHalfAndPreviousReturns, 1);
+  assert.equal(period.cacheReadDrops, 2);
+  assert.equal(bucket.comparableReturns, 5);
+  assert.equal(bucket.reusedMoreThanHalfReturns, 3);
+  assert.equal(bucket.reusedHalfOrLessReturns, 2);
+});
+
 test("continuity lens has no timing floor, requires a turn boundary, and separates confounders", () => {
   const shortGap = continuityRow({
     observed_at_ms: NOW_MS - 10_000,
@@ -526,6 +634,27 @@ test("continuity lens has no timing floor, requires a turn boundary, and separat
   assert.equal(period.postCompactionCacheReadDrops, 1);
 });
 
+test("current cache-write assumptions preserve continuity and switch eligibility with closed provenance", () => {
+  for (const [analyze, makeRow] of [
+    [analyzeCacheContinuityRows, continuityRow], [analyzeCacheSwitchRows, row],
+  ]) {
+    const expected = analyze([makeRow()], { nowMs: NOW_MS, pricer: fullyPriced });
+    for (const suffix of ["", "-partial", "-parent-model", "-parent-model-partial"]) {
+      const version = `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}${suffix}-cache-write-zero`;
+      const actual = analyze([makeRow({ parser_version: version, previous_parser_version: version })],
+        { nowMs: NOW_MS, pricer: fullyPriced });
+      assert.deepEqual(actual, expected, version);
+    }
+    for (const version of ["unified-rollout-typed-v999-cache-write-zero",
+      `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-unexpected-cache-write-zero`]) {
+      const actual = analyze([makeRow({ parser_version: version, previous_parser_version: version })],
+        { nowMs: NOW_MS, pricer: fullyPriced }).periods.find((period) => period.periodId === "all");
+      assert.equal(actual.coverageStatus, "incomplete");
+      assert.equal(actual.estimatedPremiumUsd, null);
+    }
+  }
+});
+
 test("older parser coverage withholds both continuity and switch premiums", () => {
   const oldContinuity = continuityRow({
     parser_version: "unified-rollout-typed-v2",
@@ -539,6 +668,7 @@ test("older parser coverage withholds both continuity and switch premiums", () =
   assert.equal(continuity.uncoveredReturns, 1);
   assert.equal(continuity.cacheReadDrops, 0);
   assert.equal(continuity.estimatedPremiumUsd, null);
+  assert.equal(continuity.coveredSubtotal, null);
 
   const oldSwitch = row({
     parser_version: "unified-rollout-typed-v2",
@@ -552,7 +682,131 @@ test("older parser coverage withholds both continuity and switch premiums", () =
   assert.equal(switched.uncoveredConfigurationChanges, 1);
   assert.equal(switched.cacheReadDrops, 0);
   assert.equal(switched.estimatedPremiumUsd, null);
+  assert.equal(switched.coveredSubtotal, null);
 });
+
+for (const [name, analyze, makeRow, premiumNanos] of [
+  ["switch", analyzeCacheSwitchRows, row, 9_400],
+  ["continuity", analyzeCacheContinuityRows, continuityRow, 9_000],
+]) {
+  test(`${name} covered subtotal survives an excluded comparison without becoming the period total`, () => {
+    const period = analyze([
+      makeRow({ codex_speed_mode: "fast" }),
+      makeRow({ parser_version: "unified-rollout-typed-v2" }),
+    ], { nowMs: NOW_MS, pricer: fullyPriced }).periods.find(
+      (candidate) => candidate.periodId === "7d",
+    );
+    assert.equal(period.coverageStatus, "incomplete");
+    assert.equal(period.cacheReadDrops, 1);
+    assert.equal(period.estimatedPremiumUsd, null);
+    assert.equal(period.standardApiPremiumUsd, null);
+    assert.equal(period.allowanceWeighting.status, "unavailable");
+    assert.equal(period.coveredSubtotal.scope, "covered_priced_drops");
+    assert.equal(period.coveredSubtotal.pricedDrops, 1);
+    assert.equal(period.coveredSubtotal.standardApiPremiumUsdExact, usdFromNanos(premiumNanos));
+    for (const scenario of Object.values(period.coveredSubtotal.allowanceWeighting.scenarios)) {
+      assert.equal(scenario.status, "complete");
+      assert.equal(scenario.quotaWeightedPremiumUsd, premiumNanos * 2 / 1_000_000_000);
+      assert.equal(scenario.observedSpeedDrops, 1);
+      assert.equal(scenario.pricedDrops, 1);
+    }
+    const partitions = name === "switch"
+      ? [period.byChangeType]
+      : [period.byGapBand, period.byOutcomeBucket];
+    for (const partition of partitions) {
+      const covered = Object.values(partition).filter((part) => part.coveredSubtotal !== null);
+      assert.equal(covered.length, 1);
+      assert.deepEqual(covered[0].coveredSubtotal, period.coveredSubtotal);
+      assert.equal(covered[0].estimatedPremiumUsd, null);
+    }
+    assert.equal(period.recent.length, 1);
+  });
+
+  test(`${name} subtotal excludes partial prices on either side and never invents an unpriced zero`, () => {
+    for (const unpricedSide of ["actual", "counterfactual", "both"]) {
+      const unpricedAt = NOW_MS - 30_000;
+      const pricer = (event, components) => {
+        const omit = event.timestamp === new Date(unpricedAt).toISOString()
+          && (unpricedSide === "both"
+            || (unpricedSide === "actual" && components.input_cache_read_tokens === 0)
+            || (unpricedSide === "counterfactual" && components.input_cache_read_tokens > 0));
+        return omit
+          ? { coverageStatus: "partially_priced", totalUsd: "0" }
+          : fullyPriced(event, components);
+      };
+      const good = makeRow({ codex_speed_mode: "standard" });
+      const unknownPrice = makeRow({ observed_at_ms: unpricedAt, codex_speed_mode: "fast" });
+      const period = analyze([good, unknownPrice], { nowMs: NOW_MS, pricer }).periods.find(
+        (candidate) => candidate.periodId === "7d",
+      );
+      assert.equal(period.coverageStatus, "complete", unpricedSide);
+      assert.equal(period.cacheReadDrops, 2, unpricedSide);
+      assert.equal(period.pricedDrops, 1, unpricedSide);
+      assert.equal(period.unpricedDrops, 1, unpricedSide);
+      assert.equal(period.estimatedPremiumUsd, null, unpricedSide);
+      assert.equal(period.allowanceWeighting.status, "unavailable", unpricedSide);
+      assert.equal(period.coveredSubtotal.standardApiPremiumUsdExact, usdFromNanos(premiumNanos));
+      for (const scenario of Object.values(period.coveredSubtotal.allowanceWeighting.scenarios)) {
+        assert.equal(scenario.pricedDrops, 1, unpricedSide);
+        assert.equal(scenario.observedSpeedDrops, 1, unpricedSide);
+        assert.equal(scenario.quotaWeightedPremiumUsd, premiumNanos / 1_000_000_000, unpricedSide);
+      }
+      const allUnpriced = analyze([unknownPrice], { nowMs: NOW_MS, pricer }).periods.find(
+        (candidate) => candidate.periodId === "7d",
+      );
+      assert.equal(allUnpriced.coveredSubtotal, null, unpricedSide);
+      assert.equal(allUnpriced.estimatedPremiumUsd, null, unpricedSide);
+    }
+    for (const rows of [[], [makeRow({ previous_tokens_in_cache_read: 0 })]]) {
+      const period = analyze(rows, { nowMs: NOW_MS, pricer: fullyPriced }).periods[0];
+      assert.equal(period.cacheReadDrops, 0);
+      assert.equal(period.coveredSubtotal, null);
+    }
+    // A fully priced zero is different from absent or partial pricing.
+    const free = analyze([makeRow()], {
+      nowMs: NOW_MS,
+      pricer: () => ({ coverageStatus: "fully_priced", totalUsd: "0" }),
+    }).periods[0];
+    assert.equal(free.coveredSubtotal.pricedDrops, 1);
+    assert.equal(free.coveredSubtotal.standardApiPremiumUsd, 0);
+    assert.equal(free.coveredSubtotal.standardApiPremiumUsdExact, "0");
+  });
+
+  test(`${name} subtotal uses all exact admitted drops, not the capped recent rows or another period`, () => {
+    const numberOfDrops = MAX_CACHE_SWITCH_RECENT_DETAILS + 7;
+    const rows = Array.from({ length: numberOfDrops }, (_, index) => makeRow({
+      observed_at_ms: NOW_MS - (index + 1) * 60_000,
+      previous_observed_at_ms: NOW_MS - (index + 2) * 60_000,
+    }));
+    const oldAt = NOW_MS - 20 * 24 * 60 * 60_000;
+    rows.push(makeRow({
+      observed_at_ms: oldAt,
+      previous_observed_at_ms: oldAt - 60_000,
+    }));
+    rows.push(makeRow({ parser_version: "unified-rollout-typed-v2" }));
+    const result = analyze(rows, { nowMs: NOW_MS, pricer: fullyPriced });
+    for (const period of result.periods) {
+      const expectedDrops = ["24h", "7d"].includes(period.periodId)
+        ? numberOfDrops : numberOfDrops + 1;
+      assert.equal(period.estimatedPremiumUsd, null, period.periodId);
+      assert.equal(period.recent.length, MAX_CACHE_SWITCH_RECENT_DETAILS, period.periodId);
+      assert.equal(period.coveredSubtotal.pricedDrops, expectedDrops, period.periodId);
+      assert.equal(
+        period.coveredSubtotal.standardApiPremiumUsdExact,
+        usdFromNanos(premiumNanos * expectedDrops),
+        period.periodId,
+      );
+      assert.equal(
+        period.coveredSubtotal.allowanceWeighting.scenarios.unresolved_as_standard.pricedDrops,
+        expectedDrops,
+        period.periodId,
+      );
+      assert.ok(period.coveredSubtotal.standardApiPremiumUsd > period.recent.reduce(
+        (sum, detail) => sum + detail.estimatedPremiumUsd, 0,
+      ));
+    }
+  });
+}
 
 test("context contraction and compaction prevent a switch premium", () => {
   const compacted = row({ compaction_between: 1 });
@@ -587,6 +841,24 @@ test("allowance translation couples each weighted premium to its matching capaci
     allowanceCapacity(),
   );
   assert.equal(fixed.status, "complete");
+  for (const [coverageStatus, unpricedDrops, reason] of [
+    ["incomplete", 0, "weighting_evidence_incomplete"],
+    ["complete", 1, "price_coverage_incomplete"],
+  ]) {
+    const subsetPromotedToTotal = cacheSwitchAllowanceImpact({
+      periodId: "7d",
+      coverageStatus,
+      unpricedDrops,
+      allowanceWeighting: fixedWeighting,
+      coveredSubtotal: {
+        scope: "covered_priced_drops",
+        allowanceWeighting: fixedWeighting,
+      },
+    }, allowanceCapacity());
+    assert.equal(subsetPromotedToTotal.status, "unavailable");
+    assert.equal(subsetPromotedToTotal.reason, reason);
+    assert.equal(subsetPromotedToTotal.medianPercentagePoints, null);
+  }
   assert.equal(fixed.selectedScenario, "unresolved_as_standard");
   assert.equal(fixed.medianPercentagePoints, 5);
   assert.deepEqual(
@@ -793,8 +1065,17 @@ test("raw rollout facts flow through the existing index into the read-only impac
     assert.equal(continuity.orderingCoverageGaps, 0);
     assert.equal(continuity.sameConfigurationReturns, 1);
     assert.equal(continuity.comparableReturns, 1);
+    assert.equal(continuity.reusedMoreThanHalfReturns, 0);
+    assert.equal(continuity.reusedHalfOrLessReturns, 1);
     assert.equal(continuity.cacheReadDrops, 1);
     assert.equal(continuity.lostCacheTokens, 1_100);
+    assert.equal(
+      Object.values(continuity.byOutcomeBucket).reduce(
+        (sum, bucket) => sum + bucket.comparableReturns,
+        0,
+      ),
+      continuity.comparableReturns,
+    );
     assert.ok(continuity.estimatedPremiumUsd > 0);
     assert.doesNotMatch(serialized, new RegExp(sessionId, "u"));
     assert.doesNotMatch(serialized, /turn-high|event_key|session_local/u);

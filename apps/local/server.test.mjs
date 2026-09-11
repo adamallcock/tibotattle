@@ -15,13 +15,32 @@ import {
   readdir,
   rm,
   symlink,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
 } from "../../src/local-companion-data.js";
+import {
+  readLocalUnifiedCompanionProjection,
+} from "../../src/local-unified-companion-source.js";
+import {
+  ingestLocalUnifiedIndexOffMain,
+} from "../../src/local-unified-index-off-main.js";
+import {
+  LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_APPLICATION_ID,
+  LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
+} from "../../src/local-unified-index.js";
 import {
   LocalContributionPreparationError,
 } from "../../src/local-contribution-preparation.js";
@@ -44,13 +63,24 @@ import {
   buildTelemetryContributionsFromBundle,
 } from "../../src/telemetry-contribution-builder.js";
 import {
+  DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+} from "../../src/desktop-shell-status.js";
+import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
+import {
+  PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
 import {
   configuredAccountingSourceMode,
+  configuredSemanticOpenTarget,
+  createCachedLocalUnifiedProjectionReader,
   createCentralOutboundFetch,
   createLocalCompanionServer,
+  LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+  LOCAL_STARTUP_DIAGNOSTIC_DETAILS,
+  LOCAL_STARTUP_DIAGNOSTIC_STEPS,
+  localCompanionRefreshTimeoutForUnifiedIndex,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
@@ -61,6 +91,584 @@ const DEVELOPMENT_COVERAGE = Object.freeze({
 });
 const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REVIEW_SHA256 = "a".repeat(64);
+
+function writeTimeoutClassifierIndex(indexFile, {
+  applicationId = LOCAL_UNIFIED_INDEX_APPLICATION_ID,
+  userVersion,
+  schemaVersion,
+  compatibility = null,
+}) {
+  const database = new DatabaseSync(indexFile);
+  try {
+    database.exec(`
+      PRAGMA application_id=${applicationId};
+      PRAGMA user_version=${userVersion};
+      CREATE TABLE meta(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      ) STRICT, WITHOUT ROWID;
+    `);
+    database.prepare("INSERT INTO meta(key, value) VALUES (?, ?)")
+      .run("schema_version", schemaVersion);
+    if (compatibility !== null) {
+      const insert = database.prepare(
+        "INSERT INTO meta(key, value) VALUES (?, ?)",
+      );
+      for (const [key, value] of Object.entries(compatibility)) {
+        insert.run(key, value);
+      }
+    }
+  } finally {
+    database.close();
+  }
+}
+
+function writeParserUpgradeTimeoutIndex(indexFile, {
+  parserVersion = "unified-rollout-typed-v10",
+  parserContractVersion = TELEMETRY_SCHEMA_VERSION,
+  generation = {},
+  metadata = {},
+  compatibility = {
+    compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+    compatibility_minimum_reader_user_version:
+      String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+    compatibility_minimum_writer_user_version:
+      String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
+  },
+} = {}) {
+  writeTimeoutClassifierIndex(indexFile, {
+    userVersion: LOCAL_UNIFIED_INDEX_USER_VERSION,
+    schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    compatibility,
+  });
+  const database = new DatabaseSync(indexFile);
+  try {
+    const insertMeta = database.prepare("INSERT INTO meta(key, value) VALUES (?, ?)");
+    for (const [key, value] of Object.entries({
+      source_identity_version: LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
+      contract_version: TELEMETRY_SCHEMA_VERSION,
+      // Published ids are historically stored as SQLite numeric text too.
+      current_generation_id: "2.0",
+      ...metadata,
+    })) {
+      if (value !== undefined) insertMeta.run(key, value);
+    }
+    database.exec(`
+      CREATE TABLE parser_version(
+        id INTEGER PRIMARY KEY, parser_version TEXT NOT NULL,
+        contract_version TEXT NOT NULL) STRICT;
+      CREATE TABLE index_generation(
+        id INTEGER PRIMARY KEY, parser_version_id INTEGER NOT NULL,
+        contract_version TEXT NOT NULL, status TEXT NOT NULL, block_reason TEXT,
+        completed_at_ms INTEGER, discovery_complete INTEGER NOT NULL,
+        diagnostics_complete INTEGER NOT NULL, usage_provenance_complete INTEGER NOT NULL,
+        source_order_complete INTEGER NOT NULL, quota_provenance_complete INTEGER NOT NULL,
+        tool_provenance_complete INTEGER NOT NULL, skipped_source_count INTEGER NOT NULL) STRICT;
+    `);
+    const insertParser = database.prepare("INSERT INTO parser_version VALUES (?, ?, ?)");
+    insertParser.run(1, "unified-rollout-typed-v10", TELEMETRY_SCHEMA_VERSION);
+    insertParser.run(2, parserVersion, parserContractVersion);
+    const insertGeneration = database.prepare(`
+      INSERT INTO index_generation VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const defaults = {
+      contractVersion: TELEMETRY_SCHEMA_VERSION,
+      status: "complete",
+      blockReason: null,
+      completedAtMs: 1_000,
+      discoveryComplete: 1,
+      diagnosticsComplete: 1,
+      usageProvenanceComplete: 1,
+      sourceOrderComplete: 1,
+      quotaProvenanceComplete: 1,
+      toolProvenanceComplete: 1,
+      skippedSourceCount: 0,
+    };
+    for (const [id, selected] of [[1, defaults], [2, { ...defaults, ...generation }]]) {
+      insertGeneration.run(id, id, selected.contractVersion, selected.status,
+        selected.blockReason, selected.completedAtMs, selected.discoveryComplete,
+        selected.diagnosticsComplete, selected.usageProvenanceComplete,
+        selected.sourceOrderComplete, selected.quotaProvenanceComplete,
+        selected.toolProvenanceComplete, selected.skippedSourceCount);
+    }
+  } finally {
+    database.close();
+  }
+}
+
+test("refresh timeout classifier grants the cold window only to missing or proven migratable indexes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-timeout-classifier-"));
+  const freshTimeoutMs = 14_400_000;
+  const incrementalTimeoutMs = LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS;
+  try {
+    const missing = join(root, "missing.sqlite");
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(missing),
+      freshTimeoutMs,
+    );
+
+    const fixtures = [
+      {
+        name: "schema8-v1.sqlite",
+        options: {
+          userVersion: 8,
+          schemaVersion: LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: freshTimeoutMs,
+      },
+      {
+        name: "schema9-v2.sqlite",
+        options: {
+          userVersion: 9,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: freshTimeoutMs,
+      },
+      {
+        name: "schema10-v2.sqlite",
+        options: {
+          userVersion: 10,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+          compatibility: {
+            compatibility_format_user_version: "10",
+            compatibility_minimum_reader_user_version: "10",
+            compatibility_minimum_writer_user_version: "10",
+          },
+        },
+        expected: freshTimeoutMs,
+      },
+      {
+        name: "current.sqlite",
+        options: {
+          userVersion: LOCAL_UNIFIED_INDEX_USER_VERSION,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: incrementalTimeoutMs,
+      },
+      {
+        name: "foreign.sqlite",
+        options: {
+          applicationId: 0x12345678,
+          userVersion: 9,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: incrementalTimeoutMs,
+      },
+      {
+        name: "newer.sqlite",
+        options: {
+          userVersion: LOCAL_UNIFIED_INDEX_USER_VERSION + 1,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: incrementalTimeoutMs,
+      },
+      {
+        name: "malformed-metadata.sqlite",
+        options: {
+          userVersion: 9,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+          compatibility: {
+            compatibility_format_user_version: "not-a-version",
+            compatibility_minimum_reader_user_version: "9",
+            compatibility_minimum_writer_user_version: "9",
+          },
+        },
+        expected: incrementalTimeoutMs,
+      },
+    ];
+    for (const fixture of fixtures) {
+      const indexFile = join(root, fixture.name);
+      writeTimeoutClassifierIndex(indexFile, fixture.options);
+      await chmod(indexFile, 0o600);
+      const beforeBytes = await readFile(indexFile);
+      const beforeNames = await readdir(root);
+      assert.equal(
+        localCompanionRefreshTimeoutForUnifiedIndex(indexFile),
+        fixture.expected,
+        fixture.name,
+      );
+      assert.deepEqual(await readFile(indexFile), beforeBytes, fixture.name);
+      assert.deepEqual(await readdir(root), beforeNames, fixture.name);
+    }
+
+    const corrupt = join(root, "corrupt.sqlite");
+    await writeFile(corrupt, Buffer.from("not a sqlite database", "utf8"), {
+      mode: 0o600,
+    });
+    const corruptBefore = await readFile(corrupt);
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(corrupt),
+      incrementalTimeoutMs,
+    );
+    assert.deepEqual(await readFile(corrupt), corruptBefore);
+
+    const unreadable = join(root, "unreadable.sqlite");
+    writeTimeoutClassifierIndex(unreadable, {
+      userVersion: 9,
+      schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    });
+    await chmod(unreadable, 0o000);
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(unreadable),
+      incrementalTimeoutMs,
+    );
+
+    const directory = join(root, "directory.sqlite");
+    await mkdir(directory);
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(directory),
+      incrementalTimeoutMs,
+    );
+
+    const symlinkTarget = join(root, "symlink-target.sqlite");
+    writeTimeoutClassifierIndex(symlinkTarget, {
+      userVersion: 9,
+      schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    });
+    await chmod(symlinkTarget, 0o600);
+    const linkedIndex = join(root, "linked.sqlite");
+    await symlink(symlinkTarget, linkedIndex);
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(linkedIndex),
+      incrementalTimeoutMs,
+    );
+
+    const sidecarIndex = join(root, "sidecar.sqlite");
+    writeTimeoutClassifierIndex(sidecarIndex, {
+      userVersion: 9,
+      schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    });
+    await chmod(sidecarIndex, 0o600);
+    await writeFile(`${sidecarIndex}-wal`, "", { mode: 0o600 });
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(sidecarIndex),
+      incrementalTimeoutMs,
+    );
+
+    assert.throws(
+      () => localCompanionRefreshTimeoutForUnifiedIndex(missing, {
+        freshTimeoutMs: freshTimeoutMs + 1,
+      }),
+      /outside the refresh timeout bound/u,
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("published v10 v11 v12 v13 v14 v15 upgrades to v16 receive a cold deadline without extending current or uncertain state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-timeout-parser-upgrade-"));
+  // Deliberately pin the target: another parser release must review its
+  // predecessor set, not silently keep passing a generic mismatch test.
+  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v16");
+  const fixtures = [
+    { name: "complete", cold: true },
+    { name: "quarantine-partial", cold: true, generation: {
+      status: "partial", blockReason: "codex_rollout_sources_quarantined", skippedSourceCount: 14,
+    } },
+    { name: "tool-partial", cold: true, generation: {
+      status: "partial", blockReason: "tool_provenance_incomplete", toolProvenanceComplete: 0,
+    } },
+    // Every fixture retains an older parser/generation row. Only publication
+    // provenance may select the deadline, so this stays an ordinary refresh.
+    { name: "current-with-old-history", parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
+    { name: "future", parserVersion: "unified-rollout-typed-v17" },
+    { name: "unknown", parserVersion: "unknown-parser" },
+    { name: "empty", parserVersion: "" },
+    { name: "malformed-version", parserVersion: "unified-rollout-typed-v011" },
+    { name: "decorated-version", parserVersion: "unified-rollout-typed-v11 " },
+    { name: "partial-parser", parserVersion: "unified-rollout-typed-v10-partial" },
+    { name: "v11-partial-parser", parserVersion: "unified-rollout-typed-v11-partial" },
+    { name: "v12-partial-parser", parserVersion: "unified-rollout-typed-v12-partial" },
+    { name: "v14-partial-parser", parserVersion: "unified-rollout-typed-v14-partial" },
+    { name: "v13-partial-parser", parserVersion: "unified-rollout-typed-v13-partial" },
+    { name: "v15-partial-parser", parserVersion: "unified-rollout-typed-v15-partial" },
+    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v16-partial" },
+    { name: "current-assumed-parser", parserVersion: "unified-rollout-typed-v16-cache-write-zero" },
+    { name: "unreviewed-predecessor", parserVersion: "unified-rollout-typed-v9" },
+    { name: "missing-publication", metadata: { current_generation_id: undefined } },
+    { name: "unknown-publication", metadata: { current_generation_id: "99" } },
+    { name: "invalid-publication", metadata: { current_generation_id: "2.5" } },
+    { name: "in-progress", generation: { status: "in_progress", completedAtMs: null } },
+    { name: "failed", generation: { status: "failed" } },
+    { name: "unfinished", generation: { completedAtMs: null } },
+    { name: "unexpected-complete-reason", generation: { blockReason: "unexpected" } },
+    { name: "unknown-partial", generation: { status: "partial", blockReason: "unexpected" } },
+    { name: "empty-quarantine", generation: {
+      status: "partial", blockReason: "codex_rollout_sources_quarantined", skippedSourceCount: 0,
+    } },
+    { name: "contradictory-tools", generation: {
+      status: "partial", blockReason: "tool_provenance_incomplete", toolProvenanceComplete: 1,
+    } },
+    { name: "generation-contract", generation: { contractVersion: "unknown-contract" } },
+    { name: "parser-contract", parserContractVersion: "unknown-contract" },
+    { name: "metadata-contract", metadata: { contract_version: "unknown-contract" } },
+    { name: "source-identity", metadata: { source_identity_version: "unknown-identity" } },
+    { name: "absent-compatibility", compatibility: null },
+    { name: "unsupported-current-compatibility", compatibility: {
+      compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+      compatibility_minimum_reader_user_version: "9",
+      compatibility_minimum_writer_user_version: "9",
+    } },
+    ...["discoveryComplete", "diagnosticsComplete", "usageProvenanceComplete",
+      "sourceOrderComplete", "quotaProvenanceComplete", "toolProvenanceComplete"]
+      .map((key) => ({ name: `incomplete-${key}`, generation: { [key]: 0 } })),
+  ];
+  try {
+    for (const predecessor of [10, 11, 12, 13, 14, 15]) {
+      for (const fixture of fixtures) {
+        const name = `v${predecessor}-${fixture.name}`;
+        const indexFile = join(root, `${name}.sqlite`);
+        writeParserUpgradeTimeoutIndex(indexFile, {
+          parserVersion: `unified-rollout-typed-v${predecessor}`,
+          ...fixture,
+        });
+        await chmod(indexFile, 0o600);
+        const beforeBytes = await readFile(indexFile);
+        const beforeNames = await readdir(root);
+        assert.equal(localCompanionRefreshTimeoutForUnifiedIndex(indexFile),
+          fixture.cold === true ? 14_400_000 : LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+          name);
+        assert.deepEqual(await readFile(indexFile), beforeBytes, name);
+        assert.deepEqual(await readdir(root), beforeNames, name);
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("large legacy and parser-upgrade timeout classification never scans integrity or fact collections", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-timeout-large-index-"));
+  const indexFile = join(root, "schema9-large.sqlite");
+  const sparseSize = 800 * 1024 * 1024;
+  try {
+    writeTimeoutClassifierIndex(indexFile, {
+      userVersion: 9,
+      schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    });
+    await chmod(indexFile, 0o600);
+    await truncate(indexFile, sparseSize);
+    const before = await lstat(indexFile);
+    const beforeNames = await readdir(root);
+    let integrityScans = 0;
+    const openDatabase = (selectedFile) => {
+      const immutableUrl = pathToFileURL(selectedFile);
+      immutableUrl.searchParams.set("immutable", "1");
+      const database = new DatabaseSync(immutableUrl.href, {
+        readOnly: true,
+        timeout: 1_000,
+      });
+      return {
+        exec: (sql) => database.exec(sql),
+        prepare(sql) {
+          assert.doesNotMatch(sql, /\b(?:usage_event|generation_issue|source_cursor)\b/u);
+          if (/\bFROM meta\b/u.test(sql)) assert.match(sql, /\bWHERE key\b/u);
+          if (/\b(?:quick_check|integrity_check)\b/u.test(sql)) {
+            integrityScans += 1;
+            return {
+              all() {
+                Atomics.wait(
+                  new Int32Array(new SharedArrayBuffer(4)),
+                  0,
+                  0,
+                  750,
+                );
+                return [{ quick_check: "ok" }];
+              },
+            };
+          }
+          return database.prepare(sql);
+        },
+        close: () => database.close(),
+      };
+    };
+    const startedAt = performance.now();
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(indexFile, { openDatabase }),
+      14_400_000,
+    );
+    const elapsedMs = performance.now() - startedAt;
+    assert.equal(integrityScans, 0);
+    assert.equal(elapsedMs < 250, true, `classification took ${elapsedMs}ms`);
+    const after = await lstat(indexFile);
+    assert.equal(after.size, sparseSize);
+    assert.deepEqual(
+      {
+        dev: after.dev,
+        ino: after.ino,
+        size: after.size,
+        mtimeMs: after.mtimeMs,
+        ctimeMs: after.ctimeMs,
+      },
+      {
+        dev: before.dev,
+        ino: before.ino,
+        size: before.size,
+        mtimeMs: before.mtimeMs,
+        ctimeMs: before.ctimeMs,
+      },
+    );
+    assert.deepEqual(await readdir(root), beforeNames);
+
+    const parserIndex = join(root, "schema11-parser11-large.sqlite");
+    // Match the stable predecessor for RC3: v11, physical schema11,
+    // no skipped sources, and only incomplete historical tool provenance.
+    writeParserUpgradeTimeoutIndex(parserIndex, {
+      parserVersion: "unified-rollout-typed-v11",
+      generation: {
+        status: "partial",
+        blockReason: "tool_provenance_incomplete",
+        toolProvenanceComplete: 0,
+        skippedSourceCount: 0,
+      },
+    });
+    await chmod(parserIndex, 0o600);
+    await truncate(parserIndex, sparseSize);
+    const parserBefore = await lstat(parserIndex);
+    const parserNamesBefore = await readdir(root);
+    const parserStartedAt = performance.now();
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(parserIndex, { openDatabase }),
+      14_400_000,
+    );
+    const parserElapsedMs = performance.now() - parserStartedAt;
+    assert.equal(integrityScans, 0);
+    assert.equal(parserElapsedMs < 250, true,
+      `parser classification took ${parserElapsedMs}ms`);
+    const parserAfter = await lstat(parserIndex);
+    for (const field of ["dev", "ino", "size", "mtimeMs", "ctimeMs"]) {
+      assert.equal(parserAfter[field], parserBefore[field], field);
+    }
+    assert.deepEqual(await readdir(root), parserNamesBefore);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("unchanged unified projections reuse only within exact generation, time, and baseline bounds", async () => {
+  const generationA = `generation-v2-${"a".repeat(64)}`;
+  const generationB = `generation-v2-${"b".repeat(64)}`;
+  let selectedGeneration = generationA;
+  let reads = 0;
+  const validityChecks = [];
+  const reader = createCachedLocalUnifiedProjectionReader({
+    reader: async (options) => {
+      reads += 1;
+      if (options.mode === "deferred") {
+        return { status: "deferred", generation: null };
+      }
+      return {
+        status: "available",
+        generation: { fingerprint: selectedGeneration },
+        usage: [{ marker: reads }],
+      };
+    },
+    validUntil: async (options) => {
+      validityChecks.push(options);
+      return options.nowMs + 100;
+    },
+  });
+  const options = (nowMs, baselines, mode = "full") => ({
+    indexFile: "/private/index.sqlite",
+    nowMs,
+    declaredSpeedBaselines: baselines,
+    mode,
+  });
+  const reuse = (generationFingerprint) => ({
+    reuse: { generationFingerprint },
+  });
+
+  const cold = await reader(options(100, [{ startAt: 1, mode: "standard" }]));
+  assert.equal(reads, 1);
+  assert.equal(cold.usage[0].marker, 1);
+
+  const unchanged = await reader(
+    options(150, [{ startAt: 1, mode: "standard" }]),
+    reuse(generationA),
+  );
+  assert.equal(reads, 1);
+  assert.equal(unchanged.usage[0].marker, 1);
+  // A caller cannot mutate the retained cache through a returned clone.
+  unchanged.usage[0].marker = 999;
+
+  const clockMovedBack = await reader(
+    options(99, [{ startAt: 1, mode: "standard" }]),
+    reuse(generationA),
+  );
+  assert.equal(reads, 2);
+  assert.equal(clockMovedBack.usage[0].marker, 2);
+
+  const baselineChanged = await reader(
+    options(151, [{ startAt: 1, mode: "fast" }]),
+    reuse(generationA),
+  );
+  assert.equal(reads, 3);
+  assert.equal(baselineChanged.usage[0].marker, 3);
+
+  const timeBoundaryReached = await reader(
+    options(251, [{ startAt: 1, mode: "fast" }]),
+    reuse(generationA),
+  );
+  assert.equal(reads, 4);
+  assert.equal(timeBoundaryReached.usage[0].marker, 4);
+
+  selectedGeneration = generationB;
+  const changedGeneration = await reader(
+    options(252, [{ startAt: 1, mode: "fast" }]),
+    reuse(generationB),
+  );
+  assert.equal(reads, 5);
+  assert.equal(changedGeneration.generation.fingerprint, generationB);
+
+  const deferred = await reader(
+    options(253, [{ startAt: 1, mode: "fast" }], "deferred"),
+    reuse(generationB),
+  );
+  assert.equal(reads, 6);
+  assert.equal(deferred.status, "deferred");
+  assert.equal(validityChecks.length, 5);
+
+  const afterDeferred = await reader(
+    options(254, [{ startAt: 1, mode: "fast" }]),
+    reuse(generationB),
+  );
+  assert.equal(reads, 6);
+  assert.equal(afterDeferred.usage[0].marker, 5);
+
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    reader(
+      options(255, [{ startAt: 1, mode: "fast" }]),
+      { ...reuse(generationB), signal: controller.signal },
+    ),
+    (error) => error?.code === "local_unified_companion_projection_aborted",
+  );
+  assert.equal(reads, 6);
+});
+
+test("semantic open target is stable by default and accepts only reviewed identities", () => {
+  assert.equal(configuredSemanticOpenTarget({}), PRODUCT_BRAND.appOpenURL);
+  assert.equal(
+    configuredSemanticOpenTarget({
+      USAGE_MONITOR_APP_OPEN_URL: PREVIEW_PRODUCT_BRAND.appOpenURL,
+    }),
+    PREVIEW_PRODUCT_BRAND.appOpenURL,
+  );
+  for (const value of [
+    "",
+    "https://attacker.example/open",
+    "usagemonitor-preview://other",
+  ]) {
+    assert.throws(
+      () => configuredSemanticOpenTarget({
+        USAGE_MONITOR_APP_OPEN_URL: value,
+      }),
+      /must match a reviewed product identity/u,
+    );
+  }
+});
 
 function exactReviewContribution() {
   return buildTelemetryContributionsFromBundle({
@@ -121,6 +729,35 @@ function exactReviewContribution() {
 
 function fakeStore() {
   let reloads = 0;
+  const paceOutlook = {
+    schemaVersion: "local-weekly-pace-outlook-v0.1",
+    status: "unavailable",
+    standing: null,
+    critical: false,
+    earlyEstimate: false,
+    remainingPercent: null,
+    resetsAt: null,
+    observationCount: 0,
+    elapsedHours: null,
+    rates: {
+      activePercentagePointsPerHour: null,
+      overallPercentagePointsPerHour: null,
+      headlinePercentagePointsPerHour: null,
+      sustainablePercentagePointsPerHour: null,
+      ratio: null,
+    },
+    projection: {
+      hoursToReset: null,
+      coveredHours: null,
+      dryHours: null,
+      sparePercent: null,
+      projectedExhaustionAt: null,
+    },
+    track: {
+      coveredFraction: null,
+      activeExhaustionFraction: null,
+    },
+  };
   return {
     async initialize() {},
     async reload() {
@@ -133,11 +770,17 @@ function fakeStore() {
         evidenceStatus: "available",
       };
     },
+    getDesktopShellDisplayEvidence() {
+      return null;
+    },
     getGradient() {
       return { status: "available", datasets: { rolling: [{ quota_change_pp: 3 }] } };
     },
     getWeekly() {
       return { status: "available", datasets: { summary: [{ median_weekly_value_usd: 100 }] } };
+    },
+    getWeeklyPaceOutlook() {
+      return structuredClone(paceOutlook);
     },
     getQuality() {
       return { status: "available", datasets: { summary: [{ known_speed_fraction: 0.8 }] } };
@@ -178,6 +821,8 @@ async function fixture() {
   await writeFile(join(staticRoot, "app.js"), "export const app = true;");
   await writeFile(join(staticRoot, "data-client.js"), "export const client = true;");
   await writeFile(join(staticRoot, "lib.js"), "export const lib = true;");
+  await writeFile(join(staticRoot, "model-performance.js"), "export const performance = true;");
+  await writeFile(join(staticRoot, "model-performance.css"), ".model-performance { color: black; }");
   await writeFile(
     join(staticRoot, "localization.js"),
     "export const localization = true;",
@@ -195,11 +840,62 @@ async function fixture() {
     join(staticRoot, "tibotattle-icon.png"),
     Buffer.from([0x89, 0x50, 0x4e, 0x47]),
   );
-  await writeFile(
-    join(resourceRoot, "2026-07-24-simple-quota-gradient-report.html"),
-    "<!doctype html><title>Gradient detail</title>",
-  );
+  for (const [fileName, title] of [
+    ["2026-07-24-simple-quota-gradient-report.html", "Gradient detail"],
+    ["2026-07-24-weekly-7-day-calibration-report.html", "Weekly detail"],
+    ["2026-07-24-monitoring-quality-report.html", "Quality detail"],
+    ["2026-07-24-codex-work-account-usage-report.html", "Multi-surface detail"],
+  ]) {
+    await writeFile(
+      join(resourceRoot, fileName),
+      `<!doctype html><title>${title}</title>`,
+    );
+  }
   return { root, resourceRoot, stateRoot, codexHome, staticRoot };
+}
+
+function unifiedIndexRolloutFixture() {
+  const threadId = "11111111-1111-4111-8111-111111111111";
+  return [
+    {
+      timestamp: "2026-08-24T00:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: threadId,
+        session_id: threadId,
+        thread_source: "user",
+        originator: "codex_cli_rs",
+      },
+    },
+    {
+      timestamp: "2026-08-24T00:00:01.000Z",
+      type: "turn_context",
+      payload: {
+        turn_id: "turn-1",
+        model: "gpt-5.6-sol",
+        effort: "high",
+      },
+    },
+    {
+      timestamp: "2026-08-24T00:00:02.000Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+          },
+          last_token_usage: {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+          },
+        },
+      },
+    },
+  ].map((value) => JSON.stringify(value)).join("\n") + "\n";
 }
 
 test("production authority defaults unified and keeps legacy as explicit rollback", () => {
@@ -335,9 +1031,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal(health.status, 200);
     assert.deepEqual((await health.json()).capabilities, {
       localDashboard: true,
-      claudeDesktopQuota: true,
       explicitRefresh: true,
-      contributionPreview: true,
       contributionPreparation: true,
       contributionPreparationIdentityMode: "production_keychain",
       contributionSyncStatus: true,
@@ -345,7 +1039,6 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       contributionDevicePairing: false,
       contributionDeviceDisconnect: false,
       contributionSyncExactReview: true,
-      contributionSyncActions: false,
       incrementalContributionSync: false,
       centralServiceProxy: false,
       centralParticipantRelay: false,
@@ -354,6 +1047,31 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     });
     assert.equal(health.headers.get("access-control-allow-origin"), null);
     assert.match(health.headers.get("content-security-policy"), /default-src 'none'/);
+
+    await app.snapshotReady;
+    const desktopStatus = await fetch(`${base}/api/local/desktop-status`);
+    assert.equal(desktopStatus.status, 200);
+    assert.deepEqual(await desktopStatus.json(), {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "unavailable",
+      allowance: null,
+      notificationEvidence: null,
+    });
+    assert.equal((await fetch(`${base}/api/local/desktop-status`, {
+      method: "POST",
+    })).status, 405);
+
+    const retirement = app.automaticContributionRetirement();
+    assert.equal(retirement.status, "retired");
+    assert.equal(retirement.priorState, "absent");
+    assert.equal(retirement.networkActivity, false);
+    const tombstone = JSON.parse(await readFile(join(
+      files.stateRoot,
+      "private",
+      "automatic-contribution-v0.1.json",
+    ), "utf8"));
+    assert.equal(tombstone.schemaVersion, "automatic-contribution-retired-v1");
+    assert.equal(tombstone.networkActivity, false);
 
     const onboarding = await fetch(`${base}/api/local/onboarding`);
     assert.equal(onboarding.status, 200);
@@ -387,6 +1105,16 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal(overview.status, 200);
     assert.equal((await overview.json()).mode, "real_local_evidence");
 
+    const paceOutlook = await fetch(`${base}/api/local/weekly-pace-outlook`);
+    assert.equal(paceOutlook.status, 200);
+    assert.equal(
+      (await paceOutlook.json()).weekly.paceOutlook.schemaVersion,
+      "local-weekly-pace-outlook-v0.1",
+    );
+    assert.equal((await fetch(`${base}/api/local/weekly-pace-outlook`, {
+      method: "POST",
+    })).status, 405);
+
     const page = await fetch(`${base}/`);
     assert.equal(page.status, 200);
     const pageBody = await page.text();
@@ -401,6 +1129,14 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.doesNotMatch(pageBody, new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"));
     assert.equal((await fetch(`${base}/data-client.js`)).status, 200);
     assert.equal((await fetch(`${base}/localization.js`)).status, 200);
+    for (const [path, type] of [
+      ["model-performance.js", "text/javascript; charset=utf-8"],
+      ["model-performance.css", "text/css; charset=utf-8"],
+    ]) {
+      const asset = await fetch(`${base}/${path}`);
+      assert.equal(asset.status, 200, path);
+      assert.equal(asset.headers.get("content-type"), type, path);
+    }
     assert.equal(
       (await fetch(`${base}/telemetry-shared.generated.js`)).status,
       200,
@@ -415,9 +1151,16 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal(brandIcon.status, 200);
     assert.equal(brandIcon.headers.get("content-type"), "image/png");
 
-    const report = await fetch(`${base}/reports/gradient`);
-    assert.equal(report.status, 200);
-    assert.match(await report.text(), /Gradient detail/);
+    for (const [route, title] of [
+      ["gradient", "Gradient detail"],
+      ["weekly", "Weekly detail"],
+      ["quality", "Quality detail"],
+      ["multi-surface", "Multi-surface detail"],
+    ]) {
+      const report = await fetch(`${base}/reports/${route}`);
+      assert.equal(report.status, 200, route);
+      assert.match(await report.text(), new RegExp(title, "u"), route);
+    }
     const privateReportDirectory = join(
       files.resourceRoot,
       ".usage-monitor",
@@ -432,6 +1175,40 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     const canonicalReport = await fetch(`${base}/reports/gradient`);
     assert.equal(canonicalReport.status, 200);
     assert.match(await canonicalReport.text(), /Canonical gradient detail/);
+
+    for (const retiredPath of [
+      "/api/local/claude/quota",
+      "/api/local/reports",
+      "/api/local/contribution/preview",
+      "/api/local/contribution/sync-once",
+      "/api/local/contribution/sync-pause",
+      "/api/local/contribution/sync-resume",
+      "/api/local/contribution/automatic-settings",
+      "/api/local/contribution/automatic-enable",
+      "/api/local/contribution/automatic-disable",
+    ]) {
+      for (const method of ["GET", "POST"]) {
+        const response = await fetch(`${base}${retiredPath}`, {
+          method,
+          ...(method === "POST"
+            ? {
+              headers: { "Content-Type": "application/json" },
+              body: "{}",
+            }
+            : {}),
+        });
+        assert.equal(response.status, 404, `${method} ${retiredPath}`);
+        assert.equal(
+          (await response.json()).error.code,
+          "not_found",
+          `${method} ${retiredPath}`,
+        );
+      }
+    }
+
+    assert.equal((await fetch(`${base}/reports/gradient`, {
+      method: "POST",
+    })).status, 405);
 
     assert.equal((await fetch(`${base}/reports/not-allowed`)).status, 404);
     assert.equal((await fetch(`${base}/api/local/not-allowed`)).status, 404);
@@ -448,6 +1225,37 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       `<meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}"><meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`,
     );
     assert.equal((await fetch(`${base}/index.html`)).status, 404);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("preview companion stamps only the preview semantic-open route", async () => {
+  const files = await fixture();
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    environment: {
+      ...process.env,
+      USAGE_MONITOR_APP_OPEN_URL: PREVIEW_PRODUCT_BRAND.appOpenURL,
+    },
+    refreshRunner: async () => ({}),
+    port: 0,
+  });
+  try {
+    const page = await fetch(`http://127.0.0.1:${app.port}/`);
+    assert.equal(page.status, 200);
+    const body = await page.text();
+    assert.match(body, new RegExp(PREVIEW_PRODUCT_BRAND.appOpenURL, "u"));
+    assert.doesNotMatch(body, new RegExp(PRODUCT_BRAND.appOpenURL, "u"));
+    assert.doesNotMatch(
+      body,
+      new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"),
+    );
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -533,6 +1341,101 @@ test("window-breakdown route bounds its range and returns a per-model/speed shap
   }
 });
 
+test("cache-drop thread links are private, transient, query-free local reads", async () => {
+  const files = await fixture();
+  const store = fakeStore();
+  const requests = [];
+  const privateName = "Synthetic local thread name";
+  const threadId = "11111111-1111-4111-8111-111111111111";
+  let fail = false;
+  const overviewBefore = structuredClone(store.getOverview());
+  const payload = {
+    schemaVersion: "local-cache-drop-thread-links-v1",
+    status: "available",
+    generation: "7",
+    entries: [{ kind: "switch", key: "synthetic-anonymous-pair", thread: {
+      id: threadId, name: privateName, nickname: null, parent: null,
+    } }],
+  };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: async () => ({}),
+    cacheDropThreadLinksProvider: async (options) => {
+      requests.push(options);
+      if (fail) throw new Error(privateName);
+      return payload;
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const route = `${base}/api/local/cache-drop-thread-links`;
+    const headers = { "X-Usage-Monitor-Local": "1" };
+    // Missing header, foreign origin, arbitrary identifiers/paths and methods
+    // are refused before the metadata provider is called.
+    assert.equal((await fetch(route)).status, 403);
+    assert.equal((await fetch(route, { headers: {
+      ...headers, Origin: "https://example.invalid",
+    } })).status, 403);
+    assert.equal((await fetch(`${route}?id=${threadId}`, { headers })).status, 400);
+    assert.equal((await fetch(`${route}?path=elsewhere`, { headers })).status, 400);
+    for (const method of ["POST", "DELETE", "OPTIONS"]) {
+      const response = await fetch(route, { method, headers });
+      assert.equal(response.status, 405);
+      assert.equal(response.headers.get("access-control-allow-origin"), null);
+    }
+    const rebind = await rawRequest({
+      port: app.port, path: "/api/local/cache-drop-thread-links",
+      headers: { ...headers, Host: `example.invalid:${app.port}` },
+    });
+    assert.equal(rebind.status, 403);
+    assert.equal(requests.length, 0);
+
+    // Same-origin browser GETs normally omit Origin; explicit matching Origin
+    // is allowed too. Both reads get an independent current snapshot input.
+    for (const admitted of [headers, { ...headers, Origin: base }]) {
+      const response = await fetch(route, { headers: admitted });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("access-control-allow-origin"), null);
+      assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+      assert.deepEqual(await response.json(), payload);
+    }
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[0], { overview: overviewBefore });
+    assert.deepEqual(store.getOverview(), overviewBefore);
+    assert.equal(store.reloads, 0);
+    for (const publicRoute of [
+      "/api/local/overview", "/api/local/gradient", "/api/local/weekly",
+      "/api/local/quality", "/reports/gradient", "/reports/weekly",
+    ]) {
+      const response = await fetch(`${base}${publicRoute}`);
+      assert.equal(response.status, 200, publicRoute);
+      const body = await response.text();
+      assert.equal(body.includes(privateName), false, publicRoute);
+      assert.equal(body.includes(threadId), false, publicRoute);
+    }
+
+    // Metadata failures are optional unavailability, not refresh failure or
+    // filesystem diagnostics. In particular, do not echo provider errors.
+    fail = true;
+    const unavailable = await fetch(route, { headers });
+    assert.equal(unavailable.status, 200);
+    assert.deepEqual(await unavailable.json(), {
+      schemaVersion: "local-cache-drop-thread-links-v1",
+      status: "unavailable", generation: null, entries: [],
+    });
+    assert.equal(store.reloads, 0);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("local companion remains usable before Codex is installed", async () => {
   const files = await fixture();
   const app = await startLocalCompanionServer({
@@ -577,354 +1480,84 @@ test("local companion remains usable before Codex is installed", async () => {
   }
 });
 
-test("automatic contribution endpoints require exact consent and remain foreground-only", async () => {
+test("startup retires legacy automatic contribution state to an idempotent content-free tombstone", async () => {
   const files = await fixture();
-  let now = Date.parse("2026-07-29T12:00:00.000Z");
-  let preparations = 0;
-  const preparationRequests = [];
-  const retirementRequests = [];
-  let uploads = 0;
-  let manualRuns = 0;
-  let networkCalls = 0;
-  let nextTimer = 1;
-  const timers = new Map();
-  const app = await startLocalCompanionServer({
-    resourceRoot: files.resourceRoot,
-    stateRoot: files.stateRoot,
-    codexHome: files.codexHome,
-    staticRoot: files.staticRoot,
-    dataStore: fakeStore(),
-    refreshRunner: async () => ({}),
-    centralOrigin: "http://127.0.0.1:8792",
-    centralFetch: async () => {
-      networkCalls += 1;
-      throw new Error("automatic contribution test must not use fetch");
-    },
-    contributionPreparationRunner: async (request) => {
-      preparations += 1;
-      preparationRequests.push(request);
-      const { lookbackHours } = request;
-      assert.equal(lookbackHours, 24);
-      const coveredAt = {
-        startAt: "2026-07-29T11:00:00.000Z",
-        endAt: "2026-07-29T18:00:00.000Z",
-      };
-      await request.beforePreparedPublish({
-        preparedSetId: "a".repeat(64),
-        coveredAt,
-      });
-      return {
-        schemaVersion: "local-contribution-preparation-result-v0.1",
-        status: "prepared",
-        prepared: { preparedSetId: "a".repeat(64) },
-        coveredAt,
-        networkActivity: false,
-      };
-    },
-    contributionSyncExactReviewProvider: async () => ({
-      schemaVersion: "contribution-sync-exact-review-v0.1",
-      state: "ready",
-      networkActivity: false,
-      discoveredSets: 1,
-      enqueued: 0,
-      payloadBytes: Buffer.byteLength(
-        JSON.stringify(exactReviewContribution()),
-        "utf8",
-      ),
-      payload: exactReviewContribution(),
-      reviewBinding: {
-        jobId: REVIEW_JOB_ID,
-        contributionSha256: REVIEW_SHA256,
-      },
+  const privateRoot = join(files.stateRoot, "private");
+  const settingsFile = join(
+    privateRoot,
+    "automatic-contribution-v0.1.json",
+  );
+  const legacyCanary = "legacy-consent-must-not-survive";
+  let first;
+  let restarted;
+  await mkdir(privateRoot, { recursive: true, mode: 0o700 });
+  await writeFile(
+    settingsFile,
+    JSON.stringify({
+      schemaVersion: "automatic-contribution-settings-v0.4",
+      enabled: true,
+      consent: legacyCanary,
+      destinationOrigin: "https://legacy.invalid",
     }),
-    contributionSyncOnceRunner: async ({
-      signal,
-      reviewedJob,
-      preparedSetId,
-      maximumJobs,
-      maximumReservedUploadBytes,
-    }) => {
-      uploads += 1;
-      assert.ok(signal instanceof AbortSignal);
-      if (reviewedJob !== undefined) {
-        manualRuns += 1;
-        assert.deepEqual(reviewedJob, {
-          jobId: REVIEW_JOB_ID,
-          contributionSha256: REVIEW_SHA256,
-        });
-        return {
-          status: "completed",
-          discoveredSets: 1,
-          enqueued: 0,
-          processed: 1,
-          accepted: manualRuns === 1 ? 0 : 1,
-          retryable: manualRuns === 1 ? 1 : 0,
-          rejected: 0,
-          reservedUploadBytes: 1024,
-          bandwidthLimited: false,
-          queue: { paused: false },
-          preparedSet: {
-            preparedSetId: "a".repeat(64),
-            coveredAt: {
-              startAt: "2026-07-29T11:00:00.000Z",
-              endAt: "2026-07-29T12:00:00.000Z",
-            },
-            totalJobs: 1,
-            acceptedJobs: manualRuns === 1 ? 0 : 1,
-            pendingJobs: 0,
-            retryableJobs: manualRuns === 1 ? 1 : 0,
-            inFlightJobs: 0,
-            rejectedJobs: 0,
-            completeAccepted: manualRuns !== 1,
-          },
-        };
-      }
-      assert.equal(preparedSetId, "a".repeat(64));
-      assert.equal(maximumJobs, 100);
-      assert.equal(maximumReservedUploadBytes, 64 * 1024 * 1024);
-      return {
-        status: "completed",
-        discoveredSets: 1,
-        enqueued: 1,
-        processed: 1,
-        accepted: 1,
-        retryable: 0,
-        rejected: 0,
-        reservedUploadBytes: 1024,
-        bandwidthLimited: false,
-        queue: { paused: false },
-        preparedSet: {
-          preparedSetId: "a".repeat(64),
-          coveredAt: {
-            startAt: "2026-07-29T11:00:00.000Z",
-            endAt: "2026-07-29T18:00:00.000Z",
-          },
-          totalJobs: 1,
-          acceptedJobs: 1,
-          pendingJobs: 0,
-          retryableJobs: 0,
-          inFlightJobs: 0,
-          rejectedJobs: 0,
-          completeAccepted: true,
-        },
-      };
-    },
-    automaticContributionRetirementRunner: async (request) => {
-      retirementRequests.push(request);
-      return {
-        retiredSets: 0,
-        retiredJobs: 0,
-        interrupted: false,
-        networkActivity: false,
-      };
-    },
-    automaticContributionOptions: {
-      now: () => new Date(now),
-      ditherRandom: () => 0,
-      setTimeoutImpl(callback, delay) {
-        const id = nextTimer;
-        nextTimer += 1;
-        timers.set(id, { callback, delay });
-        return id;
-      },
-      clearTimeoutImpl(id) {
-        timers.delete(id);
-      },
-    },
-    port: 0,
-  });
+    { mode: 0o600 },
+  );
   try {
-    const origin = `http://127.0.0.1:${app.port}`;
-    const settingsResponse = await fetch(
-      `${origin}/api/local/contribution/automatic-settings`,
-    );
-    assert.equal(settingsResponse.status, 200);
-    const settings = await settingsResponse.json();
-    assert.equal(settings.schemaVersion, "automatic-contribution-status-v0.1");
-    assert.equal(settings.status, "first_review_required");
-    assert.equal(settings.enabled, false);
-    assert.equal(settings.firstReviewComplete, false);
-    assert.equal(settings.intervalHours, 6);
-    assert.equal(settings.requiredConsent.destinationOrigin,
-      "http://127.0.0.1:8792");
-    assert.equal(settings.foregroundOnly, true);
-    assert.equal(settings.daemonInstalled, false);
-    assert.equal(preparations, 0);
-    assert.equal(uploads, 0);
-    assert.equal(networkCalls, 0);
+    first = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunner: async () => ({}),
+      port: 0,
+    });
+    await first.snapshotReady;
 
-    const enableBody = JSON.stringify({
-      intervalHours: 6,
-      consent: settings.requiredConsent,
-    });
-    const unauthorized = await rawRequest({
-      port: app.port,
-      path: "/api/local/contribution/automatic-enable",
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: enableBody,
-    });
-    assert.equal(unauthorized.status, 403);
-
-    const mismatched = await rawRequest({
-      port: app.port,
-      path: "/api/local/contribution/automatic-enable",
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Origin: origin,
-        "X-Usage-Monitor-Local": "1",
-      },
-      body: JSON.stringify({
-        intervalHours: 6,
-        consent: {
-          ...settings.requiredConsent,
-          privacyContractVersion: "changed-contract",
-        },
-      }),
-    });
-    assert.equal(mismatched.status, 409);
+    const retirement = first.automaticContributionRetirement();
+    assert.equal(retirement.status, "retired");
+    assert.equal(retirement.priorState, "enabled");
+    assert.equal(retirement.networkActivity, false);
     assert.equal(
-      JSON.parse(mismatched.body).error.code,
-      "automatic_contribution_first_review_required",
+      retirement.schemaVersion,
+      "automatic-contribution-retired-v1",
     );
-    assert.equal(timers.size, 0);
-    assert.equal(uploads, 0);
-    const contributionHeaders = {
-      "Content-Type": "application/json",
-      Origin: origin,
-      "X-Usage-Monitor-Local": "1",
-    };
-    const runReviewedContribution = async () => {
-      const review = await fetch(
-        `${origin}/api/local/contribution/sync-inspect-exact`,
-        {
-          method: "POST",
-          headers: contributionHeaders,
-          body: "{}",
-        },
-      ).then((response) => response.json());
-      return fetch(`${origin}/api/local/contribution/sync-once`, {
-        method: "POST",
-        headers: contributionHeaders,
-        body: JSON.stringify({ reviewToken: review.reviewToken }),
-      });
-    };
-    const unsuccessful = await runReviewedContribution();
-    assert.equal(unsuccessful.status, 200);
-    assert.equal((await unsuccessful.json()).accepted, 0);
     assert.equal(
-      (await fetch(
-        `${origin}/api/local/contribution/automatic-settings`,
-      ).then((response) => response.json())).status,
-      "first_review_required",
+      new Date(retirement.retiredAt).toISOString(),
+      retirement.retiredAt,
     );
-    const stillLocked = await rawRequest({
-      port: app.port,
-      path: "/api/local/contribution/automatic-enable",
-      method: "POST",
-      headers: contributionHeaders,
-      body: enableBody,
-    });
-    assert.equal(stillLocked.status, 409);
-    assert.equal(timers.size, 0);
-
-    const successful = await runReviewedContribution();
-    assert.equal(successful.status, 200);
-    assert.equal((await successful.json()).accepted, 1);
-    const reviewedSettings = await fetch(
-      `${origin}/api/local/contribution/automatic-settings`,
-    ).then((response) => response.json());
-    assert.equal(reviewedSettings.status, "disabled");
-    assert.equal(reviewedSettings.firstReviewComplete, true);
-    assert.equal(
-      reviewedSettings.firstReviewedAcceptedAt,
-      "2026-07-29T12:00:00.000Z",
-    );
-
-    const mismatchAfterReview = await rawRequest({
-      port: app.port,
-      path: "/api/local/contribution/automatic-enable",
-      method: "POST",
-      headers: contributionHeaders,
-      body: JSON.stringify({
-        intervalHours: 6,
-        consent: {
-          ...settings.requiredConsent,
-          privacyContractVersion: "changed-contract",
-        },
-      }),
-    });
-    assert.equal(mismatchAfterReview.status, 409);
-    assert.equal(
-      JSON.parse(mismatchAfterReview.body).error.code,
-      "automatic_contribution_consent_binding_mismatch",
-    );
-
-    const enabled = await rawRequest({
-      port: app.port,
-      path: "/api/local/contribution/automatic-enable",
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Origin: origin,
-        "X-Usage-Monitor-Local": "1",
-      },
-      body: enableBody,
-    });
-    assert.equal(enabled.status, 200);
-    const enabledStatus = JSON.parse(enabled.body);
-    assert.equal(enabledStatus.status, "scheduled");
-    assert.equal(enabledStatus.nextAttemptAt, "2026-07-29T18:00:00.000Z");
-    assert.equal(preparations, 0);
-    assert.equal(uploads, 2);
-    assert.equal(networkCalls, 0);
-
-    now += 6 * 60 * 60 * 1_000;
-    const completed = await app.automaticContribution.runDue();
-    assert.equal(completed.status, "scheduled");
-    assert.deepEqual(completed.lastOutcome, {
-      status: "succeeded",
-      code: "accepted",
-      at: "2026-07-29T18:00:00.000Z",
-    });
-    assert.equal(preparations, 1);
-    assert.equal(
-      preparationRequests[0].acceptedThroughAt,
-      "2026-07-29T12:00:00.000Z",
-    );
-    assert.equal(preparationRequests[0].replayOverlapHours, 1);
+    const serialized = await readFile(settingsFile, "utf8");
     assert.deepEqual(
-      preparationRequests[0].protectedPreparedSetIds,
-      ["a".repeat(64)],
+      Object.keys(JSON.parse(serialized)).sort(),
+      ["networkActivity", "priorState", "retiredAt", "schemaVersion"],
     );
-    assert.equal(retirementRequests.length, 1);
-    assert.equal(uploads, 3);
-    assert.equal(networkCalls, 0);
+    assert.equal(serialized.includes(legacyCanary), false);
+    assert.equal(serialized.includes("legacy.invalid"), false);
 
-    const disabled = await rawRequest({
-      port: app.port,
-      path: "/api/local/contribution/automatic-disable",
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Origin: origin,
-        "X-Usage-Monitor-Local": "1",
-      },
-      body: JSON.stringify({ reason: "user_request" }),
+    await first.close();
+    first = null;
+    restarted = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunner: async () => ({}),
+      port: 0,
     });
-    assert.equal(disabled.status, 200);
-    assert.equal(JSON.parse(disabled.body).status, "disabled");
-    assert.equal(JSON.parse(disabled.body).consentedAt, null);
+    await restarted.snapshotReady;
+    const repeated = restarted.automaticContributionRetirement();
+    assert.equal(repeated.status, "already_retired");
+    assert.equal(repeated.priorState, "enabled");
+    assert.equal(repeated.retiredAt, retirement.retiredAt);
+    assert.equal(await readFile(settingsFile, "utf8"), serialized);
   } finally {
-    await app.close();
+    await restarted?.close();
+    await first?.close();
     await rm(files.root, { recursive: true });
   }
 });
 
-test("one state root cannot run concurrent automatic schedulers", async () => {
+test("one state root cannot run concurrently while the retirement lock is held", async () => {
   const files = await fixture();
   let first;
   let restarted;
@@ -937,29 +1570,40 @@ test("one state root cannot run concurrent automatic schedulers", async () => {
     refreshRunner: async () => ({}),
     port: 0,
   };
+  const lockFile = join(
+    files.stateRoot,
+    "private",
+    "automatic-contribution-v0.1.lock",
+  );
   try {
     first = await startLocalCompanionServer(options);
+    let snapshotSettled = false;
+    first.snapshotReady.then(() => {
+      snapshotSettled = true;
+    });
+    await waitFor(() => snapshotSettled);
     await assert.rejects(
       startLocalCompanionServer({
         ...options,
         dataStore: fakeStore(),
       }),
-      (error) => error?.code === "automatic_contribution_instance_active",
+      (error) =>
+        error?.code === "automatic_contribution_retirement_instance_active",
     );
+    assert.equal((await lstat(lockFile)).isFile(), true);
+
     await first.close();
     first = null;
     await assert.rejects(
-      lstat(join(
-        files.stateRoot,
-        "private",
-        "automatic-contribution-v0.1.lock",
-      )),
+      lstat(lockFile),
       (error) => error?.code === "ENOENT",
     );
+
     restarted = await startLocalCompanionServer({
       ...options,
       dataStore: fakeStore(),
     });
+    await restarted.snapshotReady;
     assert.equal(
       (await fetch(
         `http://127.0.0.1:${restarted.port}/api/local/health`,
@@ -973,140 +1617,178 @@ test("one state root cannot run concurrent automatic schedulers", async () => {
   }
 });
 
-test("shutdown retains the automatic-contribution lock until an aborted run finishes cleanup", async () => {
+test("a startup snapshot failure files one content-free server diagnostic note", async () => {
   const files = await fixture();
-  const preparationStarted = deferred();
-  const abortObserved = deferred();
-  const cleanupBarrier = deferred();
-  let first;
-  let restarted;
-  let activeRun;
-  let closePromise;
-  let now = Date.parse("2026-07-29T12:00:00.000Z");
-  const options = {
-    resourceRoot: files.resourceRoot,
-    stateRoot: files.stateRoot,
-    codexHome: files.codexHome,
-    staticRoot: files.staticRoot,
-    dataStore: fakeStore(),
-    refreshRunner: async () => ({}),
-    centralOrigin: "http://127.0.0.1:8792",
-    contributionPreparationRunner: async ({ signal }) => {
-      preparationStarted.resolve();
-      if (!signal.aborted) {
-        await new Promise((resolveAbort) => {
-          signal.addEventListener("abort", resolveAbort, { once: true });
-        });
-      }
-      abortObserved.resolve();
-      await cleanupBarrier.promise;
-      throw new LocalContributionPreparationError("preparation_aborted");
-    },
-    contributionSyncOnceRunner: async () => {
-      throw new Error("shutdown test must not reach upload");
-    },
-    automaticContributionRetirementRunner: async () => ({
-      retiredSets: 0,
-      retiredJobs: 0,
-      interrupted: false,
-      networkActivity: false,
-    }),
-    automaticContributionOptions: {
-      now: () => new Date(now),
-      ditherRandom: () => 0,
-    },
-    port: 0,
-  };
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  const privateMessage = "private startup detail /Users/example/session.jsonl";
+  const initializationError = new Error(privateMessage);
+  initializationError.code = "private_startup_detail";
+  let app;
   try {
-    first = await startLocalCompanionServer(options);
-    const reviewedAt = {
-      startAt: "2026-07-29T11:00:00.000Z",
-      endAt: "2026-07-29T12:00:00.000Z",
-    };
-    await first.automaticContribution.recordReviewedManualAcceptance({
-      status: "completed",
-      accepted: 1,
-      preparedSet: {
-        preparedSetId: "d".repeat(64),
-        coveredAt: reviewedAt,
-        totalJobs: 1,
-        acceptedJobs: 1,
-        pendingJobs: 0,
-        retryableJobs: 0,
-        inFlightJobs: 0,
-        rejectedJobs: 0,
-        completeAccepted: true,
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: {
+        ...fakeStore(),
+        async initialize() {
+          throw initializationError;
+        },
       },
+      refreshRunner: async () => ({}),
+      diagnosticsLogFile,
+      diagnosticReferenceFactory: () => "TT-4HJ7M2",
+      clock: () => Date.parse("2026-09-08T14:30:00.000Z"),
+      port: 0,
     });
-    const disabled = await first.automaticContribution.inspect();
-    await first.automaticContribution.enable({
-      intervalHours: 6,
-      consent: disabled.requiredConsent,
-    });
-    now += 6 * 60 * 60 * 1_000;
-    activeRun = first.automaticContribution.runDue();
-    await preparationStarted.promise;
-
-    let closeSettled = false;
-    closePromise = first.close().then(() => {
-      closeSettled = true;
-    });
-    await abortObserved.promise;
-    assert.equal(closeSettled, false);
-    let explicitShutdownSettled = false;
-    const explicitShutdown = first.shutdownAutomaticContribution().then(() => {
-      explicitShutdownSettled = true;
-    });
-    await Promise.resolve();
-    assert.equal(explicitShutdownSettled, false);
 
     await assert.rejects(
-      startLocalCompanionServer({
-        ...options,
-        dataStore: fakeStore(),
-      }),
-      (error) => error?.code === "automatic_contribution_instance_active",
+      app.snapshotReady,
+      (error) => error === initializationError,
     );
-    assert.equal(closeSettled, false);
-
-    cleanupBarrier.resolve();
-    await Promise.all([activeRun, closePromise, explicitShutdown]);
-    assert.equal(explicitShutdownSettled, true);
-    activeRun = null;
-    closePromise = null;
-    first = null;
-    await assert.rejects(
-      lstat(join(
-        files.stateRoot,
-        "private",
-        "automatic-contribution-v0.1.lock",
-      )),
-      (error) => error?.code === "ENOENT",
+    const recorded = await readFile(diagnosticsLogFile, "utf8");
+    assert.equal(recorded.includes(privateMessage), false);
+    assert.equal(recorded.includes(initializationError.code), false);
+    assert.deepEqual(
+      recorded.trimEnd().split("\n").map((line) => JSON.parse(line)),
+      [{
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-09-08T14:30:00.000Z",
+        reference: "TT-4HJ7M2",
+        surface: "local_startup",
+        code: "snapshot_unavailable",
+        requestId: "",
+        step: "data_store",
+        detail: "unexpected_error",
+      }],
     );
-
-    restarted = await startLocalCompanionServer({
-      ...options,
-      dataStore: fakeStore(),
-    });
+    assert.deepEqual(LOCAL_STARTUP_DIAGNOSTIC_STEPS, [
+      "data_store",
+      "contribution_start",
+    ]);
     assert.equal(
-      (await fetch(
-        `http://127.0.0.1:${restarted.port}/api/local/health`,
-      )).status,
-      200,
+      LOCAL_STARTUP_DIAGNOSTIC_DETAILS.includes(
+        "local_collector_state_migration_busy",
+      ),
+      true,
+    );
+    assert.equal(
+      LOCAL_STARTUP_DIAGNOSTIC_DETAILS.includes("unexpected_error"),
+      true,
     );
   } finally {
-    cleanupBarrier.resolve();
-    await Promise.allSettled([
-      activeRun,
-      closePromise,
-      restarted?.close(),
-      first?.close(),
-    ].filter(Boolean));
+    await app?.close();
     await rm(files.root, { recursive: true });
   }
 });
 
-test("initialization failure retains the lock until idempotent automatic shutdown finishes", async () => {
+test("a failed startup diagnostic recorder preserves the original error and shutdown", async () => {
+  const files = await fixture();
+  const initializationError = new Error("private source startup failure");
+  initializationError.code = "collector_invalid_size";
+  let recorderCalls = 0;
+  let stopCalls = 0;
+  let app;
+  const incrementalContributionController = {
+    async start() {},
+    async stop() {
+      stopCalls += 1;
+    },
+    async inspect() {
+      return {};
+    },
+    async approve() {
+      return {};
+    },
+    async resume() {
+      return {};
+    },
+    async pauseForDeviceDisconnect() {
+      return {};
+    },
+    async pauseForDeviceRepair() {
+      return {};
+    },
+    async resumeAfterDeviceRepair() {
+      return {};
+    },
+  };
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: {
+        ...fakeStore(),
+        async initialize() {
+          throw initializationError;
+        },
+      },
+      refreshRunner: async () => ({}),
+      diagnosticReferenceFactory: () => "TT-4HJ7M2",
+      diagnosticNoteRecorder: async (note) => {
+        recorderCalls += 1;
+        assert.deepEqual(note, {
+          reference: "TT-4HJ7M2",
+          surface: "local_startup",
+          code: "snapshot_unavailable",
+          requestId: "",
+          step: "data_store",
+          detail: "collector_invalid_size",
+        });
+        throw new Error("private recorder failure");
+      },
+      incrementalContributionController,
+      port: 0,
+    });
+
+    await assert.rejects(
+      app.snapshotReady,
+      (error) => error === initializationError,
+    );
+    assert.equal(recorderCalls, 1);
+    assert.equal(stopCalls, 1);
+    assert.deepEqual(app.snapshotStatus(), {
+      status: "failed",
+      errorCode: "collector_invalid_size",
+    });
+  } finally {
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a successful startup does not mint or file a startup diagnostic note", async () => {
+  const files = await fixture();
+  let app;
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunner: async () => ({}),
+      diagnosticReferenceFactory: () => {
+        throw new Error("startup diagnostic reference must not be minted");
+      },
+      diagnosticNoteRecorder: async () => {
+        throw new Error("startup diagnostic note must not be recorded");
+      },
+      port: 0,
+    });
+
+    await app.snapshotReady;
+    assert.deepEqual(app.snapshotStatus(), { status: "ready", errorCode: null });
+  } finally {
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("initialization failure retains the retirement lock until idempotent runtime shutdown finishes", async () => {
   const files = await fixture();
   const stopStarted = deferred();
   const cleanupBarrier = deferred();
@@ -1115,9 +1797,9 @@ test("initialization failure retains the lock until idempotent automatic shutdow
   let restarted;
   let failedStart;
   let observedFailure;
-  const automaticContributionController = {
+  const incrementalContributionController = {
     async start() {
-      throw new Error("automatic controller must not start after data init fails");
+      throw new Error("incremental controller must not start after data init fails");
     },
     async stop() {
       stopCalls += 1;
@@ -1127,13 +1809,19 @@ test("initialization failure retains the lock until idempotent automatic shutdow
     async inspect() {
       return {};
     },
-    async enable() {
+    async approve() {
       return {};
     },
-    async disable() {
+    async resume() {
       return {};
     },
-    async recordReviewedManualAcceptance() {
+    async pauseForDeviceDisconnect() {
+      return {};
+    },
+    async pauseForDeviceRepair() {
+      return {};
+    },
+    async resumeAfterDeviceRepair() {
       return {};
     },
   };
@@ -1146,11 +1834,6 @@ test("initialization failure retains the lock until idempotent automatic shutdow
     port: 0,
   };
   try {
-    // The snapshot build now runs behind an already-open port, so a build that
-    // fails is surfaced on `snapshotReady` instead of on the start call. Every
-    // consequence of that failure is unchanged: automatic contribution stops
-    // exactly once, the instance lock is held until that cleanup finishes, and
-    // no second instance may start in the meantime.
     failedStart = await startLocalCompanionServer({
       ...baseOptions,
       dataStore: {
@@ -1159,7 +1842,7 @@ test("initialization failure retains the lock until idempotent automatic shutdow
           throw initializationError;
         },
       },
-      automaticContributionController,
+      incrementalContributionController,
     });
     observedFailure = assert.rejects(
       failedStart.snapshotReady,
@@ -1168,9 +1851,6 @@ test("initialization failure retains the lock until idempotent automatic shutdow
     await stopStarted.promise;
     assert.equal(stopCalls, 1);
 
-    // The port is open, so the failure has to be readable rather than silent:
-    // readiness names it, and every route that would have to project the
-    // missing snapshot refuses instead of answering with an empty one.
     const failedHealth = await fetch(
       `http://127.0.0.1:${failedStart.port}/api/local/health`,
     ).then((response) => response.json());
@@ -1187,16 +1867,17 @@ test("initialization failure retains the lock until idempotent automatic shutdow
         ...baseOptions,
         dataStore: fakeStore(),
       }),
-      (error) => error?.code === "automatic_contribution_instance_active",
+      (error) =>
+        error?.code === "automatic_contribution_retirement_instance_active",
     );
     assert.equal(stopCalls, 1);
 
     cleanupBarrier.resolve();
     await observedFailure;
     observedFailure = null;
-    assert.equal(stopCalls, 1);
     await failedStart.close();
     failedStart = null;
+    assert.equal(stopCalls, 1);
     await assert.rejects(
       lstat(join(
         files.stateRoot,
@@ -1210,6 +1891,7 @@ test("initialization failure retains the lock until idempotent automatic shutdow
       ...baseOptions,
       dataStore: fakeStore(),
     });
+    await restarted.snapshotReady;
     assert.equal(
       (await fetch(
         `http://127.0.0.1:${restarted.port}/api/local/health`,
@@ -1232,6 +1914,7 @@ test("the port and readiness answer before the first snapshot is built", async (
   const buildStarted = deferred();
   const buildBarrier = deferred();
   const store = fakeStore();
+  let initializationOptions;
   let app;
   try {
     const startedAt = Date.now();
@@ -1242,7 +1925,8 @@ test("the port and readiness answer before the first snapshot is built", async (
       staticRoot: files.staticRoot,
       dataStore: {
         ...store,
-        async initialize() {
+        async initialize(options) {
+          initializationOptions = options;
           buildStarted.resolve();
           await buildBarrier.promise;
         },
@@ -1252,6 +1936,7 @@ test("the port and readiness answer before the first snapshot is built", async (
     });
     const base = `http://127.0.0.1:${app.port}`;
     await buildStarted.promise;
+    assert.deepEqual(initializationOptions, { purpose: "startup" });
 
     // Listening, and honest about what is not ready yet. Before the port moved
     // ahead of the build this request could not even be sent: a real install
@@ -1294,6 +1979,72 @@ test("the port and readiness answer before the first snapshot is built", async (
   }
 });
 
+test("startup snapshot defers unified history until an explicit full refresh", async () => {
+  const files = await fixture();
+  const projectionModes = [];
+  let fullRefreshRequested = false;
+  let app;
+  try {
+    app = await startLocalCompanionServer({
+      environment: {},
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      homeDirectory: join(files.root, "home"),
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      accountingSourceMode: "unified",
+      codexSpeedBaseline: { readWindows: async () => [] },
+      unifiedProjectionReader: async (options) => {
+        projectionModes.push(options.mode);
+        if (options.mode === "full" && !fullRefreshRequested) {
+          throw new Error("startup_must_not_build_full_projection");
+        }
+        return readLocalUnifiedCompanionProjection(options);
+      },
+      refreshRunner: async () => ({}),
+      port: 0,
+    });
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    assert.deepEqual(projectionModes, ["deferred"]);
+    const health = await fetch(`${base}/api/local/health`)
+      .then((response) => response.json());
+    assert.deepEqual(health.snapshot, { status: "ready", errorCode: null });
+    const response = await fetch(`${base}/api/local/overview`);
+    assert.equal(response.status, 200);
+    const overview = await response.json();
+    assert.equal(overview.accounting.generationMatched, false);
+    assert.equal(overview.accounting.projection.status, "unavailable");
+    assert.equal(
+      overview.accounting.projection.reason,
+      "local_unified_index_deferred",
+    );
+    assert.deepEqual(overview.timeline.usage, []);
+    assert.equal(overview.timeline.history.status, "loading");
+
+    fullRefreshRequested = true;
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+    await waitFor(async () => {
+      const payload = await fetch(`${base}/api/local/refresh`)
+        .then((result) => result.json());
+      return payload.refresh.status === "succeeded";
+    });
+    assert.deepEqual(projectionModes, ["deferred", "full"]);
+  } finally {
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("participant relay supports explicit loopback development with exact forwarding", async () => {
   const files = await fixture();
   const forwarded = [];
@@ -1320,10 +2071,7 @@ test("participant relay supports explicit loopback development with exact forwar
         Vary: "Cookie",
       };
       if (url.endsWith("/api/v1/enroll")) headers["Set-Cookie"] = validSetCookie;
-      const responseBody = url.endsWith("/api/v1/me/export")
-        ? JSON.stringify({ payload: "x".repeat(5 * 1024 * 1024) })
-        : JSON.stringify({ status: "ok" });
-      return new Response(responseBody, {
+      return new Response(JSON.stringify({ status: "ok" }), {
         status: url.endsWith("/api/v1/enroll") ? 201 : 200,
         headers,
       });
@@ -1349,10 +2097,10 @@ test("participant relay supports explicit loopback development with exact forwar
 
     const sessionCookie =
       "__Host-usage_monitor_session=um_session_00000000-0000-4000-8000-000000000000.secret";
-    assert.equal((await fetch(`${base}/api/v1/me/stats`, {
+    assert.equal((await fetch(`${base}/api/v1/session`, {
       headers: { Cookie: `${sessionCookie}; unrelated=must-not-pass` },
     })).status, 200);
-    assert.equal((await fetch(`${base}/api/v1/me/upload-authorizations`, {
+    assert.equal((await fetch(`${base}/api/v1/me/device-pairings`, {
       method: "POST",
       headers: {
         Origin: base,
@@ -1360,32 +2108,22 @@ test("participant relay supports explicit loopback development with exact forwar
         Cookie: `${sessionCookie}; unrelated=must-not-pass`,
         "X-Usage-Monitor-CSRF": "csrf_token",
       },
-      body: '{"envelopeDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentLengthBytes":100,"contentType":"application/json"}',
+      body: "{}",
     })).status, 200);
-    const uploadAuthorization =
-      "Upload um_upload_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    assert.equal((await fetch(`${base}/api/v1/contributions`, {
-      method: "POST",
-      headers: {
-        Origin: base,
-        "Content-Type": "application/json",
-        Authorization: uploadAuthorization,
-      },
-      body: '{"schemaVersion":"telemetry-envelope-v0.1"}',
-    })).status, 200);
-    assert.equal((await fetch(`${base}/api/v1/me`, {
+    const retiredDeletion = await fetch(`${base}/api/v1/me`, {
       method: "DELETE",
       headers: {
         Origin: base,
         Cookie: sessionCookie,
         "X-Usage-Monitor-CSRF": "csrf_token",
       },
-    })).status, 200);
-    const exported = await fetch(`${base}/api/v1/me/export`, {
-      headers: { Cookie: sessionCookie },
     });
-    assert.equal(exported.status, 200);
-    assert.equal((await exported.arrayBuffer()).byteLength > 4 * 1024 * 1024, true);
+    assert.equal(retiredDeletion.status, 404);
+    assert.deepEqual(await retiredDeletion.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "not_found" },
+    });
+    assert.equal(forwarded.length, 3);
     // Hosted sign-in crosses this relay as a start and a polled result only.
     // Neither carries a code, a verifier, or a redirect: the contribution
     // service owns all three.
@@ -1423,25 +2161,20 @@ test("participant relay supports explicit loopback development with exact forwar
     });
     assert.equal(forwarded[2].headers.Cookie, sessionCookie);
     assert.equal(forwarded[2].headers["X-Usage-Monitor-CSRF"], "csrf_token");
-    assert.equal(forwarded[2].body.includes("envelopeDigest"), true);
-    assert.equal(forwarded[3].headers.Authorization, uploadAuthorization);
-    assert.equal(Object.hasOwn(forwarded[3].headers, "Cookie"), false);
-    assert.equal(forwarded[4].method, "DELETE");
-    assert.equal(forwarded[4].body, null);
-    assert.equal(forwarded[5].url, "http://127.0.0.1:8792/api/v1/me/export");
+    assert.equal(forwarded[2].body, "{}");
     assert.equal(
-      forwarded[6].url,
+      forwarded[3].url,
       "http://127.0.0.1:8792/api/v1/identity/google/start",
     );
-    assert.equal(Object.hasOwn(forwarded[6].headers, "Cookie"), false);
-    assert.equal(forwarded[6].body, "{}");
+    assert.equal(Object.hasOwn(forwarded[3].headers, "Cookie"), false);
+    assert.equal(forwarded[3].body, "{}");
     assert.equal(
-      forwarded[7].url,
+      forwarded[4].url,
       "http://127.0.0.1:8792/api/v1/identity/google/result",
     );
-    assert.equal(Object.hasOwn(forwarded[7].headers, "Cookie"), false);
-    assert.equal(forwarded[7].body.includes("SSSS"), true);
-    assert.equal(forwarded.length, 8);
+    assert.equal(Object.hasOwn(forwarded[4].headers, "Cookie"), false);
+    assert.equal(forwarded[4].body.includes("SSSS"), true);
+    assert.equal(forwarded.length, 5);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -1502,13 +2235,13 @@ test("participant relay accepts one pinned production HTTPS origin without forwa
     assert.equal(enrolled.status, 201);
     assert.equal(enrolled.headers.get("set-cookie"), validSetCookie);
 
-    const stats = await fetch(`${base}/api/v1/me/stats`, {
+    const session = await fetch(`${base}/api/v1/session`, {
       headers: {
         Cookie: `${sessionCookie}; ambient=must-not-pass`,
         "X-Ambient-Authority": "must-not-pass",
       },
     });
-    assert.equal(stats.status, 200);
+    assert.equal(session.status, 200);
     assert.deepEqual(forwarded, [
       {
         url: `${centralOrigin}/api/v1/enroll`,
@@ -1522,7 +2255,7 @@ test("participant relay accepts one pinned production HTTPS origin without forwa
         redirect: "error",
       },
       {
-        url: `${centralOrigin}/api/v1/me/stats`,
+        url: `${centralOrigin}/api/v1/session`,
         method: "GET",
         headers: {
           Accept: "application/json",
@@ -1572,14 +2305,28 @@ test("participant relay blocks unknown authority routes and fails closed", async
     const base = `http://127.0.0.1:${app.port}`;
     for (const path of [
       "/api/v1/admin",
+      "/api/v1/admin/action",
       "/api/v1/device-pairings/claim",
       "/api/v1/device/upload-authorizations",
       "/api/v1/contributions/contribution:00000000-0000-4000-8000-000000000000",
+      "/api/v1/me/stats",
     ]) {
       assert.equal((await fetch(`${base}${path}`)).status, 404);
     }
+    for (const method of ["GET", "POST", "DELETE", "PUT", "PATCH"]) {
+      const retired = await fetch(`${base}/api/v1/me`, {
+        method,
+        // Even malformed ambient authority is not parsed for an unknown route.
+        headers: { Cookie: "invalid", "X-Usage-Monitor-CSRF": "invalid cookie" },
+      });
+      assert.equal(retired.status, 404, method);
+      assert.deepEqual(await retired.json(), {
+        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+        error: { code: "not_found" },
+      });
+    }
     assert.equal(forwarded, 0);
-    assert.equal((await fetch(`${base}/api/v1/me/stats`, {
+    assert.equal((await fetch(`${base}/api/v1/session`, {
       method: "POST",
       headers: { Origin: base, "Content-Type": "application/json" },
       body: "{}",
@@ -1594,7 +2341,7 @@ test("participant relay blocks unknown authority routes and fails closed", async
       body: "{}",
     })).status, 403);
     assert.equal(forwarded, 0);
-    assert.equal((await fetch(`${base}/api/v1/me/stats`, {
+    assert.equal((await fetch(`${base}/api/v1/session`, {
       headers: { Authorization: "Bearer must-not-pass" },
     })).status, 400);
     assert.equal(forwarded, 0);
@@ -1745,7 +2492,336 @@ test("server rejects forged hosts and requires same-origin refresh authorization
   }
 });
 
-test("server exposes an authorized bounded refresh cancellation", async () => {
+test("desktop status route projects refresh lifecycle without dashboard payloads", async () => {
+  const files = await fixture();
+  const now = Date.parse("2026-08-25T12:00:00.000Z");
+  const notificationEvidence = {
+    schemaVersion: "tibotattle-notification-evidence-v2",
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt: new Date(now).toISOString(),
+    continuityKey: "a".repeat(43),
+    windows: [{
+      lane: "primary",
+      usedPercent: 26,
+      durationMinutes: 300,
+      resetAt: "2026-08-25T15:00:00.000Z",
+      resetProofKind: "provider_reported_schedule_only",
+    }],
+  };
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => {
+      await refreshGate;
+      return {
+        notificationEvidence,
+        privatePath: "/Users/private",
+      };
+    },
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+
+    const analyzing = await fetch(`${base}/api/local/desktop-status`);
+    assert.equal(analyzing.status, 200);
+    assert.deepEqual(await analyzing.json(), {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "analyzing",
+      allowance: null,
+      notificationEvidence: null,
+    });
+
+    releaseRefresh();
+    await waitFor(async () => {
+      const response = await fetch(`${base}/api/local/refresh`);
+      return (await response.json()).refresh.status === "succeeded";
+    });
+    const completed = await fetch(`${base}/api/local/refresh`)
+      .then((response) => response.json());
+    assert.deepEqual(completed.refresh.result?.notificationEvidence, notificationEvidence);
+    const fresh = await fetch(`${base}/api/local/desktop-status`);
+    assert.equal(fresh.status, 200);
+    const freshPayload = await fresh.json();
+    assert.deepEqual(freshPayload, {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "fresh",
+      allowance: {
+        source: "direct",
+        window: "five_hour",
+        remainingPercent: 74,
+      },
+      notificationEvidence,
+    });
+    assert.equal(JSON.stringify(freshPayload).includes("rollout"), false);
+    assert.equal(JSON.stringify(freshPayload).includes("/Users/private"), false);
+    assert.equal((await fetch(`${base}/api/local/desktop-status`, {
+      method: "POST",
+    })).status, 405);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("desktop status route serves cached current overview evidence without a completed refresh or notification evidence", async () => {
+  const files = await fixture();
+  const now = Date.parse("2026-09-05T12:00:00.000Z");
+  const store = fakeStore();
+  let overviewReads = 0;
+  let displayReads = 0;
+  store.getOverview = () => {
+    overviewReads += 1;
+    throw new Error("desktop status must not clone the full overview");
+  };
+  store.getDesktopShellDisplayEvidence = () => {
+    displayReads += 1;
+    return Object.freeze({
+      evidenceStatus: "available",
+      freshness: Object.freeze({ status: "live", staleAfterSeconds: 1_800 }),
+      windows: Object.freeze([Object.freeze({
+        durationMinutes: 10_080,
+        slot: "primary",
+        usedPercent: 100,
+        remainingPercent: 0,
+        observedAt: "2026-09-05T11:59:00.000Z",
+        resetAt: "2026-09-05T15:00:00.000Z",
+      })]),
+    });
+  };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: async () => ({}),
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    await app.snapshotReady;
+    const response = await fetch(
+      `http://127.0.0.1:${app.port}/api/local/desktop-status`,
+    );
+    assert.equal(response.status, 200);
+    const status = await response.json();
+    assert.deepEqual(status, {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "fresh",
+      allowance: {
+        source: "direct",
+        window: "seven_day",
+        remainingPercent: 0,
+      },
+      notificationEvidence: null,
+      displayEvidence: {
+        schemaVersion: "tibotattle-display-evidence-v1", scopeKey: null, staleAfterSeconds: 1800,
+        windows: [{ durationMinutes: 10080, remainingPercent: 0,
+          observedAt: "2026-09-05T11:59:00.000Z", resetAt: "2026-09-05T15:00:00.000Z" }],
+      },
+    });
+    assert.equal(displayReads, 1);
+    assert.equal(overviewReads, 0);
+    assert.equal(JSON.stringify(status).includes("continuity"), false);
+    assert.equal(JSON.stringify(status).includes("openai_codex"), false);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("loopback quick refresh is separately authorized and selects the quick controller mode", async () => {
+  const files = await fixture();
+  const store = fakeStore();
+  const modes = [];
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: async ({ mode }) => {
+      modes.push(mode);
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        quotaRefresh: {
+          attempted: true,
+          recordWritten: false,
+          errorCode: null,
+        },
+      };
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const unauthorized = await fetch(`${base}/api/local/refresh/quick`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(unauthorized.status, 403);
+
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh/quick`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ reason: "user_request" }),
+    });
+    assert.equal(started.status, 202);
+    await waitFor(async () => {
+      const status = await fetch(`${base}/api/local/refresh`)
+        .then((response) => response.json());
+      return status.refresh.status === "succeeded";
+    });
+    assert.deepEqual(modes, ["quick"]);
+    assert.equal(store.reloads, 1);
+    assert.equal(
+      (await fetch(`${base}/api/local/refresh/quick`)).status,
+      405,
+    );
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("loopback refresh publishes a rollout quarantine as degraded verified coverage", async () => {
+  const files = await fixture();
+  const generation = {
+    id: 9,
+    fingerprint: "d".repeat(64),
+    status: "partial",
+    blockReason: "codex_rollout_sources_quarantined",
+    discoveredSourceCount: 3,
+    discoveredSourceBytes: 3_000,
+    indexedSourceCount: 1,
+    indexedSourceBytes: 1_000,
+    skippedSourceCount: 2,
+    skippedSourceBytes: 2_000,
+    skippedThreadCount: 1,
+    issueCounts: {
+      codex_rollout_generation_ambiguous: {
+        threadCount: 1,
+        sourceCount: 2,
+        sourceBytes: 2_000,
+      },
+    },
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({
+      unifiedIndex: {
+        status: "ingested",
+        generation,
+      },
+    }),
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+    await waitFor(async () => {
+      const payload = await fetch(`${base}/api/local/refresh`)
+        .then((response) => response.json());
+      return payload.refresh.status === "degraded";
+    });
+    const payload = await fetch(`${base}/api/local/refresh`)
+      .then((response) => response.json());
+    assert.equal(payload.refresh.status, "degraded");
+    assert.equal(payload.refresh.errorCode, "refresh_degraded");
+    assert.equal(payload.refresh.failedStep, "unified_index");
+    assert.equal(
+      payload.refresh.failureCode,
+      "codex_rollout_generation_ambiguous",
+    );
+    assert.deepEqual(payload.refresh.result.unifiedIndex.generation, {
+      id: 9,
+      fingerprint: "d".repeat(64),
+      status: "partial",
+      blockReason: "codex_rollout_sources_quarantined",
+      schemaVersion: null,
+      parserVersion: null,
+      contractVersion: null,
+      coveredAt: { startAt: null, endAt: null },
+      sourceCount: 1,
+      sourceBytes: 1_000,
+      discoveredSourceCount: 3,
+      discoveredSourceBytes: 3_000,
+      indexedSourceCount: 1,
+      indexedSourceBytes: 1_000,
+      skippedSourceCount: 2,
+      skippedSourceBytes: 2_000,
+      skippedThreadCount: 1,
+      reasonCounts: {
+        codex_rollout_generation_ambiguous: 1,
+      },
+      usageEvents: 0,
+      quotaOccurrences: 0,
+      toolFacts: 0,
+      toolFactFingerprint: null,
+      discoveryComplete: true,
+      diagnosticsComplete: true,
+      usageProvenanceComplete: true,
+      sourceOrderComplete: true,
+      quotaProvenanceComplete: true,
+      toolProvenanceComplete: true,
+    });
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("server exposes an authorized cancellation without reloading deep state", async () => {
   const files = await fixture();
   const store = fakeStore();
   let observedAbort = false;
@@ -1836,7 +2912,7 @@ test("server exposes an authorized bounded refresh cancellation", async () => {
     assert.equal(observedAbort, true);
     assert.equal(status.refresh.errorCode, "refresh_cancelled");
     assert.equal(status.refresh.progress.status, "bounded_pause");
-    assert.equal(store.reloads, 1);
+    assert.equal(store.reloads, 0);
 
     const duplicateCancel = await fetch(`${base}/api/local/refresh/cancel`, {
       method: "POST",
@@ -1854,7 +2930,124 @@ test("server exposes an authorized bounded refresh cancellation", async () => {
   }
 });
 
-test("contribution preview returns counts and accounting only", async () => {
+test("Darwin loopback stays responsive and cancels a real off-main cold ingest without publication", {
+  skip: process.platform !== "darwin",
+  timeout: 15_000,
+}, async () => {
+  const files = await fixture();
+  const store = fakeStore();
+  const progressReached = deferred();
+  const releaseProgress = deferred();
+  const indexFile = join(files.stateRoot, "local-unified-index-v1.sqlite");
+  const secretFile = join(
+    files.stateRoot,
+    "local-unified-index-device-salt-v1",
+  );
+  const sessions = join(files.codexHome, "sessions", "2026", "08", "24");
+  const rolloutFile = join(
+    sessions,
+    "rollout-2026-08-24T00-00-00-11111111-1111-4111-8111-111111111111.jsonl",
+  );
+  let heldProgress = false;
+  let app;
+  try {
+    await mkdir(sessions, { recursive: true, mode: 0o700 });
+    await writeFile(rolloutFile, unifiedIndexRolloutFixture(), { mode: 0o600 });
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: store,
+      refreshRunner: ({ signal, onProgress }) => (
+        ingestLocalUnifiedIndexOffMain({
+          codexHome: files.codexHome,
+          indexFile,
+          secretFile,
+          contractVersion: TELEMETRY_SCHEMA_VERSION,
+          signal,
+          onProgress: async (progress) => {
+            await onProgress(progress);
+            if (heldProgress) return;
+            heldProgress = true;
+            progressReached.resolve();
+            await releaseProgress.promise;
+          },
+        })
+      ),
+      port: 0,
+    });
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    const authorizedHeaders = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+    await progressReached.promise;
+    await waitFor(async () => (await readdir(files.stateRoot))
+      .some((name) => name.startsWith(
+        "local-unified-index-v1.sqlite.building-",
+      )), 3_000);
+
+    const health = await fetch(`${base}/api/local/health`, {
+      signal: AbortSignal.timeout(1_000),
+    });
+    assert.equal(health.status, 200);
+    assert.equal((await health.json()).status, "ready");
+    const whileRunning = await fetch(`${base}/api/local/refresh`, {
+      signal: AbortSignal.timeout(1_000),
+    });
+    assert.equal(whileRunning.status, 200);
+    const runningPayload = await whileRunning.json();
+    assert.equal(runningPayload.refresh.status, "running");
+    assert.equal(runningPayload.refresh.progress.kind, "unified_index");
+    await assert.rejects(
+      lstat(indexFile),
+      (error) => error?.code === "ENOENT",
+    );
+
+    const cancelling = await fetch(`${base}/api/local/refresh/cancel`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(cancelling.status, 202);
+    assert.equal((await cancelling.json()).refresh.status, "cancelling");
+    await waitFor(async () => {
+      const payload = await fetch(`${base}/api/local/refresh`)
+        .then((response) => response.json());
+      return payload.refresh.status === "cancelled";
+    }, 5_000);
+    const terminal = await fetch(`${base}/api/local/refresh`)
+      .then((response) => response.json());
+    assert.equal(terminal.refresh.errorCode, "refresh_cancelled");
+    assert.equal(store.reloads, 0);
+    await assert.rejects(
+      lstat(indexFile),
+      (error) => error?.code === "ENOENT",
+    );
+    assert.deepEqual(
+      (await readdir(files.stateRoot)).filter((name) => (
+        name.startsWith("local-unified-index-v1.sqlite.building-")
+        || name.startsWith("local-unified-index-v1.sqlite.incremental-")
+      )),
+      [],
+    );
+  } finally {
+    releaseProgress.resolve();
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("retired contribution preview is absent for every method", async () => {
   const files = await fixture();
   const app = await startLocalCompanionServer({
     resourceRoot: files.resourceRoot,
@@ -1863,36 +3056,32 @@ test("contribution preview returns counts and accounting only", async () => {
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
-    contributionPreviewProvider: async () => ({
-      status: "available",
-      coveredAt: {
-        startAt: "2026-07-24T00:00:00.000Z",
-        endAt: "2026-07-25T00:00:00.000Z",
-      },
-      counts: { usageEvents: 20, quotaSnapshots: 4, activityMarkers: 2 },
-      accounting: {
-        basis: "api_price_equivalent_not_subscription_allowance",
-        fullyPricedEvents: 18,
-        partiallyPricedEvents: 1,
-        unpricedEvents: 1,
-      },
-      usageEvents: [{ content: "private prompt" }],
-      accountId: "private-account",
-    }),
     port: 0,
   });
   try {
-    const response = await fetch(`http://127.0.0.1:${app.port}/api/local/contribution/preview`);
-    assert.equal(response.status, 200);
-    const value = await response.json();
-    assert.equal(value.schemaVersion, "telemetry-contribution-v0.1");
-    assert.equal(value.counts.usageEvents, 20);
-    assert.equal(value.includesFullRows, false);
-    assert.equal(value.remoteSendEnabled, false);
-    const serialized = JSON.stringify(value);
-    assert.equal(serialized.includes("private prompt"), false);
-    assert.equal(serialized.includes("private-account"), false);
-    assert.equal(Object.hasOwn(value, "usageEvents"), false);
+    const base = `http://127.0.0.1:${app.port}`;
+    for (const method of ["GET", "POST"]) {
+      const response = await fetch(
+        `${base}/api/local/contribution/preview`,
+        {
+          method,
+          ...(method === "POST"
+            ? {
+              headers: { "Content-Type": "application/json" },
+              body: "{}",
+            }
+            : {}),
+        },
+      );
+      assert.equal(response.status, 404, method);
+      assert.equal((await response.json()).error.code, "not_found", method);
+    }
+    const health = await fetch(`${base}/api/local/health`)
+      .then((response) => response.json());
+    assert.equal(
+      Object.hasOwn(health.capabilities, "contributionPreview"),
+      false,
+    );
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -2409,6 +3598,13 @@ test("contribution preparation failures expose only fixed safe projections", asy
         error.privatePath = privateCanary;
         throw error;
       }
+      if (mode === "identity_migration_required") {
+        const error = new LocalContributionPreparationError(
+          "identity_migration_required",
+        );
+        error.privatePath = privateCanary;
+        throw error;
+      }
       return {
         schemaVersion: "local-contribution-preparation-result-v0.1",
         status: "prepared",
@@ -2468,6 +3664,13 @@ test("contribution preparation failures expose only fixed safe projections", asy
       includesIdentifiers: false,
       includesCredentials: false,
     });
+
+    mode = "identity_migration_required";
+    const migrationRequired = await request();
+    assert.equal(migrationRequired.status, 503);
+    const migrationBody = await migrationRequired.json();
+    assert.equal(migrationBody.errorCode, "identity_migration_required");
+    assert.equal(JSON.stringify(migrationBody).includes(privateCanary), false);
 
     mode = "invalid_result";
     const invalidResult = await request();
@@ -2656,7 +3859,7 @@ test("contribution sync status exposes bounded queue counts only", async () => {
   }
 });
 
-test("next inspection and foreground actions use fixed same-origin routes", async () => {
+test("next inspection, exact review, and device pairing use fixed same-origin routes", async () => {
   const files = await fixture();
   const privateCanary = "/Users/private/prepared/telemetry-secret.json";
   const queueStatus = (paused = false) => ({
@@ -2675,14 +3878,10 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
   });
   let previewCalls = 0;
   let previewValid = true;
-  let runCalls = 0;
+  let reviewCalls = 0;
   let pausedState = false;
   let pairedCode = null;
-  let releaseRun;
   const reviewedPayload = exactReviewContribution();
-  const runGate = new Promise((resolve) => {
-    releaseRun = resolve;
-  });
   const app = await startLocalCompanionServer({
     resourceRoot: files.resourceRoot,
     stateRoot: files.stateRoot,
@@ -2740,39 +3939,23 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
         },
       };
     },
-    contributionSyncExactReviewProvider: async () => ({
-      schemaVersion: "contribution-sync-exact-review-v0.1",
-      state: "ready",
-      networkActivity: false,
-      discoveredSets: 1,
-      enqueued: 0,
-      payloadBytes: Buffer.byteLength(JSON.stringify(reviewedPayload), "utf8"),
-      payload: reviewedPayload,
-      reviewBinding: {
-        jobId: REVIEW_JOB_ID,
-        contributionSha256: REVIEW_SHA256,
-      },
-    }),
-    contributionSyncOnceRunner: async ({ signal, reviewedJob }) => {
-      runCalls += 1;
-      assert.equal(signal instanceof AbortSignal, true);
-      assert.deepEqual(reviewedJob, {
-        jobId: REVIEW_JOB_ID,
-        contributionSha256: REVIEW_SHA256,
-      });
-      await runGate;
+    contributionSyncExactReviewProvider: async () => {
+      reviewCalls += 1;
       return {
-        status: "completed",
+        schemaVersion: "contribution-sync-exact-review-v0.1",
+        state: "ready",
+        networkActivity: false,
         discoveredSets: 1,
         enqueued: 0,
-        processed: 1,
-        accepted: 1,
-        retryable: 0,
-        rejected: 0,
-        reservedUploadBytes: 16_384,
-        bandwidthLimited: false,
-        queue: queueStatus(false),
-        privatePath: privateCanary,
+        payloadBytes: Buffer.byteLength(
+          JSON.stringify(reviewedPayload),
+          "utf8",
+        ),
+        payload: reviewedPayload,
+        reviewBinding: {
+          jobId: REVIEW_JOB_ID,
+          contributionSha256: REVIEW_SHA256,
+        },
       };
     },
     contributionSyncPauseSetter: async ({ paused }) => {
@@ -2786,8 +3969,12 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     const health = await fetch(`${base}/api/local/health`)
       .then((response) => response.json());
     assert.equal(health.capabilities.contributionSyncNext, true);
-    assert.equal(health.capabilities.contributionSyncActions, true);
+    assert.equal(health.capabilities.contributionSyncExactReview, true);
     assert.equal(health.capabilities.contributionDevicePairing, true);
+    assert.equal(
+      Object.hasOwn(health.capabilities, "contributionSyncActions"),
+      false,
+    );
 
     const headers = {
       "Content-Type": "application/json",
@@ -2804,11 +3991,20 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     );
     assert.equal(unauthorizedPreview.status, 403);
     assert.equal(previewCalls, 0);
+
+    const unauthorizedReview = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      },
+    );
+    assert.equal(unauthorizedReview.status, 403);
+    assert.equal(reviewCalls, 0);
+
     const pairingCode =
       "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    // Pause the queue the way a device_unavailable sync outcome would. A
-    // refused pairing must leave it paused; a successful pairing is the cure
-    // and must resume it without a separate dashboard action.
     pausedState = true;
     const unauthorizedPairing = await fetch(
       `${base}/api/local/contribution/device-pair`,
@@ -2841,90 +4037,49 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     });
     assert.equal(JSON.stringify(paired).includes("00000000"), false);
     assert.equal(JSON.stringify(paired).includes("private.example"), false);
+
     const inspected = await fetch(
       `${base}/api/local/contribution/sync-next`,
       { method: "POST", headers, body: "{}" },
     ).then((response) => response.json());
     assert.equal(previewCalls, 1);
-    assert.equal(runCalls, 0);
     assert.equal(inspected.status, "available");
-    assert.equal(inspected.deliveryConfigured, true);
+    assert.equal(inspected.deliveryConfigured, false);
     assert.equal(inspected.item.recordCounts.total, 3);
     assert.equal(inspected.networkActivity, false);
     assert.equal(JSON.stringify(inspected).includes(privateCanary), false);
+
     previewValid = false;
     const invalidPreview = await fetch(
       `${base}/api/local/contribution/sync-next`,
       { method: "POST", headers, body: "{}" },
     ).then((response) => response.json());
     assert.equal(invalidPreview.status, "unavailable");
-    previewValid = true;
 
-    const unauthorized = await fetch(
-      `${base}/api/local/contribution/sync-once`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      },
-    );
-    assert.equal(unauthorized.status, 403);
-    assert.equal(runCalls, 0);
-
-    const missingReview = await fetch(
-      `${base}/api/local/contribution/sync-once`,
-      { method: "POST", headers, body: "{}" },
-    );
-    assert.equal(missingReview.status, 400);
-    assert.equal(runCalls, 0);
     const review = await fetch(
       `${base}/api/local/contribution/sync-inspect-exact`,
       { method: "POST", headers, body: "{}" },
     ).then((response) => response.json());
+    assert.equal(reviewCalls, 1);
+    assert.equal(review.status, "available");
+    assert.equal(review.state, "ready");
+    assert.equal(review.networkActivity, false);
+    assert.equal(review.includesExactRetainedFields, true);
+    assert.deepEqual(review.payload, reviewedPayload);
     assert.match(review.reviewToken, /^[A-Za-z0-9_-]{43}$/u);
-    const firstRun = fetch(`${base}/api/local/contribution/sync-once`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ reviewToken: review.reviewToken }),
-    });
-    await waitFor(() => runCalls === 1);
-    const overlapReview = await fetch(
-      `${base}/api/local/contribution/sync-inspect-exact`,
-      { method: "POST", headers, body: "{}" },
-    ).then((response) => response.json());
-    const overlap = await fetch(
-      `${base}/api/local/contribution/sync-once`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ reviewToken: overlapReview.reviewToken }),
-      },
-    );
-    assert.equal(overlap.status, 409);
-    releaseRun();
-    const runResponse = await firstRun;
-    assert.equal(runResponse.status, 200);
-    const runResult = await runResponse.json();
-    assert.equal(runResult.accepted, 1);
-    assert.equal(runResult.reservedUploadBytes, 16_384);
-    assert.equal(JSON.stringify(runResult).includes(privateCanary), false);
 
-    const paused = await fetch(
-      `${base}/api/local/contribution/sync-pause`,
-      { method: "POST", headers, body: "{}" },
-    ).then((response) => response.json());
-    assert.equal(paused.paused, true);
-    const resumed = await fetch(
-      `${base}/api/local/contribution/sync-resume`,
-      { method: "POST", headers, body: "{}" },
-    ).then((response) => response.json());
-    assert.equal(resumed.paused, false);
-    assert.equal(
-      (await fetch(`${base}/api/local/contribution/sync-next`, {
-        method: "GET",
-      })).status,
-      405,
-    );
+    for (const path of [
+      "/api/local/contribution/sync-next",
+      "/api/local/contribution/sync-inspect-exact",
+    ]) {
+      const response = await fetch(`${base}${path}`);
+      assert.equal(response.status, 405, path);
+      assert.equal(
+        (await response.json()).error.code,
+        "method_not_allowed",
+        path,
+      );
+    }
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -3173,7 +4328,81 @@ for (const { label, thrown, routeCode } of [
   });
 }
 
-test("optional HTTPS central proxy exposes public reads without leaking authority headers", async () => {
+test("a declined legacy Keychain migration is preserved and never routed to reset", async () => {
+  const files = await fixture();
+  const privateCanary = "DO-NOT-LEAK-keychain-migration-declined";
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionDevicePairingProvider: async () => {
+      const error = new Error(privateCanary);
+      error.code = "contribution_device_credential_migration_required";
+      throw error;
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const pairingCode =
+      "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const client = new LocalCompanionClient({
+      fetchImpl: (url, options = {}) => fetch(`${base}${url}`, {
+        ...options,
+        headers: { ...options.headers, Origin: base },
+      }),
+    });
+    await assert.rejects(
+      client.pairContributionDevice(pairingCode),
+      (error) => error?.status === 409
+        && error?.code === "contribution_device_keychain_migration_required",
+    );
+
+    const response = await fetch(
+      `${base}/api/local/contribution/device-pair`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: JSON.stringify({ pairingCode }),
+      },
+    );
+    assert.equal(response.status, 409);
+    const body = await response.text();
+    assert.deepEqual(JSON.parse(body), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "contribution_device_keychain_migration_required" },
+    });
+    assert.equal(body.includes(privateCanary), false);
+
+    const appSource = await readFile(
+      new URL("../web/public/app.js", import.meta.url),
+      "utf8",
+    );
+    const recoveryClassifier = appSource.match(
+      /function contributionDeviceRecoveryIsRequired\(error\) \{([\s\S]*?)\n\}/u,
+    )?.[1] ?? "";
+    assert.doesNotMatch(
+      recoveryClassifier,
+      /contribution_device_keychain_migration_required/u,
+    );
+    assert.match(
+      appSource,
+      /contribution_device_keychain_migration_required:[\s\S]{0,500}Settings… → General[\s\S]{0,500}Review migration… under Secure upgrade[\s\S]{0,500}Do not reset or delete the credential/u,
+    );
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("optional HTTPS central proxy exposes health only without leaking authority headers", async () => {
   const files = await fixture();
   const forwarded = [];
   const app = await startLocalCompanionServer({
@@ -3191,24 +4420,11 @@ test("optional HTTPS central proxy exposes public reads without leaking authorit
         headers: { ...options.headers },
         body: options.body?.toString("utf8") ?? null,
       });
-      const readiness = url.endsWith("/api/ready");
-      return new Response(JSON.stringify(readiness ? {
-        status: "not_ready",
-        checks: {
-          lifecycle: "running",
-          lifecycleFresh: false,
-          quarantineRetentionComplete: false,
-          restoreReplayComplete: false,
-          aggregateRebuildComplete: false,
-          quarantineReconciliation: "running",
-          quarantineReconciliationComplete: false,
-        },
-        policy: { lifecycleStaleAfterMilliseconds: 3_600_000 },
-      } : {
+      return new Response(JSON.stringify({
         status: "ok",
         suppressed: true,
       }), {
-        status: readiness ? 503 : 200,
+        status: 200,
         headers: {
           "Content-Type": "application/json",
           "Idempotency-Replayed": "true",
@@ -3225,7 +4441,7 @@ test("optional HTTPS central proxy exposes public reads without leaking authorit
     assert.equal(health.capabilities.centralServiceProxy, true);
     assert.equal(health.capabilities.centralParticipantRelay, true);
 
-    const response = await fetch(`${base}/api/v1/stats/aggregate`, {
+    const response = await fetch(`${base}/api/health`, {
       headers: {
         Origin: base,
         Authorization: "Bearer must-not-pass",
@@ -3239,24 +4455,16 @@ test("optional HTTPS central proxy exposes public reads without leaking authorit
     assert.equal(response.headers.get("set-cookie"), null);
     assert.equal(forwarded.length, 1);
     assert.deepEqual(forwarded[0], {
-      url: "https://central.example/api/v1/stats/aggregate",
+      url: "https://central.example/api/health",
       method: "GET",
       headers: { Accept: "application/json" },
       body: null,
     });
-    const readiness = await fetch(`${base}/api/ready`);
-    assert.equal(readiness.status, 503);
-    assert.equal((await readiness.json()).status, "not_ready");
-    assert.deepEqual(forwarded[1], {
-      url: "https://central.example/api/ready",
-      method: "GET",
-      headers: { Accept: "application/json" },
-      body: null,
-    });
-
+    assert.equal((await fetch(`${base}/api/ready`)).status, 404);
+    assert.equal((await fetch(`${base}/api/v1/stats/aggregate`)).status, 404);
     assert.equal((await fetch(`${base}/api/v1/stats/aggregate?next=https://attacker.example`)).status, 400);
     assert.equal((await fetch(`${base}/api/v1/admin`)).status, 404);
-    assert.equal(forwarded.length, 2);
+    assert.equal(forwarded.length, 1);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -3294,6 +4502,7 @@ test("production root environment keeps writable queue state outside resources",
     assert.deepEqual(
       await readdir(join(files.stateRoot, "private")),
       [
+        "automatic-contribution-v0.1.json",
         "automatic-contribution-v0.1.lock",
         "contribution-sync-v0.1.sqlite3",
       ],
@@ -3815,6 +5024,8 @@ test("diagnostic notes are bounded, fixed-vocabulary, and land in a local log", 
     // masquerading as a code, or an extra member can never be logged.
     for (const invalid of [
       { ...note, surface: "arbitrary_journey" },
+      // Server-minted startup evidence is never a dashboard-selectable route.
+      { ...note, surface: "local_startup" },
       { ...note, reference: "TT-ILLEGAL" },
       { ...note, reference: "not-a-reference" },
       { ...note, code: "Failed reading /Users/private/state.json" },
@@ -4374,12 +5585,11 @@ test("disconnecting this Mac requires a local confirmation and returns no device
   }
 });
 
-test("disconnect serializes delivery-affecting mutations before remote revocation completes", async () => {
+test("disconnect serializes duplicate revocation while retired delivery routes stay absent", async () => {
   const files = await fixture();
   const disconnectStarted = deferred();
   const releaseDisconnect = deferred();
   let disconnectCalls = 0;
-  let syncCalls = 0;
   const app = await startLocalCompanionServer({
     resourceRoot: files.resourceRoot,
     stateRoot: files.stateRoot,
@@ -4398,23 +5608,6 @@ test("disconnect serializes delivery-affecting mutations before remote revocatio
         localBinding: "removed",
       };
     },
-    contributionSyncExactReviewProvider: async () => ({
-      schemaVersion: "contribution-sync-exact-review-v0.1",
-      state: "ready",
-      networkActivity: false,
-      discoveredSets: 1,
-      enqueued: 0,
-      payloadBytes: 16,
-      payload: exactReviewContribution(),
-      reviewBinding: {
-        jobId: REVIEW_JOB_ID,
-        contributionSha256: REVIEW_SHA256,
-      },
-    }),
-    contributionSyncOnceRunner: async () => {
-      syncCalls += 1;
-      throw new Error("sync must not start while disconnect is pending");
-    },
     port: 0,
   });
   try {
@@ -4424,10 +5617,6 @@ test("disconnect serializes delivery-affecting mutations before remote revocatio
       "X-Usage-Monitor-Local": "1",
       Origin: base,
     };
-    const review = await fetch(
-      `${base}/api/local/contribution/sync-inspect-exact`,
-      { method: "POST", headers, body: "{}" },
-    ).then((response) => response.json());
     const disconnect = fetch(
       `${base}/api/local/contribution/device-disconnect`,
       {
@@ -4438,20 +5627,19 @@ test("disconnect serializes delivery-affecting mutations before remote revocatio
     );
     await disconnectStarted.promise;
 
-    const blockedSync = await fetch(
+    const retiredSync = await fetch(
       `${base}/api/local/contribution/sync-once`,
       {
         method: "POST",
         headers,
-        body: JSON.stringify({ reviewToken: review.reviewToken }),
+        body: "{}",
       },
     );
-    assert.equal(blockedSync.status, 409);
-    assert.deepEqual(await blockedSync.json(), {
+    assert.equal(retiredSync.status, 404);
+    assert.deepEqual(await retiredSync.json(), {
       schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-      error: { code: "sync_in_progress" },
+      error: { code: "not_found" },
     });
-    assert.equal(syncCalls, 0);
 
     const duplicate = await fetch(
       `${base}/api/local/contribution/device-disconnect`,
@@ -4477,8 +5665,10 @@ test("disconnect serializes delivery-affecting mutations before remote revocatio
   }
 });
 
-test("a leftover device credential stops delivery with its own code, not a generic failure", async () => {
+test("device disconnect failures expose one fixed code without leaking details", async () => {
   const files = await fixture();
+  const privateCanary =
+    "DO-NOT-LEAK-device-disconnect-capability-conflict";
   const app = await startLocalCompanionServer({
     resourceRoot: files.resourceRoot,
     stateRoot: files.stateRoot,
@@ -4486,21 +5676,8 @@ test("a leftover device credential stops delivery with its own code, not a gener
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
-    contributionSyncExactReviewProvider: async () => ({
-      schemaVersion: "contribution-sync-exact-review-v0.1",
-      state: "ready",
-      networkActivity: false,
-      discoveredSets: 1,
-      enqueued: 0,
-      payloadBytes: 16,
-      payload: exactReviewContribution(),
-      reviewBinding: {
-        jobId: REVIEW_JOB_ID,
-        contributionSha256: REVIEW_SHA256,
-      },
-    }),
-    contributionSyncOnceRunner: async () => {
-      const error = new Error("contribution device capability failed");
+    contributionDeviceDisconnectRunner: async () => {
+      const error = new Error(privateCanary);
       error.code = "contribution_device_credential_conflict";
       throw error;
     },
@@ -4508,152 +5685,25 @@ test("a leftover device credential stops delivery with its own code, not a gener
   });
   try {
     const base = `http://127.0.0.1:${app.port}`;
-    const headers = {
-      "Content-Type": "application/json",
-      "X-Usage-Monitor-Local": "1",
-      Origin: base,
-    };
-    const review = await fetch(
-      `${base}/api/local/contribution/sync-inspect-exact`,
-      { method: "POST", headers, body: "{}" },
-    ).then((response) => response.json());
-    assert.equal(review.state, "ready");
-    const run = await fetch(`${base}/api/local/contribution/sync-once`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ reviewToken: review.reviewToken }),
-    });
-    // The cause is precisely known and has its own in-page repair, so it must
-    // not be flattened into the generic delivery failure.
-    assert.equal(run.status, 409);
-    assert.deepEqual(await run.json(), {
-      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-      error: { code: "contribution_device_recovery_required" },
-    });
-  } finally {
-    await app.close();
-    await rm(files.root, { recursive: true });
-  }
-});
-
-test("the Fast-mode preference is owner-only, fixed-valued, and rebuilds the accounting snapshot", async () => {
-  const files = await fixture();
-  const store = fakeStore();
-  const app = await startLocalCompanionServer({
-    resourceRoot: files.resourceRoot,
-    stateRoot: files.stateRoot,
-    codexHome: files.codexHome,
-    staticRoot: files.staticRoot,
-    dataStore: store,
-    refreshRunner: async () => ({}),
-    port: 0,
-  });
-  try {
-    const base = `http://127.0.0.1:${app.port}`;
-    const headers = {
-      "Content-Type": "application/json",
-      "X-Usage-Monitor-Local": "1",
-      Origin: base,
-    };
-
-    // Nothing stated yet: the Standard default is reported as a default, and
-    // the published rates travel with it so the page never restates them.
-    const initial = await fetch(
-      `${base}/api/local/accounting/fast-mode-preference`,
-    ).then((response) => response.json());
-    assert.equal(initial.schemaVersion, "fast-mode-preference-v0.1");
-    assert.equal(initial.mode, "standard");
-    assert.equal(initial.source, "default");
-    assert.equal(initial.appliesTo, "turns_with_no_observed_tier_only");
-    assert.equal(initial.logObservability.sessionBaselineRecorded, false);
-    assert.deepEqual(initial.availableModes, [
-      "standard",
-      "fast",
-      "mixed_unknown",
-    ]);
-    assert.deepEqual(initial.multipliers, {
-      "gpt-5.6": 2.5,
-      "gpt-5.5": 2.5,
-      "gpt-5.4": 2,
-    });
-
-    // Cross-origin or non-dashboard requests never reach the stored state.
-    const unauthorized = await fetch(
-      `${base}/api/local/accounting/fast-mode-preference`,
+    const failed = await fetch(
+      `${base}/api/local/contribution/device-disconnect`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "fast" }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: JSON.stringify({ confirm: "disconnect_this_mac" }),
       },
     );
-    assert.equal(unauthorized.status, 403);
-    assert.deepEqual(await unauthorized.json(), {
+    assert.equal(failed.status, 502);
+    const body = await failed.text();
+    assert.deepEqual(JSON.parse(body), {
       schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-      error: { code: "fast_mode_preference_not_authorized" },
+      error: { code: "contribution_device_disconnect_failed" },
     });
-
-    // Only the three fixed values are accepted, and only that exact key set.
-    for (const body of [
-      JSON.stringify({ mode: "turbo" }),
-      JSON.stringify({ mode: "fast", extra: 1 }),
-      "{}",
-    ]) {
-      const rejected = await fetch(
-        `${base}/api/local/accounting/fast-mode-preference`,
-        { method: "POST", headers, body },
-      );
-      assert.equal(rejected.status, 400);
-      assert.deepEqual(await rejected.json(), {
-        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-        error: { code: "invalid_request" },
-      });
-    }
-
-    const reloadsBefore = store.reloads;
-    const stated = await fetch(
-      `${base}/api/local/accounting/fast-mode-preference`,
-      { method: "POST", headers, body: JSON.stringify({ mode: "fast" }) },
-    );
-    assert.equal(stated.status, 200);
-    const storedProjection = await stated.json();
-    assert.equal(storedProjection.mode, "fast");
-    assert.equal(storedProjection.source, "stated");
-    // The accounting projection is derived from this statement, so the cached
-    // snapshot is rebuilt before the response is acknowledged.
-    assert.equal(store.reloads > reloadsBefore, true);
-
-    const persisted = await fetch(
-      `${base}/api/local/accounting/fast-mode-preference`,
-    ).then((response) => response.json());
-    assert.equal(persisted.mode, "fast");
-    assert.equal(persisted.source, "stated");
-
-    const settingsFile = join(
-      files.stateRoot,
-      "private",
-      "fast-mode-preference-v0.1.json",
-    );
-    const metadata = await lstat(settingsFile);
-    if (process.platform !== "win32") {
-      assert.equal(metadata.mode & 0o077, 0);
-    }
-    const document = JSON.parse(await readFile(settingsFile, "utf8"));
-    assert.deepEqual(Object.keys(document).sort(), [
-      "mode",
-      "recordedAt",
-      "schemaVersion",
-    ]);
-    // Content-free: a stated speed mode and when it was stated, nothing else.
-    assert.equal(JSON.stringify(document).includes(files.stateRoot), false);
-    assert.equal(JSON.stringify(document).includes(files.codexHome), false);
-
-    assert.equal(
-      (await fetch(`${base}/api/local/accounting/fast-mode-preference`, {
-        method: "DELETE",
-        headers,
-      })).status,
-      405,
-    );
+    assert.equal(body.includes(privateCanary), false);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

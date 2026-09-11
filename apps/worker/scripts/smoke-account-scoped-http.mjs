@@ -1,8 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   createTelemetryEnvelope,
   validateAccountScopedTelemetryContribution,
 } from "../../web/public/lib.js";
+import { assertRetiredDeletionHealth, createLocalOwnerEraser } from "./local-owner-erasure.mjs";
 
 function optionValue(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -15,7 +16,8 @@ function optionValue(name, fallback) {
 function loopbackOrigin(value) {
   const url = new URL(value);
   if (url.protocol !== "http:"
-      || !["127.0.0.1", "localhost"].includes(url.hostname)) {
+      || !["127.0.0.1", "localhost"].includes(url.hostname)
+      || url.username || url.password) {
     throw new Error("Account-scoped smoke accepts only a loopback HTTP origin.");
   }
   url.pathname = "/";
@@ -32,6 +34,9 @@ const HOUR_MS = 3_600_000;
 let cookie = "";
 let csrfToken = "";
 let participantId = "";
+let deviceAuthorization = "";
+let ownerEraser;
+let erasureSession;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -209,9 +214,10 @@ async function upload(payload, key) {
   });
   const serialized = JSON.stringify(envelope);
   const registration = expectStatus(
-    await request("/api/v1/me/upload-authorizations", {
+    await request("/api/v1/device/upload-authorizations", {
       method: "POST",
-      csrf: true,
+      includeCookie: false,
+      authorization: `Device ${deviceAuthorization}`,
       body: JSON.stringify({
         envelopeDigest: sha256(serialized),
         contentLengthBytes: Buffer.byteLength(serialized, "utf8"),
@@ -229,16 +235,54 @@ async function upload(payload, key) {
   });
 }
 
+async function claimDevice(pairing) {
+  if (typeof pairing?.pairingCode !== "string") {
+    throw new Error("Enrollment did not issue a device pairing authority.");
+  }
+  const deviceId = randomUUID();
+  const rawSecret = randomBytes(32);
+  const encodedSecret = rawSecret.toString("base64url");
+  let deviceSecretHash;
+  try {
+    deviceSecretHash = createHash("sha256")
+      .update("app-usagemonitor/device/v1\0")
+      .update(deviceId)
+      .update("\0")
+      .update(rawSecret)
+      .digest("hex");
+  } finally {
+    rawSecret.fill(0);
+  }
+  expectStatus(
+    await request("/api/v1/device-pairings/claim", {
+      method: "POST",
+      includeCookie: false,
+      authorization: `Pairing ${pairing.pairingCode}`,
+      body: JSON.stringify({ deviceId, deviceSecretHash }),
+    }),
+    201,
+    "Device pairing claim",
+  );
+  return `um_device_${deviceId}.${encodedSecret}`;
+}
+
 async function cleanup() {
-  if (!cookie || !csrfToken) return;
-  await request("/api/v1/me", {
-    method: "DELETE",
-    csrf: true,
-  }).catch(() => {});
+  if (!erasureSession || erasureSession.deleted) return;
+  try {
+    await ownerEraser.eraseParticipant(erasureSession, { retry: true });
+  } catch {
+    process.stderr.write("Account-scoped smoke owner cleanup was incomplete; inspect the isolated local backend state.\n");
+    process.exitCode = 1;
+  }
 }
 
 try {
+  ownerEraser = await createLocalOwnerEraser({
+    origin: origin.origin,
+    ownerAccessFile: optionValue("--owner-access-file"),
+  });
   const health = expectStatus(await request("/api/health"), 200, "Health");
+  assertRetiredDeletionHealth(health);
   if (health?.contracts?.accountScopedContribution?.status
       !== "local_preview_loopback_only"
       || health?.contracts?.accountScopedContribution
@@ -252,6 +296,7 @@ try {
       body: JSON.stringify({
         consentVersion: "privacy-safe-telemetry-v0.2",
         syntheticOnly: false,
+        deviceBootstrap: true,
       }),
     }),
     201,
@@ -262,6 +307,9 @@ try {
   if (!/^participant:/u.test(participantId) || !cookie || !csrfToken) {
     throw new Error("Enrollment did not establish the anonymous session contract.");
   }
+  erasureSession = { participantId, cookie, csrfToken, deleted: false };
+  ownerEraser.trackParticipant(erasureSession);
+  deviceAuthorization = await claimDevice(enrollment.pairing);
   const accountTrackId = `account-track:v1:${sha256(
     `usage-monitor/local-preview-smoke/v1\0${participantId}\0openai_codex`,
   )}`;
@@ -284,19 +332,6 @@ try {
     contributionIds.push(receipt.contributionId);
   }
 
-  const statsResult = await request("/api/v1/me/insights");
-  const stats = expectStatus(statsResult, 200, "Private insights");
-  const track = stats?.accountScopedQuotaAnalysis?.tracks?.[0];
-  if (stats?.totals?.usageEvents !== 36
-      || stats?.totals?.quotaSnapshots !== 40
-      || stats?.totals?.priceVerification !== "server_repriced"
-      || stats?.totals?.apiPriceEquivalentUsd === "35964"
-      || stats?.accountScopedQuotaAnalysis?.status !== "ready"
-      || track?.calibration?.tracks?.[0]?.estimatedResetCount !== 4
-      || track?.rolling?.status !== "conditional_comparison") {
-    throw new Error("Private account-scoped calibration did not recompute correctly.");
-  }
-
   const exportedResult = await request("/api/v1/me/export");
   const exported = expectStatus(exportedResult, 200, "Participant export");
   if (exported?.contributions?.length !== 4
@@ -305,7 +340,7 @@ try {
     throw new Error("Participant export was incomplete or exposed an authority.");
   }
 
-  const communityResult = await request("/api/v1/community/insights");
+  const communityResult = await request("/api/v1/community/daily");
   expectStatus(communityResult, 200, "Community output");
   if (communityResult.text.includes("accountTrackId")
       || communityResult.text.includes(accountTrackId)
@@ -313,31 +348,23 @@ try {
     throw new Error("Community output exposed participant-scoped fields.");
   }
 
-  const deletion = expectStatus(
-    await request("/api/v1/me", {
-      method: "DELETE",
-      csrf: true,
-    }),
-    200,
-    "Participant deletion",
-  );
+  await ownerEraser.verifyParticipantRefusal(erasureSession);
+  await ownerEraser.eraseParticipant(erasureSession, { expectedContributions: 4 });
   cookie = "";
   csrfToken = "";
-  if (deletion.contributionsDeleted !== 4) {
-    throw new Error("Participant deletion did not cover every contribution.");
-  }
   process.stdout.write(`${JSON.stringify({
-    schemaVersion: "account-scoped-http-smoke-receipt-v0.1",
+    schemaVersion: "account-scoped-http-smoke-receipt-v0.2",
     status: "passed",
     contributions: 4,
     usageEvents: 36,
     quotaSnapshots: 40,
-    qualifiedResetEstimates: 4,
-    rollingComparisonStatus: "conditional_comparison",
     serverRepriced: true,
     participantExportVerified: true,
     communityFieldExclusionVerified: true,
-    participantDeleted: true,
+    selfServiceDeletionRefused: true,
+    participantStateUnchangedAfterRefusal: true,
+    ownerAuthAndCsrfRequired: true,
+    participantErasedByOwner: true,
     externalParticipantsAuthorized: false,
   }, null, 2)}\n`);
 } finally {

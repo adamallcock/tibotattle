@@ -1,10 +1,13 @@
+import { createWorkUsageService } from "../../src/application/index.js";
+import { enrichWorkUsageRows } from "../../src/local-work-usage-source.js";
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { lstat, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   LOCAL_COMPANION_REPORT_FILES,
   LOCAL_COMPANION_SCHEMA_VERSION,
@@ -21,27 +24,56 @@ import {
   refreshLocalArchiveAccountingIndex,
 } from "../../src/local-archive-accounting-index.js";
 import {
-  ingestLocalUnifiedIndexIncrement,
-} from "../../src/local-unified-index-ingest.js";
+  ingestLocalUnifiedIndexOffMain,
+} from "../../src/local-unified-index-off-main.js";
+import {
+  createLocalUnifiedCompanionProjectionReader,
+} from "../../src/local-unified-companion-off-main.js";
+import {
+  LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_APPLICATION_ID,
+  LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
+  readLocalUnifiedIndexCompatibility,
+  readUnifiedIndexGenerationDescriptor,
+} from "../../src/local-unified-index.js";
 import {
   readLocalUnifiedWindowBreakdown,
 } from "../../src/local-unified-window-breakdown.js";
+import {
+  createModelPerformanceController,
+} from "./model-performance-controller.js";
+import {
+  buildLocalCacheDropThreadLinks,
+} from "../../src/local-cache-drop-thread-links.js";
 import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import {
-  AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
-  acquireAutomaticContributionInstanceLock,
-  createAutomaticContributionController,
-} from "../../src/automatic-contribution.js";
+  acquireAutomaticContributionRetirementLock,
+  retireAutomaticContributionState,
+} from "../../src/automatic-contribution-retirement.js";
 import {
   TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
   createIncrementalContributionSyncController,
+  incrementalContributionRequiredConsent,
+  telemetryV11FieldInventory,
+  sanitizeTelemetryAttributionBinding,
 } from "../../src/incremental-contribution.js";
 import {
   runIncrementalContributionSyncOnce,
+  readIncrementalContributionV11Capabilities,
+  readIncrementalContributionV11Review,
 } from "../../src/contribution-incremental-sync.js";
 import {
-  createFastModePreferenceController,
-} from "../../src/fast-mode-preference.js";
+  createLocalAccountlessContribution,
+  selectLocalAccountlessHostedRehearsalProfile,
+  selectLocalAccountlessProductionProfile,
+} from "./accountless-contribution.js";
+import { readLocalCollectorCheckpoint } from "../../src/local-collector-state.js";
 import {
   HostedSignInHandoffError,
   createHostedSignInHandoffController,
@@ -51,31 +83,18 @@ import {
 } from "../../src/codex-speed-baseline.js";
 import { createLocalCentralProxy } from "../../src/local-companion-central-proxy.js";
 import {
+  LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
   LocalCompanionRefreshController,
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
   createTerminalRefreshFailureRecorder,
-  publicClaudeQuotaResult,
 } from "../../src/local-companion-refresh.js";
-import {
-  readOrCreateClaudeDesktopQuotaSecret,
-  refreshClaudeDesktopQuota,
-} from "../../src/claude-desktop-quota-refresh.js";
-import {
-  readClaudeDesktopQuotaProjection,
-} from "../../src/claude-desktop-quota-state.js";
 import {
   createClaudeDesktopShadowController,
 } from "../../src/claude-desktop-shadow-controller.js";
 import {
-  inspectExactNextContributionSyncUpload,
-  inspectContributionSyncQueue,
-  inspectNextContributionSyncUpload,
-  retireAcceptedContributionArtifacts,
-  retireSupersededPendingContributionArtifacts,
-  runContributionSyncQueueOnce,
-  setContributionSyncPaused,
-} from "../../src/contribution-sync-queue.js";
+  localContributionSyncQueue,
+} from "../../src/local-node-runtime.js";
 import {
   CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES,
   contributionDeviceKeychainPromptSurface,
@@ -87,15 +106,18 @@ import {
 } from "../../src/contribution-device-capability.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  createExportIdentityKeychainBackend,
   deleteExportIdentityKeychainItemByAttributes,
 } from "../../src/platform/export-identity-keychain.js";
 import {
   contributionDeviceKeychainBrokerConfiguration,
   createContributionDeviceKeychainBrokerTransport,
+  createMacOSKeychainBrokerBindingFromEnvironment,
 } from "../../src/contribution-device-keychain-broker.js";
 import {
   claimContributionDevicePairing,
   disconnectContributionDevice as disconnectContributionDeviceRemotely,
+  renewContributionDeviceCredential,
 } from "../../src/contribution-device-client.js";
 import {
   renewContributionDeviceCredentialIfDue,
@@ -124,16 +146,27 @@ import {
   selectProductionParticipantIdentity,
 } from "../../src/export-identity-production.js";
 import {
+  selectProductionAccountObservationSecret,
+} from "../../src/account-observation-production.js";
+import {
+  createLinuxSecretServiceBrokerBackendFromEnvironment,
+} from "../../src/platform/linux-secret-service-broker.js";
+import {
+  createLinuxAccountObservationBrokerBackendFromEnvironment,
+  createWindowsAccountObservationBrokerBackendFromEnvironment,
+} from "../../src/platform/index.js";
+import {
+  PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
 import {
+  projectDesktopShellStatus,
+} from "../../src/desktop-shell-status.js";
+import {
   RELEASE_VERSION,
   RELEASE_VERSION_PLACEHOLDER,
 } from "../../config/release-manifest.js";
-import {
-  FAST_MODE_PREFERENCE_VALUES,
-} from "@app-usagemonitor/accounting";
 import {
   validateTelemetryContribution,
 } from "@app-usagemonitor/telemetry-contract";
@@ -148,6 +181,14 @@ import {
   createParticipantSessionCookieBridge,
   participantRelayPathUsesSessionCookie,
 } from "./transport/participant-session-cookie-bridge.js";
+
+const {
+  inspectExactNextContributionSyncUpload,
+  inspectContributionSyncQueue,
+  inspectNextContributionSyncUpload,
+  retireSupersededPendingContributionArtifacts,
+  setContributionSyncPaused,
+} = localContributionSyncQueue;
 
 const LOOPBACK_HOST = "127.0.0.1";
 const LOCAL_COMPANION_MODULE_FILE = fileURLToPath(import.meta.url);
@@ -165,14 +206,8 @@ const PARENT_WATCHDOG_EXIT_GRACE_MS = 1_000;
 const MAX_REQUEST_BODY_BYTES = 1_024;
 const MAX_STATIC_BYTES = 2 * 1024 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
-const LOCAL_SYNC_MAXIMUM_JOBS = 10;
-const LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES = 16 * 1024 * 1024;
-const LOCAL_AUTOMATIC_SYNC_MAXIMUM_JOBS = 100;
-const LOCAL_AUTOMATIC_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES =
-  64 * 1024 * 1024;
 const MAX_PARTICIPANT_RELAY_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_PARTICIPANT_RELAY_RESPONSE_BYTES = 4 * 1024 * 1024;
-const MAX_PARTICIPANT_EXPORT_RESPONSE_BYTES = 192 * 1024 * 1024;
 const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
 // Outbound pre-warm to the contribution service (owner-reported 15.23s cold
 // call, 2026-08-10). This is the outbound twin of v0.1.6's inbound keep-alive
@@ -194,6 +229,468 @@ const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
 // emitting a long `Keep-Alive: timeout=` response header; the pre-warm below is
 // the dependency-free half that removes the measured cold handshake.
 const CENTRAL_PREWARM_TIMEOUT_MS = 10_000;
+export const LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS = 5 * 60_000;
+
+function ownerOnlyRegularUnifiedIndex(metadata) {
+  return metadata.isFile()
+    && !metadata.isSymbolicLink()
+    && metadata.nlink === 1
+    && (typeof process.getuid !== "function" || metadata.uid === process.getuid())
+    && (process.platform === "win32" || (metadata.mode & 0o077) === 0);
+}
+
+function unchangedUnifiedIndexTarget(before, after) {
+  return ownerOnlyRegularUnifiedIndex(before)
+    && ownerOnlyRegularUnifiedIndex(after)
+    && before.dev === after.dev
+    && before.ino === after.ino
+    && before.size === after.size
+    && before.mtimeMs === after.mtimeMs
+    && before.ctimeMs === after.ctimeMs;
+}
+
+function localUnifiedIndexHasSidecar(indexFile, inspect) {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    try {
+      inspect(`${indexFile}${suffix}`);
+      return true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") return true;
+    }
+  }
+  return false;
+}
+
+function openImmutableLocalUnifiedIndex(indexFile) {
+  const immutableUrl = pathToFileURL(indexFile);
+  immutableUrl.searchParams.set("immutable", "1");
+  return new DatabaseSync(immutableUrl.href, {
+    readOnly: true,
+    timeout: 1_000,
+  });
+}
+
+const COLD_REFRESH_V16_PREDECESSOR_PARSERS = Object.freeze([
+  "unified-rollout-typed-v10",
+  "unified-rollout-typed-v11",
+  "unified-rollout-typed-v12",
+  "unified-rollout-typed-v13",
+  "unified-rollout-typed-v14",
+  "unified-rollout-typed-v15",
+]);
+
+function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion) {
+  // This is a deadline decision, not permission to read or publish facts. The
+  // worker still validates the complete index. Only reviewed v10 through v15
+  // predecessors can receive the v16 rescan window. Their physical schema and
+  // immutable source identity remain compatible; v12 nullable counters and
+  // v13 ordinal-bearing compaction headers and v14 paginated setting boundaries
+  // and v15 historical parent-model fallback require reparsing present sources.
+  // v16 adds the explicitly approved missing-cache-write assumption with row provenance.
+  // Keep the target pinned too: a future parser needs an explicit review and
+  // must not silently inherit this longer deadline for every mismatch.
+  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v16"
+      || schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+      || !compatibility.metadataPresent
+      || compatibility.formatUserVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION
+      || compatibility.minimumReaderUserVersion
+        !== LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION
+      || compatibility.minimumWriterUserVersion
+        !== LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION) {
+    return false;
+  }
+  const metadata = database.prepare("SELECT value FROM meta WHERE key = ?");
+  if (metadata.get("source_identity_version")?.value
+        !== LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION
+      || metadata.get("contract_version")?.value !== TELEMETRY_SCHEMA_VERSION) {
+    return false;
+  }
+  const generationId = Number(metadata.get("current_generation_id")?.value);
+  if (!Number.isSafeInteger(generationId) || generationId < 1) return false;
+
+  // Follow only the published generation, never a rotated source's older
+  // parser row. Fixed-key/primary-key reads avoid loading meta/issue collections
+  // or scanning facts on the HTTP thread. Terminal predicates mirror the
+  // ingestion worker's supported previous-generation states.
+  const generation = database.prepare(`
+    SELECT p.parser_version, p.contract_version AS parser_contract_version,
+           g.contract_version, g.completed_at_ms
+    FROM index_generation g JOIN parser_version p ON p.id = g.parser_version_id
+    WHERE g.id = ?
+      AND g.discovery_complete = 1 AND g.diagnostics_complete = 1
+      AND g.usage_provenance_complete = 1 AND g.source_order_complete = 1
+      AND g.quota_provenance_complete = 1
+      AND (
+        (g.status = 'complete' AND g.block_reason IS NULL
+          AND g.tool_provenance_complete = 1)
+        OR (g.status = 'partial'
+          AND g.block_reason = 'codex_rollout_sources_quarantined'
+          AND g.skipped_source_count > 0)
+        OR (g.status = 'partial'
+          AND g.block_reason = 'tool_provenance_incomplete'
+          AND g.tool_provenance_complete = 0)
+      )
+  `).get(generationId);
+  return COLD_REFRESH_V16_PREDECESSOR_PARSERS.includes(generation?.parser_version)
+    && generation.parser_contract_version === TELEMETRY_SCHEMA_VERSION
+    && generation.contract_version === TELEMETRY_SCHEMA_VERSION
+    && Number.isSafeInteger(generation.completed_at_ms)
+    && generation.completed_at_ms >= 0;
+}
+
+function inspectColdRefreshLocalUnifiedIndex(indexFile, inspect, openDatabase) {
+  let before;
+  try {
+    before = inspect(indexFile);
+  } catch {
+    return false;
+  }
+  if (!ownerOnlyRegularUnifiedIndex(before)
+      || localUnifiedIndexHasSidecar(indexFile, inspect)) {
+    return false;
+  }
+
+  let database;
+  let requiresColdRefresh = false;
+  try {
+    database = openDatabase(indexFile);
+    database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
+    const compatibility = readLocalUnifiedIndexCompatibility(database);
+    if (compatibility.applicationId !== LOCAL_UNIFIED_INDEX_APPLICATION_ID
+        || !Number.isSafeInteger(compatibility.userVersion)
+        || compatibility.userVersion < 1
+        || compatibility.userVersion > LOCAL_UNIFIED_INDEX_USER_VERSION
+        || compatibility.metadataPartial
+        || compatibility.metadataMalformed
+        || (compatibility.metadataPresent && [
+          compatibility.formatUserVersion,
+          compatibility.minimumReaderUserVersion,
+          compatibility.minimumWriterUserVersion,
+        ].some((version) => !Number.isSafeInteger(version)
+          || version < 1
+          || version > LOCAL_UNIFIED_INDEX_USER_VERSION))) {
+      return false;
+    }
+    const schemaVersion = database.prepare(
+      "SELECT value FROM meta WHERE key = 'schema_version'",
+    ).get()?.value ?? null;
+    if (![LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+      LOCAL_UNIFIED_INDEX_SCHEMA_VERSION].includes(schemaVersion)) {
+      return false;
+    }
+    // Deliberately do not run quick_check here. On an 800 MB retained index it
+    // scans the database synchronously before POST /refresh can answer, which
+    // also blocks health and cancellation. This main-thread selector proves
+    // only bounded compatibility metadata; the off-main ingestion worker owns
+    // full schema, integrity, migration, and publication validation.
+    requiresColdRefresh = compatibility.userVersion < LOCAL_UNIFIED_INDEX_USER_VERSION
+      || publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion);
+  } catch {
+    requiresColdRefresh = false;
+  } finally {
+    try {
+      database?.close();
+    } catch {
+      requiresColdRefresh = false;
+    }
+  }
+  if (!requiresColdRefresh || localUnifiedIndexHasSidecar(indexFile, inspect)) {
+    return false;
+  }
+  try {
+    return unchangedUnifiedIndexTarget(before, inspect(indexFile));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Select the refresh deadline from the index's actual state at the start of
+ * each run. An exact missing target, read-only-proven migratable schema, or
+ * supported published parser-upgrade rescan gets the bounded cold-build window.
+ * Current-parser, future, clearly corrupt, foreign, or otherwise uncertain
+ * state keeps the normal deadline.
+ */
+export function localCompanionRefreshTimeoutForUnifiedIndex(
+  indexFile,
+  {
+    existingTimeoutMs = LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+    freshTimeoutMs = LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
+    inspect = lstatSync,
+    openDatabase = openImmutableLocalUnifiedIndex,
+  } = {},
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("indexFile must be a non-empty string");
+  }
+  if (typeof inspect !== "function") {
+    throw new TypeError("inspect must be a function");
+  }
+  if (typeof openDatabase !== "function") {
+    throw new TypeError("openDatabase must be a function");
+  }
+  for (const [name, value] of Object.entries({
+    existingTimeoutMs,
+    freshTimeoutMs,
+  })) {
+    if (!Number.isSafeInteger(value)
+        || value < 1_000
+        || value > LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS) {
+      throw new TypeError(`${name} is outside the refresh timeout bound`);
+    }
+  }
+  const resolvedIndexFile = resolve(indexFile);
+  try {
+    inspect(resolvedIndexFile);
+  } catch (error) {
+    return error?.code === "ENOENT" ? freshTimeoutMs : existingTimeoutMs;
+  }
+  return inspectColdRefreshLocalUnifiedIndex(
+    resolvedIndexFile,
+    inspect,
+    openDatabase,
+  )
+    ? freshTimeoutMs
+    : existingTimeoutMs;
+}
+
+const LOCAL_UNIFIED_PROJECTION_FUTURE_TOLERANCE_MS = 5 * 60_000;
+const LOCAL_UNIFIED_PROJECTION_PERIOD_MS = Object.freeze([
+  24 * 60 * 60_000,
+  7 * 24 * 60 * 60_000,
+  30 * 24 * 60 * 60_000,
+]);
+
+async function localUnifiedProjectionValidUntil({
+  indexFile,
+  generationFingerprint,
+  nowMs,
+  includeWorkUsage = false,
+  inspect = lstat,
+  openDatabase = openImmutableLocalUnifiedIndex,
+} = {}) {
+  let before;
+  let database;
+  try {
+    before = await inspect(indexFile);
+    if (!ownerOnlyRegularUnifiedIndex(before) || localUnifiedIndexHasSidecar(indexFile, lstatSync)) return nowMs;
+    database = openDatabase(indexFile);
+    database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
+    const generation = readUnifiedIndexGenerationDescriptor(database);
+    if (generation?.fingerprint !== generationFingerprint) return nowMs;
+    const boundaries = [];
+    for (const durationMs of LOCAL_UNIFIED_PROJECTION_PERIOD_MS) {
+      const rawObservedAt = database.prepare(`
+        SELECT MIN(observed_at_ms) AS observed_at_ms
+        FROM usage_event
+        WHERE observed_at_ms >= ?
+      `).get(nowMs - durationMs)?.observed_at_ms;
+      const observedAt = rawObservedAt === null || rawObservedAt === undefined
+        ? null
+        : Number(rawObservedAt);
+      if (Number.isSafeInteger(observedAt)) {
+        // Period membership uses >= at its lower bound, so the row expires on
+        // the first integer millisecond after this exact equality.
+        boundaries.push(observedAt + durationMs + 1);
+      }
+    }
+    for (const table of ["usage_event", "quota_observation"]) {
+      const rawObservedAt = database.prepare(`
+        SELECT MIN(observed_at_ms) AS observed_at_ms
+        FROM ${table}
+        WHERE observed_at_ms > ?
+      `).get(nowMs + LOCAL_UNIFIED_PROJECTION_FUTURE_TOLERANCE_MS)
+        ?.observed_at_ms;
+      const observedAt = rawObservedAt === null || rawObservedAt === undefined
+        ? null
+        : Number(rawObservedAt);
+      if (Number.isSafeInteger(observedAt)) {
+        boundaries.push(
+          observedAt - LOCAL_UNIFIED_PROJECTION_FUTURE_TOLERANCE_MS,
+        );
+      }
+    }
+    if (includeWorkUsage) {
+      const observedAt = database.prepare(`
+        SELECT MIN(observed_at_ms) AS observed_at_ms FROM usage_event
+        WHERE observed_at_ms >= ?
+      `).get(nowMs)?.observed_at_ms;
+      if (observedAt !== null && Number.isSafeInteger(observedAt)) {
+        boundaries.push(observedAt + 1);
+      }
+    }
+    const after = await inspect(indexFile);
+    if (!unchangedUnifiedIndexTarget(before, after) || localUnifiedIndexHasSidecar(indexFile, lstatSync)) return nowMs;
+    return boundaries.length === 0
+      ? Number.POSITIVE_INFINITY
+      : Math.min(...boundaries.filter((value) => value > nowMs));
+  } catch {
+    return nowMs;
+  } finally {
+    try {
+      database?.close();
+    } catch {
+      // A cache-validity failure simply forces the reviewed full reader.
+    }
+  }
+}
+
+async function currentUnifiedProjectionGeneration({ indexFile }) {
+  let database;
+  try {
+    const before = await lstat(indexFile);
+    if (!ownerOnlyRegularUnifiedIndex(before) || localUnifiedIndexHasSidecar(indexFile, lstatSync)) return null;
+    database = openImmutableLocalUnifiedIndex(indexFile);
+    const fingerprint = readUnifiedIndexGenerationDescriptor(database)?.fingerprint;
+    return unchangedUnifiedIndexTarget(before, await lstat(indexFile))
+      && !localUnifiedIndexHasSidecar(indexFile, lstatSync) ? fingerprint : null;
+  } catch {
+    return null;
+  } finally {
+    database?.close();
+  }
+}
+
+function projectionAborted() {
+  const error = new Error("local_unified_companion_projection_aborted");
+  error.code = "local_unified_companion_projection_aborted";
+  return error;
+}
+
+/** Reuse cloneable accounting results, with one cancellable build per exact key. */
+export function createCachedLocalUnifiedProjectionReader({
+  reader = createLocalUnifiedCompanionProjectionReader(),
+  validUntil = localUnifiedProjectionValidUntil,
+  readGeneration = currentUnifiedProjectionGeneration,
+} = {}) {
+  for (const callback of [reader, validUntil, readGeneration]) {
+    if (typeof callback !== "function") throw new TypeError("reader must be a function");
+  }
+  let cached = null;
+  let closed = false;
+  let revision = 0;
+  const pending = new Map();
+  function subscribe(build, signal, select = value => value) {
+    if (signal?.aborted) return Promise.reject(projectionAborted());
+    build.subscribers += 1;
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const finish = (callback, value) => {
+        if (finished) return;
+        finished = true;
+        signal?.removeEventListener("abort", abort);
+        build.subscribers -= 1;
+        if (build.subscribers === 0 && !build.settled) build.controller.abort();
+        callback(value);
+      };
+      const abort = () => finish(reject, projectionAborted());
+      signal?.addEventListener("abort", abort, { once: true });
+      build.promise.then(value => {
+        try { finish(resolve, structuredClone(select(value))); }
+        catch (error) { finish(reject, error); }
+      }, error => finish(reject, error));
+    });
+  }
+  const read = async function read(options, controls = {}) {
+    if (closed) throw projectionAborted();
+    if (controls.signal?.aborted) throw projectionAborted();
+    // Deferred startup reads do not invalidate a completed full result.
+    const select = controls.selectProjection ?? (value => value);
+    if (options?.mode !== "full") return select(await reader(options, controls));
+    const nowMs = options.nowMs;
+    const key = JSON.stringify([
+      options.indexFile, options.declaredSpeedBaselines ?? [],
+      options.includeWorkUsage === true, options.codexHome ?? null, options.secretFile ?? null,
+    ]);
+    const expectedFingerprint = controls.reuse?.generationFingerprint
+      ?? (options.includeWorkUsage ? await readGeneration(options) : null);
+    if (closed || controls.signal?.aborted) throw projectionAborted();
+    if (cached && key === cached.key && expectedFingerprint === cached.generationFingerprint
+        && Number.isFinite(nowMs) && nowMs >= cached.projectedAtMs && nowMs < cached.validUntilMs) {
+      return structuredClone(select(cached.projection));
+    }
+    // Exact timestamps can share immediately. Different timestamps use the
+    // finished cache only after its time-membership proof has completed.
+    const buildKey = JSON.stringify([key, expectedFingerprint, nowMs]);
+    const earlier = [...pending.values()].find(item => item.key === key
+      && expectedFingerprint !== null && item.fingerprint === expectedFingerprint
+      && item.nowMs < nowMs && !item.controller.signal.aborted);
+    if (earlier) {
+      await subscribe(earlier, controls.signal, () => null);
+      return read(options, controls);
+    }
+    let build = pending.get(buildKey);
+    if (!build || build.controller.signal.aborted) {
+      const buildRevision = ++revision;
+      build = { key, fingerprint: expectedFingerprint, nowMs, controller: new AbortController(), subscribers: 0, settled: false };
+      const selected = build;
+      selected.promise = Promise.resolve().then(async () => {
+        const projection = await reader(options, { ...controls, signal: selected.controller.signal });
+        const companion = projection?.companion ?? projection;
+        const generationFingerprint = companion?.generation?.fingerprint;
+        if (companion?.status === "available"
+            && (!options.includeWorkUsage || projection?.workUsage?.status === "available")
+            && /^generation-v2-[0-9a-f]{64}$/u.test(generationFingerprint ?? "")
+            && Number.isFinite(nowMs)) {
+          const validUntilMs = await validUntil({
+            indexFile: options.indexFile, generationFingerprint, nowMs,
+            includeWorkUsage: options.includeWorkUsage === true,
+          });
+          if (!selected.controller.signal.aborted && buildRevision === revision && validUntilMs > nowMs) {
+            cached = { key, generationFingerprint, projectedAtMs: nowMs, validUntilMs,
+              projection: structuredClone(projection) };
+          }
+        }
+        return projection;
+      }).finally(() => {
+        selected.settled = true;
+        if (pending.get(buildKey) === selected) pending.delete(buildKey);
+      });
+      pending.set(buildKey, selected);
+    }
+    return subscribe(build, controls.signal, select);
+  };
+  read.close = async () => {
+    if (closed) return;
+    closed = true;
+    revision += 1;
+    cached = null;
+    for (const build of pending.values()) build.controller.abort();
+    await reader.close?.();
+  };
+  return read;
+}
+
+/** Internal work summaries stay out of the dashboard's persisted/public DTO. */
+export function selectSharedWorkUsageSnapshot(projection, query) {
+  const work = projection?.workUsage;
+  if (work?.status !== "available") {
+    if (/^work_usage_[a-z_]+$/u.test(work?.errorCode ?? "")) {
+      const error = new Error(work.errorCode);
+      error.code = work.errorCode;
+      throw error;
+    }
+    return { status: work?.status ?? "unavailable" };
+  }
+  const period = work.periods?.[query.period];
+  if (!period) return { status: "unavailable" };
+  const scope = query.scope ?? period.scopes.find(item => item.status === "unavailable")?.id
+    ?? period.scopes[0]?.id ?? "scope-0";
+  const snapshot = period.snapshots[scope];
+  if (!snapshot) {
+    const error = new Error("work_usage_scope_unavailable");
+    error.code = "work_usage_scope_unavailable";
+    throw error;
+  }
+  return { ...snapshot, fromMs: period.fromMs, toMs: period.toMs };
+}
+
+function createAppAwareKeychainBackend(environment) {
+  return createExportIdentityKeychainBackend({
+    loadBrokerBinding: () =>
+      createMacOSKeychainBrokerBindingFromEnvironment(environment),
+  });
+}
 
 /**
  * Wrap the outbound central fetch with a startup pre-warm, engaged only for the
@@ -254,6 +751,39 @@ const MAX_ACTIVE_REVIEW_AUTHORIZATIONS = 8;
 const DIAGNOSTICS_LOG_FILE_NAME = "diagnostics-v0.1.log";
 export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
   "local-diagnostic-note-v0.1";
+// Startup notes are minted by this server only. They are deliberately not part
+// of DIAGNOSTIC_SURFACES, which remains the closed vocabulary for caller POSTs.
+export const LOCAL_STARTUP_DIAGNOSTIC_STEPS = Object.freeze([
+  "data_store",
+  "contribution_start",
+]);
+export const LOCAL_STARTUP_DIAGNOSTIC_DETAILS = Object.freeze([
+  "codex_speed_baseline_unavailable",
+  "collector_invalid_size",
+  "collector_unavailable",
+  "local_collector_projection_aborted",
+  "local_collector_projection_worker_failed",
+  "local_collector_state_corrupt",
+  "local_collector_state_migration_busy",
+  "local_collector_state_schema_invalid",
+  "local_collector_state_unavailable",
+  "local_companion_snapshot_reload_aborted",
+  "local_unified_companion_projection_aborted",
+  "local_unified_companion_projection_worker_failed",
+  "local_unified_index_file_changed",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_missing",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_schema_newer",
+  "local_unified_index_tool_attestation_mismatch",
+  "local_unified_index_unavailable",
+  "local_unified_index_worker_failed",
+  "snapshot_invalid",
+  "snapshot_unavailable",
+  "syntax_error",
+  "type_error",
+  "unexpected_error",
+]);
 export const LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION =
   "local-contribution-diagnostics-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
@@ -262,6 +792,12 @@ export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
   "local-contribution-device-disconnect-v0.1";
 const MAX_DIAGNOSTICS_LOG_BYTES = 256 * 1024;
 const DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
+const DIAGNOSTIC_REFERENCE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const LOCAL_STARTUP_DIAGNOSTIC_DETAIL_SET = new Set(
+  LOCAL_STARTUP_DIAGNOSTIC_DETAILS,
+);
+const LOCAL_STARTUP_DIAGNOSTIC_SURFACE = "local_startup";
+const LOCAL_STARTUP_DIAGNOSTIC_CODE = "snapshot_unavailable";
 // Fixed journey names. Anything else is refused, so no free-form label can
 // ever be written to the log.
 const DIAGNOSTIC_SURFACES = new Set([
@@ -271,12 +807,11 @@ const DIAGNOSTIC_SURFACES = new Set([
   "contribution_prepare",
   "contribution_send",
   "device_credential_reset",
-  "fast_mode_preference",
   "hosted_identity",
   "hosted_privacy",
   "local_refresh",
-  // 2026-08-08 (deletion honesty): the dashboard's "Delete my contributions"
-  // action files its failures like every other journey.
+  // Retained for diagnostics from older app versions. The current dashboard
+  // has no self-service hosted deletion action.
   "participant_deletion",
 ]);
 // Identifier-shaped fixed codes only: SCREAMING_SNAKE from the contribution
@@ -302,6 +837,23 @@ const CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY =
 const CONTRIBUTION_DEVICE_APP_KEYCHAIN_CAPABILITY =
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
 const MAX_CONTRIBUTION_DEVICE_STATE_BYTES = 512;
+
+function createLocalStartupDiagnosticReference() {
+  let reference = "TT-";
+  for (const byte of randomBytes(6)) {
+    reference += DIAGNOSTIC_REFERENCE_ALPHABET[byte & 0b11111];
+  }
+  return reference;
+}
+
+function localStartupDiagnosticDetail(error) {
+  if (LOCAL_STARTUP_DIAGNOSTIC_DETAIL_SET.has(error?.code)) {
+    return error.code;
+  }
+  if (error instanceof TypeError) return "type_error";
+  if (error instanceof SyntaxError) return "syntax_error";
+  return "unexpected_error";
+}
 
 function developmentIdentityConfigurationError() {
   const error = new TypeError(
@@ -363,28 +915,29 @@ const SESSION_COOKIE_VALUE = /^[A-Za-z0-9_.-]{0,384}$/u;
 const SET_COOKIE_VALUE =
   /^__Host-usage_monitor_session=[A-Za-z0-9_.-]{0,384}; Path=\/; Max-Age=[0-9]+; Secure; HttpOnly; SameSite=Strict$/u;
 const CSRF_VALUE = /^[A-Za-z0-9_-]{1,384}$/u;
-const UPLOAD_AUTHORIZATION_VALUE =
-  /^Upload um_(?:upload|device_upload)_[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/u;
 const REPORT_ROUTES = createLocalCompanionReportRoutes(
   LOCAL_COMPANION_REPORT_FILES,
 );
 
 const API_ROUTES = new Set([
   "/api/local/health",
+  "/api/local/desktop-status",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
   "/api/local/identity/hosted-signin-handoff",
   "/api/local/onboarding",
   "/api/local/overview",
-  "/api/local/claude/quota",
+  "/api/local/cache-drop-thread-links",
+  "/api/local/work-usage/query",
   "/api/local/gradient",
   "/api/local/weekly",
+  "/api/local/weekly-pace-outlook",
   "/api/local/quality",
-  "/api/local/reports",
   "/api/local/timeline/window-breakdown",
+  "/api/local/model-performance",
   "/api/local/refresh",
+  "/api/local/refresh/quick",
   "/api/local/refresh/cancel",
-  "/api/local/contribution/preview",
   "/api/local/contribution/prepare",
   "/api/local/contribution/sync-status",
   "/api/local/contribution/sync-next",
@@ -392,27 +945,31 @@ const API_ROUTES = new Set([
   "/api/local/contribution/device-disconnect",
   "/api/local/contribution/device-credential-reset",
   "/api/local/contribution/sync-inspect-exact",
-  "/api/local/contribution/sync-once",
-  "/api/local/contribution/sync-pause",
-  "/api/local/contribution/sync-resume",
-  "/api/local/contribution/automatic-settings",
-  "/api/local/contribution/automatic-enable",
-  "/api/local/contribution/automatic-disable",
   "/api/local/contribution/incremental-status",
+  "/api/local/contribution/incremental-review-v11",
   "/api/local/contribution/incremental-approve",
   "/api/local/contribution/incremental-run",
-  "/api/local/accounting/fast-mode-preference",
 ]);
+
+// The production-v1 accountless companion keeps local collection and its
+// retained account-observation evidence, but it never exposes a legacy
+// contribution route or hosted sign-in. A prefix fence keeps future legacy
+// contribution routes closed too; diagnostics remains outside this prefix.
+function isAccountlessProductionClosedLocalRoute(path) {
+  return path === "/api/local/identity/hosted-signin-handoff"
+    || path.startsWith("/api/local/contribution/");
+}
 
 // Routes that do not read the Codex dashboard snapshot must answer while that
 // snapshot is still being built (or even if it fails): readiness, diagnostics,
-// and the separately persisted native Claude quota projection.
+// and the independently reconstructed timing analysis.
 const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
   "/api/local/health",
+  "/api/local/desktop-status",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
   "/api/local/identity/hosted-signin-handoff",
-  "/api/local/claude/quota",
+  "/api/local/model-performance",
 ]);
 
 
@@ -518,6 +1075,20 @@ function contributionDeviceRecoveryRequired(error) {
 function contributionDeviceKeychainLocked(error) {
   try {
     return error?.code === "contribution_device_credential_locked";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A legacy Keychain item that the signed app could not migrate because the
+ * one permitted interactive read was declined. The broker leaves that item
+ * untouched, so clearing or resetting it would destroy the rollback path.
+ */
+function contributionDeviceKeychainMigrationRequired(error) {
+  try {
+    return error?.code ===
+      "contribution_device_credential_migration_required";
   } catch {
     return false;
   }
@@ -692,8 +1263,8 @@ export async function readRecentDiagnosticReferences({
  * is kept; when it cannot — the exact disease this route cures — the
  * credential is deleted by its fixed attributes instead, which never needs
  * the secret (verified live 2026-08-10). Only local things are removed: the
- * app-usagemonitor.contribution-device.v1 / installation Keychain entry and
- * the binding state file (plus its pre-rename legacy twin, whose leftover
+ * this bundle's sealed contribution-device Keychain entries and the binding
+ * state file (plus its pre-rename legacy twin, whose leftover
  * would otherwise wedge the next pairing). It contacts no network, revokes
  * no hosted device, and deletes no contributed metadata; the hosted side is
  * unaware of it.
@@ -858,7 +1429,7 @@ function participantSessionCookie(value) {
 }
 
 async function boundedParticipantRelayBody(request) {
-  if (["GET", "DELETE"].includes(request.method)) {
+  if (request.method === "GET") {
     const declared = Number(request.headers["content-length"] ?? 0);
     if (Number.isFinite(declared) && declared > 0) {
       throw fixedRelayError("central_participant_request_invalid");
@@ -962,8 +1533,8 @@ function createParticipantRelay({
       const jarCookie = participantSessionCookie(request.headers.cookie);
       // Session-authenticated routes (session, logout, /me/* including the
       // device-pairing mint) take the bridge's freshest captured session so the
-      // enroll -> mint sequence never races the WKWebView jar commit. The
-      // proof/recovery/Upload routes keep exactly the jar's own cookie.
+      // enroll -> mint sequence never races the WKWebView jar commit. Identity
+      // handoff and enrollment routes keep exactly the jar's own cookie.
       const cookie = participantRelayPathUsesSessionCookie(path)
         ? sessionCookieBridge.cookieForRequest(jarCookie)
         : jarCookie;
@@ -977,12 +1548,7 @@ function createParticipantRelay({
       }
       const authorization = request.headers.authorization;
       if (authorization !== undefined) {
-        if (path !== "/api/v1/contributions"
-            || typeof authorization !== "string"
-            || !UPLOAD_AUTHORIZATION_VALUE.test(authorization)) {
-          throw fixedRelayError("central_participant_authorization_invalid");
-        }
-        headers.Authorization = authorization;
+        throw fixedRelayError("central_participant_authorization_invalid");
       }
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -1008,9 +1574,7 @@ function createParticipantRelay({
       }
       const responseBody = await boundedParticipantRelayResponse(
         upstream,
-        path === "/api/v1/me/export"
-          ? MAX_PARTICIPANT_EXPORT_RESPONSE_BYTES
-          : MAX_PARTICIPANT_RELAY_RESPONSE_BYTES,
+        MAX_PARTICIPANT_RELAY_RESPONSE_BYTES,
       );
       try {
         JSON.parse(responseBody.toString("utf8"));
@@ -1160,31 +1724,6 @@ function boundedRequestStatus(error) {
   return error?.code === "request_too_large" ? 413 : 400;
 }
 
-async function authorizeFastModePreference(request, response) {
-  if (!sameOrigin(request)
-      || request.headers["x-usage-monitor-local"] !== "1") {
-    sendError(response, 403, "fast_mode_preference_not_authorized");
-    return null;
-  }
-  let value;
-  try {
-    value = await readBoundedJsonObject(request);
-  } catch (error) {
-    sendError(
-      response,
-      boundedRequestStatus(error),
-      error.code ?? "invalid_request",
-    );
-    return null;
-  }
-  if (Object.keys(value).sort().join("\0") !== "mode"
-      || !FAST_MODE_PREFERENCE_VALUES.includes(value.mode)) {
-    sendError(response, 400, "invalid_request");
-    return null;
-  }
-  return Object.freeze({ mode: value.mode });
-}
-
 async function authorizeDiagnosticNote(request, response) {
   if (!sameOrigin(request)
       || request.headers["x-usage-monitor-local"] !== "1") {
@@ -1242,6 +1781,19 @@ function authorizeHostedSignInHandoffRead(request, response) {
   if ((origin !== undefined && !sameOrigin(request))
       || request.headers["x-usage-monitor-local"] !== "1") {
     sendError(response, 403, "hosted_signin_handoff_not_authorized");
+    return false;
+  }
+  return true;
+}
+
+function authorizeCacheDropThreadLinksRead(request, response) {
+  // This optional read includes private local display names. Ordinary browser
+  // same-origin GETs omit Origin; the custom header still requires a CORS
+  // preflight from a foreign page, which the companion never grants.
+  const origin = request.headers.origin;
+  if ((origin !== undefined && !sameOrigin(request))
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "cache_drop_thread_links_not_authorized");
     return false;
   }
   return true;
@@ -1451,91 +2003,6 @@ async function authorizeContributionPreparation(request, response) {
   }
 }
 
-async function readAutomaticContributionEnableRequest(request) {
-  const contentType = request.headers["content-type"];
-  if (typeof contentType !== "string"
-      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
-    const error = new Error("unsupported_media_type");
-    error.code = "unsupported_media_type";
-    throw error;
-  }
-  const declaredLength = Number(request.headers["content-length"]);
-  if (Number.isFinite(declaredLength)
-      && declaredLength > MAX_REQUEST_BODY_BYTES) {
-    const error = new Error("request_too_large");
-    error.code = "request_too_large";
-    throw error;
-  }
-  let bytes = 0;
-  const chunks = [];
-  for await (const chunk of request) {
-    bytes += chunk.length;
-    if (bytes > MAX_REQUEST_BODY_BYTES) {
-      const error = new Error("request_too_large");
-      error.code = "request_too_large";
-      throw error;
-    }
-    chunks.push(chunk);
-  }
-  let value;
-  try {
-    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    const error = new Error("invalid_json");
-    error.code = "invalid_json";
-    throw error;
-  }
-  const consent = value?.consent;
-  if (!value
-      || typeof value !== "object"
-      || Array.isArray(value)
-      || Object.keys(value).sort().join("\0") !== "consent\0intervalHours"
-      || value.intervalHours !== AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS
-      || !consent
-      || typeof consent !== "object"
-      || Array.isArray(consent)
-      || Object.keys(consent).sort().join("\0")
-        !== "destinationOrigin\0fieldDictionaryVersion\0privacyContractVersion\0telemetrySchemaVersion"
-      || ![
-        consent.telemetrySchemaVersion,
-        consent.fieldDictionaryVersion,
-        consent.privacyContractVersion,
-        consent.destinationOrigin,
-      ].every((entry) => typeof entry === "string"
-        && entry.length > 0
-        && entry.length <= 2_048)) {
-    const error = new Error("invalid_request");
-    error.code = "invalid_request";
-    throw error;
-  }
-  return Object.freeze({
-    intervalHours: value.intervalHours,
-    consent: Object.freeze({
-      telemetrySchemaVersion: consent.telemetrySchemaVersion,
-      fieldDictionaryVersion: consent.fieldDictionaryVersion,
-      privacyContractVersion: consent.privacyContractVersion,
-      destinationOrigin: consent.destinationOrigin,
-    }),
-  });
-}
-
-async function authorizeAutomaticContributionEnable(request, response) {
-  if (!sameOrigin(request)
-      || request.headers["x-usage-monitor-local"] !== "1") {
-    sendError(response, 403, "automatic_contribution_not_authorized");
-    return null;
-  }
-  try {
-    return await readAutomaticContributionEnableRequest(request);
-  } catch (error) {
-    const status = error.code === "unsupported_media_type"
-      ? 415
-      : error.code === "request_too_large" ? 413 : 400;
-    sendError(response, status, error.code ?? "invalid_request");
-    return null;
-  }
-}
-
 async function authorizeReviewedContributionMutation(
   request,
   response,
@@ -1575,13 +2042,17 @@ async function authorizeReviewedContributionMutation(
     sendError(response, 400, "invalid_json");
     return null;
   }
-  if (!value || typeof value !== "object" || Array.isArray(value)
-      || Object.keys(value).length !== 1
-      || !REVIEW_TOKEN.test(value.reviewToken ?? "")) {
+  const keys = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
+  const v1 = keys.length === 1 && keys[0] === "reviewToken";
+  const v11 = keys.length === 3 && keys.every((key) => ["reviewToken", "consent", "fieldInventoryDigest"].includes(key))
+    && SHA256.test(value.fieldInventoryDigest ?? "")
+    && value.consent && typeof value.consent === "object" && !Array.isArray(value.consent)
+    && Object.keys(value.consent).length === 4;
+  if ((!v1 && !v11) || !REVIEW_TOKEN.test(value?.reviewToken ?? "")) {
     sendError(response, 400, "invalid_request");
     return null;
   }
-  return value.reviewToken;
+  return value;
 }
 
 async function readFixedFile(root, file, maximumBytes) {
@@ -1609,7 +2080,23 @@ async function readFixedFile(root, file, maximumBytes) {
   return readFile(path);
 }
 
-function stampSemanticOpenTarget(body) {
+const ALLOWED_SEMANTIC_OPEN_TARGETS = new Set([
+  PRODUCT_BRAND.appOpenURL,
+  PREVIEW_PRODUCT_BRAND.appOpenURL,
+]);
+
+export function configuredSemanticOpenTarget(environment = process.env) {
+  const value = environment?.USAGE_MONITOR_APP_OPEN_URL
+    ?? PRODUCT_BRAND.appOpenURL;
+  if (typeof value !== "string" || !ALLOWED_SEMANTIC_OPEN_TARGETS.has(value)) {
+    throw new Error(
+      "USAGE_MONITOR_APP_OPEN_URL must match a reviewed product identity",
+    );
+  }
+  return value;
+}
+
+function stampSemanticOpenTarget(body, semanticOpenTarget) {
   const source = body.toString("utf8");
   const first = source.indexOf(SEMANTIC_OPEN_TARGET_PLACEHOLDER);
   if (first < 0
@@ -1624,7 +2111,7 @@ function stampSemanticOpenTarget(body) {
   return Buffer.from(
     source.replace(
       SEMANTIC_OPEN_TARGET_PLACEHOLDER,
-      PRODUCT_BRAND.appOpenURL,
+      semanticOpenTarget,
     ),
   );
 }
@@ -1644,8 +2131,10 @@ function stampReleaseVersion(body) {
   return Buffer.from(source.replace(RELEASE_VERSION_PLACEHOLDER, RELEASE_VERSION));
 }
 
-function stampLocalDashboard(body) {
-  return stampReleaseVersion(stampSemanticOpenTarget(body));
+function stampLocalDashboard(body, semanticOpenTarget) {
+  return stampReleaseVersion(
+    stampSemanticOpenTarget(body, semanticOpenTarget),
+  );
 }
 
 function finiteNonNegativeInteger(value) {
@@ -1654,36 +2143,6 @@ function finiteNonNegativeInteger(value) {
 
 function isNonNegativeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0;
-}
-
-function previewProjection(value) {
-  const counts = value?.counts ?? {};
-  const coveredAt = value?.coveredAt ?? {};
-  const accounting = value?.accounting ?? {};
-  return {
-    schemaVersion: "telemetry-contribution-v0.1",
-    status: value?.status === "available" ? "available" : "not_configured",
-    synthetic: false,
-    coveredAt: {
-      startAt: typeof coveredAt.startAt === "string" ? coveredAt.startAt : null,
-      endAt: typeof coveredAt.endAt === "string" ? coveredAt.endAt : null,
-    },
-    counts: {
-      usageEvents: finiteNonNegativeInteger(counts.usageEvents),
-      quotaSnapshots: finiteNonNegativeInteger(counts.quotaSnapshots),
-      activityMarkers: finiteNonNegativeInteger(counts.activityMarkers),
-    },
-    accounting: {
-      basis: accounting.basis === "api_price_equivalent_not_subscription_allowance"
-        ? accounting.basis
-        : "api_price_equivalent_not_subscription_allowance",
-      fullyPricedEvents: finiteNonNegativeInteger(accounting.fullyPricedEvents),
-      partiallyPricedEvents: finiteNonNegativeInteger(accounting.partiallyPricedEvents),
-      unpricedEvents: finiteNonNegativeInteger(accounting.unpricedEvents),
-    },
-    includesFullRows: false,
-    remoteSendEnabled: false,
-  };
 }
 
 function nullableInstant(value) {
@@ -1880,39 +2339,6 @@ function syncExactReviewProjection(
   };
 }
 
-function syncRunProjection(value) {
-  const allowedStates = new Set(["completed", "paused", "interrupted"]);
-  const numericFields = [
-    "discoveredSets",
-    "enqueued",
-    "processed",
-    "accepted",
-    "retryable",
-    "rejected",
-    "reservedUploadBytes",
-  ];
-  const valid = allowedStates.has(value?.status)
-    && typeof value?.bandwidthLimited === "boolean"
-    && numericFields.every((name) => isNonNegativeInteger(value?.[name]));
-  return {
-    schemaVersion: "contribution-sync-run-v0.1",
-    status: valid ? value.status : "unavailable",
-    discoveredSets: valid ? value.discoveredSets : 0,
-    newlyQueued: valid ? value.enqueued : 0,
-    processed: valid ? value.processed : 0,
-    accepted: valid ? value.accepted : 0,
-    retryable: valid ? value.retryable : 0,
-    rejected: valid ? value.rejected : 0,
-    reservedUploadBytes: valid ? value.reservedUploadBytes : 0,
-    bandwidthLimited: valid ? value.bandwidthLimited : false,
-    queue: syncStatusProjection(value?.queue),
-    includesContent: false,
-    includesPaths: false,
-    includesIdentifiers: false,
-    includesCredentials: false,
-  };
-}
-
 const INCREMENTAL_SYNC_OUTCOME_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
 const INCREMENTAL_SYNC_DAY = /^\d{4}-\d{2}-\d{2}$/u;
 
@@ -1987,7 +2413,7 @@ function deviceUnavailableIncrementalRunOutcome() {
  *
  * `keychainPrompt` rides along because this is the projection the ceremony
  * already polls: it names where a macOS Keychain dialog is still reachable
- * ("pairing", "rotation", "none") so the dashboard can withhold guidance from
+ * ("pairing", "migration", "none") so the dashboard can withhold guidance from
  * the installs that can never see one. It is a fixed vocabulary, never a
  * path, an identifier, or a credential fact.
  */
@@ -2012,7 +2438,8 @@ function incrementalSyncStatusProjection(value, {
     status: valid
       ? "available"
       : configured ? "unavailable" : "not_configured",
-    contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+    contractVersion: valid && value.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      ? TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
     keychainPrompt: promptSurface,
     consent: { approved: false, current: false, consentedAt: null },
     paused: false,
@@ -2159,6 +2586,7 @@ const PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
   "identity_unavailable",
+  "identity_migration_required",
   "no_safe_records",
   "export_too_large",
   "privacy_verification_failed",
@@ -2289,7 +2717,8 @@ function preparationErrorStatus(code) {
       || code === "consent_already_current") return 409;
   if (code === "export_too_large") return 413;
   if (code === "coverage_unavailable"
-      || code === "identity_unavailable") return 503;
+      || code === "identity_unavailable"
+      || code === "identity_migration_required") return 503;
   if (code === "coverage_invalid"
       || code === "no_safe_records"
       || code === "privacy_verification_failed") return 422;
@@ -2470,6 +2899,21 @@ export function createLocalCompanionServer(options = {}) {
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
   }
+  const accountlessChannel = options.accountlessChannel ?? process;
+  // This is a closed selection, not an environment feature toggle: the
+  // production and compiled rehearsal modes both require the live inherited
+  // private channel before any legacy contribution path is normalized.
+  const accountlessProductionProfile = environment.USAGE_MONITOR_ACCOUNTLESS_MODE
+    === "rehearsal-v1"
+    ? selectLocalAccountlessHostedRehearsalProfile({
+      environment,
+      channel: accountlessChannel,
+    })
+    : selectLocalAccountlessProductionProfile({
+      environment,
+      channel: accountlessChannel,
+    });
+  const semanticOpenTarget = configuredSemanticOpenTarget(environment);
   const parentWatchdogPid = configuredParentWatchdogPid(environment);
   const homeDirectory = configuredHomeDirectory(environment);
   // A malformed provider path must not make the ordinary disabled companion
@@ -2515,70 +2959,76 @@ export function createLocalCompanionServer(options = {}) {
       ?? environment.CODEX_HOME
       ?? join(homeDirectory, ".codex"),
   );
-  const contributionQueueFile = assertLocalStatePath(
-    installation.stateRoot,
-    options.contributionQueueFile
-      ?? environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
-      ?? installation.paths.contributionQueueFile,
-  );
+  const contributionQueueFile = accountlessProductionProfile
+    ? null
+    : assertLocalStatePath(
+      installation.stateRoot,
+      options.contributionQueueFile
+        ?? environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
+        ?? installation.paths.contributionQueueFile,
+    );
   const diagnosticsLogFile = assertLocalStatePath(
     installation.stateRoot,
     options.diagnosticsLogFile
       ?? join(installation.stateRoot, DIAGNOSTICS_LOG_FILE_NAME),
   );
-  const legacyContributionDeviceStateCandidate = Object.hasOwn(
-    options,
-    "legacyContributionDeviceStateFile",
-  )
-    ? options.legacyContributionDeviceStateFile
-    : process.platform === "darwin"
-        && !Object.hasOwn(options, "contributionDeviceBackendFactory")
-      ? join(
-        homeDirectory,
-        "Library",
-        "Application Support",
-        "app-usagemonitor",
-        "contribution-device-binding-v1.json",
-      )
-      : null;
+  const legacyContributionDeviceStateCandidate = accountlessProductionProfile
+    ? null
+    : Object.hasOwn(options, "legacyContributionDeviceStateFile")
+      ? options.legacyContributionDeviceStateFile
+      : process.platform === "darwin"
+          && !Object.hasOwn(options, "contributionDeviceBackendFactory")
+        ? join(
+          homeDirectory,
+          "Library",
+          "Application Support",
+          "app-usagemonitor",
+          "contribution-device-binding-v1.json",
+        )
+        : null;
   const legacyContributionDeviceStateFile =
     legacyContributionDeviceStateCandidate === null
       ? null
       : assertLocalAbsolutePath(legacyContributionDeviceStateCandidate);
-  const preparedCandidate = Object.hasOwn(
-    options,
-    "preparedContributionDirectory",
-  )
-    ? options.preparedContributionDirectory
-    : Object.hasOwn(environment, "USAGE_MONITOR_PREPARED_DIRECTORY")
-      ? environment.USAGE_MONITOR_PREPARED_DIRECTORY
-      : installation.paths.preparedSpoolDirectory;
+  const preparedCandidate = accountlessProductionProfile
+    ? null
+    : Object.hasOwn(options, "preparedContributionDirectory")
+      ? options.preparedContributionDirectory
+      : Object.hasOwn(environment, "USAGE_MONITOR_PREPARED_DIRECTORY")
+        ? environment.USAGE_MONITOR_PREPARED_DIRECTORY
+        : installation.paths.preparedSpoolDirectory;
   const preparedContributionDirectory = preparedCandidate === null
     ? null
     : assertLocalStatePath(installation.stateRoot, preparedCandidate);
-  const contributionPreparationOptions =
-    options.contributionPreparationOptions ?? {};
-  if (!contributionPreparationOptions
-      || typeof contributionPreparationOptions !== "object"
-      || Array.isArray(contributionPreparationOptions)) {
+  const contributionPreparationOptions = accountlessProductionProfile
+    ? null
+    : options.contributionPreparationOptions ?? {};
+  if (contributionPreparationOptions !== null
+      && (!contributionPreparationOptions
+        || typeof contributionPreparationOptions !== "object"
+        || Array.isArray(contributionPreparationOptions))) {
     throw new TypeError("contributionPreparationOptions must be an object");
   }
-  const selectedPreparationOptions = {
-    ...contributionPreparationOptions,
-    activityFile: assertLocalStatePath(
-      installation.stateRoot,
-      contributionPreparationOptions.activityFile
-        ?? installation.paths.activityMarkersFile,
-    ),
-    reviewArchiveDirectory: assertLocalStatePath(
-      installation.stateRoot,
-      contributionPreparationOptions.reviewArchiveDirectory
-        ?? installation.paths.reviewArchiveDirectory,
-    ),
-  };
+  const selectedPreparationOptions = accountlessProductionProfile
+    ? Object.freeze({})
+    : {
+      ...contributionPreparationOptions,
+      activityFile: assertLocalStatePath(
+        installation.stateRoot,
+        contributionPreparationOptions.activityFile
+          ?? installation.paths.activityMarkersFile,
+      ),
+      reviewArchiveDirectory: assertLocalStatePath(
+        installation.stateRoot,
+        contributionPreparationOptions.reviewArchiveDirectory
+          ?? installation.paths.reviewArchiveDirectory,
+      ),
+    };
   return createPreparedLocalCompanionServer({
     ...options,
     environment,
+    accountlessChannel,
+    accountlessProductionProfile,
     resourceRoot: installation.resourceRoot,
     stateRoot: installation.stateRoot,
     statePaths: installation.paths,
@@ -2589,14 +3039,21 @@ export function createLocalCompanionServer(options = {}) {
     legacyContributionDeviceStateFile,
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
+    centralOrigin: accountlessProductionProfile ? null : options.centralOrigin,
+    contributionServiceOrigin: accountlessProductionProfile
+      ? null
+      : options.contributionServiceOrigin,
     parentWatchdogPid,
     homeDirectory,
+    semanticOpenTarget,
     ...claudeShadowConfiguration,
   });
 }
 
 function createPreparedLocalCompanionServer({
   environment,
+  accountlessChannel = process,
+  accountlessProductionProfile = false,
   resourceRoot,
   stateRoot,
   statePaths,
@@ -2607,13 +3064,11 @@ function createPreparedLocalCompanionServer({
   claudeProjectDirectory,
   diagnosticsLogFile,
   parentWatchdogPid,
+  semanticOpenTarget,
   // Explicit reversible authority switch. Unified is the normal authority;
   // legacy is retained only for an explicit rollback selection.
   accountingSourceMode =
     configuredAccountingSourceMode(environment),
-  fastModePreference = createFastModePreferenceController({
-    settingsFile: statePaths.fastModePreferenceFile,
-  }),
   // The declared Codex speed-mode baseline. Codex records the mode only when
   // it is applied or changed, never at session start, so the baseline lives
   // nowhere but the configuration's top-level `service_tier` key - and only
@@ -2623,8 +3078,19 @@ function createPreparedLocalCompanionServer({
     ledgerFile: statePaths.codexSpeedBaselineFile,
     configFile: join(codexHome, "config.toml"),
   }),
+  sharedProjectionReader = createCachedLocalUnifiedProjectionReader(),
+  unifiedProjectionReader = async (options, controls) => {
+    return sharedProjectionReader({ ...options, includeWorkUsage: true, codexHome }, {
+      ...controls, selectProjection: projection => projection.companion ?? projection,
+    });
+  },
   dataStore = new LocalCompanionDataStore({
-    builder: async ({ purpose = "full" } = {}) => buildLocalCompanionSnapshot({
+    snapshotFile: statePaths.authoritativeDashboardSnapshotFile,
+    builder: async ({
+      purpose = "full",
+      signal = null,
+      unifiedProjectionReuse = null,
+    } = {}) => buildLocalCompanionSnapshot({
       root: resourceRoot,
       collectorStateFile: statePaths.collectorStateFile,
       archiveIndexFile: accountingSourceMode === "legacy"
@@ -2636,6 +3102,9 @@ function createPreparedLocalCompanionServer({
       unifiedProjectionMode: ["startup", "quick"].includes(purpose)
         ? "deferred"
         : "full",
+      unifiedProjectionReader,
+      unifiedProjectionReuse,
+      signal,
       allowDevelopmentArtifactFallback:
         environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
       includeDevelopmentSideChatEstimates:
@@ -2648,11 +3117,6 @@ function createPreparedLocalCompanionServer({
       developmentSideChatHistoricalGapAssumedSpeed:
         environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
           ?? "fast",
-      // The owner's stated Codex speed mode. It attributes only the turns that
-      // precede the first recorded tier change in their session; an observed
-      // tier always wins. A missing or unreadable statement degrades to the
-      // Standard default rather than inventing a Fast attribution.
-      fastModePreference: await fastModePreference.readMode(),
       // Timestamped declared baselines. They fill only the turns the rollout
       // log left unobserved and that a reading actually covers; an observed
       // tier always wins, and an unreadable ledger is simply no coverage.
@@ -2669,9 +3133,20 @@ function createPreparedLocalCompanionServer({
     fromMs,
     toMs,
   }),
-  claudeQuotaProvider = () => readClaudeDesktopQuotaProjection(
-    statePaths.claudeDesktopQuotaStateFile,
-  ),
+  modelPerformanceProvider = null,
+  // Never enrich the persisted overview or report DTOs with names. This
+  // optional, transient read resolves only rows from the attested snapshot.
+  cacheDropThreadLinksProvider = ({ overview }) => buildLocalCacheDropThreadLinks({
+    indexFile: statePaths.unifiedIndexFile,
+    codexHome,
+    overview,
+  }),
+  workUsageBuild = async (query, controls) => sharedProjectionReader({
+      mode: "full", nowMs: query.toMs, includeWorkUsage: true,
+      indexFile: statePaths.unifiedIndexFile, codexHome,
+      declaredSpeedBaselines: await codexSpeedBaseline.readWindows(),
+    }, { ...controls, selectProjection: projection => selectSharedWorkUsageSnapshot(projection, query) }),
+  workUsageEnrich = (query) => enrichWorkUsageRows({ ...query, codexHome }),
   // This is a programmatic, development-only gate: no environment variable,
   // settings control, route, or UI surface enables Claude usage collection.
   // A caller must explicitly opt into the production-shaped local shadow.
@@ -2684,27 +3159,31 @@ function createPreparedLocalCompanionServer({
     projectDirectory: claudeProjectDirectory,
     claudeConfigDirectory,
   }),
+  readAccountAttributionBinding = null,
   refreshRunner = createLocalCollectorRefreshRunner({
     codexHome,
     stateFile: statePaths.collectorStateFile,
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
+    readAccountAttributionBinding: () => readAccountAttributionBinding?.() ?? null,
+    selectAccountObservationSecret: (options = {}) => (
+      // The compiled hosted rehearsal intentionally has no account-observation
+      // capability. Its scheduler uses only the profile-local Electron
+      // safeStorage record received over FD3; even a foreground refresh must
+      // not open the fixed production native record namespace.
+      environment.USAGE_MONITOR_ACCOUNTLESS_MODE === "rehearsal-v1"
+        ? Object.freeze({ loadAccountObservationSecret: null })
+        : selectProductionAccountObservationSecret({
+          ...options,
+          createKeychainBackend: () =>
+            createAppAwareKeychainBackend(environment),
+          createLinuxBackend: () =>
+            createLinuxAccountObservationBrokerBackendFromEnvironment(environment),
+          createWindowsBrokerBackend: () =>
+            createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
+        })
+    ),
     refreshAccounting: refreshReplaySafeAccountingCache,
-    refreshClaudeQuota: async ({ signal }) => {
-      const secret = await readOrCreateClaudeDesktopQuotaSecret(
-        statePaths.claudeDesktopQuotaSecretFile,
-      );
-      try {
-        return await refreshClaudeDesktopQuota({
-          statePath: statePaths.claudeDesktopQuotaStateFile,
-          homeDirectory,
-          secret,
-          signal,
-        });
-      } finally {
-        secret.fill(0);
-      }
-    },
     refreshClaudeUsageShadow: claudeShadowEnabled
       ? ({ signal }) => claudeShadowController.refresh({ signal })
       : null,
@@ -2726,7 +3205,7 @@ function createPreparedLocalCompanionServer({
       : null,
     // Advance the unified index by its cursors on every foreground refresh:
     // an ordinary pass reads only the bytes the rollout corpus grew.
-    refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
+    refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexOffMain({
       ...options,
       contractVersion: TELEMETRY_SCHEMA_VERSION,
     }),
@@ -2744,13 +3223,17 @@ function createPreparedLocalCompanionServer({
       typeof environment.CODEX_HOME === "string"
       && environment.CODEX_HOME.length > 0,
   }),
-  refreshTimeoutMs = 300_000,
+  refreshTimeoutMs = LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+  refreshTimeoutMsForRun = () => localCompanionRefreshTimeoutForUnifiedIndex(
+    statePaths.unifiedIndexFile,
+    { existingTimeoutMs: refreshTimeoutMs },
+  ),
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
-  contributionPreviewProvider = async () => ({ status: "not_configured" }),
   contributionPreparationRunner = null,
   contributionPreparationOptions = {},
-  contributionPreparationCreateKeychainBackend = undefined,
+  contributionPreparationCreateKeychainBackend = () =>
+    createAppAwareKeychainBackend(environment),
   developmentExportSecretFile =
     environment[DEVELOPMENT_IDENTITY_FILE_ENV] ?? null,
   developmentIdentityOptIn =
@@ -2766,8 +3249,8 @@ function createPreparedLocalCompanionServer({
   // broker channel (a socketpair end on the named descriptor): fresh
   // contribution-device credentials are then minted and read by the app —
   // the structural fix for the first-pairing Keychain dialog — while legacy
-  // items keep their companion-side keytar path until the rotation-time
-  // migration. Without the announcement (development, tests, Windows) the
+  // items migrate through the signed app on their next protected read.
+  // Without the announcement (development, tests, Windows) the
   // production keytar backend stays authoritative, exactly as before. The
   // transport is shared across backend constructions: the channel is one
   // kernel socketpair whose lifetime is the app's.
@@ -2804,23 +3287,95 @@ function createPreparedLocalCompanionServer({
   contributionDeviceCredentialAttributeDelete = null,
   contributionDeviceDisconnectRunner = null,
   diagnosticNoteRecorder = null,
+  diagnosticReferenceFactory = createLocalStartupDiagnosticReference,
   clock = () => Date.now(),
   hostedSignInHandoffController = null,
   contributionSyncNextProvider = null,
   contributionSyncExactReviewProvider = null,
-  contributionSyncOnceRunner = null,
-  automaticContributionRetirementRunner = null,
   supersededContributionRetirementRunner = null,
   contributionSyncPauseSetter = null,
-  contributionSyncTimeoutMs = 60_000,
-  automaticContributionController = null,
-  automaticContributionOptions = {},
+  automaticContributionStateRetirementRunner =
+    retireAutomaticContributionState,
+  automaticContributionRetirementLockAcquirer =
+    acquireAutomaticContributionRetirementLock,
   incrementalContributionController = null,
+  incrementalContributionRunner = runIncrementalContributionSyncOnce,
+  incrementalAttributionCapabilitiesProvider = null,
+  incrementalAttributionReviewProvider = null,
+  accountlessContributionRunner = undefined,
+  accountlessSchedulerOptions = undefined,
+  loadExistingAccountObservationSecret = async () => {
+    if (environment.USAGE_MONITOR_ACCOUNTLESS_MODE === "rehearsal-v1") {
+      return null;
+    }
+    return selectProductionAccountObservationSecret({
+      operationLockFile: statePaths.accountObservationLockFile,
+      createKeychainBackend: () => createAppAwareKeychainBackend(environment),
+      createLinuxBackend: () => createLinuxAccountObservationBrokerBackendFromEnvironment(environment),
+      createWindowsBrokerBackend: () =>
+        createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
+      createIfMissing: false,
+    }).loadAccountObservationSecret();
+  },
+  readContributionAccountMarkers = async () => {
+    try {
+      const checkpoint = await readLocalCollectorCheckpoint({ stateFile: statePaths.collectorStateFile });
+      return checkpoint?.accountScopeMarker ? [checkpoint.accountScopeMarker] : [];
+    } catch { return []; }
+  },
   onError = () => {},
 } = {}) {
+  // This optional analysis owns neither accounting refresh nor snapshot
+  // readiness. Create its controller only when its page is first requested.
+  let modelPerformanceController = null;
+  let modelPerformanceShutdown = null;
+  const readModelPerformance = modelPerformanceProvider ?? ((period) => {
+    if (modelPerformanceShutdown !== null) {
+      throw new Error("model_performance_unavailable");
+    }
+    modelPerformanceController ??= createModelPerformanceController({
+      directory: join(stateRoot, "inference-timing-v2"),
+      codexHome,
+    });
+    return modelPerformanceController.read(period);
+  });
+  const closeModelPerformance = () => {
+    modelPerformanceShutdown ??= Promise.resolve().then(() => (
+      modelPerformanceController?.close()
+    ));
+    return modelPerformanceShutdown;
+  };
   if (!environment || typeof environment !== "object"
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
+  }
+  if (typeof accountlessProductionProfile !== "boolean") {
+    throw new TypeError("accountlessProductionProfile must be a boolean");
+  }
+  const selectedAccountlessPrivateProfile = environment.USAGE_MONITOR_ACCOUNTLESS_MODE
+    === "rehearsal-v1"
+    ? selectLocalAccountlessHostedRehearsalProfile({
+      environment,
+      channel: accountlessChannel,
+    })
+    : selectLocalAccountlessProductionProfile({
+      environment,
+      channel: accountlessChannel,
+    });
+  if (accountlessProductionProfile
+      && (!selectedAccountlessPrivateProfile
+        || contributionQueueFile !== null
+        || preparedContributionDirectory !== null
+        || legacyContributionDeviceStateFile !== null
+        || centralOrigin !== null
+        || contributionServiceOrigin !== null)) {
+    throw new TypeError("Invalid accountless contribution configuration");
+  }
+  if ([incrementalContributionRunner, loadExistingAccountObservationSecret, readContributionAccountMarkers]
+    .some((value) => typeof value !== "function")
+      || [incrementalAttributionCapabilitiesProvider, incrementalAttributionReviewProvider, readAccountAttributionBinding]
+        .some((value) => value !== null && typeof value !== "function")) {
+    throw new TypeError("attribution contribution controls are invalid");
   }
   if (!dataStore || typeof dataStore.initialize !== "function") {
     throw new TypeError("dataStore.initialize must be a function");
@@ -2828,14 +3383,18 @@ function createPreparedLocalCompanionServer({
   if (typeof onboardingProvider !== "function") {
     throw new TypeError("onboardingProvider must be a function");
   }
+  if (typeof cacheDropThreadLinksProvider !== "function") {
+    throw new TypeError("cacheDropThreadLinksProvider must be a function");
+  }
+  if (modelPerformanceProvider !== null
+      && typeof modelPerformanceProvider !== "function") {
+    throw new TypeError("modelPerformanceProvider must be a function");
+  }
   if (typeof claudeShadowEnabled !== "boolean"
       || typeof claudeShadowControllerFactory !== "function"
       || !claudeShadowController
       || typeof claudeShadowController.refresh !== "function") {
     throw new TypeError("Claude shadow controller configuration is invalid");
-  }
-  if (typeof contributionPreviewProvider !== "function") {
-    throw new TypeError("contributionPreviewProvider must be a function");
   }
   if (contributionPreparationRunner !== null
       && typeof contributionPreparationRunner !== "function") {
@@ -2854,37 +3413,32 @@ function createPreparedLocalCompanionServer({
       "contributionPreparationCreateKeychainBackend must be a function",
     );
   }
-  if (!automaticContributionOptions
-      || typeof automaticContributionOptions !== "object"
-      || Array.isArray(automaticContributionOptions)) {
-    throw new TypeError("automaticContributionOptions must be an object");
+  if ((accountlessContributionRunner !== undefined
+        && typeof accountlessContributionRunner !== "function")
+      || (accountlessSchedulerOptions !== undefined
+        && (!accountlessSchedulerOptions
+          || typeof accountlessSchedulerOptions !== "object"
+          || Array.isArray(accountlessSchedulerOptions)))) {
+    throw new TypeError("accountless contribution controls are invalid");
   }
-  if (automaticContributionController !== null
-      && (!automaticContributionController
-        || typeof automaticContributionController !== "object"
-        || typeof automaticContributionController.start !== "function"
-        || typeof automaticContributionController.stop !== "function"
-        || typeof automaticContributionController.inspect !== "function"
-        || typeof automaticContributionController.enable !== "function"
-        || typeof automaticContributionController.disable !== "function"
-        || typeof automaticContributionController
-          .recordReviewedManualAcceptance !== "function")) {
-    throw new TypeError("automaticContributionController is invalid");
-  }
-  const developmentIdentity = resolveDevelopmentIdentityConfiguration({
-    file: developmentExportSecretFile,
-    optIn: developmentIdentityOptIn,
-    environmentExportSecretPresent:
-      Object.hasOwn(environment, EXPORT_IDENTITY_ENV),
-  });
+  const developmentIdentity = accountlessProductionProfile
+    ? Object.freeze({ explicitSecretFile: null, mode: null })
+    : resolveDevelopmentIdentityConfiguration({
+      file: developmentExportSecretFile,
+      optIn: developmentIdentityOptIn,
+      environmentExportSecretPresent:
+        Object.hasOwn(environment, EXPORT_IDENTITY_ENV),
+    });
   if (typeof contributionSyncStatusProvider !== "function") {
     throw new TypeError("contributionSyncStatusProvider must be a function");
   }
-  if (typeof contributionQueueFile !== "string"
-      || contributionQueueFile.length < 1) {
+  if ((!accountlessProductionProfile
+        && (typeof contributionQueueFile !== "string"
+          || contributionQueueFile.length < 1))
+      || (accountlessProductionProfile && contributionQueueFile !== null)) {
     throw new TypeError("contributionQueueFile must be a non-empty string");
   }
-  if (preparedContributionDirectory !== null
+  if (!accountlessProductionProfile && preparedContributionDirectory !== null
       && typeof preparedContributionDirectory !== "string") {
     throw new TypeError("preparedContributionDirectory must be a string or null");
   }
@@ -2902,6 +3456,7 @@ function createPreparedLocalCompanionServer({
   if (typeof diagnosticsLogFile !== "string"
       || diagnosticsLogFile.length < 1
       || typeof clock !== "function"
+      || typeof diagnosticReferenceFactory !== "function"
       || (diagnosticNoteRecorder !== null
         && typeof diagnosticNoteRecorder !== "function")) {
     throw new TypeError("local diagnostics controls are invalid");
@@ -2926,20 +3481,17 @@ function createPreparedLocalCompanionServer({
         && typeof contributionSyncNextProvider !== "function")
       || (contributionSyncExactReviewProvider !== null
         && typeof contributionSyncExactReviewProvider !== "function")
-      || (contributionSyncOnceRunner !== null
-        && typeof contributionSyncOnceRunner !== "function")
-      || (automaticContributionRetirementRunner !== null
-        && typeof automaticContributionRetirementRunner !== "function")
       || (supersededContributionRetirementRunner !== null
         && typeof supersededContributionRetirementRunner !== "function")
       || (contributionSyncPauseSetter !== null
         && typeof contributionSyncPauseSetter !== "function")
-      || !Number.isSafeInteger(contributionSyncTimeoutMs)
-      || contributionSyncTimeoutMs < 1_000
-      || contributionSyncTimeoutMs > 5 * 60_000) {
+      || typeof automaticContributionStateRetirementRunner !== "function"
+      || typeof automaticContributionRetirementLockAcquirer !== "function") {
     throw new TypeError("contribution sync controls are invalid");
   }
-  const nextContribution = contributionSyncNextProvider
+  const nextContribution = accountlessProductionProfile
+    ? async () => null
+    : contributionSyncNextProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
       : () => inspectNextContributionSyncUpload({
@@ -2981,7 +3533,9 @@ function createPreparedLocalCompanionServer({
     }
     return false;
   };
-  const pairContributionDevice = contributionDevicePairingProvider
+  const pairContributionDevice = accountlessProductionProfile
+    ? null
+    : contributionDevicePairingProvider
     ?? (contributionServiceOrigin === null
       ? null
       : async ({ pairingCode }) => {
@@ -3020,7 +3574,9 @@ function createPreparedLocalCompanionServer({
   // 2026-08-10: the signed native binding failed its integrity pin, so even
   // constructing the backend threw), the repair proceeds by attribute delete
   // rather than refusing to run.
-  const resetContributionDeviceCredential =
+  const resetContributionDeviceCredential = accountlessProductionProfile
+    ? null
+    :
     contributionDeviceCredentialResetRunner
     ?? (async () => {
       let backend = null;
@@ -3043,7 +3599,10 @@ function createPreparedLocalCompanionServer({
   // a foreground or automatic sync cannot begin in the await between the
   // initial idle check and remote revocation.
   let contributionDeviceDisconnectInProgress = false;
-  const disconnectContributionDevice = contributionDeviceDisconnectRunner
+  let contributionReconnectInProgress = 0;
+  const disconnectContributionDevice = accountlessProductionProfile
+    ? null
+    : contributionDeviceDisconnectRunner
     ?? (contributionServiceOrigin === null
       ? null
       : async () => {
@@ -3102,62 +3661,40 @@ function createPreparedLocalCompanionServer({
       note,
       now: clock(),
     }));
-  const hostedSignInHandoff = hostedSignInHandoffController
+  const hostedSignInHandoff = accountlessProductionProfile
+    ? null
+    : hostedSignInHandoffController
     ?? createHostedSignInHandoffController({
       handoffFile: statePaths.hostedSignInHandoffFile,
       now: clock,
     });
-  const reviewExactContribution = contributionSyncExactReviewProvider
+  const reviewExactContribution = accountlessProductionProfile
+    ? async () => null
+    : contributionSyncExactReviewProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
       : () => inspectExactNextContributionSyncUpload({
         directory: preparedContributionDirectory,
         queueFile: contributionQueueFile,
       }));
-  const runContributionPass = contributionSyncOnceRunner
-    ?? (preparedContributionDirectory === null
-        || contributionServiceOrigin === null
-      ? async () => null
-      : async ({
-        signal,
-        reviewedJob,
-        preparedSetId,
-        maximumJobs = LOCAL_SYNC_MAXIMUM_JOBS,
-        maximumReservedUploadBytes =
-          LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
-      }) => {
-        const backend = await createContributionDeviceBackend();
-        return runContributionSyncQueueOnce({
-          directory: preparedContributionDirectory,
-          origin: contributionServiceOrigin,
-          backend,
-          queueFile: contributionQueueFile,
-          stateFile: statePaths.contributionDeviceStateFile,
-          maximumJobs,
-          maximumReservedUploadBytes,
-          reviewedJob,
-          preparedSetId,
-          signal,
-        });
-      });
   const setContributionPaused = contributionSyncPauseSetter
     ?? (({ paused }) => setContributionSyncPaused({
       paused,
       queueFile: contributionQueueFile,
     }));
-  const syncPreviewConfigured = preparedContributionDirectory !== null
-    || contributionSyncNextProvider !== null;
+  const syncPreviewConfigured = !accountlessProductionProfile
+    && (preparedContributionDirectory !== null
+      || contributionSyncNextProvider !== null);
   const contributionDevicePairingConfigured =
-    pairContributionDevice !== null;
+    !accountlessProductionProfile && pairContributionDevice !== null;
   const contributionDeviceDisconnectConfigured =
-    disconnectContributionDevice !== null;
-  const syncExactReviewConfigured = preparedContributionDirectory !== null
-    || contributionSyncExactReviewProvider !== null;
-  const syncDeliveryConfigured =
-    (preparedContributionDirectory !== null
-      && contributionServiceOrigin !== null)
-    || contributionSyncOnceRunner !== null;
-  const runContributionPreparation = contributionPreparationRunner
+    !accountlessProductionProfile && disconnectContributionDevice !== null;
+  const syncExactReviewConfigured = !accountlessProductionProfile
+    && (preparedContributionDirectory !== null
+      || contributionSyncExactReviewProvider !== null);
+  const runContributionPreparation = accountlessProductionProfile
+    ? null
+    : contributionPreparationRunner
     ?? createLocalContributionPreparationRunner({
       ...contributionPreparationOptions,
       coverageProvider: () => (
@@ -3172,6 +3709,8 @@ function createPreparedLocalCompanionServer({
           explicitSecretFile,
           environmentSecret: environment[EXPORT_IDENTITY_ENV],
           appStateSecretFile: statePaths.exportParticipantSecretFile,
+          createLinuxBackend: () =>
+            createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
           ...(contributionPreparationCreateKeychainBackend === undefined
             ? {}
             : {
@@ -3183,25 +3722,14 @@ function createPreparedLocalCompanionServer({
   });
   let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
-  const runAutomaticContributionRetirement =
-    automaticContributionRetirementRunner
-    ?? (preparedContributionDirectory === null
-      ? async () => ({
-        retiredSets: 0,
-        retiredJobs: 0,
-        interrupted: false,
-        networkActivity: false,
-      })
-      : ({ protectedPreparedSetIds, signal }) =>
-        retireAcceptedContributionArtifacts({
-          preparedSpoolDirectory: preparedContributionDirectory,
-          reviewArchiveDirectory:
-            contributionPreparationOptions.reviewArchiveDirectory,
-          queueFile: contributionQueueFile,
-          protectedPreparedSetIds,
-          signal,
-        }));
-  const runSupersededContributionRetirement =
+  const runSupersededContributionRetirement = accountlessProductionProfile
+    ? async () => ({
+      retiredSets: 0,
+      retiredJobs: 0,
+      interrupted: false,
+      networkActivity: false,
+    })
+    :
     supersededContributionRetirementRunner
     ?? (preparedContributionDirectory === null
       ? async () => ({
@@ -3218,53 +3746,6 @@ function createPreparedLocalCompanionServer({
           queueFile: contributionQueueFile,
           signal,
         }));
-  const runAutomaticContributionPreparation = async (request) => {
-    if (contributionPreparationInProgress) {
-      const error = new Error("preparation_in_progress");
-      error.code = "preparation_in_progress";
-      throw error;
-    }
-    contributionPreparationInProgress = true;
-    try {
-      return await runContributionPreparation(request);
-    } finally {
-      contributionPreparationInProgress = false;
-    }
-  };
-  const runAutomaticContributionUpload = async ({
-    signal,
-    preparedSetId,
-  }) => {
-    if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
-      const error = new Error("sync_in_progress");
-      error.code = "sync_in_progress";
-      error.retryable = true;
-      throw error;
-    }
-    contributionSyncInProgress = true;
-    try {
-      return await runContributionPass({
-        signal,
-        preparedSetId,
-        maximumJobs: LOCAL_AUTOMATIC_SYNC_MAXIMUM_JOBS,
-        maximumReservedUploadBytes:
-          LOCAL_AUTOMATIC_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
-      });
-    } finally {
-      contributionSyncInProgress = false;
-    }
-  };
-  const automaticContribution = automaticContributionController
-    ?? createAutomaticContributionController({
-      ...automaticContributionOptions,
-      settingsFile: statePaths.automaticContributionSettingsFile,
-      destinationOrigin: syncDeliveryConfigured
-        ? contributionServiceOrigin
-        : null,
-      prepareRunner: runAutomaticContributionPreparation,
-      uploadRunner: runAutomaticContributionUpload,
-      maintenanceRunner: runAutomaticContributionRetirement,
-    });
   if (incrementalContributionController !== null
       && (!incrementalContributionController
         || typeof incrementalContributionController !== "object"
@@ -3272,7 +3753,13 @@ function createPreparedLocalCompanionServer({
         || typeof incrementalContributionController.stop !== "function"
         || typeof incrementalContributionController.inspect !== "function"
         || typeof incrementalContributionController.approve !== "function"
-        || typeof incrementalContributionController.resume !== "function")) {
+        || typeof incrementalContributionController.resume !== "function"
+        || typeof incrementalContributionController.pauseForDeviceDisconnect
+          !== "function"
+        || typeof incrementalContributionController.pauseForDeviceRepair
+          !== "function"
+        || typeof incrementalContributionController.resumeAfterDeviceRepair
+          !== "function")) {
     throw new TypeError("incrementalContributionController is invalid");
   }
   // Resolved on first use and then held: the provider's legacy leg spawns an
@@ -3300,15 +3787,18 @@ function createPreparedLocalCompanionServer({
   // v0.1 prepared-set path. Configured only when a contribution service
   // origin exists; the health capability additionally requires the unified
   // index file to be present, because the index is the upload source.
-  const incrementalContribution = incrementalContributionController
+  const incrementalContribution = accountlessProductionProfile
+    ? null
+    : incrementalContributionController
     ?? (contributionServiceOrigin === null
       ? null
       : createIncrementalContributionSyncController({
         settingsFile: statePaths.incrementalContributionSyncSettingsFile,
         destinationOrigin: contributionServiceOrigin,
-        runner: async ({ signal }) => {
+        runner: async ({ signal, consent }) => {
           if (contributionSyncInProgress
-              || contributionDeviceDisconnectInProgress) {
+              || contributionDeviceDisconnectInProgress
+              || contributionReconnectInProgress > 0) {
             const error = new Error("sync_in_progress");
             error.code = "sync_in_progress";
             error.retryable = true;
@@ -3316,31 +3806,64 @@ function createPreparedLocalCompanionServer({
           }
           contributionSyncInProgress = true;
           try {
+            if (await contributionRepairState() !== null) {
+              const error = new Error("device_repair_required");
+              error.code = "device_repair_required";
+              throw error;
+            }
             const backend = await createContributionDeviceBackend();
-            // Silent auto-renewal (sign-in-once durability, part 2). Before the
-            // upload pass, rotate the 30-day credential in place if it is inside
-            // its renewal window, authenticated by the existing credential. This
-            // is strictly best-effort: it never throws into the pass, and a
-            // failure just leaves the still-valid credential for the next try.
+            // Rotation can commit remotely before its local CAS/receipt. A
+            // durable pause precedes the actual renewal, not merely a failed
+            // response, so restart can never retry an uncertain old bearer.
+            let renewal;
+            let renewalHintPersisted = false;
             try {
-              await renewContributionDeviceCredentialIfDue({
+              renewal = await renewContributionDeviceCredentialIfDue({
                 origin: contributionServiceOrigin,
                 renewalStateFile: statePaths.contributionDeviceRenewalStateFile,
                 capabilityOptions: {
                   backend,
                   stateFile: statePaths.contributionDeviceStateFile,
                 },
+                renew: async (options) => {
+                  await pauseContributionDeliveryForRepair();
+                  // Pausing aborts this upload pass, not the independent
+                  // rotation/CAS operation already holding the device guard.
+                  return renewContributionDeviceCredential({ ...options, fetchImpl: centralFetch });
+                },
+                writeState: async (file, value) => {
+                  await writeContributionDeviceRenewalState(file, value);
+                  renewalHintPersisted = true;
+                },
               });
             } catch {
-              // A renewal misconfiguration must never stall delivery; the pass
-              // proceeds on the credential that is still valid.
+              await pauseContributionDeliveryForRepair();
+              renewal = { status: "renewal_failed" };
             }
-            return await runIncrementalContributionSyncOnce({
+            if (renewal?.status === "renewed" || renewal?.status === "renewal_failed") {
+              // Do not repeatedly rotate against an expired hint if its write
+              // failed. The pure renewal owner deliberately tolerates that
+              // failure; this rotation-only scheduling path must not.
+              if (renewal.status === "renewed" && renewalHintPersisted) {
+                await incrementalContribution.resumeAfterDeviceRepair();
+              }
+              // The pause fenced this claim's generation. Success schedules a
+              // fresh pass only after this guard releases; ambiguity remains
+              // durably paused. Neither outcome may send an old-secret upload.
+              return deviceUnavailableIncrementalRunOutcome();
+            }
+            return await incrementalContributionRunner({
               indexFile: statePaths.unifiedIndexFile,
               origin: contributionServiceOrigin,
               backend,
               stateFile: statePaths.contributionDeviceStateFile,
-              signal,
+              signal, consent, fetchImpl: centralFetch,
+              loadExistingAccountObservationSecret,
+              readAccountMarkers: readContributionAccountMarkers,
+              onAttributionBinding: (binding) => {
+                approvedAttributionBinding = sanitizeTelemetryAttributionBinding(binding);
+                approvedAttributionBindingAt = clock();
+              },
             });
           } catch (error) {
             // 2026-08-10 (observed live): a foreground ingest writing the
@@ -3373,6 +3896,99 @@ function createPreparedLocalCompanionServer({
           }
         },
       }));
+  let approvedAttributionBinding = null;
+  let approvedAttributionBindingAt = 0;
+  const pauseContributionDeliveryForRepair = async () => {
+    approvedAttributionBinding = null;
+    attributionSupportCache = null;
+    if (incrementalContribution === null) return;
+    const paused = await incrementalContribution.pauseForDeviceRepair();
+    if (paused?.settingsAvailable !== true || paused.paused !== true
+        || paused.pausedReason !== "device_repair_required" || paused.nextAttemptAt !== null) {
+      throw new Error("device repair pause unavailable");
+    }
+  };
+  const contributionDeviceBusy = () => contributionSyncInProgress
+    || contributionDeviceDisconnectInProgress || contributionReconnectInProgress > 0;
+  const contributionRepairState = async () => {
+    if (incrementalContribution === null) return null;
+    try {
+      const state = await incrementalContribution.inspect();
+      if (state?.settingsAvailable !== true) return "settings_unavailable";
+      return state.pausedReason === "device_repair_required" ? "device_repair_required" : null;
+    } catch { return "settings_unavailable"; }
+  };
+  const contributionControlConflict = async () => {
+    if (contributionDeviceBusy()) return "sync_in_progress";
+    const repair = await contributionRepairState();
+    return contributionDeviceBusy() ? "sync_in_progress" : repair;
+  };
+  const withContributionCredentialRead = async (operation) => {
+    if (contributionDeviceBusy()) return null;
+    // Capability/review GETs lease the same rotating credential as uploads.
+    // Hold the guard before inspecting durable state so pairing cannot enter
+    // in that await or between a credential lease and its network request.
+    contributionSyncInProgress = true;
+    try {
+      if (await contributionRepairState() !== null) return null;
+      return await operation();
+    } finally { contributionSyncInProgress = false; }
+  };
+  if (readAccountAttributionBinding === null) {
+    readAccountAttributionBinding = async () => {
+      if (approvedAttributionBinding === null || clock() - approvedAttributionBindingAt > 5 * 60_000
+          || contributionDeviceDisconnectInProgress || contributionReconnectInProgress > 0) return null;
+      const status = await incrementalContribution?.inspect();
+      return status?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+        && status?.consent?.approved === true && status?.consent?.current === true
+        && status.settingsAvailable === true && status.pausedReason !== "device_repair_required"
+        ? approvedAttributionBinding : null;
+    };
+  }
+  const readAttributionCapabilities = incrementalAttributionCapabilitiesProvider ?? (async () =>
+    readIncrementalContributionV11Capabilities({ origin: contributionServiceOrigin,
+      backend: await createContributionDeviceBackend(), stateFile: statePaths.contributionDeviceStateFile,
+      fetchImpl: centralFetch, now: clock }));
+  const readAttributionReview = incrementalAttributionReviewProvider ?? (async () =>
+    readIncrementalContributionV11Review({ indexFile: statePaths.unifiedIndexFile,
+      origin: contributionServiceOrigin, backend: await createContributionDeviceBackend(),
+      stateFile: statePaths.contributionDeviceStateFile, fetchImpl: centralFetch, now: clock,
+      readAccountMarkers: readContributionAccountMarkers, loadExistingAccountObservationSecret }));
+  const attributionCapabilities = () => withContributionCredentialRead(readAttributionCapabilities);
+  const attributionReview = () => withContributionCredentialRead(readAttributionReview);
+  let attributionSupportCache = null;
+  let attributionSupportPending = null;
+  const attributionAccepted = (capability) => capability?.destinationOrigin === contributionServiceOrigin
+    && capability?.requiredConsent?.telemetrySchemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+    && capability?.formats?.some((format) => format.schemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      && format.lifecycle === "accepted") === true;
+  const attributionReviewReady = (review) => review?.status === "ready" && attributionAccepted(review.capabilities)
+    && sanitizeTelemetryAttributionBinding(review.binding) !== null
+    && review.binding.destinationOrigin === contributionServiceOrigin
+    && review.binding.enrollmentNamespace === review.capabilities.enrollmentNamespace
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(review.grantDeviceId ?? "")
+    && /^generation-v2-[0-9a-f]{64}$/u.test(review.publicationFingerprint ?? "")
+    && SHA256.test(review.sample?.manifestDigest ?? "")
+    && INCREMENTAL_SYNC_DAY.test(review.sample?.day ?? "")
+    && ["usage", "quota", "session"].every((stream) => isNonNegativeInteger(review.sample?.recordCounts?.[stream]))
+    && JSON.stringify(review.inventory) === JSON.stringify(telemetryV11FieldInventory());
+  const attributionUpgradeAvailable = async (status) => {
+    // Do not discover a new upload format before any user-approved sharing,
+    // or let polling repeatedly prompt the credential store/network.
+    if (status?.consent?.approved !== true || contributionDeviceBusy()
+        || status.settingsAvailable !== true || status.pausedReason === "device_repair_required"
+        || !await contributionDeviceBindingPresent()) return false;
+    if (attributionSupportCache !== null && clock() - attributionSupportCache.at < 60_000) {
+      return attributionSupportCache.available;
+    }
+    attributionSupportPending ??= (async () => {
+      let available = false;
+      try { available = attributionAccepted(await attributionCapabilities()); } catch { /* Staged/unavailable stays hidden. */ }
+      attributionSupportCache = { at: clock(), available };
+      return available;
+    })().finally(() => { attributionSupportPending = null; });
+    return attributionSupportPending;
+  };
   const unifiedIndexPresent = async () => {
     try {
       const metadata = await lstat(statePaths.unifiedIndexFile);
@@ -3400,50 +4016,97 @@ function createPreparedLocalCompanionServer({
   // converges such installs while keeping the oldest set: it is the instance
   // the approve-once consent was reviewed against. Failures are swallowed —
   // the next launch retries, and delivery state is never touched.
-  const maybeRetireSupersededPreparedSets = async () => {
-    const verdict = await incrementalConsentVerdict();
-    if (verdict?.approved !== true || verdict?.current !== true) return;
-    try {
-      await runSupersededContributionRetirement({});
-    } catch {
-      // Bounded cleanup only; the queue converges on a later pass.
+  let contributionRuntimeStart = null;
+  let contributionRuntimeShutdown = null;
+  const accountlessContribution = createLocalAccountlessContribution({
+    environment, stateRoot, indexFile: statePaths.unifiedIndexFile,
+    channel: accountlessChannel,
+    readAccountMarkers: readContributionAccountMarkers,
+    loadExistingAccountObservationSecret,
+    ...(accountlessContributionRunner === undefined
+      ? {}
+      : { runner: accountlessContributionRunner }),
+    ...(accountlessSchedulerOptions === undefined
+      ? {}
+      : { schedulerOptions: accountlessSchedulerOptions }),
+  });
+  let supersededContributionRetirementPending = null;
+  let supersededContributionRetirementRequested = false;
+  const maybeRetireSupersededPreparedSets = () => {
+    if (accountlessProductionProfile) return Promise.resolve();
+    if (contributionRuntimeShutdown !== null) return Promise.resolve();
+    supersededContributionRetirementRequested = true;
+    if (supersededContributionRetirementPending === null) {
+      supersededContributionRetirementPending = Promise.resolve().then(async () => {
+        // Overlapping triggers share one writer and at most one queued pass.
+        // Re-read consent on a queued pass: an approval can arrive while the
+        // startup probe is still returning its pre-consent verdict.
+        try {
+          while (supersededContributionRetirementRequested
+              && contributionRuntimeShutdown === null) {
+            supersededContributionRetirementRequested = false;
+            const verdict = await incrementalConsentVerdict();
+            if (contributionRuntimeShutdown !== null) return;
+            if (verdict?.approved !== true || verdict?.current !== true) continue;
+            try {
+              await runSupersededContributionRetirement({});
+            } catch {
+              // Bounded cleanup only; the queue converges on a later pass.
+            }
+          }
+        } finally {
+          supersededContributionRetirementPending = null;
+        }
+      });
     }
+    return supersededContributionRetirementPending;
   };
-  let automaticContributionInstanceLock = null;
-  let automaticContributionInstanceLockRelease = null;
-  let automaticContributionShutdown = null;
+  let automaticContributionRetirementLock = null;
+  let automaticContributionRetirementLockRelease = null;
+  let automaticContributionRetirement = null;
   let instanceLockPromise = null;
   let snapshotPromise = null;
-  // Building the first snapshot reads the whole retained collector state, which
-  // is seconds of work on a large install. The port is opened before that work
-  // starts, so this is the only record of whether the in-memory snapshot the
-  // read routes project from actually exists yet. It is reported verbatim by
-  // /api/local/health rather than being smoothed into "ready".
+  // The first snapshot defers full-history projection, but even its bounded
+  // local reads can wait on storage. The port opens before that work, so this
+  // records whether the in-memory snapshot the read routes project actually
+  // exists. /api/local/health reports it without smoothing it into "ready".
   let snapshotState = { status: "building", errorCode: null };
-  const releaseAutomaticContributionInstanceLock = () => {
-    if (automaticContributionInstanceLockRelease !== null) {
-      return automaticContributionInstanceLockRelease;
+  const releaseAutomaticContributionRetirementLock = () => {
+    if (automaticContributionRetirementLockRelease !== null) {
+      return automaticContributionRetirementLockRelease;
     }
-    const lock = automaticContributionInstanceLock;
-    automaticContributionInstanceLock = null;
-    automaticContributionInstanceLockRelease = Promise.resolve(
+    const lock = automaticContributionRetirementLock;
+    automaticContributionRetirementLock = null;
+    automaticContributionRetirementLockRelease = Promise.resolve(
       lock?.release(),
     );
-    return automaticContributionInstanceLockRelease;
+    return automaticContributionRetirementLockRelease;
   };
-  const shutdownAutomaticContribution = () => {
-    if (automaticContributionShutdown === null) {
-      automaticContributionShutdown = (async () => {
-        await automaticContribution.stop();
+  const shutdownContributionRuntime = () => {
+    if (contributionRuntimeShutdown === null) {
+      // Publish the shutdown fence before calling any asynchronous producer.
+      contributionRuntimeShutdown = Promise.resolve().then(async () => {
+        // A start already in flight can persist settings and arm a timer.
+        // Drain only that start before stopping, never the snapshot promise:
+        // snapshot initialization can itself fail into this shutdown path.
+        await contributionRuntimeStart?.catch(() => {});
         try {
           await incrementalContribution?.stop();
         } catch {
           onError("incremental_contribution_stop_failed");
         }
-        await releaseAutomaticContributionInstanceLock();
-      })();
+        try {
+          await accountlessContribution?.stop();
+        } catch {
+          onError("accountless_contribution_stop_failed");
+        }
+        // Retirement includes its consent probe and may still write private
+        // state. Keep the instance lock until that accepted work has settled.
+        await supersededContributionRetirementPending?.catch(() => {});
+        await releaseAutomaticContributionRetirementLock();
+      });
     }
-    return automaticContributionShutdown;
+    return contributionRuntimeShutdown;
   };
   // Single-instance exclusion is cheap (one lock file) and must still be
   // decided before this process is allowed to accept requests, so it stays on
@@ -3451,17 +4114,27 @@ function createPreparedLocalCompanionServer({
   const acquireInstanceLock = () => {
     if (instanceLockPromise === null) {
       instanceLockPromise = (async () => {
-        automaticContributionInstanceLock =
-          await acquireAutomaticContributionInstanceLock({
+        automaticContributionRetirementLock =
+          await automaticContributionRetirementLockAcquirer({
             lockFile: statePaths.automaticContributionLockFile,
           });
+        if (accountlessProductionProfile) return;
+        try {
+          automaticContributionRetirement =
+            await automaticContributionStateRetirementRunner({
+              settingsFile: statePaths.automaticContributionSettingsFile,
+            });
+        } catch (error) {
+          await releaseAutomaticContributionRetirementLock().catch(() => {});
+          throw error;
+        }
       })();
     }
     return instanceLockPromise;
   };
   // Resolved the moment the outcome of the first build is known. A failing
-  // build still finishes stopping automatic contribution before it rethrows -
-  // the instance lock must outlive that cleanup - but a request waiting to read
+  // build still finishes stopping the contribution runtime before it rethrows;
+  // the retirement lock must outlive that cleanup, but a request waiting to read
   // the snapshot is answered as soon as the answer exists, not held behind
   // someone else's teardown.
   let announceSnapshotOutcome = null;
@@ -3471,18 +4144,35 @@ function createPreparedLocalCompanionServer({
   const buildSnapshot = () => {
     if (snapshotPromise === null) {
       snapshotPromise = (async () => {
+        let startupStep = "data_store";
         try {
-          await dataStore.initialize();
-          await automaticContribution.start();
-          // v1.0 incremental sync starts beside the v0.1 scheduler; a
-          // failure here must never take the v0.1 path or the snapshot down.
-          try {
-            await incrementalContribution?.start();
-          } catch {
-            onError("incremental_contribution_start_failed");
+          // Publish the bounded startup projection first. The store retains
+          // validated prior evidence with its provenance; the normal refresh
+          // supplies the subsequent quick and full projections.
+          await dataStore.initialize({ purpose: "startup" });
+          // Contribution transport is optional and cannot take local analysis
+          // down. The closed accountless production profile starts only its
+          // FD3-backed scheduler; legacy scheduling remains absent there.
+          startupStep = "contribution_start";
+          if (contributionRuntimeShutdown === null) {
+            contributionRuntimeStart = Promise.resolve().then(async () => {
+              if (contributionRuntimeShutdown !== null) return;
+              try {
+                await incrementalContribution?.start();
+              } catch {
+                onError("incremental_contribution_start_failed");
+              }
+              if (contributionRuntimeShutdown !== null) return;
+              try {
+                await accountlessContribution?.start();
+              } catch {
+                onError("accountless_contribution_start_failed");
+              }
+            });
+            await contributionRuntimeStart;
           }
-          // Fire-and-forget: superseded v0.1 sets are cleanup, not readiness,
-          // so the snapshot never waits on (or fails with) the pass.
+          // Superseded v0.1 sets are cleanup, not readiness: only shutdown
+          // drains the tracked pass, so the snapshot never waits on it.
           void maybeRetireSupersededPreparedSets().catch(() => {});
           snapshotState = { status: "ready", errorCode: null };
           announceSnapshotOutcome();
@@ -3495,7 +4185,23 @@ function createPreparedLocalCompanionServer({
               : "snapshot_unavailable",
           };
           announceSnapshotOutcome();
-          await shutdownAutomaticContribution().catch(() => {});
+          try {
+            const reference = diagnosticReferenceFactory();
+            if (DIAGNOSTIC_REFERENCE.test(reference)) {
+              await recordDiagnosticNote({
+                reference,
+                surface: LOCAL_STARTUP_DIAGNOSTIC_SURFACE,
+                code: LOCAL_STARTUP_DIAGNOSTIC_CODE,
+                requestId: "",
+                step: startupStep,
+                detail: localStartupDiagnosticDetail(error),
+              });
+            }
+          } catch {
+            // Failure retention is best-effort. It cannot change the startup
+            // error or skip its normal contribution-runtime teardown.
+          }
+          await shutdownContributionRuntime().catch(() => {});
           throw error;
         }
       })();
@@ -3514,6 +4220,8 @@ function createPreparedLocalCompanionServer({
     runner: refreshRunner,
     dataStore,
     timeoutMs: refreshTimeoutMs,
+    timeoutMsForRun: refreshTimeoutMsForRun,
+    clock,
     // Five hours of refresh_resource_limited loops once left zero local
     // trail: the terminal classification lived only in this controller's
     // in-memory state. Every terminal refresh failure now files one bounded,
@@ -3549,6 +4257,19 @@ function createPreparedLocalCompanionServer({
     fetchImpl: centralOutbound.fetch,
   });
   const readLocalContributionDiagnostics = async () => {
+    if (accountlessProductionProfile) {
+      return localContributionDiagnosticsProjection({
+        queue: syncStatusProjection(null),
+        incremental: incrementalSyncStatusProjection(null, {
+          configured: false,
+          keychainPrompt: "none",
+        }),
+        configured: false,
+        pairingObserved: false,
+        paired: false,
+        recentDiagnosticReferences: [],
+      });
+    }
     let queueValue = null;
     let incrementalValue = null;
     let pairingObserved = false;
@@ -3621,6 +4342,7 @@ function createPreparedLocalCompanionServer({
     return authorization;
   };
 
+  const workUsage = createWorkUsageService({ build: workUsageBuild, enrich: workUsageEnrich });
   const server = createServer(async (request, response) => {
     try {
       if (!isLoopbackPeer(request)) {
@@ -3639,16 +4361,22 @@ function createPreparedLocalCompanionServer({
         return;
       }
       const path = url.pathname;
-      // Only the window-breakdown route accepts a query string, and only its
-      // two bounded integer parameters. Hosted sign-in used to redirect back to
+      // Only window breakdown and model performance accept query strings,
+      // with closed route-specific parameters. Hosted sign-in redirected back to
       // a loopback callback on this companion, which was the previous
       // exception; both providers now redirect to the contribution service's
       // own callback and the dashboard collects the result over the relay, so
       // nothing on this origin ever receives a provider's ?code again. Every
       // other route stays query-free by construction.
-      const acceptsQueryString = path === "/api/local/timeline/window-breakdown";
+      const acceptsQueryString = path === "/api/local/timeline/window-breakdown"
+        || path === "/api/local/model-performance";
       if (url.hash !== "" || (url.search !== "" && !acceptsQueryString)) {
         sendError(response, 400, "invalid_request");
+        return;
+      }
+      if (accountlessProductionProfile
+          && isAccountlessProductionClosedLocalRoute(path)) {
+        sendError(response, 404, "not_found");
         return;
       }
       if (centralProxy.handles(path)) {
@@ -3750,27 +4478,62 @@ function createPreparedLocalCompanionServer({
           remoteUploadEnabled: false,
           capabilities: {
             localDashboard: true,
-            claudeDesktopQuota: true,
             explicitRefresh: true,
-            contributionPreview: true,
-            contributionPreparation: true,
+            contributionPreparation: !accountlessProductionProfile,
             contributionPreparationIdentityMode:
-              developmentIdentity.mode,
-            contributionSyncStatus: true,
-            contributionSyncNext: syncPreviewConfigured,
+              accountlessProductionProfile ? null : developmentIdentity.mode,
+            contributionSyncStatus: !accountlessProductionProfile,
+            contributionSyncNext: accountlessProductionProfile
+              ? false
+              : syncPreviewConfigured,
             contributionDevicePairing:
-              contributionDevicePairingConfigured,
+              accountlessProductionProfile
+                ? false
+                : contributionDevicePairingConfigured,
             contributionDeviceDisconnect:
-              contributionDeviceDisconnectConfigured,
-            contributionSyncExactReview: syncExactReviewConfigured,
-            contributionSyncActions: syncDeliveryConfigured,
-            incrementalContributionSync: incrementalSyncCapability,
+              accountlessProductionProfile
+                ? false
+                : contributionDeviceDisconnectConfigured,
+            contributionSyncExactReview: accountlessProductionProfile
+              ? false
+              : syncExactReviewConfigured,
+            incrementalContributionSync: accountlessProductionProfile
+              ? false
+              : incrementalSyncCapability,
             centralServiceProxy: centralProxy.enabled,
             centralParticipantRelay: participantRelay.enabled,
             arbitraryPathAccess: false,
             remoteProxy: false,
           },
         });
+        return;
+      }
+      if (path === "/api/local/desktop-status") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        // The shell receives only the closed projection. It deliberately reads
+        // the in-memory lifecycle, refresh receipt, and a tiny cached display
+        // proof rather than the full dashboard snapshot, so five-second polls
+        // neither clone timeline data nor expose paths, source details, or
+        // accounting. Notification evidence remains exclusively on the refresh
+        // receipt; the display proof cannot authorize a notification.
+        let displayEvidence = null;
+        try {
+          displayEvidence = typeof dataStore.getDesktopShellDisplayEvidence === "function"
+            ? dataStore.getDesktopShellDisplayEvidence()
+            : null;
+        } catch {
+          // A local accessor fault is indistinguishable from unavailable
+          // display evidence at this closed route boundary.
+        }
+        send(response, 200, projectDesktopShellStatus({
+          snapshotStatus: snapshotState.status,
+          refresh: refresh.getStatus(),
+          displayEvidence,
+          now: clock(),
+        }));
         return;
       }
       if (path === "/api/local/diagnostics/contribution") {
@@ -3862,20 +4625,49 @@ function createPreparedLocalCompanionServer({
         send(response, 200, dataStore.getOverview());
         return;
       }
-      if (path === "/api/local/claude/quota") {
+      if (path === "/api/local/work-usage/query") {
+        if (request.method !== "POST") { sendError(response, 405, "method_not_allowed"); return; }
+        if (!authorizeCacheDropThreadLinksRead(request, response)) return;
+        if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(request.headers["content-type"] ?? "")) {
+          sendError(response, 415, "unsupported_media_type"); return;
+        }
+        if (Number(request.headers["content-length"]) > 4096) { sendError(response, 413, "request_too_large"); return; }
+        let bytes = 0; const chunks = [];
+        for await (const chunk of request) {
+          bytes += chunk.length;
+          if (bytes > 4096) { sendError(response, 413, "request_too_large"); return; }
+          chunks.push(chunk);
+        }
+        let query;
+        try { query = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+        catch { sendError(response, 400, "invalid_json"); return; }
+        try { send(response, 200, await workUsage.query(query)); }
+        catch (error) {
+          const code = /^work_usage_[a-z_]+$/u.test(error?.code ?? "") ? error.code : "work_usage_unavailable";
+          sendError(response, code.includes("snapshot") ? 409 : code.includes("query") ? 400 : 503, code);
+        }
+        return;
+      }
+      if (path === "/api/local/cache-drop-thread-links") {
         if (request.method !== "GET") {
           sendError(response, 405, "method_not_allowed");
           return;
         }
-        let quota = null;
+        if (!authorizeCacheDropThreadLinksRead(request, response)) return;
         try {
-          quota = await claudeQuotaProvider();
+          send(response, 200, await cacheDropThreadLinksProvider({
+            overview: dataStore.getOverview(),
+          }));
         } catch {
-          // The route never carries filesystem diagnostics. A missing,
-          // inaccessible, or invalid local state collapses to the same closed
-          // content-free projection as a malformed injected provider.
+          // Missing optional metadata is not a failed accounting refresh.
+          // Never surface filesystem errors, names, or raw thread state.
+          send(response, 200, {
+            schemaVersion: "local-cache-drop-thread-links-v1",
+            status: "unavailable",
+            generation: null,
+            entries: [],
+          });
         }
-        send(response, 200, publicClaudeQuotaResult(quota));
         return;
       }
       if (path === "/api/local/gradient") {
@@ -3900,6 +4692,37 @@ function createPreparedLocalCompanionServer({
         });
         return;
       }
+      if (path === "/api/local/weekly-pace-outlook") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          weekly: {
+            paceOutlook: dataStore.getWeeklyPaceOutlook(),
+          },
+        });
+        return;
+      }
+      if (path === "/api/local/model-performance") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        const entries = [...url.searchParams.entries()];
+        if (entries.length !== 1 || entries[0][0] !== "period"
+            || !["7", "30", "all"].includes(entries[0][1])) {
+          sendError(response, 400, "invalid_request");
+          return;
+        }
+        try {
+          send(response, 200, await readModelPerformance(entries[0][1]));
+        } catch {
+          sendError(response, 503, "model_performance_unavailable");
+        }
+        return;
+      }
       if (path === "/api/local/quality") {
         if (request.method !== "GET") {
           sendError(response, 405, "method_not_allowed");
@@ -3909,14 +4732,6 @@ function createPreparedLocalCompanionServer({
           schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
           quality: dataStore.getQuality(),
         });
-        return;
-      }
-      if (path === "/api/local/reports") {
-        if (request.method !== "GET") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        send(response, 200, dataStore.getReports());
         return;
       }
       if (path === "/api/local/timeline/window-breakdown") {
@@ -3958,20 +4773,6 @@ function createPreparedLocalCompanionServer({
           schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
           breakdown,
         });
-        return;
-      }
-      if (path === "/api/local/contribution/preview") {
-        if (request.method !== "GET") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        let preview;
-        try {
-          preview = await contributionPreviewProvider();
-        } catch {
-          preview = { status: "not_configured" };
-        }
-        send(response, 200, previewProjection(preview));
         return;
       }
       if (path === "/api/local/contribution/prepare") {
@@ -4036,93 +4837,6 @@ function createPreparedLocalCompanionServer({
         }
         return;
       }
-      if (path === "/api/local/contribution/automatic-settings") {
-        if (request.method !== "GET") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        try {
-          send(response, 200, await automaticContribution.inspect());
-        } catch {
-          sendError(
-            response,
-            500,
-            "automatic_contribution_settings_unavailable",
-          );
-        }
-        return;
-      }
-      if (path === "/api/local/contribution/automatic-enable") {
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        const enableRequest = await authorizeAutomaticContributionEnable(
-          request,
-          response,
-        );
-        if (enableRequest === null) return;
-        try {
-          send(
-            response,
-            200,
-            await automaticContribution.enable(enableRequest),
-          );
-        } catch (error) {
-          const code = error?.code;
-          if (code === "automatic_contribution_not_configured") {
-            sendError(
-              response,
-              409,
-              "automatic_contribution_not_configured",
-            );
-          } else if (
-            code === "automatic_contribution_first_review_required"
-          ) {
-            sendError(
-              response,
-              409,
-              "automatic_contribution_first_review_required",
-            );
-          } else if (
-            code === "automatic_contribution_consent_binding_mismatch"
-          ) {
-            sendError(
-              response,
-              409,
-              "automatic_contribution_consent_binding_mismatch",
-            );
-          } else {
-            sendError(
-              response,
-              500,
-              "automatic_contribution_settings_unavailable",
-            );
-          }
-        }
-        return;
-      }
-      if (path === "/api/local/contribution/automatic-disable") {
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        if (!await authorizeLocalMutation(
-          request,
-          response,
-          "automatic_contribution_not_authorized",
-        )) return;
-        try {
-          send(response, 200, await automaticContribution.disable());
-        } catch {
-          sendError(
-            response,
-            500,
-            "automatic_contribution_settings_unavailable",
-          );
-        }
-        return;
-      }
       if (path === "/api/local/contribution/incremental-status") {
         if (request.method !== "GET") {
           sendError(response, 405, "method_not_allowed");
@@ -4141,10 +4855,56 @@ function createPreparedLocalCompanionServer({
         } catch {
           status = null;
         }
-        send(response, 200, incrementalSyncStatusProjection(status, {
+        const projected = incrementalSyncStatusProjection(status, {
           configured: true,
           keychainPrompt: keychainPromptSurface(),
-        }));
+        });
+        if (await attributionUpgradeAvailable(status)) {
+          projected.attributionUpgrade = { available: true,
+            contractVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION };
+        }
+        send(response, 200, projected);
+        return;
+      }
+      if (path === "/api/local/contribution/incremental-review-v11") {
+        if (request.method !== "POST") { sendError(response, 405, "method_not_allowed"); return; }
+        if (!await authorizeLocalMutation(request, response, "exact_review_not_authorized")) return;
+        if (incrementalContribution === null) {
+          sendError(response, 409, "incremental_sync_not_configured"); return;
+        }
+        const conflict = await contributionControlConflict();
+        if (conflict !== null) { sendError(response, 409, conflict); return; }
+        let review;
+        try { review = await attributionReview(); } catch { review = null; }
+        if (!attributionReviewReady(review)) {
+          sendError(response, 409, "attribution_review_unavailable"); return;
+        }
+        const consent = incrementalContributionRequiredConsent({
+          destinationOrigin: contributionServiceOrigin, telemetrySchemaVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+        });
+        const reviewToken = randomBytes(32).toString("base64url");
+        const now = clock();
+        purgeReviewedContributionAuthorizations(now);
+        while (reviewedContributionAuthorizations.size >= MAX_ACTIVE_REVIEW_AUTHORIZATIONS) {
+          reviewedContributionAuthorizations.delete(reviewedContributionAuthorizations.keys().next().value);
+        }
+        reviewedContributionAuthorizations.set(reviewToken, {
+          reviewToken, contractVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, consent,
+          inventoryDigest: review.inventory.inventoryDigest,
+          publicationFingerprint: review.publicationFingerprint,
+          sampleDigest: review.sample.manifestDigest, sampleDay: review.sample.day,
+          binding: review.binding, grantDeviceId: review.grantDeviceId,
+          expiresAt: now + REVIEW_AUTHORIZATION_LIFETIME_MS,
+        });
+        send(response, 200, {
+          schemaVersion: "local-incremental-contribution-review-v1.1", status: "ready",
+          reviewToken, consent, inventory: review.inventory, sample: review.sample,
+          // A random hosted contribution-device target, not a provider account
+          // identifier or a credential. The session grant needs this target.
+          grantDeviceId: review.grantDeviceId,
+          hostedConsentCurrent: review.capabilities.consentCurrent === true,
+          includesContent: false, includesPaths: false, includesAccountIdentifiers: false, includesCredentials: false,
+        });
         return;
       }
       if (path === "/api/local/contribution/incremental-approve") {
@@ -4156,24 +4916,57 @@ function createPreparedLocalCompanionServer({
         // token proves one verified real instance of the covered data was on
         // screen (the review-bootstrap requirement carried into the
         // approve-once flow); it is single-use, exactly like sync-once.
-        const reviewToken = await authorizeReviewedContributionMutation(
+        const approvalRequest = await authorizeReviewedContributionMutation(
           request,
           response,
           "incremental_consent_not_authorized",
         );
-        if (reviewToken === null) return;
+        if (approvalRequest === null) return;
         if (incrementalContribution === null) {
           sendError(response, 409, "incremental_sync_not_configured");
           return;
         }
+        const conflict = await contributionControlConflict();
+        if (conflict !== null) {
+          sendError(response, 409, conflict);
+          return;
+        }
         const authorization = consumeReviewedContributionAuthorization(
-          reviewToken,
+          approvalRequest.reviewToken,
         );
         if (authorization === null) {
           sendError(response, 409, "review_expired_or_changed");
           return;
         }
+        const v11 = authorization.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+        if (v11 !== Object.hasOwn(approvalRequest, "consent")) {
+          sendError(response, 409, "review_expired_or_changed"); return;
+        }
+        if (v11) {
+          if (approvalRequest.fieldInventoryDigest !== authorization.inventoryDigest
+              || Object.entries(authorization.consent).some(([key, value]) => approvalRequest.consent[key] !== value)) {
+            sendError(response, 409, "review_expired_or_changed"); return;
+          }
+          let current;
+          try { current = await attributionReview(); } catch { current = null; }
+          if (!attributionReviewReady(current)
+              || current.publicationFingerprint !== authorization.publicationFingerprint
+              || current.sample.day !== authorization.sampleDay
+              || current.sample.manifestDigest !== authorization.sampleDigest
+              || current.inventory.inventoryDigest !== authorization.inventoryDigest
+              || current.grantDeviceId !== authorization.grantDeviceId
+              || current.binding.enrollmentNamespace !== authorization.binding.enrollmentNamespace) {
+            sendError(response, 409, "review_expired_or_changed"); return;
+          }
+          // Only the personal hosted session may create this grant. Neither
+          // the local route nor the device uploader can mint it implicitly.
+          if (current.capabilities.consentCurrent !== true) {
+            sendError(response, 409, "hosted_consent_required"); return;
+          }
+        }
         let approved;
+        if (contributionDeviceBusy()) { sendError(response, 409, "sync_in_progress"); return; }
+        contributionReconnectInProgress += 1;
         try {
           // The one-step ceremony records local consent BEFORE the hosted
           // pairing mints this Mac's upload credential, so with no binding on
@@ -4185,10 +4978,19 @@ function createPreparedLocalCompanionServer({
           // a Mac that already holds a binding keeps the immediate attempt.
           approved = await incrementalContribution.approve({
             awaitingDevicePairing: !await contributionDeviceBindingPresent(),
+            ...(v11 ? { consent: authorization.consent } : {}),
           });
-        } catch {
-          sendError(response, 500, "incremental_consent_failed");
+          if (v11) {
+            approvedAttributionBinding = authorization.binding;
+            approvedAttributionBindingAt = clock();
+          }
+        } catch (error) {
+          if (error?.code === "incremental_contribution_device_repair_required") {
+            sendError(response, 409, "device_repair_required");
+          } else sendError(response, 500, "incremental_consent_failed");
           return;
+        } finally {
+          contributionReconnectInProgress -= 1;
         }
         if (approved?.consent?.approved !== true
             || approved?.consent?.current !== true
@@ -4199,7 +5001,7 @@ function createPreparedLocalCompanionServer({
         send(response, 200, {
           schemaVersion: "local-incremental-contribution-consent-v1.0",
           status: "approved",
-          contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+          contractVersion: v11 ? TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
           consentedAt: nullableInstant(approved.consent.consentedAt),
           includesIdentifiers: false,
           includesCredentials: false,
@@ -4244,12 +5046,22 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "incremental_sync_not_configured");
           return;
         }
+        const conflict = await contributionControlConflict();
+        if (conflict !== null) {
+          sendError(response, 409, conflict);
+          return;
+        }
         let status;
+        contributionReconnectInProgress += 1;
         try {
           status = await incrementalContribution.resume();
-        } catch {
-          sendError(response, 500, "sync_control_failed");
+        } catch (error) {
+          if (error?.code === "incremental_contribution_device_repair_required") {
+            sendError(response, 409, "device_repair_required");
+          } else sendError(response, 500, "sync_control_failed");
           return;
+        } finally {
+          contributionReconnectInProgress -= 1;
         }
         // Same best-effort immediate pass as the approval and re-pair kicks:
         // the scheduled attempt survives if this tick's run fails closed.
@@ -4262,45 +5074,6 @@ function createPreparedLocalCompanionServer({
           configured: true,
           keychainPrompt: keychainPromptSurface(),
         }));
-        return;
-      }
-      if (path === "/api/local/accounting/fast-mode-preference") {
-        if (request.method === "GET") {
-          try {
-            send(response, 200, await fastModePreference.inspect());
-          } catch {
-            sendError(response, 500, "fast_mode_preference_unavailable");
-          }
-          return;
-        }
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        const selection = await authorizeFastModePreference(request, response);
-        if (selection === null) return;
-        let updated;
-        try {
-          updated = await fastModePreference.select(selection.mode);
-        } catch (error) {
-          sendError(
-            response,
-            error?.code === "fast_mode_preference_invalid" ? 400 : 500,
-            error?.code === "fast_mode_preference_invalid"
-              ? "fast_mode_preference_invalid"
-              : "fast_mode_preference_unavailable",
-          );
-          return;
-        }
-        // The accounting projection is derived from this statement, so the
-        // cached snapshot is rebuilt before the response is acknowledged.
-        try {
-          await dataStore.reload();
-        } catch {
-          // A stale snapshot is not a reason to lose the stored preference;
-          // the next refresh picks it up.
-        }
-        send(response, 200, updated);
         return;
       }
       if (path === "/api/local/contribution/sync-status") {
@@ -4335,7 +5108,7 @@ function createPreparedLocalCompanionServer({
         }
         send(response, 200, syncNextProjection(preview, {
           previewConfigured: syncPreviewConfigured,
-          deliveryConfigured: syncDeliveryConfigured,
+          deliveryConfigured: false,
         }));
         return;
       }
@@ -4357,11 +5130,20 @@ function createPreparedLocalCompanionServer({
           );
           return;
         }
-        if (contributionDeviceDisconnectInProgress) {
+        if (contributionDeviceBusy()) {
           sendError(response, 409, "sync_in_progress");
           return;
         }
+        contributionReconnectInProgress += 1;
+        let pairingSucceeded = false;
+        approvedAttributionBinding = null;
+        attributionSupportCache = null;
         try {
+          // An old bearer must never be reused after an uncertain remote
+          // rotation. Persist intent before the pairing client begins; its
+          // successful return includes both validated receipt and local CAS.
+          try { await pauseContributionDeliveryForRepair(); }
+          catch { sendError(response, 500, "contribution_device_pairing_failed"); return; }
           const paired = await pairContributionDevice({ pairingCode });
           const expiresAt = nullableInstant(paired?.expiresAt);
           if (paired?.status !== "paired"
@@ -4379,23 +5161,8 @@ function createPreparedLocalCompanionServer({
           } catch {
             // deliberately ignored
           }
-          // The v1.0 incremental sync pauses on the same trigger and is
-          // cured by the same pairing, equally best-effort.
-          try {
-            await incrementalContribution?.resume();
-          } catch {
-            // deliberately ignored
-          }
-          // 2026-08-08 (owner-directed): a fresh pairing translates into a
-          // prompt sync attempt too — the re-pair path (a v0.1-consent claim
-          // being replaced by a v1.0 one) must not leave its first pass
-          // waiting on a timer the user cannot see. Same serialization
-          // guarantees as the approval kick above.
-          try {
-            void incrementalContribution?.runDue?.()?.catch?.(() => {});
-          } catch {
-            // deliberately ignored
-          }
+          await incrementalContribution?.resumeAfterDeviceRepair();
+          pairingSucceeded = true;
           send(response, 200, {
             schemaVersion: "local-contribution-device-pairing-v0.1",
             status: "paired",
@@ -4407,8 +5174,12 @@ function createPreparedLocalCompanionServer({
         } catch (error) {
           const recoveryRequired =
             contributionDeviceRecoveryRequired(error);
-          // Two recovery causes keep their own code because the reset
-          // ceremony is the wrong instruction for them. Denied is the one the
+          const migrationRequired =
+            contributionDeviceKeychainMigrationRequired(error);
+          // Three Keychain causes keep their own code because the reset
+          // ceremony is the wrong instruction for them. Migration-required
+          // means the old item was preserved after the one interactive read
+          // was declined. Denied is the one the
           // user acted on directly — Deny (or cancel) in the macOS access
           // dialog the mint's read-back raises — so the dashboard can say
           // which dialog to answer differently. Locked is the one where
@@ -4418,17 +5189,28 @@ function createPreparedLocalCompanionServer({
           const keychainAccessDenied =
             error?.code === "contribution_device_credential_denied";
           const keychainLocked = contributionDeviceKeychainLocked(error);
+          let errorCode = "contribution_device_pairing_failed";
+          if (migrationRequired) {
+            errorCode = "contribution_device_keychain_migration_required";
+          } else if (recoveryRequired) {
+            errorCode = keychainAccessDenied
+              ? "contribution_device_keychain_access_denied"
+              : keychainLocked
+                ? "contribution_device_keychain_locked"
+                : "contribution_device_recovery_required";
+          }
           sendError(
             response,
-            recoveryRequired ? 409 : 502,
-            recoveryRequired
-              ? keychainAccessDenied
-                ? "contribution_device_keychain_access_denied"
-                : keychainLocked
-                  ? "contribution_device_keychain_locked"
-                  : "contribution_device_recovery_required"
-              : "contribution_device_pairing_failed",
+            recoveryRequired || migrationRequired ? 409 : 502,
+            errorCode,
           );
+        } finally {
+          contributionReconnectInProgress -= 1;
+        }
+        // Do not kick while the reconnect guard still excludes upload work.
+        // An ambiguous pairing never reaches this completion-only path.
+        if (pairingSucceeded) {
+          try { void incrementalContribution?.runDue?.()?.catch?.(() => {}); } catch { /* Scheduled attempt survives. */ }
         }
         return;
       }
@@ -4442,47 +5224,72 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "contribution_device_disconnect_not_configured");
           return;
         }
-        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
-          sendError(response, 409, "sync_in_progress");
+        const conflict = await contributionControlConflict();
+        if (conflict !== null) {
+          sendError(response, 409, conflict);
           return;
         }
         contributionDeviceDisconnectInProgress = true;
-        let disconnected;
+        approvedAttributionBinding = null;
+        attributionSupportCache = null;
         try {
-          disconnected = await disconnectContributionDevice();
-        } catch (error) {
-          const cleanupPending = error?.code
-            === "contribution_device_disconnect_cleanup_pending";
-          sendError(
-            response,
-            cleanupPending ? 409 : 502,
-            cleanupPending
-              ? "contribution_device_disconnect_cleanup_pending"
-              : "contribution_device_disconnect_failed",
-          );
-          return;
+          // Persist user intent before revocation or credential cleanup. If
+          // this write fails, the exact credential/binding remain available
+          // for retry; a later remote or cleanup failure keeps delivery paused.
+          if (incrementalContribution !== null) {
+            let paused;
+            try {
+              paused = await incrementalContribution.pauseForDeviceDisconnect();
+            } catch {
+              sendError(response, 500, "contribution_device_disconnect_failed");
+              return;
+            }
+            if (paused?.schemaVersion !== "incremental-contribution-sync-status-v1.0"
+                || paused.settingsAvailable !== true
+                || paused.paused !== true
+                || paused.pausedReason !== "device_disconnected"
+                || paused.nextAttemptAt !== null) {
+              sendError(response, 500, "contribution_device_disconnect_failed");
+              return;
+            }
+          }
+          let disconnected;
+          try {
+            disconnected = await disconnectContributionDevice();
+          } catch (error) {
+            const cleanupPending = error?.code
+              === "contribution_device_disconnect_cleanup_pending";
+            sendError(
+              response,
+              cleanupPending ? 409 : 502,
+              cleanupPending
+                ? "contribution_device_disconnect_cleanup_pending"
+                : "contribution_device_disconnect_failed",
+            );
+            return;
+          }
+          if (disconnected?.status !== "disconnected"
+              || disconnected.deliveryPaused !== true
+              || !["deleted", "already_missing"].includes(
+                disconnected.localCredential,
+              )
+              || disconnected.localBinding !== "removed") {
+            sendError(response, 500, "contribution_device_disconnect_failed");
+            return;
+          }
+          send(response, 200, {
+            schemaVersion: LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION,
+            status: "disconnected",
+            deliveryPaused: true,
+            localCredential: disconnected.localCredential,
+            localBinding: "removed",
+            includesIdentifiers: false,
+            includesCredentials: false,
+            hostedDataDeleted: false,
+          });
         } finally {
           contributionDeviceDisconnectInProgress = false;
         }
-        if (disconnected?.status !== "disconnected"
-            || disconnected.deliveryPaused !== true
-            || !["deleted", "already_missing"].includes(
-              disconnected.localCredential,
-            )
-            || disconnected.localBinding !== "removed") {
-          sendError(response, 500, "contribution_device_disconnect_failed");
-          return;
-        }
-        send(response, 200, {
-          schemaVersion: LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION,
-          status: "disconnected",
-          deliveryPaused: true,
-          localCredential: disconnected.localCredential,
-          localBinding: "removed",
-          includesIdentifiers: false,
-          includesCredentials: false,
-          hostedDataDeleted: false,
-        });
         return;
       }
       if (path === "/api/local/contribution/device-credential-reset") {
@@ -4494,16 +5301,20 @@ function createPreparedLocalCompanionServer({
           request,
           response,
         )) return;
-        if (contributionDeviceDisconnectInProgress) {
+        if (contributionDeviceBusy()) {
           sendError(response, 409, "sync_in_progress");
           return;
         }
         let reset;
+        contributionReconnectInProgress += 1;
         try {
+          await pauseContributionDeliveryForRepair();
           reset = await resetContributionDeviceCredential();
         } catch {
           sendError(response, 500, "device_credential_reset_failed");
           return;
+        } finally {
+          contributionReconnectInProgress -= 1;
         }
         if (!["reset", "already_absent"].includes(reset?.status)
             || !["deleted", "already_missing"].includes(reset?.credential)
@@ -4573,112 +5384,6 @@ function createPreparedLocalCompanionServer({
         }));
         return;
       }
-      if (path === "/api/local/contribution/sync-once") {
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        const reviewToken = await authorizeReviewedContributionMutation(
-          request,
-          response,
-          "sync_not_authorized",
-        );
-        if (reviewToken === null) return;
-        const authorization = consumeReviewedContributionAuthorization(
-          reviewToken,
-        );
-        if (authorization === null) {
-          sendError(response, 409, "review_expired_or_changed");
-          return;
-        }
-        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
-          sendError(response, 409, "sync_in_progress");
-          return;
-        }
-        contributionSyncInProgress = true;
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
-          contributionSyncTimeoutMs,
-        );
-        let result;
-        try {
-          result = await runContributionPass({
-            signal: controller.signal,
-            reviewedJob: authorization.reviewedJob,
-          });
-        } catch (error) {
-          // A leftover device credential is a precisely known local fault with
-          // its own repair. Reporting it as a generic delivery failure would
-          // send the user looking at the service and the network instead. A
-          // locked keychain is the one member of that family that needs no
-          // repair — it is a paused upload, not a broken credential — so it
-          // keeps its own code here too.
-          const recoveryRequired = contributionDeviceRecoveryRequired(error);
-          sendError(
-            response,
-            recoveryRequired ? 409 : 502,
-            recoveryRequired
-              ? contributionDeviceKeychainLocked(error)
-                ? "contribution_device_keychain_locked"
-                : "contribution_device_recovery_required"
-              : "sync_failed",
-          );
-          return;
-        } finally {
-          clearTimeout(timeout);
-          contributionSyncInProgress = false;
-        }
-        if (result === null) {
-          sendError(response, 503, "sync_not_configured");
-          return;
-        }
-        if (result.status === "completed"
-            && Number.isSafeInteger(result.accepted)
-            && result.accepted > 0) {
-          try {
-            await automaticContribution.recordReviewedManualAcceptance({
-              status: result.status,
-              accepted: result.accepted,
-              preparedSet: result.preparedSet,
-            });
-          } catch {
-            // Delivery already succeeded. Never misreport it as failed or invite
-            // a duplicate send merely because the optional scheduler receipt
-            // could not be persisted; automatic enablement remains closed.
-            onError("automatic_contribution_bootstrap_persist_failed");
-          }
-        }
-        send(response, 200, syncRunProjection(result));
-        return;
-      }
-      if (path === "/api/local/contribution/sync-pause"
-          || path === "/api/local/contribution/sync-resume") {
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        if (!await authorizeLocalMutation(
-          request,
-          response,
-          "sync_control_not_authorized",
-        )) return;
-        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
-          sendError(response, 409, "sync_in_progress");
-          return;
-        }
-        let status;
-        try {
-          status = await setContributionPaused({
-            paused: path.endsWith("sync-pause"),
-          });
-        } catch {
-          sendError(response, 500, "sync_control_failed");
-          return;
-        }
-        send(response, 200, syncStatusProjection(status));
-        return;
-      }
       if (path === "/api/local/refresh") {
         if (request.method === "GET") {
           send(response, 200, {
@@ -4696,11 +5401,35 @@ function createPreparedLocalCompanionServer({
           response,
           "refresh_not_authorized",
         )) return;
-        if (!refresh.start()) {
+        if (!refresh.start({ mode: "detailed" })) {
           // Keep the terminal receipt's opaque run identifier available to a
           // first-party native caller that joined an already-running explicit
           // refresh. It contains no account or evidence data and lets the
           // caller reject a later, unrelated terminal receipt.
+          send(response, 409, {
+            schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+            error: { code: "refresh_in_progress" },
+            refresh: refresh.getStatus(),
+          });
+          return;
+        }
+        send(response, 202, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          refresh: refresh.getStatus(),
+        });
+        return;
+      }
+      if (path === "/api/local/refresh/quick") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "refresh_not_authorized",
+        )) return;
+        if (!refresh.start({ mode: "quick" })) {
           send(response, 409, {
             schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
             error: { code: "refresh_in_progress" },
@@ -4771,7 +5500,7 @@ function createPreparedLocalCompanionServer({
             MAX_STATIC_BYTES,
           );
           const body = staticFile.file === "index.html"
-            ? stampLocalDashboard(source)
+            ? stampLocalDashboard(source, semanticOpenTarget)
             : source;
           send(response, 200, body, staticFile.type);
         } catch {
@@ -4797,16 +5526,23 @@ function createPreparedLocalCompanionServer({
   server.keepAliveTimeout = 90_000;
   server.headersTimeout = 95_000;
   server.once("close", () => {
-    void shutdownAutomaticContribution().catch(() => {
-      onError("automatic_contribution_lock_release_failed");
+    void closeModelPerformance().catch(() => {
+      onError("model_performance_shutdown_failed");
     });
+    void shutdownContributionRuntime().catch(() => {
+      onError("automatic_contribution_retirement_lock_release_failed");
+    });
+  });
+
+  server.on("close", () => {
+    workUsage.close();
+    void Promise.resolve(sharedProjectionReader.close?.()).catch(() => onError("local_projection_shutdown_failed"));
   });
 
   return {
     server,
     dataStore,
     refresh,
-    automaticContribution,
     centralOutbound,
     [PARENT_WATCHDOG_PID]: parentWatchdogPid,
     async initialize() {
@@ -4816,7 +5552,13 @@ function createPreparedLocalCompanionServer({
     acquireInstanceLock,
     buildSnapshot,
     snapshotStatus: () => ({ ...snapshotState }),
-    shutdownAutomaticContribution,
+    automaticContributionRetirement: () => (
+      automaticContributionRetirement === null
+        ? null
+        : { ...automaticContributionRetirement }
+    ),
+    shutdownContributionRuntime,
+    closeModelPerformance,
   };
 }
 
@@ -4866,12 +5608,12 @@ export async function startLocalCompanionServer({
   } catch (error) {
     parentWatchdog.stop();
     await closeHttpServer(app.server).catch(() => {});
-    await app.shutdownAutomaticContribution().catch(() => {});
+    await app.shutdownContributionRuntime().catch(() => {});
     throw error;
   }
   // Started behind the open port. The read routes await this same promise, and
   // a failure is surfaced through `snapshotReady` rather than being swallowed:
-  // it still stops automatic contribution and releases the instance lock.
+  // it still stops contribution activity and releases the retirement lock.
   const snapshotReady = app.buildSnapshot();
   snapshotReady.catch(() => {});
   // Warm the outbound connection to the contribution service off the hot path
@@ -4887,7 +5629,10 @@ export async function startLocalCompanionServer({
     close: async () => {
       parentWatchdog.stop();
       await closeHttpServer(app.server);
-      await app.shutdownAutomaticContribution();
+      await Promise.all([
+        app.closeModelPerformance(),
+        app.shutdownContributionRuntime(),
+      ]);
     },
   };
 }

@@ -20,6 +20,10 @@ import {
   verifyPublishedInstallerRemote,
 } from "../scripts/build-public-release-site.js";
 import {
+  createReleaseChannelProvenance,
+  STABLE_RELEASE_CHANNEL,
+} from "../config/release-channels.js";
+import {
   createMacOSSignedReplacementContract,
 } from "../scripts/macos-release-core.js";
 import { SPARKLE_VERSION } from "../scripts/macos-updater-core.js";
@@ -88,6 +92,12 @@ function sourceHtml() {
     '<meta name="usage-monitor-installer-bytes" content="">',
     '<meta name="usage-monitor-minimum-macos" content="">',
     '<meta name="usage-monitor-architectures" content="">',
+    '<meta name="usage-monitor-intel-installer-url" content="">',
+    '<meta name="usage-monitor-intel-installer-version" content="">',
+    '<meta name="usage-monitor-intel-installer-sha256" content="">',
+    '<meta name="usage-monitor-intel-installer-bytes" content="">',
+    '<meta name="usage-monitor-intel-minimum-macos" content="">',
+    '<meta name="usage-monitor-intel-architectures" content="">',
     '<meta name="usage-monitor-release-notes-url" content="">',
     '<meta name="usage-monitor-privacy-url" content="">',
     '<meta name="usage-monitor-security-url" content="">',
@@ -177,6 +187,9 @@ async function fixture() {
       dmgNotarizationAccepted: true,
       dmgTicketStapled: true,
     },
+    channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
+      publicEdKeySha256: "b".repeat(64),
+    }),
     updater: {
       appcastURL: "https://updates.tibotattle.com/appcast.xml",
       automaticChecks: true,
@@ -362,7 +375,10 @@ async function writeCrossPlatformReleaseManifest(value, overrides = {}) {
 
 function buildFixtureSite(args, overrides = {}) {
   return buildPublicReleaseSite(args, {
-    validateInstallerArtifact: async () => ({
+    validateInstallerArtifact: async (_path, options) => ({
+      architecture: options.architecture ?? "arm64",
+      minimumMacos: options.architecture === "x64" ? "14.0" : "13.0",
+      source: { commit: "a".repeat(40), tag: "v1.2.3" },
       developerIdAuthority: "Developer ID Application: TiboTattle (ABCDE12345)",
       teamIdentifier: "ABCDE12345",
     }),
@@ -378,6 +394,103 @@ function buildFixtureSite(args, overrides = {}) {
     ...overrides,
   });
 }
+
+async function dualArchitectureFixture() {
+  const value = await fixture();
+  const evidence = await writeCrossPlatformReleaseManifest(value);
+  const intelBytes = Buffer.from("separate Intel signed artifact fixture");
+  const intelName = "TiboTattle-1.2.3-macOS-x64.dmg";
+  const intelPath = join(value.root, intelName);
+  await writeFile(intelPath, intelBytes);
+  const intel = {
+    ...structuredClone(evidence.manifest.artifacts[0]),
+    architecture: "x64", fileName: intelName,
+    bytes: intelBytes.length,
+    sha256: createHash("sha256").update(intelBytes).digest("hex"),
+    downloadUrl: `https://downloads.usagemonitor.app/releases/${intelName}`,
+    sbom: null, provenance: null,
+  };
+  evidence.manifest.artifacts.push(intel);
+  await writeFile(evidence.path, `${stableStringify(evidence.manifest)}\n`);
+  return {
+    ...value, evidence, intel,
+    args: releaseArgs(value, {
+      installerReleaseManifest: evidence.path,
+      intelInstallerPath: intelPath,
+      intelInstallerUrl: intel.downloadUrl,
+      intelMinimumMacos: "14.0",
+    }),
+  };
+}
+
+test("dual-architecture site binds separate downloads to the same release and verifies both artifacts", async (t) => {
+  const value = await dualArchitectureFixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  const verified = [];
+  const result = await buildFixtureSite(value.args, {
+    verifyPublishedInstaller: async (input) => { verified.push(input); },
+  });
+  assert.equal(verified.length, 2);
+  assert.equal(result.installer.sha256, value.installerSha256);
+  assert.equal(result.intelInstaller.sha256, value.intel.sha256);
+  assert.equal(result.intelInstaller.url, value.intel.downloadUrl);
+  assert.equal(result.intelInstaller.version, result.installer.version);
+  assert.deepEqual(result.intelInstaller.architectures, ["x64"]);
+  assert.equal(result.intelInstaller.minimumMacos, "14.0");
+  assert.equal(result.intelInstaller.artifactAndNativeTrustVerified, true);
+  assert.deepEqual(result.intelInstaller.releaseEvidence.evidenceDeclared, {
+    sbom: false, provenance: false, sbomAttestation: false,
+  });
+  for (const route of ["index.html", "community.html", "404.html"]) {
+    const html = await readFile(join(value.output, route), "utf8");
+    assert.match(html, /name="usage-monitor-intel-architectures" content="x64"/u);
+    assert.ok(html.includes(`name="usage-monitor-intel-installer-sha256" content="${value.intel.sha256}"`));
+    assert.ok(html.includes(`name="usage-monitor-installer-sha256" content="${value.installerSha256}"`));
+  }
+  const manifest = JSON.parse(await readFile(join(value.output, "release-site-manifest.json"), "utf8"));
+  assert.deepEqual(manifest.intelInstaller, result.intelInstaller);
+  assert.equal(Object.hasOwn(manifest.intelInstaller, "path"), false);
+});
+
+test("Intel availability refuses incomplete, cross-routed, untrusted, and mismatched evidence", async (t) => {
+  const value = await dualArchitectureFixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  for (const overrides of [
+    { intelInstallerPath: null },
+    { intelInstallerUrl: value.args.installerUrl },
+    { intelMinimumMacos: "13.0" },
+    { intelInstallerPath: value.installerPath },
+    { installerReleaseManifest: value.installerReleaseManifest },
+  ]) {
+    await assert.rejects(buildFixtureSite({ ...value.args, ...overrides }));
+  }
+  for (const invalid of [
+    { architecture: "arm64" },
+    { source: { commit: "f".repeat(40), tag: "v1.2.3" } },
+    { source: { commit: "a".repeat(40), tag: "v1.2.4" } },
+    { minimumMacos: "15.0" },
+    { developerIdAuthority: "Developer ID Application: Other (ABCDE12345)" },
+  ]) {
+    await assert.rejects(buildFixtureSite(value.args, {
+      validateInstallerArtifact: async (_path, options) => ({
+        architecture: options.architecture, minimumMacos: options.architecture === "x64" ? "14.0" : "13.0",
+        source: { commit: "a".repeat(40), tag: "v1.2.3" },
+        developerIdAuthority: "Developer ID Application: TiboTattle (ABCDE12345)",
+        teamIdentifier: "ABCDE12345",
+        ...(options.architecture === "x64" ? invalid : {}),
+      }),
+    }), /does not match/u);
+  }
+  await assert.rejects(buildFixtureSite(value.args, {
+    verifyPublishedInstaller: async ({ installerUrl }) => {
+      if (installerUrl === value.intel.downloadUrl) throw new Error("Intel public bytes unavailable");
+    },
+  }), /Intel public bytes unavailable/u);
+  const untrusted = structuredClone(value.evidence.manifest);
+  untrusted.artifacts[1].assurances.notarizationAccepted = false;
+  await writeFile(value.evidence.path, `${stableStringify(untrusted)}\n`);
+  await assert.rejects(buildFixtureSite(value.args));
+});
 
 async function serveReleaseOutput(output) {
   const routeFiles = new Map([
@@ -449,6 +562,109 @@ function assertPublicEntryClaimBoundary(html, label = "public entry") {
   }
 }
 
+function assertPublishedPlatformSelectorContract(html) {
+  const panelStarts = Object.fromEntries(
+    ["macos", "macos-intel", "windows", "linux"].map((platform) => {
+      const marker = `id="platform-panel-${platform}"`;
+      const index = html.indexOf(marker);
+      assert.notEqual(index, -1, `published index includes the ${platform} panel`);
+      return [platform, index];
+    }),
+  );
+  assert.ok(panelStarts.macos < panelStarts["macos-intel"], "Apple silicon panel precedes Intel");
+  assert.ok(panelStarts["macos-intel"] < panelStarts.windows, "macOS Intel panel precedes Windows");
+  assert.ok(panelStarts.windows < panelStarts.linux, "Windows panel precedes Linux");
+  const panelsEnd = html.indexOf('<a class="community-inline"', panelStarts.linux);
+  assert.notEqual(panelsEnd, -1, "platform panels end before the community link");
+
+  const panels = {
+    macos: html.slice(panelStarts.macos, panelStarts["macos-intel"]),
+    "macos-intel": html.slice(panelStarts["macos-intel"], panelStarts.windows),
+    windows: html.slice(panelStarts.windows, panelStarts.linux),
+    linux: html.slice(panelStarts.linux, panelsEnd),
+  };
+
+  assert.match(html, /id="platform-selector"[^>]*role="tablist"/u);
+  for (const platform of ["macos", "macos-intel", "windows", "linux"]) {
+    assert.match(
+      html,
+      new RegExp(
+        `id="platform-tab-${platform}"[\\s\\S]*?role="tab"[\\s\\S]*?aria-controls="platform-panel-${platform}"`,
+        "u",
+      ),
+    );
+    assert.match(
+      panels[platform],
+      new RegExp(
+        `role="tabpanel"[\\s\\S]*?aria-labelledby="platform-tab-${platform}"`,
+        "u",
+      ),
+    );
+  }
+
+  for (const macOnlyId of [
+    "installer-link",
+    "installer-unavailable-action",
+    "homebrew-install",
+    "installer-details",
+    "installer-sha256-copy",
+    "download-assurance",
+  ]) {
+    assert.equal(
+      html.split(`id="${macOnlyId}"`).length - 1,
+      1,
+      `${macOnlyId} is unique in the published index`,
+    );
+    assert.ok(
+      panels.macos.includes(`id="${macOnlyId}"`),
+      `${macOnlyId} belongs only to the macOS panel`,
+    );
+  }
+  assert.match(panels.macos, /Download for macOS/u);
+  assert.match(panels.macos, /brew install --cask adamallcock\/tap\/tibotattle/u);
+  assert.match(panels.macos, /Developer ID signed and Apple notarized\./u);
+
+  for (const [platform, displayName, issue] of [
+    ["macos-intel", "macOS Intel", 93],
+    ["windows", "Windows", 3],
+    ["linux", "Linux", 4],
+  ]) {
+    const panel = platform === "macos-intel"
+      ? panels[platform].slice(panels[platform].indexOf('id="intel-installer-unavailable"'))
+      : panels[platform];
+    assert.match(panel, /Not yet available/u);
+    assert.match(
+      panel,
+      new RegExp(`TiboTattle for ${displayName} is not available yet\\.`, "u"),
+    );
+    assert.match(
+      panel,
+      new RegExp(
+        `Follow the ${displayName} support work for progress\\. A download will appear only after the ${displayName} release passes its platform and release checks\\.`,
+        "u",
+      ),
+    );
+    assert.match(
+      panel,
+      new RegExp(
+        `href="https://github\\.com/adamallcock/tibotattle/issues/${issue}"`,
+        "u",
+      ),
+    );
+    assert.equal(
+      panel.match(/<a\b/gu)?.length ?? 0,
+      1,
+      `${displayName} exposes only its roadmap issue link`,
+    );
+    assert.doesNotMatch(panel, /<button\b/iu);
+    assert.doesNotMatch(panel, /Download for|brew install|SHA-256|Developer ID|notarized|\.dmg\b/iu);
+    assert.doesNotMatch(
+      panel,
+      /\b(?:winget|choco(?:latey)?|scoop|powershell|appimage|flatpak|snap|apt(?:-get)?|dnf|yum|pacman)\b|\.(?:exe|msi|msix|deb|rpm)\b/iu,
+    );
+  }
+}
+
 test("release-site build verifies artifacts and materializes complete public metadata", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
@@ -469,7 +685,12 @@ test("release-site build verifies artifacts and materializes complete public met
   assert.equal(result.fileCount, 13);
   assert.deepEqual(validatedArtifacts, [[
     value.installerPath,
-    { production: true },
+    {
+      allowLegacyUnsealedSource: false,
+      architecture: "arm64",
+      channel: STABLE_RELEASE_CHANNEL,
+      production: true,
+    },
   ]]);
   assert.deepEqual(verifiedPublishedInstallers, [{
     expectedBytes: value.installerBytes.length,
@@ -622,7 +843,7 @@ test("release-site build accepts the canonical cross-platform macOS evidence ent
   assert.equal(result.installer.bytes, value.installerBytes.length);
   assert.deepEqual(validations, [[
     value.installerPath,
-    { expectedShortVersion: "1.2.3", production: true },
+    { architecture: "arm64", expectedShortVersion: "1.2.3", production: true },
   ]]);
   assert.equal(result.installer.artifactAndNativeTrustVerified, true);
   assert.equal(Object.hasOwn(result.installer, "verifiedSignedReleaseEvidence"), false);
@@ -848,7 +1069,7 @@ test("public static routes keep root, community, docs, privacy, and fallback out
   assert.match(root, /id="installer-unavailable-action"[\s\S]*disabled/u);
   assert.match(root, /Public download coming soon\./u);
   assert.equal(community, root, "the community route must use the public entry alias");
-  assert.match(privacy, /<h1>Your dashboard belongs on your Mac\.<\/h1>/u);
+  assert.match(privacy, /<h1>Your dashboard belongs on your device\.<\/h1>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);
   assert.doesNotMatch(privacy, /<script\b/iu);
   assert.match(docs, /<h1>TiboTattle, from download to dashboard\.<\/h1>/u);
@@ -859,6 +1080,7 @@ test("public static routes keep root, community, docs, privacy, and fallback out
     "app.js",
     "data-client.js",
     "lib.js",
+    "work-usage-view.js",
     "navigation.js",
     "telemetry-envelope.js",
     "telemetry-shared.generated.js",
@@ -966,7 +1188,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const result = await buildFixtureSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 20);
+  assert.equal(result.fileCount, 24);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
@@ -978,14 +1200,18 @@ test("checked-in public source satisfies the complete release contract", async (
       "404.html",
       "apple.svg",
       "community-data.js",
+      "community-refresh.js",
       "community-view.js",
       "community.html",
       "community.js",
       "docs.html",
       "github.svg",
+      "i18n.generated.js",
       "index.html",
       "install-cta.js",
       "localization.js",
+      "model-catalog.generated.js",
+      "model-visuals.js",
       "privacy.html",
       "robots.txt",
       "sitemap.xml",
@@ -1023,6 +1249,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const docsHtml = await readFile(join(value.output, "docs.html"), "utf8");
   const privacyHtml = await readFile(join(value.output, "privacy.html"), "utf8");
   assertPublicEntryClaimBoundary(html);
+  assertPublishedPlatformSelectorContract(html);
   assert.equal(communityHtml, html, "the community route output stays identical to the index");
   assert.equal(fallbackHtml, html, "the fallback output stays identical to the index");
   assert.match(html, /id="installer-compatibility"/u);
@@ -1069,7 +1296,7 @@ test("checked-in public source satisfies the complete release contract", async (
   assert.match(html, /src="\.\/community\.js"/u);
   assert.match(
     html,
-    /id="community-method-summary">See community activity details<\/summary>/u,
+    /id="community-method-summary"[^>]*>See community activity<\/summary>/u,
   );
   assert.match(html, /id="installer-sha256-copy"/u);
   assert.doesNotMatch(html, /The community signal|installer-verification/u);
@@ -1099,6 +1326,7 @@ test("checked-in public source satisfies the complete release contract", async (
     "app.js",
     "data-client.js",
     "lib.js",
+    "work-usage-view.js",
     "navigation.js",
     "telemetry-envelope.js",
     "telemetry-shared.generated.js",

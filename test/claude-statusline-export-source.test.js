@@ -23,8 +23,10 @@ import {
 } from "../src/claude-statusline-export-source.js";
 import { sanitizeClaudeStatusline } from "../src/claude-statusline.js";
 import { writeClaudeStatusSnapshot } from "../src/claude-statusline-storage.js";
-import { normalizeClaudeStatusQuotaSnapshots } from "../src/export-safe-records.js";
+import { localSafeRecords } from "../src/local-node-runtime.js";
 import { createExportResourceGuard, ExportResourceLimitError } from "../src/export-resource-policy.js";
+
+const { normalizeClaudeStatusQuotaSnapshots } = localSafeRecords;
 
 const SECRET = Buffer.alloc(32, 61);
 const SESSION_SECRET = Buffer.alloc(32, 62);

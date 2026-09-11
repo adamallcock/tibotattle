@@ -19,16 +19,18 @@ import {
   materializeTelemetryContributions,
   TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
 } from "../src/telemetry-contribution-builder.js";
-import {
-  buildLocalMetadataBundle,
-  writeLocalMetadataBundle,
-} from "../src/metadata-exporter.js";
+import { localMetadataExport } from "../src/local-node-runtime.js";
 import {
   PREPARED_CONTRIBUTION_SET_MANIFEST,
   PREPARED_CONTRIBUTION_SET_VERSION,
   verifyPreparedContributionSet,
 } from "../src/telemetry-prepared-set.js";
 import { stableJson } from "../src/storage.js";
+
+const {
+  buildLocalMetadataBundle,
+  writeLocalMetadataBundle,
+} = localMetadataExport;
 
 function usage(index, overrides = {}) {
   return {

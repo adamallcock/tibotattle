@@ -6,18 +6,19 @@ import { basename, dirname, join, resolve } from "node:path";
 import {
   CodexAppServerClient,
   CodexAppServerError,
-  deriveOpenAIAccountScopeWithSecretLoader,
-  sanitizeCodexAccountSnapshotWithSecretLoader,
+  sanitizeBracketedCodexAccountSnapshotWithSecretLoader,
   sanitizeRateLimit,
   sanitizeAccountScope,
 } from "./providers/codex/account.js";
 import {
+  canonicalComponentAvailability,
   canonicalComponents,
   canonicalRateLimitWindows,
   classifyToolCall,
   normalizeTokenUsage,
-  readRolloutLineage,
-} from "./codex-log-scan.js";
+  tokenComponentPresence,
+} from "./providers/codex/logs.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import {
   normalizeProviderTier,
   unknownCodexTier,
@@ -35,12 +36,18 @@ import {
   readLocalCollectorCheckpoint,
   saveLocalCollectorCheckpoint,
 } from "./local-collector-state.js";
+import {
+  verifyLocalCollectorStateIntegrityOffMain,
+} from "./local-collector-state-integrity-off-main.js";
 import { SPARK_QUOTA_LIMIT_IDS } from "./local-companion-usage-model.js";
+import { sanitizeTelemetryAttributionBinding } from "./contribution/index.js";
 
 const CHECKPOINT_SCHEMA_VERSION = "0.3";
+const { readRolloutLineage } = localCodexLogScanner;
 const RECORD_SCHEMA_VERSION = "0.3";
 const MAX_RECENT_EVENT_KEYS = 5_000;
 const MAX_ACCOUNT_SCOPE_MARKER_AGE_MS = 5 * 60_000;
+const ACCOUNT_SCOPE_MARKER_VERSION = "provisional-account-marker-v2";
 const MAX_BUFFERED_ROLLOUT_LINE_BYTES = 16 * 1024 * 1024;
 // Every line the collector can act on is tiny. Measured across the largest
 // rollout files (36,395 relevant lines): the longest `turn_context` was 2 KiB,
@@ -61,6 +68,8 @@ const MAX_RELEVANT_ROLLOUT_LINE_BYTES = 64 * 1024;
 // marker matched large records that were never going to classify as a tool
 // call, and tightening it was worth 6.8s of cumulative scan time across the
 // corpus on its own.
+// Response-usage records/checkpoint copies deliberately do not enter this
+// legacy token_count stream: neither cumulative totals nor copies are new spend.
 const ROLLOUT_LINE_NEEDLES = Object.freeze([
   Buffer.from('"turn_context"'),
   Buffer.from('"token_count"'),
@@ -125,10 +134,13 @@ const DIAGNOSTIC_COUNT_FIELDS = Object.freeze([
   "rolloutRecordBatchesWritten",
   "appServerRecordsWritten",
   "accountCredentialLocked",
+  "accountCredentialMigrationRequired",
   "accountCredentialUnavailable",
   "tierSettingEvents",
   "tierSettingOmissions",
   "malformedTierSettingEvents",
+  "forkReplayEventsSkipped",
+  "forkReplayToolCallsSkipped",
 ]);
 const COLLECTOR_RESOURCE_LIMIT_CODES = Object.freeze({
   directory_entries: "collector_resource_directory_entries_limit_exceeded",
@@ -212,6 +224,7 @@ function emptyCheckpoint(nowIso, backfill, backfillSinceAt = null) {
       rolloutRecordBatchesWritten: 0,
       appServerRecordsWritten: 0,
       accountCredentialLocked: 0,
+      accountCredentialMigrationRequired: 0,
       accountCredentialUnavailable: 0,
       appServerErrorCounts: {},
       ingestionErrorCounts: {},
@@ -219,6 +232,8 @@ function emptyCheckpoint(nowIso, backfill, backfillSinceAt = null) {
       tierSettingEvents: 0,
       tierSettingOmissions: 0,
       malformedTierSettingEvents: 0,
+      forkReplayEventsSkipped: 0,
+      forkReplayToolCallsSkipped: 0,
       tierSettingCounts: {},
     },
   };
@@ -408,14 +423,33 @@ function tierForUsage(state, observedAt) {
 function addUsageDelta(current, previous) {
   const result = {};
   for (const key of ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"]) {
-    result[key] = Math.max(0, current[key] - (previous?.[key] ?? 0));
+    result[key] = current[key] === null
+      || (previous !== null && previous !== undefined && previous[key] == null)
+      ? null
+      : Math.max(0, current[key] - (previous?.[key] ?? 0));
   }
   return result;
 }
 
+function nullableTokenUsage(value) {
+  const normalized = normalizeTokenUsage(value);
+  if (normalized === null) return null;
+  const presence = tokenComponentPresence(value);
+  return Object.fromEntries(Object.entries(normalized)
+    .map(([key, quantity]) => [key, presence[key] ? quantity : null]));
+}
+
+function availableUsageComponents(usage) {
+  if (usage === null) return null;
+  const availability = canonicalComponentAvailability(tokenComponentPresence(usage), usage);
+  // The passive v0.3 record has a complete-vector-or-null contract. Preserve
+  // missingness without adding fields or publishing a fabricated zero vector.
+  return Object.values(availability).every(Boolean) ? canonicalComponents(usage) : null;
+}
+
 function sameUsage(left, right) {
   return ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"]
-    .every((key) => left[key] === right[key]);
+    .every((key) => right[key] === null || left[key] === right[key]);
 }
 
 function positiveSafeInteger(value, label) {
@@ -647,7 +681,7 @@ async function seedCursorFromTail(path, size, {
       } else if (record.type === "event_msg" && record.payload?.type === "thread_settings_applied") {
         updateTierState(tierState, tierUpdateFromRecord(record, diagnostics));
       } else if (record.type === "event_msg" && record.payload?.type === "token_count") {
-        const total = normalizeTokenUsage(record.payload?.info?.total_token_usage);
+        const total = nullableTokenUsage(record.payload?.info?.total_token_usage);
         if (total) previousTotals = total;
       }
     }
@@ -701,33 +735,65 @@ async function lineStartAtOrAfter(path, offset, size, {
   }
 }
 
+function freshAccountMarker(marker, receivedMs) {
+  const markerCapturedMs = Date.parse(marker?.capturedAt);
+  return marker?.version === ACCOUNT_SCOPE_MARKER_VERSION
+    && Number.isFinite(markerCapturedMs)
+    && Number.isFinite(receivedMs)
+    && receivedMs >= markerCapturedMs
+    && receivedMs - markerCapturedMs <= MAX_ACCOUNT_SCOPE_MARKER_AGE_MS;
+}
+
+function provisionalRolloutAccount({ checkpoint, observedMs, receivedAt, windows = [] }) {
+  const marker = checkpoint.accountScopeMarker;
+  const markerCapturedMs = Date.parse(marker?.capturedAt);
+  const receivedMs = Date.parse(receivedAt);
+  let accountScope = sanitizeAccountScope(null);
+  if (!freshAccountMarker(marker, receivedMs)) {
+    // Old collector markers were not bracketed. A clock rollback, expiration,
+    // or pre-v2 marker must not revive that observation as fresh evidence.
+    checkpoint.accountScopeMarker = null;
+  } else if (observedMs >= markerCapturedMs && observedMs <= receivedMs
+      && receivedMs - observedMs <= MAX_ACCOUNT_SCOPE_MARKER_AGE_MS) {
+    accountScope = sanitizeAccountScope(marker.accountScope);
+    const knownPlans = new Set([accountScope.planType, ...windows.map((window) => window.planType)]
+      .filter((plan) => plan !== null && plan !== "unknown"));
+    if (knownPlans.size > 1) {
+      // A different plan on the same admitted event invalidates the global
+      // marker. Do not use it again merely because the next event omits plan.
+      checkpoint.accountScopeMarker = null;
+      accountScope = sanitizeAccountScope(null);
+    }
+  }
+  return {
+    accountScope,
+    accountScopeAttribution: accountScope.status === "available"
+      ? "provisional_fresh_app_server_marker"
+      : "unavailable_no_fresh_contemporaneous_marker",
+  };
+}
+
 function rolloutRecord({ record, state, receivedAt, checkpoint }) {
   const observedMs = Date.parse(record.timestamp);
   if (!Number.isFinite(observedMs)) {
     checkpoint.diagnostics.malformedTimestamps += 1;
     return null;
   }
-  const markerCapturedMs = Date.parse(checkpoint.accountScopeMarker?.capturedAt);
-  const receivedMs = Date.parse(receivedAt);
-  const markerIsFresh = Number.isFinite(markerCapturedMs)
-    && Number.isFinite(receivedMs)
-    && Math.abs(receivedMs - markerCapturedMs) <= MAX_ACCOUNT_SCOPE_MARKER_AGE_MS;
-  const receiptIsFresh = Number.isFinite(receivedMs)
-    && receivedMs - observedMs >= 0
-    && receivedMs - observedMs <= MAX_ACCOUNT_SCOPE_MARKER_AGE_MS;
-  const accountScope = markerIsFresh && receiptIsFresh
-    ? sanitizeAccountScope(checkpoint.accountScopeMarker.accountScope)
-    : sanitizeAccountScope(null);
-  const accountScopeAttribution = accountScope.status === "available"
-    ? "provisional_fresh_app_server_marker"
-    : "unavailable_no_fresh_contemporaneous_marker";
   if (record.type === "turn_context") {
+    // Any own turn_context ends an inline fork's replayed prefix: Codex
+    // writes the inherited history before the child's first genuine turn.
+    state.ownTurnContextSeen = true;
     if (typeof record.payload?.model === "string") state.currentModel = record.payload.model;
     return null;
   }
   if (record.type === "response_item") {
     const type = record.payload?.type;
     if (type !== "function_call" && type !== "custom_tool_call") return null;
+    if (state.isInlineFork === true && state.ownTurnContextSeen !== true) {
+      checkpoint.diagnostics.forkReplayToolCallsSkipped
+        = (checkpoint.diagnostics.forkReplayToolCallsSkipped ?? 0) + 1;
+      return null;
+    }
     const safe = {
       schemaVersion: RECORD_SCHEMA_VERSION,
       kind: "codex_tool_class_event",
@@ -738,8 +804,7 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
       source: "rollout_tool_call",
       toolClass: classifyToolCall(record.payload?.name),
       surfaceClassification: state.surfaceClassification,
-      accountScope,
-      accountScopeAttribution,
+      ...provisionalRolloutAccount({ checkpoint, observedMs, receivedAt }),
       controlledState: "unknown",
     };
     safe.eventKey = eventKey({ ...safe, receivedAt: undefined, stalenessMs: undefined });
@@ -747,10 +812,21 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
   }
   if (record.type !== "event_msg" || record.payload?.type !== "token_count") return null;
   const info = record.payload?.info;
-  const total = normalizeTokenUsage(info?.total_token_usage);
-  const last = normalizeTokenUsage(info?.last_token_usage);
+  const total = nullableTokenUsage(info?.total_token_usage);
+  const last = nullableTokenUsage(info?.last_token_usage);
   if ((info?.total_token_usage && !total) || (info?.last_token_usage && !last)) {
     checkpoint.diagnostics.malformedUsageRecords += 1;
+  }
+  if (state.isInlineFork === true && state.ownTurnContextSeen !== true) {
+    // Replayed parent turns inside an inline fork are not new spend, and
+    // their rate-limit windows carry rewritten timestamps. A skipped row
+    // still rebases the cumulative baseline — without that, the first
+    // genuine post-fork turn would be charged the entire inherited total as
+    // one enormous delta.
+    if (total) state.previousTotals = total;
+    checkpoint.diagnostics.forkReplayEventsSkipped
+      = (checkpoint.diagnostics.forkReplayEventsSkipped ?? 0) + 1;
+    return null;
   }
   let usage = null;
   if (total) {
@@ -762,7 +838,7 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
     usage = last;
   }
   const windows = canonicalRateLimitWindows(record.payload?.rate_limits);
-  if ((!usage || (usage.input_tokens === 0 && usage.output_tokens === 0)) && windows.length === 0) return null;
+  if ((!usage || !(usage.input_tokens > 0 || usage.output_tokens > 0)) && windows.length === 0) return null;
   const safe = {
     schemaVersion: RECORD_SCHEMA_VERSION,
     kind: "codex_rollout_usage_snapshot",
@@ -772,11 +848,10 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
     stalenessMs: Math.max(0, Date.parse(receivedAt) - observedMs),
     source: "rollout_token_count",
     model: record.payload?.model ?? info?.model ?? state.currentModel ?? "unknown",
-    components: usage ? canonicalComponents(usage) : null,
+    components: availableUsageComponents(usage),
     tierSemantics: tierForUsage(state, record.timestamp),
     surfaceClassification: state.surfaceClassification,
-    accountScope,
-    accountScopeAttribution,
+    ...provisionalRolloutAccount({ checkpoint, observedMs, receivedAt, windows }),
     windows,
     controlledState: "unknown",
   };
@@ -969,6 +1044,11 @@ export async function ingestRolloutUpdates({
         tailSeeded: initializeAtEnd || boundedRecentTail,
         surfaceClassification: lineage.surfaceClassification,
         lineageDisposition: lineage.surfaceClassification?.lineageDisposition ?? "standalone",
+        isInlineFork: lineage.isInlineFork === true,
+        // Codex writes an inline fork's replayed parent history before the
+        // child's first own `turn_context`; a prelude that already carries a
+        // model therefore proves the fork boundary is behind this cursor.
+        ownTurnContextSeen: seed.currentModel !== null,
       };
       if (boundedRecentTail) {
         const seedLatestMs = Date.parse(seed.latestRelevantAt);
@@ -1011,6 +1091,9 @@ export async function ingestRolloutUpdates({
       const effectiveOffset = file.metadata.size < state.offset ? 0 : state.offset;
       const mainRead = Math.max(0, file.metadata.size - effectiveOffset);
       const lineageRead = state.surfaceClassification
+          && (state.isInlineFork !== undefined
+            || state.lineageDisposition === "standalone"
+            || state.lineageDisposition === "parent_linked")
         ? 0
         : Math.min(file.metadata.size, maximumLineagePrefixBytes);
       const seedRead = state.currentModel === null
@@ -1021,12 +1104,36 @@ export async function ingestRolloutUpdates({
         : 0;
       if (!reserveSourceBytes(mainRead + lineageRead + seedRead)) break;
     }
-    if (!state.surfaceClassification) {
+    if (state.isInlineFork === undefined
+        && (state.lineageDisposition === "standalone"
+          || state.lineageDisposition === "parent_linked")) {
+      // A persisted non-forked disposition already proves this is not an
+      // inline fork, so the pre-upgrade migration costs no I/O here. Without
+      // this, the first post-upgrade run would reserve min(size, 1 MiB) of
+      // budget per tracked file and bounded-pause a large corpus before its
+      // newest — live — files were reached. Only "forked" dispositions need
+      // the re-read below to split inline forks from paginated continuations.
+      state.isInlineFork = false;
+      if (state.ownTurnContextSeen === undefined) {
+        state.ownTurnContextSeen = state.currentModel !== null;
+      }
+      markChanged();
+    }
+    if (!state.surfaceClassification || state.isInlineFork === undefined) {
       const lineage = await readRolloutLineage(file.path, {
         maximumTotalBytes: maximumLineagePrefixBytes,
       });
       state.surfaceClassification = lineage.surfaceClassification;
       state.lineageDisposition = lineage.surfaceClassification?.lineageDisposition ?? "standalone";
+      state.isInlineFork = lineage.isInlineFork === true;
+      if (state.ownTurnContextSeen === undefined) {
+        // A checkpoint from before this field: the cursor has already
+        // consumed some prefix. A known model means at least one own or
+        // replayed turn was seen; treating it as past-the-boundary matches
+        // the tail-seed rule and only ever errs toward counting, for a file
+        // whose replay damage predates the guard anyway.
+        state.ownTurnContextSeen = state.currentModel !== null;
+      }
       markChanged();
     }
     if (file.metadata.size < state.offset) {
@@ -1035,6 +1142,10 @@ export async function ingestRolloutUpdates({
       state.currentModel = null;
       state.tierState = null;
       state.tailSeeded = false;
+      // The rescan walks the replayed fork prefix again from byte zero, so
+      // the boundary must be re-derived — a stale true here would disable
+      // both fork guards for the whole rewritten file.
+      state.ownTurnContextSeen = false;
       checkpoint.diagnostics.filesTruncated += 1;
       markChanged();
     }
@@ -1043,6 +1154,12 @@ export async function ingestRolloutUpdates({
       state.currentModel = seed.currentModel;
       if (state.previousTotals === null) state.previousTotals = seed.previousTotals;
       if (state.tierState === null) state.tierState = seed.tierState;
+      // A model in the prelude implies a turn_context behind the cursor, so
+      // the fork boundary is already resolved. The converse is bounded, not
+      // exact: a giant line can push every turn_context out of the prelude
+      // window, in which case at most one in-flight fork turn is withheld
+      // (counted in forkReplayEventsSkipped) until the next turn_context.
+      if (seed.currentModel !== null) state.ownTurnContextSeen = true;
       state.tailSeeded = true;
       markChanged();
     }
@@ -1196,15 +1313,15 @@ function windowsFromAppPayload(payload) {
   const limits = new Map();
   if (canonical?.limitId) limits.set(canonical.limitId, canonical);
   for (const [id, raw] of Object.entries(byLimit)) {
-    const limit = sanitizeRateLimit(raw);
-    if (limit) limits.set(id, limit);
+    const limit = sanitizeRateLimit(raw, id);
+    if (limit) limits.set(limit.limitId, limit);
   }
   const windows = [];
   for (const limit of limits.values()) {
     for (const slot of ["primary", "secondary"]) {
       const window = limit?.[slot];
       if (!window) continue;
-      windows.push({
+      const projected = {
         provider: "openai_codex",
         planType: limit.planType ?? "unknown",
         limitId: limit.limitId ?? "unknown",
@@ -1212,10 +1329,24 @@ function windowsFromAppPayload(payload) {
         usedPercent: window.usedPercent,
         windowDurationMins: window.windowDurationMins,
         resetsAt: window.resetsAt,
-      });
+      };
+      if (limit.limitName !== null) projected.limitName = limit.limitName;
+      windows.push(projected);
     }
   }
   return windows.sort((left, right) => left.limitId.localeCompare(right.limitId) || left.slot.localeCompare(right.slot));
+}
+
+function quotaWindowIdentityProjection(windows) {
+  return windows.map((window) => ({
+    provider: window.provider,
+    planType: window.planType,
+    limitId: window.limitId,
+    slot: window.slot,
+    usedPercent: window.usedPercent,
+    windowDurationMins: window.windowDurationMins,
+    resetsAt: window.resetsAt,
+  }));
 }
 
 export function appServerSnapshotRecord(payload, { source, receivedAt }) {
@@ -1240,9 +1371,12 @@ export function appServerSnapshotRecord(payload, { source, receivedAt }) {
     officialUsageSummary: source === "app_server_read" ? (accountSnapshot?.officialUsageSummary ?? null) : null,
     controlledState: "unknown",
   };
+  // A friendly name is presentation metadata, not quota identity. Provider
+  // copy changes must not manufacture a new observation or reset dedupe.
+  const identityWindows = quotaWindowIdentityProjection(windows);
   safe.eventKey = eventKey(source === "app_server_notification"
-    ? { source, windows, accountScope: safe.accountScope.scopeId }
-    : { source, windows, accountScope: safe.accountScope.scopeId, observedAt: receivedAt });
+    ? { source, windows: identityWindows, accountScope: safe.accountScope.scopeId }
+    : { source, windows: identityWindows, accountScope: safe.accountScope.scopeId, observedAt: receivedAt });
   return safe;
 }
 
@@ -1341,17 +1475,41 @@ export function notificationEvidenceFromAppServerRecord(record) {
   };
 }
 
-async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret) {
-  const rateLimits = await client.readRateLimits();
-  const [account, accountUsage] = await Promise.all([
-    typeof client.readAccount === "function" ? client.readAccount().catch(() => null) : Promise.resolve(null),
+async function readOptionalAccount(client) {
+  try {
+    return typeof client.readAccount === "function" ? await client.readAccount() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function captureAttributionBinding(readBinding) {
+  try { return typeof readBinding === "function" ? sanitizeTelemetryAttributionBinding(await readBinding()) : null; }
+  catch { return null; }
+}
+
+function matchingCapturedBinding(before, after) {
+  return before !== null && after !== null && before.destinationOrigin === after.destinationOrigin
+    && before.enrollmentNamespace === after.enrollmentNamespace ? before : null;
+}
+
+async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret,
+  readAccountAttributionBinding = null, clock = () => Date.now()) {
+  const bindingBefore = await captureAttributionBinding(readAccountAttributionBinding);
+  const accountBefore = await readOptionalAccount(client);
+  const [rateLimits, accountUsage] = await Promise.all([
+    client.readRateLimits(),
     typeof client.readAccountUsage === "function" ? client.readAccountUsage().catch(() => null) : Promise.resolve(null),
   ]);
-  return sanitizeCodexAccountSnapshotWithSecretLoader(
-    { account, rateLimits, accountUsage },
+  const accountAfter = await readOptionalAccount(client);
+  const payload = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader(
+    { accountBefore, accountAfter, rateLimits, accountUsage },
     capturedAt,
     { loadAccountObservationSecret },
   );
+  const bindingAfter = await captureAttributionBinding(readAccountAttributionBinding);
+  return { ...payload, markerCapturedAt: capturedAt, markerReceivedAt: new Date(clock()).toISOString(),
+    observationBinding: matchingCapturedBinding(bindingBefore, bindingAfter) };
 }
 
 async function appendAppRecord({ payload, source, checkpoint, clock, commitRecord }) {
@@ -1360,6 +1518,35 @@ async function appendAppRecord({ payload, source, checkpoint, clock, commitRecor
   }
   const receivedAt = new Date(clock()).toISOString();
   const record = appServerSnapshotRecord(payload, { source, receivedAt });
+  if (Object.hasOwn(payload ?? {}, "accountScope")) {
+    // Notification processing can establish a new forward-looking marker
+    // without proving which account emitted the earlier notification itself.
+    const markerScope = Object.hasOwn(payload, "markerAccountScope")
+      ? sanitizeAccountScope(payload.markerAccountScope)
+      : record.accountScope;
+    if (markerScope.reason === "credential_locked") {
+      checkpoint.diagnostics.accountCredentialLocked = (checkpoint.diagnostics.accountCredentialLocked ?? 0) + 1;
+    }
+    if (markerScope.reason === "credential_migration_required") {
+      checkpoint.diagnostics.accountCredentialMigrationRequired =
+        (checkpoint.diagnostics.accountCredentialMigrationRequired ?? 0) + 1;
+    }
+    if (markerScope.reason === "credential_unavailable") {
+      checkpoint.diagnostics.accountCredentialUnavailable = (checkpoint.diagnostics.accountCredentialUnavailable ?? 0) + 1;
+    }
+    if (markerScope.status === "available") {
+      checkpoint.accountScopeMarker = {
+        version: ACCOUNT_SCOPE_MARKER_VERSION,
+        capturedAt: payload.markerCapturedAt ?? record.observedAt,
+        receivedAt: payload.markerReceivedAt ?? receivedAt,
+        accountScope: markerScope,
+        source: record.source,
+        observationBinding: sanitizeTelemetryAttributionBinding(payload.observationBinding),
+      };
+    } else {
+      checkpoint.accountScopeMarker = null;
+    }
+  }
   const recentSet = new Set(checkpoint.recentEventKeys);
   if (recentSet.has(record.eventKey)) {
     checkpoint.diagnostics.duplicateEventsSkipped += 1;
@@ -1367,23 +1554,6 @@ async function appendAppRecord({ payload, source, checkpoint, clock, commitRecor
   }
   addRecentKey(checkpoint, record.eventKey, recentSet);
   trimRecentKeys(checkpoint, recentSet, MAX_RECENT_EVENT_KEYS);
-  if (Object.hasOwn(payload ?? {}, "accountScope")) {
-    if (record.accountScope.reason === "credential_locked") {
-      checkpoint.diagnostics.accountCredentialLocked = (checkpoint.diagnostics.accountCredentialLocked ?? 0) + 1;
-    }
-    if (record.accountScope.reason === "credential_unavailable") {
-      checkpoint.diagnostics.accountCredentialUnavailable = (checkpoint.diagnostics.accountCredentialUnavailable ?? 0) + 1;
-    }
-    if (record.accountScope.status === "available") {
-      checkpoint.accountScopeMarker = {
-        capturedAt: record.observedAt,
-        accountScope: record.accountScope,
-        source: record.source,
-      };
-    } else {
-      checkpoint.accountScopeMarker = null;
-    }
-  }
   checkpoint.lastQuotaObservedAt = record.observedAt;
   checkpoint.diagnostics.appServerRecordsWritten += 1;
   await commitRecord([record]);
@@ -1404,6 +1574,7 @@ function safeErrorCode(error) {
 }
 
 function recordAppServerError(checkpoint, error) {
+  checkpoint.accountScopeMarker = null;
   checkpoint.diagnostics.appServerErrorCounts ??= {};
   const code = safeErrorCode(error);
   checkpoint.diagnostics.appServerErrorCounts[code] = (checkpoint.diagnostics.appServerErrorCounts[code] ?? 0) + 1;
@@ -1438,6 +1609,7 @@ async function rewindCheckpointAfterAppRecordFailure({
   }
   for (const key of Object.keys(checkpoint)) delete checkpoint[key];
   Object.assign(checkpoint, restored ?? structuredClone(pristineCheckpoint));
+  checkpoint.accountScopeMarker = null;
 }
 
 export async function runCollectorOnce({
@@ -1467,8 +1639,10 @@ export async function runCollectorOnce({
   clock = () => Date.now(),
   appServerFactory = () => new CodexAppServerClient(),
   loadAccountObservationSecret = null,
+  readAccountAttributionBinding = null,
   commitState = commitLocalCollectorState,
   saveState = saveLocalCollectorCheckpoint,
+  integrityVerifier = verifyLocalCollectorStateIntegrityOffMain,
 } = {}) {
   if (!validSignal(signal)) throw new TypeError("signal must be an AbortSignal");
   if (onProgress !== null && typeof onProgress !== "function") {
@@ -1484,6 +1658,9 @@ export async function runCollectorOnce({
   if (typeof stateFile !== "string" || stateFile.length < 1) {
     throw new TypeError("stateFile must be a non-empty string");
   }
+  if (typeof integrityVerifier !== "function") {
+    throw new TypeError("integrityVerifier must be a function");
+  }
   // The migration lease serializes one-time JSON retirement before the normal
   // collector instance lock. Reversing that order can make a second startup
   // wait on SQLite while the first startup is still importing into it.
@@ -1497,9 +1674,17 @@ export async function runCollectorOnce({
   // with the store: 636-663 ms of a 754 ms batch on the live 1.7 GB state.
   // Only the built-in write path can be pooled this way; an injected
   // `commitState` or `saveState` keeps its exact previous behaviour.
+  // Once a pooled batch commits, its close has always owed the full integrity
+  // check even when the enclosing refresh is cancelled or fails. Deliberately
+  // do not pass `signal` to the worker verifier: cancellation cannot shorten
+  // that mandatory settle, and the lock remains held until it completes.
   const pooled = commitState === commitLocalCollectorState
     && saveState === saveLocalCollectorCheckpoint
-    ? await openLocalCollectorStateSession({ stateFile, clock })
+    ? await openLocalCollectorStateSession({
+      stateFile,
+      clock,
+      integrityVerifier,
+    })
     : null;
   let sessionSettled = false;
   try {
@@ -1556,6 +1741,8 @@ export async function runCollectorOnce({
             client,
             capturedAt,
             loadAccountObservationSecret,
+            readAccountAttributionBinding,
+            clock,
           );
           if (signal?.aborted) throw new Error("collector_aborted");
           const record = await appendAppRecord({
@@ -1606,6 +1793,13 @@ export async function runCollectorOnce({
       if (pooled !== null) {
         sessionSettled = true;
         await pooled.close();
+      }
+      // A direct SQLite scan could not observe a main-loop abort while it was
+      // running. The worker leaves that loop responsive, so recheck after the
+      // equally mandatory settled close and expose the cancellation honestly.
+      if (signal?.aborted) {
+        skippedResult.status = "bounded_pause";
+        skippedResult.pauseReason = "collector_aborted";
       }
       return resultStateProperties(skippedResult, { stateFile });
     }
@@ -1771,7 +1965,8 @@ export async function runCollectorOnce({
         await client.start();
         if (signal?.aborted) throw new Error("collector_aborted");
         const capturedAt = new Date(clock()).toISOString();
-        const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret);
+        const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret,
+          readAccountAttributionBinding, clock);
         if (signal?.aborted) throw new Error("collector_aborted");
         const record = await appendAppRecord({
           payload,
@@ -1831,6 +2026,13 @@ export async function runCollectorOnce({
       sessionSettled = true;
       await pooled.close();
     }
+    // See the quota-only branch above: the integrity gate must still finish
+    // after a cancellation, but a cancellation observed during that worker
+    // wait is a bounded pause rather than a stale successful completion.
+    if (signal?.aborted) {
+      result.status = "bounded_pause";
+      result.pauseReason = result.resourceLimit?.code ?? "collector_aborted";
+    }
     return resultStateProperties(result, { stateFile });
   } finally {
     signal?.removeEventListener("abort", abortClient);
@@ -1879,6 +2081,7 @@ export async function runCollectorForeground({
   appServerFactory = () => new CodexAppServerClient(),
   watchRoot = watch,
   loadAccountObservationSecret = null,
+  readAccountAttributionBinding = null,
   ingestUpdates = ingestRolloutUpdates,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
@@ -1922,6 +2125,9 @@ export async function runCollectorForeground({
   let maximumPendingRateLimitNotifications = 0;
   let finalized = false;
   let hasDurableCheckpoint = existing !== null;
+  let accountObservationEpoch = 0;
+  let accountInvalidationQueued = false;
+  let accountInvalidationDirty = false;
   const watchers = [];
 
   checkpoint.diagnostics.ingestionErrorCounts ??= {};
@@ -1940,6 +2146,9 @@ export async function runCollectorForeground({
     hasDurableCheckpoint = durable !== null;
     for (const key of Object.keys(checkpoint)) delete checkpoint[key];
     Object.assign(checkpoint, restored);
+    // A failed operation must not revive a marker from before a known account
+    // failure, logout, disconnect, or speculative append.
+    checkpoint.accountScopeMarker = null;
     checkpoint.diagnostics.ingestionErrorCounts ??= {};
     checkpoint.diagnostics.watcherErrorCounts ??= {};
   }
@@ -2018,6 +2227,10 @@ export async function runCollectorForeground({
         await operation();
       } catch (error) {
         recordOperationError(kind, error);
+        if (kind === "rate_limit_notification") {
+          checkpoint.accountScopeMarker = null;
+          await save();
+        }
       }
     };
     operationTail = operationTail.then(run, run);
@@ -2077,22 +2290,42 @@ export async function runCollectorForeground({
     } while (observed !== operationTail);
   }
 
-  async function notificationPayloadFor(connectedClient, canonical) {
+  async function notificationPayloadFor({ connectedClient, canonical, priorAccountScope, arrivalEpoch }) {
     if (!canonical) return canonical;
-    let accountScope;
-    try {
-      const account = typeof connectedClient.readAccount === "function"
-        ? await connectedClient.readAccount()
-        : null;
-      accountScope = await deriveOpenAIAccountScopeWithSecretLoader(account, {
-        loadAccountObservationSecret,
-        planType: account?.account?.planType ?? canonical.planType,
-      });
-    } catch {
-      accountScope = sanitizeAccountScope(null);
-    }
+    const observationEpoch = accountObservationEpoch;
+    const markerCapturedAt = new Date(clock()).toISOString();
+    const bindingBefore = await captureAttributionBinding(readAccountAttributionBinding);
+    const accountBefore = await readOptionalAccount(connectedClient);
+    const accountAfter = await readOptionalAccount(connectedClient);
+    // This brackets processing, not the earlier arrival of the notification.
+    // It may seed only a forward-looking provisional marker, never an exact
+    // account/rollout occurrence bridge.
+    const payload = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader({
+      accountBefore,
+      accountAfter,
+      rateLimits: { rateLimits: canonical },
+      accountUsage: null,
+    }, markerCapturedAt, { loadAccountObservationSecret });
+    const bindingAfter = await captureAttributionBinding(readAccountAttributionBinding);
+    const markerAccountScope = connectedClient === client && observationEpoch === accountObservationEpoch
+      ? payload.accountScope
+      : sanitizeAccountScope(null);
+    const knownPlans = new Set([priorAccountScope.planType, markerAccountScope.planType, canonical.planType]
+      .filter((plan) => plan !== null && plan !== "unknown"));
+    const notificationMatchesMarker = arrivalEpoch === observationEpoch
+      && markerAccountScope.status === "available"
+      && priorAccountScope.status === "available"
+      && priorAccountScope.scopeId === markerAccountScope.scopeId
+      && knownPlans.size <= 1;
+    const accountScope = notificationMatchesMarker || markerAccountScope.status === "unavailable"
+      ? markerAccountScope
+      : sanitizeAccountScope(null);
     return {
       accountScope,
+      markerAccountScope,
+      markerCapturedAt,
+      markerReceivedAt: new Date(clock()).toISOString(),
+      observationBinding: matchingCapturedBinding(bindingBefore, bindingAfter),
       canonical,
       byLimitId: {},
       officialDailyTokens: [],
@@ -2112,7 +2345,7 @@ export async function runCollectorForeground({
           const pending = pendingRateLimitNotification;
           pendingRateLimitNotification = null;
           rateLimitNotificationPayloadsProcessed += 1;
-          const notificationPayload = await notificationPayloadFor(pending.connectedClient, pending.canonical);
+          const notificationPayload = await notificationPayloadFor(pending);
           const record = await appendForegroundAppRecord(notificationPayload, "app_server_notification");
           if (record) notificationRecords += 1;
           if (!record) await save();
@@ -2134,7 +2367,11 @@ export async function runCollectorForeground({
       // same content-free malformed-output failure as the previous path.
     }
     if (pendingRateLimitNotification !== null) rateLimitNotificationPayloadsCoalesced += 1;
-    pendingRateLimitNotification = { connectedClient, canonical };
+    const marker = checkpoint.accountScopeMarker;
+    const priorAccountScope = freshAccountMarker(marker, clock())
+      ? sanitizeAccountScope(marker.accountScope)
+      : sanitizeAccountScope(null);
+    pendingRateLimitNotification = { connectedClient, canonical, priorAccountScope, arrivalEpoch: accountObservationEpoch };
     maximumPendingRateLimitNotifications = Math.max(maximumPendingRateLimitNotifications, 1);
     return scheduleRateLimitNotificationOperation();
   }
@@ -2147,7 +2384,29 @@ export async function runCollectorForeground({
     client.on("rateLimitsUpdated", (payload) => {
       queueRateLimitNotification(connectedClient, payload);
     });
+    const invalidateAccountMarker = () => {
+      if (connectedClient !== client) return;
+      accountObservationEpoch += 1;
+      checkpoint.accountScopeMarker = null;
+      accountInvalidationDirty = true;
+      if (accountInvalidationQueued) return;
+      accountInvalidationQueued = true;
+      enqueueOperation("account_scope_invalidation", async () => {
+        try {
+          while (accountInvalidationDirty) {
+            accountInvalidationDirty = false;
+            checkpoint.accountScopeMarker = null;
+            await save();
+          }
+        } finally {
+          accountInvalidationQueued = false;
+        }
+      });
+    };
+    client.on("accountChanged", invalidateAccountMarker);
     client.on("disconnect", () => {
+      if (connectedClient !== client) return;
+      invalidateAccountMarker();
       client = null;
     });
     try {
@@ -2159,8 +2418,14 @@ export async function runCollectorForeground({
       await drainOperations();
       const lastObservedMs = checkpoint.lastQuotaObservedAt ? Date.parse(checkpoint.lastQuotaObservedAt) : Number.NEGATIVE_INFINITY;
       if (afterReconnect || clock() - lastObservedMs > staleAfterMs) {
+        const observationEpoch = accountObservationEpoch;
         const capturedAt = new Date(clock()).toISOString();
-        const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret);
+        checkpoint.accountScopeMarker = null;
+        const payload = await readSanitizedAppServerSnapshot(connectedClient, capturedAt, loadAccountObservationSecret,
+          readAccountAttributionBinding, clock);
+        if (client !== connectedClient || observationEpoch !== accountObservationEpoch) {
+          payload.accountScope = sanitizeAccountScope(null);
+        }
         const record = await appendForegroundAppRecord(payload, "app_server_read");
         if (record) notificationRecords += 1;
       }

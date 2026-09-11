@@ -9,7 +9,7 @@ import {
   sanitizeCodexAccountSnapshot,
 } from "./providers/codex/account.js";
 import { scanAndPriceCodexLogs } from "./codex-local-usage-analysis.js";
-import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import { stableJson } from "./export/index.js";
 import { subscriptionSpeedSensitivity } from "./application/index.js";
 import { validateTierDeclaration } from "./providers/codex/logs.js";
@@ -20,6 +20,7 @@ import {
 } from "@app-usagemonitor/accounting";
 
 const MANIFEST_SCHEMA_VERSION = "0.3";
+const { scanCodexLogEvents } = localCodexLogScanner;
 const RESULT_SCHEMA_VERSION = "0.3";
 const ALLOWED_MODES = new Set(["dry", "sample", "live"]);
 const ALLOWED_CACHE_STATES = new Set(["uncached", "repeat_expected", "unspecified"]);
@@ -101,8 +102,9 @@ function projectedComponents(manifest) {
 async function priceProjection(manifest, { offline, priceCards }) {
   const components = projectedComponents(manifest);
   const inputTotal = components.input_uncached_tokens + components.input_cache_read_tokens + components.input_cache_write_tokens;
+  const priceEventTime = new Date().toISOString();
   const priced = priceCodexUsageEvent({
-    timestamp: new Date().toISOString(),
+    timestamp: priceEventTime,
     model: manifest.model,
     raw: { input_tokens: inputTotal },
     components,
@@ -123,7 +125,9 @@ async function priceProjection(manifest, { offline, priceCards }) {
     priceResolution: apiPriceResolutionSummary({ priceCards }),
     tierSemantics: manifest.tierDeclaration,
     subscriptionSpeedSensitivity: subscriptionSpeedSensitivity({
-      [manifest.model]: { costUsd: Number(priced.totalUsd) },
+      [manifest.model]: { costUsd: Number(priced.totalUsd), priceEvidence: {
+        eventTime: priceEventTime, standardPriceCardIds: priced.selectedPriceCardIds,
+      } },
     }, manifest.tierDeclaration.codexSpeedMode),
   };
 }
@@ -396,7 +400,14 @@ export async function runExperiment({
       diagnostics: local.diagnostics,
       observedToolClasses,
       tierSemantics: manifest.tierDeclaration,
-      subscriptionSpeedSensitivity: subscriptionSpeedSensitivity(local.runcost.byModel, manifest.tierDeclaration.codexSpeedMode),
+      // Reuse the scanner's event-qualified token-only scenarios rather than
+      // repricing collapsed model totals (which also include tool charges).
+      subscriptionSpeedSensitivity: {
+        ...local.runcost.subscriptionSpeedSensitivity,
+        observedSpeedMode: manifest.tierDeclaration.codexSpeedMode,
+        selectedScenario: ["standard", "fast"].includes(manifest.tierDeclaration.codexSpeedMode)
+          ? manifest.tierDeclaration.codexSpeedMode : null,
+      },
     },
     concurrencyEvidence: {
       declared: manifest.concurrency,

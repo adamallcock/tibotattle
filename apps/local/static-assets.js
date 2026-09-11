@@ -7,6 +7,7 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "index.html",
     type: "text/html; charset=utf-8",
   }),
+  "/work-usage-view.js": Object.freeze({ file: "work-usage-view.js", type: "text/javascript; charset=utf-8" }),
   "/app.js": Object.freeze({
     file: "app.js",
     type: "text/javascript; charset=utf-8",
@@ -17,6 +18,58 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
   }),
   "/data-client.js": Object.freeze({
     file: "data-client.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/desktop-shell.js": Object.freeze({
+    file: "desktop-shell.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-tray-popup.html": Object.freeze({
+    file: "electron-tray-popup.html",
+    type: "text/html; charset=utf-8",
+  }),
+  "/electron-tray-popup.js": Object.freeze({
+    file: "electron-tray-popup.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-tray-popup.css": Object.freeze({
+    file: "electron-tray-popup.css",
+    type: "text/css; charset=utf-8",
+  }),
+  "/electron-settings.html": Object.freeze({
+    file: "electron-settings.html",
+    type: "text/html; charset=utf-8",
+  }),
+  "/electron-settings.js": Object.freeze({
+    file: "electron-settings.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-tray-settings.js": Object.freeze({
+    file: "electron-tray-settings.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-tray-preferences.js": Object.freeze({
+    file: "electron-tray-preferences.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-settings.css": Object.freeze({
+    file: "electron-settings.css",
+    type: "text/css; charset=utf-8",
+  }),
+  "/icon-panel-left.svg": Object.freeze({
+    file: "icon-panel-left.svg",
+    type: "image/svg+xml",
+  }),
+  "/icon-refresh-cw.svg": Object.freeze({
+    file: "icon-refresh-cw.svg",
+    type: "image/svg+xml",
+  }),
+  "/icon-settings.svg": Object.freeze({
+    file: "icon-settings.svg",
+    type: "image/svg+xml",
+  }),
+  "/i18n.generated.js": Object.freeze({
+    file: "i18n.generated.js",
     type: "text/javascript; charset=utf-8",
   }),
   "/install-cta.js": Object.freeze({
@@ -30,6 +83,22 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
   "/localization.js": Object.freeze({
     file: "localization.js",
     type: "text/javascript; charset=utf-8",
+  }),
+  "/model-visuals.js": Object.freeze({
+    file: "model-visuals.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/model-catalog.generated.js": Object.freeze({
+    file: "model-catalog.generated.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/model-performance.js": Object.freeze({
+    file: "model-performance.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/model-performance.css": Object.freeze({
+    file: "model-performance.css",
+    type: "text/css; charset=utf-8",
   }),
   "/navigation.js": Object.freeze({
     file: "navigation.js",

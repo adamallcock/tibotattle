@@ -7,6 +7,13 @@ import { createInterface } from "node:readline";
 import { isProxy } from "node:util/types";
 
 import { readBoundedUtf8Lines } from "./bounded-jsonl-reader.js";
+import { readCodexSelectedRolloutNames } from "./local-codex-thread-store.js";
+import {
+  compressedRolloutHandle,
+  inspectCompressedRollout,
+  readCompressedRolloutBytes,
+  supportsCompressedRollouts,
+} from "./bounded-rollout-bytes.js";
 
 /**
  * Concrete Node ports for the runtime-neutral Codex provider scanner.
@@ -50,6 +57,9 @@ export function createLocalCodexLogPorts(configuration = {}) {
       currentUid() {
         return typeof process.getuid === "function" ? process.getuid() : null;
       },
+      readSelectedRolloutNames(codexHome) {
+        return readCodexSelectedRolloutNames(codexHome);
+      },
       openDirectory(path) {
         return opendir(path);
       },
@@ -75,6 +85,7 @@ export function createLocalCodexLogPorts(configuration = {}) {
         });
       },
     }),
-    lineReader: Object.freeze({ readBoundedUtf8Lines }),
+    lineReader: Object.freeze({ readBoundedUtf8Lines, compressedRolloutHandle,
+      inspectCompressedRollout, readCompressedRolloutBytes, supportsCompressedRollouts }),
   });
 }

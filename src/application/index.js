@@ -13,11 +13,14 @@ export {
   createLocalExportResourceContext,
 } from "./local-export-resource-context.js";
 export {
-  createLocalAutomaticContributionContext,
-} from "./local-automatic-contribution.js";
-export {
   createLocalContributionSyncQueueContext,
 } from "./local-contribution-sync-queue.js";
+export {
+  CONTRIBUTION_PREFERENCE_SCHEMA_VERSION,
+  createLocalContributionPreference,
+} from "./local-contribution-preference.js";
+export { createAccountlessContributionScheduler } from "./accountless-contribution-scheduler.js";
+export { accountlessTransportOrigin } from "../contribution/index.js";
 export {
   createLocalMetadataBundleVerificationContext,
 } from "./local-metadata-bundle-verification.js";
@@ -52,3 +55,5 @@ export {
 export {
   createLocalMetadataExportContext,
 } from "./local-metadata-export.js";
+export { createWorkUsageService, validateWorkUsageQuery } from "./work-usage.js";
+export { createModelPerformanceContext } from './model-performance.js';

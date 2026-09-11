@@ -195,7 +195,7 @@ test("manual and JSON Schema validators enforce closed plaintext shapes", async 
   assert.equal(validateSchema(part), true, JSON.stringify(validateSchema.errors));
   assert.equal(validateTelemetryContributionV02(part).valid, true);
 
-  for (const planType of ["go", "edu", "prolite"]) {
+  for (const planType of ["go", "edu", "edu_plus", "edu_pro", "prolite"]) {
     const supported = structuredClone(part);
     supported.quotaSnapshots[0].planType = planType;
     supported.activityMarkers[0].planType = planType;

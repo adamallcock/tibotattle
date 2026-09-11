@@ -2,22 +2,52 @@ import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { expandAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contract";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import {
   collectCommunityAllowanceFits,
+  collectCommunityModelCompositions,
   summarizeCommunityAllowanceDay,
   summarizeCommunityCapacityByPlanType,
 } from "../src/community-allowance";
-import type { CommunityAllowanceFit } from "../src/community-allowance";
+import type {
+  CommunityAllowanceFit,
+  CommunityModelComposition,
+} from "../src/community-allowance";
 import {
+  buildCommunityModelCompositionDay,
+  buildAdminCommunityAllowancePreviewFromSource,
+  readCachedAdminCommunityAllowancePreview,
+  warmAdminCommunityAllowancePreviewCache,
+} from "../src/admin-community-allowance";
+import {
+  accountScopedModelCompositionV1,
   accountScopedQuotaAnalysisV1,
   accountScopedQuotaAnalysisV1FullReferenceForTest,
   downsampleQuotaForTest,
   MAX_DOWNSAMPLED_QUOTA_ROWS,
   MAX_WINDOWED_USAGE_ROWS,
+  QUOTA_DOWNSAMPLE_SQL,
   V1_ANALYSIS_WINDOW_DAYS,
+  V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+  V1_USAGE_PAGE_AT_TIME_SQL,
+  V1_USAGE_PAGE_AFTER_TIME_SQL,
+  readV1UsagePage,
+  priceChunkUsageRecord,
+  finishAccountScopedQuotaAnalysisV1,
+  finishAccountScopedModelCompositionV1,
+  v1QuotaFinishQueryReserve,
+  V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+  type V1AcquiredQuotaEvidence,
 } from "../src/quota-analysis-v1";
+import { advanceV1QuotaAcquisition, type V1QuotaAcquisitionCheckpoint } from "../src/quota-analysis-v1-reader";
+import { backfillV1QuotaFitProjection, createV1QuotaPageReader } from "../src/quota-fit-projection";
+import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
+import { createV11DeviceFixture } from "./helpers/telemetry-v11";
+import { grantTelemetryV11Consent, telemetryTransportCapabilities } from "../src/telemetry-transport-policy";
+import { telemetryV11RequiredConsent } from "@app-usagemonitor/telemetry-contract";
+import { loadV11SourcePin } from "../src/telemetry-v11-domain";
 import {
   buildResetEvidence,
   QUOTA_CALIBRATION_POLICY,
@@ -319,14 +349,48 @@ async function upload(
 ): Promise<Response> {
   const envelope = await encrypt(value);
   const raw = JSON.stringify(envelope);
+  const pairingResponse = await api("/api/v1/me/device-pairings", {
+    method: "POST",
+    headers: {
+      cookie: participant.cookie,
+      "content-type": "application/json",
+      "x-usage-monitor-csrf": participant.csrfToken,
+    },
+    body: JSON.stringify({
+      consentVersion: "ongoing-privacy-safe-telemetry-v0.2",
+      ongoingUpload: true,
+    }),
+  });
+  expect(pairingResponse.status).toBe(201);
+  const pairing = await pairingResponse.json<{ pairingCode: string }>();
+  const deviceId = crypto.randomUUID();
+  const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+  const deviceSecret = encodeBase64Url(rawSecret);
+  const prefix = new TextEncoder().encode(
+    `app-usagemonitor/device/v1\0${deviceId}\0`,
+  );
+  const secretInput = new Uint8Array(prefix.byteLength + rawSecret.byteLength);
+  secretInput.set(prefix);
+  secretInput.set(rawSecret, prefix.byteLength);
+  const deviceSecretHash = await sha256Hex(secretInput);
+  secretInput.fill(0);
+  rawSecret.fill(0);
+  const claimed = await api("/api/v1/device-pairings/claim", {
+    method: "POST",
+    headers: {
+      authorization: `Pairing ${pairing.pairingCode}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ deviceId, deviceSecretHash }),
+  });
+  expect(claimed.status).toBe(201);
   const authorizationResponse = await api(
-    "/api/v1/me/upload-authorizations",
+    "/api/v1/device/upload-authorizations",
     {
       method: "POST",
       headers: {
-        cookie: participant.cookie,
+        authorization: `Device um_device_${deviceId}.${deviceSecret}`,
         "content-type": "application/json",
-        "x-usage-monitor-csrf": participant.csrfToken,
       },
       body: JSON.stringify({
         envelopeDigest: await sha256Hex(raw),
@@ -402,6 +466,11 @@ beforeEach(async () => {
   await reset();
   const test = env as TestBindings;
   await applyD1Migrations(test.USAGE_MONITOR_DB, test.TEST_MIGRATIONS);
+  // This suite explicitly exercises the dormant v0.2 ingestion/analysis lane.
+  // Its production blocked default and participant floors remain unchanged.
+  await test.USAGE_MONITOR_DB.prepare(
+    "UPDATE telemetry_transport_formats SET lifecycle = 'accepted' WHERE schema_version = 'telemetry-contribution-v0.2'",
+  ).run();
   await applyD1Migrations(
     test.DELETION_LEDGER,
     test.TEST_DELETION_LEDGER_MIGRATIONS,
@@ -423,9 +492,13 @@ describe("summarizeCommunityAllowanceDay", () => {
     const summary = summarizeCommunityAllowanceDay(fits, "2026-08-08");
     expect(summary.fitCount).toBe(2);
     expect(summary.centralUsd).toBe(20);
-    expect(summary.basis).toBe("seven_day_codex_pro20x_trailing_30d");
-    expect(summary.planType).toBe("pro");
-    expect(summary.planVariant).toBe("pro-20x");
+    expect(summary.basis).toBe(
+      "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+    );
+    expect(summary.referencePlanType).toBe("pro");
+    expect(summary.normalization).toBe("pro_x1_prolite_x4_plus_x20");
+    expect(summary).not.toHaveProperty("planType");
+    expect(summary).not.toHaveProperty("planVariant");
     expect(summary.trailingDays).toBe(30);
     expect(summary.windowDurationMinutes).toBe(10_080);
     expect(summary.limitId).toBe("codex");
@@ -464,9 +537,79 @@ describe("summarizeCommunityAllowanceDay", () => {
     // q10/q90 with linear interpolation over five points.
     expect(five.band80Usd).toEqual({ lowerUsd: 140, upperUsd: 460 });
   });
+
+  it("normalizes supported personal plans into one combined equivalent", () => {
+    const summary = summarizeCommunityAllowanceDay([
+      fit({ participantId: "p1", planType: "pro", capacityNanousd: 100e9 }),
+      // Same person on an older Pro 5x fit: it is a second fit, but not a
+      // second contributing account after the cross-plan dedupe.
+      fit({ participantId: "p1", planType: "prolite", capacityNanousd: 25e9 }),
+      fit({ participantId: "p2", planType: "plus", capacityNanousd: 5e9 }),
+      fit({ participantId: "p3", planType: "team", capacityNanousd: 999e9 }),
+      fit({ participantId: "p4", planType: "unknown", capacityNanousd: 999e9 }),
+    ], "2026-07-25");
+    expect(summary.fitCount).toBe(3);
+    expect(summary.participantCount).toBe(2);
+    expect(summary.centralUsd).toBe(100);
+    expect(summary.band80Usd).toEqual({ lowerUsd: 100, upperUsd: 100 });
+  });
 });
 
 describe("community allowance in the daily aggregate", () => {
+  it("preserves disjoint accepted v0.2 fits instead of enabling an unproven v1.1 replacement", async () => {
+    const participant = await enrolledParticipant();
+    const accepted = await upload(participant, calibratableContribution());
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    const before = await collectCommunityAllowanceFits(db());
+    expect(before).toHaveLength(1);
+    expect(before[0]!.capacityNanousd).toBeGreaterThan(0);
+    const fixture = await createV11DeviceFixture(db(), { participantId: participant.participantId });
+    await db().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();
+    const floor = await db().prepare("SELECT minimum_rank, revision FROM telemetry_transport_participant_floors WHERE participant_id=?")
+      .bind(participant.participantId).first();
+    const capabilities = await telemetryTransportCapabilities(db(), fixture, "http://127.0.0.1:8787");
+    expect(capabilities.formats.find((format) => format.schemaVersion === "telemetry-contribution-v1.1")?.lifecycle).toBe("blocked");
+    await expect(grantTelemetryV11Consent(db(), fixture, telemetryV11RequiredConsent()))
+      .rejects.toMatchObject({code:"TELEMETRY_TRANSPORT_BLOCKED"});
+    expect(await db().prepare("SELECT minimum_rank, revision FROM telemetry_transport_participant_floors WHERE participant_id=?")
+      .bind(participant.participantId).first()).toEqual(floor);
+    expect(await loadV11SourcePin(db(), participant.participantId)).toBeNull();
+    expect(await collectCommunityAllowanceFits(db())).toEqual(before);
+  });
+
+  it("keeps an uncached admin preview read-only instead of analyzing on demand", async () => {
+    const participant = await enrolledParticipant();
+    const accepted = await upload(participant, calibratableContribution());
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    const adminIdentityKey = "a".repeat(64);
+    await db().prepare(
+      "UPDATE participants SET identity_link_key = ? WHERE id = ?",
+    ).bind(adminIdentityKey, participant.participantId).run();
+
+    const response = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { headers: { cookie: participant.cookie } },
+      bindings({ ADMIN_IDENTITY_LINK_KEY: adminIdentityKey }),
+    );
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE" },
+    });
+
+    // v0.2 has no fit-cache writer. The interactive route must fail closed,
+    // not analyze raw records, invent a cache row, or persist its expected
+    // unavailable state as a diagnostic error.
+    const cacheRows = await db().prepare(
+      "SELECT COUNT(*) AS total FROM community_allowance_fit_cache",
+    ).first<{ total: number }>();
+    const diagnosticRows = await db().prepare(
+      "SELECT COUNT(*) AS total FROM diagnostic_error_events",
+    ).first<{ total: number }>();
+    expect(cacheRows?.total).toBe(0);
+    expect(diagnosticRows?.total).toBe(0);
+  });
+
   it("collects fits from the v0.2 corpus and publishes the allowance block", async () => {
     const participant = await enrolledParticipant();
     const accepted = await upload(participant, calibratableContribution());
@@ -513,15 +656,17 @@ describe("community allowance in the daily aggregate", () => {
     expect(contributionPayload.schemaVersion)
       .toBe("community-daily-aggregate-v1.0");
     expect(contributionPayload.allowance).toMatchObject({
-      basis: "seven_day_codex_pro20x_trailing_30d",
-      planType: "pro",
-      planVariant: "pro-20x",
+      basis:
+        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+      referencePlanType: "pro",
+      normalization: "pro_x1_prolite_x4_plus_x20",
       qualification: "shared_reset_fit_gates_40pp_span_floor",
       spanFloorPp: 40,
       fitCount: 1,
       participantCount: 1,
       band80Usd: null,
     });
+    expect(contributionPayload).not.toHaveProperty("capacityByPlanType");
     expect(contributionPayload.allowance.centralUsd).toBeGreaterThan(0);
 
     const staleDay = await readLatestCommunityDailyAggregate(
@@ -539,30 +684,26 @@ describe("community allowance in the daily aggregate", () => {
     });
   });
 
-  it("excludes fits from other plan cohorts: the series is one plan, not a pool", async () => {
+  it("includes supported non-reference plans in the combined equivalent", async () => {
     const participant = await enrolledParticipant();
-    // The identical calibratable series, but observed on a ProLite (5x) plan:
-    // the fit gates pass, yet the published Pro (20x) series must not absorb a
-    // smaller plan's allowance into its median. The cohort is pinned by
-    // plan_type, so plan_type "prolite" is excluded regardless of the variant
-    // tag (which real uploads always carry as "unknown").
+    // The identical calibratable series, but observed on a ProLite (5x) plan.
+    // The fit gates pass and the combined public summary converts it to the
+    // Pro 20x-equivalent basis with the shared multiplier configuration.
     const accepted = await upload(
       participant,
       calibratableContribution("unknown", "prolite"),
     );
     expect(accepted.status, await accepted.clone().text()).toBe(202);
-    // The collector gathers all plan_types (for the capacity monitor), but the
-    // published Pro (20x) band filters to plan_type "pro" in the summarizer, so
-    // a ProLite (5x) series contributes zero fits to the band.
     const fits = await collectCommunityAllowanceFits(db());
-    expect(summarizeCommunityAllowanceDay(fits, "2026-07-27").fitCount).toBe(0);
+    const summary = summarizeCommunityAllowanceDay(fits, "2026-07-27");
+    expect(summary.fitCount).toBe(1);
+    expect(summary.centralUsd).not.toBeNull();
   });
 
   it("summarizes median capacity per plan_type for the multiplier-ratio monitor", async () => {
     // Two participants on different plans; the collector gathers both, and the
-    // additive capacity monitor buckets by plan_type so pro:prolite:plus ratios
-    // can be watched against the stated multipliers. The published band still
-    // sees only the pro cohort.
+    // private diagnostics can still bucket by plan_type even though the public
+    // payload publishes only their one combined normalized result.
     const proParticipant = await enrolledParticipant();
     expect((await upload(
       proParticipant,
@@ -581,10 +722,9 @@ describe("community allowance in the daily aggregate", () => {
     expect(capacity.pro!.medianCapacityNanousd).toBeGreaterThan(0);
     expect(capacity.prolite!.fitCount).toBeGreaterThan(0);
     expect(capacity.prolite!.medianCapacityNanousd).toBeGreaterThan(0);
-    // The published band excludes the ProLite cohort.
     const band = summarizeCommunityAllowanceDay(fits, "2026-07-27");
-    expect(band.planType).toBe("pro");
-    expect(band.fitCount).toBe(1);
+    expect(band.referencePlanType).toBe("pro");
+    expect(band.fitCount).toBe(2);
   });
 
   it("re-enqueues published days whose allowance drifts when late v0.2 fits arrive", async () => {
@@ -735,6 +875,7 @@ interface V1SeedRecord {
   occurrence_id: string;
   observed_at: string;
   provider?: string | null;
+  session_uuid?: string | null;
   model_id?: string | null;
   plan_type?: string | null;
   plan_variant?: string | null;
@@ -812,7 +953,7 @@ async function seedV1Chunk(options: {
       record.observed_at.slice(0, 10),
       record.provider ?? null,
       record.model_id ?? null,
-      null,
+      record.session_uuid ?? null,
       record.plan_type ?? null,
       record.plan_variant ?? null,
       record.limit_id ?? null,
@@ -890,6 +1031,7 @@ async function seedV1CalibratableReset(options: {
   stepPp: number;
   tag: string;
   unpriceable?: boolean;
+  planType?: string;
   // Override the nine 10+index*stepPp levels with an explicit used_percent
   // sequence — e.g. one carrying a small backward "noise" dip.
   usedPercents?: number[];
@@ -904,7 +1046,7 @@ async function seedV1CalibratableReset(options: {
       occurrence_id: `q-${options.tag}-${index}`,
       observed_at: new Date(startMs + index * 5 * 60_000).toISOString(),
       provider: "openai_codex",
-      plan_type: "pro",
+      plan_type: options.planType ?? "pro",
       // Real v1 uploads always carry the variant as "unknown" (the client
       // strips it); the band must draw from this shape, cohorting by plan_type.
       plan_variant: "unknown",
@@ -970,6 +1112,122 @@ async function seedThreeV1Resets(
 }
 
 describe("community allowance from the v1.0 chunk corpus", () => {
+  it("finishes acquired quota with exact scalar/composition parity and one shared query reserve", async () => {
+    const participantId = await seedV1Participant("acquired-finish");
+    await seedV1Session(participantId, "v1-session-acquired");
+    await seedV1Device(participantId, "v1-device-acquired", "v1-session-acquired");
+    await seedThreeV1Resets(participantId, "v1-device-acquired", 5, "acquired");
+    const nowMs = SCALE_NOW;
+    const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_DAYS * DAY_MS).toISOString().slice(0, 10) + "T00:00:00.000Z";
+    const sourcePin = await loadV1SourcePin(db(), { participantId, fromDay: observedAtCutoff.slice(0, 10) });
+    const identity = { participantId, inputFingerprint: sourcePin.fingerprint,
+      sourceMethodVersion: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION, observedAtCutoff,
+      resetsAtCutoff: new Date(Date.parse(observedAtCutoff) + 7 * DAY_MS).toISOString(),
+      windowMinutes: 10_080, maxQuotaRows: MAX_DOWNSAMPLED_QUOTA_ROWS };
+    expect((await backfillV1QuotaFitProjection(db())).status).toBe("complete");
+    const reader = await createV1QuotaPageReader(db(), participantId);
+    const winners = new Map(sourcePin.winners.map(winner => [winner.observed_day, winner.device_id]));
+    const readBudget = { remainingQueries: 30, deadlineMs: Date.now() + 60_000 };
+    let checkpoint: V1QuotaAcquisitionCheckpoint | undefined;
+    let evidence: V1AcquiredQuotaEvidence | undefined;
+    for (let step = 0; step < 8; step++) {
+      const result = await advanceV1QuotaAcquisition(reader, identity, winners, readBudget, checkpoint);
+      if (result.status === "complete") {
+        evidence = { identity, acquisition: { planAnchors: result.planAnchors, quotaRows: result.quotaRows } };
+        break;
+      }
+      expect(result.status).toBe("deferred");
+      if (result.status === "deferred") checkpoint = result.checkpoint;
+    }
+    expect(evidence).toBeDefined();
+    const scalarReference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), participantId);
+    const compositionReference = await accountScopedModelCompositionV1(db(), participantId, { nowMs, sourcePin });
+    expect(compositionReference.status).toBe("ready");
+    if (compositionReference.status === "ready") expect(compositionReference.usageEventCount).toBeGreaterThan(0);
+    const sql: string[] = [];
+    const monitored = new Proxy(db(), {
+      get(target, key) {
+        if (key === "prepare") return (query: string) => {
+          sql.push(query);
+          expect(query).not.toBe(QUOTA_DOWNSAMPLE_SQL);
+          expect(query).not.toContain("WITH plan_times AS MATERIALIZED");
+          return target.prepare(query);
+        };
+        const value: unknown = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const budget = { remainingQueries: 1000, deadlineMs: Date.now() + 60_000 };
+    for (const finish of [finishAccountScopedQuotaAnalysisV1, finishAccountScopedModelCompositionV1]) {
+      for (const missing of [undefined, null, false, {}, { identity, acquisition: undefined }]) {
+        const before = sql.length;
+        await expect(Reflect.apply(finish, undefined, [monitored, participantId, missing,
+          budget, { nowMs, sourcePin }])).rejects.toThrow("evidence required");
+        expect(sql.length).toBe(before);
+        expect(budget.remainingQueries).toBe(1000);
+      }
+      for (const maxDownsampledQuotaRows of [0, -1, 60_001, Infinity, 1.5, NaN]) {
+        const before = sql.length;
+        await expect(Reflect.apply(finish, undefined, [monitored, participantId, evidence,
+          budget, { nowMs, sourcePin, maxDownsampledQuotaRows }])).rejects.toThrow("quota bound invalid");
+        expect(sql.length).toBe(before);
+        expect(budget.remainingQueries).toBe(1000);
+      }
+      const before = sql.length;
+      await expect(Reflect.apply(finish, undefined, [monitored, participantId, evidence,
+        { ...budget, now: () => NaN }, { nowMs, sourcePin }])).rejects.toThrow("budget clock invalid");
+      expect(sql.length).toBe(before);
+    }
+    expect(v1QuotaFinishQueryReserve()).toBe(407);
+    const scalar = await finishAccountScopedQuotaAnalysisV1(monitored, participantId, evidence!, budget, { nowMs, sourcePin });
+    expect(scalar.status).toBe("complete");
+    if (scalar.status !== "complete") throw new Error("scalar unexpectedly deferred");
+    expect(bandResets(scalar.analysis as AnalysisLike)).toEqual(bandResets(scalarReference as AnalysisLike));
+    expect(bandResets(scalar.analysis as AnalysisLike).length).toBeGreaterThanOrEqual(3);
+    expect(scalar.analysis).toMatchObject({ attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+      inputFingerprint: sourcePin.fingerprint });
+    expect(budget.remainingQueries).toBe(593);
+    const composition = await finishAccountScopedModelCompositionV1(monitored, participantId, evidence!, budget, { nowMs, sourcePin });
+    expect(composition.status).toBe("complete");
+    if (composition.status !== "complete") throw new Error("composition unexpectedly deferred");
+    expect(composition.analysis).toEqual(compositionReference.status === "ready"
+      ? { ...compositionReference, attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } : compositionReference);
+    expect(budget.remainingQueries).toBe(186);
+    const before = sql.length;
+    expect(await finishAccountScopedQuotaAnalysisV1(monitored, participantId, evidence!, budget, { nowMs, sourcePin }))
+      .toEqual({ status: "deferred" });
+    expect(sql.length).toBe(before);
+    expect(budget.remainingQueries).toBe(186);
+    const mismatch = { ...evidence!, identity: { ...identity, inputFingerprint: "0".repeat(64) } };
+    await expect(finishAccountScopedQuotaAnalysisV1(monitored, participantId, mismatch,
+      { remainingQueries: 407, deadlineMs: Date.now() + 60_000 }, { nowMs, sourcePin })).rejects.toThrow("evidence mismatch");
+    // A source revision can change after the initial pin check even when the
+    // analysis exits early as not_testable. Such a refusal is not cache-ready.
+    for (const finish of [finishAccountScopedQuotaAnalysisV1, finishAccountScopedModelCompositionV1]) {
+      const freshPin = await loadV1SourcePin(db(), { participantId, fromDay: observedAtCutoff.slice(0, 10) });
+      const freshEvidence = { ...evidence!, identity: { ...identity, inputFingerprint: freshPin.fingerprint } };
+      let batchReads = 0;
+      const changing = new Proxy(monitored, {
+        get(target, key) {
+          if (key === "batch") return async (statements: D1PreparedStatement[]) => {
+            const result = await target.batch(statements);
+            if (++batchReads === 1) {
+              await db().prepare("UPDATE community_analytical_input_versions SET revision = revision + 1 WHERE participant_id = ?")
+                .bind(participantId).run();
+            }
+            return result;
+          };
+          const value: unknown = Reflect.get(target, key);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      await expect(Reflect.apply(finish, undefined, [changing, participantId, freshEvidence,
+        { remainingQueries: 7, deadlineMs: Date.now() + 60_000 },
+        { nowMs, sourcePin: freshPin, maxWindowedUsageRows: 0 }])).rejects.toThrow("source changed during analysis");
+      expect(batchReads).toBe(2);
+    }
+  });
+
   it("collects fits from a v1-only participant and draws the day band", async () => {
     const participantId = await seedV1Participant("solo");
     await seedV1Session(participantId, "v1-session-solo");
@@ -1141,15 +1399,14 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     expect(await collectCommunityAllowanceFits(db())).toHaveLength(0);
   });
 
-  it("analyzes a dual v0.2 + v1 participant through the v0.2 path", async () => {
+  it("retains a dual-source participant's valid v0.2 fit when its v1 fragment cannot fit", async () => {
     const participant = await enrolledParticipant();
     const accepted = await upload(participant, calibratableContribution());
     expect(accepted.status, await accepted.clone().text()).toBe(202);
 
-    // Give the same participant a v1 chunk so both sources exist. MIN(source)
-    // pins the participant to v0.2; the v1 branch is never analyzed. The v1
-    // chunk carries no quota series, so had the v1 path run it would yield no
-    // fit — the single v0.2 fit below proves the v0.2 path was taken.
+    // Both sources are now analyzed independently. The v1 chunk carries no
+    // quota series, so it cannot displace the qualifying v0.2 reset or join its
+    // extra usage to that reset's numerator.
     await seedV1Session(participant.participantId, "v1-session-dual");
     await seedV1Device(participant.participantId, "v1-device-dual",
       "v1-session-dual");
@@ -1174,11 +1431,16 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     expect(fits[0]!.participantId).toBe(participant.participantId);
     expect(fits[0]!.lastObservedAt).toBe("2026-07-25T12:40:00.000Z");
 
-    // No fit cache row is written for a v0.2-source participant.
+    // A mixed-source cache is written with explicit provenance, not an
+    // implicit whole-participant format preference.
     const cached = await db().prepare(
-      "SELECT COUNT(*) AS total FROM community_allowance_fit_cache",
-    ).first<{ total: number }>();
-    expect(cached?.total).toBe(0);
+      "SELECT input_fingerprint, source_method_version, fits_json FROM community_allowance_fit_cache WHERE participant_id = ?",
+    ).bind(participant.participantId).first<{
+      input_fingerprint: string; source_method_version: string; fits_json: string;
+    }>();
+    expect(cached?.input_fingerprint).toMatch(/^[0-9a-f]{64}$/u);
+    expect(cached?.source_method_version).toContain("plan-attribution-v1");
+    expect(JSON.parse(cached!.fits_json)).toEqual(fits);
   });
 });
 
@@ -1400,7 +1662,531 @@ async function newV1Participant(name: string): Promise<string> {
   return participantId;
 }
 
+async function seedPlanEraScenario(name: string, eras: Array<{
+  plan: string; offsetMinutes: number; startPp?: number; stepPp?: number;
+  unpriced?: boolean; sharedSession?: boolean;
+}>): Promise<{ participantId: string; device: string; day: string; baseMs: number; quota: V1SeedRecord[]; usage: V1SeedRecord[] }> {
+  const participantId = await newV1Participant(name);
+  const device = `v1-device-${name}`;
+  const baseMs = SCALE_NOW - 2 * DAY_MS;
+  const day = new Date(baseMs).toISOString().slice(0, 10);
+  const resetsAt = new Date(baseMs + 7 * DAY_MS).toISOString();
+  const quota: V1SeedRecord[] = [];
+  const usage: V1SeedRecord[] = [];
+  for (let index = 0; index < eras.length; index += 1) {
+    const era = eras[index]!;
+    const built = buildCalibratableTrack({ tag: `${name}-${index}`,
+      startMs: baseMs + era.offsetMinutes * MINUTE_MS, resetsAt, stepPp: era.stepPp ?? 5 });
+    quota.push(...built.quota.map((row, offset) => ({ ...row, plan_type: era.plan,
+      used_percent: (era.startPp ?? 10) + offset * (era.stepPp ?? 5) })));
+    usage.push(...built.usage.map((row) => ({ ...row,
+      ...(era.unpriced ? { model_id: "unknown", record_json: v1UnpriceableUsageJson() } : {}),
+      ...(era.sharedSession ? { session_uuid: "00000000-0000-4000-8000-000000000001" } : {}),
+    })));
+  }
+  await seedChunkedRecords(participantId, device, "quota", day, quota);
+  await seedChunkedRecords(participantId, device, "usage", day, usage);
+  return { participantId, device, day, baseMs, quota, usage };
+}
+
+describe("v1 plan attribution before fit and cost reduction", () => {
+  it("keeps separated Pro to Plus to Pro numerators equal to isolated controls", async () => {
+    const control = await seedPlanEraScenario("era-control", [{ plan: "pro", offsetMinutes: 0 }]);
+    const mixed = await seedPlanEraScenario("era-mixed", [
+      { plan: "pro", offsetMinutes: 0 },
+      { plan: "plus", offsetMinutes: 120 },
+      { plan: "pro", offsetMinutes: 240, startPp: 50 },
+    ]);
+    const expected = bandResets(await accountScopedQuotaAnalysisV1(db(), control.participantId, { nowMs: SCALE_NOW }) as AnalysisLike);
+    expect(expected).toHaveLength(1);
+    const analysis = await accountScopedQuotaAnalysisV1(db(), mixed.participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    const resets = bandResets(analysis);
+    expect(resets).toHaveLength(3);
+    expect(resets.map((reset) => reset.capacityNanousd)).toEqual(Array(3).fill(expected[0]!.capacityNanousd));
+    expect(new Set(analysis.tracks.map((track) => track.continuity.planType))).toEqual(new Set(["pro", "plus"]));
+    expect(analysis).toMatchObject({ fragmentSelection: "unselected_diagnostics" });
+    const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), mixed.participantId) as AnalysisLike;
+    expect(resets).toEqual(bandResets(reference));
+    // Population selection is downstream of fitting and the shared40pp gate:
+    // the two Pro fragments still represent ONE legacy reset parent vote.
+    const fits = (await collectCommunityAllowanceFits(db(), SCALE_NOW)).filter((fit) => fit.participantId === mixed.participantId);
+    expect(fits.filter((fit) => fit.planType === "pro")).toHaveLength(1);
+    expect(fits.filter((fit) => fit.planType === "plus")).toHaveLength(1);
+  });
+
+  it("unpriced foreign-plan usage does not poison either separate Pro era", async () => {
+    const scenario = await seedPlanEraScenario("era-unpriced", [
+      { plan: "pro", offsetMinutes: 0 },
+      { plan: "plus", offsetMinutes: 120, unpriced: true },
+      { plan: "pro", offsetMinutes: 240, startPp: 50 },
+    ]);
+    const analysis = await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    expect(bandResets(analysis)).toHaveLength(2);
+    for (const track of analysis.tracks.filter((track) => track.continuity.planType === "pro")) {
+      expect(track.calibration.tracks.flatMap((entry) => entry.resets).every((reset) => reset.status === "conditional_estimate")).toBe(true);
+    }
+  });
+
+  it("a wider invalid Pro fragment cannot hide a narrower qualifying Pro fragment", async () => {
+    const scenario = await seedPlanEraScenario("era-valid-selection", [
+      { plan: "pro", offsetMinutes: 0, stepPp: 10, unpriced: true },
+      { plan: "plus", offsetMinutes: 120 },
+      { plan: "pro", offsetMinutes: 240, startPp: 50, stepPp: 5 },
+    ]);
+    const fits = (await collectCommunityAllowanceFits(db(), SCALE_NOW))
+      .filter((fit) => fit.participantId === scenario.participantId && fit.planType === "pro");
+    expect(fits).toHaveLength(1);
+    expect(fits[0]!.lastObservedAt).toBe(new Date(scenario.baseMs + 280 * MINUTE_MS).toISOString());
+  });
+
+  it("one foreign-plan five-hour observation survives before weekly fitability gates", async () => {
+    const scenario = await seedPlanEraScenario("era-tiny-plan", [{ plan: "pro", offsetMinutes: 0, stepPp: 10 }]);
+    await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device, stream: "quota",
+      chunkDay: scenario.day, seq: 1, createdAt: `${scenario.day}T21:00:00.000Z`,
+      records: [{ occurrence_id: "single-plus-five-hour", provider: "openai_codex",
+        observed_at: new Date(scenario.baseMs + 20 * MINUTE_MS).toISOString(), plan_type: "plus",
+        plan_variant: "unknown", limit_id: "codex", slot: "five_hour", used_percent: 1,
+        window_duration_minutes: 300, resets_at: new Date(scenario.baseMs + 5 * 60 * MINUTE_MS).toISOString() }],
+    });
+    const analysis = await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    expect(bandResets(analysis)).toEqual([]);
+    expect(await accountScopedModelCompositionV1(db(), scenario.participantId, { nowMs: SCALE_NOW }))
+      .toEqual({ status: "not_testable", reason: "multi_plan_window_unsupported" });
+  });
+
+  it("an uncertain same-session quantity spanning a switch withholds only its affected reset", async () => {
+    const scenario = await seedPlanEraScenario("era-delta", [
+      { plan: "pro", offsetMinutes: 0, sharedSession: true },
+      { plan: "plus", offsetMinutes: 120, sharedSession: true },
+    ]);
+    const analysis = await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    expect(bandResets(analysis)).toHaveLength(1);
+    expect(analysis).toMatchObject({ tracks: expect.arrayContaining([
+      expect.objectContaining({ continuity: expect.objectContaining({ planType: "plus" }),
+        attribution: expect.objectContaining({ refusedResets: [expect.objectContaining({ reason: "usage_plan_interval_unresolved" })] }) }),
+    ]) });
+  });
+
+  it("uses the exact supplied source vector and refuses a changed input generation", async () => {
+    const scenario = await seedPlanEraScenario("era-stale-pin", [{ plan: "pro", offsetMinutes: 0 }]);
+    const fromDay = new Date(SCALE_NOW - V1_ANALYSIS_WINDOW_DAYS * DAY_MS).toISOString().slice(0, 10);
+    const sourcePin = await loadV1SourcePin(db(), { participantId: scenario.participantId, fromDay });
+    await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device, stream: "usage",
+      chunkDay: scenario.day, seq: 1, createdAt: `${scenario.day}T21:00:00.000Z`, records: [{
+        occurrence_id: "post-pin-usage", provider: "openai_codex", model_id: "gpt-5.6-sol",
+        observed_at: new Date(scenario.baseMs + 12 * MINUTE_MS).toISOString(), record_json: v1PriceableUsageJson(),
+      }] });
+    await expect(accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW, sourcePin }))
+      .rejects.toThrow("v1 source changed during analysis");
+    await expect(accountScopedModelCompositionV1(db(), scenario.participantId, { nowMs: SCALE_NOW, sourcePin }))
+      .rejects.toThrow("v1 source changed during analysis");
+  });
+
+  it("keeps wholly unknown-plan legacy input conditional without naming a plan", async () => {
+    const scenario = await seedPlanEraScenario("era-unknown", [{ plan: "unknown", offsetMinutes: 0 }]);
+    const analysis = await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    expect(bandResets(analysis)).toHaveLength(1);
+    expect(analysis.tracks[0]!.continuity.planType).toBe("unknown");
+    expect(analysis).toMatchObject({ tracks: [expect.objectContaining({ attribution: expect.objectContaining({ status: "legacy_conditional", accountScope: "unknown" }) })] });
+  });
+});
+
 describe("v1 analyzer scale fix — fit-preserving reduction", () => {
+  it("keeps exact tied endpoints across winning devices, partitions and era gaps", async () => {
+    const participantId = await newV1Participant("quota-neighbors");
+    const devices = ["v1-device-quota-neighbors", "v1-device-quota-neighbors-next"];
+    const loser = "v1-device-quota-neighbors-loser";
+    for (const device of [devices[1]!, loser]) {
+      await seedV1Device(participantId, device, "v1-session-quota-neighbors");
+    }
+    const foreign = await newV1Participant("quota-neighbors-foreign");
+    const baseMs = SCALE_NOW - 3 * DAY_MS;
+    const at = (minutes: number) => new Date(baseMs + minutes * MINUTE_MS).toISOString();
+    const resetsAt = new Date(baseMs + 7 * DAY_MS).toISOString();
+    const markers = [
+      ["openai_codex", "codex", "pro", "unknown", "first", "", at(20), 1],
+      ["openai_codex", "codex", "pro", "unknown", "return", at(1440), null, 2],
+      ["other_provider", "codex", "pro", "unknown", "other", "", null, 3],
+    ];
+    const expected: Array<V1SeedRecord & { plan_era_key: string; insertion: number }> = [];
+    let insertion = 0;
+    for (const [dayIndex, offset] of [0, 1440].entries()) {
+      const day = at(offset).slice(0, 10);
+      const records: V1SeedRecord[] = [];
+      for (const provider of ["openai_codex", "other_provider"]) for (const slot of ["seven_day", "secondary"]) {
+        for (let level = 0; level <= 10; level++) for (let repeat = 0; repeat < 3; repeat++) {
+          const row = { occurrence_id: `neighbor-${offset}-${provider}-${slot}-${level}-${2 - repeat}`,
+            observed_at: at(offset + level), provider, plan_type: "pro", plan_variant: "unknown",
+            limit_id: "codex", slot, used_percent: level * 10, window_duration_minutes: 10_080,
+            resets_at: resetsAt };
+          records.push(row);
+          // Literal fixture oracle: each three-row flat run retains its first
+          // and last INSERTED id, not the opposite lexical occurrence order.
+          if (repeat !== 1) expected.push({ ...row, insertion,
+            plan_era_key: provider === "other_provider" ? "other" : offset === 0 ? "first" : "return" });
+          insertion += 1;
+        }
+      }
+      const exemplar = records[0]!;
+      const noise = records.map((row) => ({ ...row, occurrence_id: `loser-${row.occurrence_id}`, used_percent: 0.5 }));
+      if (offset === 0) records.push(
+        { ...exemplar, occurrence_id: "neighbor-before-cutoff", observed_at: at(-1) },
+        { ...exemplar, occurrence_id: "neighbor-era-gap", observed_at: at(60) },
+        { ...exemplar, occurrence_id: "neighbor-short-window", used_percent: 0.5, window_duration_minutes: 300 },
+        { ...exemplar, occurrence_id: "neighbor-other-variant", used_percent: 0.5, plan_variant: "other" },
+        { ...exemplar, occurrence_id: "neighbor-short-reset", used_percent: 0.5,
+          resets_at: new Date(baseMs + 6 * DAY_MS).toISOString() },
+        ...[0, 1, 2].map((minute) => ({ ...exemplar, occurrence_id: `neighbor-nonfit-${minute}`,
+          observed_at: at(minute), used_percent: 20, resets_at: new Date(baseMs + 8 * DAY_MS).toISOString() })),
+      );
+      await seedChunkedRecords(participantId, devices[dayIndex]!, "quota", day, records);
+      await seedChunkedRecords(participantId, loser, "quota", day, noise, `${day}T19:00:00.000Z`);
+      await seedChunkedRecords(foreign, "v1-device-quota-neighbors-foreign", "quota", day, noise);
+    }
+    const pin = await loadV1SourcePin(db(), { participantId, fromDay: at(0).slice(0, 10) });
+    expect(pin.winners.map((entry) => entry.device_id)).toEqual(devices);
+    const oracle = expected.sort((left, right) => left.observed_at.localeCompare(right.observed_at)
+      || left.insertion - right.insertion).map(({ insertion: _insertion, ...row }) => row);
+    expect(oracle).toHaveLength(176);
+    // Ingest admits finite0..100 (including zero), never the -1 absence sentinel.
+    expect(oracle.filter((row) => row.used_percent === 0)).toHaveLength(16);
+    expect(oracle.filter((row) => row.used_percent === 100)).toHaveLength(16);
+    for (const limit of [1, oracle.length - 1, oracle.length, oracle.length + 1]) {
+      const result = await db().prepare(QUOTA_DOWNSAMPLE_SQL).bind(JSON.stringify(markers), pin.winnersJson,
+        participantId, at(0), resetsAt, 10_080, QUOTA_CALIBRATION_POLICY.minimumBoundaries,
+        QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, limit).all();
+      expect(result.results).toEqual(oracle.slice(0, limit));
+    }
+    expect((await db().prepare(QUOTA_DOWNSAMPLE_SQL).bind(JSON.stringify(markers), pin.winnersJson,
+      participantId, at(0), resetsAt, 10_080, 1000,
+      QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, 1).all()).results).toEqual([]);
+  });
+
+  it("preserves exact dense quota run endpoints and fits after the query rollback", async () => {
+    const participantId = await newV1Participant("quota-working-set");
+    const device = "v1-device-quota-working-set";
+    const baseMs = SCALE_NOW - 2 * DAY_MS;
+    const resetsAt = new Date(baseMs + 7 * DAY_MS).toISOString();
+    const day = new Date(baseMs).toISOString().slice(0, 10);
+    const dense = buildDenseReset({ tag: "quota-working-set", baseMs, resetsAt,
+      levels: 17, startPp: 5, stepPp: 5, repeats: 300, snapshotStepMs: 1_000,
+      usageOffsetMs: 500, gridExactLevels: [3, 8] });
+    await seedChunkedRecords(participantId, device, "quota", day, dense.quota);
+    await seedChunkedRecords(participantId, device, "usage", day, dense.usage);
+    // The predecessor/successor plan was rolled back after production CPU
+    // resets on sparse partitions. Retain its exact-result regressions, but
+    // do not require the rejected query shape or claim a memory bound here.
+    const reducedRows = await downsampleQuotaForTest(db(), participantId, SCALE_NOW);
+    expect(reducedRows.map((row) => row.occurrence_id)).toEqual(
+      Array.from({ length: 17 }, (_, level) => [
+        `q-quota-working-set-${level}-0`, `q-quota-working-set-${level}-299`,
+      ]).flat(),
+    );
+    const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), participantId) as AnalysisLike;
+    const actual = await accountScopedQuotaAnalysisV1(db(), participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    expect(bandResets(actual)).toHaveLength(1);
+    expect(bandResets(actual)).toEqual(bandResets(reference));
+  }, 20_000);
+
+  it("preserves occurrence-first same-session intervals when insertion order disagrees", async () => {
+    const scenario = await seedPlanEraScenario("tie-order", [
+      { plan: "pro", offsetMinutes: 0, sharedSession: true },
+      { plan: "plus", offsetMinutes: 120 },
+    ]);
+    // The minimum occurrence is a DROP record, but still advances the old
+    // reader's session clock. In rowid order the measurable record comes first
+    // and incorrectly inherits the cross-plan interval instead.
+    const observedAt = new Date(scenario.baseMs + 122 * MINUTE_MS).toISOString();
+    await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+      stream: "usage", chunkDay: scenario.day, seq: 1,
+      createdAt: `${scenario.day}T21:00:00.000Z`, records: [
+        { occurrence_id: "z-tie-measured", observed_at: observedAt, provider: "openai_codex",
+          session_uuid: "00000000-0000-4000-8000-000000000001", record_json: v1PriceableUsageJson() },
+        { occurrence_id: "a-tie-dropped", observed_at: observedAt, provider: "openai_codex",
+          session_uuid: "00000000-0000-4000-8000-000000000001", record_json: "{}" },
+      ] });
+    const intended = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), scenario.participantId) as AnalysisLike;
+    const rowid = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), scenario.participantId,
+      { usageTieOrder: "rowid" }) as AnalysisLike;
+    expect(bandResets(intended)).toHaveLength(2);
+    expect(bandResets(rowid)).toHaveLength(1);
+    const actual = await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    expect(bandResets(actual)).toEqual(bandResets(intended));
+  });
+
+  for (const tiedRows of [4_984, 5_005]) {
+    it(`flushes pending occurrence minima across pages and terminal reads (${tiedRows} ties)`, async () => {
+      const scenario = await seedPlanEraScenario(`tie-pages-${tiedRows}`, [
+        { plan: "pro", offsetMinutes: 0, sharedSession: true },
+        { plan: "plus", offsetMinutes: 120 },
+      ]);
+      const observedAt = new Date(scenario.baseMs + 122 * MINUTE_MS).toISOString();
+      const session = "00000000-0000-4000-8000-000000000001";
+      const rows: V1SeedRecord[] = Array.from({ length: tiedRows }, (_, index) => ({
+        occurrence_id: `tied-${String(tiedRows - index).padStart(6, "0")}`,
+        observed_at: observedAt, provider: "openai_codex", session_uuid: session,
+        record_json: index === tiedRows - 1 ? "{}" : JSON.stringify({ ...JSON.parse(v1PriceableUsageJson()),
+          components: { inputUncachedTokens: index % 3 + 1, inputCacheReadTokens: 0,
+            inputCacheWriteTokens: 0, outputTextTokens: 0, outputReasoningTokens: 0, outputCombinedTokens: null } }),
+      }));
+      for (let offset = 0; offset < rows.length; offset += 200) {
+        await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+          stream: "usage", chunkDay: scenario.day, seq: 1 + offset / 200,
+          createdAt: `${scenario.day}T21:00:00.000Z`, records: rows.slice(offset, offset + 200) });
+      }
+      const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), scenario.participantId) as AnalysisLike;
+      const actual = await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+      expect(actual.tracks).toEqual(reference.tracks);
+      // 4,984 + the 16 original events makes exactly one full physical page;
+      // 5,005 ties carries the minimum candidate into a second physical page.
+      expect(await accountScopedQuotaAnalysisV1(db(), scenario.participantId,
+        { nowMs: SCALE_NOW, maxWindowedUsageRows: tiedRows + 15 }))
+        .toMatchObject({ status: "not_testable", reason: "windowed_usage_limit_exceeded" });
+    });
+  }
+
+  it("keeps cutoff, gaps, selected-device, and inactive-participant boundaries in both seeks", async () => {
+    const participantId = await newV1Participant("seek-boundaries");
+    const device = "v1-device-seek-boundaries";
+    const loser = "v1-device-seek-loser";
+    await seedV1Device(participantId, loser, "v1-session-seek-boundaries");
+    const cutoff = new Date(SCALE_NOW - 2 * DAY_MS).toISOString();
+    const later = new Date(Date.parse(cutoff) + 1_000).toISOString();
+    const day = cutoff.slice(0, 10);
+    const own = [
+      { occurrence_id: "before", observed_at: new Date(Date.parse(cutoff) - 1).toISOString() },
+      { occurrence_id: "at-z", observed_at: cutoff },
+      { occurrence_id: "at-a", observed_at: cutoff },
+      { occurrence_id: "later-z", observed_at: later },
+      { occurrence_id: "later-a", observed_at: later },
+    ].map((row) => ({ ...row, provider: "openai_codex", record_json: v1PriceableUsageJson() }));
+    await seedChunkedRecords(participantId, device, "usage", day, own);
+    await seedChunkedRecords(participantId, loser, "usage", day,
+      own.map((row) => ({ ...row, occurrence_id: `loser-${row.occurrence_id}` })), `${day}T19:00:00.000Z`);
+    const pin = await loadV1SourcePin(db(), { participantId, fromDay: day });
+    expect(pin.winners).toEqual([expect.objectContaining({ device_id: device })]);
+    let time = cutoff;
+    let id = 0;
+    const seen: string[] = [];
+    for (;;) {
+      const page = await readV1UsagePage(db(), pin.winnersJson, participantId, time, id, 3);
+      seen.push(...page.map((row) => row.occurrence_id));
+      if (page.length < 3) break;
+      time = page.at(-1)!.observed_at;
+      id = page.at(-1)!.id;
+    }
+    expect(seen).toEqual(["at-z", "at-a", "later-z", "later-a"]);
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(await readV1UsagePage(db(), "[]", participantId, cutoff, 0, 3)).toEqual([]);
+    await db().prepare("UPDATE participants SET state = 'deleting' WHERE id = ?").bind(participantId).run();
+    expect(await readV1UsagePage(db(), pin.winnersJson, participantId, cutoff, 0, 3)).toEqual([]);
+  });
+
+  it("keeps model-composition costs and ordering stable under reversed equal-time insertion", async () => {
+    const outputs = [];
+    for (const reversed of [false, true]) {
+      const scenario = await seedPlanEraScenario(`composition-ties-${reversed}`, [{ plan: "pro", offsetMinutes: 0 }]);
+      const observedAt = new Date(scenario.baseMs + 2 * MINUTE_MS).toISOString();
+      const usageJson = (model: string, tokens: number) => JSON.stringify({ ...JSON.parse(v1PriceableUsageJson()), modelId: model,
+        components: { inputUncachedTokens: tokens, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+          outputTextTokens: 0, outputReasoningTokens: 0, outputCombinedTokens: null } });
+      const largeUnit = priceChunkUsageRecord(usageJson("gpt-5.5", 1), observedAt)!.costNanousd;
+      const miniUnit = priceChunkUsageRecord(usageJson("gpt-5.4-mini", 1), observedAt)!.costNanousd;
+      const rows = [
+        { model: "gpt-5.5", tokens: miniUnit, occurrence: "b-composition-large" },
+        { model: "gpt-5.4-mini", tokens: largeUnit, occurrence: "c-composition-mini" },
+        // This zero-cost row gives mini the first old-order Map position.
+        // Equal final model shares make that tie order observable in JSON.
+        { model: "gpt-5.4-mini", tokens: 0, occurrence: "a-composition-mini-zero" },
+      ].map(({ model, tokens, occurrence }) => ({
+        occurrence_id: occurrence,
+        observed_at: observedAt,
+        provider: "openai_codex", model_id: model,
+        record_json: usageJson(model, tokens),
+      }));
+      expect(priceChunkUsageRecord(rows[0]!.record_json, observedAt)!.costNanousd)
+        .toBe(priceChunkUsageRecord(rows[1]!.record_json, observedAt)!.costNanousd);
+      await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+        stream: "usage", chunkDay: scenario.day, seq: 1, createdAt: `${scenario.day}T21:00:00.000Z`,
+        records: reversed ? rows.reverse() : rows });
+      const result = await accountScopedModelCompositionV1(db(), scenario.participantId, { nowMs: SCALE_NOW });
+      expect(result.status).toBe("ready");
+      if (result.status !== "ready") throw new Error("synthetic composition unavailable");
+      expect(result.fit.modelCostShares["gpt-5.5"]).toBe(result.fit.modelCostShares["gpt-5.4-mini"]);
+      expect(Object.keys(result.fit.modelCostShares).indexOf("gpt-5.4-mini"))
+        .toBeLessThan(Object.keys(result.fit.modelCostShares).indexOf("gpt-5.5"));
+      const { inputFingerprint: _fingerprint, ...output } = result;
+      outputs.push(JSON.stringify(output));
+    }
+    expect(outputs[1]).toBe(outputs[0]);
+  });
+
+  // Fixed-size correctness fixture: 500 seed batches plus two 100k read
+  // passes exceed Vitest's default 5s budget under the complete Worker suite.
+  // This local test budget changes neither production caps nor query-plan
+  // performance assertions, and both exact 100k boundary checks remain below.
+  it("bounds the union of retained and pending session clocks at the existing 100k cap", async () => {
+    const scenario = await seedPlanEraScenario("session-cap", [{ plan: "pro", offsetMinutes: 0 }]);
+    // DROP-only usage still advances clocks. Two timestamps leave 50k prior
+    // scopes plus 50k current pending scopes, rather than only testing one map.
+    const row = (index: number): V1SeedRecord => ({
+      occurrence_id: `scope-${String(index).padStart(6, "0")}`,
+      observed_at: new Date(scenario.baseMs + (index < 50_000 ? 1 : 2) * MINUTE_MS).toISOString(),
+      provider: "openai_codex", record_json: "{}",
+      session_uuid: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    });
+    for (let offset = 0; offset < 100_000; offset += 200) {
+      await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+        stream: "usage", chunkDay: scenario.day, seq: 1 + offset / 200,
+        createdAt: `${scenario.day}T21:00:00.000Z`,
+        records: Array.from({ length: 200 }, (_, index) => row(offset + index)) });
+    }
+    expect(await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }))
+      .toMatchObject({ status: "ready" });
+    await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+      stream: "usage", chunkDay: scenario.day, seq: 501,
+      createdAt: `${scenario.day}T21:00:00.000Z`, records: [row(100_000)] });
+    expect(await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }))
+      .toMatchObject({ status: "not_testable", reason: "session_interval_scope_limit_exceeded" });
+  }, 20_000);
+
+  for (const laterPoison of [false, true]) {
+    it(`handles composition aggregate overflow without losing later poison evidence (${laterPoison})`, async () => {
+      const scenario = await seedPlanEraScenario(`composition-overflow-${laterPoison}`, [{ plan: "pro", offsetMinutes: 0 }]);
+      const observedAt = new Date(scenario.baseMs + MINUTE_MS).toISOString();
+      const usageJson = (tokens: number) => JSON.stringify({ ...JSON.parse(v1PriceableUsageJson()),
+        components: { inputUncachedTokens: 0, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+          outputTextTokens: tokens, outputReasoningTokens: 0, outputCombinedTokens: null } });
+      const unit = priceChunkUsageRecord(usageJson(1), observedAt);
+      expect(unit).toMatchObject({ pricingStatus: "fully_priced" });
+      expect(unit!.costNanousd).toBeGreaterThan(0);
+      // Each event stays below the server's existing per-event bound; enough
+      // admitted events in one bin exceed exact integer aggregate range.
+      const recordJson = usageJson(Math.floor(450_000_000_000 / unit!.costNanousd));
+      const priced = priceChunkUsageRecord(recordJson, observedAt);
+      expect(priced).toMatchObject({ pricingStatus: "fully_priced" });
+      const count = Math.floor(Number.MAX_SAFE_INTEGER / priced!.costNanousd) + 1;
+      expect(count).toBeGreaterThan(20_000);
+      expect(count).toBeLessThan(25_000);
+      expect(BigInt(count) * BigInt(priced!.costNanousd)).toBeGreaterThan(BigInt(Number.MAX_SAFE_INTEGER));
+      for (let offset = 0; offset < count; offset += 200) {
+        await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+          stream: "usage", chunkDay: scenario.day, seq: 1 + offset / 200,
+          createdAt: `${scenario.day}T21:00:00.000Z`,
+          records: Array.from({ length: Math.min(200, count - offset) }, (_, index) => ({
+            occurrence_id: `overflow-${String(offset + index).padStart(6, "0")}`,
+            observed_at: observedAt, provider: "openai_codex", record_json: recordJson,
+          })) });
+      }
+      if (laterPoison) {
+        await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+          stream: "usage", chunkDay: scenario.day, seq: 1 + Math.ceil(count / 200),
+          createdAt: `${scenario.day}T21:00:00.000Z`, records: [{
+            occurrence_id: "overflow-later-poison", observed_at: new Date(Date.parse(observedAt) + MINUTE_MS).toISOString(),
+            provider: "openai_codex", record_json: v1UnpriceableUsageJson(),
+          }] });
+      }
+      const actual = await accountScopedModelCompositionV1(db(), scenario.participantId, { nowMs: SCALE_NOW });
+      expect(actual).toMatchObject(laterPoison
+        ? { status: "ready", poisonedBinCount: 1, unpricedUsageEventCount: 1, fit: { totalCostUsd: 0 } }
+        : { status: "not_testable", reason: "usage_cost_limit_exceeded" });
+    });
+  }
+
+  for (const partialPricing of [false, true]) {
+    it(`refuses scalar bucket overflow without omitting partially priced evidence (${partialPricing})`, async () => {
+      const scenario = await seedPlanEraScenario(`scalar-overflow-${partialPricing}`, [{ plan: "pro", offsetMinutes: 0 }]);
+      const observedAt = new Date(scenario.baseMs + MINUTE_MS).toISOString();
+      const usageJson = (tokens: number) => JSON.stringify({ ...JSON.parse(v1PriceableUsageJson()),
+        components: { inputUncachedTokens: 0, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+          outputTextTokens: tokens, outputReasoningTokens: 0, outputCombinedTokens: null } });
+      const unit = priceChunkUsageRecord(usageJson(1), observedAt)!;
+      const recordJson = usageJson(Math.floor(450_000_000_000 / unit.costNanousd));
+      const priced = priceChunkUsageRecord(recordJson, observedAt)!;
+      expect(priced.pricingStatus).toBe("fully_priced");
+      const count = Math.floor(90_000_000_000_000 / priced.costNanousd) + 1;
+      expect(count).toBeLessThan(250);
+      const rows = Array.from({ length: count }, (_, index) => ({
+        occurrence_id: `scalar-overflow-${String(index).padStart(4, "0")}`,
+        observed_at: observedAt, provider: "openai_codex", record_json: recordJson,
+      }));
+      if (partialPricing) rows.push({ occurrence_id: "scalar-overflow-unpriced",
+        observed_at: observedAt, provider: "openai_codex", record_json: v1UnpriceableUsageJson() });
+      for (let offset = 0; offset < rows.length; offset += 200) {
+        await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+          stream: "usage", chunkDay: scenario.day, seq: 1 + offset / 200,
+          createdAt: `${scenario.day}T21:00:00.000Z`, records: rows.slice(offset, offset + 200) });
+      }
+      expect(await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }))
+        .toMatchObject({ status: "not_testable", reason: "usage_cost_limit_exceeded" });
+    });
+  }
+
+  it("seeks by time and rowid through a full equal-time page without rescanning the window prefix", async () => {
+    // The production repair must work using only the already-deployed 0036
+    // index; building the newer all-row index exceeds D1 memory limits.
+    await db().exec("DROP INDEX IF EXISTS telemetry_v1_records_time_cursor");
+    expect(await db().prepare("SELECT count(*) AS count FROM sqlite_schema WHERE name = 'telemetry_v1_records_time_cursor'")
+      .first<number>("count")).toBe(0);
+    const participantId = await newV1Participant("tuple-cursor");
+    const device = "v1-device-tuple-cursor";
+    const startMs = SCALE_NOW - 2 * DAY_MS;
+    const day = new Date(startMs).toISOString().slice(0, 10);
+    const records = buildCalibratableTrack({ tag: "tuple-cursor", startMs,
+      resetsAt: new Date(startMs + 7 * DAY_MS).toISOString(), stepPp: 5 });
+    const priceableTokens = (tokens: number) => JSON.stringify({ ...JSON.parse(v1PriceableUsageJson()),
+      components: { inputUncachedTokens: tokens, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+        outputTextTokens: 0, outputReasoningTokens: 0, outputCombinedTokens: null } });
+    // Keep all eight quota increments equally priced: the first is 5,001
+    // one-token occurrences, the others one 5,001-token occurrence each. All
+    // context sizes stay below the pricing tier boundary.
+    records.usage = [...Array.from({ length: 5_001 }, (_, index) => ({ ...records.usage[0]!,
+      occurrence_id: "u-tuple-cursor-tied-" + index, record_json: priceableTokens(1) })),
+    ...records.usage.slice(1).map((row) => ({ ...row, record_json: priceableTokens(5_001) }))];
+    await seedChunkedRecords(participantId, device, "quota", day, records.quota);
+    await seedChunkedRecords(participantId, device, "usage", day, records.usage);
+    const sourcePin = await loadV1SourcePin(db(), { participantId, fromDay: day });
+    const cursor = await db().prepare(`SELECT id, occurrence_id, observed_at FROM telemetry_v1_records
+      WHERE participant_id = ? AND stream = 'usage' ORDER BY observed_at, id LIMIT 1 OFFSET 4999`)
+      .bind(participantId).first<{ id: number; occurrence_id: string; observed_at: string }>();
+    expect(cursor).not.toBeNull();
+    for (const [sql, args, seekKeys, seekPredicate] of [
+      [V1_USAGE_PAGE_AT_TIME_SQL, [sourcePin.winnersJson, participantId, cursor!.observed_at, cursor!.id, 5_000],
+        "4", "observed_at=? AND rowid>?)"],
+      [V1_USAGE_PAGE_AFTER_TIME_SQL, [sourcePin.winnersJson, participantId, cursor!.observed_at, 5_000],
+        "3", "observed_at>?)"],
+    ] as const) {
+      const plan = await db().prepare("EXPLAIN QUERY PLAN " + sql).bind(...args).all<{ detail: string }>();
+      const steps = plan.results.map((row) => row.detail);
+      const program = await db().prepare("EXPLAIN " + sql).bind(...args)
+        .all<{ opcode: string; p4: string | null }>();
+      expect(steps.some((step) => step.includes("telemetry_v1_records_participant_stream_observed")
+        && step.includes(seekPredicate)), steps.join("\n")).toBe(true);
+      expect(program.results.some((row) => ["SeekGE", "SeekGT"].includes(row.opcode) && row.p4 === seekKeys)).toBe(true);
+      expect(steps.some((step) => /TEMP B-TREE.*ORDER BY/u.test(step))).toBe(false);
+    }
+    // The second page starts WITHIN the tied timestamp, not at its beginning.
+    const page = await readV1UsagePage(db(), sourcePin.winnersJson, participantId, cursor!.observed_at, cursor!.id, 5_000);
+    expect(page).toHaveLength(8);
+    expect(page[0]!.observed_at).toBe(cursor!.observed_at);
+    expect(page[0]!.id).toBeGreaterThan(cursor!.id);
+    expect(page.map((row) => row.occurrence_id)).toEqual([
+      records.usage[5_000]!.occurrence_id, ...records.usage.slice(5_001).map((row) => row.occurrence_id),
+    ]);
+    const composition = await accountScopedModelCompositionV1(db(), participantId, { nowMs: SCALE_NOW });
+    expect(composition).toMatchObject({ status: "ready", usageEventCount: 5_008, unpricedUsageEventCount: 0 });
+    // The scalar reader uses the same cursor and budget across pages; neither
+    // reader may turn the first 5,000 events into a successful partial result.
+    for (const analyze of [accountScopedQuotaAnalysisV1, accountScopedModelCompositionV1]) {
+      expect(await analyze(db(), participantId, { nowMs: SCALE_NOW, maxWindowedUsageRows: 5_005 }))
+        .toMatchObject({ status: "not_testable", reason: "windowed_usage_limit_exceeded" });
+    }
+    const reduced = await accountScopedQuotaAnalysisV1(db(), participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), participantId) as AnalysisLike;
+    expect(bandResets(reduced)).toHaveLength(1);
+    expect(bandResets(reduced)).toEqual(bandResets(reference));
+  });
+
   it("dense-data golden: reduced path == full per-event reference, byte-identical", async () => {
     const participantId = await newV1Participant("golden");
     const device = "v1-device-golden";
@@ -1815,5 +2601,262 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     expect(
       (await downsampleQuotaForTest(db(), at, SCALE_NOW)).length,
     ).toBeGreaterThan(0);
+  });
+});
+
+describe("per-model composition from the v1.0 chunk corpus", () => {
+  it("reads the v1 corpus per model and reports composition evidence", async () => {
+    const participantId = await seedV1Participant("composition");
+    await seedV1Session(participantId, "v1-session-composition");
+    await seedV1Device(participantId, "v1-device-composition", "v1-session-composition");
+    await seedThreeV1Resets(participantId, "v1-device-composition", 5, "composition");
+
+    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") return;
+    expect(result.planType).toBe("pro");
+    expect(result.quotaRowCount).toBeGreaterThan(0);
+    expect(result.usageEventCount).toBeGreaterThan(0);
+    expect(result.unpricedUsageEventCount).toBe(0);
+    expect(result.fit.totalCostUsd!).toBeGreaterThan(0);
+    // The fixture is single-model, so the whole cost share is Sol's.
+    expect(result.fit.modelCostShares["gpt-5.6-sol"]).toBeCloseTo(1, 5);
+    // A three-reset fixture spans too few kernel bins to identify a
+    // per-model vector; the honest outcome is the kernel's own refusal,
+    // never a fabricated fit.
+    expect([
+      "fitted",
+      "fallback_blended",
+      "insufficient_observations",
+    ]).toContain(result.fit.status);
+  });
+
+  it("caches compositions by chunk epoch and reuses them", async () => {
+    const participantId = await seedV1Participant("composition-cache");
+    await seedV1Session(participantId, "v1-session-composition-cache");
+    await seedV1Device(participantId, "v1-device-composition-cache", "v1-session-composition-cache");
+    await seedThreeV1Resets(participantId, "v1-device-composition-cache", 5, "ccache");
+
+    const first = await collectCommunityModelCompositions(db());
+    expect(first.v1ParticipantCount).toBe(1);
+    expect(first.unsupportedSourceParticipantCount).toBe(0);
+    expect(first.compositions).toHaveLength(1);
+    const cached = await db().prepare(
+      "SELECT cache_key, computed_at FROM community_model_composition_cache WHERE participant_id = ?",
+    ).bind(participantId).first<{ cache_key: string; computed_at: string }>();
+    expect(cached).not.toBeNull();
+
+    const second = await collectCommunityModelCompositions(db());
+    expect(second.compositions).toHaveLength(1);
+    const reread = await db().prepare(
+      "SELECT cache_key, computed_at FROM community_model_composition_cache WHERE participant_id = ?",
+    ).bind(participantId).first<{ cache_key: string; computed_at: string }>();
+    // An unchanged chunk epoch is a cache hit: the row is not rewritten.
+    expect(reread?.computed_at).toBe(cached?.computed_at);
+    expect(reread?.cache_key).toBe(cached?.cache_key);
+  });
+
+  it("normalizes per-model capacities by plan and takes the cohort median", () => {
+    const composition = (
+      participantId: string,
+      planType: string,
+      capacityUsdByModel: Record<string, number> | null,
+      status: "fitted" | "fallback_blended" = "fitted",
+    ): CommunityModelComposition => ({
+      participantId,
+      composition: {
+        status: "ready",
+        planType,
+        fit: {
+          status,
+          observationCount: 30,
+          totalCostUsd: 100,
+          modelCostShares: {},
+          capacityUsdByModel,
+          singleConstantUsd: 2_000,
+          r2: 0.8,
+          singleConstantR2: 0.7,
+          solverConverged: true,
+          identification: {
+            adjustedR2: 0.8,
+            singleConstantAdjustedR2: 0.7,
+            splitHalfIdentified: true,
+            splitHalfMaxCapacityDriftFraction: 0.05,
+          },
+        },
+        voidedBinCount: 0,
+        poolCount: 1,
+        quotaRowCount: 9,
+        usageEventCount: 8,
+        unpricedUsageEventCount: 0,
+        poisonedBinCount: 0,
+        latestQuotaObservedAt: "2026-08-30T12:00:00.000Z",
+        attributionStatus: "legacy_conditional",
+        attributionMethod: V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+        inputFingerprint: "a".repeat(64),
+      },
+    });
+    const day = buildCommunityModelCompositionDay({
+      compositions: [
+        composition("p-pro", "pro", {
+          "gpt-5.6-sol": 2_400,
+          "gpt-5.6-terra": 1_100,
+        }),
+        // Plus capacities are per that plan's own weekly pool; x20 normalizes
+        // to the Pro-20x basis, landing on the same 2,400.
+        composition("p-plus", "plus", { "gpt-5.6-sol": 120 }),
+        // Identification failure: contributes to unstable, never to a median.
+        composition("p-unstable", "pro", null, "fallback_blended"),
+      ],
+      v1ParticipantCount: 4,
+      unsupportedSourceParticipantCount: 2,
+      refusedParticipantCount: 1,
+    }, "2026-08-30");
+    expect(day.day).toBe("2026-08-30");
+    expect(day.fittedParticipantCount).toBe(2);
+    expect(day.unstableParticipantCount).toBe(1);
+    expect(day.staleParticipantCount).toBe(0);
+    expect(day.refusedParticipantCount).toBe(1);
+    expect(day.v1ParticipantCount).toBe(4);
+    expect(day.unsupportedSourceParticipantCount).toBe(2);
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-sol"]).toEqual({
+      capacityUsd: 2_400,
+      participantCount: 2,
+    });
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-terra"]).toEqual({
+      capacityUsd: 1_100,
+      participantCount: 1,
+    });
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-luna"]).toEqual({
+      capacityUsd: null,
+      participantCount: 0,
+    });
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.5"]).toEqual({
+      capacityUsd: null,
+      participantCount: 0,
+    });
+  });
+
+  it("ages a frozen-epoch participant out of the day cohort", () => {
+    const composition = (
+      participantId: string,
+      latestQuotaObservedAt: string,
+    ): CommunityModelComposition => ({
+      participantId,
+      composition: {
+        status: "ready",
+        planType: "pro",
+        fit: {
+          status: "fitted",
+          observationCount: 30,
+          totalCostUsd: 100,
+          modelCostShares: {},
+          capacityUsdByModel: { "gpt-5.6-sol": 2_400 },
+          singleConstantUsd: 2_000,
+          r2: 0.8,
+          singleConstantR2: 0.7,
+          solverConverged: true,
+          identification: {
+            adjustedR2: 0.8,
+            singleConstantAdjustedR2: 0.7,
+            splitHalfIdentified: true,
+            splitHalfMaxCapacityDriftFraction: 0.05,
+          },
+        },
+        voidedBinCount: 0,
+        poolCount: 1,
+        quotaRowCount: 9,
+        usageEventCount: 8,
+        unpricedUsageEventCount: 0,
+        poisonedBinCount: 0,
+        latestQuotaObservedAt,
+        attributionStatus: "legacy_conditional",
+        attributionMethod: V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+        inputFingerprint: "a".repeat(64),
+      },
+    });
+    const day = buildCommunityModelCompositionDay({
+      compositions: [
+        composition("p-live", "2026-08-29T12:00:00.000Z"),
+        // Newest quota evidence 40 days old: a departed device riding its
+        // frozen chunk-epoch cache. It must not enter the median.
+        composition("p-departed", "2026-07-21T12:00:00.000Z"),
+      ],
+      v1ParticipantCount: 2,
+      unsupportedSourceParticipantCount: 0,
+      refusedParticipantCount: 0,
+    }, "2026-08-30");
+    expect(day.fittedParticipantCount).toBe(1);
+    expect(day.staleParticipantCount).toBe(1);
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-sol"]).toEqual({
+      capacityUsd: 2_400,
+      participantCount: 1,
+    });
+  });
+
+  it("refuses a window that spans more than one plan", async () => {
+    const participantId = await seedV1Participant("composition-multiplan");
+    await seedV1Session(participantId, "v1-session-composition-multiplan");
+    await seedV1Device(participantId, "v1-device-composition-multiplan", "v1-session-composition-multiplan");
+    await seedThreeV1Resets(participantId, "v1-device-composition-multiplan", 5, "cmp");
+    // One extra reset on a different plan: a pp is worth plan-multiplier
+    // different dollars, so the kernel would mix incommensurable regimes.
+    await seedV1CalibratableReset({
+      participantId,
+      deviceId: "v1-device-composition-multiplan",
+      day: "2026-07-28",
+      startTime: "2026-07-28T12:00:00.000Z",
+      resetsAt: "2026-08-04T12:00:00.000Z",
+      stepPp: 5,
+      tag: "cmp-plus",
+      planType: "plus",
+    });
+    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    expect(result.status).toBe("not_testable");
+    if (result.status === "not_testable") {
+      expect(result.reason).toBe("multi_plan_window_unsupported");
+    }
+  });
+
+  it("voids bins that contain a not-fully-priced event", async () => {
+    const participantId = await seedV1Participant("composition-poisoned");
+    await seedV1Session(participantId, "v1-session-composition-poisoned");
+    await seedV1Device(participantId, "v1-device-composition-poisoned", "v1-session-composition-poisoned");
+    await seedThreeV1Resets(participantId, "v1-device-composition-poisoned", 5, "cpo", true);
+    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") return;
+    // Every seeded event is unpriceable, so every carrying bin is voided:
+    // nothing trains, nothing is guessed.
+    expect(result.unpricedUsageEventCount).toBeGreaterThan(0);
+    expect(result.poisonedBinCount).toBeGreaterThan(0);
+    expect(result.usageEventCount).toBe(0);
+    expect(result.fit.status).toBe("insufficient_observations");
+  });
+
+  it("embeds the day series in the scheduled preview and survives the cache validator", async () => {
+    const participantId = await seedV1Participant("composition-preview");
+    await seedV1Session(participantId, "v1-session-composition-preview");
+    await seedV1Device(participantId, "v1-device-composition-preview", "v1-session-composition-preview");
+    await seedThreeV1Resets(participantId, "v1-device-composition-preview", 5, "cprev");
+    // Warm the blended fit cache first: the scheduled preview source reads
+    // the corpus through it and fails closed otherwise.
+    await collectCommunityAllowanceFits(db());
+
+    const nowMs = Date.now();
+    const today = new Date(nowMs).toISOString().slice(0, 10);
+    const preview = await buildAdminCommunityAllowancePreviewFromSource(db(), nowMs);
+    expect(preview).not.toBeNull();
+    expect(preview!.models.days).toHaveLength(1);
+    expect(preview!.models.days[0]!.day).toBe(today);
+    expect(preview!.models.days[0]!.v1ParticipantCount).toBe(1);
+    const serialized = JSON.stringify(preview);
+    expect(serialized).not.toContain(participantId);
+
+    const warmed = await warmAdminCommunityAllowancePreviewCache(db(), nowMs);
+    expect(warmed.code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
+    const read = await readCachedAdminCommunityAllowancePreview(db(), nowMs);
+    expect(read.models.days).toHaveLength(1);
+    expect(read.models.days[0]!.day).toBe(today);
   });
 });

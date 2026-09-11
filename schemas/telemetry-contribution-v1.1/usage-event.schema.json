@@ -1,0 +1,179 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/usage-event.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventId",
+    "eventTime",
+    "sessionUuid",
+    "provider",
+    "modelId",
+    "speedMode",
+    "apiServiceTier",
+    "surface",
+    "billingSurface",
+    "reasoningEffort",
+    "agentScope",
+    "outcome",
+    "totalInputContextTokens",
+    "components",
+    "accountPlanAttribution"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "usage-event-v1.1"
+    },
+    "eventId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{8,128}$"
+    },
+    "eventTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "sessionUuid": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{8,128}$"
+    },
+    "provider": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "modelId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "speedMode": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "apiServiceTier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "surface": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "billingSurface": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "reasoningEffort": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "agentScope": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "outcome": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "totalInputContextTokens": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000000
+        }
+      ]
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputUncachedTokens",
+        "inputCacheReadTokens",
+        "inputCacheWriteTokens",
+        "outputTextTokens",
+        "outputReasoningTokens",
+        "outputCombinedTokens"
+      ],
+      "properties": {
+        "inputUncachedTokens": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000000
+            }
+          ]
+        },
+        "inputCacheReadTokens": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000000
+            }
+          ]
+        },
+        "inputCacheWriteTokens": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000000
+            }
+          ]
+        },
+        "outputTextTokens": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000000
+            }
+          ]
+        },
+        "outputReasoningTokens": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000000
+            }
+          ]
+        },
+        "outputCombinedTokens": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000000
+            }
+          ]
+        }
+      }
+    },
+    "accountPlanAttribution": {
+      "$ref": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/account-plan-attribution.schema.json"
+    }
+  }
+}

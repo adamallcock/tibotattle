@@ -4,6 +4,7 @@
   "rateLimits": [
     {
       "limit_id": "codex",
+      "limit_name": "Codex allowance",
       "plan_type": " Pro ",
       "primary": {
         "used_percent": 12,

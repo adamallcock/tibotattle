@@ -188,8 +188,11 @@ test("platform mechanics and flat modules respect the composition boundary", asy
 
   const verifierShim = await source("src/export-set-verifier.js");
   assert.doesNotMatch(verifierShim, /export (?:async )?function|export class/u);
-  assert.match(verifierShim, /src\/application|\.\/application\/index\.js/u);
-  assert.match(verifierShim, /\.\/platform\/index\.js/u);
+  assert.match(verifierShim, /from "\.\/local-node-runtime\.js"/u);
+  assert.doesNotMatch(
+    verifierShim,
+    /from "\.\/(?:application|platform)\/index\.js"/u,
+  );
 });
 
 test("local-review uses reviewed verifier composition and debt is removed", async () => {

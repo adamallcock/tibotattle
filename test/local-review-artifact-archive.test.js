@@ -377,8 +377,17 @@ test("build receipt and extracted manifest bind the exact runtime closure", asyn
       buildReceipt: candidate.buildReceipt,
     });
     assert.equal(validated.runCostPayloadFiles, 0);
-    assert.equal(validated.runtimePackageCount, 7);
-    assert.equal(validated.componentDigestCount, 8);
+    assert.equal(validated.runtimePackageCount, 9);
+    assert.equal(validated.componentDigestCount, 10);
+
+    for (const name of ["@app-usagemonitor/quota-analysis", "@app-usagemonitor/telemetry-contract"]) {
+      const incompleteReceipt = structuredClone(candidate.buildReceipt);
+      incompleteReceipt.components = incompleteReceipt.components.filter((row) => row.name !== name);
+      await assert.rejects(validateExtractedLocalReviewArtifact({
+        artifactRoot: extracted.artifactRoot,
+        buildReceipt: incompleteReceipt,
+      }), /component set is not exact/u);
+    }
 
     const wrongDigestReceipt = structuredClone(candidate.buildReceipt);
     wrongDigestReceipt.components.find(({ name }) => name === "ajv").sha256 =

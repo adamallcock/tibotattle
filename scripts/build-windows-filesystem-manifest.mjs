@@ -31,6 +31,11 @@ const BINDING_PATH = resolve(REPOSITORY_ROOT, BINDING_RELATIVE_PATH);
 const MANIFEST_PATH = `${BINDING_PATH}.manifest.json`;
 const BINDING_FILE = "windows_filesystem.node";
 const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
+const UNQUALIFIED_BINDING_PROVENANCE = Object.freeze({
+  contractVersion: "windows-binding-provenance-v1",
+  status: "unqualified",
+  source: "unsigned-development-binding",
+});
 
 function failure(code) {
   const error = new Error("Windows filesystem binding manifest unavailable");
@@ -97,6 +102,7 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
     credentialAuditFileGuardContractVersion:
       native.credentialAuditFileGuardContractVersion,
     credentialMutexContractVersion: native.credentialMutexContractVersion,
+    bindingProvenance: { ...UNQUALIFIED_BINDING_PROVENANCE },
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: native.productionSafe,

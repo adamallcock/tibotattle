@@ -81,6 +81,16 @@ test("account scope exposes non-sensitive unavailable states", () => {
   );
   assert.equal(lockedCredential.reason, "credential_locked");
   assert.deepEqual(sanitizeAccountScope(lockedCredential), lockedCredential);
+  const migrationRequired = deriveOpenAIAccountScope(
+    { account: { email: "private.owner@example.test" } },
+    {
+      secret: null,
+      unavailableSecretReason: "credential_migration_required",
+      planType: "pro",
+    },
+  );
+  assert.equal(migrationRequired.reason, "credential_migration_required");
+  assert.deepEqual(sanitizeAccountScope(migrationRequired), migrationRequired);
   assert.equal(JSON.stringify(missingSecret).includes("private.owner@example.test"), false);
 });
 

@@ -13,7 +13,8 @@ import {
   createOwnerOnlyExportWorkspaceDiscardPreflight,
   createOwnerOnlyExportWorkspaceDiscardStorage,
 } from "../src/platform/index.js";
-import { LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL } from "../src/export-workspace-discard-compatibility-internal.js";
+import { localExportWorkspaceDiscard } from
+  "../src/local-node-runtime.js";
 import { DEFAULT_EXPORT_RESOURCE_LIMITS, ExportResourceLimitError } from "../src/export/index.js";
 
 const ROLES = Object.freeze({
@@ -134,23 +135,23 @@ test("workspace discard keeps its legacy bindings while local-review enters revi
   assert.equal(localReview.includes("../src/export-workspace-discard.js"), false);
   assert.equal(localReview.includes("../src/export-workspace-discard-executor.js"), false);
   assert.equal(legacyPreflight.ExportWorkspaceDiscardError,
-    LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.ExportWorkspaceDiscardError);
+    localExportWorkspaceDiscard.ExportWorkspaceDiscardError);
   assert.equal(legacyPreflight.buildLocalExportWorkspaceDiscardPlan,
-    LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.buildLocalExportWorkspaceDiscardPlan);
+    localExportWorkspaceDiscard.buildLocalExportWorkspaceDiscardPlan);
   assert.equal(legacyPreflight.planLocalExportWorkspaceDiscard,
-    LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.planLocalExportWorkspaceDiscard);
+    localExportWorkspaceDiscard.planLocalExportWorkspaceDiscard);
   assert.equal(legacyPreflight.workspaceDiscardEvidenceToken,
-    LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.workspaceDiscardEvidenceToken);
+    localExportWorkspaceDiscard.workspaceDiscardEvidenceToken);
   assert.equal(legacyPreflight.workspaceDiscardDirectoryIdentityToken,
-    LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.workspaceDiscardDirectoryIdentityToken);
+    localExportWorkspaceDiscard.workspaceDiscardDirectoryIdentityToken);
   assert.equal(legacyPreflight.workspaceDiscardConfirmationToken,
-    LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.workspaceDiscardConfirmationToken);
+    localExportWorkspaceDiscard.workspaceDiscardConfirmationToken);
   assert.equal(legacyExecution.ExportWorkspaceDiscardExecutionError,
-    LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.ExportWorkspaceDiscardExecutionError);
+    localExportWorkspaceDiscard.ExportWorkspaceDiscardExecutionError);
   assert.equal(legacyExecution.discardLocalExportWorkspace,
-    LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.discardLocalExportWorkspace);
+    localExportWorkspaceDiscard.discardLocalExportWorkspace);
   assert.equal(legacyExecution.recoverLocalExportWorkspaceDiscard,
-    LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.recoverLocalExportWorkspaceDiscard);
+    localExportWorkspaceDiscard.recoverLocalExportWorkspaceDiscard);
 });
 
 test("ordinary accessor options are rejected by every public discard operation without invocation", async () => {

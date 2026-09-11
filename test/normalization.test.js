@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   codexAppServerChildEnv,
+  sanitizeBracketedCodexAccountSnapshotWithSecretLoader,
   sanitizeCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,
 } from "../src/providers/codex/account.js";
@@ -21,14 +22,18 @@ import { defaultContaminationFile, defaultInferenceFile, defaultTransitionFile, 
 import { scanAndPriceCodexLogs } from "../src/codex-local-usage-analysis.js";
 import {
   classifyToolCall,
-  appendedRolloutSourcesAreAfterEnd,
   canonicalComponentAvailability,
   createSnapshotLineage,
   extractToolObservations,
-  hasForkReplayPrefix,
   normalizeTokenUsage,
+} from "../src/providers/codex/logs.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
+
+const {
+  appendedRolloutSourcesAreAfterEnd,
+  hasForkReplayPrefix,
   scanCodexLogEvents,
-} from "../src/codex-log-scan.js";
+} = localCodexLogScanner;
 
 test("fork snapshot lineage shares ancestors instead of copying their keys", () => {
   const chain = [];
@@ -130,6 +135,80 @@ test("locked, denied, and malformed credential loads remain safely unattributed"
     });
     assert.equal(JSON.stringify(result).includes("DO-NOT-LEAK"), false);
   }
+});
+
+test("bracketed account sanitation uses one disposable root lease and preserves only matching account/plan evidence", async () => {
+  const account = { account: { email: "bracket.fixture@example.test", planType: "pro" } };
+  const snapshot = {
+    accountBefore: account,
+    accountAfter: { account: { email: "BRACKET.FIXTURE@example.test", planType: "pro" } },
+    rateLimits: { rateLimits: {
+      limitId: "codex", planType: "pro",
+      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 123 },
+    } },
+    accountUsage: { dailyUsageBuckets: [{ startDate: "2026-07-23", tokens: 10 }] },
+  };
+  const disposable = Buffer.alloc(32, 77);
+  let loads = 0;
+  const result = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snapshot, "2026-07-23T00:00:00.000Z", {
+    loadAccountObservationSecret: async () => { loads += 1; return disposable; },
+  });
+  assert.equal(loads, 1);
+  assert.deepEqual(disposable, Buffer.alloc(32));
+  assert.equal(result.accountScope.status, "available");
+  assert.equal(result.accountScope.planType, "pro");
+  assert.equal(result.canonical.primary.usedPercent, 25);
+  assert.deepEqual(result.officialDailyTokens, [{ date: "2026-07-23", tokens: 10 }]);
+  assert.equal(JSON.stringify(result).includes("fixture@example.test"), false);
+
+  const conflicts = [
+    { accountBefore: null },
+    { accountAfter: null },
+    { accountAfter: { account: { email: "different.fixture@example.test", planType: "pro" } } },
+    { accountBefore: { account: { email: "bracket.fixture@example.test", planType: "plus" } } },
+    { accountAfter: { account: { email: "bracket.fixture@example.test", planType: "plus" } } },
+    { rateLimits: { rateLimits: { ...snapshot.rateLimits.rateLimits, planType: "plus" } } },
+    { rateLimits: {
+      ...snapshot.rateLimits,
+      rateLimitsByLimitId: { codex_bengalfox: { ...snapshot.rateLimits.rateLimits, limitId: "codex_bengalfox", planType: "plus" } },
+    } },
+  ];
+  for (const conflict of conflicts) {
+    const result = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader({ ...snapshot, ...conflict }, "2026-07-23T00:00:00.000Z", {
+      loadAccountObservationSecret: async () => Buffer.alloc(32, 77),
+    });
+    assert.equal(result.accountScope.status, "unavailable");
+    assert.equal(result.accountScope.scopeId, null);
+    assert.equal(result.canonical.primary.usedPercent, 25, "account uncertainty must not discard the quota evidence");
+    assert.deepEqual(result.officialDailyTokens, [{ date: "2026-07-23", tokens: 10 }]);
+    assert.equal(JSON.stringify(result).includes("fixture@example.test"), false);
+  }
+});
+
+test("bracketed account sanitation preserves credential recovery status and zeroes the lease on malformed quota input", async () => {
+  const account = { account: { email: "safe.fixture@example.test", planType: "pro" } };
+  const snapshot = {
+    accountBefore: account, accountAfter: account,
+    rateLimits: { rateLimits: { limitId: "codex", planType: "pro", primary: { usedPercent: 3, windowDurationMins: 300 } } },
+    accountUsage: null,
+  };
+  for (const [code, reason] of [
+    ["account_observation_credential_locked", "credential_locked"],
+    ["account_observation_credential_migration_required", "credential_migration_required"],
+    ["account_observation_credential_unavailable", "credential_unavailable"],
+  ]) {
+    const result = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snapshot, "2026-07-23T00:00:00.000Z", {
+      loadAccountObservationSecret: async () => { const error = new Error("DO-NOT-LEAK"); error.code = code; throw error; },
+    });
+    assert.equal(result.accountScope.status, "unavailable");
+    assert.equal(result.accountScope.reason, reason);
+    assert.equal(JSON.stringify(result).includes("DO-NOT-LEAK"), false);
+  }
+  const disposable = Buffer.alloc(32, 79);
+  await assert.rejects(() => sanitizeBracketedCodexAccountSnapshotWithSecretLoader({ ...snapshot, rateLimits: {} }, "2026-07-23T00:00:00.000Z", {
+    loadAccountObservationSecret: async () => disposable,
+  }), /canonical rate-limit snapshot/u);
+  assert.deepEqual(disposable, Buffer.alloc(32));
 });
 
 test("ccusage summary keeps token categories disjoint", () => {
@@ -328,9 +407,12 @@ test("Codex sanitizer rejects quota percentages outside zero to one hundred", ()
   assert.equal(result.canonical.secondary, null);
 });
 
-test("local usage normalization rejects negative and non-numeric counters", () => {
+test("local usage normalization accepts only non-negative safe-integer counters", () => {
   assert.equal(normalizeTokenUsage({ input_tokens: -1 }), null);
   assert.equal(normalizeTokenUsage({ input_tokens: "10" }), null);
+  assert.equal(normalizeTokenUsage({ input_tokens: 1.5 }), null);
+  assert.equal(normalizeTokenUsage({ input_tokens: Number.MAX_SAFE_INTEGER + 1 }), null);
+  assert.equal(normalizeTokenUsage([]), null);
   assert.deepEqual(normalizeTokenUsage({ input_tokens: 10, output_tokens: 2 }), {
     input_tokens: 10,
     cached_input_tokens: 0,
@@ -441,7 +523,7 @@ test("forked cumulative snapshots are excluded while new fork usage is retained"
       record("2026-07-23T00:00:01.000Z", usage(100), usage(100)),
     ].join("\n");
     const fork = [
-      JSON.stringify({ timestamp: "2026-07-23T00:01:00.000Z", type: "session_meta", payload: { forked_from_id: "controller-parent-secret" } }),
+      JSON.stringify({ timestamp: "2026-07-23T00:01:00.000Z", type: "session_meta", payload: { id: "controller-fork-secret", forked_from_id: "controller-parent-secret" } }),
       JSON.stringify({ timestamp: "2026-07-23T00:01:00.001Z", type: "turn_context", payload: { model: "gpt-test" } }),
       record("2026-07-23T00:01:00.002Z", usage(100), usage(100)),
       record("2026-07-23T00:01:01.000Z", usage(160), usage(60)),
@@ -549,6 +631,89 @@ test("forked cumulative snapshots are excluded while new fork usage is retained"
     assert.equal(JSON.stringify(controllerExcluded).includes("controller-parent-secret"), false);
     assert.equal(JSON.stringify(controllerExcluded).includes("sibling"), false);
     assert.equal(JSON.stringify(controllerExcluded).includes("sibling-turn-secret"), false);
+  } finally {
+    await rm(codexHome, { recursive: true });
+  }
+});
+
+test("an inline fork with no reachable parent fails closed instead of charging its replay", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "app-usagemonitor-scan-test-"));
+  try {
+    const sessions = join(codexHome, "sessions");
+    await mkdir(sessions, { recursive: true });
+    const usage = (input_tokens, total_tokens = input_tokens) => ({
+      input_tokens,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+      total_tokens,
+    });
+    const record = (timestamp, total, last) => JSON.stringify({
+      timestamp,
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: { total_token_usage: total, last_token_usage: last },
+      },
+    });
+    const turn = (timestamp) => JSON.stringify({
+      timestamp,
+      type: "turn_context",
+      payload: { model: "gpt-test" },
+    });
+    // The orphan replays an adversarial shape: a turn_context INSIDE the
+    // replayed prefix, which defeats the parser's no-turn-context-yet rule.
+    // With the parent file gone, only failing closed keeps it out of spend.
+    const orphan = [
+      JSON.stringify({ timestamp: "2026-07-23T00:01:00.000Z", type: "session_meta", payload: { id: "orphan-fork", forked_from_id: "vanished-parent" } }),
+      turn("2026-07-23T00:01:00.001Z"),
+      record("2026-07-23T00:01:00.002Z", usage(100), usage(100)),
+      record("2026-07-23T00:01:01.000Z", usage(160), usage(60)),
+    ].join("\n");
+    // The grandchild's parent IS present (the orphan), so it parses normally
+    // — and the orphan's fail-closed pass still collected its own keys,
+    // which include the replayed ancestral prefix. Replay suppression
+    // survives the missing common ancestor.
+    const grandchild = [
+      JSON.stringify({ timestamp: "2026-07-23T00:02:00.000Z", type: "session_meta", payload: { id: "grandchild", forked_from_id: "orphan-fork" } }),
+      turn("2026-07-23T00:02:00.001Z"),
+      record("2026-07-23T00:02:00.002Z", usage(100), usage(100)),
+      record("2026-07-23T00:02:00.003Z", usage(160), usage(60)),
+      record("2026-07-23T00:02:01.000Z", usage(210), usage(50)),
+    ].join("\n");
+    const standalone = [
+      JSON.stringify({ timestamp: "2026-07-23T00:03:00.000Z", type: "session_meta", payload: { id: "standalone" } }),
+      turn("2026-07-23T00:03:00.001Z"),
+      record("2026-07-23T00:03:01.000Z", usage(20), usage(20)),
+    ].join("\n");
+    await writeFile(join(sessions, "rollout-2026-07-23T00-01-00-orphan.jsonl"), `${orphan}\n`);
+    await writeFile(join(sessions, "rollout-2026-07-23T00-02-00-grandchild.jsonl"), `${grandchild}\n`);
+    await writeFile(join(sessions, "rollout-2026-07-23T00-03-00-standalone.jsonl"), `${standalone}\n`);
+    const result = await scanAndPriceCodexLogs({
+      codexHome,
+      startAt: "2026-07-22T23:59:00.000Z",
+      endAt: "2026-07-23T00:04:00.000Z",
+      priceCards: [{
+        schema_version: "0.1",
+        id: "openai:gpt-test:test",
+        provider: "openai",
+        model: "gpt-test",
+        components: [{
+          usage_component: "input_uncached_tokens",
+          unit: "token",
+          price: { amount: "1", currency: "USD", per: "1" },
+        }],
+        source: { name: "test", url: "https://example.invalid/pricing", retrieved_at: "2026-07-23T00:00:00.000Z" },
+      }],
+    });
+    assert.equal(result.diagnostics.lineageParentsMissing, 1);
+    assert.equal(result.diagnostics.forkRolloutsFailedClosed, 1);
+    assert.equal(result.diagnostics.forkReplayEventsSkipped, 2);
+    assert.equal(result.eventCount, 2);
+    assert.equal(result.totalTokens, 70);
+    assert.equal(result.runcost.totalUsd, 70);
+    assert.equal(result.diagnostics.usageBearingRollouts, 2);
   } finally {
     await rm(codexHome, { recursive: true });
   }

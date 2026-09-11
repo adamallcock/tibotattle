@@ -29,7 +29,7 @@
     "observedTime": { "type": "string", "format": "date-time", "maxLength": 32 },
     "receivedTime": { "type": "string", "format": "date-time", "maxLength": 32 },
     "provider": { "enum": ["openai_codex", "anthropic_claude_code"] },
-    "planType": { "enum": ["free", "go", "plus", "pro", "prolite", "business", "enterprise", "edu", "team", "unknown"] },
+    "planType": { "enum": ["free", "go", "plus", "pro", "prolite", "team", "self_serve_business_prolite", "self_serve_business_usage_based", "business", "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based", "enterprise", "edu", "edu_plus", "edu_pro", "unknown"] },
     "planVariant": { "enum": ["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"] },
     "limitId": { "enum": ["unknown", "codex", "codex-spark"] },
     "slot": { "enum": ["primary", "secondary", "five_hour", "seven_day", "other", "unknown"] },

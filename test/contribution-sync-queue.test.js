@@ -15,19 +15,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import {
-  conservativeUploadReservationBytes,
-  discoverCommittedPreparedSets,
-  inspectExactNextContributionSyncUpload,
-  inspectContributionSyncQueue,
-  inspectNextContributionSyncUpload,
-  RETRY_BACKOFF_POLICY,
-  retireAcceptedContributionArtifacts,
-  retireSupersededPendingContributionArtifacts,
-  runContributionSyncQueueOnce,
-  runContributionSyncQueueWatch,
-  setContributionSyncPaused,
-} from "../src/contribution-sync-queue.js";
+import { localContributionSyncQueue } from
+  "../src/local-node-runtime.js";
 import {
   ContributionDeviceSyncError,
 } from "../src/contribution-device-sync.js";
@@ -50,6 +39,20 @@ import {
   MAX_TELEMETRY_BROWSER_BYTES,
   parseTelemetryEnvelope,
 } from "@app-usagemonitor/telemetry-contract";
+
+const {
+  conservativeUploadReservationBytes,
+  discoverCommittedPreparedSets,
+  inspectExactNextContributionSyncUpload,
+  inspectContributionSyncQueue,
+  inspectNextContributionSyncUpload,
+  RETRY_BACKOFF_POLICY,
+  retireAcceptedContributionArtifacts,
+  retireSupersededPendingContributionArtifacts,
+  runContributionSyncQueueOnce,
+  runContributionSyncQueueWatch,
+  setContributionSyncPaused,
+} = localContributionSyncQueue;
 
 const ORIGIN = "https://usage.example";
 const ACCEPTED_ID =

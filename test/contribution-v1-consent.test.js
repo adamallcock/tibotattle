@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 
 import {
   createLocalIncrementalContributionSyncContext,
+  incrementalContributionRequiredConsent,
 } from "../src/application/local-incremental-contribution-sync.js";
+import { TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 
 const ORIGIN = "https://usage.example";
 const SETTINGS_FILE = "/state/private/incremental-contribution-sync-v1.json";
@@ -42,6 +44,7 @@ function fakeTimers() {
   let nextId = 1;
   const scheduled = new Map();
   return {
+    get count() { return scheduled.size; },
     setTimeoutImpl(callback, delay) {
       const id = nextId;
       nextId += 1;
@@ -114,6 +117,35 @@ test("nothing syncs before the approve-once consent is recorded", async () => {
   assert.equal(status.consent.current, false);
   assert.equal(status.nextAttemptAt, null);
   assert.equal(status.progress, null);
+});
+
+test("v1.1 requires an explicit exact destination-bound approval and survives controller restart", async () => {
+  const seen = [];
+  const runner = async ({ consent }) => { seen.push(consent); return runOutcome(); };
+  const first = harness({ runner });
+  await first.controller.start();
+  await first.controller.approve();
+  await first.controller.runDue();
+  assert.equal(seen[0].telemetrySchemaVersion, "telemetry-contribution-v1.0");
+  const consent = incrementalContributionRequiredConsent({ destinationOrigin: ORIGIN,
+    telemetrySchemaVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION });
+  for (const invalid of [
+    { ...consent, destinationOrigin: "https://other.example" },
+    { ...consent, fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1" },
+    { ...consent, consentedAt: first.nowIso() },
+  ]) await assert.rejects(first.controller.approve({ consent: invalid }), { code: "incremental_contribution_consent_unavailable" });
+  assert.equal((await first.controller.inspect()).contractVersion, "telemetry-contribution-v1.0");
+  const approved = await first.controller.approve({ consent });
+  assert.equal(approved.contractVersion, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION);
+  assert.equal(approved.progress, null, "old v1 acknowledged days are not v1.1 activation evidence");
+  await first.controller.stop();
+  const restarted = harness({ storage: first.storage, runner });
+  await restarted.controller.start();
+  assert.equal((await restarted.controller.inspect()).consent.current, true);
+  await restarted.controller.runDue();
+  assert.deepEqual(seen[1], consent);
+  assert.equal(Object.isFrozen(seen[1]), true);
+  await restarted.controller.stop();
 });
 
 test("approval records the exact v1.0 consent once and syncing runs without further action", async () => {
@@ -509,6 +541,204 @@ test("consent survives a restart: the schedule resumes with no user action", asy
   second.advance(7 * 60 * 60 * 1_000);
   await second.controller.runDue();
   assert.equal(second.runs.length, 1);
+});
+
+test("device disconnect persists user intent across restart without losing consent, progress, or history", async () => {
+  const timers = fakeTimers();
+  const first = harness({ timers, outcomes: [runOutcome({
+    status: "partial", daysSynced: 1, daysPending: 1,
+  })] });
+  await first.controller.start();
+  await first.controller.approve();
+  await first.controller.runDue();
+  const previous = JSON.parse(first.storage.files.get(SETTINGS_FILE));
+  assert.equal(timers.count, 1);
+
+  const paused = await first.controller.pauseForDeviceDisconnect();
+  const expected = {
+    ...previous, paused: true, pausedReason: "device_disconnected", nextAttemptAt: null,
+  };
+  assert.equal(paused.settingsAvailable, true);
+  assert.equal(paused.pausedReason, "device_disconnected");
+  assert.deepEqual(JSON.parse(first.storage.files.get(SETTINGS_FILE)), expected);
+  assert.equal(timers.count, 0);
+  first.advance(7 * 24 * 60 * 60 * 1_000);
+  await first.controller.start();
+  await first.controller.runDue();
+  assert.equal(first.runs.length, 1);
+  await first.controller.stop();
+
+  const second = harness({ storage: first.storage, timers });
+  await second.controller.start();
+  second.advance(7 * 24 * 60 * 60 * 1_000);
+  await second.controller.runDue();
+  assert.equal(second.runs.length, 0);
+  assert.equal(timers.count, 0);
+  assert.deepEqual(JSON.parse(second.storage.files.get(SETTINGS_FILE)), expected);
+
+  // The explicit pairing/retry flow can resume without rewriting consent or
+  // erasing actual pass history. A mere restart above could not do so.
+  const resumed = await second.controller.resume();
+  assert.equal(resumed.paused, false);
+  assert.equal(resumed.pausedReason, null);
+  assert.equal(resumed.nextAttemptAt, second.nowIso());
+  assert.deepEqual(resumed.consent, paused.consent);
+  assert.deepEqual(resumed.progress, paused.progress);
+  assert.deepEqual(resumed.lastOutcome, paused.lastOutcome);
+  await second.controller.runDue();
+  assert.equal(second.runs.length, 1);
+  await second.controller.stop();
+});
+
+test("disconnect before approval does not invent consent, progress, or a pass", async () => {
+  const { controller, storage, runs } = harness();
+  const paused = await controller.pauseForDeviceDisconnect();
+  assert.equal(paused.consent.approved, false);
+  assert.equal(paused.progress, null);
+  assert.equal(paused.lastOutcome, null);
+  assert.equal(paused.lastAttemptAt, null);
+  assert.equal(JSON.parse(storage.files.get(SETTINGS_FILE)).consent, null);
+  await controller.start();
+  await controller.runDue();
+  assert.equal(runs.length, 0);
+  await controller.approve();
+  await controller.runDue();
+  assert.equal(runs.length, 1);
+  await controller.stop();
+});
+
+test("device repair pause survives restart and only validated repair completion can rearm delivery", async () => {
+  const first = harness();
+  await first.controller.start();
+  await first.controller.approve();
+  await first.controller.runDue();
+  const before = JSON.parse(first.storage.files.get(SETTINGS_FILE));
+  const paused = await first.controller.pauseForDeviceRepair();
+  assert.equal(paused.pausedReason, "device_repair_required");
+  assert.deepEqual(JSON.parse(first.storage.files.get(SETTINGS_FILE)), {
+    ...before, paused: true, pausedReason: "device_repair_required", nextAttemptAt: null,
+  });
+  await first.controller.stop();
+  const second = harness({ storage: first.storage });
+  await second.controller.start();
+  second.advance(7 * 24 * 60 * 60 * 1_000);
+  for (const bypass of [() => second.controller.resume(), () => second.controller.approve(),
+    () => second.controller.pauseForDeviceDisconnect()]) {
+    await assert.rejects(bypass(), { code: "incremental_contribution_device_repair_required" });
+  }
+  await second.controller.runDue();
+  assert.equal(second.runs.length, 0);
+  assert.equal((await second.controller.inspect()).pausedReason, "device_repair_required");
+  const resumed = await second.controller.resumeAfterDeviceRepair();
+  assert.equal(resumed.paused, false);
+  assert.deepEqual(resumed.consent, paused.consent);
+  assert.deepEqual(resumed.progress, paused.progress);
+  assert.deepEqual(resumed.lastOutcome, paused.lastOutcome);
+  await second.controller.runDue();
+  assert.equal(second.runs.length, 1);
+  await second.controller.stop();
+});
+
+for (const completion of ["success", "rejection", "deadline"]) {
+  test(`a disconnected run's late ${completion} cannot overwrite the durable pause`, async () => {
+    const timers = fakeTimers();
+    const entered = Promise.withResolvers();
+    const finished = Promise.withResolvers();
+    let signal;
+    const { controller, storage } = harness({
+      timers,
+      runTimeoutMilliseconds: 1_000,
+      runner: async (options) => {
+        signal = options.signal;
+        entered.resolve();
+        return finished.promise;
+      },
+    });
+    await controller.start();
+    await controller.approve();
+    const run = controller.runDue();
+    await entered.promise;
+    const before = JSON.parse(storage.files.get(SETTINGS_FILE));
+    await controller.pauseForDeviceDisconnect();
+    assert.equal(signal.aborted, true);
+    const pausedText = storage.files.get(SETTINGS_FILE);
+    assert.deepEqual(JSON.parse(pausedText), {
+      ...before, paused: true, pausedReason: "device_disconnected", nextAttemptAt: null,
+    });
+    if (completion === "rejection") finished.reject(new Error("aborted synthetic run"));
+    else if (completion === "deadline") timers.fireFirst(1_000);
+    else finished.resolve(runOutcome());
+    const settled = await run;
+    assert.equal(settled.running, false);
+    assert.equal(settled.pausedReason, "device_disconnected");
+    assert.equal(timers.count, 0);
+    assert.equal(storage.files.get(SETTINGS_FILE), pausedText);
+    if (completion === "deadline") {
+      finished.resolve(runOutcome());
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(storage.files.get(SETTINGS_FILE), pausedText);
+    }
+    await controller.stop();
+  });
+}
+
+test("failed disconnect persistence stays fail-closed and can retry the exact pause", async () => {
+  const storage = fakeStorage();
+  const write = storage.writeSettingsText;
+  let failPause = true;
+  storage.writeSettingsText = async (request) => {
+    if (failPause && JSON.parse(request.text).pausedReason === "device_disconnected") {
+      throw new Error("synthetic settings write failed");
+    }
+    await write(request);
+  };
+  const timers = fakeTimers();
+  const { controller, runs } = harness({ storage, timers });
+  await controller.start();
+  await controller.approve();
+  await controller.runDue();
+  const previous = storage.files.get(SETTINGS_FILE);
+  await assert.rejects(controller.pauseForDeviceDisconnect(), /settings write failed/u);
+  const failed = await controller.inspect();
+  assert.equal(failed.settingsAvailable, false);
+  assert.equal(failed.paused, true);
+  assert.equal(failed.pausedReason, "device_disconnected");
+  assert.equal(failed.nextAttemptAt, null);
+  assert.equal(timers.count, 0);
+  assert.equal(storage.files.get(SETTINGS_FILE), previous);
+  await assert.rejects(controller.resume(), {
+    code: "incremental_contribution_settings_unavailable",
+  });
+  await controller.runDue();
+  assert.equal(runs.length, 1);
+  failPause = false;
+  assert.equal((await controller.pauseForDeviceDisconnect()).settingsAvailable, true);
+  assert.deepEqual(JSON.parse(storage.files.get(SETTINGS_FILE)), {
+    ...JSON.parse(previous),
+    paused: true, pausedReason: "device_disconnected", nextAttemptAt: null,
+  });
+  await controller.stop();
+});
+
+test("pause reasons stay closed and unreadable settings are never replaced by disconnect", async () => {
+  for (const reason of ["device_disconnected", "device_unavailable", "unrecognized_reason"]) {
+    const original = JSON.stringify(persistedSettings({ paused: true, pausedReason: reason }));
+    const storage = fakeStorage(new Map([[SETTINGS_FILE, original]]));
+    const { controller, runs } = harness({ storage });
+    const started = await controller.start();
+    assert.equal(started.settingsAvailable, reason !== "unrecognized_reason");
+    await controller.runDue();
+    assert.equal(runs.length, 0);
+    if (reason === "unrecognized_reason") {
+      await assert.rejects(controller.pauseForDeviceDisconnect(), {
+        code: "incremental_contribution_settings_unavailable",
+      });
+    } else {
+      assert.equal(started.pausedReason, reason);
+    }
+    assert.equal(storage.files.get(SETTINGS_FILE), original);
+    await controller.stop();
+  }
 });
 
 test("approval without a configured destination fails closed", async () => {

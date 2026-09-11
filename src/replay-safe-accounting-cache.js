@@ -4,7 +4,7 @@ import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import {
   defaultLocalUnifiedIndexPath,
   openLocalUnifiedIndex,
@@ -15,7 +15,12 @@ import {
   createIndexedCodexLogScan,
   defaultLocalAnalysisIndexSecretPath,
 } from "./local-analysis-index.js";
-import { createLocalUnifiedAccountingSource } from "./local-unified-accounting-source.js";
+import {
+  canonicalInstant,
+  createLocalUnifiedAccountingSource,
+  createLocalUnifiedUsageAttributionReader,
+  precomputeLocalUnifiedUsageAttribution,
+} from "./local-unified-accounting-source.js";
 import {
   CODEX_TRANSITION_DERIVATION_CEILINGS,
   deriveCodexTransitionSeriesCooperatively,
@@ -39,6 +44,8 @@ import {
   costWarningCodes,
   emptySpeedWeightingCrossing,
   fastModeModelFamilyKey,
+  FAST_MODE_ASSUMED_MULTIPLIER,
+  FAST_MODE_QUOTA_MULTIPLIERS,
   priceCodexUsageEvent,
   APP_PRICE_REGISTRY_MANIFEST,
 } from "@app-usagemonitor/accounting";
@@ -47,9 +54,13 @@ import {
   analyzeQuotaPace,
   blendedCompositionCapacityUsd,
   buildCompositionObservations,
+  buildPlanAttributionIndex,
+  classifyUsageAttribution,
   calibrateCompositionCapacities,
   isValidQuotaWindowDuration,
   MODEL_COMPOSITION_POLICY,
+  planAttributionContextKey,
+  planEraForInterval,
   SEVEN_DAY_WINDOW_MINUTES,
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
@@ -68,8 +79,8 @@ import { stableJson } from "./storage.js";
 import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
   projectBoundedWeeklyCalibrationSummary,
+  validWeeklyPlanPopulations,
 } from "./reporting/index.js";
-import { fastQuotaMultiplier } from "./application/index.js";
 
 // v0.4 added per-model allowance-track and API-price-applicability state, and
 // the combined `modelUsage` row set. v0.5 (2026-08-08) sources the weekly
@@ -114,10 +125,23 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // holds only its totals, and the missing cells cannot be recovered by dividing
 // them, so the cache is withheld and rebuilt rather than served with the
 // components silently absent.
+// v0.13 (2026-08-30): speed crossings use canonical registered models and
+// event-qualified Priority cards. Old prefix-family crossings cannot recover
+// the model/context/epoch eligibility, so they must be rebuilt, not relabeled.
+// v0.14: exact occurrence plans and bounded quantity intervals survive compact
+// replay; plan-era populations replace provider-wide calibration numerators.
+// v0.15: the selected plan gets its own generation-bound, plan-era-attributed
+// usage timeline. The ordinary timeline remains the conserved all-plan ledger;
+// allowance-facing Trends may use the scoped timeline only when its plan,
+// generation, basis and fitted-reset cohort match the selected capacity.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.12";
+  "local-replay-safe-accounting-v0.15";
+const { scanCodexLogEvents } = localCodexLogScanner;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
+const PLAN_SCOPED_TIMELINE_SCHEMA_VERSION =
+  "local-plan-scoped-accounting-timeline-v1";
+const PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION = "plan-era-v1";
 const ALLOWANCE_SCENARIO_CANDIDATES = Object.freeze({
   unresolved_as_standard: "speed_lower",
   unresolved_as_fast: "speed_upper",
@@ -142,6 +166,7 @@ const ACCOUNTING_SOURCE_ERROR_CODES = Object.freeze({
   local_unified_index_file_invalid: "accounting_unified_index_unavailable",
   local_unified_index_file_changed: "accounting_unified_generation_changed",
   local_unified_index_schema_invalid: "accounting_unified_index_incompatible",
+  local_unified_index_schema_newer: "local_unified_index_schema_newer",
   local_unified_index_compatibility_invalid: "accounting_unified_index_incompatible",
   local_unified_index_meta_invalid: "accounting_unified_index_invalid",
   local_unified_index_row_invalid: "accounting_unified_index_invalid",
@@ -167,6 +192,11 @@ const MINIMUM_WINDOW_DAYS = 365;
 const MAXIMUM_WINDOW_DAYS = 3_653;
 const DEFAULT_WINDOW_DAYS = MINIMUM_WINDOW_DAYS;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
+// Resource ceilings, not retention windows: refuse this optional comparison
+// lane as a whole rather than truncating history or failing ordinary accounting.
+const MAX_PLAN_TIMELINE_ROWS = 100_000;
+const MAX_PLAN_TIMELINE_BYTES = 4 * 1024 * 1024;
+const PLAN_TIMELINE_ENCODING = "plan_bucket_v1";
 const MAX_QUOTA_TIMELINE_ROWS = 10_000;
 const WEEKLY_WINDOW_MINUTES = SEVEN_DAY_WINDOW_MINUTES;
 const SPARK_MODEL = OPENAI_CODEX_SPARK_MODEL_ID;
@@ -196,6 +226,12 @@ const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
 // delta alone can never pass the absolute. Change them as a PAIR, and read
 // ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB before changing either — the derived
 // cap is what keeps a miss an honest deferral rather than a SIGABRT.
+//
+// All three describe the REBUILD, which since #38 runs in a short-lived child.
+// The resident companion's archive projection is a separate process situation
+// and has a separate pair, MAX_ARCHIVE_ACCOUNTING_RSS_BYTES and
+// ARCHIVE_ACCOUNTING_RSS_DELTA_BUDGET_BYTES, further down. Nothing here is a
+// default for anything there; that inheritance is the bug they exist to close.
 // ---------------------------------------------------------------------------
 // Absolute whole-process RSS TARGET for one accounting rebuild. It is a
 // TARGET, not a hard blocker: a miss degrades to a retained-cache soft-fail
@@ -249,11 +285,14 @@ const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
 //     derived. That derivation is what keeps the RSS guard reading before V8
 //     aborts, so a miss arrives as a typed deferral instead of a SIGABRT the
 //     parent can only report as accounting_rebuild_subprocess_failed.
-//   - it is also the default ceiling for buildReplaySafeAccountingPeriod, so
-//     the archive projection that the resident companion runs (see
-//     src/local-archive-accounting-index.js) is loosened by the same amount.
-//     That path is bounded first by its own read budgets and chunking; this
-//     ceiling is its backstop, not its budget.
+//   - its reach STOPS at the rebuild. Until 2026-08-20 it was also the
+//     default ceiling for buildReplaySafeAccountingPeriod, so raising it
+//     here silently loosened the archive projection the RESIDENT companion
+//     runs by the same 4 GiB — the opposite of what #38 moved the rebuild
+//     into a child to achieve. That path now resolves its own ceiling from
+//     MAX_ARCHIVE_ACCOUNTING_RSS_BYTES below, and a regression pins that it
+//     does not follow this constant. Headroom is free in a process that
+//     exits; it is not free in one that stays.
 const MAX_ACCOUNTING_RSS_BYTES = Math.floor(6 * 1024 * 1024 * 1024);
 // What one accounting rebuild may itself ADD to process RSS over the baseline
 // captured at build start. The effective ceiling is
@@ -369,6 +408,70 @@ const ACCOUNTING_REBUILD_CHILD_ENTRY = fileURLToPath(
 const ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB = Math.ceil(
   MAX_ACCOUNTING_RSS_BYTES / (1024 * 1024),
 );
+// ---------------------------------------------------------------------------
+// The ARCHIVE projection's own ceiling, deliberately NOT the rebuild's.
+//
+// buildReplaySafeAccountingPeriod has two callers with opposite memory
+// situations, and until 2026-08-20 they shared one number by inheritance
+// rather than by decision:
+//   - the rebuild calls it as a sub-build and NAMES its own ceiling (the
+//     effective target it already computed), so it is unaffected by anything
+//     here and must stay that way;
+//   - refreshLocalArchiveAccountingIndex (src/local-archive-accounting-index.js)
+//     names nothing, and runs inside the RESIDENT menu-bar companion.
+// A ceiling sized for a short-lived child that hands every page back to the OS
+// on exit is the wrong ceiling for a process the user leaves running all day.
+// The 2 -> 6 GiB rebuild raise reached this path only because the default was
+// never chosen; that is the defect these two constants close.
+//
+// The shape is baseline + delta rather than a bare absolute, and that is the
+// substance of the fix rather than a stylistic echo of the rebuild policy. A
+// whole-process absolute cannot work in the companion, because it charges the
+// pass for memory the pass did not allocate and cannot free. Measured on the
+// owner's own machine (dogfood 0.1.13 build 1020, 4,886 sources / 128.5 GB
+// indexed), the resident companion oscillates between 1,312 and 2,089 MiB
+// across a twenty-second window — it crosses 2 GiB on GC timing alone. Under
+// the pre-raise 2 GiB absolute this projection would therefore have deferred
+// or not deferred depending on when V8 last collected, which is the worst of
+// the available failure modes: not a bound, a coin flip. A delta measured off
+// THIS pass's own baseline is the only arm that attributes growth to the pass
+// that caused it.
+//
+// 512 MiB of delta is set against a measured need, not a guess. Streaming a
+// corpus the size of the owner's real one (572,089 events over two years,
+// with production dimension cardinality across model, speed, service tier,
+// surface, agent scope and lineage) through this builder peaks at 98.6 MiB of
+// RSS growth. Doubling and quadrupling that stream — 1.14M and 2.29M events —
+// peaks at 119.8 MiB and 113.9 MiB, i.e. FLAT. That is the constant-memory
+// contract in the builder's own doc comment holding up under measurement: the
+// aggregate is fixed-shape and retains no raw inputs, so its residency tracks
+// dimension cardinality and not corpus size. 512 MiB is roughly 4x the peak
+// at 4x the owner's corpus, which is headroom for cardinality drift and lazy
+// GC without being room for a regression to hide in. Note what this delta is
+// NOT: it is not the 512 MiB that made the 2026-08-11 incident inevitable.
+// That number was applied to the REBUILD, whose transition mining genuinely
+// needs gigabytes; applying it to a pass measured flat at ~100 MiB is a
+// different claim with different evidence behind it.
+const ARCHIVE_ACCOUNTING_RSS_DELTA_BUDGET_BYTES = Math.floor(
+  512 * 1024 * 1024,
+);
+// The absolute backstop over the delta, and the arm that stops the companion
+// being driven into swap by a projection off an already-enormous baseline.
+// 3 GiB is picked so that on real hardware the DELTA is what binds: at the
+// companion's observed 2,089 MiB peak the effective ceiling is
+// min(3 GiB, ~2.54 GiB) = ~2.54 GiB, leaving the pass its full 512 MiB
+// against a measured need near 100 MiB. The absolute takes over only above a
+// ~2.5 GiB baseline — a companion half again the size of the fattest yet
+// observed — and above that line refusing to add another half gigabyte is the
+// correct answer rather than a regrettable one. This is a real cliff and is
+// meant to be, and it is survivable in the exact way that matters: the trip
+// is caught and reported as archive_projection_unavailable, never a failed
+// refresh and never a lost index — the indexing pass has already committed by
+// the time the projection runs. The prior projection is left on disk and goes
+// on being served until the index advances past its coverage fingerprint,
+// after which the surface reads unavailable rather than stale. Past this line
+// the companion's size is the bug to fix, not the ceiling.
+const MAX_ARCHIVE_ACCOUNTING_RSS_BYTES = Math.floor(3 * 1024 * 1024 * 1024);
 // The memory policy as the tests and any future caller should read it: derived
 // from the constants above rather than mirrored, so a regression can pin the
 // RELATIONSHIPS (cap >= absolute >= effective ceiling) without going stale the
@@ -377,6 +480,12 @@ export const REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY = Object.freeze({
   maximumRssBytes: MAX_ACCOUNTING_RSS_BYTES,
   rssDeltaBudgetBytes: ACCOUNTING_RSS_DELTA_BUDGET_BYTES,
   rebuildChildOldSpaceMib: ACCOUNTING_REBUILD_CHILD_OLD_SPACE_MIB,
+  // The resident archive projection's ceiling, carried here so a regression
+  // can pin that it is SEPARATE from the rebuild's rather than trusting the
+  // two to stay apart by accident. Every field above describes a process that
+  // exits after one pass; these two describe one that does not.
+  archiveMaximumRssBytes: MAX_ARCHIVE_ACCOUNTING_RSS_BYTES,
+  archiveRssDeltaBudgetBytes: ARCHIVE_ACCOUNTING_RSS_DELTA_BUDGET_BYTES,
 });
 // SIGTERM asks the child to unwind through its own abort checks (typed abort
 // envelope); a child that cannot unwind inside this grace is killed hard. The
@@ -399,8 +508,13 @@ export const REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION =
 // phase. The general analysis-index and unified-index worker policies remain
 // unchanged.
 const DEFAULT_ACCOUNTING_INDEX_WORKERS = 4;
-const COMPACT_USAGE_RETAINED_BYTES = 256;
+const COMPACT_USAGE_RETAINED_BYTES = 352;
 const COMPACT_SNAPSHOT_RETAINED_BYTES = 192;
+// Exact typed-buffer storage: two Float64 stamp columns, then Uint8 +
+// Int32 + Float64 + Uint8 attribution memo columns. SQLite page objects,
+// dictionaries and decoded batches remain covered by the unchanged RSS guard.
+const STREAMED_USAGE_STAMP_BYTES = 16;
+const STREAMED_USAGE_MEMO_BYTES = 14;
 const DEFAULT_TRANSITION_RESOURCE_LIMITS = Object.freeze({
   usageEvents: CODEX_TRANSITION_DERIVATION_CEILINGS.usageEvents,
   weeklySnapshots:
@@ -640,10 +754,20 @@ function sourceDescriptor({
     coverage: mode === "unified"
       ? {
         status: boundedDescriptorText(coverage?.status),
+        blockReason: boundedDescriptorText(coverage?.blockReason),
         generatedAt: canonicalInstant(coverage?.generatedAt) ?? null,
         coveredAt,
         sourceCount: boundedDescriptorCount(coverage?.sourceCount),
         sourceBytes: boundedDescriptorCount(coverage?.sourceBytes),
+        skippedSourceCount: boundedDescriptorCount(
+          coverage?.skippedSourceCount,
+        ),
+        skippedSourceBytes: boundedDescriptorCount(
+          coverage?.skippedSourceBytes,
+        ),
+        skippedThreadCount: boundedDescriptorCount(
+          coverage?.skippedThreadCount,
+        ),
         usageEvents: boundedDescriptorCount(coverage?.usageEvents),
         quotaObservations: boundedDescriptorCount(coverage?.quotaObservations),
         quotaOccurrences: boundedDescriptorCount(coverage?.quotaOccurrences),
@@ -700,7 +824,15 @@ function normalizeUnifiedCoverage(scanned, expectedGeneration) {
   if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) {
     throw fixedError("accounting_unified_coverage_unavailable");
   }
-  if (coverage.status !== "complete" || coverage.generationProof !== true) {
+  const attestedGap = coverage.status === "partial"
+    && coverage.blockReason === "codex_rollout_sources_quarantined"
+    && coverage.generationProof === true
+    && Number.isSafeInteger(coverage.skippedSourceCount)
+    && coverage.skippedSourceCount > 0
+    && Number.isSafeInteger(coverage.skippedThreadCount)
+    && coverage.skippedThreadCount > 0;
+  if ((coverage.status !== "complete" && !attestedGap)
+      || coverage.generationProof !== true) {
     throw fixedError("accounting_unified_coverage_incomplete");
   }
   const capabilities = scanned?.capabilities;
@@ -804,7 +936,7 @@ function historyProjection(value, coverage, generation, generationFingerprint) {
     status: "available",
     errorCode: null,
     coverage: {
-      status: "complete",
+      status: coverage.coverage.status,
       generatedAt: value.generatedAt,
       coveredAt: value.coveredAt,
       generation,
@@ -915,14 +1047,6 @@ function transitionResourceLimits(value) {
   }));
 }
 
-function canonicalInstant(value) {
-  if (typeof value !== "string") return null;
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
-    ? value
-    : null;
-}
-
 function emptyComponents() {
   return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, 0]));
 }
@@ -975,9 +1099,9 @@ function newPeriod(id, label, { includeSpark = true } = {}) {
     bySurface: emptyDimension(SURFACES),
     byAgentScope: emptyDimension(AGENT_SCOPES),
     byLineage: emptyDimension(LINEAGE),
-    // Observed speed mode crossed with the model's published Fast credit rate
-    // family. The crossing is what lets the owner's Fast-mode preference be
-    // applied at read time without rebuilding this cache.
+    // Observed speed mode crossed with the model's Priority (Fast) price-
+    // ratio family. The crossing is what lets the published ratio be applied
+    // at read time without rebuilding this cache.
     speedWeighting: emptySpeedWeightingCrossing(),
     // The same crossing, holding only the events the log left UNOBSERVED that
     // a timestamped Codex `service_tier` reading actually covers. Kept apart
@@ -1014,6 +1138,61 @@ function scaledUsdString(value) {
   const whole = Math.floor(value / FAST_PRICE_SCALE);
   const fraction = String(value % FAST_PRICE_SCALE).padStart(9, "0");
   return `${whole}.${fraction}`.replace(/\.?0+$/u, "");
+}
+
+// Exact-ledger fast lane. The decimal-string ledger (`addUsdStrings`) is the
+// contract: every retained exact total is the canonical decimal string of an
+// exact sum. Folding it one event at a time re-parses the growing total and
+// re-formats the sum on every add, and at ~1.2 us a call it was ~5% of a
+// large rebuild. Fast-path prices are integer nano-dollars, so an event's
+// contribution can be accumulated as a BigInt and folded into the string
+// ledger only when a non-integer addend arrives or the period is finalized.
+// The exact sum is the same either way; the canonical string of that sum is
+// therefore identical to the per-event fold, and the string field stays the
+// value of record. The pending BigInt lives on a non-enumerable symbol so it
+// never reaches a spread, JSON, or the closed cache schema.
+const EXACT_SCALED = Symbol("exactUsdScaledPending");
+const SCALED_TOTAL = Symbol("pricedUsdScaledTotals");
+// A fused unified read delivers one raw usage row to both the windowed and
+// the full-history consumer. The projection is a pure function of the row
+// and the (memoized, instance-independent) pricer, so the first consumer
+// leaves it on the row under this non-enumerable symbol and the second reuses
+// it rather than pricing the row again.
+const PROJECTED_EVENT = Symbol("projectedUsageEvent");
+
+function bigIntNanoUsdString(value) {
+  const whole = value / 1_000_000_000n;
+  const fraction = String(value % 1_000_000_000n).padStart(9, "0");
+  return `${whole}.${fraction}`;
+}
+
+function addExactUsd(target, key, addendString, addendScaled) {
+  if (addendScaled !== null) {
+    const pending = target[EXACT_SCALED];
+    const next = (pending === undefined ? 0n : pending) + BigInt(addendScaled);
+    if (pending === undefined) {
+      Object.defineProperty(target, EXACT_SCALED, {
+        value: next,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    } else {
+      target[EXACT_SCALED] = next;
+    }
+    return;
+  }
+  flushExactUsd(target, key);
+  target[key] = addUsdStrings(target[key], addendString);
+}
+
+function flushExactUsd(target, key) {
+  const pending = target[EXACT_SCALED];
+  if (pending === undefined) return;
+  if (pending > 0n) {
+    target[key] = addUsdStrings(target[key], bigIntNanoUsdString(pending));
+  }
+  target[EXACT_SCALED] = 0n;
 }
 
 // Exported for the unified-index companion read: one memoized unit-price plan
@@ -1098,6 +1277,7 @@ export function createAccountingPricer() {
     }
     const pricedComponents = [];
     const priceCardBreakdown = new Map();
+    const cardScaled = new Map();
     let totalUsdScaled = 0;
     for (const name of COMPONENT_KEYS) {
       const quantity = components[name] ?? 0;
@@ -1139,16 +1319,26 @@ export function createAccountingPricer() {
         costUsd: scaledUsdString(costUsdScaled),
         priceCardId: template.priceCardId,
       });
-      const card = priceCardBreakdown.get(template.priceCardId) ?? {
-        priceCardId: template.priceCardId,
-        events: 0,
-        costUsd: "0",
-      };
-      card.events = 1;
-      card.costUsd = addUsdStrings(card.costUsd, scaledUsdString(costUsdScaled));
-      priceCardBreakdown.set(template.priceCardId, card);
+      // Per-card cost is the exact sum of this event's integer-scaled
+      // component costs; format it once instead of folding decimal strings.
+      // (totalUsdScaled is proven safe above, and each card's sum is a part
+      // of it.)
+      cardScaled.set(
+        template.priceCardId,
+        (cardScaled.get(template.priceCardId) ?? 0) + costUsdScaled,
+      );
+      if (!priceCardBreakdown.has(template.priceCardId)) {
+        priceCardBreakdown.set(template.priceCardId, {
+          priceCardId: template.priceCardId,
+          events: 1,
+          costUsd: "0",
+        });
+      }
     }
-    return {
+    for (const [priceCardId, scaled] of cardScaled) {
+      priceCardBreakdown.get(priceCardId).costUsd = scaledUsdString(scaled);
+    }
+    const priced = {
       totalUsd: scaledUsdString(totalUsdScaled),
       coverageStatus: "fully_priced",
       components: pricedComponents,
@@ -1158,6 +1348,13 @@ export function createAccountingPricer() {
       ),
       warnings: plan.warnings,
     };
+    // Integer-scaled totals for the exact-ledger fast lane (see addExactUsd).
+    // Non-enumerable: the priced shape callers see and serialize is unchanged.
+    Object.defineProperty(priced, SCALED_TOTAL, {
+      value: { totalUsd: totalUsdScaled, byCard: cardScaled },
+      enumerable: false,
+    });
+    return priced;
   };
 }
 
@@ -1214,6 +1411,10 @@ function eventProjection(event, price) {
   return {
     timestamp: event.timestamp,
     model,
+    fastModeFamily: fastModeModelFamilyKey(model, {
+      eventTime: event.timestamp,
+      standardPriceCardIds: priced.selectedPriceCardIds ?? [],
+    }),
     modelPricingStatus: codexModelPricingStatus(event.model),
     modelAllowanceTrack: codexModelAllowanceTrack(event.model),
     modelApiPriceEquivalentApplicable:
@@ -1253,9 +1454,12 @@ function transitionUsageProjection(event, projection) {
       : 0
   ));
   const costUsd = Number(projection.priced.totalUsd);
-  const multiplier = fastQuotaMultiplier(projection.model);
+  const multiplier = FAST_MODE_QUOTA_MULTIPLIERS[projection.fastModeFamily] ?? null;
+  // The scenario retains the owner-approved assumed ratio when Priority
+  // context/date evidence is missing. The period crossing reports that
+  // Standard cost separately in the explicit unsupported/assumed bucket.
   const fastWeightedEquivalentUsd =
-    multiplier === null ? null : costUsd * multiplier;
+    costUsd * (multiplier ?? FAST_MODE_ASSUMED_MULTIPLIER);
   const effectiveSpeed = ["standard", "fast"].includes(projection.speed)
     ? projection.speed
     : ["standard", "fast"].includes(projection.declaredSpeed)
@@ -1288,7 +1492,71 @@ function transitionUsageProjection(event, projection) {
       .sort(),
     projection.priced.selectedPriceCardIds,
     projection.priced.priceCardBreakdown ?? [],
+    [
+      event.planAttribution?.basis ?? "unavailable",
+      event.planAttribution?.planType ?? null,
+      event.usageIntervalStartedAt ?? null,
+      event.usageIntervalBasis ?? "unavailable",
+    ],
   ];
+}
+
+// Keep the first and last observation of a chronological same-plan run. Its
+// last old/first new anchors delimit the uncertain switch interval. This is
+// independent of percent, reset and token changes, so quota-only evidence
+// survives the fit-oriented snapshot collapse below.
+function calibrationPlanEvidence({ ordered = false, maximum = 750_000 } = {}) {
+  const rows = [];
+  const runs = new Map();
+  let latestMs = Number.NEGATIVE_INFINITY;
+  let latestPlans = new Set();
+  const planTypes = new Set();
+  return {
+    observe(snapshot) {
+      const window = snapshot?.window;
+      const observedAtMs = Number.isFinite(snapshot?.timestampMs)
+        ? snapshot.timestampMs : Date.parse(snapshot?.timestamp);
+      if (!window || window.provider !== "openai_codex" || window.limitId !== "codex"
+          || !Number.isSafeInteger(observedAtMs)) return;
+      const planType = typeof window.planType === "string" && /^[a-z][a-z0-9_-]{0,31}$/u.test(window.planType)
+        ? window.planType : "unknown";
+      if (planType !== "unknown") {
+        planTypes.add(planType);
+        if (observedAtMs > latestMs) { latestMs = observedAtMs; latestPlans = new Set(); }
+        if (observedAtMs === latestMs) latestPlans.add(planType);
+      }
+      const row = {
+        contextKey: planAttributionContextKey(window.provider, window.limitId),
+        observedAtMs, planType, planVariant: "unknown", accountScopeId: null,
+      };
+      const run = runs.get(row.contextKey);
+      if (ordered && run?.planType === planType && observedAtMs >= run.lastMs) {
+        if (run.lastIndex === run.firstIndex) {
+          run.lastIndex = rows.length;
+          rows.push(row);
+        } else rows[run.lastIndex] = row;
+        run.lastMs = observedAtMs;
+      } else {
+        runs.set(row.contextKey, { planType, firstIndex: rows.length, lastIndex: rows.length, lastMs: observedAtMs });
+        rows.push(row);
+      }
+      if (rows.length > maximum) throw fixedError("accounting_transition_snapshot_limit_exceeded");
+    },
+    finish() {
+      const index = buildPlanAttributionIndex(rows);
+      rows.length = 0;
+      runs.clear();
+      if (index.status !== "ready") throw fixedError("accounting_transition_derivation_limit_exceeded");
+      return {
+        index,
+        summary: {
+          planTypes: [...planTypes].sort(),
+          latestPlanType: latestPlans.size === 1 ? [...latestPlans][0] : "unknown",
+          singlePlanComparisonEligible: planTypes.size === 1 && index.conflicts.length === 0,
+        },
+      };
+    },
+  };
 }
 
 function weeklyRateLimitProjection(snapshot) {
@@ -1874,8 +2142,12 @@ function projectWeeklyPaceForecast(rows, endMs) {
 function addSpeedWeighting(crossing, event) {
   // "fast", "standard" and "unknown" are the only observed values; anything
   // else collapses to unknown rather than being treated as Standard.
-  const speed = crossing[event.speed] ? event.speed : "unknown";
-  const cell = crossing[speed][fastModeModelFamilyKey(event.model)];
+  const speed = ["standard", "fast", "unknown"].includes(event.speed)
+    ? event.speed : "unknown";
+  const row = crossing[speed] ??= {};
+  const cell = row[event.fastModeFamily ?? "unsupported"] ??= {
+    events: 0, apiPriceEquivalentUsd: 0,
+  };
   cell.events += 1;
   cell.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
 }
@@ -1886,7 +2158,10 @@ function addDeclaredSpeedWeighting(crossing, event) {
   if (event.declaredSpeed !== "standard" && event.declaredSpeed !== "fast") {
     return;
   }
-  const cell = crossing[event.declaredSpeed][fastModeModelFamilyKey(event.model)];
+  const row = crossing[event.declaredSpeed] ??= {};
+  const cell = row[event.fastModeFamily ?? "unsupported"] ??= {
+    events: 0, apiPriceEquivalentUsd: 0,
+  };
   cell.events += 1;
   cell.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
 }
@@ -1902,8 +2177,8 @@ function finalizeSpeedWeighting(crossing) {
 }
 
 function compactSpeedWeighting(crossing) {
-  // Timeline buckets overwhelmingly occupy one or two of the twelve possible
-  // speed/model-family cells. Persist only those cells; readers validate the
+  // Timeline buckets overwhelmingly occupy one or two of the closed
+  // speed/model cells. Persist only those cells; readers validate the
   // allowed sparse keys and treat absence as an exact zero.
   const compact = {};
   for (const [speed, families] of Object.entries(crossing)) {
@@ -1928,9 +2203,12 @@ function addEvent(period, event) {
   period.events += 1;
   period.totalTokens += event.totalTokens;
   period.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
-  period.apiPriceEquivalentUsdExact = addUsdStrings(
-    period.apiPriceEquivalentUsdExact,
+  const scaledTotals = event.priced?.[SCALED_TOTAL] ?? null;
+  addExactUsd(
+    period,
+    "apiPriceEquivalentUsdExact",
     event.priced?.totalUsd ?? "0",
+    scaledTotals === null ? null : scaledTotals.totalUsd,
   );
   addComponents(period.components, event.components);
   addComponentCosts(period.componentCosts, event.components, event.priced);
@@ -1944,7 +2222,13 @@ function addEvent(period, event) {
       costUsd: "0",
     };
     row.events += item.events ?? 0;
-    row.costUsd = addUsdStrings(row.costUsd, item.costUsd ?? "0");
+    const cardScaled = scaledTotals?.byCard.get(item.priceCardId);
+    addExactUsd(
+      row,
+      "costUsd",
+      item.costUsd ?? "0",
+      Number.isSafeInteger(cardScaled) ? cardScaled : null,
+    );
     period.priceCardBreakdown[item.priceCardId] = row;
   }
   const model = period.byModel[event.model] ??= {
@@ -2054,6 +2338,11 @@ function combinedModelUsage(finalized) {
 function finalizePeriod(period) {
   const priced = period.pricingCoverage.fullyPricedEvents
     + period.pricingCoverage.partiallyPricedEvents;
+  // Settle the exact-ledger fast lane before anything reads the strings.
+  flushExactUsd(period, "apiPriceEquivalentUsdExact");
+  for (const row of Object.values(period.priceCardBreakdown)) {
+    flushExactUsd(row, "costUsd");
+  }
   const finalized = {
     ...period,
     apiPriceEquivalentUsd: roundedExactMoney(
@@ -2114,7 +2403,11 @@ export async function buildReplaySafeAccountingPeriod({
   signal = null,
   declaredSpeedBaselines = [],
   rss = () => process.memoryUsage().rss,
-  maximumRssBytes = MAX_ACCOUNTING_RSS_BYTES,
+  // null is "the caller does not name a ceiling", which is the ARCHIVE case:
+  // resolve one off this pass's own baseline from the archive policy. The
+  // rebuild names its own and is unaffected. Inheriting the rebuild's number
+  // here is exactly the defect MAX_ARCHIVE_ACCOUNTING_RSS_BYTES documents.
+  maximumRssBytes = null,
 } = {}) {
   const canonicalStart = canonicalInstant(startAt);
   const canonicalEnd = canonicalInstant(endAt);
@@ -2129,8 +2422,8 @@ export async function buildReplaySafeAccountingPeriod({
       || typeof scan !== "function"
       || !validAbortSignal(signal)
       || typeof rss !== "function"
-      || !Number.isSafeInteger(maximumRssBytes)
-      || maximumRssBytes < 1) {
+      || (maximumRssBytes !== null
+        && (!Number.isSafeInteger(maximumRssBytes) || maximumRssBytes < 1))) {
     throw new TypeError("Replay-safe accounting period options are invalid");
   }
   const baselines = Array.isArray(declaredSpeedBaselines)
@@ -2141,12 +2434,26 @@ export async function buildReplaySafeAccountingPeriod({
   const period = newPeriod(id, label);
   const price = createAccountingPricer();
   let acceptedEvents = 0;
+  // A named ceiling is taken verbatim and costs no extra reading, so the
+  // rebuild's sub-build samples rss() exactly as often as it always has.
+  // Only the unnamed archive case measures a baseline and derives from it.
+  let effectiveMaximumRssBytes = maximumRssBytes;
+  if (effectiveMaximumRssBytes === null) {
+    const baselineRss = rss();
+    if (!Number.isSafeInteger(baselineRss) || baselineRss < 0) {
+      throw fixedError("accounting_archive_rss_measurement_invalid");
+    }
+    effectiveMaximumRssBytes = Math.min(
+      MAX_ARCHIVE_ACCOUNTING_RSS_BYTES,
+      baselineRss + ARCHIVE_ACCOUNTING_RSS_DELTA_BUDGET_BYTES,
+    );
+  }
   const checkRuntimeMemory = () => {
     const currentRss = rss();
     if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
       throw fixedError("accounting_archive_rss_measurement_invalid");
     }
-    if (currentRss > maximumRssBytes) {
+    if (currentRss > effectiveMaximumRssBytes) {
       throw fixedError("accounting_archive_rss_limit_exceeded");
     }
   };
@@ -2155,6 +2462,9 @@ export async function buildReplaySafeAccountingPeriod({
     startAt: canonicalStart,
     endAt: canonicalEnd,
     signal,
+    // A period total never reads plan attribution or usage intervals; declare
+    // that so a unified reader can skip deriving them for every row.
+    usageAttribution: "none",
     onUsage: (rawEvent) => {
       throwIfAborted(signal);
       const observedAt = canonicalInstant(rawEvent?.timestamp);
@@ -2194,8 +2504,8 @@ function newTimelineBucket(startMs) {
     usageEvents: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
-    speedWeighting: emptySpeedWeightingCrossing(),
-    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
+    speedWeighting: {},
+    declaredSpeedWeighting: {},
     components: emptyComponents(),
     pricingCoverage: {
       fullyPricedEvents: 0,
@@ -2243,6 +2553,284 @@ function finalizeTimeline(buckets) {
       components: bucket.components,
       pricingCoverage: bucket.pricingCoverage,
     }));
+}
+
+function compactPlanScopedTimelineEvent(row, declaredSpeedBaselines) {
+  if (!Array.isArray(row) || row.length !== 21
+      || !Array.isArray(row[20]) || row[20].length !== 4) return null;
+  const timestamp = canonicalInstant(row[0]);
+  const components = Object.fromEntries(COMPONENT_KEYS.map((key, index) => [
+    key,
+    Number.isSafeInteger(row[index + 3]) && row[index + 3] >= 0
+      ? row[index + 3] : null,
+  ]));
+  const standardUsd = Number(row[10]);
+  const standardScenarioUsd = Number(row[14]);
+  const fastScenarioUsd = Number(row[15]);
+  if (timestamp === null || Object.values(components).includes(null)
+      || !Number.isFinite(standardUsd) || standardUsd < 0
+      || !Number.isFinite(standardScenarioUsd) || standardScenarioUsd < 0
+      || !Number.isFinite(fastScenarioUsd) || fastScenarioUsd < 0
+      || !["fully_priced", "partially_priced", "unpriced"].includes(row[12])) {
+    return null;
+  }
+  const speed = ["standard", "fast"].includes(row[9]) ? row[9] : "unknown";
+  // Re-run the same timestamped declaration lookup used when the compact row
+  // was constructed. Dollar equality is not provenance: it can also arise for
+  // a zero-cost event (or a future 1x rate), so inferring a declaration from
+  // equal scenario totals would silently relabel unknown evidence.
+  const declarationResolved = speed === "unknown"
+    && ["standard", "fast"].includes(
+      declaredSpeedModeAt(declaredSpeedBaselines, Date.parse(timestamp)),
+    );
+  return {
+    timestamp,
+    components,
+    totalTokens: tokenTotal(components),
+    standardUsd,
+    standardScenarioUsd,
+    fastScenarioUsd,
+    pricingCoverageStatus: row[12],
+    observedSpeed: speed !== "unknown",
+    declarationResolved,
+  };
+}
+
+function addCompactPlanScopedTimelineEvent(buckets, event) {
+  const observedMs = Date.parse(event.timestamp);
+  const startMs = Math.floor(observedMs / TIMELINE_BUCKET_MS)
+    * TIMELINE_BUCKET_MS;
+  const bucket = buckets.get(startMs) ?? {
+    ...newTimelineBucket(startMs),
+    scenarioWeighting: {
+      unresolved_as_standard: 0,
+      unresolved_as_fast: 0,
+    },
+    weightingCoverage: {
+      observedEvents: 0,
+      declaredFromConfigEvents: 0,
+      assumedEvents: 0,
+    },
+  };
+  bucket.usageEvents += 1;
+  bucket.totalTokens += event.totalTokens;
+  bucket.apiPriceEquivalentUsd += event.standardUsd;
+  bucket.scenarioWeighting.unresolved_as_standard +=
+    event.standardScenarioUsd;
+  bucket.scenarioWeighting.unresolved_as_fast += event.fastScenarioUsd;
+  addComponents(bucket.components, event.components);
+  bucket.pricingCoverage[
+    event.pricingCoverageStatus === "fully_priced"
+      ? "fullyPricedEvents"
+      : event.pricingCoverageStatus === "partially_priced"
+        ? "partiallyPricedEvents"
+        : "unpricedEvents"
+  ] += 1;
+  if (event.observedSpeed) bucket.weightingCoverage.observedEvents += 1;
+  else if (event.declarationResolved) {
+    bucket.weightingCoverage.declaredFromConfigEvents += 1;
+  } else {
+    bucket.weightingCoverage.assumedEvents += 1;
+  }
+  buckets.set(startMs, bucket);
+  return startMs;
+}
+
+function finalizePlanScopedTimelineDraft({
+  buckets,
+  invalidBuckets,
+  attributionIndex,
+  contextKey,
+  planType,
+  diagnostics,
+  endMs,
+  resourceLimited,
+  quota,
+}) {
+  let invalidatedCandidateEvents = 0;
+  let invalidatedBuckets = 0;
+  const rows = [];
+  for (const bucket of [...buckets.values()].sort((left, right) => (
+    left.startMs - right.startMs
+  ))) {
+    const lookup = planEraForInterval(attributionIndex, {
+      contextKey,
+      intervalStartMs: bucket.startMs,
+      observedAtMs: bucket.startMs + TIMELINE_BUCKET_MS - 1,
+    });
+    if (invalidBuckets.has(bucket.startMs)
+        || lookup.status !== "matched"
+        || lookup.era.planType !== planType) {
+      invalidatedBuckets += 1;
+      invalidatedCandidateEvents += bucket.usageEvents;
+      invalidBuckets.add(bucket.startMs);
+      continue;
+    }
+    rows.push({
+      startAt: new Date(bucket.startMs).toISOString(),
+      endAt: new Date(bucket.startMs + TIMELINE_BUCKET_MS).toISOString(),
+      usageEvents: bucket.usageEvents,
+      totalTokens: bucket.totalTokens,
+      apiPriceEquivalentUsd: roundedMoney(bucket.apiPriceEquivalentUsd),
+      scenarioWeighting: Object.fromEntries(
+        Object.entries(bucket.scenarioWeighting).map(([scenario, value]) => [
+          scenario,
+          roundedMoney(value),
+        ]),
+      ),
+      weightingCoverage: { ...bucket.weightingCoverage },
+      components: bucket.components,
+      pricingCoverage: bucket.pricingCoverage,
+    });
+  }
+  // Publish explicit comparable intervals, including quiet buckets, so a
+  // consumer cannot bridge an omitted ambiguous bucket or another plan era.
+  // Bounds come from the same attribution index, not the fit's training resets.
+  const comparisonIntervals = [];
+  const currentStart = Math.floor(endMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS;
+  const firstStart = Math.min(rows.length ? Date.parse(rows[0].startAt) : currentStart,
+    quota.length ? Math.floor(quota[0][0] / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS : currentStart);
+  const lastEnd = (Math.floor(endMs / TIMELINE_BUCKET_MS) + 1) * TIMELINE_BUCKET_MS;
+  const invalid = [...invalidBuckets].sort((a, b) => a - b);
+  let invalidAt = 0;
+  for (const era of attributionIndex?.eras ?? []) {
+    if (era.contextKey !== contextKey || era.accountScopeId !== null
+        || era.planType !== planType) continue;
+    let start = Math.max(firstStart, era.lowerBoundMs === null ? firstStart
+      : Math.ceil(era.lowerBoundMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS);
+    const end = Math.min(lastEnd, era.upperBoundMs === null ? lastEnd
+      : Math.floor((era.upperBoundMs + 1) / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS);
+    while (invalidAt < invalid.length && invalid[invalidAt] < start) invalidAt += 1;
+    while (invalidAt < invalid.length && invalid[invalidAt] < end) {
+      const gapStart = invalid[invalidAt++];
+      if (gapStart > start) comparisonIntervals.push([start, gapStart]);
+      start = gapStart + TIMELINE_BUCKET_MS;
+    }
+    if (start < end) comparisonIntervals.push([start, end]);
+  }
+  const comparableQuota = [];
+  let quotaIntervalAt = 0;
+  for (const row of quota) {
+    while (quotaIntervalAt < comparisonIntervals.length
+        && comparisonIntervals[quotaIntervalAt][1] <= row[0]) quotaIntervalAt += 1;
+    const interval = comparisonIntervals[quotaIntervalAt];
+    if (interval && row[0] >= interval[0] && row[0] < interval[1]) comparableQuota.push(row);
+  }
+  return {
+    planType,
+    rows,
+    comparisonIntervals,
+    resourceLimited,
+    attributionReady: attributionIndex?.status === "ready",
+    quota: comparableQuota,
+    diagnostics: {
+      ...diagnostics,
+      admittedEvents: rows.reduce((sum, row) => sum + row.usageEvents, 0),
+      invalidatedBuckets,
+      invalidatedCandidateEvents,
+    },
+  };
+}
+
+// Closed compact form avoids duplicating full object keys for every historical
+// bucket. Keep the event-summed token total: combined-output and split-output
+// events can coexist in one bucket. Only coverage complements are derived.
+function encodePlanScopedTimelineRow(row) {
+  return [Date.parse(row.startAt), row.usageEvents,
+    ...COMPONENT_KEYS.map((key) => row.components[key]),
+    row.apiPriceEquivalentUsd,
+    row.scenarioWeighting.unresolved_as_standard,
+    row.scenarioWeighting.unresolved_as_fast,
+    row.weightingCoverage.observedEvents,
+    row.weightingCoverage.declaredFromConfigEvents,
+    row.pricingCoverage.fullyPricedEvents,
+    row.pricingCoverage.partiallyPricedEvents, row.totalTokens];
+}
+
+export function decodePlanScopedTimelineRow(row) {
+  if (!Array.isArray(row) || row.length !== 16
+      || row.some((value) => typeof value !== "number" || !Number.isFinite(value))
+      || !Number.isSafeInteger(row[0]) || row[0] % TIMELINE_BUCKET_MS !== 0
+      || !Number.isFinite(new Date(row[0] + TIMELINE_BUCKET_MS).getTime())
+      || row.slice(1).some((value) => value < 0)
+      || [1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15].some((i) => !Number.isSafeInteger(row[i]))
+      || row[1] < 1 || row[11] + row[12] > row[1]
+      || row[13] + row[14] > row[1]) return null;
+  const components = Object.fromEntries(COMPONENT_KEYS.map((key, i) => [key, row[i + 2]]));
+  return {
+    startAt: new Date(row[0]).toISOString(),
+    endAt: new Date(row[0] + TIMELINE_BUCKET_MS).toISOString(),
+    usageEvents: row[1], totalTokens: row[15], components,
+    apiPriceEquivalentUsd: row[8],
+    scenarioWeighting: { unresolved_as_standard: row[9], unresolved_as_fast: row[10] },
+    weightingCoverage: { observedEvents: row[11], declaredFromConfigEvents: row[12],
+      assumedEvents: row[1] - row[11] - row[12] },
+    pricingCoverage: { fullyPricedEvents: row[13], partiallyPricedEvents: row[14],
+      unpricedEvents: row[1] - row[13] - row[14] },
+  };
+}
+
+function unavailablePlanTimeline(reason) {
+  return {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    encoding: PLAN_TIMELINE_ENCODING,
+    status: "unavailable", reason, planScope: null, usage: [], quota: [], comparisonIntervals: [],
+    diagnostics: { consideredEvents: 0, admittedEvents: 0, incompatibleEvents: 0,
+      unresolvedEvents: 0, conflictedEvents: 0, malformedEvents: 0,
+      invalidatedBuckets: 0, invalidatedCandidateEvents: 0 },
+  };
+}
+
+function calibrationCohortId(calibration) {
+  if (calibration?.status !== "estimated"
+      || !Array.isArray(calibration.recentResets)
+      || calibration.recentResets.length === 0) return null;
+  const cohort = calibration.recentResets.map((row) => row?.resetIdentity);
+  if (cohort.some((value) => canonicalInstant(value) === null)) return null;
+  return createHash("sha256").update(JSON.stringify(cohort)).digest("hex");
+}
+
+function planScopedTimelineReceipt({
+  draft,
+  sourceMode,
+  generation,
+  generationFingerprint,
+  capacityPlanScope,
+}) {
+  const unavailable = unavailablePlanTimeline;
+  if (sourceMode !== "unified"
+      || generation === null || generation === undefined
+      || generationFingerprint === null
+      || generationFingerprint === undefined) {
+    return unavailable("plan_scoped_generation_unavailable");
+  }
+  if (!draft || draft.attributionReady !== true || draft.planType === "unknown"
+      || draft.diagnostics?.malformedEvents !== 0
+      || capacityPlanScope?.planType !== draft.planType
+      || capacityPlanScope?.methodVersion
+        !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION) {
+    return unavailable("plan_scoped_attribution_unavailable");
+  }
+  if (draft.resourceLimited || draft.rows.length > MAX_PLAN_TIMELINE_ROWS
+      || draft.comparisonIntervals.length > MAX_PLAN_TIMELINE_ROWS
+      || draft.quota.length > MAX_PLAN_TIMELINE_ROWS) return unavailable("plan_scoped_resource_limit");
+  const receipt = {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    encoding: PLAN_TIMELINE_ENCODING,
+    status: "available",
+    reason: null,
+    planScope: {
+      ...capacityPlanScope,
+      sourceGeneration: generation,
+      sourceGenerationFingerprint: generationFingerprint,
+    },
+    usage: draft.rows.map(encodePlanScopedTimelineRow),
+    comparisonIntervals: draft.comparisonIntervals,
+    quota: draft.quota,
+    diagnostics: draft.diagnostics,
+  };
+  return Buffer.byteLength(stableJson(receipt)) <= MAX_PLAN_TIMELINE_BYTES
+    ? receipt : unavailable("plan_scoped_resource_limit");
 }
 
 function publicDiagnostics(value) {
@@ -2347,6 +2935,8 @@ async function deriveBoundedWeeklyCalibrationSeries({
   diagnostics,
   signal,
   resourceCheck,
+  planAttributionIndex,
+  limits = DEFAULT_TRANSITION_RESOURCE_LIMITS,
 }) {
   if ((rawUsageEvents === null) === (usageCorpus === null)) {
     throw new TypeError(
@@ -2361,20 +2951,29 @@ async function deriveBoundedWeeklyCalibrationSeries({
       ? []
       : usageCorpus.readSlice(low, high)
   );
-  const derive = (usage, snapshots) => deriveCodexTransitionSeriesCooperatively({
-    startAt,
-    endAt,
-    rawUsageEvents: usage,
-    rateLimitSnapshots: snapshots,
-    diagnostics,
-    includeSnapshotIntervals: false,
-    windowDurationMins: WEEKLY_WINDOW_MINUTES,
-    signal,
-    consumeInputs: true,
-    includeNormalizedInputs: false,
-    inputEncoding: "accounting_prepriced_compact_v2",
-    resourceCheck,
-  });
+  const batchUsageBudget = Math.min(CALIBRATION_BATCH_USAGE_BUDGET, limits.usageEvents);
+  const derive = (usage, snapshots) => {
+    if (usage.length > limits.usageEvents
+        || snapshots.length > limits.weeklySnapshots
+        || usage.length + snapshots.length > limits.combinedInputs) {
+      throw fixedError("accounting_transition_derivation_limit_exceeded");
+    }
+    return deriveCodexTransitionSeriesCooperatively({
+      startAt,
+      endAt,
+      rawUsageEvents: usage,
+      rateLimitSnapshots: snapshots,
+      diagnostics,
+      includeSnapshotIntervals: false,
+      windowDurationMins: WEEKLY_WINDOW_MINUTES,
+      signal,
+      consumeInputs: true,
+      includeNormalizedInputs: false,
+      inputEncoding: "accounting_prepriced_compact_v3",
+      planAttributionIndex,
+      resourceCheck,
+    });
+  };
 
   // Group the compact snapshots exactly as the miner will, and count the
   // transitions each group will derive: within a group the miner walks
@@ -2457,7 +3056,7 @@ async function deriveBoundedWeeklyCalibrationSeries({
   resourceCheck?.();
 
   if (totalTransitions <= CALIBRATION_BATCH_TRANSITION_BUDGET
-      && usageEventCount <= CALIBRATION_BATCH_USAGE_BUDGET) {
+      && usageEventCount <= batchUsageBudget) {
     const usage = usageCorpus === null
       ? rawUsageEvents
       : await readUsageSlice(0, usageEventCount);
@@ -2519,7 +3118,7 @@ async function deriveBoundedWeeklyCalibrationSeries({
         || (current.groups.length > 0
           && (current.transitions + group.transitions
               > CALIBRATION_BATCH_TRANSITION_BUDGET
-            || nextUsageRows > CALIBRATION_BATCH_USAGE_BUDGET))) {
+            || nextUsageRows > batchUsageBudget))) {
       current = {
         groups: [],
         transitions: 0,
@@ -2615,6 +3214,9 @@ export async function fitCompositionFromCompactCorpus({
   endMs,
   signal = null,
   checkRuntimeMemory = () => {},
+  planAttributionIndex = null,
+  selectedPlanType = null,
+  declaredSpeedBaselines = [],
 }) {
   return fitCompositionFromCorpusStream({
     forEachUsageRow: async (consume) => {
@@ -2624,6 +3226,9 @@ export async function fitCompositionFromCompactCorpus({
     endMs,
     signal,
     checkRuntimeMemory,
+    planAttributionIndex,
+    selectedPlanType,
+    declaredSpeedBaselines,
   });
 }
 
@@ -2638,14 +3243,45 @@ async function fitCompositionFromCorpusStream({
   endMs,
   signal = null,
   checkRuntimeMemory = () => {},
+  planAttributionIndex = null,
+  selectedPlanType = null,
+  declaredSpeedBaselines = [],
 }) {
   const grainMs = MODEL_COMPOSITION_POLICY.grainMs;
+  const contextKey = planAttributionContextKey("openai_codex", "codex");
+  const attributionIndex = planAttributionIndex ?? buildPlanAttributionIndex(
+    weeklyRateLimitSnapshots.filter(Array.isArray)
+      .map((row) => ({ contextKey, observedAtMs: row[1], planType: row[3] })),
+  );
+  const planType = selectedPlanType ?? weeklyRateLimitSnapshots.filter((row) => (
+    Array.isArray(row) && Number.isSafeInteger(row[1])
+  ))
+    .sort((left, right) => left[1] - right[1]).at(-1)?.[3] ?? "unknown";
+  const excludedBins = new Set();
+  const planScopedBuckets = new Map();
+  const invalidPlanScopedBuckets = new Set();
+  let planTimelineResourceLimited = false;
+  const checkPlanTimelineSize = () => {
+    if (planScopedBuckets.size + invalidPlanScopedBuckets.size > MAX_PLAN_TIMELINE_ROWS) {
+      planTimelineResourceLimited = true;
+      planScopedBuckets.clear();
+      invalidPlanScopedBuckets.clear();
+    }
+  };
+  const planScopedDiagnostics = {
+    consideredEvents: 0,
+    incompatibleEvents: 0,
+    unresolvedEvents: 0,
+    conflictedEvents: 0,
+    malformedEvents: 0,
+  };
   const recentStartMs = endMs - COMPOSITION_RECENT_MIX_DAYS * 24 * 60 * 60 * 1_000;
   // binStartMs -> Map(model -> summed costUsd), Maps kept in first-encounter
   // order so the kernel accumulates in the same order the per-event path did
   // and the fit stays bit-identical.
   const binCosts = new Map();
   const recentMix = {};
+  const recentCostsByBin = new Map();
   let processed = 0;
   await forEachUsageRow(async (row) => {
     processed += 1;
@@ -2662,10 +3298,51 @@ async function fitCompositionFromCorpusStream({
         || !Number.isFinite(costUsd)
         || costUsd < 0) return;
     const model = row[1];
+    const binStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
+    const intervalStartMs = Date.parse(row[20]?.[2] ?? "");
+    const association = classifyUsageAttribution(attributionIndex, {
+      contextKey, observedAtMs,
+      ...(Number.isSafeInteger(intervalStartMs) ? { intervalStartMs } : {}),
+      observedPlanType: row[20]?.[0] === "same_record" ? row[20][1] : null,
+    }, { planType });
+    const planTimelineEvent = compactPlanScopedTimelineEvent(
+      row,
+      declaredSpeedBaselines,
+    );
+    if (planTimelineEvent === null) {
+      planScopedDiagnostics.malformedEvents += 1;
+    } else {
+      planScopedDiagnostics.consideredEvents += 1;
+    }
+    if (association.disposition === "incompatible") {
+      if (planTimelineEvent !== null) {
+        planScopedDiagnostics.incompatibleEvents += 1;
+      }
+      return;
+    }
+    if (row[20]?.[0] === "conflicted"
+        || association.disposition === "unresolved") {
+      excludedBins.add(binStartMs);
+      if (planTimelineEvent !== null) {
+        if (!planTimelineResourceLimited) invalidPlanScopedBuckets.add(
+          Math.floor(observedAtMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS,
+        );
+        checkPlanTimelineSize();
+        if (row[20]?.[0] === "conflicted") {
+          planScopedDiagnostics.conflictedEvents += 1;
+        } else {
+          planScopedDiagnostics.unresolvedEvents += 1;
+        }
+      }
+      return;
+    }
+    if (planTimelineEvent !== null && !planTimelineResourceLimited) {
+      addCompactPlanScopedTimelineEvent(planScopedBuckets, planTimelineEvent);
+    }
+    checkPlanTimelineSize();
     // The kernel's own binning refuses empty model names; the recent mix
     // mirrors the historical per-event behavior and keeps them.
     if (model.length > 0) {
-      const binStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
       let costs = binCosts.get(binStartMs);
       if (costs === undefined) {
         costs = new Map();
@@ -2674,10 +3351,18 @@ async function fitCompositionFromCorpusStream({
       costs.set(model, (costs.get(model) ?? 0) + costUsd);
     }
     if (observedAtMs >= recentStartMs) {
-      recentMix[model] = (recentMix[model] ?? 0) + costUsd;
+      let recentCosts = recentCostsByBin.get(binStartMs);
+      if (recentCosts === undefined) {
+        recentCosts = new Map();
+        recentCostsByBin.set(binStartMs, recentCosts);
+      }
+      recentCosts.set(model, (recentCosts.get(model) ?? 0) + costUsd);
     }
   });
   const quotaRows = [];
+  // Use admitted plan-preserving snapshots, not the generic timeline whose
+  // same-instant collapse may already have chosen a different plan's row.
+  const scopedQuota = new Map();
   for (const row of weeklyRateLimitSnapshots) {
     processed += 1;
     if (processed % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
@@ -2692,6 +3377,26 @@ async function fitCompositionFromCorpusStream({
     if (!Number.isFinite(observedAtMs)
         || !Number.isFinite(resetsAtSeconds)
         || !Number.isFinite(usedPercent)) continue;
+    if (row[3] !== planType) continue;
+    if (!planTimelineResourceLimited && row[2] === "openai_codex"
+        && row[4] === "codex" && row[6] === WEEKLY_WINDOW_MINUTES
+        && usedPercent >= 0 && usedPercent <= 100) {
+      const match = planEraForInterval(attributionIndex, { contextKey, observedAtMs });
+      if (match.status === "matched" && match.era.planType === planType) {
+        const prior = scopedQuota.get(observedAtMs);
+        if (prior === null) {
+          // Once contradictory, later repeated rows cannot restore a winner.
+        } else if (prior && (prior[1] !== resetsAtSeconds || prior[2] !== usedPercent)) {
+          scopedQuota.set(observedAtMs, null);
+          invalidPlanScopedBuckets.add(Math.floor(observedAtMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS);
+          checkPlanTimelineSize();
+        } else scopedQuota.set(observedAtMs, [observedAtMs, resetsAtSeconds, usedPercent]);
+        if (scopedQuota.size > MAX_PLAN_TIMELINE_ROWS || planTimelineResourceLimited) {
+          planTimelineResourceLimited = true;
+          scopedQuota.clear();
+        }
+      }
+    }
     quotaRows.push({
       observedAtMs,
       planType: typeof row[3] === "string" ? row[3] : "unknown",
@@ -2701,14 +3406,27 @@ async function fitCompositionFromCorpusStream({
   }
   // One aggregated row per (bin, model): O(bins x models), not O(events).
   const usageRows = [];
-  for (const [binStartMs, costs] of binCosts) {
-    for (const [model, costUsd] of costs) {
+  for (const binStartMs of new Set([...binCosts.keys(), ...recentCostsByBin.keys()])) {
+    const lookup = planEraForInterval(attributionIndex, {
+      contextKey, observedAtMs: binStartMs + grainMs - 1, intervalStartMs: binStartMs,
+    });
+    if (lookup.status !== "matched" || lookup.era.planType !== planType) excludedBins.add(binStartMs);
+    if (excludedBins.has(binStartMs)) continue;
+    for (const [model, costUsd] of binCosts.get(binStartMs) ?? []) {
       usageRows.push({ observedAtMs: binStartMs, model, costUsd });
+    }
+    // Later conflicting rows can invalidate a whole bin. The recent model mix
+    // must use the same eligible bins as the fit, not an already-added subtotal.
+    for (const [model, costUsd] of recentCostsByBin.get(binStartMs) ?? []) {
+      recentMix[model] = (recentMix[model] ?? 0) + costUsd;
     }
   }
   binCosts.clear();
+  recentCostsByBin.clear();
   const { observations, voidedBinCount, poolCount } =
-    buildCompositionObservations({ usageRows, quotaRows });
+    buildCompositionObservations({ usageRows, quotaRows: quotaRows.filter((row) => (
+      !excludedBins.has(Math.floor(row.observedAtMs / grainMs) * grainMs)
+    )) });
   const fit = calibrateCompositionCapacities(observations);
   const blendedRecentMixUsd = fit.status === "fitted"
     ? blendedCompositionCapacityUsd(recentMix, {
@@ -2716,7 +3434,20 @@ async function fitCompositionFromCorpusStream({
       fallbackCapacityUsd: fit.singleConstantUsd,
     })
     : null;
+  const planScopedTimeline = finalizePlanScopedTimelineDraft({
+    buckets: planScopedBuckets,
+    invalidBuckets: invalidPlanScopedBuckets,
+    attributionIndex,
+    contextKey,
+    planType,
+    diagnostics: planScopedDiagnostics,
+    endMs,
+    resourceLimited: planTimelineResourceLimited,
+    quota: [...scopedQuota.values()].filter((row) => row !== null).sort((a, b) => a[0] - b[0]),
+  });
   return {
+    planType,
+    attributionExcludedBins: excludedBins.size,
     status: fit.status,
     grainHours: MODEL_COMPOSITION_POLICY.grainMs / 3_600_000,
     observationCount: fit.observationCount,
@@ -2737,6 +3468,7 @@ async function fitCompositionFromCorpusStream({
       ? Number(blendedRecentMixUsd.toFixed(2))
       : null,
     recentMixDays: COMPOSITION_RECENT_MIX_DAYS,
+    planScopedTimeline,
   };
 }
 
@@ -2806,12 +3538,10 @@ function publishedUnifiedGenerationTokens(database) {
  *
  * This is what removes the calibration's data window: `usage_event` and
  * `quota_observation` have no lower time bound, so the corpus spans everything
- * ever indexed. The only remaining bound is the transition miner's structural
- * input ceiling (750k usage events — count-based memory safety owned by
- * codex-transition-miner.js, not a day window; it covers years of typical use
- * and 130+ days of the heaviest observed usage). When the corpus exceeds it,
- * the newest rows are retained and the returned `coveredAt` names the span
- * honestly.
+ * ever indexed. The transition miner's input ceiling applies per reset batch,
+ * never to the complete historical corpus. Typed metadata and quota snapshots
+ * retain their byte/count budgets, and the RSS guard remains authoritative.
+ * A budget miss defers the complete rebuild rather than truncating history.
  *
  * Residency: the priced compact rows are NEVER all resident at once. A full
  * corpus at the 750k ceiling measured ~635 real bytes per materialized row —
@@ -2848,6 +3578,7 @@ async function openUnifiedIndexCalibrationCorpus({
   signal,
   checkRuntimeMemory,
   expectedGeneration = null,
+  allowLegacyUnpublished = false,
 }) {
   let metadata;
   try {
@@ -2872,16 +3603,116 @@ async function openUnifiedIndexCalibrationCorpus({
       // A close failure cannot make the read-only handle more open.
     }
   };
+  const descriptor = readUnifiedIndexGenerationDescriptor(database);
+  const generationId = descriptor?.id ?? null;
+  // Publication membership is not a SQLite snapshot. A writer can replace an
+  // earlier offset or append facts while the last published descriptor stays
+  // unchanged. Fence the entire multi-pass read, not just its initial row count.
+  const dataVersion = Number(database.prepare("PRAGMA data_version").get()?.data_version);
   const verifyGeneration = () => {
-    if (expectedGeneration === null || expectedGeneration === undefined) return;
-    const expected = expectedGenerationTokens(expectedGeneration);
-    const observed = publishedUnifiedGenerationTokens(database);
-    if (expected.length === 0
-        || !generationMatchesExpected(expectedGeneration, observed)) {
+    if (!Number.isSafeInteger(dataVersion)
+        || Number(database.prepare("PRAGMA data_version").get()?.data_version) !== dataVersion) {
+      throw fixedError("accounting_unified_generation_mismatch");
+    }
+    if (generationId !== null) {
+      const current = readUnifiedIndexGenerationDescriptor(database);
+      const inProgress = database.prepare(`SELECT 1 FROM index_generation
+        WHERE id > ? AND status = 'in_progress' LIMIT 1`).get(generationId);
+      if (current?.id !== generationId || current?.fingerprint !== descriptor.fingerprint
+          || inProgress !== undefined) {
+        throw fixedError("accounting_unified_generation_mismatch");
+      }
+    }
+    if (expectedGeneration !== null && expectedGeneration !== undefined
+        && (expectedGenerationTokens(expectedGeneration).length === 0
+          || !generationMatchesExpected(expectedGeneration, publishedUnifiedGenerationTokens(database)))) {
       throw fixedError("accounting_unified_generation_mismatch");
     }
   };
   const usageGraceMs = endMs + 5 * 60_000;
+  if (generationId === null && !allowLegacyUnpublished) {
+    dispose();
+    return null;
+  }
+  // Bound inside the fenced open pass below, once the generation's complete
+  // fact sets are proven: the reader is handed a one-pass precomputation of
+  // its per-row lookups so the projection streams issue no point queries.
+  let attributionReader = null;
+  let attributionPrecompute = null;
+  // Attribution memo, keyed by retained position. A row's attribution is a
+  // pure function of the immutable generation this handle is fenced to, and
+  // the derivation re-reads every retained row at least once after the fit
+  // has already projected it; each of those re-reads paid the reader's
+  // membership lookup plus up to three point queries again. Remember the
+  // result on first projection in thin typed columns (~14 bytes per retained
+  // row, allocated once the retained count is known) and replay it on every
+  // later projection of the same position. Only the reader's closed
+  // vocabulary is memoized; anything else is re-derived each time.
+  const ATTRIBUTION_BASES = ["unavailable", "same_record", "conflicted"];
+  const INTERVAL_BASES = [
+    "unavailable",
+    "previous_session_record",
+    "previous_source_record",
+  ];
+  let memoBasis = null;
+  let memoPlan = null;
+  let memoIntervalMs = null;
+  let memoIntervalBasis = null;
+  const memoPlanTable = [];
+  const memoPlanIndex = new Map();
+  let attributionReads = 0;
+  let projectedRows = 0;
+  const attributionAt = (row, position) => {
+    if (attributionReader === null) return {};
+    if (memoBasis !== null && position !== undefined
+        && memoBasis[position] !== 0) {
+      const planIndex = memoPlan[position];
+      const intervalMs = memoIntervalMs[position];
+      return {
+        planAttribution: {
+          basis: ATTRIBUTION_BASES[memoBasis[position] - 1],
+          planType: planIndex < 0 ? null : memoPlanTable[planIndex],
+          planVariant: null,
+        },
+        usageIntervalStartedAt: Number.isNaN(intervalMs)
+          ? null
+          : new Date(intervalMs).toISOString(),
+        usageIntervalBasis: INTERVAL_BASES[memoIntervalBasis[position]],
+      };
+    }
+    attributionReads += 1;
+    const result = attributionReader.read(row);
+    if (memoBasis === null || position === undefined) return result;
+    const basisIndex = ATTRIBUTION_BASES.indexOf(result.planAttribution?.basis);
+    const intervalBasisIndex = INTERVAL_BASES.indexOf(result.usageIntervalBasis);
+    const planType = result.planAttribution?.planType ?? null;
+    const intervalMs = result.usageIntervalStartedAt === null
+      ? Number.NaN
+      : Date.parse(result.usageIntervalStartedAt);
+    if (basisIndex === -1 || intervalBasisIndex === -1
+        || result.planAttribution?.planVariant !== null
+        || (planType !== null && typeof planType !== "string")
+        || (result.usageIntervalStartedAt !== null
+          && (!Number.isSafeInteger(intervalMs)
+            || new Date(intervalMs).toISOString()
+              !== result.usageIntervalStartedAt))) {
+      return result;
+    }
+    let planIndex = -1;
+    if (planType !== null) {
+      planIndex = memoPlanIndex.get(planType) ?? -1;
+      if (planIndex === -1) {
+        planIndex = memoPlanTable.push(planType) - 1;
+        memoPlanIndex.set(planType, planIndex);
+      }
+    }
+    memoBasis[position] = basisIndex + 1;
+    memoPlan[position] = planIndex;
+    memoIntervalMs[position] = intervalMs;
+    memoIntervalBasis[position] = intervalBasisIndex;
+    return result;
+  };
+  const planEvidence = calibrationPlanEvidence({ ordered: true, maximum: limits.weeklySnapshots });
   const price = createAccountingPricer();
   // Shared row-count cadence across every read this source performs (the open
   // pass and the later re-read streams continue one counter), matching the
@@ -2917,11 +3748,18 @@ async function openUnifiedIndexCalibrationCorpus({
   };
   // The priced compact projection, identical to the windowed scan's retention
   // shape. Returns null for exactly the rows retainedByLightFilter refuses.
-  const projectUsageRow = (row) => {
+  const projectUsageRow = (row, position) => {
     const observedMs = Number(row.observed_at_ms);
     if (!Number.isSafeInteger(observedMs)) return null;
+    // Refuse the rows the discovery pass refused (zero-token, Spark) BEFORE
+    // deriving attribution: the memo is keyed by retained position, and a
+    // refused row would otherwise be derived and remembered under the
+    // position of the retained row that follows it.
+    if (!retainedByLightFilter(row)) return null;
+    projectedRows += 1;
     const rawEvent = {
       timestamp: new Date(observedMs).toISOString(),
+      ...attributionAt(row, position),
       model: row.model_id,
       // NULL means "the record did not report a total"; it must stay
       // absent so the pricer bands by the summed input components exactly
@@ -2953,6 +3791,10 @@ async function openUnifiedIndexCalibrationCorpus({
   };
   const USAGE_COLUMNS = `
       SELECT u.rowid AS row_id,
+             u.source_local AS source_local,
+             u.source_offset AS source_offset,
+             u.source_ordinal AS source_ordinal,
+             u.session_local AS session_local,
              u.observed_at_ms AS observed_at_ms,
              m.model_id AS model_id,
              t.codex_speed_mode AS codex_speed_mode,
@@ -2969,6 +3811,58 @@ async function openUnifiedIndexCalibrationCorpus({
       JOIN tier_semantics t ON t.id = u.tier_id`;
   try {
     verifyGeneration();
+    if (generationId !== null) {
+      // Count the complete physical fact sets once, before display/fit filters.
+      // Extra unpublished facts cannot be made safe by marking their attribution
+      // unknown: they must not enter the published quantity numerator at all.
+      for (const [table, declaredCount] of [
+        ["usage_event", descriptor.usageEvents],
+        ["quota_occurrence", descriptor.quotaOccurrences],
+      ]) {
+        const counts = database.prepare(`SELECT COUNT(*) AS total,
+          COALESCE(SUM(CASE WHEN gs.source_local IS NULL THEN 1 ELSE 0 END), 0) AS unproven
+          FROM ${table} f LEFT JOIN generation_source gs
+            ON gs.generation_id = ? AND gs.source_local = f.source_local
+            AND gs.source_ordinal = f.source_ordinal
+            AND f.source_offset >= 0 AND f.source_offset <= gs.scanned_bytes
+            AND gs.status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+            AND gs.diagnostics_complete = 1`).get(generationId);
+        if (Number(counts.total) !== declaredCount || Number(counts.unproven) !== 0) {
+          throw fixedError("accounting_unified_generation_mismatch");
+        }
+      }
+      verifyGeneration();
+      // One ordered pass replaces the reader's per-row point queries for the
+      // whole generation with dense live-row columns, preflighted against
+      // the existing retained-byte budget and runtime headroom. Every walk
+      // yields/checks cancellation and RSS; an oversized optimization falls
+      // back to the authoritative point queries without excluding history.
+      try {
+        attributionPrecompute = await precomputeLocalUnifiedUsageAttribution({
+          database,
+          generationId,
+          maximumRetainedBytes: limits.retainedBytes,
+          signal,
+          checkRuntimeMemory,
+        });
+      } catch (error) {
+        // A reservation for OPTIONAL arrays/dictionary is not required by
+        // the point-query reader. Decline only that planned allocation;
+        // actual RSS failures, invalid samples, cancellation and provenance
+        // failures still propagate through the normal build policy.
+        if (error?.code !== "accounting_transition_memory_budget_exceeded"
+            || error?.name === "AbortError") throw error;
+        attributionPrecompute = null;
+      }
+      attributionReader = createLocalUnifiedUsageAttributionReader({
+        database,
+        generationId,
+        precomputed: attributionPrecompute,
+      });
+      throwIfAborted(signal);
+      checkRuntimeMemory();
+      verifyGeneration();
+    }
     const usageCount = Number(database.prepare(
       "SELECT COUNT(*) AS c FROM usage_event WHERE observed_at_ms <= ?",
     ).get(usageGraceMs)?.c ?? 0);
@@ -2976,89 +3870,90 @@ async function openUnifiedIndexCalibrationCorpus({
       dispose();
       return null;
     }
-    let retainedStartMs = null;
-    if (usageCount > limits.usageEvents) {
-      const cutoff = database.prepare(`
-        SELECT observed_at_ms AS ms FROM usage_event
-        WHERE observed_at_ms <= ?
-        ORDER BY observed_at_ms DESC
-        LIMIT 1 OFFSET ?`).get(usageGraceMs, limits.usageEvents - 1);
-      retainedStartMs = Number(cutoff?.ms);
-      if (!Number.isSafeInteger(retainedStartMs)) {
-        dispose();
-        return null;
-      }
+    // The corpus streams decoded rows in reset-sized batches. The miner's
+    // per-call row ceiling is not a history-retention rule. Keep every date,
+    // bound exact typed-buffer residency before allocation, and fail closed
+    // on budget pressure instead of silently deleting the oldest evidence.
+    const stampBytes = usageCount * STREAMED_USAGE_STAMP_BYTES;
+    if (!Number.isSafeInteger(stampBytes) || stampBytes > limits.retainedBytes) {
+      throw fixedError("accounting_transition_memory_budget_exceeded");
     }
-
+    checkRuntimeMemory(stampBytes);
+    const stampedMs = new Float64Array(usageCount);
+    const stampedRowid = new Float64Array(usageCount);
+    // The timestamp index already orders ties by SQLite rowid. Keyset pages
+    // avoid a resident JS sort/index array and never use OFFSET pagination.
     const usageStatement = database.prepare(`${USAGE_COLUMNS}
-      WHERE u.rowid > ? AND u.observed_at_ms >= ? AND u.observed_at_ms <= ?
-      ORDER BY u.rowid
+      WHERE (u.observed_at_ms, u.rowid) > (?, ?) AND +u.observed_at_ms <= ?
+      ORDER BY u.observed_at_ms, u.rowid
       LIMIT ${UNIFIED_CALIBRATION_READ_BATCH_ROWS}`);
-    // Discovery pass: thin (observedMs, rowid) stamps for the rows the corpus
-    // retains, in the same rowid stream order the one-shot reader walked.
-    const stampedMs = [];
-    const stampedRowid = [];
+    let afterMs = -1;
     let afterRowId = -1;
-    const lowerBoundMs = retainedStartMs ?? -1;
+    let retainedUsageEvents = 0;
     for (;;) {
-      const batch = usageStatement.all(afterRowId, lowerBoundMs, usageGraceMs);
+      const batch = usageStatement.all(afterMs, afterRowId, usageGraceMs);
       if (batch.length === 0) break;
       for (const row of batch) {
         await cadence();
         if (!retainedByLightFilter(row)) continue;
-        stampedMs.push(Number(row.observed_at_ms));
-        stampedRowid.push(Number(row.row_id));
-        // Projected-bytes accounting per retained row, mirroring the windowed
-        // path's reserveTransitionInput: the byte budget bounds what the
-        // derivation may RETAIN, so the moment the discovered working set
-        // projects past it the read refuses — it never finishes discovering a
-        // corpus the final gate was always going to reject. (The retention
-        // cutoff bounds the row COUNT up to timestamp ties; only this check
-        // bounds bytes.)
-        if (stampedMs.length * COMPACT_USAGE_RETAINED_BYTES
-            > limits.retainedBytes) {
-          dispose();
-          return null;
+        if (retainedUsageEvents >= usageCount) {
+          throw fixedError("accounting_unified_generation_changed");
         }
+        stampedMs[retainedUsageEvents] = Number(row.observed_at_ms);
+        stampedRowid[retainedUsageEvents] = Number(row.row_id);
+        retainedUsageEvents += 1;
       }
+      afterMs = Number(batch.at(-1).observed_at_ms);
       afterRowId = Number(batch.at(-1).row_id);
       if (batch.length < UNIFIED_CALIBRATION_READ_BATCH_ROWS) break;
     }
-    if (stampedMs.length === 0) {
+    if (retainedUsageEvents === 0) {
       dispose();
       return null;
     }
-    // Retained order is (observedMs, rowid): the one-shot reader's stable
-    // ms-sort over a rowid-ordered stream produced exactly this order.
-    const order = stampedMs.map((_, index) => index);
-    order.sort((left, right) => stampedMs[left] - stampedMs[right]
-      || stampedRowid[left] - stampedRowid[right]);
-    const dropped = Math.max(0, order.length - limits.usageEvents);
-    const usageMs = new Array(order.length - dropped);
-    const usageRowid = new Array(order.length - dropped);
-    for (let index = dropped; index < order.length; index += 1) {
-      usageMs[index - dropped] = stampedMs[order[index]];
-      usageRowid[index - dropped] = stampedRowid[order[index]];
-    }
-    order.length = 0;
-    stampedMs.length = 0;
-    stampedRowid.length = 0;
-    const retainedUsageEvents = usageMs.length;
+    const usageMs = stampedMs.subarray(0, retainedUsageEvents);
+    const usageRowid = stampedRowid.subarray(0, retainedUsageEvents);
     const firstUsageMs = usageMs[0];
+    const memoBytes = retainedUsageEvents * STREAMED_USAGE_MEMO_BYTES;
+    if (stampBytes + memoBytes > limits.retainedBytes) {
+      throw fixedError("accounting_transition_memory_budget_exceeded");
+    }
+    checkRuntimeMemory(memoBytes);
+    memoBasis = new Uint8Array(retainedUsageEvents);
+    memoPlan = new Int32Array(retainedUsageEvents);
+    memoIntervalMs = new Float64Array(retainedUsageEvents);
+    memoIntervalBasis = new Uint8Array(retainedUsageEvents);
+    const usageMetadataBytes = stampedMs.byteLength + stampedRowid.byteLength
+      + memoBasis.byteLength + memoPlan.byteLength + memoIntervalMs.byteLength
+      + memoIntervalBasis.byteLength;
+    throwIfAborted(signal);
+    checkRuntimeMemory();
 
-    const snapshotLowerMs = retainedStartMs === null
-      ? -1
-      : firstUsageMs;
-    const snapshotStatement = database.prepare(`
-      SELECT observed_at_ms, slot, plan_type, used_percent, resets_at_ms
-      FROM quota_observation
-      WHERE limit_id = 'codex' AND duration_mins = ?
-        AND used_percent IS NOT NULL AND resets_at_ms IS NOT NULL
-        AND observed_at_ms >= ? AND observed_at_ms <= ?
-      ORDER BY observed_at_ms, id`);
+    const snapshotLowerMs = -1;
+    const snapshotStatement = generationId === null
+      // Explicit legacy/unpublished fixture/import mode only. Production
+      // schema-11 reads MUST use occurrences; a canonical winner can belong
+      // to a different source/plan at the same time.
+      ? database.prepare(`SELECT observed_at_ms, slot, plan_type, used_percent,
+          resets_at_ms, duration_mins, 'openai_codex' AS provider
+        FROM quota_observation WHERE limit_id = 'codex'
+          AND observed_at_ms >= ? AND observed_at_ms <= ?
+        ORDER BY observed_at_ms, id`)
+      : database.prepare(`SELECT q.observed_at_ms, q.slot, q.plan_type, q.used_percent,
+          q.resets_at_ms, q.duration_mins, q.provider
+        FROM quota_occurrence q
+        JOIN generation_source gs ON gs.generation_id = ?
+          AND gs.source_local = q.source_local AND gs.source_ordinal = q.source_ordinal
+          AND q.source_offset >= 0 AND q.source_offset <= gs.scanned_bytes
+          AND gs.status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+          AND gs.diagnostics_complete = 1
+        WHERE q.limit_id = 'codex' AND q.admission = 'admitted'
+          AND q.observed_at_ms >= ? AND q.observed_at_ms <= ?
+        ORDER BY q.observed_at_ms, q.id`);
     const weeklyRateLimitSnapshots = [];
     let firstSnapshotMs = null;
     const groupRuns = new Map();
+    let lastObservedPlan = null;
     // Incremental reservation for every snapshot row the collapse decides to
     // retain, mirroring reserveTransitionInput on the windowed path: bytes,
     // snapshot count, and combined count are all checked BEFORE the row is
@@ -3067,13 +3962,11 @@ async function openUnifiedIndexCalibrationCorpus({
     // stops consuming the snapshot stream entirely and reports the corpus
     // unusable (null -> the caller's typed
     // accounting_calibration_corpus_unavailable).
-    const retainedUsageBytes =
-      retainedUsageEvents * COMPACT_USAGE_RETAINED_BYTES;
+    const retainedUsageBytes = usageMetadataBytes;
     let retainedInputBudgetExceeded = false;
     const reserveSnapshotRetention = () => {
       const retainedSnapshots = weeklyRateLimitSnapshots.length + 1;
       if (retainedSnapshots > limits.weeklySnapshots
-          || retainedUsageEvents + retainedSnapshots > limits.combinedInputs
           || retainedUsageBytes
             + retainedSnapshots * COMPACT_SNAPSHOT_RETAINED_BYTES
             > limits.retainedBytes) {
@@ -3098,11 +3991,8 @@ async function openUnifiedIndexCalibrationCorpus({
         },
       }));
     };
-    for (const row of snapshotStatement.iterate(
-      WEEKLY_WINDOW_MINUTES,
-      snapshotLowerMs,
-      endMs,
-    )) {
+    for (const row of snapshotStatement.iterate(...(generationId === null
+      ? [snapshotLowerMs, endMs] : [generationId, snapshotLowerMs, endMs]))) {
       // Stop reading the stream the moment retention refused a row: every
       // later row would either be refused too or misrepresent a corpus that
       // is already over budget as complete. (Break rather than return: the
@@ -3111,6 +4001,19 @@ async function openUnifiedIndexCalibrationCorpus({
       if (retainedInputBudgetExceeded) break;
       await cadence();
       const observedMs = Number(row.observed_at_ms);
+      planEvidence.observe({
+        timestampMs: observedMs,
+        window: { provider: row.provider, limitId: "codex", planType: row.plan_type },
+      });
+      if (typeof row.plan_type === "string" && row.plan_type !== "unknown") {
+        if (lastObservedPlan !== null && row.plan_type !== lastObservedPlan) {
+          for (const run of groupRuns.values()) if (run.pending) emit(run.pending);
+          groupRuns.clear();
+        }
+        lastObservedPlan = row.plan_type;
+      }
+      if (Number(row.duration_mins) !== WEEKLY_WINDOW_MINUTES || row.resets_at_ms === null
+          || row.used_percent === null) continue;
       const resetsAtSec = Math.floor(Number(row.resets_at_ms) / 1_000);
       const usedPercent = Number(row.used_percent);
       if (!Number.isSafeInteger(observedMs)
@@ -3151,9 +4054,7 @@ async function openUnifiedIndexCalibrationCorpus({
       return null;
     }
     if (weeklyRateLimitSnapshots.length > limits.weeklySnapshots
-        || retainedUsageEvents + weeklyRateLimitSnapshots.length
-          > limits.combinedInputs
-        || retainedUsageEvents * COMPACT_USAGE_RETAINED_BYTES
+        || usageMetadataBytes
           + weeklyRateLimitSnapshots.length * COMPACT_SNAPSHOT_RETAINED_BYTES
           > limits.retainedBytes) {
       dispose();
@@ -3196,6 +4097,7 @@ async function openUnifiedIndexCalibrationCorpus({
       if (closed) {
         throw fixedError("accounting_calibration_corpus_unavailable");
       }
+      verifyGeneration();
       const endBoundMs = usageMs[high - 1];
       const endBoundRowid = usageRowid[high - 1];
       let cursorMs = usageMs[low];
@@ -3213,7 +4115,11 @@ async function openUnifiedIndexCalibrationCorpus({
           if (batch.length === 0) break;
           for (const row of batch) {
             await cadence();
-            const projected = projectUsageRow(row);
+            // `low + served` is this row's retained position: the stream
+            // yields exactly the retained rows between its bounds in retained
+            // order, and projectUsageRow returns null for precisely the rows
+            // the discovery pass refused (verified by the count below).
+            const projected = projectUsageRow(row, low + served);
             if (projected === null) continue;
             served += 1;
             await consume(projected);
@@ -3237,6 +4143,7 @@ async function openUnifiedIndexCalibrationCorpus({
       if (served !== high - low) {
         throw fixedError("accounting_unified_generation_changed");
       }
+      verifyGeneration();
     };
     return {
       coveredAt: {
@@ -3244,13 +4151,33 @@ async function openUnifiedIndexCalibrationCorpus({
         endAt: new Date(endMs).toISOString(),
       },
       retainedUsageEvents,
+      usageMetadataCapacity: usageCount,
+      usageMetadataBytes,
       weeklyRateLimitSnapshots,
+      planAttribution: planEvidence.finish(),
       usageMs,
+      // Content-free work counters for structural regression tests: how many
+      // rows the re-read streams projected and how many attribution reads
+      // the memo let through. Counts only, never rows. (The snapshot count is
+      // captured now because the derivation consumes that array in place.)
+      metrics: ((retainedWeeklySnapshots) => () => ({
+        retainedUsageEvents,
+        weeklySnapshots: retainedWeeklySnapshots,
+        projectedRows,
+        attributionReads,
+        attributionPrecomputeUsed: attributionPrecompute !== null,
+        attributionPrecomputeRows: attributionPrecompute?.retainedRows ?? 0,
+        attributionPrecomputeBytes: attributionPrecompute?.retainedBytes ?? 0,
+      }))(weeklyRateLimitSnapshots.length),
       readUsageSlice: async (low, high) => {
         if (!Number.isSafeInteger(low) || !Number.isSafeInteger(high)
             || low < 0 || high > retainedUsageEvents || low >= high) {
           throw new TypeError("Calibration usage slice bounds are invalid");
         }
+        if (high - low > limits.usageEvents) {
+          throw fixedError("accounting_transition_derivation_limit_exceeded");
+        }
+        checkRuntimeMemory((high - low) * COMPACT_USAGE_RETAINED_BYTES);
         const rows = [];
         await streamProjectedRange(low, high, (row) => rows.push(row));
         return rows;
@@ -3279,9 +4206,10 @@ async function openUnifiedIndexCalibrationCorpus({
     };
   } catch (error) {
     dispose();
-    if (error?.name === "AbortError"
-        || (typeof error?.code === "string"
-          && error.code.startsWith("accounting_"))) {
+    if (error?.name === "AbortError") {
+      throw fixedError("accounting_refresh_aborted", "AbortError");
+    }
+    if (typeof error?.code === "string" && error.code.startsWith("accounting_")) {
       throw error;
     }
     return null;
@@ -3312,9 +4240,18 @@ export async function buildReplaySafeAccountingCache({
   transitionResourceLimits: requestedTransitionResourceLimits = null,
   rss = () => process.memoryUsage().rss,
   maximumRssBytes = MAX_ACCOUNTING_RSS_BYTES,
+  // In-process characterization seam: receives the unified calibration
+  // corpus's content-free work counters (row and attribution-read counts)
+  // once the corpus has been fully consumed. Functions cannot cross the
+  // rebuild child's boundary, so a caller that sets this stays in process.
+  onCalibrationCorpusMetrics = null,
 } = {}) {
   if (scan === null && (sourceMode === null || sourceMode === undefined)) {
     throw fixedError("accounting_source_required");
+  }
+  if (onCalibrationCorpusMetrics !== null
+      && typeof onCalibrationCorpusMetrics !== "function") {
+    throw new TypeError("onCalibrationCorpusMetrics must be a function or null");
   }
   const selectedSourceMode = normalizeAccountingSourceMode(sourceMode);
   const selectedContextBehavior = normalizeContextBehavior(contextBehavior);
@@ -3370,7 +4307,7 @@ export async function buildReplaySafeAccountingCache({
     maximumRssBytes,
     baselineRss + ACCOUNTING_RSS_DELTA_BUDGET_BYTES,
   );
-  const checkRuntimeMemory = () => {
+  const checkRuntimeMemory = (additionalBytes = 0) => {
     const currentRss = rss();
     if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
       throw fixedError("accounting_transition_rss_measurement_invalid");
@@ -3384,6 +4321,11 @@ export async function buildReplaySafeAccountingCache({
           ceilingRssBytes: effectiveMaximumRssBytes,
         },
       );
+    }
+    // Allocation reservations are not measured RSS: fail before allocation
+    // using the retained-memory budget code, never fabricate an RSS sample.
+    if (additionalBytes > effectiveMaximumRssBytes - currentRss) {
+      throw fixedError("accounting_transition_memory_budget_exceeded");
     }
   };
   checkRuntimeMemory();
@@ -3447,6 +4389,7 @@ export async function buildReplaySafeAccountingCache({
   const weeklyPaceSnapshots = [];
   const rawUsageEvents = [];
   const weeklyRateLimitSnapshots = [];
+  const windowedPlanEvidence = calibrationPlanEvidence({ maximum: limits.weeklySnapshots });
   let retainedSparkUsageEvents = 0;
   let retainedSparkSnapshotInputs = 0;
   const price = createAccountingPricer();
@@ -3488,6 +4431,51 @@ export async function buildReplaySafeAccountingCache({
       checkRuntimeMemory();
     }
   };
+  // Unified authority: the full-history period total is folded in the SAME
+  // physical read as the windowed scan. A unified reader that supports the
+  // fused read delivers every usage row of the generation's covered range to
+  // this consumer (rows inside the window arrive after the windowed consumer
+  // has projected them, so the projection is shared); a scanner that does
+  // not report `indexedHistory` falls back to the separate full-history read
+  // below. The accumulation mirrors buildReplaySafeAccountingPeriod exactly,
+  // metered at the same ceiling with the archive's HARD failure policy.
+  const historyPeriod = selectedSourceMode === "unified"
+    ? newPeriod("history", "Indexed history")
+    : null;
+  let historyAcceptedEvents = 0;
+  let historyStarted = false;
+  const checkHistoryRuntimeMemory = () => {
+    const currentRss = rss();
+    if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
+      throw fixedError("accounting_archive_rss_measurement_invalid");
+    }
+    if (currentRss > effectiveMaximumRssBytes) {
+      throw fixedError("accounting_archive_rss_limit_exceeded");
+    }
+  };
+  const historyOnUsage = (rawEvent) => {
+    throwIfAborted(signal);
+    if (!historyStarted) {
+      checkHistoryRuntimeMemory();
+      historyStarted = true;
+    }
+    const observedAt = canonicalInstant(rawEvent?.timestamp);
+    if (observedAt === null) return;
+    let event = rawEvent[PROJECTED_EVENT];
+    if (event === undefined) {
+      event = eventProjection(rawEvent, price);
+      if (event === null) return;
+      const observedMs = Date.parse(observedAt);
+      event.declaredSpeed = event.speed === "unknown"
+        ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
+        : "unknown";
+    }
+    addEvent(historyPeriod, event);
+    historyAcceptedEvents += 1;
+    if (historyAcceptedEvents % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
+      checkHistoryRuntimeMemory();
+    }
+  };
   let scanned;
   let unifiedCoverage = null;
   try {
@@ -3497,6 +4485,14 @@ export async function buildReplaySafeAccountingCache({
       codexHome,
       resourceGuard: scanResourceGuard,
       signal,
+      // Per-row plan attribution is consumed only by the compact calibration
+      // rows this pass retains on the windowed-fallback path. When the unified
+      // corpus supplies calibration, the streaming corpus derives attribution
+      // itself and this pass is a pure aggregate consumer.
+      usageAttribution: retainWindowedCalibrationInputs ? "required" : "none",
+      ...(historyPeriod === null
+        ? {}
+        : { indexedHistory: { onUsage: historyOnUsage } }),
       onUsage: (rawEvent) => {
         throwIfAborted(signal);
         const observedAt = canonicalInstant(rawEvent?.timestamp);
@@ -3510,6 +4506,13 @@ export async function buildReplaySafeAccountingCache({
         event.declaredSpeed = event.speed === "unknown"
           ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
           : "unknown";
+        if (Object.isExtensible(rawEvent)) {
+          Object.defineProperty(rawEvent, PROJECTED_EVENT, {
+            value: event,
+            enumerable: false,
+            configurable: true,
+          });
+        }
         if (retainWindowedCalibrationInputs) {
           reserveTransitionInput("usage");
         } else {
@@ -3541,6 +4544,7 @@ export async function buildReplaySafeAccountingCache({
         if (!Number.isFinite(observedMs)
             || observedMs < startMs
             || observedMs > endMs) return;
+        if (retainWindowedCalibrationInputs) windowedPlanEvidence.observe(snapshot);
         // Rows keep the observed limit id: consumers filter the series with
         // SPARK_QUOTA_LIMIT_IDS.includes(row.limitId), same as the unified
         // and collector paths.
@@ -3595,6 +4599,9 @@ export async function buildReplaySafeAccountingCache({
     throw error;
   }
   throwIfAborted(signal);
+  // Do not let the subsequent windowed/transition check convert an archive
+  // end-of-pass overflow into a soft, indefinitely deferred accounting miss.
+  if (scanned?.indexedHistory?.status === "available") checkHistoryRuntimeMemory();
   checkRuntimeMemory();
   let history = historyUnavailable(
     selectedSourceMode === "unified"
@@ -3605,23 +4612,55 @@ export async function buildReplaySafeAccountingCache({
     unifiedCoverage?.generationFingerprint ?? null,
   );
   if (selectedSourceMode === "unified" && unifiedCoverage !== null) {
+    const fusedHistory = scanned?.indexedHistory;
     let historyScanned = null;
     const historyScan = async (scanOptions) => {
       historyScanned = await effectiveScan(scanOptions);
       return historyScanned;
     };
     try {
-      const historyValue = await buildReplaySafeAccountingPeriod({
-        id: "history",
-        label: "Indexed history",
-        startAt: unifiedCoverage.coveredAt.startAt,
-        endAt: unifiedCoverage.coveredAt.endAt,
-        scan: historyScan,
-        signal,
-        declaredSpeedBaselines: baselines,
-        rss,
-        maximumRssBytes: effectiveMaximumRssBytes,
-      });
+      let historyValue;
+      if (fusedHistory !== undefined) {
+        // The reader proved the covered range in the fused read; an
+        // unavailable outcome carries the same reader code a separate read
+        // of that range would have thrown, and takes the same path below.
+        if (fusedHistory?.status !== "available") {
+          throw fixedError(
+            typeof fusedHistory?.errorCode === "string"
+              ? fusedHistory.errorCode
+              : "local_unified_index_read_failed",
+          );
+        }
+        historyScanned = {
+          ...scanned,
+          coverage: fusedHistory.coverage,
+          capabilities: fusedHistory.capabilities,
+          diagnosticsAvailable: fusedHistory.diagnosticsAvailable,
+        };
+        historyValue = {
+          generatedAt: unifiedCoverage.coveredAt.endAt,
+          coveredAt: {
+            startAt: unifiedCoverage.coveredAt.startAt,
+            endAt: unifiedCoverage.coveredAt.endAt,
+          },
+          priceEpochBasis: HISTORICAL_PRICE_EPOCH_BASIS,
+          priceRegistryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
+          priceRegistryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+          period: finalizePeriod(historyPeriod),
+        };
+      } else {
+        historyValue = await buildReplaySafeAccountingPeriod({
+          id: "history",
+          label: "Indexed history",
+          startAt: unifiedCoverage.coveredAt.startAt,
+          endAt: unifiedCoverage.coveredAt.endAt,
+          scan: historyScan,
+          signal,
+          declaredSpeedBaselines: baselines,
+          rss,
+          maximumRssBytes: effectiveMaximumRssBytes,
+        });
+      }
       const historyCoverage = normalizeUnifiedCoverage(
         historyScanned,
         expectedGeneration,
@@ -3672,6 +4711,7 @@ export async function buildReplaySafeAccountingCache({
       declaredSpeedBaselines: baselines,
       signal,
       checkRuntimeMemory,
+      allowLegacyUnpublished: selectedSourceMode === "legacy",
       ...(selectedSourceMode === "unified"
         ? { expectedGeneration: unifiedCoverage?.generation ?? null }
         : {}),
@@ -3685,6 +4725,7 @@ export async function buildReplaySafeAccountingCache({
     }
   }
   let composition = null;
+  let planScopedTimelineDraft = null;
   let compositionFitFailure = null;
   let transitionSeries;
   const retainedUsageEvents = retainWindowedCalibrationInputs
@@ -3695,7 +4736,7 @@ export async function buildReplaySafeAccountingCache({
     : calibrationCorpus.weeklyRateLimitSnapshots.length;
   const calibrationRetainedBytes = retainWindowedCalibrationInputs
     ? retainedTransitionBytes
-    : retainedUsageEvents * COMPACT_USAGE_RETAINED_BYTES
+    : calibrationCorpus.usageMetadataBytes
       + retainedWeeklySnapshots * COMPACT_SNAPSHOT_RETAINED_BYTES;
   const calibrationCoveredAt = {
     startAt: retainWindowedCalibrationInputs
@@ -3703,6 +4744,8 @@ export async function buildReplaySafeAccountingCache({
       : calibrationCorpus.coveredAt.startAt,
     endAt: new Date(endMs).toISOString(),
   };
+  const calibrationAttribution = retainWindowedCalibrationInputs
+    ? windowedPlanEvidence.finish() : calibrationCorpus.planAttribution;
   try {
     // The composition fit reads the same compact corpus the derivation below
     // will consume, so it must run first. It is strictly optional enrichment:
@@ -3713,13 +4756,16 @@ export async function buildReplaySafeAccountingCache({
     // dies here re-runs the same doomed pass on every scheduler tick while the
     // on-disk cache stays a rejected older artifact.
     try {
-      composition = retainWindowedCalibrationInputs
+      const compositionResult = retainWindowedCalibrationInputs
         ? await fitCompositionFromCompactCorpus({
           rawUsageEvents,
           weeklyRateLimitSnapshots,
           endMs,
           signal,
           checkRuntimeMemory,
+          planAttributionIndex: calibrationAttribution.index,
+          selectedPlanType: calibrationAttribution.summary.latestPlanType,
+          declaredSpeedBaselines: baselines,
         })
         : await fitCompositionFromCorpusStream({
           forEachUsageRow: calibrationCorpus.forEachRetainedUsage,
@@ -3727,7 +4773,12 @@ export async function buildReplaySafeAccountingCache({
           endMs,
           signal,
           checkRuntimeMemory,
+          planAttributionIndex: calibrationAttribution.index,
+          selectedPlanType: calibrationAttribution.summary.latestPlanType,
+          declaredSpeedBaselines: baselines,
         });
+      ({ planScopedTimeline: planScopedTimelineDraft, ...composition } =
+        compositionResult);
     } catch (error) {
       compositionFitFailure = {
         status: "fit_failed",
@@ -3760,6 +4811,8 @@ export async function buildReplaySafeAccountingCache({
           : {},
         signal,
         resourceCheck: checkRuntimeMemory,
+        planAttributionIndex: calibrationAttribution.index,
+        limits,
       });
     } catch (error) {
       if (error?.name === "AbortError"
@@ -3781,12 +4834,19 @@ export async function buildReplaySafeAccountingCache({
     // slices were read off is still the generation the build is bound to, and
     // release the read handle. The one-shot reader ran the same checks at its
     // end; streaming widens the window they cover, not their meaning.
-    if (calibrationCorpus !== null) await calibrationCorpus.finish();
+    if (calibrationCorpus !== null) {
+      const corpusMetrics = calibrationCorpus.metrics();
+      await calibrationCorpus.finish();
+      if (onCalibrationCorpusMetrics !== null) {
+        onCalibrationCorpusMetrics(corpusMetrics);
+      }
+    }
   } catch (error) {
     calibrationCorpus?.dispose();
     throw error;
   }
   const weeklyCalibrationDataset = {
+    attribution: calibrationAttribution.summary,
     parserVersion: PARSER_VERSION,
     scope: {
       startAt: calibrationCoveredAt.startAt,
@@ -3834,15 +4894,32 @@ export async function buildReplaySafeAccountingCache({
       ),
     }]),
   );
+  const selectedAllowanceCalibration = allowanceScenarios
+    .unresolved_as_standard.calibration;
+  const capacityPlanScope = {
+    methodVersion: PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION,
+    planType: selectedAllowanceCalibration.selectedPlanType,
+    basisFamilyId:
+      allowanceScenarios.unresolved_as_standard.basis.basisFamilyId,
+    cohortId: calibrationCohortId(selectedAllowanceCalibration),
+  };
   const allowanceCapacityByScenario = {
     schemaVersion: ALLOWANCE_CAPACITY_SCHEMA_VERSION,
     basisFamilyId:
       allowanceScenarios.unresolved_as_standard.basis.basisFamilyId,
+    planScope: capacityPlanScope,
     scenarios: allowanceScenarios,
   };
+  const planScopedTimeline = planScopedTimelineReceipt({
+    draft: planScopedTimelineDraft,
+    sourceMode: selectedSourceMode,
+    generation: unifiedCoverage?.generation ?? null,
+    generationFingerprint: unifiedCoverage?.generationFingerprint ?? null,
+    capacityPlanScope,
+  });
   const paceForecast = projectWeeklyPaceForecast(weeklyPaceSnapshots, endMs);
   throwIfAborted(signal);
-  return {
+  const cache = {
     schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
     generatedAt: new Date(endMs).toISOString(),
     coveredAt: {
@@ -3869,6 +4946,7 @@ export async function buildReplaySafeAccountingCache({
     history,
     periods: [...periods.values()].map(finalizePeriod),
     timeline: finalizeTimeline(timeline),
+    planScopedTimeline,
     sparkUsageTimeline: finalizeTimeline(sparkTimeline),
     quotaTimeline: finalizeWeeklyQuotaTimeline(
       weeklyQuotaTimelineBuckets,
@@ -3883,7 +4961,12 @@ export async function buildReplaySafeAccountingCache({
     allowanceCapacityByScenario,
     weeklyCalibrationInput: {
       status: "complete",
-      encoding: "accounting_compact_v2",
+      encoding: retainWindowedCalibrationInputs
+        ? "accounting_compact_v3" : "accounting_streamed_v1",
+      ...(!retainWindowedCalibrationInputs ? {
+        usageMetadataCapacity: calibrationCorpus.usageMetadataCapacity,
+        usageMetadataBytes: calibrationCorpus.usageMetadataBytes,
+      } : {}),
       // Which corpus fed the calibration: the whole unified index when it is
       // present, the scan window only as the fallback. `coveredAt` states the
       // span that corpus actually reaches, so a reader can tell full history
@@ -3899,6 +4982,11 @@ export async function buildReplaySafeAccountingCache({
     },
     diagnostics: publicDiagnostics(scanned?.diagnostics),
   };
+  if (cache.planScopedTimeline.status === "available"
+      && Buffer.byteLength(stableJson(cache)) > MAX_CACHE_BYTES) {
+    cache.planScopedTimeline = unavailablePlanTimeline("plan_scoped_resource_limit");
+  }
+  return cache;
 }
 
 // Everything the child may not say: an envelope whose error code fails the
@@ -3907,18 +4995,22 @@ export async function buildReplaySafeAccountingCache({
 const SUBPROCESS_FAILURE_CODE_PATTERN = /^[a-z0-9_]{1,64}$/u;
 const SUBPROCESS_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 
-// The child inherits almost nothing. TMPDIR is the one passthrough: inside the
-// sandboxed macOS app it names the container's writable temp root, which
-// SQLite may need for spill files. Deliberately absent: NODE_OPTIONS (nothing
-// may override the child's pinned old-space cap or preload code into the
-// rebuild), HOME (every path the child touches arrives resolved in the
-// request), and PATH (the child execs nothing).
-function minimalRebuildChildEnvironment() {
-  const environment = {};
-  if (typeof process.env.TMPDIR === "string" && process.env.TMPDIR.length > 0) {
-    environment.TMPDIR = process.env.TMPDIR;
+// The child inherits almost nothing. TMPDIR is the one ordinary passthrough:
+// inside the sandboxed macOS app it names the container's writable temp root,
+// which SQLite may need for spill files. The packaged Electron executable also
+// needs its exact node-mode switch to run the child entrypoint. Deliberately
+// absent: NODE_OPTIONS (nothing may override the child's pinned old-space cap
+// or preload code into the rebuild), HOME (every path the child touches arrives
+// resolved in the request), and PATH (the child execs nothing).
+export function minimalRebuildChildEnvironment(environment = process.env) {
+  const selected = {};
+  if (typeof environment?.TMPDIR === "string" && environment.TMPDIR.length > 0) {
+    selected.TMPDIR = environment.TMPDIR;
   }
-  return environment;
+  if (environment?.ELECTRON_RUN_AS_NODE === "1") {
+    selected.ELECTRON_RUN_AS_NODE = "1";
+  }
+  return selected;
 }
 
 function parseRebuildChildEnvelope(stdoutText) {
@@ -4244,10 +5336,12 @@ export async function refreshReplaySafeAccountingCache({
   // "auto". Everything a production call carries is serializable, so the
   // production paths (unified reader, legacy indexed scan) are reconstructed
   // inside the child by value.
-  const subprocessEligible = scan === null && !Object.hasOwn(options, "rss");
+  const subprocessEligible = scan === null
+    && !Object.hasOwn(options, "rss")
+    && !Object.hasOwn(options, "onCalibrationCorpusMetrics");
   if (selectedRebuildIsolation === "subprocess" && !subprocessEligible) {
     throw new TypeError(
-      "rebuildIsolation subprocess cannot carry injected scan or rss seams",
+      "rebuildIsolation subprocess cannot carry injected scan, rss or metrics seams",
     );
   }
   const rebuildInSubprocess = selectedRebuildIsolation === "subprocess"
@@ -4411,14 +5505,23 @@ export async function refreshReplaySafeAccountingCache({
   if (Buffer.byteLength(stableJson(cache)) > MAX_CACHE_BYTES) {
     throw fixedError("cache_invalid_size");
   }
-  await writeLocalCollectorAccountingCache({ stateFile: selectedStateFile, cache });
+  // A timeout/cancel can arrive after the isolated child has returned a valid
+  // artifact but before its atomic publication. Recheck at the final durable
+  // boundary so a run already reported as stopped cannot replace the retained
+  // cache behind that terminal state.
+  throwIfAborted(options.signal ?? null);
+  await writeLocalCollectorAccountingCache({
+    stateFile: selectedStateFile,
+    cache,
+    signal: options.signal ?? null,
+  });
   return cache;
 }
 
 function validWeeklyCalibrationInput(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.status !== "complete"
-      || value.encoding !== "accounting_compact_v2"
+      || !["accounting_compact_v3", "accounting_streamed_v1"].includes(value.encoding)
       || !["unified_index", "windowed_scan"].includes(value.source)
       || canonicalInstant(value.coveredAt?.startAt) === null
       || canonicalInstant(value.coveredAt?.endAt) === null
@@ -4438,6 +5541,18 @@ function validWeeklyCalibrationInput(value) {
     limits = transitionResourceLimits(value.limits);
   } catch {
     return false;
+  }
+  if (value.encoding === "accounting_streamed_v1") {
+    return value.source === "unified_index"
+      && Number.isSafeInteger(value.usageMetadataCapacity)
+      && value.usageMetadataCapacity >= value.retainedUsageEvents
+      && Number.isSafeInteger(value.usageMetadataBytes)
+      && value.usageMetadataBytes === value.usageMetadataCapacity * STREAMED_USAGE_STAMP_BYTES
+        + value.retainedUsageEvents * STREAMED_USAGE_MEMO_BYTES
+      && value.retainedWeeklySnapshots <= limits.weeklySnapshots
+      && value.estimatedRetainedBytes === value.usageMetadataBytes
+        + value.retainedWeeklySnapshots * COMPACT_SNAPSHOT_RETAINED_BYTES
+      && value.estimatedRetainedBytes <= limits.retainedBytes;
   }
   return value.retainedUsageEvents <= limits.usageEvents
     && value.retainedWeeklySnapshots <= limits.weeklySnapshots
@@ -4683,6 +5798,7 @@ function validSourceDescriptor(value) {
     const coverage = value.coverage;
     const coverageKeys = [
       "admittedQuotaOccurrences",
+      "blockReason",
       "coveredAt",
       "generatedAt",
       "generationProof",
@@ -4690,6 +5806,9 @@ function validSourceDescriptor(value) {
       "quotaOccurrences",
       "sourceBytes",
       "sourceCount",
+      "skippedSourceBytes",
+      "skippedSourceCount",
+      "skippedThreadCount",
       "status",
       "usageEvents",
     ].sort().join("\0");
@@ -4717,20 +5836,37 @@ function validSourceDescriptor(value) {
         && boundedDescriptorText(value.generationFingerprint) === null) {
       return false;
     }
-    return value.coverageStatus === "complete"
+    const complete = value.coverageStatus === "complete"
+      && coverage?.status === "complete"
+      && coverage?.blockReason === null
+      && coverage?.skippedSourceCount === 0
+      && coverage?.skippedSourceBytes === 0
+      && coverage?.skippedThreadCount === 0;
+    const attestedGap = value.coverageStatus === "partial"
+      && coverage?.status === "partial"
+      && coverage?.blockReason === "codex_rollout_sources_quarantined"
+      && Number.isSafeInteger(coverage?.skippedSourceCount)
+      && coverage.skippedSourceCount > 0
+      && Number.isSafeInteger(coverage?.skippedSourceBytes)
+      && coverage.skippedSourceBytes >= 0
+      && Number.isSafeInteger(coverage?.skippedThreadCount)
+      && coverage.skippedThreadCount > 0;
+    return (complete || attestedGap)
       && value.diagnosticsAvailable === true
       && value.generationMatched === true
       && coverage
       && typeof coverage === "object"
       && !Array.isArray(coverage)
       && Object.keys(coverage).sort().join("\0") === coverageKeys
-      && coverage.status === "complete"
       && (coverage.generatedAt === null
         || canonicalInstant(coverage.generatedAt) !== null)
       && validCoveredAt
       && [
         coverage.sourceCount,
         coverage.sourceBytes,
+        coverage.skippedSourceCount,
+        coverage.skippedSourceBytes,
+        coverage.skippedThreadCount,
         coverage.usageEvents,
         coverage.quotaObservations,
         coverage.quotaOccurrences,
@@ -4786,7 +5922,7 @@ function validHistory(value) {
       || !value.coverage
       || typeof value.coverage !== "object"
       || Array.isArray(value.coverage)
-      || !["complete", "unavailable"].includes(value.coverage.status)
+      || !["complete", "partial", "unavailable"].includes(value.coverage.status)
       || (value.generation !== null
         && generationToken(value.generation) === null)
       || (value.generationFingerprint !== null
@@ -4810,7 +5946,7 @@ function validHistory(value) {
   if (!validCoveredAt) return false;
   if (value.status === "available") {
     return value.errorCode === null
-      && value.coverage.status === "complete"
+      && ["complete", "partial"].includes(value.coverage.status)
       && value.generation !== null
       && validHistoryPeriod(value.period);
   }
@@ -4897,6 +6033,14 @@ function validAllowanceCalibrationSummary(value, forcedCandidateId) {
 function validAllowanceCapacityByScenario(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.schemaVersion !== ALLOWANCE_CAPACITY_SCHEMA_VERSION
+      || value.planScope?.methodVersion
+        !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+      || typeof value.planScope?.planType !== "string"
+      || !/^[a-z][a-z0-9_-]{0,31}$/u.test(value.planScope.planType)
+      || value.planScope.basisFamilyId !== value.basisFamilyId
+      || !(value.planScope.cohortId === null
+        || (typeof value.planScope.cohortId === "string"
+          && /^[a-f0-9]{64}$/u.test(value.planScope.cohortId)))
       || !value.scenarios || typeof value.scenarios !== "object"
       || Array.isArray(value.scenarios)
       || Object.keys(value.scenarios).sort().join(",")
@@ -4911,12 +6055,132 @@ function validAllowanceCapacityByScenario(value) {
     if (!row || typeof row !== "object" || Array.isArray(row)
         || stableJson(row.basis) !== stableJson(expectedBasis)
         || value.basisFamilyId !== expectedBasis.basisFamilyId
+        || row.calibration?.selectedPlanType !== value.planScope.planType
         || !validAllowanceCalibrationSummary(
           row.calibration,
           forcedCandidateId,
-        )) return false;
+        ) || !validWeeklyPlanPopulations(row.calibration, (population) => (
+          validAllowanceCalibrationSummary(population, forcedCandidateId)
+        ))) return false;
   }
-  return true;
+  const selectedCalibration = value.scenarios.unresolved_as_standard.calibration;
+  return value.planScope.cohortId === calibrationCohortId(selectedCalibration);
+}
+
+function validPlanScopedTimeline(value, sourceDescriptor, capacity) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.schemaVersion !== PLAN_SCOPED_TIMELINE_SCHEMA_VERSION
+      || value.encoding !== PLAN_TIMELINE_ENCODING
+      || !["available", "unavailable"].includes(value.status)
+      || !Array.isArray(value.usage)
+      || value.usage.length > MAX_PLAN_TIMELINE_ROWS
+      || !Array.isArray(value.comparisonIntervals)
+      || value.comparisonIntervals.length > MAX_PLAN_TIMELINE_ROWS
+      || !Array.isArray(value.quota) || value.quota.length > MAX_PLAN_TIMELINE_ROWS
+      || !value.diagnostics || typeof value.diagnostics !== "object"
+      || Array.isArray(value.diagnostics)) return false;
+  const diagnosticKeys = [
+    "consideredEvents",
+    "admittedEvents",
+    "incompatibleEvents",
+    "unresolvedEvents",
+    "conflictedEvents",
+    "malformedEvents",
+    "invalidatedBuckets",
+    "invalidatedCandidateEvents",
+  ];
+  if (!diagnosticKeys.every((key) => (
+    Number.isSafeInteger(value.diagnostics[key])
+      && value.diagnostics[key] >= 0
+  ))) return false;
+  if (value.status === "unavailable") {
+    return value.planScope === null && value.usage.length === 0
+      && value.comparisonIntervals.length === 0 && value.quota.length === 0
+      && [
+        "plan_scoped_generation_unavailable",
+        "plan_scoped_attribution_unavailable",
+        "plan_scoped_resource_limit",
+      ].includes(value.reason);
+  }
+  const scope = value.planScope;
+  if (value.reason !== null || !scope || typeof scope !== "object"
+      || Array.isArray(scope)
+      || scope.methodVersion !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+      || typeof scope.planType !== "string"
+      || !/^[a-z][a-z0-9_-]{0,31}$/u.test(scope.planType)
+      || scope.basisFamilyId !== capacity?.basisFamilyId
+      || scope.planType !== capacity?.planScope?.planType
+      || scope.cohortId !== capacity?.planScope?.cohortId
+      || scope.sourceGeneration !== sourceDescriptor?.generation
+      || scope.sourceGenerationFingerprint
+        !== sourceDescriptor?.generationFingerprint) return false;
+  let admittedEvents = 0;
+  let priorEndMs = Number.NEGATIVE_INFINITY;
+  for (const interval of value.comparisonIntervals) {
+    if (!Array.isArray(interval) || interval.length !== 2
+        || !interval.every((ms) => Number.isSafeInteger(ms)
+          && ms % TIMELINE_BUCKET_MS === 0 && Number.isFinite(new Date(ms).getTime()))
+        || interval[0] < priorEndMs || interval[1] <= interval[0]) return false;
+    priorEndMs = interval[1];
+  }
+  priorEndMs = Number.NEGATIVE_INFINITY;
+  let quotaIntervalAt = 0;
+  for (const row of value.quota) {
+    if (!Array.isArray(row) || row.length !== 3
+        || !row.every((n) => typeof n === "number" && Number.isFinite(n))
+        || !Number.isSafeInteger(row[0]) || row[0] <= priorEndMs
+        || !Number.isFinite(new Date(row[0]).getTime())
+        || !Number.isFinite(new Date(row[1] * 1000).getTime())
+        || row[2] < 0 || row[2] > 100) return false;
+    while (quotaIntervalAt < value.comparisonIntervals.length
+        && value.comparisonIntervals[quotaIntervalAt][1] <= row[0]) quotaIntervalAt += 1;
+    const interval = value.comparisonIntervals[quotaIntervalAt];
+    if (!interval || row[0] < interval[0] || row[0] >= interval[1]) return false;
+    priorEndMs = row[0];
+  }
+  priorEndMs = Number.NEGATIVE_INFINITY;
+  let intervalAt = 0;
+  for (const compact of value.usage) {
+    const row = decodePlanScopedTimelineRow(compact);
+    if (row === null) return false;
+    const startMs = Date.parse(row?.startAt ?? "");
+    const endMs = Date.parse(row?.endAt ?? "");
+    while (intervalAt < value.comparisonIntervals.length
+        && value.comparisonIntervals[intervalAt][1] <= startMs) intervalAt += 1;
+    const interval = value.comparisonIntervals[intervalAt];
+    if (!interval || interval[0] > startMs || interval[1] < endMs) return false;
+    const scenarios = row?.scenarioWeighting;
+    const coverage = row?.weightingCoverage;
+    const pricing = row?.pricingCoverage;
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)
+        || endMs - startMs !== TIMELINE_BUCKET_MS
+        || startMs < priorEndMs
+        || !Number.isSafeInteger(row.usageEvents) || row.usageEvents < 1
+        || !Number.isSafeInteger(row.totalTokens) || row.totalTokens < 0
+        || !Number.isFinite(row.apiPriceEquivalentUsd)
+        || row.apiPriceEquivalentUsd < 0
+        || !scenarios || typeof scenarios !== "object"
+        || Array.isArray(scenarios)
+        || Object.keys(scenarios).sort().join(",")
+          !== Object.keys(ALLOWANCE_SCENARIO_CANDIDATES).sort().join(",")
+        || !Object.values(scenarios).every((amount) => (
+          Number.isFinite(amount) && amount >= 0
+        ))
+        || !coverage || !["observedEvents", "declaredFromConfigEvents", "assumedEvents"]
+          .every((key) => Number.isSafeInteger(coverage[key]) && coverage[key] >= 0)
+        || coverage.observedEvents + coverage.declaredFromConfigEvents
+          + coverage.assumedEvents !== row.usageEvents
+        || !pricing || !["fullyPricedEvents", "partiallyPricedEvents", "unpricedEvents"]
+          .every((key) => Number.isSafeInteger(pricing[key]) && pricing[key] >= 0)
+        || pricing.fullyPricedEvents + pricing.partiallyPricedEvents
+          + pricing.unpricedEvents !== row.usageEvents
+        || !row.components || COMPONENT_KEYS.some((key) => (
+          !Number.isSafeInteger(row.components[key]) || row.components[key] < 0
+        ))) return false;
+    priorEndMs = endMs;
+    admittedEvents += row.usageEvents;
+  }
+  return admittedEvents === value.diagnostics.admittedEvents;
 }
 
 const COMPOSITION_CACHE_STATUSES = new Set([
@@ -5032,8 +6296,17 @@ function validCache(value) {
       || !validAllowanceCapacityByScenario(
         value.allowanceCapacityByScenario,
       )
+      || !validPlanScopedTimeline(
+        value.planScopedTimeline,
+        value.sourceDescriptor,
+        value.allowanceCapacityByScenario,
+      )
       || value.weeklyCalibration?.schemaVersion
         !== "weekly-calibration-summary-v0.1"
+      || !validWeeklyPlanPopulations(value.weeklyCalibration, (population) => (
+        validAllowanceCalibrationSummary(population, population.validation?.selectedCostBasis)
+          && validWeeklyCalibrationComposition(population.composition)
+      ))
       || canonicalInstant(value.weeklyCalibration.generatedAt) === null
       || !["estimated", "insufficient_evidence"].includes(
         value.weeklyCalibration.status,

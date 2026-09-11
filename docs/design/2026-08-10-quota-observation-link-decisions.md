@@ -1,6 +1,14 @@
-# Owner decisions: carrying the event→quota-observation link (telemetry v1.1)
+---
+title: Carrying the event-to-quota-observation link
+date: 2026-08-10
+type: design
+status: active
+---
 
-Date: 2026-08-10. Status: decided, pending implementation.
+# Carrying the event-to-quota-observation link (telemetry v1.1)
+
+The owner decision is accepted and implementation remains pending. Current
+telemetry v1.0 must not be described as carrying this explicit link.
 Companion to the wire-contract brief circulated the same day. The owner has
 answered the brief's blocking questions; this note records those answers so
 implementation can proceed in one pass without re-litigating them.

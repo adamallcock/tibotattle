@@ -12,6 +12,10 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  ARCHITECTURE_APPLICATIONS,
+  ARCHITECTURE_APPLICATION_ROOTS,
+} from "./lib/application-layout-policy.mjs";
 import { extractEsmImports } from "./lib/esm-imports.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -27,6 +31,19 @@ const SOURCE_EXTENSIONS = new Set([
   ".tsx",
 ]);
 const COMMONJS_SOURCE_EXTENSIONS = new Set([".cjs", ".cts"]);
+// Electron's sandboxed renderer preload is a deliberate runtime exception:
+// Electron provides its restricted renderer bridge through a polyfilled
+// CommonJS `require("electron")` and ignores package `type: module` for `.js`
+// preloads. Keep this allowlist exact and validate the only permitted require
+// below so it cannot become a general CommonJS escape hatch.
+const REVIEWED_SANDBOXED_PRELOADS = new Map([
+  ["apps/electron/preload.cjs", "electron"],
+  ["apps/electron/recovery-preload.cjs", "electron"],
+  ["apps/electron/tray-popover-preload.cjs", "electron"],
+]);
+const REVIEWED_SANDBOXED_PRELOAD_DECLARATION_PATTERN =
+  /^const\s*\{\s*contextBridge\s*,\s*ipcRenderer\s*\}\s*=\s*require\(\s*["']electron["']\s*\)\s*;\s*/u;
+const IMPORT_META_PATTERN = /\bimport\s*\.\s*meta\b/u;
 const EXCLUDED_DIRECTORY_NAMES = new Set([
   ".git",
   ".release-build",
@@ -75,6 +92,17 @@ const REVIEWED_SOURCE_OWNER_PUBLIC_ENTRYPOINTS = new Set([
   "src/export/workspace-runtime.js",
   "src/export/set-materialization-runtime.js",
   "src/platform/index.js",
+  "src/platform/linux-accountless-installation-credential.js",
+  "src/platform/linux-account-observation-credential.js",
+  "src/platform/linux-credential-mutation-lease.js",
+  "src/platform/linux-credential-state.js",
+  "src/platform/linux-secret-service.js",
+  "src/platform/linux-secret-service-broker.js",
+  "src/platform/windows-accountless-installation-credential.js",
+  // Fixed main-process qualification facade; keep its native manager closure
+  // out of the shared index used by portable/local-only client exports.
+  "src/platform/windows-account-observation-credential.js",
+  "src/platform/windows-credential-manager-probe.js",
   "src/platform/claude-callback-lifecycle.js",
   "src/platform/export-identity-keychain.js",
   "src/platform/local-review.js",
@@ -120,22 +148,16 @@ const SOURCE_OWNER_ALLOWED_PACKAGES = new Map([
     "quota-analysis",
   ])],
 ]);
-const APP_ALLOWED_PACKAGES = new Map([
-  ["cloud-run", new Set(["telemetry-contract"])],
-  ["local", new Set([
-    "accounting",
-    "quota-analysis",
-    "telemetry-contract",
-  ])],
-  ["local-review", new Set()],
-  ["macos", new Set()],
-  ["web", new Set()],
-  ["worker", new Set([
-    "accounting",
-    "quota-analysis",
-    "telemetry-contract",
-  ])],
-]);
+const APP_ALLOWED_PACKAGES = new Map(
+  ARCHITECTURE_APPLICATIONS.map(({ allowedPackages, name }) => [
+    name,
+    new Set(allowedPackages),
+  ]),
+);
+const APPLICATIONS_BY_ROOT = Object.freeze(
+  [...ARCHITECTURE_APPLICATIONS]
+    .sort((left, right) => right.root.length - left.root.length),
+);
 const NON_BASELINABLE_ARCHITECTURE_CATEGORIES = new Set([
   "contribution_owner_public_entrypoint",
   "production_import_cycle",
@@ -306,23 +328,54 @@ export const LEGACY_STORAGE_DIRECT_IMPORTERS = Object.freeze([
 ]);
 
 /**
- * Removed compatibility forwarders. This is intentionally an exact, permanent
- * absence ledger: unlike migration debt, neither the files nor imports into
- * them may be reintroduced or baselined.
+ * Removed production modules and compatibility forwarders. This is an exact,
+ * permanent absence ledger: unlike migration debt, neither the files nor
+ * imports into them may be reintroduced or baselined.
  */
 export const RETIRED_PRODUCTION_SOURCE_PATHS = Object.freeze([
   "shared/quota-calibration.js",
   "shared/quota-rolling.js",
   "shared/quota-tracks.js",
+  "src/application/local-automatic-contribution.js",
+  "src/automatic-contribution.js",
+  "src/claude-desktop-quota-refresh.js",
+  "src/claude-desktop-quota-state.js",
+  "src/codex-log-scan.js",
+  "src/contribution/recurrence-policy.js",
+  "src/contribution-sync-queue.js",
   "src/cost-ledger.js",
+  "src/export-checkpoint-state.js",
+  "src/export-deletion-compatibility-internal.js",
+  "src/export-deletion-schema.js",
   "src/export-registries.js",
+  "src/export-safe-records.js",
+  "src/export-set-materializer.js",
+  "src/export-source-pipeline-compatibility-internal.js",
   "src/export-versions.js",
+  "src/export-workspace-compatibility-internal.js",
+  "src/export-workspace-discard-compatibility-internal.js",
+  "src/export-workspace-lock-compatibility-internal.js",
+  "src/export-workspace-lock.js",
+  "src/export-workspace.js",
   "src/local-api-pricing.js",
+  "src/metadata-exporter.js",
   "src/price-registry.js",
   "src/tier-semantics.js",
 ]);
 const RETIRED_PRODUCTION_SOURCE_PATH_SET = new Set(
   RETIRED_PRODUCTION_SOURCE_PATHS,
+);
+
+/**
+ * Entire retired product trees. Any descendant is forbidden, including a new
+ * filename that never existed in the removed implementation. This keeps a
+ * removed deployment architecture from returning under a fresh entrypoint.
+ */
+export const RETIRED_PRODUCTION_TREE_PATHS = Object.freeze([
+  "apps/cloud-run",
+]);
+const RETIRED_PRODUCTION_TREE_PATH_SET = new Set(
+  RETIRED_PRODUCTION_TREE_PATHS,
 );
 
 export const CURRENT_ARCHITECTURE_BOUNDARY_BASELINE = Object.freeze(
@@ -362,18 +415,20 @@ function sourceLocation(relativePath) {
       topLevel: "shared",
     };
   }
+  const application = APPLICATIONS_BY_ROOT.find(({ root }) =>
+    relativePath === root || relativePath.startsWith(`${root}/`));
+  if (application) {
+    return {
+      appName: application.name,
+      kind: "app",
+      topLevel: application.root.split("/")[0],
+    };
+  }
   if (segments[0] === "apps" && segments.length >= 2) {
     return {
       appName: segments[1],
       kind: "app",
       topLevel: "apps",
-    };
-  }
-  if (segments[0] === "local-review") {
-    return {
-      appName: "local-review",
-      kind: "app",
-      topLevel: "local-review",
     };
   }
   if (segments[0] === "scripts" || segments[0] === "tools") {
@@ -443,10 +498,8 @@ function sourceOwnerDependencyDirectionViolation(importer, target) {
     if (importerLocation.appName === "web") {
       return destinationLocation.kind === "src";
     }
-    if (
-      new Set(["cloud-run", "macos"]).has(importerLocation.appName)
-      && OWNED_SOURCE_OWNER_KINDS.has(destinationOwner.kind)
-    ) {
+    if (importerLocation.appName === "macos"
+        && OWNED_SOURCE_OWNER_KINDS.has(destinationOwner.kind)) {
       return true;
     }
     if (
@@ -542,6 +595,50 @@ function staticJsonRequireArgument(argument) {
   return unquoted.endsWith(".json");
 }
 
+async function isReviewedSandboxedPreload(relativePath, source) {
+  const requiredSpecifier = REVIEWED_SANDBOXED_PRELOADS.get(relativePath);
+  const declaration = source.match(
+    REVIEWED_SANDBOXED_PRELOAD_DECLARATION_PATTERN,
+  );
+  if (requiredSpecifier === undefined
+      || DIRECT_CREATE_REQUIRE_IMPORT_PATTERN.test(source)
+      || CREATE_REQUIRE_REFERENCE_PATTERN.test(source)
+      || MODULE_CREATE_REQUIRE_PATTERN.test(source)
+      || requiredSpecifier !== "electron"
+      || declaration === null
+      || IMPORT_META_PATTERN.test(source)) {
+    CREATE_REQUIRE_REFERENCE_PATTERN.lastIndex = 0;
+    MODULE_CREATE_REQUIRE_PATTERN.lastIndex = 0;
+    return false;
+  }
+  CREATE_REQUIRE_REFERENCE_PATTERN.lastIndex = 0;
+  MODULE_CREATE_REQUIRE_PATTERN.lastIndex = 0;
+  if (/\brequire\b/u.test(source.slice(declaration[0].length))) {
+    return false;
+  }
+  DIRECT_REQUIRE_CALL_PATTERN.lastIndex = 0;
+  const calls = [...source.matchAll(DIRECT_REQUIRE_CALL_PATTERN)];
+  DIRECT_REQUIRE_CALL_PATTERN.lastIndex = 0;
+  if (
+    calls.length !== 1
+    || calls[0][1].trim() !== JSON.stringify(requiredSpecifier)
+  ) {
+    return false;
+  }
+  // The exception is intentionally a CommonJS bridge with one fixed require,
+  // so even a valid-looking preload must not gain static or dynamic ESM
+  // imports that bypass this allowlist. The normal import graph still runs
+  // below for the accepted file; this check only rejects the exception shape.
+  try {
+    const imports = await extractEsmImports(source, {
+      sourceName: relativePath,
+    });
+    return imports.length === 0;
+  } catch {
+    return false;
+  }
+}
+
 function esmCommonJsLoadingIssue(source) {
   const memberMatch = MODULE_CREATE_REQUIRE_PATTERN.exec(source);
   MODULE_CREATE_REQUIRE_PATTERN.lastIndex = 0;
@@ -625,13 +722,15 @@ async function collectProductionSourceFiles(rootDirectory) {
     }
   }
 
-  for (const rootName of [
+  const productionRoots = new Set([
     "apps",
-    "local-review",
     "packages",
     "shared",
     "src",
-  ]) {
+    ...ARCHITECTURE_APPLICATION_ROOTS.filter((root) =>
+      root !== "apps" && !root.startsWith("apps/")),
+  ]);
+  for (const rootName of productionRoots) {
     await visit(join(rootDirectory, rootName));
   }
   return files.sort();
@@ -888,8 +987,12 @@ function sourceTargetCandidates(target) {
 }
 
 function retiredProductionSourceTarget(target) {
-  return sourceTargetCandidates(target).find((candidate) =>
-    RETIRED_PRODUCTION_SOURCE_PATH_SET.has(candidate)) ?? null;
+  const exactTarget = sourceTargetCandidates(target).find((candidate) =>
+    RETIRED_PRODUCTION_SOURCE_PATH_SET.has(candidate));
+  if (exactTarget) return exactTarget;
+  return [...RETIRED_PRODUCTION_TREE_PATH_SET].find((retiredTree) => (
+    target === retiredTree || target.startsWith(`${retiredTree}/`)
+  )) ?? null;
 }
 
 async function pathContainsSymbolicLink(rootDirectory, relativePath) {
@@ -1147,7 +1250,10 @@ export async function checkArchitectureBoundaries({
   const productionFiles = new Set(files);
   let importCount = 0;
 
-  for (const retiredPath of RETIRED_PRODUCTION_SOURCE_PATHS) {
+  for (const retiredPath of [
+    ...RETIRED_PRODUCTION_SOURCE_PATHS,
+    ...RETIRED_PRODUCTION_TREE_PATHS,
+  ]) {
     try {
       await lstat(join(absoluteRoot, retiredPath));
       detectedViolations.push({
@@ -1184,28 +1290,34 @@ export async function checkArchitectureBoundaries({
   }
 
   for (const importer of files) {
-    if (COMMONJS_SOURCE_EXTENSIONS.has(extname(importer))) {
-      detectedViolations.push({
-        category: "commonjs_production_source",
-        importer,
-        kind: "commonjs",
-        line: 1,
-        specifier: "<commonjs-source>",
-        target: importer,
-      });
-      continue;
-    }
     const source = await readFile(join(absoluteRoot, importer), "utf8");
-    const commonJsLoadingIssue = esmCommonJsLoadingIssue(source);
-    if (commonJsLoadingIssue) {
-      detectedViolations.push({
-        category: "esm_commonjs_loading",
-        importer,
-        kind: "commonjs-loading",
-        line: commonJsLoadingIssue.line,
-        specifier: commonJsLoadingIssue.specifier,
-        target: "<runtime-commonjs-loader>",
-      });
+    const reviewedSandboxedPreload = COMMONJS_SOURCE_EXTENSIONS.has(extname(importer))
+      && await isReviewedSandboxedPreload(importer, source);
+    if (COMMONJS_SOURCE_EXTENSIONS.has(extname(importer))) {
+      if (!reviewedSandboxedPreload) {
+        detectedViolations.push({
+          category: "commonjs_production_source",
+          importer,
+          kind: "commonjs",
+          line: 1,
+          specifier: "<commonjs-source>",
+          target: importer,
+        });
+        continue;
+      }
+    }
+    if (!reviewedSandboxedPreload) {
+      const commonJsLoadingIssue = esmCommonJsLoadingIssue(source);
+      if (commonJsLoadingIssue) {
+        detectedViolations.push({
+          category: "esm_commonjs_loading",
+          importer,
+          kind: "commonjs-loading",
+          line: commonJsLoadingIssue.line,
+          specifier: commonJsLoadingIssue.specifier,
+          target: "<runtime-commonjs-loader>",
+        });
+      }
     }
     const imports = await extractEsmImports(source, {
       sourceName: importer,

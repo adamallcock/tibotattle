@@ -1,0 +1,481 @@
+import { constants } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { normalizeWorkUsageRepositoryOrigin } from "./work-usage-projects.js";
+import { readBoundedUtf8LineEntries } from "./bounded-jsonl-reader.js";
+
+const CODEX_THREAD_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const CODEX_SELECTED_ROLLOUT_NAME = new RegExp(
+  "^rollout-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-"
+    + "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    + "(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?"
+    + "\\.jsonl(?:\\.zst)?$",
+  "iu",
+);
+
+function ownerControlledRegularFile(stats) {
+  const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
+  return stats.isFile()
+    && !stats.isSymbolicLink()
+    && stats.nlink === 1
+    && (currentUid === null || stats.uid === currentUid)
+    && (stats.mode & 0o022) === 0;
+}
+
+/**
+ * Read Codex's selected rollout heads from an owner-controlled, non-writable-
+ * by-others database without retaining its titles, cwd,
+ * prompts, previews or other thread-store content. Failure is a normal null
+ * fallback: canonical metadata remains sufficient for accounting, while a
+ * selected head only disambiguates which physical generation should provide
+ * carried state to a later logical fork.
+ */
+export async function readCodexSelectedRolloutNames(codexHome) {
+  if (typeof codexHome !== "string" || codexHome.length < 1) return null;
+  const databaseFile = join(codexHome, "state_5.sqlite");
+  let stats;
+  try {
+    stats = await lstat(databaseFile);
+  } catch {
+    return null;
+  }
+  if (!ownerControlledRegularFile(stats)) return null;
+  let database;
+  try {
+    database = new DatabaseSync(databaseFile, { readOnly: true, timeout: 2_000 });
+    const columns = new Set(database.prepare("PRAGMA table_info(threads)")
+      .all().map((row) => row.name));
+    if (!columns.has("id") || !columns.has("rollout_path")) return null;
+    const selected = new Map();
+    for (const row of database.prepare(
+      "SELECT id, rollout_path FROM threads",
+    ).iterate()) {
+      if (typeof row.id !== "string"
+          || !CODEX_THREAD_ID.test(row.id)
+          || typeof row.rollout_path !== "string") {
+        continue;
+      }
+      const selectedName = basename(row.rollout_path);
+      if (selectedName.length < 1 || selectedName.length > 255) continue;
+      const selectedMatch = CODEX_SELECTED_ROLLOUT_NAME.exec(selectedName);
+      if (selectedMatch === null
+          || selectedMatch[1].toLowerCase() !== row.id.toLowerCase()) continue;
+      selected.set(row.id.toLowerCase(), selectedName);
+    }
+    return selected;
+  } catch {
+    return null;
+  } finally {
+    database?.close();
+  }
+}
+
+const MAX_LOCAL_THREAD_LOOKUPS = 160;
+const MAX_SESSION_INDEX_BYTES = 32 * 1024 * 1024;
+const MAX_SESSION_INDEX_LINE_BYTES = 64 * 1024;
+const MAX_SESSION_INDEX_LINES = 200_000;
+const MAX_THREAD_DISPLAY_NAME_LENGTH = 512;
+const MAX_AGENT_NICKNAME_LENGTH = 80;
+const MAX_THREAD_SOURCE_LENGTH = 4_096;
+const MAX_THREAD_SOURCE_CLASS_LENGTH = 80;
+const MAX_ROLLOUT_PATH_LENGTH = 4_096;
+const MAX_SESSION_METADATA_LINE_BYTES = 64 * 1024;
+const AUTO_REVIEW_THREAD_SOURCE = "guardian_review";
+const AUTO_REVIEW_SOURCE_KIND = "guardian";
+const LOCAL_NAVIGATION_THREAD_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function threadId(value) {
+  return typeof value === "string" && LOCAL_NAVIGATION_THREAD_ID.test(value)
+    ? value.toLowerCase()
+    : null;
+}
+
+function displayName(value, maximumLength = MAX_THREAD_DISPLAY_NAME_LENGTH) {
+  if (typeof value !== "string" || value.length > maximumLength
+      || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function sameOwnerControlledFile(before, after) {
+  return ownerControlledRegularFile(after)
+    && before.dev === after.dev && before.ino === after.ino;
+}
+
+async function ownerControlledCodexHome(codexHome) {
+  if (typeof codexHome !== "string" || codexHome.length < 1) return false;
+  try {
+    const stats = await lstat(codexHome);
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    return stats.isDirectory() && !stats.isSymbolicLink()
+      && (uid === null || stats.uid === uid) && (stats.mode & 0o022) === 0;
+  } catch {
+    return false;
+  }
+}
+
+function parseThreadSource(value) {
+  if (typeof value !== "string" || value.length > MAX_THREAD_SOURCE_LENGTH) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function workerMetadata(source, id) {
+  // This is Codex's explicit collaboration ancestry, not rollout-fork lineage
+  // or an inferred relationship from timestamps, names, or working directory.
+  const spawn = source?.subagent?.thread_spawn;
+  if (spawn === null || typeof spawn !== "object" || Array.isArray(spawn)) {
+    return null;
+  }
+  const parentId = threadId(spawn.parent_thread_id);
+  return parentId === null || parentId === id ? null : {
+    parentId,
+    nickname: displayName(spawn.agent_nickname, MAX_AGENT_NICKNAME_LENGTH),
+  };
+}
+
+function isAutoReviewThreadSource(value) {
+  return value === AUTO_REVIEW_THREAD_SOURCE;
+}
+
+function isAutoReviewSource(value) {
+  return value?.subagent?.other === AUTO_REVIEW_SOURCE_KIND;
+}
+
+function isAutoReviewSessionMetadata(record, id) {
+  const payload = record?.payload;
+  return record?.type === "session_meta"
+    && threadId(payload?.id) === id
+    && payload?.thread_source === AUTO_REVIEW_THREAD_SOURCE
+    && payload?.source?.subagent?.other === AUTO_REVIEW_SOURCE_KIND;
+}
+
+function isCodexSessionPath(codexHome, rolloutPath) {
+  const path = relative(codexHome, rolloutPath);
+  return path.startsWith(`sessions${sep}`);
+}
+
+/**
+ * Guardian-review records have no parent column in Codex's thread store. Their
+ * own first, bounded session-metadata record is the only accepted source for
+ * this relationship. It is never retained or exposed: this returns one UUID
+ * only after both the selected thread and its source classification agree.
+ */
+async function readAutoReviewParent(codexHome, rolloutPath, id) {
+  if (typeof rolloutPath !== "string" || rolloutPath.length === 0
+      || !isAbsolute(rolloutPath)) return null;
+  let handle;
+  try {
+    const [home, path] = await Promise.all([realpath(codexHome), realpath(rolloutPath)]);
+    if (!isCodexSessionPath(home, path)) return null;
+    const before = await lstat(path);
+    if (!ownerControlledRegularFile(before)) return null;
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    if (!sameOwnerControlledFile(before, await handle.stat())) return null;
+    const bytes = Buffer.alloc(MAX_SESSION_METADATA_LINE_BYTES + 1);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    const newline = bytes.subarray(0, bytesRead).indexOf(0x0a);
+    if (newline < 0) return null;
+    const line = bytes.toString("utf8", 0, newline);
+    if (line.includes("\ufffd")) return null;
+    const record = JSON.parse(line);
+    const parentId = threadId(record?.payload?.parent_thread_id);
+    if (!isAutoReviewSessionMetadata(record, id) || parentId === null || parentId === id) {
+      return null;
+    }
+    const after = await handle.stat();
+    return sameOwnerControlledFile(before, after)
+        && before.size === after.size && before.mtimeMs === after.mtimeMs
+        && sameOwnerControlledFile(before, await lstat(path))
+      ? parentId
+      : null;
+  } catch {
+    return null;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function boundedTextColumn(columns, name, maximumLength) {
+  // Column names are a fixed internal allowlist, never caller-controlled SQL.
+  // SQLite length(TEXT) stops at NUL, so independently cap encoded bytes before
+  // a value crosses into JavaScript. Four bytes per character preserves UTF-8
+  // names; the existing character and control checks still apply afterward.
+  return columns.has(name)
+    ? `CASE WHEN typeof(${name}) = 'text'
+         AND length(CAST(${name} AS BLOB)) <= ${maximumLength * 4}
+         AND length(${name}) <= ${maximumLength}
+       THEN ${name} ELSE NULL END AS ${name}`
+    : `NULL AS ${name}`;
+}
+
+async function safeSqliteSidecars(databaseFile) {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    try {
+      if (!ownerControlledRegularFile(await lstat(`${databaseFile}${suffix}`))) {
+        return false;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") return false;
+    }
+  }
+  return true;
+}
+
+async function readSelectedThreadMetadata(codexHome, ids, { ancestryOnly = false, allowTitleFallback = false } = {}) {
+  const databaseFile = join(codexHome, "state_5.sqlite");
+  let database;
+  try {
+    const before = await lstat(databaseFile);
+    if (!ownerControlledRegularFile(before)
+        || !await safeSqliteSidecars(databaseFile)) return new Map();
+    database = new DatabaseSync(databaseFile, { readOnly: true, timeout: 500 });
+    if (!sameOwnerControlledFile(before, await lstat(databaseFile))) return new Map();
+    database.exec("BEGIN");
+    if (database.prepare(
+      "SELECT type FROM sqlite_master WHERE name = 'threads'",
+    ).get()?.type !== "table") return new Map();
+    const info = database.prepare("PRAGMA table_info(threads)").all();
+    if (!info.some((column) => column.name === "id" && column.pk > 0)) {
+      return new Map();
+    }
+    const columns = new Set(info.map((column) => column.name));
+    // Titles may contain opening-message text. Only the owner-approved local
+    // Projects & threads display opts into this bounded fallback. Ancestry and
+    // other callers keep the existing title-free contract.
+    const selected = [
+      "id",
+      allowTitleFallback && !ancestryOnly && columns.has("title")
+        ? `CASE WHEN typeof(title) = 'text' AND instr(title, char(0)) = 0 THEN substr(title, 1, ${MAX_THREAD_DISPLAY_NAME_LENGTH}) ELSE NULL END AS display_title`
+        : "NULL AS display_title",
+      ancestryOnly ? "NULL AS name" : boundedTextColumn(columns, "name", MAX_THREAD_DISPLAY_NAME_LENGTH),
+      ancestryOnly ? "NULL AS agent_nickname" : boundedTextColumn(columns, "agent_nickname", MAX_AGENT_NICKNAME_LENGTH),
+      boundedTextColumn(columns, "source", MAX_THREAD_SOURCE_LENGTH),
+      boundedTextColumn(columns, "thread_source", MAX_THREAD_SOURCE_CLASS_LENGTH),
+      boundedTextColumn(columns, "rollout_path", MAX_ROLLOUT_PATH_LENGTH),
+    ].join(", ");
+    const statement = database.prepare(`SELECT ${selected} FROM threads WHERE id = ?`);
+    const result = new Map();
+    const selectedName = (row) => displayName(row.name) ??
+      (allowTitleFallback && !ancestryOnly && typeof row.display_title === "string"
+        ? displayName(row.display_title.replace(/\s+/gu, " ")) : null);
+    const parentIds = new Set();
+    for (const id of ids) {
+      const row = statement.get(id);
+      if (row === undefined || threadId(row.id) !== id) continue;
+      const source = parseThreadSource(row.source);
+      const threadStoreAutoReview = isAutoReviewThreadSource(row.thread_source);
+      const sourceAutoReview = isAutoReviewSource(source);
+      // Either exact guardian classification suppresses navigation to a review
+      // row's internal UUID. A parent is trusted only when both stores agree.
+      const autoReview = threadStoreAutoReview || sourceAutoReview;
+      const verifiedAutoReview = threadStoreAutoReview && sourceAutoReview;
+      const worker = autoReview ? null : workerMetadata(source, id);
+      const parentId = verifiedAutoReview && !ancestryOnly
+        ? await readAutoReviewParent(codexHome, row.rollout_path, id)
+        : worker?.parentId ?? null;
+      if (parentId !== null) parentIds.add(parentId);
+      result.set(id, {
+        name: selectedName(row),
+        nickname: displayName(row.agent_nickname, MAX_AGENT_NICKNAME_LENGTH)
+          ?? worker?.nickname ?? null,
+        parentId,
+        origin: autoReview ? "auto_review" : null,
+      });
+    }
+    for (const id of parentIds) {
+      if (result.size + parentIds.size > 50_000) return new Map();
+      if (result.has(id)) continue;
+      const row = statement.get(id);
+      if (row !== undefined && threadId(row.id) === id) {
+        const source = parseThreadSource(row.source);
+        // Internal guardian surfaces must not become navigation targets or
+        // collaboration ancestors. Preserve the current display contract.
+        if (isAutoReviewThreadSource(row.thread_source) || isAutoReviewSource(source)) {
+          continue;
+        }
+        const parentId = ancestryOnly ? workerMetadata(source, id)?.parentId ?? null : null;
+        if (parentId) parentIds.add(parentId);
+        result.set(id, { name: selectedName(row), nickname: null, parentId, origin: null });
+      }
+    }
+    return sameOwnerControlledFile(before, await lstat(databaseFile))
+        && await safeSqliteSidecars(databaseFile)
+      ? result
+      : new Map();
+  } catch {
+    // Local display metadata is optional. Never expose paths or SQLite errors.
+    return new Map();
+  } finally {
+    if (database?.isOpen) database.close();
+  }
+}
+
+async function readSelectedSessionIndexNames(codexHome, selectedIds) {
+  const file = join(codexHome, "session_index.jsonl");
+  let handle;
+  try {
+    const before = await lstat(file);
+    if (!ownerControlledRegularFile(before)
+        || before.size > MAX_SESSION_INDEX_BYTES) return new Map();
+    handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    if (!sameOwnerControlledFile(before, await handle.stat())) return new Map();
+    const last = Buffer.alloc(1);
+    if (before.size > 0) await handle.read(last, 0, 1, before.size - 1);
+    const names = new Map();
+    let lines = 0;
+    for await (const entry of readBoundedUtf8LineEntries(handle, {
+      maximumLineBytes: MAX_SESSION_INDEX_LINE_BYTES,
+      maximumTotalBytes: before.size,
+      highWaterMark: 64 * 1024,
+    })) {
+      lines += 1;
+      if (lines > MAX_SESSION_INDEX_LINES) return new Map();
+      // An appended but unterminated record is not a published display name.
+      if (entry.endByteExclusive === before.size && last[0] !== 0x0a) continue;
+      if (entry.line.includes("\ufffd")) continue;
+      let row;
+      try {
+        row = JSON.parse(entry.line);
+      } catch {
+        continue;
+      }
+      const id = threadId(row?.id);
+      if (id === null || !selectedIds.has(id)) continue;
+      const name = displayName(row.thread_name);
+      const updated = typeof row.updated_at === "string"
+          && row.updated_at.length <= 40
+          && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u.test(row.updated_at)
+        ? Date.parse(row.updated_at)
+        : NaN;
+      if (name === null || !Number.isSafeInteger(updated)) continue;
+      const prior = names.get(id);
+      if (prior === undefined || updated > prior.updated) {
+        names.set(id, { updated, name });
+      } else if (updated === prior.updated && name !== prior.name) {
+        // Conflicting equally current names do not justify choosing one.
+        names.set(id, { updated, name: null });
+      }
+    }
+    const after = await handle.stat();
+    if (!sameOwnerControlledFile(before, after)
+        || before.size !== after.size || before.mtimeMs !== after.mtimeMs
+        || !sameOwnerControlledFile(before, await lstat(file))) return new Map();
+    return new Map([...names].map(([id, value]) => [id, value.name]));
+  } catch {
+    return new Map();
+  } finally {
+    await handle?.close();
+  }
+}
+
+/**
+ * Resolve only selected usage-row UUIDs to ephemeral, local-only display
+ * metadata. The local Projects & threads caller may explicitly allow bounded
+ * Codex titles. No transcript/body is read; display text and ancestry must
+ * never enter accounting caches, derived indexes, or exports. Name search may
+ * explicitly request up to 25,000 selected IDs in one bounded, transient pass;
+ * ordinary row display remains capped at 160 IDs.
+ */
+export async function readCodexLocalThreadMetadata(codexHome, threadIds, { allowTitleFallback = false, forNameSearch = false } = {}) {
+  if (!Array.isArray(threadIds) || threadIds.length === 0
+      || threadIds.length > (forNameSearch === true ? 25_000 : MAX_LOCAL_THREAD_LOOKUPS)
+      || !await ownerControlledCodexHome(codexHome)) return new Map();
+  const ids = [...new Set(threadIds.map(threadId))];
+  if (ids.includes(null)) return new Map();
+  const selected = await readSelectedThreadMetadata(codexHome, ids, { allowTitleFallback: allowTitleFallback === true });
+  const nameIds = new Set(ids);
+  for (const id of ids) {
+    const parentId = selected.get(id)?.parentId;
+    if (parentId) nameIds.add(parentId);
+  }
+  const names = await readSelectedSessionIndexNames(codexHome, nameIds);
+  return new Map(ids.map((id) => {
+    const metadata = selected.get(id);
+    const parentId = metadata?.parentId ?? null;
+    const parentMetadata = parentId === null ? null : selected.get(parentId);
+    const result = {
+      id,
+      name: names.has(id) ? names.get(id) : metadata?.name ?? null,
+      nickname: metadata?.nickname ?? null,
+      // A generic worker keeps its existing explicit-parent fallback. Guardian
+      // review may navigate only to a parent that is itself still accessible
+      // from Codex's selected local thread store.
+      parent: parentId === null || (metadata?.origin === "auto_review"
+        && (parentMetadata === undefined || parentMetadata.origin === "auto_review")) ? null : {
+        id: parentId,
+        name: names.has(parentId)
+          ? names.get(parentId)
+          : parentMetadata?.name ?? null,
+      },
+    };
+    if (metadata?.origin === "auto_review") result.origin = "auto_review";
+    return [id, result];
+  }));
+}
+
+/** Read only explicit collaboration edges; no names or prompt-bearing titles. */
+export async function readCodexLocalThreadAncestry(codexHome, threadIds) {
+  if (!Array.isArray(threadIds) || threadIds.length > 25_000 || !await ownerControlledCodexHome(codexHome)) return new Map();
+  const ids = [...new Set(threadIds.map(threadId))];
+  if (ids.includes(null)) return new Map();
+  const selected = await readSelectedThreadMetadata(codexHome, ids, { ancestryOnly: true });
+  const roots = new Map();
+  for (const id of ids) {
+    let current = id;
+    const seen = new Set();
+    for (let depth = 0; depth <= 64; depth++) {
+      if (depth === 64 || seen.has(current)) { current = id; break; }
+      seen.add(current);
+      const parent = selected.get(current)?.parentId;
+      if (!parent) break;
+      current = parent;
+    }
+    roots.set(id, current);
+  }
+  return roots;
+}
+
+
+/** Local-only repository hints for vanished working folders. Never reads titles. */
+export async function readCodexLocalRepositoryOrigins(codexHome) {
+  if (!await ownerControlledCodexHome(codexHome)) return new Map();
+  const databaseFile = join(codexHome, "state_5.sqlite");
+  let database;
+  try {
+    const before = await lstat(databaseFile);
+    if (!ownerControlledRegularFile(before) || !await safeSqliteSidecars(databaseFile)) return new Map();
+    database = new DatabaseSync(databaseFile, { readOnly: true, timeout: 500 });
+    if (!sameOwnerControlledFile(before, await lstat(databaseFile))) return new Map();
+    database.exec("BEGIN");
+    if (database.prepare("SELECT type FROM sqlite_master WHERE name = 'threads'").get()?.type !== "table") return new Map();
+    const columns = new Set(database.prepare("PRAGMA table_info(threads)").all().map(row => row.name));
+    if (!columns.has("cwd") || !columns.has("git_origin_url")) return new Map();
+    const selected = [boundedTextColumn(columns, "cwd", 4096),
+      boundedTextColumn(columns, "git_origin_url", 4096),
+      "CASE WHEN git_origin_url IS NULL OR (typeof(git_origin_url) = 'text' AND length(CAST(git_origin_url AS BLOB)) = 0) THEN 0 ELSE 1 END AS origin_present"].join(", ");
+    const result = new Map();
+    let count = 0;
+    for (const row of database.prepare(`SELECT ${selected} FROM threads LIMIT 25001`).iterate()) {
+      if (++count > 25_000) return new Map();
+      if (typeof row.cwd !== "string" || !isAbsolute(row.cwd) || /[\u0000-\u001f\u007f]/u.test(row.cwd)) continue;
+      if (!row.origin_present) continue;
+      const origin = normalizeWorkUsageRepositoryOrigin(row.git_origin_url);
+      const cwd = resolve(row.cwd);
+      if (!result.has(cwd)) result.set(cwd, origin);
+      else if (result.get(cwd) !== origin) result.set(cwd, null);
+    }
+    return sameOwnerControlledFile(before, await lstat(databaseFile)) && await safeSqliteSidecars(databaseFile)
+      ? result : new Map();
+  } catch { return new Map(); }
+  finally { if (database?.isOpen) database.close(); }
+}

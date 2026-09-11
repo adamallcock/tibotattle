@@ -3,16 +3,25 @@ import { basename, dirname, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 
 import {
+  codexRolloutDiscoveryReceipt,
   createLeadingRateLimitGate,
-  discoverCodexRolloutInfos,
-} from "./codex-log-scan.js";
+} from "./providers/codex/logs.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import { recognizedExportModelId } from "./export/index.js";
 import {
   createLineageSnapshots,
   extractRolloutUsage,
   inheritedTierSeed,
   ownObservedTier,
+  resolveLogicalRolloutHeads,
+  rolloutContentQuarantineReason,
 } from "./local-unified-index-extract.js";
+import {
+  createHistoryBaseSeedResolver,
+  createParentModelResolver,
+  selectRolloutUsageSeed,
+} from "./local-unified-index-history.js";
+import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 import {
   assertSafeLocalUnifiedIndexTarget,
   createUnifiedIndexWriter,
@@ -21,6 +30,7 @@ import {
   recoverUnifiedIndexGenerations,
   defaultLocalUnifiedIndexPath,
   defaultLocalUnifiedIndexSecretPath,
+  LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
   localDigest,
   openLocalUnifiedIndex,
   outcomeOrdinal,
@@ -47,8 +57,203 @@ import {
 // leaves the previous index untouched and costs only the work done so far.
 
 const MAXIMUM_WORKERS = 10;
+const MAXIMUM_AUTOMATIC_WORKERS = 6;
+const AUTOMATIC_WORKER_RESERVED_PARALLELISM = 3;
+// A received worker batch is written through synchronous node:sqlite calls.
+// Bound that one host turn independently from the writer's commit cadence so
+// loopback health, progress, and cancellation can run between batches.
+export const LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS = 500;
+// `postMessage` itself has no producer-side queue bound. Two shared credits let
+// one parser overlap extraction with one synchronous host write without ever
+// retaining more than two structured-clone batches (1,000 records) per lane.
+export const LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW = 2;
+
+const WORKER_BATCH_CREDITS = 0;
+const WORKER_BATCH_OUTSTANDING = 1;
+const WORKER_BATCH_PEAK_OUTSTANDING = 2;
+const WORKER_BATCH_WAIT_COUNT = 3;
+const WORKER_BATCH_WINDOW = 4;
+const WORKER_BATCH_CONTROL_LENGTH = 5;
+
+function assertWorkerBatchControl(control) {
+  if (!(control instanceof Int32Array)
+      || !(control.buffer instanceof SharedArrayBuffer)
+      || control.length !== WORKER_BATCH_CONTROL_LENGTH) {
+    throw new TypeError("worker batch control is invalid");
+  }
+  return control;
+}
+
+export function createLocalUnifiedIndexWorkerBatchControl({
+  initialCredits = LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+} = {}) {
+  if (!Number.isSafeInteger(initialCredits)
+      || initialCredits < 0
+      || initialCredits > LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW) {
+    throw new TypeError(
+      `initialCredits must be between 0 and ${LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW}`,
+    );
+  }
+  const control = new Int32Array(new SharedArrayBuffer(
+    Int32Array.BYTES_PER_ELEMENT * WORKER_BATCH_CONTROL_LENGTH,
+  ));
+  Atomics.store(control, WORKER_BATCH_CREDITS, initialCredits);
+  Atomics.store(
+    control,
+    WORKER_BATCH_WINDOW,
+    LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+  );
+  return control;
+}
+
+export function localUnifiedIndexWorkerBatchControlSnapshot(control) {
+  const view = assertWorkerBatchControl(control);
+  return {
+    credits: Atomics.load(view, WORKER_BATCH_CREDITS),
+    outstanding: Atomics.load(view, WORKER_BATCH_OUTSTANDING),
+    peakOutstanding: Atomics.load(view, WORKER_BATCH_PEAK_OUTSTANDING),
+    waitCount: Atomics.load(view, WORKER_BATCH_WAIT_COUNT),
+    window: Atomics.load(view, WORKER_BATCH_WINDOW),
+  };
+}
+
+export function releaseLocalUnifiedIndexWorkerBatch(control) {
+  const view = assertWorkerBatchControl(control);
+  while (true) {
+    const outstanding = Atomics.load(view, WORKER_BATCH_OUTSTANDING);
+    if (outstanding < 1) {
+      throw new Error("worker batch acknowledgement is unbalanced");
+    }
+    if (Atomics.compareExchange(
+      view,
+      WORKER_BATCH_OUTSTANDING,
+      outstanding,
+      outstanding - 1,
+    ) === outstanding) break;
+  }
+  const credits = Atomics.add(view, WORKER_BATCH_CREDITS, 1) + 1;
+  const window = Atomics.load(view, WORKER_BATCH_WINDOW);
+  if (credits > window) {
+    Atomics.sub(view, WORKER_BATCH_CREDITS, 1);
+    Atomics.add(view, WORKER_BATCH_OUTSTANDING, 1);
+    throw new Error("worker batch acknowledgement exceeds its window");
+  }
+  Atomics.notify(view, WORKER_BATCH_CREDITS, 1);
+}
+
+/**
+ * Deliver content-free progress with constant retained state. While one
+ * callback is in flight, newer snapshots replace the single pending slot.
+ * Callback failures are remembered but do not prevent the newest/final
+ * snapshot from being offered; drain then rethrows the first failure, matching
+ * the former promise-chain contract without retaining one closure per source.
+ */
+export function createLocalUnifiedIndexProgressPump(onProgress) {
+  if (typeof onProgress !== "function") {
+    throw new TypeError("onProgress must be a function");
+  }
+  let pending = null;
+  let running = false;
+  let runner = null;
+  let failure = null;
+
+  const run = async () => {
+    while (pending !== null) {
+      const progress = pending;
+      pending = null;
+      try {
+        await onProgress(progress);
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+  };
+  const start = () => {
+    if (running || pending === null) return;
+    running = true;
+    runner = run().finally(() => {
+      running = false;
+      if (pending !== null) start();
+    });
+  };
+
+  return Object.freeze({
+    offer(progress) {
+      pending = progress;
+      start();
+    },
+    async drain() {
+      while (running || pending !== null) {
+        if (!running) start();
+        const active = runner;
+        if (active !== null) await active;
+      }
+      if (failure !== null) throw failure;
+    },
+  });
+}
+
+// An off-main attempt owns one immutable, parent-generated token. The narrow
+// shape lets the bounded abandoned-stage scanner distinguish a terminated
+// same-process worker from the currently admitted retry without globbing by
+// token prefix. Direct callers leave the token unset and retain the legacy
+// PID/timestamp stage-name contract.
+export const LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
+
+export function validateLocalUnifiedIndexAttemptToken(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string"
+      || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(value)) {
+    throw fixedError("local_unified_index_attempt_token_invalid");
+  }
+  return value;
+}
+
+export function localUnifiedIndexStageFile(
+  indexFile,
+  kind,
+  attemptToken = null,
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw fixedError("local_unified_index_worker_options_invalid");
+  }
+  if (kind !== "building" && kind !== "incremental") {
+    throw fixedError("local_unified_index_worker_options_invalid");
+  }
+  const resolvedIndexFile = resolve(indexFile);
+  const token = validateLocalUnifiedIndexAttemptToken(attemptToken);
+  return token === null
+    ? `${resolvedIndexFile}.${kind}-${process.pid}-${Date.now().toString(36)}`
+    : `${resolvedIndexFile}.${kind}-${process.pid}-${token}`;
+}
+const { discoverCodexRolloutInfos } = localCodexLogScanner;
 
 const CODEX_BILLING_SURFACE = "chatgpt_subscription";
+
+export function sourceIdentityForInfo(info) {
+  return typeof info?.sourceIdentity === "string"
+      && info.sourceIdentity.length > 0
+    ? info.sourceIdentity
+    : info.rolloutKey;
+}
+
+export function sourceRepresentationIdentityForInfo(info) {
+  return typeof info?.path === "string" && info.path.length > 0
+    ? `representation:${info.path}`
+    : `representation:${info?.rolloutKey ?? "unknown"}`;
+}
+
+export function sourcePhysicalIdentityToken(info) {
+  const values = [info?.dev, info?.ino, info?.birthtimeMs].map(Number);
+  if (!values.every(Number.isFinite)) return null;
+  return values.map((value) => String(value)).join(":");
+}
+
+export function sourcePhysicalStateToken(info) {
+  const values = [info?.mtimeMs, info?.ctimeMs].map(Number);
+  if (!values.every(Number.isFinite)) return null;
+  return values.map((value) => String(value)).join(":");
+}
 
 function fixedError(code) {
   const error = new Error(code);
@@ -122,35 +327,98 @@ export function surfaceRow(surfaceClassification) {
  * when components are spread across worker threads.
  */
 export function lineageComponents(infos) {
-  const bySessionId = new Map();
+  const byThreadId = new Map();
+  const byRolloutId = new Map();
   for (const info of infos) {
-    if (info.lineage?.sessionId) bySessionId.set(info.lineage.sessionId, info);
-  }
-  const componentOf = new Map();
-  const components = [];
-
-  function rootOf(info, seen = new Set()) {
-    const parentId = info.lineage?.parentId;
-    if (!parentId || seen.has(parentId)) return info;
-    const parent = bySessionId.get(parentId);
-    if (!parent) return info;
-    seen.add(parentId);
-    return rootOf(parent, seen);
-  }
-
-  for (const info of infos) {
-    const root = rootOf(info);
-    let component = componentOf.get(root);
-    if (component === undefined) {
-      component = { root, members: [], bytes: 0 };
-      componentOf.set(root, component);
-      components.push(component);
+    const threadId = info.threadId ?? info.lineage?.sessionId;
+    if (threadId) {
+      const members = byThreadId.get(threadId) ?? [];
+      members.push(info);
+      byThreadId.set(threadId, members);
     }
-    component.members.push(info);
-    component.bytes += Number(info.size ?? 0);
+    if (info.rolloutId) byRolloutId.set(info.rolloutId, info);
   }
-  // `infos` already arrives sorted parent-before-child by lineage depth, so
-  // member order within a component is preserved by the push above.
+  const dependencies = new Map(infos.map((info) => [info, new Set()]));
+  const neighbors = new Map(infos.map((info) => [info, new Set()]));
+  function connect(info, dependency) {
+    if (dependency === undefined || dependency === info) return;
+    dependencies.get(info).add(dependency);
+    neighbors.get(info).add(dependency);
+    neighbors.get(dependency).add(info);
+  }
+  for (const info of infos) {
+    const baseId = info.lineage?.historyBase?.rolloutId ?? null;
+    if (baseId !== null) connect(info, byRolloutId.get(baseId));
+    const parentId = info.lineage?.parentId ?? null;
+    for (const parent of byThreadId.get(parentId) ?? []) {
+      connect(info, parent);
+    }
+  }
+
+  const components = [];
+  const assigned = new Set();
+  for (const start of infos) {
+    if (assigned.has(start)) continue;
+    const members = [];
+    const queue = [start];
+    let queueIndex = 0;
+    assigned.add(start);
+    while (queueIndex < queue.length) {
+      const current = queue[queueIndex];
+      queueIndex += 1;
+      members.push(current);
+      for (const neighbor of neighbors.get(current)) {
+        if (assigned.has(neighbor)) continue;
+        assigned.add(neighbor);
+        queue.push(neighbor);
+      }
+    }
+    const depthMemo = new Map();
+    function depth(startInfo) {
+      if (depthMemo.has(startInfo)) return depthMemo.get(startInfo);
+      const active = new Set();
+      const stack = [{ info: startInfo, expanded: false }];
+      while (stack.length > 0) {
+        const frame = stack[stack.length - 1];
+        if (depthMemo.has(frame.info)) {
+          active.delete(frame.info);
+          stack.pop();
+          continue;
+        }
+        if (!frame.expanded) {
+          frame.expanded = true;
+          active.add(frame.info);
+          for (const parent of dependencies.get(frame.info)) {
+            if (!depthMemo.has(parent) && !active.has(parent)) {
+              stack.push({ info: parent, expanded: false });
+            }
+          }
+          continue;
+        }
+        let maximumParentDepth = -1;
+        for (const parent of dependencies.get(frame.info)) {
+          maximumParentDepth = Math.max(
+            maximumParentDepth,
+            depthMemo.get(parent) ?? 0,
+          );
+        }
+        depthMemo.set(frame.info, maximumParentDepth + 1);
+        active.delete(frame.info);
+        stack.pop();
+      }
+      return depthMemo.get(startInfo) ?? 0;
+    }
+    members.sort((left, right) => (
+      depth(left) - depth(right)
+      || Number(left.resolvedHead === true) - Number(right.resolvedHead === true)
+      || left.rolloutKey.localeCompare(right.rolloutKey)
+    ));
+    components.push({
+      root: members[0],
+      members,
+      bytes: members.reduce((sum, info) => sum + Number(info.size ?? 0), 0),
+    });
+  }
   return components.sort((left, right) => right.bytes - left.bytes);
 }
 
@@ -174,6 +442,16 @@ export function balanceComponents(components, workerCount) {
   }
   return lanes.filter((lane) => lane.members.length > 0);
 }
+
+/**
+ * Resolve a paginated rollout's carried state at the exact physical history
+ * boundary named by Codex. The scan is content-free and emits no facts; its
+ * only output is the same bounded model/tier/counter and replay-snapshot state
+ * the normal extractor would hold after that prefix. Results are cached by
+ * immutable rollout id and cutoff so successive generations do not re-read
+ * one base boundary within a pass.
+ */
+export { createHistoryBaseSeedResolver };
 
 function accumulate(totals, source, oversizedLines) {
   totals.relevantLines += source.relevantLines;
@@ -202,9 +480,10 @@ export function writeCursorForOutcome(writer, deviceSalt, info, state, {
   finalTurnContextPending = false,
   turnContextSeen,
   snapshotsPersisted = false,
+  quarantineCode = null,
 }) {
   writer.writeSourceCursor({
-    sourceLocal: sourceLocal(deviceSalt, info.rolloutKey),
+    sourceLocal: sourceLocal(deviceSalt, sourceIdentityForInfo(info)),
     sourceOrdinal: state.sourceOrdinal ?? null,
     sessionLocal: state.sessionLocal,
     scannedBytes: nextOffset,
@@ -212,6 +491,17 @@ export function writeCursorForOutcome(writer, deviceSalt, info, state, {
     mtimeMs: Number.isSafeInteger(info.mtimeMs)
       ? info.mtimeMs
       : Math.floor(Number(info.mtimeMs ?? 0)),
+    sourceDev: Number.isSafeInteger(Number(info.dev)) ? Number(info.dev) : null,
+    sourceIno: Number.isSafeInteger(Number(info.ino)) ? Number(info.ino) : null,
+    sourceBirthtimeMs: Number.isFinite(Number(info.birthtimeMs))
+      ? Math.floor(Number(info.birthtimeMs))
+      : null,
+    sourceCtimeMs: Number.isFinite(Number(info.ctimeMs))
+      ? Math.floor(Number(info.ctimeMs))
+      : null,
+    sourceIdentityToken: sourcePhysicalIdentityToken(info),
+    sourceStateToken: sourcePhysicalStateToken(info),
+    quarantineCode,
     snapshotsPersisted,
     turnContextSeen,
     carryModel: finalModel,
@@ -239,17 +529,35 @@ export function persistingCollector(collector, writer, deviceSalt, sessionLocalK
   };
 }
 
-function eventKeyFor(deviceSalt, sessionLocalKey, sourceOffset, observedAtMs) {
+function replacePersistedSnapshotsFromHistory({
+  snapshots,
+  info,
+  historySeed,
+  collector,
+  writer,
+  deviceSalt,
+  sessionLocalKey,
+}) {
+  if (collector === null) return;
+  const seedSnapshots = historySeed?.seedSnapshots ?? [];
+  if (!snapshots.replaceFor(info, seedSnapshots)) return;
+  writer.clearLineageSnapshots(sessionLocalKey);
+  for (const key of seedSnapshots) {
+    writer.addLineageSnapshot(sessionLocalKey, snapshotLocal(deviceSalt, key));
+  }
+}
+
+function eventKeyFor(deviceSalt, sourceLocalKey, sourceOffset, observedAtMs) {
   // 32 raw bytes, deterministic, content-free, and stable across rebuilds: the
-  // same (session, byte offset) always produces the same key, so a rerun is
-  // idempotent rather than duplicating history. The old key was 64 hex
+  // same (physical rollout, byte offset) always produces the same key, so a
+  // rerun is idempotent rather than duplicating history. The old key was 64 hex
   // characters of SHA-256 over a JSON re-encoding of the entire record, which
   // meant every stored field had to be reproduced byte-for-byte to recompute
   // it.
   return localDigest(
     deviceSalt,
     "unified-index-event",
-    `${sessionLocalKey.toString("hex")}\0${sourceOffset}\0${observedAtMs}`,
+    `${Buffer.from(sourceLocalKey).toString("hex")}\0${sourceOffset}\0${observedAtMs}`,
   );
 }
 
@@ -282,6 +590,19 @@ export function createEventSink({
   const gates = new Map();
   const settled = new Map();
   const sourceSuppressed = new Map();
+  const perSourceCounts = new Map();
+
+  function sourceKey(source) {
+    return source.sourceLocal.toString("hex");
+  }
+
+  function add(source, field, value = 1) {
+    counts[field] += value;
+    const key = sourceKey(source);
+    const sourceCounts = perSourceCounts.get(key) ?? {};
+    sourceCounts[field] = (sourceCounts[field] ?? 0) + value;
+    perSourceCounts.set(key, sourceCounts);
+  }
 
   function gateFor(source) {
     const key = source.sourceLocal.toString("hex");
@@ -297,21 +618,23 @@ export function createEventSink({
 
   function occurrence(entry, admission) {
     writer.writeQuotaOccurrence({ ...entry, generationId, admission });
-    if (admission === "admitted") counts.quotaOccurrences += 1;
+    if (admission === "admitted") add(entry, "quotaOccurrences");
   }
 
   return {
     counts,
     write(source, event) {
       const declaration = modelDeclaration(event.model);
-      if (declaration.recognition === "missing") counts.modelMissing += 1;
-      if (declaration.recognition === "unrecognized") counts.modelUnrecognized += 1;
-      if (event.partial) counts.partialEvents += 1;
+      if (declaration.recognition === "missing") add(source, "modelMissing");
+      if (declaration.recognition === "unrecognized") {
+        add(source, "modelUnrecognized");
+      }
+      if (event.partial) add(source, "partialEvents");
       let quotaObservationId = null;
       const gate = gateFor(source);
       for (const [slotOrder, window] of event.quota.entries()) {
         const id = writer.internQuota(window);
-        counts.quotaObservations += 1;
+        add(source, "quotaObservations");
         if (quotaObservationId === null || window.slot === "primary") {
           quotaObservationId = id;
         }
@@ -348,7 +671,7 @@ export function createEventSink({
           windowDurationMins: entry.durationMins,
         }, entry.observedAtMs, entry);
         for (const withheld of decision.withheld) {
-          counts.contradictedLeadingSnapshotsSkipped += 1;
+          add(source, "contradictedLeadingSnapshotsSkipped");
           const key = source.sourceLocal.toString("hex");
           sourceSuppressed.set(key, (sourceSuppressed.get(key) ?? 0) + 1);
           occurrence(withheld, "suppressed");
@@ -362,7 +685,7 @@ export function createEventSink({
       writer.writeUsageEvent({
         eventKey: eventKeyFor(
           deviceSalt,
-          source.sessionLocal,
+          source.sourceLocal,
           event.sourceOffset,
           event.observedAtMs,
         ),
@@ -392,15 +715,20 @@ export function createEventSink({
         tokensOutCombined: null,
         totalInputContext: null,
         partial: event.partial === true,
+        modelInherited: event.modelInherited === true,
+        cacheWriteAssumedZero: event.cacheWriteAssumedZero === true,
       });
-      counts.usageEvents += 1;
-      if (counts.usageEvents % 50_000 === 0) onCounts?.(counts);
+      add(source, "usageEvents");
+      if (onCounts !== null && onCounts !== undefined
+          && counts.usageEvents % LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS === 0) {
+        onCounts(counts);
+      }
     },
     writeBoundary(source, event) {
       writer.writeUsageEventBoundary({
         currentEventKey: eventKeyFor(
           deviceSalt,
-          source.sessionLocal,
+          source.sourceLocal,
           event.currentSourceOffset,
           event.currentObservedAtMs,
         ),
@@ -409,7 +737,7 @@ export function createEventSink({
         compactedAtMs: event.compactedAtMs,
         sessionLocal: source.sessionLocal,
       });
-      counts.boundaryLinks += 1;
+      add(source, "boundaryLinks");
     },
     writeTool(source, event) {
       const inserted = writer.writeToolClassFact({
@@ -429,7 +757,7 @@ export function createEventSink({
         toolClass: event.toolClass,
         sourceKind: event.sourceKind,
       });
-      counts.toolEvents += inserted;
+      add(source, "toolEvents", inserted);
     },
     finishSource(source) {
       const gate = gates.get(source.sourceLocal.toString("hex"));
@@ -442,23 +770,51 @@ export function createEventSink({
           sourceSuppressed.get(source.sourceLocal.toString("hex")) ?? 0,
       };
     },
+    discardSource(source) {
+      const key = sourceKey(source);
+      const sourceCounts = perSourceCounts.get(key) ?? {};
+      for (const [field, value] of Object.entries(sourceCounts)) {
+        counts[field] -= value;
+      }
+      perSourceCounts.delete(key);
+      gates.delete(key);
+      settled.delete(key);
+      sourceSuppressed.delete(key);
+    },
   };
 }
 
 async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatch }) {
   return new Promise((settle, fail) => {
+    const batchControl = createLocalUnifiedIndexWorkerBatchControl();
     const worker = new Worker(
       new URL("./local-unified-index-worker.js", import.meta.url),
       {
         workerData: {
           maximumLineBytes,
+          batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
+          batchControl: batchControl.buffer,
+          batchWindow: LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
           components: lane.components.map((members) => members.map((info) => ({
             path: info.path,
             size: Number(info.size ?? 0),
+            physicalSize: info.physicalSize,
+            compressed: info.compressed === true,
             sessionId: info.lineage?.sessionId ?? null,
             parentId: info.lineage?.parentId ?? null,
             isFork: info.lineage?.isFork === true,
+            isInlineFork: info.lineage?.isInlineFork === true,
+            historyMode: info.lineage?.historyMode ?? "legacy",
+            historyBase: info.lineage?.historyBase ?? null,
+            startOrdinal: info.lineage?.startOrdinal ?? 0,
+            resolvedHead: info.resolvedHead === true,
+            rolloutId: info.rolloutId ?? null,
             rolloutKey: info.rolloutKey,
+            dev: info.dev,
+            ino: info.ino,
+            birthtimeMs: info.birthtimeMs,
+            mtimeMs: info.mtimeMs,
+            ctimeMs: info.ctimeMs,
           }))),
         },
         execArgv: [],
@@ -473,6 +829,7 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
     let failed = null;
     const abort = () => worker.terminate();
     signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     worker.on("message", (message) => {
       if (message.type === "batch") {
         try {
@@ -480,6 +837,8 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
         } catch (error) {
           failed = error;
           worker.terminate();
+        } finally {
+          releaseLocalUnifiedIndexWorkerBatch(batchControl);
         }
         return;
       }
@@ -518,6 +877,7 @@ export async function rebuildLocalUnifiedIndex({
   commitRows = 10_000,
   deferSecondaryIndexes = true,
   maximumLineBytes,
+  attemptToken = null,
   signal = null,
   onProgress = null,
   discoveryLimits = null,
@@ -535,6 +895,10 @@ export async function rebuildLocalUnifiedIndex({
   if (typeof deferSecondaryIndexes !== "boolean") {
     throw new TypeError("deferSecondaryIndexes must be a boolean");
   }
+  if (onProgress !== null && typeof onProgress !== "function") {
+    throw new TypeError("onProgress must be a function or null");
+  }
+  validateLocalUnifiedIndexAttemptToken(attemptToken);
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
   await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
@@ -550,10 +914,15 @@ export async function rebuildLocalUnifiedIndex({
     signal,
     discoveryLimits,
   });
+  const discovery = codexRolloutDiscoveryReceipt(infos);
   const discoveredAt = performance.now();
-  const sourceBytes = infos.reduce((total, info) => total + Number(info.size ?? 0), 0);
+  const sourceBytes = discovery.discoveredSourceBytes;
 
-  const stageFile = `${resolvedIndexFile}.building-${process.pid}-${Date.now().toString(36)}`;
+  const stageFile = localUnifiedIndexStageFile(
+    resolvedIndexFile,
+    "building",
+    attemptToken,
+  );
   await removeIfPresent(stageFile);
   let database = null;
   let generation = null;
@@ -569,7 +938,7 @@ export async function rebuildLocalUnifiedIndex({
     recoverUnifiedIndexGenerations(database);
     generation = beginUnifiedIndexGeneration(database, {
       contractVersion,
-      discoveredSourceCount: infos.length,
+      discoveredSourceCount: discovery.discoveredSourceCount,
       discoveredSourceBytes: sourceBytes,
     });
     writer = createUnifiedIndexWriter(database, {
@@ -595,7 +964,7 @@ export async function rebuildLocalUnifiedIndex({
       deviceSalt,
       accountScopeId,
       generationId: generation.generationId,
-      onCounts: null,
+      onCounts: () => queueProgress(),
     });
   } catch (error) {
     try {
@@ -607,8 +976,12 @@ export async function rebuildLocalUnifiedIndex({
     throw error;
   }
   const diagnostics = {
-    sources: infos.length,
+    sources: discovery.discoveredSourceCount,
     sourceBytes,
+    skippedSourceCount: discovery.skippedSourceCount,
+    skippedSourceBytes: discovery.skippedSourceBytes,
+    skippedThreadCount: discovery.skippedThreadCount,
+    quarantineReasonCounts: { ...discovery.reasonCounts },
     sourcesScanned: 0,
     bytesScanned: 0,
     relevantLines: 0,
@@ -623,22 +996,28 @@ export async function rebuildLocalUnifiedIndex({
     peakRetainedSnapshotKeys: 0,
   };
 
+  const allSources = [...infos, ...discovery.quarantined]
+    .toSorted((left, right) => (
+      left.rolloutKey.localeCompare(right.rolloutKey)
+      || left.path.localeCompare(right.path)
+    ));
   const sourceOrdinals = new Map(
-    infos.map((info, ordinal) => [info.rolloutKey, ordinal]),
+    allSources.map((info, ordinal) => [info, ordinal]),
   );
-  let progressTail = Promise.resolve();
-  let progressFailure = null;
-  function queueProgress() {
+  const progressPump = onProgress === null
+    ? null
+    : createLocalUnifiedIndexProgressPump(onProgress);
+  let lastQueuedProgressAt = -Infinity;
+  function queueProgress({ force = false } = {}) {
     if (onProgress === null) return;
+    const now = performance.now();
+    if (!force && now - lastQueuedProgressAt < 1_000) return;
+    lastQueuedProgressAt = now;
     const progress = {
       ...diagnostics,
       usageEvents: sink.counts.usageEvents,
     };
-    progressTail = progressTail
-      .then(() => onProgress(progress))
-      .catch((error) => {
-        progressFailure ??= error;
-      });
+    progressPump.offer(progress);
   }
   const sourceState = new Map();
   function stateFor(info) {
@@ -646,13 +1025,13 @@ export async function rebuildLocalUnifiedIndex({
     let state = sourceState.get(key);
     if (state === undefined) {
       const sessionId = info.lineage?.sessionId ?? info.rolloutKey;
-      const local = sourceLocal(deviceSalt, info.rolloutKey);
+      const local = sourceLocal(deviceSalt, sourceIdentityForInfo(info));
       const surface = surfaceRow(info.lineage?.surfaceClassification);
       state = {
         sessionLocal: sessionLocal(deviceSalt, sessionId),
         sourceLocal: local,
         sourceId: writer.internSource(local),
-        sourceOrdinal: sourceOrdinals.get(info.rolloutKey),
+        sourceOrdinal: sourceOrdinals.get(info),
         surface,
         surfaceId: writer.internSurface(surface),
         finalModel: null,
@@ -678,15 +1057,188 @@ export async function rebuildLocalUnifiedIndex({
     return state;
   }
 
-  const bySessionId = new Map();
-  for (const info of infos) {
-    if (info.lineage?.sessionId) bySessionId.set(info.lineage.sessionId, info);
+  const issueTotals = new Map();
+  const issueGroups = new Map();
+  const issueThreadCounts = new Map();
+  const skippedThreadLocals = new Set();
+  for (const info of discovery.quarantined) {
+    const sessionId = info.threadId ?? info.lineage?.sessionId ?? info.rolloutKey;
+    const sessionKey = sessionLocal(deviceSalt, sessionId);
+    // Failed discovery rows represent each physical filename separately. They
+    // carry no facts or cursor; accepted facts use sourceIdentityForInfo.
+    const sourceKey = sourceLocal(
+      deviceSalt,
+      sourceRepresentationIdentityForInfo(info),
+    );
+    const surface = surfaceRow(info.lineage?.surfaceClassification);
+    writer.recordSessionIdentity(sessionKey, sessionId);
+    writer.writeGenerationSource({
+      sourceLocal: sourceKey,
+      sourceOrdinal: sourceOrdinals.get(info),
+      sessionLocal: sessionKey,
+      surfaceId: writer.internSurface(surface),
+      status: "failed",
+      discoveredSizeBytes: Number(info.size ?? 0),
+      scannedBytes: 0,
+      mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
+      diagnosticsComplete: true,
+    });
+    const totals = issueTotals.get(info.quarantineReason) ?? {
+      sourceCount: 0,
+      sourceBytes: 0,
+    };
+    totals.sourceCount += 1;
+    totals.sourceBytes += Number(info.size ?? 0);
+    issueTotals.set(info.quarantineReason, totals);
+    const groupKey = `${sessionKey.toString("hex")}\0${info.quarantineReason}`;
+    skippedThreadLocals.add(sessionKey.toString("hex"));
+    const newGroup = !issueGroups.has(groupKey);
+    const group = issueGroups.get(groupKey) ?? {
+      groupLocal: sessionKey,
+      code: info.quarantineReason,
+      sourceCount: 0,
+      sourceBytes: 0,
+    };
+    group.sourceCount += 1;
+    group.sourceBytes += Number(info.size ?? 0);
+    issueGroups.set(groupKey, group);
+    if (newGroup) {
+      issueThreadCounts.set(
+        info.quarantineReason,
+        (issueThreadCounts.get(info.quarantineReason) ?? 0) + 1,
+      );
+    }
   }
+  for (const [code, totals] of issueTotals) {
+    writer.writeGenerationIssue(code, {
+      ...totals,
+      threadCount: issueThreadCounts.get(code) ?? 0,
+    });
+  }
+  for (const group of issueGroups.values()) {
+    writer.writeGenerationIssueGroup(group.groupLocal, group.code, group);
+  }
+
+  function recordRuntimeIssue(info, code, state) {
+    const totals = issueTotals.get(code) ?? { sourceCount: 0, sourceBytes: 0 };
+    totals.sourceCount += 1;
+    totals.sourceBytes += Number(info.size ?? 0);
+    issueTotals.set(code, totals);
+    const sessionHex = state.sessionLocal.toString("hex");
+    skippedThreadLocals.add(sessionHex);
+    const groupKey = `${sessionHex}\0${code}`;
+    const newGroup = !issueGroups.has(groupKey);
+    const group = issueGroups.get(groupKey) ?? {
+      groupLocal: state.sessionLocal,
+      code,
+      sourceCount: 0,
+      sourceBytes: 0,
+    };
+    group.sourceCount += 1;
+    group.sourceBytes += Number(info.size ?? 0);
+    issueGroups.set(groupKey, group);
+    if (newGroup) {
+      issueThreadCounts.set(code, (issueThreadCounts.get(code) ?? 0) + 1);
+    }
+    writer.writeGenerationIssue(code, {
+      ...totals,
+      threadCount: issueThreadCounts.get(code) ?? 0,
+    });
+    writer.writeGenerationIssueGroup(group.groupLocal, code, group);
+    diagnostics.skippedSourceCount += 1;
+    diagnostics.skippedSourceBytes += Number(info.size ?? 0);
+    diagnostics.skippedThreadCount = skippedThreadLocals.size;
+    if (newGroup) {
+      diagnostics.quarantineReasonCounts[code]
+        = (diagnostics.quarantineReasonCounts[code] ?? 0) + 1;
+    }
+  }
+
+  const invalidRolloutIds = new Set();
+  const invalidSessionIds = new Set();
+  // One entry at most per discovered source. Runtime quarantine can be
+  // detected only after that source has already emitted facts, but a cold
+  // stage intentionally has no secondary indexes while parser lanes load.
+  // Retain only the bounded metadata needed to remove and cursor the source
+  // after those indexes exist; no record content is kept here.
+  const pendingQuarantineCleanup = new Map();
+  function dependencyUnavailable(info) {
+    const baseId = info.lineage?.historyBase?.rolloutId ?? null;
+    if (baseId !== null && invalidRolloutIds.has(baseId)) return true;
+    const parentId = info.lineage?.parentId ?? null;
+    return info.lineage?.isInlineFork === true
+      && parentId !== null
+      && invalidSessionIds.has(parentId);
+  }
+  function markUnavailable(info) {
+    if (typeof info.rolloutId === "string") invalidRolloutIds.add(info.rolloutId);
+    if (typeof info.lineage?.sessionId === "string") {
+      invalidSessionIds.add(info.lineage.sessionId);
+    }
+  }
+
+  function writeQuarantineCursor(info, state, reason) {
+    if (reason !== "codex_rollout_content_invalid"
+        && reason !== "codex_rollout_tail_incomplete"
+        && reason !== "codex_rollout_lineage_invalid") return;
+    writeCursorForOutcome(writer, deviceSalt, info, state, {
+      nextOffset: 0,
+      finalModel: null,
+      finalEffort: null,
+      finalTierRaw: null,
+      finalTierObservedAtMs: null,
+      finalTotals: null,
+      turnContextSeen: false,
+      snapshotsPersisted: false,
+      quarantineCode: reason,
+    });
+  }
+
+  function quarantineSource(
+    info,
+    state,
+    reason,
+    sourceDiagnostics = {},
+    { factsMayExist = true } = {},
+  ) {
+    sink.discardSource(state);
+    markUnavailable(info);
+    if (deferSecondaryIndexes && factsMayExist) {
+      pendingQuarantineCleanup.set(state.sourceLocal.toString("hex"), {
+        info,
+        state,
+        reason,
+      });
+    } else {
+      // Discovery/dependency quarantines have emitted no staged facts and can
+      // write their terminal cursor immediately. Runtime quarantines clean up
+      // immediately only when the database already has its secondary indexes.
+      if (factsMayExist) {
+        writer.deleteSourceFacts(state.sourceLocal, state.sessionLocal);
+      }
+      writeQuarantineCursor(info, state, reason);
+    }
+    writer.writeSourceDiagnostics(state.sourceLocal, sourceDiagnostics);
+    writer.writeGenerationSource({
+      sourceLocal: state.sourceLocal,
+      sourceOrdinal: state.sourceOrdinal,
+      sessionLocal: state.sessionLocal,
+      surfaceId: state.surfaceId,
+      status: "failed",
+      discoveredSizeBytes: Number(info.size ?? 0),
+      scannedBytes: 0,
+      mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
+      diagnosticsComplete: true,
+    });
+    recordRuntimeIssue(info, reason, state);
+  }
+
+  const logicalHeads = resolveLogicalRolloutHeads(infos);
   function seedFor(info) {
     const none = { seedModel: null, seedEffort: null, seedTier: null };
     const parentId = info.lineage?.parentId;
     if (!parentId) return none;
-    const parent = bySessionId.get(parentId);
+    const parent = logicalHeads.get(parentId);
     if (!parent) return none;
     const parentState = sourceState.get(parent.rolloutKey);
     if (parentState === undefined) return none;
@@ -700,8 +1252,20 @@ export async function rebuildLocalUnifiedIndex({
       seedTier: inheritedTierSeed(parentState.finalTier),
     };
   }
+  const parentModels = createParentModelResolver(infos, { maximumLineBytes, signal });
+  const historySeeds = createHistoryBaseSeedResolver(infos, {
+    maximumLineBytes,
+    signal,
+  });
 
   try {
+    // Discovery and schema setup can take observable time before the first
+    // source completes. Publish the known content-free inventory immediately,
+    // then keep large single-source scans visibly moving below.
+    await onProgress?.({
+      ...diagnostics,
+      usageEvents: sink.counts.usageEvents,
+    });
     if (workerCount === 1) {
       // Iterated by lineage component, exactly as the worker lanes are, so the
       // ancestor snapshot sets a fork needs are alive when it is scanned and
@@ -712,39 +1276,102 @@ export async function rebuildLocalUnifiedIndex({
           for (const info of component.members) {
             if (signal?.aborted) throw fixedError("local_unified_index_aborted");
             const state = stateFor(info);
-            const seed = seedFor(info);
-            if (seed.seedModel !== null) diagnostics.modelSeededFromLineage += 1;
+            if (dependencyUnavailable(info)) {
+              quarantineSource(
+                info,
+                state,
+                "codex_rollout_lineage_invalid",
+                {},
+                { factsMayExist: false },
+              );
+              queueProgress();
+              continue;
+            }
+            const logicalSeed = info.lineage?.historyMode === "paginated"
+              ? null
+              : seedFor(info);
             const collector = snapshots.collectorFor(info);
-            const outcome = await extractRolloutUsage(info.path, {
+            const historySeed = await historySeeds.resolveSeed(info, {
+              // Exact history snapshots are only needed when another inline
+              // fork can replay this logical session. Ordinary paginated
+              // continuations need only the constant-size carried state.
+              includeSnapshots: collector !== null,
+            });
+            const selectedSeed = selectRolloutUsageSeed(info, {
+              historySeed,
+              logicalSeed,
+            });
+            if (selectedSeed.seedModel !== null) {
+              diagnostics.modelSeededFromLineage += 1;
+            }
+            replacePersistedSnapshotsFromHistory({
+              snapshots,
+              info,
+              historySeed,
+              collector,
+              writer,
+              deviceSalt,
+              sessionLocalKey: state.sessionLocal,
+            });
+            const parentModelAt = selectedSeed.seedModel === null
+              ? await parentModels.forSource(info) : null;
+            const outcome = await withStableRolloutSource(info, (source) => (
+              extractRolloutUsage(source, {
               size: Number(info.size ?? 0),
-              isFork: info.lineage?.isFork === true,
-              inheritedSnapshots: snapshots.inheritedFor(info),
+              isFork: info.lineage?.isInlineFork === true,
+              inheritedSnapshots: info.lineage?.isInlineFork === true
+                ? snapshots.inheritedFor(info)
+                : null,
               collectSnapshots: persistingCollector(
                 collector,
                 writer,
                 deviceSalt,
                 state.sessionLocal,
               ),
-              seedModel: seed.seedModel,
-              seedEffort: seed.seedEffort,
-              seedTier: seed.seedTier,
+              ...selectedSeed,
+              parentModelAt,
               maximumLineBytes,
               signal,
               onEvent: (event) => sink.write(state, event),
               onBoundary: (event) => sink.writeBoundary(state, event),
-              onTool: (event) => sink.writeTool(state, event),
-            });
+                onTool: (event) => sink.writeTool(state, event),
+              })
+            ));
+            sink.finishSource(state);
+            const sourceDiagnostics = {
+              ...outcome.diagnostics,
+              oversizedLines: outcome.read.oversizedLines,
+              ...sink.diagnosticsForSource(state),
+            };
+            diagnostics.sourcesScanned += 1;
+            diagnostics.bytesScanned += Number(info.size ?? 0);
+            accumulate(diagnostics, outcome.diagnostics, outcome.read.oversizedLines);
+            diagnostics.peakRetainedSnapshotKeys = Math.max(
+              diagnostics.peakRetainedSnapshotKeys,
+              snapshots.retainedKeys,
+            );
+            const quarantineReason = rolloutContentQuarantineReason(outcome);
+            if (quarantineReason !== null) {
+              quarantineSource(
+                info,
+                state,
+                quarantineReason,
+                sourceDiagnostics,
+              );
+              queueProgress();
+              continue;
+            }
             state.finalModel = outcome.finalModel;
             state.finalEffort = outcome.finalEffort;
             state.finalTier = outcome.finalTier;
-            sink.finishSource(state);
             writeCursorForOutcome(writer, deviceSalt, info, state, {
               nextOffset: outcome.read.nextOffset,
               finalModel: outcome.finalModel,
               finalEffort: outcome.finalEffort,
               // Only this file's own declarations are carried. An inherited
-              // seed is re-derived from the ancestor chain on the next pass,
-              // so its lineage_inherited provenance survives a resume.
+              // seed is re-derived from the exact physical history base for
+              // paginated sources or the legacy inline ancestor chain, so its
+              // lineage_inherited provenance survives a resume.
               finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
               finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
               finalTotals: outcome.finalTotals,
@@ -753,11 +1380,7 @@ export async function rebuildLocalUnifiedIndex({
               turnContextSeen: outcome.finalTurnContextSeen,
               snapshotsPersisted: collector !== null,
             });
-            writer.writeSourceDiagnostics(state.sourceLocal, {
-              ...outcome.diagnostics,
-              oversizedLines: outcome.read.oversizedLines,
-              ...sink.diagnosticsForSource(state),
-            });
+            writer.writeSourceDiagnostics(state.sourceLocal, sourceDiagnostics);
             writer.writeGenerationSource({
               sourceLocal: state.sourceLocal,
               sourceOrdinal: state.sourceOrdinal,
@@ -769,14 +1392,7 @@ export async function rebuildLocalUnifiedIndex({
               mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
               diagnosticsComplete: true,
             });
-            diagnostics.sourcesScanned += 1;
-            diagnostics.bytesScanned += Number(info.size ?? 0);
-            accumulate(diagnostics, outcome.diagnostics, outcome.read.oversizedLines);
-            diagnostics.peakRetainedSnapshotKeys = Math.max(
-              diagnostics.peakRetainedSnapshotKeys,
-              snapshots.retainedKeys,
-            );
-            await onProgress?.({ ...diagnostics, usageEvents: sink.counts.usageEvents });
+            queueProgress();
           }
         } finally {
           snapshots.release();
@@ -792,6 +1408,15 @@ export async function rebuildLocalUnifiedIndex({
           const info = byRolloutKey.get(message.rolloutKey);
           if (info === undefined) return;
           const state = stateFor(info);
+          if (message.snapshotReset === true) {
+            writer.clearLineageSnapshots(state.sessionLocal);
+            for (const key of message.snapshotSeedKeys ?? []) {
+              writer.addLineageSnapshot(
+                state.sessionLocal,
+                snapshotLocal(deviceSalt, key),
+              );
+            }
+          }
           for (const event of message.events) sink.write(state, event);
           for (const event of message.boundaries ?? []) {
             sink.writeBoundary(state, event);
@@ -807,6 +1432,41 @@ export async function rebuildLocalUnifiedIndex({
           }
           if (message.final === true) {
             sink.finishSource(state);
+            const sourceDiagnostics = {
+              ...message.diagnostics,
+              oversizedLines: message.diagnostics.oversizedLines ?? 0,
+              ...sink.diagnosticsForSource(state),
+            };
+            const sourceWasScanned = Number.isSafeInteger(
+              message.diagnostics.relevantLines,
+            );
+            if (sourceWasScanned) {
+              diagnostics.sourcesScanned += 1;
+              diagnostics.bytesScanned += Number(info.size ?? 0);
+              accumulate(
+                diagnostics,
+                message.diagnostics,
+                message.diagnostics.oversizedLines,
+              );
+              diagnostics.peakRetainedSnapshotKeys = Math.max(
+                diagnostics.peakRetainedSnapshotKeys,
+                message.diagnostics.retainedSnapshotKeys ?? 0,
+              );
+              if (message.diagnostics.seeded) {
+                diagnostics.modelSeededFromLineage += 1;
+              }
+            }
+            if (typeof message.quarantineReason === "string") {
+              quarantineSource(
+                info,
+                state,
+                message.quarantineReason,
+                sourceDiagnostics,
+                { factsMayExist: sourceWasScanned },
+              );
+              queueProgress();
+              return;
+            }
             if (message.cursor) {
               writeCursorForOutcome(
                 writer,
@@ -816,11 +1476,7 @@ export async function rebuildLocalUnifiedIndex({
                 message.cursor,
               );
             }
-            writer.writeSourceDiagnostics(state.sourceLocal, {
-              ...message.diagnostics,
-              oversizedLines: message.diagnostics.oversizedLines,
-              ...sink.diagnosticsForSource(state),
-            });
+            writer.writeSourceDiagnostics(state.sourceLocal, sourceDiagnostics);
             writer.writeGenerationSource({
               sourceLocal: state.sourceLocal,
               sourceOrdinal: state.sourceOrdinal,
@@ -832,25 +1488,22 @@ export async function rebuildLocalUnifiedIndex({
               mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
               diagnosticsComplete: true,
             });
-            diagnostics.sourcesScanned += 1;
-            diagnostics.bytesScanned += Number(info.size ?? 0);
-            accumulate(
-              diagnostics,
-              message.diagnostics,
-              message.diagnostics.oversizedLines,
-            );
-            diagnostics.peakRetainedSnapshotKeys = Math.max(
-              diagnostics.peakRetainedSnapshotKeys,
-              message.diagnostics.retainedSnapshotKeys ?? 0,
-            );
-            if (message.diagnostics.seeded) diagnostics.modelSeededFromLineage += 1;
             queueProgress();
+            return;
           }
+          // One large rollout can take minutes to close. The worker's bounded
+          // batches already contain content-free counts, so publish them at a
+          // one-second maximum cadence without exposing source identity.
+          queueProgress();
         },
       })));
-      await progressTail;
-      if (progressFailure !== null) throw progressFailure;
     }
+    // A forced final offer overwrites any stale pending snapshot, while an
+    // already in-flight callback is allowed to settle normally. Thus every
+    // rebuild publishes its initial and final state with at most two retained
+    // progress objects regardless of source count or callback latency.
+    queueProgress({ force: true });
+    await progressPump?.drain();
 
     const scannedAt = performance.now();
     if (signal?.aborted) throw fixedError("local_unified_index_aborted");
@@ -861,21 +1514,68 @@ export async function rebuildLocalUnifiedIndex({
       // depend on them.
       writer.flush();
       createLocalUnifiedIndexSecondaryIndexes(database);
+      if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+      // Cleanup begins only after schema-v11's exact supporting indexes exist.
+      // Failed generation rows and public progress were already updated when
+      // quarantine was detected, but no bad fact can reach finalization.
+      for (const cleanup of pendingQuarantineCleanup.values()) {
+        if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+        writer.deleteSourceFacts(
+          cleanup.state.sourceLocal,
+          cleanup.state.sessionLocal,
+        );
+        writeQuarantineCursor(
+          cleanup.info,
+          cleanup.state,
+          cleanup.reason,
+        );
+      }
+      writer.flush();
     }
-    writer.writeMeta("source_count", infos.length);
+    writer.writeMeta("source_count", discovery.discoveredSourceCount);
     writer.writeMeta("source_bytes", sourceBytes);
     writer.writeMeta("usage_events", sink.counts.usageEvents);
     writer.writeMeta("boundary_links", sink.counts.boundaryLinks);
     writer.writeMeta("generated_at", new Date().toISOString());
     writer.writeMeta("contract_version", contractVersion);
+    writer.writeMeta(
+      "source_identity_version",
+      LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
+    );
+    writer.writeMeta("rollout_discovery_fingerprint", discovery.fingerprint);
+    writer.writeMeta(
+      "rollout_quarantine_fingerprint",
+      discovery.quarantineFingerprint,
+    );
     if (signal?.aborted) throw fixedError("local_unified_index_aborted");
-    writer.writeMeta("status", "complete");
+    writer.flush();
+    const indexedSources = database.prepare(`
+      SELECT COUNT(*) AS count,
+             COALESCE(SUM(discovered_size_bytes), 0) AS bytes
+      FROM generation_source
+      WHERE generation_id = ? AND status <> 'failed'`).get(
+      generation.generationId,
+    );
+    const totalSkippedSourceCount = [...issueTotals.values()]
+      .reduce((sum, totals) => sum + totals.sourceCount, 0);
+    const totalSkippedSourceBytes = [...issueTotals.values()]
+      .reduce((sum, totals) => sum + totals.sourceBytes, 0);
+    const generationStatus = totalSkippedSourceCount > 0
+      ? "partial"
+      : "complete";
+    writer.writeMeta("status", generationStatus);
     writer.finalizeGeneration({
-      status: "complete",
-      discoveredSourceCount: infos.length,
+      status: generationStatus,
+      blockReason: generationStatus === "partial"
+        ? "codex_rollout_sources_quarantined"
+        : null,
+      discoveredSourceCount: discovery.discoveredSourceCount,
       discoveredSourceBytes: sourceBytes,
-      indexedSourceCount: infos.length,
-      indexedSourceBytes: sourceBytes,
+      indexedSourceCount: Number(indexedSources.count),
+      indexedSourceBytes: Number(indexedSources.bytes),
+      skippedSourceCount: totalSkippedSourceCount,
+      skippedSourceBytes: totalSkippedSourceBytes,
+      skippedThreadCount: skippedThreadLocals.size,
       discoveryComplete: true,
       diagnosticsComplete: true,
     });
@@ -884,7 +1584,8 @@ export async function rebuildLocalUnifiedIndex({
       generation.generationId,
     );
     const closed = await writer.close({ integrityCheck: true, fsyncPath: null });
-    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile);
+    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile, { signal });
     return {
       status: "built",
       indexFile: resolvedIndexFile,
@@ -918,8 +1619,14 @@ export async function rebuildLocalUnifiedIndex({
   }
 }
 
-export function defaultRebuildWorkerCount() {
-  return Math.min(MAXIMUM_WORKERS, Math.max(1, availableParallelism() - 2));
+export function defaultRebuildWorkerCount(parallelism = availableParallelism()) {
+  if (!Number.isSafeInteger(parallelism) || parallelism < 1) {
+    throw new TypeError("parallelism must be a positive safe integer");
+  }
+  return Math.min(
+    MAXIMUM_AUTOMATIC_WORKERS,
+    Math.max(1, parallelism - AUTOMATIC_WORKER_RESERVED_PARALLELISM),
+  );
 }
 
 export function rebuildSourceLabel(info) {

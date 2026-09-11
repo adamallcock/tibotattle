@@ -198,13 +198,19 @@ test("published legacy and unified indexes classify context-presence mismatch th
       contradictedLeadingSnapshotsSkipped: 0,
       cumulativeCounterRegressions: 0,
       forkReplayEventsSkipped: 0,
+      malformedAccountingRecords: 0,
       malformedLines: 0,
+      malformedRateLimitRecords: 0,
       malformedTimestamps: 0,
+      malformedUsageRecords: 0,
       modelMissing: 0,
       modelSeededFromLineage: 0,
       oversizedLines: 0,
       partialLines: 0,
-      relevantLines: 3,
+      // The hardened extractor treats the single leading session_meta as a
+      // reviewed structural record so an appended second identity can poison
+      // the source atomically instead of merging two threads.
+      relevantLines: 4,
       salvagedRecords: 0,
       tierEvents: 0,
       tierSeededFromLineage: 0,

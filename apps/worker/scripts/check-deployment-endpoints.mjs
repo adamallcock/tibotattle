@@ -29,6 +29,7 @@ import {
 import {
   RELEASE_CHANNELS,
   STABLE_RELEASE_CHANNEL,
+  resolveReleaseChannel,
 } from "../../../config/release-channels.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -162,6 +163,12 @@ export function validateWorkerSparkleReleaseContract(
       );
     }
   }
+  const intel = resolveReleaseChannel(STABLE_RELEASE_CHANNEL, { architecture: "x64" });
+  for (const field of ["appcastURL", "appcastObjectKey", "objectPrefix"]) {
+    if (contract.intel?.[field] !== intel.sparkle[field]) {
+      fail(`Worker Sparkle Intel contract ${field} must match the reviewed architecture`);
+    }
+  }
   if (contract.serviceOrigin !== endpoints.public.origin
       || contract.updateOrigin !== endpoints.sparkle.origin
       || contract.appcastURL !== endpoints.sparkle.appcastURL
@@ -248,6 +255,17 @@ export function validateWorkerDeploymentEndpoints(
   endpoints = DEPLOYMENT_ENDPOINTS,
 ) {
   assertDeploymentEndpoints(endpoints);
+  const staging = configuration?.env?.staging;
+  if (!staging || typeof staging !== "object") {
+    fail("wrangler.jsonc must define an env.staging deployment");
+  }
+  if (staging.name !== endpoints.staging.workerName
+      || staging.workers_dev !== endpoints.staging.workersDev
+      || staging.preview_urls !== endpoints.staging.previewUrls
+      || Object.hasOwn(staging, "routes")
+      || staging.vars?.PUBLIC_ORIGIN !== endpoints.staging.origin) {
+    fail("Worker staging configuration must match the reviewed nonproduction endpoint");
+  }
   const production = configuration?.env?.production;
   if (!production || typeof production !== "object") {
     fail("wrangler.jsonc must define an env.production deployment");
@@ -275,6 +293,7 @@ export function validateWorkerDeploymentEndpoints(
     adminHost: endpoints.admin.host,
     publicOrigin: production.vars.PUBLIC_ORIGIN,
     routeHosts: Object.freeze([...routeHosts]),
+    stagingOrigin: endpoints.staging.origin,
   });
 }
 
@@ -290,7 +309,7 @@ export function validateDeploymentEndpointConsumers({
   if (MACOS_PREVIEW_PUBLIC_CONFIGURATION.centralOrigin
       !== endpoints.public.origin
       || MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL
-        !== endpoints.sparkle.appcastURL) {
+        !== endpoints.sparkle.previewAppcastURL) {
     fail("macOS preview defaults must match config/deployment-endpoints.js");
   }
   if (APPROVED_R2_BUCKET !== endpoints.sparkle.r2Bucket
@@ -323,6 +342,7 @@ export function validateDeploymentEndpointConsumers({
   }
   return Object.freeze({
     appcastURL: endpoints.sparkle.appcastURL,
+    previewAppcastURL: endpoints.sparkle.previewAppcastURL,
     publicOrigin: endpoints.public.origin,
     r2Bucket: endpoints.sparkle.r2Bucket,
   });

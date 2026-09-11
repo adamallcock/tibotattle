@@ -4,8 +4,8 @@ import { dirname, relative, resolve, sep } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import * as legacyScanner from "../src/codex-log-scan.js";
 import * as codexLocalUsageAnalysis from "../src/codex-local-usage-analysis.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import * as providerNormalization from "../src/providers/codex/log-normalization.js";
 import * as providerLogs from "../src/providers/codex/logs.js";
 import * as providerSurface from "../src/providers/codex/surface-classification.js";
@@ -24,20 +24,28 @@ const CODEX_PROVIDER_ROOT = resolve(
 const PROVIDER_PUBLIC_EXPORTS = [
   "CODEX_LOG_SCAN_VERSION",
   "CodexLogSourceChangedError",
+  "MAX_STATE_BYTES",
+  "METHOD",
   "canonicalComponentAvailability",
   "canonicalComponents",
+  "canonicalRateLimitSnapshot",
   "canonicalRateLimitWindows",
   "classifySessionSurface",
   "classifyToolCall",
+  "codexSessionMetaIdentity",
+  "codexRolloutDiscoveryReceipt",
   "createCodexLogScanner",
   "createLeadingRateLimitGate",
+  "createParser",
   "createSnapshotLineage",
   "cumulativeSnapshotKey",
   "deltaComponentPresence",
+  "digest",
   "extractToolObservations",
   "isCodexSpeedMode",
   "normalizeProviderTier",
   "normalizeTokenUsage",
+  "parseCodexRolloutFilename",
   "sameUsage",
   "subtractUsage",
   "tokenComponentPresence",
@@ -45,35 +53,22 @@ const PROVIDER_PUBLIC_EXPORTS = [
   "validateTierDeclaration",
 ].sort();
 
-const LEGACY_SCANNER_EXPORTS = [
-  "CodexLogSourceChangedError",
+const RUNTIME_SCANNER_OPERATIONS = [
   "appendedRolloutSourcesAreAfterEnd",
-  "canonicalComponentAvailability",
-  "canonicalComponents",
-  "canonicalRateLimitWindows",
-  "classifyToolCall",
   "codexLogSourceFingerprint",
-  "createLeadingRateLimitGate",
-  "createSnapshotLineage",
-  "cumulativeSnapshotKey",
-  "deltaComponentPresence",
+  "codexRolloutDiscoveryReceipt",
   "discoverCodexRolloutInfos",
   "discoverCodexRollouts",
-  "extractToolObservations",
   "hasForkReplayPrefix",
-  "normalizeTokenUsage",
   "readRolloutLineage",
-  "sameUsage",
-  "scanAndPriceCodexLogs",
   "scanCodexLogEvents",
-  "subtractUsage",
   "summarizeCodexRolloutSources",
-  "tokenComponentPresence",
 ].sort();
 
 const BOUND_SCANNER_OPERATIONS = [
   "appendedRolloutSourcesAreAfterEnd",
   "codexLogSourceFingerprint",
+  "codexRolloutDiscoveryReceipt",
   "discoverCodexRolloutInfos",
   "discoverCodexRollouts",
   "hasForkReplayPrefix",
@@ -85,8 +80,10 @@ const BOUND_SCANNER_OPERATIONS = [
 const LEGACY_PURE_PROVIDER_BINDINGS = [
   "canonicalComponentAvailability",
   "canonicalComponents",
+  "canonicalRateLimitSnapshot",
   "canonicalRateLimitWindows",
   "classifyToolCall",
+  "codexSessionMetaIdentity",
   "createLeadingRateLimitGate",
   "createSnapshotLineage",
   "cumulativeSnapshotKey",
@@ -96,6 +93,12 @@ const LEGACY_PURE_PROVIDER_BINDINGS = [
   "sameUsage",
   "subtractUsage",
   "tokenComponentPresence",
+];
+
+const PROVIDER_NORMALIZATION_BINDINGS = [
+  ...LEGACY_PURE_PROVIDER_BINDINGS,
+  "canonicalRateLimitSnapshot",
+  "codexSessionMetaIdentity",
 ];
 
 const TIER_PROVIDER_BINDINGS = [
@@ -168,31 +171,17 @@ test("only the application scanner composition owner references the provider fac
   assert.deepEqual(references, ["src/application/local-codex-log-scanner.js"]);
 });
 
-test("the root Codex scanner preserves its exact legacy API through provider identities", () => {
+test("the local Node composition exposes only bound scanner operations", () => {
   assert.deepEqual(
-    Object.keys(legacyScanner).sort(),
-    LEGACY_SCANNER_EXPORTS,
+    Object.keys(localCodexLogScanner).sort(),
+    RUNTIME_SCANNER_OPERATIONS,
   );
-  assert.equal(
-    legacyScanner.scanAndPriceCodexLogs,
-    codexLocalUsageAnalysis.scanAndPriceCodexLogs,
-    "the exact legacy pricing binding remains application-owned",
-  );
-  for (const binding of LEGACY_PURE_PROVIDER_BINDINGS) {
-    assert.equal(
-      legacyScanner[binding],
-      providerLogs[binding],
-      `${binding} must be the provider binding, not a duplicate wrapper`,
-    );
-  }
-  assert.equal(
-    legacyScanner.CodexLogSourceChangedError,
-    providerLogs.CodexLogSourceChangedError,
-  );
+  assert.equal(Object.hasOwn(localCodexLogScanner, "scanAndPriceCodexLogs"), false);
+  assert.equal(typeof codexLocalUsageAnalysis.scanAndPriceCodexLogs, "function");
 });
 
 test("the Codex log facade re-exports each pure provider binding by identity", () => {
-  for (const binding of LEGACY_PURE_PROVIDER_BINDINGS) {
+  for (const binding of PROVIDER_NORMALIZATION_BINDINGS) {
     assert.equal(
       providerLogs[binding],
       providerNormalization[binding],
@@ -212,7 +201,7 @@ test("the Codex log facade re-exports each pure provider binding by identity", (
   }
 });
 
-test("the Codex log scanner factory binds exactly the eight source operations", () => {
+test("the Codex log scanner factory binds exactly the nine source operations", () => {
   const filesystem = Object.fromEntries([
     "createSha256",
     "currentUid",
@@ -221,6 +210,7 @@ test("the Codex log scanner factory binds exactly the eight source operations", 
     "lstatPath",
     "openDirectory",
     "openReadOnlyNoFollow",
+    "readSelectedRolloutNames",
     "readUtf8LinesRange",
     "readUtf8Range",
     "statPath",

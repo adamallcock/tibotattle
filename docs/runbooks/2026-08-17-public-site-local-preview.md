@@ -2,7 +2,7 @@
 title: TiboTattle public-site local preview
 date: 2026-08-17
 type: runbook
-status: developer-local-visual-review
+status: maintained
 ---
 
 # TiboTattle public-site local preview

@@ -1,13 +1,22 @@
 import { access } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
+import { promisify } from "node:util";
 import { deriveOpenAIAccountScope, sanitizeAccountScope } from "./account-scope.js";
 import { normalizeProviderPlanType } from "./plan-normalization.js";
+import {
+  sanitizeProviderQuotaLimitDisplayName,
+  sanitizeProviderQuotaLimitId,
+} from "./quota-metadata.js";
 import { normalizeProviderQuotaWindow } from "./quota-normalization.js";
 import { RELEASE_VERSION } from "../../../config/release-manifest.js";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
+const BINARY_VERSION_TIMEOUT_MS = 5_000;
+const BINARY_VERSION_MAXIMUM_BYTES = 4_096;
+const CODEX_BINARY_DIAGNOSTIC_SCHEMA_VERSION = "codex-binary-diagnostic-v0.1";
+const execFileAsync = promisify(execFile);
 const ACCOUNT_HMAC_ENV = "APP_USAGEMONITOR_ACCOUNT_HMAC_KEY";
 // The app's Keychain broker announcement names a descriptor in *this*
 // process, and this child's descriptor 0 is a different file entirely. No
@@ -23,26 +32,98 @@ export function codexAppServerChildEnv(environment = process.env) {
   return childEnvironment;
 }
 
-async function isExecutable(path) {
+async function isExecutable(path, accessFile = access) {
   try {
-    await access(path);
+    await accessFile(path);
     return true;
   } catch {
     return false;
   }
 }
 
-export async function findCodexBinary() {
+async function resolveCodexBinary({
+  environment = process.env,
+  accessFile = access,
+} = {}) {
   const candidates = [
-    process.env.CODEX_BIN,
-    "/Applications/ChatGPT.app/Contents/Resources/codex",
-    "/Applications/Codex.app/Contents/Resources/codex",
-  ].filter(Boolean);
+    {
+      binary: environment.CODEX_BIN,
+      source: "environment_override",
+    },
+    {
+      binary: "/Applications/ChatGPT.app/Contents/Resources/codex",
+      source: "chatgpt_bundled",
+    },
+    {
+      binary: "/Applications/Codex.app/Contents/Resources/codex",
+      source: "codex_bundled",
+    },
+  ].filter((candidate) => (
+    typeof candidate.binary === "string" && candidate.binary.length > 0
+  ));
 
   for (const candidate of candidates) {
-    if (await isExecutable(candidate)) return candidate;
+    if (await isExecutable(candidate.binary, accessFile)) return candidate;
   }
-  return "codex";
+  return { binary: "codex", source: "path" };
+}
+
+export async function findCodexBinary(options = {}) {
+  return (await resolveCodexBinary(options)).binary;
+}
+
+async function readCodexBinaryVersion(binary, {
+  environment = process.env,
+} = {}) {
+  const { stdout } = await execFileAsync(binary, ["--version"], {
+    encoding: "utf8",
+    env: codexAppServerChildEnv(environment),
+    maxBuffer: BINARY_VERSION_MAXIMUM_BYTES,
+    timeout: BINARY_VERSION_TIMEOUT_MS,
+    windowsHide: true,
+  });
+  return stdout;
+}
+
+function normalizedCodexBinaryVersion(value) {
+  if (typeof value !== "string" || value.length > BINARY_VERSION_MAXIMUM_BYTES) {
+    return null;
+  }
+  const pattern = /^(?:codex(?:-cli)?\s+)?([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/u;
+  for (const line of value.split(/\r?\n/u)) {
+    const match = pattern.exec(line.trim());
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/**
+ * Resolve the same binary precedence as the app-server client, but return only
+ * a path-free, closed diagnostic. Version inspection is best effort: doctor
+ * must still identify the selected source when an old or broken binary cannot
+ * answer `--version`.
+ */
+export async function inspectCodexBinary({
+  environment = process.env,
+  accessFile = access,
+  readVersion = readCodexBinaryVersion,
+} = {}) {
+  const selected = await resolveCodexBinary({ environment, accessFile });
+  let version = null;
+  try {
+    version = normalizedCodexBinaryVersion(await readVersion(selected.binary, {
+      environment,
+    }));
+  } catch {
+    // Reachability is established separately by app-server initialization.
+    // Never copy process errors, stderr, or a raw path into this diagnostic.
+  }
+  return {
+    schemaVersion: CODEX_BINARY_DIAGNOSTIC_SCHEMA_VERSION,
+    source: selected.source,
+    versionStatus: version === null ? "unavailable" : "available",
+    version,
+  };
 }
 
 export class CodexAppServerError extends Error {
@@ -129,6 +210,10 @@ export class CodexAppServerClient extends EventEmitter {
     }
     if (message.method === "account/rateLimits/updated") {
       this.emit("rateLimitsUpdated", message.params ?? null);
+    } else if (message.method === "account/updated" || message.method === "account/login/completed") {
+      // Account-change notifications can contain identity/login material. The
+      // collector only needs an invalidation signal, never that payload.
+      this.emit("accountChanged");
     }
   }
 
@@ -211,11 +296,11 @@ function sanitizeLimitWindow(window) {
   return normalizeProviderQuotaWindow(window);
 }
 
-export function sanitizeRateLimit(limit) {
-  if (!limit) return null;
+export function sanitizeRateLimit(limit, fallbackLimitId = "unknown") {
+  if (!limit || typeof limit !== "object" || Array.isArray(limit)) return null;
   return {
-    limitId: limit.limitId,
-    limitName: limit.limitName ?? null,
+    limitId: sanitizeProviderQuotaLimitId(limit.limitId ?? fallbackLimitId),
+    limitName: sanitizeProviderQuotaLimitDisplayName(limit.limitName),
     primary: sanitizeLimitWindow(limit.primary),
     secondary: sanitizeLimitWindow(limit.secondary),
     planType: normalizeProviderPlanType(limit.planType),
@@ -249,10 +334,18 @@ export function sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
     throw new Error(raw?.error?.message ?? "Codex did not return a canonical rate-limit snapshot");
   }
   const canonical = sanitizeRateLimit(raw.rateLimits);
+  if (canonical === null) {
+    throw new Error("Codex returned a malformed canonical rate-limit snapshot");
+  }
   const byLimitId = Object.fromEntries(
-    Object.entries(raw.rateLimitsByLimitId ?? {}).map(([id, limit]) => [id, sanitizeRateLimit(limit)]),
+    Object.entries(raw.rateLimitsByLimitId ?? {}).flatMap(([id, limit]) => {
+      const sanitized = sanitizeRateLimit(limit, id);
+      return sanitized === null ? [] : [[sanitized.limitId, sanitized]];
+    }),
   );
-  if (!byLimitId[canonical.limitId]) byLimitId[canonical.limitId] = canonical;
+  if (!Object.hasOwn(byLimitId, canonical.limitId)) {
+    byLimitId[canonical.limitId] = canonical;
+  }
 
   const usage = snapshot.accountUsage;
   const dailyUsageBuckets = Array.isArray(usage?.dailyUsageBuckets)
@@ -291,11 +384,16 @@ async function loadAccountObservationSecretSafely(loadAccountObservationSecret) 
     }
     return { secret, unavailableReason: null };
   } catch (error) {
+    let unavailableReason = "credential_unavailable";
+    if (error?.code === "account_observation_credential_locked") {
+      unavailableReason = "credential_locked";
+    } else if (error?.code
+        === "account_observation_credential_migration_required") {
+      unavailableReason = "credential_migration_required";
+    }
     return {
       secret: null,
-      unavailableReason: error?.code === "account_observation_credential_locked"
-        ? "credential_locked"
-        : "credential_unavailable",
+      unavailableReason,
     };
   }
 }
@@ -325,6 +423,50 @@ export async function sanitizeCodexAccountSnapshotWithSecretLoader(snapshot, cap
       accountHmacKey: loaded.secret,
       accountCredentialUnavailableReason: loaded.unavailableReason,
     });
+  } finally {
+    loaded.secret?.fill(0);
+  }
+}
+
+/**
+ * A matching account read on each side of an observation is still only
+ * provisional account evidence, not an exact bridge to a rollout occurrence.
+ * Keep the quota/usage evidence when either account read is unavailable or the
+ * reads disagree, but do not attach an account to that evidence.
+ */
+export async function sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snapshot, capturedAt, {
+  loadAccountObservationSecret,
+} = {}) {
+  const loaded = await loadAccountObservationSecretSafely(loadAccountObservationSecret);
+  try {
+    const result = sanitizeCodexAccountSnapshot({
+      account: snapshot.accountAfter,
+      rateLimits: snapshot.rateLimits,
+      accountUsage: snapshot.accountUsage,
+    }, capturedAt, {
+      accountHmacKey: loaded.secret,
+      accountCredentialUnavailableReason: loaded.unavailableReason,
+    });
+    const before = sanitizeAccountScope(deriveOpenAIAccountScope(snapshot.accountBefore, {
+      secret: loaded.secret,
+      planType: normalizeProviderPlanType(snapshot.accountBefore?.account?.planType ?? result.canonical.planType),
+      unavailableSecretReason: loaded.unavailableReason,
+    }));
+    const after = result.accountScope;
+    if (before.status !== "available" || after.status !== "available") {
+      result.accountScope = after.status === "unavailable" ? after : before;
+      return result;
+    }
+    const knownPlans = new Set([
+      before.planType,
+      after.planType,
+      result.canonical.planType,
+      ...Object.values(result.byLimitId).map((limit) => limit.planType),
+    ].filter((plan) => plan !== null && plan !== "unknown"));
+    if (before.scopeId !== after.scopeId || knownPlans.size > 1) {
+      result.accountScope = sanitizeAccountScope(null);
+    }
+    return result;
   } finally {
     loaded.secret?.fill(0);
   }

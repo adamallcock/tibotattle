@@ -118,10 +118,14 @@ test("removal confirmation is target-bound and wrong tokens are non-mutating", a
   assert.equal(backend.calls.includes("delete"), false);
 });
 
-test("locked, denied, and unavailable backend failures are fixed and content-free", async () => {
+test("Keychain recovery failures are fixed and content-free", async () => {
   for (const [upstream, expected] of [
     ["export_identity_keychain_locked", "credential_locked"],
     ["export_identity_keychain_denied", "credential_denied"],
+    [
+      "export_identity_keychain_migration_required",
+      "credential_migration_required",
+    ],
     ["arbitrary", "credential_unavailable"],
   ]) {
     const backend = memoryBackend();

@@ -1,33 +1,75 @@
----
-title: TiboTattle macOS Release Runbook
-date: 2026-07-29
-type: runbook
-status: implemented-foundation
----
+# Native macOS app
 
-# TiboTattle macOS release runbook
+This directory contains TiboTattle's supported native foreground launcher and
+macOS release contracts. Public stable releases are signed, notarized, packaged,
+and published through the retained external-distribution gates. A local source
+or development build is usable for development but does not inherit those
+release claims. The canonical operator sequence is the
+[macOS stable release runbook](../../docs/runbooks/macos-stable-release-runbook.md);
+this README documents the maintained component and user lifecycle.
 
-This directory contains the native foreground launcher and the release
-contracts for a self-contained Usage Monitor app. The ordinary developer build
-is usable locally but is not a public installer. The external-distribution path
-fails closed unless production service configuration, approved artwork,
-Developer ID signing, Apple notarization, stapling, Gatekeeper assessment, and
-a clean-profile smoke all succeed.
+For the native/loopback launch contract, fixed URL scheme, WKWebView messages,
+Keychain broker, Codex subprocess protocol, platform APIs, and system diagram,
+see the canonical
+[TiboTattle API surface reference](../../docs/reference/api-surface.md).
+
+The packaged companion reaches Keychain only through the app's private
+protocol-v2 socket broker. Its closed capability enum covers export identity,
+account observation, Claude-session pseudonym, and contribution device; no
+service/account string crosses the wire. The current packaged-companion graph
+uses the export-identity, account-observation, and contribution-device
+mappings; the Claude callback remains a standalone CLI/local-review
+composition. When only a legacy `.v1` item exists, a narrow native helper with
+the legacy Node signing identity attempts a silent read up to three times, with
+short backoff. Automatic reads forbid Keychain interaction. The retry budget is
+shared for the app process, including companion restarts. The helper can serve
+only an authenticated native parent over its private descriptor; it accepts no
+service, account, path, or arbitrary credential query.
+
+The native app creates the `.app.v1` item only if absent and verifies an exact
+readback. A conflicting modern item is never overwritten; the legacy item is
+retained as a recovery copy. If silent attempts cannot finish, the broker
+returns `migration_required` and the app quietly offers **Settings… → General →
+Secure upgrade → Review migration…**. Only the explained **Approve migration**
+action can enable a Keychain prompt. Cancel is the default, and a denial leaves
+the key intact and does not schedule another prompt. The menu's **Finish secure
+upgrade…** action opens Settings, not the system prompt. Reset or deletion is
+not migration recovery. All four adapters retain a content-free
+migration-required diagnostic. The packaged runtime excludes `@github/keytar`;
+standalone CLI/local-review tooling retains that compatibility backend. See the
+[migration decision and remaining qualification gates](../../docs/decisions/2026-08-31-silent-keychain-migration.md)
+before treating source tests as signed-upgrade evidence.
 
 ## Consumer lifecycle in the app
 
+The companion's first snapshot uses its bounded startup projection and retains
+only validated last-good evidence with explicit coverage labels. The initial
+automatic refresh updates current quota/headline evidence only. Manual
+**Refresh** updates quota and detailed accounting together; detailed accounting
+also runs through the bounded hourly attempt;
+optional contribution requests do not define local-dashboard readiness.
+The native host treats 20 seconds as a quiet slow-load threshold, keeps the
+document visible, and continues one generation-fenced readiness observation for
+at most 120 seconds. A stalled JavaScript reply cannot suspend that deadline.
+New navigation or teardown cancels the old observation. A valid late result (or
+an explicit Open Dashboard after the hard deadline) consumes the pending initial
+refresh once and clears the stale readiness-timeout diagnostic.
+
 1. Launch **TiboTattle.app**.
 2. On the first launch, review the one-time **Get Started** disclosure. It
-   explains exactly which Codex metadata can be read after an explicit Analyze
-   action, what owner-only local state is retained, which content is excluded,
-   how optional contribution stays off, and what happens when the browser or
-   app closes. The accessible native **Start TiboTattle at login** control is
+   names every normal local source: selected Codex `sessions` and
+   `archived_sessions`, `state_5.sqlite`, `session_index.jsonl`, `config.toml`, the installed Codex
+   app-server methods `account/read`, `account/rateLimits/read`, and
+   `account/usage/read`. It also explains what owner-only derived state is
+   retained, which content is excluded, how optional contribution stays off,
+   and what happens when the window or app closes. The
+   accessible native **Start TiboTattle at login** control is
    visibly preselected. Choosing **Get Started** is the affirmative action
    that may register the native Login Item; clearing it continues without a
    Login Item. The acknowledgement is an owner-only local receipt; moving
    local app data to Trash makes the disclosure appear again.
 3. The native window starts one private loopback companion on an ephemeral
-   port and performs its existing bounded local refresh while the normal app
+   port and performs a quick quota/headline refresh while the normal app
    remains open. The Login Item adds no separate scanner; raw logs and prompts
    are never uploaded by the launch itself, and optional contribution keeps its
    separate review and consent controls.
@@ -36,14 +78,40 @@ a clean-profile smoke all succeed.
    foreground application and installs no `LSUIElement` agent. The compact
    title shows the primary observed quota lane only while the companion reports
    fresh verified evidence; stale, unobserved, starting, and failed states all
-   show a neutral `–`, and an in-progress pass shows `…`. The menu lists every
-   supported observed quota lane. It hides stale percentages and reset times,
-   and shows a reset countdown only for fresh verified evidence. Its disabled
-   rows name the observation and freshness state, so the menu bar never
-   displays a number it cannot justify. The item offers one primary **Open
-   TiboTattle** destination, state-aware **Analyze/Update Local Usage**, and
-   **Quit TiboTattle**; Quit uses the same graceful shutdown as the window's own
-   Quit control.
+   show a neutral `–`. An in-progress pass keeps the fresh current number when
+   one is available and shows `…` only while no current lane can be shown.
+   Left-click opens a
+   transient native popover with fresh-only five-hour and seven-day allowance
+   tracks, the shared weekly pace forecast expressed as under, near, or over
+   sustainable pace with a now-to-reset coverage track, and coverage-aware
+   local-calendar usage bars for 7 or 30 days. The pace reading is shown only
+   after compatible local quota observations bind to the exact current weekly
+   reset; one observation is named as collecting, never promoted to a trend.
+   The bars use
+   observed tokens; dollar figures are explicitly Standard API-price
+   equivalents, not a subscription bill, and disappear when pricing evidence
+   cannot support them. During refresh the last completed usage analysis stays
+   visible with an explicit retained-history label, including both chart ranges
+   and their original coverage. A transient read failure also keeps that
+   labelled history, while current quota and forecast claims are cleared.
+   Companion restart or source replacement clears all previous in-memory
+   evidence; first-run or invalid history is never fabricated. Missing evidence
+   is a named gap, never a zero. The
+   popover forecast is an ephemeral, strict projection from the companion's
+   narrow read-only weekly-pace endpoint. Request-time geometry is recalculated
+   from the retained strict forecast without rerunning accounting; it is never
+   stored, logged, exported, or added to community data. It contains no account
+   identity, plan claim, purchase flow, reset credits, or redemption action.
+   Clicking outside the popover dismisses it even if another app was already
+   active when it opened. Its outside mouse listener exists only while the
+   popover is open; it does not record event content, monitor global keys, or
+   consume clicks destined for other apps. Popover controls and a second click
+   on its status icon retain their normal control and toggle behavior.
+   Right-click or Control-click opens the native action menu with **Open
+   TiboTattle**, state-aware **Analyze/Update Local
+   Usage**, Settings, About, update checks when available, and **Quit
+   TiboTattle**. Quit uses the same graceful shutdown as the window's own Quit
+   control.
 5. Choose **Open TiboTattle** and explicitly start local analysis.
 6. If the companion fails or exits, choose **Retry**. The app does not require
    a relaunch for ordinary recovery.
@@ -56,7 +124,7 @@ a clean-profile smoke all succeed.
    only `default` or `custom`, never the path.
 9. Choose **About TiboTattle** → **Check for Updates** to check a signed
    production appcast. Automatic update downloads are controlled by one native
-   switch in **Settings…** → **General**. Developer and ad-hoc builds contain
+   switch in **Settings…** → **About**. Developer and ad-hoc builds contain
    no updater framework and perform no update networking.
 10. **Settings…** → **Notifications** contains **Local allowance
    notifications**. It is off by default; enabling it is the only action that
@@ -130,8 +198,25 @@ better outside the report: local status, **Refresh usage**, **Share**, and
 **Settings**. **Share** opens the report's existing local share card; it does
 not create a second report or sharing service.
 
-The toolbar has no independent data authority. **Refresh usage** reuses the
-already-running loopback Node companion and its existing local refresh route.
+Both recent cache-drop tables offer local **Thread name** links, with separate
+parent and subworker links when ancestry is known. Click or keyboard-activate
+a link to open its canonical `codex://threads/<UUID>` target in Codex. A
+native-owned isolated content world checks the trusted click; the shell then
+revalidates the source main frame, pinned companion origin, and exact target.
+Programmatic navigation and generic new-window requests cannot open Codex, and
+no names or identifiers are logged or persisted by this handoff. Native
+context-menu **Open Link** does not perform this Codex handoff; use the link
+itself. Existing HTTPS and hosted sign-in-return behavior are unchanged.
+
+The toolbar has no independent data authority. **Refresh usage**, Cmd-R, and
+menu-bar/popover Refresh use the already-running loopback companion's detailed
+route: quota and retained history advance together, and valid cached accounting
+is reused. There is no separate detailed-accounting action. The foreground interval may make at
+most one automatic detailed attempt per hour while no refresh is in flight;
+startup and intervening checks stay quick. Failed, cancelled, and interrupted
+detailed attempts count toward the hourly budget. A companion terminal receipt
+clears the native busy state before optional presentation reads; activation and
+wake reconcile that state without launching a second refresh.
 There is still one companion child while the app is open; the in-app refresh
 timer is only foreground scheduling, not a daemon, login item, LaunchAgent, or
 background URL session. The separate Keychain-reset helper remains available
@@ -155,23 +240,65 @@ Before touching Keychain, it stops the companion and validates the two exact
 local residue files. Other indexes, cached analysis, prepared contributions,
 settings, account-observation keys, Claude-session pseudonym keys, and Codex
 logs remain. The action does not revoke a hosted device or delete hosted data;
-those require the hosted privacy workflow. It does not claim secure erasure.
+confirmed **Disconnect this Mac** separately revokes this device's hosted
+authority while preserving hosted/local history. Private owner erasure is
+separate and has no self-service app control under the
+[2026-08-30 source contract](../../docs/decisions/2026-08-30-self-service-deletion-retirement.md).
+This source change is not an installed-release or deployment claim. Local reset
+does not claim secure erasure.
 After the reset, future contribution activity uses a new identity and requires
 pairing again.
 
-The ordinary uninstall journey is simply: quit Usage Monitor and move
+The ordinary uninstall journey is simply: quit TiboTattle and move
 **TiboTattle.app** to Trash. Advanced local cleanup is kept under
 **Data & Diagnostics…** rather than presented as part of normal onboarding.
 
 ## Developer build
 
-The current bundle is pinned to Node 26.2.0 and Apple silicon:
+The builder requires Node 26.2.0 on Apple silicon. Its default target remains
+Apple silicon:
 
 ```bash
 npm run product:macos:build
 npm run product:macos:validate:development
 open ".release-build/macos/TiboTattle.app"
 ```
+
+An Intel target is available on the same Apple silicon builder. The published
+0.1.18 Intel app is supported under its release-specific manual-qualification
+waiver; the command here creates only a development test build:
+
+```bash
+node scripts/build-macos-app.js --architecture x64 \
+  --node-runtime "<verified-node-v26.2.0-darwin-x64>/bin/node" \
+  --test-build --output ".release-build/macos-intel-test/TiboTattle.app"
+```
+
+Use the official Node 26.2.0 Darwin x64 distribution, including its adjacent
+`LICENSE`. The builder checks the pinned executable and license hashes before
+executing the staged runtime. It compiles the launcher and native Keychain
+migration helper for `x86_64`. A development build retains ad-hoc signing and a
+disabled updater. Do not install this shared-identity development app over a
+stable app or run it against stable user state as a qualification shortcut.
+
+The DMG packager, installer validator and release CLI accept `--architecture
+x64`; native inspection checks all bundled executables against that target.
+Release construction also requires the verified `--node-runtime`. Preview and
+release modes retain their existing signing, source, identity and credential
+gates. Intel uses separate stable/dogfood/Preview feeds; it cannot consume the
+Apple silicon feed. Published installers for both architectures are also
+available through the [same Homebrew cask](../../README.md#install-macos-apple-silicon-or-intel),
+which selects the matching DMG; it does not change the app's update feed.
+
+These source paths do not qualify real Intel hardware, final signed/notarized
+installers or updater installation. See the
+[Intel release plan](../../docs/plans/2026-09-03-macos-intel-release.md) and
+[macOS release runbook](../../docs/runbooks/macos-stable-release-runbook.md)
+for the remaining gates. The owner's [0.1.18-only manual qualification
+waiver](../../docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+accepts unavailable physical Intel testing as a release risk, not a passed
+hardware test. The commands below show the default Apple silicon
+packaging path; pass `--architecture x64` and the Intel app path for Intel.
 
 Create a deterministic-layout developer DMG:
 
@@ -231,24 +358,46 @@ workflow, test requirements, and the future-locale checklist are in
 ## Preview distribution build
 
 Use the explicit preview channel when a local test client must exercise an
-approved deployed HTTPS central service while retaining the normal
-`com.usagemonitor.local` bundle identity for OAuth callbacks. It is not a
-production release. The command stages the bundle at
-`.release-build/macos-preview/current/TiboTattle.app`, validates it, and
-reports its local path, integrity information, channel, and updater mode.
+approved deployed HTTPS central service. It is not a production release, and
+it is deliberately isolated from the stable client:
+
+- app and bundle identity: `TiboTattle Preview.app` and
+  `com.usagemonitor.local.preview`;
+- semantic-open route: `usagemonitor-preview://open`;
+- local state root: `~/Library/Application Support/Usage Monitor Preview`;
+- Keychain namespace/account: `app-usagemonitor.preview.*` and
+  `preview-installation`, never stable's existing `app-usagemonitor.*` /
+  `installation` pairs; and
+- update feed: `/preview/appcast.xml`, never stable's `/appcast.xml`.
+
+The command stages the bundle at
+`.release-build/macos-preview/current/TiboTattle Preview.app`, validates those
+boundaries, and reports its local path, integrity information, channel, and
+updater mode. A newly installed Preview therefore starts without the stable
+app's derived index and must build its own schema-11 index from readable local
+source history. It is suitable for isolated product smoke, not for proving an
+in-place stable-data migration or immediate continuity of stable dashboard
+figures; use the signed `internal-dogfood` lane for that release gate, or
+rehearse migration against a disposable copy. Launching or replacing a preview
+does not migrate, overwrite, read, reset, or delete stable application or
+Keychain state. The native plist seals the reviewed namespace/account pair to the
+preview bundle identifier, and the companion accepts only that complete pair
+or stable's historical pair; arbitrary service/account input is rejected.
 
 The preview command prepares the pinned framework and, by default, uses the
-same public central-service origin, signed-feed URL, and Sparkle public key as
-the installed TiboTattle client. That makes the ordinary local QA build a real
-client of the deployed service rather than a no-service development bundle.
-No private release credential is embedded or read.
+same public central-service origin as the installed TiboTattle client, but a
+separate preview appcast path. That makes the ordinary local QA build a real
+client of the deployed service without enrolling it in stable updates. The
+preview feed may remain unpublished; in that state manual update checks report
+unavailable and automatic update opt-in remains disabled. No private release
+credential is embedded or read.
 
 An operator may override those **public** values only when deliberately testing
 another reviewed deployed environment:
 
 ```bash
 export USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN='https://APPROVED-DEPLOYED-HOST'
-export USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL='https://APPROVED-DEPLOYED-HOST/appcast.xml'
+export USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL='https://APPROVED-DEPLOYED-HOST/preview/appcast.xml'
 export USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY='BASE64_32_BYTE_PUBLIC_KEY='
 npm run product:macos:preview
 ```
@@ -261,16 +410,20 @@ variable or `--output`. A different Sparkle framework can be supplied with
 `USAGE_MONITOR_PREVIEW_SPARKLE_FRAMEWORK`. The build rejects HTTP, IP-literal
 and loopback origins, credentials and URL decorations,
 malformed public keys, unverified Sparkle trees, and `/Applications` output
-paths. The private Sparkle update-signing key is not an input to this build and
-must never be placed in the repository or bundle.
+paths. It also rejects stable's exact appcast URL even when supplied through an
+override, including percent-encoded or slash aliases. The private Sparkle
+update-signing key is not an input to this build
+and must never be placed in the repository or bundle.
 
 The resulting marker is `preview_distribution` in both the build manifest and
 `UsageMonitorBuildChannel`, with `UsageMonitorPreviewDistribution=true` and
 `externalDistributionRequested=false`. The central-service runtime key remains
 `production_https` so the existing launcher accepts the approved deployed
-origin; the separate channel marker prevents the artifact from being treated
-as a production release. Preview builds make **manual** updater checks only:
-they never automatically check, download, or install an update.
+origin; the separate channel marker, app identity, state root, semantic-open
+route, and feed prevent the artifact from being treated as a production
+release. Preview builds make **manual** updater checks only: the Automatic
+updates switch is disabled and its detail text explains that previews never
+automatically check, download, or install an update.
 
 After validation, install it only through the guarded replacement command:
 
@@ -278,11 +431,13 @@ After validation, install it only through the guarded replacement command:
 npm run product:macos:preview:install
 ```
 
-That command accepts only `/Applications/TiboTattle.app` (or an explicit
-per-user Applications target), validates the staged preview before and after
-copying it, and moves an existing app to a timestamped sibling backup rather
-than deleting it. It requires the explicit `--replace` flag; no preview build
-or validation command copies into `/Applications` on its own.
+That command accepts only `/Applications/TiboTattle Preview.app` (or the exact
+per-user preview Applications target) and explicitly refuses either stable
+`TiboTattle.app` location. It validates the staged preview before and after
+copying it, and moves an existing preview to a timestamped sibling backup
+rather than deleting it. It requires the explicit `--replace` flag; no preview
+build or validation command copies into `/Applications` on its own. The stable
+application and `Usage Monitor` state directory remain untouched.
 
 Validate the staged preview without network access by default:
 
@@ -299,14 +454,53 @@ Run it only when checking the published service boundary:
 npm run product:macos:preview:remote:live
 # or verify the installed preview directly
 node ./scripts/verify-macos-preview-remote.js \
-  --app "/Applications/TiboTattle.app" \
+  --app "/Applications/TiboTattle Preview.app" \
   --channel preview_distribution \
   --live
 ```
 
-If the central service is healthy but the appcast is not yet published, the
-command exits non-zero and says so plainly. That is an external release-input
-gap, not a claim that Sparkle has updated the preview client.
+If the configured preview feed has no qualifying appcast entry, the command
+exits non-zero and says so plainly. That is an external release-input gap, not
+a claim that Sparkle has updated the preview client.
+
+## macOS bundle-version allocation
+
+`CFBundleShortVersionString` remains the user-facing package version. The
+Sparkle ordering key, `CFBundleVersion`, is explicitly allocated for signed
+builds that retain the stable bundle identifier. The 0.1.17 stable allocation
+uses build `1024` and accepted runtime basis
+`394c8a03a986e0daadbe662679fd002202682e44`; internal RC9 build `1023.7` was the
+preceding dogfood allocation. The exact source provenance is the annotated
+[`v0.1.17` tag](https://github.com/adamallcock/tibotattle/tree/v0.1.17). A future
+signed version/channel must add a reviewed monotonic allocation before release
+tooling will run. Corrected combined Astra/Intel 0.1.18 RC3 reserves `1025.2`
+for dogfood and retains `1026` for stable on both architectures. Signed Intel
+RC1 build `1025` and combined RC2 build `1025.1` remain immutable; their evidence
+does not qualify the corrected RC3 source. The ordering is
+`1025 < 1025.1 < 1025.2 < 1026`, and allocation alone proves neither signing,
+installation nor release.
+
+Earlier RCs are historical qualification evidence only. The build-1024
+release retains the fail-closed source, generation, resource, validation,
+atomic-publication, selected-plan Trends, and snapshot safeguards. PR #94
+outcome is `passed_with_historical_artifact_refusal` in the
+[qualification receipt](../../docs/receipts/2026-09-03-pr94-account-plan-attribution-qualification.md).
+Hosted migrations and end-to-end device pairing are not activated by the
+desktop release.
+
+Release tooling accepts `USAGE_MONITOR_BUNDLE_VERSION` only when it exactly
+matches the checked-in channel allocation, and the signed stable path still
+requires the candidate to compare strictly newer than the immediately previous
+stable manifest. The exact historical stable `0.x.y` form may be read only as a
+previous stable migration source whose bundle and marketing versions match;
+new candidates and appcasts must use the strict positive-first Apple form.
+Preview has a different bundle identifier and feed, so it retains the
+deterministic epoch `(2000 + major).minor.patch` for local ordering; preview
+package `0.1.17` therefore uses `2000.1.17` without stranding or advancing the
+stable line. Both paths enforce
+[Apple's `CFBundleVersion` component limits](https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html):
+a positive one-to-four-digit first component and optional one-to-two-digit
+second and third components.
 
 ## External-distribution build gate
 
@@ -325,7 +519,7 @@ npm run product:macos:updater:prepare
 
 The generic builder rejects `--external-distribution` entirely, including when
 the old environment marker is supplied or a similar CLI marker is attempted.
-Build the release candidate only through `product:macos:release`, which performs
+Build a later stable release candidate only through `product:macos:release`, which performs
 the continuity and source-provenance checks before calling the external-build
 API. The appcast public key is public; the matching private update-signing key
 must not enter the repository or release host:
@@ -334,19 +528,18 @@ must not enter the repository or release host:
 npm run product:macos:release -- \
   --channel stable \
   --prepare-candidate \
-  --stable-bootstrap
-```
-
-`--stable-bootstrap` is an explicit first-stable-release decision. For every
-later stable release, replace it with the manifest from the immediately
-previous stable release so the gate can prove version continuity:
-
-```bash
-npm run product:macos:release -- \
-  --channel stable \
-  --prepare-candidate \
   --previous-stable-manifest "/path/to/previous-stable-release.json"
 ```
+
+`--prepare-candidate` does not stop after compilation: this command continues
+into Developer ID signing and notarization. It is a protected release action,
+not a secret-free build check or dry run.
+
+`--stable-bootstrap` is an explicit owner-only first-stable-release decision
+for one architecture, not the normal upgrade path. The first Intel stable
+release has no prior Intel artifact and uses this flow. Every later release
+in that lane must use its immediately previous same-architecture stable
+manifest; an ARM receipt cannot establish Intel continuity.
 
 The command rejects a missing origin, HTTP, loopback, credentials, paths,
 queries, fragments, missing artwork, missing provenance, placeholder
@@ -354,6 +547,19 @@ provenance, invalid bundle versions, an unpinned framework tree, unsafe
 framework symlinks, a non-HTTPS appcast, or a malformed Ed25519 public key.
 Developer builds reject all updater inputs. The candidate remains ad-hoc signed
 until the release command completes.
+
+The release source must be clean and exactly annotated for its channel. Stable
+accepts only `vX.Y.Z` matching the short version. Internal dogfood accepts only
+`tibotattle-internal-dogfood-X.Y.Z-rcN-source-YYYYMMDD`, with a positive
+non-zero-padded `N` and a real calendar date. Lightweight tags, aliases, wrong
+versions, and multiple matching channel tags at HEAD fail closed.
+
+External-release bundles set only the outer `.app` Finder creation and
+modification dates from the sealed source commit's Git committer timestamp.
+Payload files retain the fixed epoch used for reproducible inventories, and the
+DMG packager reapplies the same source-bound dates after staging. This
+filesystem metadata is outside the signed and inventoried payload; no build-host
+wall clock is used for it.
 
 ## Developer ID and notarization
 
@@ -371,21 +577,27 @@ process environment:
 ```bash
 export USAGE_MONITOR_DEVELOPER_ID_APPLICATION='Developer ID Application: APPROVED OWNER (TEAMID1234)'
 export USAGE_MONITOR_NOTARY_PROFILE='usage-monitor-notary'
-export USAGE_MONITOR_BUNDLE_VERSION='1'
 export USAGE_MONITOR_SPARKLE_FRAMEWORK="$PWD/.release-deps/Sparkle.framework"
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY='REPLACE_WITH_32_BYTE_BASE64_PUBLIC_KEY='
 npm run product:macos:release -- \
   --channel stable \
   --prepare-candidate \
-  --stable-bootstrap
+  --previous-stable-manifest "/path/to/previous-stable-release.json"
 ```
 
 For a later stable release, use `--previous-stable-manifest` in place of
 `--stable-bootstrap`, as shown above. The two options are mutually exclusive;
 the release command refuses to guess which continuity policy applies.
+`USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
+present it must exactly equal the checked-in allocation for the selected
+signed release version and channel (`1025.2` for corrected 0.1.18 RC3 internal
+dogfood, `1026` for 0.1.18 stable). Earlier signed RC1 build `1025` and RC2 build
+`1025.1`, together with their immutable evidence, remain unchanged and cannot
+be reused as the current signing allocation.
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin
-and Sparkle appcast. Legacy `USAGE_MONITOR_PRODUCTION_ORIGIN` and
+and the distinct stable and preview Sparkle appcasts. Legacy
+`USAGE_MONITOR_PRODUCTION_ORIGIN` and
 `USAGE_MONITOR_SPARKLE_APPCAST_URL` values are accepted only when they exactly
 match that manifest, so an independent release-time endpoint cannot slip in.
 
@@ -396,14 +608,18 @@ The release command:
    the candidate;
 2. verifies every regular candidate payload file, mode, size, and digest against the
    build inventory, rejects unlisted entries and symbolic links, and
-   normalizes only the three expected Mach-O signature envelopes;
+   normalizes only the reviewed Mach-O signature envelopes for the launcher,
+   embedded Node, migration helper, and Sparkle code;
 3. rebuilds into an isolated directory from the checked-out source and approved
    inputs, requires the fresh source and payload digests to match the reviewed
    candidate, and discards the candidate bytes;
 4. signs Sparkle's Installer XPC, Downloader XPC (preserving its entitlement),
    Autoupdate helper, Updater app, and framework in the upstream-documented
-   inside-out order, followed by keytar, embedded Node, the native launcher,
-   and the outer app;
+   inside-out order, followed by embedded Node, the migration helper, the native
+   launcher, and the outer app. The helper must have the exact legacy Node
+   Developer ID designated requirement, the same Team ID, hardened runtime,
+   and no entitlements; the finalizer verifies those requirements against the
+   actual signatures;
 5. applies hardened runtime and a minimal, reviewed Node runtime entitlement
    file;
 6. verifies the complete Developer ID signature;
@@ -422,19 +638,19 @@ operator explicitly supplies `--replace`.
 
 ## Signed replacement and rollback contract
 
-Production Usage Monitor builds use the pinned Sparkle 2.9.3 framework. Sparkle
+Production TiboTattle builds use the pinned Sparkle 2.9.3 framework. Sparkle
 checks one exact HTTPS appcast automatically and exposes a user-initiated
 **Check for Updates** action. Every published artifact must carry an Ed25519
 signature made by the offline update key as well as the existing Developer ID
 and notarization assurances. Automatic update downloads are on by default in a
 signed release. The user can turn them off with the native **Automatic
-updates** switch in **Settings…** → **General** and can always use **Check for
-Updates** from About. A manual signed-DMG replacement remains the fallback.
+updates** switch in **Settings…** → **About** and can always use **Check for
+Updates** there. A manual signed-DMG replacement remains the fallback.
 
 Every new `usage-monitor-macos-release-v0.2` manifest records the fixed
 `usage-monitor-macos-signed-replacement-v1` contract:
 
-- quit Usage Monitor before replacing the app in `/Applications`;
+- quit TiboTattle before replacing the app in `/Applications`;
 - require the candidate bundle version to be strictly newer;
 - require both candidate and rollback DMGs to have complete Developer ID,
   hardened-runtime, notarization, stapling, Gatekeeper, and clean-profile
@@ -467,6 +683,16 @@ rollback has been rehearsed.
 
 ## Automated validation
 
+For menu-bar refresh changes, start with `npm run test:macos:source` and
+`npm run test:macos:smoke`. The latter compiles a development-only app and checks
+retained history through both the companion's projection and the native view,
+including both ranges, read failure, and source reset. Its development-only
+`--menu-bar-overview-render-smoke-test <derived-overview.json> <output-directory>`
+mode renders ready, updating, and read-failure states without starting a
+companion or altering installed app state. Automated fixtures must remain
+synthetic; local real-data visual QA is separate from those tests and from an
+installed or signed-artifact gate.
+
 Run the focused suite:
 
 ```bash
@@ -483,9 +709,27 @@ The automated validator proves the bundle and Gatekeeper contract on the build
 Mac with an empty temporary home. It also runs the packaged Login Item contract
 smoke against an injected fake manager; that check makes zero real
 ServiceManagement calls. It is not a substitute for a truly clean machine.
+The manual clean-profile and physical Login Item matrix was deferred for
+0.1.17 only; see the [release-specific decision](../../docs/plans/2026-09-03-public-0.1.17-release.md).
+That historical decision does not carry forward. The owner separately approved
+the [0.1.18-only waiver](../../docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+of the disposable clean-profile/manual Login Item matrix and physical Intel
+qualification. Those checks remain unperformed, not passed. Reports that other
+testers are running the app are owner-reported, not independently verified
+hardware or artifact-bound evidence. The waiver does not change the v2 receipt
+validator or justify manufacturing a manual receipt; exact signed-artifact,
+data-preservation, updater-integrity and unexpected-Keychain-prompt gates remain.
 
-Before sending the DMG to any external user, perform a human clean-Mac or
-disposable-VM rehearsal:
+For Finder metadata, inspect the app directly on the final frozen DMG, read-only,
+after stapling. Derive the expected timestamp from the sealed source commit in
+`build-manifest.json`, then compare the outer bundle's creation and modification
+dates with that source-derived value. The isolated `ditto` copy used for
+clean-profile smoke is not evidence of mounted-volume Finder metadata.
+
+The normal release policy requires the following human clean-Mac or disposable-VM
+rehearsal before external distribution. For 0.1.18, apply only the explicitly
+waived scope above; do not report the unperformed matrix or its receipt gate as
+passed:
 
 1. transfer the DMG through the intended download channel so quarantine
    metadata is present;
@@ -526,15 +770,27 @@ disposable-VM rehearsal:
      --rehearsal "docs/receipts/YYYY-MM-DD-macos-login-item-release-rehearsal.json"
    ```
 
-## Human-only gates
+   This gate defaults to Apple silicon (`--architecture arm64`) and
+   `--channel stable`. For an Intel internal-dogfood rehearsal, add
+   `--architecture x64 --channel internal-dogfood`; both installed-app validation
+   and bundle inspection require that exact selection. The receipt still binds
+   to the inspected signed app's identity/version at the required Applications
+   path; these options neither install it nor perform the manual rehearsal.
+   The current v2 receipt additionally binds architecture, channel, source commit
+   and normalized payload SHA-256, and requires human-observed native hardware,
+   a supported macOS version and `rosetta: false`. Old v1 receipts are historical,
+   not current qualification. See the [receipt amendment](../../docs/decisions/2026-08-03-macos-login-item-lifecycle-decision.md#2026-09-04-two-architecture-receipt-amendment).
 
-The repository cannot complete these without an authorized person:
+## Protected per-release inputs and gates
+
+The repository cannot complete a new release without an authorized person. A
+previously published release does not satisfy these gates for later bytes:
 
 - approve final icon artwork and its distribution rights;
 - supply and authorize an Apple Developer Program team and Developer ID
   Application certificate;
 - create the `notarytool` Keychain credential profile;
-- approve the production HTTPS service origin;
+- verify the reviewed production HTTPS service origin;
 - create and protect a Sparkle Ed25519 update-signing key outside the
   repository and hosting environment;
 - approve and publish the exact HTTPS appcast URL;
@@ -546,7 +802,47 @@ The repository cannot complete these without an authorized person:
   copy; and
 - authorize external distribution.
 
-The repository implements and tests the fail-closed updater build boundary, but
-cannot claim a live update until an authorized operator supplies the appcast,
-public key, matching private signing key, Developer ID identity, notarization
-profile, and a previously installed signed release for an update rehearsal.
+The repository implements and tests the fail-closed updater build boundary.
+Current source, signed candidate, notarization, publication, feed availability,
+installed upgrade, and rollback rehearsal remain separate gates recorded in
+the [current status matrix](../../docs/current-status.md).
+
+## Menu bar customization
+
+**Settings → General → Menu bar → Customize menu bar…** and **More →
+Customize menu bar…** open the same native presentation settings. Changes apply
+immediately and persist locally in the existing state root's
+`tray-preferences-v1.json`. The file contains no allowance observations.
+Unreadable and newer schemas are preserved, with a visible save warning.
+
+Choose labeled 5-hour, 7-day, both, or icon-only contents; a plain app icon,
+single meter, or fixed top 5-hour/bottom 7-day meters; and remaining allowance,
+reset time, or both for a single window. Reset times use a minute countdown or
+the local clock, including a date outside today. Optional low-allowance emphasis
+enters at 10% and clears at 12% within a verified observation; stale/unavailable
+evidence, reset changes, and replacement observations clear it. The compact DTO
+has no account identity, so an 11% replacement observation cannot inherit a prior
+source's low state. This changes presentation only and sends no notifications.
+
+Show, hide, and reorder Allowances, Weekly pace, Local usage, and Cache reuse.
+Choose 7 or 30 days, chart visibility, tokens/API-equivalent cost/usage-change
+totals, and compact or detailed density. Cache reuse uses the existing dashboard
+projection and its coverage, never a separate accounting calculation. The cache
+action opens Usage and costs. Partial pricing, retained history, missing evidence,
+and permanent header/actions stay explicit. Hiding sections does not stop collection.
+
+New installations default to 7-day remaining with a 7-day meter and the three
+original popup sections. Existing installations keep the current automatic
+primary-window choice; community PR #73 selections migrate from
+`tibotattle.menu-bar-allowance.v1`, including icon-only for `off`. Initial choices
+are materialized so later upgrades retain them. Undo reverses the last saved
+customization; Restore tray defaults deliberately selects new-install defaults.
+Synthetic Example states and an example popup preview changes without fetching
+account data. UI preferences never change refresh cadence or dashboard filters.
+
+The compiled `--tray-customization-smoke-test` exercises the closed preference
+contract, legacy mapping, persistence, failed writes, future-schema preservation,
+pinned/missing/zero lanes, retained refresh, reset expiry and low-allowance
+hysteresis. Development-only `--tray-customization-render-smoke-test <directory>`
+renders synthetic Settings and popup states; it does not qualify an installed
+signed application or physical secondary-display behavior.

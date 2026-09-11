@@ -2,10 +2,15 @@
 title: TiboTattle Visual Identity Brief
 date: 2026-08-01
 type: design-brief
-status: open
+status: implemented
 ---
 
 # TiboTattle — app icon & identity brief
+
+The approved application icon was produced from this brief. The maintained
+asset provenance is recorded in `apps/macos/Assets/AppIcon.provenance.txt`;
+this file remains only because that provenance points to the original design
+constraints.
 
 Hand this to an image-generation agent or designer. Everything below is a
 constraint or a steer; the "Concepts" section is where the creative latitude

@@ -99,14 +99,11 @@ export function collectR7ReleaseEvidenceRuntimeSourcePaths({
       if (entry.isDirectory()) {
         visit(relativePath);
       } else if (entry.isFile()) {
-        // Operating-system metadata is not workload source and must not be
-        // attested as such, but neither should its presence fail the release
-        // gate: `.DS_Store` reappears whenever anyone opens the folder in
-        // Finder, and it took down the whole suite three times before this
-        // guard existed. No runtime module in these trees is a dotfile, and
-        // OS metadata always is, so skipping dotfiles excludes the noise
-        // without widening what the digest is allowed to cover.
-        if (entry.name.startsWith(".")) continue;
+        // Operating-system metadata and repository-scoped agent guidance are
+        // not workload source and must not be attested as such. Keep this
+        // exclusion exact: arbitrary Markdown and every other non-runtime
+        // file still fail closed below.
+        if (entry.name.startsWith(".") || entry.name === "AGENTS.md") continue;
         if (!entry.name.endsWith(".js") && !entry.name.endsWith(".mjs")) {
           throw new TypeError("R7 workload source tree contains an unsupported file");
         }
@@ -159,6 +156,7 @@ function workloadSourcePaths() {
   visitRuntimeJsonDirectory("packages/telemetry-contract/schemas");
   return [
     ...collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }),
+    "config/deployment-endpoints.js",
     "scripts/r7-materialized-boundary-worker.js",
     "scripts/r7-resource-benchmark-worker.js",
     ...runtimeJsonPaths,

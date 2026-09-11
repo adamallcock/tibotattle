@@ -1,10 +1,19 @@
 import {
+  canonicalRateLimitSnapshot,
+  codexSessionMetaIdentity,
   cumulativeSnapshotKey,
   extractToolObservations,
 } from "./providers/codex/logs.js";
 import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js";
 
 // Projection from one Codex rollout file to typed usage facts.
+//
+// Codex #41912 also persists top-level token_usage_record and compaction
+// checkpoint copies. They overlap the still-emitted legacy token_count stream
+// and are intentionally not additional accounting sources. Authored
+// configuration_update controls are likewise not backend application receipts;
+// reasoningEffort remains the recorded turn/request setting, not inferred
+// effective effort. See docs/reference/unified-index-schema.md.
 //
 // This module is pure: no SQLite, no filesystem writes, no identity. That is
 // what lets the identical code run in-process and inside a worker thread. Its
@@ -22,7 +31,9 @@ import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js
 // cannot leak in by default. Note in particular that `turn_context` carries `cwd`,
 // `workspace_roots` and a
 // `collaboration_mode.settings.developer_instructions` block: all three are
-// content or filesystem paths, and none of them is read here.
+// content or filesystem paths, and none is used by accounting extraction.
+// The separate optional metadata-only traversal below reads only bounded cwd
+// for the owner-approved transient local Projects & threads view.
 
 // Byte-level needles. Matching on the raw Buffer avoids decoding the ~99% of
 // lines that are irrelevant. The response-item marker is exact and is decoded
@@ -31,21 +42,24 @@ import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js
 const NEEDLE_TURN_CONTEXT = Buffer.from('"turn_context"');
 const NEEDLE_TOKEN_COUNT = Buffer.from('"token_count"');
 const NEEDLE_THREAD_SETTINGS = Buffer.from('"thread_settings_applied"');
+const NEEDLE_SESSION_META = Buffer.from('"type":"session_meta"');
 const NEEDLE_RESPONSE_ITEM = Buffer.from('"type":"response_item"');
 const NEEDLE_RELEVANT_PREFIX = Buffer.from('"t');
 const COMPACTION_TIMESTAMP_PREFIX = Buffer.from('{"timestamp":"');
 const COMPACTION_TYPE_SUFFIX = Buffer.from(',"type":"compacted"');
 const COMPACTION_TYPE_PREFIX = Buffer.from('{"type":"compacted","timestamp":"');
+const COMPACTION_ORDINAL_PREFIX = Buffer.from(',"ordinal":');
 
 // A compacted record can contain an enormous replacement_history payload. Its
 // top-level header is bounded and arrives first. Codex's current serializer
-// emits timestamp then type, while a standards-compliant producer may emit
+// emits timestamp, optional ordinal, then type; older producers may emit
 // the two top-level scalars in the opposite order:
 //
 //   {"timestamp":"...","type":"compacted","payload":...}
+//   {"timestamp":"...","ordinal":123,"type":"compacted","payload":...}
 //   {"type":"compacted","timestamp":"...","payload":...}
 //
-// Match only those two exact byte headers and decode only the timestamp
+// Match only those exact byte headers and decode only the timestamp
 // scalar. Unknown fields, whitespace variants and any marker appearing after
 // payload fail closed. This is
 // deliberately not JSON.parse, and it never converts even the bounded start
@@ -71,7 +85,22 @@ export function parseCompactionPrefix(line) {
   if (timestampEnd < timestampStart
       || timestampEnd - timestampStart > 64) return null;
   if (timestampFirst) {
-    const typeStart = timestampEnd + 1;
+    let typeStart = timestampEnd + 1;
+    if (line.subarray(typeStart, typeStart + COMPACTION_ORDINAL_PREFIX.length)
+      .equals(COMPACTION_ORDINAL_PREFIX)) {
+      const ordinalStart = typeStart + COMPACTION_ORDINAL_PREFIX.length;
+      let ordinalEnd = ordinalStart;
+      while (ordinalEnd < line.length && ordinalEnd - ordinalStart < 20
+          && line[ordinalEnd] >= 0x30 && line[ordinalEnd] <= 0x39) ordinalEnd += 1;
+      const digits = ordinalEnd - ordinalStart;
+      // Validate the bounded unsigned integer without reading payload or
+      // rounding a possible u64 ordinal through a JavaScript number.
+      if (digits === 0 || line[ordinalEnd] !== 0x2c
+          || (digits > 1 && line[ordinalStart] === 0x30)
+          || (digits === 20 && line.toString("ascii", ordinalStart, ordinalEnd)
+            > "18446744073709551615")) return null;
+      typeStart = ordinalEnd;
+    }
     const typeEnd = typeStart + COMPACTION_TYPE_SUFFIX.length;
     if (line.length <= typeEnd
         || !line.subarray(typeStart, typeEnd).equals(COMPACTION_TYPE_SUFFIX)
@@ -117,6 +146,7 @@ function relevant(line) {
     if (line[at + 2] === 0x6f) needle = NEEDLE_TOKEN_COUNT;
     else if (line[at + 2] === 0x75) needle = NEEDLE_TURN_CONTEXT;
     else if (line[at + 2] === 0x68) needle = NEEDLE_THREAD_SETTINGS;
+    else if (line[at + 2] === 0x79) needle = NEEDLE_SESSION_META;
     if (needle !== null
         && at + needle.length <= line.length
         && line.compare(needle, 0, needle.length, at, at + needle.length) === 0) {
@@ -126,21 +156,65 @@ function relevant(line) {
   }
 }
 
+function accountingMarker(text) {
+  return text.includes('"turn_context"')
+    || text.includes('"token_count"')
+    || text.includes('"thread_settings_applied"')
+    || text.includes('"type":"session_meta"');
+}
+
+export function rolloutContentQuarantineReason(outcome) {
+  if (outcome?.read?.partialDeferred === true) {
+    return "codex_rollout_tail_incomplete";
+  }
+  if (Number(outcome?.diagnostics?.malformedAccountingRecords ?? 0) > 0
+      || Number(outcome?.diagnostics?.malformedUsageRecords ?? 0) > 0) {
+    return "codex_rollout_content_invalid";
+  }
+  // A malformed provider quota window is bounded to that one observation.
+  // The extractor already omits the invalid window and records its diagnostic;
+  // quarantining the source here would also discard unrelated measured usage
+  // and tool facts from the same otherwise-valid rollout.
+  if (Number(outcome?.diagnostics?.sourceStartedAtOffset ?? -1) === 0
+      && Number(outcome?.diagnostics?.sessionMetaRecords ?? 0) < 1) {
+    return "codex_rollout_content_invalid";
+  }
+  return null;
+}
+
 function normalizeUsage(value) {
-  if (!value || typeof value !== "object") return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const normalized = {};
   for (const key of TOKEN_KEYS) {
-    const quantity = value[key] ?? 0;
-    if (!Number.isFinite(quantity) || quantity < 0) return null;
+    const quantity = value[key];
+    // Nullable counters preserve provider missingness through worker messages,
+    // SQLite and incremental cursor seeds. Missing is not an observed zero.
+    if (quantity === undefined || quantity === null) {
+      normalized[key] = null;
+      continue;
+    }
+    if (!Number.isSafeInteger(quantity) || quantity < 0) return null;
     normalized[key] = quantity;
   }
   return normalized;
 }
 
+function lineageUsage(value) {
+  if (value === null) return null;
+  // This is only the pre-existing replay identity representation, never usage
+  // evidence. Retain the provider scanner/v11 snapshot-key contract so a new
+  // child still matches snapshots of a parent whose source has rotated away.
+  if (TOKEN_KEYS.every((key) => value[key] !== null)) return value;
+  return Object.fromEntries(TOKEN_KEYS.map((key) => [key, value[key] ?? 0]));
+}
+
 function subtract(current, previous) {
   const result = {};
   for (const key of TOKEN_KEYS) {
-    result[key] = Math.max(0, current[key] - (previous?.[key] ?? 0));
+    result[key] = current[key] === null
+      || (previous !== null && previous !== undefined && previous[key] == null)
+      ? null
+      : Math.max(0, current[key] - (previous?.[key] ?? 0));
   }
   return result;
 }
@@ -158,27 +232,34 @@ function subtract(current, previous) {
 const CUMULATIVE_DELTA_VS_LAST_TOLERANCE_TOKENS = 16;
 
 function sameUsage(left, right) {
-  return TOKEN_KEYS.every((key) => left[key] === right[key]);
+  // A missing cumulative component cannot contradict an explicit per-response
+  // component. Prefer the latter when the observed delta agrees everywhere
+  // it has evidence, including the total used to enter this branch.
+  return TOKEN_KEYS.every((key) => right[key] === null || left[key] === right[key]);
 }
 
-// Mirrors the reviewed provider normalization exactly, restated so that the
-// hot path does not cross a facade for five subtractions. `cumulativeSnapshotKey`
+// Mirrors the reviewed provider normalization and component availability,
+// projecting unavailable components directly as null instead of a separate
+// presence object. `cumulativeSnapshotKey`
 // above is imported rather than restated for the opposite reason: it defines
 // the fork-replay boundary, and a boundary that drifts from the reviewed
 // definition would silently change what counts as spend.
 export function canonicalComponents(raw) {
-  const cacheRead = Math.min(raw.cached_input_tokens, raw.input_tokens);
-  const cacheWrite = Math.min(
-    raw.cache_write_input_tokens,
-    Math.max(0, raw.input_tokens - cacheRead),
-  );
-  const reasoning = Math.min(raw.reasoning_output_tokens, raw.output_tokens);
+  const has = (key) => Number.isSafeInteger(raw[key]) && raw[key] >= 0;
+  const inputKnown = has("input_tokens") && has("cached_input_tokens");
+  const allInputKnown = inputKnown && has("cache_write_input_tokens");
+  const inputConsistent = (raw.cached_input_tokens ?? 0)
+    + (raw.cache_write_input_tokens ?? 0) <= (raw.input_tokens ?? 0);
+  const outputKnown = has("output_tokens") && has("reasoning_output_tokens")
+    && raw.reasoning_output_tokens <= raw.output_tokens;
   return {
-    inputUncachedTokens: Math.max(0, raw.input_tokens - cacheRead - cacheWrite),
-    inputCacheReadTokens: cacheRead,
-    inputCacheWriteTokens: cacheWrite,
-    outputTextTokens: Math.max(0, raw.output_tokens - reasoning),
-    outputReasoningTokens: reasoning,
+    inputUncachedTokens: allInputKnown && inputConsistent
+      ? raw.input_tokens - raw.cached_input_tokens - raw.cache_write_input_tokens
+      : null,
+    inputCacheReadTokens: inputKnown && inputConsistent ? raw.cached_input_tokens : null,
+    inputCacheWriteTokens: allInputKnown && inputConsistent ? raw.cache_write_input_tokens : null,
+    outputTextTokens: outputKnown ? raw.output_tokens - raw.reasoning_output_tokens : null,
+    outputReasoningTokens: outputKnown ? raw.reasoning_output_tokens : null,
   };
 }
 
@@ -188,32 +269,20 @@ function safeClassification(value) {
     : null;
 }
 
-function quotaWindows(rateLimits, observedAtMs) {
-  if (!rateLimits || typeof rateLimits !== "object") return [];
-  const limitId = safeClassification(rateLimits.limit_id) ?? "unknown";
-  const planType = safeClassification(rateLimits.plan_type);
-  const windows = [];
-  for (const slot of ["primary", "secondary"]) {
-    const window = rateLimits[slot];
-    if (!window || typeof window !== "object") continue;
-    const usedPercent = window.used_percent;
-    const durationMins = window.window_minutes;
-    const resetsAt = window.resets_at;
-    if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) continue;
-    if (!Number.isSafeInteger(durationMins) || durationMins < 1) continue;
-    windows.push({
+function quotaSnapshot(rateLimits, observedAtMs) {
+  const snapshot = canonicalRateLimitSnapshot(rateLimits);
+  if (snapshot === null) return null;
+  return {
+    windows: snapshot.windows.map((window) => ({
       observedAtMs,
-      limitId,
-      slot,
-      planType,
-      usedPercent,
-      resetsAtMs: Number.isSafeInteger(resetsAt) && resetsAt > 0
-        ? resetsAt * 1_000
-        : null,
-      durationMins,
-    });
-  }
-  return windows;
+      limitId: window.limitId,
+      slot: window.slot,
+      planType: window.planType,
+      usedPercent: window.usedPercent,
+      resetsAtMs: window.resetsAt * 1_000,
+      durationMins: window.windowDurationMins,
+    })),
+  };
 }
 
 // A truncated prefix cannot be handed to JSON.parse. Rather than dropping the
@@ -259,7 +328,8 @@ export function salvagePartialTokenCount(text) {
  * resume cursor carried, which is the same declaration seen earlier). An
  * inherited seed is provenance-distinct: it must never be persisted into the
  * cursor's carry as if it were an own observation — the next pass re-derives
- * it from the ancestor chain instead, so the `lineage_inherited` label
+ * it only from the exact physical history base for a paginated source or the
+ * ancestor chain for a legacy inline source, so the `lineage_inherited` label
  * survives a resume rather than being laundered into
  * `rollout_thread_settings`.
  */
@@ -330,6 +400,7 @@ export async function extractRolloutUsage(path, {
   highWaterMark = 1024 * 1024,
   signal = null,
   onEvent,
+  parentModelAt = null,
   onBoundary = null,
   onTool = null,
 } = {}) {
@@ -341,6 +412,9 @@ export async function extractRolloutUsage(path, {
   }
   if (onTool !== null && typeof onTool !== "function") {
     throw new TypeError("onTool must be a function or null");
+  }
+  if (parentModelAt !== null && typeof parentModelAt !== "function") {
+    throw new TypeError("parentModelAt must be a function or null");
   }
   let currentModel = seedModel;
   let currentEffort = seedEffort;
@@ -389,6 +463,21 @@ export async function extractRolloutUsage(path, {
   // continuity lens compares positive-input requests, so only the next one is
   // a meaningful boundary.
   function emitUsage(event, rawUsage) {
+    // Product-approved assumption: historical Codex counters can omit cache
+    // writes. Apply it only after choosing the charged usage, keeping raw
+    // cumulative counters unchanged for replay and delta decisions.
+    if (rawUsage != null && rawUsage.cache_write_input_tokens == null
+        && Number.isSafeInteger(rawUsage.input_tokens) && rawUsage.input_tokens >= 0
+        && Number.isSafeInteger(rawUsage.cached_input_tokens) && rawUsage.cached_input_tokens >= 0
+        && rawUsage.cached_input_tokens <= rawUsage.input_tokens) {
+      event.components = canonicalComponents({ ...rawUsage, cache_write_input_tokens: 0 });
+      event.cacheWriteAssumedZero = true;
+    }
+    if (event.model === null && parentModelAt !== null) {
+      event.model = parentModelAt(event.observedAtMs);
+      event.modelInherited = event.model !== null;
+    }
+    if (event.model === null) diagnostics.modelMissing += 1;
     const finish = () => {
       if ((compactionPending === null && !turnContextPending)
           || !positiveInput(rawUsage)) return;
@@ -449,9 +538,15 @@ export async function extractRolloutUsage(path, {
     }
   }
   const diagnostics = {
+    sourceStartedAtOffset: startOffset,
+    sessionMetaRecords: 0,
+    unexpectedSessionMetaRecords: 0,
     relevantLines: 0,
     malformedLines: 0,
     malformedTimestamps: 0,
+    malformedAccountingRecords: 0,
+    malformedUsageRecords: 0,
+    malformedRateLimitRecords: 0,
     partialLines: 0,
     salvagedRecords: 0,
     turnContexts: 0,
@@ -495,11 +590,17 @@ export async function extractRolloutUsage(path, {
       let record = null;
       if (partial) {
         diagnostics.partialLines += 1;
+        if (accountingMarker(text)) {
+          diagnostics.malformedAccountingRecords += 1;
+        }
       } else {
         try {
           record = JSON.parse(text);
         } catch {
           diagnostics.malformedLines += 1;
+          if (accountingMarker(text)) {
+            diagnostics.malformedAccountingRecords += 1;
+          }
           if (text.includes(NEEDLE_RESPONSE_ITEM)) {
             diagnostics.toolRecordsSkipped += 1;
           }
@@ -562,9 +663,25 @@ export async function extractRolloutUsage(path, {
         }, delta);
       }
 
-      const observedAtMs = Date.parse(record?.timestamp);
+      if (record.type === "session_meta") {
+        diagnostics.sessionMetaRecords += 1;
+        if (codexSessionMetaIdentity(record.payload) === null) {
+          diagnostics.unexpectedSessionMetaRecords += 1;
+          diagnostics.malformedAccountingRecords += 1;
+        }
+        return;
+      }
+      const observedAtMs = typeof record?.timestamp === "string"
+        ? Date.parse(record.timestamp)
+        : Number.NaN;
       if (!Number.isFinite(observedAtMs)) {
         diagnostics.malformedTimestamps += 1;
+        if (record?.type === "turn_context"
+            || (record?.type === "event_msg"
+              && ["token_count", "thread_settings_applied"]
+                .includes(record?.payload?.type))) {
+          diagnostics.malformedAccountingRecords += 1;
+        }
         return;
       }
       if (record.type === "turn_context") {
@@ -601,23 +718,33 @@ export async function extractRolloutUsage(path, {
       if (record.type !== "event_msg") return;
       if (record.payload?.type === "thread_settings_applied") {
         const settings = record.payload?.thread_settings;
-        if (!settings || typeof settings !== "object") return;
-        if (!Object.hasOwn(settings, "service_tier")) return;
-        const raw = settings.service_tier;
-        if (raw !== null && typeof raw !== "string") return;
-        diagnostics.tierEvents += 1;
-        // An own-file declaration always supersedes an inherited seed — the
-        // ancestor's declaration is upstream of everything in this file, so
-        // its timestamp must not outvote a genuine local observation. Among
-        // own declarations the latest-at-or-before rule stands.
-        const priorMs = tierState === null || tierState.inherited === true
-          ? Number.NEGATIVE_INFINITY
-          : tierState.observedAtMs;
-        if (observedAtMs >= priorMs) {
-          tierState = {
-            providerTierRaw: safeClassification(raw),
-            observedAtMs,
-          };
+        if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+          diagnostics.malformedAccountingRecords += 1;
+          return;
+        }
+        // An explicit UI selection supersedes the inherited default. A later
+        // turn_context remains authoritative for its own turn.
+        if (typeof settings.model === "string") currentModel = settings.model;
+        if (Object.hasOwn(settings, "service_tier")) {
+          const raw = settings.service_tier;
+          if (raw !== null && typeof raw !== "string") {
+            diagnostics.malformedAccountingRecords += 1;
+            return;
+          }
+          diagnostics.tierEvents += 1;
+          // An own-file declaration always supersedes an inherited seed — the
+          // ancestor's declaration is upstream of everything in this file, so
+          // its timestamp must not outvote a genuine local observation. Among
+          // own declarations the latest-at-or-before rule stands.
+          const priorMs = tierState === null || tierState.inherited === true
+            ? Number.NEGATIVE_INFINITY
+            : tierState.observedAtMs;
+          if (observedAtMs >= priorMs) {
+            tierState = {
+              providerTierRaw: safeClassification(raw),
+              observedAtMs,
+            };
+          }
         }
         // A thread setting is only a fallback. `turn_context.effort` is what
         // actually applied to the turn, and the two genuinely disagree in real
@@ -633,6 +760,15 @@ export async function extractRolloutUsage(path, {
       const info = record.payload?.info;
       const total = normalizeUsage(info?.total_token_usage);
       const last = normalizeUsage(info?.last_token_usage);
+      const malformedInfo = info !== null && info !== undefined
+        && (typeof info !== "object" || Array.isArray(info));
+      if (malformedInfo
+          || (info?.total_token_usage !== null
+            && info?.total_token_usage !== undefined && total === null)
+          || (info?.last_token_usage !== null
+            && info?.last_token_usage !== undefined && last === null)) {
+        diagnostics.malformedUsageRecords += 1;
+      }
 
       // Fork-replay suppression.
       //
@@ -654,7 +790,7 @@ export async function extractRolloutUsage(path, {
       // A skipped row still rebases the cumulative baseline. Without that, the
       // first genuine post-fork turn would be charged the entire inherited
       // total as if it were one enormous turn.
-      const snapshotKey = cumulativeSnapshotKey(total, last);
+      const snapshotKey = cumulativeSnapshotKey(lineageUsage(total), lineageUsage(last));
       if (isFork && snapshotKey !== null && inheritedSnapshots?.has(snapshotKey)) {
         consumeReplayedBoundary(last ?? total);
         if (total) rebaseTotals(total);
@@ -664,7 +800,9 @@ export async function extractRolloutUsage(path, {
       // Ordering matters and mirrors the reviewed implementation: a row
       // suppressed by rule 1 is not offered to descendants, a row suppressed
       // by rule 2 is.
-      if (snapshotKey !== null) collectSnapshots?.add(snapshotKey);
+      if (snapshotKey !== null) {
+        collectSnapshots?.add(snapshotKey, lineEndOffset);
+      }
       if (isFork && !turnContextSeenHere) {
         consumeReplayedBoundary(last ?? total);
         if (total) rebaseTotals(total);
@@ -711,10 +849,15 @@ export async function extractRolloutUsage(path, {
       } else {
         usage = last;
       }
-      const quota = quotaWindows(record.payload?.rate_limits, observedAtMs);
-      if ((!usage || (usage.input_tokens === 0 && usage.output_tokens === 0))
+      const normalizedQuota = quotaSnapshot(record.payload?.rate_limits, observedAtMs);
+      const quota = normalizedQuota?.windows ?? [];
+      if (record.payload?.rate_limits !== null
+          && record.payload?.rate_limits !== undefined
+          && normalizedQuota === null) {
+        diagnostics.malformedRateLimitRecords += 1;
+      }
+      if ((!usage || !(usage.input_tokens > 0 || usage.output_tokens > 0))
           && quota.length === 0) return;
-      if (currentModel === null) diagnostics.modelMissing += 1;
       return emitUsage({
         observedAtMs,
         sourceOffset: lineEndOffset,
@@ -750,6 +893,33 @@ export async function extractRolloutUsage(path, {
 }
 
 /**
+ * Resolve logical-parent authority independently of physical scan order.
+ * Every physical source remains accounting evidence, but only the explicit
+ * selected head supplies descendants. Old noncanonical single-source inputs
+ * have no immutable rollout id or head receipt and remain unambiguous; a
+ * canonical retired source or an unresolved multi-source thread never wins
+ * merely because it happened to be visited last.
+ */
+export function resolveLogicalRolloutHeads(members) {
+  const bySessionId = new Map();
+  for (const info of members) {
+    const sessionId = info.lineage?.sessionId;
+    if (!sessionId) continue;
+    const generations = bySessionId.get(sessionId) ?? [];
+    generations.push(info);
+    bySessionId.set(sessionId, generations);
+  }
+  const heads = new Map();
+  for (const [sessionId, generations] of bySessionId) {
+    const selected = generations.filter((generation) => generation.resolvedHead === true);
+    if (selected.length === 1) heads.set(sessionId, selected[0]);
+    else if (selected.length === 0 && generations.length === 1
+        && generations[0].rolloutId == null) heads.set(sessionId, generations[0]);
+  }
+  return heads;
+}
+
+/**
  * A tracker for the fork-replay boundary over one lineage component.
  *
  * These in-memory sets exist for the length of a component and are dropped
@@ -758,10 +928,12 @@ export async function extractRolloutUsage(path, {
  * which is exactly the moment that in-memory-only design stops being valid:
  * an ancestor's set must outlive the pass that built it so a later-ingested
  * fork can still recognise replayed turns. The build and ingest paths
- * therefore persist every collected key into the `lineage_snapshot` table
- * (as salted digests), and the incremental path consults that table for
- * ancestors it is not currently scanning. The in-memory sets remain the hot
- * path within a single pass.
+ * therefore persist the selected physical-history snapshot set into the
+ * `lineage_snapshot` table (as salted digests), and the incremental path
+ * consults that table for ancestors it is not currently scanning. Paginated
+ * generations replace the set with the exact history-base prefix before
+ * adding their local rows, so a reverted suffix cannot suppress later work.
+ * The in-memory sets remain the hot path within a single pass.
  *
  * Only a source that some later source names as an ancestor gets a set at all,
  * so a corpus of unforked sessions allocates nothing.
@@ -772,22 +944,40 @@ export function createLineageSnapshots(members) {
     const parentId = info.lineage?.parentId;
     if (parentId) referenced.add(parentId);
   }
-  const bySessionId = new Map();
-  for (const info of members) {
-    if (info.lineage?.sessionId) bySessionId.set(info.lineage.sessionId, info);
-  }
+  const logicalHeads = resolveLogicalRolloutHeads(members);
   const sets = new Map();
 
+  function suppliesResolvedHistory(info) {
+    const sessionId = info.lineage?.sessionId;
+    if (!sessionId) return false;
+    return logicalHeads.get(sessionId) === info;
+  }
+
   return {
-    /** The set this source should record into, or null if nothing inherits. */
+    /**
+     * The selected physical head's set, or null when this generation cannot
+     * supply logical descendants. Unselected generations remain accounting
+     * evidence but must never influence replay suppression.
+     */
     collectorFor(info) {
       const sessionId = info.lineage?.sessionId;
-      if (!sessionId || !referenced.has(sessionId)) return null;
-      const set = new Set();
+      if (!sessionId || !referenced.has(sessionId)
+          || !suppliesResolvedHistory(info)) return null;
+      const set = sets.get(sessionId) ?? new Set();
       sets.set(sessionId, set);
       return set;
     },
-    /** A view over every ancestor's set, nearest first. */
+    replaceFor(info, values) {
+      const sessionId = info.lineage?.sessionId;
+      if (!sessionId || !referenced.has(sessionId)
+          || !suppliesResolvedHistory(info)) return false;
+      const set = sets.get(sessionId) ?? new Set();
+      set.clear();
+      for (const value of values ?? []) set.add(value);
+      sets.set(sessionId, set);
+      return true;
+    },
+    /** Ancestor sets nearest first, ending at an exact paginated history. */
     inheritedFor(info) {
       const chain = [];
       const seen = new Set();
@@ -796,7 +986,13 @@ export function createLineageSnapshots(members) {
         seen.add(parentId);
         const set = sets.get(parentId);
         if (set) chain.push(set);
-        parentId = bySessionId.get(parentId)?.lineage?.parentId ?? null;
+        const selected = logicalHeads.get(parentId);
+        // This set already is the selected physical base-prefix plus own
+        // snapshots, or only own snapshots after an independent reset. A
+        // logical grandparent beyond it may contain discarded history and
+        // must not suppress genuinely new matching counters in a descendant.
+        if (selected?.lineage?.historyMode === "paginated") break;
+        parentId = selected?.lineage?.parentId ?? null;
       }
       if (chain.length === 0) return null;
       return { has: (key) => chain.some((set) => set.has(key)) };
@@ -813,4 +1009,64 @@ export function createLineageSnapshots(members) {
       return total;
     },
   };
+}
+
+/** Metadata-only traversal using the index's bounded line reader. Never derives usage. */
+export async function extractRolloutWorkContexts(path, { end, onContext, onQuotaOnly = null, signal = null } = {}) {
+  if (typeof onContext !== "function") throw new TypeError("onContext is required");
+  const sessionMetaKind = Buffer.from('"session_meta"');
+  let previousReportedTotal = null;
+  const completeConsistentTotal = (value) => value !== null
+    && TOKEN_KEYS.every((key) => Number.isSafeInteger(value[key]) && value[key] >= 0)
+    && value.input_tokens + value.output_tokens === value.total_tokens
+    && value.cached_input_tokens + value.cache_write_input_tokens <= value.input_tokens
+    && value.reasoning_output_tokens <= value.output_tokens;
+  return forEachRolloutLine(path, { end, signal, onLine(line, offset, partial) {
+    if (onQuotaOnly && line.includes(NEEDLE_TOKEN_COUNT)) {
+      if (partial) { previousReportedTotal = null; return; }
+      let record;
+      try { record = JSON.parse(line.toString("utf8")); } catch { previousReportedTotal = null; return; }
+      // Classify only a verified status update. Ambiguous, malformed or
+      // incomplete usage objects remain unknown even when quota is present.
+      // This observes record kind; it never calculates or replays token deltas.
+      if (record?.type === "event_msg" && record.payload?.type === "token_count") {
+        const total = normalizeUsage(record.payload.info?.total_token_usage);
+        // A repeated complete cumulative snapshot is another status reading,
+        // not a new usage change. Compare exact observed counters using the
+        // owner's normalization; do not calculate or admit any token delta.
+        const unchanged = completeConsistentTotal(total) && completeConsistentTotal(previousReportedTotal)
+          && TOKEN_KEYS.every((key) => total[key] === previousReportedTotal[key]);
+        if (record.payload.info != null) previousReportedTotal = total;
+        const at = Date.parse(record.timestamp);
+        if ((record.payload.info == null || unchanged) && Number.isFinite(at)
+            && quotaSnapshot(record.payload.rate_limits, at)?.windows.length > 0) {
+          return onQuotaOnly({ offset });
+        }
+      }
+    }
+    if (!line.includes(NEEDLE_TURN_CONTEXT)
+        && !line.includes(sessionMetaKind)
+        && !line.includes(NEEDLE_THREAD_SETTINGS)) return;
+    // A malformed context invalidates the carry; it cannot silently retain an
+    // earlier workspace across a context change we could not interpret.
+    if (partial) return onContext({ offset, cwd: null });
+    let record;
+    try { record = JSON.parse(line.toString("utf8")); } catch { return onContext({ offset, cwd: null }); }
+    let settings;
+    if (record?.type === "session_meta" || record?.type === "turn_context") {
+      settings = record.payload;
+    } else if (record?.type === "event_msg"
+        && record.payload?.type === "thread_settings_applied") {
+      settings = record.payload.thread_settings;
+    } else return;
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      return onContext({ offset, cwd: null });
+    }
+    // The initial session directory applies before the first turn. Later
+    // applied settings can move it; sparse settings leave it unchanged.
+    // Never fill earlier usage backwards from a later directory observation.
+    if (!Object.hasOwn(settings, "cwd")) return;
+    const cwd = settings.cwd;
+    return onContext({ offset, cwd: typeof cwd === "string" && cwd.length <= 4096 && !/[\u0000-\u001f\u007f]/u.test(cwd) ? cwd : null });
+  } });
 }

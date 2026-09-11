@@ -6,6 +6,7 @@ import {
   mkdtemp,
   mkdir,
   readdir,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import {
   assessDisabledEnrollmentConfiguration,
   REQUIRED_COLUMNS,
@@ -24,7 +26,15 @@ import {
   validateMigrationSource,
   runReleasePreflight,
 } from "./release-preflight.mjs";
-import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
+import {
+  ATTRIBUTION_SCHEMA_COLUMNS,
+  ATTRIBUTION_SCHEMA_OBJECTS,
+  EXPECTED_STAGING_MIGRATIONS,
+  POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  SCALE_SCHEMA_COLUMNS,
+  SCALE_SCHEMA_OBJECTS,
+  POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
+} from "./staging-readiness-lib.mjs";
 
 const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
 const localWrangler = join(
@@ -172,11 +182,16 @@ function containedCollectionControlRow() {
 async function standardFixture({
   collectionControlRows = [containedCollectionControlRow()],
   schemaMismatch = null,
+  schemaObjectMissing = null,
+  attributionSchemaRows = [{ attribution_objects: 1, attribution_columns: 1 }],
+  scaleSchemaRows = [{ scale_objects: 1, scale_columns: 1 }],
 } = {}) {
   const calls = [];
   const primaryMigrations = await migrationNames("migrations");
   const deletionLedgerMigrations = await migrationNames("deletion-ledger-migrations");
-  const schemaRows = REQUIRED_SCHEMA_OBJECTS.map(([type, name]) => ({ type, name }));
+  const schemaRows = REQUIRED_SCHEMA_OBJECTS
+    .filter(([type, name]) => `${type}:${name}` !== schemaObjectMissing)
+    .map(([type, name]) => ({ type, name }));
   const deletionLedgerSchemaRows = REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS.map(
     ([type, name]) => ({ type, name }),
   );
@@ -222,6 +237,12 @@ async function standardFixture({
     if (sql.includes("FROM collection_controls")) {
       assert.equal(/\b(?:INSERT|UPDATE|DELETE)\b/iu.test(sql), false);
       return { status: 0, stdout: jsonRows(collectionControlRows) };
+    }
+    if (sql.includes("AS attribution_objects")) {
+      return { status: 0, stdout: jsonRows(attributionSchemaRows) };
+    }
+    if (sql.includes("AS scale_objects")) {
+      return { status: 0, stdout: jsonRows(scaleSchemaRows) };
     }
     if (sql.includes("sqlite_master")) {
       return {
@@ -305,7 +326,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
   assert.equal(result.checks.collectionControlsCoherent, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
-  assert.equal(result.evidence.migrationWindow, "0023-0029");
+  assert.equal(result.evidence.migrationWindow, "0001-0059");
   assert.ok(statePath);
   await assert.rejects(access(statePath));
   assert.equal(calls.filter((args) => args.includes("migrations")).length, 4);
@@ -463,6 +484,134 @@ test("release preflight blocks a missing community schema invariant", async () =
   assert.equal(result.collectionAuthorized, false);
 });
 
+test("release preflight refuses missing attribution guards and acquisition objects despite complete migration labels", async () => {
+  for (const [type, name] of ATTRIBUTION_SCHEMA_OBJECTS.filter(([type, name]) =>
+    type === "trigger" || type === "view"
+      || name.startsWith("telemetry_v1_quota_fit_") || name.startsWith("community_analysis_work"))) {
+    const { spawn } = await standardFixture({ schemaObjectMissing: `${type}:${name}` });
+    const result = await runReleasePreflight({
+      config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+      createState: disposableState, cleanupState: removeState,
+    });
+    assert.equal(result.checks.primaryMigrationsAppliedInOrder, true, name);
+    assert.equal(result.checks.requiredSchemaPresent, false, name);
+    assert.equal(result.state, "blocked", name);
+    assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"], name);
+    assert.equal(result.collectionAuthorized, false, name);
+    assert.equal(result.checks.isolatedStateCleaned, true, name);
+  }
+});
+
+test("release preflight refuses absent or incomplete attribution column proof", async () => {
+  for (const attributionSchemaRows of [[], [{}], [
+    { attribution_objects: 1, attribution_columns: 0 },
+  ], [
+    { attribution_objects: 0, attribution_columns: 1 },
+  ]]) {
+    const { spawn } = await standardFixture({ attributionSchemaRows });
+    const result = await runReleasePreflight({
+      config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+      createState: disposableState, cleanupState: removeState,
+    });
+    assert.equal(result.checks.primaryMigrationsAppliedInOrder, true);
+    assert.equal(result.checks.requiredSchemaPresent, false);
+    assert.equal(result.state, "blocked");
+    assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"]);
+    assert.equal(result.collectionAuthorized, false);
+  }
+});
+
+test("release preflight independently requires every scale object and exact metadata proof", async () => {
+  for (const [type, name] of SCALE_SCHEMA_OBJECTS) {
+    const { spawn } = await standardFixture({ schemaObjectMissing: `${type}:${name}` });
+    const result = await runReleasePreflight({
+      config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+      createState: disposableState, cleanupState: removeState,
+    });
+    assert.equal(result.checks.primaryMigrationsAppliedInOrder, true, name);
+    assert.equal(result.checks.requiredSchemaPresent, false, name);
+    assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"], name);
+    assert.equal(result.collectionAuthorized, false, name);
+    assert.equal(result.checks.isolatedStateCleaned, true, name);
+  }
+  for (const scaleSchemaRows of [[], [{}], [{ scale_objects: 1, scale_columns: 0 }],
+    [{ scale_objects: 0, scale_columns: 1 }], [{ scale_objects: true, scale_columns: true }],
+    [{ scale_objects: 1, scale_columns: 1 }, { scale_objects: 1, scale_columns: 1 }]]) {
+    const { calls, spawn } = await standardFixture({ scaleSchemaRows });
+    const result = await runReleasePreflight({
+      config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+      createState: disposableState, cleanupState: removeState,
+    });
+    assert.equal(result.checks.primaryMigrationsAppliedInOrder, true);
+    assert.equal(result.checks.requiredSchemaPresent, false);
+    assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"]);
+    assert.equal(result.collectionAuthorized, false);
+    assert.equal(calls.filter(args => args.includes(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL)).length, 1);
+    assert.equal(calls.filter(args => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
+    assert.equal(calls.some(args => args.includes("--remote") || args.includes("deploy")), false);
+  }
+});
+
+test("release preflight uses the real independent scale column proof, including the nullable predecessor publication field", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+      const sql = await readFile(join(workerDirectory, "migrations", name), "utf8");
+      database.exec(name.startsWith("0058_") ? `BEGIN;\n${sql}\nCOMMIT;` : sql);
+    }
+    for (const [table, column] of Object.entries(SCALE_SCHEMA_COLUMNS).flatMap(([table, columns]) =>
+      columns.map(column => [table, column]))) {
+      database.exec(`SAVEPOINT missing_scale_column;
+        ALTER TABLE ${table} RENAME COLUMN ${column} TO synthetic_missing_column;`);
+      const actualProbe = { ...database.prepare(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL).get() };
+      assert.equal(actualProbe.scale_columns, 0, `${table}.${column}`);
+      const { spawn } = await standardFixture({ scaleSchemaRows: [actualProbe] });
+      const result = await runReleasePreflight({
+        config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+        createState: disposableState, cleanupState: removeState,
+      });
+      assert.equal(result.checks.requiredSchemaPresent, false, `${table}.${column}`);
+      assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"], `${table}.${column}`);
+      assert.equal(result.collectionAuthorized, false);
+      database.exec("ROLLBACK TO missing_scale_column; RELEASE missing_scale_column;");
+    }
+  } finally {
+    database.close();
+  }
+});
+
+test("release preflight requires every staged checkpoint column without authorizing collection", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+      const sql = await readFile(join(workerDirectory, "migrations", name), "utf8");
+      database.exec(name.startsWith("0058_") ? `BEGIN;\n${sql}\nCOMMIT;` : sql);
+    }
+    assert.equal(database.prepare(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL).get().attribution_columns, 1);
+    for (const column of ATTRIBUTION_SCHEMA_COLUMNS.community_analysis_work_stage) {
+      database.exec(`SAVEPOINT missing_stage_column;
+        ALTER TABLE community_analysis_work_stage RENAME COLUMN "${column}" TO synthetic_missing_column;`);
+      const actualProbe = { ...database.prepare(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL).get() };
+      assert.equal(actualProbe.attribution_columns, 0, column);
+      const { calls, spawn } = await standardFixture({ attributionSchemaRows: [actualProbe] });
+      const result = await runReleasePreflight({
+        config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+        createState: disposableState, cleanupState: removeState,
+      });
+      assert.equal(result.checks.primaryMigrationsAppliedInOrder, true, column);
+      assert.equal(result.checks.requiredSchemaPresent, false, column);
+      assert.equal(result.state, "blocked", column);
+      assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"], column);
+      assert.equal(result.collectionAuthorized, false, column);
+      assert.equal(result.checks.isolatedStateCleaned, true, column);
+      assert.equal(calls.some(args => args.includes("--remote") || args.includes("deploy")), false, column);
+      database.exec("ROLLBACK TO missing_stage_column; RELEASE missing_stage_column;");
+    }
+  } finally {
+    database.close();
+  }
+});
+
 test("migration failure is content-free, local-only, and still cleans isolated state", async () => {
   let cleanupCalled = false;
   const result = await runReleasePreflight({
@@ -505,6 +654,15 @@ test("missing deletion-ledger schema blocks the gate with a separate blocker", a
     }
     if (sql.includes("FROM collection_controls")) {
       return { status: 0, stdout: jsonRows([containedCollectionControlRow()]) };
+    }
+    if (sql.includes("AS attribution_objects")) {
+      return { status: 0, stdout: jsonRows([{
+        attribution_objects: 1,
+        attribution_columns: 1,
+      }]) };
+    }
+    if (sql.includes("AS scale_objects")) {
+      return { status: 0, stdout: jsonRows([{ scale_objects: 1, scale_columns: 1 }]) };
     }
     if (sql.includes("sqlite_master")) {
       return {
@@ -582,7 +740,7 @@ test("real Wrangler proves both local D1 streams, schema, and controls coherence
         rowsForBinding.push(rows);
         migrationRows.set(binding, rowsForBinding);
       }
-      if (sql?.includes("sqlite_master") && binding !== null) {
+      if (sql?.startsWith("SELECT name, type FROM sqlite_master") && binding !== null) {
         schemaRows.set(binding, rows);
       }
       if (sql?.includes("FROM collection_controls")) {
@@ -610,7 +768,16 @@ test("real Wrangler proves both local D1 streams, schema, and controls coherence
     // Freshly migrated databases seed an operational controls row; that is a
     // coherent, passing outcome under the migration-gate governance
     // (docs/governance/2026-08-07-production-deploy-migration-gate.md).
-    assert.equal(result.state, "ready");
+    assert.equal(result.state, "ready", JSON.stringify({
+      blockers: result.blockers,
+      checks: result.checks,
+      commandFailures: commands.filter(({ result }) => result.status !== 0).map(({ result }) => ({
+        status: result.status,
+        errorCode: result.error?.code ?? null,
+        permissionFailure: /EPERM|EACCES/u.test(result.stderr ?? ""),
+        bindFailure: /listen|bind/u.test(result.stderr ?? ""),
+      })),
+    }));
     assert.equal(result.collectionAuthorized, false);
     assert.deepEqual(result.blockers, []);
     assert.equal(result.checks.localOnly, true);

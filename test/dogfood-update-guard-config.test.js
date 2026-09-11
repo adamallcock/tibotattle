@@ -39,7 +39,13 @@ test("dogfood guard deployment matches the reviewed release channel", async () =
     pattern: new URL(channel.sparkle.atomicGuardURL).hostname,
     custom_domain: true,
   }]);
+  const intel = resolveReleaseChannel(INTERNAL_DOGFOOD_RELEASE_CHANNEL, { architecture: "x64" });
   assert.deepEqual(contract, {
+    intel: {
+      appcastURL: intel.sparkle.appcastURL,
+      appcastObjectKey: intel.sparkle.appcastObjectKey,
+      objectPrefix: intel.sparkle.objectPrefix,
+    },
     schemaVersion: "usage-monitor-worker-sparkle-release-contract-v1",
     channel: channel.name,
     serviceOrigin: channel.serviceOrigin,

@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { createContext, runInContext } from "node:vm";
+import { FAST_MODE_QUOTA_MULTIPLIERS } from "@app-usagemonitor/accounting";
 import {
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../../config/product-brand.js";
@@ -20,9 +22,13 @@ import {
   serviceRequestId,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
+  HISTORY_INFORMATIONAL_GAP_MAX_SHARE,
+  historyCoverageNoticeKind,
+  LOCAL_REFRESH_POLLING_WINDOW_MS,
   createSyntheticEnvelope,
   createTelemetryEnvelope,
   detectDeviationPeriods,
+  historyIndexContinuationDecision,
   contributionReviewBootstrapAction,
   contributionReviewPreparationPermitted,
   withContributionReviewDeadline,
@@ -32,8 +38,9 @@ import {
   DEVIATION_MAX_PERIODS,
   parseJsonWithUniqueObjectKeys,
   isContributionReviewableQueueState,
+  refreshAccountingStatus,
+  refreshQuickResultStatus,
   refreshNeedsContinuation,
-  runReviewedContributionGate,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
   ENVELOPE_SCHEMA_VERSION,
   safeApiError,
@@ -44,7 +51,6 @@ import {
   validateTelemetryContribution
 } from "../public/lib.js";
 import {
-  AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_PRIMARY_LIMIT_ID,
   CODEX_SPARK_LIMIT_ID,
@@ -66,13 +72,11 @@ import {
   normalizeIncrementalContributionSyncStatus,
   normalizeContributionDeletionReceipt,
   normalizeBackendReadiness,
-  normalizeAutomaticContributionStatus,
   normalizeLocalContributionDevicePairing,
   normalizeLocalContributionPreparation,
   normalizeLocalOnboarding,
   normalizeDashboardPayload,
   normalizeParticipantCommunityComparison,
-  normalizeParticipantDeletionReceipt,
   normalizeParticipantHistory,
   normalizeParticipantStats,
   normalizeLocalContributionDeviceDisconnect,
@@ -84,6 +88,7 @@ import {
   PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
   PARTICIPANT_PROFILE_SCHEMA_VERSION,
   PARTICIPANT_STATS_SCHEMA_VERSION,
+  selectAllowancePlanPopulation,
   selectPrimaryCodexQuotaWindow,
   isPrimaryCodexQuotaWindow,
   isPrimaryCodexWeeklyQuotaWindow,
@@ -115,6 +120,7 @@ import {
   translatePlural,
 } from "../public/localization.js";
 import {
+  TELEMETRY_PLAN_DISPLAY_NAMES,
   TELEMETRY_PLAN_TYPES,
 } from "../public/telemetry-shared.generated.js";
 
@@ -328,7 +334,7 @@ async function loadLineChartRenderer(documentRef, { translate = null } = {}) {
  * the hero copy can be compared across control positions instead of inferred
  * from the source.
  */
-async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
+async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planType = null }) {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const chartStart = appSource.indexOf("const CHART_POINT_STYLE = Object.freeze(");
   const chartEnd = appSource.indexOf("\nfunction firstFiniteForecastNumber", chartStart);
@@ -354,6 +360,9 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
   const money = (value, digits = 0) => value === null || value === undefined
     ? "—"
     : `$${Number(value).toFixed(digits)}`;
+  const { shareCardPlanLabel } = await loadShareCardPlan();
+  let shared = null;
+  let paceData = null;
 
   Function(
     "document", "ResizeObserver", "adaptiveChartTickCount", "finite",
@@ -370,6 +379,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     // the hero harness stubs it like the other side-effect renderers.
     "renderStaleServeNote",
     "activeWeeklyRangeDays", "activeWeeklyMinimumObservedSpanPp",
+    "selectAllowancePlanPopulation", "activeWeeklyPlanType",
+    "renderWeeklyPlanControl", "shareCardPlanLabel",
     `${section}\nreturn renderWeekly;`,
   )(
     { createElementNS: () => new FakeSvgElement("g") },
@@ -398,11 +409,15 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     () => ({ append() {}, textContent: "" }),
     (value) => new Date(value).toISOString().slice(0, 10),
     (value) => String(value),
-    () => {},
-    () => {},
+    (selectedData) => { paceData = selectedData; },
+    (selectedData, { history }) => { shared = { data: selectedData, history }; },
     () => {},
     rangeDays,
     span,
+    selectAllowancePlanPopulation,
+    planType,
+    () => {},
+    shareCardPlanLabel,
   )(data);
 
   return {
@@ -411,7 +426,11 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     range: element("#weekly-range").textContent,
     explanation: element("#weekly-explanation").textContent,
     timeZone: element("#weekly-chart-timezone").textContent,
+    spanLabel: element("#weekly-span-label").textContent,
+    spanNote: element("#weekly-span-note"),
     empty: element("#weekly-empty"),
+    shared,
+    paceData,
   };
 }
 
@@ -1007,63 +1026,6 @@ test("quota timeline lookup parses supported dashboard bounds only once", () => 
   assert.equal(observedAtReads, quotaRowCount);
 });
 
-test("reviewed contribution must be accepted before recurring contribution can be enabled", async () => {
-  const calls = [];
-  let resolveSend;
-  const acceptedSend = new Promise((resolve) => {
-    resolveSend = resolve;
-  });
-  const running = runReviewedContributionGate({
-    reviewToken: "review-token",
-    hasPendingAutomaticConsent: true,
-    runReviewedSend: async (token) => {
-      calls.push(["send", token]);
-      return acceptedSend;
-    },
-    enableAutomaticContribution: async () => {
-      calls.push(["enable"]);
-      return { status: "scheduled" };
-    },
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(calls, [["send", "review-token"]]);
-  resolveSend({ status: "completed", accepted: 1 });
-  const accepted = await running;
-  assert.equal(accepted.accepted, true);
-  assert.deepEqual(calls, [["send", "review-token"], ["enable"]]);
-  assert.deepEqual(accepted.automatic, { status: "scheduled" });
-
-  for (const result of [
-    { status: "completed", accepted: 0 },
-    { status: "interrupted", accepted: 1 },
-    { status: "completed", accepted: -1 },
-  ]) {
-    let enabled = false;
-    const rejected = await runReviewedContributionGate({
-      reviewToken: "review-token",
-      hasPendingAutomaticConsent: true,
-      runReviewedSend: async () => result,
-      enableAutomaticContribution: async () => {
-        enabled = true;
-      },
-    });
-    assert.equal(rejected.accepted, false);
-    assert.equal(enabled, false);
-  }
-
-  let enabledWithoutConsent = false;
-  const noConsent = await runReviewedContributionGate({
-    reviewToken: "review-token",
-    hasPendingAutomaticConsent: false,
-    runReviewedSend: async () => ({ status: "completed", accepted: 1 }),
-    enableAutomaticContribution: async () => {
-      enabledWithoutConsent = true;
-    },
-  });
-  assert.equal(noConsent.accepted, true);
-  assert.equal(enabledWithoutConsent, false);
-});
-
 test("refresh polling budget gives each accepted continuation a fresh window", () => {
   let nowMs = 1_000;
   const budget = createRefreshPollingBudget({
@@ -1094,11 +1056,65 @@ test("refresh polling budget gives each accepted continuation a fresh window", (
 
 test("default local analysis permits only two bounded continuations", () => {
   const budget = createRefreshPollingBudget();
+  assert.equal(LOCAL_REFRESH_POLLING_WINDOW_MS, 241 * 60 * 1_000);
   assert.equal(budget.canContinue(), true);
   assert.equal(budget.noteContinuation(), true);
   assert.equal(budget.noteContinuation(), true);
   assert.equal(budget.canContinue(), false);
   assert.equal(budget.noteContinuation(), false);
+});
+
+test("quick-result progress never turns a loaded no-numbers overview into a headline claim", () => {
+  const noNumbersOverview = {
+    state: "insufficient",
+    quotaWindows: [],
+    accounting: { status: "unavailable" },
+  };
+
+  assert.deepEqual(noNumbersOverview.quotaWindows, []);
+  assert.equal(
+    refreshQuickResultStatus({
+      dashboardLoaded: true,
+      elapsedLabel: "7s",
+    }),
+    "Local summary updated · checking full history… 7s",
+  );
+  assert.equal(
+    refreshQuickResultStatus({
+      dashboardLoaded: false,
+      elapsedLabel: "7s",
+    }),
+    "Preparing local summary… 7s",
+  );
+  assert.equal(
+    refreshQuickResultStatus({ dashboardLoaded: true, elapsedLabel: "1m 2s" }),
+    "Local summary updated · checking full history… 1m 2s",
+  );
+  assert.equal(
+    refreshQuickResultStatus({ dashboardLoaded: true }),
+    "Local summary updated · checking full history…",
+  );
+});
+
+test("accounting progress is explicit work, with no source-counter or ready fallback", () => {
+  const progress = { kind: "accounting", status: "calculating" };
+  assert.equal(refreshAccountingStatus({ progress }), "Calculating accounting…");
+  assert.equal(
+    refreshAccountingStatus({ progress, elapsedLabel: "1m 7s" }),
+    "Calculating accounting… 1m 7s",
+  );
+  for (const invalid of [
+    null, [], "accounting",
+    { kind: "accounting" },
+    { ...progress, status: "complete" },
+    { ...progress, phase: "quick_result" },
+    { ...progress, filesProcessed: 7, filesSelected: 7_215 },
+    { ...progress, message: "synthetic unreviewed text" },
+    { kind: "future_worker", status: "calculating" },
+    { phase: "accounting" },
+  ]) {
+    assert.equal(refreshAccountingStatus({ progress: invalid }), null);
+  }
 });
 
 test("contribution admission uses participant allowance without inventing an unknown limit", () => {
@@ -1166,6 +1182,118 @@ test("completed bounded passes continue under the original user action", () => {
     errorCode: "collector_failed",
     progress: { status: "bounded_pause" },
   }), false);
+});
+
+test("history auto-continuation stops on terminal gaps and unchanged receipts", () => {
+  const history = {
+    status: "partial",
+    phase: "scanning",
+    indexedSourceCount: 7,
+    indexedBytes: 7_000,
+    sourceCount: 10,
+    sourceBytes: 10_000,
+  };
+  const advancing = historyIndexContinuationDecision({
+    history,
+    generation: 4,
+    generationFingerprint: "a".repeat(64),
+  });
+  assert.equal(advancing.incomplete, true);
+  assert.equal(advancing.shouldContinue, true);
+  assert.equal(typeof advancing.receipt, "string");
+
+  const unchanged = historyIndexContinuationDecision({
+    history,
+    generation: 4,
+    generationFingerprint: "a".repeat(64),
+    previousReceipt: advancing.receipt,
+  });
+  assert.equal(unchanged.incomplete, true);
+  assert.equal(unchanged.shouldContinue, false);
+
+  const advancedBytes = historyIndexContinuationDecision({
+    history: { ...history, indexedBytes: 7_001 },
+    generation: 4,
+    generationFingerprint: "a".repeat(64),
+    previousReceipt: advancing.receipt,
+  });
+  assert.equal(advancedBytes.shouldContinue, true);
+
+  const terminalGap = historyIndexContinuationDecision({
+    history: {
+      ...history,
+      phase: "partial_terminal",
+      skippedSourceCount: 3,
+    },
+    generation: 5,
+    generationFingerprint: "b".repeat(64),
+    previousReceipt: advancing.receipt,
+  });
+  assert.equal(terminalGap.incomplete, false);
+  assert.equal(terminalGap.shouldContinue, false);
+  assert.equal(terminalGap.terminalGap, true);
+
+  assert.equal(historyIndexContinuationDecision({
+    history: { ...history, status: "complete" },
+  }).shouldContinue, false);
+});
+
+test("terminal history gaps are informational only when small, coherent, and fully accounted", () => {
+  const accountingProjection = { status: "available" };
+  const history = {
+    status: "partial",
+    phase: "partial_terminal",
+    sourceCount: 7_156,
+    indexedSourceCount: 7_142,
+    pendingSourceCount: 0,
+    skippedSourceCount: 14,
+  };
+  assert.equal(HISTORY_INFORMATIONAL_GAP_MAX_SHARE, 0.01);
+  assert.equal(historyCoverageNoticeKind({
+    history,
+    accountingProjection,
+  }), "info");
+  assert.equal(historyCoverageNoticeKind({
+    history: {
+      ...history,
+      sourceCount: 100,
+      indexedSourceCount: 99,
+      skippedSourceCount: 1,
+    },
+    accountingProjection,
+  }), "info");
+  assert.equal(historyCoverageNoticeKind({
+    history: {
+      ...history,
+      sourceCount: 100,
+      indexedSourceCount: 98,
+      skippedSourceCount: 2,
+    },
+    accountingProjection,
+  }), "warning");
+  assert.equal(historyCoverageNoticeKind({
+    history: {
+      ...history,
+      sourceCount: 14,
+      indexedSourceCount: 0,
+      skippedSourceCount: 14,
+    },
+    accountingProjection,
+  }), "warning");
+  for (const status of ["retained", "unavailable"]) {
+    assert.equal(historyCoverageNoticeKind({
+      history,
+      accountingProjection: { status },
+    }), "warning");
+  }
+  assert.equal(historyCoverageNoticeKind({
+    history: { ...history, pendingSourceCount: 1 },
+    accountingProjection,
+  }), "warning");
+  assert.equal(historyCoverageNoticeKind({
+    history: { ...history, indexedSourceCount: 7_141 },
+    accountingProjection,
+  }), "warning");
 });
 
 function communitySnapshot() {
@@ -1587,6 +1715,47 @@ test("history coverage only becomes complete from coherent archive evidence", ()
     }).pricing.historyCoverage.errorCode,
     "archive_disk_space",
   );
+  const terminalGap = {
+    status: "partial",
+    phase: "partial_terminal",
+    generatedAt: "2026-08-03T12:00:00.000Z",
+    coveredAt: complete.coveredAt,
+    sourceCount: 3,
+    indexedSourceCount: 1,
+    pendingSourceCount: 0,
+    skippedSourceCount: 2,
+    skippedSourceBytes: 60,
+    skippedThreadCount: 1,
+    sourceBytes: 100,
+    indexedBytes: 40,
+  };
+  assert.deepEqual(
+    normalizeDashboardPayload({ pricing: { historyCoverage: terminalGap } })
+      .pricing.historyCoverage,
+    {
+      status: "partial",
+      phase: "partial_terminal",
+      sourceCount: 3,
+      indexedSourceCount: 1,
+      pendingSourceCount: 0,
+      skippedSourceCount: 2,
+      skippedSourceBytes: 60,
+      skippedThreadCount: 1,
+      sourceBytes: 100,
+      indexedBytes: 40,
+      generatedAt: "2026-08-03T12:00:00.000Z",
+      errorCode: null,
+      coveredAt: complete.coveredAt,
+    },
+  );
+  assert.equal(
+    normalizeDashboardPayload({
+      pricing: {
+        historyCoverage: { ...terminalGap, skippedSourceBytes: 59 },
+      },
+    }).pricing.historyCoverage.phase,
+    "not_started",
+  );
 });
 
 test("the cost card drops its metadata line while coverage honesty stays elsewhere", async () => {
@@ -1808,6 +1977,191 @@ test("missing numeric evidence stays missing instead of becoming zero", () => {
   assert.equal(result.pricing.coveragePercent, null);
 });
 
+test("newer-schema accounting remains a terminal unavailable state across the browser boundary", async () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    activity: { toolEvents: null },
+    timeline: {
+      usage: [],
+      history: {
+        status: "unavailable",
+        reason: "local_unified_index_schema_newer",
+        boundedDays: 31,
+      },
+    },
+    accounting: {
+      projection: {
+        status: "unavailable",
+        reason: "local_unified_index_schema_newer",
+        terminal: true,
+      },
+      accountingCacheStatus: "unavailable",
+      toolClasses: {
+        status: "unavailable",
+        reason: "typed_tool_history_partial",
+        total: null,
+        counts: {
+          apply_patch: null,
+          local_shell: null,
+          other: null,
+          subagent: null,
+          tool_gateway: null,
+        },
+      },
+      events: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+    },
+  });
+  assert.deepEqual(result.accounting.projection, {
+    status: "unavailable",
+    reason: "local_unified_index_schema_newer",
+    terminal: true,
+    retainedAt: null,
+    coveredAt: null,
+  });
+  assert.equal(result.timeline.history.status, "unavailable");
+  assert.equal(
+    result.timeline.history.reason,
+    "local_unified_index_schema_newer",
+  );
+  assert.equal(result.timeline.history.usageEvents, null);
+  assert.equal(result.activity.toolEvents, null);
+  assert.equal(result.accounting.toolClasses.total, null);
+  assert.ok(Object.values(result.accounting.toolClasses.counts).every(
+    (value) => value === null,
+  ));
+
+  const appSource = await readFile(
+    new URL("../public/app.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(appSource, /function accountingRequiresNewerBuild\(data\)/u);
+  assert.match(appSource, /projection\.status !== "available"/u);
+  assert.match(appSource, /accountingIsUnavailable\(data\).*activePoints\.length === 0/u);
+  assert.match(appSource, /unavailable && visiblePoints\.length === 0[\s\S]*?"—"/u);
+  assert.ok(
+    appSource.includes('if (projection.status === "unavailable") return null;'),
+    "share-card accounting selection closes on terminal unavailable data",
+  );
+  assert.ok(
+    appSource.includes('&& finite(totalCostUsd, 0) <= 0'),
+    "a retained zero cost is withheld rather than shared as measured evidence",
+  );
+  assert.ok(
+    appSource.includes('t("share.detail.newerBuildRequired")'),
+    "the shared-card unavailable state names the required newer build",
+  );
+  assert.ok(
+    appSource.includes('"share.detail.lastVerifiedNewerBuild"'),
+    "retained share-card evidence is labeled last verified and names the newer build",
+  );
+});
+
+test("a contradictory available accounting attestation fails closed", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    accounting: {
+      projection: {
+        status: "available",
+        reason: "local_unified_index_schema_newer",
+        terminal: true,
+      },
+      events: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+    },
+  });
+  assert.deepEqual(result.accounting.projection, {
+    status: "unavailable",
+    reason: "local_unified_index_unavailable",
+    terminal: true,
+    retainedAt: null,
+    coveredAt: null,
+  });
+});
+
+test("real local accounting without an authority attestation renders unavailable", async () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    accounting: {
+      events: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+    },
+  });
+  assert.deepEqual(result.accounting.projection, {
+    status: "unavailable",
+    reason: "local_unified_index_unavailable",
+    terminal: true,
+    retainedAt: null,
+    coveredAt: null,
+  });
+
+  const appSource = await readFile(
+    new URL("../public/app.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    appSource,
+    /if \(projection\.status !== "available"\)[\s\S]*?\$\("#cost-total"\)\.textContent = retainedEvidence[\s\S]*?: "—";/u,
+    "an unavailable real-local projection must render a dash, not its zero placeholders",
+  );
+});
+
+test("retained accounting provenance admits only reviewed reason codes", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    timeline: {
+      history: {
+        status: "partial",
+        reason: "typed_tool_history_partial",
+        coveredAt: {
+          startAt: "2026-08-01T00:00:00.000Z",
+          endAt: "2026-08-27T00:00:00.000Z",
+        },
+        usageEvents: 12,
+        sourceCount: 3,
+        indexBytes: 42,
+      },
+    },
+    accounting: {
+      projection: {
+        status: "retained",
+        reason: "private path /Users/example",
+        terminal: true,
+        retainedAt: "2026-08-27T00:00:00.000Z",
+      },
+      staleServe: {
+        stale: true,
+        reason: "local_unified_index_schema_newer",
+        schemaVersion: "local-replay-safe-accounting-v0.13",
+        computedAt: "2026-08-27T00:00:00.000Z",
+        coveredAt: {
+          startAt: "2026-08-01T00:00:00.000Z",
+          endAt: "2026-08-27T00:00:00.000Z",
+        },
+        periods: [{
+          periodId: "7d",
+          periodLabel: "Last 7 days",
+          events: 12,
+          totalTokens: 123,
+          apiPriceEquivalentUsd: 1.25,
+        }],
+      },
+    },
+  });
+  assert.equal(
+    result.accounting.projection.reason,
+    "local_unified_index_unavailable",
+  );
+  assert.equal(
+    result.accounting.staleServe.reason,
+    "local_unified_index_schema_newer",
+  );
+  assert.equal(result.timeline.history.reason, "typed_tool_history_partial");
+});
+
 test("new accounting caveats survive the closed dashboard normalizer", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",
@@ -1846,7 +2200,7 @@ test("the Fast-mode blind spot reports a share instead of a bare not-observed", 
   assert.doesNotMatch(result.monitoringGaps[0].explanation, /NOT OBSERVED/iu);
 });
 
-test("the closed accounting normalizer keeps the quota-weighted metric and its coverage split", () => {
+test("the closed accounting normalizer keeps the speed-priced metric and its coverage split", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",
     status: "live",
@@ -1857,25 +2211,25 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
       apiPriceEquivalentUsd: 20,
       quotaWeightedApiPriceEquivalentUsd: 34,
       speedWeighting: {
-        fast: { "gpt-5.6": { events: 4, apiPriceEquivalentUsd: 8 } },
+        fast: { "gpt-5.6-sol": { events: 4, apiPriceEquivalentUsd: 8 } },
         standard: { "gpt-5.4": { events: 2, apiPriceEquivalentUsd: 4 } },
         unknown: { unsupported: { events: 4, apiPriceEquivalentUsd: 8 } }
       },
       fastMode: {
-        preference: "mixed_unknown",
+        unresolvedScenario: "unresolved_as_standard",
         quotaWeightedApiPriceEquivalentUsd: 34,
         standardApiPriceEquivalentUsd: 20,
         unweightedUnknownApiPriceEquivalentUsd: 8,
         weightingStatus: "partial",
-        appliedMultipliers: { "gpt-5.6": 2.5 },
+        appliedMultipliers: { "gpt-5.6-sol": 2.5 },
         coverage: {
           totalEvents: 10,
           observedEvents: 6,
-          assumedFromPreferenceEvents: 0,
+          assumedEvents: 4,
           inferredEvents: 3,
-          unknownEvents: 4,
+          unknownEvents: 0,
           observedSharePercent: 60,
-          unknownSharePercent: 40
+          unknownSharePercent: 0
         },
         inference: {
           status: "inferred",
@@ -1893,38 +2247,69 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
   assert.equal(accounting.quotaWeightedApiPriceEquivalentUsd, 34);
   assert.equal(accounting.apiPriceEquivalentUsd, 20);
   assert.equal(accounting.evidenceStartDate, "2026-07-26");
-  assert.equal(accounting.fastMode.preference, "mixed_unknown");
+  assert.equal(accounting.fastMode.unresolvedScenario, "unresolved_as_standard");
   assert.equal(accounting.fastMode.weightingStatus, "partial");
   assert.equal(accounting.fastMode.unweightedUnknownApiPriceEquivalentUsd, 8);
   assert.deepEqual(accounting.fastMode.coverage, {
     totalEvents: 10,
     observedEvents: 6,
-    assumedFromPreferenceEvents: 0,
+    declaredFromConfigEvents: 0,
+    assumedEvents: 4,
     inferredEvents: 3,
-    unknownEvents: 4,
+    unknownEvents: 0,
     observedSharePercent: 60,
-    unknownSharePercent: 40
+    unknownSharePercent: 0
   });
   assert.ok(accounting.fastMode.coverage.inferredEvents
-    <= accounting.fastMode.coverage.unknownEvents);
+    <= accounting.fastMode.coverage.assumedEvents
+      + accounting.fastMode.coverage.unknownEvents);
   // The multipliers and the metric name are stated by this page, never taken
   // from the server, and inference can never be reported as weighted.
-  assert.deepEqual(accounting.fastMode.multipliers, {
-    "gpt-5.6": 2.5,
-    "gpt-5.5": 2.5,
-    "gpt-5.4": 2
-  });
-  assert.equal(accounting.fastMode.metricLabel, "Quota-weighted API-price equivalent");
+  assert.deepEqual(accounting.fastMode.multipliers, { ...FAST_MODE_QUOTA_MULTIPLIERS });
+  assert.equal(accounting.fastMode.metricLabel, "Speed-priced API-price equivalent");
   assert.equal(accounting.fastMode.inference.appliedToWeighting, false);
   assert.equal(accounting.fastMode.inference.inferredFastWindows, 2);
   assert.equal(accounting.fastMode.logRecordsTierChangesOnly, true);
-  assert.equal(
-    accounting.fastMode.preferenceAppliesTo,
-    "turns_with_no_observed_tier_only"
-  );
-  assert.equal(accounting.speedWeighting.fast["gpt-5.6"].events, 4);
+  assert.equal(accounting.speedWeighting.fast["gpt-5.6-sol"].events, 4);
   assert.equal(accounting.speedWeighting.unknown.unsupported.apiPriceEquivalentUsd, 8);
   assert.equal(accounting.speedWeighting.fast["gpt-5.5"].events, 0);
+});
+
+test("config-only speed provenance survives normalization and appears in the rendered coverage sentence", async () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    status: "live",
+    accounting: {
+      fastMode: {
+        coverage: {
+          totalEvents: 4,
+          observedEvents: 0,
+          declaredFromConfigEvents: 4,
+          assumedEvents: 0,
+          inferredEvents: 0,
+          unknownEvents: 0,
+          observedSharePercent: 0,
+          unknownSharePercent: 0
+        }
+      }
+    }
+  });
+  assert.equal(result.accounting.fastMode.coverage.declaredFromConfigEvents, 4);
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const match = source.match(/function fastModeCoverageSentence\(fastMode\) \{[\s\S]*?\n\}/u);
+  assert.ok(match);
+  const render = new Function("t", "compact", "formatPercent", "formatApiMoney",
+    `${match[0]}; return fastModeCoverageSentence;`)(
+    (key, values) => translate(key, values, "en"),
+    String, (value) => `${value}%`, String,
+  );
+  assert.match(render(result.accounting.fastMode), /4 declared by timestamped Codex config/u);
+  for (const locale of SUPPORTED_LOCALES) {
+    const sentence = translate("accounting.fastMode.declaredFromConfig", { count: "4" }, locale);
+    assert.ok(sentence.includes("4"));
+    assert.ok(sentence.includes("Codex"));
+    assert.notEqual(sentence, "accounting.fastMode.declaredFromConfig");
+  }
 });
 
 test("an absent or hostile Fast-mode projection degrades to an explicit unknown", () => {
@@ -1935,11 +2320,14 @@ test("an absent or hostile Fast-mode projection degrades to an explicit unknown"
       events: 3,
       apiPriceEquivalentUsd: 5,
       quotaWeightedApiPriceEquivalentUsd: -12,
-      fastMode: { preference: "turbo", weightingStatus: "definitely" }
+      fastMode: { unresolvedScenario: "turbo", weightingStatus: "definitely" }
     }
   });
   assert.equal(result.accounting.quotaWeightedApiPriceEquivalentUsd, null);
-  assert.equal(result.accounting.fastMode.preference, "standard");
+  assert.equal(
+    result.accounting.fastMode.unresolvedScenario,
+    "unresolved_as_standard",
+  );
   assert.equal(result.accounting.fastMode.weightingStatus, "unknown");
   assert.equal(result.accounting.fastMode.coverage.totalEvents, 0);
   assert.equal(result.accounting.fastMode.inference.status, "not_run");
@@ -2001,7 +2389,7 @@ test("normal Codex allowance selection uses stable identifiers, not labels", () 
   // still derived from (limitId, duration) alone, never from the provider's
   // label string supplied above.
   assert.equal(result.quotaWindows[1].label, "Spark seven-day allowance");
-  assert.equal(result.quotaWindows[2].label, "Other observed allowance");
+  assert.equal(result.quotaWindows[2].label, "Other observed 7-day allowance");
   assert.equal(result.quotaWindows[0].limitId, CODEX_PRIMARY_LIMIT_ID);
   assert.equal(result.quotaWindows[1].limitId, CODEX_SPARK_LIMIT_ID);
   assert.equal(result.quotaWindows[2].limitId, "unknown");
@@ -2123,7 +2511,7 @@ test("web timeline expands the compact weighted tuple and rejects encoding drift
   const encoding = {
     schemaVersion: "quota-weighted-timeline-v0.1",
     basisFamilyId:
-      "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario",
+      "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario",
     scenarioOrder: [
       "unresolved_as_standard",
       "unresolved_as_fast"
@@ -2161,7 +2549,7 @@ test("web timeline expands the compact weighted tuple and rejects encoding drift
   );
   assert.equal(
     normalized.timeline.usage[0].allowanceWeighting.scenarios
-      .unresolved_as_standard.coverage.assumedFromPreferenceEvents,
+      .unresolved_as_standard.coverage.assumedEvents,
     2
   );
 
@@ -2280,12 +2668,16 @@ test("quota presentation keeps Spark separate and weekly surfaces exact", async 
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(appSource, /isSparkQuotaLimitId/u);
   assert.match(appSource, /const sparkWindows = data\.quotaWindows\.filter/u);
+  assert.match(appSource, /const otherWindows = data\.quotaWindows\.filter/u);
+  assert.match(appSource, /\.\.\.otherOrderedWindows/u);
   assert.match(appSource, /quota-card-spark/u);
   assert.match(appSource, /dashboard\.quota\.windowSpark/u);
   // The Spark limit's two recognized windows carry duration-named titles; the
   // duration-blind windowSpark key stays as the honest generic fallback only.
   assert.match(appSource, /dashboard\.quota\.windowSparkFiveHour/u);
   assert.match(appSource, /dashboard\.quota\.windowSparkSevenDay/u);
+  assert.match(appSource, /dashboard\.quota\.windowOtherDuration/u);
+  assert.match(appSource, /dashboard\.quota\.windowNamedObserved/u);
   assert.match(appSource, /dashboard\.quota\.spark/u);
   assert.match(appSource, /const normalWindows = data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u);
   assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);
@@ -2324,8 +2716,7 @@ test("local split overview contract derives quota and seven-day pricing without 
         }
       ],
       pricing: { apiServiceTier: "standard" }
-    },
-    reports: { reports: [{ id: "weekly", title: "Weekly", href: "/reports/weekly", modifiedAt: "2026-07-25T12:00:00Z" }] }
+    }
   });
   assert.equal(result.state, "live");
   assert.equal(result.quotaWindows[0].remainingPercent, 61);
@@ -2333,7 +2724,7 @@ test("local split overview contract derives quota and seven-day pricing without 
   assert.equal(result.pricing.totalCostUsd, 511.64);
   assert.equal(result.pricing.coveragePercent, 55.014);
   assert.equal(result.pricing.components.length, 2);
-  assert.equal(result.reports[0].updatedAt, "2026-07-25T12:00:00Z");
+  assert.equal(Object.hasOwn(result, "reports"), false);
 });
 
 test("demo data is labeled demo at the contract root and has multiple useful sections", () => {
@@ -2351,26 +2742,11 @@ test("demo data is labeled demo at the contract root and has multiple useful sec
   assert.ok(result.quality.opportunities.length > 2);
 });
 
-test("local client prefers consolidated dashboard and falls back to split endpoints", async () => {
+test("local client requests only implemented split endpoints", async () => {
   const calls = [];
-  const consolidated = new LocalCompanionClient({
+  const client = new LocalCompanionClient({
     fetchImpl: async (url) => {
       calls.push(url);
-      return new Response(JSON.stringify({
-        schemaVersion: "local-dashboard-v0.1",
-        status: "ready",
-        quotaWindows: []
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-  });
-  assert.equal((await consolidated.load()).state, "live");
-  assert.ok(calls.includes("/api/local/v1/dashboard"));
-
-  const split = new LocalCompanionClient({
-    fetchImpl: async (url) => {
-      if (url.endsWith("/v1/dashboard") || url.endsWith("/v1/status")) {
-        return new Response("", { status: 404 });
-      }
       if (url.endsWith("/overview")) {
         return new Response(JSON.stringify({ schemaVersion: "split", status: "insufficient" }), {
           status: 200,
@@ -2380,7 +2756,13 @@ test("local client prefers consolidated dashboard and falls back to split endpoi
       return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
     }
   });
-  assert.equal((await split.load()).schemaVersion, "split");
+  assert.equal((await client.load()).schemaVersion, "split");
+  assert.deepEqual(calls, [
+    "/api/local/overview",
+    "/api/local/gradient",
+    "/api/local/weekly",
+    "/api/local/quality"
+  ]);
 });
 
 test("local refresh uses the closed same-origin contract and exposes polling", async () => {
@@ -2395,11 +2777,15 @@ test("local refresh uses the closed same-origin contract and exposes polling", a
     }
   });
   await client.refresh();
+  await client.recalculateDetailedAccounting();
   await client.refreshStatus();
-  assert.equal(calls[0].url, "/api/local/refresh");
+  assert.equal(calls[0].url, "/api/local/refresh/quick");
   assert.equal(calls[0].options.body, "{}");
   assert.equal(calls[0].options.headers["X-Usage-Monitor-Local"], "1");
-  assert.equal(calls[1].options.method, undefined);
+  assert.equal(calls[1].url, "/api/local/refresh");
+  assert.equal(calls[1].options.method, "POST");
+  assert.equal(calls[2].url, "/api/local/refresh");
+  assert.equal(calls[2].options.method, undefined);
 });
 
 test("local health exposes the content-free preparation mode", async () => {
@@ -2703,266 +3089,23 @@ test("the local OAuth recovery client is fixed-route, exact-shape, and fail clos
   assert.deepEqual(JSON.parse(calls[2].options.body), { action: "clear" });
 });
 
-function automaticContributionStatusFixture(overrides = {}) {
-  return {
-    schemaVersion: AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
-    status: "disabled",
-    enabled: false,
-    intervalHours: 6,
-    consentCurrent: false,
-    firstReviewComplete: true,
-    firstReviewedAcceptedAt: "2026-07-29T11:59:00.000Z",
-    requiredConsent: {
-      telemetrySchemaVersion: "telemetry-contribution-v0.1",
-      fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
-      privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
-      destinationOrigin: "https://contribute.example.test"
-    },
-    consentedAt: null,
-    lastAttemptAt: null,
-    lastSuccessAt: null,
-    nextAttemptAt: null,
-    lastOutcome: null,
-    foregroundOnly: true,
-    daemonInstalled: false,
-    networkActivity: false,
-    includesContent: false,
-    includesPaths: false,
-    includesIdentifiers: false,
-    includesCredentials: false,
-    ...overrides
-  };
-}
-
-test("automatic contribution settings are fixed, foreground-only, and fail closed", () => {
-  const scheduled = normalizeAutomaticContributionStatus(
-    automaticContributionStatusFixture({
-      status: "scheduled",
-      enabled: true,
-      consentCurrent: true,
-      consentedAt: "2026-07-29T12:00:00.000Z",
-      lastAttemptAt: "2026-07-29T12:01:00.000Z",
-      lastSuccessAt: "2026-07-29T12:01:00.000Z",
-      nextAttemptAt: "2026-07-29T18:01:00.000Z",
-      lastOutcome: {
-        status: "succeeded",
-        code: "accepted",
-        at: "2026-07-29T12:01:00.000Z"
-      }
-    })
-  );
-  assert.equal(scheduled.state, "scheduled");
-  assert.equal(scheduled.enabled, true);
-  assert.equal(scheduled.intervalHours, 6);
-  assert.equal(scheduled.foregroundOnly, true);
-  assert.equal(scheduled.daemonInstalled, false);
-  assert.equal(
-    scheduled.requiredConsent.destinationOrigin,
-    "https://contribute.example.test"
-  );
-  assert.deepEqual(scheduled.lastOutcome, {
-    status: "succeeded",
-    code: "accepted",
-    at: "2026-07-29T12:01:00.000Z"
-  });
-
-  const publicationRecovery = normalizeAutomaticContributionStatus(
-    automaticContributionStatusFixture({
-      status: "scheduled",
-      enabled: true,
-      consentCurrent: true,
-      consentedAt: "2026-07-29T12:00:00.000Z",
-      lastAttemptAt: "2026-07-29T12:01:00.000Z",
-      nextAttemptAt: "2026-07-29T18:01:00.000Z",
-      lastOutcome: {
-        status: "failed",
-        code: "publication_incomplete",
-        at: "2026-07-29T12:01:00.000Z"
-      }
-    })
-  );
-  assert.equal(publicationRecovery.state, "scheduled");
-  assert.equal(
-    publicationRecovery.lastOutcome.code,
-    "publication_incomplete"
-  );
-
-  const localDevelopment = normalizeAutomaticContributionStatus(
-    automaticContributionStatusFixture({
-      status: "consent_required",
-      requiredConsent: {
-        telemetrySchemaVersion: "telemetry-contribution-v0.1",
-        fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
-        privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
-        destinationOrigin: "http://127.0.0.1:8791"
-      }
-    })
-  );
-  assert.equal(localDevelopment.state, "consent_required");
-
-  const firstReviewRequired = normalizeAutomaticContributionStatus(
-    automaticContributionStatusFixture({
-      status: "first_review_required",
-      firstReviewComplete: false,
-      firstReviewedAcceptedAt: null
-    })
-  );
-  assert.equal(firstReviewRequired.state, "first_review_required");
-  assert.equal(firstReviewRequired.firstReviewComplete, false);
-  assert.equal(firstReviewRequired.firstReviewedAcceptedAt, "");
-  assert.equal(
-    normalizeAutomaticContributionStatus(
-      automaticContributionStatusFixture({
-        status: "failed",
-        firstReviewComplete: false,
-        firstReviewedAcceptedAt: null
-      })
-    ).state,
-    "failed"
-  );
-  assert.equal(
-    normalizeAutomaticContributionStatus(
-      automaticContributionStatusFixture({
-        status: "not_configured",
-        firstReviewComplete: false,
-        firstReviewedAcceptedAt: null,
-        requiredConsent: {
-          telemetrySchemaVersion: "telemetry-contribution-v0.1",
-          fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
-          privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
-          destinationOrigin: null
-        }
-      })
-    ).state,
-    "not_configured"
-  );
-
-  for (const invalid of [
-    automaticContributionStatusFixture({ extra: true }),
-    automaticContributionStatusFixture({ intervalHours: 4 }),
-    automaticContributionStatusFixture({ includesIdentifiers: true }),
-    automaticContributionStatusFixture({
-      status: "scheduled",
-      enabled: false,
-      consentCurrent: true
-    }),
-    automaticContributionStatusFixture({
-      lastOutcome: {
-        status: "succeeded",
-        code: "retry_scheduled",
-        at: "2026-07-29T12:01:00.000Z"
-      }
-    }),
-    automaticContributionStatusFixture({
-      firstReviewComplete: false
-    }),
-    automaticContributionStatusFixture({
-      status: "first_review_required"
-    }),
-    automaticContributionStatusFixture({
-      requiredConsent: {
-        telemetrySchemaVersion: "telemetry-contribution-v0.1",
-        fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
-        privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
-        destinationOrigin: "https://contribute.example.test/collect"
-      }
-    })
-  ]) {
-    assert.equal(normalizeAutomaticContributionStatus(invalid).state, "unavailable");
-  }
-});
-
-test("automatic contribution client uses only fixed local status, enable, and disable routes", async () => {
-  const requiredConsent = automaticContributionStatusFixture().requiredConsent;
+test("the browser client no longer exposes automatic contribution controls", () => {
   const calls = [];
   const client = new LocalCompanionClient({
-    fetchImpl: async (url, options = {}) => {
-      calls.push({ url, options });
-      const payload = url.endsWith("/automatic-enable")
-        ? automaticContributionStatusFixture({
-            status: "scheduled",
-            enabled: true,
-            consentCurrent: true,
-            consentedAt: "2026-07-29T12:00:00.000Z",
-            nextAttemptAt: "2026-07-29T18:00:00.000Z"
-          })
-        : automaticContributionStatusFixture();
-      return new Response(JSON.stringify(payload), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
+    fetchImpl: async (...args) => {
+      calls.push(args);
+      throw new Error("retired automatic contribution route was called");
     }
   });
 
-  assert.equal((await client.automaticContributionStatus()).state, "disabled");
-  assert.equal(
-    (await client.enableAutomaticContribution(requiredConsent)).state,
-    "scheduled"
-  );
-  assert.equal((await client.disableAutomaticContribution()).state, "disabled");
-  assert.deepEqual(
-    calls.map(({ url }) => url),
-    [
-      "/api/local/contribution/automatic-settings",
-      "/api/local/contribution/automatic-enable",
-      "/api/local/contribution/automatic-disable"
-    ]
-  );
-  assert.deepEqual(
-    JSON.parse(calls[1].options.body),
-    { intervalHours: 6, consent: requiredConsent }
-  );
-  assert.deepEqual(
-    JSON.parse(calls[2].options.body),
-    { reason: "user_request" }
-  );
-  assert.equal(calls[1].options.headers["X-Usage-Monitor-Local"], "1");
-  assert.equal(calls[2].options.headers["X-Usage-Monitor-Local"], "1");
-  await assert.rejects(
-    client.enableAutomaticContribution({
-      ...requiredConsent,
-      destinationOrigin: "https://contribute.example.test/collect"
-    }),
-    /consent is invalid/u
-  );
-
-  const reviewLockedClient = new LocalCompanionClient({
-    fetchImpl: async () => new Response(JSON.stringify({
-      schemaVersion: "local-companion-v0.1",
-      error: { code: "automatic_contribution_first_review_required" }
-    }), {
-      status: 409,
-      headers: { "Content-Type": "application/json" }
-    })
-  });
-  await assert.rejects(
-    reviewLockedClient.enableAutomaticContribution(requiredConsent),
-    (error) => (
-      error.status === 409
-      && error.code === "automatic_contribution_first_review_required"
-    )
-  );
-  const malformedReviewLockedClient = new LocalCompanionClient({
-    fetchImpl: async () => new Response(JSON.stringify({
-      schemaVersion: "local-companion-v0.1",
-      error: {
-        code: "automatic_contribution_first_review_required",
-        privateDetail: "must not be trusted"
-      }
-    }), {
-      status: 409,
-      headers: { "Content-Type": "application/json" }
-    })
-  });
-  await assert.rejects(
-    malformedReviewLockedClient.enableAutomaticContribution(requiredConsent),
-    (error) => error.status === 409 && error.code === undefined
-  );
+  assert.equal(client.automaticContributionStatus, undefined);
+  assert.equal(client.enableAutomaticContribution, undefined);
+  assert.equal(client.disableAutomaticContribution, undefined);
+  assert.deepEqual(calls, []);
 });
 
-test("local sync preview and actions keep privileged values behind loopback", async () => {
+test("local reviewed-queue and device pairing stay behind fixed loopback routes", async () => {
   const privateCanary = "/Users/private/telemetry-secret.json";
-  const reviewToken = "r".repeat(43);
   const previewPayload = {
     schemaVersion: CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION,
     status: "available",
@@ -3048,24 +3191,6 @@ test("local sync preview and actions keep privileged values behind loopback", as
   });
 
   const calls = [];
-  const statusPayload = {
-    schemaVersion: CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
-    status: "available",
-    paused: true,
-    counts: {
-      pending: 1,
-      inFlight: 0,
-      accepted: 0,
-      retryable: 0,
-      rejected: 0
-    },
-    dueNow: 1,
-    nextAttemptAt: "2026-07-26T13:00:00.000Z",
-    lastAcceptedAt: null,
-    includesContent: false,
-    includesPaths: false,
-    includesCredentials: false
-  };
   const pairedPayload = {
     schemaVersion: "local-contribution-device-pairing-v0.1",
     status: "paired",
@@ -3081,11 +3206,7 @@ test("local sync preview and actions keep privileged values behind loopback", as
   const client = new LocalCompanionClient({
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
-      const body = url.endsWith("device-pair")
-        ? pairedPayload
-        : url.endsWith("sync-next")
-        ? previewPayload
-        : url.endsWith("sync-once") ? runPayload : statusPayload;
+      const body = url.endsWith("device-pair") ? pairedPayload : previewPayload;
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { "Content-Type": "application/json" }
@@ -3099,13 +3220,11 @@ test("local sync preview and actions keep privileged values behind loopback", as
     (await client.pairContributionDevice(pairingCode)).status,
     "paired"
   );
-  assert.equal((await client.runContributionSyncOnce(reviewToken)).accepted, 1);
-  assert.equal((await client.setContributionSyncPaused(true)).state, "paused");
+  assert.equal(client.runContributionSyncOnce, undefined);
+  assert.equal(client.setContributionSyncPaused, undefined);
   assert.deepEqual(calls.map((call) => call.url), [
     "/api/local/contribution/sync-next",
-    "/api/local/contribution/device-pair",
-    "/api/local/contribution/sync-once",
-    "/api/local/contribution/sync-pause"
+    "/api/local/contribution/device-pair"
   ]);
   for (const call of calls) {
     assert.equal(call.options.method, "POST");
@@ -3113,8 +3232,6 @@ test("local sync preview and actions keep privileged values behind loopback", as
   }
   assert.equal(calls[0].options.body, "{}");
   assert.equal(calls[1].options.body, JSON.stringify({ pairingCode }));
-  assert.equal(calls[2].options.body, JSON.stringify({ reviewToken }));
-  assert.equal(calls[3].options.body, "{}");
 });
 
 test("the local review bootstrap is independent of delivery scheduling", () => {
@@ -3298,51 +3415,6 @@ return {
   }
 });
 
-test("the Fast-mode preference travels on a fixed same-origin local route", async () => {
-  const calls = [];
-  const client = new LocalCompanionClient({
-    fetchImpl: async (url, options = {}) => {
-      calls.push({ url, options });
-      return new Response(JSON.stringify({
-        schemaVersion: "fast-mode-preference-v0.1",
-        mode: "mixed_unknown",
-        source: "stated",
-        recordedAt: "2026-08-01T12:00:00.000Z"
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-  });
-  const read = await client.fastModePreference();
-  assert.equal(read.mode, "mixed_unknown");
-  assert.equal(read.source, "stated");
-  const written = await client.selectFastModePreference("fast");
-  assert.equal(written.mode, "mixed_unknown");
-  assert.deepEqual(calls.map((call) => call.url), [
-    "/api/local/accounting/fast-mode-preference",
-    "/api/local/accounting/fast-mode-preference"
-  ]);
-  assert.equal(calls[0].options.method, undefined);
-  assert.equal(calls[1].options.method, "POST");
-  assert.equal(calls[1].options.headers["X-Usage-Monitor-Local"], "1");
-  assert.equal(calls[1].options.body, JSON.stringify({ mode: "fast" }));
-  // A value outside the fixed set never reaches the network.
-  await assert.rejects(
-    () => client.selectFastModePreference("turbo"),
-    TypeError
-  );
-  assert.equal(calls.length, 2);
-
-  // An unreadable preference reads back as the untouched Standard default
-  // rather than an invented Fast attribution.
-  const offline = new LocalCompanionClient({
-    fetchImpl: async () => {
-      throw new Error("companion unreachable");
-    }
-  });
-  const fallback = await offline.fastModePreference();
-  assert.equal(fallback.mode, "standard");
-  assert.equal(fallback.source, "default");
-});
-
 test("local pairing preserves fixed identifier-shaped codes and drops anything else", async () => {
   const pairingCode =
     "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -3519,6 +3591,25 @@ test("local contribution preparation exposes only verified bounded results", asy
       && !JSON.stringify(error).includes(privateCanary)
   );
 
+  const migrationClient = new LocalCompanionClient({
+    fetchImpl: async () => new Response(JSON.stringify({
+      schemaVersion: "local-contribution-preparation-error-v0.1",
+      status: "failed",
+      errorCode: "identity_migration_required",
+      privatePath: privateCanary,
+    }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    }),
+  });
+  await assert.rejects(
+    migrationClient.prepareContribution(),
+    (error) => error.code === "identity_migration_required"
+      && error.message === "Request failed (503)."
+      && error.detail === null
+      && !JSON.stringify(error).includes(privateCanary),
+  );
+
   // export_too_large classifies a whole family of ceilings. The bound the
   // companion named must reach the reader's error, and nothing else may.
   const boundedClient = (detail) => new LocalCompanionClient({
@@ -3559,81 +3650,59 @@ test("local contribution preparation exposes only verified bounded results", asy
   }
 });
 
-test("community adapter separates cookie sessions from one-use upload authority", async () => {
+test("community adapter exposes only the current browser-session routes", async () => {
   const calls = [];
-  const participantId = "participant:00000000-0000-4000-8000-000000000001";
   const client = new CommunityClient({
     getCsrfToken: () => "csrf-confirmation",
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
-      const payload = url === "/api/v1/me" && options.method === "DELETE"
-        ? { deleted: true, participantId, contributionsDeleted: 0 }
-        : { ok: true };
-      return new Response(JSON.stringify(payload), {
+      return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { "Content-Type": "application/json" }
       });
     }
   });
+  await client.health();
   await client.session();
-  await client.registerUpload({
-    envelopeDigest: "a".repeat(64),
-    contentLengthBytes: 123,
-    contentType: "application/json"
-  });
-  await client.contributeSerialized(
-    JSON.stringify({ schemaVersion: TELEMETRY_ENVELOPE_SCHEMA_VERSION }),
-    "one-use-upload"
-  );
-  await client.personalStats();
-  await client.communityStats();
-  await client.participantExport();
-  await client.deleteParticipant();
   await client.createDevicePairing();
-  await client.devices();
-  await client.revokeDevice("00000000-0000-4000-8000-000000000001");
   await client.logout();
-  await client.securityReset();
-  assert.equal(calls[0].url, "/api/v1/session");
-  assert.equal(calls[0].options.credentials, "same-origin");
-  assert.equal(calls[1].url, "/api/v1/me/upload-authorizations");
-  assert.equal(calls[1].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.equal(calls[0].url, "/api/health");
+  assert.equal(calls[1].url, "/api/v1/session");
   assert.equal(calls[1].options.credentials, "same-origin");
-  assert.equal(calls[2].url, "/api/v1/contributions");
-  assert.equal(calls[2].options.headers.Authorization, "Upload one-use-upload");
-  assert.equal(calls[2].options.credentials, "omit");
-  assert.equal(calls[3].url, "/api/v1/me/stats");
-  assert.equal(calls[3].options.credentials, "same-origin");
-  assert.equal(calls[4].url, "/api/v1/stats/aggregate");
-  assert.equal(calls[5].url, "/api/v1/me/export");
-  assert.equal(calls[6].url, "/api/v1/me");
-  assert.equal(calls[6].options.method, "DELETE");
-  assert.equal(calls[6].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
-  assert.equal(calls[7].url, "/api/v1/me/device-pairings");
-  assert.equal(calls[7].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.equal(calls[2].url, "/api/v1/me/device-pairings");
+  assert.equal(calls[2].options.method, "POST");
+  assert.equal(calls[2].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
   // Re-pinned 2026-08-08 (v1.0 wiring): a telemetry participant's pairing now
   // requests the v1.0 incremental consent identifier. The companion's CLAIM
   // of this pairing is what records the server-side consent-once grant that
   // v1.0 chunk uploads are verified against; the v0.1 identifier here left
   // production refusing every upload with 403 TELEMETRY_CONSENT_INVALID.
-  assert.match(calls[7].options.body, /ongoing-privacy-safe-telemetry-v1\.0/);
-  assert.doesNotMatch(calls[7].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
-  assert.equal(calls[8].url, "/api/v1/me/devices");
-  assert.equal(calls[9].url, "/api/v1/me/devices/revoke");
-  assert.equal(calls[9].options.method, "POST");
-  assert.equal(calls[9].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
-  assert.match(calls[9].options.body, /00000000-0000-4000-8000-000000000001/);
-  assert.equal(calls[10].url, "/api/v1/logout");
-  assert.equal(calls[11].url, "/api/v1/me/security-reset");
-  await client.health();
-  await client.readiness();
+  assert.match(calls[2].options.body, /ongoing-privacy-safe-telemetry-v1\.0/);
+  assert.doesNotMatch(calls[2].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
+  assert.equal(calls[3].url, "/api/v1/logout");
+  assert.equal(calls[3].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
   await client.enroll("um_invite_test");
-  await client.recover("um_recovery_test");
-  assert.equal(calls[12].url, "/api/health");
-  assert.equal(calls[13].url, "/api/ready");
-  assert.match(calls[14].options.body, /privacy-safe-telemetry-v0\.1/);
-  assert.match(calls[14].options.body, /um_invite_test/);
-  assert.match(calls[15].options.body, /um_recovery_test/);
+  assert.match(calls[4].options.body, /privacy-safe-telemetry-v0\.1/);
+  assert.match(calls[4].options.body, /um_invite_test/);
+  assert.equal(calls.some(({ options }) => options.method === "DELETE"), false);
+  for (const retired of [
+    "readiness",
+    "recover",
+    "registerUpload",
+    "contributeSerialized",
+    "contribution",
+    "deleteContribution",
+    "deleteParticipant",
+    "personalStats",
+    "participantProfile",
+    "communityStats",
+    "participantExport",
+    "devices",
+    "revokeDevice",
+    "securityReset"
+  ]) {
+    assert.equal(typeof client[retired], "undefined", retired);
+  }
 });
 
 test("community enrollment can atomically request one upload-only device pairing", async () => {
@@ -4097,7 +4166,7 @@ function assignsCompanionHealth(source) {
   for (let match = assignment.exec(source); match !== null; match = assignment.exec(source)) {
     branches.push(source.slice(match.index, match.index + 600));
   }
-  assert.ok(branches.length >= 2, "expected both the loaded and fallback health paths");
+  assert.ok(branches.length >= 2, "expected both the startup and recovery health paths");
   return branches;
 }
 
@@ -4219,7 +4288,8 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     /@media \(max-width: 760px\)[\s\S]*?\.topbar \.button\.compact \{ display: none; \}/u,
   );
   assert.match(html, />\s*Sign out\s*</u);
-  assert.match(html, /Signing out ends this app's contribution session/u);
+  assert.match(html, /id="identity-account-detail"[^>]+data-i18n="contribution.signOutDetail"/u);
+  assert.match(html, /Signing out ends this app's hosted session\. It does not stop this Mac's uploads; use Disconnect this Mac for that\./u);
   assert.doesNotMatch(html, /Hosted privacy controls remain available separately/u);
   assert.doesNotMatch(html, /metadata already contributed\s+stays until you delete it/u);
   assert.match(html, /<div class="identity-account" id="identity-account" hidden>/u);
@@ -4394,28 +4464,7 @@ test("backend readiness accepts fail-closed 503 state without calling it ready",
       lifecycleStaleAfterMilliseconds: 3_600_000
     }
   };
-  let fetchReceiver = "not-called";
-  const client = new CommunityClient({
-    fetchImpl: async function fetchReadiness() {
-      fetchReceiver = this;
-      return new Response(JSON.stringify(payload), {
-        status: 503,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-  });
-  assert.deepEqual(await client.readiness(), {
-    state: "not_ready",
-    lifecycle: "stale",
-    lifecycleFresh: false,
-    quarantineRetentionComplete: true,
-    restoreReplayComplete: true,
-    aggregateRebuildComplete: false,
-    maintenanceCycleMatched: false,
-    quarantineReconciliation: "running",
-    quarantineReconciliationComplete: false
-  });
-  assert.equal(fetchReceiver, undefined);
+  assert.equal(typeof CommunityClient.prototype.readiness, "undefined");
   const ready = {
     ...payload,
     status: "ready",
@@ -4454,41 +4503,13 @@ test("backend readiness accepts fail-closed 503 state without calling it ready",
   );
 });
 
-test("contribution read and deletion keep identifiers out of request URLs", async () => {
-  const calls = [];
-  const contributionId = "contribution:00000000-0000-4000-8000-000000000001";
-  const client = new CommunityClient({
-    getCsrfToken: () => "csrf-confirmation",
-    fetchImpl: async (url, options) => {
-      calls.push({ url, options });
-      const payload = url.endsWith("/delete")
-        ? { deleted: true, contributionId }
-        : { ok: true };
-      return new Response(JSON.stringify(payload), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-  });
-
-  await client.contribution(contributionId);
-  await client.deleteContribution(contributionId);
-
-  assert.deepEqual(calls.map((call) => call.url), [
-    "/api/v1/me/contributions/read",
-    "/api/v1/me/contributions/delete"
-  ]);
-  for (const call of calls) {
-    assert.equal(call.options.method, "POST");
-    assert.equal(call.options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
-    assert.equal(JSON.parse(call.options.body).contributionId, contributionId);
-    assert.equal(call.url.includes(contributionId), false);
-  }
+test("retired granular contribution methods are absent from the browser adapter", () => {
+  assert.equal(typeof CommunityClient.prototype.contribution, "undefined");
+  assert.equal(typeof CommunityClient.prototype.deleteContribution, "undefined");
 });
 
-test("deletion receipts fail closed before the UI can claim success", async () => {
+test("historical granular deletion receipts remain parse-only and fail closed", () => {
   const contributionId = "contribution:00000000-0000-4000-8000-000000000001";
-  const participantId = "participant:00000000-0000-4000-8000-000000000001";
 
   assert.deepEqual(
     normalizeContributionDeletionReceipt(
@@ -4496,14 +4517,6 @@ test("deletion receipts fail closed before the UI can claim success", async () =
       contributionId
     ),
     { deleted: true, contributionId }
-  );
-  assert.deepEqual(
-    normalizeParticipantDeletionReceipt({
-      deleted: true,
-      participantId,
-      contributionsDeleted: 2
-    }),
-    { deleted: true, participantId, contributionsDeleted: 2 }
   );
 
   assert.throws(
@@ -4520,54 +4533,7 @@ test("deletion receipts fail closed before the UI can claim success", async () =
     ),
     /invalid contribution deletion receipt/
   );
-  assert.throws(
-    () => normalizeParticipantDeletionReceipt({
-      deleted: true,
-      participantId,
-      contributionsDeleted: -1
-    }),
-    /invalid participant deletion receipt/
-  );
-  assert.throws(
-    () => normalizeParticipantDeletionReceipt({
-      deleted: true,
-      participantId,
-      contributionsDeleted: "1"
-    }),
-    /invalid participant deletion receipt/
-  );
-  assert.throws(
-    () => normalizeParticipantDeletionReceipt(
-      { deleted: true, participantId, contributionsDeleted: 1 },
-      "participant:00000000-0000-4000-8000-000000000002"
-    ),
-    /invalid participant deletion receipt/
-  );
-  assert.throws(
-    () => normalizeParticipantDeletionReceipt({
-      deleted: true,
-      participantId,
-      contributionsDeleted: 1,
-      ignored: true
-    }),
-    /invalid participant deletion receipt/
-  );
-
-  const malformedClient = new CommunityClient({
-    getCsrfToken: () => "csrf-confirmation",
-    fetchImpl: async () => new Response(JSON.stringify({ deleted: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    })
-  });
-  await assert.rejects(
-    malformedClient.deleteContribution(contributionId),
-    /invalid contribution deletion receipt/
-  );
-  await assert.rejects(
-    malformedClient.deleteParticipant(),
-    /invalid participant deletion receipt/
-  );
+  assert.equal(typeof CommunityClient.prototype.deleteContribution, "undefined");
 });
 
 test("community snapshots fail closed and never disclose threshold distance", () => {
@@ -4969,28 +4935,7 @@ test("participant history keeps lifecycle and provenance bounded and private", a
     "unknown",
   );
 
-  const calls = [];
-  const client = new CommunityClient({
-    fetchImpl: async (url, options = {}) => {
-      calls.push({ url, options });
-      return new Response(JSON.stringify(profile), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-  });
-  await client.participantProfile();
-  assert.deepEqual(calls, [{
-    url: "/api/v1/me",
-    options: {
-      credentials: "same-origin",
-      headers: { Accept: "application/json" }
-    }
-  }]);
-  assert.throws(
-    () => client.deleteContribution("not-a-contribution"),
-    /valid contribution/
-  );
+  assert.equal(typeof CommunityClient.prototype.participantProfile, "undefined");
 });
 
 test("participant results fail closed for unverifiable prices and honest not-testable movement", () => {
@@ -5082,7 +5027,11 @@ test("public interface is dashboard-first and never substitutes demo data automa
 });
 
 test("native dashboard readiness follows both first-render outcomes", async () => {
-  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const [html, appSource, styles] = await Promise.all([
+    readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
+  ]);
   const markerStart = appSource.indexOf("function markLocalDashboardReady() {");
   const markerEnd = appSource.indexOf(
     "\n}\n\nasync function loadLocalDashboard",
@@ -5098,6 +5047,30 @@ test("native dashboard readiness follows both first-render outcomes", async () =
 
   const marker = appSource.slice(markerStart, markerEnd);
   const loader = appSource.slice(loadStart, loadEnd);
+  const bootSurface = html.match(
+    /<section[\s\S]*?id="dashboard-boot-state"[\s\S]*?<\/section>/u,
+  )?.[0] ?? "";
+  assert.ok(bootSurface, "the native dashboard has a static boot surface");
+  assert.match(bootSurface, /role="status"/u);
+  assert.match(bootSurface, /aria-live="polite"/u);
+  assert.match(bootSurface, /aria-busy="true"/u);
+  assert.match(bootSurface, /Loading saved results…/u);
+  assert.match(
+    bootSurface,
+    /Checking the summary on this Mac\. Nothing is sent while you look at it\./u,
+  );
+  const bootOpeningTag = bootSurface.match(/^<section[\s\S]*?>/u)?.[0] ?? "";
+  assert.doesNotMatch(bootOpeningTag, /\shidden(?:\s|=|>)/u);
+  assert.doesNotMatch(bootSurface, /data-requires-evidence/u);
+  assert.match(styles, /\.dashboard-boot-state \{ display: none; \}/u);
+  assert.match(
+    styles,
+    /html\.native-dashboard:not\(\[data-local-dashboard-ready="true"\]\) \.dashboard-boot-state,[\s\S]*?display: grid;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 520px\)[\s\S]*?\.dashboard-boot-card \.state-pill \{[\s\S]*?width: max-content;[\s\S]*?font-size: \.67rem;/u,
+  );
   assert.match(
     marker,
     /document\.documentElement\.dataset\.localDashboardReady = "true";/u,
@@ -5115,6 +5088,541 @@ test("native dashboard readiness follows both first-render outcomes", async () =
     2,
     "the first available or unavailable render marks readiness exactly once",
   );
+});
+
+test("native dashboard readiness does not wait on secondary companion reads", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const loadStart = appSource.indexOf("async function loadLocalDashboard() {");
+  const loadEnd = appSource.indexOf(
+    "\n}\n\n// The \"preparation identity\"",
+    loadStart,
+  );
+  assert.ok(loadStart >= 0 && loadEnd > loadStart, "dashboard loader is present");
+
+  const loader = appSource.slice(loadStart, loadEnd);
+  const successEnd = loader.indexOf("\n  } catch {");
+  const successPath = loader.slice(0, successEnd);
+  const dashboardRender = successPath.indexOf("renderDashboard(data);");
+  const onboardingRender = successPath.indexOf("renderLocalOnboarding(localOnboarding);");
+  const readinessMarker = successPath.indexOf("markLocalDashboardReady();");
+  const secondary = appSource.match(
+    /^async function loadLocalDashboardSecondaryState\([\s\S]*?^\}/mu,
+  )?.[0] ?? "";
+  const secondaryStatus = secondary.indexOf("await loadIncrementalSyncStatus({ isCurrent });");
+  const contributionPreview = secondary.indexOf("renderContributionSyncPreview(");
+
+  assert.ok(dashboardRender >= 0, "the primary dashboard render is present");
+  assert.ok(onboardingRender > dashboardRender, "cached onboarding unhides the real result");
+  assert.ok(
+    readinessMarker > onboardingRender,
+    "the native shell is released after the primary render",
+  );
+  assert.doesNotMatch(loader, /localClient\.(health|onboarding|refreshStatus|contributionSyncPreview|contributionSyncStatus)\(/u);
+  assert.doesNotMatch(loader, /await load(?:IncrementalSyncStatus|LocalDashboardSecondaryState)\(/u);
+  assert.ok(loader.indexOf("void loadLocalDashboardSecondaryState(") > loader.indexOf("} finally {"),
+    "the shared secondary path starts after primary busy state is released");
+  assert.ok(
+    secondaryStatus >= 0 && contributionPreview > secondaryStatus,
+    "the consent status still resolves before the contribution preview",
+  );
+});
+
+test("the primary dashboard owner resumes one deferred Electron startup pass after releasing its lock", async () => {
+  const primary = dashboardStartupDeferred();
+  const harness = await createDashboardStartupHarness({
+    client: { load: () => primary.promise },
+  });
+  harness.context.electronStartupRefreshDeferred = true;
+
+  const loading = harness.context.loadLocalDashboard();
+  await settleDashboardStartupTasks();
+  assert.equal(harness.context.localActionBusy, true);
+  assert.equal(harness.context.electronStartupRefreshDeferred, true);
+  assert.equal(harness.state.startupRefreshChecks, 0,
+    "the launch pass remains deferred while the primary owner is busy");
+
+  primary.resolve({ marker: "primary", mode: "real_local_evidence" });
+  await loading;
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.context.electronStartupRefreshDeferred, false);
+  assert.equal(harness.state.startupRefreshChecks, 1,
+    "the real loader retries exactly once after restoring its previous busy state");
+});
+
+function dashboardStartupDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function dashboardStartupStatus(approved = true) {
+  return {
+    schemaVersion: "local-incremental-contribution-sync-v1.0",
+    status: "available",
+    keychainPrompt: "none",
+    consent: { approved, current: approved },
+    paused: false,
+    running: false,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  };
+}
+
+async function createDashboardStartupHarness({
+  client = {},
+  initialBusy = false,
+  initialHealth = null,
+  initialConsentApproved = false,
+  incrementalStatus = async () => dashboardStartupStatus(),
+} = {}) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const state = {
+    events: [], previews: [], primaryReads: 0, statusReads: 0, polls: 0,
+    preparations: 0, reviewUnavailableReports: 0, returnRefreshChecks: 0,
+    startupRefreshChecks: 0,
+  };
+  const elements = new Map();
+  const element = (selector) => {
+    if (!elements.has(selector)) elements.set(selector, {
+      disabled: false,
+      hidden: false,
+      textContent: "",
+      setAttribute() {},
+    });
+    return elements.get(selector);
+  };
+  const context = createContext({
+    $: element,
+    window: { setTimeout: (callback) => { queueMicrotask(callback); } },
+    document: { documentElement: { dataset: {} } },
+    cacheDropThreadLinks: { loadToken: 0 },
+    activeLocalDashboardLoad: null,
+    localActionBusy: initialBusy,
+    localRefreshInProgress: false,
+    electronStartupRefreshDeferred: false,
+    localCompanionHealth: initialHealth,
+    localOnboarding: null,
+    dashboard: null,
+    accountingRebuildDeferral: { consecutive: 2 },
+    incrementalSyncStatus: null,
+    incrementalConsentApproved: initialConsentApproved,
+    incrementalConsentBusy: false,
+    incrementalSyncLastOutcomeDetailCode: null,
+    incrementalSyncPollCount: 0,
+    INCREMENTAL_SYNC_CONTRACT: "telemetry-contribution-v1.0",
+    contributionSyncBusy: false,
+    contributionSyncPreview: null,
+    contributionSyncExactReview: null,
+    contributionReviewUnavailableKey: null,
+    demoDashboard: () => ({ marker: "demo", mode: "demo" }),
+    localClient: {
+      async load() {
+        state.primaryReads += 1;
+        return client.load ? client.load() : { marker: "primary", mode: "real_local_evidence" };
+      },
+      health: async () => ({ capabilities: {
+        incrementalContributionSync: "telemetry-contribution-v1.0",
+      } }),
+      onboarding: async () => ({ state: "ready" }),
+      refreshStatus: async () => ({ refresh: { result: {} } }),
+      contributionSyncPreview: async () => ({ status: "available", state: "empty", item: null }),
+      contributionSyncStatus: async () => ({ status: "available" }),
+      ...Object.fromEntries(Object.entries(client).filter(([key]) => key !== "load")),
+    },
+    fetch: async () => {
+      state.statusReads += 1;
+      return { ok: true, json: incrementalStatus };
+    },
+    normalizeIncrementalContributionSyncStatus,
+    contributionReviewBootstrapAction,
+    contributionReviewPreparationPermitted,
+    boundedOutcomeDetailCode: () => null,
+    observeContributionDisconnectPause() {},
+    runsInsideNativeDashboard: () => true,
+    // The extracted startup harness exercises the loader without evaluating
+    // Electron's launch coordinator. Keep that path explicitly inert so the
+    // optional onboarding callback remains faithful to the browser/native
+    // readiness tests.
+    startElectronStartupRefresh: () => {
+      state.startupRefreshChecks += 1;
+      return true;
+    },
+    setJourneyState(value) { state.journey = value; },
+    scheduleIncrementalSyncStatusPoll() { state.polls += 1; },
+    scheduleReturningUserRefresh() { state.returnRefreshChecks += 1; },
+    maybePrepareIncrementalReviewInstance() { state.preparations += 1; },
+    maybeReportContributionReviewUnavailable() { state.reviewUnavailableReports += 1; },
+    updateLocalActionButtons() {
+      element("#refresh-button").disabled = context.localActionBusy;
+    },
+    renderDashboard(value) {
+      context.dashboard = value;
+      state.events.push(["primary", value.marker]);
+    },
+    renderDashboardUnavailableState(kind) { state.events.push(["unavailable", kind]); },
+    renderHostedIdentity() { state.events.push(["identity"]); },
+    renderAccounting() { state.events.push(["accounting"]); },
+    // The extracted startup harness has no Electron preload bridge. Keep the
+    // production loader's optional accountless-sharing read on its faithful
+    // no-bridge path while the startup assertions exercise primary readiness.
+    loadElectronSharingPreference: async () => null,
+    renderContributionActionState() { state.events.push(["consent", context.incrementalConsentApproved]); },
+    renderContributionSyncStatus(value) { state.events.push(["sync-status", value]); },
+  });
+  for (const name of [
+    "renderLocalOnboarding", "markLocalDashboardReady", "loadLocalDashboard",
+    "loadLocalDashboardSecondaryState", "recoverLocalCompanionReads",
+    "loadIncrementalSyncStatus", "contributionServiceConfigured",
+    "incrementalSyncCapabilityAdvertised", "localCompanionHealthUnknown",
+    "incrementalSyncCapabilitySettled", "localOnboardingUnsettled",
+    "renderContributionSyncPreview", "maybeReviewPreparedSummary",
+    "loadQuickResultDashboard", "showDemoDashboard",
+  ]) {
+    const match = appSource.match(new RegExp(
+      `^(?:async )?function ${name}\\([\\s\\S]*?^\\}`, "mu",
+    ));
+    // The optional helper is absent on the pre-fix loader; execute that loader
+    // too so a regression fails on behavior, not on an extraction convention.
+    if (name === "loadLocalDashboardSecondaryState" && match === null) continue;
+    assert.ok(match, `${name} is executed from production source`);
+    runInContext(match[0], context);
+  }
+  const renderPreview = context.renderContributionSyncPreview;
+  context.renderContributionSyncPreview = (value) => {
+    state.previews.push({ value, approved: context.incrementalConsentApproved });
+    renderPreview(value);
+  };
+  return { context, state, element };
+}
+
+const settleDashboardStartupTasks = () => new Promise(setImmediate);
+
+test("primary startup renders and releases busy state while optional reads remain pending", async (t) => {
+  for (const method of [
+    "health", "onboarding", "refreshStatus", "contributionSyncPreview",
+    "contributionSyncStatus", "incrementalStatus",
+  ]) {
+    await t.test(method, async () => {
+      const pending = dashboardStartupDeferred();
+      const harness = await createDashboardStartupHarness(method === "incrementalStatus"
+        ? { incrementalStatus: () => pending.promise }
+        : { client: { [method]: () => pending.promise } });
+      let completed = false;
+      const loading = harness.context.loadLocalDashboard().then(() => { completed = true; });
+      try {
+        await settleDashboardStartupTasks();
+        assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
+        assert.equal(harness.context.dashboard.marker, "primary");
+        assert.equal(harness.state.journey, "local-ready",
+          "real evidence must not remain hidden by first-run while onboarding waits");
+        assert.equal(completed, true, "only the primary result owns the dashboard load promise");
+        assert.equal(harness.context.localActionBusy, false);
+        assert.equal(harness.element("#refresh-button").disabled, false);
+      } finally {
+        pending.resolve(null);
+        await loading;
+      }
+    });
+  }
+});
+
+test("primary startup failure renders unavailable without waiting on optional recovery", async () => {
+  const pending = dashboardStartupDeferred();
+  const harness = await createDashboardStartupHarness({ client: {
+    load: async () => { throw new Error("synthetic primary read failure"); },
+    health: () => pending.promise,
+    onboarding: () => pending.promise,
+  } });
+  let completed = false;
+  const loading = harness.context.loadLocalDashboard().then(() => { completed = true; });
+  try {
+    await settleDashboardStartupTasks();
+    assert.equal(harness.state.primaryReads, 2, "the existing single retry is retained");
+    assert.equal(harness.context.dashboard, null);
+    assert.equal(harness.state.events.filter(([kind]) => kind === "primary").length, 0);
+    assert.deepEqual(harness.state.events.filter(([kind]) => kind === "unavailable"), [
+      ["unavailable", "companion-unavailable"],
+    ]);
+    assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
+    assert.equal(completed, true);
+    assert.equal(harness.context.localActionBusy, false);
+  } finally {
+    pending.resolve(null);
+    await loading;
+  }
+  await settleDashboardStartupTasks();
+  assert.ok(harness.state.polls > 0,
+    "the failed primary path still starts optional companion recovery after readiness");
+});
+
+test("overlapping primary startup loads publish only the newest result and restore the original busy owner", async (t) => {
+  for (const olderSettlesFirst of [true, false]) {
+    await t.test(olderSettlesFirst ? "older settles first" : "newer settles first", async () => {
+      const first = dashboardStartupDeferred();
+      const second = dashboardStartupDeferred();
+      const reads = [first, second];
+      const harness = await createDashboardStartupHarness({
+        client: { load: () => reads.shift().promise },
+      });
+      const older = harness.context.loadLocalDashboard();
+      const newer = harness.context.loadLocalDashboard();
+      if (olderSettlesFirst) {
+        first.resolve({ marker: "old" });
+        await older;
+        assert.equal(harness.context.dashboard, null);
+        assert.equal(harness.context.localActionBusy, true);
+      }
+      second.resolve({ marker: "new" });
+      await newer;
+      assert.equal(harness.context.dashboard.marker, "new");
+      assert.equal(harness.context.localActionBusy, false);
+      if (!olderSettlesFirst) {
+        first.resolve({ marker: "old" });
+        await older;
+      }
+      assert.equal(harness.context.dashboard.marker, "new");
+      assert.equal(harness.context.localActionBusy, false);
+      assert.deepEqual(harness.state.events.filter(([kind]) => kind === "primary"), [["primary", "new"]]);
+    });
+  }
+  const outerOwner = await createDashboardStartupHarness({ initialBusy: true });
+  await outerOwner.context.loadLocalDashboard();
+  assert.equal(outerOwner.context.localActionBusy, true,
+    "a surrounding analysis or setup action retains its own busy state");
+});
+
+test("startup optional failures preserve primary evidence, known health and recorded consent", async () => {
+  const knownHealth = { capabilities: {
+    incrementalContributionSync: "telemetry-contribution-v1.0",
+  } };
+  const fail = async () => { throw new Error("synthetic optional read failure"); };
+  const harness = await createDashboardStartupHarness({
+    client: Object.fromEntries([
+      "health", "onboarding", "refreshStatus", "contributionSyncPreview", "contributionSyncStatus",
+    ].map((method) => [method, fail])),
+    initialHealth: knownHealth,
+    initialConsentApproved: true,
+    incrementalStatus: fail,
+  });
+  await harness.context.loadLocalDashboard();
+  await settleDashboardStartupTasks();
+  assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
+  assert.equal(harness.context.dashboard.marker, "primary");
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.context.localCompanionHealth, knownHealth);
+  assert.equal(harness.context.accountingRebuildDeferral.consecutive, 2);
+  assert.equal(harness.context.incrementalSyncStatus.status, "unavailable");
+  assert.equal(harness.context.incrementalConsentApproved, true);
+  assert.deepEqual(harness.state.previews, [{ value: null, approved: true }]);
+  assert.equal(harness.state.preparations, 0);
+  assert.equal(harness.state.events.filter(([kind]) => kind === "unavailable").length, 0);
+  assert.equal(harness.state.polls, 1);
+});
+
+test("startup preview waits for a validated consent verdict before any automatic preparation", async (t) => {
+  for (const verdict of ["approved", "pre-consent", "unreadable", "invalid"]) {
+    await t.test(verdict, async () => {
+      const pending = dashboardStartupDeferred();
+      const harness = await createDashboardStartupHarness({ incrementalStatus: () => pending.promise });
+      await harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
+      assert.equal(harness.context.localActionBusy, false);
+      assert.equal(harness.state.statusReads, 1);
+      assert.equal(harness.state.previews.length, 0);
+      assert.equal(harness.state.preparations, 0);
+      if (verdict === "unreadable") pending.reject(new Error("synthetic consent failure"));
+      else if (verdict === "invalid") pending.resolve({ status: "available", consent: { approved: false, current: false } });
+      else pending.resolve(dashboardStartupStatus(verdict === "approved"));
+      await settleDashboardStartupTasks();
+      assert.equal(harness.state.previews.length, 1);
+      assert.equal(harness.state.previews[0].approved, verdict === "approved");
+      assert.equal(harness.state.preparations, verdict === "pre-consent" ? 1 : 0,
+        "the production preview/bootstrap pair may prepare only from a validated pre-consent read");
+      assert.equal(harness.context.incrementalSyncStatus.status,
+        ["unreadable", "invalid"].includes(verdict) ? "unavailable" : "available");
+    });
+  }
+});
+
+test("an older primary failure cannot clear a newer result or start an obsolete retry", async () => {
+  const pending = dashboardStartupDeferred();
+  let reads = 0;
+  const harness = await createDashboardStartupHarness({ client: {
+    load: () => ++reads === 1 ? pending.promise : Promise.resolve({ marker: "new" }),
+  } });
+  const older = harness.context.loadLocalDashboard();
+  await harness.context.loadLocalDashboard();
+  pending.reject(new Error("synthetic older primary failure"));
+  await older;
+  await settleDashboardStartupTasks();
+  assert.equal(reads, 2);
+  assert.equal(harness.context.dashboard.marker, "new");
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.state.events.filter(([kind]) => kind === "unavailable").length, 0);
+});
+
+test("older startup secondary reads cannot replace a newer load or native quick result", async (t) => {
+  for (const nextLoad of ["loadLocalDashboard", "loadQuickResultDashboard"]) {
+    await t.test(nextLoad, async () => {
+      const newer = {
+        health: { marker: "new", capabilities: { incrementalContributionSync: "telemetry-contribution-v1.0" } },
+        onboarding: { state: "ready", marker: "new" },
+        refreshStatus: { refresh: { result: { accountingRebuildDeferred: { consecutive: 3 } } } },
+        contributionSyncPreview: { status: "available", state: "empty", item: null, marker: "new" },
+        contributionSyncStatus: { status: "available", marker: "new" },
+      };
+      const pending = Object.fromEntries(Object.keys(newer).map((method) => [method, dashboardStartupDeferred()]));
+      const reads = {};
+      let primaryReads = 0;
+      const harness = await createDashboardStartupHarness({ client: {
+        load: async () => ({ marker: ++primaryReads === 1 ? "old" : "new" }),
+        ...Object.fromEntries(Object.entries(newer).map(([method, value]) => [method, () => {
+          reads[method] = (reads[method] ?? 0) + 1;
+          return reads[method] === 1 ? pending[method].promise : Promise.resolve(value);
+        }])),
+      } });
+      await harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      await harness.context[nextLoad]();
+      await settleDashboardStartupTasks();
+      assert.equal(harness.state.previews.length, 1);
+      const eventCount = harness.state.events.length;
+      const refreshChecks = harness.state.returnRefreshChecks;
+      pending.health.resolve({ marker: "old", capabilities: {} });
+      pending.onboarding.resolve({ state: "unavailable", marker: "old" });
+      pending.refreshStatus.resolve({ refresh: { result: {} } });
+      pending.contributionSyncStatus.resolve({ status: "unavailable", marker: "old" });
+      pending.contributionSyncPreview.resolve({ status: "unavailable", marker: "old" });
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.dashboard.marker, "new");
+      assert.equal(harness.context.localCompanionHealth, newer.health);
+      assert.equal(harness.context.localOnboarding, newer.onboarding);
+      assert.equal(harness.context.accountingRebuildDeferral.consecutive, 3);
+      assert.equal(harness.context.incrementalConsentApproved, true);
+      assert.equal(harness.state.previews.length, 1);
+      assert.equal(harness.state.previews[0].value, newer.contributionSyncPreview);
+      assert.equal(harness.state.events.length, eventCount);
+      assert.equal(harness.state.returnRefreshChecks, refreshChecks);
+      assert.equal(harness.context.localActionBusy, false);
+    });
+  }
+});
+
+test("older incremental responses cannot revoke consent established by a newer dashboard load", async (t) => {
+  for (const origin of ["startup", "poll"]) {
+    await t.test(origin, async () => {
+      const pending = dashboardStartupDeferred();
+      let statusReads = 0;
+      const harness = await createDashboardStartupHarness({
+        incrementalStatus: () => ++statusReads === 1 ? pending.promise : Promise.resolve(dashboardStartupStatus()),
+      });
+      const older = origin === "poll"
+        ? harness.context.loadIncrementalSyncStatus()
+        : harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      assert.equal(statusReads, 1);
+      await harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.incrementalConsentApproved, true);
+      assert.equal(harness.state.previews.length, 1);
+      const polls = harness.state.polls;
+      pending.resolve({ ...dashboardStartupStatus(false), keychainPrompt: "migration" });
+      await older;
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.incrementalConsentApproved, true);
+      assert.equal(harness.context.incrementalSyncStatus.keychainPrompt, "none");
+      assert.equal(harness.state.previews.length, 1);
+      assert.equal(harness.state.preparations, 0);
+      assert.equal(harness.state.polls, polls);
+    });
+  }
+});
+
+test("an older recovery health read cannot replace a newer dashboard health answer", async () => {
+  const pending = dashboardStartupDeferred();
+  const newerHealth = { marker: "new", capabilities: { incrementalContributionSync: "telemetry-contribution-v1.0" } };
+  let healthReads = 0;
+  const harness = await createDashboardStartupHarness({ client: {
+    health: () => {
+      healthReads += 1;
+      if (healthReads === 1) return Promise.resolve(null);
+      if (healthReads === 2) return pending.promise;
+      return Promise.resolve(newerHealth);
+    },
+  } });
+  await harness.context.loadLocalDashboard();
+  await settleDashboardStartupTasks();
+  assert.equal(healthReads, 2, "the first load entered recovery after its health read missed");
+  await harness.context.loadLocalDashboard();
+  await settleDashboardStartupTasks();
+  const eventCount = harness.state.events.length;
+  pending.resolve({ marker: "old", capabilities: {} });
+  await settleDashboardStartupTasks();
+  assert.equal(harness.context.localCompanionHealth, newerHealth);
+  assert.equal(harness.context.incrementalConsentApproved, true);
+  assert.equal(harness.state.statusReads, 1);
+  assert.equal(harness.state.events.length, eventCount);
+});
+
+test("quick reload races and failures preserve the newest real dashboard", async () => {
+  const pending = dashboardStartupDeferred();
+  let primaryReads = 0;
+  const harness = await createDashboardStartupHarness({ client: {
+    load: () => ++primaryReads === 1 ? pending.promise : Promise.resolve({ marker: "new" }),
+  } });
+  const olderQuick = harness.context.loadQuickResultDashboard();
+  await harness.context.loadLocalDashboard();
+  pending.resolve({ marker: "old" });
+  await olderQuick;
+  assert.equal(harness.context.dashboard.marker, "new");
+  harness.context.localClient.load = async () => { throw new Error("synthetic quick failure"); };
+  await assert.rejects(harness.context.loadQuickResultDashboard(), /synthetic quick failure/u);
+  await settleDashboardStartupTasks();
+  assert.equal(harness.context.dashboard.marker, "new");
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.state.events.filter(([kind]) => kind === "unavailable").length, 0);
+  assert.equal(harness.context.incrementalConsentApproved, true,
+    "a failed quick read must not strand optional recovery from the earlier generation");
+});
+
+test("explicit demo selection fences pending primary, quick and secondary reads", async (t) => {
+  for (const origin of ["primary", "quick", "secondary"]) {
+    await t.test(origin, async () => {
+      const pending = dashboardStartupDeferred();
+      const harness = await createDashboardStartupHarness({ client: origin === "secondary"
+        ? { health: () => pending.promise }
+        : { load: () => pending.promise } });
+      const loading = origin === "quick"
+        ? harness.context.loadQuickResultDashboard()
+        : harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      harness.context.showDemoDashboard();
+      assert.equal(harness.context.dashboard.mode, "demo");
+      assert.equal(harness.context.localActionBusy, false);
+      const eventCount = harness.state.events.length;
+      pending.resolve(origin === "secondary"
+        ? { capabilities: { incrementalContributionSync: "telemetry-contribution-v1.0" } }
+        : { marker: "obsolete" });
+      await loading;
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.dashboard.mode, "demo");
+      assert.equal(harness.context.localActionBusy, false);
+      assert.equal(harness.state.events.length, eventCount);
+      assert.equal(harness.state.previews.length, 0);
+      assert.equal(harness.context.document.documentElement.dataset.localDashboardReady,
+        origin === "secondary" ? "true" : undefined,
+        "demo selection itself is never mistaken for a real local readiness result");
+    });
+  }
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.match(appSource, /\$\("#demo-button"\)\.addEventListener\("click", showDemoDashboard\);/u);
 });
 
 test("first run is a truthful install and local preflight journey", async () => {
@@ -5193,11 +5701,11 @@ test("first run is a truthful install and local preflight journey", async () => 
     new URL("../public/install-cta.js", import.meta.url),
     "utf8",
   );
-  assert.match(installSource, /function configuredInstallerUrl\(documentRef\)/u);
+  assert.match(installSource, /function configuredInstallerUrl\(documentRef, architecture\)/u);
   assert.match(installSource, /function configuredInstallerMetadata\(/u);
   assert.match(
     installSource,
-    /export function configuredInstallerRelease\(documentRef\)/u,
+    /export function configuredInstallerRelease\(documentRef, \{ architecture = "arm64" \} = \{\}\)/u,
   );
   assert.doesNotMatch(installSource, /configuredSemanticOpenTarget|usage-monitor-semantic-open-target/u);
   assert.match(appSource, /from "\.\/install-cta\.js"/u);
@@ -5247,8 +5755,18 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /phase === "quick_result"/u);
   assert.match(appSource, /await loadQuickResultDashboard\(\)/u);
   assert.match(appSource, /renderDashboard\(data\)/u);
-  assert.match(appSource, /Headline ready; finishing deeper accounting/u);
-  assert.match(appSource, /finishing deeper accounting/u);
+  assert.match(appSource, /refreshQuickResultStatus\(\{/u);
+  assert.match(appSource, /refreshAccountingStatus\(\{ progress \}\)/u);
+  assert.match(appSource, /renderRefreshProgress\(button, phase, \{ processed, selected, elapsedSeconds \}\)/u);
+  assert.match(appSource, /const accountingStatus = outcome === "running"/u);
+  assert.match(appSource, /const collectorProgress = progress\?\.kind === undefined/u);
+  assert.match(appSource, /if \(collectorProgress\s*&& progress\?\.phase === "quick_result"/u);
+  assert.match(appSource, /const countedProgress = collectorProgress \|\| unifiedIndexScanning/u);
+  assert.match(appSource, /outcome === "cancelling"[\s\S]*?accountingStatus !== null[\s\S]*?archiveScanning/u);
+  assert.doesNotMatch(appSource, /Verified summary ready|Preparing verified summary/u);
+  assert.match(appSource, /kind === "unified_index"/u);
+  assert.match(appSource, /Scanning local history/u);
+  assert.doesNotMatch(appSource, /Headline ready; finishing deeper accounting/u);
   assert.match(appSource, /Local analysis cancelled/u);
   assert.match(appSource, /Verified existing results were kept/u);
   assert.match(appSource, /preserving a resumable local checkpoint/u);
@@ -5361,6 +5879,16 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
     styles,
     /\.topbar \.history-index-badge \{ display: none; \}/u,
     "the later evidence-card rule cannot re-show the toolbar badge",
+  );
+  assert.match(
+    styles,
+    /\.index-progress \{\n  display: grid;/u,
+    "the in-card history progress treatment owns the full-width layout",
+  );
+  assert.doesNotMatch(
+    styles,
+    /\.history-index-badge \{\n  display: grid;/u,
+    "the compact toolbar badge cannot inherit the in-card progress layout",
   );
   assert.match(
     styles,
@@ -5536,7 +6064,7 @@ test("the weekly headline is a stable all-data median and says so on screen", as
     1,
     "the across-reset range never moves when a chart control moves",
   );
-  assert.equal(views[0].label, "Quota-weighted all-data median");
+  assert.equal(views[0].label, "Speed-priced all-data median");
   assert.match(views[0].range, /all data/u, "the range names the population it summarizes");
   assert.equal(
     new Set(views.map((view) => view.explanation)).size,
@@ -5558,6 +6086,12 @@ test("the weekly headline is a stable all-data median and says so on screen", as
   // sentence names the relaxed floor.
   assert.match(views[0].explanation, /drawing 2 of 52/u);
   assert.match(views[0].explanation, /any length/u);
+  assert.equal(views[0].spanLabel, "Well-observed quota span");
+  assert.equal(views[0].spanNote.hidden, false);
+  assert.match(views[0].spanNote.textContent, /includes all spans/u);
+  assert.equal(views[1].spanLabel, "Minimum observed quota span");
+  assert.equal(views[1].spanNote.hidden, true);
+
   assert.match(views[2].explanation, /drawing 34 of 52/u);
   assert.match(views[3].explanation, /drawing 52 of 52/u);
   // An empty chart names its reason with numbers instead of the generic
@@ -5579,6 +6113,62 @@ test("the weekly headline is a stable all-data median and says so on screen", as
       `${locale} states the headline/chart relationship`,
     );
   }
+});
+
+test("the rendered allowance headline, history, pace and shared history use one selected plan", async () => {
+  const populations = [["pro", 2_400], ["plus", 85]].map(([planType, value]) => ({
+    planType,
+    status: "available",
+    planAttribution: {
+      methodVersion: "plan-era-v1", status: "historical_plan_conditional",
+      accountVerified: false, comparisonEligibility: "unavailable",
+    },
+    datasets: {
+      summary: [{
+        median_weekly_value_usd: value,
+        lower_80_across_resets_usd: value * .8,
+        upper_80_across_resets_usd: value * 1.2,
+        qualifying_resets: 2,
+      }],
+      weekly_values: [0, 1].map((week) => ({
+        plan_type: planType,
+        aggregation_eligibility: "primary_conditional",
+        value_usd: value,
+        last_observed_at: new Date(Date.UTC(2026, 7, 20 + week * 7)).toISOString(),
+        displayed_span_pp: week ? 80 : 35,
+      })),
+    },
+  }));
+  const data = normalizeDashboardPayload({ weekly: {
+    ...populations[1], selectedPlanType: "plus", planPopulations: populations,
+  } });
+  const plus = await renderWeeklyHero(data, { span: 0, rangeDays: 36_500 });
+  const pro = await renderWeeklyHero(data, { span: 50, rangeDays: 36_500, planType: "pro" });
+  const proInSpanish = await renderWeeklyHero(data, {
+    span: 0, rangeDays: 7, planType: "pro", locale: "es",
+  });
+  assert.match(plus.label, /Plus/u);
+  assert.match(plus.estimate, /\$85/u);
+  assert.match(plus.range, /\$68.*\$102/u);
+  assert.match(pro.label, /Pro \(20×\)/u);
+  assert.match(pro.estimate, /\$2400/u);
+  assert.match(pro.range, /\$1920.*\$2880/u);
+  assert.match(proInSpanish.label, /Pro \(20×\)/u);
+  assert.match(proInSpanish.estimate, /\$2400/u);
+  for (const [view, planType, value, shown] of [
+    [plus, "plus", 85, 2], [pro, "pro", 2_400, 1], [proInSpanish, "pro", 2_400, 2],
+  ]) {
+    assert.equal(view.shared.data.weekly.planType, planType);
+    assert.strictEqual(view.shared.data, view.paceData,
+      "pace and the share card receive the same selected population as the headline");
+    assert.equal(view.shared.history.points.length, shown);
+    assert.ok(view.shared.history.points.every((row) => row.value === value),
+      "the share card gets the exact selected-plan and filtered history, never a pooled graph");
+    assert.strictEqual(view.shared.data.accounting, data.accounting,
+      "plan-specific estimates do not discard the complete activity ledger");
+  }
+  assert.equal(pro.paceData.weekly.paceForecast, null);
+  assert.deepEqual(pro.shared.data.quotaWindows, []);
 });
 
 test("reset boundaries tolerate the provider's timestamp jitter but not a real reset", async () => {
@@ -5725,6 +6315,7 @@ test("allowance history draws visible evidence dots while the dense usage timeli
         label: { key: "series.wellObserved" },
         connect: false,
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        pointFilter: (point) => point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
       },
       {
@@ -5733,6 +6324,7 @@ test("allowance history draws visible evidence dots while the dense usage timeli
         label: { key: "series.shortObservation" },
         connect: false,
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        pointFilter: (point) => !point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
     ],
@@ -5742,6 +6334,8 @@ test("allowance history draws visible evidence dots while the dense usage timeli
   });
   const mature = sparse.querySelectorAll("circle.chart-point-weekly-mature");
   const partial = sparse.querySelectorAll("circle.chart-point-weekly-partial");
+  assert.equal(mature.length, 3, "well-observed points have no short-series hit target");
+  assert.equal(partial.length, 1, "only the short observation can show its tooltip");
   const drawn = [...mature, ...partial].filter(
     (circle) => Number(circle.getAttribute("r")) > 0
       && !circle.getAttribute("class").includes("chart-point-hit-target"),
@@ -6253,12 +6847,12 @@ test("weekly details keep reset evidence concise and do not present speed covera
   assert.doesNotMatch(appSource, /function renderWeeklyTrend|function renderWeeklyStats/u);
 });
 
-test("live timeline couples quota-weighted usage to the matching allowance capacity", async () => {
+test("live timeline couples speed-priced usage to the matching allowance capacity", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(html, />Expected from quota-weighted API cost</u);
+  assert.match(html, />Expected from speed-priced API cost</u);
   assert.doesNotMatch(html, />Expected from API cost</u);
-  assert.match(html, /id="usage-cost-legend-label">Quota-weighted API-equivalent usage</u);
+  assert.match(html, /id="usage-cost-legend-label">Speed-priced API-equivalent usage</u);
   assert.match(html, /id="usage-allowance-legend"/u);
   assert.match(
     appSource,
@@ -6347,11 +6941,11 @@ test("live timeline couples quota-weighted usage to the matching allowance capac
     /data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u,
   );
   // Owner-directed 2026-08-20: the Spark cards lead the row and the
-  // normal-Codex allowance follows. Pinned so the grouping is not quietly
-  // reverted to normal-first by a later edit.
+  // normal-Codex allowance follows. Future pools remain visible only after
+  // both reviewed groups, never promoted into either one.
   assert.match(
     quotaCardsMatch[1],
-    /const windows = \[\.\.\.sparkOrderedWindows, \.\.\.normalOrderedWindows\];/u,
+    /const windows = \[[\s\S]*?\.\.\.sparkOrderedWindows,[\s\S]*?\.\.\.normalOrderedWindows,[\s\S]*?\.\.\.otherOrderedWindows,[\s\S]*?\];/u,
   );
   // Within the Spark pair the order comes from the window duration, not from
   // the provider's slot assignment, so five-hour precedes seven-day even if
@@ -6589,7 +7183,7 @@ test("primary contribution journey is one review-and-approve ceremony without ex
   assert.match(html, /Approval is asked once\./u);
 });
 
-test("post-results contribution CTA is explicit while technical and deletion controls stay quiet", async () => {
+test("post-results contribution CTA is explicit and disconnect remains separate", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const communityPosition = html.indexOf('id="community"');
   const footerPosition = html.indexOf("<footer");
@@ -6615,6 +7209,8 @@ test("post-results contribution CTA is explicit while technical and deletion con
   assert.doesNotMatch(html, /id="prepare-contribution"/u);
   assert.doesNotMatch(html, /id="sync-run-once"/u);
   assert.match(html, /id="incremental-consent-approve"/u);
+  assert.match(html, /id="disconnect-device"/u);
+  assert.doesNotMatch(html, /delete-contributions|Delete my contributions/u);
   assert.doesNotMatch(html, /automatic-contribution|contribution-history|backend|browser validation|JSON export|download-participant/iu);
 });
 
@@ -6684,15 +7280,20 @@ test("stale local device conflicts name the leftover credential and offer the re
   assert.match(recoverySource, /action\.href = SEMANTIC_OPEN_TARGET/u);
   assert.match(
     appSource,
-    /error\?\.code === "contribution_device_recovery_required"\s*\n\s*\|\| error\?\.code === "contribution_device_credential_conflict"\s*\n\s*\|\| error\?\.code === "contribution_device_keychain_access_denied"/u,
+    /error\?\.code === "contribution_device_recovery_required"\s*\n\s*\|\| error\?\.code === "contribution_device_credential_conflict";/u,
   );
-  // A denied macOS access dialog reaches the same reset ceremony with its own
-  // sentence (2026-08-19): it names the dialog and the answer — Always Allow
-  // on the next approval — instead of the leftover-credential story.
+  // Denial does not establish an unusable credential and never belongs to
+  // this explicitly confirmed reset ceremony.
   assert.match(
     appSource,
-    /contribution_device_keychain_access_denied:\n\s*"macOS did not let TiboTattle read the upload credential/u,
+    /contribution_device_keychain_access_denied:\n\s*"Uploads are paused because TiboTattle could not access this Mac's upload credential/u,
   );
+  const reset = appSource.match(/async function resetContributionDeviceCredential\([\s\S]*?\n\}/u)?.[0];
+  assert.ok(reset);
+  assert.match(reset, /if \(!window\.confirm\(DEVICE_CREDENTIAL_RESET_CONFIRMATION\)\) return;/u);
+  const confirmationPosition = reset.indexOf("window.confirm(DEVICE_CREDENTIAL_RESET_CONFIRMATION)");
+  const mutationPosition = reset.indexOf("localClient.resetContributionDeviceCredential()");
+  assert.ok(confirmationPosition >= 0 && mutationPosition > confirmationPosition);
   assert.equal(
     (appSource.match(/id = "reset-device-credential"/gu) ?? []).length,
     1,
@@ -6704,8 +7305,8 @@ test("a locked login keychain reads as a paused upload, never as a broken creden
   // fine. What is not fine is telling the user their credential is leftover
   // from an earlier install and handing them a destructive clear — the wrong
   // diagnosis, whose suggested cure forces a needless re-pair for something
-  // their login password fixes. So `locked` leaves the recovery family at the
-  // route and gets its own surface here.
+  // an intact, temporarily unavailable credential. So `locked` leaves the
+  // recovery family at the route and gets its own surface here.
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const lockedMatch = appSource.match(
     /async function renderContributionDeviceKeychainLocked\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n/u,
@@ -6773,6 +7374,184 @@ test("a locked login keychain reads as a paused upload, never as a broken creden
   }
 });
 
+test("a declined legacy Keychain migration preserves the credential and never offers reset", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const copy = appSource.match(
+    /contribution_device_keychain_migration_required:\n\s*"([^"]+)"/u,
+  )?.[1];
+  assert.ok(copy, "migration-required recovery copy is present");
+  assert.match(copy, /existing upload credential and local history are unchanged/u);
+  assert.match(copy, /Settings… → General/u);
+  assert.match(copy, /Review migration… under Secure upgrade/u);
+  assert.match(copy, /Nothing was uploaded/u);
+  assert.match(copy, /Do not reset or delete the credential/u);
+  assert.doesNotMatch(copy, /Quit and reopen|when macOS asks|approve again/u);
+  const recoveryClassifier = appSource.match(
+    /function contributionDeviceRecoveryIsRequired\(error\) \{([\s\S]*?)\n\}\n/u,
+  )?.[1] ?? "";
+  assert.doesNotMatch(
+    recoveryClassifier,
+    /contribution_device_keychain_migration_required/u,
+  );
+});
+
+test("only fixed Keychain recovery is translated before diagnostics", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const allowlist = appSource.match(
+    /const LOCALIZED_KEYCHAIN_RECOVERY_CODES = new Set\(\[([\s\S]*?)\]\);/u,
+  )?.[1] ?? "";
+  assert.deepEqual(
+    [...allowlist.matchAll(/"([^"]+)"/gu)].map(([, code]) => code),
+    [
+      "identity_migration_required",
+      "contribution_device_keychain_migration_required",
+      "contribution_device_keychain_access_denied",
+    ],
+  );
+  const localized = appSource.match(
+    /function localizedKeychainRecoveryExplanation\(explanation, code\) \{([\s\S]*?)\n\}/u,
+  )?.[1] ?? "";
+  assert.match(localized, /LOCALIZED_KEYCHAIN_RECOVERY_CODES\.has\(code\)/u);
+  assert.match(localized, /localization\.translateText\(explanation\)/u);
+  assert.doesNotMatch(localized, /error|reference|requestId|fallback/u);
+  const describe = appSource.match(
+    /async function describeFailure\([\s\S]*?\n\}/u,
+  )?.[0] ?? "";
+  assert.match(
+    describe,
+    /const fixedExplanation = fixedCopy\(messages, code\)[\s\S]*?localizedKeychainRecoveryExplanation\(\s*fixedExplanation,\s*code,[\s\S]*?diagnosticReferenceSentence/u,
+  );
+  assert.match(describe, /localizedKeychainRecoveryExplanation\(\s*fixedExplanation,\s*code,\s*\) \?\? fallback;/u);
+  assert.doesNotMatch(describe, /localization\.translateText\(error|translateText\(fallback/u);
+
+  const fixedCopySource = appSource.match(/function fixedCopy\([\s\S]*?\n\}/u)?.[0];
+  const localizedSource = appSource.match(/function localizedKeychainRecoveryExplanation\([\s\S]*?\n\}/u)?.[0];
+  assert.ok(fixedCopySource);
+  assert.ok(localizedSource);
+  const translationInputs = [];
+  const recordedNotes = [];
+  const identityCopy = appSource.match(/identity_migration_required:\n\s*"([^"]+)"/u)?.[1];
+  const credentialCopy = appSource.match(/contribution_device_keychain_migration_required:\n\s*"([^"]+)"/u)?.[1];
+  const deniedCopy = appSource.match(/contribution_device_keychain_access_denied:\n\s*"([^"]+)"/u)?.[1];
+  assert.ok(identityCopy);
+  assert.ok(credentialCopy);
+  assert.ok(deniedCopy);
+  const describeFixture = new Function("dependencies", `
+    const {
+      localization, localClient, createDiagnosticReference, diagnosticErrorCode,
+      serviceRequestId, diagnosticSurface, diagnosticReferenceSentence,
+      SERVICE_ERROR_COPY, LOCAL_COMPANION_ERROR_COPY,
+    } = dependencies;
+    const LOCALIZED_KEYCHAIN_RECOVERY_CODES = new Set([${allowlist}]);
+    ${fixedCopySource}
+    ${localizedSource}
+    ${describe}
+    return describeFailure;
+  `)({
+    localization: {
+      translateText(text) {
+        translationInputs.push(text);
+        return translateLegacyText(text, "es");
+      },
+    },
+    localClient: {
+      async recordDiagnosticNote(note) {
+        recordedNotes.push(note);
+        return { status: "recorded", reference: note.reference };
+      },
+    },
+    createDiagnosticReference: () => "TT-ABC123",
+    diagnosticErrorCode,
+    serviceRequestId,
+    diagnosticSurface,
+    diagnosticReferenceSentence,
+    SERVICE_ERROR_COPY: {},
+    LOCAL_COMPANION_ERROR_COPY: {
+      contribution_device_keychain_migration_required: credentialCopy,
+      contribution_device_keychain_access_denied: deniedCopy,
+      contribution_device_keychain_locked: "Fixed locked-keychain explanation.",
+    },
+  });
+  const reference = "TT-ABC123";
+  const requestId = "11111111-1111-4111-8111-111111111111";
+  const trailer = diagnosticReferenceSentence({ reference, requestId, writtenToLocalLog: true });
+  for (const [code, copy, messages] of [
+    ["identity_migration_required", identityCopy, { identity_migration_required: identityCopy }],
+    ["contribution_device_keychain_migration_required", credentialCopy, {}],
+    ["contribution_device_keychain_access_denied", deniedCopy, {}],
+  ]) {
+    const result = await describeFixture({
+      surface: DIAGNOSTIC_SURFACES[0],
+      error: { code, requestId, message: "Untrusted raw server message" },
+      messages,
+      fallback: "Untranslated fallback.",
+    });
+    assert.equal(result.text, `${translateLegacyText(copy, "es")} ${trailer}`);
+    assert.equal(result.reference, reference);
+    assert.equal(result.requestId, requestId);
+    assert.equal(result.localNote, "recorded");
+    assert.doesNotMatch(result.text, /Untrusted raw server message|Untranslated fallback/u);
+  }
+  assert.deepEqual(translationInputs, [identityCopy, credentialCopy, deniedCopy]);
+  for (const [code, expected] of [
+    ["contribution_device_keychain_locked", "Fixed locked-keychain explanation."],
+    ["unrecognized_code", "Untranslated fallback."],
+    ["constructor", "Untranslated fallback."],
+    ["identity_migration_required", "Untranslated fallback."],
+  ]) {
+    const result = await describeFixture({
+      surface: DIAGNOSTIC_SURFACES[0],
+      error: { code, requestId, message: "Untrusted raw server message" },
+      fallback: "Untranslated fallback.",
+    });
+    assert.equal(result.text, `${expected} ${trailer}`);
+  }
+  assert.deepEqual(translationInputs, [identityCopy, credentialCopy, deniedCopy], "unrelated errors, fallback, raw errors and diagnostic identifiers never enter translation");
+  assert.equal(recordedNotes.length, 7, "every failure still records its existing diagnostics note");
+});
+
+test("pairing progress stays neutral across every Keychain surface and locale", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const steps = appSource.match(/const CONTRIBUTION_CONNECT_STEPS = Object\.freeze\(\{[\s\S]*?\n\}\);/u)?.[0];
+  const runner = appSource.match(/async function contributionConnectStep\([\s\S]*?\n\}/u)?.[0];
+  const classifier = appSource.match(/function keychainPromptSurface\([\s\S]*?\n\}/u)?.[0];
+  assert.ok(steps);
+  assert.ok(runner);
+  assert.ok(classifier);
+  for (const locale of SUPPORTED_LOCALES) {
+    for (const projection of [undefined, null, {}, { keychainPrompt: "pairing" },
+      { keychainPrompt: "migration" }, { keychainPrompt: "none" }, { keychainPrompt: "unknown" }]) {
+      const scope = new Function("incrementalSyncStatus", "setProductText", `
+        ${steps}
+        ${runner}
+        ${classifier}
+        return { contributionConnectStep, keychainPromptSurface };
+      `)(projection, (target, text) => { target.textContent = translateLegacyText(text, locale); });
+      assert.equal(scope.keychainPromptSurface(),
+        ["migration", "none"].includes(projection?.keychainPrompt) ? projection.keychainPrompt : "pairing");
+      const status = { hidden: true, className: "participant-action-status error", textContent: "" };
+      const expected = translateLegacyText("Connecting this Mac as an upload-only device…", locale);
+      let ran = false;
+      const result = await scope.contributionConnectStep("device_pairing", status, async () => {
+        ran = true;
+        assert.equal(status.hidden, false);
+        assert.equal(status.className, "participant-action-status");
+        assert.equal(status.textContent, expected, "neutral copy is visible before pairing runs");
+        return "paired";
+      });
+      assert.equal(ran, true);
+      assert.equal(result, "paired");
+      const failure = Object.assign(new Error("Synthetic denied access"), {
+        code: "contribution_device_keychain_access_denied",
+      });
+      await assert.rejects(scope.contributionConnectStep("device_pairing", status, async () => {
+        throw failure;
+      }), (error) => error === failure && error.contributionStep === "device_pairing");
+      assert.equal(status.textContent, expected, "failure tagging does not introduce prompt advice");
+    }
+  }
+});
+
 test("the approve card shows one verified review instance before one explicit approval", async () => {
   // Re-pinned 2026-08-08 (owner-directed): the concise review moved onto the
   // approve-once card. The GATE is the contract and survives the removed
@@ -6817,13 +7596,10 @@ test("the approve card shows one verified review instance before one explicit ap
   );
   assert.match(html, /See what the community published/u);
   assert.doesNotMatch(appSource, /loadCommunityResults\(\).*renderSharedCommunitySnapshot/su);
-  // The card prepares the reader for the macOS keychain dialog BEFORE the
-  // click that triggers it (2026-08-19, first pairing on a fresh Mac): the
-  // connect step stores the upload credential in the login keychain, and the
-  // OS dialog itself explains nothing.
+  // The card describes storage without preparing or authorizing an OS dialog.
   assert.match(
     html,
-    /Connecting stores this Mac's upload credential in your login\s+keychain\. If macOS asks for permission, choose Always Allow so\s+background uploads keep working\./u,
+    /Connecting stores this Mac's upload credential in your login\s+keychain\. Local reporting and history are unchanged\./u,
   );
 });
 
@@ -6985,7 +7761,7 @@ test("the approve-once consent surface lights up only with the advertised v1.0 s
   assert.match(html, /Approval is asked once\./u);
   assert.match(
     appSource,
-    /approve\.disabled = busy\s*\n\s*\|\| \(incrementalConsentApproved && !repairNeeded\)\s*\n\s*\|\| \(!incrementalConsentApproved && !reviewVerified\)\s*\n\s*\|\| hostedSignInRequired\(\);/u,
+    /approve\.disabled = busy\s*\n\s*\|\| contributionDisconnectOutcome === "cleanup_pending"\s*\n\s*\|\| \(incrementalConsentApproved && !repairNeeded\)\s*\n\s*\|\| \(!incrementalConsentApproved && !reviewVerified\)\s*\n\s*\|\| hostedSignInRequired\(\);/u,
   );
   assert.match(
     appSource,
@@ -7202,7 +7978,7 @@ test("service request ids survive rejection so both sides of a failure can be jo
     }),
   });
   await assert.rejects(
-    failing({ error: { code: "INTERNAL_ERROR", requestId } }).personalStats(),
+    failing({ error: { code: "INTERNAL_ERROR", requestId } }).session(),
     (error) => error.status === 500
       && error.code === "INTERNAL_ERROR"
       && error.requestId === requestId,
@@ -7211,11 +7987,11 @@ test("service request ids survive rejection so both sides of a failure can be jo
   // no code to branch on and no request id to show.
   await assert.rejects(
     failing({ error: { code: "sorry, it broke", requestId: "private-value" } })
-      .personalStats(),
+      .session(),
     (error) => error.code === undefined && error.requestId === undefined,
   );
   await assert.rejects(
-    failing("not json at all").personalStats(),
+    failing("not json at all").session(),
     (error) => error.status === 500
       && error.code === undefined
       && error.requestId === undefined,
@@ -7385,7 +8161,7 @@ test("clients never invoke browser-native fetch with themselves as receiver", as
   );
   assert.equal(receiverStrictFetch.calls.length, 1);
 
-  function receiverStrictReady(url, options = {}) {
+  function receiverStrictHealth(url, options = {}) {
     if (this !== undefined && this !== globalThis) {
       throw new TypeError("Illegal invocation");
     }
@@ -7394,11 +8170,8 @@ test("clients never invoke browser-native fetch with themselves as receiver", as
       checks: {},
     }), { status: 200, headers: { "Content-Type": "application/json" } }));
   }
-  const community = new CommunityClient({ fetchImpl: receiverStrictReady });
-  // The stub's minimal body normalizes to the fail-closed unavailable shape;
-  // what matters here is that the request was made at all instead of dying
-  // on the receiver check.
-  assert.equal((await community.readiness()).state, "unavailable");
+  const community = new CommunityClient({ fetchImpl: receiverStrictHealth });
+  assert.deepEqual(await community.health(), { status: "ready", checks: {} });
 });
 
 test("the device credential repair is explicit, local-only, and fails closed", async () => {
@@ -7997,7 +8770,11 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.ok(describe, "the failure describer is available");
   assert.match(
     describe,
-    /const explanation = fixedCopy\(messages, code\)\s*\n\s*\?\? fixedCopy\(SERVICE_ERROR_COPY, code\)\s*\n\s*\?\? fixedCopy\(LOCAL_COMPANION_ERROR_COPY, code\)\s*\n\s*\?\? fallback;/u,
+    /const fixedExplanation = fixedCopy\(messages, code\)\s*\n\s*\?\? fixedCopy\(SERVICE_ERROR_COPY, code\)\s*\n\s*\?\? fixedCopy\(LOCAL_COMPANION_ERROR_COPY, code\);/u,
+  );
+  assert.match(
+    describe,
+    /const explanation = localizedKeychainRecoveryExplanation\(\s*fixedExplanation,\s*code,\s*\) \?\? fallback;/u,
   );
   // The reference is minted per failure and filed against a fixed surface.
   assert.match(describe, /const reference = createDiagnosticReference\(\);/u);
@@ -8048,43 +8825,25 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(connect, /contributionConnectStep\(\s*"service_check"/u);
   assert.match(connect, /contributionConnectStep\(\s*"hosted_enrollment"/u);
   assert.match(connect, /contributionConnectStep\(\s*"device_pairing"/u);
-  // The pairing step is the one that stores the upload credential in the
-  // login keychain, so its progress line — on screen before the macOS access
-  // dialog can appear (2026-08-19, first pairing on a fresh Mac) — must
-  // prepare the reader: what asks, that the requester is the bundled helper
-  // macOS lists as node, and that Always Allow keeps background uploads
-  // working instead of re-prompting every pass.
+  // Connection progress is the same neutral statement for every retained
+  // surface classification, including an unknown or missing broker.
   const pairingStep = appSource.match(
     /device_pairing: Object\.freeze\(\{([\s\S]*?)\}\),/u,
   )?.[1] ?? "";
-  assert.match(pairingStep, /macOS may ask for your login password/u);
-  assert.match(pairingStep, /which macOS lists as node/u);
-  assert.match(
-    pairingStep,
-    /Choose Always Allow so background uploads keep working/u,
-  );
-  // ...and only where a dialog is reachable. A brokered install mints inside
-  // the signed app, so the step must carry a second line that warns about
-  // nothing and never names a process the reader cannot see.
-  const brokeredProgress = pairingStep.match(
-    /brokeredProgress: "([^"]*)"/u,
-  )?.[1] ?? "";
-  assert.equal(brokeredProgress.length > 0, true);
-  assert.doesNotMatch(brokeredProgress, /node/u);
-  assert.doesNotMatch(brokeredProgress, /keychain|Keychain/u);
-  assert.doesNotMatch(brokeredProgress, /Always Allow/u);
+  assert.match(pairingStep, /progress: "Connecting this Mac as an upload-only device…"/u);
+  assert.doesNotMatch(pairingStep, /brokeredProgress|Always Allow|login password/u);
   assert.match(
     appSource,
-    /setProductText\(status, keychainPromptSurface\(\) === "pairing"\s*\n\s*\? step\.progress\s*\n\s*: step\.brokeredProgress \?\? step\.progress\);/u,
+    /setProductText\(status, step\.progress\);/u,
   );
   // The surface is only ever narrowed on a positive statement from the
-  // companion: anything else must keep today's guidance on screen.
+  // companion; the fallback is now neutral connection information.
   const promptSurface = appSource.match(
     /function keychainPromptSurface\(\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
   assert.match(
     promptSurface,
-    /reported === "rotation" \|\| reported === "none" \? reported : "pairing"/u,
+    /reported === "migration" \|\| reported === "none" \? reported : "pairing"/u,
   );
   // Re-pinned 2026-08-08 (owner-directed, second round): queue_refresh left
   // with the separate connect flow — the merged ceremony's invisible
@@ -8102,6 +8861,17 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     /local_preparation: Object\.freeze\(\{|local_review: Object\.freeze\(\{|queue_refresh: Object\.freeze\(\{/u,
   );
   assert.match(appSource, /INCREMENTAL_PREPARATION_ERROR_COPY = \{/u);
+  assert.match(appSource, /identity_migration_required:/u);
+  const identityMigrationCopy = appSource.match(
+    /identity_migration_required:\n\s*"([^"]+)"/u,
+  )?.[1];
+  assert.ok(identityMigrationCopy, "identity migration recovery remains explicit");
+  assert.match(identityMigrationCopy, /existing local identity and history are unchanged/u);
+  assert.match(identityMigrationCopy, /Settings… → General/u);
+  assert.match(identityMigrationCopy, /Review migration… under Secure upgrade/u);
+  assert.match(identityMigrationCopy, /No upload occurred/u);
+  assert.match(identityMigrationCopy, /Do not reset, delete, or rotate the identity/u);
+  assert.doesNotMatch(identityMigrationCopy, /Quit and reopen|when macOS asks/u);
   assert.match(appSource, /identity_unavailable:/u);
   assert.match(appSource, /coverage_unavailable:/u);
   for (const code of [
@@ -8159,7 +8929,6 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     "contribution_prepare",
     "automatic_contribution",
     "hosted_identity",
-    "fast_mode_preference",
   ]) {
     assert.ok(surfaces.includes(journey), `${journey} reports failures`);
   }
@@ -8227,12 +8996,14 @@ async function loadShareCardPlan() {
   const section = appSource.slice(start, end);
   return Function(
     "finite",
+    "TELEMETRY_PLAN_DISPLAY_NAMES",
     "TELEMETRY_PLAN_TYPES",
     `${section}\nreturn { SHARE_CARD_PLAN_LABELS, shareCardPlanLabel, shareCardPlan };`,
   )(
     (value, fallback = null) => (
       typeof value === "number" && Number.isFinite(value) ? value : fallback
     ),
+    TELEMETRY_PLAN_DISPLAY_NAMES,
     TELEMETRY_PLAN_TYPES,
   );
 }
@@ -8244,6 +9015,8 @@ test("the share card names only a known, most-recent Codex plan", async () => {
   assert.equal(shareCardPlanLabel("pro"), "Pro (20×)");
   assert.equal(shareCardPlanLabel("prolite"), "Pro Lite (5×)");
   assert.equal(shareCardPlanLabel("plus"), "Plus");
+  assert.equal(shareCardPlanLabel("edu_plus"), "Edu Plus");
+  assert.equal(shareCardPlanLabel("edu_pro"), "Edu Pro");
   assert.equal(
     shareCardPlanLabel("self_serve_business_prolite"),
     "Business · Pro Lite (5×)",
@@ -8255,9 +9028,10 @@ test("the share card names only a known, most-recent Codex plan", async () => {
   assert.equal(shareCardPlanLabel(undefined), "");
   assert.equal(shareCardPlanLabel(null), "");
   assert.ok(!Object.hasOwn(SHARE_CARD_PLAN_LABELS, "unknown"));
-  for (const plan of Object.keys(SHARE_CARD_PLAN_LABELS)) {
-    assert.ok(TELEMETRY_PLAN_TYPES.includes(plan), `${plan} is a KnownPlan value`);
-  }
+  assert.deepEqual(
+    Object.keys(SHARE_CARD_PLAN_LABELS).sort(),
+    TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "unknown").sort(),
+  );
 
   assert.equal(
     shareCardPlan([
@@ -8303,11 +9077,11 @@ test("the share card wires plan copy through the canvas and transcript", async (
 
   assert.match(
     section,
-    /const planLabel = shareCardPlan\(data\?\.quotaWindows \?\? \[\]\);/u,
+    /const planLabel = data\.allowancePlanSelection\s*\n\s*\? shareCardPlanLabel\(data\?\.weekly\?\.planType\) \|\| t\("weekly\.plan\.unknown"\)\s*\n\s*: shareCardPlan\(data\?\.quotaWindows \?\? \[\]\);/u,
   );
   assert.match(
     section,
-    /plan: planLabel === "" \? "" : t\("share\.plan", \{ plan: planLabel \}\),/u,
+    /plan: planLabel === "" \? "" : t\(\s*\n\s*data\.allowancePlanSelection \? "share\.planAllowance" : "share\.plan",\s*\n\s*\{ plan: planLabel \},\s*\n\s*\),/u,
   );
   assert.match(
     section,
@@ -8338,6 +9112,8 @@ test("the share card wires plan copy through the canvas and transcript", async (
   assert.ok(signature, "the share-card signature is available");
   assert.match(signature, /headlineDate,/u);
   assert.match(signature, /shareCardPlan\(data\?\.quotaWindows \?\? \[\]\),/u);
+  assert.match(signature, /data\.allowancePlanSelection \?\? null,/u);
+  assert.match(section, /caveats\.push\(t\("share\.caveat\.planConditional"\)\);/u);
 });
 
 test("a posted results card can carry only fixed copy and formatted figures", async () => {
@@ -8394,6 +9170,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     )].sort(),
     [
       "data.accounting",
+      "data.allowancePlanSelection",
       "data?.accounting?.periods",
       "data?.freshness?.latestObservedAt",
       "data?.mode",
@@ -8406,6 +9183,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "data?.pricing?.totalCostUsd",
       "data?.quotaWindows",
       "data?.schemaVersion",
+      "data?.weekly?.planType",
       "data?.weekly?.summary",
       "data?.weekly?.summary?.median",
       "data?.weekly?.summary?.medianWeeklyValueUsd",
@@ -8491,7 +9269,10 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.doesNotMatch(section, /observed\.find\(/u);
   assert.match(
     section,
-    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";/u,
+    // A selected plan population is itself an explicit seven-day calibration
+    // contract, even when its historical account has no current quota window.
+    // Legacy payloads still cannot borrow a seven-day fit for another duration.
+    /const isWeeklyWindow = data\.allowancePlanSelection !== undefined\s*\n\s*\|\| shareCardWindowKind\(allowanceWindow\) === "seven_day";/u,
   );
   assert.match(
     section,
@@ -8829,7 +9610,7 @@ test("the posted allowance graph uses the exact history model from the dashboard
     // Re-pinned 2026-08-08 (owner-verified regression): the chart renderer
     // hands its own model in; the card derives one only when rendered
     // standalone, and both reads share the active-filter state.
-    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
+    /const isWeeklyWindow = data\.allowancePlanSelection !== undefined\s*\n\s*\|\| shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
   );
   assert.match(
     section,
@@ -8875,6 +9656,7 @@ test("a posted results card always carries a diagnostic-format reference", async
     "shareCardWindowKind(allowanceWindow)",
     "finite(allowanceWindow?.durationMinutes)",
     "finite(allowanceWindow?.remainingPercent)",
+    "data.allowancePlanSelection ?? null",
     "finite(data?.pricing?.quotaWeightedTotalCostUsd)",
     "finite(data?.pricing?.totalCostUsd)",
     "finite(data?.pricing?.coveragePercent)",
@@ -8888,7 +9670,7 @@ test("a posted results card always carries a diagnostic-format reference", async
     // Re-pinned 2026-08-08 (owner-verified regression): the chart renderer
     // hands its own model in; the card derives one only when rendered
     // standalone, and both reads share the active-filter state.
-    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
+    /const isWeeklyWindow = data\.allowancePlanSelection !== undefined\s*\n\s*\|\| shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
   );
   assert.match(
     section,
@@ -9001,7 +9783,7 @@ test("a posted results card states a figure in full, dates real evidence, and ma
   // line names its denominator — and the chart takes the reclaimed height.
   assert.match(section, /const trendTop = statTop \+ statHeight \+ 34;/u);
   assert.doesNotMatch(section, /relationshipNote/u);
-  assert.match(section, /label: t\("share\.stat\.recordedActivity"\),/u);
+  assert.match(section, /label: t\(data\.allowancePlanSelection\s*\n\s*\? "share\.stat\.recordedActivityAllPlans" : "share\.stat\.recordedActivity"\),/u);
   assert.match(
     section,
     /label: isWeeklyWindow\s*\n\s*\? t\("share\.stat\.estimatedAllowance"\)\s*\n\s*: t\("share\.stat\.estimatedAllowanceUnavailable"\),/u,
@@ -9123,6 +9905,56 @@ test("a chart says so when its series does not reach back as far as its label", 
 // state wholesale, and its copy and rendering are owned there.
 // ---------------------------------------------------------------------------
 
+test("dashboard warnings omit internal tool history while preserving usage caveats and diagnostics", () => {
+  const toolWarning =
+    "Usage accounting is complete, but typed tool history is partial. Tool totals are withheld rather than reported as zero.";
+  const usageWarning = "Some usage events name an unrecognized model and remain unpriced rather than being assigned a guessed price.";
+  const historyWarning = "The unified local index is unreadable.";
+  const otherToolWarning = "Some tool activity has unpriced usage.";
+  const toolClasses = {
+    status: "unavailable",
+    reason: "typed_tool_history_partial",
+    total: null,
+    counts: Object.fromEntries(
+      ["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]
+        .map((key) => [key, null]),
+    ),
+  };
+  const overview = {
+    warnings: [
+      toolWarning,
+      usageWarning,
+      { message: toolWarning },
+      { message: historyWarning },
+      "",
+      null,
+      {},
+      otherToolWarning,
+    ],
+    activity: { toolEvents: null },
+    pricing: { totalCostUsd: 12.5 },
+    accounting: { toolClasses },
+    timeline: {
+      history: { status: "partial", reason: "typed_tool_history_partial" },
+    },
+  };
+  const original = structuredClone(overview);
+  for (const dashboard of [
+    normalizeDashboardPayload(overview),
+    normalizeDashboardPayload({ overview }),
+    normalizeDashboardPayload({}, { overview }),
+  ]) {
+    assert.deepEqual(dashboard.warnings, [usageWarning, historyWarning, otherToolWarning]);
+    assert.equal(dashboard.pricing.totalCostUsd, 12.5);
+    assert.equal(dashboard.activity.toolEvents, null);
+    assert.deepEqual(dashboard.accounting.toolClasses, toolClasses);
+    assert.equal(dashboard.timeline.history.status, "partial");
+    assert.equal(dashboard.timeline.history.reason, "typed_tool_history_partial");
+  }
+  assert.deepEqual(overview, original, "source diagnostics stay unchanged for retention and inspection");
+  assert.deepEqual(normalizeDashboardPayload({ warnings: [toolWarning] }).warnings, []);
+});
+
 test("self-resolving degraded notes are classed informational and keep the quiet style", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
@@ -9146,6 +9978,12 @@ test("self-resolving degraded notes are classed informational and keep the quiet
     styles,
     /\.evidence-warning\.progress,\n\.evidence-warning\.informational \{\n  border-inline-start-color: var\(--blue\);/u,
   );
+  assert.match(
+    "Local analysis complete with limited history coverage",
+    informational,
+  );
+  assert.match(appSource, /historyCoverageNoticeKind\(\{/u);
+  assert.doesNotMatch("known gap", informational);
 
   // The self-resolving sentences the companion actually publishes. Each must
   // exist verbatim in the companion source and fall inside the matcher's
@@ -9195,8 +10033,12 @@ test("self-resolving degraded notes are classed informational and keep the quiet
     "Recent cost figures come from the live collector projection until the"
       + " replay-safe cache is refreshed. They may double-count usage that"
       + " forked child sessions inherited.",
-    "Usage accounting is complete, but typed tool history is partial. Tool"
-      + " totals are withheld rather than reported as zero.",
+    "Indexed-history totals include ${historyCoverage.indexedSourceCount} of"
+      + " ${historyCoverage.sourceCount} verified sources."
+      + " ${historyCoverage.skippedSourceCount} sources across"
+      + " ${historyCoverage.skippedThreadCount} threads did not pass local"
+      + " validation. This is a material coverage gap; missing usage remains"
+      + " unavailable rather than zero.",
   ];
   for (const sentence of alertSentences) {
     assert.ok(
@@ -9236,7 +10078,7 @@ test("a session-rejected repair clears the dead session and renders one sign-in 
   // silent discard (owner-reported, 2026-08-10).
   assert.match(
     appSource,
-    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\s*\n\s*&& !contributionSessionMintedWithinRaceWindow\(\)\) \{[\s\S]{0,900}?await renderContributionSessionSignInGate\(status, error\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\s*\n\s*\|\| contributionDeviceKeychainIsLocked\(error\)\) \{/u,
+    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\s*\n\s*&& !contributionSessionMintedWithinRaceWindow\(\)\) \{[\s\S]{0,900}?await renderContributionSessionSignInGate\(status, error\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\s*\n\s*\|\| contributionDeviceKeychainIsLocked\(error\)\s*\n\s*\|\| contributionDeviceKeychainAccessIsDenied\(error\)\) \{/u,
   );
 
   // The gate clears every piece of the dead authority — the identity proof,
@@ -9434,7 +10276,7 @@ test("the inspection list keeps every row and restarts paging when the selection
 // ---------------------------------------------------------------------------
 
 const TEST_ALLOWANCE_BASIS_FAMILY =
-  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 const testAllowanceBasisId = (scenario) =>
   `${TEST_ALLOWANCE_BASIS_FAMILY}:${scenario}`;
 const testAllowanceWeighting = (selectedUsd, { available = true } = {}) => ({
@@ -9468,6 +10310,9 @@ const testAllowanceCapacity = (medianCapacityUsd = 1_000) => ({
 
 async function loadLiveTimelinePoints() {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const usageStart = appSource.indexOf("function allowanceTimelineUsage(data) {");
+  const usageEnd = appSource.indexOf("\nfunction renderComparison(", usageStart);
+  assert.ok(usageStart >= 0 && usageEnd > usageStart, "allowanceTimelineUsage is available");
   const start = appSource.indexOf("function mainWeeklyQuotaTrack(rows) {");
   const end = appSource.indexOf("\nfunction groupedUsageTimeline(");
   assert.ok(start >= 0 && end > start, "liveTimelinePoints is available");
@@ -9480,7 +10325,7 @@ async function loadLiveTimelinePoints() {
     "isPrimaryCodexWeeklyQuotaWindow",
     "CALIBRATION_WINDOW_HOURS",
     "activeCalibrationRangeDays",
-    `${section}\nreturn liveTimelinePoints;`,
+    `${appSource.slice(usageStart, usageEnd)}\n${section}\nreturn liveTimelinePoints;`,
   )(
     finite,
     () => Number.NEGATIVE_INFINITY,
@@ -9516,6 +10361,33 @@ async function loadLiveTimelinePoints() {
   };
 }
 
+test("selected-plan rolling windows and cumulative drift cannot bridge an omitted era or ambiguous bucket", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const base = Date.parse("2026-08-05T00:00:00Z");
+  const hour = (i) => new Date(base + i * 3_600_000).toISOString();
+  const usage = [0, 1, 3, 4, 5].map((i) => ({ startAt: hour(i), endAt: hour(i + 1),
+    usageEvents: 1, apiPriceEquivalentUsd: 10, allowanceWeighting: testAllowanceWeighting(10) }));
+  const points = liveTimelinePoints({
+    allowancePlanSelection: { comparisonAvailable: true },
+    timeline: { usage, selectedPlanUsage: usage,
+      comparisonIntervals: [[base, base + 2 * 3_600_000], [base + 3 * 3_600_000, base + 6 * 3_600_000]],
+      quota: [0, 1, 2, 3, 4, 5, 6].map((i) => ({ observedAt: hour(i),
+        usedPercent: i * 2, remainingPercent: 100 - i * 2, limitId: "codex",
+        durationMinutes: 10_080, resetAt: "2026-08-12T00:00:00Z" })) },
+  }, { windowHours: 3 });
+  const crossing = points.find((p) => p.timestamp === hour(4));
+  assert.equal(crossing.expected, null);
+  assert.equal(crossing.observed, null);
+  assert.equal(crossing.residual, null);
+  assert.equal(crossing.status, "reset_or_track_change");
+  assert.equal(crossing.driftReanchor, true);
+  assert.equal(crossing.cumulativeResidual, 0);
+  const recovered = points.find((p) => p.timestamp === hour(6));
+  assert.equal(recovered.expected, 3);
+  assert.equal(recovered.observed, 6);
+  assert.equal(recovered.residual, 3);
+});
+
 test("cumulative drift sums non-overlapping buckets and re-anchors at each reset boundary", async () => {
   const liveTimelinePoints = await loadLiveTimelinePoints();
   const hour = (index) => new Date(Date.UTC(2026, 7, 5, index)).toISOString();
@@ -9537,7 +10409,7 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
         startAt: hour(index),
         endAt: hour(index + 1),
         // Standard cost deliberately differs: every allowance-facing result
-        // below must use the quota-weighted $50 instead of this $20.
+        // below must use the speed-priced $50 instead of this $20.
         apiPriceEquivalentUsd: 20,
         allowanceWeighting: testAllowanceWeighting(50),
         usageEvents: 5,
@@ -10027,7 +10899,8 @@ async function loadContributionCeremony(harness) {
   const start = appSource.indexOf("async function approveIncrementalContribution() {");
   const end = appSource.indexOf("async function loadCommunityResults() {");
   assert.ok(start >= 0 && end > start, "the contribution ceremony is available");
-  const section = appSource.slice(start, end);
+  const section = appSource.match(/^function attributionContributionSelected\([\s\S]*?^\}/mu)[0]
+    + "\n" + appSource.slice(start, end);
 
   const elements = new Map();
   const element = (id) => {
@@ -10048,6 +10921,7 @@ async function loadContributionCeremony(harness) {
   harness.sessions = [];
   harness.localCalls = [];
   harness.fetchCalls = [];
+  harness.createdNodes = [];
 
   const fakeFetch = async (url, options = {}) => {
     const headers = options.headers ?? {};
@@ -10068,25 +10942,29 @@ async function loadContributionCeremony(harness) {
   const communityClient = new CommunityClient({
     fetchImpl: fakeFetch,
     getCsrfToken: () => harness.session?.csrfToken ?? null,
-    getParticipantId: () => harness.session?.participantId ?? null,
   });
   const localClient = {
     async pairContributionDevice(code) {
       harness.localCalls.push({ pairContributionDevice: code });
+      if (harness.pairingError) throw harness.pairingError;
       return { status: "paired", expiresAt: "2026-08-09T00:00:00.000Z" };
     },
   };
 
   return Function(
-    "harness", "$", "setProductText", "setLocalizedText",
+    "harness", "$", "setProductText", "setRawText", "setLocalizedText",
     "renderContributionActionState", "renderHostedIdentity",
     "localCompanionHealth", "communityClient", "localClient",
     "loadIncrementalSyncStatus", "scheduleIncrementalSyncStatusPoll",
     "showFailure", "describeFailure", "formatLocal", "t", "node",
-    `let incrementalConsentBusy = false;
+    `const TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION = "telemetry-contribution-v1.1";
+let incrementalConsentBusy = false;
 let communityConnectBusy = false;
-let communityDevicePaired = false;
-let communityDevicePairedV1 = false;
+let contributionDisconnectBusy = false;
+let contributionDisconnectOutcome = harness.disconnectOutcome ?? null;
+let incrementalSyncStatus = harness.syncStatus ?? null;
+let communityDevicePaired = harness.previouslyPaired === true;
+let communityDevicePairedV1 = harness.previouslyPaired === true;
 let incrementalRepairAttempted = false;
 let hostedIdentity = harness.identity;
 let communitySession = harness.session;
@@ -10128,6 +11006,9 @@ return {
   approveIncrementalContribution,
   maybeRepairIncrementalAuthorization,
   resumeContributionCeremonyAfterSignIn,
+  reportContributionConnectFailure,
+  contributionDeviceRecoveryIsRequired,
+  contributionDeviceKeychainAccessIsDenied,
   state: () => ({
     hostedIdentity,
     communitySession,
@@ -10142,6 +11023,10 @@ return {
     harness,
     element,
     (target, text) => { target.textContent = text; },
+    (target, text) => {
+      harness.rawTextWrites = (harness.rawTextWrites ?? 0) + 1;
+      target.textContent = text;
+    },
     (target, key, values = {}) => {
       target.localizedKeys.push(key);
       target.textContent = `[${key}] ${JSON.stringify(values)}`;
@@ -10165,9 +11050,68 @@ return {
     },
     (value) => String(value),
     (key) => `[${key}]`,
-    () => ({ append() {}, textContent: "" }),
+    (...args) => {
+      harness.createdNodes.push(args);
+      return { append() {}, textContent: "" };
+    },
   );
 }
+
+test("denied Keychain access pauses the actual ceremony without reset or identity discard", async () => {
+  const session = { csrfToken: "synthetic-live-csrf", participantId: "synthetic-participant", consentVersion: null };
+  const denied = Object.assign(new Error("Untrusted server text must not become guidance"), {
+    code: "contribution_device_keychain_access_denied",
+  });
+  const harness = {
+    identity: null,
+    session,
+    approved: true,
+    grantRejected: true,
+    pairingError: denied,
+    responses: [{ status: 201, payload: { pairingCode: "synthetic-pairing" } }],
+  };
+  const scope = await loadContributionCeremony(harness);
+  await scope.approveIncrementalContribution();
+  const status = harness.elements("#incremental-consent-status");
+  assert.equal(status.hidden, false);
+  assert.equal(status.className, "participant-action-status", "denial is a calm pause, not a reset error");
+  assert.equal(status.textContent, "described", "the pause uses the fixed diagnostic description");
+  assert.equal(harness.rawTextWrites, 1, "the earlier progress translation is retired");
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "synthetic-pairing" }]);
+  assert.equal(harness.fetchCalls.length, 1, "no new pairing or automatic retry is invented");
+  assert.equal(harness.createdNodes.length, 0, "denial creates no reset or approval action");
+  assert.deepEqual(harness.sessions, [], "the existing session is not replaced or cleared");
+  assert.equal(harness.pendingHandoffClears ?? 0, 0);
+  assert.equal(scope.state().communitySession, session);
+  assert.equal(scope.state().incrementalConsentApproved, true);
+  assert.equal(scope.state().communityDevicePairedV1, false, "failed pairing is not reported as connected");
+  assert.equal(scope.state().incrementalConsentBusy, false);
+  assert.deepEqual(harness.describeFailures, [{
+    surface: "contribution_connect",
+    code: "contribution_device_keychain_access_denied",
+    requestId: null,
+  }]);
+  assert.equal(scope.contributionDeviceRecoveryIsRequired(denied), false);
+  assert.equal(scope.contributionDeviceKeychainAccessIsDenied(denied), true);
+  for (const code of ["contribution_device_recovery_required", "contribution_device_credential_conflict"]) {
+    assert.equal(scope.contributionDeviceRecoveryIsRequired({ code }), true, "genuine unusable/conflict recovery remains distinct");
+    assert.equal(scope.contributionDeviceKeychainAccessIsDenied({ code }), false);
+  }
+  const untaggedDenial = { code: denied.code };
+  await scope.reportContributionConnectFailure(status, untaggedDenial, {
+    enrollmentAttemptedWithHostedIdentity: true,
+    enrollmentEstablished: false,
+  });
+  assert.equal(status.className, "participant-action-status");
+  assert.equal(harness.rawTextWrites, 2);
+  assert.equal(harness.createdNodes.length, 0);
+  assert.equal(harness.pendingHandoffClears ?? 0, 0);
+  assert.equal(scope.state().communitySession, session);
+  assert.equal(harness.describeFailures.length, 2, "untagged denial still records its diagnostic code");
+  const unreadableCode = Object.defineProperty({}, "code", { get() { throw new Error("unreadable code"); } });
+  assert.equal(scope.contributionDeviceRecoveryIsRequired(unreadableCode), false);
+  assert.equal(scope.contributionDeviceKeychainAccessIsDenied(unreadableCode), false);
+});
 
 async function settleCeremony(scope, harness, { untilFetchCount }) {
   // A tick with real wall-clock time so the ceremony's bounded cookie-commit
@@ -10244,6 +11188,29 @@ test("the post-sign-in resume enrolls with the proof first, then mints and claim
     harness.elements("#incremental-consent-status").localizedKeys
       .includes("consent.authorityRefreshed"),
   );
+});
+
+test("uncertain credential repair requires an explicit fresh pair despite remembered legacy pairing", async () => {
+  const harness = {
+    identity: null,
+    session: { csrfToken: "synthetic-live-csrf", participantId: "synthetic-participant", consentVersion: null },
+    approved: true, grantRejected: false, deviceUnavailable: true, previouslyPaired: true,
+    syncStatus: { status: "available", paused: true, pausedReason: "device_repair_required" },
+    responses: [{ status: 201, payload: { pairingCode: "synthetic-repair-code" } }],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.maybeRepairIncrementalAuthorization();
+  scope.resumeContributionCeremonyAfterSignIn();
+  assert.deepEqual(harness.fetchCalls, [], "neither automatic entrypoint retries an uncertain rotation");
+  assert.deepEqual(harness.localCalls, []);
+  await scope.approveIncrementalContribution();
+  assert.deepEqual(harness.fetchCalls.map((call) => [call.url, call.method, call.csrf]), [
+    ["/api/v1/me/device-pairings", "POST", "synthetic-live-csrf"],
+  ]);
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "synthetic-repair-code" }]);
+  assert.equal(scope.state().incrementalConsentApproved, true);
+  assert.equal(scope.state().communityDevicePairedV1, true);
+  assert.equal(scope.state().incrementalRepairAttempted, false);
 });
 
 test("a lost device credential re-opens the ceremony exactly like a rejected grant", async () => {
@@ -10637,6 +11604,34 @@ test("two concurrent ceremony invocations run exactly once", async () => {
   );
   assert.equal(scope.state().communityDevicePairedV1, true);
   assert.equal(scope.state().hostedIdentity, null);
+});
+
+test("a durable disconnect cannot auto-pair but an explicit approval reconnects with the retained session", async () => {
+  const harness = {
+    identity: null,
+    session: {
+      csrfToken: "synthetic-retained-csrf",
+      participantId: "participant:00000000-0000-4000-8000-000000000001",
+      consentVersion: "privacy-safe-telemetry-v0.1",
+    },
+    approved: true,
+    grantRejected: false,
+    syncStatus: { status: "available", paused: true, pausedReason: "device_disconnected" },
+    responses: [{ status: 201, payload: { pairingCode: "synthetic-pairing" } }],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.maybeRepairIncrementalAuthorization();
+  scope.resumeContributionCeremonyAfterSignIn();
+  assert.deepEqual(harness.fetchCalls, []);
+  assert.deepEqual(harness.localCalls, []);
+  await scope.approveIncrementalContribution();
+  assert.deepEqual(harness.fetchCalls.map(({ url, csrf }) => [url, csrf]), [
+    ["/api/v1/me/device-pairings", "synthetic-retained-csrf"],
+  ]);
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "synthetic-pairing" }]);
+  assert.equal(scope.state().communityDevicePairedV1, true);
+  assert.equal(scope.state().incrementalConsentApproved, true);
+  assert.deepEqual(harness.sessions, [], "reconnect preserves the participant session");
 });
 
 test("the merged identity status renders the right label and one next action per state", async () => {
@@ -12087,6 +13082,10 @@ async function loadCompanionHealthRecovery(harness) {
       "// The live-progress poll behind the first pass",
       "\nasync function freshReviewTokenForApproval(",
     ),
+    slice(
+      "function contributionDeviceDisconnectPaused() {",
+      "\nfunction contributionDisconnectBlocksRepair() {",
+    ),
   ].join("\n\n");
   // The two surfaces the reader actually sees, taken from the same source
   // rather than restated here: whether the approve ceremony is in the document
@@ -12148,13 +13147,15 @@ async function loadCompanionHealthRecovery(harness) {
   return Function(
     "harness", "window", "localClient", "renderHostedIdentity", "fetch",
     "normalizeIncrementalContributionSyncStatus", "boundedOutcomeDetailCode",
-    `let localCompanionHealth = harness.health;
+    `const cacheDropThreadLinks = { loadToken: 0 };
+let localCompanionHealth = harness.health;
 let localOnboarding = harness.onboarding;
 let incrementalSyncPollTimer = null;
 let incrementalSyncPollCount = 0;
 let incrementalSyncStatus = null;
 let incrementalConsentApproved = false;
 let incrementalSyncLastOutcomeDetailCode = null;
+let contributionDisconnectOutcome = null;
 function renderLocalOnboarding(value) {
   localOnboarding = value;
   harness.onboardingRenders.push(value?.state ?? null);
@@ -12327,10 +13328,19 @@ test("the recovery poll is not gated on the capability it is recovering", async 
   );
   assert.ok(loadLocalDashboard.length > 0, "the dashboard load is available");
   assert.equal(
-    loadLocalDashboard.match(/await loadIncrementalSyncStatus\(\);/gu)?.length,
-    2,
-    "both the loaded and the companion-unavailable paths start the recovery chain",
+    loadLocalDashboard.match(/void loadLocalDashboardSecondaryState\(/gu)?.length,
+    1,
+    "both primary outcomes share one nonblocking secondary recovery path",
   );
+  assert.ok(
+    loadLocalDashboard.indexOf("void loadLocalDashboardSecondaryState(")
+      > loadLocalDashboard.indexOf("} finally {"),
+    "recovery starts after either primary outcome restores busy state",
+  );
+  const secondary = appSource.match(
+    /^async function loadLocalDashboardSecondaryState\([\s\S]*?^\}/mu,
+  )?.[0] ?? "";
+  assert.match(secondary, /await loadIncrementalSyncStatus\(\{ isCurrent \}\);/u);
   // And the gate that returns early must schedule before it does, or the first
   // pass is the last one.
   assert.match(
@@ -12462,6 +13472,10 @@ async function communityJourneyStageFor(facts) {
   );
   assert.ok(start >= 0 && end > start, "the community journey stage chain is available");
   const chain = appSource.slice(start, end);
+  const disconnectPause = appSource.match(
+    /function contributionDeviceDisconnectPaused\(\) \{[\s\S]*?\n\}/u,
+  )?.[0];
+  assert.ok(disconnectPause);
   const staged = [];
   Function(
     "facts", "stage",
@@ -12474,6 +13488,9 @@ function incrementalUploadAuthorityLost() { return false; }
 function hostedEnrollmentIsPaused() { return false; }
 function hostedSignInRequired() { return facts.signInRequired === true; }
 const incrementalConsentApproved = facts.approved === true;
+const contributionDisconnectOutcome = facts.disconnectOutcome ?? null;
+const incrementalSyncStatus = facts.syncStatus ?? null;
+${disconnectPause}
 ${chain}`,
   )(facts, (name, state, key) => staged.push({ name, state, key }));
   assert.equal(staged.length, 1, "the chain states exactly one community stage");
@@ -12548,4 +13565,56 @@ test("the journey names the unanswered health, never an index that is not the bl
   );
   assert.doesNotMatch(appSource, /journey\.community\.waitingCompanion/u);
   assert.doesNotMatch(localizationSource, /journey\.community\.waitingCompanion/u);
+});
+
+test("Forest Ink dark appearance is explicit, balanced, and live-updateable", async () => {
+  const [styles, appSource] = await Promise.all([
+    readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
+    readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(styles, /html\[data-theme="dark"\] \{/u);
+  assert.match(styles, /--paper: #141a17;/u);
+  assert.match(styles, /--surface-raised: #24322c;/u);
+  assert.match(styles, /--ink: #f5f1e8;/u);
+  assert.match(styles, /--green: #76aa9c;/u);
+  assert.match(styles, /--feature-bg: #2d7466;/u);
+  assert.match(styles, /--chart-accent: #99c5ba;/u);
+  assert.match(styles, /--blue: #7d9eb8;/u);
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.weekly-hero \{[\s\S]*?gap: 0;[\s\S]*?padding: 0;[\s\S]*?background: var\(--surface\);/u,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.weekly-hero > div:first-child \{[\s\S]*?background: var\(--feature-bg\);/u,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.notice\.notice-info\.accounting-disclosure \{[\s\S]*?border-inline-start: 3px solid var\(--blue\);[\s\S]*?background: var\(--surface\);/u,
+  );
+  assert.match(
+    styles,
+    /Portable share-card exports deliberately keep the existing light brand/u,
+  );
+  assert.doesNotMatch(
+    styles,
+    /@media[^\{]*prefers-color-scheme[^\{]*\{[\s\S]*?--paper: #141a17/u,
+  );
+
+  assert.match(
+    appSource,
+    /const NATIVE_APPEARANCE_THEMES = new Set\(\["light", "dark"\]\)/u,
+  );
+  assert.match(
+    appSource,
+    /if \(!NATIVE_APPEARANCE_THEMES\.has\(theme\)\) return false;/u,
+  );
+  assert.match(appSource, /document\.documentElement\.dataset\.theme = theme/u);
+  assert.match(appSource, /__TIBOTATTLE_APPEARANCE__\?\.resolvedTheme/u);
+  assert.match(appSource, /"tibotattle:appearance-override"/u);
+  assert.match(
+    appSource,
+    /theme === "dark" \? "#141a17" : "#f5f1e8"/u,
+  );
 });

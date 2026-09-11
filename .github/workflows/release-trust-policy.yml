@@ -4,7 +4,10 @@ on:
   pull_request:
     paths:
       - ".github/**"
+      - "CHANGELOG.md"
       - "config/release-evidence.js"
+      - "release-notes/**"
+      - "scripts/check-release-notes.mjs"
       - "schemas/release-evidence-v1/**"
       - "scripts/check-release-workflow-policy.mjs"
       - "scripts/release-attestation-evidence.mjs"
@@ -14,6 +17,8 @@ on:
       - "scripts/macos-release-core.js"
       - "scripts/build-public-release-site.js"
       - "scripts/validate-release-sbom.mjs"
+      - "tools/operations/validate-documentation.mjs"
+      - "test/documentation-governance.test.js"
       - "test/release-*.test.js"
       - "test/macos-app-bundle.test.js"
       - "test/public-release-site.test.js"
@@ -29,7 +34,10 @@ on:
       - main
     paths:
       - ".github/**"
+      - "CHANGELOG.md"
       - "config/release-evidence.js"
+      - "release-notes/**"
+      - "scripts/check-release-notes.mjs"
       - "schemas/release-evidence-v1/**"
       - "scripts/check-release-workflow-policy.mjs"
       - "scripts/release-attestation-evidence.mjs"
@@ -39,6 +47,8 @@ on:
       - "scripts/macos-release-core.js"
       - "scripts/build-public-release-site.js"
       - "scripts/validate-release-sbom.mjs"
+      - "tools/operations/validate-documentation.mjs"
+      - "test/documentation-governance.test.js"
       - "test/release-*.test.js"
       - "test/macos-app-bundle.test.js"
       - "test/public-release-site.test.js"
@@ -67,6 +77,7 @@ jobs:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned Node.js
@@ -87,11 +98,17 @@ jobs:
       - name: Enforce immutable workflow dependencies and runner policy
         run: node ./scripts/check-release-workflow-policy.mjs
 
+      - name: Check release documentation
+        run: node ./scripts/check-release-notes.mjs
+
+      - name: Check the checked-in Codex contract
+        run: npm run codex:contract:check
+
       - name: Test release evidence and attestation contracts
-        run: node --test test/release-workflow-policy.test.js test/release-evidence.test.js test/release-attestation-action.test.js test/release-sbom-action.test.js
+        run: node --test test/codex-contract-drift.test.js test/release-workflow-policy.test.js test/release-evidence.test.js test/release-attestation-action.test.js test/release-sbom-action.test.js
 
       - name: Test public verification documentation
         run: node --test apps/web/test/community-site.test.mjs
 
-      - name: Check documentation links
-        run: npm run docs:links:check
+      - name: Check documentation governance
+        run: npm run docs:check

@@ -2,7 +2,7 @@
 title: Production deploy gate — migrations, not intake
 date: 2026-08-07
 type: governance-decision
-status: decided-and-implemented
+status: complete
 ---
 
 # Production deploy gate: migrations, not intake
@@ -112,8 +112,8 @@ comment citing this note.
 
 ## Runbook alignment
 
-[The owner release execution runbook](../runbooks/2026-08-04-owner-release-execution.md)
-describes the new deploy sequence and no longer instructs writing containment
+The maintained [production operations runbook](../runbooks/production-operations.md)
+describes the deploy sequence and does not instruct writing containment
 receipts for routine deploys. The read-only production observer
 (`release-readiness.mjs --probe-public`) remains available as an intake
 posture check for incident response and intake-policy decisions; its output

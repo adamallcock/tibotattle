@@ -72,6 +72,7 @@ const PUBLIC_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
   "identity_unavailable",
+  "identity_migration_required",
   "no_safe_records",
   "export_too_large",
   "privacy_verification_failed",
@@ -380,6 +381,11 @@ function mappedError(error, stage, signal = null) {
     return new LocalContributionPreparationError("no_safe_records");
   }
   if (stage === "identity") {
+    if (code === "export_identity_keychain_migration_required") {
+      return new LocalContributionPreparationError(
+        "identity_migration_required",
+      );
+    }
     return new LocalContributionPreparationError("identity_unavailable");
   }
   if (stage === "verify_source"

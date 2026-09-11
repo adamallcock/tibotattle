@@ -42,7 +42,15 @@ const REQUIRED_METHODS = Object.freeze([
   "releaseCredentialAuditFileGuard",
   "acquireCredentialMutex",
   "releaseCredentialMutex",
+  "acquireAccountlessInstallationCredentialMutex",
+  "releaseAccountlessInstallationCredentialMutex",
 ]);
+const WINDOWS_FILESYSTEM_ADAPTERS = new WeakSet();
+const BINDING_PROVENANCE = Object.freeze({
+  contractVersion: "windows-binding-provenance-v1",
+  status: "unqualified",
+  source: "unsigned-development-binding",
+});
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",
   "bindingFile",
@@ -54,6 +62,7 @@ const MANIFEST_KEYS = Object.freeze([
   "securityContractVersion",
   "credentialAuditFileGuardContractVersion",
   "credentialMutexContractVersion",
+  "bindingProvenance",
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
@@ -122,6 +131,7 @@ function parseBindingManifest(value) {
 function assertBindingManifest(manifest) {
   const nativeClaims = manifest.nativeClaims;
   const approvedPolicy = manifest.approvedPolicy;
+  const bindingProvenance = manifest.bindingProvenance;
   const requiredMethods = manifest.requiredMethods;
   const manifestKeys = Object.keys(manifest);
   const valid = manifestKeys.length === MANIFEST_KEYS.length
@@ -140,6 +150,13 @@ function assertBindingManifest(manifest) {
     && manifest.credentialAuditFileGuardContractVersion
       === "windows-credential-audit-file-guard-v1"
     && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
+    && bindingProvenance !== null
+    && typeof bindingProvenance === "object"
+    && !Array.isArray(bindingProvenance)
+    && Object.keys(bindingProvenance).length === Object.keys(BINDING_PROVENANCE).length
+    && Object.keys(BINDING_PROVENANCE).every((key) =>
+      Object.hasOwn(bindingProvenance, key)
+        && bindingProvenance[key] === BINDING_PROVENANCE[key])
     && Array.isArray(requiredMethods)
     && requiredMethods.length === REQUIRED_METHODS.length
     && requiredMethods.every((method, index) => method === REQUIRED_METHODS[index])
@@ -170,6 +187,7 @@ function assertBindingManifest(manifest) {
   if (!valid) throw failure("INVALID_MANIFEST");
   return Object.freeze({
     ...manifest,
+    bindingProvenance: Object.freeze({ ...bindingProvenance }),
     nativeClaims: Object.freeze({ ...nativeClaims }),
     approvedPolicy: Object.freeze({ ...approvedPolicy }),
     requiredMethods: Object.freeze([...requiredMethods]),
@@ -368,12 +386,121 @@ export function createWindowsFilesystemAdapter({
   } else {
     native = assertBinding(binding);
   }
-  return Object.freeze({
+  const adapter = Object.freeze({
     productionSafe: approvedPolicy?.productionSafe === true
       && native.productionSafe === true
       && native.pathWalkRaceSafe === true,
     pathWalkRaceSafe: approvedPolicy?.pathWalkRaceSafe === true
       && native.pathWalkRaceSafe === true,
+    // These are the two narrow capability facts that the verified native
+    // sidecar actually publishes.  An injected source-test binding has no
+    // approved sidecar, so it cannot acquire either qualification fact.
+    credentialMutexSafe: approvedPolicy?.credentialMutexSafe === true
+      && native.credentialMutexSafe === true,
+    credentialAuditFileGuardSafe: approvedPolicy?.credentialAuditFileGuardSafe === true
+      && native.credentialAuditFileGuardSafe === true,
+    // The binding source exports these root-bound child operations. Keep them
+    // optional at this v1 manifest boundary until a native Windows build and
+    // qualification record make the installed binary surface required. The
+    // protected store rejects an adapter missing any one of them before it
+    // creates its root.
+    ...(typeof native.inspectProtectedChild === "function"
+      ? {
+        inspectProtectedChild(rootPath, rootIdentity, childPath) {
+          return call(native, "inspectProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+          ]);
+        },
+      }
+      : {}),
+    ...(typeof native.readProtectedChild === "function"
+      ? {
+        readProtectedChild(rootPath, rootIdentity, childPath, maximumBytes) {
+          return call(native, "readProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+            maximumBytes,
+          ]);
+        },
+      }
+      : {}),
+    ...(typeof native.createProtectedChild === "function"
+      ? {
+        createProtectedChild(rootPath, rootIdentity, childPath, data) {
+          return call(native, "createProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+            data,
+          ]);
+        },
+      }
+      : {}),
+    ...(typeof native.deleteProtectedChild === "function"
+      ? {
+        deleteProtectedChild(rootPath, rootIdentity, childPath, identity) {
+          return call(native, "deleteProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+            identity,
+          ]);
+        },
+      }
+      : {}),
+    ...(typeof native.replaceProtectedChild === "function"
+      ? {
+        replaceProtectedChild(
+          rootPath,
+          rootIdentity,
+          childPath,
+          identity,
+          data,
+        ) {
+          return call(native, "replaceProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+            identity,
+            data,
+          ]);
+        },
+      }
+      : {}),
+    // This mutex has no capability argument. It is reserved for the fixed,
+    // main-process accountless-installation record and deliberately does not
+    // extend the four legacy Credential Manager capability IDs.
+    acquireAccountlessInstallationCredentialMutex() {
+      try {
+        const result = call(native, "acquireAccountlessInstallationCredentialMutex", []);
+        let valid = false;
+        try {
+          valid = result !== null
+            && typeof result === "object"
+            && !Array.isArray(result)
+            && Object.keys(result).sort().join("\0") === "abandoned\0lease"
+            && typeof result.abandoned === "boolean"
+            && result.lease !== null
+            && (typeof result.lease === "object" || typeof result.lease === "function");
+        } catch {
+          valid = false;
+        }
+        if (!valid) throw failure("INVALID_RESULT");
+        return Object.freeze({ abandoned: result.abandoned, lease: result.lease });
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    releaseAccountlessInstallationCredentialMutex(lease) {
+      try {
+        return call(native, "releaseAccountlessInstallationCredentialMutex", [lease]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
     inspectPath(path) {
       try {
         const result = call(native, "inspectPath", [path]);
@@ -433,6 +560,18 @@ export function createWindowsFilesystemAdapter({
       }
     },
   });
+  WINDOWS_FILESYSTEM_ADAPTERS.add(adapter);
+  return adapter;
+}
+
+export function isWindowsFilesystemAdapter(adapter) {
+  try {
+    return adapter !== null
+      && typeof adapter === "object"
+      && WINDOWS_FILESYSTEM_ADAPTERS.has(adapter);
+  } catch {
+    return false;
+  }
 }
 
 export function isWindowsFilesystemNotFound(error) {

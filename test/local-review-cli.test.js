@@ -8,8 +8,13 @@ import {
   runLocalReview,
 } from "../local-review/cli.js";
 import { parseLocalReviewArgs } from "../local-review/arguments.js";
-import { createLocalExportWorkspace } from "../src/export-set-controller.js";
-import { materializeLocalExportSet } from "../src/export-set-materializer.js";
+import {
+  localExportSetMaterialization,
+  localExportSourcePipeline,
+} from "../src/local-node-runtime.js";
+
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
 
 const PRIVATE_CLI_CANARY = "PRIVATE_LOCAL_REVIEW_DELETION_CANARY";
 

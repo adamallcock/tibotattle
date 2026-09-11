@@ -19,10 +19,9 @@ import {
 } from "../src/platform/index.js";
 import { createLocalExportWorkspaceContext } from "../src/application/index.js";
 import {
-  createEmptyCodexCheckpointState,
-  normalizeCodexCheckpointState,
-  serializeCodexCheckpointState,
-} from "../src/export-checkpoint-state.js";
+  localCodexCheckpointState,
+  localExportWorkspace,
+} from "../src/local-node-runtime.js";
 import { EXPORT_SOURCE_PLAN_VERSION, summarizeExportSourcePlan } from "../src/export-source-plan.js";
 import {
   assertCanonicalSupplementalCursorJson,
@@ -32,8 +31,11 @@ import {
   summarizeSupplementalSourcePlan,
 } from "../src/export-supplemental-source-plan.js";
 import { isProxy } from "node:util/types";
-import * as workspaceShim from "../src/export-workspace.js";
-import * as workspaceLockShim from "../src/export-workspace-lock.js";
+const {
+  createEmptyCodexCheckpointState,
+  normalizeCodexCheckpointState,
+  serializeCodexCheckpointState,
+} = localCodexCheckpointState;
 
 const WORKSPACE_SHIM_EXPORTS = Object.freeze([
   "DEFAULT_EXPORT_WORKSPACE_BATCH_RECORDS",
@@ -176,24 +178,10 @@ test("workspace platform owners import no higher-level owner or legacy storage",
   }
 });
 
-test("workspace compatibility shims expose only their exact alias surfaces", async () => {
-  assert.deepEqual(Object.keys(workspaceShim).sort(), [...WORKSPACE_SHIM_EXPORTS].sort());
-  assert.deepEqual(Object.keys(workspaceLockShim).sort(), [...WORKSPACE_LOCK_SHIM_EXPORTS].sort());
-
-  const workspaceSource = await readFile(
-    new URL("../src/export-workspace.js", import.meta.url),
-    "utf8",
+test("workspace and lease operations share one exact local runtime context", () => {
+  assert.deepEqual(
+    Object.keys(localExportWorkspace).sort(),
+    [...WORKSPACE_SHIM_EXPORTS, ...WORKSPACE_LOCK_SHIM_EXPORTS,
+      "isTrustedExportWorkspaceLockError"].sort(),
   );
-  const lockSource = await readFile(
-    new URL("../src/export-workspace-lock.js", import.meta.url),
-    "utf8",
-  );
-  for (const name of WORKSPACE_SHIM_EXPORTS) {
-    assert.match(workspaceSource, new RegExp(`export const ${name} = workspace\\.${name};`, "u"));
-  }
-  for (const name of WORKSPACE_LOCK_SHIM_EXPORTS) {
-    assert.match(lockSource, new RegExp(`export const ${name} = lease\\.${name};`, "u"));
-  }
-  assert.doesNotMatch(workspaceSource, /export (?:async )?function|export class/u);
-  assert.doesNotMatch(lockSource, /export (?:async )?function|export class/u);
 });

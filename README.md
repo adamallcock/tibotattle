@@ -1,22 +1,26 @@
 # TiboTattle
 
-Privacy-first, local-only monitoring for coding-agent usage. TiboTattle
-reads the session metadata that Codex already stores on your Mac, reconstructs
-your usage at standard API prices, and compares it with the quota movement your
-provider reports — so you can see where your allowance stands, what a week of
-work would have cost at API prices, and how well token cost explains your quota
-consumption.
+Local-first monitoring for coding-agent usage. TiboTattle
+processes local Codex usage metadata and provider-reported quota evidence to
+show where your allowance stands, what observed work would have cost at
+standard API prices, and where the available evidence does not support a
+confident answer.
 
-Everything runs locally. Raw logs never leave your machine, and no prompt,
-response, file path, or raw account identifier ever enters any derived
-artifact.
+Personal analysis runs locally and works without an account. Raw source logs do
+not leave your machine, and prompts, responses, file paths, and raw account
+identifiers do not enter TiboTattle's derived artifacts. The released native app's hosted contribution path remains off by default,
+with local review and an explicit send. The unified Electron workstream adopts
+[accountless automatic sharing](docs/decisions/2026-09-04-accountless-sharing-policy.md):
+fresh installs default on, existing users receive three notices, and a persistent
+opt-out is available without sign-in. The current Electron candidate implements
+the preference and notices; its accountless upload transport is not yet active.
 
 
 > **The name:** TiboTattle is named with affection for the Codex community and
 > its patron saint of quota resets. It is not affiliated with or endorsed by
 > OpenAI or Thibault Sottiaux, and we will happily rename it if asked. Your
-> tokens tattle only to you: everything runs locally and nothing leaves your
-> Mac without your explicit, reviewed consent.
+> personal analysis stays local, and sharing follows the applicable versioned
+> policy and your saved preference.
 
 ## What it shows
 
@@ -30,52 +34,68 @@ artifact.
   explicit uncertainty band.
 - **Timelines** — hourly/daily/weekly usage against allowance, entirely from
   local evidence.
-- **Fast-mode weighting** — Fast turns are counted at the provider's published
-  credit rates rather than as if they were Standard. Codex records the speed
-  mode only when it is applied or changed, so turns before the first change in
-  a session stay an explicit unknown and are excluded from the weighted total
-  instead of being quietly counted at 1x.
+- **Fast-mode pricing** — Codex Fast mode is the API's Priority processing
+  tier, so Fast turns are priced at the provider's published Priority (Fast)
+  API rates: 2x Standard for the GPT-5.6 and GPT-5.4 families, 2.5x for
+  GPT-5.5, and a clearly disclosed assumed 2x for models with no published
+  Priority rate. Codex records the speed mode only when it is applied or
+  changed, so turns before the first change in a session are attributed to
+  Standard as a visible assumption unless a timestamped configuration reading
+  covers them.
 - **A menu bar item** — where the allowance stands without opening the app,
   including a Check for Updates entry in builds that ship the updater.
 
-## Install
+## Install (macOS, Apple silicon or Intel)
 
-For a published macOS release, install the signed, notarized app with Homebrew:
+Requires **macOS 14 or later**, on either Apple silicon or Intel. With
+[Homebrew](https://brew.sh/) installed, one command selects the correct signed,
+notarized app for your Mac:
 
 ```bash
 brew install --cask adamallcock/tap/tibotattle
 ```
 
-Or, when the website exposes a current download, download the DMG from
+The app includes its runtime. You do **not** need Node.js, pnpm, or Xcode to
+install or use the published app.
+
+Alternatively, choose the **macOS Apple silicon** or **macOS Intel** DMG from
 [tibotattle.com](https://tibotattle.com) or the
 [TiboTattle releases page](https://github.com/adamallcock/tibotattle/releases).
+If you are unsure, **Apple menu → About This Mac** shows either an Apple chip or
+an Intel processor. Open the DMG, drag TiboTattle to Applications, and launch it.
 When both refer to the same published version, those channels point to the same
-Developer ID artifact; the app continues to use its signed Sparkle feed for
+architecture-specific Developer ID artifact; the app continues to use its signed Sparkle feed for
 updates. A missing website slot is not a release claim—use the GitHub release
 page for the exact version and digest. A v1 release manifest may explicitly
 leave SBOM or provenance fields `null`; source-to-binary provenance is claimed
 only when a trusted hosted workflow generated/finalized and cryptographically
 verified the exact final bytes for that specific release. This repository is
-the source of truth for the public app and its releases. To build from source
-instead, follow the quick start below.
+the source of truth for the public app and its releases. See the
+[user guide](docs/user-guide.md#install-and-first-launch) for first launch,
+or the developer section below to build from source.
 See [Verify a TiboTattle release](docs/verify-release.md) to check the downloaded
 bytes, Apple signature and notarization, and any non-null release-specific
 GitHub provenance evidence yourself.
 
-## Quick start (macOS, Apple Silicon)
+## Build from source (developers)
 
-Requirements: macOS 14 or later on arm64, Node.js ≥ 22.13 for the repository tooling,
+These requirements are for development, not installation of the released app.
+The native app builder runs on macOS 14 or later on Apple silicon. Repository
+tooling requires Node.js ≥ 22.13,
 [pnpm](https://pnpm.io) 11, and the Xcode command-line tools. The app-bundle
 build itself requires exactly Node v26.2.0 on macOS arm64: it fails on any
 other runtime rather than producing an unverifiable bundle.
+The default target is Apple silicon. To build an Intel target on that same
+builder, follow the explicit target and verified-runtime instructions in
+[the native developer guide](apps/macos/README.md#developer-build). A native
+Intel build host is not currently supported by this builder.
 
-The root workspace uses pnpm; the worker and Cloud Run apps keep their own
-npm lockfiles (only needed for the hosted-service checks and the full gates):
+The root workspace uses pnpm; the Worker keeps its own npm lockfile, which is
+needed only for hosted-service checks and the full gates:
 
 ```bash
 pnpm install
 npm --prefix apps/worker ci
-npm --prefix apps/cloud-run ci
 ```
 
 Build and open the self-contained desktop app:
@@ -130,7 +150,7 @@ for the provenance and future-locale policy.
   an enabled item. This starts the normal app at login; it does not install a
   daemon, LaunchAgent, privileged helper, or separate background worker.
 - Optional macOS allowance notifications are **off by default** and local-only.
-  If enabled in **Settings → General**, they are evaluated only after the
+  If enabled in **Settings → Notifications**, they are evaluated only after the
   existing foreground refresh receives fresh direct provider quota evidence.
   Stale, inferred, mixed-source, unknown, unobserved, forecast, and
   log-derived state never notifies; turning the same switch off immediately
@@ -141,14 +161,32 @@ for the provenance and future-locale policy.
 - The dashboard binds to loopback only. The packaged app's network behavior is
   audited at build time (zero JavaScript and zero native network attempts in
   offline mode).
+- Manual Refresh updates quota and detailed accounting together, reusing a
+  valid generation-bound cache. Startup and frequent automatic quota checks
+  stay lightweight; automatic detailed attempts are limited to once per hour.
+  Detailed refresh reads more than the selected session folders. It processes
+  metadata from the selected Codex `sessions` and `archived_sessions` folders;
+  reads `state_5.sqlite` for rollout lineage and `config.toml` for service-tier
+  settings; invokes the installed Codex binary's local `app-server` methods
+  `account/read`, `account/rateLimits/read`, and `account/usage/read`. Source
+  records are processed locally; prompt and response text is not retained in
+  derived state.
 - Contribution to the optional hosted community-aggregate service is **off by
   default**, requires an explicit review of the exact retained metadata, and is
-  pseudonymous and content-free. Hosted deletion is always available.
+  pseudonymous and content-free. Confirmed **Disconnect this Mac** stops this
+  device's contribution authority while preserving hosted and local history.
+  Self-service hosted deletion is retired in current source; hosted erasure is
+  a separate private owner operation, not an app control.
 - Contributing requires signing in with Google or Apple so that one person
   counts once. The service stores only an irreversible hash of that sign-in,
   never your name or email, and local-only use needs no account at all.
 - Derived artifacts (reports, exports, telemetry) are schema-validated to
   exclude prompts, responses, commands, paths, URLs, and raw identifiers.
+
+The [2026-08-30 deletion-retirement decision](docs/decisions/2026-08-30-self-service-deletion-retirement.md)
+is a source contract, not a deployed-service or installed-release claim. It
+does not change retention or settle privacy-request obligations; see the
+[privacy inventory](docs/reference/local-data-and-privacy.md).
 
 ### Private local report artifacts
 
@@ -164,10 +202,10 @@ compatibility fallback until they are explicitly migrated.
 | Path | Contents |
 | --- | --- |
 | `apps/macos`, `apps/local`, `apps/web` | Desktop app shell, loopback companion server, and browser dashboard |
-| `apps/worker`, `apps/cloud-run` | Optional hosted contribution service (off by default) |
-| `packages/` | Workspace packages: accounting, quota analysis, telemetry contract, identity core |
+| `apps/worker` | Optional hosted contribution service (off by default) |
+| `packages/` | Workspace packages: accounting, quota analysis, telemetry contract, identity core, and i18n |
 | `src/` | Product source: `application/`, `platform/`, `export/`, `contribution/`, `reporting/`, `providers/` owners plus compatibility roots |
-| `docs/` | Reference, decisions, plans, receipts, and historical goal documents |
+| `docs/` | Maintained references and runbooks plus retained dated decisions and evidence |
 | `local-review/` | Reproducible standalone review artifact tooling |
 
 Despite the name, `local-review/` is committed developer tooling that builds a
@@ -179,6 +217,12 @@ the deploy scripts in this repository target the owner's Cloudflare account.
 Forks that want their own hosted service must provision their own resources
 per `apps/worker/wrangler.jsonc`; the local app never requires the hosted
 service.
+
+For the complete engineering map of loopback and hosted HTTP routes, native
+bridges, child-process protocols, Cloudflare bindings, workspace package APIs,
+schemas, and third-party services, see the maintained
+[TiboTattle API surface reference](docs/reference/api-surface.md).
+Its source-parity check is `npm run docs:api:check`.
 
 ## Development
 
@@ -196,8 +240,8 @@ pnpm container:portable:test
 ```
 
 These commands are preparation evidence only. The shipping application remains
-macOS-only; see the [four-day Windows readiness goal](docs/goals/2026-08-17-four-day-windows-readiness-goal.md)
-for the native Windows gate and the work still required before a support claim.
+macOS-only. See the [current status matrix](docs/current-status.md) for the
+separate source, native, installed, release, updater, and platform gates.
 
 ```bash
 npm run product:check
@@ -233,22 +277,30 @@ each build has a separate output and compiler scratch directory. Measure the
 local lanes with `npm run test:benchmark` (or `test:benchmark:release` to
 include the retained release gate).
 
-`npm run architecture:check` enforces the ownership boundaries. The complete
-command catalog, privacy boundary documentation, and operational detail live in
-the [full product reference](docs/reference/product-reference.md).
+`npm run architecture:check` enforces ownership boundaries. Maintained current
+references are deliberately split by authority:
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
-workflow and gates, and [SECURITY.md](SECURITY.md) for how to report
-vulnerabilities privately.
+- [system architecture](docs/reference/system-architecture.md);
+- [local data and privacy](docs/reference/local-data-and-privacy.md);
+- [API surface](docs/reference/api-surface.md);
+- [CLI commands](docs/reference/cli-reference.md); and
+- [production operations](docs/runbooks/production-operations.md).
+
+Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+workflow and gates. For help, start with [SUPPORT.md](SUPPORT.md); report
+vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Status
 
-This is an early, personal-pilot release (v0.1.12). It is not a
-provider-authoritative billing dashboard: quota estimates carry explicit
-uncertainty, and unknown models or tiers stay explicit unknowns rather than
-silently defaulted. See
-[docs/reports](docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md)
-for the current verification boundary.
+TiboTattle is a published macOS product with an operational optional hosted
+service. The current published version and user-facing history are listed in
+the [changelog](CHANGELOG.md) and on the
+[GitHub Releases page](https://github.com/adamallcock/tibotattle/releases).
+TiboTattle is not a provider-authoritative billing dashboard: quota estimates
+carry explicit uncertainty, and unknown models or tiers remain explicit rather
+than silently defaulted. The maintained [current status matrix](docs/current-status.md)
+records source, live-service, installed-artifact, public-release, updater, and
+platform qualification separately.
 
 ## License
 

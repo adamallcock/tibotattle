@@ -8,7 +8,29 @@ export type SupportedQuotaWindowDurationMinutes = QuotaWindowDurationMinutes;
 export const FIVE_HOUR_WINDOW_MINUTES: 300;
 export const SEVEN_DAY_WINDOW_MINUTES: 10080;
 export const MAX_QUOTA_WINDOW_DURATION_MINUTES: 525600;
-export const SUPPORTED_QUOTA_WINDOW_DURATIONS: readonly [300, 10080];
+export const MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH: 80;
+export const CODEX_PRIMARY_LIMIT_ID: "codex";
+export const CODEX_SPARK_LIMIT_ID: "codex_bengalfox";
+export const CODEX_SPARK_RESERVED_LIMIT_ID: "codex-spark";
+export const CODEX_SPARK_LIMIT_IDS: readonly ["codex_bengalfox", "codex-spark"];
+export const QUOTA_LIMIT_DISPLAY_ALIASES: Readonly<{
+  codex: "Codex";
+  codex_bengalfox: "Spark";
+  "codex-spark": "Spark";
+}>;
+export const QUOTA_WINDOW_KINDS: readonly [
+  "codex_five_hour",
+  "codex_seven_day",
+  "codex_provider_reported",
+  "spark_five_hour",
+  "spark_seven_day",
+  "spark_other",
+  "other",
+];
+export function sanitizeQuotaLimitId(value: unknown): string;
+export function sanitizeQuotaLimitDisplayName(value: unknown): string | null;
+export function quotaLimitDisplayAlias(limitId: unknown): string | null;
+export function isSparkQuotaLimitId(value: unknown): boolean;
 export function isValidQuotaWindowDuration(value: number): boolean;
 export function isSupportedQuotaWindowDuration(
   value: number,
@@ -21,11 +43,16 @@ export interface QuotaWindowSelectionInput {
   durationMinutes?: number;
   windowDurationMins?: number;
 }
-export function selectPrimaryQuotaWindow<T extends QuotaWindowSelectionInput>(
-  windows: readonly T[] | null | undefined,
-): T | null;
 export function formatQuotaWindowDuration(value: number): string | null;
-export function quotaWindowLabel(limitId: string, durationMinutes: number): string;
+export function classifyQuotaWindowKind(
+  limitId: unknown,
+  durationMinutes: number | null | undefined,
+): typeof QUOTA_WINDOW_KINDS[number];
+export function quotaWindowLabel(
+  limitId: unknown,
+  durationMinutes: number | null | undefined,
+  limitName?: unknown,
+): string;
 
 export type QuotaSlot =
   | "primary"
@@ -38,6 +65,131 @@ export type PricingStatus =
   | "fully_priced"
   | "partially_priced"
   | "unpriced";
+
+export const PLAN_ATTRIBUTION_POLICY: Readonly<{
+  methodVersion: "plan-attribution-v1";
+  maxObservations: number;
+  maxContexts: number;
+  maxEras: number;
+}>;
+
+export interface PlanAttributionObservation {
+  contextKey: string;
+  observedAtMs: number;
+  planType: string | null | undefined;
+  planVariant?: string;
+  /** Optional bounded continuity claim; splits same-plan eras, never account proof. */
+  continuityId?: string | null;
+  /** Explicit contradictory evidence is a barrier, unlike an ordinary unknown plan. */
+  conflicted?: boolean;
+  /** Positively comparable account evidence only; never a device/transport ID. */
+  accountScopeId?: string | null;
+  observationId?: string;
+}
+
+export interface PlanAttributionEra {
+  readonly eraKey: string;
+  readonly contextKey: string;
+  readonly accountScopeId: string | null;
+  readonly planType: string;
+  readonly planVariant: string;
+  readonly continuityId: string | null;
+  readonly firstObservedAtMs: number;
+  readonly lastObservedAtMs: number;
+  /** Inclusive observation anchors; null is open, not verified continuity. */
+  readonly lowerBoundMs: number | null;
+  readonly upperBoundMs: number | null;
+}
+
+export interface PlanAttributionConflict {
+  readonly contextKey: string;
+  readonly accountScopeId: string | null;
+  readonly observedAtMs: number;
+}
+
+/** Opaque in-memory analysis input. Do not serialize into transport/cache DTOs. */
+export interface PlanAttributionIndex {
+  readonly methodVersion: "plan-attribution-v1";
+  readonly status: "ready" | "limit_exceeded";
+  readonly observationCount: number;
+  readonly ignoredObservationCount: number;
+  readonly eras: readonly PlanAttributionEra[];
+  readonly conflicts: readonly PlanAttributionConflict[];
+  readonly contexts: ReadonlyMap<string, {
+    readonly eras: readonly PlanAttributionEra[];
+    readonly conflicts: readonly PlanAttributionConflict[];
+    readonly singlePlan: boolean;
+  }>;
+}
+
+export interface PlanAttributionInterval {
+  contextKey: string;
+  observedAtMs: number;
+  /** Quantity interval is (intervalStartMs, observedAtMs]; omission is a point. */
+  intervalStartMs?: number | null;
+  accountScopeId?: string | null;
+}
+
+export type PlanAttributionEraMatch = {
+  status: "matched";
+  era: PlanAttributionEra;
+  reason: string;
+} | {
+  status: "unavailable" | "conflicted";
+  era: null;
+  reason: string;
+};
+
+export interface PlanAttributionUsage extends PlanAttributionInterval {
+  observedPlanType?: string | null;
+  observedPlanVariant?: string;
+  quantityBasis?: "reported-increment" | "reconstructed-counter-delta" | "legacy-unknown";
+}
+
+export interface PlanAttributionTarget {
+  contextKey?: string;
+  accountScopeId?: string | null;
+  planType?: string;
+  eraKey?: string;
+}
+
+export type PlanAttributionClassification = PlanAttributionEraMatch & {
+  disposition: "compatible" | "legacy_conditional" | "unresolved" | "incompatible";
+  planType: string | null;
+  planVariant: string;
+  accountScopeId: string | null;
+};
+
+export function planAttributionContextKey(provider: string, limitId: string): string;
+export function planAttributionObservationFromSnapshot(snapshot: {
+  provider?: string;
+  limitId?: string;
+  observedAt?: string;
+  observedAtMs?: number;
+  planType?: string | null;
+  planVariant?: string;
+  continuityId?: string | null;
+  conflicted?: boolean;
+  accountScopeId?: string | null;
+  accountTrackId?: string;
+  snapshotId?: string;
+} | null | undefined, options?: {
+  contextKey?: string;
+  accountScopeId?: string | null;
+}): PlanAttributionObservation | null;
+export function buildPlanAttributionIndex(
+  observations?: readonly (PlanAttributionObservation | null)[],
+  options?: { maxObservations?: number; maxContexts?: number; maxEras?: number },
+): PlanAttributionIndex;
+export function planEraForInterval(
+  index: PlanAttributionIndex,
+  input: PlanAttributionInterval,
+): PlanAttributionEraMatch;
+export function classifyUsageAttribution(
+  index: PlanAttributionIndex,
+  usage: PlanAttributionUsage,
+  target?: PlanAttributionTarget,
+): PlanAttributionClassification;
 
 export interface QuotaContinuityInput {
   accountTrackId: string;
@@ -264,11 +416,6 @@ export interface QuotaRollingComparisons {
   comparisons: QuotaRollingComparison[];
 }
 
-export const QUOTA_TRACK_POLICY: Readonly<{
-  supportedDurationsMinutes: readonly [300, 10080];
-  maximumReceiptLagMs: number;
-}>;
-
 export const QUOTA_CALIBRATION_POLICY: Readonly<{
   minimumBoundaries: number;
   minimumDisplayedSpanPp: number;
@@ -281,11 +428,6 @@ export const QUOTA_CALIBRATION_POLICY: Readonly<{
   minimumScoredResetsForEmpiricalError: number;
 }>;
 
-export const QUOTA_ROLLING_POLICY: Readonly<{
-  rollingHours: readonly [1, 2, 3];
-  maximumEndpointBracketMs: number;
-}>;
-
 export function continuityKey(row: QuotaContinuityInput): string;
 export function resetKey(row: QuotaResetIdentityInput): string;
 export function buildResetEvidence(
@@ -294,10 +436,6 @@ export function buildResetEvidence(
 export function fitResetCapacity(
   input: QuotaResetEvidence,
 ): QuotaResetCalibration;
-export function forecastCapacityFromPriorResets(
-  priorResetFits: readonly QuotaResetCalibration[],
-  currentResetFit: QuotaResetCalibration,
-): PriorCapacityForecast | null;
 export function analyzeQuotaCalibration(
   input: QuotaTrackEvidence,
 ): QuotaCalibration;
@@ -371,18 +509,126 @@ export interface QuotaPaceForecast {
   hoursToReset: number | null;
 }
 
-export const QUOTA_PACE_POLICY: Readonly<{
-  schemaVersion: "quota-pace-forecast-v0.2";
-  method: "median_adjacent_quota_slope";
-  /** Which rate `etaAt`, `hoursToExhaustion` and `status` are derived from. */
-  etaBasis: "overall_percentage_points_per_hour";
-  windowDurationMinutes: 10080;
-  maximumReceiptLagMs: number;
-  maximumPacePpPerHour: number;
-  minimumObservations: 2;
-}>;
-
 export function analyzeQuotaPace(input: {
   currentSnapshot: QuotaPaceSnapshotInput;
   observations: readonly QuotaPaceSnapshotInput[];
 }): QuotaPaceForecast;
+
+// ---------------------------------------------------------------------------
+// Model-composition kernel (src/model-composition.js)
+// ---------------------------------------------------------------------------
+
+export interface CompositionUsageRow {
+  /** Epoch milliseconds of the priced usage (any grain; only bin sums matter). */
+  observedAtMs: number;
+  model: string;
+  costUsd: number;
+}
+
+export interface CompositionQuotaRow {
+  /** Epoch milliseconds of the weekly-window reading. */
+  observedAtMs: number;
+  planType: string;
+  /** Epoch milliseconds of the pool's printed expiry. */
+  resetsAtMs: number;
+  /** Displayed 0-100 gauge value. */
+  usedPercent: number;
+}
+
+export interface CompositionObservation {
+  binStartMs: number;
+  poolKey: string;
+  segmentIndex: number;
+  ppDelta: number;
+  costByModel: Readonly<Record<string, number>>;
+}
+
+export interface CompositionObservationCorpus {
+  observations: CompositionObservation[];
+  voidedBinCount: number;
+  poolCount: number;
+}
+
+export interface CompositionIdentification {
+  adjustedR2: number | null;
+  singleConstantAdjustedR2: number | null;
+  splitHalfIdentified: boolean;
+  splitHalfMaxCapacityDriftFraction: number | null;
+}
+
+export type CompositionFitStatus =
+  | "fitted"
+  | "fallback_blended"
+  | "insufficient_observations";
+
+export interface CompositionFit {
+  status: CompositionFitStatus;
+  observationCount: number;
+  totalCostUsd: number | null;
+  modelCostShares: Readonly<Record<string, number>>;
+  /** Null unless status is "fitted". */
+  capacityUsdByModel: Readonly<Record<string, number>> | null;
+  singleConstantUsd: number | null;
+  r2: number | null;
+  singleConstantR2: number | null;
+  solverConverged: boolean | null;
+  identification: CompositionIdentification | null;
+}
+
+export const MODEL_COMPOSITION_POLICY: Readonly<{
+  grainMs: number;
+  poolToleranceMs: number;
+  resetDropPp: number;
+  maxCrossingElapsedMs: number;
+  minimumModelCostShare: number;
+  minimumObservations: number;
+  otherModelKey: string;
+  maxSplitHalfCapacityDriftFraction: number;
+}>;
+
+export function buildCompositionObservations(
+  input?: {
+    usageRows?: readonly CompositionUsageRow[];
+    quotaRows?: readonly CompositionQuotaRow[];
+  },
+  policy?: {
+    grainMs?: number;
+    poolToleranceMs?: number;
+    resetDropPp?: number;
+    maxCrossingElapsedMs?: number;
+  },
+): CompositionObservationCorpus;
+
+/** One-pass usage input in nondecreasing kernel-bin order. Within each bin,
+ * preserve the original row order for exact floating-point sums. Invalid rows
+ * are dropped as in the array API; descending valid bins throw TypeError. */
+export function buildCompositionObservationsFromOrderedUsage(
+  input?: {
+    usageRows?: Iterable<CompositionUsageRow>;
+    quotaRows?: readonly CompositionQuotaRow[];
+  },
+  policy?: {
+    grainMs?: number;
+    poolToleranceMs?: number;
+    resetDropPp?: number;
+    maxCrossingElapsedMs?: number;
+  },
+): CompositionObservationCorpus;
+
+export function calibrateCompositionCapacities(
+  observations: readonly CompositionObservation[],
+  policy?: {
+    minimumModelCostShare?: number;
+    minimumObservations?: number;
+    otherModelKey?: string;
+    maxSplitHalfCapacityDriftFraction?: number;
+  },
+): CompositionFit;
+
+export function blendedCompositionCapacityUsd(
+  costByModel: Readonly<Record<string, number>>,
+  options: {
+    capacityUsdByModel: Readonly<Record<string, number>> | null;
+    fallbackCapacityUsd: number | null;
+  },
+): number | null;

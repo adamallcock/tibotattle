@@ -18,14 +18,14 @@ import * as v02Compatibility from "../src/telemetry-contribution-v0.2.js";
 import * as preparedCompatibility from "../src/telemetry-prepared-set.js";
 
 const CONTRIBUTION_PUBLIC_EXPORTS = Object.freeze([
-  "AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS",
-  "AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS",
-  "AUTOMATIC_CONTRIBUTION_MAXIMUM_SCHEDULE_DITHER_MILLISECONDS",
-  "AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION",
-  "AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS",
-  "AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION",
-  "AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION",
-  "AutomaticContributionError",
+  "accountlessDeviceUnavailableCode",
+  "accountlessLocalLaboratoryOrigin",
+  "accountlessTransportOrigin",
+  "ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS",
+  "ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION",
+  "ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION",
+  "ACCOUNTLESS_UPLOAD_OWNER_SCOPE",
+  "ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION",
   "MAX_PREPARED_CONTRIBUTION_BATCHES",
   "PREPARED_CONTRIBUTION_ELIGIBLE_SCHEMA",
   "PREPARED_CONTRIBUTION_LIMITS",
@@ -33,32 +33,32 @@ const CONTRIBUTION_PUBLIC_EXPORTS = Object.freeze([
   "PREPARED_CONTRIBUTION_SET_VERSION",
   "PreparedContributionSetError",
   "TELEMETRY_ACCOUNT_TRACK_VERSION",
+  "TELEMETRY_ACCOUNT_TRACK_V2_VERSION",
   "TELEMETRY_CONTRIBUTION_BUILDER_VERSION",
   "TELEMETRY_CONTRIBUTION_V02_CONSENT_VERSION",
   "TELEMETRY_CONTRIBUTION_V02_STATUS",
   "TELEMETRY_CONTRIBUTION_V02_VERSION",
   "TELEMETRY_CONTRIBUTION_VERSION",
   "UNATTRIBUTED_ACCOUNT_TRACK_ID",
-  "applyAutomaticContributionScheduleDither",
-  "automaticContributionRequiredConsent",
   "buildTelemetryContributionsFromBundle",
   "buildTelemetryContributionsV02",
-  "claimAutomaticContributionRun",
-  "completeAutomaticContributionRun",
-  "createInitialAutomaticContributionState",
+  "createTelemetryV11Day",
   "deriveTelemetryAccountTrackId",
+  "deriveTelemetryAccountTrackIdV2",
+  "deriveTelemetryPlanEraIdV1",
+  "deriveTelemetryV11Attribution",
+  "deriveTelemetryV11QuotaOccurrenceId",
   "deriveTelemetryDatasetIdV02",
-  "disableAutomaticContribution",
-  "enableAutomaticContribution",
   "isPreparedContributionBasename",
   "isTelemetryAccountTrackId",
-  "parseAutomaticContributionState",
+  "isTelemetryAccountTrackIdV2",
   "preparedContributionBasename",
   "preparedContributionRecordCounts",
   "preparedContributionSetId",
-  "projectAutomaticContributionStatus",
-  "recordPreparedAutomaticContribution",
-  "recordReviewedManualAcceptance",
+  "readTelemetryV11Capabilities",
+  "runTelemetryV11Sync",
+  "sanitizeTelemetryAttributionBinding",
+  "telemetryV11FieldInventory",
   "validatePreparedContributionFileEntry",
   "validatePreparedContributionManifest",
   "validatePreparedTelemetryContributionV01",
@@ -67,9 +67,14 @@ const CONTRIBUTION_PUBLIC_EXPORTS = Object.freeze([
 ]);
 const ACCOUNT_COMPATIBILITY_EXPORTS = Object.freeze([
   "TELEMETRY_ACCOUNT_TRACK_VERSION",
+  "TELEMETRY_ACCOUNT_TRACK_V2_VERSION",
   "UNATTRIBUTED_ACCOUNT_TRACK_ID",
   "deriveTelemetryAccountTrackId",
+  "deriveTelemetryAccountTrackIdV2",
+  "deriveTelemetryPlanEraIdV1",
   "isTelemetryAccountTrackId",
+  "isTelemetryAccountTrackIdV2",
+  "sanitizeTelemetryAttributionBinding",
 ]);
 const BUILDER_COMPATIBILITY_EXPORTS = Object.freeze([
   "TELEMETRY_CONTRIBUTION_BUILDER_VERSION",
@@ -275,7 +280,6 @@ test("contribution implementations use only reviewed package and owner edges", a
   for (const relativePath of [
     "src/contribution/account-track.js",
     "src/contribution/prepared-set-contract.js",
-    "src/contribution/recurrence-policy.js",
     "src/contribution/telemetry-v01-projection.js",
     "src/contribution/telemetry-v02-projection.js",
   ]) {
@@ -291,11 +295,6 @@ test("contribution implementations use only reviewed package and owner edges", a
       .map(({ specifier }) => specifier),
     ["@app-usagemonitor/identity-core"],
   );
-  assert.deepEqual(
-    implementationImports.get("src/contribution/recurrence-policy.js")
-      .map(({ specifier }) => specifier),
-    ["./telemetry-v01-projection.js", "../export/index.js"],
-  );
   for (const imports of implementationImports.values()) {
     for (const { specifier } of imports) {
       assert.equal(typeof specifier, "string");
@@ -303,10 +302,6 @@ test("contribution implementations use only reviewed package and owner edges", a
       assert.doesNotMatch(specifier, /(?:platform|application|providers)\//u);
     }
   }
-  assert.doesNotMatch(
-    await source("src/contribution/recurrence-policy.js"),
-    /from "node:|\b(?:process|randomUUID|setTimeout|AbortController)\b/u,
-  );
   assert.doesNotMatch(
     await source("src/telemetry-contribution-builder.js"),
     /from "\.\/storage\.js"/u,
@@ -336,37 +331,6 @@ test("contribution implementations use only reviewed package and owner edges", a
     await source("src/local-contribution-preparation.js"),
     /\.\/storage\.js/u,
   );
-  const automaticRootImports = await extractEsmImports(
-    await source("src/automatic-contribution.js"),
-    { sourceName: "src/automatic-contribution.js" },
-  );
-  assert.deepEqual(
-    automaticRootImports.map(({ specifier }) => specifier).sort(),
-    [
-      "./application/index.js",
-      "./contribution/index.js",
-      "./contribution/index.js",
-      "./platform/index.js",
-      "node:crypto",
-      "node:path",
-    ],
-  );
-  assert.doesNotMatch(
-    await source("src/automatic-contribution.js"),
-    /node:fs|\.\/storage\.js/u,
-  );
-  const automaticApplicationImports = await extractEsmImports(
-    await source("src/application/local-automatic-contribution.js"),
-    { sourceName: "src/application/local-automatic-contribution.js" },
-  );
-  assert.deepEqual(
-    automaticApplicationImports.map(({ specifier }) => specifier),
-    ["../contribution/index.js"],
-  );
-  assert.doesNotMatch(
-    await source("src/application/local-automatic-contribution.js"),
-    /from "node:|\.\.\/platform\/|\.\.\/storage\.js/u,
-  );
   const automaticStorageImports = await extractEsmImports(
     await source(
       "src/platform/owner-only-automatic-contribution-storage.js",
@@ -386,22 +350,27 @@ test("contribution implementations use only reviewed package and owner edges", a
       "node:path",
     ],
   );
-  const queueRootImports = await extractEsmImports(
-    await source("src/contribution-sync-queue.js"),
-    { sourceName: "src/contribution-sync-queue.js" },
+  const localRuntimeImports = await extractEsmImports(
+    await source("src/local-node-runtime.js"),
+    { sourceName: "src/local-node-runtime.js" },
   );
   assert.deepEqual(
-    queueRootImports.map(({ specifier }) => specifier).sort(),
+    localRuntimeImports.map(({ specifier }) => specifier).sort(),
     [
       "./application/index.js",
       "./contribution-device-sync.js",
+      "./export/index.js",
+      "./export/set-materialization-runtime.js",
       "./platform/index.js",
+      "./providers/claude/statusline.js",
       "./telemetry-prepared-set.js",
+      "node:crypto",
       "node:path",
+      "node:util/types",
     ],
   );
   assert.doesNotMatch(
-    await source("src/contribution-sync-queue.js"),
+    await source("src/local-node-runtime.js"),
     /node:fs|node:sqlite|\.\/storage\.js/u,
   );
   const queueApplicationImports = await extractEsmImports(

@@ -484,7 +484,7 @@ export function containedPilotHealth(value, enrollmentMode = "invite_only") {
     && value?.collectionControls?.processing === false
     && value?.collectionControls?.publication === false
     && value?.capabilities?.encryptedUpload === false
-    && value?.capabilities?.delayedAggregateStats === false
+    && value?.capabilities?.communityDaily === false
     && value?.capabilities?.ongoingDeviceUploadRegistration === false
     && value?.contracts?.accountScopedContribution
       ?.externalParticipantsAuthorized === false;
@@ -499,7 +499,7 @@ export function activePilotHealth(value) {
     && value?.collectionControls?.processing === true
     && value?.collectionControls?.publication === false
     && value?.capabilities?.encryptedUpload === true
-    && value?.capabilities?.delayedAggregateStats === false
+    && value?.capabilities?.communityDaily === false
     && value?.capabilities?.ongoingDeviceUploadRegistration === true
     && value?.contracts?.accountScopedContribution
       ?.externalParticipantsAuthorized === false;

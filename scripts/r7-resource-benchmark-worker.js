@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { createLocalExportWorkspace, resumeLocalExportWorkspace } from "../src/export-set-controller.js";
 import { BundleVerificationError } from "../src/bundle-verifier.js";
 import { ClaudeCallbackLifecycleError } from "../src/claude-callback-lifecycle.js";
 import { ExportSourcePlanError } from "../src/export-source-plan.js";
@@ -9,25 +8,20 @@ import { ExportSourcePlanBundleError } from "../src/export-source-plan-bundle.js
 import { CodexCollectorExportSourceError } from "../src/codex-collector-export-source.js";
 import { ClaudeStatusLedgerExportSourceError } from "../src/claude-statusline-export-source.js";
 import { ClaudeTranscriptExportSourceError } from "../src/claude-transcript-export-source.js";
-import { materializeLocalExportSet } from "../src/export-set-materializer.js";
 import { ExportCompressionError } from "../src/export-compression.js";
-import { ExportDeletionError, planLocalExportDeletion } from "../src/export-deletion.js";
-import {
-  deleteLocalExport,
-  ExportDeletionExecutionError,
-  recoverLocalExportDeletion,
-} from "../src/export-deletion-executor.js";
 import { ExportResourceLimitError } from "../src/export-resource-policy.js";
-import { ExportSetError } from "../src/export-set-materializer.js";
-import { ExportSetVerificationError, verifyLocalExportSet } from "../src/export-set-verifier.js";
-import { ExportWorkspaceDiscardError, planLocalExportWorkspaceDiscard } from "../src/export-workspace-discard.js";
 import {
-  discardLocalExportWorkspace,
-  ExportWorkspaceDiscardExecutionError,
-  recoverLocalExportWorkspaceDiscard,
-} from "../src/export-workspace-discard-executor.js";
-import { ExportWorkspaceLockError } from "../src/export-workspace-lock.js";
-import { ExportWorkspaceError } from "../src/export-workspace.js";
+  ExportSetError,
+  ExportSetVerificationError,
+} from "../src/export/index.js";
+import {
+  localExportDeletion,
+  localExportSetMaterialization,
+  localExportSetVerification,
+  localExportSourcePipeline,
+  localExportWorkspace,
+  localExportWorkspaceDiscard,
+} from "../src/local-node-runtime.js";
 import {
   recoverClaudeCallbackLifecycle,
   uninstallClaudeCallback,
@@ -50,6 +44,31 @@ const OPERATIONS = new Set([
   "claude_callback_uninstall",
   "claude_callback_recovery",
 ]);
+
+const {
+  createLocalExportWorkspace,
+  resumeLocalExportWorkspace,
+} = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
+const { verifyLocalExportSet } = localExportSetVerification;
+const {
+  ExportDeletionError,
+  ExportDeletionExecutionError,
+  deleteLocalExport,
+  planLocalExportDeletion,
+  recoverLocalExportDeletion,
+} = localExportDeletion;
+const {
+  ExportWorkspaceDiscardError,
+  ExportWorkspaceDiscardExecutionError,
+  discardLocalExportWorkspace,
+  planLocalExportWorkspaceDiscard,
+  recoverLocalExportWorkspaceDiscard,
+} = localExportWorkspaceDiscard;
+const {
+  ExportWorkspaceError,
+  ExportWorkspaceLockError,
+} = localExportWorkspace;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");

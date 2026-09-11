@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -8,6 +8,7 @@ import {
   createTelemetryEnvelope,
   validateTelemetryContribution,
 } from "../../web/public/lib.js";
+import { assertRetiredDeletionHealth, createLocalOwnerEraser } from "./local-owner-erasure.mjs";
 
 function optionValue(name, fallback = null) {
   const index = process.argv.indexOf(name);
@@ -75,6 +76,7 @@ if (!contributionPath || !persistTo) {
 const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
 const operator = resolve(workerDirectory, "scripts/collection-control.mjs");
 const sessions = [];
+let ownerEraser;
 let controlState = "unknown";
 
 function operate(action, { confirm = false } = {}) {
@@ -153,8 +155,11 @@ function expect(result, status, label, code = null) {
 
 async function enroll() {
   const session = {
+    participantId: null,
     cookie: null,
     csrfToken: null,
+    bootstrapPairing: null,
+    device: null,
     created: false,
     deleted: false,
   };
@@ -165,6 +170,7 @@ async function enroll() {
       body: JSON.stringify({
         consentVersion: "privacy-safe-telemetry-v0.1",
         syntheticOnly: false,
+        deviceBootstrap: true,
       }),
     }),
     201,
@@ -174,17 +180,49 @@ async function enroll() {
     throw new Error("Enrollment did not establish a bounded session.");
   }
   session.csrfToken = enrolled.csrfToken;
+  session.participantId = enrolled.participantId;
+  session.bootstrapPairing = enrolled.pairing;
   session.created = true;
   sessions.push(session);
+  ownerEraser.trackParticipant(session);
   return session;
 }
 
 async function registerUpload(session, envelope) {
+  if (session.device === null) {
+    const pairingCode = session.bootstrapPairing?.pairingCode;
+    if (typeof pairingCode !== "string") {
+      throw new Error("Enrollment did not issue a device pairing authority.");
+    }
+    const deviceId = randomUUID();
+    const rawSecret = randomBytes(32);
+    const encodedSecret = rawSecret.toString("base64url");
+    let deviceSecretHash;
+    try {
+      deviceSecretHash = createHash("sha256")
+        .update("app-usagemonitor/device/v1\0")
+        .update(deviceId)
+        .update("\0")
+        .update(rawSecret)
+        .digest("hex");
+    } finally {
+      rawSecret.fill(0);
+    }
+    expect(
+      await request("/api/v1/device-pairings/claim", {
+        method: "POST",
+        authorization: `Pairing ${pairingCode}`,
+        body: JSON.stringify({ deviceId, deviceSecretHash }),
+      }),
+      201,
+      "Device pairing claim",
+    );
+    session.device = `um_device_${deviceId}.${encodedSecret}`;
+  }
   const registered = expect(
-    await request("/api/v1/me/upload-authorizations", {
+    await request("/api/v1/device/upload-authorizations", {
       method: "POST",
-      session,
-      csrf: true,
+      authorization: `Device ${session.device}`,
       body: JSON.stringify({
         envelopeDigest: sha256Hex(envelope),
         contentLengthBytes: Buffer.byteLength(envelope, "utf8"),
@@ -200,20 +238,18 @@ async function registerUpload(session, envelope) {
   return registered.uploadAuthorization;
 }
 
-async function deleteParticipant(session) {
-  if (!session.created || session.deleted || !session.cookie) return false;
-  const result = await request("/api/v1/me", {
-    method: "DELETE",
-    session,
-    csrf: true,
-  });
-  if (result.response.status !== 200) return false;
-  session.deleted = true;
-  return true;
+async function eraseParticipant(session, options = { retry: true }) {
+  if (!session.created || session.deleted) return;
+  await ownerEraser.eraseParticipant(session, options);
 }
 
 try {
+  ownerEraser = await createLocalOwnerEraser({
+    origin,
+    ownerAccessFile: optionValue("--owner-access-file"),
+  });
   const initial = expect(await request("/api/health"), 200, "Initial health");
+  assertRetiredDeletionHealth(initial);
   if (initial?.collectionControls?.state !== "operational") {
     throw new Error("The incident drill requires an initially operational backend.");
   }
@@ -256,6 +292,7 @@ try {
     200,
     "Contained health",
   );
+  assertRetiredDeletionHealth(containedHealth);
   if (containedHealth?.collectionControls?.state !== "contained") {
     throw new Error("The running Worker did not observe containment.");
   }
@@ -273,10 +310,9 @@ try {
     "COLLECTION_ENROLLMENT_DISABLED",
   );
   expect(
-    await request("/api/v1/me/upload-authorizations", {
+    await request("/api/v1/device/upload-authorizations", {
       method: "POST",
-      session: resumedParticipant,
-      csrf: true,
+      authorization: `Device ${resumedParticipant.device}`,
       body: JSON.stringify({
         envelopeDigest: sha256Hex(serializedEnvelope),
         contentLengthBytes: Buffer.byteLength(serializedEnvelope, "utf8"),
@@ -298,24 +334,18 @@ try {
     "PROCESSING_DISABLED",
   );
   expect(
-    await request("/api/v1/stats/aggregate"),
+    await request("/api/v1/community/daily"),
     503,
     "Contained publication",
     "PUBLICATION_DISABLED",
-  );
-  expect(
-    await request("/api/v1/me/stats", { session: rightsParticipant }),
-    200,
-    "Contained private statistics",
   );
   expect(
     await request("/api/v1/me/export", { session: rightsParticipant }),
     200,
     "Contained participant export",
   );
-  if (!await deleteParticipant(rightsParticipant)) {
-    throw new Error("Participant deletion failed during containment.");
-  }
+  await ownerEraser.verifyParticipantRefusal(rightsParticipant);
+  await eraseParticipant(rightsParticipant, { expectedContributions: 0 });
 
   const restored = operate("restore-all", { confirm: true });
   if (restored.state !== "operational"
@@ -348,19 +378,20 @@ try {
   if (typeof accepted?.contributionId !== "string") {
     throw new Error("Resumed ingestion did not return an accepted contribution.");
   }
-  const stats = expect(
-    await request("/api/v1/me/stats", { session: resumedParticipant }),
+  const participantExport = expect(
+    await request("/api/v1/me/export", { session: resumedParticipant }),
     200,
-    "Resumed participant statistics",
+    "Resumed participant export",
   );
-  if (stats?.totals?.usageEvents !== contribution.usageEvents.length
-      || stats?.totals?.quotaSnapshots !== contribution.quotaSnapshots.length
-      || stats?.totals?.activityMarkers !== contribution.activityMarkers.length) {
-    throw new Error("Resumed ingestion did not update private statistics.");
+  const expectedRecords = contribution.usageEvents.length
+    + contribution.quotaSnapshots.length
+    + contribution.activityMarkers.length;
+  if (participantExport?.contributions?.length !== 1
+      || participantExport.contributions[0]?.records?.length !== expectedRecords) {
+    throw new Error("Resumed ingestion did not update the participant export.");
   }
-  if (!await deleteParticipant(resumedParticipant)) {
-    throw new Error("Participant deletion failed after restoration.");
-  }
+  await ownerEraser.verifyParticipantRefusal(resumedParticipant);
+  await eraseParticipant(resumedParticipant, { expectedContributions: 1 });
 
   process.stdout.write(`${JSON.stringify({
     status: "passed",
@@ -370,34 +401,39 @@ try {
     uploadRegistrationBlocked: true,
     processingBlockedWithoutConsumingAuthority: true,
     publicationBlocked: true,
-    privateStatsAvailableDuringContainment: true,
     exportAvailableDuringContainment: true,
-    deletionAvailableDuringContainment: true,
+    selfServiceDeletionRefusedDuringContainment: true,
+    selfServiceDeletionRefusedAfterRestore: true,
+    participantStateUnchangedAfterRefusal: true,
+    ownerAuthAndCsrfRequired: true,
+    ownerErasureAvailableDuringContainment: true,
     explicitRestoreRequired: true,
     ingestionResumedAfterRestore: true,
-    privateStatsUpdatedAfterRestore: true,
-    participantsDeleted: sessions.filter((session) => session.deleted).length,
+    participantExportUpdatedAfterRestore: true,
+    participantsErasedByOwner: sessions.filter((session) => session.deleted).length,
   }, null, 2)}\n`);
 } finally {
-  if (controlState !== "operational") {
+  if (controlState !== "unknown" && controlState !== "operational") {
     try {
       operate("restore-all", { confirm: true });
     } catch {
       process.stderr.write(
         "Incident smoke could not restore local collection controls.\n",
       );
+      process.exitCode = 1;
     }
   }
   for (const session of sessions) {
     try {
-      await deleteParticipant(session);
+      await eraseParticipant(session);
     } catch {
       // The fixed cleanup warning below contains no authority or participant ID.
     }
   }
   if (sessions.some((session) => session.created && !session.deleted)) {
     process.stderr.write(
-      "Incident smoke participant cleanup was incomplete; discard the isolated local state.\n",
+      "Incident smoke owner cleanup was incomplete; inspect the isolated local state before reuse.\n",
     );
+    process.exitCode = 1;
   }
 }

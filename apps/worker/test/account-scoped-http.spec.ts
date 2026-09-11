@@ -4,6 +4,7 @@ import type { D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
+import { ownerErase } from "./helpers/owner-erasure";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -242,20 +243,55 @@ async function participantFrom(response: Response): Promise<Participant> {
   return { ...body, cookie: setCookie.split(";", 1)[0]! };
 }
 
+async function enableLegacyTransportForFixture(): Promise<void> {
+  // local_preview is necessary but not sufficient: this deliberately dormant
+  // format also needs an explicit policy opt-in in this synthetic database.
+  await bindings().USAGE_MONITOR_DB.prepare(
+    "UPDATE telemetry_transport_formats SET lifecycle = 'accepted' WHERE schema_version = 'telemetry-contribution-v0.2'",
+  ).run();
+}
+
 async function upload(
   participant: Participant,
   value: unknown,
 ): Promise<{ response: Response; envelope: object }> {
   const envelope = await encrypt(value);
   const raw = JSON.stringify(envelope);
+  const pairingResponse = await api("/api/v1/me/device-pairings", {
+    method: "POST",
+    headers: {
+      cookie: participant.cookie,
+      "content-type": "application/json",
+      "x-usage-monitor-csrf": participant.csrfToken,
+    },
+    body: JSON.stringify({
+      consentVersion: "ongoing-privacy-safe-telemetry-v0.2",
+      ongoingUpload: true,
+    }),
+  });
+  expect(pairingResponse.status).toBe(201);
+  const pairing = await pairingResponse.json<{ pairingCode: string }>();
+  const deviceId = crypto.randomUUID();
+  const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+  const deviceSecret = encodeBase64Url(rawSecret);
+  const secretHash = await deviceSecretHash(deviceId, rawSecret);
+  rawSecret.fill(0);
+  const claimed = await api("/api/v1/device-pairings/claim", {
+    method: "POST",
+    headers: {
+      authorization: `Pairing ${pairing.pairingCode}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ deviceId, deviceSecretHash: secretHash }),
+  });
+  expect(claimed.status).toBe(201);
   const authorizationResponse = await api(
-    "/api/v1/me/upload-authorizations",
+    "/api/v1/device/upload-authorizations",
     {
       method: "POST",
       headers: {
-        cookie: participant.cookie,
+        authorization: `Device um_device_${deviceId}.${deviceSecret}`,
         "content-type": "application/json",
-        "x-usage-monitor-csrf": participant.csrfToken,
       },
       body: JSON.stringify({
         envelopeDigest: await sha256Hex(raw),
@@ -356,6 +392,7 @@ describe("account-scoped local HTTP ingestion", () => {
   });
 
   it("accepts, reprices, analyzes, exports, and deletes encrypted v0.2 data", async () => {
+    await enableLegacyTransportForFixture();
     const enrollment = await enrollAccountScoped();
     expect(enrollment.status).toBe(201);
     await expect(enrollment.clone().json()).resolves.toMatchObject({
@@ -394,27 +431,6 @@ describe("account-scoped local HTTP ingestion", () => {
     expect(stored?.server_cost_usd).not.toBe("999.000000");
     expect(await bindings().QUARANTINE.head(stored!.r2_key)).not.toBeNull();
 
-    const stats = await api("/api/v1/me/insights", {
-      headers: { cookie: participant.cookie },
-    });
-    expect(stats.status).toBe(200);
-    await expect(stats.json()).resolves.toMatchObject({
-      totals: {
-        usageEvents: 1,
-        quotaSnapshots: 1,
-        priceVerification: "server_repriced",
-      },
-      accountScopedQuotaAnalysis: {
-        status: "ready",
-        tracks: [{
-          continuity: {
-            accountTrackId: TRACK_A,
-            windowDurationMinutes: 10_080,
-          },
-        }],
-      },
-    });
-
     const exported = await api("/api/v1/me/export", {
       headers: { cookie: participant.cookie },
     });
@@ -422,15 +438,7 @@ describe("account-scoped local HTTP ingestion", () => {
     const exportText = await exported.text();
     expect(exportText).toContain(TRACK_A);
 
-    const deleted = await api("/api/v1/me/contributions/delete", {
-      method: "POST",
-      headers: {
-        cookie: participant.cookie,
-        "content-type": "application/json",
-        "x-usage-monitor-csrf": participant.csrfToken,
-      },
-      body: JSON.stringify({ contributionId: receipt.contributionId }),
-    });
+    const deleted = await ownerErase(bindings(), participant.participantId);
     expect(deleted.status).toBe(200);
     expect(await bindings().QUARANTINE.head(stored!.r2_key)).toBeNull();
     const remaining = await bindings().USAGE_MONITOR_DB.prepare(
@@ -440,6 +448,7 @@ describe("account-scoped local HTTP ingestion", () => {
   });
 
   it("replays exact content and rejects conflicting account-track reuse", async () => {
+    await enableLegacyTransportForFixture();
     const participant = await participantFrom(await enrollAccountScoped());
     const first = await upload(participant, contribution());
     const firstReceipt = await first.response.json<{ contributionId: string }>();
@@ -464,6 +473,7 @@ describe("account-scoped local HTTP ingestion", () => {
   });
 
   it("supports an upload-only v0.2 device without granting private-result access", async () => {
+    await enableLegacyTransportForFixture();
     const participant = await participantFrom(await enrollAccountScoped());
     const pairingResponse = await api("/api/v1/me/device-pairings", {
       method: "POST",
@@ -526,11 +536,56 @@ describe("account-scoped local HTTP ingestion", () => {
     });
     expect(accepted.status).toBe(202);
 
-    const denied = await api("/api/v1/me/insights", {
+    const denied = await api("/api/v1/me/export", {
       headers: {
         authorization: `Device um_device_${deviceId}.${deviceSecret}`,
       },
     });
     expect(denied.status).toBe(401);
+  });
+
+  it("keeps v0.2 blocked by default even in local preview with explicit device consent", async () => {
+    const participant = await participantFrom(await enrollAccountScoped());
+    const database = bindings().USAGE_MONITOR_DB;
+    expect(await database.prepare(
+      "SELECT lifecycle FROM telemetry_transport_formats WHERE schema_version = 'telemetry-contribution-v0.2'",
+    ).first("lifecycle")).toBe("blocked");
+    const denied = await upload(participant, contribution());
+    expect(denied.response.status).toBe(403);
+    await expect(denied.response.json()).resolves.toMatchObject({
+      error: { code: "TELEMETRY_TRANSPORT_BLOCKED" },
+    });
+    expect(await database.prepare(
+      "SELECT count(*) AS total FROM telemetry_contributions WHERE participant_id = ?",
+    ).bind(participant.participantId).first("total")).toBe(0);
+    expect(await database.prepare(
+      "SELECT minimum_rank, revision FROM telemetry_transport_participant_floors WHERE participant_id = ?",
+    ).bind(participant.participantId).first()).toEqual({ minimum_rank: 1, revision: 0 });
+  });
+
+  it("refuses an accepted legacy format below the participant floor after new-device pairing", async () => {
+    await enableLegacyTransportForFixture();
+    const participant = await participantFrom(await enrollAccountScoped());
+    const database = bindings().USAGE_MONITOR_DB;
+    await database.prepare(
+      "UPDATE telemetry_transport_participant_floors SET minimum_rank = 10, revision = revision + 1 WHERE participant_id = ?",
+    ).bind(participant.participantId).run();
+    const denied = await upload(participant, contribution());
+    expect(denied.response.status).toBe(403);
+    await expect(denied.response.json()).resolves.toMatchObject({
+      error: { code: "TELEMETRY_TRANSPORT_BLOCKED" },
+    });
+    expect(await database.prepare(
+      "SELECT count(*) AS total FROM device_credentials WHERE participant_id = ?",
+    ).bind(participant.participantId).first("total")).toBe(1);
+    expect(await database.prepare(
+      "SELECT count(*) AS total FROM telemetry_contributions WHERE participant_id = ?",
+    ).bind(participant.participantId).first("total")).toBe(0);
+    await expect(database.prepare(
+      "UPDATE telemetry_transport_participant_floors SET minimum_rank = 2, revision = revision + 1 WHERE participant_id = ?",
+    ).bind(participant.participantId).run()).rejects.toThrow("telemetry_transport_rollback_required");
+    expect(await database.prepare(
+      "SELECT minimum_rank, revision FROM telemetry_transport_participant_floors WHERE participant_id = ?",
+    ).bind(participant.participantId).first()).toEqual({ minimum_rank: 10, revision: 1 });
   });
 });

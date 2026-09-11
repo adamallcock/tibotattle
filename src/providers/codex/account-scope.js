@@ -92,7 +92,11 @@ export function deriveOpenAIAccountScope(accountRead, {
 
   const key = usableSecret(secret);
   if (!key) {
-    const reason = ["credential_locked", "credential_unavailable"].includes(unavailableSecretReason)
+    const reason = [
+      "credential_locked",
+      "credential_migration_required",
+      "credential_unavailable",
+    ].includes(unavailableSecretReason)
       ? unavailableSecretReason
       : "missing_secret";
     return unavailable(reason, safePlanType);
@@ -129,7 +133,14 @@ export function sanitizeAccountScope(value) {
     };
   }
 
-  const reason = ["missing_account", "malformed_subject", "missing_secret", "credential_locked", "credential_unavailable"].includes(value?.reason)
+  const reason = [
+    "missing_account",
+    "malformed_subject",
+    "missing_secret",
+    "credential_locked",
+    "credential_migration_required",
+    "credential_unavailable",
+  ].includes(value?.reason)
     ? value.reason
     : "missing_account";
   return unavailable(reason, planType);

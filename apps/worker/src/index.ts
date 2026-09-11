@@ -1,3 +1,8 @@
+import { allowanceReconstructionMode } from "./allowance-reconstruction";
+import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
+import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
+import { COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES, warmCommunityModelHistory } from "./community-model-history";
+import { backfillV1QuotaFitProjection } from "./quota-fit-projection";
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
@@ -23,6 +28,26 @@ import {
   type BoundedBodyReadPolicy,
 } from "./bounded-body";
 import {
+  ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
+  configuredAccountlessEnrollmentMode,
+  enrollAccountlessDevice,
+  parseAccountlessEnrollmentJson,
+  type AccountlessEnrollmentRequest,
+} from "./accountless-enrollment";
+import {
+  ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+  assertAccountlessOwnershipEnabled,
+  createAccountlessUploadOwner,
+  parseAccountlessOwnershipJson,
+  type AccountlessOwnershipRequest,
+} from "./accountless-ownership";
+import {
+  ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+  parseAccountlessRenewalJson,
+  renewAccountlessUploadOwner,
+  type AccountlessRenewalRequest,
+} from "./accountless-renewal";
+import {
   assertAccountScopedLocalPreview,
   configuredAccountScopedIngestMode,
 } from "./account-scoped-ingest";
@@ -30,13 +55,11 @@ import {
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   BACKEND_LIFECYCLE_STALE_MILLISECONDS,
   JSON_HEADERS,
-  MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS,
   MAX_REQUEST_BYTES,
   MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
   ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
   ONGOING_TELEMETRY_CONSENT_VERSION,
   ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
-  QUARANTINE_RETENTION_MILLISECONDS,
   TELEMETRY_CONSENT_VERSION,
 } from "./constants";
 import {
@@ -53,6 +76,9 @@ import {
   type CollectionControlReason,
 } from "./admin-operations";
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
+import { readAdminReconstructionProgress } from "./admin-reconstruction-progress";
+import { readAdminGraphRefreshProgress } from "./admin-graph-refresh-progress";
+import { retireV1PreparedEvidence } from "./prepared-v1-evidence";
 import { readDistributionAnalytics } from "./distribution-analytics";
 import {
   githubUnavailable,
@@ -67,8 +93,6 @@ import {
 } from "./admin-ui";
 import {
   buildCommunityWeeklySnapshot,
-  readLatestCommunityWeeklySnapshot,
-  readParticipantCommunityComparison,
   rebuildPendingCommunityWeeklySnapshots,
 } from "./community-snapshots";
 import {
@@ -96,6 +120,7 @@ import {
   revokeParticipantDevice,
   rotateDeviceCredential,
   type DeviceTransportConsentVersion,
+  type DevicePrincipal,
 } from "./device-auth";
 import {
   ApiError,
@@ -103,21 +128,21 @@ import {
   jsonResponse,
 } from "./errors";
 import {
-  assertDeletionOwner,
+  MIGRATION_MUTATION_BARRIER_ENABLED,
+  MUTATION_BARRIER_ERROR_CODE,
+  mutationBarrierBlocksDynamicRequest,
+  mutationBarrierSkipsScheduledMaintenance,
+} from "./mutation-barrier";
+import {
   contributionCount,
   contributionForResponse,
-  contributionHistoryMetadata,
   enroll,
   envelopeDigest,
   existingContribution,
-  finishParticipantDeletion,
   insertContribution,
   listContributions,
-  markParticipantDeleting,
-  participantIdentityLinkKeyForDeletion,
   participantIdentityLinkState,
   reattachParticipantByLinkKey,
-  recoverAccess,
   revokeSession,
   securityReset,
 } from "./repository";
@@ -138,6 +163,29 @@ import {
 } from "./identity-google";
 import { assertPinnedIdentityLinkSecretConfiguration } from "./identity-link-configuration";
 import { identityRequired, verifyHostedIdentity } from "./identity-oidc";
+import {
+  validateTelemetryV11Envelope,
+  TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION,
+} from "@app-usagemonitor/telemetry-contract";
+import {
+  assertTelemetryTransportWriteAllowed,
+  grantTelemetryV11Consent,
+  parseTelemetryTransportRollbackRequest,
+  rollbackTelemetryTransportAsOwner,
+  telemetryTransportCapabilities,
+  telemetryTransportSchemaForEnvelope,
+  telemetryTransportSchemaVersion,
+} from "./telemetry-transport-policy";
+import {
+  existingTelemetryV11StagedChunk,
+  persistTelemetryV11StagedChunk,
+  readTelemetryV11DayCandidates,
+  readTelemetryV11DayChunkVector,
+  registerTelemetryV11DayManifest,
+  telemetryV11ExportEntries,
+  validateTelemetryV11StagedChunk,
+} from "./telemetry-v11-repository";
+import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "./telemetry-v11-domain";
 import {
   claimPendingAppleSignInHandoff,
   completeAppleSignInHandoff,
@@ -161,11 +209,9 @@ import {
   purgeExpiredDeletionTombstones,
   purgeExpiredIdentityReenrollmentCooldowns,
   purgeExpiredPrimaryIdentityReenrollmentCooldowns,
-  recordIdentityReenrollmentCooldownFromDigest,
-  recordDeletionTombstone,
-  recordPrimaryIdentityReenrollmentCooldown,
   runBackendLifecycle,
 } from "./retention";
+import { eraseParticipantAsOwner, parseParticipantErasureRequest } from "./participant-erasure";
 import {
   assertSignInStartAdmission,
   assertSignInStartAdmissionConfiguration,
@@ -174,41 +220,30 @@ import {
 import {
   matchWorkerRoute,
   type ApiWorkerRouteId,
+  type WorkerRouteMatch,
+  type WorkerRouteMethod,
 } from "./route-registry";
 import { handleSparkleAppcastGuard } from "./sparkle-appcast-guard";
 import {
   assertAdminCsrf,
   assertCsrf,
   assertSameOrigin,
-  abandonUploadAuthorization,
   authenticateSession,
-  claimUploadAuthorization,
   clearedSessionCookie,
-  createUploadAuthorizationMaterial,
   hasSessionCookie,
-  recordUploadReceipt,
   sessionCookie,
-  storeUploadAuthorization,
   type SessionPrincipal,
 } from "./session";
 import {
   type TelemetryContributionAdmission,
-  deleteTelemetryContribution,
   existingTelemetryContribution,
   insertTelemetryContribution,
-  listRecentTelemetryContributions,
-  markTelemetryContributionDeleting,
-  personalStats,
-  telemetryContributionById,
   telemetryContributionAdmission,
   telemetryContributionCount,
   telemetryContributionPage,
-  telemetryContributionHistoryMetadata,
   telemetryContributionMetadata,
-  telemetryContributionR2KeyPage,
   telemetryEnvelopeDigest,
   telemetryPlaintextDigest,
-  telemetryRecordsForContribution,
 } from "./telemetry-repository";
 
 // Wrangler discovers Durable Object classes through the Worker module's named
@@ -216,6 +251,7 @@ import {
 export { UploadIngressBudget } from "./ingress-budget";
 
 const DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{7,64}$/u;
+const EXACT_DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
 
 function configuredDeploymentSourceCommit(env: Env): string | null {
   const configured = (env as Env & {
@@ -227,6 +263,42 @@ function configuredDeploymentSourceCommit(env: Env): string | null {
     throw new ApiError(503, "DEPLOYMENT_SOURCE_COMMIT_INVALID");
   }
   return configured;
+}
+
+/**
+ * The reviewed migration-only snapshot has one deliberately storage-free
+ * liveness response. It lets the normal deployment wrapper bind the immutable
+ * source it just installed, while its explicit maintenance shape prevents the
+ * response from being interpreted as a D1/R2/DO qualification. Every other
+ * dynamic route remains behind the mutation barrier.
+ */
+function migrationMutationBarrierHealthResponse(env: Env): Response {
+  const configured = (env as Env & {
+    DEPLOYMENT_SOURCE_COMMIT?: unknown;
+  }).DEPLOYMENT_SOURCE_COMMIT;
+  const sourceCommit = typeof configured === "string"
+    && EXACT_DEPLOYMENT_SOURCE_COMMIT_PATTERN.test(configured)
+    ? configured
+    : null;
+  if (sourceCommit === null) {
+    return noStore(jsonResponse({
+      status: "unavailable",
+      mode: "migration-mutation-barrier",
+      maintenance: {
+        state: "fenced",
+        storageQualified: false,
+      },
+    }, 503));
+  }
+  return noStore(jsonResponse({
+    status: "ok",
+    mode: "migration-mutation-barrier",
+    maintenance: {
+      state: "fenced",
+      storageQualified: false,
+    },
+    deployment: { sourceCommit },
+  }));
 }
 
 function telemetryContributionLimitError(
@@ -264,7 +336,6 @@ import {
   telemetryV1ChunkAdmissionError,
   telemetryV1ChunkCount,
   telemetryV1ChunkId,
-  telemetryV1ChunkR2KeyPage,
   telemetryV1DeviceConsentCurrent,
   telemetryV1DeviceForUploadAuthorization,
   telemetryV1SyncManifest,
@@ -272,13 +343,26 @@ import {
   type TelemetryV1ChunkRow,
 } from "./telemetry-v1-repository";
 import {
-  readPublishedCommunityDailyAggregates,
+  readPublishedCommunityDailyAggregatesWithAllowanceState,
+  isCurrentCommunityAllowancePublication,
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
+import { isCurrentCommunityDailySpend } from "./community-daily-spend";
+import { projectPublicAllowanceGraph } from "./public-allowance-breakdowns";
+import {
+  COMMUNITY_ALLOWANCE_BASIS,
+  COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
+} from "./community-allowance";
 import {
   captureAdminMetricSnapshot,
-  readAdminMetricsHistory,
+  readCachedAdminMetricsHistory,
+  warmAdminMetricsHistoryCache,
 } from "./admin-metrics-history";
+import {
+  readCachedAdminCommunityAllowancePreview,
+  warmAdminCommunityAllowancePreviewCache,
+} from "./admin-community-allowance";
 import { canonicalJson } from "./canonical-json";
 import {
   insertTelemetryContributionV02,
@@ -326,8 +410,109 @@ async function readBoundedJson(
   }
 }
 
-const UPLOAD_AUTHORIZATION_HEADER =
-  /^Upload um_(?:device_)?upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
+/**
+ * The accountless enrollment body is a small closed contract. Keep its cap
+ * independent from contribution envelopes so a future upload schema change
+ * cannot widen this unauthenticated admission boundary accidentally.
+ */
+async function readBoundedAccountlessJson(
+  request: Request,
+): Promise<AccountlessEnrollmentRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    const raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })
+      .decode(combined);
+    return parseAccountlessEnrollmentJson(raw);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
+async function readBoundedAccountlessOwnershipJson(
+  request: Request,
+): Promise<AccountlessOwnershipRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    return parseAccountlessOwnershipJson(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined),
+    );
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
+async function readBoundedAccountlessRenewalJson(
+  request: Request,
+): Promise<AccountlessRenewalRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    return parseAccountlessRenewalJson(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined),
+    );
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
+const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
+  /^Upload um_device_upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 
 /**
  * Reject requests that cannot possibly be a contribution before spending a
@@ -353,7 +538,7 @@ function contributionRequestPreflight(request: Request): string {
   }
   if (!request.body) throw new ApiError(400, "BODY_INVALID");
   if (typeof authorization !== "string"
-      || !UPLOAD_AUTHORIZATION_HEADER.test(authorization)) {
+      || !DEVICE_UPLOAD_AUTHORIZATION_HEADER.test(authorization)) {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   }
   return authorization;
@@ -397,10 +582,111 @@ async function readBoundedForm(
   }
 }
 
-function methodNotAllowed(allowed: string[]): never {
+function methodNotAllowed(allowed: readonly string[]): never {
   const error = new ApiError(405, "METHOD_NOT_ALLOWED");
-  Object.defineProperty(error, "allowed", { value: allowed });
+  Object.defineProperty(error, "allowed", {
+    value: Object.freeze([...allowed]),
+  });
   throw error;
+}
+
+function assertWorkerRouteMethod(
+  request: Request,
+  route: Extract<WorkerRouteMatch, { kind: "exact" }>,
+): void {
+  if (route.methods === "all") return;
+  if (!route.methods.includes(request.method as WorkerRouteMethod)) {
+    methodNotAllowed(route.methods);
+  }
+}
+
+async function handleAccountlessEnrollment(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  // Accountless enrollment has no ambient browser authority. Reject an
+  // existing participant cookie rather than allowing a browser session to be
+  // mistaken for the installation's stable device proof.
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  if (configuredAccountlessEnrollmentMode(env) !== "enabled") {
+    throw new ApiError(503, "ACCOUNTLESS_ENROLLMENT_DISABLED");
+  }
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
+  await assertAttemptAllowed(
+    env.ENROLLMENT_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "enrollment",
+  );
+  const body = await readBoundedAccountlessJson(request);
+  const result = await enrollAccountlessDevice(
+    env.USAGE_MONITOR_DB,
+    // The bounded reader performs duplicate-key rejection and the helper
+    // validates the closed request shape; no raw body or secret is logged.
+    body,
+  );
+  return jsonResponse(result.response, result.status);
+}
+
+async function handleAccountlessOwnership(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  assertAccountlessOwnershipEnabled(env);
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "accountless_ownership",
+  );
+  const body = await readBoundedAccountlessOwnershipJson(request);
+  const result = await createAccountlessUploadOwner(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+    body,
+  );
+  return jsonResponse(result.response, result.status);
+}
+
+async function handleAccountlessRenewal(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  if (configuredAccountlessEnrollmentMode(env) !== "enabled") {
+    throw new ApiError(503, "ACCOUNTLESS_ENROLLMENT_DISABLED");
+  }
+  assertAccountlessOwnershipEnabled(env);
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "accountless_renewal",
+  );
+  const body = await readBoundedAccountlessRenewalJson(request);
+  return jsonResponse(await renewAccountlessUploadOwner(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+    body,
+  ));
 }
 
 function allowedHeader(error: ApiError): HeadersInit | undefined {
@@ -1501,45 +1787,6 @@ function handleRetiredAppleDomainAssociation(): never {
   throw new ApiError(404, "NOT_FOUND");
 }
 
-async function handleRecover(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "POST") methodNotAllowed(["POST"]);
-  assertSameOrigin(request);
-  configuredEnrollmentMode(env);
-  if (identityRequired(env)) {
-    // Hosted identity is mandatory outside development: signing in again
-    // reattaches the same participant, replacing the recovery-code flow.
-    throw new ApiError(401, "IDENTITY_REQUIRED");
-  }
-  assertAdmissionBindings(env);
-  await assertAttemptAllowed(
-    env.RECOVERY_RATE_LIMIT,
-    env.CLIENT_ATTEMPT_RATE_LIMIT,
-    request,
-    env,
-    "recovery",
-  );
-  const body = await readBoundedJson(request);
-  if (typeof body.value !== "object"
-    || body.value === null
-    || Array.isArray(body.value)
-    || Object.keys(body.value).length !== 2
-    || !Object.hasOwn(body.value, "recoveryCode")
-    || !Object.hasOwn(body.value, "recoveryAttemptId")) {
-    throw new ApiError(400, "BODY_INVALID");
-  }
-  const recovered = await recoverAccess(
-    env.USAGE_MONITOR_DB,
-    Reflect.get(body.value, "recoveryCode"),
-    Reflect.get(body.value, "recoveryAttemptId"),
-  );
-  return jsonResponse({
-    participantId: recovered.participantId,
-    csrfToken: recovered.csrfToken,
-    recoveryCode: recovered.recoveryCode,
-    consentVersion: recovered.consentVersion,
-  }, 200, { "set-cookie": sessionCookie(recovered.session) });
-}
-
 async function personalSession(
   request: Request,
   env: Env,
@@ -1608,50 +1855,6 @@ async function handleSecurityReset(request: Request, env: Env): Promise<Response
     csrfToken: session.csrfToken,
     consentVersion: session.consentVersion,
   }, 200, { vary: "Cookie" });
-}
-
-async function handleUploadAuthorization(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "POST") methodNotAllowed(["POST"]);
-  assertAdmissionBindings(env);
-  assertUploadAuthorizationBindings(env);
-  assertUploadIngressConfiguration(env);
-  await assertCollectionControl(
-    env.USAGE_MONITOR_DB,
-    "uploadRegistration",
-  );
-  const session = await personalSession(request, env);
-  assertCsrf(request, session);
-  await assertUploadAuthorizationAllowed(
-    env.UPLOAD_AUTHORIZATION_RATE_LIMIT,
-    env.UPLOAD_PRINCIPAL_RATE_LIMIT,
-    session.participantId,
-    env,
-  );
-  await probeUploadIngressBudget(env);
-  const body = await readBoundedJson(request);
-  if (typeof body.value !== "object"
-      || body.value === null
-      || Array.isArray(body.value)
-      || Object.keys(body.value).length !== 3
-      || typeof Reflect.get(body.value, "envelopeDigest") !== "string"
-      || !/^[0-9a-f]{64}$/u.test(Reflect.get(body.value, "envelopeDigest") as string)
-      || !Number.isSafeInteger(Reflect.get(body.value, "contentLengthBytes"))
-      || (Reflect.get(body.value, "contentLengthBytes") as number) <= 0
-      || (Reflect.get(body.value, "contentLengthBytes") as number) > MAX_REQUEST_BYTES
-      || Reflect.get(body.value, "contentType") !== "application/json") {
-    throw new ApiError(400, "BODY_INVALID");
-  }
-  const authorization = await createUploadAuthorizationMaterial(
-    session.participantId,
-    session.sessionId,
-    Reflect.get(body.value, "envelopeDigest") as string,
-    Reflect.get(body.value, "contentLengthBytes") as number,
-  );
-  await storeUploadAuthorization(env.USAGE_MONITOR_DB, authorization);
-  return jsonResponse({
-    uploadAuthorization: authorization.encoded,
-    expiresAt: authorization.expiresAt,
-  }, 201, { vary: "Cookie" });
 }
 
 async function handleDevicePairing(request: Request, env: Env): Promise<Response> {
@@ -1726,6 +1929,9 @@ async function handleDevicePairingClaim(request: Request, env: Env): Promise<Res
     request.headers.get("authorization"),
     Reflect.get(body.value, "deviceId") as string,
     Reflect.get(body.value, "deviceSecretHash") as string,
+    undefined,
+    undefined,
+    request.headers.get("x-previous-device-authorization"),
   ), 201);
 }
 
@@ -1760,7 +1966,8 @@ async function handleDeviceUploadAuthorization(
   if (typeof body.value !== "object"
       || body.value === null
       || Array.isArray(body.value)
-      || Object.keys(body.value).length !== 3
+      || ![3, 4].includes(Object.keys(body.value).length)
+      || Object.keys(body.value).some((key) => !["envelopeDigest", "contentLengthBytes", "contentType", "telemetrySchemaVersion"].includes(key))
       || typeof Reflect.get(body.value, "envelopeDigest") !== "string"
       || !/^[0-9a-f]{64}$/u.test(Reflect.get(body.value, "envelopeDigest") as string)
       || !Number.isSafeInteger(Reflect.get(body.value, "contentLengthBytes"))
@@ -1769,6 +1976,11 @@ async function handleDeviceUploadAuthorization(
       || Reflect.get(body.value, "contentType") !== "application/json") {
     throw new ApiError(400, "BODY_INVALID");
   }
+  await assertTelemetryTransportWriteAllowed(
+    env.USAGE_MONITOR_DB,
+    device,
+    telemetryTransportSchemaVersion(Reflect.get(body.value, "telemetrySchemaVersion") ?? "telemetry-contribution-v1.0"),
+  );
   return jsonResponse(await createDeviceUploadAuthorization(
     env.USAGE_MONITOR_DB,
     device,
@@ -1918,7 +2130,7 @@ function handleEnvelopeKey(request: Request, env: Env): Response {
 
 async function handleSyntheticContribution(
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: { id: string; consentVersion: string | null },
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
@@ -2013,7 +2225,7 @@ async function handleSyntheticContribution(
 async function handleTelemetryContribution(
   request: Request,
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: { id: string; consentVersion: string | null },
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
@@ -2027,6 +2239,11 @@ async function handleTelemetryContribution(
   } else if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
     throw new ApiError(400, "TELEMETRY_REQUIRED");
   }
+  const sourceDeviceId = await telemetryV1DeviceForUploadAuthorization(env.USAGE_MONITOR_DB, uploadAuthorization.authorizationId);
+  if (!sourceDeviceId) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  await assertTelemetryTransportWriteAllowed(env.USAGE_MONITOR_DB,
+    { participantId: participant.id, deviceId: sourceDeviceId },
+    accountScoped ? "telemetry-contribution-v0.2" : "telemetry-contribution-v0.1");
   const envelope = validateTelemetryEnvelope(body.value);
   const envelopeDigestValue = await telemetryEnvelopeDigest(envelope);
   const envelopeReplay = await existingTelemetryContribution(
@@ -2233,6 +2450,82 @@ async function telemetryV1ChunkReceipt(
   );
 }
 
+async function handleTelemetryV11Contribution(
+  body: { raw: string; value: unknown },
+  participant: {
+    id: string;
+    consentVersion: string | null;
+    ownerKind: "social" | "accountless";
+  },
+  deviceId: string,
+  authorizationId: string,
+  env: Env,
+): Promise<Response> {
+  if ((participant.ownerKind === "social"
+      && participant.consentVersion !== TELEMETRY_CONSENT_VERSION)
+      || (participant.ownerKind === "accountless"
+        && participant.consentVersion !== null)) {
+    throw new ApiError(400, "TELEMETRY_REQUIRED");
+  }
+  const principal = { participantId: participant.id, deviceId };
+  const envelope = validateTelemetryV11Envelope(body.value);
+  const plaintext = await decryptSyntheticEnvelope(
+    envelope, env.ENVELOPE_PUBLIC_JWK, env.ENVELOPE_PRIVATE_JWK,
+  );
+  const chunk = await validateTelemetryV11StagedChunk(plaintext);
+  const receipt = (contributionId: string, manifestId: string, replayed: boolean) => jsonResponse({
+    schemaVersion: "telemetry-chunk-receipt-v1.1",
+    contributionId, manifestId, chunkId: chunk.chunkId, chunkRevision: 1,
+    status: "staged", replayed,
+    recordCounts: { declared: chunk.records.length, accepted: chunk.records.length },
+  }, 202, replayed ? { "idempotency-replayed": "true" } : undefined);
+  const prior = await existingTelemetryV11StagedChunk(env.USAGE_MONITOR_DB, principal, chunk);
+  if (prior) {
+    if (prior.chunk_digest !== chunk.chunkDigest || prior.record_count !== chunk.records.length) {
+      throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+    }
+    return receipt(prior.id, prior.manifest_id, true);
+  }
+  const chunkRowId = `chunk:${crypto.randomUUID()}`;
+  const r2Key = `telemetry/v11-${crypto.randomUUID()}`;
+  // The one-use authorization binds the exact HTTP body, including its
+  // envelope serialization, rather than a second digest definition.
+  const envelopeDigest = await sha256Hex(body.raw);
+  await putTrackedQuarantineObject(env.USAGE_MONITOR_DB, env.QUARANTINE, {
+    contributionId: chunkRowId, objectKind: "telemetry", r2Key,
+    registeredAt: new Date().toISOString(),
+  }, body.raw, {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: { contributionId: chunkRowId,
+      schemaVersion: TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION,
+      plaintextSchemaVersion: chunk.schemaVersion, synthetic: "false" },
+  });
+  try {
+    const result = await persistTelemetryV11StagedChunk(env.USAGE_MONITOR_DB, principal, chunk, {
+      chunkRowId, r2Key, envelopeDigest, deviceUploadAuthorizationId: authorizationId,
+    });
+    if (result.replay) {
+      // A content replay won after our first lookup. Only our unreferenced
+      // object is removable; the retained winner is never touched.
+      await env.QUARANTINE.delete(r2Key);
+      await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
+    }
+    return receipt(result.contributionId, result.manifestId, result.replay);
+  } catch (error) {
+    const retained = await existingTelemetryV11StagedChunk(env.USAGE_MONITOR_DB, principal, chunk);
+    if (retained && retained.chunk_digest === chunk.chunkDigest) {
+      return receipt(retained.id, retained.manifest_id, true);
+    }
+    // A completed lookup proves there is no retained matching write. Failed
+    // cleanup leaves its registration for owner-safe reconciliation.
+    try {
+      await env.QUARANTINE.delete(r2Key);
+      await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
+    } catch { /* durable pending registration is the cleanup journal */ }
+    throw error;
+  }
+}
+
 /**
  * telemetry-contribution-v1.0 incremental chunk ingest. Additive alongside
  * the deployed v0.1 prepared-sample path: v1.0 envelopes carry their own
@@ -2242,7 +2535,7 @@ async function telemetryV1ChunkReceipt(
  */
 async function handleTelemetryV1Contribution(
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: { id: string; consentVersion: string | null },
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
@@ -2440,8 +2733,9 @@ const DAY_MILLISECONDS = 24 * 60 * 60 * 1000;
 async function deviceSyncPrincipal(
   request: Request,
   env: Env,
-): Promise<{ participantId: string; deviceId: string }> {
-  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  method: "GET" | "POST" = "GET",
+): Promise<DevicePrincipal> {
+  if (request.method !== method) methodNotAllowed([method]);
   assertAdmissionBindings(env);
   await assertAttemptAllowed(
     env.RECOVERY_RATE_LIMIT,
@@ -2460,7 +2754,7 @@ async function deviceSyncPrincipal(
   if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
-  return { participantId: device.participantId, deviceId: device.deviceId };
+  return device;
 }
 
 async function handleDeviceSyncState(
@@ -2468,6 +2762,9 @@ async function handleDeviceSyncState(
   env: Env,
 ): Promise<Response> {
   const device = await deviceSyncPrincipal(request, env);
+  if (device.authorityKind !== "social") {
+    throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  }
   const [state, admission] = await Promise.all([
     telemetryV1SyncState(
       env.USAGE_MONITOR_DB,
@@ -2483,11 +2780,72 @@ async function handleDeviceSyncState(
   return jsonResponse({ ...state, admission });
 }
 
+async function handleDeviceSyncCapabilities(request: Request, env: Env): Promise<Response> {
+  const device = await deviceSyncPrincipal(request, env);
+  const requestOrigin = new URL(request.url).origin;
+  const destinationOrigin = identityRequired(env) ? Reflect.get(env, "PUBLIC_ORIGIN") : requestOrigin;
+  if (typeof destinationOrigin !== "string" || destinationOrigin !== requestOrigin) {
+    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+  return jsonResponse(await telemetryTransportCapabilities(env.USAGE_MONITOR_DB, device, destinationOrigin));
+}
+
+async function handleTelemetryV11Consent(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const session = await personalSession(request, env);
+  assertCsrf(request, session);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  if (session.consentVersion !== TELEMETRY_CONSENT_VERSION) throw new ApiError(400, "TELEMETRY_REQUIRED");
+  const { value } = await readBoundedJson(request);
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+      || Object.keys(value).length !== 3
+      || Object.keys(value).some((key) => !["deviceId", "consent", "ongoingUpload"].includes(key))
+      || typeof Reflect.get(value, "deviceId") !== "string"
+      || Reflect.get(value, "ongoingUpload") !== true) throw new ApiError(400, "BODY_INVALID");
+  return jsonResponse(await grantTelemetryV11Consent(env.USAGE_MONITOR_DB, {
+    participantId: session.participantId, sessionId: session.sessionId,
+    deviceId: Reflect.get(value, "deviceId") as string,
+  }, Reflect.get(value, "consent")), 201, { vary: "Cookie" });
+}
+
+async function handleTelemetryV11DayManifests(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "POST") methodNotAllowed(["GET", "POST"]);
+  const device = await deviceSyncPrincipal(request, env, request.method);
+  if (request.method === "POST") {
+    await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
+    const body = await readBoundedJson(request);
+    const candidate = await registerTelemetryV11DayManifest(env.USAGE_MONITOR_DB, device, body.value);
+    const stagedChunks = await readTelemetryV11DayChunkVector(env.USAGE_MONITOR_DB, device, candidate.manifestId);
+    return jsonResponse({ ...candidate, stagedChunks }, 201);
+  }
+  const query = new URL(request.url).searchParams;
+  if ([...query.keys()].some((key) => !["fromDay", "toDay"].includes(key))
+      || query.getAll("fromDay").length !== 1 || query.getAll("toDay").length !== 1) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return jsonResponse(await readTelemetryV11DayCandidates(env.USAGE_MONITOR_DB, device, {
+    fromDay: query.get("fromDay")!, toDay: query.get("toDay")!,
+  }));
+}
+
+async function handleTelemetryV11Domain(request: Request, env: Env, activate: boolean): Promise<Response> {
+  const device = await deviceSyncPrincipal(request, env, "POST");
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
+  const body = await readBoundedJson(request);
+  if (activate) return jsonResponse(await activateTelemetryV11Domain(env.USAGE_MONITOR_DB, device, body.value), 201);
+  if (typeof body.value !== "object" || body.value === null || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 0) throw new ApiError(400, "BODY_INVALID");
+  return jsonResponse(await createTelemetryV11DomainPredecessor(env.USAGE_MONITOR_DB, device), 201);
+}
+
 async function handleDeviceSyncManifest(
   request: Request,
   env: Env,
 ): Promise<Response> {
   const device = await deviceSyncPrincipal(request, env);
+  if (device.authorityKind !== "social") {
+    throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  }
   const url = new URL(request.url);
   const fromDay = url.searchParams.get("fromDay");
   const toDay = url.searchParams.get("toDay");
@@ -2537,7 +2895,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
   let claimed: {
     authorizationId: string;
     participantId: string;
-    authorizationKind: "session" | "device";
+    authorizationKind: "device";
   } | null = null;
   try {
     const body = await readBoundedJson(request, bodyReadPolicy);
@@ -2547,17 +2905,11 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     const scopeDigest = await sha256Hex(body.bytes);
     await heartbeat.assertActive();
     await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
-    claimed = authorizationHeader.startsWith("Upload um_device_upload_")
-      ? await claimDeviceUploadAuthorization(
-        env.USAGE_MONITOR_DB,
-        authorizationHeader,
-        { envelopeDigest: scopeDigest, bodyBytes, contentType },
-      )
-      : await claimUploadAuthorization(
-        env.USAGE_MONITOR_DB,
-        authorizationHeader,
-        { envelopeDigest: scopeDigest, bodyBytes, contentType },
-      );
+    claimed = await claimDeviceUploadAuthorization(
+      env.USAGE_MONITOR_DB,
+      authorizationHeader,
+      { envelopeDigest: scopeDigest, bodyBytes, contentType },
+    );
     await heartbeat.assertActive();
     if (!hasExactEnvelopeKeyOccurrences(body.raw)) {
       throw new ApiError(400, "ENVELOPE_INVALID");
@@ -2566,48 +2918,50 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       throw new ApiError(400, "ENVELOPE_INVALID");
     }
     const participant = await env.USAGE_MONITOR_DB.prepare(
-      `SELECT id, consent_version AS consentVersion
+      `SELECT id, consent_version AS consentVersion, owner_kind AS ownerKind
          FROM participants WHERE id = ? AND state = 'active'`,
-    ).bind(claimed.participantId).first<{ id: string; consentVersion: string }>();
+    ).bind(claimed.participantId).first<{
+      id: string;
+      consentVersion: string | null;
+      ownerKind: "social" | "accountless";
+    }>();
     if (!participant) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     if (await hasDeletionTombstone(env.DELETION_LEDGER, participant.id)) {
       throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     }
     await heartbeat.assertActive();
     const declaredEnvelopeVersion = Reflect.get(body.value, "schemaVersion");
+    const sourceDeviceId = await telemetryV1DeviceForUploadAuthorization(env.USAGE_MONITOR_DB, claimed.authorizationId);
+    if (!sourceDeviceId) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    await assertTelemetryTransportWriteAllowed(env.USAGE_MONITOR_DB,
+      { participantId: participant.id, deviceId: sourceDeviceId },
+      telemetryTransportSchemaForEnvelope(declaredEnvelopeVersion));
     const response = declaredEnvelopeVersion === "telemetry-envelope-v0.1"
       ? await handleTelemetryContribution(request, body, participant, claimed, env)
       : declaredEnvelopeVersion === TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION
         ? await handleTelemetryV1Contribution(body, participant, claimed, env)
-        : await handleSyntheticContribution(body, participant, claimed, env);
+        : declaredEnvelopeVersion === TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION
+          ? await handleTelemetryV11Contribution(body, participant, sourceDeviceId, claimed.authorizationId, env)
+          : await handleSyntheticContribution(body, participant, claimed, env);
     await heartbeat.assertActive();
     const receipt = await response.clone().json<{ contributionId?: unknown }>();
     if (typeof receipt.contributionId !== "string") {
       throw new ApiError(500, "INTERNAL_ERROR");
     }
-    if (claimed.authorizationKind === "device") {
-      await recordDeviceUploadReceipt(
-        env.USAGE_MONITOR_DB,
-        claimed.authorizationId,
-        receipt.contributionId,
-      );
-    } else {
-      await recordUploadReceipt(
-        env.USAGE_MONITOR_DB,
-        claimed.authorizationId,
-        receipt.contributionId,
-      );
-    }
+    await recordDeviceUploadReceipt(
+      env.USAGE_MONITOR_DB,
+      claimed.authorizationId,
+      receipt.contributionId,
+    );
     completed = true;
     return response;
   } finally {
     try {
       if (!completed && claimed !== null) {
-        if (claimed.authorizationKind === "device") {
-          await abandonDeviceUploadAuthorization(env.USAGE_MONITOR_DB, claimed.authorizationId);
-        } else {
-          await abandonUploadAuthorization(env.USAGE_MONITOR_DB, claimed.authorizationId);
-        }
+        await abandonDeviceUploadAuthorization(
+          env.USAGE_MONITOR_DB,
+          claimed.authorizationId,
+        );
       }
     } catch {
       // Preserve the original client-visible status and leave a redacted
@@ -2630,59 +2984,6 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       }
     }
   }
-}
-
-async function handleMe(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const session = await personalSession(request, env);
-  const [
-    contributions,
-    telemetryContributions,
-    telemetryTotal,
-    contributionAdmission,
-  ] = await Promise.all([
-    listContributions(env.USAGE_MONITOR_DB, session.participantId),
-    listRecentTelemetryContributions(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS
-        - MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
-    ),
-    telemetryContributionCount(env.USAGE_MONITOR_DB, session.participantId),
-    telemetryContributionAdmission(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-    ),
-  ]);
-  const history = ([
-    ...contributions.map(contributionHistoryMetadata),
-    ...telemetryContributions.map(telemetryContributionHistoryMetadata),
-  ] as Array<{ contributionId: string; createdAt: string }>).sort(
-    (left, right) => left.createdAt.localeCompare(right.createdAt)
-      || left.contributionId.localeCompare(right.contributionId),
-  );
-  return jsonResponse({
-    schemaVersion: "participant-profile-v0.2",
-    participantId: session.participantId,
-    createdAt: session.participantCreatedAt,
-    consentVersion: session.consentVersion,
-    syntheticOnly: session.consentVersion === "synthetic-preview-v0.1",
-    contributionCount: history.length,
-    totalContributionCount: contributions.length + telemetryTotal,
-    latestContribution: history[history.length - 1] ?? null,
-    contributions: history,
-    contributionAdmission,
-    historyPolicy: {
-      maximumItems: MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS,
-      returnedItems: history.length,
-      totalItems: contributions.length + telemetryTotal,
-      truncated: contributions.length + telemetryTotal > history.length,
-      order: "oldest_to_newest_within_recent_window",
-      quarantineRetentionMilliseconds: QUARANTINE_RETENTION_MILLISECONDS,
-      canonicalMetadataRetainedAfterQuarantine: true,
-      clientSoftwareVersion: "unavailable_in_transport",
-    },
-  }, 200, { vary: "Cookie" });
 }
 
 async function handleExport(request: Request, env: Env): Promise<Response> {
@@ -2731,6 +3032,12 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
       }
       cursor = page.nextCursor;
     } while (cursor);
+    yield encoder.encode('],"attributionTransport":[');
+    let wroteAttributionEntry = false;
+    for await (const entry of telemetryV11ExportEntries(env.USAGE_MONITOR_DB, session.participantId, generatedAt)) {
+      yield encoder.encode((wroteAttributionEntry ? "," : "") + JSON.stringify(entry));
+      wroteAttributionEntry = true;
+    }
     yield encoder.encode(
       `],"generatedAt":${JSON.stringify(generatedAt)}}`,
     );
@@ -2763,140 +3070,6 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
   return new Response(stream, { status: 200, headers });
 }
 
-async function handleDelete(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "DELETE") methodNotAllowed(["DELETE"]);
-  const session = await personalSession(request, env, true, true);
-  assertCsrf(request, session);
-  if (identityRequired(env)) {
-    await assertPinnedIdentityLinkSecretConfiguration(
-      env.USAGE_MONITOR_DB,
-      Reflect.get(env, "IDENTITY_LINK_SECRET"),
-      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
-    );
-  }
-  if (session.participantState === "active") {
-    await markParticipantDeleting(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      session.sessionId,
-    );
-  }
-  await assertDeletionOwner(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    session.sessionId,
-  );
-  await recordDeletionTombstone(
-    env.DELETION_LEDGER,
-    session.participantId,
-  );
-  const identityLinkKey = await participantIdentityLinkKeyForDeletion(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    session.sessionId,
-  );
-  if (identityLinkKey !== null) {
-    const rawIdentityLinkSecret = Reflect.get(env, "IDENTITY_LINK_SECRET");
-    if (typeof rawIdentityLinkSecret !== "string"
-        || rawIdentityLinkSecret.length < 32) {
-      if (identityRequired(env)) {
-        throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
-      }
-    } else {
-      const cooldownDigest = await identityReenrollmentCooldownDigest(
-        rawIdentityLinkSecret,
-        identityLinkKey,
-      );
-      // Persist the primary marker before dropping the old unique link key.
-      // The external ledger remains the independent restoration safeguard;
-      // this primary marker is what makes fresh INSERT admission atomic.
-      await recordPrimaryIdentityReenrollmentCooldown(
-        env.USAGE_MONITOR_DB,
-        cooldownDigest,
-      );
-      await recordIdentityReenrollmentCooldownFromDigest(
-        env.DELETION_LEDGER,
-        cooldownDigest,
-      );
-    }
-  }
-  const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
-  if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT) {
-    throw new ApiError(500, "INTERNAL_ERROR");
-  }
-  const telemetryTotal = await telemetryContributionCount(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
-  const telemetryV1Total = await telemetryV1ChunkCount(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
-  const syntheticR2Keys = contributions.map((row) => row.r2_key);
-  if (syntheticR2Keys.length > 0) {
-    await env.QUARANTINE.delete(syntheticR2Keys);
-  }
-  let cursor: { createdAt: string; contributionId: string } | null = null;
-  do {
-    const page = await telemetryContributionR2KeyPage(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      cursor,
-    );
-    if (page.rows.length > 0) {
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
-    }
-    cursor = page.nextCursor;
-  } while (cursor);
-  let chunkCursor: { createdAt: string; chunkRowId: string } | null = null;
-  do {
-    const page = await telemetryV1ChunkR2KeyPage(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      chunkCursor,
-    );
-    if (page.rows.length > 0) {
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
-    }
-    chunkCursor = page.nextCursor;
-  } while (chunkCursor);
-  const currentTelemetryTotal = await telemetryContributionCount(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
-  const currentTelemetryV1Total = await telemetryV1ChunkCount(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
-  if (currentTelemetryTotal !== telemetryTotal
-      || currentTelemetryV1Total !== telemetryV1Total) {
-    throw new ApiError(409, "UPLOAD_IN_PROGRESS");
-  }
-  await finishParticipantDeletion(env.USAGE_MONITOR_DB, session.participantId);
-  return jsonResponse({
-    deleted: true,
-    participantId: session.participantId,
-    contributionsDeleted: contributions.length + telemetryTotal
-      + telemetryV1Total,
-  }, 200, { "set-cookie": clearedSessionCookie(), vary: "Cookie" });
-}
-
-async function handleStats(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const session = await personalSession(request, env);
-  const [stats, communityComparison] = await Promise.all([
-    personalStats(env.USAGE_MONITOR_DB, session.participantId),
-    readParticipantCommunityComparison(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-    ),
-  ]);
-  return jsonResponse(
-    { ...stats, communityComparison },
-    200,
-    { vary: "Cookie" },
-  );
-}
 
 const ADMIN_ACTIONS = new Set<AdminAction>([
   "set_collection_controls",
@@ -2944,11 +3117,54 @@ async function handleAdminMetricsHistory(
     }
     await adminSession(request, env);
   }
-  const history = await readAdminMetricsHistory(env.USAGE_MONITOR_DB, Date.now());
+  const history = await readCachedAdminMetricsHistory(
+    env.USAGE_MONITOR_DB,
+    Date.now(),
+  );
   return jsonResponse(history, 200, {
     "cache-control": "no-store",
     vary: "Cookie",
   });
+}
+
+async function handleAdminCommunityAllowancePreview(
+  request: Request,
+  env: Env,
+  access?: { readonly identityKey: string },
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  if (access === undefined) {
+    if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+      throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+    }
+    await adminSession(request, env);
+  }
+  const preview = await readCachedAdminCommunityAllowancePreview(
+    env.USAGE_MONITOR_DB,
+    Date.now(),
+  );
+  return jsonResponse(preview, 200, {
+    "cache-control": "no-store",
+    vary: "Cookie",
+  });
+}
+
+async function handleAdminReconstructionProgress(
+  request: Request, env: Env, access?: { readonly identityKey: string },
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  if (access === undefined) {
+    if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+      throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+    }
+    await adminSession(request, env);
+  }
+  const params = [...new URL(request.url).searchParams];
+  const includePreparation = params.length === 1 && params[0]?.[0] === "detail" && params[0]?.[1] === "preparation";
+  if (params.length !== 0 && !includePreparation) throw new ApiError(400, "BODY_INVALID");
+  const progress = await readAdminGraphRefreshProgress(env.USAGE_MONITOR_DB, Date.now(), allowanceReconstructionMode(env),
+    { includePreparation });
+  return jsonResponse(progress, 200, { "cache-control": "no-store", vary: "Cookie" });
 }
 
 async function handleAdminOverview(
@@ -2973,7 +3189,7 @@ async function handleAdminOverview(
   }
   const nowEpoch = Date.now();
   const distributionEnabled = env.ENVIRONMENT === "production";
-  const [overview, ingress, githubSnapshot] = await Promise.all([
+  const [overview, ingress, githubSnapshot, reconstruction] = await Promise.all([
     readAdminOverview(env.USAGE_MONITOR_DB, env.DELETION_LEDGER, {
       environment: env.ENVIRONMENT,
       enrollmentMode: env.ENROLLMENT_MODE,
@@ -2986,6 +3202,8 @@ async function handleAdminOverview(
       ? readGithubDistributionSnapshot(env.USAGE_MONITOR_DB, nowEpoch)
         .catch(() => githubUnavailable("unavailable", "GITHUB_SNAPSHOT_UNAVAILABLE"))
       : Promise.resolve(undefined),
+    readAdminReconstructionProgress(env.USAGE_MONITOR_DB, nowEpoch,
+      allowanceReconstructionMode(env)),
   ]);
   const distribution = await readDistributionAnalytics({
     enabled: distributionEnabled,
@@ -2998,7 +3216,7 @@ async function handleAdminOverview(
     githubSnapshot,
   }, nowEpoch);
   return jsonResponse(
-    { ...overview, ingress, distribution },
+    { ...overview, ingress, distribution, reconstruction },
     200,
     { "cache-control": "no-store", vary: "Cookie" },
   );
@@ -3033,6 +3251,21 @@ async function handleAdminAction(
     throw new ApiError(400, "BODY_INVALID");
   }
   if (action === "run_maintenance") {
+    if (Object.hasOwn(body.value, "transportRollback")) {
+      const target = parseTelemetryTransportRollbackRequest(body.value);
+      const result = await rollbackTelemetryTransportAsOwner(env.USAGE_MONITOR_DB, identityKey, target);
+      return jsonResponse({ schemaVersion: "admin-action-v0.1", action, result }, 200,
+        { "cache-control": "no-store", vary: "Cookie" });
+    }
+    if (Object.hasOwn(body.value, "participantErasure")) {
+      const participantId = parseParticipantErasureRequest(body.value);
+      const result = await eraseParticipantAsOwner(env, identityKey, participantId);
+      return jsonResponse(
+        { schemaVersion: "admin-action-v0.1", action, result },
+        200,
+        { "cache-control": "no-store", vary: "Cookie" },
+      );
+    }
     if (Object.keys(body.value).length !== 1) throw new ApiError(400, "BODY_INVALID");
     const operationId = await beginAdminOperation(
       env.USAGE_MONITOR_DB,
@@ -3188,31 +3421,6 @@ async function handleAdminAction(
   );
 }
 
-async function handleCommunityStats(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "GET") methodNotAllowed(["GET"]);
-  await assertCollectionControl(env.USAGE_MONITOR_DB, "publication");
-  await assertPublicAggregateReadAllowed(env.PUBLIC_READ_RATE_LIMIT, request, env);
-  const snapshot = await readLatestCommunityWeeklySnapshot(env.USAGE_MONITOR_DB);
-  if (!snapshot.cacheable) {
-    return new Response(snapshot.payloadJson, {
-      headers: { ...JSON_HEADERS, "cache-control": "no-store" },
-    });
-  }
-  const etag = `"community-snapshot-${snapshot.snapshotId}-r${snapshot.revision}"`;
-  const headers = new Headers({
-    ...JSON_HEADERS,
-    // A released payload is sealed to this revision. Keep browsers
-    // revalidating the mutable `latest` route, while allowing a shared edge
-    // cache to retain this immutable revision briefly.
-    "cache-control": "public, max-age=0, must-revalidate, s-maxage=60",
-    etag,
-  });
-  if (request.headers.get("if-none-match") === etag) {
-    return new Response(null, { status: 304, headers });
-  }
-  return new Response(snapshot.payloadJson, { headers });
-}
-
 const COMMUNITY_DAILY_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -3253,12 +3461,33 @@ async function handleCommunityDaily(
   if (rangeDays < 1 || rangeDays > COMMUNITY_DAILY_MAX_RANGE_DAYS) {
     throw new ApiError(400, "BODY_INVALID");
   }
-  const rows = await readPublishedCommunityDailyAggregates(
+  // Two SELECTs in one snapshot read this precomputed range/readiness plus one
+  // bounded published cache. Interactive requests never analyze history,
+  // duplicate the preview JSON across daily rows, or write readiness state.
+  const nowMs = Date.now();
+  const read = await readPublishedCommunityDailyAggregatesWithAllowanceState(
     env.USAGE_MONITOR_DB,
     from,
     to,
   );
-  const days = rows.map((row) => {
+  const today = new Date(nowMs).toISOString().slice(0, 10);
+  const todayStartMs = Date.parse(`${today}T00:00:00.000Z`);
+  const mergedHistoryFrom = new Date(
+    todayStartMs
+      - (COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS - 1)
+        * MILLISECONDS_PER_DAY,
+  ).toISOString().slice(0, 10);
+  // The read has already fenced the snapshot against hard invalidation. New
+  // append-only inputs can leave it visible while the next calculation runs.
+  const graph = projectPublicAllowanceGraph(read.allowanceBreakdownsCache, {
+    publishedDays: read.rows.map((row) => row.day), nowMs,
+  });
+  const dailyAllowanceReady = isCurrentCommunityAllowancePublication(read.allowancePublicationState, todayStartMs);
+  const allowanceState = graph !== null || dailyAllowanceReady
+    ? "ready"
+    : "updating";
+  const allowanceBreakdowns = graph?.breakdowns ?? null;
+  const days = read.rows.map((row) => {
     let payload: unknown;
     try {
       payload = JSON.parse(row.payload_json);
@@ -3274,78 +3503,50 @@ async function handleCommunityDaily(
       payload,
     };
   });
+  for (const day of days) {
+    if (typeof day.payload !== "object"
+        || day.payload === null
+        || Array.isArray(day.payload)) continue;
+    const publicPayload = { ...day.payload as Record<string, unknown> };
+    // The old diagnostic shape remains private. Only the separate validated,
+    // owner-approved public allowanceBreakdowns contract exposes plan/model
+    // dollar estimates and counts; it never serializes these historical fields.
+    delete publicPayload.capacityByPlanType;
+    const spend = publicPayload.apiEquivalentSpend;
+    const totals = publicPayload.totals;
+    if (!isCurrentCommunityDailySpend(spend) || !totals || typeof totals !== "object"
+        || Array.isArray(totals) || (totals as Record<string, unknown>).usageEvents !== spend.usageEvents) {
+      delete publicPayload.apiEquivalentSpend;
+    }
+    const allowance = publicPayload.allowance;
+    const allowanceBasis = typeof allowance === "object"
+        && allowance !== null
+        && !Array.isArray(allowance)
+      ? (allowance as Record<string, unknown>).basis
+      : null;
+    if (!dailyAllowanceReady
+        || allowanceBasis !== COMMUNITY_ALLOWANCE_BASIS) {
+      delete publicPayload.allowance;
+    }
+    day.payload = publicPayload;
+  }
   return jsonResponse(
     {
       schemaVersion: "community-daily-read-v1.0",
       from,
       to,
+      allowanceState,
+      allowanceReadState: read.allowanceReadState,
+      ...(allowanceBreakdowns === null ? {} : { allowanceBreakdowns }),
       days,
     },
     200,
     // Every returned revision is immutable, but the latest-revision selection
     // is not: withdrawal and late-data recomputation both move it. A modest
     // shared lifetime keeps the read cheap without pinning a stale revision.
-    { "cache-control": "public, max-age=300" },
+    { "cache-control": read.allowanceReadState === "temporarily_unavailable"
+      ? "no-store" : "public, max-age=300" },
   );
-}
-
-const CONTRIBUTION_ID_PATTERN =
-  /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-
-async function handleContributionResource(
-  request: Request,
-  env: Env,
-  operation: "read" | "delete",
-): Promise<Response> {
-  if (request.method !== "POST") methodNotAllowed(["POST"]);
-  const session = await personalSession(request, env);
-  assertCsrf(request, session);
-  const body = await readBoundedJson(request);
-  if (typeof body.value !== "object"
-      || body.value === null
-      || Array.isArray(body.value)
-      || Object.keys(body.value).length !== 1
-      || typeof Reflect.get(body.value, "contributionId") !== "string"
-      || !CONTRIBUTION_ID_PATTERN.test(
-        Reflect.get(body.value, "contributionId") as string,
-      )) {
-    throw new ApiError(400, "BODY_INVALID");
-  }
-  const contributionId = Reflect.get(body.value, "contributionId") as string;
-  const row = await telemetryContributionById(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    contributionId,
-  );
-  if (!row) throw new ApiError(404, "NOT_FOUND");
-  if (operation === "read") {
-    const records = await telemetryRecordsForContribution(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      contributionId,
-    );
-    return jsonResponse({
-      ...telemetryContributionMetadata(row),
-      records: records.flatMap((record) => {
-        const value = parseStoredRecordJson(record.record_json);
-        return value ? [{ kind: record.record_kind, value }] : [];
-      }),
-    }, 200, { vary: "Cookie" });
-  }
-  if (!await markTelemetryContributionDeleting(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    contributionId,
-  )) {
-    throw new ApiError(409, "CONTRIBUTION_DELETE_CONFLICT");
-  }
-  await env.QUARANTINE.delete(row.r2_key);
-  await deleteTelemetryContribution(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    contributionId,
-  );
-  return jsonResponse({ deleted: true, contributionId }, 200, { vary: "Cookie" });
 }
 
 type LifecycleReadinessState =
@@ -3472,6 +3673,12 @@ async function routeApi(
       return handleRetiredAppleDomainAssociation();
     case "enroll":
       return handleEnroll(request, env);
+    case "accountless_enrollment":
+      return handleAccountlessEnrollment(request, env);
+    case "accountless_ownership":
+      return handleAccountlessOwnership(request, env);
+    case "accountless_renewal":
+      return handleAccountlessRenewal(request, env);
     case "sparkle_appcast_guard":
       return handleSparkleAppcastGuard(request, env);
     case "identity_google_start":
@@ -3486,8 +3693,6 @@ async function routeApi(
       return handleIdentityAppleCallback(request, env);
     case "identity_apple_result":
       return handleIdentityAppleResult(request, env);
-    case "recover":
-      return handleRecover(request, env);
     case "session":
       return handleSession(request, env);
     case "logout":
@@ -3496,12 +3701,14 @@ async function routeApi(
       return handleAdminOverview(request, env);
     case "admin_metrics_history":
       return handleAdminMetricsHistory(request, env);
+    case "admin_community_allowance_preview":
+      return handleAdminCommunityAllowancePreview(request, env);
+    case "admin_reconstruction_progress":
+      return handleAdminReconstructionProgress(request, env);
     case "admin_action":
       return handleAdminAction(request, env);
     case "security_reset":
       return handleSecurityReset(request, env);
-    case "upload_authorization":
-      return handleUploadAuthorization(request, env);
     case "device_pairing":
       return handleDevicePairing(request, env);
     case "device_pairing_claim":
@@ -3516,6 +3723,16 @@ async function routeApi(
       return handleDeviceSyncState(request, env);
     case "device_sync_manifest":
       return handleDeviceSyncManifest(request, env);
+    case "device_sync_capabilities":
+      return handleDeviceSyncCapabilities(request, env);
+    case "telemetry_v11_consent":
+      return handleTelemetryV11Consent(request, env);
+    case "telemetry_v11_day_manifests":
+      return handleTelemetryV11DayManifests(request, env);
+    case "telemetry_v11_domain_predecessor":
+      return handleTelemetryV11Domain(request, env, false);
+    case "telemetry_v11_domain_activate":
+      return handleTelemetryV11Domain(request, env, true);
     case "participant_devices":
       return handleDevices(request, env);
     case "participant_device_revocation":
@@ -3524,29 +3741,46 @@ async function routeApi(
       return handleEnvelopeKey(request, env);
     case "contributions":
       return handleContribution(request, env);
-    case "contribution_read":
-      return handleContributionResource(request, env, "read");
-    case "contribution_delete":
-      return handleContributionResource(request, env, "delete");
     case "participant_export":
       return handleExport(request, env);
-    case "participant_stats":
-      return handleStats(request, env);
-    case "community_stats":
-      return handleCommunityStats(request, env);
     case "community_daily":
       return handleCommunityDaily(request, env);
-    case "participant":
-      if (request.method === "DELETE") return handleDelete(request, env);
-      return handleMe(request, env);
   }
   return unreachableApiRoute(routeId);
 }
 
-export async function handleRequest(request: Request, env: Env): Promise<Response> {
+/** The optional override is test-only; deployed fetch always uses the constant. */
+export async function handleRequest(
+  request: Request,
+  env: Env,
+  testMutationBarrierEnabled = MIGRATION_MUTATION_BARRIER_ENABLED,
+): Promise<Response> {
   const requestId = crypto.randomUUID();
   const url = new URL(request.url);
   const route = matchWorkerRoute(url.pathname);
+  const configuredAdminHostname = adminHostname(env);
+  const adminSurface = isAdminSurfacePath(url.pathname)
+    || configuredAdminHostname === url.hostname;
+  if (testMutationBarrierEnabled
+      && route.id === "health"
+      && request.method === "GET"
+      && !adminSurface) {
+    return migrationMutationBarrierHealthResponse(env);
+  }
+  // A migration-only source snapshot changes the constant in mutation-barrier.
+  // This return intentionally precedes redirect, admin identity, and every
+  // D1/R2/DO path. It fences new dynamic work but cannot prove an older
+  // already-admitted reader has finished.
+  if (mutationBarrierBlocksDynamicRequest(
+    route.id,
+    adminSurface,
+    testMutationBarrierEnabled,
+  )) {
+    return noStore(errorResponse(
+      new ApiError(503, MUTATION_BARRIER_ERROR_CODE),
+      requestId,
+    ));
+  }
   try {
     const canonicalRedirectUrl = canonicalPublicRedirectUrl(url, env);
     if (canonicalRedirectUrl !== null) {
@@ -3558,7 +3792,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // carry a verifiable Cf-Access-Jwt-Assertion (defense in depth beneath
     // the edge policy), and the public origin keeps its deliberate 404s.
     // Development environments pin no PUBLIC_ORIGIN and are unchanged.
-    const configuredAdminHostname = adminHostname(env);
     if (configuredAdminHostname !== null) {
       if (url.hostname === configuredAdminHostname) {
         // Authenticate + owner-pin ONCE, at the chokepoint, before the UI or
@@ -3576,23 +3809,48 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         const adminUi = adminUiResponse(request.method, url.pathname);
         if (adminUi !== null) return adminUi;
         if (route.kind === "exact" && route.id === "admin_overview") {
+          assertWorkerRouteMethod(request, route);
           return noStore(await handleAdminOverview(request, env, { identityKey }));
         }
         if (route.kind === "exact" && route.id === "admin_metrics_history") {
+          assertWorkerRouteMethod(request, route);
           return noStore(
             await handleAdminMetricsHistory(request, env, { identityKey }),
           );
         }
+        if (route.kind === "exact"
+          && route.id === "admin_community_allowance_preview") {
+          return noStore(
+            await handleAdminCommunityAllowancePreview(
+              request,
+              env,
+              { identityKey },
+            ),
+          );
+        }
         if (route.kind === "exact" && route.id === "admin_action") {
+          assertWorkerRouteMethod(request, route);
           return noStore(await handleAdminAction(request, env, { identityKey }));
+        }
+        if (route.kind === "exact" && route.id === "admin_reconstruction_progress") {
+          assertWorkerRouteMethod(request, route);
+          return noStore(await handleAdminReconstructionProgress(request, env, { identityKey }));
         }
       } else if (isAdminSurfacePath(url.pathname)
         || (route.kind === "exact"
           && (route.id === "admin_overview"
             || route.id === "admin_metrics_history"
+            || route.id === "admin_community_allowance_preview"
+            || route.id === "admin_reconstruction_progress"
             || route.id === "admin_action"))) {
         throw new ApiError(404, "NOT_FOUND");
       }
+    }
+    if (route.kind === "exact") {
+      // The reviewed registry is the common method envelope for every exact
+      // route. Handler-local checks remain defense in depth and may narrow a
+      // branch, but no undocumented method can reach one of them.
+      assertWorkerRouteMethod(request, route);
     }
     if (route.id === "ready") {
       return noStore(await handleReady(request, env));
@@ -3683,10 +3941,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           encryptedUpload: collectionControls.processing,
           serverValidation: true,
           idempotentDeduplication: true,
-          participantStats: true,
-          delayedAggregateStats: collectionControls.publication,
+          communityDaily: collectionControls.publication,
           participantExport: true,
-          participantDeletion: true,
+          participantDeletion: false,
           boundedQuarantineRetention: true,
           deletionSafeRestoreReplay: true,
           ongoingDeviceUploadRegistration:
@@ -3698,7 +3955,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (route.id === "unknown_api") throw new ApiError(404, "NOT_FOUND");
     if (route.id !== "asset") {
       const response = await routeApi(request, env, route.id);
-      return route.id === "community_stats" || route.id === "community_daily"
+      return route.id === "community_daily"
         ? response
         : noStore(response);
     }
@@ -3731,8 +3988,46 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }));
       return noStore(errorResponse(apiError, requestId));
     }
+    if ([
+      "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE",
+      "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE",
+      "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE",
+      "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE",
+      "ADMIN_RECONSTRUCTION_PROGRESS_UNAVAILABLE",
+    ].includes(apiError.code)) {
+      // Expected fail-closed state for read-only admin aggregates. Scheduled
+      // maintenance warms each cache; an interactive request never writes a
+      // cache, falls through to raw analysis, or persists a diagnostic row
+      // while waiting for it.
+      console.warn(JSON.stringify({
+        level: "warn",
+        event: "request_unavailable",
+        requestId,
+        method: request.method,
+        routeClass: route.routeClass,
+        code: apiError.code,
+        status: apiError.status,
+      }));
+      return noStore(errorResponse(apiError, requestId));
+    }
+    // A migration snapshot deliberately still serves ordinary public assets,
+    // but an asset-layer failure must not turn that permitted read into a D1
+    // diagnostic write while the mutation barrier is active.
+    if (testMutationBarrierEnabled && route.id === "asset") {
+      console.warn(JSON.stringify({
+        level: "warn",
+        event: "migration_barrier_static_asset_unavailable",
+        requestId,
+        method: request.method,
+        routeClass: route.routeClass,
+        code: apiError.code,
+        status: apiError.status,
+      }));
+      return noStore(errorResponse(apiError, requestId));
+    }
     const expectedContainment = [
       "COLLECTION_ENROLLMENT_DISABLED",
+      "ACCOUNTLESS_ENROLLMENT_DISABLED",
       "UPLOAD_REGISTRATION_DISABLED",
       "PROCESSING_DISABLED",
       "PUBLICATION_DISABLED",
@@ -3767,7 +4062,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 interface ScheduledMaintenanceLog {
   level: "info" | "error";
   event: "scheduled_backend_maintenance";
-  outcome: "success" | "failure";
+  outcome: "success" | "failure" | "skipped";
   code: string;
   lifecycleComplete: boolean;
   quarantineRetentionComplete: boolean;
@@ -3851,7 +4146,84 @@ async function ownsRenewedMaintenanceLease(
 export async function runScheduledMaintenance(
   env: Env,
   scheduledTime: number,
+  testMutationBarrierEnabled = MIGRATION_MUTATION_BARRIER_ENABLED,
 ): Promise<ScheduledMaintenanceLog> {
+  if (mutationBarrierSkipsScheduledMaintenance(testMutationBarrierEnabled)) {
+    const log: ScheduledMaintenanceLog = {
+      level: "info",
+      event: "scheduled_backend_maintenance",
+      outcome: "skipped",
+      code: MUTATION_BARRIER_ERROR_CODE,
+      lifecycleComplete: false,
+      quarantineRetentionComplete: false,
+      restoreReplayComplete: false,
+      quarantineReconciliationComplete: false,
+      expiredIdentityHandoffsPurged: 0,
+      expiredIdentityHandoffPurgeComplete: false,
+      expiredDeletionTombstonesPurged: 0,
+      deletionTombstonePurgeComplete: false,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged: 0,
+      primaryIdentityReenrollmentCooldownPurgeComplete: false,
+      expiredIdentityReenrollmentCooldownsPurged: 0,
+      identityReenrollmentCooldownPurgeComplete: false,
+      expiredSignInAdmissionsPurged: 0,
+      signInAdmissionPurgeComplete: false,
+      staleDevicePairingsRevoked: 0,
+      staleDeviceCredentialsRevoked: 0,
+      staleDeviceUploadAuthorizationsRevoked: 0,
+      expiredDeviceCredentialRotationsPurged: 0,
+      expiredDevicePairingEventsPurged: 0,
+      aggregateRebuildComplete: false,
+      publicationEnabled: null,
+    };
+    console.warn(JSON.stringify(log));
+    return log;
+  }
+  const reconstructionMode = allowanceReconstructionMode(env);
+  const queryMeter = createD1InvocationBudget();
+  queryMeter.reserveQueries = 1;
+  const originalEnv = env;
+  env = new Proxy(originalEnv, { get(target, property) {
+    if (property === "USAGE_MONITOR_DB") return queryMeter.wrap(target.USAGE_MONITOR_DB);
+    if (property === "DELETION_LEDGER") return queryMeter.wrap(target.DELETION_LEDGER);
+    return Reflect.get(target, property);
+  } });
+  const maintenanceStartedMs = Date.now();
+  const optionalDeadlineMs = maintenanceStartedMs + 40_000;
+  const phaseTiming = () => {
+    const nowMs = Date.now();
+    return { queriesUsed: queryMeter.queriesUsed,
+      elapsedMs: Math.max(0, nowMs - maintenanceStartedMs),
+      deadlineRemainingMs: Math.max(0, optionalDeadlineMs - nowMs) };
+  };
+  const attemptedMetricCaches = new Set<string>();
+  const warmOwnerMetricCaches = async (phase: "before_analysis" | "after_analysis") => {
+    // These scheduled-only helpers retain their 55-minute self-throttle. A
+    // browser never rebuilds them; at most one attempt per cache per invocation.
+    for (const task of [
+      { event: "admin_metrics_snapshot", current: "SNAPSHOT_CURRENT", unavailable: "SNAPSHOT_UNAVAILABLE", run: captureAdminMetricSnapshot },
+      { event: "admin_metrics_history_cache", current: "HISTORY_CACHE_CURRENT", unavailable: "HISTORY_CACHE_UNAVAILABLE", run: warmAdminMetricsHistoryCache },
+    ]) {
+      if (attemptedMetricCaches.has(task.event)) continue;
+      if (queryMeter.remainingQueries < 40 || Date.now() >= optionalDeadlineMs) {
+        console.log(JSON.stringify({level:"info",event:task.event,phase,outcome:"deferred",
+          code:"OWNER_METRICS_BUDGET_DEFERRED",...phaseTiming()}));
+        continue;
+      }
+      attemptedMetricCaches.add(task.event);
+      const startedQueries = queryMeter.queriesUsed;
+      let code = task.unavailable;
+      try { code = (await task.run(env.USAGE_MONITOR_DB, Date.now())).code; }
+      catch { /* Keep prior cache; diagnostics cannot undo required work. */ }
+      if (code === task.current) continue;
+      const unavailable = code === task.unavailable;
+      const log = {level:unavailable ? "warn" : "info",event:task.event,phase,
+        outcome:unavailable ? "failure" : "success",code,
+        phaseQueries:queryMeter.queriesUsed-startedQueries,...phaseTiming()};
+      if (unavailable) console.warn(JSON.stringify(log));
+      else console.log(JSON.stringify(log));
+    }
+  };
   let lifecycleComplete = false;
   let quarantineRetentionComplete = false;
   let restoreReplayComplete = false;
@@ -3912,52 +4284,9 @@ export async function runScheduledMaintenance(
     const ownedMaintenanceLease = maintenanceLease;
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     await pruneDiagnosticErrors(env.USAGE_MONITOR_DB);
-    // Distribution snapshots are independent owner diagnostics. A transient
-    // GitHub failure must be recorded for the admin view but must never block
-    // deletion retention, object reconciliation, or community publication.
-    try {
-      const distributionSync = await syncGithubDistributionSnapshots(
-        env.USAGE_MONITOR_DB,
-        {
-          enabled: env.ENVIRONMENT === "production",
-          githubApiToken: Reflect.get(env, "DISTRIBUTION_GITHUB_API_TOKEN"),
-        },
-        Date.now(),
-      );
-      if (distributionSync.code === "GITHUB_SYNC_FAILED") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "github_distribution_sync",
-          outcome: "failure",
-          code: distributionSync.failureCode,
-        }));
-      }
-    } catch {
-      // The regular maintenance work below remains authoritative. The next
-      // overview will surface a snapshot-storage failure as source-unavailable.
-    }
-    // Hourly gauge snapshots for the owner metrics history. Same isolation
-    // contract as the distribution sync: an unavailable snapshot store (or an
-    // unapplied migration 0038) must never block retention, reconciliation,
-    // or publication. The capture self-throttles to hourly and never throws.
-    try {
-      const snapshot = await captureAdminMetricSnapshot(
-        env.USAGE_MONITOR_DB,
-        Date.now(),
-      );
-      if (snapshot.code === "SNAPSHOT_UNAVAILABLE") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "admin_metric_snapshot",
-          outcome: "failure",
-          code: snapshot.code,
-        }));
-      }
-    } catch {
-      // captureAdminMetricSnapshot reports rather than throws; this guard
-      // exists so no future edit can turn a metrics failure into a
-      // maintenance failure.
-    }
+    // Required lifecycle work runs before optional analytics and diagnostics.
+    // Catching a memory/time failure after the fact cannot protect work that
+    // never got a chance to execute.
     const handoffPurge = await purgeExpiredIdentityHandoffs(
       env.USAGE_MONITOR_DB,
       // A delayed Cron invocation must still clear handoffs that have expired
@@ -4020,6 +4349,18 @@ export async function runScheduledMaintenance(
     lifecycleComplete = quarantineRetentionComplete
       && restoreReplayComplete;
 
+    // Raw retention revokes derived days immediately via triggers. Drain their
+    // private projections independently of publication/reconstruction switches,
+    // with the same actual-statement meter and lease-release headroom.
+    if (queryMeter.remainingQueries >= 14 && await env.USAGE_MONITOR_DB.prepare(
+      "SELECT 1 AS present FROM sqlite_schema WHERE type='table' AND name='community_prepared_source_days'",
+    ).first<{ present: number }>()) {
+      const retirement = await retireV1PreparedEvidence(env.USAGE_MONITOR_DB,
+        { maxPages: 2, deadlineMs: Date.now() + 5_000 });
+      if (retirement.pagesRun > 0) console.log(JSON.stringify({ level: "info", event: "prepared_evidence_retirement",
+        outcome: retirement.status, pages: retirement.pagesRun, queries: retirement.queriesUsed }));
+    }
+
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const reconciliation = await reconcilePendingQuarantineObjects(
       env.USAGE_MONITOR_DB,
@@ -4052,17 +4393,147 @@ export async function runScheduledMaintenance(
         env.USAGE_MONITOR_DB,
         scheduledTime,
       );
-      await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
-      const dailyRebuild = await rebuildPendingCommunityDailyAggregates(
-        env.USAGE_MONITOR_DB,
-        scheduledTime,
-      );
-      rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+      if (reconstructionMode !== "paused") {
+        queryMeter.reserveQueries = 12;
+        try {
+          await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+          if (reconstructionMode === "resumable") {
+            // Budget admissions refresh from actual queries used. Helpers share
+            // their conservative allocation within each phase, while this one
+            // meter enforces the sum across both bindings and ALL phases.
+            const phaseBudget = () => ({ remainingQueries: Math.max(0, queryMeter.remainingQueries), deadlineMs: optionalDeadlineMs });
+            const rebuildModelHistory = async (phase: "before_analysis" | "after_publication") => {
+              const startedQueries = queryMeter.queriesUsed, startedMs = Date.now();
+              const timing = () => ({phaseQueries:queryMeter.queriesUsed-startedQueries,
+                phaseElapsedMs:Math.max(0,Date.now()-startedMs),...phaseTiming()});
+              const deadlineReached = Date.now() >= optionalDeadlineMs;
+              if (deadlineReached || queryMeter.remainingQueries < 64) {
+                console.log(JSON.stringify({level:"info",event:"scheduled_model_history",phase,outcome:"deferred",
+                  code:deadlineReached ? "MODEL_HISTORY_DEADLINE_DEFERRED" : "MODEL_HISTORY_BUDGET_DEFERRED",
+                  ...timing()}));
+                return;
+              }
+              try {
+                const history = await warmCommunityModelHistory(env.USAGE_MONITOR_DB, scheduledTime,
+                  {meter:queryMeter,deadlineMs:optionalDeadlineMs,maintenanceLease:ownedMaintenanceLease});
+                console.log(JSON.stringify({level:"info",event:"scheduled_model_history",phase,outcome:history.status,
+                  code:"BOUNDED_MODEL_HISTORY_PROGRESS",day:history.day,
+                  resolvedAccounts:history.resolvedAccounts,requiredAccounts:history.requiredAccounts,
+                  publishedDays:history.publishedDays,...timing()}));
+              } catch (error) {
+                console.warn(JSON.stringify({level:"warn",event:"scheduled_model_history",phase,outcome:"deferred",
+                  code:error instanceof D1InvocationBudgetExceededError ? error.code : "MODEL_HISTORY_UNAVAILABLE",
+                  ...timing()}));
+              }
+            };
+            const publishPreview = async (phase: "before_analysis" | "after_analysis") => {
+              const startedQueries = queryMeter.queriesUsed;
+              const result = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime,
+                {mode:"cache-only",budget:phaseBudget()});
+              if (result.code !== "ALLOWANCE_PREVIEW_CACHE_CURRENT") {
+                const unavailable = result.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE";
+                const log = {level:unavailable ? "warn" : "info",event:"admin_allowance_preview_cache",phase,
+                  outcome:unavailable ? phase === "before_analysis" ? "deferred" : "failure" : "success",
+                  code:result.code,phaseQueries:queryMeter.queriesUsed-startedQueries,...phaseTiming()};
+                if (unavailable) console.warn(JSON.stringify(log));
+                else console.log(JSON.stringify(log));
+              }
+              return result;
+            };
+            // Rotate first use of the same optional budget across previews,
+            // current accounts and historical models. History must sometimes
+            // precede the current probes/daily publisher so its non-resumable
+            // finish can be admitted. Required lifecycle work stays above every
+            // slot; no lane gains a separate deadline or runs in parallel.
+            const optionalPriority = Math.floor(scheduledTime / 60_000) % COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES;
+            const historyFirst = optionalPriority === COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES - 1;
+            if (historyFirst) await rebuildModelHistory("before_analysis");
+            const priorPreview = optionalPriority === 0
+              ? await publishPreview("before_analysis")
+              : null;
+            // The independent growth-history cache has the same expiry risk.
+            // Give it an early chance only on preview-first passes, retaining
+            // the current/history-first budgets and the late fallback.
+            if (priorPreview !== null) await warmOwnerMetricCaches("before_analysis");
+            try {
+              if (queryMeter.remainingQueries >= 249 && Date.now() < optionalDeadlineMs) {
+              let backfill = await backfillV1QuotaFitProjection(env.USAGE_MONITOR_DB);
+              // Fill the cheap lookup progressively without spending one minute
+              // per tiny batch. Every helper call remains <=49 statements and
+              // <=4096 physical rows/page; the actual shared meter bounds the sum.
+              for (let pass=1;pass<8 && backfill.status!=="complete"
+                && queryMeter.remainingQueries>=249 && Date.now()<optionalDeadlineMs;pass++) {
+                backfill=await backfillV1QuotaFitProjection(env.USAGE_MONITOR_DB);
+              }
+              if (backfill.status === "complete" && queryMeter.remainingQueries >= 50) {
+                const warming = await warmCommunityAnalysisCaches(env.USAGE_MONITOR_DB, scheduledTime,
+                  {meter:queryMeter,deadlineMs:optionalDeadlineMs,maintenanceLease});
+                console.log(JSON.stringify({level:"info",event:"scheduled_allowance_reconstruction",outcome:warming.status,
+                  code:"BOUNDED_ANALYSIS_PROGRESS",visited:warming.visited,published:warming.published,
+                  resumed:warming.resumed,...phaseTiming()}));
+              }
+              }
+            } catch (error) {
+              // A stale/corrupt account or unavailable lookup must not prevent
+              // publishing other already-complete evidence or new activity.
+              console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
+                stage:"analysis",code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+                ...phaseTiming()}));
+            }
+            if (priorPreview === null || priorPreview.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
+              await publishPreview("after_analysis");
+            }
+            const dailyStartedQueries = queryMeter.queriesUsed;
+            const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
+              24, undefined, {mode:"cache-only",budget:phaseBudget()});
+            console.log(JSON.stringify({level:"info",event:"scheduled_daily_publication",
+              outcome:dailyRebuild.deferred ? "deferred" : "complete",code:"BOUNDED_DAILY_PUBLICATION_PROGRESS",
+              processed:dailyRebuild.processed,remaining:dailyRebuild.remaining,
+              phaseQueries:queryMeter.queriesUsed-dailyStartedQueries,...phaseTiming()}));
+            if (dailyRebuild.deferred && queryMeter.remainingQueries >= 100 && Date.now() < optionalDeadlineMs) {
+              await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
+                4, undefined, {mode:"activity-only",budget:phaseBudget()});
+            }
+            rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+            // Use spare resources in the other slots, but never retry an early
+            // history attempt in this invocation, including after a failure.
+            if (!historyFirst) await rebuildModelHistory("after_publication");
+          } else {
+            const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime);
+            rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+            const allowanceCache = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime);
+            if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
+              console.warn(JSON.stringify({level:"warn",event:"admin_allowance_preview_cache",outcome:"failure",code:allowanceCache.code}));
+            }
+          }
+        } catch (error) {
+          // Optional reconstruction cannot undo successful essential maintenance.
+          // All incomplete work/cache/publication writes are independently fenced.
+          console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
+            code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+            queriesUsed:queryMeter.queriesUsed}));
+        }
+      } else {
+        console.log(JSON.stringify({level:"info",event:"scheduled_allowance_reconstruction",outcome:"paused",
+          code:"ALLOWANCE_RECONSTRUCTION_PAUSED"}));
+      }
     } else {
-      rebuildComplete = await aggregateRebuildComplete(
+      rebuildComplete = reconstructionMode !== "paused" && await aggregateRebuildComplete(
         env.USAGE_MONITOR_DB,
       );
     }
+
+    // Independent owner diagnostics retain their cadence and failure isolation,
+    // but no longer precede deletion, retention, or source reconciliation.
+    queryMeter.reserveQueries = 1;
+    if (queryMeter.remainingQueries >= 40 && Date.now() < optionalDeadlineMs) {
+      try {
+        const sync = await syncGithubDistributionSnapshots(env.USAGE_MONITOR_DB,
+          {enabled:env.ENVIRONMENT === "production",githubApiToken:Reflect.get(env,"DISTRIBUTION_GITHUB_API_TOKEN")}, Date.now());
+        if (sync.code === "GITHUB_SYNC_FAILED") console.warn(JSON.stringify({level:"warn",event:"github_distribution_sync",outcome:"failure",code:sync.failureCode}));
+      } catch { /* Optional diagnostics never block maintenance. */ }
+    }
+    await warmOwnerMetricCaches("after_analysis");
 
     const complete = lifecycleComplete
       && quarantineReconciliationComplete
@@ -4132,6 +4603,7 @@ export async function runScheduledMaintenance(
     console.error(JSON.stringify(log));
     throw error;
   } finally {
+    queryMeter.reserveQueries = 0;
     if (maintenanceLease !== null) {
       try {
         // A successor may have acquired an expired lease while this pass was

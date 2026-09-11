@@ -1,0 +1,340 @@
+---
+title: User guide
+date: 2026-09-07
+type: guide
+status: maintained
+---
+
+# TiboTattle user guide
+
+TiboTattle is a local-first macOS companion for understanding AI-tool usage,
+cost, quota windows, and trends. Local analysis works without an account and
+keeps session content on this Mac. Optional community contribution is a separate,
+content-free, consented feature.
+
+Current support is macOS 14 or later on Apple silicon and Intel. Windows and Linux are not
+supported; see [platform support](./reference/platform-support.md).
+
+## Install and first launch
+
+With [Homebrew](https://brew.sh/) installed, use the same command on either Mac
+architecture; the cask selects the matching signed, notarized installer:
+
+```bash
+brew install --cask adamallcock/tap/tibotattle
+```
+
+Alternatively, choose the Apple silicon or Intel download at
+[tibotattle.com](https://tibotattle.com/#download) or the
+[latest GitHub release](https://github.com/adamallcock/tibotattle/releases/latest).
+**Apple menu → About This Mac** shows whether your Mac has an Apple chip or an
+Intel processor. Open the matching DMG and drag TiboTattle to Applications.
+For checksum and artifact checks, follow [verify-release.md](./verify-release.md).
+
+Launch TiboTattle from Applications. The app bundles its runtime; Node.js, pnpm,
+and Xcode are needed only for development, not for installing or using the app.
+
+On first launch, the app explains which local sources it may inspect. Those are
+the selected OpenAI Codex session and archived-session directories, the Codex
+state database, display-name index and local configuration, and content-free account, quota, and
+usage projections from the installed Codex app-server. The shipping refresh
+does not read Claude or Gemini sources. TiboTattle derives usage/accounting
+metadata; it does not upload prompts, responses, commands, filenames,
+credentials, or raw session content.
+
+The first index can take time on a large history. Keep the app open until the
+foreground progress completes. Loading, unavailable, stale, or unattributed
+states are meaningful; TiboTattle does not replace missing evidence with zero.
+
+## Reading the dashboard
+
+- **Overview and trends** summarize locally derived activity and quota evidence.
+- **Usage and costs** use the repository’s accounting/pricing contracts. A cost
+  estimate is not a provider bill.
+- **Quota or allowance views** use provider-reported observations where
+  available. Unknown plan, reset, or coverage stays explicit.
+- **Source coverage** tells you which local inputs were available. A missing
+  source is not “no usage.”
+
+Display windows do not delete older local history. The dashboard may show a
+shorter horizon while the local index retains the evidence needed for replay,
+corrections, and longer-term views.
+
+When local history contains more than one plan, **Allowance** separates the
+plans instead of averaging Plus and Pro reset estimates together. The plan
+selector keeps the headline, history, range, pace and share card on the same
+selected population. The newest observed plan is selected even if it does not
+yet have enough usable evidence; older-plan estimates remain selectable rather
+than being presented as the current plan's allowance.
+
+These historical estimates are conditional on the locally observed plan, not
+proof of which provider account generated every token. Known plan switches and
+ambiguous boundary quantities are excluded narrowly; coherent older history is
+still useful. **Usage and costs** continues to retain all-plan accounting totals.
+Community chart lines and headline values retain their common Pro 20x-equivalent
+scale. In By plan, the smaller card value shows that plan's own weekly allowance
+at API prices: divide the headline by 1 for Pro 20x, 4 for Pro 5x, or 20 for Plus.
+This is an estimated API value, not the subscription price, and does not authorize
+mixing personal Plus and Pro allowance histories.
+
+Switching and cache-drop overheads estimate the API-equivalent premium in
+observed comparisons, not a proven cause or a bill. A labelled covered subtotal
+includes only comparisons with usable ordering and prices. Sessions whose
+request order cannot be proven, and comparisons without prices, remain excluded
+and disclosed; that subtotal is not the whole-period total or a percentage of
+your allowance. A subtotal with no priceable comparisons stays unavailable,
+not a zero-valued placeholder.
+
+The **Thread name** column in both recent cache-drop tables opens the associated
+Codex thread. A worker row shows a parent-name link and a separate bracketed
+subworker link. Hover a link for the local event time; keyboard users receive
+the same time in its accessible description. If a name is missing, the link
+uses a shortened thread ID. If attribution cannot be proven, it stays unlinked.
+Names are looked up locally and are not included in reports, share cards,
+diagnostics, or community contributions.
+
+## Model performance in development source
+
+Open **Model performance** from the dashboard sidebar, then choose a model
+and **7 days**, **30 days**, or **All time**. The web and native navigation
+include this page in development source; an installed release must contain
+these changes before the page is available there.
+
+**Output speed** estimates tokens per second from covered response windows.
+**First-token latency** uses independently available turn timing, so its sample
+count can be much larger. The plots show median trends and middle-50% bands
+where enough observations exist. Newer and older timing methods stay separate;
+missing timing is unavailable, never zero.
+
+Sweep horizontally anywhere in a chart to inspect the same date in both metrics.
+Use arrow keys after focusing a chart point, or Escape to dismiss the tooltip.
+Empty dates explicitly show no measurements. Expand **About these measurements**
+for interpretation and coverage.
+
+These diagnostics cover Codex files on this device across accounts. Tool waits
+are excluded from matched output windows, but the estimate is not a provider
+benchmark or a billing measure. All reasoning efforts remain included. Opening
+the page collects timing in bounded background passes; saved data can appear
+before collection finishes. Leaving the page lets the worker stop, and a later
+visit resumes progress. Timing failures do not block usage accounting.
+
+## Customize the menu bar and popup
+
+Tray customization is implemented in the development source; the published
+0.1.18 app does not gain these controls until an update containing them ships.
+Open **Customize menu bar…** from the native popup's More menu or General
+Settings. Electron's Settings includes the corresponding **Menu bar** or
+**Tray** controls and the popup opens the same page.
+
+Choose 5-hour remaining, 7-day remaining, both, or icon only. The `5h` and `7d`
+labels keep the windows distinguishable. Single-window meters follow that
+window; both and icon-only modes let you choose the meter's window. A plain
+app icon and a two-meter option are also available. With two meters, the top
+is 5-hour and the bottom is 7-day. Unknown evidence is outlined, not zero.
+
+For one window, you can show remaining allowance, reset time, or both. Reset
+format is shared with the popup: countdown or local clock time. Both-window
+mode keeps just the two remaining percentages to limit width. Windows and
+Linux use their supported icon, tooltip and popup surfaces rather than macOS
+text beside the icon; this does not change their platform qualification status.
+
+Show, hide and reorder Allowances, Weekly pace, Local usage and Cache reuse.
+Select a 7-day or 30-day popup history range, comfortable or compact spacing,
+and which totals to display: tokens, API-equivalent cost and usage changes.
+You can hide the usage chart; keep either a chart or a total when Local usage
+is enabled. The header, status and essential actions always remain available.
+
+Cache reuse uses the dashboard's comparable-follow-up denominator: the share
+that reused more than half of the previous cached input. It is not the share
+of all tokens that were cached. No comparable follow-ups produces an explicit
+empty state. Incomplete coverage and retained historical data remain labeled.
+API-equivalent cost is a reference estimate, not a subscription charge.
+
+**Emphasize low allowance** is an optional visual cue, off by default. It starts
+at 10% remaining, clears after recovery to 12%, and never sends a notification
+or changes the selected metric. Stale or reset evidence clears that cue.
+
+Changes apply immediately and survive relaunch. The preview uses labeled
+example data, including missing and stale states. **Undo** reverses the last
+customization; **Restore defaults** resets only tray preferences. Existing
+users retain their prior primary-window behavior until they choose a preset.
+New installations default to 7-day remaining with a 7-day meter.
+
+Refreshing preserves valid values while they remain current. An unavailable
+window shows a dash in its own slot and never borrows the other window's value.
+Changing presentation does not change collection, notifications, contribution,
+or dashboard filters. A save failure leaves the previous selection in use;
+settings written by a newer app are preserved rather than overwritten.
+
+## Projects and threads (development build)
+
+The development branch includes **Projects & threads** in the dashboard sidebar.
+Expand a repository to see named tasks and their grouped subworkers, then expand
+a task for model and contributor details. Worktrees share a repository group;
+folders with no identifiable repository appear under **Non-project tasks**.
+Missing source context remains **Unassigned**.
+
+Open **Projects & threads** in the dashboard sidebar, or choose
+**View → Projects and Threads** in the Electron desktop app.
+
+Search by project or task name, including subworker names, or paste a complete
+thread ID or Codex link. Name search covers the full report before pagination.
+A matching subworker brings back its task family; a matching project includes
+all its tasks. Search result rows show matching work, while summary totals,
+token mix and share denominators retain the selected period/model scope.
+Results update as you type after two characters and a short pause (300 ms).
+Deleting the text or shortening it below two characters restores the project
+list automatically. Names and search terms stay local.
+
+Small bars beside token and cost shares show their relative size. The token-mix
+strip separates cached and uncached input from recorded output categories;
+combined output stays combined when no split was recorded. Numeric labels remain
+available alongside the graphics. Model rows reuse the app's decorative icons.
+
+Choose a period and model to compare token and API-equivalent shares. These are
+estimates of recorded usage, not subscription charges or quota shares. Omitted
+cache-write counts use the explicitly approved zero assumption when the remaining
+input counters support it; **Includes assumed counts** distinguishes them from
+observed values. Other missing counts remain labelled partial.
+
+**Refresh report** updates this view from the existing local index. Use the app's
+main **Refresh** to collect new usage first. Each report displays its own as-of
+time; opening another section does not rewrite an existing report's snapshot.
+While Projects & threads is visible, a lightweight keep-alive preserves its
+cached report without recalculating usage. Reports may be released after five
+minutes away from the page; returning automatically rebuilds an expired report.
+A fresh refresh can still require accounting work when the underlying cache
+is no longer valid.
+This feature is qualified in a local development build and has not been released.
+
+## Refresh, progress, and recovery
+
+Use **Refresh** (or Cmd-R in the native app) to update quota, retained history,
+and detailed Usage-and-costs and Trends evidence together. A valid
+generation-bound accounting cache is reused; a changed generation is
+recalculated. There is no separate detailed-accounting button. The app keeps
+verified prior figures visible, with their current freshness state, while work
+is in progress. If another refresh is already running, the shared controller
+keeps that single operation authoritative. Native controls follow its progress;
+the browser shows an informational notice without starting a second operation.
+
+Startup and frequent automatic quota checks stay light. While the app remains
+open it may make one automatic detailed attempt after an hour. Failed,
+cancelled, and interrupted detailed attempts count toward that hour so they do
+not become a retry loop. After an already-running quick quota check finishes,
+you can choose Refresh again to request detailed work.
+
+Trends compares the selected plan's compatible usage and quota history. Earlier
+history on another plan does not disable a usable current-plan fit, and it is
+not borrowed into that fit. Ambiguous intervals and plan transitions remain
+gaps. Unresolved speed uses the labelled Standard scenario, without pretending
+that Standard speed was observed. During refresh, its last compatible plan-specific
+history stays visible with the retained calibration. Expanded model/speed details
+for unchanged periods stay open and keep their last successful result while
+updated details load; temporary lookup failures do not erase that result.
+
+Do not repeatedly relaunch during a detailed pass; that can make progress appear
+to restart even when source data is intact.
+
+During an explicit or hourly detailed pass, **Calculating accounting…** means
+the app is calculating and preparing the updated dashboard. It replaces the
+file counter: a small number of changed files does not mean all the unchanged
+files are being read again. Only the terminal refresh status establishes
+completion.
+
+If the dashboard stays blank or reports a schema/index error:
+
+1. Record the exact message and app version.
+2. Quit and reopen once, then allow a complete refresh.
+3. Do not delete Application Support, the unified index, source histories, or
+   Keychain items as a troubleshooting shortcut.
+4. Follow [SUPPORT.md](../SUPPORT.md) and share only sanitized diagnostics.
+
+If the report is visible but the Overview, Usage, Trends, and Community sidebar
+has disappeared, use the narrowly scoped
+[collapsed-sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md).
+That procedure resets only the persisted window geometry for published 0.1.16
+and earlier builds; it does not remove usage history, credentials, or settings.
+
+Maintainers use the preservation-first
+[unified-index recovery runbook](./runbooks/unified-index-recovery.md). Recovery
+is performed against a copy before replacing durable state.
+
+### Secure upgrade
+
+In builds with the [native migration change](./decisions/2026-08-31-silent-keychain-migration.md),
+TiboTattle first tries to preserve older saved keys silently, up to three times.
+If it cannot finish, **Secure upgrade** appears quietly in **Settings… →
+General**. Choose **Review migration…** when ready. The explanation tells you
+why access is needed before **Approve migration** can open a macOS Keychain
+dialog. Enter a password only in that macOS dialog; TiboTattle does not receive
+it. Cancel leaves migration pending, and approval changes neither key values
+nor contribution consent. Do not reset keys or delete local history to resolve
+this state. The linked decision records qualification; this is not a claim
+that an older installed app already has the new flow.
+
+## Optional community contribution
+
+Community participation requires sign-in and explicit consent. Before the first
+upload, TiboTattle presents the derived, allowlisted contribution. Contributions
+are pseudonymous and omit session content; pseudonymous does not mean anonymous.
+
+A staged successor contribution format can add account/plan attribution only
+after a separate field review and explicit new consent, and only if the hosted
+service enables that format. Existing consent is not upgraded automatically.
+Its pseudonyms can link observations within an enrollment/destination; they
+never include raw provider account identifiers. Interrupted replacement uploads
+remain staged while the previous complete hosted history stays selected.
+Missing identity proof does not erase local usage or imply zero usage.
+
+Re-pairing or renewing this Mac's contribution credential pauses delivery while
+the credential changes. If completion cannot be verified, delivery stays paused
+and the app offers device repair; an ordinary refresh cannot bypass that pause.
+Local usage analysis and previously contributed history remain available.
+
+Signing in, pairing a device, local indexing, successful upload, aggregate
+publication, and device disconnect are separate states. Keep the app’s
+displayed state or sanitized error if support is needed.
+
+### Stop sharing from this Mac
+
+Choose **Disconnect this Mac** and review the confirmation. Confirming revokes
+this Mac's hosted contribution authority, clears its local device credential
+and binding, and pauses delivery. It preserves previously contributed hosted
+history, other devices, and local analysis. Signing out only ends the browser
+session; it is not device disconnect.
+
+Self-service hosted deletion is retired under the
+[2026-08-30 source decision](./decisions/2026-08-30-self-service-deletion-retirement.md).
+Private hosted erasure is a separate maintainer operation, not a dashboard
+control. See [support and privacy-request boundaries](../SUPPORT.md#hosted-history-and-privacy-requests).
+This documents the source change, not a deployed-service or installed-release
+update; an older app may still show an old deletion control. A failed request
+is not evidence that any history was erased.
+
+## Privacy, local data, and uninstall
+
+The exact maintained inventory of local reads, local stores, Keychain use,
+network destinations, hosted retention, deletion, and uninstall residue is in
+[local-data-and-privacy.md](./reference/local-data-and-privacy.md). The public
+privacy notice is at `https://tibotattle.com/privacy.html`.
+
+Uninstalling the app bundle does not imply that accumulated local indexes,
+preferences, logs, or Keychain items were erased. That separation prevents an
+ordinary application replacement from destroying history. Use documented
+local erase, identity-reset, and device-disconnect controls only for their
+separate effects. None erases hosted history; private owner erasure is separate.
+Follow the support guide for intentional cleanup and never remove broad
+Application Support or Keychain locations blindly.
+
+## Updates and help
+
+Stable builds check the signed Sparkle feed at
+`https://updates.tibotattle.com/appcast.xml`. A temporary network failure should
+leave the installed app usable; it does not prove an update exists or failed to
+publish. Verify the current release independently if an update looks stale.
+
+For bugs, diagnostics, privacy questions, and security reporting, start at
+[SUPPORT.md](../SUPPORT.md). Security-sensitive reports follow
+[SECURITY.md](../SECURITY.md). Do not attach raw session files, databases,
+credentials, account identifiers, or private screenshots to a public issue.

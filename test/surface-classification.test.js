@@ -38,6 +38,29 @@ test("classifies structured IDE, CLI, and local-interactive metadata conservativ
   assert.equal(classifySessionSurface(null).threadSource, "unknown");
 });
 
+test("Codex 0.149.1 custom thread sources remain safe until their semantics are reviewed", () => {
+  assert.deepEqual(classifySessionSurface({
+    source: "exec",
+    thread_source: "automated_review",
+  }), {
+    schemaVersion: "0.1",
+    threadSource: "unknown",
+    surface: "cli_exec",
+    agentScope: "unknown",
+    lineageDisposition: "standalone",
+  });
+
+  assert.deepEqual(classifySessionSurface({
+    thread_source: "memory_consolidation",
+  }), {
+    schemaVersion: "0.1",
+    threadSource: "unknown",
+    surface: "local_rollout_unclassified",
+    agentScope: "unknown",
+    lineageDisposition: "standalone",
+  });
+});
+
 test("never serializes private source, identifier, path, title, or nested metadata", () => {
   const privateValues = [
     "private-source-token-511",

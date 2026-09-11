@@ -288,6 +288,37 @@ export async function insertTelemetryV1Chunk(
 ): Promise<{ acceptedRecords: number }> {
   const { chunk } = insert;
   const statements: D1PreparedStatement[] = [];
+  // Scoped preservation is not an authorization bypass: the normal admission
+  // triggers still validate and consume the upload. This marker only separates
+  // an accepted contribution/correction from revocation of published evidence.
+  // Both supersession and insertion consume the exact marker within this batch.
+  statements.push(db.prepare(`INSERT INTO community_graph_update_scope
+    (singleton,participant_id,device_id,stream,chunk_day,chunk_seq,old_chunk_id,new_chunk_id,
+      new_revision,chunk_digest,parser_version,record_count,authorization_id,envelope_digest,created_at,expected_epoch,phase)
+    SELECT 1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,s.mutation_epoch,?15
+    FROM community_snapshot_mutation_control s
+    JOIN participants p ON p.id=?1 AND p.state='active'
+    JOIN device_credentials d ON d.id=?2 AND d.participant_id=p.id AND d.state='active'
+      AND d.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    JOIN device_upload_authorizations a ON a.id=?12 AND a.participant_id=p.id
+      AND a.issued_by_device_id=d.id AND a.state='consuming' AND a.envelope_digest=?13
+      AND a.consume_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    JOIN telemetry_v1_device_consents consent ON consent.participant_id=p.id AND consent.device_id=d.id
+      AND consent.telemetry_schema_version=?16 AND consent.field_dictionary_version=?17
+      AND consent.privacy_contract_version=?18
+    WHERE s.singleton_id=1
+      AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads WHERE participant_id=p.id)
+      AND NOT EXISTS (SELECT 1 FROM telemetry_contributions WHERE participant_id=p.id AND status='accepted')
+      AND ((?6 IS NULL AND NOT EXISTS (SELECT 1 FROM telemetry_v1_chunks c
+        WHERE c.participant_id=?1 AND c.device_id=?2 AND c.stream=?3 AND c.chunk_day=?4 AND c.chunk_seq=?5))
+      OR EXISTS (SELECT 1 FROM telemetry_v1_chunks c
+        WHERE c.id=?6 AND c.participant_id=?1 AND c.device_id=?2 AND c.stream=?3 AND c.chunk_day=?4
+          AND c.chunk_seq=?5 AND c.revision=?8-1 AND c.superseded_at IS NULL))`)
+    .bind(insert.participantId, insert.deviceId, chunk.stream, chunk.chunkDay, chunk.chunkSeq,
+      insert.supersedes?.id ?? null, insert.chunkRowId, chunk.chunkRevision, chunk.chunkDigest,
+      chunk.parserVersion, chunk.records.length, insert.deviceUploadAuthorizationId, insert.envelopeDigest,
+      insert.createdAt, insert.supersedes ? "supersede" : "insert", TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+      TELEMETRY_V1_FIELD_DICTIONARY_VERSION, TELEMETRY_V1_PRIVACY_CONTRACT_VERSION));
   // The prior revision leaves the current view before the new revision
   // enters it: the partial current-identity uniqueness would otherwise see
   // two current rows for one chunk mid-batch. The batch is one transaction,
@@ -309,7 +340,7 @@ export async function insertTelemetryV1Chunk(
       revision, chunk_digest, envelope_digest, parser_version,
       record_count, accepted_record_count, r2_key,
       device_upload_authorization_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
   ).bind(
     insert.chunkRowId,
     insert.participantId,
@@ -337,13 +368,17 @@ export async function insertTelemetryV1Chunk(
       record,
     ));
   }
+  statements.push(db.prepare("DELETE FROM community_graph_update_scope WHERE new_chunk_id = ?")
+    .bind(insert.chunkRowId));
   let results: D1Result<unknown>[];
   try {
     results = await db.batch(statements);
   } catch (error) {
     throw mapTelemetryV1BatchError(error);
   }
-  if ((results[chunkStatementIndex]?.meta.changes ?? 0) < 1) {
+  const inserted = results[chunkStatementIndex]?.results;
+  if (inserted?.length !== 1 || typeof inserted[0] !== "object" || inserted[0] === null
+      || Reflect.get(inserted[0], "id") !== insert.chunkRowId) {
     throw new ApiError(409, "PARTICIPANT_DELETING");
   }
   return { acceptedRecords: chunk.records.length };

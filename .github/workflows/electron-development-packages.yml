@@ -1,0 +1,705 @@
+name: Electron four-target development packages
+run-name: Electron ${{ inputs.qualification || 'full' }} checks (${{ github.ref_name }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      qualification:
+        description: Full qualification or an independent diagnostic runtime lane
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - windows-runtime
+          - linux-runtime
+          - native-runtime
+  push:
+    branches:
+      - codex/unified-desktop-accountless
+
+permissions:
+  contents: read
+
+concurrency:
+  group: electron-development-packages-${{ github.ref }}-${{ inputs.qualification || 'full' }}
+  cancel-in-progress: false
+
+jobs:
+  darwin-arm64:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full'
+    name: darwin-arm64 unsigned development packages
+    runs-on: macos-26
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: arm64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='arm64')process.exit(1)"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Validate packaging contracts
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
+      - name: Validate macOS startup, signing-order and final metadata without credentials
+        run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js apps/electron/test/desktop-macos-keychain.test.mjs
+      - name: Build and verify development distributions
+        run: node scripts/package-electron-development.mjs --target darwin-arm64 --format distribution --replace-staging
+      - name: Retain verified development packages and receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-darwin-arm64-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/darwin-arm64/distribution/
+          if-no-files-found: error
+          retention-days: 14
+
+  darwin-x64:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full'
+    name: darwin-x64 unsigned development packages
+    runs-on: macos-26-intel
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='x64')process.exit(1)"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Validate packaging contracts
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
+      - name: Validate macOS startup, signing-order and final metadata without credentials
+        run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js apps/electron/test/desktop-macos-keychain.test.mjs
+      - name: Build and verify development distributions
+        run: node scripts/package-electron-development.mjs --target darwin-x64 --format distribution --replace-staging
+      - name: Retain verified development packages and receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-darwin-x64-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/darwin-x64/distribution/
+          if-no-files-found: error
+          retention-days: 14
+
+  win32-x64:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full'
+    name: win32-x64 unsigned development packages
+    runs-on: windows-2025
+    timeout-minutes: 45
+    outputs:
+      development-artifact-id: ${{ steps.retain-win32-development.outputs.artifact-id }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_INSTALL_FAILED' }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_ENABLE_FAILED' }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'PNPM_PREPARE_FAILED' }
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='win32'||process.arch!=='x64')process.exit(1)"
+          if ($LASTEXITCODE -ne 0) { throw 'NATIVE_RUNTIME_REQUIRED' }
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
+      # Fail on native process-probe prerequisites before packaging installers.
+      - name: Validate disposable Windows installer lifecycle contracts
+        run: node --test test/electron-windows-nsis-lifecycle.test.js
+      - name: Build the reviewed Windows filesystem binding
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $npmCommand = (Get-Command npm.cmd).Source
+          $nodeRoot = Split-Path $npmCommand -Parent
+          $nodeGypScript = Join-Path $nodeRoot 'node_modules/npm/node_modules/node-gyp/bin/node-gyp.js'
+          if (-not (Test-Path -LiteralPath $nodeGypScript -PathType Leaf)) { throw 'WINDOWS_BINDING_BUILDER_UNAVAILABLE' }
+          node $nodeGypScript rebuild --directory native/windows-filesystem
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_BUILD_FAILED' }
+          node scripts/build-windows-filesystem-manifest.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_MANIFEST_FAILED' }
+      - name: Check native binding and synthetic filesystem contracts
+        run: node --test test/windows-filesystem-loader.test.js test/windows-filesystem-manifest.test.js test/windows-filesystem-native-contract.test.js test/windows-filesystem-security.test.js test/windows-accountless-installation-credential.test.js test/windows-accountless-installation-credential-native.test.js test/electron-windows-accountless-smoke.test.js
+      - name: Check ordinary companion startup and fixed credential channel contracts
+        run: node --test test/windows-account-observation-credential.test.js apps/electron/test/shell-core.test.mjs apps/electron/test/desktop-windows-account-observation-broker.test.mjs apps/electron/test/desktop-windows-account-observation-qualification.test.mjs apps/electron/test/windows-account-observation-qualification-smoke.test.mjs apps/electron/test/windows-account-observation-ipc-coexistence.test.mjs
+      - name: Validate packaging contracts
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
+      - name: Build and verify development distributions
+        run: node scripts/package-electron-development.mjs --target win32-x64 --format distribution --replace-staging
+      - name: Exercise synthetic upload and account-observation storage through packaged Electron and inherited IPC
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageRoot = Join-Path $env:GITHUB_WORKSPACE ".release-build/electron-candidates/$env:GITHUB_SHA/win32-x64/distribution"
+          $appPath = Join-Path $packageRoot 'win-unpacked/TiboTattle Dev.exe'
+          $stagedApp = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-dev/win32-x64/app'
+          $packageReceipt = Join-Path $packageRoot 'development-package.json'
+          $smokeReceipt = Join-Path $packageRoot 'accountless-storage-smoke.json'
+          node scripts/smoke-electron-windows-accountless.mjs --app $appPath --staged-app $stagedApp --package-receipt $packageReceipt --source-revision $env:GITHUB_SHA --receipt $smokeReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_ACCOUNTLESS_PACKAGED_SMOKE_FAILED' }
+      # Retain only the two inspected, pinned dependency dotfiles. Refuse
+      # other hidden content and reparse points before enabling their upload
+      # from these exact staging/distribution roots.
+      - name: Validate exact retained Windows artifact inputs
+        id: validate-win32-retained-inputs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $distributionRoot = Join-Path $env:GITHUB_WORKSPACE ".release-build/electron-candidates/$env:GITHUB_SHA/win32-x64/distribution"
+          $stagedAppRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-dev/win32-x64/app'
+          $expectedStagedHiddenFiles = @(
+            [pscustomobject]@{
+              relativePath = 'node_modules/json-schema-traverse/.eslintrc.yml'
+              inventoryName = 'approved_json_schema'
+              sha256 = 'b1ea981e2461f053646b08a616efcaba0d3b278b223957e9eb931bcbc3971ccc'
+            },
+            [pscustomobject]@{
+              relativePath = 'node_modules/fast-uri/.gitattributes'
+              inventoryName = 'approved_fast_uri'
+              sha256 = 'e173bffc6cde613d3e6d06e49f2b1d05385cb02aa68c4931656b5b051ab649dd'
+            }
+          )
+          $roots = @(
+            [pscustomobject]@{
+              inventoryRoot = 'distribution'
+              path = $distributionRoot
+              expectedHiddenFiles = @()
+              excludedHiddenDirectory = '.icon-ico'
+            },
+            [pscustomobject]@{
+              inventoryRoot = 'staged'
+              path = $stagedAppRoot
+              expectedHiddenFiles = $expectedStagedHiddenFiles
+              excludedHiddenDirectory = $null
+            }
+          )
+          function Fail-WindowsRetainedArtifactGuard {
+            param([string]$Code)
+            throw [System.InvalidOperationException]::new($Code)
+          }
+          function Write-WindowsRetainedArtifactHiddenTopology {
+            param(
+              [ValidateSet('distribution', 'staged')][string]$RootKind,
+              [ValidateSet('dot_directory', 'dot_file', 'missing')][string]$EntryKind,
+              [ValidateSet('approved_json_schema', 'approved_fast_uri', 'unapproved')][string]$NameKind
+            )
+            Write-Host "WINDOWS_RETAINED_ARTIFACT_HIDDEN_TOPOLOGY root=$RootKind entry=$EntryKind name=$NameKind"
+          }
+          $knownFailures = @(
+            'WINDOWS_RETAINED_ARTIFACT_ROOT_MISSING',
+            'WINDOWS_RETAINED_ARTIFACT_REPARSE_POINT',
+            'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_INVALID',
+            'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_HASH_INVALID',
+            'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_SET_INVALID'
+          )
+          try {
+            foreach ($rootSpec in $roots) {
+              $root = [System.IO.DirectoryInfo]::new([System.IO.Path]::GetFullPath($rootSpec.path))
+              if (-not $root.Exists) { Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_ROOT_MISSING' }
+              if (($root.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_REPARSE_POINT'
+              }
+              $observedHiddenFiles = [System.Collections.Generic.List[string]]::new()
+              $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
+              $pending.Push($root)
+              while ($pending.Count -gt 0) {
+                $current = $pending.Pop()
+                foreach ($entry in $current.EnumerateFileSystemInfos()) {
+                  if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_REPARSE_POINT'
+                  }
+                  $relativePath = [System.IO.Path]::GetRelativePath($root.FullName, $entry.FullName).Replace('\', '/')
+                  $isDotPath = @($relativePath.Split('/') | Where-Object { $_.StartsWith('.') }).Count -gt 0
+                  if ($isDotPath) {
+                    $expected = @($rootSpec.expectedHiddenFiles | Where-Object { $_.relativePath -ceq $relativePath })
+                    $entryKind = if (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) { 'dot_directory' } else { 'dot_file' }
+                    $nameKind = if ($expected.Count -eq 1) { $expected[0].inventoryName } else { 'unapproved' }
+                    # This exact non-reparse distribution-root directory is an
+                    # app-builder-lib icon-conversion cache, never a retained
+                    # artifact input. Do not traverse or transfer it.
+                    $isFixedExcludedCache = $rootSpec.inventoryRoot -ceq 'distribution' `
+                      -and $relativePath -ceq $rootSpec.excludedHiddenDirectory `
+                      -and $entry -is [System.IO.DirectoryInfo]
+                    if ($isFixedExcludedCache) { continue }
+                    if ($entry -isnot [System.IO.FileInfo] -or $expected.Count -ne 1) {
+                      Write-WindowsRetainedArtifactHiddenTopology $rootSpec.inventoryRoot $entryKind $nameKind
+                      Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_INVALID'
+                    }
+                    $sha256 = (Get-FileHash -LiteralPath $entry.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($sha256 -cne $expected[0].sha256) {
+                      Write-WindowsRetainedArtifactHiddenTopology $rootSpec.inventoryRoot $entryKind $nameKind
+                      Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_HASH_INVALID'
+                    }
+                    [void]$observedHiddenFiles.Add($relativePath)
+                  }
+                  if (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                    $pending.Push([System.IO.DirectoryInfo]::new($entry.FullName))
+                  }
+                }
+              }
+              foreach ($expected in $rootSpec.expectedHiddenFiles) {
+                if (@($observedHiddenFiles | Where-Object { $_ -ceq $expected.relativePath }).Count -ne 1) {
+                  Write-WindowsRetainedArtifactHiddenTopology $rootSpec.inventoryRoot 'missing' $expected.inventoryName
+                  Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_SET_INVALID'
+                }
+              }
+              if ($observedHiddenFiles.Count -ne $rootSpec.expectedHiddenFiles.Count) {
+                Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_SET_INVALID'
+              }
+            }
+          } catch {
+            $failure = $_.Exception.Message
+            if ($knownFailures -ccontains $failure) { throw $failure }
+            throw 'WINDOWS_RETAINED_ARTIFACT_GUARD_FAILED'
+          }
+      - name: Retain verified Windows package, staging tree, and receipts
+        if: ${{ !cancelled() && steps.validate-win32-retained-inputs.outcome == 'success' }}
+        id: retain-win32-development
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-win32-x64-${{ github.sha }}
+          # Keep the exact staged tree with the package receipt. The isolated
+          # lifecycle job revalidates both against the installed application.
+          path: |
+            .release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/
+            !.release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/.icon-ico/**
+            .release-build/electron-dev/win32-x64/app/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+
+  # This fresh hosted account never runs the credential qualification probes.
+  # Normal credentials and preferences belong only to its disposable lifetime.
+  win32-x64-normal-candidate:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full' || inputs.qualification == 'windows-runtime' || inputs.qualification == 'native-runtime'
+    name: win32-x64 unsigned normal app journey
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_INSTALL_FAILED' }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_ENABLE_FAILED' }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'PNPM_PREPARE_FAILED' }
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='win32'||process.arch!=='x64')process.exit(1)"
+          if ($LASTEXITCODE -ne 0) { throw 'NATIVE_RUNTIME_REQUIRED' }
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
+      - name: Check normal-candidate contracts without native credentials
+        run: |
+          node --test test/electron-windows-normal-candidate.test.js apps/electron/test/windows-normal-quit-control.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_CONTRACT_FAILED' }
+      - name: Build the reviewed Windows filesystem binding
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $npmCommand = (Get-Command npm.cmd).Source
+          $nodeRoot = Split-Path $npmCommand -Parent
+          $nodeGypScript = Join-Path $nodeRoot 'node_modules/npm/node_modules/node-gyp/bin/node-gyp.js'
+          if (-not (Test-Path -LiteralPath $nodeGypScript -PathType Leaf)) { throw 'WINDOWS_BINDING_BUILDER_UNAVAILABLE' }
+          node $nodeGypScript rebuild --directory native/windows-filesystem
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_BUILD_FAILED' }
+          node scripts/build-windows-filesystem-manifest.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_MANIFEST_FAILED' }
+      - name: Prepare the unsigned Windows normal-startup candidate without publication
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/package-electron-production.mjs --target win32-x64 --source-revision $env:GITHUB_SHA --build-number $env:GITHUB_RUN_NUMBER --replace-staging
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_PREPARATION_FAILED' }
+          $env:TIBOTATTLE_ELECTRON_TARGET = 'win32-x64'
+          $env:TIBOTATTLE_ELECTRON_SOURCE_REVISION = $env:GITHUB_SHA
+          $env:TIBOTATTLE_ELECTRON_BUILD_NUMBER = $env:GITHUB_RUN_NUMBER
+          $env:TIBOTATTLE_ELECTRON_VERSION = node -p 'require("./package.json").version'
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_VERSION_FAILED' }
+          # Overrides apply only to this runner-only unpacked test candidate.
+          # The release configuration still requires signing and updater trust.
+          pnpm exec electron-builder --config apps/electron/electron-builder.production.config.cjs --win dir --x64 --publish never --config.forceCodeSigning=false --config.win.signExecutable=false
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_BUILD_FAILED' }
+      - name: Exercise normal Windows startup with outbound traffic blocked
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64'
+          $appPath = Join-Path $candidateRoot 'artifacts/win-unpacked/TiboTattle.exe'
+          $stagedApp = Join-Path $candidateRoot 'app'
+          $sourceCandidate = Join-Path $candidateRoot 'production-source-candidate.json'
+          $smokeReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-windows-normal-candidate/normal-candidate-smoke.json'
+          node scripts/smoke-electron-windows-normal-candidate.mjs --app $appPath --staged-app $stagedApp --source-candidate $sourceCandidate --source-revision $env:GITHUB_SHA --receipt $smokeReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_SMOKE_FAILED' }
+      - name: Retain only the Windows normal-candidate receipt
+        if: ${{ !cancelled() && hashFiles('.release-build/electron-windows-normal-candidate/normal-candidate-smoke.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-windows-normal-candidate-${{ github.sha }}
+          path: .release-build/electron-windows-normal-candidate/normal-candidate-smoke.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # The fixed FD4 Credential Manager record intentionally survives for the
+  # disposable runner account lifetime. Run the installed lifecycle in a fresh
+  # hosted account so it never shares the packaged-smoke record above.
+  win32-x64-nsis-lifecycle:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full'
+    name: win32-x64 unsigned NSIS installed lifecycle
+    needs: win32-x64
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies without lifecycle scripts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_INSTALL_FAILED' }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_ENABLE_FAILED' }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'PNPM_PREPARE_FAILED' }
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='win32'||process.arch!=='x64')process.exit(1)"
+          if ($LASTEXITCODE -ne 0) { throw 'NATIVE_RUNTIME_REQUIRED' }
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
+      - name: Download the exact retained Windows package inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.win32-x64.outputs.development-artifact-id }}
+          path: .release-build
+          # v4 extracts ID-selected artifacts into a name subdirectory unless
+          # this is explicit. Preserve the producer's verified layout.
+          merge-multiple: true
+      - name: Exercise unsigned NSIS install, whole-app restart and owned uninstall
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageRoot = Join-Path $env:GITHUB_WORKSPACE ".release-build/electron-candidates/$env:GITHUB_SHA/win32-x64/distribution"
+          $stagedApp = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-dev/win32-x64/app'
+          $packageReceipt = Join-Path $packageRoot 'development-package.json'
+          $packageRecord = Get-Content -LiteralPath $packageReceipt -Raw | ConvertFrom-Json
+          $installerRecords = @($packageRecord.distributions | Where-Object { $_.file -match '^[A-Za-z0-9._-]+\.exe$' })
+          if ($installerRecords.Count -ne 1) { throw 'WINDOWS_NSIS_INSTALLER_SELECTION_INVALID' }
+          $installerPath = Join-Path $packageRoot $installerRecords[0].file
+          $lifecycleReceipt = Join-Path $packageRoot 'nsis-lifecycle-smoke.json'
+          node scripts/smoke-electron-windows-nsis-lifecycle.mjs --installer $installerPath --staged-app $stagedApp --package-receipt $packageReceipt --source-revision $env:GITHUB_SHA --receipt $lifecycleReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NSIS_LIFECYCLE_SMOKE_FAILED' }
+      - name: Retain Windows NSIS lifecycle receipt
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-win32-x64-nsis-lifecycle-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/nsis-lifecycle-smoke.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-x64:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full' || inputs.qualification == 'linux-runtime' || inputs.qualification == 'native-runtime'
+    name: linux-x64 unsigned development packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='linux'||process.arch!=='x64')process.exit(1)"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install Linux package and desktop prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libsecret-1-0 libsecret-1-dev pkg-config libarchive-tools libfuse2t64
+      - name: Build and qualify the native Linux credential mutex
+        run: |
+          set -euo pipefail
+          node_gyp_script="$(npm root --global)/npm/node_modules/node-gyp/bin/node-gyp.js"
+          if [ ! -f "$node_gyp_script" ]; then
+            echo "LINUX_CREDENTIAL_MUTEX_NODE_GYP_UNAVAILABLE" >&2
+            exit 1
+          fi
+          node "$node_gyp_script" rebuild --directory native/linux-credential-mutex
+          node scripts/stage-linux-credential-mutex-binding.mjs
+          node scripts/build-linux-credential-mutex-manifest.mjs
+          node scripts/qualify-linux-credential-mutex.mjs
+      - name: Validate private Linux credential channel and identity selection
+        run: node --test apps/electron/test/desktop-linux-secret-service-broker.test.mjs apps/electron/test/desktop-linux-secret-service-composition.test.mjs test/linux-credential-state.test.js test/export-identity-production.test.js test/account-observation-secret.test.js test/linux-account-observation-credential.test.js
+      - name: Validate the normal Linux candidate and packaged harness contracts
+        run: node --test apps/electron/test/platform-gate.test.mjs test/linux-portability-workflow.test.js test/electron-linux-normal-packaged-smoke.test.js test/electron-linux-appimage-updater.test.js test/electron-linux-real-appimage-updater.test.js
+      - name: Validate packaging contracts
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
+      - name: Build and verify development distributions
+        run: node scripts/package-electron-development.mjs --target linux-x64 --format distribution --replace-staging
+      - name: Prepare the approved Linux normal-startup candidate without publication
+        run: |
+          node scripts/package-electron-production.mjs --target linux-x64 \
+            --source-revision "$GITHUB_SHA" --build-number "$GITHUB_RUN_NUMBER" --replace-staging
+          export TIBOTATTLE_ELECTRON_TARGET=linux-x64
+          export TIBOTATTLE_ELECTRON_SOURCE_REVISION="$GITHUB_SHA"
+          export TIBOTATTLE_ELECTRON_BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          export TIBOTATTLE_ELECTRON_VERSION="$(node -p 'require("./package.json").version')"
+          pnpm exec electron-builder --config apps/electron/electron-builder.production.config.cjs \
+            --linux dir --x64 --publish never
+      - name: Build two private genuine Linux AppImages from the normal staged app
+        run: node scripts/build-linux-updater-rehearsal.mjs
+      - name: Exercise the pinned Linux AppImage updater adapter on loopback
+        run: |
+          set -euo pipefail
+          receipt="$GITHUB_WORKSPACE/.release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/linux-appimage-updater-smoke.json"
+          timeout 90s node scripts/smoke-electron-linux-appimage-updater.mjs --self-test --receipt "$receipt"
+      - name: Exercise packaged Linux credentials in disposable Secret Service
+        run: |
+          set -euo pipefail
+          node scripts/build-electron-linux-container.mjs --architecture amd64
+          docker build --platform=linux/amd64 \
+            --file containers/electron-linux-packaged/Dockerfile \
+            --build-arg "TIBOTATTLE_QUALIFICATION_REVISION=$GITHUB_SHA" \
+            --tag tibotattle-electron-linux-packaged:test .
+          package_root="/workspace/.release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution"
+          host_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/secret-service-storage-smoke.json"
+          observation_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/account-observation-native-qualification.json"
+          # Prove the absent .local/state fallback in its own fresh home before
+          # the separate packaged credential journey. Neither run sees host state.
+          docker run --rm --init --platform=linux/amd64 --network none \
+            --tmpfs /home/node:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=16m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 \
+            --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config \
+            --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share \
+            --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            --env USAGE_MONITOR_LINUX_CREDENTIAL_MUTEX_NATIVE_TEST=1 \
+            --env USAGE_MONITOR_LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_TEST=1 \
+            --entrypoint node tibotattle-electron-linux-packaged:test \
+            --input-type=module --eval '
+              import { spawnSync } from "node:child_process";
+              import { proveLinuxSecretServiceContainerIsolation } from "./scripts/qualify-linux-secret-service.mjs";
+              const fail = () => {
+                process.stderr.write("LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_FAILED\n");
+                process.exit(1);
+              };
+              try {
+                if (proveLinuxSecretServiceContainerIsolation().status !== "isolated") fail();
+                if (process.env.XDG_STATE_HOME !== undefined) fail();
+                const result = spawnSync(process.execPath, [
+                  "--test", "--test-reporter=tap",
+                  "--test-name-pattern=^native Linux credential state bootstrap creates the absent passwd-home default only in the isolated lane$",
+                  "./test/linux-credential-mutex-native.test.js",
+                ], {
+                  encoding: "utf8",
+                  maxBuffer: 16 * 1024,
+                  shell: false,
+                  stdio: ["ignore", "pipe", "pipe"],
+                  timeout: 15000,
+                });
+                const marker = "# LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_BOOTSTRAP_PASSED";
+                const markers = typeof result.stdout === "string"
+                  ? result.stdout.split(/\r?\n/u).filter((line) => line === marker)
+                  : [];
+                if (result.error || result.signal !== null || result.status !== 0
+                    || markers.length !== 1) fail();
+                process.stdout.write("LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_PASSED\n");
+              } catch {
+                fail();
+              }
+            '
+          # The new fixed observation facade gets its own disposable service.
+          # Its exact native test marker is required; a zero-exit skip is refused.
+          docker run --rm --init --platform=linux/amd64 --network none \
+            --tmpfs /home/node:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=16m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 \
+            --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config \
+            --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share \
+            --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            --entrypoint node tibotattle-electron-linux-packaged:test \
+            scripts/run-linux-secret-service-qualification.mjs --account-observation \
+            > "$observation_receipt"
+          docker run --rm --init --platform=linux/amd64 --network none \
+            --tmpfs /home/node:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=16m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 \
+            --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config \
+            --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share \
+            --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            tibotattle-electron-linux-packaged:test \
+            --app "$package_root/linux-unpacked/tibotattle-dev" \
+            --staged-app /workspace/.release-build/electron-dev/linux-x64/app \
+            --package-receipt "$package_root/development-package.json" \
+            --source-revision "$GITHUB_SHA" \
+            --receipt /run/user/1000/packaged-credential-receipt.json \
+            > "$host_receipt"
+      - name: Exercise normal packaged Linux startup with external networking disabled
+        run: |
+          candidate_root=/workspace/.release-build/electron-production/linux-x64
+          host_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/normal-packaged-smoke.json"
+          # Reuse the existing GUI container's sandbox capability. No host
+          # paths are mounted and both profile roots remain private/noexec.
+          # The production candidate stays inside this runner; only its bounded
+          # test receipt joins the already-authorized development artifacts.
+          docker run --rm --init --platform=linux/amd64 --cap-add=SYS_ADMIN --network none \
+            --tmpfs /home/node:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 \
+            --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config \
+            --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share \
+            --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            --env USAGE_MONITOR_LINUX_IMAGE_PLATFORM=linux/amd64 \
+            --env USAGE_MONITOR_LINUX_NETWORK_BOUNDARY=network-none \
+            --entrypoint xvfb-run tibotattle-electron-linux-packaged:test \
+            --auto-servernum --server-args='-screen 0 1280x900x24 -nolisten tcp' \
+            node scripts/smoke-electron-linux-packaged.mjs \
+            --app "$candidate_root/artifacts/linux-unpacked/tibotattle" \
+            --staged-app "$candidate_root/app" \
+            --source-candidate "$candidate_root/production-source-candidate.json" \
+            --source-revision "$GITHUB_SHA" \
+            --receipt /run/user/1000/linux-normal-packaged-smoke.json \
+            > "$host_receipt"
+      - name: Exercise a genuine AppImage update and automatic restart in isolation
+        run: |
+          set -euo pipefail
+          host_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/real-appimage-updater-smoke.json"
+          # Only the fixed feed host resolves to our local HTTPS fixture. Its
+          # CA is generated in this disposable profile; no host trust changes.
+          timeout 420s docker run --rm --init --platform=linux/amd64 --cap-add=SYS_ADMIN --network none \
+            --add-host updates.tibotattle.com:127.0.0.1 \
+            --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+            --tmpfs /home/node:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=1024m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /opt/tibotattle-updater-exec:rw,exec,nosuid,size=2048m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            --env USAGE_MONITOR_LINUX_IMAGE_PLATFORM=linux/amd64 --env USAGE_MONITOR_LINUX_NETWORK_BOUNDARY=network-none \
+            --entrypoint xvfb-run tibotattle-electron-linux-packaged:test \
+            --auto-servernum --server-args='-screen 0 1280x900x24 -nolisten tcp' \
+            node scripts/smoke-electron-linux-real-appimage-updater.mjs > "$host_receipt"
+      - name: Retain only the Linux normal-candidate receipt
+        if: ${{ !cancelled() && hashFiles(format('.release-build/electron-candidates/{0}/linux-x64/distribution/normal-packaged-smoke.json', github.sha)) != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-linux-normal-candidate-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/linux-x64/distribution/normal-packaged-smoke.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain verified development packages and receipts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-linux-x64-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/linux-x64/distribution/
+          if-no-files-found: error
+          retention-days: 14

@@ -13,6 +13,7 @@ export function selectProductionParticipantIdentity({
   architecture,
   appStateSecretFile,
   createKeychainBackend,
+  createLinuxBackend,
   keychainCapability,
   allowedKeychainCapability,
 } = {}) {
@@ -39,7 +40,40 @@ export function selectProductionParticipantIdentity({
       }),
     });
   }
-  if (platform !== "darwin" || architecture !== "arm64") {
+  // Linux has no implicit credential loader. Only the companion's explicitly
+  // injected, fixed-capability parent broker can supply this source-only path.
+  if (platform === "linux") {
+    if (architecture !== "x64" || typeof createLinuxBackend !== "function") {
+      throw selectionError("EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE");
+    }
+    if (allowedKeychainCapability === undefined || keychainCapability !== allowedKeychainCapability) {
+      throw selectionError("EXPORT_IDENTITY_PRODUCTION_BACKEND_INVALID");
+    }
+    let participantSecretBackend;
+    try {
+      participantSecretBackend = createLinuxBackend();
+      if (participantSecretBackend === null || typeof participantSecretBackend !== "object"
+          || ["read", "createIfMissing", "replaceExact", "deleteExact", "describe"].some(
+            (method) => typeof participantSecretBackend[method] !== "function")) {
+        throw new Error("Unavailable broker");
+      }
+    } catch {
+      throw selectionError("EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE");
+    }
+    return Object.freeze({
+      mode: "linux_secret_service_broker",
+      identityOptions: Object.freeze({
+        environmentSecret: null,
+        secretFile: appStateSecretFile,
+        participantSecretBackend,
+        participantSecretCapability: keychainCapability,
+      }),
+    });
+  }
+  // The native app injects the same capability-scoped broker on both macOS
+  // architectures. Legacy binding availability remains the adapter's concern.
+  if (platform !== "darwin"
+      || (architecture !== "arm64" && architecture !== "x64")) {
     throw selectionError("EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE");
   }
   if (

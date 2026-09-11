@@ -2,7 +2,7 @@
 title: Cross-platform release trust
 date: 2026-08-18
 type: decision
-status: accepted
+status: maintained
 ---
 
 # Cross-platform release trust

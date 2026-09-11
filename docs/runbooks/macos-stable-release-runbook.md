@@ -2,7 +2,7 @@
 title: macOS stable release
 date: 2026-08-18
 type: runbook
-status: canonical
+status: maintained
 ---
 
 # macOS stable release runbook (canonical)
@@ -27,7 +27,178 @@ previous stable version.
 
 ---
 
+## Separate Apple silicon and Intel candidates
+
+The 0.1.18 working candidate adds a separate Intel lane; it is not a public
+support declaration. The published 0.1.17 release is immutable and remains
+unchanged. Follow the [Intel qualification plan](../plans/2026-09-03-macos-intel-release.md)
+before publishing Intel, with the owner's explicit
+[0.1.18-only manual qualification waiver](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
+That release decision accepts missing physical evidence; it does not establish
+that the waived tests passed. Both installers must come from the same
+frozen annotated tag and source commit and enter the draft release before it
+is made immutable. Never append a later source build under an older tag.
+
+| Target | CLI architecture | Native slices | Stable feed | Immutable prefix |
+|---|---|---|---|---|
+| Apple silicon | `arm64` (default) | exactly `arm64` | `/appcast.xml` | `releases` |
+| Intel | `x64` | exactly `x86_64` | `/intel/appcast.xml` | `intel/releases` |
+
+Both stable feeds use the existing stable update origin, bucket and trusted
+public key. Dogfood retains its independent origin/bucket/key; Intel dogfood
+uses `/internal-dogfood/intel/appcast.xml` and `internal-dogfood/intel/releases`.
+Intel Preview uses `/preview/intel/appcast.xml`. Native runtime checks the
+compiled architecture's exact feed path. The publishing guard authenticates
+requests before selecting its allowlisted architecture target; compare-and-swap
+operates on that target's appcast key. Deploy the updated guard through the
+normal protected deployment gate before attempting Intel publication.
+
+Build on macOS ARM with Node 26.2.0. Supply `--architecture x64` and
+`--node-runtime <verified-node-v26.2.0-darwin-x64>/bin/node` to the builder and
+release CLI. The official runtime's adjacent `LICENSE` must also be present;
+both input and private staged copies are pinned and verified before execution.
+Use distinct app/output directories per architecture. The packaging, installer
+validation, appcast and publication commands accept `--architecture x64`; use
+`TiboTattle-X.Y.Z-macOS-x64.dmg` for the Intel final artifact. ARM filenames
+and default CLI behavior are unchanged. Universal binaries are not accepted.
+
+The corrected combined Astra/Intel 0.1.18 RC3 allocations are dogfood `1025.2`
+and stable `1026` for both architectures, above signed RC2 `1025.1`, earlier
+Intel RC1 `1025`, and 0.1.17 stable `1024`. Preserve RC1/RC2 artifacts and
+receipts; neither prior build may be reused for the corrected source.
+Allocation is not a qualification receipt. A first Intel
+stable release has no previous Intel installation:
+use the existing explicit owner-only `--stable-bootstrap` flow, never an ARM
+receipt as Intel prior-release or rollback evidence. The current stable key
+must still match the authenticated publishing guard. Later Intel releases
+require a previous Intel manifest and preserve that lane's key and ordering.
+
+Sign/finalize/validate each architecture independently. Preserve unique filenames
+for both appcast evidence files in the flat public manifest, even though each
+live feed ends in `appcast.xml`. Each artifact has its own checksum, native
+assurances and any SBOM/attestation evidence. Do not copy ARM evidence into an
+Intel entry. Cross-compilation, Rosetta and ad-hoc packaging do not qualify
+physical Intel clean install, login items, silent Keychain access or A-to-B
+signed update installation.
+
+The installed Login Item gate accepts explicit `--architecture` and `--channel`
+selection and requires the v2 [manual rehearsal receipt](../decisions/2026-08-03-macos-login-item-lifecycle-decision.md#2026-09-04-two-architecture-receipt-amendment).
+It binds the inspected app's architecture, channel, source commit and normalized
+payload alongside version identity. Native hardware, supported macOS and
+non-Rosetta execution remain human observations; neither old v1 receipts nor an
+ARM rehearsal can qualify Intel. The payload binding is not a final-DMG digest
+and does not replace independent artifact/signature checks.
+
+For 0.1.18 only, the owner waived the disposable clean-profile/manual Login Item
+matrix and physical Intel qualification in the linked release decision. Record
+these as waived and unperformed, not passed; do not manufacture a v2 receipt or
+claim its validator succeeded. Other testers running the app is an owner report,
+not independently verified, architecture- and artifact-bound evidence. The v2
+validator, actual automated isolated smoke, native signatures, exact-byte
+verification, data preservation, updater integrity and unexpected-Keychain-prompt
+stop conditions remain unchanged. This does not carry forward to a later release.
+
+The existing website command below remains ARM-compatible. To expose a qualified
+Intel artifact from the same canonical `release-manifest.json`, also supply:
+
+~~~text
+--intel-installer-path <absolute-path>/TiboTattle-X.Y.Z-macOS-x64.dmg
+--intel-installer-url https://github.com/adamallcock/tibotattle/releases/download/vX.Y.Z/TiboTattle-X.Y.Z-macOS-x64.dmg
+--intel-minimum-macos 14.0
+~~~
+
+The generator validates Intel source, bytes, trust, architecture and minimum
+macOS independently, including the published download. Omit these flags to
+retain the unavailable Intel tab. The first-party Homebrew cask selects ARM or
+Intel automatically. Its updater verifies both installers and compares the
+complete rendered cask, including same-version repairs. Verify that independent
+publication before showing the command on either website tab.
+
 ## 0. Version lockstep and preflight
+
+### Native Sparkle to Electron transition
+
+For the 0.1.21 transition, users of native 0.1.18 must be able to use its
+existing Check for Updates and Install controls and continue with their retained
+history, settings and contribution choice. Publishing Electron installers or its
+YAML feeds alone does not update either native Sparkle feed.
+
+The final application remains the ordinary signed Electron build, with its own
+outgoing updater configuration. Follow the shared
+[Mac bundle-version allocation](../decisions/2026-09-11-electron-macos-bundle-version-allocation.md):
+0.1.21 uses bundle version 1028, above native 0.1.18's 1026. The provenance build
+number is a separate value. Retain the predecessor's exact public SUPublicEDKey
+in the signed Electron Info.plist: Sparkle refuses removal of that key even
+after a valid archive signature. This passive compatibility value does not add
+a Sparkle framework, feed configuration or second running updater. Preserve
+Apple's version grammar and the Electron inspection fuse.
+
+1. Finalize the exact signed/notarized/stapled Mac DMGs and updater ZIPs through
+   the Electron finalizer. Generate the incoming feed with the existing
+   generate-sparkle-appcast.js entrypoint and its explicit --electron-transition
+   option. This uses the pinned official generator and sign_update tool for
+   both enclosure and feed signatures with the existing native stable key.
+2. First generate an isolated feed with --electron-transition-test-source set
+   to the exact application source and --skip-retain. Its only namespace is
+   electron/test/native-sparkle/<source>/<bundleVersion>/<dmgSha256>/.
+   The production publisher refuses this test namespace. Uploading these test
+   objects requires the existing test-publication authority and shared owner.
+3. Run electron-macos-sparkle-transition.yml on both native hosted architectures
+   with exact source, installer, ASAR and feed hashes. The unchanged signed
+   native predecessor receives a test-feed preference only in its disposable
+   account. Sparkle alone installs the candidate. Require successful actual
+   update/relaunch, retained rows, settings, salt, opt-out and repeated restart.
+   A manual replacement or an ARM receipt cannot substitute for the Intel proof.
+4. Bind each passed receipt as a local qualification file in the explicit
+   tibotattle-electron-sparkle-transition-v1 publisher receipt. It includes the
+   incoming key digest and feed URL separately from the Electron ASAR and
+   outgoing updater configuration digest. The publisher revalidates the signed
+   mounted DMG, receipt, previous native manifest and annotated source tag.
+   It does not treat an arbitrary receipt path as successful qualification.
+5. Generate the final stable incoming feeds and use the existing guarded
+   publish-sparkle-update.js operation below for both architectures. Preserve
+   key continuity and atomic replacement. Intel's native route uses a
+   byte-identical TiboTattle-0.1.21-macOS-x64.dmg alias; the public GitHub download
+   retains the ordinary TiboTattle-0.1.21-mac-x64.dmg name and identical digest.
+6. Coordinate activation with the GitHub release, Electron feeds, Homebrew and
+   website through the cross-platform runbook. Then rerun the native journey
+   with production_feed and no override, and run
+   electron-macos-production-update.yml using the unchanged released Electron
+   0.1.20 app. Preserve these production receipts separately from the isolated
+   test proof. Its signed app cannot be redirected with a Node inspector.
+
+Existing-credential coverage remains an explicit receipt field; the synthetic
+opt-out fixture does not claim an existing Keychain credential rehearsal.
+The active closure plan is
+[the installed update sequence](../plans/2026-09-11-electron-upgrade-release-closure.md).
+
+### Common release preflight
+
+Start with `node scripts/release-agent.mjs doctor --json`. Supply an exact-source
+plan for target-specific checks; see [agent release operations](agent-release-operations.md).
+The doctor reads only local evidence and configured references. It does not
+access signing keys, test Apple authentication, sign, build or publish. A
+configured credential reference is not verified usability; unexercised/manual
+checks remain outstanding.
+
+Run [early synthetic admission](release-qualification-admission.md) before
+expensive R7 or native finalization. It can reuse an exact reviewed local proof,
+but cannot replace R7, predecessor, installed-app or hardware qualification.
+If hosted migrations are included, perform the populated
+[migration rehearsal](release-migration-rehearsal.md) early too. Once both final
+installers and the website are qualified, use
+[publication reconciliation](release-publication-reconciliation.md) to inspect
+GitHub, both feeds, Homebrew and the website together, then resume only the
+separately authorized pending publication steps. Its read-only default is not
+publication permission and its stable dual-macOS scope does not cover dogfood.
+
+The release CLI uses a private journal at `<output>.operation` by default.
+An interrupted authorized finalization resumes with the original arguments plus
+`--resume`, never `--prepare-candidate` or `--replace`. Keep the exact candidate,
+source, tools and inputs unchanged. Use `release-agent.mjs status --operation`
+to inspect progress. Known Apple submissions are waited on again; unknown
+submission outcomes require owner reconciliation, not a new upload. Do not
+delete retained staging or alter receipts to make a resume pass.
 
 A version bump is **not** just package.json. Bump or regenerate all of:
 
@@ -44,11 +215,23 @@ A version bump is **not** just package.json. Bump or regenerate all of:
 5. The worker workspace copies with cd apps/worker && npm ci; they are copies,
    not symlinks, and stale copies make the worker check and bundle use old
    package versions.
+6. `release-notes/X.Y.Z.md` with the reviewed user-facing release body, and a
+   dated `CHANGELOG.md` entry linking to it. The entry must link the future
+   GitHub Release, annotated source tag, and exact previous-tag comparison.
+   Add only publicly verifiable PR/issue credits, label source-only or open
+   boundaries explicitly, and move shipped items out of `Unreleased`. Do not
+   reconstruct claims or attribution that were not validated.
 
-Run the release preflight before tagging:
+Run candidate preflight while untagged work remains under `Unreleased`. The
+documentation checker requires a stable tag for a dated release entry: finalize
+and commit the release text, create the local annotated tag as described in
+section 1, then run the final preflight below before pushing that tag. Do not
+weaken the checker or edit tracked release text after freezing the tag.
 
 ~~~bash
+node scripts/check-release-notes.mjs
 npm test
+npm run codex:contract:release:check
 npm run product:worker:check
 npm run architecture:check
 cd apps/worker && npx vitest run
@@ -73,6 +256,113 @@ grep -E "^ℹ (tests|pass|fail)" preflight.log; echo "exit=$ec"
 
 Expect `fail 0`. A green-looking terminal is not a green suite.
 
+### 0.1.17 local-state migration gate
+
+Before signing the 0.1.17 internal-dogfood candidate, rehearse the applicable
+schema-11 transition against a consistent disposable copy of the stable unified
+index and its matching device salt. Schema 8/9 must take the normal staged
+rebuild from readable raw history. Schema 10 takes the additive physical
+schema-11 migration on a staged copy, but that does not bypass parser
+compatibility: upgrading parser v10 to v11 still reprocesses readable sources
+through normal ingestion. Only an unchanged source whose parser and source
+provenance are already current can be reused without rescanning. Record both
+`PRAGMA user_version` and the published generation's parser provenance; the
+physical version alone cannot establish whether a parser rescan is required.
+Keep the installed app stopped while taking the copy, leave the live source
+read-only, and compare SQLite integrity, generation metadata, row counts,
+aggregate token/cost ranges, and source-cursor coverage before and after the
+transition. Follow the canonical
+[local unified-index recovery runbook](./unified-index-recovery.md)
+for compatibility and preservation rules.
+
+The isolated `preview_distribution` app cannot satisfy this gate: it creates a
+fresh schema-11 index under `Usage Monitor Preview` and may test a full rebuild,
+but it cannot read or migrate stable state. The signed same-identity
+`internal-dogfood` installation is the later in-place upgrade proof. Never copy
+the live stable database into Preview, relabel `PRAGMA user_version`, delete the
+index, or reopen a migrated schema-10 or schema-11 index with shipped 0.1.16.
+
+The replacement validator has a closed previous-only exception for published
+stable `0.1.16` / bundle version `0.1.16`: SHA-256
+`5e3e60402ffa3c61d8279f5f759548a8b48084f1ae567eeb1b30156c7f30a9fe`,
+49,341,389 bytes, source `4f30508eff55c122e73025ad06d73b33cadbc508`
+at `v0.1.16`. Its exact receipt, source/payload digests, updater key/framework,
+and normalized Keytar tuple are pinned. Only the checksum-verified previous
+artifact receives short-lived compatibility for the absent source seal,
+migration helper, and both Keychain identity plist fields. A version match or
+public boolean cannot authorize it. The capability expires before candidate
+validation, including when previous validation fails. Native signature,
+notarization, Gatekeeper, and isolated-smoke checks remain required; the old
+manifest and artifact are never rewritten. This is replacement-artifact proof,
+not existing-state rollback or prompt-free installed-upgrade proof.
+
+A separate closed previous-only exception covers the
+pre-policy internal-dogfood `0.1.16` / build `1022` DMG: SHA-256
+`2b32964c8b3bc2912620dbbe078aaf4e2fd49f1725a4e94a62dff184cdc9f8c1`,
+49,341,249 bytes, source `5adaca5fdc8f981c391144e0d29b6f4c764f0f96`
+at `v0.1.16`. Its receipt predates channel-specific tags and its app lacks an
+embedded source seal. Only the checksum-verified previous side of
+`validate-macos-replacement.js` accepts that identity, its exact build digests,
+and the existing channel, updater-key, and signed-release assurances. Native
+signature, notarization, Gatekeeper, and isolated-smoke checks still run. Matching
+previous-only rules cover its exact normalized Keytar binary and its two absent
+Keychain identity plist fields. The old payload is fully verified, never
+rewritten; current candidates still require the current normalization inventory
+and both explicit Keychain identity fields. No compatibility flag is available
+for a candidate, public installer, or signing path.
+Do not rewrite the old receipt or tag. Preserving this artifact does not prove
+state rollback: a schema-9 backup is already newer than its schema-8 reader.
+
+### Native Keychain migration gate
+
+Unexpected Keychain security prompts block dogfood replacement and public
+release. Normal startup, refresh, background work, and automatic migration must
+not enable Keychain interaction. Preserve the last usable local state when
+access is unavailable; do not erase an identity, weaken access controls, disable
+macOS protections, or move secrets to plaintext to make a candidate appear ready.
+
+The silent-migration source change adds a separately signed native helper to
+the closed payload inventory. Its `node` signing identifier and exact Developer
+ID designated requirement must match the previously shipped Node reader, with
+the same Team ID, hardened runtime, and no helper entitlements. The native app
+keeps its own stable identity. Do not broaden an ACL or restore a general
+interpreter credential reader to make a test pass.
+
+Before qualifying that change, obtain explicit owner authorization for the
+signed synthetic probe described in
+[`test/fixtures/macos-keychain-migration/README.md`](../../test/fixtures/macos-keychain-migration/README.md).
+Its default invocation is inert; `--compile-only` compiles without signing or
+Keychain access. The protected `--run-signed` invocation uses the release signing
+key and creates/deletes only its own validated private fixture Keychain. It must
+prove exact-secret migration, no-clobber adoption, repeated-upgrade continuity,
+unauthorized-peer rejection, bounded helper lifetime, and unchanged default and
+search lists. This approximates historical default ACLs; it does not establish
+every installed user's access controls or a notarized replacement.
+
+The separate installed-candidate check must cover clean installation and a
+same-identity old-to-new upgrade using the exact signed artifacts. Check normal
+launch, refresh, companion restart, locked/unavailable Keychain, exhausted
+retries, partial migration, and denial/cancellation. Confirm no automatic
+Keychain prompt, up to three bounded silent attempts, and the explained native
+**Secure upgrade** fallback only after deliberate approval, with Cancel as the
+default. Keep the old key as a recovery copy; do not treat reset/deletion as
+migration recovery. Verify the separate, deliberate reset waits for all current
+and retiring credential writers, then removes that capability's legacy copy
+before its modern copy, without allowing delayed migration to restore it. The
+implementation and synthetic reset evidence are recorded in the
+[migration decision](../decisions/2026-08-31-silent-keychain-migration.md)
+and do not authorize resetting real credentials during qualification. An
+unsigned smoke or a blocked signed probe is not signed-upgrade evidence.
+
+Another closed previous-only exception accepts the retained 0.1.17 / build
+1023 RC2 DMG, SHA-256
+`125a15da9b0e260ec3797527d6b98e15aa1172e8b6fc8e7942d2a799cc2b29b0`,
+49,574,961 bytes, source `3d9055fc8e58c84f8ba71feb5deb58b52c532138`.
+It predates the helper inventory. Its exact source and normalized payload
+digests remain pinned; it is never rewritten. Only the previous side of the
+replacement validator permits the absent helper. Current candidate inspection,
+signing, and release paths require it.
+
 **The failure class to expect after a batch of merges** is a *pin* that was
 never updated: a reviewed public-API list, a pinned action SHA, a byte-identity
 digest, a root-workspace allowlist, or an exact `deepEqual` on an exported
@@ -88,18 +378,57 @@ the new constant.
 
 The macOS finalizer requires an empty tree (including untracked files) and an
 exact annotated tag. The tag must identify the reviewed release commit and be
-protected by the repository's version-tag rules.
+protected by the repository's version-tag rules. It may identify the frozen,
+reviewed PR head; it need not identify the later main merge commit. Build only
+with HEAD at that exact tagged commit.
+
+The sole historical exception is the pre-policy `v0.1.10` published ref. It is
+a protected lightweight tag at
+`3b3a852abad643095c296550a827ed448b3720fa`, while the v0.1.10
+version-bump source is `151adec996c9a0f621819f89777ac5a05f1df8b6`. The release
+documentation checker accepts only that exact pair and reports it separately
+from annotated tags. This closed exception does not authorize another
+lightweight tag: every new stable tag must remain annotated and protected.
 
 ~~~bash
 git status --porcelain=v1 --untracked-files=all   # must print nothing
-git describe --exact-match --tags HEAD             # must print vX.Y.Z
-git tag -a vX.Y.Z <reviewed-commit> -m "TiboTattle X.Y.Z ..."
-git push origin vX.Y.Z
+git tag -a vX.Y.Z HEAD -m "TiboTattle X.Y.Z ..."  # final reviewed commit
+git describe --exact-match --tags HEAD           # must print vX.Y.Z
 ~~~
+
+For a tagged PR head, complete local checks and final-artifact validation from
+that frozen checkout before atomically pushing its branch and tag. Set
+`RELEASE_BRANCH` to the actual reviewed branch; do not push directly to main:
+
+~~~bash
+git push --atomic origin "refs/heads/$RELEASE_BRANCH" "refs/tags/vX.Y.Z"
+~~~
+
+Require passing CI for the frozen PR head after the remote tag is available.
+The release-trust PR job uses the PR merge checkout and fetches full history;
+the tag need not point at that synthetic merge. Merge normally, without squash
+or rebase, preserving the tagged head as an ancestor and an identical tree.
+Resolve `MERGE_COMMIT` to the actual resulting merge commit and verify:
+
+~~~bash
+git merge-base --is-ancestor "vX.Y.Z^{}" "$MERGE_COMMIT"
+git diff --exit-code "vX.Y.Z^{tree}" "$MERGE_COMMIT^{tree}"
+~~~
+
+Only then proceed to public release publication. Keep artifact provenance at
+the tagged PR-head commit, not the later merge commit. Do not rewrite tags or
+shared history; if CI or merge changes require different source bytes, stop and
+resolve the release identity before continuing. Final notes and changelog must
+already be committed before the local tag; later publication steps verify and
+upload that frozen text rather than changing it.
 
 Do not sign from a branch that is ahead of or different from the tag. The
 source identity later recorded in the release evidence descriptor must be the
 same version, tag, commit, and repository URL.
+The stable release gate accepts only the exact annotated `vX.Y.Z` tag for the
+bundle's short version. An internal-dogfood source tag, lightweight tag, tag
+alias, dirty checkout, or second matching stable version tag is not a stable
+release source.
 
 ## 2. Build, sign, notarize, staple, and freeze the DMG
 
@@ -114,7 +443,7 @@ design.
 rm -rf .release-build/macos-production
 export USAGE_MONITOR_DEVELOPER_ID_APPLICATION="Developer ID Application: … (…)"
 export USAGE_MONITOR_NOTARY_PROFILE="…"
-export USAGE_MONITOR_BUNDLE_VERSION="X.Y.Z"
+export USAGE_MONITOR_BUNDLE_VERSION="1026"
 export USAGE_MONITOR_SPARKLE_FRAMEWORK=".release-deps/Sparkle.framework"
 export USAGE_MONITOR_SPARKLE_APPCAST_URL="https://updates.tibotattle.com/appcast.xml"
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY="jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw="
@@ -126,21 +455,89 @@ node scripts/release-macos-app.js \
   --previous-stable-manifest "<path to P.Q.R .release.json>"
 ~~~
 
-Codesign may prompt for Keychain access once; choose **Always Allow** on the
-release machine. The finalizer validates Developer ID signing, hardened
-runtime, notarization, stapling, Gatekeeper, and clean installation. It emits
+For the 0.1.17 stable release, `CFBundleShortVersionString` remains `0.1.17`
+and the owner-reviewed signed `CFBundleVersion` is exactly `1024`. It follows
+the refresh-policy RC9 internal-dogfood allocation `1023.7`, fit-metadata RC8
+allocation `1023.6`, retired-checkpoint
+RC7 `1023.5`, accounting-deadline RC6 `1023.4`, integrated RC5 `1023.3`,
+startup-recovery RC4 `1023.2`, migration RC3 `1023.1`, retained RC2 `1023`,
+and earlier shared-identity dogfood `1022`. The
+checked-in allocation is authoritative; the
+current 0.1.18 `USAGE_MONITOR_BUNDLE_VERSION=1026` example above is only an exact
+assertion and cannot select or override a different build. A future stable version must add
+and test a new monotonic channel allocation before the release path will run.
+The separate `TiboTattle Preview.app` identity may use the deterministic
+preview epoch (`2000.1.17` for 0.1.17); it does not participate in stable
+Sparkle ordering.
+
+The owner accepted the runtime from source
+`394c8a03a986e0daadbe662679fd002202682e44` in dogfood `1023.7` and inspected
+stable build `1024`. That acceptance is the retained runtime basis, not proof
+of newly finalized bytes. The final `0.1.17`/`1024` artifact must bind the
+reviewed release tag and pass fresh signed-artifact and exact previous-stable
+replacement validation. Formal PR #94 local qualification completed with
+`passed_with_historical_artifact_refusal`; the final candidate passes its strict
+cache validator. The
+[qualification receipt](../receipts/2026-09-03-pr94-account-plan-attribution-qualification.md)
+records exact data conservation, coverage review, and resource measurements.
+Failed or partial earlier comparison runs remain historical failures, not
+qualification evidence.
+
+For 0.1.17 only, the full clean-profile/physical Login Item matrix is explicitly
+deferred, not passed, under the
+[owner's release-specific decision](../plans/2026-09-03-public-0.1.17-release.md).
+Automated isolated-profile and fake-manager checks do not establish those
+manual results. Data conservation, signatures, updater integrity, and the
+unexpected-Keychain-prompt stop condition remain unchanged. Hosted migrations,
+protocol activation, live contribution tests, and website publication remain
+separate; this release decision does not authorize them.
+
+The [2026-09-05 owner decision](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+is the separate forward exception for 0.1.18's unavailable manual/physical
+matrix. It does not alter the historical 0.1.17 decision or create a passing
+manual receipt for either architecture.
+
+Signing-key access on the release machine is a separate owner provisioning
+step, not an end-user permission requirement. If signing requests approval,
+pause for the owner to verify the exact signer and key. Do not automatically
+approve the dialog, recommend blanket Always Allow access, or change Keychain
+ACLs/partitions to unblock an unattended build. The finalizer validates Developer
+ID signing, hardened runtime, notarization, stapling, Gatekeeper, and clean
+installation. It emits
 the final arm64 DMG at:
 
 ~~~text
 .release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg
 ~~~
 
-Read the minimum OS out of the bundle now, and use only this value afterwards:
+Read the minimum OS and Finder dates from the app inside the final DMG, not
+the retained review candidate (the finalizer signs a separate staged app).
+After final validation, mount the DMG read-only without launching the app.
+Compare the outer `.app` directory's birth time and modification time against
+the committer timestamp of its sealed source commit:
 
 ~~~bash
-/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" \
-  .release-build/macos-production/TiboTattle.app/Contents/Info.plist
+(
+  set -e
+  FINDER_DMG="$PWD/.release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg"
+  FINDER_MOUNT="$(mktemp -d /private/tmp/tibotattle-final-finder.XXXXXX)"
+  /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint "$FINDER_MOUNT" "$FINDER_DMG"
+  trap '/usr/bin/hdiutil detach "$FINDER_MOUNT"' EXIT
+  FINDER_APP="$FINDER_MOUNT/TiboTattle.app"
+  FINDER_COMMIT="$(/usr/bin/plutil -extract release.source.commit raw -o - \
+    "$FINDER_APP/Contents/Resources/build-manifest.json")"
+  FINDER_EPOCH="$(git show -s --format=%ct "$FINDER_COMMIT^{commit}")"
+  test "$(/usr/bin/stat -f %B "$FINDER_APP")" = "$FINDER_EPOCH"
+  test "$(/usr/bin/stat -f %m "$FINDER_APP")" = "$FINDER_EPOCH"
+  /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" \
+    "$FINDER_APP/Contents/Info.plist"
+)
 ~~~
+
+Both timestamp comparisons must pass. This checks only the outer bundle's
+Finder metadata; internal payload timestamps remain normalized. Never repair
+dates inside a mounted or signed artifact. Use the printed minimum OS value
+afterwards.
 
 It is typed by hand in two places later — the "Requires macOS N or later" line
 in `release-notes/X.Y.Z.md`, and `--minimum-macos` in the release-site command
@@ -178,13 +575,14 @@ npm run product:macos:appcast -- \
   --channel stable \
   --app ".release-build/macos-production/TiboTattle.app" \
   --dmg ".release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg" \
-  --bundle-version "X.Y.Z" \
+  --bundle-version "1026" \
   --sparkle-public-ed-key "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw="
 ~~~
 
 This uses the pinned generate_appcast and embeds the feed signature required by
 the installed client's SURequireSignedFeed=true. A hand-built minimal appcast
-is not a valid updater subject.
+is not a valid updater subject. `1026` is the allocated 0.1.18 stable build,
+not the marketing version; future releases must use their reviewed allocation.
 
 Do **not** run the publishing command yet. The appcast is carried as updater
 metadata in the release evidence descriptor and is published only after the
@@ -380,12 +778,14 @@ gh release create "$TAG" --repo "$REPO" --verify-tag --draft \
   --title "TiboTattle X.Y.Z" --notes-file "$NOTES_FILE"
 # Use this baseline upload for a native/checksum-only manifest (null evidence):
 gh release upload "$TAG" --repo "$REPO" \
-  "$DMG" "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE"
+  "$DMG" "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE" \
+  "$RELEASE_DIR/appcast.xml"
 
 # For the attested v1 profile/path, use this command instead:
 gh release upload "$TAG" --repo "$REPO" \
   "$DMG" "$SPDX" "$PROVENANCE" "$SBOM_ATTESTATION" \
-  "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE"
+  "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE" \
+  "$RELEASE_DIR/appcast.xml"
 ~~~
 
 Download every asset into a fresh directory. During the draft phase, verify the
@@ -457,6 +857,12 @@ test "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq '.isDraft')" =
 test "$(gh release view "$TAG" --repo "$REPO" --json isImmutable --jq '.isImmutable')" = "true"
 ~~~
 
+Confirm that the published UTC calendar date matches the `CHANGELOG.md`
+heading, the published body matches `release-notes/X.Y.Z.md` apart from a
+conventional terminal newline, and every release/tag/comparison/reference link
+opens the intended public record. Do not convert a related issue into a closed
+claim unless GitHub shows it closed.
+
 Now run GitHub's release-level checks for the published release. Download every
 published asset again into a new directory; never reuse the draft download for
 this read-back. These are deliberately post-publication checks: gh release
@@ -477,6 +883,7 @@ gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/$ARTIFACT_NAME" --repo "$R
 gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/release-manifest.json" --repo "$REPO"
 gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/SHA256SUMS" --repo "$REPO"
 gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/verify-release.md" --repo "$REPO"
+gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/appcast.xml" --repo "$REPO"
 ~~~
 
 For an attested v1 profile/path, also verify each published evidence asset:
@@ -535,11 +942,23 @@ Verify content by **downloading the bytes and hashing them**, not by reading a
 field that says what you expect:
 
 ~~~bash
-curl -s -o /tmp/live.dmg "https://updates.tibotattle.com/releases/X.Y.Z/$SHA/TiboTattle-X.Y.Z-macOS-arm64.dmg"
-shasum -a 256 /tmp/live.dmg     # must equal $SHA
-gh release download "$TAG" --repo "$REPO" --dir /tmp/gh --pattern '*.dmg' --clobber
-shasum -a 256 /tmp/gh/*.dmg     # must equal $SHA
+(
+  set -e -o pipefail
+  LIVE_VERIFY_DIR="$(mktemp -d /private/tmp/tibotattle-live-update.XXXXXX)"
+  SPARKLE_DOWNLOAD_URL="$(/usr/bin/xmllint --xpath \
+    'string(/rss/channel/item/enclosure/@url)' "$RELEASE_DIR/appcast.xml")"
+  test -n "$SPARKLE_DOWNLOAD_URL"
+  curl --fail --show-error --location \
+    --output "$LIVE_VERIFY_DIR/$ARTIFACT_NAME" "$SPARKLE_DOWNLOAD_URL"
+  LIVE_SHA="$(shasum -a 256 "$LIVE_VERIFY_DIR/$ARTIFACT_NAME" | awk '{print $1}')"
+  EXPECTED_SHA="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+  test "$LIVE_SHA" = "$EXPECTED_SHA"
+)
 ~~~
+
+Use the actual generated enclosure URL: its content-addressed namespace is the
+bundle build (`releases/1024/...` for 0.1.17), not the marketing version. The
+fresh GitHub-download validation in section 6 separately verifies those bytes.
 
 **A 200 from a hash-named R2 URL is evidence of publication, not of content.**
 The digest in that key is a naming convention; R2 serves whatever bytes live at
@@ -566,9 +985,10 @@ Two more traps on the reading side:
 ### Refresh the first-party Homebrew tap
 
 The public [`adamallcock/homebrew-tap`](https://github.com/adamallcock/homebrew-tap)
-workflow polls the latest non-draft GitHub release hourly, verifies the exact
-arm64 DMG asset, updates the cask version and SHA-256, runs the cask gates, and
-commits only when those values changed. It requires no cross-repository token.
+workflow polls the latest non-draft GitHub release hourly, verifies both exact
+ARM and Intel DMG assets, renders the architecture-selecting cask, runs its
+gates, and commits only when the complete desired cask differs. It requires no
+cross-repository token.
 For an immediate release, trigger the same workflow instead of waiting for the
 next scheduled poll:
 

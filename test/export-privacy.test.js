@@ -2,11 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { inspectSensitiveExportStrings, verifyPrivacySafeBundle } from "../src/export-privacy.js";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
-import {
+import { localSafeRecords } from "../src/local-node-runtime.js";
+import { deriveEventOccurrenceId, deriveSessionScopeId } from "../src/export-identity.js";
+
+const {
   normalizeClaudeStatusQuotaSnapshots,
   normalizeCodexCollectorQuotaCandidate,
-} from "../src/export-safe-records.js";
-import { deriveEventOccurrenceId, deriveSessionScopeId } from "../src/export-identity.js";
+} = localSafeRecords;
 
 const SECRET = Buffer.alloc(32, 51);
 

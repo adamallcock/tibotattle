@@ -2,6 +2,7 @@ import { MAX_PLAINTEXT_BYTES } from "./constants";
 import { ApiError } from "./errors";
 import type { SyntheticEnvelope } from "./validation";
 import type { TelemetryEnvelope } from "./telemetry-validation";
+import type { TelemetryV11Envelope } from "@app-usagemonitor/telemetry-contract";
 import { parseStrictJson } from "./strict-json";
 
 const encoder = new TextEncoder();
@@ -131,7 +132,7 @@ export function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
 }
 
 export async function decryptSyntheticEnvelope(
-  envelope: SyntheticEnvelope | TelemetryEnvelope,
+  envelope: SyntheticEnvelope | TelemetryEnvelope | TelemetryV11Envelope,
   publicJwkRaw: string,
   privateJwkRaw: string,
 ): Promise<unknown> {

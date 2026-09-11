@@ -22,6 +22,11 @@ import {
   HOMEBREW_INSTALL_COMMAND,
   copyInstallerChecksum,
   copyHomebrewInstallCommand,
+  detectPublicPlatform,
+  resolveInitialPublicPlatform,
+  renderPublicInstallerJourney,
+  wirePublicPlatformSelector,
+  selectCommunityAllowancePayload,
 } from "../public/community.js";
 import {
   compactMacOSVersion,
@@ -49,6 +54,7 @@ class FakeElement {
     this.tag = tag;
     this.children = [];
     this.attributes = new Map();
+    this.dataset = {};
     this.className = "";
     this.textContent = "";
     this.hidden = false;
@@ -107,6 +113,120 @@ function fakeDocument(metaContent = {}) {
     },
     byId,
   };
+}
+
+function openingTagForId(html, id) {
+  const match = html.match(new RegExp(`<[^>]+\\bid="${id}"[^>]*>`, "u"));
+  assert.ok(match, `${id} has an opening tag`);
+  return match[0];
+}
+
+class FakePlatformNode {
+  constructor({ dataset = {}, hidden = false } = {}) {
+    this.attributes = new Map();
+    this.dataset = { ...dataset };
+    this.hidden = hidden;
+    this.focusCount = 0;
+    this.listeners = new Map();
+  }
+
+  addEventListener(type, listener) {
+    this.listeners.set(type, listener);
+  }
+
+  dispatch(type, event) {
+    this.listeners.get(type)?.(event);
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, value);
+  }
+
+  focus() {
+    this.focusCount += 1;
+  }
+
+  closest(selector) {
+    return selector === '[role="tab"][data-platform]' && this.dataset.platform
+      ? this
+      : null;
+  }
+}
+
+function fakePlatformSelectorDocument({ missingPanel = null } = {}) {
+  const platforms = ["macos", "macos-intel", "windows", "linux"];
+  const tabs = new Map(platforms.map((platform) => [
+    platform,
+    new FakePlatformNode({ dataset: { platform } }),
+  ]));
+  const panels = new Map(platforms
+    .filter((platform) => platform !== missingPanel)
+    .map((platform) => [
+      platform,
+      new FakePlatformNode({
+        dataset: { platformPanel: platform },
+        hidden: platform !== "macos",
+      }),
+    ]));
+  const selector = new FakePlatformNode({ hidden: true });
+  selector.querySelectorAll = (query) => query === '[role="tab"][data-platform]'
+    ? [...tabs.values()]
+    : [];
+  selector.contains = (candidate) => [...tabs.values()].includes(candidate);
+  const documentRef = {
+    documentElement: { dataset: {} },
+    querySelector(query) {
+      return query === "#platform-selector" ? selector : null;
+    },
+    querySelectorAll(query) {
+      return query === "[data-platform-panel]" ? [...panels.values()] : [];
+    },
+  };
+  return { documentRef, panels, selector, tabs };
+}
+
+function recordingStorage(initial = {}) {
+  const values = new Map(Object.entries(initial));
+  const reads = [];
+  const writes = [];
+  return {
+    getItem(key) {
+      reads.push(key);
+      return values.get(key) ?? null;
+    },
+    reads,
+    setItem(key, value) {
+      writes.push([key, value]);
+      values.set(key, value);
+    },
+    values,
+    writes,
+  };
+}
+
+function assertPlatformSelection(fixture, selectedPlatform) {
+  assert.equal(
+    fixture.documentRef.documentElement.dataset.downloadPlatform,
+    selectedPlatform,
+  );
+  assert.equal(fixture.selector.hidden, false);
+  for (const platform of ["macos", "macos-intel", "windows", "linux"]) {
+    assert.equal(
+      fixture.tabs.get(platform).attributes.get("aria-selected"),
+      String(platform === selectedPlatform),
+      `${platform} aria-selected`,
+    );
+    assert.equal(
+      fixture.tabs.get(platform).attributes.get("tabindex"),
+      platform === selectedPlatform ? "0" : "-1",
+      `${platform} tabindex`,
+    );
+    assert.equal(
+      fixture.panels.get(platform).hidden,
+      platform !== selectedPlatform,
+      `${platform} panel visibility`,
+    );
+  }
 }
 
 function publishedSnapshot(overrides = {}) {
@@ -188,11 +308,16 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /id="installer-unavailable"/u);
   assert.match(html, /id="homebrew-install"[^>]*hidden/u);
   assert.match(html, /id="homebrew-copy-button"/u);
+  assert.match(html, /id="intel-homebrew-install"[^>]*hidden/u);
+  assert.match(html, /id="intel-homebrew-copy-button"/u);
   assert.doesNotMatch(html, /open-installed-app|usage-monitor-semantic-open-target|usagemonitor:\/\//u);
   assert.match(html, /id="community-daily-result"/u);
   assert.match(html, /id="community-daily-state"/u);
   assert.match(html, /id="community-daily-hero"/u);
-  assert.match(html, /id="community-method-summary">See community activity details<\/summary>/u);
+  assert.match(
+    html,
+    /id="community-method-summary"[^>]*>See community activity<\/summary>/u,
+  );
   assert.doesNotMatch(html, /community-daily-status|community-daily-panel-state/u);
 
   // The legacy sealed-snapshot presentation is retired: the page carries no
@@ -267,6 +392,24 @@ test("the public site presents only the install call to action and the community
     /<nav\s+class="primary-nav"\s+aria-label="Site sections"(?:\s[^>]*)?>/u,
   );
   assert.match(html, /aria-labelledby="install-title"/u);
+  const tablist = openingTagForId(html, "platform-selector");
+  assert.match(tablist, /\brole="tablist"/u);
+  assert.match(tablist, /\baria-label="Choose your platform"/u);
+  assert.match(tablist, /\bhidden(?:\s|>)/u);
+  for (const platform of ["macos", "macos-intel", "windows", "linux"]) {
+    const tab = openingTagForId(html, `platform-tab-${platform}`);
+    assert.match(tab, /\brole="tab"/u);
+    assert.match(tab, new RegExp(`\\baria-controls="platform-panel-${platform}"`, "u"));
+    const panel = openingTagForId(html, `platform-panel-${platform}`);
+    assert.match(panel, /\brole="tabpanel"/u);
+    assert.match(panel, new RegExp(`\\baria-labelledby="platform-tab-${platform}"`, "u"));
+    assert.match(panel, /\btabindex="0"/u);
+  }
+  assert.doesNotMatch(
+    openingTagForId(html, "platform-panel-macos"),
+    /\bhidden(?:\s|>)/u,
+    "macOS remains the usable no-JavaScript fallback",
+  );
   assert.match(html, /aria-labelledby="community-method-summary"/u);
   assert.match(
     await readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
@@ -331,24 +474,55 @@ test("the public community client exposes only the read-only daily request", asy
   );
 });
 
-test("the first visit leads with the product, Mac download action, and daily community view", async () => {
+test("the first visit leads with the product, platform choice, and daily community view", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   assert.match(html, /<h1 id="install-title">What the Codex allowance is really worth\.<\/h1>/u);
   assert.match(html, /turns your seven-day Codex allowance into an\s+API-price-equivalent estimate/u);
-  assert.match(html, /calculates your personal dashboard on your Mac\./u);
+  assert.match(html, /calculates your personal dashboard locally on your computer\./u);
+  assert.doesNotMatch(html, /calculates your personal dashboard on your Mac\./u);
+  assert.match(html, /id="header-download-label"[^>]*>\s*Get the app\s*<\/span>/u);
+  assert.doesNotMatch(html, /Get the Mac app/u);
+  for (const [platform, label] of [
+    ["macos", "macOS Apple silicon"],
+    ["macos-intel", "macOS Intel"],
+    ["windows", "Windows"],
+    ["linux", "Linux"],
+  ]) {
+    const start = html.indexOf(`id="platform-tab-${platform}"`);
+    const end = html.indexOf("</button>", start);
+    assert.ok(start >= 0 && end > start, `${label} tab is complete`);
+    assert.match(html.slice(start, end), new RegExp(`>${label}<\\/span>`, "u"));
+    assert.doesNotMatch(
+      html.slice(start, end),
+      /<small\b/u,
+      `${label} keeps availability detail in its panel instead of the selector`,
+    );
+  }
   assert.match(html, /Download for macOS/u);
+  assert.equal(
+    html.match(/Download for macOS/gu)?.length,
+    3,
+    "the ARM actions and optional Intel action retain their platform-specific labels",
+  );
   assert.match(html, /Copy SHA-256/u);
   assert.match(
     html,
     /brew install --cask adamallcock\/tap\/tibotattle/u,
   );
   assert.match(html, /Latest community evidence/u);
-  assert.match(html, /See community activity details/u);
+  assert.match(html, /See community activity/u);
+  assert.match(html, /Community activity over time/u);
+  assert.match(
+    html,
+    /Delayed, aggregate daily totals from optional contributions\./u,
+  );
   assert.doesNotMatch(html, /The community signal|Personal dashboards and contributions stay in the Mac app\./u);
   assert.doesNotMatch(html, /community-estimate-summary|community-daily-panel-state|community-daily-status/u);
-  assert.match(html, /Install the Mac app/u);
+  assert.match(html, /Install the desktop app/u);
+  assert.doesNotMatch(html, /Install the Mac app/u);
   assert.match(html, /See your week/u);
-  assert.match(html, /Share only if you choose/u);
+  assert.match(html, /data-i18n="electron\.sharing\.publicFeatureTitle"/u);
+  assert.match(html, /Control your sharing/u);
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
   assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
   assert.match(html, /src="\.\/apple\.svg"/u);
@@ -389,6 +563,367 @@ test("the first visit leads with the product, Mac download action, and daily com
     html,
     /best guess|privacy[- ]reviewed|privacy and quality checks/u,
   );
+});
+
+test("platform tabs keep the live macOS release separate from honest unavailable panels", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const macosStart = html.indexOf('id="platform-panel-macos"');
+  const intelStart = html.indexOf('id="platform-panel-macos-intel"');
+  const windowsStart = html.indexOf('id="platform-panel-windows"');
+  const linuxStart = html.indexOf('id="platform-panel-linux"');
+  const panelsEnd = html.indexOf('class="community-inline"', linuxStart);
+
+  assert.ok(macosStart >= 0, "macOS panel exists");
+  assert.ok(intelStart > macosStart, "Intel panel follows Apple silicon");
+  assert.ok(windowsStart > intelStart, "Windows panel follows macOS Intel");
+  assert.ok(linuxStart > windowsStart, "Linux panel follows Windows");
+  assert.ok(panelsEnd > linuxStart, "platform panels end before community activity");
+
+  const macosPanel = html.slice(macosStart, intelStart);
+  const intelPanel = html.slice(intelStart, windowsStart);
+  const windowsPanel = html.slice(windowsStart, linuxStart);
+  const linuxPanel = html.slice(linuxStart, panelsEnd);
+
+  assert.match(macosPanel, /id="installer-link"/u);
+  assert.match(macosPanel, /id="homebrew-install"/u);
+  assert.match(macosPanel, /id="installer-sha256-copy"/u);
+  assert.match(macosPanel, /Developer ID signed and Apple notarized\./u);
+  assert.match(intelPanel, /id="intel-homebrew-install"/u);
+  assert.match(intelPanel, /id="intel-homebrew-install-command"[^>]*>brew install --cask adamallcock\/tap\/tibotattle<\/code>/u);
+  assert.match(intelPanel, /id="intel-homebrew-copy-button"[\s\S]*?aria-describedby="intel-homebrew-copy-status"/u);
+
+  for (const [platform, panel] of [
+    ["macOS Intel", intelPanel.slice(intelPanel.indexOf('id="intel-installer-unavailable"'))],
+    ["Windows", windowsPanel],
+    ["Linux", linuxPanel],
+  ]) {
+    assert.match(panel, new RegExp(`TiboTattle for ${platform} is not available yet\\.`, "u"));
+    assert.match(panel, /Not yet available/u);
+    assert.doesNotMatch(panel, /id="installer-|id="homebrew-|brew install/iu);
+    assert.doesNotMatch(panel, /Download for|\.dmg\b|\.exe\b|\.msi\b|AppImage/iu);
+    assert.doesNotMatch(panel, /SHA-256|Developer ID|notarized|Version 0\./iu);
+    assert.doesNotMatch(panel, /<a\b[^>]*class="[^"]*\bbutton\b/iu);
+    assert.doesNotMatch(panel, /<button\b[^>]*disabled/iu);
+  }
+  assert.match(intelPanel, /tibotattle\/issues\/93/u);
+  assert.match(openingTagForId(html, "intel-installation"), /\bhidden(?:\s|>)/u);
+  assert.match(openingTagForId(html, "intel-download-assurance"), /\bhidden(?:\s|>)/u);
+  assert.match(windowsPanel, /tibotattle\/issues\/3/u);
+  assert.match(linuxPanel, /tibotattle\/issues\/4/u);
+
+  const macosTab = openingTagForId(html, "platform-tab-macos");
+  assert.match(macosTab, /\baria-selected="true"/u);
+  assert.match(macosTab, /\btabindex="0"/u);
+  for (const platform of ["macos-intel", "windows", "linux"]) {
+    const tab = openingTagForId(html, `platform-tab-${platform}`);
+    assert.match(tab, /\baria-selected="false"/u);
+    assert.match(tab, /\btabindex="-1"/u);
+    assert.match(openingTagForId(html, `platform-panel-${platform}`), /\bhidden(?:\s|>)/u);
+  }
+});
+
+test("platform detection is conservative and explicit choices take precedence", () => {
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "Windows",
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    }),
+    "windows",
+  );
+  assert.equal(
+    detectPublicPlatform({ userAgentDataPlatform: "macOS", userAgent: "" }),
+    "macos",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "MacIntel",
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    }),
+    "macos",
+    "Intel browser tokens also occur on Apple silicon and cannot identify the chip",
+  );
+  assert.equal(
+    detectPublicPlatform({ userAgentDataPlatform: "Linux", userAgent: "" }),
+    "linux",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    }),
+    "windows",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "",
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    }),
+    "macos",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "",
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64)",
+    }),
+    "linux",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "",
+      userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 9)",
+    }),
+    null,
+    "Android's Linux token must not imply Linux desktop availability",
+  );
+  assert.equal(
+    detectPublicPlatform({ userAgentDataPlatform: "Chrome OS", userAgent: "" }),
+    null,
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "macOS",
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      maxTouchPoints: 5,
+    }),
+    null,
+    "an iPad presenting a desktop Mac user agent must not select macOS",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "Linux",
+      userAgent: "Mozilla/5.0 (X11; CrOS x86_64 16093.68.0)",
+    }),
+    null,
+    "a ChromeOS Linux token must not select a Linux desktop build",
+  );
+
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: "macos-intel",
+      savedPlatform: "windows",
+      detectedPlatform: "macos",
+    }),
+    "macos-intel",
+  );
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: "linux",
+      savedPlatform: "windows",
+      detectedPlatform: "macos",
+    }),
+    "linux",
+  );
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: "not-a-platform",
+      savedPlatform: "windows",
+      detectedPlatform: "macos",
+    }),
+    "windows",
+  );
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: null,
+      savedPlatform: "invalid",
+      detectedPlatform: "linux",
+    }),
+    "linux",
+  );
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: null,
+      savedPlatform: null,
+      detectedPlatform: null,
+    }),
+    "macos",
+    "macOS remains the truthful default when no desktop platform can be inferred",
+  );
+});
+
+test("the platform selector applies URL state and persists only user interaction", () => {
+  const storageKey = "tibotattle.download-platform.v1";
+  const storage = recordingStorage({ [storageKey]: "windows" });
+  const fixture = fakePlatformSelectorDocument();
+  assert.equal(
+    wirePublicPlatformSelector(fixture.documentRef, {
+      navigatorRef: {
+        userAgentData: { platform: "macOS" },
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        maxTouchPoints: 0,
+      },
+      locationRef: { search: "?campaign=homepage&platform=linux" },
+      storage,
+    }),
+    "linux",
+  );
+  assert.equal(fixture.selector.dataset.platformBound, "true");
+  assert.deepEqual(storage.reads, [storageKey]);
+  assert.deepEqual(storage.writes, [], "initial selection is never persisted");
+  assertPlatformSelection(fixture, "linux");
+
+  fixture.selector.dispatch("click", { target: fixture.tabs.get("windows") });
+  assertPlatformSelection(fixture, "windows");
+  assert.deepEqual(storage.writes, [[storageKey, "windows"]]);
+
+  function press(platform, key, expectedPlatform) {
+    let prevented = 0;
+    fixture.selector.dispatch("keydown", {
+      key,
+      preventDefault() {
+        prevented += 1;
+      },
+      target: fixture.tabs.get(platform),
+    });
+    assert.equal(prevented, 1, `${key} prevents native scrolling`);
+    assertPlatformSelection(fixture, expectedPlatform);
+    assert.ok(
+      fixture.tabs.get(expectedPlatform).focusCount > 0,
+      `${key} moves focus to ${expectedPlatform}`,
+    );
+  }
+
+  press("windows", "ArrowRight", "linux");
+  press("linux", "ArrowRight", "macos");
+  press("macos", "ArrowRight", "macos-intel");
+  press("macos-intel", "ArrowRight", "windows");
+  press("windows", "ArrowLeft", "macos-intel");
+  press("macos-intel", "ArrowLeft", "macos");
+  press("macos", "ArrowLeft", "linux");
+  press("linux", "Home", "macos");
+  press("macos", "End", "linux");
+  assert.deepEqual(
+    storage.writes.map(([, value]) => value),
+    ["windows", "linux", "macos", "macos-intel", "windows", "macos-intel", "macos", "linux", "macos", "linux"],
+  );
+});
+
+test("explicit Intel selection hides the ARM panel and survives the next visit", () => {
+  const storage = recordingStorage();
+  const fixture = fakePlatformSelectorDocument();
+  wirePublicPlatformSelector(fixture.documentRef, {
+    navigatorRef: { userAgentData: { platform: "macOS" } },
+    locationRef: { search: "" },
+    storage,
+  });
+  fixture.selector.dispatch("click", { target: fixture.tabs.get("macos-intel") });
+  assertPlatformSelection(fixture, "macos-intel");
+  assert.equal(fixture.panels.get("macos").hidden, true);
+
+  const nextVisit = fakePlatformSelectorDocument();
+  assert.equal(wirePublicPlatformSelector(nextVisit.documentRef, {
+    navigatorRef: { userAgentData: { platform: "macOS" } },
+    locationRef: { search: "" },
+    storage,
+  }), "macos-intel");
+  assertPlatformSelection(nextVisit, "macos-intel");
+  assert.equal(storage.writes.length, 1, "only the deliberate selection is persisted");
+
+  const linkedVisit = fakePlatformSelectorDocument();
+  assert.equal(wirePublicPlatformSelector(linkedVisit.documentRef, {
+    navigatorRef: { userAgentData: { platform: "Windows" } },
+    locationRef: { search: "?platform=macos-intel" },
+    storage: recordingStorage({ "tibotattle.download-platform.v1": "windows" }),
+  }), "macos-intel");
+  assertPlatformSelection(linkedVisit, "macos-intel");
+});
+
+test("platform inference reveals the selector without writing session state", () => {
+  const storage = recordingStorage();
+  const fixture = fakePlatformSelectorDocument();
+  assert.equal(
+    wirePublicPlatformSelector(fixture.documentRef, {
+      navigatorRef: {
+        userAgentData: { platform: "Windows" },
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      },
+      locationRef: { search: "" },
+      storage,
+    }),
+    "windows",
+  );
+  assertPlatformSelection(fixture, "windows");
+  assert.deepEqual(storage.writes, []);
+});
+
+test("mobile Mac and ChromeOS hints fall back safely through the wired selector", () => {
+  for (const [label, navigatorRef] of [
+    ["iPad", {
+      userAgentData: { platform: "macOS" },
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      maxTouchPoints: 5,
+    }],
+    ["ChromeOS", {
+      userAgentData: { platform: "Linux" },
+      userAgent: "Mozilla/5.0 (X11; CrOS x86_64 16093.68.0)",
+      maxTouchPoints: 0,
+    }],
+  ]) {
+    const storage = recordingStorage();
+    const fixture = fakePlatformSelectorDocument();
+    assert.equal(
+      wirePublicPlatformSelector(fixture.documentRef, {
+        navigatorRef,
+        locationRef: { search: "" },
+        storage,
+      }),
+      "macos",
+      label,
+    );
+    assertPlatformSelection(fixture, "macos");
+    assert.deepEqual(storage.writes, [], label);
+  }
+});
+
+test("the selector tolerates unavailable or throwing storage", () => {
+  const throwingStorage = {
+    getItem() {
+      throw new Error("storage blocked");
+    },
+    setItem() {
+      throw new Error("storage blocked");
+    },
+  };
+  for (const [label, storage] of [
+    ["unavailable", null],
+    ["throwing", throwingStorage],
+  ]) {
+    const fixture = fakePlatformSelectorDocument();
+    assert.equal(
+      wirePublicPlatformSelector(fixture.documentRef, {
+        navigatorRef: {
+          userAgentData: { platform: "Windows" },
+          userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        },
+        locationRef: { search: "" },
+        storage,
+      }),
+      "windows",
+      label,
+    );
+    assertPlatformSelection(fixture, "windows");
+    assert.doesNotThrow(() => fixture.selector.dispatch("click", {
+      target: fixture.tabs.get("linux"),
+    }));
+    assertPlatformSelection(fixture, "linux");
+  }
+});
+
+test("a malformed platform selector fails closed before binding", () => {
+  const fixture = fakePlatformSelectorDocument({ missingPanel: "linux" });
+  const storage = recordingStorage();
+  assert.equal(
+    wirePublicPlatformSelector(fixture.documentRef, {
+      navigatorRef: { userAgentData: { platform: "Linux" } },
+      locationRef: { search: "?platform=linux" },
+      storage,
+    }),
+    null,
+  );
+  assert.equal(fixture.selector.hidden, true);
+  assert.equal(fixture.selector.dataset.platformBound, undefined);
+  assert.equal(fixture.documentRef.documentElement.dataset.downloadPlatform, undefined);
+  assert.deepEqual(storage.reads, []);
+  assert.deepEqual(storage.writes, []);
 });
 
 test("the Homebrew action copies only the fixed first-party tap command", async () => {
@@ -441,11 +976,16 @@ test("the installer checksum action copies only a complete SHA-256 digest", asyn
   );
 });
 
-test("the public hero keeps equal columns and a bounded stacked preview", async () => {
+test("the public hero keeps equal top-aligned columns and a bounded stacked preview", async () => {
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   assert.match(
     styles,
     /grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/u,
+  );
+  assert.match(
+    styles,
+    /\.community-site \.product-hero \{[\s\S]*?align-items: start;/u,
+    "OS panel height changes must not vertically recenter the community graph",
   );
   assert.match(styles, /@media \(max-width: 1120px\)/u);
   assert.match(styles, /width: min\(100%, 620px\);/u);
@@ -471,6 +1011,34 @@ test("the Homebrew command stays bounded and readable at narrow widths", async (
     styles,
     /@media \(max-width: 420px\) \{[\s\S]*?\.community-site \.homebrew-install code \{\s*overflow-x: visible;\s*white-space: normal;/u,
   );
+  assert.match(
+    styles,
+    /\.community-site \.homebrew-install code \{[\s\S]*?font-size: \.6rem;/u,
+    "the long fixed command uses the deliberately smaller desktop type size",
+  );
+});
+
+test("the platform selector stays compact and wraps full architecture labels at narrow widths", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const selectorRule = styles.match(/\.community-site \.platform-selector \{([^}]*)\}/u)?.[1] ?? "";
+  const tabRule = styles.match(/\.community-site \.platform-tab \{([^}]*)\}/u)?.[1] ?? "";
+  const selectedRule = styles.match(/\.community-site \.platform-tab\[aria-selected="true"\] \{([^}]*)\}/u)?.[1] ?? "";
+
+  assert.match(selectorRule, /display: inline-flex;/u);
+  assert.match(selectorRule, /flex-wrap: wrap;/u);
+  assert.match(selectorRule, /width: auto;/u);
+  assert.match(selectorRule, /border: 0;/u);
+  assert.match(selectorRule, /background: transparent;/u);
+  assert.match(selectorRule, /box-shadow: none;/u);
+  assert.match(tabRule, /min-height: 32px;/u);
+  assert.match(
+    styles,
+    /\.community-site \.platform-tab \+ \.platform-tab \{\s*border-inline-start: 1px solid/u,
+  );
+  assert.match(selectedRule, /border-bottom-color: var\(--site-green-bright\);/u);
+  assert.match(selectedRule, /font-weight: var\(--weight-bold\);/u);
+  assert.match(selectedRule, /background: transparent;/u);
+  assert.match(selectedRule, /box-shadow: none;/u);
 });
 
 test("the public header and footer stay compact on narrow screens", async () => {
@@ -554,7 +1122,12 @@ test("unavailable community activity uses the compact public state", async () =>
   );
   assert.match(
     html,
-    /<summary id="community-method-summary">See community activity details<\/summary>/u,
+    /<summary id="community-method-summary"[^>]*>See community activity<\/summary>/u,
+  );
+  assert.match(html, /Community activity over time/u);
+  assert.match(
+    html,
+    /This public view includes no prompts, responses, or account details\./u,
   );
   assert.doesNotMatch(
     html,
@@ -578,6 +1151,9 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   const verifyRelease = await readFile(VERIFY_RELEASE, "utf8");
   const privacy = await readFile(PRIVACY_HTML, "utf8");
   assert.match(docs, /<title>TiboTattle Docs<\/title>/u);
+  assert.match(docs, /macOS 14 or later on Apple silicon and Intel/u);
+  assert.match(docs, /<code data-i18n-skip>brew install --cask adamallcock\/tap\/tibotattle<\/code>/u);
+  assert.match(docs, /installing it does not require Node\.js, pnpm, or Xcode/u);
   assert.match(
     docs,
     /Estimated API-equivalent value of the observed seven-day allowance\./u,
@@ -617,7 +1193,17 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   assert.match(verifyRelease, /does not prove safety/u);
   assert.match(privacy, /<title>TiboTattle Privacy Overview<\/title>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);
-  assert.match(privacy, /Nothing is contributed unless you review and opt in\./u);
+  assert.match(privacy, /fresh installations enable sharing\s+automatically/u);
+  assert.match(privacy, /No social sign-in is required/u);
+  assert.match(privacy, /three\s+visible notices/u);
+  assert.match(privacy, /at least seven days from the transition's start/u);
+  assert.match(privacy, /at least one day after the final notice/u);
+  assert.match(privacy, /Known off, paused, or\s+disconnected installations stay off/u);
+  assert.match(privacy, /Unreadable or uncertain preference state does not\s+enable sharing/u);
+  assert.match(privacy, /does not prove a unique person/u);
+  assert.match(privacy, /Accountless contributions are currently excluded from public/u);
+  assert.doesNotMatch(privacy, /Nothing is contributed unless|one-person account boundary/u);
+  assert.doesNotMatch(docs, /Contribution stays off until|one pseudonymous person|delete the complete hosted participation/u);
   for (const page of [docs, privacy]) {
     assert.match(page, /href="\.\/community\.html#download"/u);
     assert.match(
@@ -707,6 +1293,7 @@ test("the retained weekly snapshot normalizer still guards the app's closed cont
 test("the community allowance surface leads the product hero with honest labeling", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const source = await readFile(SITE_SOURCE, "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 
   assert.match(html, /id="community-allowance-figure"/u);
   assert.match(html, /id="community-allowance-result"/u);
@@ -725,17 +1312,71 @@ test("the community allowance surface leads the product hero with honest labelin
     allowanceIndex < communityIndex && communityIndex < dailyIndex && dailyIndex < featureIndex,
     "the daily-activity disclosure renders above the supporting feature strip",
   );
-  // Segmented time controls follow the app's established range pattern.
-  for (const control of [
-    'data-range-days="30"',
-    'data-range-days="90"',
-    'data-range-days=""',
-  ]) {
+  // The honest recomputation horizon is 70 days, so 90d would duplicate All.
+  for (const control of ['data-range-days="30"', 'data-range-days=""']) {
     assert.match(html, new RegExp(control, "u"), control);
   }
+  assert.doesNotMatch(html, /data-range-days="90"/u);
+  assert.match(
+    html,
+    /data-range-days="30" class="active" aria-pressed="true"/u,
+  );
+  assert.match(html, /Pro 20x-equivalent allowance/u);
+  assert.match(html, /API-price value of a Pro 20x-equivalent week: overall, by plan or by model/u);
+  for (const view of ["aggregate", "plans", "models"]) {
+    assert.equal(html.match(new RegExp(`data-allowance-view="${view}"`, "gu"))?.length, 2);
+  }
+  assert.equal(html.match(/data-allowance-view-controls/gu)?.length, 2);
+  assert.match(html, /role="group" aria-label="Allowance graph view"/u);
+  assert.doesNotMatch(source, /admin-client|admin\.js|\/admin\/community/u,
+    "public controls must never call or import the private admin surface");
+
+  // The larger chart is a standard native-dialog lightbox. The launcher is
+  // hidden until a published chart is actually renderable, then exposes the
+  // dialog relationship to assistive technology without invoking browser
+  // fullscreen mode.
+  const launcherIndex = html.indexOf('id="community-allowance-expand"');
+  assert.ok(launcherIndex >= 0, "the allowance chart has an expand launcher");
+  const launcherMarkup = html.slice(
+    html.lastIndexOf("<button", launcherIndex),
+    html.indexOf("</button>", launcherIndex) + "</button>".length,
+  );
+  assert.match(launcherMarkup, /aria-haspopup="dialog"/u);
+  assert.match(launcherMarkup, /aria-controls="community-allowance-dialog"/u);
+  assert.match(launcherMarkup, /aria-label="Expand community allowance chart"/u);
+  assert.match(launcherMarkup, /\shidden(?:\s|>)/u);
+
+  assert.match(
+    html,
+    /<dialog[\s\S]*?id="community-allowance-dialog"[\s\S]*?aria-labelledby="community-allowance-dialog-title"[\s\S]*?aria-describedby="community-allowance-dialog-copy"/u,
+  );
+  assert.match(
+    html,
+    /<h2 id="community-allowance-dialog-title"[^>]*>Community allowance history<\/h2>/u,
+  );
+  assert.match(
+    html,
+    /id="community-allowance-dialog-close"[\s\S]*?type="button"[\s\S]*?aria-label="Close expanded community allowance chart"/u,
+  );
+  assert.match(html, /id="community-allowance-dialog-range-controls"/u);
+  assert.equal(
+    html.match(/data-allowance-range-controls/g)?.length,
+    2,
+    "inline and expanded views expose the same synchronized range contract",
+  );
 
   assert.match(source, /renderCommunityAllowanceSection/u);
-  assert.match(source, /community-allowance-range-controls/u);
+  assert.match(source, /syncAllowanceRangeControls/u);
+  assert.match(source, /launcher\.hidden = !available;/u);
+  assert.match(source, /dialog\.showModal\(\);/u);
+  assert.match(source, /closeButton\.focus\(\);/u);
+  assert.match(source, /dialog\.addEventListener\("close"/u);
+  assert.match(source, /allowanceDialogReturnFocus\?\.focus\?\.\(\);/u);
+  assert.match(styles, /\.community-site \.community-chart-dialog::backdrop/u);
+  assert.match(
+    styles,
+    /\.community-site \.community-chart-dialog \{\s*width: min\(1180px, calc\(100vw - 32px\)\);/u,
+  );
 
   const publicCopy = `${html}\n${source}`;
   assert.doesNotMatch(
@@ -807,6 +1448,7 @@ function publishedDailySeries(overrides = {}) {
     schemaVersion: COMMUNITY_DAILY_READ_SCHEMA_VERSION,
     from: "2025-08-08",
     to: "2026-08-08",
+    allowanceState: "ready",
     days: [
       publishedDailyDay("2026-08-06", 1),
       publishedDailyDay("2026-08-07", 2),
@@ -814,6 +1456,28 @@ function publishedDailySeries(overrides = {}) {
     ...overrides,
   };
 }
+
+test("an activity-only storage fallback preserves only the confirmed allowance observation", () => {
+  const previous = publishedDailySeries();
+  const temporary = publishedDailySeries({
+    allowanceState: "updating", allowanceReadState: "temporarily_unavailable",
+    days: [publishedDailyDay("2026-08-07", 3)],
+  });
+  assert.equal(selectCommunityAllowancePayload(previous, temporary), previous);
+  assert.equal(normalizeCommunityDailySeries(temporary).days[0].revision, 3,
+    "the new daily activity remains independently renderable");
+  assert.equal(selectCommunityAllowancePayload(null, temporary), null,
+    "a temporary response cannot invent a first graph");
+  const withdrawn = publishedDailySeries({ allowanceState: "updating", allowanceReadState: "confirmed", days: [] });
+  assert.equal(selectCommunityAllowancePayload(previous, withdrawn), withdrawn);
+  assert.equal(selectCommunityAllowancePayload(withdrawn, temporary), withdrawn,
+    "later read failures cannot resurrect a withdrawn graph");
+  assert.equal(selectCommunityAllowancePayload(previous, null), null);
+  const malformed = { ...temporary, days: "malformed" };
+  assert.equal(selectCommunityAllowancePayload(previous, malformed), malformed,
+    "an invalid payload cannot use a fallback marker as authority");
+  assert.equal(normalizeCommunityDailySeries({ ...temporary, allowanceReadState: "unreviewed" }).state, "unsupported_schema");
+});
 
 test("the public daily client requests exactly the inclusive year window", async () => {
   const calls = [];
@@ -837,7 +1501,7 @@ test("the public daily client requests exactly the inclusive year window", async
   );
   assert.deepEqual(calls, [[
     `/api/v1/community/daily?from=${from}&to=${to}`,
-    { headers: { Accept: "application/json" } },
+    { headers: { Accept: "application/json" }, cache: "no-cache" },
   ]]);
 });
 
@@ -921,7 +1585,7 @@ test("the daily series normalizer accepts only the closed published contract", (
   }
 });
 
-test("a published daily series renders revision freshness, latest-first", () => {
+test("a published daily series renders friendly cumulative activity, latest-first", () => {
   const documentRef = fakeDocument();
   const container = documentRef.createElement("div");
   const stateNode = documentRef.createElement("span");
@@ -934,16 +1598,49 @@ test("a published daily series renders revision freshness, latest-first", () => 
   });
   assert.equal(state, "published");
   assert.equal(stateNode.textContent, "Daily series available");
-  assert.match(container.text, /Latest published day/u);
-  assert.match(container.text, /Aug 7, 2026/u);
-  assert.doesNotMatch(container.text, /Aug 6, 2026/u);
-  assert.match(container.text, /r2/u);
-  assert.match(container.text, /Revision age/u);
-  assert.match(container.text, /Published days in window/u);
-  assert.match(container.text, /never edit history/u);
+  const quality = container.descendants().find(
+    (element) => element.className === "snapshot-quality-grid",
+  );
+  assert.ok(quality, "the reader-facing activity summary is present");
+  const terms = quality.descendants()
+    .filter(({ tag }) => tag === "dt")
+    .map(({ textContent }) => textContent);
+  const values = quality.descendants()
+    .filter(({ tag }) => tag === "dd")
+    .map(({ textContent }) => textContent);
+  const details = quality.descendants()
+    .filter(({ tag }) => tag === "small")
+    .map(({ textContent }) => textContent);
+  assert.deepEqual(terms, [
+    "Activity through",
+    "Total API-equivalent spend",
+    "Turns counted",
+    "All tokens counted",
+  ]);
+  assert.deepEqual(values, ["Aug 7, 2026", "—", "240", "3K"]);
+  assert.deepEqual(details, [
+    "Most recent community day",
+    "API-equivalent spend unavailable; not an actual bill",
+    "Usage events across 2 shared days",
+    "Input and output across 2 shared days",
+  ]);
+  for (const retiredOperationalLabel of [
+    "Latest published day",
+    "Revision",
+    "Revision age",
+    "Released",
+    "Published days in window",
+    "Contributors that day",
+  ]) {
+    assert.equal(quality.text.includes(retiredOperationalLabel), false, retiredOperationalLabel);
+  }
+  assert.match(
+    container.text,
+    /Late contributions can update a day; this view always shows the newest published totals\./u,
+  );
 
   // The chart precedes the table: bars for usage events, a line series for
-  // combined output, and — while the series is one or two days long — dots
+  // all input/output tokens, and — while the series is one or two days long — dots
   // plus the still-filling note.
   const svg = container.descendants().find(({ tag }) => tag === "svg");
   assert.ok(svg, "a published daily series renders its inline SVG chart");
@@ -959,10 +1656,10 @@ test("a published daily series renders revision freshness, latest-first", () => 
     .filter((element) => element.attributes.get("class") === "daily-events-bar");
   assert.equal(bars.length, 2);
   const dots = svg.descendants().filter(({ tag }) => tag === "circle");
-  assert.equal(dots.length, 2, "a sparse series marks every output point with a dot");
+  assert.equal(dots.length, 2, "a sparse series marks every token point with a dot");
   assert.match(container.text, /still filling/u);
   assert.match(container.text, /Usage events/u);
-  assert.match(container.text, /Output tokens/u);
+  assert.match(container.text, /All tokens/u);
 
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a published daily series renders its table");
@@ -975,14 +1672,14 @@ test("a published daily series renders revision freshness, latest-first", () => 
     "Usage events",
     "Quota observations",
     "Contributing devices",
-    "Output tokens",
-    "Released",
+    "All tokens",
   ]) {
     assert.equal(columnLabels.includes(label), true, label);
   }
-  // The revision column is gone from the table; revision freshness lives in
-  // the summary grid above (asserted earlier in this test).
+  // Operational publication metadata does not compete with the reader-facing
+  // activity itself in either the summary or detailed table.
   assert.equal(columnLabels.includes("Revision"), false);
+  assert.equal(columnLabels.includes("Released"), false);
   const bodyRows = table
     .descendants()
     .filter((element) => element.tag === "tr")
@@ -996,6 +1693,88 @@ test("a published daily series renders revision freshness, latest-first", () => 
   const numericCells = bodyRows[0].children
     .filter((cell) => cell.className === "numeric");
   assert.equal(numericCells.length, 4);
+});
+
+test("daily detail disclosure keeps its open state across publication refreshes without reviving unavailable content", () => {
+  const documentRef = fakeDocument(), container = documentRef.createElement("div");
+  const render = (payload = publishedDailySeries()) => renderCommunityDailySeries({ documentRef, container, payload });
+  const disclosure = () => container.descendants().find(element => element.tag === "details");
+  render(); const first = disclosure();
+  assert.equal(first.open, false); first.open = true;
+  render(); assert.notEqual(disclosure(), first); assert.equal(disclosure().open, true);
+  disclosure().open = false; render(); assert.equal(disclosure().open, false);
+  disclosure().open = true;
+  const separate = documentRef.createElement("div");
+  renderCommunityDailySeries({ documentRef, container: separate, payload: publishedDailySeries() });
+  assert.equal(separate.descendants().find(element => element.tag === "details").open, false);
+  assert.equal(render(null), "service_unavailable"); assert.equal(disclosure(), undefined);
+  render(); assert.equal(disclosure().open, false);
+});
+
+test("community spend card sums only reported equivalents and qualifies incomplete history", () => {
+  function spendBlock(knownCostUsd, overrides = {}) {
+    return {
+      basis: "reported_usage_event_time_api_price_equivalent_v1",
+      currency: "USD", knownCostUsd, coverage: "complete", usageEvents: 120,
+      fullyPricedUsageEvents: 120, partiallyPricedUsageEvents: 0, unpricedUsageEvents: 0,
+      pricingMethodVersion: "server-api-price-equivalent-v1.0", registrySha256: "a".repeat(64),
+      ...overrides,
+    };
+  }
+  const completeDay = (day, value) => publishedDailyDay(day, 1, {
+    payload: { apiEquivalentSpend: spendBlock(value), allowance: allowanceBlock({ centralUsd: 9999 }) },
+  });
+  const partialDay = publishedDailyDay("2026-08-07", 1, {
+    payload: { apiEquivalentSpend: spendBlock(2.5, {
+      coverage: "partial", fullyPricedUsageEvents: 100, unpricedUsageEvents: 20,
+    }) },
+  });
+  const unpricedDay = publishedDailyDay("2026-08-07", 1, {
+    payload: { apiEquivalentSpend: spendBlock(null, {
+      coverage: "unavailable", fullyPricedUsageEvents: 0, unpricedUsageEvents: 120,
+    }) },
+  });
+  const zeroDay = publishedDailyDay("2026-08-07", 1);
+  zeroDay.payload.totals.usageEvents = 0;
+  zeroDay.payload.apiEquivalentSpend = spendBlock(0, { usageEvents: 0, fullyPricedUsageEvents: 0 });
+  for (const [label, days, value, detail] of [
+    ["complete", [completeDay("2026-08-06", 1.25), completeDay("2026-08-07", 2.5)], "$3.75",
+      "Across 2 shared days in USD; not an actual bill"],
+    ["partial pricing", [completeDay("2026-08-06", 1.25), partialDay], "$3.75",
+      "Priced portion across 2 of 2 shared days in USD; not an actual bill"],
+    ["old day missing spend", [completeDay("2026-08-06", 1.25), publishedDailyDay("2026-08-07", 1)], "$1.25",
+      "Priced portion across 1 of 2 shared days in USD; not an actual bill"],
+    ["unpriced day", [completeDay("2026-08-06", 1.25), unpricedDay], "$1.25",
+      "Priced portion across 1 of 2 shared days in USD; not an actual bill"],
+    ["all unpriced", [unpricedDay], "—", "API-equivalent spend unavailable; not an actual bill"],
+    ["genuine zero", [zeroDay], "$0", "Across 1 shared days in USD; not an actual bill"],
+    ["overflow", [completeDay("2026-08-06", Number.MAX_VALUE), completeDay("2026-08-07", Number.MAX_VALUE)], "—",
+      "API-equivalent spend unavailable; not an actual bill"],
+  ]) {
+    const documentRef = fakeDocument();
+    const container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: publishedDailySeries({ days }) });
+    const cards = container.descendants().find((element) => element.className === "snapshot-quality-grid").children;
+    assert.equal(cards[1].children[0].textContent, "Total API-equivalent spend", label);
+    assert.equal(cards[1].children[1].textContent, value, label);
+    assert.equal(cards[1].children[2].textContent, detail, label);
+    assert.doesNotMatch(container.text, /Contributors that day|9,999/u, label);
+  }
+});
+
+test("community spend coverage wording is translated in every shipped language", () => {
+  for (const [locale, label, detail] of [
+    ["en-US", "Total API-equivalent spend", "API-equivalent spend unavailable; not an actual bill"],
+    ["zh-Hans", "API 等值总支出", "API 等值支出不可用；非实际账单"],
+    ["es", "Gasto total equivalente de API", "Gasto equivalente de API no disponible; no es una factura real"],
+  ]) {
+    const documentRef = fakeDocument();
+    documentRef.documentElement.lang = locale;
+    const container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: publishedDailySeries() });
+    assert.ok(container.text.includes(label), locale);
+    assert.ok(container.text.includes(detail), locale);
+  }
 });
 
 test("daily table columns share one unit chosen from the column maximum", () => {
@@ -1046,11 +1825,13 @@ test("the public site hosts the daily series containers", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   assert.match(html, /id="community-daily-result"/u);
   assert.match(html, /id="community-daily-state"/u);
-  assert.match(html, /Daily activity series/u);
-  assert.match(html, /latest published revision/u);
+  assert.match(html, /Community activity over time/u);
+  assert.match(html, /Delayed, aggregate daily totals from optional contributions\./u);
+  assert.doesNotMatch(html, /latest published revision/u);
   const source = await readFile(SITE_SOURCE, "utf8");
   assert.match(source, /renderCommunityDailySeries/u);
-  assert.match(source, /communityDaily\(\)/u);
+  assert.match(source, /communityDaily\(options\)/u);
+  assert.match(source, /createCommunityRefresh/u);
   assert.doesNotMatch(source, /communityStats|renderCommunitySnapshot/u);
 });
 
@@ -1074,13 +1855,13 @@ test("the daily chart model maps published days honestly", () => {
   );
   assert.equal(sparse.sparse, true);
   assert.deepEqual(sparse.bars.map(({ day }) => day), ["2026-08-06", "2026-08-07"]);
-  assert.equal(sparse.outputSegments.length, 1);
-  assert.equal(sparse.outputSegments[0].length, 2);
+  assert.equal(sparse.tokenSegments.length, 1);
+  assert.equal(sparse.tokenSegments[0].length, 2);
   assert.deepEqual(sparse.dayTicks.map(({ day }) => day), ["2026-08-06", "2026-08-07"]);
   assert.equal(sparse.tickLabelStyle, "day");
   assert.ok(sparse.bars[0].x < sparse.bars[1].x, "bars advance with the calendar");
 
-  // Events scale from zero on the left axis; output tokens scale on the right.
+  // Events scale from zero on the left axis; all tokens scale on the right.
   assert.equal(sparse.eventsTicks[0].value, 0);
   assert.equal(sparse.eventsTicks[0].y, sparse.plot.bottom);
   assert.ok(
@@ -1088,8 +1869,8 @@ test("the daily chart model maps published days honestly", () => {
     "the events axis covers the maximum usage-event total",
   );
   assert.ok(
-    sparse.outputTicks[sparse.outputTicks.length - 1].value >= 500,
-    "the output axis covers the maximum combined-output total",
+    sparse.tokenTicks[sparse.tokenTicks.length - 1].value >= 1500,
+    "the token axis covers the maximum all-token total",
   );
 });
 
@@ -1104,10 +1885,10 @@ test("the daily chart model renders unpublished days as gaps, not zeros", () => 
   const model = buildCommunityDailyChartModel(series);
   assert.equal(model.sparse, false);
   assert.equal(model.bars.length, 3, "only published days draw a bar");
-  // The output line breaks at the two-day publication gap: one connected
+  // The token line breaks at the two-day publication gap: one connected
   // segment for the adjacent days, then an isolated single-point segment.
   assert.deepEqual(
-    model.outputSegments.map((segment) => segment.map(({ day }) => day)),
+    model.tokenSegments.map((segment) => segment.map(({ day }) => day)),
     [["2026-08-01", "2026-08-02"], ["2026-08-05"]],
   );
   const positions = model.bars.map(({ x }) => x);
@@ -1147,15 +1928,75 @@ test("the daily chart model thins ticks and bars for a year of days", () => {
   }
 });
 
-test("the daily chart keeps an all-zero output series on the baseline", () => {
-  // Combined-output totals were zero before the server-side fix; a series of
-  // zeros must chart as a flat baseline, never as an invented scale.
+test("all-token totals count disjoint inputs and combined output exactly once", () => {
+  const day = publishedDailyDay("2026-08-06", 1);
+  Object.assign(day.payload.totals, {
+    inputUncachedTokens: 100,
+    inputCacheReadTokens: 200,
+    inputCacheWriteTokens: 300,
+    outputTextTokens: 40,
+    outputReasoningTokens: 60,
+    outputCombinedTokens: 100,
+  });
+  const payload = publishedDailySeries({ days: [day] });
+  const model = buildCommunityDailyChartModel(normalizeCommunityDailySeries(payload));
+  assert.equal(model.tokenPoints[0].allTokens, 700);
+  const documentRef = fakeDocument();
+  const container = documentRef.createElement("div");
+  renderCommunityDailySeries({ documentRef, container, payload });
+  const summaryValues = container.descendants()
+    .filter(({ tag }) => tag === "dd").map(({ textContent }) => textContent);
+  assert.equal(summaryValues[3], "700");
+  const tableRow = container.descendants().filter(({ tag }) => tag === "tr")[1];
+  assert.equal(tableRow.children[4].textContent, "700");
+  assert.doesNotMatch(container.text, /Output tokens/u);
+});
+
+test("unsafe all-token sums stay unavailable and break the token line", () => {
+  const invalidDay = publishedDailyDay("2026-08-07", 1);
+  invalidDay.payload.totals.inputUncachedTokens = Number.MAX_SAFE_INTEGER;
+  const payload = publishedDailySeries({ days: [
+    publishedDailyDay("2026-08-06", 1), invalidDay,
+    publishedDailyDay("2026-08-08", 1),
+  ] });
+  const model = buildCommunityDailyChartModel(normalizeCommunityDailySeries(payload));
+  assert.equal(model.bars.length, 3, "valid event totals still render");
+  assert.deepEqual(model.tokenSegments.map((segment) => segment.map(({ day }) => day)),
+    [["2026-08-06"], ["2026-08-08"]]);
+  const documentRef = fakeDocument();
+  const container = documentRef.createElement("div");
+  renderCommunityDailySeries({ documentRef, container, payload });
+  const summaryValues = container.descendants()
+    .filter(({ tag }) => tag === "dd").map(({ textContent }) => textContent);
+  assert.equal(summaryValues[3], "—");
+  const invalidRow = container.descendants().filter(({ tag }) => tag === "tr")[2];
+  assert.equal(invalidRow.children[4].textContent, "—");
+});
+
+test("all-token activity labels preserve their meaning in every shipped language", () => {
+  for (const [locale, label, detail] of [
+    ["en-US", "All tokens counted", "Input and output across 2 shared days"],
+    ["zh-Hans", "已计入的全部 token", "跨 2 个共享日期的输入与输出"],
+    ["es", "Todos los tokens contabilizados", "Entrada y salida en 2 días compartidos"],
+  ]) {
+    const documentRef = fakeDocument();
+    documentRef.documentElement.lang = locale;
+    const container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: publishedDailySeries() });
+    assert.ok(container.text.includes(label), locale);
+    assert.ok(container.text.includes(detail), locale);
+  }
+});
+
+test("the daily chart keeps an all-zero token series on the baseline", () => {
+  // A genuine series of zeros must stay on the baseline, not invent activity.
   const series = normalizeCommunityDailySeries(publishedDailySeries({
     days: [
       publishedDailyDay("2026-08-06", 1, {
         payload: {
           totals: {
             ...publishedDailyDay("2026-08-06", 1).payload.totals,
+            inputUncachedTokens: 0,
             outputCombinedTokens: 0,
           },
         },
@@ -1164,6 +2005,7 @@ test("the daily chart keeps an all-zero output series on the baseline", () => {
         payload: {
           totals: {
             ...publishedDailyDay("2026-08-07", 1).payload.totals,
+            inputUncachedTokens: 0,
             outputCombinedTokens: 0,
           },
         },
@@ -1171,17 +2013,17 @@ test("the daily chart keeps an all-zero output series on the baseline", () => {
     ],
   }));
   const model = buildCommunityDailyChartModel(series);
-  for (const point of model.outputPoints) {
+  for (const point of model.tokenPoints) {
     assert.equal(point.y, model.plot.bottom);
   }
 });
 
 function allowanceBlock(overrides = {}) {
   return {
-    basis: "seven_day_codex_pro20x_trailing_30d",
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
     limitId: "codex",
-    planType: "pro",
-    planVariant: "pro-20x",
+    referencePlanType: "pro",
+    normalization: "pro_x1_prolite_x4_plus_x20",
     windowDurationMinutes: 10_080,
     trailingDays: 30,
     qualification: "shared_reset_fit_gates_40pp_span_floor",
@@ -1237,14 +2079,11 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
   // malformed.
   for (const [label, hostile] of [
     ["unknown basis", allowanceBlock({ basis: "five_hour_trailing_7d" })],
-    // A different plan_type is a different product's allowance (ProLite is the
-    // 5x plan); the page's copy names the Pro (20x) cohort, so the block must
-    // not render under it. Cohorting is by plan_type, not the frozen variant tag.
-    ["different plan cohort", allowanceBlock({ planType: "prolite" })],
-    ["cohort-less pooled block", allowanceBlock({
-      planType: undefined,
-      planVariant: undefined,
+    ["wrong reference plan", allowanceBlock({ referencePlanType: "prolite" })],
+    ["altered normalization", allowanceBlock({
+      normalization: "pro_x1_prolite_x5_plus_x20",
     })],
+    ["missing normalization", allowanceBlock({ normalization: undefined })],
     ["negative fit count", allowanceBlock({ fitCount: -1 })],
     ["missing central with fits", allowanceBlock({ centralUsd: null })],
     ["zero-dollar central", allowanceBlock({ centralUsd: 0 })],
@@ -1390,8 +2229,9 @@ test("the allowance section renders the estimate with its visible caveat", () =>
   assert.match(container.text, /5 qualifying reset fits in the trailing 30 days/u);
   assert.match(container.text, /Latest published estimate \(Aug 7, 2026\)/u);
   assert.doesNotMatch(container.text, /Latest published estimate \(Aug 6, 2026\)/u);
-  // The methodology note names the shared gates and the absent span floor.
-  assert.match(container.text, /no display-side span floor/u);
+  // The methodology note names the merged multipliers and real 40pp gate.
+  assert.match(container.text, /Pro ×1, Pro 5x ×4, Plus ×20/u);
+  assert.match(container.text, /40-point observed-span floor/u);
   // Chart present with band, line, and fit dots; sparse two-point series
   // carries the still-filling note.
   const svg = container.descendants().find(({ tag }) => tag === "svg");
@@ -1431,6 +2271,22 @@ test("the allowance section degrades honestly through every state", () => {
     assert.equal(stateNode.textContent, "Allowance estimates unavailable");
     assert.equal(stateNode.className, "evidence-chip neutral");
     assert.match(container.text, marker, expectedState);
+  }
+
+  // A basis cutover never renders a partly rebuilt merged history.
+  {
+    const documentRef = fakeDocument();
+    const container = documentRef.createElement("div");
+    const stateNode = documentRef.createElement("span");
+    const state = renderCommunityAllowanceSection({
+      documentRef,
+      container,
+      stateNode,
+      payload: publishedDailySeries({ allowanceState: "updating" }),
+    });
+    assert.equal(state, "allowance_updating");
+    assert.equal(stateNode.textContent, "Merged history updating");
+    assert.match(container.text, /Daily activity remains available/u);
   }
 
   // Published days exist but no estimate has accrued anywhere.
@@ -1492,6 +2348,67 @@ test("the allowance section follows the active UI language", () => {
   });
   assert.equal(stateNode.textContent, "额度估计可用");
   assert.match(container.text, /来自 1 个贡献账户/u);
+});
+
+test("Intel download rendering stays independent and refuses partial or ARM metadata", () => {
+  const metadata = {
+    "usage-monitor-installer-url": "https://downloads.example.org/TiboTattle-1.2.3-macOS-arm64.dmg",
+    "usage-monitor-installer-version": "1.2.3",
+    "usage-monitor-installer-sha256": "a".repeat(64),
+    "usage-monitor-installer-bytes": "12000000",
+    "usage-monitor-minimum-macos": "13.0",
+    "usage-monitor-architectures": "arm64",
+    "usage-monitor-release-notes-url": "https://example.org/releases/1.2.3",
+    "usage-monitor-privacy-url": "https://example.org/privacy",
+    "usage-monitor-security-url": "https://example.org/security",
+    "usage-monitor-support-url": "https://example.org/support",
+  };
+  const intel = {
+    "usage-monitor-intel-installer-url": "https://downloads.example.org/TiboTattle-1.2.3-macOS-x64.dmg",
+    "usage-monitor-intel-installer-version": "1.2.3",
+    "usage-monitor-intel-installer-sha256": "b".repeat(64),
+    "usage-monitor-intel-installer-bytes": "13000000",
+    "usage-monitor-intel-minimum-macos": "14.0",
+    "usage-monitor-intel-architectures": "x64",
+  };
+  const documentRef = fakeDocument({ ...metadata, ...intel });
+  renderPublicInstallerJourney(documentRef);
+  assert.equal(documentRef.byId.get("installer-link").href, metadata["usage-monitor-installer-url"]);
+  assert.equal(documentRef.byId.get("intel-installer-link").href, intel["usage-monitor-intel-installer-url"]);
+  assert.equal(documentRef.byId.get("intel-installation").hidden, false);
+  assert.equal(documentRef.byId.get("intel-installer-unavailable").hidden, true);
+  assert.equal(documentRef.byId.get("intel-download-assurance").hidden, false);
+  assert.equal(documentRef.byId.get("intel-installer-sha256-copy").dataset.checksum, "b".repeat(64));
+  assert.equal(documentRef.byId.get("installer-sha256-copy").dataset.checksum, "a".repeat(64));
+  assert.equal(documentRef.byId.get("intel-installer-version").textContent, "Version 1.2.3");
+  assert.equal(documentRef.byId.get("intel-installer-compatibility").textContent, "macOS 14 or later · Intel");
+  assert.equal(documentRef.byId.get("homebrew-install").hidden, false);
+  assert.equal(documentRef.byId.get("intel-homebrew-install").hidden, false);
+
+  // The existing release contract requires a verified, same-version pair.
+  const missingPrimary = fakeDocument({ ...metadata, "usage-monitor-installer-url": "", ...intel });
+  renderPublicInstallerJourney(missingPrimary);
+  assert.equal(missingPrimary.byId.get("homebrew-install").hidden, true);
+  assert.equal(missingPrimary.byId.get("intel-homebrew-install").hidden, true);
+
+  for (const invalid of [
+    {},
+    ...Object.keys(intel).map((key) => ({ ...intel, [key]: "" })),
+    { ...intel, "usage-monitor-intel-architectures": "arm64" },
+    { ...intel, "usage-monitor-intel-installer-url": metadata["usage-monitor-installer-url"] },
+  ]) {
+    const unavailable = fakeDocument({ ...metadata, ...invalid });
+    renderPublicInstallerJourney(unavailable);
+    assert.equal(unavailable.byId.get("installer-link").hidden, false);
+    assert.equal(unavailable.byId.get("homebrew-install").hidden, false);
+    assert.equal(unavailable.byId.get("intel-homebrew-install").hidden, true);
+    assert.equal(unavailable.byId.get("intel-installation").hidden, true);
+    assert.equal(unavailable.byId.get("intel-installer-link").hidden, true);
+    assert.equal(Object.hasOwn(unavailable.byId.get("intel-installer-link"), "href"), false);
+    assert.equal(unavailable.byId.get("intel-download-assurance").hidden, true);
+    assert.equal(unavailable.byId.get("intel-installer-unavailable").hidden, false);
+    assert.equal(unavailable.byId.get("intel-installer-sha256-copy").dataset.checksum, undefined);
+  }
 });
 
 test("the install card refuses a partially injected release", () => {

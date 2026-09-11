@@ -6,9 +6,10 @@ body:
     attributes:
       value: |
         The hosted service is operated by the maintainer. For security
-        problems (including anything touching contributor pseudonymity or
-        the upload/deletion endpoints), use a private GitHub Security
-        Advisory, not a public issue (see SECURITY.md).
+        problems (including anything touching contributor pseudonymity,
+        contribution uploads, device disconnect, private owner erasure, or
+        deletion-safe restore), use a private GitHub Security Advisory,
+        not a public issue (see SECURITY.md).
   - type: input
     id: page
     attributes:

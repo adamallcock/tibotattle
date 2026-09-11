@@ -8,6 +8,7 @@ import {
   deriveCodexTransitionSeriesCooperatively,
   mineCodexTransitions,
 } from "../src/codex-transition-miner.js";
+import { scanAndPriceCodexLogs } from "../src/codex-local-usage-analysis.js";
 import { stableJson, writeJsonOwnerOnlyAtomic } from "../src/storage.js";
 
 const PRICE_CARDS = [{
@@ -98,6 +99,32 @@ const RANGE = {
   endAt: "2026-07-23T00:10:00.000Z",
   priceCards: PRICE_CARDS,
 };
+
+test("legacy pricing consumers preserve short-context Priority and long-context assumed subtotals", async () => {
+  const home = await fixtureHome([
+    ...metadata("gpt-5.5"),
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(1_000), usage(1_000), null),
+    tokenRecord("2026-07-23T00:00:02.000Z", usage(273_000), usage(272_000), null),
+  ]);
+  try {
+    const options = { ...RANGE, priceCards: null, codexHome: home };
+    const transitions = await mineCodexTransitions(options);
+    const local = await scanAndPriceCodexLogs(options);
+    for (const sensitivity of [
+      transitions.pricing.subscriptionSpeedSensitivity,
+      local.runcost.subscriptionSpeedSensitivity,
+    ]) {
+      assert.equal(sensitivity.scenarios.standard.weightedStandardApiEquivalentUsd, 2.725);
+      assert.equal(sensitivity.scenarios.fast.weightedStandardApiEquivalentUsd, 5.4525);
+      assert.equal(sensitivity.scenarios.fast.assumedRatioStandardApiEquivalentUsd, 2.72);
+      assert.equal(sensitivity.modelMultipliers["gpt-5.5"], null);
+    }
+    assert.equal(transitions.pricing.observedTierSensitivity.complete, true);
+    assert.equal(transitions.pricing.observedTierSensitivity.upperWeightedStandardApiEquivalentUsd, 5.4525);
+  } finally {
+    await rm(home, { recursive: true });
+  }
+});
 
 test("pure transition derivation rejects invalid envelopes and ignores malformed rows", () => {
   assert.throws(
@@ -254,7 +281,7 @@ test("tier attribution follows timestamps and cannot leak a future setting into 
   }
 });
 
-test("active rollout wins over an archive duplicate and null or malformed records remain diagnostic", async () => {
+test("a byte-identical active/archive duplicate is scanned once and malformed records remain diagnostic", async () => {
   const active = [
     ...metadata(),
     tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), null),
@@ -262,10 +289,7 @@ test("active rollout wins over an archive duplicate and null or malformed record
     tokenRecord("2026-07-23T00:00:02.000Z", usage(20), usage(10), limits({ primary: 1 })),
     tokenRecord("2026-07-23T00:00:03.000Z", usage(30), usage(10), limits({ primary: 2 })),
   ];
-  const archive = [
-    ...metadata(),
-    tokenRecord("2026-07-23T00:00:01.000Z", usage(999), usage(999), limits({ primary: 1 })),
-  ];
+  const archive = [...active];
   const home = await fixtureHome(active, { archiveLines: archive });
   try {
     const dataset = await mineCodexTransitions({ ...RANGE, codexHome: home });

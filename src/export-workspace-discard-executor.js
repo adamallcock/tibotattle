@@ -1,5 +1,5 @@
-import { LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL } from "./export-workspace-discard-compatibility-internal.js";
+import { localExportWorkspaceDiscard } from "./local-node-runtime.js";
 
-export const ExportWorkspaceDiscardExecutionError = LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.ExportWorkspaceDiscardExecutionError;
-export const discardLocalExportWorkspace = LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.discardLocalExportWorkspace;
-export const recoverLocalExportWorkspaceDiscard = LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.recoverLocalExportWorkspaceDiscard;
+export const ExportWorkspaceDiscardExecutionError = localExportWorkspaceDiscard.ExportWorkspaceDiscardExecutionError;
+export const discardLocalExportWorkspace = localExportWorkspaceDiscard.discardLocalExportWorkspace;
+export const recoverLocalExportWorkspaceDiscard = localExportWorkspaceDiscard.recoverLocalExportWorkspaceDiscard;

@@ -28,14 +28,16 @@ import { deriveParticipantId } from "../src/export-identity.js";
 import { createExportResourceGuard, ExportResourceLimitError } from "../src/export-resource-policy.js";
 import { createCodexExportSourcePlan } from "../src/export-source-plan.js";
 import { createEmptySupplementalSourcePlan } from "../src/export-supplemental-source-plan.js";
-import {
+import { localExportSourcePipeline, localExportWorkspace } from
+  "../src/local-node-runtime.js";
+const {
   buildExportWorkspaceDescriptor,
   createExportWorkspace,
-} from "../src/export-workspace.js";
-import {
+} = localExportWorkspace;
+const {
   createLocalExportWorkspace,
   resumeLocalExportWorkspace,
-} from "../src/export-set-controller.js";
+} = localExportSourcePipeline.controller;
 
 const SECRET = Buffer.alloc(32, 83);
 const START = "2026-07-20T00:00:00.000Z";
@@ -127,7 +129,7 @@ async function fixture(lines, { tail = "" } = {}) {
 }
 
 async function readSnapshots(directory) {
-  const workspace = await (await import("../src/export-workspace.js")).openExportWorkspace({ directory });
+  const workspace = await localExportWorkspace.openExportWorkspace({ directory });
   try {
     return [...workspace.iterateRecords()]
       .filter((row) => row.family === "quotaSnapshots")
@@ -448,7 +450,7 @@ test("collector resource usage survives reopening and no-collector workspaces re
   const empty = await fixture([]);
   try {
     const result = await controllerRun(value, { enableCollector: true });
-    const reopened = await (await import("../src/export-workspace.js")).openExportWorkspace({ directory: value.workspace });
+    const reopened = await localExportWorkspace.openExportWorkspace({ directory: value.workspace });
     try {
       assert.equal(reopened.resourceUsage().sourceFiles, 1);
       assert.equal(reopened.resourceUsage().sourceBytes, Buffer.byteLength(value.complete));
@@ -483,7 +485,7 @@ test("collector commits newly reviewed diagnostic rows without a supplemental re
     const result = await controllerRun(value, { collectorCandidatesPerBatch: 1 });
     assert.equal(result.status.scanComplete, true);
     assert.deepEqual(result.collectorDiagnosticRegistryGaps, []);
-    const workspace = await (await import("../src/export-workspace.js")).openExportWorkspace({ directory: value.workspace });
+    const workspace = await localExportWorkspace.openExportWorkspace({ directory: value.workspace });
     try {
       const sourceKey = workspace.loadSupplementalSourcePlan().sources[0].sourceKey;
       assert.deepEqual(workspace.supplementalDiagnosticRegistryGaps(sourceKey), []);

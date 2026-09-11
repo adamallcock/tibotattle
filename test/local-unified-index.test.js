@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   appendFile,
+  chmod,
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -12,23 +15,36 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import { readCacheImpacts } from "../src/cache-switch-impact.js";
+import { buildLocalCompanionSnapshot } from "../src/local-companion-data.js";
 import { readLocalUnifiedCompanionProjection } from "../src/local-unified-companion-source.js";
 import { createLocalUnifiedAccountingSource } from "../src/local-unified-accounting-source.js";
 
 import {
   balanceComponents,
+  createLocalUnifiedIndexWorkerBatchControl,
+  createLocalUnifiedIndexProgressPump,
+  defaultRebuildWorkerCount,
+  LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
+  LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
   lineageComponents,
+  localUnifiedIndexStageFile,
+  localUnifiedIndexWorkerBatchControlSnapshot,
   modelDeclaration,
   rebuildLocalUnifiedIndex,
+  releaseLocalUnifiedIndexWorkerBatch,
 } from "../src/local-unified-index-build.js";
 import {
   extractRolloutUsage,
   parseCompactionPrefix,
+  resolveLogicalRolloutHeads,
   salvagePartialTokenCount,
 } from "../src/local-unified-index-extract.js";
 import {
@@ -39,12 +55,17 @@ import {
   createLocalUnifiedIndexSecondaryIndexes,
   createUnifiedIndexWriter,
   beginUnifiedIndexGeneration,
+  defaultLocalUnifiedIndexRecoveryLockPath,
   inspectLocalUnifiedIndex,
+  LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
   localDigest,
   openLocalUnifiedIndex,
   OUTCOMES,
   outcomeOrdinal,
+  publishStagedUnifiedIndex,
   readUnifiedIndexAggregate,
   readUnifiedIndexGenerationDescriptor,
   REASONING_EFFORTS,
@@ -54,6 +75,247 @@ import {
 import { readLocalUnifiedWindowBreakdown } from "../src/local-unified-window-breakdown.js";
 
 const CONTRACT = "usage-event-v0.2";
+
+function runWindowsPublicationChild({ failPublishedFileSync = false } = {}) {
+  const moduleUrl = new URL("../src/local-unified-index.js", import.meta.url).href;
+  const source = `
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import { lstat, mkdtemp, rm, writeFile } from "node:fs/promises";
+    import { tmpdir } from "node:os";
+    import { basename, join } from "node:path";
+
+    const require = createRequire(import.meta.url);
+    const promises = require("node:fs/promises");
+    const originalOpen = promises.open;
+    const syncedFiles = [];
+    const failPublishedFileSync = ${JSON.stringify(failPublishedFileSync)};
+    promises.open = async (path, ...rest) => {
+      const metadata = await promises.lstat(path);
+      if (metadata.isDirectory()) {
+        const error = new Error("directory open unavailable");
+        error.code = "EPERM";
+        throw error;
+      }
+      const handle = await originalOpen(path, ...rest);
+      const sync = handle.sync.bind(handle);
+      handle.sync = async (...syncArguments) => {
+        const fileName = basename(path);
+        syncedFiles.push(fileName);
+        if (failPublishedFileSync && fileName === "published-index.sqlite") {
+          const error = new Error("published file sync failed");
+          error.code = "EIO";
+          throw error;
+        }
+        return sync(...syncArguments);
+      };
+      return handle;
+    };
+    syncBuiltinESMExports();
+    Object.defineProperty(process, "platform", {
+      value: "win32",
+      configurable: true,
+    });
+    const { publishStagedUnifiedIndex } = await import(${JSON.stringify(moduleUrl)});
+    const root = await mkdtemp(join(tmpdir(), "unified-index-win-publish-"));
+    const stageFile = join(root, "stage.sqlite");
+    const indexFile = join(root, "published-index.sqlite");
+    try {
+      await writeFile(stageFile, "synthetic");
+      await publishStagedUnifiedIndex(stageFile, indexFile);
+      process.stdout.write(\`published:\${syncedFiles.join(",")}\`);
+    } catch (error) {
+      const target = await lstat(indexFile).then(
+        () => "target_present",
+        (failure) => failure?.code === "ENOENT" ? "target_absent" : "target_unknown",
+      );
+      const stage = await lstat(stageFile).then(
+        () => "stage_present",
+        (failure) => failure?.code === "ENOENT" ? "stage_absent" : "stage_unknown",
+      );
+      process.stdout.write(
+        \`failed:\${error?.code ?? "unclassified"}:\${error?.published === true ? "published" : "unpublished"}:\${target}:\${stage}:\${syncedFiles.join(",")}\`,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  `;
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  });
+}
+
+test("Windows staged publication records exact file flushes when directory fsync is unavailable", () => {
+  const result = runWindowsPublicationChild();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "published:stage.sqlite,published-index.sqlite");
+});
+
+test("a post-rename unified-index file sync failure remains durability uncertainty", () => {
+  const result = runWindowsPublicationChild({ failPublishedFileSync: true });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    result.stdout,
+    "failed:local_unified_index_publication_durability_uncertain:published:target_present:stage_absent:stage.sqlite,published-index.sqlite",
+  );
+});
+
+test("worker batches bound synchronous companion write turns", () => {
+  assert.equal(LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS, 500);
+  assert.equal(LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW, 2);
+});
+
+test("progress pump retains one latest snapshot across many small sources", async () => {
+  let releaseFirst;
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const firstBlocked = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const delivered = [];
+  const pump = createLocalUnifiedIndexProgressPump(async (progress) => {
+    delivered.push(progress.sourcesScanned);
+    if (progress.sourcesScanned === 1) {
+      markStarted();
+      await firstBlocked;
+    }
+  });
+
+  pump.offer({ sourcesScanned: 1 });
+  await started;
+  for (let source = 2; source <= 5_000; source += 1) {
+    pump.offer({ sourcesScanned: source });
+  }
+  assert.deepEqual(delivered, [1]);
+  releaseFirst();
+  await pump.drain();
+  assert.deepEqual(delivered, [1, 5_000]);
+});
+
+test("progress pump drains its final snapshot before propagating callback failure", async () => {
+  const expected = new Error("synthetic progress failure");
+  const delivered = [];
+  const pump = createLocalUnifiedIndexProgressPump((progress) => {
+    delivered.push(progress.sourcesScanned);
+    if (progress.sourcesScanned === 1) throw expected;
+  });
+  pump.offer({ sourcesScanned: 1 });
+  pump.offer({ sourcesScanned: 2 });
+  await assert.rejects(pump.drain(), (error) => error === expected);
+  assert.deepEqual(delivered, [1, 2]);
+});
+
+test("direct rebuild bounds callbacks across many small sources", async () => {
+  const sourceCount = 160;
+  const files = Object.fromEntries(Array.from({ length: sourceCount }, (_, index) => {
+    const sessionId = `00000000-0000-4000-8000-${(index + 1)
+      .toString(16).padStart(12, "0")}`;
+    return [
+      canonicalRolloutName("2026-07-25T00-00-00", sessionId),
+      [
+        sessionMeta(sessionId),
+        turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+        tokenCount("2026-07-25T00:00:01.000Z", usage(index + 1), usage(1)),
+      ],
+    ];
+  }));
+  const { root } = await corpus(files);
+  const progress = [];
+  try {
+    const result = await build(root, {
+      workerCount: 1,
+      onProgress: (value) => progress.push(value.sourcesScanned),
+    });
+    assert.equal(result.sourcesScanned, sourceCount);
+    assert.equal(progress[0], 0);
+    assert.equal(progress.at(-1), sourceCount);
+    assert.ok(
+      progress.length < sourceCount / 4,
+      `${progress.length} callbacks were not bounded relative to ${sourceCount} sources`,
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("automatic rebuild workers reserve the companion and outer worker CPUs", () => {
+  for (const [parallelism, expected] of [
+    [1, 1],
+    [3, 1],
+    [4, 1],
+    [5, 2],
+    [8, 5],
+    [9, 6],
+    [64, 6],
+  ]) {
+    assert.equal(defaultRebuildWorkerCount(parallelism), expected, `${parallelism} CPUs`);
+  }
+  assert.throws(() => defaultRebuildWorkerCount(0), /positive safe integer/u);
+  assert.throws(() => defaultRebuildWorkerCount(1.5), /positive safe integer/u);
+});
+const THREAD_ONE = "11111111-1111-4111-8111-111111111111";
+const THREAD_TWO = "22222222-2222-4222-8222-222222222222";
+const ROLLOUT_TWO = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const ROLLOUT_THREE = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+function canonicalRolloutName(timestamp, threadId, rolloutId = null) {
+  return `rollout-${timestamp}-${threadId}${rolloutId === null ? "" : `_${rolloutId}`}.jsonl`;
+}
+
+function paginatedSessionMeta(sessionId, {
+  ordinal,
+  baseRolloutId,
+  endOrdinalExclusive,
+  endByteOffset,
+  parentId = null,
+} = {}) {
+  return JSON.stringify({
+    ordinal,
+    timestamp: "2026-07-25T00:00:00.000Z",
+    type: "session_meta",
+    payload: {
+      id: sessionId,
+      session_id: sessionId,
+      history_mode: "paginated",
+      history_base: {
+        thread_id: baseRolloutId,
+        end_ordinal_exclusive: endOrdinalExclusive,
+        end_byte_offset: endByteOffset,
+      },
+      ...(parentId === null ? {} : {
+        forked_from_id: parentId,
+        parent_thread_id: parentId,
+      }),
+      thread_source: "user",
+      originator: "codex_cli_rs",
+    },
+  });
+}
+
+function paginatedResetSessionMeta(sessionId, { ordinal = 0, parentId = null } = {}) {
+  return JSON.stringify({
+    ordinal,
+    timestamp: "2026-07-25T00:00:00.000Z",
+    type: "session_meta",
+    payload: {
+      id: sessionId,
+      session_id: sessionId,
+      history_mode: "paginated",
+      ...(parentId === null ? {} : {
+        forked_from_id: parentId,
+        parent_thread_id: parentId,
+      }),
+      thread_source: "user",
+      originator: "codex_cli_rs",
+    },
+  });
+}
+
+function jsonlBytes(lines) {
+  return Buffer.byteLength(`${lines.join("\n")}\n`);
+}
 
 function sessionMeta(sessionId, { parentId = null, threadSource = "user" } = {}) {
   return JSON.stringify({
@@ -137,9 +399,10 @@ function tokenCountTotalOnly(timestamp, total) {
   });
 }
 
-function compacted(timestamp, paddingBytes = 0) {
+function compacted(timestamp, paddingBytes = 0, ordinal = null) {
   return JSON.stringify({
     timestamp,
+    ...(ordinal === null ? {} : { ordinal }),
     type: "compacted",
     payload: {
       message: "SECRET COMPACTION SUMMARY DO NOT INDEX",
@@ -183,9 +446,343 @@ async function build(root, extra = {}) {
   });
 }
 
+function promiseWithin(promise, timeoutMs, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function abortWhenStageGenerationFinalizes(
+  stageFile,
+  controller,
+  { timeoutMs = 2_000 } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let database = null;
+    try {
+      // This is a test-only observer of an already-known synthetic stage, not
+      // a production index reader. Never wait synchronously for its exclusive
+      // writer: that writer needs this event loop to finish and close. A busy
+      // stage is retried after yielding, within the same bounded deadline.
+      database = new DatabaseSync(stageFile, { readOnly: true, timeout: 0 });
+      const status = database.prepare(`
+        SELECT status FROM index_generation
+        ORDER BY id DESC LIMIT 1`).get()?.status ?? null;
+      if (["complete", "partial"].includes(status)) {
+        controller.abort();
+        return status;
+      }
+    } catch {
+      // The stage is absent, incomplete, or momentarily locked. It becomes a
+      // readable terminal generation only after the writer's final commit.
+    } finally {
+      try {
+        database?.close();
+      } catch {
+        // A failed read-only probe does not own the writer or publication.
+      }
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error("stage generation did not finalize before publication");
+}
+
+async function waitForBatchControl(control, predicate, message) {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const snapshot = localUnifiedIndexWorkerBatchControlSnapshot(control);
+    if (predicate(snapshot)) return snapshot;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(message);
+}
+
+function parserWorkerData(source, batchControl) {
+  return {
+    batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
+    batchControl: batchControl.buffer,
+    batchWindow: LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+    components: [[{
+      path: source.path,
+      size: source.size,
+      sessionId: THREAD_ONE,
+      parentId: null,
+      isFork: false,
+      isInlineFork: false,
+      historyMode: "legacy",
+      historyBase: null,
+      startOrdinal: 0,
+      rolloutId: null,
+      rolloutKey: source.path,
+      dev: source.dev,
+      ino: source.ino,
+      birthtimeMs: source.birthtimeMs,
+      mtimeMs: source.mtimeMs,
+      ctimeMs: source.ctimeMs,
+    }]],
+  };
+}
+
+test("parser worker blocks at its acknowledgement window and resumes without deadlock", async () => {
+  const startMs = Date.parse("2026-07-25T00:00:01.000Z");
+  const { root, sessions } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+      ...Array.from({ length: 1_600 }, (_, index) => tokenCount(
+        new Date(startMs + index).toISOString(),
+        usage(index + 1),
+        usage(1),
+      )),
+    ],
+  });
+  const path = join(
+    sessions,
+    canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE),
+  );
+  const source = { path, ...await stat(path) };
+  const control = createLocalUnifiedIndexWorkerBatchControl();
+  const batches = [];
+  let acknowledge = false;
+  const worker = new Worker(
+    new URL("../src/local-unified-index-worker.js", import.meta.url),
+    { workerData: parserWorkerData(source, control), execArgv: [] },
+  );
+  worker.on("message", (message) => {
+    if (message.type !== "batch") return;
+    batches.push(message);
+    if (acknowledge) releaseLocalUnifiedIndexWorkerBatch(control);
+  });
+  const exited = new Promise((resolve, reject) => {
+    worker.once("error", reject);
+    worker.once("exit", resolve);
+  });
+  try {
+    const blocked = await waitForBatchControl(
+      control,
+      (snapshot) => snapshot.waitCount > 0
+        && snapshot.outstanding === LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW
+        && batches.length === LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+      "parser did not block at its acknowledgement window",
+    );
+    assert.deepEqual(blocked, {
+      credits: 0,
+      outstanding: 2,
+      peakOutstanding: 2,
+      waitCount: blocked.waitCount,
+      window: 2,
+    });
+
+    acknowledge = true;
+    for (let index = 0; index < blocked.outstanding; index += 1) {
+      releaseLocalUnifiedIndexWorkerBatch(control);
+    }
+    assert.equal(
+      await promiseWithin(exited, 2_000, "acknowledged parser worker did not exit"),
+      0,
+    );
+    assert.equal(batches.reduce((sum, batch) => sum + batch.events.length, 0), 1_600);
+    assert.equal(batches.at(-1).final, true);
+    const finished = localUnifiedIndexWorkerBatchControlSnapshot(control);
+    assert.equal(finished.outstanding, 0);
+    assert.equal(finished.credits, finished.window);
+    assert.equal(finished.peakOutstanding, finished.window);
+  } finally {
+    if (worker.threadId !== -1) await worker.terminate();
+    await rm(root, { recursive: true });
+  }
+});
+
+test("blocked parser termination and pre-batch failure do not await credits", async () => {
+  const startMs = Date.parse("2026-07-25T00:00:01.000Z");
+  const { root, sessions } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+      ...Array.from({ length: 1_600 }, (_, index) => tokenCount(
+        new Date(startMs + index).toISOString(),
+        usage(index + 1),
+        usage(1),
+      )),
+    ],
+  });
+  const path = join(
+    sessions,
+    canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE),
+  );
+  const source = { path, ...await stat(path) };
+  const blockedControl = createLocalUnifiedIndexWorkerBatchControl();
+  const blockedWorker = new Worker(
+    new URL("../src/local-unified-index-worker.js", import.meta.url),
+    { workerData: parserWorkerData(source, blockedControl), execArgv: [] },
+  );
+  let failedWorker = null;
+  try {
+    await waitForBatchControl(
+      blockedControl,
+      (snapshot) => snapshot.waitCount > 0
+        && snapshot.outstanding === LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+      "parser did not reach the blocked state before termination",
+    );
+    const terminationCode = await promiseWithin(
+      blockedWorker.terminate(),
+      2_000,
+      "blocked parser worker did not terminate",
+    );
+    assert.notEqual(terminationCode, 0);
+
+    const failedControl = createLocalUnifiedIndexWorkerBatchControl({
+      initialCredits: 0,
+    });
+    failedWorker = new Worker(
+      new URL("../src/local-unified-index-worker.js", import.meta.url),
+      {
+        workerData: {
+          batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
+          batchControl: failedControl.buffer,
+          batchWindow: LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+          components: null,
+        },
+        execArgv: [],
+      },
+    );
+    let failureMessage = null;
+    failedWorker.on("message", (message) => {
+      failureMessage = message;
+    });
+    const failedExit = new Promise((resolve, reject) => {
+      failedWorker.once("error", reject);
+      failedWorker.once("exit", resolve);
+    });
+    assert.equal(
+      await promiseWithin(failedExit, 2_000, "invalid parser worker did not exit"),
+      1,
+    );
+    assert.equal(failureMessage?.type, "failed");
+    assert.deepEqual(localUnifiedIndexWorkerBatchControlSnapshot(failedControl), {
+      credits: 0,
+      outstanding: 0,
+      peakOutstanding: 0,
+      waitCount: 0,
+      window: 2,
+    });
+  } finally {
+    if (blockedWorker.threadId !== -1) await blockedWorker.terminate();
+    if (failedWorker !== null && failedWorker.threadId !== -1) {
+      await failedWorker.terminate();
+    }
+    await rm(root, { recursive: true });
+  }
+});
+
+test("direct rebuild reports record progress before a large source completes", async () => {
+  const startMs = Date.parse("2026-07-25T00:00:01.000Z");
+  const lines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+    ...Array.from({ length: 600 }, (_, index) => tokenCount(
+      new Date(startMs + index).toISOString(),
+      usage(index + 1),
+      usage(1),
+    )),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: lines,
+  });
+  const progress = [];
+  try {
+    const result = await build(root, {
+      workerCount: 1,
+      onProgress(value) {
+        progress.push({
+          sources: value.sources,
+          sourcesScanned: value.sourcesScanned,
+          usageEvents: value.usageEvents,
+        });
+      },
+    });
+    assert.equal(result.usageEvents, 600);
+    assert.deepEqual(progress[0], {
+      sources: 1,
+      sourcesScanned: 0,
+      usageEvents: 0,
+    });
+    assert.ok(
+      progress.some((value) => (
+        value.sourcesScanned === 0 && value.usageEvents > 0
+      )),
+      "record count must prove direct work inside a source before it completes",
+    );
+    assert.deepEqual(progress.at(-1), {
+      sources: 1,
+      sourcesScanned: 1,
+      usageEvents: 600,
+    });
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("parallel rebuild reports record progress before a large source completes", async () => {
+  const startMs = Date.parse("2026-07-25T00:00:01.000Z");
+  const lines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+    ...Array.from({ length: 600 }, (_, index) => tokenCount(
+      new Date(startMs + index).toISOString(),
+      usage(index + 1),
+      usage(1),
+    )),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: lines,
+  });
+  const progress = [];
+  try {
+    const result = await build(root, {
+      workerCount: 2,
+      onProgress(value) {
+        progress.push({
+          sources: value.sources,
+          sourcesScanned: value.sourcesScanned,
+          usageEvents: value.usageEvents,
+        });
+      },
+    });
+    assert.equal(result.usageEvents, 600);
+    assert.deepEqual(progress[0], {
+      sources: 1,
+      sourcesScanned: 0,
+      usageEvents: 0,
+    });
+    assert.ok(
+      progress.some((value) => (
+        value.sourcesScanned === 0 && value.usageEvents > 0
+      )),
+      "record count must prove work inside a source before it completes",
+    );
+    assert.deepEqual(progress.at(-1), {
+      sources: 1,
+      sourcesScanned: 1,
+      usageEvents: 600,
+    });
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 const SECONDARY_INDEX_NAMES = [
   "usage_event_observed",
   "usage_event_session",
+  "usage_event_source",
+  "usage_event_source_predecessor",
+  "usage_event_session_predecessor",
+  "usage_event_quota_observation",
   "usage_event_boundary_session",
   "usage_event_replay_order",
   "quota_occurrence_canonical",
@@ -461,6 +1058,69 @@ test("deferred secondary indexes preserve logical facts and are present before p
   }
 });
 
+test("v11 predecessor indexes are additive writable maintenance and read-only opens preserve older v11 files", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-attribution-index.jsonl": [
+      sessionMeta("session-attribution-index"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const compatibleIndexNames = [
+    "usage_event_source_predecessor", "usage_event_session_predecessor",
+  ];
+  try {
+    await build(root);
+    const old = openLocalUnifiedIndex(indexFile);
+    const facts = logicalProjection(old);
+    const generation = readUnifiedIndexGenerationDescriptor(old);
+    assert.deepEqual(secondaryIndexNames(old), [...SECONDARY_INDEX_NAMES].sort());
+    assert.equal(Number(old.prepare("PRAGMA user_version").get().user_version), 11);
+    old.exec(`
+      DROP INDEX usage_event_source_predecessor;
+      DROP INDEX usage_event_session_predecessor;
+    `);
+    old.close();
+    const bytesBefore = await readFile(indexFile);
+    const readOnly = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual(logicalProjection(readOnly), facts);
+      assert.deepEqual(readUnifiedIndexGenerationDescriptor(readOnly), generation);
+      assert.deepEqual(secondaryIndexNames(readOnly), SECONDARY_INDEX_NAMES
+        .filter((name) => !compatibleIndexNames.includes(name)).sort());
+    } finally {
+      readOnly.close();
+    }
+    assert.deepEqual(await readFile(indexFile), bytesBefore,
+      "a read-only open must not create compatible accelerators in the live file");
+
+    const upgraded = openLocalUnifiedIndex(indexFile);
+    try {
+      assert.deepEqual(secondaryIndexNames(upgraded), [...SECONDARY_INDEX_NAMES].sort());
+      assert.deepEqual(logicalProjection(upgraded), facts);
+      assert.deepEqual(readUnifiedIndexGenerationDescriptor(upgraded), generation);
+      assert.equal(Number(upgraded.prepare("PRAGMA user_version").get().user_version), 11);
+      assert.deepEqual(Object.fromEntries(upgraded.prepare(`
+        SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
+      `).all().map((row) => [row.key, row.value])), {
+        compatibility_format_user_version: "11",
+        compatibility_minimum_reader_user_version: "11",
+        compatibility_minimum_writer_user_version: "11",
+      });
+    } finally {
+      upgraded.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("quota coverage proof is planned through its canonical-occurrence index", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-proof-index.jsonl": [
@@ -509,7 +1169,168 @@ test("quota coverage proof is planned through its canonical-occurrence index", a
   }
 });
 
-test("existing incremental indexes repair the quota proof index while read-only validation rejects its absence", async () => {
+test("schema-11 cleanup queries use every required source and quota index", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unified-index-cleanup-plans-"));
+  const indexFile = join(root, "index.sqlite");
+  const plan = (database, sql) => database.prepare(
+    `EXPLAIN QUERY PLAN ${sql}`,
+  ).all(Buffer.alloc(32)).map((row) => String(row.detail));
+  try {
+    const database = openLocalUnifiedIndex(indexFile, { create: true });
+    try {
+      assert.deepEqual(plan(database,
+        "DELETE FROM usage_event WHERE source_local = ?"), [
+        "SEARCH usage_event USING COVERING INDEX usage_event_source (source_local=?)",
+        "SEARCH usage_event_boundary USING COVERING INDEX sqlite_autoindex_usage_event_boundary_1 (current_event_key=?)",
+      ]);
+      assert.deepEqual(plan(database,
+        "SELECT 1 FROM usage_event WHERE quota_observation_id = ?"), [
+        "SEARCH usage_event USING COVERING INDEX usage_event_quota_observation (quota_observation_id=?)",
+      ]);
+      assert.deepEqual(plan(database, `
+        SELECT plan_type, used_percent, resets_at_ms, duration_mins
+        FROM quota_occurrence WHERE canonical_observation_id = ?
+        ORDER BY used_percent DESC, COALESCE(resets_at_ms, -1) DESC, id ASC
+        LIMIT 1`), [
+        "SEARCH quota_occurrence USING INDEX quota_occurrence_canonical (canonical_observation_id=?)",
+        "USE TEMP B-TREE FOR ORDER BY",
+      ]);
+      assert.deepEqual(plan(database, `
+        SELECT DISTINCT canonical_observation_id AS id
+        FROM quota_occurrence WHERE source_local = ?`), [
+        "SEARCH quota_occurrence USING INDEX sqlite_autoindex_quota_occurrence_1 (source_local=?)",
+        "USE TEMP B-TREE FOR DISTINCT",
+      ]);
+      assert.deepEqual(plan(database,
+        "DELETE FROM tool_class_fact WHERE source_local = ?"), [
+        "SEARCH tool_class_fact USING COVERING INDEX tool_class_fact_source (source_local=?)",
+      ]);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("source cleanup is impossible until a deferred stage has all schema-11 indexes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unified-index-cleanup-guard-"));
+  const stageFile = join(root, "stage.sqlite");
+  let database = null;
+  try {
+    database = openLocalUnifiedIndex(stageFile, {
+      create: true,
+      staging: true,
+      deferSecondaryIndexes: true,
+    });
+    const writer = createUnifiedIndexWriter(database, {
+      contractVersion: CONTRACT,
+    });
+    assert.throws(
+      () => writer.deleteSourceFacts(Buffer.alloc(32), Buffer.alloc(32)),
+      (error) => error?.code === "local_unified_index_secondary_indexes_missing",
+    );
+    writer.flush();
+    createLocalUnifiedIndexSecondaryIndexes(database);
+    assert.deepEqual(
+      writer.deleteSourceFacts(Buffer.alloc(32), Buffer.alloc(32)),
+      { usageEvents: 0, quotaOccurrences: 0, toolFacts: 0 },
+    );
+    writer.flush();
+  } finally {
+    database?.close();
+    await rm(root, { recursive: true });
+  }
+});
+
+test("late runtime quarantine waits for deferred indexes before removing many quota facts", async () => {
+  const malformedAccounting = "{\"timestamp\":\"2026-07-25T03:00:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"";
+  const quotaEvents = Array.from({ length: 600 }, (_, index) => tokenCount(
+    new Date(Date.parse("2026-07-25T01:00:00.000Z") + index).toISOString(),
+    usage((index + 1) * 100, index + 1),
+    usage(100, 1),
+    { usedPercent: (index % 99) + 1 },
+  ));
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-valid.jsonl": [
+      sessionMeta("11111111-1111-4111-8111-111111111111"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+    "rollout-2026-07-25T01-00-00-quarantined.jsonl": [
+      sessionMeta("22222222-2222-4222-8222-222222222222"),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-terra"),
+      ...quotaEvents,
+      malformedAccounting,
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    const built = await build(root, {
+      deferSecondaryIndexes: true,
+      workerCount: 2,
+    });
+    assert.equal(built.usageEvents, 1);
+    assert.equal(built.quotaObservations, 1);
+    assert.equal(built.generation.status, "partial");
+    assert.equal(built.generation.indexedSourceCount, 1);
+    assert.equal(built.generation.skippedSourceCount, 1);
+    assert.equal(built.generation.usageEvents, 1);
+    assert.equal(built.generation.quotaOccurrences, 1);
+    assert.equal(
+      built.generation.issueCounts.codex_rollout_content_invalid.sourceCount,
+      1,
+    );
+
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(database.prepare(
+        "PRAGMA user_version",
+      ).get().user_version), LOCAL_UNIFIED_INDEX_USER_VERSION);
+      assert.deepEqual(
+        secondaryIndexNames(database),
+        [...SECONDARY_INDEX_NAMES].sort(),
+      );
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), 1);
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS count FROM quota_occurrence",
+      ).get().count), 1);
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS count FROM quota_observation",
+      ).get().count), 1);
+      assert.deepEqual(database.prepare(`
+        SELECT status, COUNT(*) AS count FROM generation_source
+        GROUP BY status ORDER BY status`).all().map((row) => ({ ...row })), [
+        { status: "complete", count: 1 },
+        { status: "failed", count: 1 },
+      ]);
+      const cursors = database.prepare(`
+        SELECT quarantine_code, scanned_bytes FROM source_cursor
+        ORDER BY quarantine_code IS NULL, quarantine_code`).all()
+        .map((row) => ({ ...row }));
+      assert.equal(cursors.length, 2);
+      assert.deepEqual(cursors[0], {
+        quarantine_code: "codex_rollout_content_invalid",
+        scanned_bytes: 0,
+      });
+      assert.equal(cursors[1].quarantine_code, null);
+      assert.ok(Number(cursors[1].scanned_bytes) > 0);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("writable ingest repairs required cleanup indexes while read-only validation rejects their absence", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-proof-migration.jsonl": [
       sessionMeta("session-proof-migration"),
@@ -521,7 +1342,11 @@ test("existing incremental indexes repair the quota proof index while read-only 
   try {
     await build(root);
     const writable = openLocalUnifiedIndex(indexFile, { readOnly: false });
-    writable.exec("DROP INDEX quota_occurrence_canonical");
+    writable.exec(`
+      DROP INDEX usage_event_source;
+      DROP INDEX usage_event_quota_observation;
+      DROP INDEX quota_occurrence_canonical;
+    `);
     writable.close();
 
     assert.throws(
@@ -1035,6 +1860,1302 @@ test("a standalone source is never suppressed", async () => {
   }
 });
 
+test("a paginated replacement charges old removed work and only its post-boundary delta", async () => {
+  const baseLines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    // Work later removed from the visible branch remains actual spend.
+    tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+  ];
+  const retainedPrefix = baseLines.slice(0, 3);
+  const replacementLines = [
+    paginatedSessionMeta(THREAD_ONE, {
+      ordinal: retainedPrefix.length,
+      baseRolloutId: THREAD_ONE,
+      endOrdinalExclusive: retainedPrefix.length,
+      endByteOffset: jsonlBytes(retainedPrefix),
+    }),
+    turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+    // No last_token_usage: the exact history seed is the only way to derive
+    // the new 150/15 delta from this cumulative 250/25 counter.
+    tokenCountTotalOnly("2026-07-25T01:00:01.000Z", usage(250, 25)),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: baseLines,
+    [canonicalRolloutName("2026-07-25T01-00-00", THREAD_ONE, ROLLOUT_TWO)]: replacementLines,
+  });
+  try {
+    const single = await build(root);
+    assert.equal(single.generation.status, "complete");
+    assert.equal(single.usageEvents, 3);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output,
+               COUNT(DISTINCT source_local) AS sources,
+               COUNT(DISTINCT session_local) AS sessions
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 450);
+      assert.equal(Number(totals.output), 45);
+      assert.equal(Number(totals.sources), 2);
+      assert.equal(Number(totals.sessions), 1);
+    } finally {
+      database.close();
+    }
+
+    // Exercise the worker implementation separately; its history-base seed
+    // resolver must be bit-for-bit equivalent to the in-process reference.
+    await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "parallel.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 2,
+    });
+    const reference = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    const parallel = openLocalUnifiedIndex(join(root, "parallel.sqlite"), { readOnly: true });
+    try {
+      assert.deepEqual(logicalProjection(parallel), logicalProjection(reference));
+    } finally {
+      reference.close();
+      parallel.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+function paginatedSeedRows(indexFile) {
+  const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+  try {
+    return database.prepare(`
+      SELECT m.model_id AS model, u.reasoning_effort AS effort,
+             t.codex_speed_mode AS speed, t.tier_source AS tierSource,
+             t.provider_tier_raw AS rawTier, u.tokens_in_uncached AS input,
+             u.tokens_out_text AS output
+      FROM usage_event u
+      JOIN model m ON m.id = u.model_id
+      JOIN tier_semantics t ON t.id = u.tier_id
+      WHERE u.observed_at_ms >= ? AND u.observed_at_ms < ?
+      ORDER BY u.observed_at_ms`).all(
+      Date.parse("2026-07-25T01:00:00.000Z"),
+      Date.parse("2026-07-25T02:00:00.000Z"),
+    ).map((row) => ({ ...row }));
+  } finally {
+    database.close();
+  }
+}
+
+const UNKNOWN_PAGINATED_SEED_ROW = Object.freeze({
+  model: "unknown",
+  effort: reasoningEffortOrdinal(null),
+  speed: "unknown",
+  tierSource: "unobserved",
+  rawTier: null,
+  input: 50,
+  output: 5,
+});
+
+for (const history of ["reset", "anchored-null"]) {
+  for (const pipeline of ["serial rebuild", "worker rebuild", "incremental"]) {
+    test(`paginated seed isolation: ${history} ${pipeline} ignores the live parent's final state`, async () => {
+      const parentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+      const childName = canonicalRolloutName("2026-07-25T01-00-00", THREAD_TWO);
+      const prefix = [sessionMeta(THREAD_ONE)];
+      const childMeta = history === "reset"
+        ? paginatedResetSessionMeta(THREAD_TWO, { parentId: THREAD_ONE })
+        : paginatedSessionMeta(THREAD_TWO, {
+          ordinal: prefix.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: prefix.length,
+          endByteOffset: jsonlBytes(prefix),
+          parentId: THREAD_ONE,
+        });
+      const laterParentSettings = [
+        turnContext("2026-07-25T03:00:00.000Z", "gpt-6-astra", "ultra"),
+        threadSettings("2026-07-25T03:00:00.500Z", "priority"),
+        tokenCount("2026-07-25T03:00:01.000Z", usage(300, 30), usage(200, 20)),
+      ];
+      const { root, sessions } = await corpus({
+        [parentName]: [
+          ...prefix,
+          turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "low"),
+          tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+          // This update occurs after the child's usage. Neither a reset nor
+          // the exact all-null prefix may inherit the live parent's suffix.
+          ...(pipeline === "incremental" ? [] : laterParentSettings),
+        ],
+        [childName]: [
+          childMeta,
+          // The first own observation establishes the independent counter;
+          // its later total-only append must continue from this exact value.
+          tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+        ],
+      });
+      // A reset now inherits the parent's historical model only. The exact
+      // all-null base still remains unknown; later Astra never rewrites either.
+      const seedRow = { ...UNKNOWN_PAGINATED_SEED_ROW,
+        model: history === "reset" ? "gpt-5.6-sol" : "unknown" };
+      const indexFile = join(root, "index.sqlite");
+      const ingest = () => ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      });
+      try {
+        const initial = pipeline === "incremental"
+          ? await ingest()
+          : await build(root, { workerCount: pipeline === "serial rebuild" ? 1 : 2 });
+        assert.equal(initial.generation.status, "complete");
+        if (pipeline !== "incremental") {
+          assert.equal(initial.modelSeededFromLineage, 0);
+        }
+        assert.deepEqual(paginatedSeedRows(indexFile), [seedRow]);
+        const provenance = openLocalUnifiedIndex(indexFile, { readOnly: true });
+        try {
+          const stamp = provenance.prepare(`SELECT p.parser_version
+            FROM usage_event u JOIN parser_version p ON p.id = u.parser_version_id
+            WHERE u.observed_at_ms = ?`).get(Date.parse("2026-07-25T01:00:01.000Z"));
+          assert.equal(stamp.parser_version, history === "reset"
+            ? "unified-rollout-typed-v16-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+        } finally { provenance.close(); }
+
+        if (pipeline !== "incremental") return;
+
+        // The parent also changes physically between passes: neither its
+        // newly observed final model nor tier may rewrite the child's past.
+        await appendFile(join(sessions, parentName), `${laterParentSettings.join("\n")}\n`);
+        await appendFile(join(sessions, childName), `${tokenCountTotalOnly(
+          "2026-07-25T01:00:02.000Z", usage(80, 8),
+        )}\n`);
+        const resumed = await ingest();
+        assert.equal(resumed.sourcesResumed, 2);
+        assert.equal(resumed.insertedUsageEvents, 2);
+        const unknownRows = [
+          seedRow,
+          { ...seedRow, input: 30, output: 3 },
+        ];
+        assert.deepEqual(paginatedSeedRows(indexFile), unknownRows);
+
+        // A later own declaration is positive evidence from this point only;
+        // replay must neither backfill the earlier unknowns nor duplicate work.
+        await appendFile(join(sessions, childName), `${[
+          turnContext("2026-07-25T01:00:03.000Z", "gpt-5.6-terra", "high"),
+          threadSettings("2026-07-25T01:00:03.500Z", "default"),
+          tokenCountTotalOnly("2026-07-25T01:00:04.000Z", usage(120, 12)),
+        ].join("\n")}\n`);
+        const own = await ingest();
+        assert.equal(own.sourcesResumed, 1);
+        assert.equal(own.insertedUsageEvents, 1);
+        assert.equal(own.totalUsageEvents, 5);
+        const expected = [...unknownRows, {
+          model: "gpt-5.6-terra",
+          effort: reasoningEffortOrdinal("high"),
+          speed: "standard",
+          tierSource: "rollout_thread_settings",
+          rawTier: "default",
+          input: 40,
+          output: 4,
+        }];
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+
+        const raw = openLocalUnifiedIndex(indexFile, { readOnly: false });
+        try {
+          raw.prepare(
+            "UPDATE parser_version SET parser_version = replace(parser_version, 'v16', 'v13')",
+          ).run();
+        } finally {
+          raw.close();
+        }
+        const reparsed = await ingest();
+        assert.equal(reparsed.sourcesReparsedForParserVersion, 2);
+        assert.equal(reparsed.usageRowsDeletedForReparse, 5);
+        assert.equal(reparsed.totalUsageEvents, 5);
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+        const settled = await ingest();
+        assert.equal(settled.insertedUsageEvents, 0);
+        assert.equal(settled.totalUsageEvents, 5);
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+}
+
+for (const ownTier of ["absent", "explicit-null"]) {
+  test(`paginated seed isolation: anchored resume preserves ${ownTier} tier authority`, async () => {
+    const parentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+    const childName = canonicalRolloutName("2026-07-25T01-00-00", THREAD_TWO);
+    const prefix = [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+      threadSettings("2026-07-25T00:00:00.500Z", "priority"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ];
+    const ownDeclarationMs = Date.parse("2026-07-25T01:00:00.500Z");
+    const { root, sessions } = await corpus({
+      [parentName]: [
+        ...prefix,
+        turnContext("2026-07-25T03:00:00.000Z", "gpt-6-astra", "ultra"),
+        threadSettings("2026-07-25T03:00:00.500Z", "default"),
+        tokenCount("2026-07-25T03:00:01.000Z", usage(300, 30), usage(200, 20)),
+      ],
+      [childName]: [
+        paginatedSessionMeta(THREAD_TWO, {
+          ordinal: prefix.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: prefix.length,
+          endByteOffset: jsonlBytes(prefix),
+          parentId: THREAD_ONE,
+        }),
+        ...(ownTier === "explicit-null" ? [
+          threadSettings(new Date(ownDeclarationMs).toISOString(), null),
+        ] : []),
+        tokenCountTotalOnly("2026-07-25T01:00:01.000Z", usage(150, 15)),
+      ],
+    });
+    const indexFile = join(root, "index.sqlite");
+    const ingest = () => ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    const row = {
+      model: "gpt-5.6-sol",
+      effort: reasoningEffortOrdinal("high"),
+      speed: ownTier === "explicit-null" ? "unknown" : "fast",
+      tierSource: ownTier === "explicit-null"
+        ? "rollout_thread_settings" : "lineage_inherited",
+      rawTier: ownTier === "explicit-null" ? null : "priority",
+      input: 50,
+      output: 5,
+    };
+    try {
+      const initial = await ingest();
+      assert.equal(initial.generation.status, "complete");
+      assert.deepEqual(paginatedSeedRows(indexFile), [row]);
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        const cursor = database.prepare(`
+          SELECT carry_tier_raw AS raw, carry_tier_observed_at_ms AS observed
+          FROM source_cursor WHERE carry_model = 'gpt-5.6-sol'`).get();
+        assert.equal(cursor.raw, null);
+        assert.equal(cursor.observed, ownTier === "explicit-null" ? ownDeclarationMs : null);
+      } finally {
+        database.close();
+      }
+      await appendFile(join(sessions, childName), `${tokenCountTotalOnly(
+        "2026-07-25T01:00:02.000Z", usage(180, 18),
+      )}\n`);
+      const resumed = await ingest();
+      assert.equal(resumed.sourcesResumed, 1);
+      assert.equal(resumed.insertedUsageEvents, 1);
+      assert.equal(resumed.totalUsageEvents, 4);
+      const expected = [row, { ...row, input: 30, output: 3 }];
+      assert.deepEqual(paginatedSeedRows(indexFile), expected);
+
+      // Reconstructing an inherited tier must use exactly the retained prefix,
+      // and an own explicit null remains authoritative after restart/rebuild.
+      for (const workerCount of [1, 2]) {
+        const rebuiltIndex = join(root, `rebuilt-${workerCount}.sqlite`);
+        const rebuilt = await build(root, { indexFile: rebuiltIndex, workerCount });
+        assert.equal(rebuilt.usageEvents, 4);
+        assert.deepEqual(paginatedSeedRows(rebuiltIndex), expected);
+        const reference = openLocalUnifiedIndex(indexFile, { readOnly: true });
+        const fresh = openLocalUnifiedIndex(rebuiltIndex, { readOnly: true });
+        try {
+          assert.deepEqual(logicalProjection(reference), logicalProjection(fresh));
+        } finally {
+          reference.close();
+          fresh.close();
+        }
+      }
+      const settled = await ingest();
+      assert.equal(settled.insertedUsageEvents, 0);
+      assert.equal(settled.totalUsageEvents, 4);
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
+
+for (const history of ["reset", "anchored", "anchored-own-null"]) {
+  for (const entry of ["new child", "resumed child"]) {
+    test(`paginated ancestor isolation: ${history} retains tier authority for a warm inline ${entry}`, async () => {
+      const childId = "33333333-3333-4333-8333-333333333333";
+      const laterChildId = "44444444-4444-4444-8444-444444444444";
+      const grandparentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+      const parentName = canonicalRolloutName("2026-07-25T00-30-00", THREAD_TWO);
+      const childName = canonicalRolloutName("2026-07-25T01-00-00", childId);
+      const prefix = [
+        sessionMeta(THREAD_ONE),
+        turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+        threadSettings("2026-07-25T00:00:00.500Z", "default"),
+        tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      ];
+      const parentMeta = history === "reset"
+        ? paginatedResetSessionMeta(THREAD_TWO, { parentId: THREAD_ONE })
+        : paginatedSessionMeta(THREAD_TWO, {
+          ordinal: prefix.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: prefix.length,
+          endByteOffset: jsonlBytes(prefix),
+          parentId: THREAD_ONE,
+        });
+      const childLines = (id, minute) => [
+        sessionMeta(id, { parentId: THREAD_TWO, threadSource: "subagent" }),
+        turnContext(`2026-07-25T01:${minute}:00.000Z`, "gpt-5.6-sol", "high"),
+        tokenCount(`2026-07-25T01:${minute}:01.000Z`, usage(225, 22), usage(75, 7)),
+      ];
+      const { root, sessions } = await corpus({
+        [grandparentName]: [
+          ...prefix,
+          // The live logical grandparent is Fast. An unchanged paginated
+          // ancestor must terminate traversal before this unrelated suffix.
+          turnContext("2026-07-25T03:00:00.000Z", "gpt-6-astra", "ultra"),
+          threadSettings("2026-07-25T03:00:00.500Z", "priority"),
+          tokenCount("2026-07-25T03:00:01.000Z", usage(300, 30), usage(200, 20)),
+        ],
+        [parentName]: [
+          parentMeta,
+          turnContext("2026-07-25T00:30:00.000Z", "gpt-5.6-sol", "high"),
+          ...(history === "anchored-own-null" ? [
+            threadSettings("2026-07-25T00:30:00.500Z", null),
+          ] : []),
+          tokenCount("2026-07-25T00:30:01.000Z", usage(150, 15), usage(50, 5)),
+        ],
+        // This first inline descendant makes replay snapshots durable before
+        // the warm pass; the paginated parent must genuinely remain unscanned.
+        [childName]: childLines(childId, "00"),
+      });
+      const indexFile = join(root, "index.sqlite");
+      const ingest = () => ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      });
+      const row = {
+        model: "gpt-5.6-sol",
+        effort: reasoningEffortOrdinal("high"),
+        speed: history === "anchored" ? "standard" : "unknown",
+        tierSource: history === "reset" ? "unobserved" : "lineage_inherited",
+        rawTier: history === "anchored" ? "default" : null,
+        input: 75,
+        output: 7,
+      };
+      try {
+        const initial = await ingest();
+        assert.equal(initial.generation.status, "complete");
+        assert.equal(initial.totalUsageEvents, 4);
+        assert.deepEqual(paginatedSeedRows(indexFile), [row]);
+        for (const workerCount of [1, 2]) {
+          const freshIndex = join(root, `fresh-${workerCount}.sqlite`);
+          const fresh = await build(root, { indexFile: freshIndex, workerCount });
+          assert.equal(fresh.usageEvents, 4);
+          assert.deepEqual(paginatedSeedRows(freshIndex), [row]);
+        }
+        if (entry === "new child") {
+          await writeFile(join(sessions, canonicalRolloutName(
+            "2026-07-25T01-10-00", laterChildId,
+          )), `${childLines(laterChildId, "10").join("\n")}\n`);
+        } else {
+          await appendFile(join(sessions, childName), `${tokenCount(
+            "2026-07-25T01:00:02.000Z", usage(250, 25), usage(25, 3),
+          )}\n`);
+        }
+        const warm = await ingest();
+        assert.equal(warm.sourcesRescanned, entry === "new child" ? 1 : 0);
+        assert.equal(warm.sourcesResumed, entry === "resumed child" ? 1 : 0);
+        assert.equal(warm.sourcesSkipped, entry === "new child" ? 3 : 2);
+        assert.equal(warm.insertedUsageEvents, 1);
+        assert.equal(warm.totalUsageEvents, 5);
+        const expected = [row, entry === "new child"
+          ? row : { ...row, input: 25, output: 3 }];
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+        for (const workerCount of [1, 2]) {
+          const freshIndex = join(root, `fresh-warm-${workerCount}.sqlite`);
+          const fresh = await build(root, { indexFile: freshIndex, workerCount });
+          assert.equal(fresh.usageEvents, 5);
+          assert.deepEqual(paginatedSeedRows(freshIndex), expected);
+          const warmDatabase = openLocalUnifiedIndex(indexFile, { readOnly: true });
+          const freshDatabase = openLocalUnifiedIndex(freshIndex, { readOnly: true });
+          try {
+            assert.deepEqual(logicalProjection(warmDatabase), logicalProjection(freshDatabase));
+          } finally {
+            warmDatabase.close();
+            freshDatabase.close();
+          }
+        }
+        const settled = await ingest();
+        assert.equal(settled.insertedUsageEvents, 0);
+        assert.equal(settled.totalUsageEvents, warm.totalUsageEvents);
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+}
+
+for (const history of ["reset", "anchored"]) {
+  for (const pipeline of ["serial rebuild", "worker rebuild", "warm new child", "warm resume"]) {
+    test(`paginated replay isolation: ${history} ${pipeline} limits inline suppression to selected history`, async () => {
+      const childId = "33333333-3333-4333-8333-333333333333";
+      const grandparentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+      const parentName = canonicalRolloutName("2026-07-25T00-30-00", THREAD_TWO);
+      const childName = canonicalRolloutName("2026-07-25T01-00-00", childId);
+      const prefix = [
+        sessionMeta(THREAD_ONE),
+        turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+        tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      ];
+      const parentMeta = history === "reset"
+        ? paginatedResetSessionMeta(THREAD_TWO, { parentId: THREAD_ONE })
+        : paginatedSessionMeta(THREAD_TWO, {
+          ordinal: prefix.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: prefix.length,
+          endByteOffset: jsonlBytes(prefix),
+          parentId: THREAD_ONE,
+        });
+      const parentTotal = history === "reset" ? usage(50, 5) : usage(150, 15);
+      const childTail = [
+        // X is new work after a reset, but actual selected history for an
+        // anchored parent. It is suppressed only in the anchored variant.
+        tokenCount("2026-07-25T01:00:01.000Z", usage(100, 10), usage(100, 10)),
+        // Z matches removed grandparent suffix work, never the parent's
+        // selected history. It is real child usage in both variants.
+        tokenCount("2026-07-25T01:00:02.000Z", usage(300, 30), usage(200, 20)),
+        // Y is the paginated parent's own snapshot and must still suppress.
+        tokenCount("2026-07-25T01:00:03.000Z", parentTotal, usage(50, 5)),
+      ];
+      const { root, sessions } = await corpus({
+        [grandparentName]: [
+          ...prefix,
+          tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+        ],
+        [parentName]: [
+          parentMeta,
+          turnContext("2026-07-25T00:30:00.000Z", "gpt-5.6-sol", "high"),
+          tokenCount("2026-07-25T00:30:01.000Z", parentTotal, usage(50, 5)),
+        ],
+        [childName]: [
+          sessionMeta(childId, { parentId: THREAD_TWO, threadSource: "subagent" }),
+          turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol", "high"),
+          ...(pipeline.startsWith("warm ") ? [] : childTail),
+        ],
+      });
+      const indexFile = join(root, "index.sqlite");
+      const ingest = () => ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      });
+      const row = {
+        model: "gpt-5.6-sol",
+        effort: reasoningEffortOrdinal("high"),
+        speed: "unknown",
+        tierSource: "unobserved",
+        rawTier: null,
+        input: 100,
+        output: 10,
+      };
+      const expected = [
+        ...(history === "reset" ? [row] : []),
+        { ...row, input: 200, output: 20 },
+      ];
+      try {
+        let result;
+        if (pipeline.startsWith("warm ")) {
+          const initial = await ingest();
+          assert.equal(initial.totalUsageEvents, 3);
+          if (pipeline === "warm new child") {
+            const laterChildId = "44444444-4444-4444-8444-444444444444";
+            await writeFile(join(sessions, canonicalRolloutName(
+              "2026-07-25T01-10-00", laterChildId,
+            )), `${[
+              sessionMeta(laterChildId, { parentId: THREAD_TWO, threadSource: "subagent" }),
+              turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol", "high"),
+              ...childTail,
+            ].join("\n")}\n`);
+          } else {
+            await appendFile(join(sessions, childName), `${childTail.join("\n")}\n`);
+          }
+          result = await ingest();
+          assert.equal(result.sourcesRescanned, pipeline === "warm new child" ? 1 : 0);
+          assert.equal(result.sourcesResumed, pipeline === "warm resume" ? 1 : 0);
+          assert.equal(result.sourcesSkipped, pipeline === "warm new child" ? 3 : 2);
+        } else {
+          result = await build(root, { workerCount: pipeline === "serial rebuild" ? 1 : 2 });
+        }
+        assert.equal(result.generation.status, "complete");
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+        assert.equal(result.forkReplayEventsSkipped, history === "reset" ? 1 : 2);
+        const settled = await ingest();
+        assert.equal(settled.insertedUsageEvents, 0);
+        assert.equal(settled.totalUsageEvents, 3 + expected.length);
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+}
+
+test("a later inline fork inherits only the selected paginated history snapshots", async () => {
+  const baseLines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    // This paid work is retained in accounting but removed from the visible
+    // branch. Its cumulative snapshot must not suppress coincidentally equal
+    // new work in a later inline fork.
+    tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+  ];
+  const retainedPrefix = baseLines.slice(0, 3);
+  const replacementLines = [
+    paginatedSessionMeta(THREAD_ONE, {
+      ordinal: retainedPrefix.length,
+      baseRolloutId: THREAD_ONE,
+      endOrdinalExclusive: retainedPrefix.length,
+      endByteOffset: jsonlBytes(retainedPrefix),
+    }),
+  ];
+  const childLines = [
+    sessionMeta(THREAD_TWO, {
+      parentId: THREAD_ONE,
+      threadSource: "subagent",
+    }),
+    // Replayed retained prefix, suppressed by the pre-turn-context rule.
+    tokenCount("2026-07-25T02:00:00.000Z", usage(100, 10), usage(100, 10)),
+    turnContext("2026-07-25T02:00:01.000Z", "gpt-5.6-sol"),
+    // This is genuinely new spend but deliberately shares the removed
+    // suffix's cumulative/last snapshot. A union of every physical parent
+    // generation would wrongly suppress it.
+    tokenCount("2026-07-25T02:00:02.000Z", usage(300, 30), usage(200, 20)),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: baseLines,
+    [canonicalRolloutName(
+      "2026-07-25T01-00-00",
+      THREAD_ONE,
+      ROLLOUT_TWO,
+    )]: replacementLines,
+    [canonicalRolloutName("2026-07-25T02-00-00", THREAD_TWO)]: childLines,
+  });
+  try {
+    const single = await build(root);
+    assert.equal(single.generation.status, "complete");
+    assert.equal(single.usageEvents, 3);
+    assert.equal(single.forkReplayEventsSkipped, 1);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 500);
+      assert.equal(Number(totals.output), 50);
+    } finally {
+      database.close();
+    }
+
+    const parallel = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "parallel-history.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 2,
+    });
+    assert.equal(parallel.usageEvents, 3);
+    const parallelDatabase = openLocalUnifiedIndex(
+      join(root, "parallel-history.sqlite"),
+      { readOnly: true },
+    );
+    try {
+      const totals = parallelDatabase.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 500);
+      assert.equal(Number(totals.output), 50);
+    } finally {
+      parallelDatabase.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a no-base paginated replacement resets persisted and worker lineage snapshots", async () => {
+  const originalName = canonicalRolloutName(
+    "2026-07-25T00-00-00",
+    THREAD_ONE,
+  );
+  const replacementName = canonicalRolloutName(
+    "2026-07-25T01-00-00",
+    THREAD_ONE,
+    ROLLOUT_TWO,
+  );
+  const childName = canonicalRolloutName(
+    "2026-07-25T02-00-00",
+    THREAD_TWO,
+  );
+  const { root, sessions } = await corpus({
+    [originalName]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ],
+    [replacementName]: [
+      paginatedResetSessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+    ],
+  });
+  try {
+    const stateFile = join(root, "state_5.sqlite");
+    const state = new DatabaseSync(stateFile);
+    state.exec("CREATE TABLE threads(id TEXT, rollout_path TEXT)");
+    state.prepare("INSERT INTO threads(id, rollout_path) VALUES (?, ?)").run(
+      THREAD_ONE,
+      join(sessions, replacementName),
+    );
+    state.close();
+    await chmod(stateFile, 0o600);
+
+    const initial = await build(root);
+    assert.equal(initial.generation.status, "complete");
+    assert.equal(initial.usageEvents, 3);
+
+    await writeFile(join(sessions, childName), `${[
+      sessionMeta(THREAD_TWO, {
+        parentId: THREAD_ONE,
+        threadSource: "subagent",
+      }),
+      turnContext("2026-07-25T02:00:00.000Z", "gpt-5.6-sol"),
+      // This selected-generation snapshot is inherited and suppressed.
+      tokenCount("2026-07-25T02:00:01.000Z", usage(50, 5), usage(50, 5)),
+      // This matches the replaced physical generation. It is genuinely new
+      // work and must remain after the no-base reset clears that old set.
+      tokenCount("2026-07-25T02:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ].join("\n")}\n`);
+
+    const incremental = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile: join(root, "index.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(incremental.generation.status, "complete");
+    assert.equal(incremental.totalUsageEvents, 4);
+    assert.equal(incremental.forkReplayEventsSkipped, 1);
+
+    const serial = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "serial-reset.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 1,
+    });
+    assert.equal(serial.generation.status, "complete");
+    assert.equal(serial.usageEvents, 4);
+    assert.equal(serial.forkReplayEventsSkipped, 1);
+
+    const parallel = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "parallel-reset.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 2,
+    });
+    assert.equal(parallel.generation.status, "complete");
+    assert.equal(parallel.usageEvents, 4);
+    assert.equal(parallel.forkReplayEventsSkipped, 1);
+
+    const referenceDatabase = openLocalUnifiedIndex(
+      join(root, "index.sqlite"),
+      { readOnly: true },
+    );
+    const parallelDatabase = openLocalUnifiedIndex(
+      join(root, "parallel-reset.sqlite"),
+      { readOnly: true },
+    );
+    const serialDatabase = openLocalUnifiedIndex(
+      join(root, "serial-reset.sqlite"),
+      { readOnly: true },
+    );
+    try {
+      assert.deepEqual(
+        logicalProjection(serialDatabase),
+        logicalProjection(referenceDatabase),
+      );
+      assert.deepEqual(
+        logicalProjection(parallelDatabase),
+        logicalProjection(referenceDatabase),
+      );
+    } finally {
+      referenceDatabase.close();
+      serialDatabase.close();
+      parallelDatabase.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("lineage snapshots follow the selected original instead of a newer unselected reset", async () => {
+  const originalName = canonicalRolloutName(
+    "2026-07-25T00-00-00",
+    THREAD_ONE,
+  );
+  const replacementName = canonicalRolloutName(
+    "2026-07-25T01-00-00",
+    THREAD_ONE,
+    ROLLOUT_TWO,
+  );
+  const childName = canonicalRolloutName(
+    "2026-07-25T02-00-00",
+    THREAD_TWO,
+  );
+  const { root, sessions } = await corpus({
+    [originalName]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100), usage(100)),
+    ],
+    [replacementName]: [
+      paginatedResetSessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(50), usage(50)),
+    ],
+  });
+  try {
+    const stateFile = join(root, "state_5.sqlite");
+    const state = new DatabaseSync(stateFile);
+    state.exec("CREATE TABLE threads(id TEXT, rollout_path TEXT)");
+    state.prepare("INSERT INTO threads(id, rollout_path) VALUES (?, ?)").run(
+      THREAD_ONE,
+      join(sessions, originalName),
+    );
+    state.close();
+    await chmod(stateFile, 0o600);
+
+    const initial = await build(root);
+    assert.equal(initial.generation.status, "complete");
+    assert.equal(initial.usageEvents, 2);
+
+    await writeFile(join(sessions, childName), `${[
+      sessionMeta(THREAD_TWO, {
+        parentId: THREAD_ONE,
+        threadSource: "subagent",
+      }),
+      turnContext("2026-07-25T02:00:00.000Z", "gpt-5.6-sol"),
+      // The explicitly selected original owns this inherited snapshot.
+      tokenCount("2026-07-25T02:00:01.000Z", usage(100), usage(100)),
+      // The unselected replacement reported this snapshot. It is new work on
+      // the selected branch and must not be suppressed by filename order.
+      tokenCount("2026-07-25T02:00:02.000Z", usage(50), usage(50)),
+    ].join("\n")}\n`);
+
+    const incremental = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile: join(root, "index.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(incremental.generation.status, "complete");
+    assert.equal(incremental.totalUsageEvents, 3);
+    assert.equal(incremental.forkReplayEventsSkipped, 1);
+
+    const parallel = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "parallel-selected-original.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 2,
+    });
+    assert.equal(parallel.generation.status, "complete");
+    assert.equal(parallel.usageEvents, 3);
+    assert.equal(parallel.forkReplayEventsSkipped, 1);
+
+    for (const indexFile of [
+      join(root, "index.sqlite"),
+      join(root, "parallel-selected-original.sqlite"),
+    ]) {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        const totals = database.prepare(`
+          SELECT COUNT(*) AS events, SUM(tokens_in_uncached) AS input
+          FROM usage_event
+        `).get();
+        assert.equal(Number(totals.events), 3);
+        assert.equal(Number(totals.input), 200);
+      } finally {
+        database.close();
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("selected head isolation: logical head resolution refuses ambiguous and retired canonical sources", () => {
+  const source = (fields = {}) => Object.freeze({
+    lineage: Object.freeze({ sessionId: THREAD_ONE }),
+    ...fields,
+  });
+  const selected = source({ rolloutId: ROLLOUT_TWO, resolvedHead: true });
+  const retired = source({ rolloutId: ROLLOUT_THREE, resolvedHead: false });
+  const original = source({ rolloutId: THREAD_ONE, resolvedHead: false });
+  for (const members of [
+    [selected, original, retired],
+    [retired, selected, original],
+    [original, retired, selected],
+  ]) {
+    const heads = resolveLogicalRolloutHeads(Object.freeze(members));
+    assert.equal(heads.size, 1);
+    assert.equal(heads.get(THREAD_ONE), selected, "return the explicit head, not the last visited source");
+  }
+  for (const legacy of [source(), source({ rolloutId: null })]) {
+    const heads = resolveLogicalRolloutHeads([legacy]);
+    assert.equal(heads.size, 1);
+    assert.equal(heads.get(THREAD_ONE), legacy, "single legacy source remains compatible");
+  }
+  for (const members of [
+    [],
+    [retired],
+    [source({ rolloutId: THREAD_ONE })],
+    [original, retired],
+    [source(), source()],
+    [source(), retired],
+    [selected, source({ rolloutId: ROLLOUT_THREE, resolvedHead: true })],
+    [{ rolloutId: THREAD_ONE, resolvedHead: true }],
+  ]) {
+    assert.equal(resolveLogicalRolloutHeads(members).size, 0);
+  }
+  const otherLegacy = source({ lineage: Object.freeze({ sessionId: THREAD_TWO }) });
+  const mixed = resolveLogicalRolloutHeads([original, retired, otherLegacy]);
+  assert.equal(mixed.size, 1);
+  assert.equal(mixed.has(THREAD_ONE), false);
+  assert.equal(mixed.get(THREAD_TWO), otherLegacy, "ambiguity is scoped to its logical session");
+});
+
+for (const pipeline of ["serial rebuild", "worker rebuild", "warm new child", "warm resume"]) {
+  test(`selected head isolation: ${pipeline} ignores a deeper retired continuation for inline inheritance`, async () => {
+    const originalName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+    const selectedName = canonicalRolloutName("2026-07-25T01-00-00", THREAD_ONE, ROLLOUT_TWO);
+    const retiredName = canonicalRolloutName("2026-07-25T02-00-00", THREAD_ONE, ROLLOUT_THREE);
+    const childName = canonicalRolloutName("2026-07-25T03-00-00", THREAD_TWO);
+    const original = [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ];
+    const childContext = JSON.stringify({
+      timestamp: "2026-07-25T03:00:00.000Z",
+      type: "turn_context",
+      payload: {},
+    });
+    const childTail = [
+      // The retired branch's snapshot is not selected history. Coincidentally
+      // equal work after the child's own turn remains a genuine new charge.
+      tokenCount("2026-07-25T03:00:01.000Z", usage(300, 30), usage(200, 20)),
+      // Conversely, the selected reset's own snapshot still suppresses.
+      tokenCount("2026-07-25T03:00:02.000Z", usage(50, 5), usage(50, 5)),
+    ];
+    const { root, sessions } = await corpus({
+      [originalName]: original,
+      [selectedName]: [
+        paginatedResetSessionMeta(THREAD_ONE),
+        turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-terra", "low"),
+        threadSettings("2026-07-25T01:00:00.500Z", "default"),
+        tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+      ],
+      [retiredName]: [
+        paginatedSessionMeta(THREAD_ONE, {
+          ordinal: original.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: original.length,
+          endByteOffset: jsonlBytes(original),
+        }),
+        turnContext("2026-07-25T02:00:00.000Z", "gpt-6-astra", "ultra"),
+        threadSettings("2026-07-25T02:00:00.500Z", "priority"),
+        tokenCount("2026-07-25T02:00:01.000Z", usage(300, 30), usage(200, 20)),
+      ],
+      [childName]: [
+        sessionMeta(THREAD_TWO, { parentId: THREAD_ONE, threadSource: "subagent" }),
+        childContext,
+        ...(pipeline.startsWith("warm ") ? [] : childTail),
+      ],
+    });
+    const indexFile = join(root, "index.sqlite");
+    const ingest = () => ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    const expected = [{
+      model: "gpt-5.6-terra",
+      effort: reasoningEffortOrdinal("low"),
+      speed: "standard",
+      tierSource: "lineage_inherited",
+      input: 200,
+      output: 20,
+    }];
+    const inspectSelected = (file) => {
+      const database = openLocalUnifiedIndex(file, { readOnly: true });
+      try {
+        const childRows = database.prepare(`
+          SELECT m.model_id AS model, u.reasoning_effort AS effort,
+                 t.codex_speed_mode AS speed, t.tier_source AS tierSource,
+                 u.tokens_in_uncached AS input, u.tokens_out_text AS output
+          FROM usage_event u
+          JOIN model m ON m.id = u.model_id
+          JOIN tier_semantics t ON t.id = u.tier_id
+          WHERE u.observed_at_ms >= ?
+          ORDER BY u.observed_at_ms`).all(Date.parse("2026-07-25T03:00:00.000Z"))
+          .map((row) => ({ ...row }));
+        assert.deepEqual(childRows, expected);
+        const totals = database.prepare(`
+          SELECT COUNT(*) AS events, SUM(tokens_in_uncached) AS input,
+                 SUM(tokens_out_text) AS output FROM usage_event`).get();
+        assert.equal(totals.events, 4);
+        assert.equal(totals.input, 550);
+        assert.equal(totals.output, 55);
+        // Selection controls inheritance, not retention: all three paid
+        // parent physical generations remain accounted under their own model.
+        assert.deepEqual(database.prepare(`
+          SELECT m.model_id AS model, SUM(u.tokens_in_uncached) AS input
+          FROM usage_event u JOIN model m ON m.id = u.model_id
+          WHERE u.observed_at_ms < ? GROUP BY m.model_id ORDER BY m.model_id`)
+          .all(Date.parse("2026-07-25T03:00:00.000Z")).map((row) => ({ ...row })), [
+          { model: "gpt-5.6-sol", input: 100 },
+          { model: "gpt-5.6-terra", input: 50 },
+          { model: "gpt-6-astra", input: 200 },
+        ]);
+      } finally {
+        database.close();
+      }
+    };
+    try {
+      const stateFile = join(root, "state_5.sqlite");
+      const state = new DatabaseSync(stateFile);
+      try {
+        state.exec("CREATE TABLE threads(id TEXT, rollout_path TEXT)");
+        state.prepare("INSERT INTO threads(id, rollout_path) VALUES (?, ?)").run(
+          THREAD_ONE, join(sessions, selectedName),
+        );
+      } finally {
+        state.close();
+      }
+      await chmod(stateFile, 0o600);
+      let result;
+      if (pipeline.startsWith("warm ")) {
+        const initial = await ingest();
+        assert.equal(initial.totalUsageEvents, 3);
+        if (pipeline === "warm new child") {
+          const laterChildId = "33333333-3333-4333-8333-333333333333";
+          await writeFile(join(sessions, canonicalRolloutName(
+            "2026-07-25T03-10-00", laterChildId,
+          )), `${[
+            sessionMeta(laterChildId, { parentId: THREAD_ONE, threadSource: "subagent" }),
+            childContext,
+            ...childTail,
+          ].join("\n")}\n`);
+        } else {
+          await appendFile(join(sessions, childName), `${childTail.join("\n")}\n`);
+        }
+        result = await ingest();
+        assert.equal(result.sourcesRescanned, pipeline === "warm new child" ? 1 : 0);
+        assert.equal(result.sourcesResumed, pipeline === "warm resume" ? 1 : 0);
+        assert.equal(result.sourcesSkipped, pipeline === "warm new child" ? 4 : 3);
+      } else {
+        result = await build(root, { workerCount: pipeline === "serial rebuild" ? 1 : 2 });
+      }
+      assert.equal(result.generation.status, "complete");
+      assert.equal(result.forkReplayEventsSkipped, 1);
+      inspectSelected(indexFile);
+      const settled = await ingest();
+      assert.equal(settled.insertedUsageEvents, 0);
+      assert.equal(settled.totalUsageEvents, 4);
+      inspectSelected(indexFile);
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
+
+test("a replacement counter reset re-anchors once, charges per-turn usage, and records the regression", async () => {
+  const baseLines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+  ];
+  const replacementLines = [
+    paginatedSessionMeta(THREAD_ONE, {
+      ordinal: baseLines.length,
+      baseRolloutId: THREAD_ONE,
+      endOrdinalExclusive: baseLines.length,
+      endByteOffset: jsonlBytes(baseLines),
+    }),
+    turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+    tokenCount("2026-07-25T01:00:02.000Z", usage(100, 10), usage(50, 5)),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: baseLines,
+    [canonicalRolloutName("2026-07-25T01-00-00", THREAD_ONE, ROLLOUT_TWO)]: replacementLines,
+  });
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 200);
+      assert.equal(Number(totals.output), 20);
+      assert.equal(Number(database.prepare(`
+        SELECT COALESCE(SUM(count), 0) AS count FROM source_diagnostic
+        WHERE code = 'cumulativeCounterRegressions'`).get().count), 1);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a third physical generation appends incrementally with a recursively resolved history seed", async () => {
+  const baseLines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+  ];
+  const replacementLines = [
+    paginatedSessionMeta(THREAD_ONE, {
+      ordinal: baseLines.length,
+      baseRolloutId: THREAD_ONE,
+      endOrdinalExclusive: baseLines.length,
+      endByteOffset: jsonlBytes(baseLines),
+    }),
+    turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+    tokenCountTotalOnly("2026-07-25T01:00:01.000Z", usage(150, 15)),
+  ];
+  const baseName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+  const replacementName = canonicalRolloutName(
+    "2026-07-25T01-00-00",
+    THREAD_ONE,
+    ROLLOUT_TWO,
+  );
+  const { root, sessions } = await corpus({
+    [baseName]: baseLines,
+    [replacementName]: replacementLines,
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    const first = await build(root);
+    assert.equal(first.usageEvents, 2);
+    const thirdLines = [
+      paginatedSessionMeta(THREAD_ONE, {
+        ordinal: baseLines.length + replacementLines.length,
+        baseRolloutId: ROLLOUT_TWO,
+        endOrdinalExclusive: baseLines.length + replacementLines.length,
+        endByteOffset: jsonlBytes(replacementLines),
+      }),
+      turnContext("2026-07-25T02:00:00.000Z", "gpt-5.6-sol"),
+      tokenCountTotalOnly("2026-07-25T02:00:01.000Z", usage(190, 19)),
+    ];
+    await writeFile(join(
+      sessions,
+      canonicalRolloutName("2026-07-25T02-00-00", THREAD_ONE, ROLLOUT_THREE),
+    ), `${thirdLines.join("\n")}\n`);
+
+    const advanced = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(advanced.rebuilt, undefined);
+    assert.equal(advanced.sourcesRescanned, 1);
+    assert.equal(advanced.insertedUsageEvents, 1);
+    assert.equal(advanced.totalUsageEvents, 3);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output,
+               COUNT(DISTINCT source_local) AS sources
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 190);
+      assert.equal(Number(totals.output), 19);
+      assert.equal(Number(totals.sources), 3);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("same-thread rollout events at identical timestamp and byte offset keep distinct event keys", async () => {
+  const baseMeta = sessionMeta(THREAD_ONE);
+  const baseCutoffBytes = Buffer.byteLength(`${baseMeta}\n`);
+  const replacementMeta = paginatedSessionMeta(THREAD_ONE, {
+    ordinal: 1,
+    baseRolloutId: THREAD_ONE,
+    endOrdinalExclusive: 1,
+    endByteOffset: baseCutoffBytes,
+  });
+  const context = turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol");
+  const event = tokenCount(
+    "2026-07-25T00:00:01.000Z",
+    usage(10, 1),
+    usage(10, 1),
+  );
+  const basePrefixBytes = Buffer.byteLength(`${baseMeta}\n${context}\n`);
+  const replacementPrefixBytes = Buffer.byteLength(`${replacementMeta}\n${context}\n`);
+  assert.ok(replacementPrefixBytes >= basePrefixBytes);
+  const paddedContext = `${context}${" ".repeat(replacementPrefixBytes - basePrefixBytes)}`;
+  assert.equal(
+    Buffer.byteLength(`${baseMeta}\n${paddedContext}\n`),
+    replacementPrefixBytes,
+  );
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: [
+      baseMeta,
+      paddedContext,
+      event,
+    ],
+    [canonicalRolloutName("2026-07-25T01-00-00", THREAD_ONE, ROLLOUT_TWO)]: [
+      replacementMeta,
+      context,
+      event,
+    ],
+  });
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT observed_at_ms, source_offset, hex(source_local) AS source_local,
+               hex(event_key) AS event_key
+        FROM usage_event ORDER BY source_local`).all();
+      assert.equal(rows.length, 2);
+      assert.equal(rows[0].observed_at_ms, rows[1].observed_at_ms);
+      assert.equal(rows[0].source_offset, rows[1].source_offset);
+      assert.notEqual(rows[0].source_local, rows[1].source_local);
+      assert.notEqual(rows[0].event_key, rows[1].event_key);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("one divergent thread publishes an attested partial generation and an unchanged pass terminates", async () => {
+  const validLines = [
+    sessionMeta(THREAD_TWO),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(25, 2), usage(25, 2)),
+  ];
+  const divergentA = [sessionMeta(THREAD_ONE)];
+  const divergentB = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-terra"),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: divergentA,
+    [canonicalRolloutName("2026-07-25T00-00-01", THREAD_ONE)]: divergentB,
+    [canonicalRolloutName("2026-07-25T00-00-02", THREAD_TWO)]: validLines,
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    const built = await build(root);
+    assert.equal(built.generation.status, "partial");
+    assert.equal(built.generation.blockReason, "codex_rollout_sources_quarantined");
+    assert.equal(built.generation.discoveredSourceCount, 3);
+    assert.equal(built.generation.indexedSourceCount, 1);
+    assert.equal(built.generation.skippedSourceCount, 2);
+    assert.equal(built.generation.skippedThreadCount, 1);
+    assert.deepEqual(built.generation.issueCounts, {
+      codex_rollout_generation_ambiguous: {
+        threadCount: 1,
+        sourceCount: 2,
+        sourceBytes: jsonlBytes(divergentA) + jsonlBytes(divergentB),
+      },
+    });
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual(database.prepare(`
+        SELECT status, COUNT(*) AS count FROM generation_source
+        WHERE generation_id = ? GROUP BY status ORDER BY status
+      `).all(built.generation.id).map((row) => ({ ...row })), [
+        { status: "complete", count: 1 },
+        { status: "failed", count: 2 },
+      ]);
+      const groups = database.prepare(`
+        SELECT code, source_count, source_bytes, length(group_local) AS local_bytes
+        FROM generation_issue_group WHERE generation_id = ?
+      `).all(built.generation.id).map((row) => ({ ...row }));
+      assert.deepEqual(groups, [{
+        code: "codex_rollout_generation_ambiguous",
+        source_count: 2,
+        source_bytes: jsonlBytes(divergentA) + jsonlBytes(divergentB),
+        local_bytes: 32,
+      }]);
+    } finally {
+      database.close();
+    }
+
+    const rows = [];
+    const accountingSource = createLocalUnifiedAccountingSource({
+      indexFile,
+      requireComplete: true,
+      expectedGeneration: built.generation,
+      contextBehavior: "legacy_zero",
+    });
+    const accounting = await accountingSource({
+      startAt: "2026-07-25T00:00:00.000Z",
+      endAt: "2026-07-26T00:00:00.000Z",
+      onUsage: (row) => rows.push(row),
+    });
+    assert.equal(accounting.coverage.status, "partial");
+    assert.equal(accounting.coverage.generationProof, true);
+    assert.equal(accounting.coverage.skippedSourceCount, 2);
+    assert.equal(accounting.coverage.skippedThreadCount, 1);
+    assert.equal(rows.length, 1);
+
+    const unchanged = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.generation.id, built.generation.id);
+    assert.equal(unchanged.sourcesScanned, 0);
+    assert.equal(unchanged.skippedSourceCount, 2);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("the worker rebuild produces the same index as the single-threaded rebuild", async () => {
   const files = {};
   for (let index = 0; index < 6; index += 1) {
@@ -1211,6 +3332,23 @@ test("a compaction is recognized only from its bounded top-level header", async 
     )),
     { observedAtMs: Date.parse("2026-07-25T00:00:02.000Z") },
   );
+  for (const ordinal of ["0", "123", "18446744073709551615"]) {
+    assert.deepEqual(parseCompactionPrefix(Buffer.from(
+      `{"timestamp":"2026-07-25T00:00:02.000Z","ordinal":${ordinal},`
+      + '"type":"compacted","payload":{"content":"SECRET"}}',
+    )), { observedAtMs: Date.parse("2026-07-25T00:00:02.000Z") });
+  }
+  for (const ordinal of ["", "-1", "1.5", "1e3", '"1"', "null", "01",
+    "18446744073709551616", "1".repeat(1000)]) {
+    assert.equal(parseCompactionPrefix(Buffer.from(
+      `{"timestamp":"2026-07-25T00:00:02.000Z","ordinal":${ordinal},`
+      + '"type":"compacted","payload":{}}',
+    )), null);
+  }
+  assert.equal(parseCompactionPrefix(Buffer.from(
+    '{"timestamp":"2026-07-25T00:00:02.000Z","ordinal":1,"payload":'
+      + '{"type":"compacted"},"type":"compacted"}',
+  )), null);
   // A content-bearing record may itself contain an object whose type happens
   // to be `compacted`. Anchoring on the top-level timestamp/type header keeps
   // that nested marker from becoming a false boundary (or making the parser
@@ -1230,7 +3368,8 @@ test("a compaction is recognized only from its bounded top-level header", async 
   }))), null);
 });
 
-test("an oversized compaction stores only a content-free boundary with provenance", async () => {
+for (const ordinal of [null, 123]) {
+test(`an oversized compaction stores only a content-free boundary with provenance (ordinal ${ordinal})`, async () => {
   const root = await mkdtemp(join(tmpdir(), "unified-compaction-"));
   const sessions = join(root, "sessions", "2026", "07", "25");
   await mkdir(sessions, { recursive: true });
@@ -1244,7 +3383,7 @@ test("an oversized compaction stores only a content-free boundary with provenanc
       type: "response_item",
       payload: { metadata: { type: "compacted" }, content: "SECRET NESTED" },
     }),
-    compacted(compactedAt, 20_000),
+    compacted(compactedAt, 20_000, ordinal),
     tokenCount("2026-07-25T00:00:02.000Z", usage(100, 10), usage(100, 10)),
   ].join("\n")}\n`);
   try {
@@ -1304,6 +3443,7 @@ test("an oversized compaction stores only a content-free boundary with provenanc
     await rm(root, { recursive: true });
   }
 });
+}
 
 test("boundaries attach to the exact next positive input and require a real turn marker", async () => {
   const tied = "2026-07-25T00:05:00.000Z";
@@ -1453,6 +3593,7 @@ test("cache adjacency follows exact source order and exposes incomplete order co
           assert.equal(period.coverageStatus, "incomplete");
           assert.equal(period.estimatedPremiumUsd, null);
           assert.equal(period.estimatedPremiumUsdExact, null);
+          assert.equal(period.coveredSubtotal, null);
         }
         const switchPeriod = impacts.cacheSwitchImpact.periods.find(
           (candidate) => candidate.periodId === "24h",
@@ -1571,8 +3712,113 @@ test("ordering coverage is period-scoped and ignores sessions without adjacency"
         switchThirty.byChangeType.reasoning_only.estimatedPremiumUsd,
         0,
       );
+      assert.equal(switchThirty.coveredSubtotal.scope, "covered_priced_drops");
+      assert.equal(switchThirty.coveredSubtotal.pricedDrops, 1);
+      assert.equal(switchThirty.coveredSubtotal.standardApiPremiumUsdExact, "0");
     } finally {
       database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("covered cache subtotals survive a multi-source session exclusion through companion projection", async () => {
+  const nowMs = Date.parse("2026-07-25T12:00:00.000Z");
+  const turnAt = (timestamp, effort, totalInput, totalCached, cached) => [
+    turnContext(timestamp, "gpt-5.6-sol", effort),
+    tokenCount(timestamp, usage(totalInput, 0, totalCached), usage(1_200, 0, cached)),
+  ];
+  const { root } = await corpus({
+    "rollout-2026-07-25T10-00-00-covered.jsonl": [
+      sessionMeta("session-covered"),
+      ...turnAt("2026-07-25T10:00:00.000Z", "high", 1_200, 1_000, 1_000),
+      ...turnAt("2026-07-25T10:01:00.000Z", "max", 2_400, 1_000, 0),
+      ...turnAt("2026-07-25T10:02:00.000Z", "max", 3_600, 2_000, 1_000),
+      ...turnAt("2026-07-25T10:03:00.000Z", "max", 4_800, 2_000, 0),
+    ],
+    "rollout-2026-07-25T11-00-00-part-a.jsonl": [
+      sessionMeta("session-part-a"),
+      ...turnAt("2026-07-25T11:00:00.000Z", "high", 1_200, 1_000, 1_000),
+      ...turnAt("2026-07-25T11:01:00.000Z", "max", 2_400, 1_000, 0),
+    ],
+    "rollout-2026-07-25T11-10-00-part-b.jsonl": [
+      sessionMeta("session-part-b"),
+      ...turnAt("2026-07-25T11:10:00.000Z", "high", 1_200, 1_000, 1_000),
+      ...turnAt("2026-07-25T11:11:00.000Z", "max", 2_400, 1_000, 0),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      // Synthetic retained structure: both source-local offsets remain valid,
+      // but they cannot order one session across two coordinate systems.
+      database.prepare(`
+        UPDATE usage_event SET session_local = (
+          SELECT session_local FROM usage_event WHERE observed_at_ms = ? LIMIT 1
+        ) WHERE observed_at_ms >= ?`).run(
+        Date.parse("2026-07-25T11:00:00.000Z"),
+        Date.parse("2026-07-25T11:10:00.000Z"),
+      );
+      const coverage = database.prepare(`
+        SELECT COUNT(*) AS events, COUNT(source_id) AS sourced,
+               COUNT(source_offset) AS ordered, COUNT(DISTINCT source_id) AS sources
+        FROM usage_event WHERE observed_at_ms >= ?`).get(
+        Date.parse("2026-07-25T11:00:00.000Z"),
+      );
+      assert.deepEqual({ ...coverage }, { events: 4, sourced: 4, ordered: 4, sources: 2 });
+      const impacts = readCacheImpacts(database, {
+        nowMs,
+        pricer: (_event, components) => ({
+          coverageStatus: "fully_priced",
+          totalUsd: String(components.input_uncached_tokens),
+        }),
+      });
+      for (const projection of [impacts.cacheSwitchImpact, impacts.cacheContinuityImpact]) {
+        for (const period of projection.periods) {
+          assert.equal(period.orderingCoverageGaps, 1, period.periodId);
+          assert.equal(period.coverageStatus, "incomplete", period.periodId);
+          assert.equal(period.cacheReadDrops, 1, period.periodId);
+          assert.equal(period.pricedDrops, 1, period.periodId);
+          assert.equal(period.estimatedPremiumUsd, null, period.periodId);
+          assert.equal(period.standardApiPremiumUsd, null, period.periodId);
+          assert.equal(period.allowanceWeighting.status, "unavailable", period.periodId);
+          assert.equal(period.coveredSubtotal.standardApiPremiumUsdExact, "1000", period.periodId);
+          assert.equal(period.recent.length, 1, period.periodId);
+        }
+      }
+    } finally {
+      database.close();
+    }
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      unifiedIndexFile: indexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => nowMs,
+    });
+    for (const key of ["cacheSwitchImpact", "cacheContinuityImpact"]) {
+      const impact = snapshot.overview.accounting[key];
+      assert.equal(impact.status, "available", key);
+      assert.equal(impact.periodId, "7d", key);
+      assert.equal(impact.orderingCoverageGaps, 1, key);
+      assert.equal(impact.estimatedPremiumUsd, null, key);
+      assert.equal(impact.allowanceWeighting.status, "unavailable", key);
+      assert.equal(impact.allowanceImpact.status, "unavailable", key);
+      assert.equal(impact.allowanceImpact.medianPercentagePoints, null, key);
+      assert.equal(impact.coveredSubtotal.scope, "covered_priced_drops", key);
+      assert.equal(impact.coveredSubtotal.pricedDrops, 1, key);
+      assert.ok(impact.coveredSubtotal.standardApiPremiumUsd > 0, key);
+      assert.equal(impact.coveredSubtotal.allowanceWeighting.status, "complete", key);
+      assert.equal(impact.coveredSubtotal.allowanceWeighting.selectedPremiumUsd,
+        impact.coveredSubtotal.standardApiPremiumUsd, key);
+      for (const period of impact.periods) {
+        assert.deepEqual(period.coveredSubtotal, impact.coveredSubtotal, key);
+        assert.equal(period.allowanceImpact.status, "unavailable", key);
+      }
+      assert.doesNotMatch(JSON.stringify(impact), /session-covered|session-part|source_id|source_offset/u);
     }
   } finally {
     await rm(root, { recursive: true });
@@ -2030,6 +4276,16 @@ test("an oversized typed tool record blocks complete generation publication", as
     } finally {
       database.close();
     }
+    const unchanged = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile: join(root, "index.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      maximumLineBytes: 512,
+    });
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.sourcesScanned, 0);
+    assert.equal(unchanged.generation.blockReason, "tool_provenance_incomplete");
   } finally {
     await rm(root, { recursive: true });
   }
@@ -2258,6 +4514,255 @@ test("a rotated pre-tool source withholds tools without blocking accounting", as
     assert.equal(projection.tools.total, 0);
     assert.equal(projection.discoveredSourceCount, 1);
     assert.equal(projection.indexedSourceCount, 2);
+
+    const unchanged = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.sourcesScanned, 0);
+    assert.equal(unchanged.totalUsageEvents, 2);
+    assert.equal(unchanged.generation.status, "partial");
+    assert.equal(
+      unchanged.generation.blockReason,
+      "tool_provenance_incomplete",
+    );
+    assert.equal(unchanged.generation.toolProvenanceComplete, false);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an abort after rebuild close cannot cross the pre-rename publication boundary", async () => {
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-late-rebuild-abort.jsonl": [
+      sessionMeta("session-late-rebuild-abort"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const sourceFile = join(
+    sessions,
+    "rollout-2026-07-25T00-00-00-late-rebuild-abort.jsonl",
+  );
+  const attemptToken = "9".repeat(32);
+  const stageFile = localUnifiedIndexStageFile(
+    indexFile,
+    "building",
+    attemptToken,
+  );
+  try {
+    const built = await build(root);
+    const before = await readFile(indexFile);
+    await appendFile(
+      sourceFile,
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}\n`,
+    );
+    const controller = new AbortController();
+    let abortQueued = false;
+    let confirmAbort;
+    const abortedAtPublication = new Promise((resolve) => {
+      confirmAbort = resolve;
+    });
+    const pending = rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      attemptToken,
+      signal: controller.signal,
+      onProgress(progress) {
+        if (abortQueued || progress.sourcesScanned !== 1) return;
+        abortQueued = true;
+        setImmediate(() => {
+          controller.abort();
+          confirmAbort();
+        });
+      },
+    });
+    await Promise.all([
+      assert.rejects(
+        pending,
+        (error) => error?.code === "local_unified_index_aborted",
+      ),
+      abortedAtPublication,
+    ]);
+    assert.deepEqual(await readFile(indexFile), before);
+    await assert.rejects(() => stat(stageFile), { code: "ENOENT" });
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(database.prepare(
+          "SELECT value FROM meta WHERE key = 'current_generation_id'",
+        ).get().value),
+        built.generation.id,
+      );
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a recovery lock acquired during target validation blocks staged publication", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-recovery-publication-race.jsonl": [
+      sessionMeta("session-recovery-publication-race"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = join(root, "candidate.sqlite");
+  const recoveryLockFile = defaultLocalUnifiedIndexRecoveryLockPath(indexFile);
+  try {
+    await build(root);
+    const publishedBefore = await readFile(indexFile);
+    await copyFile(indexFile, stageFile);
+
+    const controller = new AbortController();
+    let abortedReads = 0;
+    let resolveLockAcquired;
+    const lockAcquired = new Promise((resolve) => {
+      resolveLockAcquired = resolve;
+    });
+    Object.defineProperty(controller.signal, "aborted", {
+      configurable: true,
+      get() {
+        abortedReads += 1;
+        // The third read is the pre-validation cancellation check. Queueing a
+        // microtask here lets assertSafeLocalUnifiedIndexTarget start and yield
+        // on its asynchronous lstat before the recovery owner acquires its
+        // owner-only lock. This deterministically exercises the former gap
+        // between the pre-validation lock check and the final rename.
+        if (abortedReads === 3) {
+          queueMicrotask(() => {
+            writeFileSync(recoveryLockFile, "recovery owns publication\n", {
+              flag: "wx",
+              mode: 0o600,
+            });
+            resolveLockAcquired();
+          });
+        }
+        return false;
+      },
+    });
+
+    await assert.rejects(
+      publishStagedUnifiedIndex(stageFile, indexFile, {
+        signal: controller.signal,
+      }),
+      (error) => error?.code === "local_unified_index_recovery_in_progress",
+    );
+    await lockAcquired;
+    assert.ok(abortedReads >= 4);
+    assert.deepEqual(await readFile(indexFile), publishedBefore);
+    assert.deepEqual(await readFile(stageFile), publishedBefore);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("the finalized-stage observer yields to an exclusive writer on the same event loop", async () => {
+  const { root } = await corpus({});
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = join(root, "finalized-stage.sqlite");
+  let writer = null;
+  let released = null;
+  try {
+    await build(root);
+    await copyFile(indexFile, stageFile);
+    writer = new DatabaseSync(stageFile);
+    writer.exec("BEGIN EXCLUSIVE");
+    released = new Promise((resolve, reject) => {
+      setImmediate(() => {
+        try {
+          writer.exec("COMMIT");
+          writer.close();
+          writer = null;
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    const controller = new AbortController();
+    // The observer's existing two-second deadline must include contention.
+    // A synchronous five-second busy wait prevents the queued COMMIT above
+    // from running, so the old probe fails this deterministically.
+    const status = await abortWhenStageGenerationFinalizes(stageFile, controller);
+    await released;
+    assert.equal(status, "complete");
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(writer, null);
+  } finally {
+    await released?.catch(() => {});
+    if (writer?.isOpen) writer.close();
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an abort during incremental close cannot publish its finalized stage", async () => {
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-late-incremental-abort.jsonl": [
+      sessionMeta("session-late-incremental-abort"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const sourceFile = join(
+    sessions,
+    "rollout-2026-07-25T00-00-00-late-incremental-abort.jsonl",
+  );
+  const attemptToken = "8".repeat(32);
+  const stageFile = localUnifiedIndexStageFile(
+    indexFile,
+    "incremental",
+    attemptToken,
+  );
+  try {
+    const built = await build(root);
+    const before = await readFile(indexFile);
+    await appendFile(
+      sourceFile,
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}\n`,
+    );
+    const controller = new AbortController();
+    const monitor = abortWhenStageGenerationFinalizes(stageFile, controller);
+    const pending = ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      attemptToken,
+      signal: controller.signal,
+    });
+    const [, stagedStatus] = await Promise.all([
+      assert.rejects(
+        pending,
+        (error) => error?.code === "local_unified_index_aborted",
+      ),
+      monitor,
+    ]);
+    assert.equal(stagedStatus, "complete");
+    assert.deepEqual(await readFile(indexFile), before);
+    await assert.rejects(() => stat(stageFile), { code: "ENOENT" });
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(database.prepare(
+          "SELECT value FROM meta WHERE key = 'current_generation_id'",
+        ).get().value),
+        built.generation.id,
+      );
+    } finally {
+      database.close();
+    }
   } finally {
     await rm(root, { recursive: true });
   }
@@ -2395,7 +4900,7 @@ test("a fork created after its parent was indexed still suppresses replay", asyn
   }
 });
 
-test("a version-1 index is migrated additively, never rebuilt", async () => {
+test("a version-1 index can be opened through the additive v11 schema migration", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
       sessionMeta("session-a"),
@@ -2418,6 +4923,8 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
         DROP TABLE session_identity;
         DROP TABLE usage_event_boundary;
         DROP INDEX usage_event_replay_order;
+        DROP INDEX usage_event_source_predecessor;
+        DROP INDEX usage_event_session_predecessor;
         UPDATE usage_event SET source_id = NULL, source_offset = NULL;
         ALTER TABLE usage_event DROP COLUMN source_offset;
         ALTER TABLE usage_event DROP COLUMN source_id;
@@ -2440,7 +4947,7 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
     const writable = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: false });
     assert.equal(
       Number(writable.prepare("PRAGMA user_version").get().user_version),
-      8,
+      LOCAL_UNIFIED_INDEX_USER_VERSION,
     );
     assert.equal(
       Number(writable.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),
@@ -2452,13 +4959,1149 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
     assert.ok(writable.prepare("PRAGMA table_info(usage_event)").all()
       .some((column) => column.name === "source_offset"));
     writable.prepare("SELECT COUNT(*) AS c FROM source_boundary_state").get();
+    writable.prepare("SELECT COUNT(*) AS c FROM generation_issue").get();
+    writable.prepare("SELECT COUNT(*) AS c FROM generation_issue_group").get();
     writable.close();
   } finally {
     await rm(root, { recursive: true });
   }
 });
 
-test("v7 diagnostic rows survive the closed-vocabulary v8 migration", async () => {
+test("the schema-8 index shipped by v0.1.16 migrates transactionally to v11", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v016-schema8.jsonl": [
+      sessionMeta("session-v016-schema8"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const shipped = new DatabaseSync(indexFile);
+    const before = Number(shipped.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count);
+    // Recreate the exact schema widenings that were absent from the tagged
+    // v0.1.16 source: schema 8 had no compatibility metadata, generation
+    // issue tables, skipped-source attestation, physical cursor identity, or
+    // the three malformed-record diagnostic codes.
+    shipped.exec(`
+      BEGIN IMMEDIATE;
+      DROP TABLE generation_issue_group;
+      DROP TABLE generation_issue;
+      ALTER TABLE index_generation DROP COLUMN skipped_thread_count;
+      ALTER TABLE index_generation DROP COLUMN skipped_source_bytes;
+      ALTER TABLE index_generation DROP COLUMN skipped_source_count;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      ALTER TABLE source_cursor DROP COLUMN source_state_token;
+      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
+      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_ino;
+      ALTER TABLE source_cursor DROP COLUMN source_dev;
+      ALTER TABLE source_diagnostic RENAME TO source_diagnostic_v10;
+      CREATE TABLE source_diagnostic(
+        generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+        source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+        code TEXT NOT NULL CHECK(code IN (
+          'relevantLines', 'malformedLines', 'malformedTimestamps',
+          'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
+          'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
+          'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
+          'tierSeededFromLineage', 'modelMissing', 'oversizedLines',
+          'contradictedLeadingSnapshotsSkipped', 'toolRecords', 'toolEvents',
+          'toolRecordsSkipped', 'toolSourceHistoryUnavailable')),
+        count INTEGER NOT NULL CHECK(count >= 0),
+        PRIMARY KEY(generation_id, source_local, code)) STRICT, WITHOUT ROWID;
+      INSERT INTO source_diagnostic(generation_id, source_local, code, count)
+        SELECT generation_id, source_local, code, count
+        FROM source_diagnostic_v10
+        WHERE code NOT IN (
+          'malformedAccountingRecords',
+          'malformedUsageRecords',
+          'malformedRateLimitRecords');
+      DROP TABLE source_diagnostic_v10;
+      UPDATE parser_version
+        SET parser_version = 'unified-rollout-typed-v8';
+      DELETE FROM meta WHERE key LIKE 'compatibility_%';
+      PRAGMA user_version=8;
+      COMMIT;
+    `);
+    assert.equal(
+      Number(shipped.prepare("PRAGMA user_version").get().user_version),
+      8,
+    );
+    assert.equal(shipped.prepare(
+      "SELECT value FROM meta WHERE key = 'schema_version'",
+    ).get().value, "local-unified-index-v2");
+    assert.deepEqual(shipped.prepare(
+      "SELECT parser_version FROM parser_version ORDER BY id",
+    ).all().map((row) => row.parser_version), ["unified-rollout-typed-v8"]);
+    assert.equal(Number(shipped.prepare(`
+      SELECT COUNT(*) AS count FROM meta WHERE key LIKE 'compatibility_%'
+    `).get().count), 0);
+    assert.equal(shipped.prepare(
+      "SELECT name FROM sqlite_master WHERE name = 'generation_issue'",
+    ).get(), undefined);
+    assert.equal(shipped.prepare(
+      "SELECT sql FROM sqlite_master WHERE name = 'source_diagnostic'",
+    ).get().sql.includes("malformedAccountingRecords"), false);
+    shipped.close();
+
+    const migrated = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      assert.equal(
+        Number(migrated.prepare("PRAGMA user_version").get().user_version),
+        LOCAL_UNIFIED_INDEX_USER_VERSION,
+      );
+      assert.equal(Number(migrated.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), before);
+      const generationColumns = new Set(migrated.prepare(
+        "PRAGMA table_info(index_generation)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "skipped_source_count",
+        "skipped_source_bytes",
+        "skipped_thread_count",
+      ]) {
+        assert.ok(generationColumns.has(column), `migration restored ${column}`);
+      }
+      const cursorColumns = new Set(migrated.prepare(
+        "PRAGMA table_info(source_cursor)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "source_dev",
+        "source_ino",
+        "source_birthtime_ms",
+        "source_ctime_ms",
+        "source_identity_token",
+        "source_state_token",
+        "quarantine_code",
+      ]) {
+        assert.ok(cursorColumns.has(column), `migration restored ${column}`);
+      }
+      migrated.prepare("SELECT COUNT(*) AS count FROM generation_issue").get();
+      migrated.prepare(
+        "SELECT COUNT(*) AS count FROM generation_issue_group",
+      ).get();
+      assert.equal(migrated.prepare(
+        "SELECT sql FROM sqlite_master WHERE name = 'source_diagnostic'",
+      ).get().sql.includes("malformedAccountingRecords"), true);
+      const compatibility = Object.fromEntries(migrated.prepare(`
+        SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
+      `).all().map((row) => [row.key, row.value]));
+      assert.deepEqual(compatibility, {
+        compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+        compatibility_minimum_reader_user_version:
+          String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+        compatibility_minimum_writer_user_version:
+          String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
+      });
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a version-9 index migrates transactionally to v11 with compatibility metadata", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v9.jsonl": [
+      sessionMeta("session-v9"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    const before = Number(old.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count);
+    old.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      ALTER TABLE source_cursor DROP COLUMN source_state_token;
+      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
+      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_ino;
+      ALTER TABLE source_cursor DROP COLUMN source_dev;
+      DELETE FROM meta WHERE key LIKE 'compatibility_%';
+      PRAGMA user_version=9;
+      COMMIT;
+    `);
+    old.close();
+
+    const migrated = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      assert.equal(
+        Number(migrated.prepare("PRAGMA user_version").get().user_version),
+        LOCAL_UNIFIED_INDEX_USER_VERSION,
+      );
+      assert.equal(Number(migrated.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), before);
+      const cursorColumns = new Set(migrated.prepare(
+        "PRAGMA table_info(source_cursor)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "source_dev",
+        "source_ino",
+        "source_birthtime_ms",
+        "source_ctime_ms",
+        "source_identity_token",
+        "source_state_token",
+        "quarantine_code",
+      ]) {
+        assert.ok(cursorColumns.has(column), `migration restored ${column}`);
+      }
+      const compatibility = Object.fromEntries(migrated.prepare(`
+        SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
+      `).all().map((row) => [row.key, row.value]));
+      assert.deepEqual(compatibility, {
+        compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+        compatibility_minimum_reader_user_version:
+          String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+        compatibility_minimum_writer_user_version:
+          String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
+      });
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("normal ingest cold-rebuilds recognized v8 and v9 indexes atomically into v11", async (t) => {
+  for (const userVersion of [8, 9]) {
+    await t.test(`physical schema ${userVersion}`, async () => {
+      const { root } = await corpus({
+        [`rollout-2026-07-25T00-00-00-v${userVersion}-cold.jsonl`]: [
+          sessionMeta(`session-v${userVersion}-cold`),
+          turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+          tokenCount(
+            "2026-07-25T00:00:01.000Z",
+            usage(100, 10),
+            usage(100, 10),
+            { usedPercent: 12 },
+          ),
+        ],
+      });
+      const indexFile = join(root, "index.sqlite");
+      const attemptToken = String(userVersion).repeat(32);
+      const stageFile = localUnifiedIndexStageFile(
+        indexFile,
+        "building",
+        attemptToken,
+      );
+      try {
+        await build(root);
+        const { DatabaseSync } = await import("node:sqlite");
+        const legacy = new DatabaseSync(indexFile);
+        legacy.exec(`
+          BEGIN IMMEDIATE;
+          DROP INDEX usage_event_source;
+          DROP INDEX usage_event_quota_observation;
+          ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+          ALTER TABLE source_cursor DROP COLUMN source_state_token;
+          ALTER TABLE source_cursor DROP COLUMN source_identity_token;
+          ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
+          ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
+          ALTER TABLE source_cursor DROP COLUMN source_ino;
+          ALTER TABLE source_cursor DROP COLUMN source_dev;
+          DELETE FROM meta WHERE key LIKE 'compatibility_%';
+          PRAGMA user_version=9;
+          COMMIT;
+        `);
+        if (userVersion === 8) {
+          // Schema 8, as shipped by v0.1.16, also predates skipped-source
+          // attestation, issue tables and the widened diagnostic vocabulary.
+          legacy.exec(`
+            BEGIN IMMEDIATE;
+            DROP TABLE generation_issue_group;
+            DROP TABLE generation_issue;
+            ALTER TABLE index_generation DROP COLUMN skipped_thread_count;
+            ALTER TABLE index_generation DROP COLUMN skipped_source_bytes;
+            ALTER TABLE index_generation DROP COLUMN skipped_source_count;
+            ALTER TABLE source_diagnostic RENAME TO source_diagnostic_v11;
+            CREATE TABLE source_diagnostic(
+              generation_id INTEGER NOT NULL
+                REFERENCES index_generation ON DELETE CASCADE,
+              source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+              code TEXT NOT NULL CHECK(code IN (
+                'relevantLines', 'malformedLines', 'malformedTimestamps',
+                'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
+                'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
+                'cumulativeCounterRegressions', 'tierEvents',
+                'modelSeededFromLineage', 'tierSeededFromLineage',
+                'modelMissing', 'oversizedLines',
+                'contradictedLeadingSnapshotsSkipped', 'toolRecords',
+                'toolEvents', 'toolRecordsSkipped',
+                'toolSourceHistoryUnavailable')),
+              count INTEGER NOT NULL CHECK(count >= 0),
+              PRIMARY KEY(generation_id, source_local, code)
+            ) STRICT, WITHOUT ROWID;
+            INSERT INTO source_diagnostic(
+              generation_id, source_local, code, count)
+              SELECT generation_id, source_local, code, count
+              FROM source_diagnostic_v11
+              WHERE code NOT IN (
+                'malformedAccountingRecords',
+                'malformedUsageRecords',
+                'malformedRateLimitRecords');
+            DROP TABLE source_diagnostic_v11;
+            UPDATE parser_version
+              SET parser_version = 'unified-rollout-typed-v8';
+            PRAGMA user_version=8;
+            COMMIT;
+          `);
+        }
+        assert.equal(Number(legacy.prepare(
+          "PRAGMA user_version",
+        ).get().user_version), userVersion);
+        assert.equal(legacy.prepare(
+          "SELECT value FROM meta WHERE key = 'schema_version'",
+        ).get().value, "local-unified-index-v2");
+        assert.deepEqual(secondaryIndexNames(legacy), [
+          ...SECONDARY_INDEX_NAMES,
+        ].filter((name) => ![
+          "usage_event_source",
+          "usage_event_quota_observation",
+        ].includes(name)).sort());
+        legacy.close();
+        const publishedBefore = await readFile(indexFile);
+        let progressCalls = 0;
+
+        const rebuilt = await ingestLocalUnifiedIndexIncrement({
+          codexHome: root,
+          indexFile,
+          secretFile: join(root, "salt"),
+          contractVersion: CONTRACT,
+          attemptToken,
+          onProgress: async () => {
+            progressCalls += 1;
+            assert.deepEqual(
+              await readFile(indexFile),
+              publishedBefore,
+              "the legacy live index remains untouched while its replacement builds",
+            );
+          },
+        });
+
+        assert.ok(progressCalls > 0);
+        assert.equal(rebuilt.status, "ingested");
+        assert.equal(rebuilt.rebuilt, true);
+        assert.equal(rebuilt.rebuildReason, "source_identity_changed");
+        assert.equal(rebuilt.sourcesRescanned, 1);
+        assert.equal(rebuilt.totalUsageEvents, 1);
+        assert.equal(rebuilt.generation.status, "complete");
+        await assert.rejects(() => stat(stageFile), { code: "ENOENT" });
+
+        const current = openLocalUnifiedIndex(indexFile, { readOnly: true });
+        try {
+          assert.equal(Number(current.prepare(
+            "PRAGMA user_version",
+          ).get().user_version), LOCAL_UNIFIED_INDEX_USER_VERSION);
+          assert.deepEqual(
+            secondaryIndexNames(current),
+            [...SECONDARY_INDEX_NAMES].sort(),
+          );
+          assert.equal(Number(current.prepare(
+            "SELECT COUNT(*) AS count FROM usage_event",
+          ).get().count), 1);
+        } finally {
+          current.close();
+        }
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+});
+
+test("a version-10 index migrates transactionally to v11 cleanup indexes", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v10-transition.jsonl": [
+      sessionMeta("session-v10-transition"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    const before = Number(old.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count);
+    old.exec(`
+      BEGIN IMMEDIATE;
+      DROP INDEX usage_event_source;
+      DROP INDEX usage_event_quota_observation;
+      UPDATE meta SET value = '10'
+      WHERE key IN (
+        'compatibility_format_user_version',
+        'compatibility_minimum_reader_user_version',
+        'compatibility_minimum_writer_user_version');
+      PRAGMA user_version=10;
+      COMMIT;
+    `);
+    assert.equal(Number(old.prepare(
+      "PRAGMA user_version",
+    ).get().user_version), 10);
+    assert.deepEqual(secondaryIndexNames(old), [
+      ...SECONDARY_INDEX_NAMES,
+    ].filter((name) => ![
+      "usage_event_source",
+      "usage_event_quota_observation",
+    ].includes(name)).sort());
+    old.close();
+
+    const writable = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      assert.equal(Number(writable.prepare(
+        "PRAGMA user_version",
+      ).get().user_version), LOCAL_UNIFIED_INDEX_USER_VERSION);
+      assert.equal(Number(writable.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), before);
+      assert.deepEqual(
+        secondaryIndexNames(writable),
+        [...SECONDARY_INDEX_NAMES].sort(),
+      );
+      assert.deepEqual(Object.fromEntries(writable.prepare(`
+        SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
+      `).all().map((row) => [row.key, row.value])), {
+        compatibility_format_user_version: "11",
+        compatibility_minimum_reader_user_version: "11",
+        compatibility_minimum_writer_user_version: "11",
+      });
+    } finally {
+      writable.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("unchanged v10 ingest migrates its staged copy without a cold rebuild", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v10-staged-migration.jsonl": [
+      sessionMeta("11111111-1111-4111-8111-111111111111"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    old.exec(`
+      BEGIN IMMEDIATE;
+      DROP INDEX usage_event_source;
+      DROP INDEX usage_event_quota_observation;
+      UPDATE meta SET value = '10'
+      WHERE key IN (
+        'compatibility_format_user_version',
+        'compatibility_minimum_reader_user_version',
+        'compatibility_minimum_writer_user_version');
+      PRAGMA user_version=10;
+      COMMIT;
+    `);
+    old.close();
+
+    const migrated = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(migrated.rebuilt, undefined);
+    assert.equal(migrated.rebuildReason, undefined);
+    assert.equal(migrated.sourcesScanned, 0);
+    assert.equal(migrated.sourcesSkipped, 1);
+    assert.equal(migrated.totalUsageEvents, 1);
+    assert.equal(migrated.generation.status, "complete");
+
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(database.prepare(
+        "PRAGMA user_version",
+      ).get().user_version), LOCAL_UNIFIED_INDEX_USER_VERSION);
+      assert.deepEqual(
+        secondaryIndexNames(database),
+        [...SECONDARY_INDEX_NAMES].sort(),
+      );
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), 1);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a failed staged v10 migration leaves the live index byte-identical", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v10-stage-failure.jsonl": [
+      sessionMeta("11111111-1111-4111-8111-111111111111"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const attemptToken = "a".repeat(32);
+  const stageFile = localUnifiedIndexStageFile(
+    indexFile,
+    "incremental",
+    attemptToken,
+  );
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    old.exec(`
+      BEGIN IMMEDIATE;
+      DROP INDEX usage_event_source;
+      DROP INDEX usage_event_quota_observation;
+      UPDATE meta SET value = '10'
+      WHERE key IN (
+        'compatibility_format_user_version',
+        'compatibility_minimum_reader_user_version',
+        'compatibility_minimum_writer_user_version');
+      CREATE TRIGGER reject_v11_compatibility_stamp
+      BEFORE UPDATE OF value ON meta
+      WHEN OLD.key = 'compatibility_format_user_version'
+        AND NEW.value = '11'
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture rejects v11 compatibility stamp');
+      END;
+      PRAGMA user_version=10;
+      COMMIT;
+    `);
+    assert.equal(Number(old.prepare(
+      "PRAGMA user_version",
+    ).get().user_version), 10);
+    assert.deepEqual(secondaryIndexNames(old), [
+      ...SECONDARY_INDEX_NAMES,
+    ].filter((name) => ![
+      "usage_event_source",
+      "usage_event_quota_observation",
+    ].includes(name)).sort());
+    old.close();
+    const publishedBefore = await readFile(indexFile);
+
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+        attemptToken,
+      }),
+      (error) => error?.code === "local_unified_index_unavailable",
+    );
+
+    assert.deepEqual(await readFile(indexFile), publishedBefore);
+    await assert.rejects(() => stat(stageFile), { code: "ENOENT" });
+    const retained = new DatabaseSync(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(retained.prepare(
+        "PRAGMA user_version",
+      ).get().user_version), 10);
+      assert.deepEqual(secondaryIndexNames(retained), [
+        ...SECONDARY_INDEX_NAMES,
+      ].filter((name) => ![
+        "usage_event_source",
+        "usage_event_quota_observation",
+      ].includes(name)).sort());
+      assert.deepEqual(Object.fromEntries(retained.prepare(`
+        SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
+      `).all().map((row) => [row.key, row.value])), {
+        compatibility_format_user_version: "10",
+        compatibility_minimum_reader_user_version: "10",
+        compatibility_minimum_writer_user_version: "10",
+      });
+    } finally {
+      retained.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a failed v9 to v11 migration rolls back its widening and version stamp", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v9-rollback.jsonl": [
+      sessionMeta("session-v9-rollback"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    old.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      DELETE FROM meta WHERE key LIKE 'compatibility_%';
+      CREATE TRIGGER reject_compatibility_stamp
+      BEFORE INSERT ON meta
+      WHEN NEW.key = 'compatibility_format_user_version'
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture rejects compatibility stamp');
+      END;
+      PRAGMA user_version=9;
+      COMMIT;
+    `);
+    const before = Number(old.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count);
+    old.close();
+
+    assert.throws(
+      () => openLocalUnifiedIndex(indexFile, { readOnly: false }),
+      (error) => error?.code === "local_unified_index_unavailable",
+    );
+
+    const retained = new DatabaseSync(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(
+        retained.prepare("PRAGMA user_version").get().user_version,
+      ), 9);
+      assert.equal(Number(retained.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), before);
+      assert.ok(!retained.prepare("PRAGMA table_info(source_cursor)").all()
+        .some((column) => column.name === "quarantine_code"));
+      assert.equal(Number(retained.prepare(`
+        SELECT COUNT(*) AS count FROM meta WHERE key LIKE 'compatibility_%'
+      `).get().count), 0);
+    } finally {
+      retained.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("writable opens refuse unrelated SQLite files byte-for-byte", async (t) => {
+  for (const fixture of ["foreign-application", "spoofed-application-id"]) {
+    await t.test(fixture, async () => {
+      const root = await mkdtemp(join(tmpdir(), `unified-index-unrelated-${fixture}-`));
+      const indexFile = join(root, "unrelated.sqlite");
+      try {
+        const { DatabaseSync } = await import("node:sqlite");
+        const unrelated = new DatabaseSync(indexFile);
+        unrelated.exec(`
+          CREATE TABLE unrelated_record(id INTEGER PRIMARY KEY, value TEXT);
+          INSERT INTO unrelated_record(value) VALUES ('must survive');
+          PRAGMA user_version=1;
+          ${fixture === "spoofed-application-id"
+            ? "PRAGMA application_id=0x554d5549;"
+            : ""}
+        `);
+        unrelated.close();
+        await chmod(indexFile, 0o600);
+        const before = await readFile(indexFile);
+
+        for (const options of [
+          { readOnly: false },
+          { readOnly: false, create: true },
+        ]) {
+          assert.throws(
+            () => openLocalUnifiedIndex(indexFile, options),
+            (error) => error?.code === "local_unified_index_schema_invalid",
+          );
+          assert.deepEqual(await readFile(indexFile), before);
+        }
+
+        const retained = new DatabaseSync(indexFile, { readOnly: true });
+        const retainedRows = retained.prepare(
+          "SELECT id, value FROM unrelated_record",
+        ).all();
+        assert.equal(retainedRows.length, 1);
+        assert.equal(retainedRows[0].id, 1);
+        assert.equal(retainedRows[0].value, "must survive");
+        retained.close();
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+});
+
+test("symlinks to a migratable v9 index are refused without touching the target", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-symlink-v9.jsonl": [
+      sessionMeta("session-symlink-v9"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const targetFile = join(root, "index.sqlite");
+  const linkFile = join(root, "index-via-link.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const legacy = new DatabaseSync(targetFile);
+    legacy.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      DELETE FROM meta WHERE key LIKE 'compatibility_%';
+      PRAGMA user_version=9;
+      COMMIT;
+    `);
+    legacy.close();
+    await symlink(targetFile, linkFile);
+    const targetBefore = await readFile(targetFile);
+
+    for (const options of [
+      { readOnly: true },
+      { readOnly: false },
+      { readOnly: false, create: true },
+      { readOnly: false, create: true, staging: true },
+    ]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(linkFile, options),
+        (error) => error?.code === "local_unified_index_file_invalid",
+      );
+      assert.deepEqual(await readFile(targetFile), targetBefore);
+    }
+
+    const retained = new DatabaseSync(targetFile, { readOnly: true });
+    assert.equal(Number(retained.prepare(
+      "PRAGMA user_version",
+    ).get().user_version), 9);
+    assert.equal(retained.prepare("PRAGMA table_info(source_cursor)").all()
+      .some((column) => column.name === "quarantine_code"), false);
+    retained.close();
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a symlinked parent directory is never traversed for index opens or creation", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-parent-link.jsonl": [
+      sessionMeta("session-parent-link"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const realParent = join(root, "real-index-parent");
+  const linkedParent = join(root, "linked-index-parent");
+  const targetFile = join(realParent, "index.sqlite");
+  const linkedExistingFile = join(linkedParent, "index.sqlite");
+  const linkedNewFile = join(linkedParent, "new.sqlite");
+  const realNewFile = join(realParent, "new.sqlite");
+  try {
+    await mkdir(realParent, { mode: 0o700 });
+    await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: targetFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 1,
+    });
+    await symlink(realParent, linkedParent);
+    const targetBefore = await readFile(targetFile);
+
+    for (const options of [
+      { readOnly: true },
+      { readOnly: false },
+      { readOnly: false, create: true },
+      { readOnly: false, staging: true },
+    ]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(linkedExistingFile, options),
+        (error) => error?.code === "local_unified_index_file_invalid",
+      );
+      assert.deepEqual(await readFile(targetFile), targetBefore);
+    }
+
+    for (const options of [
+      { readOnly: false, create: true },
+      { readOnly: false, create: true, staging: true },
+      {
+        readOnly: false,
+        create: true,
+        staging: true,
+        deferSecondaryIndexes: true,
+      },
+    ]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(linkedNewFile, options),
+        (error) => error?.code === "local_unified_index_file_invalid",
+      );
+      await assert.rejects(
+        lstat(realNewFile),
+        (error) => error?.code === "ENOENT",
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an N+1 index is refused by readers and ingest without mutating it", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-newer.jsonl": [
+      sessionMeta("session-newer"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const newer = new DatabaseSync(indexFile);
+    const nextVersion = LOCAL_UNIFIED_INDEX_USER_VERSION + 1;
+    const stamp = newer.prepare(`
+      INSERT INTO meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
+    stamp.run("compatibility_format_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_reader_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_writer_user_version", String(nextVersion));
+    newer.exec(`PRAGMA user_version=${nextVersion}`);
+    newer.close();
+    const before = await readFile(indexFile);
+
+    for (const readOnly of [true, false]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(indexFile, { readOnly }),
+        (error) => {
+          assert.equal(error?.code, "local_unified_index_schema_newer");
+          assert.deepEqual(error?.compatibility, {
+            accessMode: readOnly ? "read" : "write",
+            databaseUserVersion: nextVersion,
+            formatUserVersion: nextVersion,
+            supportedUserVersion: LOCAL_UNIFIED_INDEX_USER_VERSION,
+            minimumReaderUserVersion: nextVersion,
+            minimumWriterUserVersion: nextVersion,
+            requiredUserVersion: nextVersion,
+            requirements: [
+              { requirement: "pragma_user_version", version: nextVersion },
+              { requirement: "format_user_version", version: nextVersion },
+              {
+                requirement: readOnly
+                  ? "minimum_reader_user_version"
+                  : "minimum_writer_user_version",
+                version: nextVersion,
+              },
+            ],
+          });
+          return true;
+        },
+      );
+      assert.deepEqual(await readFile(indexFile), before);
+    }
+
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_schema_newer",
+    );
+    assert.deepEqual(await readFile(indexFile), before);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("ingest refuses an N+1 index before creating an absent device salt", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-newer-no-salt.jsonl": [
+      sessionMeta("session-newer-no-salt"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const secretFile = join(root, "salt");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const nextVersion = LOCAL_UNIFIED_INDEX_USER_VERSION + 1;
+    const newer = new DatabaseSync(indexFile);
+    const stamp = newer.prepare(`
+      INSERT INTO meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
+    stamp.run("compatibility_format_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_reader_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_writer_user_version", String(nextVersion));
+    newer.exec(`PRAGMA user_version=${nextVersion}`);
+    newer.close();
+    await rm(secretFile);
+    await assert.rejects(lstat(secretFile), (error) => error?.code === "ENOENT");
+    const before = await readFile(indexFile);
+
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile,
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_schema_newer",
+    );
+
+    await assert.rejects(lstat(secretFile), (error) => error?.code === "ENOENT");
+    assert.deepEqual(await readFile(indexFile), before);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("ingest refuses a foreign index before creating an absent device salt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unified-index-foreign-no-salt-"));
+  const indexFile = join(root, "index.sqlite");
+  const secretFile = join(root, "salt");
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    const foreign = new DatabaseSync(indexFile);
+    foreign.exec(`
+      CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO meta(key, value) VALUES
+        ('schema_version', 'local-unified-index-v2'),
+        ('compatibility_format_user_version', '10'),
+        ('compatibility_minimum_reader_user_version', '10'),
+        ('compatibility_minimum_writer_user_version', '10');
+      PRAGMA application_id=1234;
+      PRAGMA user_version=10;
+    `);
+    foreign.close();
+    await chmod(indexFile, 0o600);
+    const before = await readFile(indexFile);
+
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile,
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_schema_invalid",
+    );
+
+    await assert.rejects(lstat(secretFile), (error) => error?.code === "ENOENT");
+    assert.deepEqual(await readFile(indexFile), before);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("metadata-only N+1 requirements refuse each access mode without mutation", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-metadata-newer.jsonl": [
+      sessionMeta("session-metadata-newer"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const nextVersion = LOCAL_UNIFIED_INDEX_USER_VERSION + 1;
+    const newer = new DatabaseSync(indexFile);
+    const stamp = newer.prepare(`
+      INSERT INTO meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
+    // PRAGMA remains current: only the explicit compatibility contract moves.
+    stamp.run("compatibility_format_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_reader_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_writer_user_version", String(nextVersion));
+    newer.close();
+    const before = await readFile(indexFile);
+
+    for (const readOnly of [true, false]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(indexFile, { readOnly }),
+        (error) => {
+          assert.equal(error?.code, "local_unified_index_schema_newer");
+          assert.equal(error?.compatibility?.accessMode, readOnly ? "read" : "write");
+          assert.equal(
+            error?.compatibility?.databaseUserVersion,
+            LOCAL_UNIFIED_INDEX_USER_VERSION,
+          );
+          assert.equal(error?.compatibility?.formatUserVersion, nextVersion);
+          assert.equal(error?.compatibility?.requiredUserVersion, nextVersion);
+          assert.deepEqual(
+            error?.compatibility?.requirements.map((entry) => entry.requirement),
+            [
+              "format_user_version",
+              readOnly
+                ? "minimum_reader_user_version"
+                : "minimum_writer_user_version",
+            ],
+          );
+          return true;
+        },
+      );
+      assert.deepEqual(await readFile(indexFile), before);
+    }
+
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_schema_newer"
+        && error?.compatibility?.accessMode === "write",
+    );
+    assert.deepEqual(await readFile(indexFile), before);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("partial or malformed compatibility metadata is refused without mutation", async (t) => {
+  for (const fixture of ["partial", "malformed"]) {
+    await t.test(fixture, async () => {
+      const { root } = await corpus({
+        [`rollout-2026-07-25T00-00-00-compatibility-${fixture}.jsonl`]: [
+          sessionMeta(`session-compatibility-${fixture}`),
+          turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+          tokenCount(
+            "2026-07-25T00:00:01.000Z",
+            usage(100, 10),
+            usage(100, 10),
+          ),
+        ],
+      });
+      const indexFile = join(root, "index.sqlite");
+      try {
+        await build(root);
+        const { DatabaseSync } = await import("node:sqlite");
+        const database = new DatabaseSync(indexFile);
+        if (fixture === "partial") {
+          database.prepare(`
+            DELETE FROM meta
+            WHERE key = 'compatibility_minimum_writer_user_version'
+          `).run();
+        } else {
+          database.prepare(`
+            UPDATE meta SET value = 'not-a-version'
+            WHERE key = 'compatibility_format_user_version'
+          `).run();
+        }
+        database.close();
+        const before = await readFile(indexFile);
+
+        for (const readOnly of [true, false]) {
+          assert.throws(
+            () => openLocalUnifiedIndex(indexFile, { readOnly }),
+            (error) => error?.code === "local_unified_index_schema_invalid",
+          );
+          assert.deepEqual(await readFile(indexFile), before);
+        }
+        await assert.rejects(
+          ingestLocalUnifiedIndexIncrement({
+            codexHome: root,
+            indexFile,
+            secretFile: join(root, "salt"),
+            contractVersion: CONTRACT,
+          }),
+          (error) => error?.code === "local_unified_index_schema_invalid",
+        );
+        assert.deepEqual(await readFile(indexFile), before);
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+});
+
+test("minimum reader and writer metadata are enforced for their access modes", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-access-newer.jsonl": [
+      sessionMeta("session-access-newer"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const nextVersion = LOCAL_UNIFIED_INDEX_USER_VERSION + 1;
+    const database = new DatabaseSync(indexFile);
+    database.prepare(`
+      UPDATE meta SET value = ?
+      WHERE key = 'compatibility_minimum_reader_user_version'
+    `).run(String(nextVersion));
+    database.close();
+    const readerBefore = await readFile(indexFile);
+    assert.throws(
+      () => openLocalUnifiedIndex(indexFile, { readOnly: true }),
+      (error) => error?.code === "local_unified_index_schema_newer"
+        && error?.compatibility?.requirements.some((entry) => (
+          entry.requirement === "minimum_reader_user_version"
+        )),
+    );
+    assert.deepEqual(await readFile(indexFile), readerBefore);
+
+    // A separate writer-only fixture proves the writable preflight chooses the
+    // writer requirement and refuses before configureDatabase can touch bytes.
+    const writer = new DatabaseSync(indexFile);
+    writer.prepare(`
+      UPDATE meta SET value = ?
+      WHERE key = 'compatibility_minimum_reader_user_version'
+    `).run(String(LOCAL_UNIFIED_INDEX_USER_VERSION));
+    writer.prepare(`
+      UPDATE meta SET value = ?
+      WHERE key = 'compatibility_minimum_writer_user_version'
+    `).run(String(nextVersion));
+    writer.close();
+    const writerBefore = await readFile(indexFile);
+    assert.throws(
+      () => openLocalUnifiedIndex(indexFile, { readOnly: false }),
+      (error) => error?.code === "local_unified_index_schema_newer"
+        && error?.compatibility?.requirements.some((entry) => (
+          entry.requirement === "minimum_writer_user_version"
+        )),
+    );
+    assert.deepEqual(await readFile(indexFile), writerBefore);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("v7 diagnostic rows survive the closed-vocabulary v11 migration", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-v7-diagnostics.jsonl": [
       sessionMeta("session-v7-diagnostics"),
@@ -2492,7 +6135,10 @@ test("v7 diagnostic rows survive the closed-vocabulary v8 migration", async () =
       INSERT INTO source_diagnostic(generation_id, source_local, code, count)
         SELECT generation_id, source_local, code, count
         FROM source_diagnostic_v8
-        WHERE code NOT IN ('toolRecords', 'toolEvents', 'toolRecordsSkipped');
+        WHERE code NOT IN (
+          'toolRecords', 'toolEvents', 'toolRecordsSkipped',
+          'toolSourceHistoryUnavailable', 'malformedAccountingRecords',
+          'malformedUsageRecords', 'malformedRateLimitRecords');
       DROP TABLE source_diagnostic_v8;
       PRAGMA user_version=7;
       COMMIT;
@@ -2507,7 +6153,7 @@ test("v7 diagnostic rows survive the closed-vocabulary v8 migration", async () =
     try {
       assert.equal(
         Number(migrated.prepare("PRAGMA user_version").get().user_version),
-        8,
+        LOCAL_UNIFIED_INDEX_USER_VERSION,
       );
       assert.equal(Number(migrated.prepare(
         "SELECT COUNT(*) AS count FROM source_diagnostic",
@@ -2517,6 +6163,7 @@ test("v7 diagnostic rows survive the closed-vocabulary v8 migration", async () =
         WHERE type = 'table' AND name = 'source_diagnostic'
       `).get()?.sql;
       assert.match(sql, /toolRecordsSkipped/u);
+      assert.match(sql, /malformedAccountingRecords/u);
     } finally {
       migrated.close();
     }
@@ -2561,7 +6208,7 @@ test("the first ingest after a legacy migration publishes a clean authoritative 
       contractVersion: CONTRACT,
     });
     assert.equal(healed.rebuilt, true);
-    assert.equal(healed.rebuildReason, "legacy_schema");
+    assert.equal(healed.rebuildReason, "source_identity_changed");
     assert.equal(healed.generation.status, "complete");
     assert.equal(healed.generation.usageProvenanceComplete, true);
     assert.equal(healed.generation.sourceOrderComplete, true);
@@ -2614,40 +6261,91 @@ test("an additively widened but unattested generation rebuilds in one refresh", 
   }
 });
 
-test("classifySource maps growth, touch, shrink and novelty to the right work", () => {
-  const info = { size: 100, mtimeMs: 5 };
+test("classifySource maps growth, identity, corruption, shrink and novelty to the right work", () => {
+  const info = {
+    size: 100,
+    mtimeMs: 5,
+    ctimeMs: 6,
+    dev: 7,
+    ino: 8,
+    birthtimeMs: 9,
+  };
+  const physicalCursor = {
+    source_identity_token: "7:8:9",
+    source_state_token: "5:6",
+    quarantine_code: null,
+    scanned_bytes: 100,
+  };
   assert.deepEqual(classifySource(info, undefined), { mode: "rescan" });
   assert.deepEqual(
-    classifySource(info, { size_bytes: 100, mtime_ms: 5 }),
+    classifySource(info, { ...physicalCursor, size_bytes: 100, mtime_ms: 5 }),
     { mode: "skip" },
   );
   assert.deepEqual(
-    classifySource(info, { size_bytes: 100, mtime_ms: 4 }),
+    classifySource(info, {
+      ...physicalCursor,
+      size_bytes: 100,
+      mtime_ms: 4,
+      source_state_token: "4:6",
+    }),
     { mode: "rescan", reason: "same_size_changed" },
   );
   assert.deepEqual(
-    classifySource(info, { size_bytes: 60, mtime_ms: 5 }),
+    classifySource(info, {
+      ...physicalCursor,
+      size_bytes: 60,
+      scanned_bytes: 60,
+      mtime_ms: 5,
+    }),
     { mode: "resume" },
   );
   assert.deepEqual(
-    classifySource(info, { size_bytes: 160, mtime_ms: 5 }),
+    classifySource(info, {
+      ...physicalCursor,
+      size_bytes: 160,
+      scanned_bytes: 160,
+      mtime_ms: 5,
+    }),
     { mode: "rescan", reason: "shrink" },
+  );
+  assert.deepEqual(
+    classifySource(info, {
+      ...physicalCursor,
+      size_bytes: 100,
+      scanned_bytes: 99,
+    }),
+    { mode: "rescan", reason: "cursor_invalid" },
   );
 });
 
 test("classifySource forces a whole-file rescan for cursors stamped by an older parser", () => {
-  const info = { size: 100, mtimeMs: 5 };
+  const info = {
+    size: 100,
+    mtimeMs: 5,
+    ctimeMs: 6,
+    dev: 7,
+    ino: 8,
+    birthtimeMs: 9,
+  };
   // An up-to-date cursor keeps its cheap classification.
   assert.deepEqual(
     classifySource(
       info,
-      { size_bytes: 100, mtime_ms: 5, parser_version: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
+      {
+        size_bytes: 100,
+        mtime_ms: 5,
+        source_identity_token: "7:8:9",
+        source_state_token: "5:6",
+        quarantine_code: null,
+        scanned_bytes: 100,
+        parser_version: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      },
       LOCAL_UNIFIED_INDEX_PARSER_VERSION,
     ),
     { mode: "skip" },
   );
   // A cursor stamped by an older parser is re-derived regardless of size or
-  // mtime — skip, touch and resume are all overridden.
+  // state — skip and resume are both overridden.
   for (const cursor of [
     { size_bytes: 100, mtime_ms: 5, parser_version: "unified-rollout-typed-v1" },
     { size_bytes: 100, mtime_ms: 4, parser_version: "unified-rollout-typed-v1" },
@@ -2666,7 +6364,7 @@ test("classifySource forces a whole-file rescan for cursors stamped by an older 
   }
 });
 
-test("a v5 development cursor migrates to v8 with complete source order", async () => {
+test("a v5 development cursor cold-rebuilds into v10 rollout identity", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
       sessionMeta("session-a"),
@@ -2703,9 +6401,11 @@ test("a v5 development cursor migrates to v8 with complete source order", async 
     }
 
     const healed = await ingest();
-    assert.equal(healed.sourcesReparsedForParserVersion, 1);
-    assert.equal(healed.usageRowsDeletedForReparse, 2);
-    assert.equal(healed.boundaryRowsDeletedForReparse, 2);
+    assert.equal(healed.rebuilt, true);
+    assert.equal(healed.rebuildReason, "source_identity_changed");
+    assert.equal(healed.sourcesReparsedForParserVersion ?? 0, 0);
+    assert.equal(healed.usageRowsDeletedForReparse ?? 0, 0);
+    assert.equal(healed.boundaryRowsDeletedForReparse ?? 0, 0);
     assert.equal(healed.generation.status, "complete");
     assert.equal(healed.generation.usageProvenanceComplete, true);
     assert.equal(healed.generation.sourceOrderComplete, true);
@@ -2717,7 +6417,7 @@ test("a v5 development cursor migrates to v8 with complete source order", async 
     try {
       assert.equal(
         Number(database.prepare("PRAGMA user_version").get().user_version),
-        8,
+        LOCAL_UNIFIED_INDEX_USER_VERSION,
       );
       assert.equal(
         Number(database.prepare(`

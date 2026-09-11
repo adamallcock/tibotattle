@@ -7,12 +7,13 @@ import { createHash } from "node:crypto";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
 import { deriveParticipantId } from "../src/export-identity.js";
 import { createCodexExportSourcePlan } from "../src/export-source-plan.js";
-import {
+import { localExportWorkspace } from "../src/local-node-runtime.js";
+const {
   buildExportWorkspaceDescriptor,
   createExportWorkspace,
   ExportWorkspaceError,
   openExportWorkspace,
-} from "../src/export-workspace.js";
+} = localExportWorkspace;
 
 const SECRET = Buffer.alloc(32, 41);
 

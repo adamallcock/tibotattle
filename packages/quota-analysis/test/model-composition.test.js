@@ -5,13 +5,74 @@ import {
   MODEL_COMPOSITION_POLICY,
   blendedCompositionCapacityUsd,
   buildCompositionObservations,
+  buildCompositionObservationsFromOrderedUsage,
   calibrateCompositionCapacities,
   compositionExpectedPp,
-  solveNonNegativeLeastSquares,
 } from "../index.js";
+import { solveNonNegativeLeastSquares } from "../src/model-composition.js";
 
 const HOUR_MS = 60 * 60 * 1_000;
 const GRAIN_MS = MODEL_COMPOSITION_POLICY.grainMs;
+
+test("ordered composition usage exactly matches array corpus and fit across adversarial rows", () => {
+  for (let seed = 1; seed <= 24; seed++) {
+    const quotaRows = Array.from({ length: 90 }, (_, index) => ({ observedAtMs: index * HOUR_MS,
+      resetsAtMs: (7 * 24 + (index % 7 === 0 ? 1 : 0)) * HOUR_MS,
+      planType: index % 17 === 0 ? "unknown" : "pro", usedPercent: (index * 3 + seed) % 85 }));
+    // Stable ties, stale drops, reset-cluster jitter, overlapping pools and a
+    // smeared gap all use the SAME existing topology in both APIs.
+    quotaRows.push({ ...quotaRows[20] }, { ...quotaRows[40], resetsAtMs: 400 * HOUR_MS },
+      { ...quotaRows[70], observedAtMs: 100 * HOUR_MS, usedPercent: 99 });
+    quotaRows.reverse();
+    const names = ["z-model", "2", "__proto__", "constructor", "1", "a-model"];
+    const usageRows = Array.from({ length: 720 }, (_, index) => ({
+      // Deliberately descending times WITHIN each bin are allowed. Addition
+      // order, not timestamp reordering, controls floating-point parity.
+      observedAtMs: Math.floor(index / 8) * GRAIN_MS + (7 - index % 8) * 1000,
+      model: names[(index + seed) % names.length], costUsd: index % 11 === 0 ? 0 : (index % 13 + 1) / (seed * 7),
+    }));
+    usageRows.splice(17, 0, null, { observedAtMs: NaN, model: "invalid", costUsd: 1 },
+      { observedAtMs: -10, model: "", costUsd: 1 }, { observedAtMs: -10, model: "invalid", costUsd: -1 });
+    const policy = { grainMs: GRAIN_MS, poolToleranceMs: (seed % 3 + 1) * HOUR_MS,
+      resetDropPp: seed % 6 + 1, maxCrossingElapsedMs: (seed % 4 + 1) * HOUR_MS };
+    const expected = buildCompositionObservations({ usageRows, quotaRows }, policy);
+    let iterations = 0, consumed = 0;
+    const iterable = { *[Symbol.iterator]() { assert.equal(++iterations, 1); for (const row of usageRows) { consumed++; yield row; } } };
+    const actual = buildCompositionObservationsFromOrderedUsage({ usageRows: iterable, quotaRows }, policy);
+    assert.deepEqual(actual, expected);
+    assert.deepEqual(calibrateCompositionCapacities(actual.observations), calibrateCompositionCapacities(expected.observations));
+    assert.equal(consumed, usageRows.length);
+  }
+});
+
+test("ordered composition input preserves floating addition and own model property order", () => {
+  const quotaRows = [{ observedAtMs: 0, resetsAtMs: 168 * HOUR_MS, planType: "pro", usedPercent: 0 },
+    { observedAtMs: HOUR_MS, resetsAtMs: 168 * HOUR_MS, planType: "pro", usedPercent: 5 }];
+  const usageRows = [1e16, 1, 1].map(costUsd => ({ observedAtMs: 1000, model: "constructor", costUsd }));
+  for (const model of ["__proto__", "2", "1", "z"]) usageRows.push({ observedAtMs: 999, model, costUsd: 0.1 });
+  const expected = buildCompositionObservations({ usageRows, quotaRows });
+  const actual = buildCompositionObservationsFromOrderedUsage({ usageRows: (function* () { yield* usageRows; })(), quotaRows });
+  assert.equal(actual.observations.length, 1);
+  assert.deepEqual(actual, expected);
+  assert.equal(actual.observations[0].costByModel.constructor, 1e16);
+  assert.equal(Object.hasOwn(actual.observations[0].costByModel, "__proto__"), true);
+  assert.deepEqual(Object.keys(actual.observations[0].costByModel), ["1", "2", "constructor", "__proto__", "z"]);
+});
+
+test("ordered composition rejects descending valid bins and closes the iterator", () => {
+  let closed = false;
+  const usageRows = (function* () { try {
+    yield { observedAtMs: GRAIN_MS, model: "m", costUsd: 1 };
+    yield { observedAtMs: 0, model: "m", costUsd: 1 };
+  } finally { closed = true; } })();
+  assert.throws(() => buildCompositionObservationsFromOrderedUsage({ usageRows }), /nondecreasing/);
+  assert.equal(closed, true);
+  assert.throws(() => buildCompositionObservationsFromOrderedUsage({ usageRows: {} }), /iterable/);
+  // The established array API still accepts unsorted input.
+  assert.deepEqual(buildCompositionObservations({ usageRows: [
+    { observedAtMs: GRAIN_MS, model: "m", costUsd: 1 }, { observedAtMs: 0, model: "m", costUsd: 1 },
+  ] }), { observations: [], poolCount: 0, voidedBinCount: 0 });
+});
 
 // Deterministic pseudo-noise so recovery tests exercise a non-trivial corpus
 // without flaking.

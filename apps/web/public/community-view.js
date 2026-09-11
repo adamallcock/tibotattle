@@ -1,16 +1,16 @@
+import { allowanceModelPresentation, modelThemeIcon } from "./model-visuals.js";
+export { allowanceModelPresentation, modelThemeIcon } from "./model-visuals.js";
 // The community aggregate view. It needs no local companion, so the public
 // website can show it honestly. The public site renders the day-partitioned
 // daily series only: the legacy sealed weekly snapshot presentation was
 // retired in favour of daily revisions, so no snapshot render path lives here
 // any more.
 
-import { normalizeCommunityDailySeries } from "./community-data.js";
+import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd } from "./community-data.js";
 import {
   compact,
   createDomHelpers,
   dateTimeFormatter,
-  formatAge,
-  formatLocal,
   formatUtcCalendarDay,
   numberFormatter,
 } from "./ui-format.js";
@@ -40,12 +40,15 @@ const COMMUNITY_DAILY_COLUMN_KEYS = Object.freeze([
   "community.metric.usageEvents",
   "community.daily.quotaObservations",
   "community.daily.contributingDevices",
-  "community.metric.combinedOutput",
-  "community.released",
+  "community.metric.allTokens",
 ]);
 // Header indexes that carry numbers; they right-align with tabular digits so
 // magnitudes line up down a column.
 const COMMUNITY_DAILY_NUMERIC_COLUMNS = Object.freeze(new Set([1, 2, 3, 4]));
+// Container-scoped interaction only: no response or point values are retained.
+// Replacing an unavailable view drops its state rather than reviving old data.
+const dailyDisclosureByContainer = new WeakMap();
+const allowanceInspectionByContainer = new WeakMap();
 
 /**
  * One unit for a whole column, chosen from the column maximum: mixing 44 and
@@ -55,12 +58,54 @@ const COMMUNITY_DAILY_NUMERIC_COLUMNS = Object.freeze(new Set([1, 2, 3, 4]));
 export function communityDailyColumnFormatter(values) {
   const maximum = Math.max(0, ...values);
   if (maximum >= 1_000_000) {
-    return (value) => `${(value / 1_000_000).toFixed(1)}M`;
+    return (value) => value === null ? compact(null) : `${(value / 1_000_000).toFixed(1)}M`;
   }
   if (maximum >= 1_000) {
-    return (value) => `${(value / 1_000).toFixed(1)}K`;
+    return (value) => value === null ? compact(null) : `${(value / 1_000).toFixed(1)}K`;
   }
-  return (value) => String(value);
+  return (value) => value === null ? compact(null) : String(value);
+}
+
+function sumSafeCounts(values) {
+  let total = 0;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    total += value;
+    if (!Number.isSafeInteger(total)) return null;
+  }
+  return total;
+}
+
+// Input categories are disjoint; combined output already includes reasoning.
+// Never add text/reasoning again or count cache reads twice.
+function allTokens(totals) {
+  return sumSafeCounts([
+    totals.inputUncachedTokens,
+    totals.inputCacheReadTokens,
+    totals.inputCacheWriteTokens,
+    totals.outputCombinedTokens,
+  ]);
+}
+
+function communityDailySpendSummary(days) {
+  let knownCostUsd = 0;
+  let pricedDays = 0;
+  let complete = true;
+  for (const day of days) {
+    const spend = day.apiEquivalentSpend;
+    complete &&= spend?.coverage === "complete";
+    if (spend?.knownCostUsd === null || spend?.knownCostUsd === undefined) continue;
+    knownCostUsd += spend.knownCostUsd;
+    if (!Number.isFinite(knownCostUsd)) {
+      return { knownCostUsd: null, pricedDays: 0, coverage: "unavailable" };
+    }
+    pricedDays += 1;
+  }
+  return {
+    knownCostUsd: pricedDays > 0 ? knownCostUsd : null,
+    pricedDays,
+    coverage: pricedDays === 0 ? "unavailable" : complete ? "complete" : "partial",
+  };
 }
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -109,12 +154,12 @@ function valueAxis(maximum, plotTop, plotBottom) {
 
 /**
  * Pure geometry for the public daily-series chart: usage events as bars on
- * the left axis and combined output tokens as a line on the right axis.
+ * the left axis and all input/output tokens as a line on the right axis.
  *
  * The mapping is honest about the series' shape:
  * - the x scale covers the published days only, positioned by real date, so a
  *   day that was never published is a gap, not a zero;
- * - the output line breaks at any gap wider than one day instead of bridging
+ * - the token line breaks at any gap wider than one day instead of bridging
  *   days that do not exist;
  * - one or two published days mark the series as `sparse`, which the renderer
  *   turns into visible dots plus a still-filling note;
@@ -140,7 +185,7 @@ export function buildCommunityDailyChartModel(series, {
     day: day.day,
     atMs: communityDayStartMs(day.day),
     usageEvents: day.totals.usageEvents,
-    outputCombinedTokens: day.totals.outputCombinedTokens,
+    allTokens: allTokens(day.totals),
   }));
   const startMs = days[0].atMs;
   const endMs = days[days.length - 1].atMs;
@@ -158,8 +203,8 @@ export function buildCommunityDailyChartModel(series, {
     plotTop,
     plotBottom,
   );
-  const output = valueAxis(
-    Math.max(...days.map((day) => day.outputCombinedTokens)),
+  const tokens = valueAxis(
+    Math.max(0, ...days.map((day) => day.allTokens ?? 0)),
     plotTop,
     plotBottom,
   );
@@ -177,27 +222,29 @@ export function buildCommunityDailyChartModel(series, {
     };
   });
 
-  const outputPoints = days.map((day) => ({
+  const tokenPoints = days.filter((day) => day.allTokens !== null).map((day) => ({
     day: day.day,
-    outputCombinedTokens: day.outputCombinedTokens,
+    allTokens: day.allTokens,
     x: x(day.atMs),
-    y: output.y(day.outputCombinedTokens),
+    y: tokens.y(day.allTokens),
   }));
   // Split the line at unpublished days: consecutive points stay connected only
   // when their days are adjacent on the calendar.
-  const outputSegments = [];
-  let segment = [outputPoints[0]];
-  for (let index = 1; index < days.length; index += 1) {
-    const gapDays = Math.round(
-      (days[index].atMs - days[index - 1].atMs) / MILLISECONDS_PER_DAY,
-    );
+  const tokenSegments = [];
+  let segment = [];
+  for (const point of tokenPoints) {
+    const previous = segment[segment.length - 1];
+    const gapDays = previous ? Math.round(
+      (communityDayStartMs(point.day) - communityDayStartMs(previous.day))
+        / MILLISECONDS_PER_DAY,
+    ) : 0;
     if (gapDays > 1) {
-      outputSegments.push(segment);
+      tokenSegments.push(segment);
       segment = [];
     }
-    segment.push(outputPoints[index]);
+    segment.push(point);
   }
-  outputSegments.push(segment);
+  if (segment.length > 0) tokenSegments.push(segment);
 
   // Date ticks: every published day while they fit, then evenly spaced
   // calendar positions across the span, labelled by month once the span makes
@@ -234,10 +281,10 @@ export function buildCommunityDailyChartModel(series, {
     barWidth,
     sparse: days.length <= 2,
     bars,
-    outputPoints,
-    outputSegments,
+    tokenPoints,
+    tokenSegments,
     eventsTicks: events.ticks,
-    outputTicks: output.ticks,
+    tokenTicks: tokens.ticks,
     dayTicks,
     tickLabelStyle,
   };
@@ -269,7 +316,7 @@ export const COMMUNITY_ALLOWANCE_CHART_HEIGHT = 320;
  * range carries an estimate; the caller distinguishes those two states from
  * the series itself.
  */
-export function buildCommunityAllowanceChartModel(series, {
+function buildCommunityAllowanceSingleChartModel(series, {
   rangeDays = null,
   width = COMMUNITY_ALLOWANCE_CHART_WIDTH,
   height = COMMUNITY_ALLOWANCE_CHART_HEIGHT,
@@ -408,6 +455,118 @@ export function buildCommunityAllowanceChartModel(series, {
   };
 }
 
+/** Presentation only: validated public series in, shared dollar axes and gap-aware
+ * geometry out. No owner data access, pricing, fitting, or inferred history. */
+export function buildCommunityAllowanceChartModel(series, options = {}) {
+  const { view = "aggregate", rangeDays = null,
+    width = COMMUNITY_ALLOWANCE_CHART_WIDTH,
+    height = COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
+  if (!["aggregate", "plans", "models"].includes(view)) return null;
+  if (!series?.breakdowns) {
+    return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, options) : null;
+  }
+  if (series.state !== "published" || series.days.length === 0) return null;
+  const anchor = series.breakdowns.hasCombined
+    ? series.breakdowns.days.at(-1)?.day ?? series.days.at(-1).day : series.days.at(-1).day;
+  const cutoff = Number.isFinite(rangeDays) && rangeDays >= 1
+    ? communityDayStartMs(anchor) - (rangeDays - 1) * MILLISECONDS_PER_DAY : -Infinity;
+  const rangeDaysWithActivity = series.days.filter(day => day.day <= anchor && communityDayStartMs(day.day) >= cutoff);
+  if (rangeDaysWithActivity.length === 0) return null;
+  const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
+  const definitions = [
+    { key: "aggregate", view: "aggregate", label: null, className: "" },
+    ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
+      key, label, view: "plans", className: `allowance-series-${index}`,
+    })),
+    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
+      key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
+    })).sort((left, right) => left.order - right.order),
+  ];
+  const summaryFor = (day, definition) => {
+    const breakdown = breakdownDays.get(day.day);
+    if (definition.view === "aggregate") return series.breakdowns.hasCombined ? breakdown?.combined : day.allowance;
+    if (definition.view === "plans") return breakdown?.byPlanType[definition.key];
+    const value = breakdown?.models.find(([id]) => id === definition.key);
+    return value ? { centralUsd: value[1], participantCount: value[2], fitCount: null, band80Usd: null } : null;
+  };
+  const viewDefinitions = definitions.filter(definition => definition.view === view);
+  // "All" means all estimates for this view, not the unrelated activity year.
+  // Keep real dates and interior gaps; never stretch each series independently.
+  let days = rangeDaysWithActivity;
+  if (cutoff === -Infinity) {
+    const hasEstimate = day => viewDefinitions.some(definition => summaryFor(day, definition)?.centralUsd != null);
+    const first = days.findIndex(hasEstimate);
+    if (first < 0) return null;
+    const last = days.findLastIndex(hasEstimate);
+    days = days.slice(first, last + 1);
+  }
+  // Dollar axes stay comparable across tabs, even when date coverage differs.
+  let maximum = 0;
+  for (const day of rangeDaysWithActivity) for (const definition of definitions) {
+    const summary = summaryFor(day, definition);
+    if (summary?.centralUsd != null) maximum = Math.max(maximum,
+      summary.centralUsd, summary.band80Usd?.upperUsd ?? 0);
+  }
+  if (maximum <= 0) return null;
+  const margin = { top: 16, right: 24, bottom: 32, left: 64 };
+  const plot = { top: margin.top, bottom: height - margin.bottom,
+    left: margin.left, right: width - margin.right };
+  const startMs = communityDayStartMs(days[0].day);
+  const endMs = communityDayStartMs(days.at(-1).day);
+  const x = day => startMs === endMs ? (plot.left + plot.right) / 2
+    : plot.left + (communityDayStartMs(day) - startMs) / (endMs - startMs) * (plot.right - plot.left);
+  const dollars = valueAxis(maximum, plot.top, plot.bottom);
+  const split = points => {
+    const segments = [];
+    for (const point of points) {
+      const last = segments.at(-1);
+      if (!last || communityDayStartMs(point.day) - communityDayStartMs(last.at(-1).day) > MILLISECONDS_PER_DAY) {
+        segments.push([point]);
+      } else last.push(point);
+    }
+    return segments;
+  };
+  const daySpacing = (plot.right - plot.left) / Math.max(1, (endMs - startMs) / MILLISECONDS_PER_DAY);
+  const visible = viewDefinitions.map((definition, seriesOrder) => {
+    const dots = days.flatMap(day => {
+      const summary = summaryFor(day, definition);
+      if (summary?.centralUsd == null) return [];
+      return [{ ...summary, day: day.day, x: x(day.day), y: dollars.y(summary.centralUsd),
+        radius: Math.min(5, Math.max(1.6, daySpacing * .3), 2.6 + Math.sqrt(summary.fitCount ?? summary.participantCount)),
+        seriesKey: definition.key, seriesLabel: definition.label, seriesClass: definition.className,
+        seriesTheme: definition.theme ?? null, seriesOrder }];
+    });
+    const band = dots.filter(dot => dot.band80Usd !== null).map(dot => ({
+      day: dot.day, x: dot.x, upperY: dollars.y(dot.band80Usd.upperUsd),
+      lowerY: dollars.y(dot.band80Usd.lowerUsd), seriesClass: dot.seriesClass, seriesKey: dot.seriesKey,
+    }));
+    const centralSegments = split(dots);
+    // Dense lines retain every observation for hover/keyboard inspection, but
+    // only segment endpoints need permanent markers to avoid a solid dot mass.
+    const markerDots = daySpacing < 14
+      ? centralSegments.flatMap(segment => segment.length === 1 ? segment : [segment[0], segment.at(-1)]) : dots;
+    return { ...definition, dots, markerDots, centralSegments, bandSegments: split(band), latest: dots.at(-1) ?? null };
+  }).filter(definition => definition.dots.length > 0);
+  if (visible.length === 0) return null;
+  const dots = visible.flatMap(definition => definition.dots)
+    .sort((a, b) => a.day.localeCompare(b.day) || a.seriesOrder - b.seriesOrder);
+  const dayTicks = Array.from({ length: 6 }, (_, index) => {
+    const day = new Date(startMs + Math.round((endMs - startMs) * index / 5 / MILLISECONDS_PER_DAY)
+      * MILLISECONDS_PER_DAY).toISOString().slice(0, 10);
+    return { day, x: x(day) };
+  }).filter((tick, index, ticks) => index === 0 || tick.day !== ticks[index - 1].day);
+  return { width, height, margin, plot, dots, view,
+    markerDots: visible.flatMap(definition => definition.markerDots),
+    latest: dots.at(-1), legendSeries: view === "aggregate" ? null : visible,
+    latestSummaries: visible.map(definition => definition.latest),
+    spanDays: 1 + Math.round((endMs - startMs) / MILLISECONDS_PER_DAY),
+    sparse: new Set(dots.map(dot => dot.day)).size <= 2,
+    centralSegments: visible.flatMap(definition => definition.centralSegments),
+    bandSegments: visible.flatMap(definition => definition.bandSegments),
+    dollarTicks: dollars.ticks, dayTicks,
+    tickLabelStyle: endMs - startMs > MONTH_TICK_SPAN_DAYS * MILLISECONDS_PER_DAY ? "month" : "day" };
+}
+
 function svgNode(documentRef, tag, className = "", attributes = {}) {
   const element = documentRef.createElementNS(SVG_NAMESPACE, tag);
   // SVG elements take their class through setAttribute: assigning
@@ -431,7 +590,7 @@ function tickLabelFormatter(style) {
 /**
  * Renders the inline SVG daily chart. The site is CSP-strict and
  * dependency-free, so this is plain SVG construction: bars for usage events
- * on the left axis, a line for combined output tokens on the right axis, and
+ * on the left axis, a line for all input/output tokens on the right axis, and
  * dots plus a note while the series is still one or two days long.
  */
 function appendCommunityDailyChart({ documentRef, container, series, t }) {
@@ -443,7 +602,7 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
   const legend = node("p", "community-daily-legend");
   for (const [swatchClass, labelKey] of [
     ["daily-legend-swatch events", "community.metric.usageEvents"],
-    ["daily-legend-swatch output", "community.metric.combinedOutput"],
+    ["daily-legend-swatch output", "community.metric.allTokens"],
   ]) {
     const item = node("span");
     const swatch = node("span", swatchClass);
@@ -476,7 +635,7 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
     label.textContent = compact(tick.value);
     svg.append(label);
   }
-  for (const tick of model.outputTicks) {
+  for (const tick of model.tokenTicks) {
     const label = svgNode(documentRef, "text", "chart-axis-label daily-axis-output", {
       x: model.plot.right + 8,
       y: tick.y + 3,
@@ -505,7 +664,7 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
     }));
   }
 
-  for (const segment of model.outputSegments) {
+  for (const segment of model.tokenSegments) {
     if (segment.length >= 2) {
       svg.append(svgNode(documentRef, "polyline", "daily-output-line", {
         points: segment
@@ -534,22 +693,24 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
 }
 
 /**
- * Renders the day-partitioned community series: the latest published
- * revision per day inside the requested year window. Revision freshness is
- * first-class — every row carries its revision and release time, and the
- * headline names the latest published day's revision and age — because a day
- * here is never sealed: late contributions replace it with a new revision.
+ * Renders the day-partitioned community series. Publication revisions remain
+ * part of the read contract, but the reader-facing summary describes the
+ * activity itself: its latest day, API-equivalent spend, turns and all tokens.
+ * Late contributions still replace a day's published aggregate behind the
+ * scenes, which the concise disclosure below explains without exposing
+ * operational revision metadata as a headline metric.
  */
 export function renderCommunityDailySeries({
   documentRef,
   container,
   stateNode = null,
   payload,
-  now = Date.now(),
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
   const t = (key, values = {}) => translate(key, values, locale);
+  const wasOpen = dailyDisclosureByContainer.get(container)?.open === true;
+  dailyDisclosureByContainer.delete(container);
   clear(container);
   const series = normalizeCommunityDailySeries(payload);
   if (stateNode) {
@@ -566,19 +727,42 @@ export function renderCommunityDailySeries({
   }
 
   const latest = series.days[series.days.length - 1];
+  const usageEvents = sumSafeCounts(series.days.map((day) => day.totals.usageEvents));
+  const tokens = sumSafeCounts(series.days.map((day) => allTokens(day.totals)));
+  const spend = communityDailySpendSummary(series.days);
+  const historyDays = compact(series.days.length);
   const quality = node("dl", "snapshot-quality-grid");
-  for (const [term, value] of [
-    [t("community.daily.latestDay"), formatUtcCalendarDay(latest.day)],
-    [t("community.daily.revision"), `r${latest.revision}`],
-    [t("community.released"), formatLocal(latest.releasedAt)],
+  for (const [term, value, detail] of [
     [
-      t("community.daily.revisionAge"),
-      formatAge(Math.max(0, (now - Date.parse(latest.releasedAt)) / 1_000)),
+      t("community.daily.activityThrough"),
+      formatUtcCalendarDay(latest.day),
+      t("community.daily.activityThroughDetail"),
     ],
-    [t("community.daily.publishedDays"), compact(series.days.length)],
+    [
+      t("community.daily.apiEquivalentSpend"),
+      spend.knownCostUsd === null ? compact(null) : usdFormatter(2).format(spend.knownCostUsd),
+      t(`community.daily.apiEquivalentSpendDetail.${spend.coverage}`, {
+        days: historyDays,
+        pricedDays: compact(spend.pricedDays),
+      }),
+    ],
+    [
+      t("community.daily.turnsCounted"),
+      compact(usageEvents),
+      t("community.daily.turnsCountedDetail", { days: historyDays }),
+    ],
+    [
+      t("community.daily.allTokensCounted"),
+      compact(tokens),
+      t("community.daily.allTokensCountedDetail", { days: historyDays }),
+    ],
   ]) {
     const item = node("div");
-    item.append(node("dt", "", term), node("dd", "", value));
+    item.append(
+      node("dt", "", term),
+      node("dd", "", value),
+      node("small", "", detail),
+    );
     quality.append(item);
   }
   container.append(quality);
@@ -591,6 +775,7 @@ export function renderCommunityDailySeries({
   appendCommunityDailyChart({ documentRef, container, series, t });
 
   const breakdown = node("details", "journey-disclosure snapshot-breakdown");
+  breakdown.open = wasOpen;
   const summary = node("summary");
   summary.append(node(
     "span",
@@ -624,8 +809,8 @@ export function renderCommunityDailySeries({
   const formatContributingDevices = formatColumn(
     series.days.map((day) => day.totals.contributingDevices),
   );
-  const formatOutputTokens = formatColumn(
-    series.days.map((day) => day.totals.outputCombinedTokens),
+  const formatAllTokens = formatColumn(
+    series.days.map((day) => allTokens(day.totals)),
   );
   // Most recent day first: freshness is what a reader scans for.
   for (const day of [...series.days].reverse()) {
@@ -639,8 +824,7 @@ export function renderCommunityDailySeries({
       formatUsageEvents(day.totals.usageEvents),
       formatQuotaObservations(day.totals.quotaObservations),
       formatContributingDevices(day.totals.contributingDevices),
-      formatOutputTokens(day.totals.outputCombinedTokens),
-      formatLocal(day.releasedAt),
+      formatAllTokens(allTokens(day.totals)),
     ];
     cells.forEach((value, index) => {
       const td = documentRef.createElement("td");
@@ -662,6 +846,7 @@ export function renderCommunityDailySeries({
   wrap.append(table);
   breakdown.append(wrap);
   container.append(breakdown);
+  dailyDisclosureByContainer.set(container, breakdown);
   return series.state;
 }
 
@@ -685,32 +870,49 @@ function usdFormatter(maximumFractionDigits = 0) {
  * where days published one, the central line, and per-day dots sized by fit
  * count. Same CSP-strict plain-SVG construction as the daily chart.
  */
-function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
+function appendCommunityAllowanceChart({ documentRef, container, model, t, inspection = null }) {
   const { node } = createDomHelpers(documentRef);
   const dollars = usdFormatter();
 
   const figure = node("div", "community-daily-chart community-allowance-chart");
-  const legend = node("p", "community-daily-legend");
-  for (const [swatchClass, labelKey] of [
+  const legend = node("div", "community-daily-legend allowance-series-legend");
+  const legendButtons = [];
+  const legendItems = model.legendSeries?.map(series => [
+    `daily-legend-swatch allowance-central ${series.className}`, series.label, series.key,
+  ]) ?? [
     ["daily-legend-swatch allowance-central", "community.allowance.legendCentral"],
     ["daily-legend-swatch allowance-band", "community.allowance.legendBand"],
     ["daily-legend-swatch allowance-dot", "community.allowance.legendDots"],
-  ]) {
-    const item = node("span");
+  ].map(([className, key]) => [className, t(key)]);
+  for (const [swatchClass, label, seriesKey] of legendItems) {
+    const item = node(seriesKey ? "button" : "span", seriesKey ? "allowance-legend-button" : "");
+    if (seriesKey) {
+      item.setAttribute("type", "button");
+      item.setAttribute("aria-pressed", "false");
+      legendButtons.push({ item, seriesKey });
+    }
     const swatch = node("span", swatchClass);
     swatch.setAttribute("aria-hidden", "true");
-    item.append(swatch, node("span", "", t(labelKey)));
+    item.append(swatch, node("span", "", label));
     legend.append(item);
   }
   figure.append(legend);
+  if (legendButtons.length) figure.append(node("p", "allowance-legend-hint", t("community.allowance.legendFocus")));
 
   const svg = svgNode(documentRef, "svg", "", {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
-    "aria-label": t("community.allowance.chartLabel"),
-    "aria-description": t("community.allowance.chartDescription"),
+    "aria-label": t(model.view === "models" ? "community.allowance.modelChartLabel"
+      : model.view === "plans" ? "community.allowance.planChartLabel" : "community.allowance.chartLabel"),
+    "aria-description": t(model.view === "models" ? "community.allowance.modelChartDescription"
+      : model.view === "plans" ? "community.allowance.planChartDescription" : "community.allowance.chartDescription"),
   });
   svg.setAttribute("data-i18n-skip", "");
+  const seriesMarks = [];
+  const appendSeriesMark = (mark, seriesKey) => {
+    seriesMarks.push({ mark, seriesKey });
+    svg.append(mark);
+  };
 
   for (const tick of model.dollarTicks) {
     svg.append(svgNode(documentRef, "line", "chart-grid", {
@@ -746,47 +948,48 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
         .map((point) => `${point.x.toFixed(1)},${point.upperY.toFixed(1)}`);
       const backward = [...band].reverse()
         .map((point) => `${point.x.toFixed(1)},${point.lowerY.toFixed(1)}`);
-      svg.append(svgNode(documentRef, "path", "allowance-band-area", {
+      appendSeriesMark(svgNode(documentRef, "path", `allowance-band-area ${band[0].seriesClass ?? ""}`.trim(), {
         d: `M${[...forward, ...backward].join(" L")} Z`,
-      }));
+      }), band[0].seriesKey);
     } else {
-      svg.append(svgNode(documentRef, "line", "allowance-band-mark", {
+      appendSeriesMark(svgNode(documentRef, "line", `allowance-band-mark ${band[0].seriesClass ?? ""}`.trim(), {
         x1: band[0].x,
         x2: band[0].x,
         y1: band[0].upperY,
         y2: band[0].lowerY,
-      }));
+      }), band[0].seriesKey);
     }
   }
 
   for (const segment of model.centralSegments) {
     if (segment.length >= 2) {
-      svg.append(svgNode(documentRef, "polyline", "allowance-central-line", {
+      appendSeriesMark(svgNode(documentRef, "polyline", `allowance-central-line ${segment[0].seriesClass ?? ""}`.trim(), {
         points: segment
           .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
           .join(" "),
-      }));
+      }), segment[0].seriesKey);
     }
   }
 
   const locale = documentRef?.documentElement?.lang ?? "en-US";
   const plural = (key, count) => translatePlural(key, count, {}, locale);
+  const pointEvidence = dot => dot.fitCount === null
+    ? plural("community.allowance.accountCount", dot.participantCount)
+    : `${plural("community.allowance.fitCount", dot.fitCount)} · ${plural("community.allowance.accountCount", dot.participantCount)}`;
 
   // Data dots. Each keeps a native <title> so the accessibility tree and any
   // no-JS fallback still name the point; the richer visual tooltip below layers
   // on top for pointer and keyboard users.
-  for (const dot of model.dots) {
-    const circle = svgNode(documentRef, "circle", "allowance-fit-dot", {
+  for (const dot of model.markerDots ?? model.dots) {
+    const circle = svgNode(documentRef, "circle", `allowance-fit-dot ${dot.seriesClass ?? ""}`.trim(), {
       cx: dot.x,
       cy: dot.y,
       r: dot.radius,
     });
     const title = svgNode(documentRef, "title");
-    title.textContent = `${dot.day}: ${dollars.format(dot.centralUsd)} — ${
-      plural("community.allowance.fitCount", dot.fitCount)
-    } · ${plural("community.allowance.accountCount", dot.participantCount)}`;
+    title.textContent = `${dot.seriesLabel ? `${dot.seriesLabel} · ` : ""}${dot.day}: ${dollars.format(dot.centralUsd)} — ${pointEvidence(dot)}`;
     circle.append(title);
-    svg.append(circle);
+    appendSeriesMark(circle, dot.seriesKey);
   }
 
   // Hover furniture, painted above the dots but under a transparent capture
@@ -834,12 +1037,23 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     && model.dots.length > 0;
   if (!interactive) return;
 
+  let activeSeriesKey = legendButtons.some(button => button.seriesKey === inspection?.activeSeriesKey)
+    ? inspection.activeSeriesKey : null;
+  let inspectionDots = activeSeriesKey === null ? model.dots
+    : model.dots.filter(dot => dot.seriesKey === activeSeriesKey);
+  const restoredIndex = inspectionDots.findIndex(dot => dot.day === inspection?.day
+    && dot.seriesKey === inspection?.seriesKey);
+  let selected = restoredIndex >= 0 ? restoredIndex : inspectionDots.length - 1;
+  let tooltipVisible = false;
+  let restoringFocus = false;
+
   const formatTipDate = dateTimeFormatter({
     timeZone: "UTC", year: "numeric", month: "short", day: "numeric",
   });
 
   const fillTooltip = (dot) => {
     tooltip.replaceChildren();
+    if (dot.seriesLabel) tooltip.append(node("strong", "", dot.seriesLabel));
     tooltip.append(node(
       "div",
       "allowance-tooltip-date",
@@ -868,9 +1082,7 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     tooltip.append(node(
       "div",
       "allowance-tooltip-meta",
-      `${plural("community.allowance.fitCount", dot.fitCount)} · ${
-        plural("community.allowance.accountCount", dot.participantCount)
-      }`,
+      pointEvidence(dot),
     ));
   };
 
@@ -905,6 +1117,8 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   };
 
   const showDot = (dot) => {
+    selected = inspectionDots.indexOf(dot);
+    tooltipVisible = true;
     crosshair.setAttribute("x1", dot.x);
     crosshair.setAttribute("x2", dot.x);
     crosshair.setAttribute("data-visible", "true");
@@ -918,29 +1132,54 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   };
 
   const hide = () => {
+    tooltipVisible = false;
     crosshair.setAttribute("data-visible", "false");
     highlight.setAttribute("data-visible", "false");
     tooltip.setAttribute("data-visible", "false");
   };
 
-  const nearestDot = (clientX) => {
+  const updateSeriesSelection = () => {
+    for (const button of legendButtons) {
+      button.item.setAttribute("aria-pressed", String(button.seriesKey === activeSeriesKey));
+    }
+    for (const { mark, seriesKey: key } of seriesMarks) {
+      mark.setAttribute("data-muted", String(activeSeriesKey !== null && key !== activeSeriesKey));
+    }
+  };
+  updateSeriesSelection();
+  for (const { item, seriesKey } of legendButtons) {
+    item.addEventListener("click", () => {
+      activeSeriesKey = activeSeriesKey === seriesKey ? null : seriesKey;
+      inspectionDots = activeSeriesKey === null ? model.dots
+        : model.dots.filter(dot => dot.seriesKey === activeSeriesKey);
+      selected = inspectionDots.length - 1;
+      updateSeriesSelection();
+      hide();
+    });
+  }
+
+  const nearestDot = (clientX, clientY) => {
     const rect = svg.getBoundingClientRect();
-    if (!rect || rect.width === 0) return model.dots[0];
+    if (!rect || rect.width === 0) return inspectionDots[0];
     const viewX = ((clientX - rect.left) / rect.width) * model.width;
-    let best = model.dots[0];
+    const viewY = ((clientY - rect.top) / rect.height) * model.height;
+    let best = inspectionDots[0];
     let bestDistance = Infinity;
-    for (const dot of model.dots) {
+    let bestVerticalDistance = Infinity;
+    for (const dot of inspectionDots) {
       const distance = Math.abs(dot.x - viewX);
-      if (distance < bestDistance) {
+      const vertical = Math.abs(dot.y - viewY);
+      if (distance < bestDistance || (distance === bestDistance && vertical < bestVerticalDistance)) {
         bestDistance = distance;
+        bestVerticalDistance = vertical;
         best = dot;
       }
     }
     return best;
   };
 
-  capture.addEventListener("pointermove", (event) => showDot(nearestDot(event.clientX)));
-  capture.addEventListener("pointerdown", (event) => showDot(nearestDot(event.clientX)));
+  capture.addEventListener("pointermove", (event) => showDot(nearestDot(event.clientX, event.clientY)));
+  capture.addEventListener("pointerdown", (event) => showDot(nearestDot(event.clientX, event.clientY)));
   // A touch tap fires pointerleave the instant the finger lifts, which would
   // hide the tooltip before it could be read; keep it up for touch (the next
   // tap moves it) and only auto-dismiss for a mouse leaving the plot.
@@ -955,7 +1194,6 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   // events, which SVG graphics elements dispatch inconsistently across engines.
   // The tooltip is an aria-live region, so each step is announced.
   svg.setAttribute("tabindex", "0");
-  let selected = model.dots.length - 1;
   svg.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       hide();
@@ -963,24 +1201,43 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     }
     let moved = true;
     if (event.key === "ArrowRight") {
-      selected = Math.min(model.dots.length - 1, selected + 1);
+      selected = Math.min(inspectionDots.length - 1, selected + 1);
     } else if (event.key === "ArrowLeft") {
       selected = Math.max(0, selected - 1);
     } else if (event.key === "Home") {
       selected = 0;
     } else if (event.key === "End") {
-      selected = model.dots.length - 1;
+      selected = inspectionDots.length - 1;
     } else {
       moved = false;
     }
     if (!moved) return;
     event.preventDefault();
-    showDot(model.dots[selected]);
+    showDot(inspectionDots[selected]);
   });
   // Best effort: some engines do fire focus/blur on the SVG root even when they
   // skip its graphics children. When they do, the chart shows/hides on tab.
-  svg.addEventListener("focus", () => showDot(model.dots[selected]));
+  svg.addEventListener("focus", () => { if (!restoringFocus) showDot(inspectionDots[selected]); });
   svg.addEventListener("blur", hide);
+
+  allowanceInspectionByContainer.set(container, () => ({
+    view: model.view ?? "aggregate", activeSeriesKey,
+    day: inspectionDots[selected]?.day, seriesKey: inspectionDots[selected]?.seriesKey,
+    visible: tooltipVisible,
+    focusChart: documentRef.activeElement === svg || Boolean(svg.contains?.(documentRef.activeElement)),
+    focusedLegendKey: legendButtons.find(button => button.item === documentRef.activeElement)?.seriesKey,
+  }));
+  // Only reattach focus that the replaced chart owned, without scrolling a
+  // reader back from another control. Missing points never reuse old values.
+  if (inspection) {
+    const focusedLegend = legendButtons.find(button => button.seriesKey === inspection.focusedLegendKey)?.item;
+    const focusTarget = inspection.focusChart ? svg
+      : focusedLegend ?? (inspection.focusedLegendKey ? svg : null);
+    restoringFocus = true;
+    focusTarget?.focus?.({ preventScroll: true });
+    restoringFocus = false;
+    if (inspection.visible && restoredIndex >= 0) showDot(inspectionDots[selected]);
+  }
 }
 
 /**
@@ -1003,11 +1260,15 @@ export function renderCommunityAllowanceSection({
   stateNode = null,
   payload,
   rangeDays = null,
+  view = "aggregate",
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
   const t = (key, values = {}) => translate(key, values, locale);
   const plural = (key, count) => translatePlural(key, count, {}, locale);
+  const previousInspection = allowanceInspectionByContainer.get(container)?.();
+  const inspection = previousInspection?.view === view ? previousInspection : null;
+  allowanceInspectionByContainer.delete(container);
   clear(container);
   const series = normalizeCommunityDailySeries(payload);
   const setChip = (labelKey, published) => {
@@ -1023,17 +1284,32 @@ export function renderCommunityAllowanceSection({
     return series.state;
   }
 
-  const model = buildCommunityAllowanceChartModel(series, { rangeDays });
-  if (model === null) {
-    const anyEstimate = series.days.some((day) => (
-      day.allowance && day.allowance.centralUsd !== null
+  if (series.allowanceState === "updating") {
+    setChip("community.allowance.updating", false);
+    container.append(node(
+      "p",
+      "",
+      t("community.allowance.updatingCopy"),
     ));
+    return "allowance_updating";
+  }
+
+  if (view !== "aggregate" && !series.breakdowns) {
+    setChip("community.allowance.unavailable", false);
+    container.append(node("p", "", t("community.allowance.breakdownsUnavailable")));
+    return "breakdowns_unavailable";
+  }
+
+  const model = buildCommunityAllowanceChartModel(series, { rangeDays, view });
+  if (model === null) {
+    const anyEstimate = buildCommunityAllowanceChartModel(series, { view }) !== null;
     setChip("community.allowance.accumulating", false);
     container.append(node(
       "p",
       "",
       t(anyEstimate
         ? "community.allowance.noneInRange"
+        : view === "models" ? "community.allowance.modelsAccumulating"
         : "community.allowance.stillAccumulating"),
     ));
     return anyEstimate ? "no_estimates_in_range" : "estimates_accumulating";
@@ -1041,6 +1317,29 @@ export function renderCommunityAllowanceSection({
 
   setChip("community.allowance.available", true);
   const dollars = usdFormatter();
+  container.append(node("p", "snapshot-disclosure", t("community.allowance.smallSampleDisclosure")));
+  if (view !== "aggregate") {
+    container.append(node("p", "allowance-summary-caption", t("community.allowance.cardsCaption")));
+    const cards = node("div", "allowance-summary-cards");
+    for (const latest of model.latestSummaries) {
+      const card = node("article", `allowance-summary-card ${latest.seriesClass}`.trim());
+      const heading = node("div", "allowance-summary-heading");
+      heading.append(node("h3", "", latest.seriesLabel));
+      const icon = modelThemeIcon(documentRef, latest.seriesTheme);
+      if (icon) heading.append(icon);
+      card.append(heading,
+        node("strong", "allowance-summary-value", dollars.format(latest.centralUsd)));
+      const planUsd = view === "plans" ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey) : null;
+      if (planUsd !== null) card.append(node("p", "allowance-plan-value", t("community.allowance.actualPlanValue", { value: dollars.format(planUsd) })));
+      card.append(node("p", "allowance-headline-caveat", `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.shortAccountCount", latest.participantCount)}`));
+      cards.append(card);
+    }
+    container.append(cards);
+    appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
+    container.append(node("p", "snapshot-disclosure", t(view === "models"
+      ? "community.allowance.modelMethod" : "community.allowance.planMethod")));
+    return "published";
+  }
   const headline = node("div", "allowance-headline");
   const value = node("p", "allowance-headline-value");
   value.append(
@@ -1076,7 +1375,7 @@ export function renderCommunityAllowanceSection({
   ));
   container.append(headline);
 
-  appendCommunityAllowanceChart({ documentRef, container, model, t });
+  appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
 
   container.append(node(
     "p",

@@ -1,4 +1,4 @@
-import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import { validAbortSignal } from "./valid-abort-signal.js";
 import {
   fastQuotaMultiplier,
@@ -9,10 +9,19 @@ import {
   addUsdStrings,
   apiPriceResolutionSummary,
   costWarningCodes,
+  FAST_MODE_ASSUMED_MULTIPLIER,
+  fastModeModelFamilyKey,
   priceCodexUsageEvent,
 } from "@app-usagemonitor/accounting";
+import {
+  buildPlanAttributionIndex,
+  classifyUsageAttribution,
+  planAttributionContextKey,
+  planEraForInterval,
+} from "@app-usagemonitor/quota-analysis";
 
 const SCHEMA_VERSION = "0.3";
+const { scanCodexLogEvents } = localCodexLogScanner;
 export const PARSER_VERSION = "0.3.2";
 const ESTIMATOR_VERSION = "provider-neutral-api-price-equivalent-v0.2";
 const COMPONENT_NAMES = [
@@ -89,8 +98,11 @@ function roundUsd(value) {
 function priceUsageEvent(event, priceCards) {
   const ledger = priceCodexUsageEvent(event, { priceCards });
   const costUsd = Number(ledger.totalUsd);
-  const multiplier = fastQuotaMultiplier(event.model);
-  const fastWeightedEquivalentUsd = multiplier === null ? null : costUsd * multiplier;
+  const multiplier = fastQuotaMultiplier(event.model, {
+    eventTime: event.timestamp,
+    standardPriceCardIds: ledger.selectedPriceCardIds,
+  });
+  const fastWeightedEquivalentUsd = costUsd * (multiplier ?? FAST_MODE_ASSUMED_MULTIPLIER);
   const observedSpeedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
   const speedMode = ["standard", "fast"].includes(observedSpeedMode)
     ? observedSpeedMode
@@ -265,7 +277,97 @@ function windowKey(window) {
 }
 
 function snapshotKey(snapshot) {
-  return `${windowKey(snapshot.window)}|${snapshot.timestamp}|${snapshot.window.usedPercent}`;
+  return `${windowKey(snapshot.window)}|${snapshot.planEraKey ?? "legacy"}|${snapshot.timestamp}|${snapshot.window.usedPercent}`;
+}
+
+// Attribution changes analysis associations, never the priced usage ledger.
+// The full index may be supplied by the streaming caller: rebuilding it from
+// a reset-sized batch would erase intervening quota-only plan changes.
+function transitionAttributionState(snapshots, usageEvents, suppliedIndex) {
+  const index = suppliedIndex ?? buildPlanAttributionIndex(snapshots.map((snapshot) => ({
+    contextKey: planAttributionContextKey(snapshot.window.provider, snapshot.window.limitId),
+    observedAtMs: snapshot.timestampMs,
+    planType: snapshot.window.planType,
+    planVariant: snapshot.window.planVariant ?? "unknown",
+    accountScopeId: snapshot.accountScopeId ?? null,
+  })));
+  const contexts = [...new Set(snapshots.map((snapshot) => (
+    planAttributionContextKey(snapshot.window.provider, snapshot.window.limitId)
+  )))];
+  // Bounds are input-safety limits, not permission to silently drop families.
+  if (contexts.length > 32) throw fixedError("transition_derivation_input_limit_exceeded");
+  const state = { index, snapshots: [], usageByEra: new Map(), unresolvedByContext: new Map() };
+  state.steps = (function* prepare() {
+    for (const snapshot of snapshots) {
+      const contextKey = planAttributionContextKey(snapshot.window.provider, snapshot.window.limitId);
+      const lookup = planEraForInterval(index, {
+        contextKey, observedAtMs: snapshot.timestampMs,
+        accountScopeId: snapshot.accountScopeId ?? null,
+      });
+      if (lookup.status === "matched" && lookup.era.planType === snapshot.window.planType) {
+        state.snapshots.push({ ...snapshot, planEraKey: lookup.era.eraKey, attributionEra: lookup.era });
+      }
+      yield;
+    }
+    for (const event of usageEvents) {
+      for (const contextKey of contexts) {
+        const intervalStartMs = Date.parse(event.usageIntervalStartedAt ?? "");
+        const classification = classifyUsageAttribution(index, {
+          contextKey,
+          observedAtMs: event.timestampMs,
+          ...(Number.isSafeInteger(intervalStartMs) ? { intervalStartMs } : {}),
+          observedPlanType: event.planAttribution?.basis === "same_record"
+            ? event.planAttribution.planType : null,
+          observedPlanVariant: event.planAttribution?.planVariant ?? "unknown",
+          accountScopeId: event.accountScopeId ?? null,
+        });
+        if (event.planAttribution?.basis === "conflicted"
+            || classification.disposition === "unresolved"
+            || !classification.era) {
+          const unresolved = state.unresolvedByContext.get(contextKey) ?? [];
+          unresolved.push(event);
+          state.unresolvedByContext.set(contextKey, unresolved);
+        } else if (classification.disposition !== "incompatible") {
+          const key = classification.era.eraKey;
+          const bucket = state.usageByEra.get(key) ?? [];
+          const prior = bucket.at(-1);
+          // Every cumulative field must be recomputed in the same population;
+          // retaining a provider-wide prefix after filtering still mixes plans.
+          bucket.push({
+            ...event,
+            cumulativeScanCostUsd: roundUsd((prior?.cumulativeScanCostUsd ?? 0) + event.costUsd),
+            cumulativeScanCostUsdExact: addUsdStrings(prior?.cumulativeScanCostUsdExact ?? "0", event.costUsdExact ?? "0"),
+            cumulativeQuotaWeightedLowerUsd: roundUsd((prior?.cumulativeQuotaWeightedLowerUsd ?? 0)
+              + (Number.isFinite(event.quotaWeightedLowerUsd) ? event.quotaWeightedLowerUsd : 0)),
+            cumulativeQuotaWeightedUpperUsd: roundUsd((prior?.cumulativeQuotaWeightedUpperUsd ?? 0)
+              + (Number.isFinite(event.quotaWeightedUpperUsd) ? event.quotaWeightedUpperUsd : 0)),
+            cumulativeQuotaWeightedLowerUnknownEvents: (prior?.cumulativeQuotaWeightedLowerUnknownEvents ?? 0)
+              + (Number.isFinite(event.quotaWeightedLowerUsd) ? 0 : 1),
+            cumulativeQuotaWeightedUpperUnknownEvents: (prior?.cumulativeQuotaWeightedUpperUnknownEvents ?? 0)
+              + (Number.isFinite(event.quotaWeightedUpperUsd) ? 0 : 1),
+          });
+          state.usageByEra.set(key, bucket);
+        }
+      }
+      yield;
+    }
+  })();
+  return state;
+}
+
+function unresolvedQuantityCount(events, prior, next, guard) {
+  let count = 0;
+  const scope = prior.attributionEra?.accountScopeId ?? null;
+  for (let index = upperBound(events, prior.timestampMs); index < events.length
+      && events[index].timestampMs <= next.timestampMs; index += 1) {
+    consumeDerivationWork(guard);
+    const event = events[index];
+    // Positive evidence of a different account is an exclusion, not a reason
+    // to refuse the independently supported account's numerator.
+    if (scope && event.accountScopeId && event.accountScopeId !== scope) continue;
+    count += 1;
+  }
+  return count;
 }
 
 function coverageFor(snapshot, scanStartMs) {
@@ -290,6 +392,7 @@ function makeTransition({
   scanStartMs,
   diagnostics,
   guard = null,
+  unresolvedUsageEvents = [],
 }) {
   const windowStartMs = (prior.window.resetsAt - prior.window.windowDurationMins * 60) * 1000;
   const localWindowStartExclusiveMs = Math.max(scanStartMs, windowStartMs) - 1;
@@ -319,11 +422,17 @@ function makeTransition({
   if (marginal.eventCount === 0) warnings.add("quota_transition_without_retained_usage_event");
   for (const warning of marginal.pricingWarnings) warnings.add(`pricing:${warning}`);
   const attributionWarnings = Object.hasOwn(marginal.models, "unknown") ? ["unknown_model"] : [];
+  const unresolvedUsageEventCount = unresolvedQuantityCount(unresolvedUsageEvents, prior, next, guard);
+  if (unresolvedUsageEventCount > 0) attributionWarnings.push("unresolved_usage_quantity");
   for (const warning of attributionWarnings) warnings.add(`attribution:${warning}`);
 
   return {
     parserVersion: PARSER_VERSION,
-    accountScopeId: "unattributed",
+    accountScopeId: prior.attributionEra?.accountScopeId ?? "unattributed",
+    planEraKey: prior.planEraKey ?? "legacy",
+    planVariant: prior.attributionEra?.planVariant ?? "unknown",
+    aggregationEligibility: unresolvedUsageEventCount > 0 ? "diagnostic_only" : "primary_conditional",
+    quantityAttribution: { compatibleUsageEvents: marginal.eventCount, unresolvedUsageEvents: unresolvedUsageEventCount },
     provider: prior.window.provider,
     planType: prior.window.planType,
     limitId: prior.window.limitId,
@@ -390,6 +499,7 @@ function makeSnapshotInterval({
   toolEvents,
   scanStartMs,
   guard = null,
+  unresolvedUsageEvents = [],
 }) {
   const marginal = aggregateUsage(
     usageEvents,
@@ -404,10 +514,14 @@ function makeSnapshotInterval({
   if (coverage.elapsedTimeCoverageFraction < 1) warnings.push("partial_local_window_coverage");
   if (marginal.eventCount === 0) warnings.push("quota_interval_without_retained_usage_event");
   const attributionWarnings = Object.hasOwn(marginal.models, "unknown") ? ["unknown_model"] : [];
+  const unresolvedUsageEventCount = unresolvedQuantityCount(unresolvedUsageEvents, prior, next, guard);
+  if (unresolvedUsageEventCount > 0) attributionWarnings.push("unresolved_usage_quantity");
   return {
     parserVersion: PARSER_VERSION,
     intervalKind: "adjacent_snapshot_interval",
-    accountScopeId: "unattributed",
+    accountScopeId: prior.attributionEra?.accountScopeId ?? "unattributed",
+    planEraKey: prior.planEraKey ?? "legacy",
+    aggregationEligibility: unresolvedUsageEventCount > 0 ? "diagnostic_only" : "primary_conditional",
     provider: prior.window.provider,
     planType: prior.window.planType,
     limitId: prior.window.limitId,
@@ -451,7 +565,7 @@ function makeSnapshotInterval({
   };
 }
 
-function collapseTransitions({ snapshots, usageEvents, toolEvents, scanStartMs, diagnostics, includeSnapshotIntervals }) {
+function collapseTransitions({ snapshots, attribution, toolEvents, scanStartMs, diagnostics, includeSnapshotIntervals }) {
   const groups = new Map();
   const deduplicated = new Map();
   for (const snapshot of snapshots) {
@@ -459,7 +573,7 @@ function collapseTransitions({ snapshots, usageEvents, toolEvents, scanStartMs, 
     if (!deduplicated.has(key)) deduplicated.set(key, snapshot);
   }
   for (const snapshot of deduplicated.values()) {
-    const key = windowKey(snapshot.window);
+    const key = `${windowKey(snapshot.window)}|${snapshot.planEraKey}`;
     const group = groups.get(key) ?? [];
     group.push(snapshot);
     groups.set(key, group);
@@ -469,6 +583,10 @@ function collapseTransitions({ snapshots, usageEvents, toolEvents, scanStartMs, 
   const snapshotIntervals = [];
   const groupSummaries = [];
   for (const group of groups.values()) {
+    const usageEvents = attribution.usageByEra.get(group[0].planEraKey) ?? [];
+    const unresolvedUsageEvents = attribution.unresolvedByContext.get(
+      group[0].attributionEra.contextKey,
+    ) ?? [];
     group.sort((left, right) => left.timestampMs - right.timestampMs || left.window.usedPercent - right.window.usedPercent);
     if (includeSnapshotIntervals) {
       for (let index = 1; index < group.length; index += 1) {
@@ -477,6 +595,7 @@ function collapseTransitions({ snapshots, usageEvents, toolEvents, scanStartMs, 
             prior: group[index - 1],
             next: group[index],
             usageEvents,
+            unresolvedUsageEvents,
             toolEvents,
             scanStartMs,
           }),
@@ -497,6 +616,7 @@ function collapseTransitions({ snapshots, usageEvents, toolEvents, scanStartMs, 
         prior: lastOfRun,
         next: snapshot,
         usageEvents,
+        unresolvedUsageEvents,
         toolEvents,
         scanStartMs,
         diagnostics,
@@ -507,7 +627,8 @@ function collapseTransitions({ snapshots, usageEvents, toolEvents, scanStartMs, 
       lastOfRun = snapshot;
     }
     groupSummaries.push({
-      accountScopeId: "unattributed",
+      accountScopeId: group[0].attributionEra?.accountScopeId ?? "unattributed",
+      planEraKey: group[0].planEraKey,
       provider: group[0].window.provider,
       planType: group[0].window.planType,
       limitId: group[0].window.limitId,
@@ -563,15 +684,18 @@ function decodeCompactAccountingUsage(value) {
 
 function decodePrepricedCompactAccountingUsage(value) {
   if (!Array.isArray(value)
-      || ![19, 20].includes(value.length)
+      || ![19, 20, 21].includes(value.length)
       || !Array.isArray(value[16])
       || !Array.isArray(value[17])
       || !Array.isArray(value[18])) return null;
-  if (value.length === 20 && !Array.isArray(value[19])) return null;
+  if (value.length >= 20 && !Array.isArray(value[19])) return null;
+  const attribution = value.length === 21 ? decodeCompactAttribution(value[20]) : {};
+  if (attribution === null) return null;
   const base = decodeCompactAccountingUsage(value.slice(0, 10));
   if (base === null) return null;
   return {
     ...base,
+    ...attribution,
     costUsd: value[10],
     costUsdExact: value[11],
     pricingCoverageStatus: value[12],
@@ -594,14 +718,17 @@ function decodePrepricedCompactAccountingUsage(value) {
 // output is only a bounded reset summary.
 function decodeLeanPrepricedCompactAccountingUsage(value, sequence) {
   if (!Array.isArray(value)
-      || value.length !== 20
+      || ![20, 21].includes(value.length)
       || !Array.isArray(value[16])
       || !Array.isArray(value[17])
       || !Array.isArray(value[18])
       || !Array.isArray(value[19])) return null;
+  const attribution = value.length === 21 ? decodeCompactAttribution(value[20]) : {};
+  if (attribution === null) return null;
   const timestampMs = Date.parse(value[0]);
   return {
     timestamp: value[0],
+    ...attribution,
     timestampMs,
     sequence,
     model: value[1],
@@ -622,6 +749,20 @@ function decodeLeanPrepricedCompactAccountingUsage(value, sequence) {
     priceCardIds: value[18],
     priceCardBreakdown: value[19],
     prepricedAccountingInput: true,
+  };
+}
+
+function decodeCompactAttribution(value) {
+  if (!Array.isArray(value) || value.length !== 4
+      || !["same_record", "unavailable", "conflicted"].includes(value[0])
+      || !(value[1] === null || (typeof value[1] === "string" && /^[a-z][a-z0-9_-]{0,31}$/u.test(value[1])))
+      || !(value[2] === null || (typeof value[2] === "string" && Number.isFinite(Date.parse(value[2]))))
+      || !["previous_session_record", "previous_source_record", "unavailable"].includes(value[3])) return null;
+  if (value[0] === "same_record" && value[1] === null) return null;
+  return {
+    planAttribution: { basis: value[0], planType: value[1], planVariant: null },
+    usageIntervalStartedAt: value[2],
+    usageIntervalBasis: value[3],
   };
 }
 
@@ -661,6 +802,10 @@ async function normalizeTransitionInputsCooperatively({
     await cooperativeCheckpoint(index, signal, { resourceCheck });
     const source = rawUsageEvents[index];
     if (consumeInputs) rawUsageEvents[index] = null;
+    if (inputEncoding === "accounting_prepriced_compact_v3"
+        && (!Array.isArray(source) || source.length !== 21)) continue;
+    if (["accounting_prepriced_compact_v1", "accounting_prepriced_compact_v2"].includes(inputEncoding)
+        && Array.isArray(source) && source.length === 21) continue;
     if (leanPrepricedInput) {
       const normalized = decodeLeanPrepricedCompactAccountingUsage(
         source,
@@ -677,7 +822,7 @@ async function normalizeTransitionInputsCooperatively({
     }
     const event = inputEncoding === "accounting_compact_v1"
       ? decodeCompactAccountingUsage(source)
-      : ["accounting_prepriced_compact_v1", "accounting_prepriced_compact_v2"].includes(inputEncoding)
+      : ["accounting_prepriced_compact_v1", "accounting_prepriced_compact_v2", "accounting_prepriced_compact_v3"].includes(inputEncoding)
         ? decodePrepricedCompactAccountingUsage(source)
         : source;
     if (!event || typeof event !== "object" || Array.isArray(event)) continue;
@@ -713,15 +858,14 @@ async function normalizeTransitionInputsCooperatively({
       "accounting_compact_v1",
       "accounting_prepriced_compact_v1",
       "accounting_prepriced_compact_v2",
+      "accounting_prepriced_compact_v3",
     ].includes(inputEncoding)
       ? decodeCompactAccountingSnapshot(source)
       : source;
     if (!snapshot || typeof snapshot !== "object"
         || Array.isArray(snapshot)
         || !snapshot.window
-        || typeof snapshot.window !== "object"
-        || (windowDurationMins !== null
-          && snapshot.window.windowDurationMins !== windowDurationMins)) {
+        || typeof snapshot.window !== "object") {
       continue;
     }
     const normalized = {
@@ -869,7 +1013,7 @@ async function priceUsageEventsCooperatively({
 
 async function collapseTransitionsCooperatively({
   snapshots,
-  usageEvents,
+  attribution,
   toolEvents,
   scanStartMs,
   diagnostics,
@@ -890,7 +1034,7 @@ async function collapseTransitionsCooperatively({
   for (const snapshot of deduplicated.values()) {
     await cooperativeCheckpoint(grouped, signal, { resourceCheck });
     grouped += 1;
-    const key = windowKey(snapshot.window);
+    const key = `${windowKey(snapshot.window)}|${snapshot.planEraKey}`;
     const group = groups.get(key) ?? [];
     group.push(snapshot);
     groups.set(key, group);
@@ -902,6 +1046,10 @@ async function collapseTransitionsCooperatively({
   let derivedRows = 0;
   let groupIndex = 0;
   for (const group of groups.values()) {
+    const usageEvents = attribution.usageByEra.get(group[0].planEraKey) ?? [];
+    const unresolvedUsageEvents = attribution.unresolvedByContext.get(
+      group[0].attributionEra.contextKey,
+    ) ?? [];
     await cooperativeCheckpoint(groupIndex, signal, {
       force: true,
       resourceCheck,
@@ -920,6 +1068,7 @@ async function collapseTransitionsCooperatively({
           prior: group[index - 1],
           next: group[index],
           usageEvents,
+          unresolvedUsageEvents,
           toolEvents,
           scanStartMs,
           guard,
@@ -945,6 +1094,7 @@ async function collapseTransitionsCooperatively({
         prior: lastOfRun,
         next: snapshot,
         usageEvents,
+        unresolvedUsageEvents,
         toolEvents,
         scanStartMs,
         diagnostics,
@@ -959,7 +1109,8 @@ async function collapseTransitionsCooperatively({
       lastOfRun = snapshot;
     }
     groupSummaries.push({
-      accountScopeId: "unattributed",
+      accountScopeId: group[0].attributionEra?.accountScopeId ?? "unattributed",
+      planEraKey: group[0].planEraKey,
       provider: group[0].window.provider,
       planType: group[0].window.planType,
       limitId: group[0].window.limitId,
@@ -1012,6 +1163,7 @@ export async function deriveCodexTransitionSeriesCooperatively({
   includeNormalizedInputs = true,
   inputEncoding = "object",
   resourceCheck = null,
+  planAttributionIndex = null,
 } = {}) {
   const scanStartMs = Date.parse(startAt);
   const scanEndMs = Date.parse(endAt);
@@ -1032,6 +1184,7 @@ export async function deriveCodexTransitionSeriesCooperatively({
         "accounting_compact_v1",
         "accounting_prepriced_compact_v1",
         "accounting_prepriced_compact_v2",
+        "accounting_prepriced_compact_v3",
       ].includes(inputEncoding)) {
     throw new TypeError("Cooperative transition series inputs are invalid");
   }
@@ -1056,7 +1209,7 @@ export async function deriveCodexTransitionSeriesCooperatively({
     consumeInputs,
     inputEncoding,
     leanPrepricedInput:
-      inputEncoding === "accounting_prepriced_compact_v2"
+      ["accounting_prepriced_compact_v2", "accounting_prepriced_compact_v3"].includes(inputEncoding)
       && includeNormalizedInputs === false,
     resourceCheck,
   });
@@ -1066,9 +1219,16 @@ export async function deriveCodexTransitionSeriesCooperatively({
     signal,
     resourceCheck,
   });
+  const attribution = transitionAttributionState(normalized.snapshots, priced.usageEvents, planAttributionIndex);
+  let attributedRows = 0;
+  for (const ignored of attribution.steps) {
+    void ignored;
+    await cooperativeCheckpoint(attributedRows++, signal, { resourceCheck });
+  }
   const collapsed = await collapseTransitionsCooperatively({
-    snapshots: normalized.snapshots,
-    usageEvents: priced.usageEvents,
+    snapshots: attribution.snapshots.filter((snapshot) => windowDurationMins === null
+      || snapshot.window.windowDurationMins === windowDurationMins),
+    attribution,
     toolEvents: normalized.toolEvents,
     scanStartMs,
     diagnostics,
@@ -1106,6 +1266,7 @@ export function deriveCodexTransitionSeries({
   priceCards = null,
   includeSnapshotIntervals = true,
   windowDurationMins = null,
+  planAttributionIndex = null,
 } = {}) {
   const scanStartMs = Date.parse(startAt);
   const scanEndMs = Date.parse(endAt);
@@ -1136,9 +1297,7 @@ export function deriveCodexTransitionSeries({
   const snapshots = rateLimitSnapshots
     .filter((snapshot) => snapshot && typeof snapshot === "object"
       && !Array.isArray(snapshot)
-      && snapshot.window && typeof snapshot.window === "object"
-      && (windowDurationMins === null
-        || snapshot.window.windowDurationMins === windowDurationMins))
+      && snapshot.window && typeof snapshot.window === "object")
     .map((snapshot) => ({
       ...snapshot,
       timestampMs: Number.isFinite(snapshot.timestampMs)
@@ -1206,9 +1365,12 @@ export function deriveCodexTransitionSeries({
   const quotaWeightedSensitivityComplete =
     cumulativeQuotaWeightedLowerUnknownEvents === 0
     && cumulativeQuotaWeightedUpperUnknownEvents === 0;
+  const attribution = transitionAttributionState(snapshots, usageEvents, planAttributionIndex);
+  for (const ignored of attribution.steps) void ignored;
   const collapsed = collapseTransitions({
-    snapshots,
-    usageEvents,
+    snapshots: attribution.snapshots.filter((snapshot) => windowDurationMins === null
+      || snapshot.window.windowDurationMins === windowDurationMins),
+    attribution,
     toolEvents,
     scanStartMs,
     diagnostics,
@@ -1258,7 +1420,6 @@ export async function mineCodexTransitions({
       rawUsageEvents.push({ ...event, timestampMs: Date.parse(event.timestamp), sequence: sequence++ });
     },
     onRateLimitSnapshot(snapshot) {
-      if (windowDurationMins !== null && snapshot.window.windowDurationMins !== windowDurationMins) return;
       snapshots.push({ ...snapshot, sequence: sequence++ });
     },
     onToolCall(event) {
@@ -1293,11 +1454,19 @@ export async function mineCodexTransitions({
   const usageEventsByModel = {};
   const tokenComponentsByModel = {};
   const costByModel = {};
+  const speedWeightingByModel = {};
   const unpricedModels = new Set();
   for (const event of usageEvents) {
     usageEventsByModel[event.model] = (usageEventsByModel[event.model] ?? 0) + 1;
     const costSummary = costByModel[event.model] ??= { costUsd: 0 };
     costSummary.costUsd += event.costUsd;
+    const family = fastModeModelFamilyKey(event.model, {
+      eventTime: event.timestamp, standardPriceCardIds: event.priceCardIds,
+    });
+    const crossing = speedWeightingByModel[event.model] ??= { unknown: {} };
+    const cell = crossing.unknown[family] ??= { events: 0, apiPriceEquivalentUsd: 0 };
+    cell.events += 1;
+    cell.apiPriceEquivalentUsd += event.costUsd;
     const components = tokenComponentsByModel[event.model] ??= emptyComponents();
     addComponents(components, event.components);
     if (event.pricingCoverageStatus !== "fully_priced" || event.priceCardIds.length === 0) unpricedModels.add(event.model);
@@ -1319,7 +1488,9 @@ export async function mineCodexTransitions({
     pricing: {
       basis: "standard_openai_api_prices_not_codex_subscription_credits",
       tierSemantics: unknownCodexTier(),
-      subscriptionSpeedSensitivity: subscriptionSpeedSensitivity(costByModel),
+      subscriptionSpeedSensitivity: subscriptionSpeedSensitivity(costByModel, "unknown", {
+        speedWeightingByModel,
+      }),
       observedTierSensitivity: {
         complete: quotaWeightedSensitivityComplete,
         lowerWeightedStandardApiEquivalentUsd: quotaWeightedSensitivityComplete ? cumulativeQuotaWeightedLowerUsd : null,

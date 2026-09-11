@@ -192,9 +192,13 @@
     "pendingRebuildsBounded": false
   },
   "errors": {
+    "retentionDays": 30,
+    "sampled": true,
+    "capacity": 256,
     "groups": [{
       "routeClass": "admin_overview",
       "errorCode": "BACKEND_STORAGE_UNAVAILABLE",
+      "status": 503,
       "occurrences": 2,
       "ratePerDay": 0.29,
       "latestAt": "2026-08-02T10:00:00.000Z"

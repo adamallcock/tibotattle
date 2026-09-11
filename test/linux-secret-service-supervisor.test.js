@@ -1,0 +1,437 @@
+import assert from "node:assert/strict";
+import { PassThrough } from "node:stream";
+import test from "node:test";
+
+import {
+  cleanupLinuxQualificationProcesses,
+  parseLinuxProcStartTime,
+  runLinuxSecretServiceSupervisor,
+  runLinuxAccountObservationNativeQualification,
+  signalLinuxProcessIdentity,
+  validateLinuxQualificationSupervisorReceipt,
+} from "../scripts/run-linux-secret-service-qualification.mjs";
+
+const RECEIPT = Object.freeze({
+  schemaVersion: "linux-credential-qualification-v1",
+  status: "passed",
+  scope: "development_only",
+  platform: "linux",
+  architecture: "x64",
+  subject: "pinned_native_binding",
+  capabilities: 4,
+  lifecycle: "round_trip_absence_confirmed",
+  cleanup: "confirmed",
+  leaseCrossProcessSafe: false,
+  crashRecoveryComplete: false,
+});
+
+function createQualificationChild({ stdout = "", stderr = "" } = {}) {
+  const stdoutStream = new PassThrough();
+  const stderrStream = new PassThrough();
+  const child = Object.freeze({
+    pid: 42,
+    stdout: stdoutStream,
+    stderr: stderrStream,
+  });
+  queueMicrotask(() => {
+    stdoutStream.end(stdout);
+    stderrStream.end(stderr);
+  });
+  return child;
+}
+
+function isolatedSupervisorRuntime(overrides = {}) {
+  return {
+    platform: "linux",
+    architecture: "x64",
+    environment: {
+      HOME: "/home/node",
+      TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED: "1",
+    },
+    listProcesses: async () => [],
+    spawnChild: () => createQualificationChild({
+      stdout: JSON.stringify(RECEIPT),
+    }),
+    readProcessGroupIdentity: async () => Object.freeze({
+      pid: 42,
+      executable: "/usr/bin/dbus-run-session",
+      startTime: "100",
+    }),
+    cleanupProcesses: async () => true,
+    waitForChildClose: async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+      return [0, null];
+    },
+    scheduleDeadline: () => Object.freeze({ kind: "fake-timer" }),
+    cancelDeadline: () => {},
+    ...overrides,
+  };
+}
+
+test("Linux Secret Service supervisor parses exact process start identities", () => {
+  const fieldsThreeThroughTwentyTwo = [
+    "S", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "10", "11", "12", "13", "14", "15", "16", "17", "18", "98765",
+  ];
+  assert.equal(
+    parseLinuxProcStartTime(`42 (gnome keyring daemon) ${fieldsThreeThroughTwentyTwo.join(" ")}`),
+    "98765",
+  );
+  assert.equal(parseLinuxProcStartTime("42 malformed"), null);
+  assert.equal(parseLinuxProcStartTime("x".repeat(16_385)), null);
+});
+
+test("Linux Secret Service supervisor accepts only the exact content-free receipt", () => {
+  assert.deepEqual(validateLinuxQualificationSupervisorReceipt({ ...RECEIPT }), RECEIPT);
+  assert.equal(validateLinuxQualificationSupervisorReceipt({ ...RECEIPT, extra: true }), null);
+  assert.equal(validateLinuxQualificationSupervisorReceipt({
+    ...RECEIPT,
+    cleanup: "best_effort",
+  }), null);
+  assert.equal(validateLinuxQualificationSupervisorReceipt(Object.create(RECEIPT)), null);
+});
+
+test("Linux Secret Service supervisor rejects a preexisting qualification daemon before spawn", async () => {
+  let spawnCalls = 0;
+  const identity = Object.freeze({
+    pid: 77,
+    executable: "/usr/bin/gnome-keyring-daemon",
+    startTime: "200",
+  });
+  const outcome = await runLinuxSecretServiceSupervisor(
+    isolatedSupervisorRuntime({
+      listProcesses: async () => [identity],
+      spawnChild: () => {
+        spawnCalls += 1;
+        return createQualificationChild();
+      },
+    }),
+  );
+  assert.deepEqual(outcome, {
+    status: "failed",
+    code: "LINUX_SECRET_SERVICE_SUPERVISOR_ISOLATION_DIRTY",
+  });
+  assert.equal(spawnCalls, 0);
+});
+
+test("Linux Secret Service supervisor times out only after cleanup is confirmed", async () => {
+  const processGroupIdentity = Object.freeze({
+    pid: 42,
+    executable: "/usr/bin/dbus-run-session",
+    startTime: "100",
+  });
+  const cleanupCalls = [];
+  let cancelledTimer = null;
+  const timer = Object.freeze({ kind: "deadline" });
+  const outcome = await runLinuxSecretServiceSupervisor(
+    isolatedSupervisorRuntime({
+      readProcessGroupIdentity: async () => processGroupIdentity,
+      waitForChildClose: () => new Promise(() => {}),
+      scheduleDeadline: (callback, durationMs) => {
+        assert.equal(durationMs, 123);
+        queueMicrotask(callback);
+        return timer;
+      },
+      cancelDeadline: (value) => {
+        cancelledTimer = value;
+      },
+      cleanupProcesses: async (identity) => {
+        cleanupCalls.push(identity);
+        return true;
+      },
+      waitFor: async (durationMs) => {
+        assert.equal(durationMs, 17);
+      },
+      childDeadlineMs: 123,
+      killCleanupDeadlineMs: 17,
+    }),
+  );
+  assert.deepEqual(outcome, {
+    status: "failed",
+    code: "LINUX_SECRET_SERVICE_SUPERVISOR_DEADLINE_EXCEEDED",
+  });
+  assert.equal(cancelledTimer, timer);
+  assert.deepEqual(cleanupCalls, [processGroupIdentity]);
+});
+
+test("Linux Secret Service supervisor reports cleanup failure ahead of timeout", async () => {
+  const outcome = await runLinuxSecretServiceSupervisor(
+    isolatedSupervisorRuntime({
+      waitForChildClose: () => new Promise(() => {}),
+      scheduleDeadline: (callback) => {
+        queueMicrotask(callback);
+        return Object.freeze({ kind: "deadline" });
+      },
+      cleanupProcesses: async () => false,
+    }),
+  );
+  assert.deepEqual(outcome, {
+    status: "failed",
+    code: "LINUX_SECRET_SERVICE_SUPERVISOR_PROCESS_CLEANUP_FAILED",
+  });
+});
+
+test("Linux Secret Service supervisor fails closed when captured output overflows", async () => {
+  let cleanupCalls = 0;
+  const outcome = await runLinuxSecretServiceSupervisor(
+    isolatedSupervisorRuntime({
+      spawnChild: () => createQualificationChild({ stdout: "123456789" }),
+      cleanupProcesses: async () => {
+        cleanupCalls += 1;
+        return true;
+      },
+      maxOutputBytes: 8,
+    }),
+  );
+  assert.deepEqual(outcome, {
+    status: "failed",
+    code: "LINUX_SECRET_SERVICE_SUPERVISOR_OUTPUT_INVALID",
+  });
+  assert.equal(cleanupCalls, 1);
+});
+
+test("Linux Secret Service cleanup escalates exact identities from TERM to KILL", async () => {
+  const group = Object.freeze({
+    pid: 42,
+    executable: "/usr/bin/dbus-run-session",
+    startTime: "100",
+  });
+  const daemon = Object.freeze({
+    pid: 43,
+    executable: "/usr/bin/gnome-keyring-daemon",
+    startTime: "101",
+  });
+  const events = [];
+  const cleanupConfirmed = await cleanupLinuxQualificationProcesses(group, {
+    signalGroup: async (identity, signal) => {
+      events.push(["group", identity, signal]);
+    },
+    listProcesses: async () => {
+      events.push(["list"]);
+      return [daemon];
+    },
+    signalIdentity: async (identity, signal) => {
+      events.push(["identity", identity, signal]);
+    },
+    waitForExit: async (deadlineMs) => {
+      events.push(["wait", deadlineMs]);
+      return false;
+    },
+    cleanupDeadlineMs: 123,
+    killCleanupDeadlineMs: 17,
+  });
+  assert.equal(cleanupConfirmed, false);
+  assert.deepEqual(events, [
+    ["group", group, "SIGTERM"],
+    ["list"],
+    ["identity", daemon, "SIGTERM"],
+    ["wait", 123],
+    ["group", group, "SIGKILL"],
+    ["list"],
+    ["identity", daemon, "SIGKILL"],
+    ["wait", 17],
+  ]);
+});
+
+test("Linux Secret Service cleanup accepts a proved post-KILL exit", async () => {
+  const waits = [];
+  const cleanupConfirmed = await cleanupLinuxQualificationProcesses(
+    Object.freeze({
+      pid: 42,
+      executable: "/usr/bin/dbus-run-session",
+      startTime: "100",
+    }),
+    {
+      signalGroup: async () => {},
+      listProcesses: async () => [],
+      signalIdentity: async () => {},
+      waitForExit: async (deadlineMs) => {
+        waits.push(deadlineMs);
+        return waits.length === 2;
+      },
+      cleanupDeadlineMs: 123,
+      killCleanupDeadlineMs: 17,
+    },
+  );
+  assert.equal(cleanupConfirmed, true);
+  assert.deepEqual(waits, [123, 17]);
+});
+
+test("Linux Secret Service signaling rejects PID-reused identities", async () => {
+  const expected = Object.freeze({
+    pid: 42,
+    executable: "/usr/bin/gnome-keyring-daemon",
+    startTime: "100",
+  });
+  const signals = [];
+  const killProcess = (pid, signal) => signals.push([pid, signal]);
+  const startTimeChanged = await signalLinuxProcessIdentity(expected, "SIGTERM", {
+    readIdentity: async () => Object.freeze({ ...expected, startTime: "101" }),
+    killProcess,
+  });
+  const executableChanged = await signalLinuxProcessIdentity(expected, "SIGTERM", {
+    readIdentity: async () => Object.freeze({
+      ...expected,
+      executable: "/usr/bin/dbus-daemon",
+    }),
+    killProcess,
+  });
+  const exactGroup = await signalLinuxProcessIdentity(expected, "SIGKILL", {
+    asProcessGroup: true,
+    readIdentity: async () => expected,
+    killProcess,
+  });
+  assert.equal(startTimeChanged, false);
+  assert.equal(executableChanged, false);
+  assert.equal(exactGroup, true);
+  assert.deepEqual(signals, [[-42, "SIGKILL"]]);
+});
+
+
+const OBSERVATION_RECEIPT = Object.freeze({
+  schemaVersion: "linux-account-observation-qualification-v1",
+  status: "passed",
+  scope: "development_only",
+  platform: "linux",
+  architecture: "x64",
+  subject: "pinned_native_binding",
+  capability: "account_observation",
+  lifecycle: "read_create_no_replace_and_digest_reconciliation",
+  credentialCleanup: "disposable_container_lifetime",
+  productionSafe: false,
+});
+
+test("observation qualification accepts only its own exact receipt and profile", async () => {
+  assert.deepEqual(validateLinuxQualificationSupervisorReceipt(OBSERVATION_RECEIPT, "account_observation"), OBSERVATION_RECEIPT);
+  assert.equal(validateLinuxQualificationSupervisorReceipt(OBSERVATION_RECEIPT), null);
+  assert.equal(validateLinuxQualificationSupervisorReceipt(RECEIPT, "account_observation"), null);
+  assert.equal(validateLinuxQualificationSupervisorReceipt(OBSERVATION_RECEIPT, "arbitrary-command"), null);
+  assert.equal(validateLinuxQualificationSupervisorReceipt({ ...OBSERVATION_RECEIPT, productionSafe: true }, "account_observation"), null);
+  let spawns = 0;
+  const invalid = await runLinuxSecretServiceSupervisor(isolatedSupervisorRuntime({
+    profile: "arbitrary-command",
+    spawnChild: () => { spawns += 1; throw new Error("must not spawn"); },
+  }));
+  assert.equal(invalid.code, "LINUX_SECRET_SERVICE_SUPERVISOR_PROFILE_INVALID");
+  assert.equal(spawns, 0);
+  const passed = await runLinuxSecretServiceSupervisor(isolatedSupervisorRuntime({
+    profile: "account_observation",
+    spawnChild: () => createQualificationChild({ stdout: JSON.stringify(OBSERVATION_RECEIPT) }),
+  }));
+  assert.deepEqual(passed, { status: "passed", receipt: OBSERVATION_RECEIPT });
+  const crossProfile = await runLinuxSecretServiceSupervisor(isolatedSupervisorRuntime({ profile: "account_observation" }));
+  assert.equal(crossProfile.code, "LINUX_SECRET_SERVICE_SUPERVISOR_RECEIPT_INVALID");
+});
+
+test("native observation proof requires actual success marker and bounded fixed invocation", () => {
+  const environment = { TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED: "1", DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic-bus" };
+  const runtime = {
+    platform: "linux", architecture: "x64", environment,
+    proveIsolation: ({ environment: observed }) => {
+      assert.equal(observed, environment);
+      return { status: "isolated" };
+    },
+    startDaemon: () => ({ status: "started" }),
+  };
+  const execute = (outcome) => runLinuxAccountObservationNativeQualification({
+    ...runtime,
+    spawnTest: (executable, args, options) => {
+      assert.equal(executable, process.execPath);
+      assert.deepEqual(args, ["--test", "--test-reporter=tap", "test/linux-account-observation-credential-native.test.js"]);
+      assert.equal(options.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST, "1");
+      assert.equal(options.env.DBUS_SESSION_BUS_ADDRESS, environment.DBUS_SESSION_BUS_ADDRESS);
+      assert.equal(options.timeout, 15_000);
+      assert.equal(options.maxBuffer, 16_384);
+      assert.equal(options.shell, false);
+      assert.deepEqual(options.stdio, ["ignore", "pipe", "pipe"]);
+      return outcome;
+    },
+  });
+  assert.throws(() => execute({
+    status: 1, signal: null,
+    stdout: "# LINUX_ACCOUNT_OBSERVATION_PHASE_INITIAL_READ\n# LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE\nprivate native diagnostic\n",
+  }), (error) => error.code === "LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_CREATE"
+    && error.message === "LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED");
+  for (const phase of [
+    "CREATE_PRECHECK", "CREATE_PRECHECK_UNAVAILABLE", "CREATE_PRECHECK_RECOVERY_REQUIRED",
+    "CREATE_PRECHECK_OTHER", "CREATE_MUTATION", "CREATE_MUTATION_UNAVAILABLE",
+    "CREATE_MUTATION_RECOVERY_REQUIRED", "CREATE_MUTATION_OTHER",
+    "SERVICE_DEADLINE_NATIVE_WATCHDOG", "SERVICE_DEADLINE_NATIVE_LEASE",
+    "SERVICE_DEADLINE_NATIVE_READ", "SERVICE_DEADLINE_NATIVE_DEADLINE",
+    "SERVICE_DEADLINE_NATIVE_OTHER",
+    "CREATE_NATIVE_READ", "CREATE_NATIVE_READ_UNAVAILABLE", "CREATE_NATIVE_READ_RECOVERY_REQUIRED",
+    "CREATE_NATIVE_READ_OTHER", "CREATE_COLLECTION", "CREATE_COLLECTION_READY",
+    "CREATE_COLLECTION_MISSING", "CREATE_COLLECTION_LOCKED", "CREATE_COLLECTION_UNAVAILABLE",
+    "CREATE_COLLECTION_INVALID",
+    "CREATE_MUTATION_NATIVE_WATCHDOG_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_LEASE_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_READ_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_DEADLINE_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_PRE_CANCELLED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_NULL_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_LOCKED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_POST_CANCELLED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_OTHER_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_CANCELLED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_TIMED_OUT_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_NOT_FOUND_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_PERMISSION_DENIED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_INVALID_ARGUMENT_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_NOT_INITIALIZED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_NOT_SUPPORTED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_CLOSED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_DBUS_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_GIO_OTHER_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_SERVICE_UNKNOWN_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_NO_OWNER_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_NO_REPLY_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_ACCESS_DENIED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_AUTH_FAILED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_TIMEOUT_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_DISCONNECTED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_INVALID_ARGUMENT_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_NOT_SUPPORTED_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_NOT_FOUND_UNAVAILABLE",
+    "CREATE_MUTATION_NATIVE_COLLECTION_ERROR_DBUS_OTHER_UNAVAILABLE",
+  ]) {
+    assert.throws(() => execute({
+      status: 1, signal: null,
+      stdout: `# LINUX_ACCOUNT_OBSERVATION_PHASE_INITIAL_READ\r\n# LINUX_ACCOUNT_OBSERVATION_PHASE_${phase}\r\nprivate native diagnostic\r\n`,
+    }), (error) => error.code === `LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_${phase}`
+      && error.message === "LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED");
+  }
+  assert.throws(() => execute({
+    status: 1, signal: null,
+    stdout: "# LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION\n# LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION_PRIVATE_DATA\n",
+  }), (error) => error.code === "LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_CREATE_MUTATION");
+  assert.throws(() => execute({
+    status: 1, signal: null,
+    stdout: "# LINUX_ACCOUNT_OBSERVATION_PHASE_PRIVATE_DATA\n",
+  }), (error) => error.code === "LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_BEFORE_TEST");
+  for (const eol of ["\n", "\r\n"]) {
+    assert.deepEqual(execute({ status: 0, signal: null, stdout: `TAP version 13${eol}# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED${eol}` }), OBSERVATION_RECEIPT);
+  }
+  for (const outcome of [
+    { status: 0, signal: null, stdout: "ok 1 - native observation # SKIP\n" },
+    { status: 0, signal: null, stdout: "" },
+    { status: 0, signal: null, stdout: "# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n" },
+    { status: 1, signal: null, stdout: "# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n" },
+    { status: 0, signal: "SIGTERM", stdout: "# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n" },
+    { status: 0, signal: null, error: new Error("synthetic failure"), stdout: "# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n" },
+  ]) assert.throws(() => execute(outcome), /LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED/u);
+  for (const refusal of [
+    { environment: {} },
+    { platform: "darwin" },
+    { architecture: "arm64" },
+    { proveIsolation: () => ({ status: "not_isolated" }) },
+    { startDaemon: () => ({ status: "failed" }) },
+  ]) {
+    let spawned = false;
+    assert.throws(() => runLinuxAccountObservationNativeQualification({
+      ...runtime,
+      ...refusal,
+      spawnTest: () => { spawned = true; },
+    }), /LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED/u);
+    assert.equal(spawned, false);
+  }
+});

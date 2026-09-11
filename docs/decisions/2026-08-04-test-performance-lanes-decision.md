@@ -2,7 +2,7 @@
 title: Test performance lanes
 date: 2026-08-04
 type: decision-record
-status: implemented
+status: complete
 ---
 
 # Test performance lanes

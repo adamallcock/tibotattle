@@ -16,7 +16,7 @@ import {
   createExportResourceGuard,
   readBoundedDirectoryEntries,
 } from "../src/export-resource-policy.js";
-import { normalizeClaudeTranscriptUsageCandidate, scanCodexSafeRecords } from "../src/export-safe-records.js";
+import { localSafeRecords } from "../src/local-node-runtime.js";
 import {
   createR7ReleaseWorkloadFixture,
   inspectR7ReleaseWorkloadFixture,
@@ -29,6 +29,11 @@ import {
   R7_RELEASE_SYNTHETIC_SEMANTICS_PARAMETERS,
   R7_RELEASE_WORKLOAD_START_AT,
 } from "../src/r7-release-workload-fixture.js";
+
+const {
+  normalizeClaudeTranscriptUsageCandidate,
+  scanCodexSafeRecords,
+} = localSafeRecords;
 
 const SECRET = Buffer.alloc(32, 0x45);
 const TEST_OPTIONS = Object.freeze({

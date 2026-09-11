@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import * as codexLocalUsageAnalysis from "../src/codex-local-usage-analysis.js";
-import * as codexLogScanner from "../src/codex-log-scan.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { extractEsmImports } from "../scripts/lib/esm-imports.mjs";
 
 const START_AT = "2026-07-30T00:00:00.000Z";
@@ -154,30 +154,26 @@ async function createCodexRolloutFixture() {
   return { codexHome, rolloutPath };
 }
 
-test("Codex pricing analysis has one public entry point and stays out of the scanner", async () => {
+test("Codex pricing analysis has one public entry point and stays out of the scanner owner", async () => {
   assert.deepEqual(
     Object.keys(codexLocalUsageAnalysis),
     ["scanAndPriceCodexLogs"],
   );
-  assert.equal(
-    codexLogScanner.scanAndPriceCodexLogs,
-    codexLocalUsageAnalysis.scanAndPriceCodexLogs,
-    "the scanner preserves the legacy application-owned pricing binding",
-  );
+  assert.equal(Object.hasOwn(localCodexLogScanner, "scanAndPriceCodexLogs"), false);
 
   const scannerSource = await readFile(
-    new URL("../src/codex-log-scan.js", import.meta.url),
+    new URL("../src/application/local-codex-log-scanner.js", import.meta.url),
     "utf8",
   );
   const forbiddenImports = (await extractEsmImports(scannerSource, {
-    sourceName: "src/codex-log-scan.js",
+    sourceName: "src/application/local-codex-log-scanner.js",
   }))
     .map(({ specifier }) => specifier)
     .filter(isForbiddenScannerImport);
   assert.deepEqual(
     forbiddenImports,
     [],
-    "the Codex scanner must remain independent from every pricing/accounting entry point",
+    "the Codex scanner owner must remain independent from every pricing/accounting entry point",
   );
 });
 
@@ -272,6 +268,14 @@ test("Codex pricing analysis preserves exact model/day/surface and tool-unit out
         modelCostUsd: 2.157,
       },
     });
+
+    // Tool-call prices remain in the API total but never enter the token-speed
+    // scenario. An unregistered fixture model uses only the disclosed fallback.
+    const sensitivity = result.runcost.subscriptionSpeedSensitivity;
+    assert.equal(sensitivity.scenarios.standard.weightedStandardApiEquivalentUsd, 2.15);
+    assert.equal(sensitivity.scenarios.fast.weightedStandardApiEquivalentUsd, 4.3);
+    assert.equal(sensitivity.scenarios.fast.assumedRatioStandardApiEquivalentUsd, 2.15);
+    assert.equal(sensitivity.modelMultipliers[MODEL], null);
 
     const serialized = JSON.stringify(result);
     for (const privateValue of [

@@ -173,18 +173,6 @@ export function localCompanionStatePaths(stateRoot) {
       selected,
       "local-unified-index-device-salt-v1",
     ),
-    // Claude Desktop plan quota is intentionally outside the Codex collector
-    // database. Its source/account pseudonyms use a distinct owner-only key,
-    // so neither product's local identity namespace can be joined to the
-    // other by accident.
-    claudeDesktopQuotaStateFile: join(
-      selected,
-      "claude-desktop-quota-state-v1.sqlite",
-    ),
-    claudeDesktopQuotaSecretFile: join(
-      selected,
-      "claude-desktop-quota-state-v1-secret",
-    ),
     // Reserved, provider-isolated paths for the opt-in development shadow.
     // Merely resolving installation paths never creates these files; the
     // installed companion leaves shadow usage disabled until a reviewed
@@ -243,10 +231,14 @@ export function localCompanionStatePaths(stateRoot) {
       "private",
       "hosted-signin-handoff-v1.json",
     ),
-    fastModePreferenceFile: join(
+    // A bounded, generation-matched dashboard receipt used only when the
+    // current build cannot read its local history. It never replaces the
+    // unified index and lives under the same owner-only private boundary as
+    // the other local companion preferences.
+    authoritativeDashboardSnapshotFile: join(
       selected,
       "private",
-      "fast-mode-preference-v0.1.json",
+      "authoritative-dashboard-snapshot-v1.json",
     ),
     codexSpeedBaselineFile: join(
       selected,

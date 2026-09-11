@@ -4,10 +4,24 @@ import {
   createSecretKey,
   randomBytes,
 } from "node:crypto";
-import { constants, lstatSync } from "node:fs";
-import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { closeSync, constants, lstatSync, openSync } from "node:fs";
+import {
+  chmod,
+  copyFile,
+  mkdtemp,
+  rm,
+  lstat,
+  mkdir,
+  open,
+  opendir,
+  rename,
+  unlink,
+} from "node:fs/promises";
+import { basename, dirname, resolve, join, isAbsolute } from "node:path";
+import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
+
+import { syncDirectory } from "./platform/index.js";
 
 // The one local index.
 //
@@ -32,7 +46,8 @@ import { DatabaseSync } from "node:sqlite";
 //   * `scope_local` is the same construction over the local account scope id.
 
 export const LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v2";
-const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
+export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
+  "local-unified-index-v1";
 
 // Stamped onto every row. A parser change re-scans only the affected rows'
 // source files; rows whose rollout files have rotated away keep their
@@ -83,7 +98,46 @@ const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 // v8 (2026-08-17): typed response-item tool observations are source-scoped and
 // generation-bound. Existing v7 cursors must rescan so a complete generation
 // cannot silently publish an empty tool projection for already indexed files.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v8";
+//
+// v9 (2026-08-23): stable thread identity and immutable rollout identity are
+// separate. Source and event keys are now rollout-scoped, and paginated
+// history-base counters are seeded at their exact byte/ordinal boundary. This
+// changes primary-key semantics, so incremental ingest performs a cold staged
+// rebuild instead of mixing v8 and v9 facts.
+//
+// v10 (2026-08-23): every scan is bound to one opened physical source
+// snapshot. Malformed accounting and unfinished JSONL tails are quarantined,
+// with physical identity and the quarantine reason persisted in the cursor so
+// an unchanged damaged rollout terminates cheaply and a changed one retries
+// from byte zero.
+//
+// v11 (2026-08-29): an invalid quota window is withheld at record level while
+// valid usage, tool, and quota facts from the same source remain available.
+// A paginated replacement without history_base resets the selected lineage
+// snapshot generation at the source-start boundary accepted by Codex.
+// v12 (2026-09-04): preserve missing usage components as nullable facts and
+// cursor counters. Existing retained sources reparse from byte zero; removed
+// sources keep their original parser provenance rather than inventing proof.
+// v13 (2026-09-04): recover compaction boundaries whose top-level header
+// includes the current Codex serializer's ordinal before type.
+// v14 (2026-09-04): paginated resets and exact history-base unknowns cannot
+// inherit a logical parent's later model, effort, tier or counter state.
+// Resume keeps own cursor state and reconstructs an absent inherited tier
+// only from the same exact physical base, never the parent's final state.
+// Inline descendants also stop tier and replay-snapshot traversal at that
+// physical boundary instead of reviving discarded logical-ancestor history.
+// Logical-parent state and ancestry are selected by resolved head, never by
+// dependency/scan order among retained physical generations of one thread.
+// v15 (2026-09-07): parent model declarations at/before the event and fork
+// boundary recover missing paginated-fork models. Explicit child selections
+// supersede the default. Counters, effort, tier and replay remain independent.
+// v16 (2026-09-09): missing cache-write counts use the explicit product
+// assumption of zero when input/cache-read counters are valid and consistent.
+// A per-event suffix retains the assumption; raw delta/replay counters do not
+// change. The base cursor stamp forces historical sources to be reparsed.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v16";
+export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
+  "codex-immutable-rollout-v1";
 
 // A row salvaged from a line that exceeded the bounded-line cap carries this
 // parser version instead. The agreed schema has no "partial" column and the
@@ -92,9 +146,17 @@ export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v8";
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v8-partial";
+  "unified-rollout-typed-v16-partial";
 
-const INDEX_APPLICATION_ID = 0x554d5549;
+// Per-row provenance variants retain the inherited-model assumption without
+// changing the physical schema. Ingest cursors keep the base v16 stamp.
+export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION =
+  "unified-rollout-typed-v16-parent-model";
+export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION =
+  "unified-rollout-typed-v16-parent-model-partial";
+
+export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
+const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;
 // Version 2 (2026-08-07) widens version 1 with the two incremental-ingest
 // tables below: `source_cursor` and `lineage_snapshot`. Version 3 (2026-08-07)
 // adds `session_identity`, the raw provider-issued session UUID beside its
@@ -109,9 +171,23 @@ const INDEX_APPLICATION_ID = 0x554d5549;
 // generation-bound tool facts and widens the closed diagnostic vocabulary.
 // Each widening is additive except that closed diagnostic CHECK widening,
 // which is rebuilt transactionally while preserving every existing row.
-export const LOCAL_UNIFIED_INDEX_USER_VERSION = 8;
+// Version 11 (2026-08-28) makes the source- and quota-keyed usage indexes
+// required schema. Runtime quarantine cleanup needs both to remain bounded
+// after a deferred-index cold load.
+export const LOCAL_UNIFIED_INDEX_USER_VERSION = 11;
 const INDEX_USER_VERSION = LOCAL_UNIFIED_INDEX_USER_VERSION;
-const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+// Compatibility is persisted separately from PRAGMA user_version so a newer
+// writer can describe the oldest reader and writer that understand its
+// semantics. The current format intentionally requires v11 for both: cleanup
+// query-plan bounds are part of safe staged publication, not optional tuning.
+export const LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION = 11;
+export const LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION = 11;
+const COMPATIBILITY_META_KEYS = Object.freeze({
+  formatUserVersion: "compatibility_format_user_version",
+  minimumReaderUserVersion: "compatibility_minimum_reader_user_version",
+  minimumWriterUserVersion: "compatibility_minimum_writer_user_version",
+});
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
@@ -120,6 +196,9 @@ const DIAGNOSTIC_CODES = new Set([
   "relevantLines",
   "malformedLines",
   "malformedTimestamps",
+  "malformedAccountingRecords",
+  "malformedUsageRecords",
+  "malformedRateLimitRecords",
   "partialLines",
   "salvagedRecords",
   "turnContexts",
@@ -137,6 +216,14 @@ const DIAGNOSTIC_CODES = new Set([
   "toolEvents",
   "toolRecordsSkipped",
   "toolSourceHistoryUnavailable",
+]);
+const GENERATION_ISSUE_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
 ]);
 // The one shape a stored raw session identity may take: the provider-issued
 // UUID. Deliberately narrower than the transport regex so a filename-shaped
@@ -221,6 +308,9 @@ const SCHEMA = `
     discovered_source_bytes INTEGER,
     indexed_source_count INTEGER,
     indexed_source_bytes INTEGER,
+    skipped_source_count INTEGER,
+    skipped_source_bytes INTEGER,
+    skipped_thread_count INTEGER,
     usage_events INTEGER,
     quota_occurrences INTEGER,
     covered_start_ms INTEGER,
@@ -404,6 +494,16 @@ const SCHEMA = `
     scanned_bytes INTEGER NOT NULL,
     size_bytes INTEGER NOT NULL,
     mtime_ms INTEGER NOT NULL,
+    source_dev INTEGER,
+    source_ino INTEGER,
+    source_birthtime_ms INTEGER,
+    source_ctime_ms INTEGER,
+    source_identity_token TEXT,
+    source_state_token TEXT,
+    quarantine_code TEXT CHECK(quarantine_code IS NULL OR quarantine_code IN (
+      'codex_rollout_content_invalid',
+      'codex_rollout_tail_incomplete',
+      'codex_rollout_lineage_invalid')),
     -- 1 when this source's whole fork-replay snapshot set is durably in
     -- lineage_snapshot. A source scanned before anything forked from it was
     -- never asked to collect one; when a fork of it later appears, the
@@ -477,6 +577,38 @@ const SCHEMA = `
       CHECK(diagnostics_complete IN (0, 1)),
     PRIMARY KEY(generation_id, source_local)) STRICT, WITHOUT ROWID;
 
+  -- One bounded row per quarantine reason in a publication. Counts only: no
+  -- path, thread id, rollout id, basename, message text or payload crosses
+  -- this boundary. Owner-directed diagnostics use the separately salted
+  -- discovery receipt before publication.
+  CREATE TABLE IF NOT EXISTS generation_issue(
+    generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+    code TEXT NOT NULL CHECK(code IN (
+      'codex_rollout_compression_unsupported',
+      'codex_rollout_filename_identity_mismatch',
+      'codex_rollout_generation_ambiguous',
+      'codex_rollout_lineage_invalid',
+      'codex_rollout_content_invalid',
+      'codex_rollout_tail_incomplete')),
+    thread_count INTEGER NOT NULL CHECK(thread_count >= 0),
+    source_count INTEGER NOT NULL CHECK(source_count >= 0),
+    source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+    PRIMARY KEY(generation_id, code)) STRICT, WITHOUT ROWID;
+
+  CREATE TABLE IF NOT EXISTS generation_issue_group(
+    generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+    group_local BLOB NOT NULL CHECK(length(group_local) = 32),
+    code TEXT NOT NULL CHECK(code IN (
+      'codex_rollout_compression_unsupported',
+      'codex_rollout_filename_identity_mismatch',
+      'codex_rollout_generation_ambiguous',
+      'codex_rollout_lineage_invalid',
+      'codex_rollout_content_invalid',
+      'codex_rollout_tail_incomplete')),
+    source_count INTEGER NOT NULL CHECK(source_count >= 0),
+    source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+    PRIMARY KEY(generation_id, group_local, code)) STRICT, WITHOUT ROWID;
+
   -- Diagnostic names are deliberately a closed set. Counts contain no source
   -- path, message or content and are only meaningful when the owning source
   -- row says diagnostics_complete=1.
@@ -485,6 +617,8 @@ const SCHEMA = `
     source_local BLOB NOT NULL CHECK(length(source_local) = 32),
     code TEXT NOT NULL CHECK(code IN (
       'relevantLines', 'malformedLines', 'malformedTimestamps',
+      'malformedAccountingRecords', 'malformedUsageRecords',
+      'malformedRateLimitRecords',
       'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
       'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
       'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
@@ -509,6 +643,16 @@ const SECONDARY_INDEX_SCHEMA = `
     ON usage_event(observed_at_ms);
   CREATE INDEX IF NOT EXISTS usage_event_session
     ON usage_event(session_local);
+  CREATE INDEX IF NOT EXISTS usage_event_source
+    ON usage_event(source_local);
+  CREATE INDEX IF NOT EXISTS usage_event_source_predecessor
+    ON usage_event(source_local, source_offset, observed_at_ms,
+                   source_ordinal, session_local);
+  CREATE INDEX IF NOT EXISTS usage_event_session_predecessor
+    ON usage_event(session_local, observed_at_ms, source_local,
+                   source_ordinal);
+  CREATE INDEX IF NOT EXISTS usage_event_quota_observation
+    ON usage_event(quota_observation_id);
   CREATE INDEX IF NOT EXISTS usage_event_boundary_session
     ON usage_event_boundary(session_local);
   CREATE INDEX IF NOT EXISTS usage_event_replay_order
@@ -528,6 +672,10 @@ const SECONDARY_INDEX_SCHEMA = `
 const SECONDARY_INDEX_NAMES = Object.freeze([
   "usage_event_observed",
   "usage_event_session",
+  "usage_event_source",
+  "usage_event_source_predecessor",
+  "usage_event_session_predecessor",
+  "usage_event_quota_observation",
   "usage_event_boundary_session",
   "usage_event_replay_order",
   "quota_occurrence_canonical",
@@ -535,10 +683,44 @@ const SECONDARY_INDEX_NAMES = Object.freeze([
   "tool_class_fact_generation",
   "tool_class_fact_source",
 ]);
+// These accelerators add no fields or admission semantics. Existing v11 files
+// remain readable without them; writable initialization and staged publication
+// add them transactionally without changing the format/minimum reader version.
+const COMPATIBLE_READER_INDEX_NAMES = new Set([
+  "usage_event_source_predecessor",
+  "usage_event_session_predecessor",
+]);
 
 function fixedError(code) {
   const error = new Error(code);
   error.code = code;
+  return error;
+}
+
+function schemaNewerError(compatibility, { readOnly = false } = {}) {
+  const accessRequirement = readOnly
+    ? compatibility.minimumReaderUserVersion
+    : compatibility.minimumWriterUserVersion;
+  const requirements = [
+    ["pragma_user_version", compatibility.userVersion],
+    ["format_user_version", compatibility.formatUserVersion],
+    [readOnly ? "minimum_reader_user_version" : "minimum_writer_user_version",
+      accessRequirement],
+  ].filter(([, version]) => Number.isSafeInteger(version)
+    && version > INDEX_USER_VERSION);
+  const error = fixedError("local_unified_index_schema_newer");
+  error.compatibility = Object.freeze({
+    accessMode: readOnly ? "read" : "write",
+    databaseUserVersion: compatibility.userVersion,
+    formatUserVersion: compatibility.formatUserVersion,
+    supportedUserVersion: INDEX_USER_VERSION,
+    minimumReaderUserVersion: compatibility.minimumReaderUserVersion,
+    minimumWriterUserVersion: compatibility.minimumWriterUserVersion,
+    requiredUserVersion: Math.max(...requirements.map(([, version]) => version)),
+    requirements: Object.freeze(requirements.map(([requirement, version]) => (
+      Object.freeze({ requirement, version })
+    ))),
+  });
   return error;
 }
 
@@ -552,6 +734,10 @@ export function defaultLocalUnifiedIndexSecretPath(
   return resolve(dirname(resolve(indexFile)), "local-unified-index-device-salt-v1");
 }
 
+export function defaultLocalUnifiedIndexRecoveryLockPath(indexFile) {
+  return `${resolve(indexFile)}.recovery.lock`;
+}
+
 function ownerOnlyRegularFile(metadata) {
   return metadata.isFile()
     && !metadata.isSymbolicLink()
@@ -560,13 +746,86 @@ function ownerOnlyRegularFile(metadata) {
     && (process.platform === "win32" || (metadata.mode & 0o077) === 0);
 }
 
-export async function assertSafeLocalUnifiedIndexTarget(
+function safeDirectoryComponent(metadata, { trustedBoundary = false } = {}) {
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) return false;
+  if (typeof process.getuid !== "function" || process.platform === "win32") {
+    return true;
+  }
+  const currentUid = process.getuid();
+  if (metadata.uid === currentUid) {
+    // Read/execute sharing is harmless; only the owner may replace children.
+    return (metadata.mode & 0o022) === 0;
+  }
+  if (!trustedBoundary || metadata.uid !== 0) return false;
+  // Root-owned ancestors are a trust boundary. A sticky root-owned temporary
+  // directory is also safe because other users cannot replace our child.
+  return (metadata.mode & 0o022) === 0 || (metadata.mode & 0o1000) !== 0;
+}
+
+function captureSafeLocalUnifiedIndexDirectoryChain(indexFile) {
+  const chain = [];
+  let directory = dirname(resolve(indexFile));
+  while (true) {
+    let metadata;
+    try {
+      metadata = lstatSync(directory);
+    } catch {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    const ownedByCurrentUser = typeof process.getuid !== "function"
+      || metadata.uid === process.getuid();
+    const parent = dirname(directory);
+    const trustedBoundary = !ownedByCurrentUser || parent === directory;
+    if (!safeDirectoryComponent(metadata, { trustedBoundary })) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    chain.push(Object.freeze({
+      path: directory,
+      dev: metadata.dev,
+      ino: metadata.ino,
+      uid: metadata.uid,
+      mode: metadata.mode,
+    }));
+    if (trustedBoundary) break;
+    directory = parent;
+  }
+  return Object.freeze(chain);
+}
+
+function sameLocalUnifiedIndexDirectoryChain(left, right) {
+  return left.length === right.length && left.every((entry, index) => (
+    entry.path === right[index].path
+      && entry.dev === right[index].dev
+      && entry.ino === right[index].ino
+      && entry.uid === right[index].uid
+      && entry.mode === right[index].mode
+  ));
+}
+
+function recheckLocalUnifiedIndexDirectoryChain(indexFile, expected) {
+  const current = captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  if (!sameLocalUnifiedIndexDirectoryChain(expected, current)) {
+    throw fixedError("local_unified_index_file_invalid");
+  }
+  return current;
+}
+
+export function assertSafeLocalUnifiedIndexParentPath(
   indexFile,
-  { allowMissing = true } = {},
+  expectedDirectoryChain = null,
 ) {
+  const current = captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  if (expectedDirectoryChain !== null
+      && !sameLocalUnifiedIndexDirectoryChain(expectedDirectoryChain, current)) {
+    throw fixedError("local_unified_index_file_invalid");
+  }
+  return current;
+}
+
+function safeLocalUnifiedIndexTargetSync(indexFile, { allowMissing = false } = {}) {
   let metadata;
   try {
-    metadata = await lstat(resolve(indexFile));
+    metadata = lstatSync(resolve(indexFile));
   } catch (error) {
     if (allowMissing && error?.code === "ENOENT") return null;
     if (error?.code?.startsWith("local_unified_index_")) throw error;
@@ -575,6 +834,64 @@ export async function assertSafeLocalUnifiedIndexTarget(
   if (!ownerOnlyRegularFile(metadata)) {
     throw fixedError("local_unified_index_file_invalid");
   }
+  return metadata;
+}
+
+function sameLocalUnifiedIndexTarget(left, right) {
+  return ownerOnlyRegularFile(left)
+    && ownerOnlyRegularFile(right)
+    && left.dev === right.dev
+    && left.ino === right.ino;
+}
+
+function reserveNewLocalUnifiedIndexTarget(indexFile, expectedDirectoryChain) {
+  recheckLocalUnifiedIndexDirectoryChain(indexFile, expectedDirectoryChain);
+  let descriptor;
+  try {
+    descriptor = openSync(
+      resolve(indexFile),
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
+        | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    throw fixedError("local_unified_index_unavailable");
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+  const directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+    indexFile,
+    expectedDirectoryChain,
+  );
+  return Object.freeze({
+    metadata: safeLocalUnifiedIndexTargetSync(indexFile),
+    directoryChain,
+  });
+}
+
+export async function assertSafeLocalUnifiedIndexTarget(
+  indexFile,
+  { allowMissing = true } = {},
+) {
+  const directoryChain = captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  let metadata;
+  try {
+    metadata = await lstat(resolve(indexFile));
+  } catch (error) {
+    if (allowMissing && error?.code === "ENOENT") {
+      recheckLocalUnifiedIndexDirectoryChain(indexFile, directoryChain);
+      return null;
+    }
+    if (error?.code?.startsWith("local_unified_index_")) throw error;
+    throw fixedError("local_unified_index_unavailable");
+  }
+  if (!ownerOnlyRegularFile(metadata)) {
+    throw fixedError("local_unified_index_file_invalid");
+  }
+  recheckLocalUnifiedIndexDirectoryChain(indexFile, directoryChain);
   return metadata;
 }
 
@@ -607,6 +924,21 @@ export async function readOrCreateDeviceSalt(
   } finally {
     await handle?.close();
   }
+  const secret = await readExistingDeviceSalt(secretFile);
+  await chmod(secretFile, 0o600);
+  return secret;
+}
+
+/**
+ * Read an existing device salt without creating directories, changing mode,
+ * or otherwise mutating the path. Recovery preparation uses this stricter
+ * operation so a missing or damaged live identity cannot be silently repaired
+ * while constructing a candidate.
+ */
+export async function readExistingDeviceSalt(
+  secretFile = defaultLocalUnifiedIndexSecretPath(),
+) {
+  const directoryChain = captureSafeLocalUnifiedIndexDirectoryChain(secretFile);
   let readHandle;
   try {
     readHandle = await open(
@@ -619,9 +951,17 @@ export async function readOrCreateDeviceSalt(
         || metadata.size > MAX_SECRET_BYTES) {
       throw fixedError("local_unified_index_secret_invalid");
     }
-    const buffer = Buffer.alloc(metadata.size);
-    await readHandle.read(buffer, 0, buffer.length, 0);
-    await chmod(secretFile, 0o600);
+    const buffer = await readHandle.readFile();
+    const finalMetadata = await readHandle.stat();
+    if (buffer.length !== metadata.size
+        || finalMetadata.dev !== metadata.dev
+        || finalMetadata.ino !== metadata.ino
+        || finalMetadata.size !== metadata.size
+        || finalMetadata.mtimeMs !== metadata.mtimeMs
+        || finalMetadata.ctimeMs !== metadata.ctimeMs) {
+      throw fixedError("local_unified_index_secret_invalid");
+    }
+    recheckLocalUnifiedIndexDirectoryChain(secretFile, directoryChain);
     return buffer;
   } catch (error) {
     if (error?.code?.startsWith("local_unified_index_")) throw error;
@@ -748,13 +1088,16 @@ function schemaSql({ deferSecondaryIndexes = false } = {}) {
     : `${SCHEMA}\n${SECONDARY_INDEX_SCHEMA}`;
 }
 
-function assertSecondaryIndexes(database) {
-  const placeholders = SECONDARY_INDEX_NAMES.map(() => "?").join(", ");
+function assertSecondaryIndexes(database, { allowMissingCompatible = false } = {}) {
+  const requiredNames = allowMissingCompatible
+    ? SECONDARY_INDEX_NAMES.filter((name) => !COMPATIBLE_READER_INDEX_NAMES.has(name))
+    : SECONDARY_INDEX_NAMES;
+  const placeholders = requiredNames.map(() => "?").join(", ");
   const present = new Set(database.prepare(
     `SELECT name FROM sqlite_master
      WHERE type = 'index' AND name IN (${placeholders})`,
-  ).all(...SECONDARY_INDEX_NAMES).map((row) => row.name));
-  const missing = SECONDARY_INDEX_NAMES.filter((name) => !present.has(name));
+  ).all(...requiredNames).map((row) => row.name));
+  const missing = requiredNames.filter((name) => !present.has(name));
   if (missing.length > 0) {
     throw fixedError("local_unified_index_secondary_indexes_missing");
   }
@@ -791,6 +1134,7 @@ function initializeSchema(database, { deferSecondaryIndexes = false } = {}) {
   `);
   database.prepare("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)")
     .run("schema_version", LOCAL_UNIFIED_INDEX_SCHEMA_VERSION);
+  stampDatabaseCompatibility(database);
 }
 
 function tableColumns(database, tableName) {
@@ -804,12 +1148,251 @@ function tableExists(database, tableName) {
   ).get(tableName) !== undefined;
 }
 
+function compatibilityInteger(value) {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/u.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+/**
+ * Read the bounded compatibility header without changing the database.
+ * Missing metadata is accepted only on a recognized physical schema version;
+ * the next writable open migrates and stamps all three keys atomically.
+ */
+export function readLocalUnifiedIndexCompatibility(database) {
+  const applicationId = Number(
+    database.prepare("PRAGMA application_id").get()?.application_id,
+  );
+  const userVersion = Number(
+    database.prepare("PRAGMA user_version").get()?.user_version,
+  );
+  const values = new Map();
+  try {
+    if (tableExists(database, "meta")) {
+      for (const row of database.prepare(`
+        SELECT key, value FROM meta
+        WHERE key IN (?, ?, ?)
+      `).all(
+        COMPATIBILITY_META_KEYS.formatUserVersion,
+        COMPATIBILITY_META_KEYS.minimumReaderUserVersion,
+        COMPATIBILITY_META_KEYS.minimumWriterUserVersion,
+      )) {
+        values.set(row.key, row.value);
+      }
+    }
+  } catch {
+    // A future schema may reshape metadata. PRAGMA application_id and
+    // user_version remain sufficient to make the conservative typed refusal;
+    // current-version validation below still rejects a malformed meta table.
+  }
+  const formatUserVersion = compatibilityInteger(
+    values.get(COMPATIBILITY_META_KEYS.formatUserVersion),
+  );
+  const minimumReaderUserVersion = compatibilityInteger(
+    values.get(COMPATIBILITY_META_KEYS.minimumReaderUserVersion),
+  );
+  const minimumWriterUserVersion = compatibilityInteger(
+    values.get(COMPATIBILITY_META_KEYS.minimumWriterUserVersion),
+  );
+  const metadataPartial = values.size > 0 && values.size < 3;
+  const metadataMalformed = values.size === 3
+    && [formatUserVersion, minimumReaderUserVersion, minimumWriterUserVersion]
+      .some((value) => value === null);
+  return Object.freeze({
+    applicationId,
+    userVersion,
+    formatUserVersion,
+    minimumReaderUserVersion: minimumReaderUserVersion ?? userVersion,
+    minimumWriterUserVersion: minimumWriterUserVersion ?? userVersion,
+    metadataPresent: values.size === 3,
+    metadataPartial,
+    metadataMalformed,
+  });
+}
+
+function stampDatabaseCompatibility(database) {
+  const upsert = database.prepare(`
+    INSERT INTO meta(key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `);
+  upsert.run(
+    COMPATIBILITY_META_KEYS.formatUserVersion,
+    String(INDEX_USER_VERSION),
+  );
+  upsert.run(
+    COMPATIBILITY_META_KEYS.minimumReaderUserVersion,
+    String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+  );
+  upsert.run(
+    COMPATIBILITY_META_KEYS.minimumWriterUserVersion,
+    String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
+  );
+}
+
+/**
+ * Reject a database produced by a newer writer before a writable connection
+ * changes journal/header state.  The application id gate prevents an
+ * unrelated SQLite file with a high user_version being misdiagnosed as one of
+ * our indexes.
+ */
+export function assertLocalUnifiedIndexNotNewer(
+  database,
+  { readOnly = false } = {},
+) {
+  const compatibility = readLocalUnifiedIndexCompatibility(database);
+  if (compatibility.applicationId === INDEX_APPLICATION_ID
+      && (compatibility.metadataPartial || compatibility.metadataMalformed)) {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  const accessRequirement = readOnly
+    ? compatibility.minimumReaderUserVersion
+    : compatibility.minimumWriterUserVersion;
+  if (compatibility.applicationId === INDEX_APPLICATION_ID
+      && (compatibility.userVersion > INDEX_USER_VERSION
+        || compatibility.formatUserVersion > INDEX_USER_VERSION
+        || accessRequirement > INDEX_USER_VERSION)) {
+    throw schemaNewerError(compatibility, { readOnly });
+  }
+  return compatibility;
+}
+
+function currentCompatibilityIsSupported(compatibility) {
+  return !compatibility.metadataPartial
+    && (!compatibility.metadataPresent
+      || (compatibility.formatUserVersion === INDEX_USER_VERSION
+        && compatibility.minimumReaderUserVersion
+          === LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION
+        && compatibility.minimumWriterUserVersion
+          === LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION));
+}
+
+/**
+ * A writable SQLite connection can alter journal/header bytes before schema
+ * validation. Existing files therefore have to prove that they are one of our
+ * recognized current or migratable schemas through this read-only handle.
+ */
+function assertWritableLocalUnifiedIndexPreflight(database) {
+  const compatibility = assertLocalUnifiedIndexNotNewer(database, {
+    readOnly: false,
+  });
+  if (compatibility.applicationId !== INDEX_APPLICATION_ID) {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  let schemaVersion;
+  try {
+    schemaVersion = database.prepare(
+      "SELECT value FROM meta WHERE key = 'schema_version'",
+    ).get()?.value ?? null;
+  } catch {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  const legacy = MIGRATABLE_USER_VERSIONS.has(compatibility.userVersion)
+    && compatibility.userVersion < INDEX_USER_VERSION
+    // Pre-release v7-v9 databases already carried the v2 schema marker while
+    // their physical tables were still widened transactionally by later user
+    // versions. Both known markers are therefore legitimate migration roots.
+    && [
+      LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+      LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    ].includes(schemaVersion);
+  const current = compatibility.userVersion === INDEX_USER_VERSION
+    && schemaVersion === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+    && currentCompatibilityIsSupported(compatibility);
+  if (!legacy && !current) {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  return compatibility;
+}
+
+/** Check retained native data using the authoritative writer compatibility
+ * policy. SQLite may write shared-memory bytes even for a read-only WAL reader;
+ * inspect a disposable clone so the verified backup remains byte-for-byte intact.
+ */
+export async function validateRetainedNativeState({ stateRoot } = {}) {
+  if (typeof stateRoot !== "string" || !isAbsolute(stateRoot) || stateRoot.includes("\0")) {
+    throw new TypeError("Native state root must be absolute");
+  }
+  const indexFile = join(stateRoot, "local-unified-index-v1.sqlite");
+  captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  if (safeLocalUnifiedIndexTargetSync(indexFile, { allowMissing: true }) === null) return true;
+  assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
+  const scratch = await mkdtemp(join(tmpdir(), "tibotattle-native-compatibility-"));
+  try {
+    await chmod(scratch, 0o700);
+    const copiedIndex = join(scratch, "index.sqlite");
+    for (const suffix of ["", "-wal"]) {
+      const source = `${indexFile}${suffix}`;
+      const before = safeLocalUnifiedIndexTargetSync(source, { allowMissing: suffix !== "" });
+      if (before === null) continue;
+      await copyFile(source, `${copiedIndex}${suffix}`, constants.COPYFILE_EXCL | constants.COPYFILE_FICLONE);
+      await chmod(`${copiedIndex}${suffix}`, 0o600);
+      if (!sameLocalUnifiedIndexTarget(before, safeLocalUnifiedIndexTargetSync(source))) {
+        throw fixedError("local_unified_index_file_invalid");
+      }
+    }
+    return validateLocalUnifiedIndexForMigration(copiedIndex);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
+/** Read-only compatibility check for an owner-private migration backup.
+ * Reuses the writer preflight so all supported historical schemas are admitted
+ * without opening a writable connection or migrating the preserved backup.
+ */
+export function validateLocalUnifiedIndexForMigration(indexFile) {
+  const path = resolve(indexFile);
+  let chain = captureSafeLocalUnifiedIndexDirectoryChain(path);
+  const before = safeLocalUnifiedIndexTargetSync(path, { allowMissing: true });
+  if (before === null) return true;
+  assertLocalUnifiedIndexRecoveryUnlocked(path);
+  let database;
+  try {
+    database = new DatabaseSync(path, { readOnly: true, timeout: 5_000 });
+    chain = recheckLocalUnifiedIndexDirectoryChain(path, chain);
+    if (!sameLocalUnifiedIndexTarget(before, safeLocalUnifiedIndexTargetSync(path))) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    assertWritableLocalUnifiedIndexPreflight(database);
+    recheckLocalUnifiedIndexDirectoryChain(path, chain);
+    if (!sameLocalUnifiedIndexTarget(before, safeLocalUnifiedIndexTargetSync(path))) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    return true;
+  } catch (error) {
+    if (error?.code?.startsWith("local_unified_index_")) throw error;
+    throw fixedError("local_unified_index_unavailable");
+  } finally {
+    database?.close();
+  }
+}
+
+export function assertLocalUnifiedIndexRecoveryUnlocked(indexFile) {
+  try {
+    const metadata = lstatSync(defaultLocalUnifiedIndexRecoveryLockPath(indexFile));
+    if (!ownerOnlyRegularFile(metadata)) {
+      throw fixedError("local_unified_index_recovery_lock_invalid");
+    }
+    throw fixedError("local_unified_index_recovery_in_progress");
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    if (error?.code?.startsWith("local_unified_index_")) throw error;
+    throw fixedError("local_unified_index_recovery_lock_invalid");
+  }
+}
+
 function addColumnIfMissing(database, tableName, columnName, definition) {
   if (tableColumns(database, tableName).has(columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
 }
 
 function ensureGenerationAttestationColumns(database) {
+  addColumnIfMissing(database, "index_generation", "skipped_source_count",
+    "INTEGER");
+  addColumnIfMissing(database, "index_generation", "skipped_source_bytes",
+    "INTEGER");
+  addColumnIfMissing(database, "index_generation", "skipped_thread_count",
+    "INTEGER");
   addColumnIfMissing(database, "index_generation", "usage_provenance_complete",
     "INTEGER NOT NULL DEFAULT 0 CHECK(usage_provenance_complete IN (0, 1))");
   addColumnIfMissing(database, "index_generation", "source_order_complete",
@@ -822,13 +1405,16 @@ function ensureGenerationAttestationColumns(database) {
     "INTEGER NOT NULL DEFAULT 0 CHECK(tool_provenance_complete IN (0, 1))");
 }
 
-function ensureToolDiagnosticCodes(database) {
+function ensureDiagnosticCodes(database) {
   const sql = database.prepare(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'source_diagnostic'",
   ).get()?.sql;
   if (typeof sql !== "string"
       || (sql.includes("toolRecordsSkipped")
-        && sql.includes("toolSourceHistoryUnavailable"))) return;
+        && sql.includes("toolSourceHistoryUnavailable")
+        && sql.includes("malformedAccountingRecords")
+        && sql.includes("malformedUsageRecords")
+        && sql.includes("malformedRateLimitRecords"))) return;
   // SQLite cannot widen a CHECK constraint in place. Rebuild this small,
   // content-free count table inside the caller's migration transaction so a
   // v7 index either retains every diagnostic row under the v8 vocabulary or
@@ -840,6 +1426,8 @@ function ensureToolDiagnosticCodes(database) {
       source_local BLOB NOT NULL CHECK(length(source_local) = 32),
       code TEXT NOT NULL CHECK(code IN (
         'relevantLines', 'malformedLines', 'malformedTimestamps',
+        'malformedAccountingRecords', 'malformedUsageRecords',
+        'malformedRateLimitRecords',
         'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
         'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
         'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
@@ -855,16 +1443,62 @@ function ensureToolDiagnosticCodes(database) {
   `);
 }
 
+function ensureGenerationIssueCodes(database) {
+  const sql = database.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'generation_issue'",
+  ).get()?.sql;
+  if (typeof sql !== "string"
+      || (sql.includes("codex_rollout_content_invalid")
+        && sql.includes("codex_rollout_tail_incomplete"))) return;
+  database.exec(`
+    ALTER TABLE generation_issue RENAME TO generation_issue_v9;
+    CREATE TABLE generation_issue(
+      generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+      code TEXT NOT NULL CHECK(code IN (
+        'codex_rollout_compression_unsupported',
+        'codex_rollout_filename_identity_mismatch',
+        'codex_rollout_generation_ambiguous',
+        'codex_rollout_lineage_invalid',
+        'codex_rollout_content_invalid',
+        'codex_rollout_tail_incomplete')),
+      thread_count INTEGER NOT NULL CHECK(thread_count >= 0),
+      source_count INTEGER NOT NULL CHECK(source_count >= 0),
+      source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+      PRIMARY KEY(generation_id, code)) STRICT, WITHOUT ROWID;
+    INSERT INTO generation_issue(
+      generation_id, code, thread_count, source_count, source_bytes)
+      SELECT generation_id, code, thread_count, source_count, source_bytes
+      FROM generation_issue_v9;
+    DROP TABLE generation_issue_v9;
+
+    ALTER TABLE generation_issue_group RENAME TO generation_issue_group_v9;
+    CREATE TABLE generation_issue_group(
+      generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+      group_local BLOB NOT NULL CHECK(length(group_local) = 32),
+      code TEXT NOT NULL CHECK(code IN (
+        'codex_rollout_compression_unsupported',
+        'codex_rollout_filename_identity_mismatch',
+        'codex_rollout_generation_ambiguous',
+        'codex_rollout_lineage_invalid',
+        'codex_rollout_content_invalid',
+        'codex_rollout_tail_incomplete')),
+      source_count INTEGER NOT NULL CHECK(source_count >= 0),
+      source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+      PRIMARY KEY(generation_id, group_local, code)) STRICT, WITHOUT ROWID;
+    INSERT INTO generation_issue_group(
+      generation_id, group_local, code, source_count, source_bytes)
+      SELECT generation_id, group_local, code, source_count, source_bytes
+      FROM generation_issue_group_v9;
+    DROP TABLE generation_issue_group_v9;
+  `);
+}
+
 function validateDatabase(database, {
   readOnly = false,
   deferSecondaryIndexes = false,
 } = {}) {
-  const applicationId = Number(
-    database.prepare("PRAGMA application_id").get().application_id,
-  );
-  const userVersion = Number(
-    database.prepare("PRAGMA user_version").get().user_version,
-  );
+  const compatibility = assertLocalUnifiedIndexNotNewer(database, { readOnly });
+  const { applicationId, userVersion } = compatibility;
   const schema = database.prepare(
     "SELECT value FROM meta WHERE key = 'schema_version'",
   ).get();
@@ -875,18 +1509,26 @@ function validateDatabase(database, {
     && schema?.value === LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION;
   const current = userVersion === INDEX_USER_VERSION
     && schema?.value === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION;
+  const compatibilityCurrent = currentCompatibilityIsSupported(compatibility);
   const acceptable = readOnly ? (legacy || current) : current;
-  if (applicationId !== INDEX_APPLICATION_ID || !acceptable) {
+  if (applicationId !== INDEX_APPLICATION_ID || !acceptable
+      || (current && !compatibilityCurrent)) {
     throw fixedError("local_unified_index_schema_invalid");
   }
-  if (current && !deferSecondaryIndexes) assertSecondaryIndexes(database);
-  return { userVersion, schemaVersion: schema?.value ?? null, legacy };
+  if (current && !deferSecondaryIndexes) {
+    assertSecondaryIndexes(database, { allowMissingCompatible: readOnly });
+  }
+  return {
+    ...compatibility,
+    schemaVersion: schema?.value ?? null,
+    legacy,
+  };
 }
 
 function migrateDatabase(database, { deferSecondaryIndexes = false } = {}) {
-  const userVersion = Number(
-    database.prepare("PRAGMA user_version").get().user_version,
-  );
+  const { userVersion } = assertLocalUnifiedIndexNotNewer(database, {
+    readOnly: false,
+  });
   if (!MIGRATABLE_USER_VERSIONS.has(userVersion)) {
     throw fixedError("local_unified_index_schema_invalid");
   }
@@ -912,13 +1554,25 @@ function migrateDatabase(database, { deferSecondaryIndexes = false } = {}) {
     addColumnIfMissing(database, "usage_event", "tier_observed_at_ms", "INTEGER");
     addColumnIfMissing(database, "source_cursor", "source_ordinal",
       "INTEGER CHECK(source_ordinal IS NULL OR source_ordinal >= 0)");
-    ensureToolDiagnosticCodes(database);
+    addColumnIfMissing(database, "source_cursor", "source_dev", "INTEGER");
+    addColumnIfMissing(database, "source_cursor", "source_ino", "INTEGER");
+    addColumnIfMissing(database, "source_cursor", "source_birthtime_ms", "INTEGER");
+    addColumnIfMissing(database, "source_cursor", "source_ctime_ms", "INTEGER");
+    addColumnIfMissing(database, "source_cursor", "source_identity_token", "TEXT");
+    addColumnIfMissing(database, "source_cursor", "source_state_token", "TEXT");
+    addColumnIfMissing(database, "source_cursor", "quarantine_code",
+      "TEXT CHECK(quarantine_code IS NULL OR quarantine_code IN "
+        + "('codex_rollout_content_invalid', 'codex_rollout_tail_incomplete', "
+        + "'codex_rollout_lineage_invalid'))");
+    ensureDiagnosticCodes(database);
+    ensureGenerationIssueCodes(database);
     if (!deferSecondaryIndexes) database.exec(SECONDARY_INDEX_SCHEMA);
     ensureGenerationAttestationColumns(database);
     database.prepare(
       "INSERT INTO meta(key, value) VALUES (?, ?) "
         + "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run("schema_version", LOCAL_UNIFIED_INDEX_SCHEMA_VERSION);
+    stampDatabaseCompatibility(database);
     database.exec(`PRAGMA user_version=${INDEX_USER_VERSION}`);
     database.exec("COMMIT");
   } catch (error) {
@@ -936,33 +1590,125 @@ export function openLocalUnifiedIndex(indexFile, {
   create = false,
   staging = false,
   deferSecondaryIndexes = false,
+  allowRecoveryLock = false,
 } = {}) {
+  const resolvedIndexFile = resolve(indexFile);
+  let directoryChain = captureSafeLocalUnifiedIndexDirectoryChain(
+    resolvedIndexFile,
+  );
   if (deferSecondaryIndexes && (readOnly || !create || !staging)) {
     throw fixedError("local_unified_index_deferred_indexes_invalid");
   }
   if (deferSecondaryIndexes) {
-    try {
-      lstatSync(resolve(indexFile));
+    const existingStage = safeLocalUnifiedIndexTargetSync(resolvedIndexFile, {
+      allowMissing: true,
+    });
+    if (existingStage !== null) {
       throw fixedError("local_unified_index_deferred_indexes_requires_new_stage");
-    } catch (error) {
-      if (error?.code === "ENOENT") {
-        // The stage is genuinely new. DatabaseSync creates it below.
-      } else if (error?.code?.startsWith("local_unified_index_")) {
-        throw error;
-      } else {
-        throw fixedError("local_unified_index_unavailable");
-      }
     }
   }
   let database;
+  let preflight;
+  let existedBeforeOpen = false;
+  let targetMetadata = null;
   try {
-    database = new DatabaseSync(indexFile, { readOnly, timeout: 5_000 });
+    if (!allowRecoveryLock) {
+      assertLocalUnifiedIndexRecoveryUnlocked(resolvedIndexFile);
+    }
+    // Refuse symlinks, hard links, non-owner files and shared modes before any
+    // SQLite handle is opened. Missing writable/create targets are atomically
+    // reserved as owner-only regular files, closing the creation substitution
+    // window within the cooperative same-user boundary.
+    targetMetadata = safeLocalUnifiedIndexTargetSync(resolvedIndexFile, {
+      allowMissing: true,
+    });
+    directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+      resolvedIndexFile,
+      directoryChain,
+    );
+    existedBeforeOpen = targetMetadata !== null;
+    if (deferSecondaryIndexes && existedBeforeOpen) {
+      throw fixedError("local_unified_index_deferred_indexes_requires_new_stage");
+    }
+    // SQLite may rewrite journal/header state as soon as a writable connection
+    // is configured. Inspect an existing file through a separate read-only
+    // handle first so an older binary's refusal of N+1 state is byte-for-byte
+    // non-mutating.
+    if (!readOnly) {
+      if (existedBeforeOpen) {
+        directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+          resolvedIndexFile,
+          directoryChain,
+        );
+        preflight = new DatabaseSync(resolvedIndexFile, {
+          readOnly: true,
+          timeout: 5_000,
+        });
+        const preflightMetadata = safeLocalUnifiedIndexTargetSync(
+          resolvedIndexFile,
+        );
+        directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+          resolvedIndexFile,
+          directoryChain,
+        );
+        if (!sameLocalUnifiedIndexTarget(targetMetadata, preflightMetadata)) {
+          throw fixedError("local_unified_index_file_invalid");
+        }
+        assertWritableLocalUnifiedIndexPreflight(preflight);
+        const validatedMetadata = safeLocalUnifiedIndexTargetSync(
+          resolvedIndexFile,
+        );
+        directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+          resolvedIndexFile,
+          directoryChain,
+        );
+        if (!sameLocalUnifiedIndexTarget(
+          preflightMetadata,
+          validatedMetadata,
+        )) {
+          throw fixedError("local_unified_index_file_invalid");
+        }
+        preflight.close();
+        preflight = null;
+        targetMetadata = validatedMetadata;
+      } else if (!create) {
+        throw fixedError("local_unified_index_unavailable");
+      } else {
+        const reservation = reserveNewLocalUnifiedIndexTarget(
+          resolvedIndexFile,
+          directoryChain,
+        );
+        targetMetadata = reservation.metadata;
+        directoryChain = reservation.directoryChain;
+      }
+    } else if (!existedBeforeOpen) {
+      throw fixedError("local_unified_index_unavailable");
+    }
+    directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+      resolvedIndexFile,
+      directoryChain,
+    );
+    database = new DatabaseSync(resolvedIndexFile, { readOnly, timeout: 5_000 });
+    const openedMetadata = safeLocalUnifiedIndexTargetSync(resolvedIndexFile);
+    directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+      resolvedIndexFile,
+      directoryChain,
+    );
+    if (!sameLocalUnifiedIndexTarget(targetMetadata, openedMetadata)) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    if (!allowRecoveryLock) {
+      assertLocalUnifiedIndexRecoveryUnlocked(resolvedIndexFile);
+    }
     configureDatabase(database, { readOnly, staging });
-    if (create) initializeSchema(database, { deferSecondaryIndexes });
+    if (create && !existedBeforeOpen) {
+      initializeSchema(database, { deferSecondaryIndexes });
+    }
     if (!readOnly) migrateDatabase(database, { deferSecondaryIndexes });
     validateDatabase(database, { readOnly, deferSecondaryIndexes });
     return database;
   } catch (error) {
+    if (preflight?.isOpen) preflight.close();
     if (database?.isOpen) database.close();
     if (error?.code?.startsWith("local_unified_index_")) throw error;
     throw fixedError("local_unified_index_unavailable");
@@ -1055,7 +1801,9 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
     SELECT id, started_at_ms, completed_at_ms, parser_version_id,
            contract_version, status, block_reason,
            discovered_source_count, discovered_source_bytes,
-           indexed_source_count, indexed_source_bytes, usage_events,
+           indexed_source_count, indexed_source_bytes,
+           skipped_source_count, skipped_source_bytes, skipped_thread_count,
+           usage_events,
            quota_occurrences, covered_start_ms, covered_end_ms,
            discovery_complete, diagnostics_complete,
            usage_provenance_complete, source_order_complete,
@@ -1071,7 +1819,9 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
     row.id, row.started_at_ms, row.completed_at_ms, row.parser_version_id,
     row.contract_version, row.status, row.block_reason,
     row.discovered_source_count, row.discovered_source_bytes,
-    row.indexed_source_count, row.indexed_source_bytes, row.usage_events,
+    row.indexed_source_count, row.indexed_source_bytes,
+    row.skipped_source_count, row.skipped_source_bytes,
+    row.skipped_thread_count, row.usage_events,
     row.quota_occurrences, row.covered_start_ms, row.covered_end_ms,
     row.discovery_complete, row.diagnostics_complete,
     row.usage_provenance_complete, row.source_order_complete,
@@ -1080,6 +1830,14 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
   ].map((value) => value === null || value === undefined ? "" : String(value));
   const first = row.covered_start_ms === null ? null : Number(row.covered_start_ms);
   const last = row.covered_end_ms === null ? null : Number(row.covered_end_ms);
+  const issueCounts = Object.fromEntries(database.prepare(`
+    SELECT code, thread_count, source_count, source_bytes
+    FROM generation_issue WHERE generation_id = ? ORDER BY code
+  `).all(id).map((issue) => [issue.code, Object.freeze({
+    threadCount: Number(issue.thread_count),
+    sourceCount: Number(issue.source_count),
+    sourceBytes: Number(issue.source_bytes),
+  })]));
   return {
     id,
     fingerprint: `generation-v2-${createHash("sha256")
@@ -1099,6 +1857,13 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
       ? null : Number(row.indexed_source_count),
     indexedSourceBytes: row.indexed_source_bytes === null
       ? null : Number(row.indexed_source_bytes),
+    skippedSourceCount: row.skipped_source_count === null
+      ? 0 : Number(row.skipped_source_count),
+    skippedSourceBytes: row.skipped_source_bytes === null
+      ? 0 : Number(row.skipped_source_bytes),
+    skippedThreadCount: row.skipped_thread_count === null
+      ? 0 : Number(row.skipped_thread_count),
+    issueCounts: Object.freeze(issueCounts),
     usageEvents: row.usage_events === null ? null : Number(row.usage_events),
     quotaOccurrences: row.quota_occurrences === null
       ? null : Number(row.quota_occurrences),
@@ -1177,21 +1942,6 @@ async function syncFile(path) {
     await handle.sync();
   } finally {
     await handle.close();
-  }
-}
-
-async function syncDirectoryPath(path) {
-  let handle;
-  try {
-    handle = await open(path, constants.O_RDONLY);
-    await handle.sync();
-  } catch (error) {
-    if (error?.code === "local_unified_index_directory_sync_failed") {
-      throw error;
-    }
-    throw fixedError("local_unified_index_directory_sync_failed");
-  } finally {
-    await handle?.close();
   }
 }
 
@@ -1356,6 +2106,32 @@ export function createUnifiedIndexWriter(database, {
     deleteToolFactsForSource: database.prepare(
       "DELETE FROM tool_class_fact WHERE source_local = ?",
     ),
+    affectedQuotaForSource: database.prepare(`
+      SELECT DISTINCT canonical_observation_id AS id
+      FROM quota_occurrence WHERE source_local = ?`),
+    deleteUsageForSource: database.prepare(
+      "DELETE FROM usage_event WHERE source_local = ?",
+    ),
+    deleteQuotaForSource: database.prepare(
+      "DELETE FROM quota_occurrence WHERE source_local = ?",
+    ),
+    replacementQuota: database.prepare(`
+      SELECT plan_type, used_percent, resets_at_ms, duration_mins
+      FROM quota_occurrence WHERE canonical_observation_id = ?
+      ORDER BY used_percent DESC, COALESCE(resets_at_ms, -1) DESC, id ASC
+      LIMIT 1`),
+    updateCanonicalQuota: database.prepare(`
+      UPDATE quota_observation SET plan_type = ?, used_percent = ?,
+        resets_at_ms = ?, duration_mins = ? WHERE id = ?`),
+    deleteOrphanQuota: database.prepare(`
+      DELETE FROM quota_observation WHERE id = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM quota_occurrence WHERE canonical_observation_id = ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM usage_event WHERE quota_observation_id = ?)`),
+    deleteSourceCursor: database.prepare(
+      "DELETE FROM source_cursor WHERE source_local = ?",
+    ),
     rebindToolFactsForSource: database.prepare(`
       UPDATE tool_class_fact SET generation_id = ? WHERE source_local = ?`),
     clearToolClasses: database.prepare("DELETE FROM tool_class_count"),
@@ -1367,17 +2143,27 @@ export function createUnifiedIndexWriter(database, {
     sourceCursor: database.prepare(`
       INSERT INTO source_cursor(
         source_local, source_ordinal, session_local, scanned_bytes, size_bytes, mtime_ms,
+        source_dev, source_ino, source_birthtime_ms, source_ctime_ms,
+        source_identity_token, source_state_token,
+        quarantine_code,
         snapshots_persisted, turn_context_seen, carry_model, carry_effort,
         carry_tier_raw, carry_tier_observed_at_ms, carry_total_input,
         carry_total_cached, carry_total_cache_write, carry_total_output,
         carry_total_reasoning, carry_total_total, ingest_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(source_local) DO UPDATE SET
         source_ordinal = excluded.source_ordinal,
         session_local = excluded.session_local,
         scanned_bytes = excluded.scanned_bytes,
         size_bytes = excluded.size_bytes,
         mtime_ms = excluded.mtime_ms,
+        source_dev = excluded.source_dev,
+        source_ino = excluded.source_ino,
+        source_birthtime_ms = excluded.source_birthtime_ms,
+        source_ctime_ms = excluded.source_ctime_ms,
+        source_identity_token = excluded.source_identity_token,
+        source_state_token = excluded.source_state_token,
+        quarantine_code = excluded.quarantine_code,
         snapshots_persisted = excluded.snapshots_persisted,
         turn_context_seen = excluded.turn_context_seen,
         carry_model = excluded.carry_model,
@@ -1406,6 +2192,8 @@ export function createUnifiedIndexWriter(database, {
     lineageSnapshot: database.prepare(`
       INSERT INTO lineage_snapshot(session_local, snapshot_local)
       VALUES (?, ?) ON CONFLICT DO NOTHING`),
+    deleteLineageSnapshots: database.prepare(`
+      DELETE FROM lineage_snapshot WHERE session_local = ?`),
     sessionIdentity: database.prepare(`
       INSERT INTO session_identity(session_local, session_uuid)
       VALUES (?, ?) ON CONFLICT DO NOTHING`),
@@ -1429,6 +2217,21 @@ export function createUnifiedIndexWriter(database, {
       VALUES (?, ?, ?, ?)
       ON CONFLICT(generation_id, source_local, code)
       DO UPDATE SET count = excluded.count`),
+    generationIssue: database.prepare(`
+      INSERT INTO generation_issue(
+        generation_id, code, thread_count, source_count, source_bytes)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(generation_id, code) DO UPDATE SET
+        thread_count = excluded.thread_count,
+        source_count = excluded.source_count,
+        source_bytes = excluded.source_bytes`),
+    generationIssueGroup: database.prepare(`
+      INSERT INTO generation_issue_group(
+        generation_id, group_local, code, source_count, source_bytes)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(generation_id, group_local, code) DO UPDATE SET
+        source_count = excluded.source_count,
+        source_bytes = excluded.source_bytes`),
     copySourceDiagnostics: database.prepare(`
       INSERT INTO source_diagnostic(generation_id, source_local, code, count)
       SELECT ?, source_local, code, count
@@ -1444,6 +2247,8 @@ export function createUnifiedIndexWriter(database, {
       UPDATE index_generation SET
         completed_at_ms = ?, status = ?, block_reason = ?,
         indexed_source_count = ?, indexed_source_bytes = ?,
+        skipped_source_count = ?, skipped_source_bytes = ?,
+        skipped_thread_count = ?,
         usage_events = ?, quota_occurrences = ?,
         covered_start_ms = ?, covered_end_ms = ?,
         discovery_complete = ?, diagnostics_complete = ?,
@@ -1698,14 +2503,21 @@ export function createUnifiedIndexWriter(database, {
 
     writeUsageEvent(event) {
       begin();
+      const provenanceVersion = event.modelInherited
+        ? event.partial
+          ? LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION
+          : LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION
+        : event.partial ? LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION : parserVersion;
+      const eventParserVersionId = event.cacheWriteAssumedZero === true
+        ? internParserVersion(`${provenanceVersion}-cache-write-zero`)
+        : event.modelInherited || event.partial
+          ? internParserVersion(provenanceVersion) : defaultParserVersionId;
       const changes = statements.usage.run(
         event.eventKey,
         event.observedAtMs,
         event.generationId ?? generationId,
         ingestRunId,
-        event.partial
-          ? internParserVersion(LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION)
-          : defaultParserVersionId,
+        eventParserVersionId,
         event.sourceId ?? null,
         event.sourceOffset ?? null,
         event.sessionLocal,
@@ -1797,6 +2609,46 @@ export function createUnifiedIndexWriter(database, {
       return Number(result.changes ?? 0);
     },
 
+    deleteSourceFacts(sourceLocalKey, sessionLocalKey = null) {
+      // Source cleanup touches every large fact table and may probe canonical
+      // quota ownership once per affected observation. Schema v11 makes the
+      // supporting secondary indexes a precondition so no caller can
+      // accidentally reintroduce an unbounded scan on a deferred-index stage.
+      assertSecondaryIndexes(database);
+      begin();
+      const affectedQuotaIds = statements.affectedQuotaForSource
+        .all(sourceLocalKey).map((row) => Number(row.id));
+      const usageEvents = Number(
+        statements.deleteUsageForSource.run(sourceLocalKey).changes ?? 0,
+      );
+      const quotaOccurrences = Number(
+        statements.deleteQuotaForSource.run(sourceLocalKey).changes ?? 0,
+      );
+      const toolFacts = Number(
+        statements.deleteToolFactsForSource.run(sourceLocalKey).changes ?? 0,
+      );
+      statements.deleteSourceCursor.run(sourceLocalKey);
+      if (sessionLocalKey !== null) {
+        statements.deleteLineageSnapshots.run(sessionLocalKey);
+      }
+      for (const quotaId of affectedQuotaIds) {
+        const replacement = statements.replacementQuota.get(quotaId);
+        if (replacement === undefined) {
+          statements.deleteOrphanQuota.run(quotaId, quotaId, quotaId);
+        } else {
+          statements.updateCanonicalQuota.run(
+            replacement.plan_type,
+            replacement.used_percent,
+            replacement.resets_at_ms,
+            replacement.duration_mins,
+            quotaId,
+          );
+        }
+      }
+      step();
+      return { usageEvents, quotaOccurrences, toolFacts };
+    },
+
     rebindToolFactsForSource(sourceLocalKey, targetGenerationId = generationId) {
       if (targetGenerationId === null || targetGenerationId === undefined) {
         throw fixedError("local_unified_index_generation_required");
@@ -1819,6 +2671,13 @@ export function createUnifiedIndexWriter(database, {
         cursor.scannedBytes,
         cursor.sizeBytes,
         cursor.mtimeMs,
+        cursor.sourceDev ?? null,
+        cursor.sourceIno ?? null,
+        cursor.sourceBirthtimeMs ?? null,
+        cursor.sourceCtimeMs ?? null,
+        cursor.sourceIdentityToken ?? null,
+        cursor.sourceStateToken ?? null,
+        cursor.quarantineCode ?? null,
         cursor.snapshotsPersisted ? 1 : 0,
         cursor.turnContextSeen ? 1 : 0,
         cursor.carryModel ?? null,
@@ -1865,6 +2724,51 @@ export function createUnifiedIndexWriter(database, {
         source.scannedBytes,
         source.mtimeMs,
         source.diagnosticsComplete ? 1 : 0,
+      );
+      step();
+    },
+
+    writeGenerationIssue(code, {
+      threadCount = 0,
+      sourceCount = 0,
+      sourceBytes = 0,
+    } = {}) {
+      if (generationId === null || !GENERATION_ISSUE_CODES.has(code)) {
+        throw fixedError("local_unified_index_generation_invalid");
+      }
+      for (const value of [threadCount, sourceCount, sourceBytes]) {
+        if (!Number.isSafeInteger(value) || value < 0) {
+          throw fixedError("local_unified_index_generation_invalid");
+        }
+      }
+      begin();
+      statements.generationIssue.run(
+        generationId,
+        code,
+        threadCount,
+        sourceCount,
+        sourceBytes,
+      );
+      step();
+    },
+
+    writeGenerationIssueGroup(groupLocal, code, {
+      sourceCount = 0,
+      sourceBytes = 0,
+    } = {}) {
+      if (generationId === null || !GENERATION_ISSUE_CODES.has(code)
+          || !Buffer.isBuffer(groupLocal) || groupLocal.length !== 32
+          || !Number.isSafeInteger(sourceCount) || sourceCount < 0
+          || !Number.isSafeInteger(sourceBytes) || sourceBytes < 0) {
+        throw fixedError("local_unified_index_generation_invalid");
+      }
+      begin();
+      statements.generationIssueGroup.run(
+        generationId,
+        groupLocal,
+        code,
+        sourceCount,
+        sourceBytes,
       );
       step();
     },
@@ -1924,6 +2828,12 @@ export function createUnifiedIndexWriter(database, {
       step();
     },
 
+    clearLineageSnapshots(sessionLocalKey) {
+      begin();
+      statements.deleteLineageSnapshots.run(sessionLocalKey);
+      step();
+    },
+
     /**
      * Record the raw provider-issued session UUID beside its local join key.
      * Only a strictly UUID-shaped identifier is accepted: the ingest paths
@@ -1956,6 +2866,9 @@ export function createUnifiedIndexWriter(database, {
       discoveredSourceBytes = null,
       indexedSourceCount = null,
       indexedSourceBytes = null,
+      skippedSourceCount = 0,
+      skippedSourceBytes = 0,
+      skippedThreadCount = 0,
       coveredStartMs = null,
       coveredEndMs = null,
       discoveryComplete = status === "complete",
@@ -1994,7 +2907,7 @@ export function createUnifiedIndexWriter(database, {
       const sourceCompleteness = database.prepare(`
         SELECT COUNT(*) AS total,
                SUM(CASE WHEN diagnostics_complete <> 1
-                          OR status IN ('pending', 'failed')
+                          OR status = 'pending'
                         THEN 1 ELSE 0 END) AS incomplete
         FROM generation_source
         WHERE generation_id = ?
@@ -2049,6 +2962,7 @@ export function createUnifiedIndexWriter(database, {
           (SELECT COUNT(*) FROM generation_source gs
            LEFT JOIN source_cursor sc ON sc.source_local = gs.source_local
            WHERE gs.generation_id = ?
+             AND gs.status <> 'failed'
              AND (sc.source_local IS NULL OR sc.source_ordinal IS NULL
                OR sc.source_ordinal != gs.source_ordinal))
         ) AS count
@@ -2127,6 +3041,9 @@ export function createUnifiedIndexWriter(database, {
         publishedReason,
         indexedSourceCount ?? discoveredSourceCount,
         indexedSourceBytes ?? discoveredSourceBytes,
+        skippedSourceCount,
+        skippedSourceBytes,
+        skippedThreadCount,
         Number(counts?.usage_events ?? 0),
         Number(counts?.quota_occurrences ?? 0),
         starts.length === 0 ? coveredStartMs : Math.min(...starts),
@@ -2153,7 +3070,7 @@ export function createUnifiedIndexWriter(database, {
       begin();
       statements.generation.run(
         Date.now(), "failed", blockReason,
-        null, null, null, null, null, null, 0, 0, 0, 0, 0,
+        null, null, null, null, null, null, null, null, null, 0, 0, 0, 0, 0,
         null, null, 0, generationId,
       );
       commit();
@@ -2196,13 +3113,36 @@ export function createUnifiedIndexWriter(database, {
  * fsynced first, so a crash mid-publish leaves either the old index or the new
  * one, never a torn mixture.
  */
-export async function publishStagedUnifiedIndex(stageFile, indexFile) {
+export async function publishStagedUnifiedIndex(
+  stageFile,
+  indexFile,
+  { allowRecoveryLock = false, signal = null } = {},
+) {
+  if (signal !== null
+      && (typeof signal !== "object" || typeof signal.aborted !== "boolean")) {
+    throw new TypeError("signal must be an AbortSignal or null");
+  }
+  if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+  if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await chmod(stageFile, 0o600);
   await syncFile(stageFile);
+  // A rebuild close can be entirely synchronous. Yield once after the durable
+  // stage fsync so an already-queued cancellation becomes observable before
+  // final target validation; never yield after validation or the signal check.
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+  if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await assertSafeLocalUnifiedIndexTarget(indexFile, { allowMissing: true });
+  // Target validation yields to the event loop. Recovery can acquire its lock
+  // while that validation is in flight, so re-check exclusion after the await
+  // and adjacent to the atomic rename. No asynchronous boundary remains after
+  // this cancellation/lock pair; neither an abort nor a newly acquired recovery
+  // lock can therefore be missed because target verification was suspended.
+  if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+  if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await rename(stageFile, indexFile);
   try {
-    await syncDirectoryPath(dirname(resolve(indexFile)));
+    await syncDirectory(dirname(resolve(indexFile)));
     await syncFile(indexFile);
   } catch {
     // The rename has already happened. Report that exact bounded state so the
@@ -2224,9 +3164,349 @@ export async function removeIfPresent(path) {
   }
 }
 
+// Cooperative abort removes its own stage. A hard worker termination cannot
+// run that catch path, so a bounded scanner reclaims only old, exact stage
+// names whose process/attempt owner is proven inactive.
+export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS =
+  2 * 60 * 60_000;
+export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT = 64;
+const LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
+
+function localUnifiedIndexStageOwner(name, indexName) {
+  for (const kind of ["building", "incremental"]) {
+    const prefix = `${indexName}.${kind}-`;
+    if (!name.startsWith(prefix)) continue;
+    const match = /^([1-9][0-9]*)-([0-9a-z]+)$/u.exec(
+      name.slice(prefix.length),
+    );
+    if (match === null) return null;
+    const pid = Number(match[1]);
+    return Number.isSafeInteger(pid)
+      ? {
+        pid,
+        attemptToken: LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(match[2])
+          ? match[2]
+          : null,
+      }
+      : null;
+  }
+  return null;
+}
+
+function processAppearsAlive(pid) {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+// A filename cursor must re-enumerate from the beginning to discover that its
+// remembered entry was deleted. Retain the bounded directory stream itself so
+// every pass performs at most scanLimit raw reads and resumes at the next OS
+// directory entry. The product owns one index; the cap only contains injected
+// callers/tests and every handle is closed at EOF or eviction.
+const abandonedStageDirectoryScans = new Map();
+const MAX_ABANDONED_STAGE_DIRECTORY_SCANS = 64;
+
+async function closeAbandonedStageDirectoryScan(indexFile, state) {
+  if (abandonedStageDirectoryScans.get(indexFile) === state) {
+    abandonedStageDirectoryScans.delete(indexFile);
+  }
+  try {
+    await state.handle.close();
+  } catch {
+    // A directory stream can already be closed after an iteration/read error.
+  }
+}
+
+async function abandonedStageDirectoryScan(
+  directory,
+  indexFile,
+  scanLimit,
+  openDirectory,
+  directoryChain,
+) {
+  let state = abandonedStageDirectoryScans.get(indexFile) ?? null;
+  if (state !== null
+      && (state.directory !== directory
+        || state.openDirectory !== openDirectory
+        || !sameLocalUnifiedIndexDirectoryChain(
+          state.directoryChain,
+          directoryChain,
+        ))) {
+    await closeAbandonedStageDirectoryScan(indexFile, state);
+    state = null;
+  }
+  if (state === null) {
+    let handle;
+    try {
+      handle = await openDirectory(directory, {
+        bufferSize: Math.min(scanLimit, 32),
+      });
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    state = { directory, directoryChain, handle, openDirectory };
+    abandonedStageDirectoryScans.set(indexFile, state);
+    while (abandonedStageDirectoryScans.size
+        > MAX_ABANDONED_STAGE_DIRECTORY_SCANS) {
+      const oldestIndexFile = abandonedStageDirectoryScans.keys().next().value;
+      const oldest = abandonedStageDirectoryScans.get(oldestIndexFile);
+      await closeAbandonedStageDirectoryScan(oldestIndexFile, oldest);
+    }
+  } else {
+    // Map insertion order is the eviction order; touching a live scan keeps it
+    // from being evicted by unrelated injected index paths.
+    abandonedStageDirectoryScans.delete(indexFile);
+    abandonedStageDirectoryScans.set(indexFile, state);
+  }
+  return state;
+}
+
+async function rotatingLocalUnifiedIndexStageNames(
+  directory,
+  indexFile,
+  indexName,
+  scanLimit,
+  openDirectory,
+  directoryChain,
+) {
+  const state = await abandonedStageDirectoryScan(
+    directory,
+    indexFile,
+    scanLimit,
+    openDirectory,
+    directoryChain,
+  );
+  if (state === null) return null;
+  const selected = [];
+  for (let enumerated = 0; enumerated < scanLimit; enumerated += 1) {
+    let entry;
+    try {
+      entry = await state.handle.read();
+    } catch (error) {
+      await closeAbandonedStageDirectoryScan(indexFile, state);
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    if (entry === null) {
+      await closeAbandonedStageDirectoryScan(indexFile, state);
+      break;
+    }
+    const name = entry.name;
+    if (localUnifiedIndexStageOwner(name, indexName) === null) continue;
+    selected.push(name);
+  }
+  return selected;
+}
+
+/**
+ * Remove only the two stage names an exact, confirmed-terminated off-main
+ * attempt could own. The unguessable token, current PID, safe directory chain,
+ * and owner-only single-link file checks make this narrower than an abandoned
+ * stage scan; anything uncertain is retained for later diagnosis.
+ */
+export async function removeExactLocalUnifiedIndexAttemptStages(
+  indexFile,
+  attemptToken,
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("indexFile must be a non-empty string");
+  }
+  if (typeof attemptToken !== "string"
+      || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(attemptToken)) {
+    throw new TypeError("attemptToken must be a 32-character hex token");
+  }
+  const resolvedIndexFile = resolve(indexFile);
+  const directoryChain = assertSafeLocalUnifiedIndexParentPath(
+    resolvedIndexFile,
+  );
+  let inspected = 0;
+  let removed = 0;
+  let skipped = 0;
+  for (const kind of ["building", "incremental"]) {
+    const candidate = `${resolvedIndexFile}.${kind}-${process.pid}-${attemptToken}`;
+    let metadata;
+    try {
+      metadata = await lstat(candidate);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      skipped += 1;
+      continue;
+    }
+    inspected += 1;
+    if (!ownerOnlyRegularFile(metadata)) {
+      skipped += 1;
+      continue;
+    }
+    let verified;
+    try {
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+      verified = await lstat(candidate);
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    if (!sameLocalUnifiedIndexTarget(metadata, verified)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await unlink(candidate);
+      removed += 1;
+    } catch (error) {
+      if (error?.code !== "ENOENT") skipped += 1;
+    }
+  }
+  return Object.freeze({ inspected, removed, skipped });
+}
+
+export async function removeAbandonedLocalUnifiedIndexStages(
+  indexFile,
+  {
+    nowMs = Date.now(),
+    minimumAgeMs = LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS,
+    scanLimit = LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT,
+    platform = process.platform,
+    isProcessAlive = processAppearsAlive,
+    activeAttemptToken = null,
+    openDirectory = opendir,
+  } = {},
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("indexFile must be a non-empty string");
+  }
+  if (!Number.isFinite(nowMs) || !Number.isFinite(minimumAgeMs)
+      || minimumAgeMs < 60_000) {
+    throw new TypeError("abandoned stage age is invalid");
+  }
+  if (!Number.isSafeInteger(scanLimit) || scanLimit < 1 || scanLimit > 256) {
+    throw new TypeError("abandoned stage scan limit is invalid");
+  }
+  if (typeof isProcessAlive !== "function") {
+    throw new TypeError("isProcessAlive must be a function");
+  }
+  if (typeof openDirectory !== "function") {
+    throw new TypeError("openDirectory must be a function");
+  }
+  if (activeAttemptToken !== null
+      && (typeof activeAttemptToken !== "string"
+        || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(activeAttemptToken))) {
+    throw new TypeError(
+      "activeAttemptToken must be null or a 32-character hex token",
+    );
+  }
+  // Windows state remains behind its separately qualified native capability.
+  if (platform === "win32") {
+    return Object.freeze({ inspected: 0, removed: 0, skipped: 0 });
+  }
+
+  const resolvedIndexFile = resolve(indexFile);
+  const directory = dirname(resolvedIndexFile);
+  const indexName = basename(resolvedIndexFile);
+  const directoryChain = assertSafeLocalUnifiedIndexParentPath(
+    resolvedIndexFile,
+  );
+  const names = await rotatingLocalUnifiedIndexStageNames(
+    directory,
+    resolvedIndexFile,
+    indexName,
+    scanLimit,
+    openDirectory,
+    directoryChain,
+  );
+  if (names === null) {
+    return Object.freeze({ inspected: 0, removed: 0, skipped: 0 });
+  }
+
+  let inspected = 0;
+  let removed = 0;
+  let skipped = 0;
+  for (const name of names) {
+    inspected += 1;
+    const owner = localUnifiedIndexStageOwner(name, indexName);
+    const pid = owner?.pid ?? null;
+    const candidate = resolve(directory, name);
+    if (pid === null || dirname(candidate) !== directory) {
+      skipped += 1;
+      continue;
+    }
+    let metadata;
+    try {
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+      metadata = await lstat(candidate);
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      skipped += 1;
+      continue;
+    }
+    if (!ownerOnlyRegularFile(metadata)
+        || !Number.isFinite(metadata.mtimeMs)
+        || nowMs - metadata.mtimeMs < minimumAgeMs) {
+      skipped += 1;
+      continue;
+    }
+    const ownerIsAlive = owner.attemptToken !== null
+      && pid === process.pid
+      && activeAttemptToken !== null
+      ? owner.attemptToken === activeAttemptToken
+      : isProcessAlive(pid);
+    if (ownerIsAlive) {
+      skipped += 1;
+      continue;
+    }
+    let verified;
+    try {
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+      verified = await lstat(candidate);
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    if (!sameLocalUnifiedIndexTarget(metadata, verified)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await unlink(candidate);
+      removed += 1;
+    } catch (error) {
+      if (error?.code !== "ENOENT") skipped += 1;
+    }
+  }
+  return Object.freeze({ inspected, removed, skipped });
+}
+
 const EMPTY_INSPECTION = Object.freeze({
   status: "missing",
   schemaVersion: null,
+  userVersion: null,
+  compatibility: null,
   usageEvents: 0,
   quotaObservations: 0,
   toolClassRows: 0,
@@ -2250,6 +3530,7 @@ export async function inspectLocalUnifiedIndex({
   let database;
   try {
     database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    const compatibility = readLocalUnifiedIndexCompatibility(database);
     const usage = database.prepare(`
       SELECT COUNT(*) AS events,
              COUNT(DISTINCT session_local) AS sessions,
@@ -2269,6 +3550,8 @@ export async function inspectLocalUnifiedIndex({
     return {
       status: "available",
       schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+      userVersion: compatibility.userVersion,
+      compatibility,
       usageEvents: Number(usage?.events ?? 0),
       quotaObservations: Number(
         database.prepare("SELECT COUNT(*) AS c FROM quota_observation").get()?.c ?? 0,
@@ -2317,4 +3600,25 @@ export function readUnifiedIndexAggregate(database) {
     firstObservedAtMs: totals?.first_ms === null ? null : Number(totals.first_ms),
     lastObservedAtMs: totals?.last_ms === null ? null : Number(totals.last_ms),
   };
+}
+
+/** Internal reporting port: preserve admitted identities and nullable facts.
+ * Caller holds one read transaction/publication. No compatibility zero coercion,
+ * attribution joins or independent replay filtering occurs at this boundary.
+ */
+export function iterateUnifiedWorkUsageFacts(database, { fromMs, toMs, accountScopeId }) {
+  if (!Number.isSafeInteger(fromMs) || fromMs < 0 || !Number.isSafeInteger(toMs)
+      || toMs < fromMs || !Number.isSafeInteger(accountScopeId) || accountScopeId < 0) {
+    throw fixedError("local_unified_index_work_query_invalid");
+  }
+  return database.prepare(`SELECT u.event_key, u.observed_at_ms, u.source_local,
+    u.source_ordinal, u.source_offset, u.session_local, u.account_scope_id,
+    u.tokens_in_uncached, u.tokens_in_cache_read, u.tokens_in_cache_write,
+    u.tokens_out_text, u.tokens_out_reasoning, u.tokens_out_combined, u.total_input_context, u.quota_observation_id,
+    m.model_id, t.codex_speed_mode, t.api_service_tier, i.session_uuid, p.parser_version
+    FROM usage_event u JOIN model m ON m.id=u.model_id JOIN tier_semantics t ON t.id=u.tier_id
+    JOIN parser_version p ON p.id=u.parser_version_id
+    LEFT JOIN session_identity i ON i.session_local=u.session_local
+    WHERE u.observed_at_ms >= ? AND u.observed_at_ms < ? AND u.account_scope_id=?
+    ORDER BY u.observed_at_ms, u.event_key`).iterate(fromMs, toMs, accountScopeId);
 }

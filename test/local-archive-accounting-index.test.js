@@ -21,6 +21,10 @@ import {
   readLocalArchiveAccountingPeriod,
   refreshLocalArchiveAccountingIndex,
 } from "../src/local-archive-accounting-index.js";
+import {
+  REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY,
+  buildReplaySafeAccountingPeriod,
+} from "../src/replay-safe-accounting-cache.js";
 
 const CHUNK_BYTES = 4 * 1024 * 1024;
 const PRIVATE_CANARY = "PRIVATE_ARCHIVE_INDEX_CANARY";
@@ -96,6 +100,59 @@ async function fixture({
   }
   return { root, codexHome };
 }
+
+test("the resident archive projection reads its own ceiling, not the rebuild's", async () => {
+  // This refresh runs INSIDE the menu-bar companion. Until 2026-08-20 it named
+  // no ceiling and so inherited buildReplaySafeAccountingPeriod's default,
+  // which was the rebuild's absolute target — a number sized for a short-lived
+  // child that hands every page back on exit. Raising that constant to 6 GiB
+  // for the child therefore loosened the resident process by the same 4 GiB,
+  // against the whole point of moving the rebuild out of process (#38).
+  const { archiveMaximumRssBytes, maximumRssBytes } =
+    REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY;
+  // Residency chosen to sit strictly BETWEEN the two policies: over the
+  // archive ceiling, comfortably under the rebuild's. Under the old inherited
+  // default this projection completed; under the archive policy it must not.
+  const betweenPolicies = archiveMaximumRssBytes + 64 * 1024 * 1024;
+  assert.ok(betweenPolicies > archiveMaximumRssBytes);
+  assert.ok(betweenPolicies < maximumRssBytes);
+
+  const { root, codexHome } = await fixture({ includeUsage: true });
+  const indexFile = join(root, "local-archive-accounting-index-v1.sqlite");
+  const secretFile = join(root, "local-archive-accounting-index-secret-v1");
+  const observedOptions = [];
+  try {
+    const refreshed = await refreshLocalArchiveAccountingIndex({
+      indexFile,
+      secretFile,
+      codexHome,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      workerCount: 1,
+      chunkBytes: CHUNK_BYTES,
+      buildAccountingPeriod: (options) => {
+        observedOptions.push(options);
+        return buildReplaySafeAccountingPeriod({
+          ...options,
+          rss: () => betweenPolicies,
+        });
+      },
+    });
+
+    // The indexing pass itself is untouched — only the projection is refused,
+    // and refused as a reported outcome rather than a failed refresh.
+    assert.equal(refreshed.refreshStatus, "built");
+    assert.equal(refreshed.projectionStatus, "unavailable");
+    assert.equal(refreshed.projectionErrorCode, "archive_projection_unavailable");
+
+    // And the call site still names no ceiling, which is what makes the
+    // default the thing under test. If a future edit starts passing one, this
+    // fails loudly rather than quietly moving the property somewhere else.
+    assert.equal(observedOptions.length, 1);
+    assert.equal(observedOptions[0].maximumRssBytes, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("archive read budgets remain strict for short non-aligned passes", async () => {
   const { root, codexHome } = await fixture({ includeSecondSource: true });

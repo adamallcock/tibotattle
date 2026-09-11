@@ -7,10 +7,6 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 
 const EXACT_ROUTES = new Map([
   ["/api/health", new Set(["GET"])],
-  ["/api/ready", new Set(["GET"])],
-  ["/api/v1/envelope-key", new Set(["GET"])],
-  ["/api/v1/stats/aggregate", new Set(["GET"])],
-  ["/api/v1/community/insights", new Set(["GET"])],
 ]);
 
 function fixedError(code) {

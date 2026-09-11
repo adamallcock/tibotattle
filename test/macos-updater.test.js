@@ -249,3 +249,25 @@ test("Sparkle framework input fails closed on aliases and modified trees", async
     await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
+
+
+test("updater configuration accepts only explicit thin release architectures", async () => {
+  const publicEdKey = Buffer.alloc(32, 3).toString("base64");
+  const intelURL = "https://updates.tibotattle.com/intel/appcast.xml";
+  assert.equal(normalizeMacOSUpdaterMetadata({
+    architecture: "x64", appcastURL: intelURL, publicEdKey,
+  }).appcastURL, intelURL);
+  assert.throws(() => normalizeMacOSUpdaterMetadata({
+    appcastURL: intelURL, publicEdKey,
+  }), { code: "MACOS_UPDATER_ARCHITECTURE_MISMATCH" });
+  assert.throws(() => normalizeMacOSUpdaterMetadata({
+    architecture: "x64", appcastURL: "https://updates.tibotattle.com/appcast.xml", publicEdKey,
+  }), { code: "MACOS_UPDATER_ARCHITECTURE_MISMATCH" });
+  for (const architecture of ["universal", "x86_64", null]) {
+    assert.throws(() => normalizeMacOSUpdaterMetadata({
+      architecture, appcastURL: intelURL, publicEdKey,
+    }), { code: "RELEASE_ARCHITECTURE_INVALID" });
+    await assert.rejects(normalizeMacOSUpdaterConfiguration({ architecture }),
+      { code: "RELEASE_ARCHITECTURE_INVALID" });
+  }
+});

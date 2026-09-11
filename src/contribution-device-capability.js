@@ -44,7 +44,10 @@ const ERROR_CODES = new Set([
   "device_id_invalid",
   "credential_locked",
   "credential_denied",
+  "credential_migration_required",
+  "credential_recovery_required",
   "credential_unavailable",
+  "credential_mutation_uncertain",
   "credential_missing",
   "credential_conflict",
   "state_unavailable",
@@ -56,16 +59,17 @@ const ERROR_CODES = new Set([
 ]);
 
 export class ContributionDeviceCapabilityError extends Error {
-  constructor(code) {
+  constructor(code, { retryable = false } = {}) {
     if (!ERROR_CODES.has(code)) throw new TypeError("Unknown contribution device capability error code");
     super("Contribution device capability operation failed");
     this.name = "ContributionDeviceCapabilityError";
     this.code = `contribution_device_${code}`;
+    this.retryable = retryable === true;
   }
 }
 
-function fail(code) {
-  throw new ContributionDeviceCapabilityError(code);
+function fail(code, options = {}) {
+  throw new ContributionDeviceCapabilityError(code, options);
 }
 
 function assertBackend(backend) {
@@ -84,13 +88,30 @@ function assertBackend(backend) {
 
 function translateBackendFailure(error) {
   let code;
+  let retryable;
   try {
     code = error?.code;
+    retryable = error?.retryable === true;
   } catch {
     fail("credential_unavailable");
   }
   if (code === "export_identity_keychain_locked") fail("credential_locked");
   if (code === "export_identity_keychain_denied") fail("credential_denied");
+  if (code === "export_identity_keychain_migration_required") {
+    fail("credential_migration_required");
+  }
+  if (code === "contribution_device_credential_mutation_uncertain") {
+    fail("credential_mutation_uncertain", { retryable });
+  }
+  if (code === "contribution_device_credential_recovery_required") {
+    fail("credential_recovery_required");
+  }
+  // A protected parent channel and the Electron credential adapter mark only
+  // provider availability failures as retryable. Do not infer retryability for
+  // malformed, missing, conflicting, or unauthorized credential state.
+  if (code === "contribution_device_credential_unavailable") {
+    fail("credential_unavailable", { retryable });
+  }
   fail("credential_unavailable");
 }
 
@@ -437,7 +458,7 @@ const APP_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceA
 
 export const CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES = Object.freeze([
   "pairing",
-  "rotation",
+  "migration",
   "none",
 ]);
 
@@ -454,12 +475,13 @@ export const CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES = Object.freeze([
  * - `pairing`: no broker announcement (development, a standalone companion, or
  *   an app that could not create the channel). The companion still mints
  *   through the `security` CLI and reads it back, so today's copy is exact.
- * - `rotation`: brokered, but the credential is still the legacy `.v1` item.
- *   The dialog moved with the migration; it can only appear at the rotation
- *   that retires that item, never at pairing.
+ * - `migration`: brokered, but the credential is still the legacy `.v1`
+ *   item. The one permitted interactive read can appear on the next use that
+ *   needs the credential; a successful read is copied exactly into app-owned
+ *   storage before the legacy item is retired.
  * - `none`: brokered with no legacy item. No dialog exists to explain.
  *
- * An indeterminate probe answers `rotation`: conditional guidance that turns
+ * An indeterminate probe answers `migration`: conditional guidance that turns
  * out to be unnecessary costs one sentence, while withholding it from an
  * install that does raise a dialog is the harm this exists to prevent.
  */
@@ -484,7 +506,7 @@ export function contributionDeviceKeychainPromptSurface({
   } catch {
     presence = "unknown";
   }
-  return presence === "missing" ? "none" : "rotation";
+  return presence === "missing" ? "none" : "migration";
 }
 
 function assertBackendSecret(value) {
@@ -836,6 +858,7 @@ export async function ensureContributionDeviceCapability({
   let readback = null;
   let publication = null;
   let stored = false;
+  let mutationOutcomeUncertain = false;
   try {
     let generatedDeviceId;
     let now;
@@ -866,7 +889,14 @@ export async function ensureContributionDeviceCapability({
     }
     generated = copySecret(generatedValue);
     publication = await writeNewState(stateFile, canonicalState(state));
-    const outcome = await invokeBackend(selected, "createIfMissing", generated);
+    let outcome;
+    try {
+      outcome = await invokeBackend(selected, "createIfMissing", generated);
+    } catch (error) {
+      mutationOutcomeUncertain = error instanceof ContributionDeviceCapabilityError
+        && error.code === "contribution_device_credential_mutation_uncertain";
+      throw error;
+    }
     if (outcome !== "created") fail("credential_conflict");
     stored = true;
     readback = await invokeBackend(selected, "read");
@@ -879,7 +909,9 @@ export async function ensureContributionDeviceCapability({
     if (Buffer.isBuffer(generatedValue)) generatedValue.fill(0);
     generated?.fill(0);
     if (Buffer.isBuffer(readback)) readback.fill(0);
-    if (publication !== null && !stored) await removeCreatedState(publication);
+    if (publication !== null && !stored && !mutationOutcomeUncertain) {
+      await removeCreatedState(publication);
+    }
   }
 }
 
@@ -961,10 +993,12 @@ export async function rotateContributionDeviceCredential({
   expectedOrigin = null,
   performRemoteRotation,
   generateSecret = () => randomBytes(SECRET_BYTES),
+  deriveSecret = null,
 } = {}) {
   const selected = assertBackend(backend);
   if (typeof performRemoteRotation !== "function"
-      || typeof generateSecret !== "function") {
+      || typeof generateSecret !== "function"
+      || (deriveSecret !== null && typeof deriveSecret !== "function")) {
     fail("invalid_configuration");
   }
   const state = await readState(stateFile);
@@ -984,7 +1018,12 @@ export async function rotateContributionDeviceCredential({
     }
     oldSecret = copySecret(oldStored);
     try {
-      newValue = generateSecret();
+      // Fresh-social re-pairing uses a deterministic, purpose-separated target
+      // so an unacknowledged remote commit can be reconstructed on retry. The
+      // ordinary renewal API retains its existing random-secret default.
+      newValue = deriveSecret === null ? generateSecret() : deriveSecret(Object.freeze({
+        currentSecret: oldSecret, origin: state.origin, deviceId: state.deviceId,
+      }));
     } catch {
       fail("credential_unavailable");
     }

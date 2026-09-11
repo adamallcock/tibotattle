@@ -1,3 +1,4 @@
+import { projectRecordedTokenComponents } from "./reporting/index.js";
 import {
   addUsdStrings,
   emptySpeedWeightingCrossing,
@@ -8,6 +9,8 @@ import {
 } from "@app-usagemonitor/accounting";
 import {
   isValidQuotaWindowDuration,
+  sanitizeQuotaLimitDisplayName,
+  sanitizeQuotaLimitId,
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import {
@@ -228,20 +231,17 @@ export function emptyDimension(keys) {
 }
 
 export function usageProjection(record, declaredSpeed = "unknown", pricer = null) {
-  const components = emptyComponents();
-  addComponents(components, record.components);
-  if (components.output_combined_tokens > 0
-      && components.output_text_tokens + components.output_reasoning_tokens > 0) {
-    components.output_combined_tokens = 0;
-  }
-  const totalTokens = components.input_uncached_tokens
-    + components.input_cache_read_tokens
-    + components.input_cache_write_tokens
-    + (components.output_combined_tokens > 0
-      ? components.output_combined_tokens
-      : components.output_text_tokens + components.output_reasoning_tokens);
+  const recorded = projectRecordedTokenComponents(record.components);
+  const components = Object.fromEntries(Object.entries(recorded.components)
+    .map(([key, value]) => [key, value ?? 0]));
+  const totalTokens = recorded.totalTokens ?? 0;
   if (totalTokens === 0) return null;
   const model = safeModel(record.model);
+  const pricingEvent = { timestamp: record.observedAt, model };
+  if (Number.isSafeInteger(record.totalInputContextTokens)
+      && record.totalInputContextTokens >= 0) {
+    pricingEvent.totalInputContextTokens = record.totalInputContextTokens;
+  }
   let priced;
   try {
     // A caller iterating a large store passes a memoized pricer (the same one
@@ -249,10 +249,9 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
     // whenever its per-(model, band, date) plan cannot be proven exact, so
     // the figures are identical either way — only the wall time differs.
     priced = pricer !== null
-      ? pricer({ timestamp: record.observedAt, model }, components)
+      ? pricer(pricingEvent, components)
       : priceCodexUsageEvent({
-        timestamp: record.observedAt,
-        model,
+        ...pricingEvent,
         components,
       }, {
         // Subscription speed and the API billing tier are separate concepts.
@@ -304,6 +303,10 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
     : [];
   return {
     model,
+    fastModeFamily: fastModeModelFamilyKey(model, {
+      eventTime: record.observedAt,
+      standardPriceCardIds: priceCardIds,
+    }),
     modelPricingStatus: modelPricingStatus(record.model),
     modelAllowanceTrack: codexModelAllowanceTrack(record.model),
     modelApiPriceEquivalentApplicable:
@@ -363,8 +366,8 @@ export function newUsagePeriod(id, label, { includeSpark = true } = {}) {
     byReasoningEffort: {
       unknown: { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
     },
-    // Observed speed mode crossed with the model's published Fast credit rate
-    // family, so the owner's Fast-mode preference can be applied at read time.
+    // Observed speed mode crossed with the model's Priority (Fast) price-
+    // ratio family, so the published ratio can be applied at read time.
     speedWeighting: emptySpeedWeightingCrossing(),
     // The same crossing, holding only the events the log left UNOBSERVED that
     // a timestamped Codex `service_tier` reading actually covers.
@@ -383,8 +386,11 @@ export function newUsagePeriod(id, label, { includeSpark = true } = {}) {
 }
 
 function addSpeedWeighting(crossing, projection) {
-  const speed = crossing[projection.speed] ? projection.speed : "unknown";
-  const cell = crossing[speed][fastModeModelFamilyKey(projection.model)];
+  const speed = OBSERVED_SPEED_MODE_KEYS.includes(projection.speed)
+    ? projection.speed : "unknown";
+  const family = projection.fastModeFamily ?? "unsupported";
+  const row = crossing[speed] ??= {};
+  const cell = row[family] ??= { events: 0, apiPriceEquivalentUsd: 0 };
   cell.events += 1;
   cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
 }
@@ -394,8 +400,9 @@ function addDeclaredSpeedWeighting(crossing, projection) {
   // events the log left unobserved; everything else is left unattributed.
   if (projection.declaredSpeed !== "standard"
       && projection.declaredSpeed !== "fast") return;
-  const cell =
-    crossing[projection.declaredSpeed][fastModeModelFamilyKey(projection.model)];
+  const family = projection.fastModeFamily ?? "unsupported";
+  const row = crossing[projection.declaredSpeed] ??= {};
+  const cell = row[family] ??= { events: 0, apiPriceEquivalentUsd: 0 };
   cell.events += 1;
   cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
 }
@@ -594,8 +601,10 @@ function newTimelineBucket(startMs) {
     totalTokens: 0,
     components: emptyComponents(),
     apiPriceEquivalentUsd: 0,
-    speedWeighting: emptySpeedWeightingCrossing(),
-    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
+    // Timeline cells are sparse, as in the replay-safe cache. Registry model
+    // additions must not multiply retained/transmitted empty cells per bucket.
+    speedWeighting: {},
+    declaredSpeedWeighting: {},
     fullyPricedEvents: 0,
     partiallyPricedEvents: 0,
     unpricedEvents: 0,
@@ -652,8 +661,11 @@ export function quotaWindowProjection(window) {
   if (durationMinutes === null) return null;
   const resetAt = quotaResetIsoInstant(window.resetsAt);
   if (resetAt === null) return null;
-  return {
-    limitId: KNOWN_LIMITS.has(window.limitId) ? window.limitId : "unknown",
+  const projected = {
+    // Preserve a bounded future provider id for local display and track
+    // separation. Closed accounting/export boundaries still map it through
+    // their reviewed registries, so this cannot promote a new quota pool.
+    limitId: sanitizeQuotaLimitId(window.limitId),
     slot: KNOWN_SLOTS.has(window.slot) ? window.slot : "unknown",
     planType: KNOWN_PLANS.has(window.planType) ? window.planType : "unknown",
     usedPercent,
@@ -661,6 +673,9 @@ export function quotaWindowProjection(window) {
     durationMinutes,
     resetAt,
   };
+  const limitName = sanitizeQuotaLimitDisplayName(window.limitName);
+  if (limitName !== null) projected.limitName = limitName;
+  return projected;
 }
 
 function primaryCodexWindowIndex(windows) {

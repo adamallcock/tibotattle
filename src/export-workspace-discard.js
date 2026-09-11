@@ -4,7 +4,7 @@ import {
   EXPORT_WORKSPACE_DISCARD_QUARANTINE_PREFIX,
   EXPORT_WORKSPACE_DISCARD_RECEIPT_BASENAME,
 } from "./export/index.js";
-import { LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL } from "./export-workspace-discard-compatibility-internal.js";
+import { localExportWorkspaceDiscard } from "./local-node-runtime.js";
 
 export {
   EXPORT_WORKSPACE_DISCARD_COMMIT_MARKER_BASENAME,
@@ -12,9 +12,9 @@ export {
   EXPORT_WORKSPACE_DISCARD_QUARANTINE_PREFIX,
   EXPORT_WORKSPACE_DISCARD_RECEIPT_BASENAME,
 };
-export const ExportWorkspaceDiscardError = LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.ExportWorkspaceDiscardError;
-export const buildLocalExportWorkspaceDiscardPlan = LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.buildLocalExportWorkspaceDiscardPlan;
-export const planLocalExportWorkspaceDiscard = LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.planLocalExportWorkspaceDiscard;
-export const workspaceDiscardEvidenceToken = LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.workspaceDiscardEvidenceToken;
-export const workspaceDiscardDirectoryIdentityToken = LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.workspaceDiscardDirectoryIdentityToken;
-export const workspaceDiscardConfirmationToken = LEGACY_EXPORT_WORKSPACE_DISCARD_INTERNAL.workspaceDiscardConfirmationToken;
+export const ExportWorkspaceDiscardError = localExportWorkspaceDiscard.ExportWorkspaceDiscardError;
+export const buildLocalExportWorkspaceDiscardPlan = localExportWorkspaceDiscard.buildLocalExportWorkspaceDiscardPlan;
+export const planLocalExportWorkspaceDiscard = localExportWorkspaceDiscard.planLocalExportWorkspaceDiscard;
+export const workspaceDiscardEvidenceToken = localExportWorkspaceDiscard.workspaceDiscardEvidenceToken;
+export const workspaceDiscardDirectoryIdentityToken = localExportWorkspaceDiscard.workspaceDiscardDirectoryIdentityToken;
+export const workspaceDiscardConfirmationToken = localExportWorkspaceDiscard.workspaceDiscardConfirmationToken;

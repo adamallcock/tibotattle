@@ -152,7 +152,7 @@ test("streaming directory enumeration stops before retaining entry limit plus on
 
 test("export-set and destructive paths do not call array-returning readdir directly", async () => {
   for (const path of [
-    "../src/export-set-materializer.js",
+    "../src/application/local-export-set-materialization.js",
     "../src/export-set-verifier.js",
     "../src/export-deletion.js",
     "../src/export-deletion-executor.js",
@@ -161,7 +161,7 @@ test("export-set and destructive paths do not call array-returning readdir direc
     "../src/export-workspace-discard.js",
     "../src/export-workspace-discard-executor.js",
     "../src/application/local-export-workspace-discard.js",
-    "../src/export-workspace-discard-compatibility-internal.js",
+    "../src/local-node-runtime.js",
     "../src/platform/owner-only-export-workspace-discard-preflight.js",
     "../src/platform/owner-only-export-workspace-discard-storage.js",
     "../src/storage.js",

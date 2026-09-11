@@ -3,6 +3,9 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { defaultExportStateDirectory } from "./export-identity.js";
+import {
+  isWindowsAccountObservationBrokerBackend,
+} from "./platform/index.js";
 
 const SECRET_BYTES = 32;
 const LOCK_SCHEMA_VERSION = "account-observation-operation-v1";
@@ -26,12 +29,12 @@ function fail(code) {
   throw new AccountObservationSecretError(code);
 }
 
-function assertBackend(backend, capability) {
+function assertBackend(backend, capability, { createIfMissing = true } = {}) {
   let valid = capability !== null && capability !== undefined;
   try {
     valid = valid && backend !== null && typeof backend === "object"
       && typeof backend.read === "function"
-      && typeof backend.createIfMissing === "function";
+      && (!createIfMissing || typeof backend.createIfMissing === "function");
   } catch {
     valid = false;
   }
@@ -56,10 +59,16 @@ async function invokeBackend(backend, method, ...args) {
     } catch {
       // Hostile backend errors are collapsed below.
     }
-    fail(code === "export_identity_keychain_locked"
-      || code === "windows_credential_manager_locked"
-      ? "account_observation_credential_locked"
-      : "account_observation_credential_unavailable");
+    if (code === "export_identity_keychain_locked"
+        || code === "windows_credential_manager_locked"
+        || code === "windows_account_observation_broker_locked"
+        || code === "linux_secret_service_broker_locked") {
+      fail("account_observation_credential_locked");
+    }
+    if (code === "export_identity_keychain_migration_required") {
+      fail("account_observation_credential_migration_required");
+    }
+    fail("account_observation_credential_unavailable");
   }
 }
 
@@ -326,7 +335,9 @@ async function releaseOperationLease(path, lease) {
 export function createAccountObservationSecretLoader({
   backend,
   capability,
-  operationLockFile = defaultAccountObservationOperationLockFile(),
+  createIfMissing = true,
+  operationLockFile = undefined,
+  parentAuthoritativeMutationLease = false,
   generateSecret = () => randomBytes(SECRET_BYTES),
   clock = () => Date.now(),
   processExists = (processId) => {
@@ -341,22 +352,38 @@ export function createAccountObservationSecretLoader({
   staleLockMilliseconds = DEFAULT_STALE_LOCK_MILLISECONDS,
   operationHook = null,
 } = {}) {
-  assertBackend(backend, capability);
-  if (typeof generateSecret !== "function" || typeof clock !== "function" || typeof processExists !== "function"
+  assertBackend(backend, capability, { createIfMissing });
+  if (typeof createIfMissing !== "boolean"
+      || typeof parentAuthoritativeMutationLease !== "boolean"
+      || typeof generateSecret !== "function" || typeof clock !== "function" || typeof processExists !== "function"
       || !Number.isSafeInteger(processId) || processId < 1
       || !Number.isFinite(staleLockMilliseconds) || staleLockMilliseconds < 1
       || (operationHook !== null && typeof operationHook !== "function")) {
     fail("account_observation_credential_invalid");
   }
+  if (parentAuthoritativeMutationLease) {
+    if (operationLockFile !== undefined || operationHook !== null
+        || !isWindowsAccountObservationBrokerBackend(backend)) {
+      fail("account_observation_credential_invalid");
+    }
+  }
+  const selectedOperationLockFile = parentAuthoritativeMutationLease
+    ? null
+    : operationLockFile === undefined
+      ? defaultAccountObservationOperationLockFile()
+      : operationLockFile;
 
   return async function loadAccountObservationSecret() {
-    const lease = await acquireOperationLease(operationLockFile, {
-      clock,
-      processExists,
-      processId,
-      staleLockMilliseconds,
-      operationHook,
-    });
+    const lease = parentAuthoritativeMutationLease ? null : await acquireOperationLease(
+      selectedOperationLockFile,
+      {
+        clock,
+        processExists,
+        processId,
+        staleLockMilliseconds,
+        operationHook,
+      },
+    );
     let generated = null;
     let generatedValue = null;
     let persisted = null;
@@ -367,6 +394,9 @@ export function createAccountObservationSecretLoader({
         if (Buffer.isBuffer(existing)) existing.fill(0);
         return result;
       }
+      // Upload/review may lease an existing observation root, but must never
+      // create an identity merely because contribution was requested.
+      if (!createIfMissing) return null;
 
       generatedValue = generateSecret();
       generated = copySecret(generatedValue);
@@ -387,7 +417,7 @@ export function createAccountObservationSecretLoader({
       if (Buffer.isBuffer(generatedValue)) generatedValue.fill(0);
       generated?.fill(0);
       if (Buffer.isBuffer(persisted)) persisted.fill(0);
-      await releaseOperationLease(operationLockFile, lease);
+      if (lease !== null) await releaseOperationLease(selectedOperationLockFile, lease);
     }
   };
 }

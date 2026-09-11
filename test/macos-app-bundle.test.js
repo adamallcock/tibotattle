@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
+import { writeFileSync } from "node:fs";
 import {
+  access,
   appendFile,
   chmod,
   copyFile,
@@ -24,7 +26,9 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import {
+  PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   validateStateDirectoryName,
 } from "../config/product-brand.js";
@@ -47,10 +51,14 @@ import {
   MACOS_ACCOUNTING_RUNTIME_FILES,
   MACOS_BUILD_PROFILES,
   MACOS_IDENTITY_CORE_RUNTIME_FILES,
+  MACOS_KEYCHAIN_MIGRATION_HELPER,
+  MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES,
   MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
   MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
   MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
   MACOS_WEB_MODULE_ENTRYPOINTS,
+  assertMacOSBundleArchitecture,
+  assertMacOSMachOArchitecture,
   buildMacOSApp,
   buildMacOSAppForRelease,
   buildMacOSReleaseCandidate,
@@ -61,19 +69,24 @@ import {
   collectVerifiedMacOSWebModuleGraph,
   captureMacOSWorkspaceRuntimePackages,
   calculateMacOSSourceInputDigest,
+  deriveMacOSBundleVersion,
   assertMacOSWebModuleInventory,
   assertMacOSWorkspaceRuntimePackageInventory,
   assertMacOSExternalBuildOutputIsFresh,
   normalizeMacOSBundleVersion,
+  normalizeMacOSBuildArchitecture,
   normalizeMacOSBuildProfile,
   normalizeMacOSCentralOrigin,
   parseMacOSBuildArguments,
   pinnedPackage,
   pinnedPackageTreeDigest,
+  readMacOSReleaseSourceTimestamp,
   stageMacOSWebModules,
   stageMacOSWorkspaceRuntimePackages,
+  setMacOSBundleFinderMetadata,
   installMacOSExternalBuildOutput,
   validateMacOSPreviewApp,
+  validateMacOSNodeRuntimeInput,
   validateMacOSPreviewOutputPath,
   validateMacOSDistributionConfiguration,
 } from "../scripts/build-macos-app.js";
@@ -87,6 +100,8 @@ import {
   developerIDSignMacOSApp,
   developerIDSignMacOSDMG,
   inspectMacOSApp,
+  macOSReleaseManifestArchitecture,
+  isMacOSReleaseSourceTagForChannel,
   packageMacOSDMG,
   prepareMacOSReleaseCandidate,
   readMacOSReleaseSourceProvenance,
@@ -94,7 +109,9 @@ import {
   readMacOSReleaseCredentials,
   readStableReleaseManifest,
   submitToAppleNotary,
+  validateInstalledMacOSApp,
   validateNodeRuntimeEntitlements,
+  validateMacOSSignedReleaseArtifact,
   validateMacOSSignedReplacementArtifacts,
   validateMacOSSignedReplacementPair,
   validateMacOSApplicationsLink,
@@ -102,8 +119,15 @@ import {
   validateMacOSLoginItemReleaseRehearsal,
 } from "../scripts/macos-release-core.js";
 import {
+  resolveSignedMacOSBundleVersion,
+} from "../scripts/macos-bundle-version.js";
+import {
   parseArguments as parseMacOSDMGArguments,
 } from "../scripts/package-macos-dmg.js";
+import {
+  main as validateMacOSLoginItemRelease,
+  parseArguments as parseMacOSLoginItemReleaseArguments,
+} from "../scripts/validate-macos-login-item-release.js";
 import {
   SPARKLE_FRAMEWORK_LINKS,
   SPARKLE_FRAMEWORK_SHA256,
@@ -116,8 +140,10 @@ import {
 } from "../apps/macos/reset-local-keychain.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  deleteExportIdentityKeychainItemByAttributes,
   exportIdentityKeychainAttributeDeleteArguments,
   exportIdentityKeychainAttributeProbeArguments,
+  exportIdentityKeychainItemPresenceByAttributes,
 } from "../src/export-identity-keychain.js";
 import {
   CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV,
@@ -126,6 +152,16 @@ import {
 const REPOSITORY_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "..",
+);
+const DERIVED_MACOS_BUNDLE_VERSION = deriveMacOSBundleVersion();
+const INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION =
+  resolveSignedMacOSBundleVersion(
+    RELEASE_VERSION,
+    INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  );
+const STABLE_SIGNED_BUNDLE_VERSION = resolveSignedMacOSBundleVersion(
+  RELEASE_VERSION,
+  STABLE_RELEASE_CHANNEL,
 );
 const SWIFT_SOURCE = join(
   REPOSITORY_ROOT,
@@ -146,6 +182,34 @@ const MENU_BAR_STATUS_SOURCE = join(
   "macos",
   "Sources",
   "MenuBarStatus.swift",
+);
+const MENU_BAR_POPOVER_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarPopover.swift",
+);
+const MENU_BAR_POPUP_MODEL_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarPopupModel.swift",
+);
+const MENU_BAR_PACE_OUTLOOK_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarPaceOutlook.swift",
+);
+const NATIVE_BRAND_PALETTE_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "NativeBrandPalette.swift",
 );
 const KEYCHAIN_BROKER_SOURCE = join(
   REPOSITORY_ROOT,
@@ -253,6 +317,8 @@ test("reviewed product brand owns the native bundle and semantic-open identity",
     appOpenHost: "open",
     appOpenURL: "usagemonitor://open",
     stateDirectoryName: "Usage Monitor",
+    keychainNamespace: "app-usagemonitor",
+    keychainAccount: "installation",
     monitoredAppDisplayName: "Codex",
     monitoredAppBundleIdentifier: "com.openai.codex",
   });
@@ -260,6 +326,198 @@ test("reviewed product brand owns the native bundle and semantic-open identity",
     PRODUCT_BRAND.appOpenURL,
     `${PRODUCT_BRAND.appOpenScheme}://${PRODUCT_BRAND.appOpenHost}`,
   );
+  assert.equal(Object.isFrozen(PREVIEW_PRODUCT_BRAND), true);
+  assert.deepEqual(PREVIEW_PRODUCT_BRAND, {
+    displayName: "TiboTattle Preview",
+    bundleName: "TiboTattle Preview.app",
+    executableName: "TiboTattle",
+    bundleIdentifier: "com.usagemonitor.local.preview",
+    appOpenScheme: "usagemonitor-preview",
+    appOpenHost: "open",
+    appOpenURL: "usagemonitor-preview://open",
+    stateDirectoryName: "Usage Monitor Preview",
+    keychainNamespace: "app-usagemonitor.preview",
+    keychainAccount: "preview-installation",
+    monitoredAppDisplayName: "Codex",
+    monitoredAppBundleIdentifier: "com.openai.codex",
+  });
+  for (const key of [
+    "bundleName",
+    "bundleIdentifier",
+    "appOpenScheme",
+    "appOpenURL",
+    "stateDirectoryName",
+    "keychainNamespace",
+    "keychainAccount",
+  ]) {
+    assert.notEqual(PREVIEW_PRODUCT_BRAND[key], PRODUCT_BRAND[key], key);
+  }
+});
+
+test("external release Finder metadata is bound to the source revision", () => {
+  const commit = execFileSync(
+    "/usr/bin/git",
+    ["-C", REPOSITORY_ROOT, "rev-parse", "HEAD"],
+    { encoding: "utf8" },
+  ).trim();
+  const expectedTimestamp = Number(execFileSync(
+    "/usr/bin/git",
+    ["-C", REPOSITORY_ROOT, "show", "-s", "--format=%ct", commit],
+    { encoding: "utf8" },
+  ).trim());
+  const timestamp = readMacOSReleaseSourceTimestamp({ commit });
+  assert.equal(timestamp, expectedTimestamp);
+  assert.notEqual(timestamp, 946_684_800);
+
+  const calls = [];
+  assert.deepEqual(
+    setMacOSBundleFinderMetadata("/private/tmp/TiboTattle.app", {
+      birthTimeSeconds: timestamp,
+      commandRunner: (...arguments_) => calls.push(arguments_),
+    }),
+    {
+      birthTimeSeconds: timestamp,
+      modificationTimeSeconds: timestamp,
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "/usr/bin/SetFile");
+  assert.deepEqual(calls[0][1].slice(0, 1), ["-d"]);
+  assert.equal(calls[0][1][2], "-m");
+  assert.equal(calls[0][1][1], calls[0][1][3]);
+  const expectedDate = new Date(timestamp * 1_000);
+  const pad = (value) => String(value).padStart(2, "0");
+  assert.equal(
+    calls[0][1][1],
+    `${pad(expectedDate.getUTCMonth() + 1)}/${pad(expectedDate.getUTCDate())}/${expectedDate.getUTCFullYear()} `
+      + `${pad(expectedDate.getUTCHours())}:${pad(expectedDate.getUTCMinutes())}:${pad(expectedDate.getUTCSeconds())}`,
+  );
+  assert.equal(calls[0][1][4], "/private/tmp/TiboTattle.app");
+  assert.deepEqual(calls[0][2], {
+    env: {
+      PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      TZ: "UTC",
+    },
+  });
+});
+
+test("SetFile normalizes bundle birth and modification dates", {
+  skip: process.platform === "darwin"
+    ? false
+    : "requires macOS SetFile",
+}, async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-finder-metadata-"),
+  );
+  const app = join(temporaryRoot, "TiboTattle.app");
+  const timestamp = 1_700_000_000;
+  try {
+    await mkdir(app, { recursive: true });
+    setMacOSBundleFinderMetadata(app, {
+      birthTimeSeconds: timestamp,
+    });
+    const metadata = await lstat(app);
+    assert.equal(Math.trunc(metadata.birthtimeMs / 1_000), timestamp);
+    assert.equal(Math.trunc(metadata.mtimeMs / 1_000), timestamp);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("release DMG packaging resolves source-bound Finder metadata before hdiutil", {
+  skip: process.platform === "darwin"
+    ? false
+    : "requires macOS release tooling",
+}, async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-release-finder-metadata-"),
+  );
+  const sourceApp = join(temporaryRoot, "input", "TiboTattle.app");
+  const output = join(temporaryRoot, "output", "TiboTattle-release.dmg");
+  const failedOutput = join(
+    temporaryRoot,
+    "failed-output",
+    "TiboTattle-release.dmg",
+  );
+  const commit = execFileSync(
+    "/usr/bin/git",
+    ["-C", REPOSITORY_ROOT, "rev-parse", "HEAD"],
+    { encoding: "utf8" },
+  ).trim();
+  const expectedTimestamp = readMacOSReleaseSourceTimestamp({ commit });
+  const events = [];
+  const inspectInput = async (appPath, distribution, channel) => {
+    assert.equal(appPath, sourceApp);
+    assert.equal(distribution, "release");
+    assert.equal(channel, STABLE_RELEASE_CHANNEL);
+    return Object.freeze({
+      appPath,
+      shortVersion: RELEASE_VERSION,
+      source: Object.freeze({ commit }),
+    });
+  };
+  const commandRunner = (command, arguments_) => {
+    events.push([command, arguments_[0]]);
+    if (command === "/usr/bin/ditto") {
+      const copied = spawnSync(command, arguments_, {
+        encoding: "utf8",
+      });
+      assert.equal(copied.status, 0, copied.stderr || copied.stdout);
+    } else if (command === "/usr/bin/hdiutil"
+        && arguments_[0] === "create") {
+      writeFileSync(arguments_.at(-1), "synthetic-dmg");
+    }
+    return { stderr: "", stdout: "" };
+  };
+  const finderMetadataSetter = (path, metadata) => {
+    events.push(["/usr/bin/SetFile", path]);
+    setMacOSBundleFinderMetadata(path, metadata);
+  };
+  try {
+    await mkdir(join(sourceApp, "Contents"), { recursive: true });
+    await writeFile(join(sourceApp, "Contents", "marker.txt"), "synthetic");
+    const packaged = await packageMacOSDMG({
+      appPath: sourceApp,
+      output,
+      distribution: "release",
+      channel: STABLE_RELEASE_CHANNEL,
+    }, {
+      commandRunner,
+      finderMetadataSetter,
+      inspectInput,
+    });
+    assert.equal(packaged.output, output);
+    assert.equal(packaged.distribution, "release");
+    assert.equal(packaged.bytes, Buffer.byteLength("synthetic-dmg"));
+    assert.equal(
+      events.findIndex(([command]) => command === "/usr/bin/SetFile")
+        < events.findIndex(([command, action]) =>
+          command === "/usr/bin/hdiutil" && action === "create"),
+      true,
+    );
+    assert.equal(await stat(output).then((metadata) => metadata.isFile()), true);
+
+    await mkdir(dirname(failedOutput), { recursive: true });
+    await assert.rejects(
+      packageMacOSDMG({
+        appPath: sourceApp,
+        output: failedOutput,
+        distribution: "release",
+        channel: STABLE_RELEASE_CHANNEL,
+      }, {
+        commandRunner,
+        finderMetadataSetter() {
+          throw new Error("synthetic SetFile failure");
+        },
+        inspectInput,
+      }),
+      /synthetic SetFile failure/u,
+    );
+    await assert.rejects(lstat(failedOutput), { code: "ENOENT" });
+    assert.equal(expectedTimestamp, readMacOSReleaseSourceTimestamp({ commit }));
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
 });
 
 test("state directory branding rejects filesystem aliases", () => {
@@ -270,6 +528,79 @@ test("state directory branding rejects filesystem aliases", () => {
       /Invalid product-brand value: stateDirectoryName/u,
     );
   }
+});
+
+test("native launch binds each bundle ID to one reviewed runtime identity", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const launchValidation = source.indexOf(
+    "BundledProduct.validateRuntimeIdentity()",
+  );
+  const semanticOpenConstruction = source.indexOf(
+    "let semanticOpenTarget = SemanticOpenTarget(",
+    launchValidation,
+  );
+  const keychainBrokerSmoke = source.indexOf(
+    'if arguments.contains("--keychain-broker-contract-smoke-test")',
+    launchValidation,
+  );
+  assert.notEqual(launchValidation, -1);
+  assert.equal(keychainBrokerSmoke > launchValidation, true);
+  assert.equal(semanticOpenConstruction > launchValidation, true);
+
+  assert.match(
+    source,
+    /case "com\.usagemonitor\.local":[\s\S]*?"TiboTattle"[\s\S]*?"usagemonitor:\/\/open"[\s\S]*?"Usage Monitor"[\s\S]*?"app-usagemonitor"[\s\S]*?"installation"/u,
+  );
+  assert.match(
+    source,
+    /case "com\.usagemonitor\.local\.preview":[\s\S]*?"TiboTattle Preview"[\s\S]*?"usagemonitor-preview:\/\/open"[\s\S]*?"Usage Monitor Preview"[\s\S]*?"app-usagemonitor\.preview"[\s\S]*?"preview-installation"/u,
+  );
+  assert.match(
+    source,
+    /bundleIdentifier,[\s\S]*buildChannel,[\s\S]*releaseChannel,[\s\S]*isPreviewDistribution/u,
+  );
+  assert.match(
+    source,
+    /"com\.usagemonitor\.local",\s*"development",\s*"development",\s*false[\s\S]*validateDevelopmentUpdaterPolicy/u,
+  );
+  assert.match(
+    source,
+    /"com\.usagemonitor\.local\.preview",\s*"preview_distribution",\s*"preview_distribution",\s*true[\s\S]*requiredAppcastPath: MacOSUpdaterFeedPolicy\.previewPath[\s\S]*automaticUpdates: false/u,
+  );
+  assert.equal(
+    source.includes(DEPLOYMENT_ENDPOINTS.sparkle.appcastURL),
+    true,
+  );
+  const dogfoodAppcast = new URL(
+    getReleaseChannel(INTERNAL_DOGFOOD_RELEASE_CHANNEL).sparkle.appcastURL,
+  );
+  assert.equal(source.includes(`${dogfoodAppcast.origin}/`), true);
+  assert.equal(source.includes(dogfoodAppcast.pathname), true);
+  assert.equal(
+    source.includes(`requiredString("UsageMonitorUpdaterFrameworkVersion") == "${SPARKLE_VERSION}"`),
+    true,
+  );
+  assert.match(
+    source,
+    /requiredBool\("SUEnableAutomaticChecks"\) == automaticUpdates[\s\S]*requiredBool\("SUAllowsAutomaticUpdates"\) == automaticUpdates[\s\S]*requiredBool\("SUAutomaticallyUpdate"\) == automaticUpdates[\s\S]*requiredBool\("SURequireSignedFeed"\)[\s\S]*requiredBool\("SUVerifyUpdateBeforeExtraction"\)/u,
+  );
+  assert.match(
+    source,
+    /components\.percentEncodedPath == requiredPath[\s\S]*expectedURL == nil \|\| appcast == expectedURL/u,
+  );
+  assert.match(source, /MacOSUpdaterFeedPolicy\.accepts\(\s*appcast,[\s\S]*expectedURL: expectedAppcastURL,[\s\S]*requiredPath: requiredAppcastPath\s*\)/u);
+  assert.match(
+    source,
+    /publicKeyBytes\.count == 32[\s\S]*publicKeyBytes\.base64EncodedString\(\) == publicKey/u,
+  );
+  assert.match(
+    source,
+    /forInfoDictionaryKey: "CFBundleURLTypes"[\s\S]*urlTypes\.count == 1[\s\S]*Set\(urlType\.keys\) == Set\(\[[\s\S]*"CFBundleTypeRole"[\s\S]*"CFBundleURLName"[\s\S]*"CFBundleURLSchemes"/u,
+  );
+  assert.match(
+    source,
+    /urlType\["CFBundleTypeRole"\] as\? String == "Viewer"[\s\S]*urlType\["CFBundleURLName"\] as\? String[\s\S]*"\\\(bundleIdentifier\)\.\\\(appOpenHost\)"[\s\S]*registeredSchemes == \[appOpenScheme\]/u,
+  );
 });
 
 test("local-companion readiness stays machine-readable across rebrands", async () => {
@@ -314,12 +645,18 @@ async function sha256File(path) {
 }
 
 const NORMALIZED_TEST_CODE_PATHS = new Set([
+  MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
   "Contents/MacOS/TiboTattle",
   "Contents/Resources/runtime/bin/node",
-  "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
   ...SPARKLE_MACH_O_PATHS.map(
     (path) => `Contents/Frameworks/Sparkle.framework/${path}`,
   ),
+]);
+const RETIRED_PREVIEW_KEYTAR_PATH =
+  "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node";
+const LEGACY_PREVIEW_NORMALIZED_TEST_CODE_PATHS = new Set([
+  ...NORMALIZED_TEST_CODE_PATHS,
+  RETIRED_PREVIEW_KEYTAR_PATH,
 ]);
 
 function canonicalizeTestMachO(bytes) {
@@ -355,8 +692,13 @@ function canonicalizeTestMachO(bytes) {
   return canonical;
 }
 
-async function testPayloadBytes(path, relativePath, temporaryRoot) {
-  if (!NORMALIZED_TEST_CODE_PATHS.has(relativePath)) {
+async function testPayloadBytes(
+  path,
+  relativePath,
+  temporaryRoot,
+  normalizedCodePaths = NORMALIZED_TEST_CODE_PATHS,
+) {
+  if (!normalizedCodePaths.has(relativePath)) {
     return readFile(path);
   }
   const normalizationRoot = await mkdtemp(
@@ -376,25 +718,28 @@ async function testPayloadBytes(path, relativePath, temporaryRoot) {
   }
 }
 
-async function testPayloadInventory(app, temporaryRoot) {
+async function testPayloadInventory(
+  app,
+  temporaryRoot,
+  { normalizedCodePaths = NORMALIZED_TEST_CODE_PATHS } = {},
+) {
   const walked = await walk(app);
   const files = walked.filter(({ relativePath, entry }) =>
     entry.isFile()
-    && ![
-      "Contents/Resources/build-manifest.json",
-      "Contents/_CodeSignature/CodeResources",
-    ].includes(relativePath));
+    && relativePath !== "Contents/Resources/build-manifest.json"
+    && !relativePath.split("/").includes("_CodeSignature"));
   const aggregate = createHash("sha256");
   const inventory = [];
   let totalBytes = 0;
   for (const file of files) {
-    const normalization = NORMALIZED_TEST_CODE_PATHS.has(file.relativePath)
+    const normalization = normalizedCodePaths.has(file.relativePath)
       ? "mach_o_without_code_signature"
       : "raw";
     const bytes = await testPayloadBytes(
       file.path,
       file.relativePath,
       temporaryRoot,
+      normalizedCodePaths,
     );
     const metadata = await lstat(file.path);
     const entry = {
@@ -726,7 +1071,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(source, /case companionAlreadyRunning/u);
   assert.match(source, /UM_MACOS_COMPANION_ALREADY_RUNNING/u);
-  assert.match(source, /automatic_contribution_instance_active/u);
+  assert.match(
+    source,
+    /activeInstanceErrorCodes: Set<String> = \[[\s\S]*?"automatic_contribution_instance_active"[\s\S]*?"automatic_contribution_retirement_instance_active"[\s\S]*?\]/u,
+  );
+  assert.match(
+    source,
+    /diagnosticTokens = pendingStandardError\.split[\s\S]*?Self\.activeInstanceErrorCodes\.contains\(String\(\$0\)\)/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /pendingStandardError\.contains\("automatic_contribution(?:_retirement)?_instance_active"\)/u,
+  );
   assert.match(
     source,
     /anotherInstanceIsActive\s*\? LauncherError\.companionAlreadyRunning/u,
@@ -764,6 +1120,12 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(
     source,
     /requiredDirectoryName\("UsageMonitorStateDirectoryName"\)/u,
+  );
+  assert.match(source, /requiredString\("UsageMonitorKeychainNamespace"\)/u);
+  assert.match(source, /requiredString\("UsageMonitorKeychainAccount"\)/u);
+  assert.match(
+    source,
+    /case "com\.usagemonitor\.local":[\s\S]*?\("app-usagemonitor", "installation"\)[\s\S]*?case "com\.usagemonitor\.local\.preview":[\s\S]*?\("app-usagemonitor\.preview", "preview-installation"\)/u,
   );
   assert.match(source, /value != "\."[\s\S]*value != "\.\."/u);
   assert.match(source, /!value\.contains\("\/"\)/u);
@@ -832,7 +1194,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /guard !quitting, retryAllowed, firstRunAcknowledged else \{ return \}/u,
+    /guard !quitting, retryAllowed, firstRunAcknowledged,\s*keychainResetGeneration == nil, keychainResetProcess == nil else \{ return \}/u,
   );
   assert.match(
     source,
@@ -857,7 +1219,15 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /guard Self\.feedResponseIsReachable\([\s\S]*showFeedFailureAlert/u,
+    /guard Self\.feedResponseIsReachable\([\s\S]*showUpdateFailureAlert\(\s*messageKey:\s*\.settingsUpdateCheckUnavailableTitle,\s*informativeTextKey:\s*\.settingsUpdateCheckUnavailableMessage/u,
+  );
+  assert.match(
+    source,
+    /guard let appcastURL = Self\.appcastURL else \{[\s\S]*showUpdateFailureAlert\(\s*messageKey:\s*\.launcherUpdateUnavailable,\s*informativeTextKey:\s*\.settingsAutomaticUpdatesUnavailable/u,
+  );
+  assert.match(
+    source,
+    /private func showUpdateFailureAlert\([\s\S]*?alert\.messageText = TiboTattleLocalization\.string\(messageKey\)[\s\S]*?alert\.informativeText = TiboTattleLocalization\.string\(informativeTextKey\)/u,
   );
   assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.launcherRetry\)\)/u);
   assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.commonCancel\)\)/u);
@@ -866,6 +1236,10 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /var settingsSummary: String \{([\s\S]*?)\n    \}\n\n    private func setState/u,
   )?.[1];
   assert.ok(updaterSummary, "updater summary source should be present");
+  assert.match(
+    updaterSummary,
+    /if isAvailable && !allowsAutomaticUpdateOptIn[\s\S]*settingsUpdateDisclosurePreview[\s\S]*settingsAutomaticUpdatesUnavailable/u,
+  );
   const readySummary = updaterSummary.match(
     /case \.ready:([\s\S]*?)case \.checking:/u,
   )?.[1];
@@ -893,6 +1267,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /didAbortWithError[\s\S]*stateForUpdaterAbort\([\s\S]*errorDomain: updaterError\.domain[\s\S]*errorCode: updaterError\.code/u,
   );
   assert.match(source, /controller\.checkForUpdates\(sender\)/u);
+  assert.match(
+    source,
+    /var canConfigureAutomaticUpdates: Bool \{[\s\S]*guard isAvailable,[\s\S]*feedIsReachable,[\s\S]*allowsAutomaticUpdateOptIn[\s\S]*!\[\.checking, \.failed\]\.contains\(state\)/u,
+  );
+  assert.match(
+    source,
+    /var allowsAutomaticUpdateOptIn: Bool \{[\s\S]*!Self\.isPreviewDistribution[\s\S]*updater\.allowsAutomaticUpdates == true/u,
+  );
+  assert.match(
+    source,
+    /func setAutomaticUpdatesEnabled\(_ enabled: Bool\) \{[\s\S]*guard !Self\.isPreviewDistribution,[\s\S]*updater\.allowsAutomaticUpdates,[\s\S]*feedIsReachable/u,
+  );
   assert.match(source, /runtimeStateDescription/u);
   assert.match(
     source,
@@ -919,6 +1305,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /settingsUpdateDisclosureAutomaticOn/u,
   );
   assert.match(source, /updater\.automaticallyDownloadsUpdates = enabled/u);
+  assert.match(
+    source,
+    /"USAGE_MONITOR_APP_OPEN_URL": BundledProduct\.appOpenURL/u,
+  );
+  assert.match(
+    source,
+    /"USAGE_MONITOR_KEYCHAIN_NAMESPACE":\s*BundledProduct\.keychainNamespace/u,
+  );
+  assert.match(
+    source,
+    /"USAGE_MONITOR_KEYCHAIN_ACCOUNT": BundledProduct\.keychainAccount/u,
+  );
   assert.match(source, /NSSwitch\(\)/u);
   assert.match(
     source,
@@ -935,6 +1333,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(
     source,
     /TiboTattleLocalization\.string\(\.settingsLanguageSummary\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.settingsAppearance\)/u,
+  );
+  assert.match(
+    source,
+    /\(\.system, \.settingsAppearanceSystem\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.settingsAppearanceSummary\)/u,
   );
   assert.match(
     source,
@@ -957,7 +1367,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.ok(generalSettings, "general settings page wiring should be present");
   assert.match(
     generalSettings,
-    /languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
+    /appearanceSection[\s\S]*languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
   );
   assert.doesNotMatch(generalSettings, /quotaNotificationsSection/u);
   assert.doesNotMatch(
@@ -1010,6 +1420,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     );
   }
   assert.match(settingsSource, /symbolName: "globe"/u);
+  assert.match(settingsSource, /symbolName: "circle\.lefthalf\.filled"/u);
   assert.match(settingsSource, /symbolName: "folder"/u);
   assert.match(settingsSource, /symbolName: "clock"/u);
   assert.match(source, /settingsOpenNotifications/u);
@@ -1026,6 +1437,38 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(
     localizationSource,
     /Start TiboTattle when you sign in\. Manage this in System Settings → Login Items\./iu,
+  );
+  assert.match(localizationSource, /Uses your Mac appearance by default\./iu);
+  assert.match(source, /static let defaultsKey = "tibotattle\.appearance\.v1"/u);
+  assert.match(source, /case system\s*\n\s*case light\s*\n\s*case dark/u);
+  assert.match(
+    source,
+    /guard let rawValue = defaults\.string\(forKey: defaultsKey\),[\s\S]*?else \{\s*\n\s*return \.system\s*\n\s*\}/u,
+  );
+  assert.match(
+    source,
+    /var applicationAppearance: NSAppearance\? \{[\s\S]*?case \.system:\s*\n\s*nil[\s\S]*?case \.light:\s*\n\s*NSAppearance\(named: \.aqua\)[\s\S]*?case \.dark:\s*\n\s*NSAppearance\(named: \.darkAqua\)/u,
+  );
+  assert.match(
+    source,
+    /func resolvedTheme\(for systemAppearance: NSAppearance\) -> String \{[\s\S]*?case \.light:\s*\n\s*return "light"[\s\S]*?case \.dark:\s*\n\s*return "dark"[\s\S]*?case \.system:[\s\S]*?systemAppearance\.bestMatch\(from: \[\.darkAqua, \.aqua\]\)[\s\S]*?\? "dark"\s*\n\s*: "light"/u,
+  );
+  assert.match(source, /NSApp\.appearance = preference\.applicationAppearance/u);
+  assert.match(
+    source,
+    /private func synchronizeResolvedAppearance\(\) \{[\s\S]*?let preference = NativeAppearancePreference\.current[\s\S]*?guard preference == \.system else \{ return \}[\s\S]*?notifyAppearancePreferenceChange\(preference\)/u,
+  );
+  assert.match(
+    source,
+    /func applicationDidBecomeActive\([\s\S]*?synchronizeResolvedAppearance\(\)/u,
+  );
+  assert.match(
+    source,
+    /chrome\.onAppearanceChange = \{ \[weak self\] in\s*\n\s*self\?\.synchronizeResolvedAppearance\(\)/u,
+  );
+  assert.match(
+    source,
+    /private func selectAppearancePreference\([\s\S]*?NativeAppearancePreference\.set\(preference\)[\s\S]*?applyAppearancePreference\(\)/u,
   );
   assert.match(source, /NSApp\.applicationIconImage/u);
   assert.doesNotMatch(source, /showAutomaticUpdateOptions/u);
@@ -1047,7 +1490,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(destinationSource, /case community\b/u);
   assert.deepEqual(
     [...destinationSource.matchAll(/^\s*case (\w+)$/gmu)].map((match) => match[1]),
-    ["overview", "weekly", "trends", "method", "community"],
+    ["overview", "weekly", "trends", "performance", "method", "community"],
   );
   assert.match(source, /private final class NativeDashboardReportPane/u);
   // The chrome is an NSSplitViewController with a real sidebar item, so the
@@ -1069,7 +1512,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.doesNotMatch(source, /webView\.autoresizingMask = \[\.width/u);
   assert.match(source, /override func layout\(\) \{[\s\S]*?fitWebViewToBounds\(\)/u);
   assert.match(source, /webView\.frame = frame/u);
-  assert.match(source, /private func loadWhenViewportIsReady\(\)/u);
+  assert.match(source, /private func loadWhenViewportIsReady\(generation: UInt64\)/u);
   assert.match(source, /viewport\.width >= 120, viewport\.height >= 120/u);
   assert.match(source, /nativeDashboardChrome\?\.prepareReportViewport\(\)/u);
   // `didFinish` only means that WebKit has loaded the document shell. The
@@ -1078,7 +1521,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   // sampling a transient DOM node that is legitimately empty during startup.
   assert.match(
     source,
-    /private func awaitDashboardContent\([\s\S]*?webView\.evaluateJavaScript\(\s*"document\.documentElement\?\.dataset\.localDashboardReady === 'true';"\s*\) \{[\s\S]*?guard let self, self\.hasDashboardTarget else \{ return \}[\s\S]*?let localDashboardReady = \(value as\? NSNumber\)\?\.boolValue \?\? false[\s\S]*?if error == nil, localDashboardReady \{[\s\S]*?self\.onLoaded\(\)[\s\S]*?return/u,
+    /private func awaitDashboardContent\([\s\S]*?webView\.evaluateJavaScript\(\s*"document\.documentElement\?\.dataset\.localDashboardReady === 'true';"\s*\) \{[\s\S]*?guard let self, self\.hasDashboardTarget,[\s\S]*?self\.dashboardReadiness\.isObserving\(generation\)[\s\S]*?let localDashboardReady = \(value as\? NSNumber\)\?\.boolValue \?\? false[\s\S]*?if error == nil, localDashboardReady \{[\s\S]*?ready: true[\s\S]*?if outcome == \.ready[\s\S]*?self\.finishDashboardContentObservation\(ready: true\)/u,
   );
   assert.doesNotMatch(source, /document\.querySelector\('#main'\)\?\.innerText/u);
   assert.match(source, /addSplitViewItem\(reportItem\)/u);
@@ -1086,7 +1529,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.doesNotMatch(source, /split\.addArrangedSubview\(webView\)/u);
   assert.match(source, /newWindow\.toolbar = makeDashboardToolbar\(\)/u);
   assert.match(source, /newWindow\.toolbarStyle = \.unified/u);
-  assert.match(source, /refreshLocalUsage\(automatic: true\)/u);
+  assert.match(
+    source,
+    /refreshLocalUsage\(automatic: true, mode: \.quick\)/u,
+  );
+  assert.match(
+    source,
+    /NativeDetailedRefreshCadence[\s\S]*?minimumInterval: TimeInterval = 60 \* 60[\s\S]*?defaults\.set\(nowInterval, forKey: defaultsKey\)[\s\S]*?return \.quick[\s\S]*?return \.detailed/u,
+  );
+  assert.match(source, /let detailedReservation = mode == \.detailed[\s\S]*?NativeDetailedRefreshCadence\.recordDetailedAttempt\(\)[\s\S]*?nativeEvidenceReader\.startAnalysis/u);
+  assert.match(source, /case let \.alreadyRunning\(_, attempt\)[\s\S]*?restoreAfterQuickJoin\(\s*detailedReservation,\s*attempt: attempt/u);
+  assert.match(source, /restoreAfterQuickJoin[\s\S]*?attempt\?\.mode == \.quick[\s\S]*?reservation\.stampedAt[\s\S]*?reservation\.token/u);
+  assert.match(source, /!cadenceStatusChecked[\s\S]*?nativeEvidenceReader\.readAnalysisActivity[\s\S]*?allowAutomaticDetailed: controllerIdle/u);
   assert.match(source, /static let defaultsKey = "tibotattle\.refresh-interval\.v1"/u);
   assert.match(source, /static let allowedSeconds = \[60, 5 \* 60, 15 \* 60, 30 \* 60\]/u);
   assert.match(source, /static func seconds\(in defaults: UserDefaults\) -> Int/u);
@@ -1099,6 +1553,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /DispatchQueue\.main\.asyncAfter\(deadline: deadline, execute: work\)/u);
   assert.match(source, /setSeconds\(value, in: UserDefaults\.standard\)/u);
   assert.match(source, /--native-refresh-settings-contract-smoke-test/u);
+  assert.match(source, /--native-appearance-settings-contract-smoke-test/u);
   assert.doesNotMatch(source, /nativeRefreshIntervalSeconds/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
   const refreshIntervalSelectionSource = source.match(
@@ -1200,11 +1655,11 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(source, /button\.isBordered = false/u);
   assert.doesNotMatch(source, /\.systemYellow|\.systemGreen/u);
-  // The colorway mirrors the title's own precedence: a running refresh,
-  // then a terminal failure, then an incomplete index, then evidence.
+  // The colorway mirrors the title's own precedence: a running refresh and
+  // attested partial coverage are amber; hard failures remain rust.
   assert.match(
     source,
-    /private func nativeToolbarStatusColor\([\s\S]*?if isRefreshing \{[\s\S]*?return \.busy[\s\S]*?if nativeRefreshFailure != nil \{[\s\S]*?return \.failed[\s\S]*?!coverage\.isComplete \{[\s\S]*?return \.busy[\s\S]*?case \.live:[\s\S]*?return \.fresh/u,
+    /private func nativeToolbarStatusColor\([\s\S]*?if isRefreshing \{[\s\S]*?return \.busy[\s\S]*?coverage\.partialTerminal \{[\s\S]*?return \.busy[\s\S]*?if nativeRefreshFailure != nil \{[\s\S]*?return \.failed[\s\S]*?!coverage\.isComplete \{[\s\S]*?return \.busy[\s\S]*?case \.live:[\s\S]*?return \.fresh/u,
   );
   assert.match(source, /nativeStatusPill\?\.colorway = colorway/u);
   assert.match(source, /nativeDashboardFresh/u);
@@ -1305,21 +1760,50 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /func applicationWillTerminate[\s\S]*menuBarStatus\?\.shutDown\(\)/u,
   );
   // The shipped app must never become a menu-bar-only surface. Accessory
-  // activation is confined to the non-launching AppKit smoke modes.
+  // activation is confined to isolated AppKit smoke modes, including the
+  // development-only, data-free interaction harness below.
   assert.match(
     source,
     /private enum MenuBarContractSmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
   );
   assert.equal(
     source.match(/setActivationPolicy\(\.accessory\)/gu)?.length,
-    4,
+    8,
     "only isolated AppKit smoke modes may use accessory activation",
   );
-  // The fourth is the sidebar-recovery smoke, which builds real chrome in a
-  // window it never brings forward.
+  assert.match(
+    source,
+    /static func render\(outputDirectory: String\) -> Int32 \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
+  );
+  assert.match(
+    source,
+    /static func renderOverview\(inputPath: String, outputDirectory: String\) -> Int32 \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
+  );
+  const menuBarSmokeSource = source.match(
+    /private enum MenuBarContractSmokeTest \{[\s\S]*?(?=\nprivate enum NativeSettingsLayout)/u,
+  )?.[0] ?? "";
+  const interactionHarness = menuBarSmokeSource.match(
+    /static func runInteractionHarness\(\) -> Int32 \{[\s\S]*?\n    \}/u,
+  )?.[0] ?? "";
+  assert.match(interactionHarness, /application\.setActivationPolicy\(\.accessory\)/u);
+  assert.match(interactionHarness, /MenuBarStatusController\(/u);
+  assert.doesNotMatch(interactionHarness,
+    /CompanionProcess|CompanionResources|\bProcess\(|companionReady\(|startCompanion\(|openDashboard\(/u);
+  const interactionEntry = source.match(
+    /if arguments\.contains\("--menu-bar-interaction-smoke-test"\) \{[\s\S]*?\n        \}/u,
+  )?.[0] ?? "";
+  assert.match(interactionEntry,
+    /guard BundledProduct\.buildChannel == "development"[\s\S]*?else \{\s*exit\(2\)/u);
+  assert.match(interactionEntry, /MenuBarContractSmokeTest\.runInteractionHarness\(\)/u);
+  // The sidebar-recovery and interaction-safety smokes build real AppKit or
+  // WebKit objects in windows they never bring forward.
   assert.match(
     source,
     /private enum NativeDashboardSidebarRecoverySmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
+  );
+  assert.match(
+    source,
+    /private enum NativeDashboardInteractionSafetySmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
   );
   for (const forbidden of [
     "LSUIElement",
@@ -1423,6 +1907,16 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(source, /WKUserScript\([\s\S]*injectionTime: \.atDocumentStart/u);
   assert.match(source, /document\.documentElement\.classList\.add\('native-dashboard'\)/u);
+  assert.equal(
+    source.includes("window.__TIBOTATTLE_APPEARANCE__ = \\(json);"),
+    true,
+  );
+  assert.match(source, /document\.documentElement\.dataset\.theme = theme/u);
+  assert.match(source, /theme !== 'light' && theme !== 'dark'/u);
+  assert.match(
+    source,
+    /func notifyAppearancePreferenceChange\([\s\S]*?refreshDocumentStartScripts\(\)[\s\S]*?tibotattle:appearance-override/u,
+  );
   assert.match(
     source,
     /func notifyHostedSignInReturn\(\) \{[\s\S]*?window\.dispatchEvent\(new Event\('tibotattle:hosted-sign-in-return'\)\)/u,
@@ -1441,14 +1935,46 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(
     source,
-    /decisionHandler\(\.cancel\)\s*\n\s*openExternally\(url\)/u,
+    /decisionHandler\(\.cancel\)\s*\n\s*openExternalNavigation\(navigationAction, url: url\)/u,
   );
   // A second window is never opened in-app; its target is handed straight to
   // the user's browser and this delegate returns nothing.
   assert.match(
     source,
-    /createWebViewWith configuration: WKWebViewConfiguration,[\s\S]*?openExternally\(url\)\s*\n\s*\}\s*\n\s*return nil/u,
+    /createWebViewWith configuration: WKWebViewConfiguration,[\s\S]*?openExternalNavigation\(navigationAction, url: url\)\s*\n\s*\}\s*\n\s*return nil/u,
   );
+  // Neither navigation delegate is a trusted-user attestation. Only the
+  // isolated-content-world click bridge can open Codex; generic navigations
+  // (including script clicks/new windows/downloads) cannot.
+  assert.match(
+    source,
+    /private func openExternalNavigation\([\s\S]*?url\.scheme\?\.lowercased\(\) == "codex" \{\s*(?:\/\/[^\n]*\n\s*)*return\s*\}\s*openExternally\(url\)/u,
+  );
+  assert.match(
+    source,
+    /configuration\.userContentController\.add\(\s*self,\s*contentWorld: Self\.codexThreadLinkWorld,\s*name: "tibotattleCodexThreadLink"/u,
+  );
+  assert.match(
+    source,
+    /source: trustedCodexThreadLinkScript\(\),\s*injectionTime: \.atDocumentStart,\s*forMainFrameOnly: true,\s*in: codexThreadLinkWorld/u,
+  );
+  assert.match(
+    source,
+    /message\.name == "tibotattleCodexThreadLink"[\s\S]*?message\.world === Self\.codexThreadLinkWorld[\s\S]*?payload\.count == 1[\s\S]*?threadId\.count == 36[\s\S]*?CodexThreadOpenTarget\.acceptsNavigation\([\s\S]*?sourceIsMainFrame: frame\.isMainFrame[\s\S]*?sourceURL: frame\.request\.url[\s\S]*?sourceOrigin: \(origin\.protocol, origin\.host, origin\.port\)[\s\S]*?companionPort: allowedPort/u,
+  );
+  assert.match(
+    source,
+    /decidePolicyFor navigationAction: WKNavigationAction,[\s\S]*?if url\.scheme\?\.lowercased\(\) == "codex" \{[\s\S]*?decisionHandler\(\.cancel\)[\s\S]*?openExternalNavigation\(navigationAction, url: url\)[\s\S]*?return[\s\S]*?navigationAction\.shouldPerformDownload/u,
+  );
+  assert.match(
+    source,
+    /private enum CodexThreadOpenTarget[\s\S]*?parts\.scheme == "codex"[\s\S]*?parts\.host == "threads"[\s\S]*?parts\.user == nil[\s\S]*?parts\.password == nil[\s\S]*?parts\.port == nil[\s\S]*?parts\.query == nil[\s\S]*?parts\.fragment == nil[\s\S]*?UUID\(uuidString:[\s\S]*?url\.absoluteString[\s\S]*?identifier\.uuidString\.lowercased\(\)/u,
+  );
+  assert.match(
+    source,
+    /private func openExternalDashboardLink\(_ url: URL\) \{[\s\S]*?if CodexThreadOpenTarget\.accepts\(url\) \{\s*NSWorkspace\.shared\.open\(url\)\s*return/u,
+  );
+  assert.match(source, /let codexThreadLinksSafe = codexThreadPolicyIsSafe\(\)/u);
   assert.match(
     source,
     /private func openExternalDashboardLink\(_ url: URL\) \{[\s\S]*?semanticOpenTarget\.accepts\(url\)[\s\S]*?NSApp\.activate\(ignoringOtherApps: true\)[\s\S]*?url\.scheme\?\.lowercased\(\) == "https"[\s\S]*?url\.user == nil,\s*\n\s*url\.password == nil/u,
@@ -1459,6 +1985,20 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.doesNotMatch(source, /Finish signing in in your browser/u);
   assert.match(source, /webView\.allowsBackForwardNavigationGestures = false/u);
+  assert.match(source, /webView = NativeDashboardWebView\(/u);
+  assert.match(source, /webView\.allowsLinkPreview = false/u);
+  const nativeWebView = source.match(
+    /private final class NativeDashboardWebView: WKWebView \{([\s\S]*?)\n\}\n\n\/\/\/ The dashboard is hosted/u,
+  )?.[1];
+  assert.ok(nativeWebView, "the native dashboard WKWebView subclass should be present");
+  for (const hiddenIdentifier of [
+    "WKMenuItemIdentifierGoBack",
+    "WKMenuItemIdentifierGoForward",
+    "WKMenuItemIdentifierDownloadLinkedFile",
+  ]) {
+    assert.match(nativeWebView, new RegExp(hiddenIdentifier, "u"));
+  }
+  assert.doesNotMatch(nativeWebView, /WKMenuItemIdentifierReload/u);
   for (const forbidden of [
     "allowsLinkPreview = true",
     "javaScriptCanOpenWindowsAutomatically",
@@ -1490,18 +2030,18 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(
     source,
-    /func webView\(_ webView: WKWebView, didFinish navigation: WKNavigation!\) \{\s*\n\s*guard hasDashboardTarget else \{ return \}/u,
+    /func webView\(_ webView: WKWebView, didFinish navigation: WKNavigation!\) \{\s*\n\s*guard hasDashboardTarget, let navigation,\s*\n\s*navigation === activeDashboardNavigation\s*\n\s*else \{ return \}/u,
   );
 
   // A failed web view never becomes the only thing on screen: the status
   // stack and the native recovery controls return together.
   assert.match(
     source,
-    /private func dashboardWebViewFailed\(code: String\) \{[\s\S]*?dashboardContainer\.isHidden = true\s*\n\s*statusStack\.isHidden = false/u,
+    /private func dashboardWebViewFailed\(_ failure: LauncherError\) \{[\s\S]*?dashboardContainer\.isHidden = true\s*\n\s*statusStack\.isHidden = false/u,
   );
   assert.match(
     source,
-    /private func dashboardWebViewFailed\(code: String\) \{[\s\S]*?retryButton\.isEnabled = retryAllowed && firstRunAcknowledged/u,
+    /private func dashboardWebViewFailed\(_ failure: LauncherError\) \{[\s\S]*?retryButton\.isEnabled = retryAllowed && firstRunAcknowledged/u,
   );
   assert.match(
     source,
@@ -1517,14 +2057,107 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(
     source,
+    /for button in \[\s*retryButton,\s*openButton,\s*\] \{\s*actionRow\.addView\(button, in: \.trailing\)/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /for button in \[\s*retryButton,\s*openButton,\s*openInBrowserButton,/u,
+  );
+  assert.match(
+    source,
     /@objc private func openDashboard\(\) \{[\s\S]*?showDashboardWebView\(dashboardURL\)/u,
   );
   assert.match(
     source,
     /@objc private func openDashboardInBrowser\(\) \{[\s\S]*?NSWorkspace\.shared\.open\(dashboardURL\)/u,
   );
+  // Recovery copy and diagnostics distinguish the host phase without adding
+  // another dashboard lifecycle or retry path.
+  assert.match(source, /private let onFailure: \(LauncherError\) -> Void/u);
+  assert.match(
+    source,
+    /guard viewportPreparationAttempts < 20 else \{[\s\S]*?onFailure\(\.dashboardViewportUnavailable\)/u,
+  );
+  assert.match(
+    source,
+    /case \.timedOut:[\s\S]*?finishDashboardContentObservation\(ready: false\)/u,
+  );
+  assert.match(
+    source,
+    /private func finishDashboardContentObservation\(ready: Bool\)[\s\S]*?hasDashboardTarget = false[\s\S]*?onFailure\(\.dashboardReadinessTimeout\)/u,
+  );
+  assert.match(
+    source,
+    /func webViewWebContentProcessDidTerminate[\s\S]*?onFailure\(\.dashboardContentProcessTerminated\)/u,
+  );
+  assert.match(
+    source,
+    /private func reportNavigationFailure[\s\S]*?onFailure\(\.dashboardNavigationFailed\)/u,
+  );
+  assert.match(
+    source,
+    /private func dashboardWebViewFailed\(_ failure: LauncherError\) \{[\s\S]*?case \.dashboardReadinessTimeout:[\s\S]*?headline = \.launcherDashboardTakingLonger[\s\S]*?lastFailureCode = failure\.failureCode[\s\S]*?failure\.errorDescription[\s\S]*?failure\.failureCode[\s\S]*?failure\.recoverySuggestion/u,
+  );
+  assert.match(source, /UM_MACOS_DASHBOARD_VIEWPORT_UNAVAILABLE/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_NAVIGATION_FAILED/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_WEB_PROCESS_TERMINATED/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_READY_TIMEOUT/u);
   assert.match(source, /UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE/u);
   assert.match(source, /UM_MACOS_DASHBOARD_DOWNLOAD_FAILED/u);
+});
+
+test("native Codex link bridge requires a trusted click and a canonical thread target", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const swiftScript = source.match(
+    /private static func trustedCodexThreadLinkScript\(\) -> String \{\s*"""([\s\S]*?)"""/u,
+  )?.[1];
+  assert.ok(swiftScript, "the native-owned isolated click script exists");
+  const messages = [];
+  let listener;
+  let prevented = 0;
+  class Element {
+    constructor(href) { this.href = href; }
+    closest(selector) {
+      assert.equal(selector, "a[href]");
+      return this;
+    }
+    getAttribute(name) {
+      assert.equal(name, "href");
+      return this.href;
+    }
+  }
+  runInNewContext(swiftScript.replaceAll("\\\\", "\\"), {
+    Element,
+    document: { addEventListener(type, callback, capture) {
+      assert.equal(type, "click");
+      assert.equal(capture, true);
+      listener = callback;
+    } },
+    window: { webkit: { messageHandlers: { tibotattleCodexThreadLink: {
+      postMessage: (value) => messages.push(JSON.parse(JSON.stringify(value))),
+    } } } },
+  });
+  const id = "11111111-1111-4111-8111-111111111111";
+  function click(href, isTrusted = true) {
+    listener({
+      target: new Element(href), isTrusted,
+      preventDefault() { prevented += 1; },
+    });
+  }
+  click(`codex://threads/${id}`, false);
+  for (const href of [
+    `https://threads/${id}`, `codex://other/${id}`, `codex://threads/${id}/`,
+    `codex://threads/${id}?query=1`, `codex://threads/${id}#fragment`,
+    `codex://user@threads/${id}`, `codex://threads:123/${id}`,
+    `codex://threads/%31${id.slice(1)}`, `codex://threads/${id}\n`,
+    "codex://threads/not-a-uuid", "codex://threads/11111111-1111-0111-8111-111111111111",
+    "codex://threads/11111111-1111-4111-1111-111111111111", null,
+  ]) click(href);
+  assert.deepEqual(messages, []);
+  assert.equal(prevented, 0);
+  click(`codex://threads/${id}`);
+  assert.deepEqual(messages, [{ threadId: id }]);
+  assert.equal(prevented, 1);
 });
 
 test("native dashboard launch gates its first refresh on the rendered page", async () => {
@@ -1545,7 +2178,7 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
     "private func navigateNativeDashboard(",
   );
   const dashboardFailure = section(
-    "private func dashboardWebViewFailed(code: String)",
+    "private func dashboardWebViewFailed(_ failure: LauncherError)",
     "private func hideDashboardWebView()",
   );
   const dashboardTeardown = section(
@@ -1566,7 +2199,7 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
   );
   assert.doesNotMatch(
     companionReady,
-    /refreshLocalUsage\(automatic: true\)/u,
+    /refreshLocalUsage\(automatic: true, mode: \.quick\)/u,
   );
 
   // The page-host callback is the only consumer of that pending flag: clear
@@ -1574,26 +2207,224 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
   // second startup pass.
   assert.match(
     dashboardLoaded,
-    /if startupAutomaticRefreshPending \{\s*\n\s*startupAutomaticRefreshPending = false\s*\n\s*refreshLocalUsage\(automatic: true\)/u,
+    /if startupAutomaticRefreshPending \{\s*\n\s*startupAutomaticRefreshPending = false\s*\n\s*refreshLocalUsage\(automatic: true, mode: \.quick\)/u,
   );
   assert.equal(
     dashboardLoaded.indexOf("startupAutomaticRefreshPending = false")
-      < dashboardLoaded.indexOf("refreshLocalUsage(automatic: true)"),
+      < dashboardLoaded.indexOf(
+        "refreshLocalUsage(automatic: true, mode: .quick)",
+      ),
     true,
     "the launch-only refresh is consumed before collection starts",
   );
 
-  // A page that never marks its result ready, a navigation failure, a
-  // companion exit, or an explicit teardown all discard the pending work.
+  // A deadline stops observation but an explicit Open Dashboard may still
+  // consume the unspent initial refresh. Real failures and teardown discard it.
   assert.match(
     dashboardFailure,
-    /cancelNativeRefreshSchedule\(\)[\s\S]*?startupAutomaticRefreshPending = false/u,
+    /cancelNativeRefreshSchedule\(\)[\s\S]*?if case \.dashboardReadinessTimeout = failure \{[\s\S]*?\} else \{\s*startupAutomaticRefreshPending = false/u,
   );
   assert.match(
     dashboardTeardown,
     /cancelNativeRefreshSchedule\(\)[\s\S]*?startupAutomaticRefreshPending = false/u,
   );
   assert.match(companionExit, /startupAutomaticRefreshPending = false/u);
+  const takingLonger = section(
+    "private func dashboardWebViewTakingLonger()",
+    "private func dashboardWebViewLoaded()",
+  );
+  assert.doesNotMatch(takingLonger, /startupAutomaticRefreshPending = false/u);
+  assert.doesNotMatch(takingLonger, /dashboardContainer\.isHidden = true/u);
+  assert.doesNotMatch(takingLonger, /nativeEvidenceState = \.readFailed/u);
+  assert.match(dashboardLoaded,
+    /lastFailureCode == LauncherError\.dashboardReadinessTimeout\.failureCode[\s\S]*?lastFailureCode = nil[\s\S]*?lastRecoverySuggestion = nil/u);
+});
+
+test("native dashboard readiness fences documents and keeps a bounded renderer watchdog", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const host = source.slice(source.indexOf("private final class DashboardWebHost:"),
+    source.indexOf("// MARK: - Window, dialog, and file affordances"));
+  assert.match(source, /static let slowThreshold: TimeInterval = 20/u);
+  assert.match(source, /static let hardDeadline: TimeInterval = 120/u);
+  assert.match(host, /func load\(_ url: URL\)[\s\S]*?invalidateDashboardContentObservation\(\)/u);
+  assert.match(host, /func stop\(\)[\s\S]*?invalidateDashboardContentObservation\(\)/u);
+  assert.match(host, /didStartProvisionalNavigation[\s\S]*?generation\.uint64Value == dashboardReadiness\.generation/u);
+  assert.match(host, /didFinish navigation:[\s\S]*?navigation === activeDashboardNavigation/u);
+  assert.match(host, /private func loadWhenViewportIsReady[\s\S]*?generation == dashboardReadiness\.generation/u);
+  const polling = host.slice(host.indexOf("private func awaitDashboardContent("),
+    host.indexOf("private func finishDashboardContentObservation("));
+  const scheduleOffset = polling.indexOf("DispatchQueue.main.asyncAfter");
+  const evaluationOffset = polling.indexOf("webView.evaluateJavaScript");
+  assert.ok(scheduleOffset >= 0, "the independent watchdog schedule exists");
+  assert.ok(evaluationOffset >= 0, "the readiness JavaScript evaluation exists");
+  assert.ok(scheduleOffset < evaluationOffset,
+    "watchdog is scheduled without waiting for a JavaScript completion");
+  assert.match(polling, /guard !dashboardContentEvaluationInFlight else \{ return \}/u);
+  assert.match(polling, /dashboardReadiness\.isObserving\(generation\)/u);
+  assert.match(host, /private func invalidateDashboardContentObservation[\s\S]*?dashboardContentPoll\?\.cancel\(\)[\s\S]*?dashboardReadiness\.invalidate\(\)/u);
+});
+
+test("native app disables AppKit window tabbing before startup", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const mainStart = source.indexOf("static func main() {");
+  const tabbingOptOut = source.indexOf(
+    "NSWindow.allowsAutomaticWindowTabbing = false",
+    mainStart,
+  );
+  const argumentParsing = source.indexOf(
+    "let arguments = Array(CommandLine.arguments.dropFirst())",
+    mainStart,
+  );
+
+  assert.ok(mainStart >= 0, "the native app entry point is present");
+  assert.ok(tabbingOptOut > mainStart, "AppKit window tabbing is disabled");
+  assert.ok(
+    argumentParsing > tabbingOptOut,
+    "window tabbing is disabled before any startup or smoke-test path",
+  );
+});
+
+test("native refresh progress stays fixed-vocabulary and count-bounded", async () => {
+  const [source, menuBarStatusSource] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+  ]);
+  const progressProjection = menuBarStatusSource.match(
+    /struct LocalAnalysisProgress:[\s\S]*?(?=\n\/\/\/ Whether an explicit local analysis pass)/u,
+  )?.[0] ?? "";
+  const activityDecoder = menuBarStatusSource.match(
+    /static func decodeActivity\([\s\S]*?(?=\n    private static func decodeRefreshID)/u,
+  )?.[0] ?? "";
+  const refreshPoll = source.match(
+    /private func pollNativeRefresh\([\s\S]*?(?=\n    private func finishNativeRefresh)/u,
+  )?.[0] ?? "";
+
+  assert.ok(progressProjection, "native progress projection is present");
+  assert.match(progressProjection, /case discovering/u);
+  assert.match(progressProjection, /case rolloutIndex = "rollout_index"/u);
+  assert.match(progressProjection, /case quotaRefresh = "quota_refresh"/u);
+  assert.match(progressProjection, /case quickResult = "quick_result"/u);
+  assert.match(progressProjection, /case archiveIndex = "archive_index"/u);
+  assert.match(progressProjection, /case accounting/u);
+  assert.match(progressProjection, /case \.accounting:[\s\S]*?nativeDashboardProgressAccounting/u);
+  assert.match(
+    progressProjection,
+    /func nativeToolbarTitle\(\s*hasUsableHeadlineEvidence: Bool = false\s*\)[\s\S]*?case \.quickResult:[\s\S]*?hasUsableHeadlineEvidence[\s\S]*?nativeDashboardProgressQuickResult[\s\S]*?nativeDashboardProgressAnalyzing/u,
+  );
+  assert.doesNotMatch(progressProjection, /\b(?:percentage|percent|eta)\b/iu);
+  assert.match(activityDecoder, /maximumProgressCount = 1_000_000_000/u);
+  assert.match(
+    menuBarStatusSource,
+    /enum LocalAnalysisTerminalOutcome:[\s\S]*?case succeeded[\s\S]*?case degraded[\s\S]*?case cancelled[\s\S]*?case failed[\s\S]*?automaticRefreshSuppressed/u,
+  );
+  assert.match(
+    menuBarStatusSource,
+    /enum LocalAnalysisMode:[\s\S]*?case quick[\s\S]*?case detailed[\s\S]*?case \.quick:[\s\S]*?"\/api\/local\/refresh\/quick"[\s\S]*?case \.detailed:[\s\S]*?"\/api\/local\/refresh"/u,
+  );
+  assert.match(
+    menuBarStatusSource,
+    /func startAnalysis\([\s\S]*?mode: LocalAnalysisMode[\s\S]*?path: mode\.routePath/u,
+  );
+  assert.match(
+    menuBarStatusSource,
+    /automaticRefreshInFlight = false[\s\S]*?outcome\.automaticRefreshSuppressed[\s\S]*?automaticRefreshSuppressed = suppressed/u,
+  );
+  assert.match(
+    menuBarStatusSource,
+    /refreshStaleEvidenceIfNeeded\(\)[\s\S]*?!automaticRefreshSuppressed/u,
+  );
+  const manualRefresh = menuBarStatusSource.match(
+    /@objc private func analyzeLocalUsage\(\)[\s\S]*?(?=\n    @objc private func quit)/u,
+  )?.[0] ?? "";
+  assert.ok(manualRefresh, "manual menu-bar refresh action is present");
+  assert.doesNotMatch(manualRefresh, /automaticRefreshSuppressed/u);
+  assert.match(manualRefresh, /reader\.startAnalysis\(base: dashboardURL, mode: \.detailed\)/u,
+    "manual menu and popover refresh use the existing full accounting route");
+  assert.match(manualRefresh, /case let \.started\(refreshID, _\), let \.alreadyRunning\(refreshID, _\):/u,
+    "a controller conflict joins the existing update without starting another build");
+  const automaticRefresh = menuBarStatusSource.slice(
+    menuBarStatusSource.indexOf("private func refreshStaleEvidenceIfNeeded()"),
+  );
+  assert.match(automaticRefresh, /reader\.startAnalysis\(base: dashboardURL, mode: \.quick\)/u,
+    "automatic stale-quota polling remains lightweight");
+  assert.doesNotMatch(automaticRefresh, /mode: \.detailed/u);
+  assert.match(activityDecoder, /doubleValue\.rounded\(\.towardZero\)/u);
+  assert.match(activityDecoder, /progress\["phase"\]/u);
+  assert.match(activityDecoder, /progress\["kind"\][\s\S]*?"archive_index"/u);
+  assert.match(
+    activityDecoder,
+    /progress\["kind"\][\s\S]*?"unified_index"[\s\S]*?Set\(progress\.keys\) == expectedKeys[\s\S]*?filesProcessed <= filesSelected[\s\S]*?filesSelected <= filesDiscovered/u,
+  );
+  for (const field of [
+    "filesDiscovered",
+    "filesSelected",
+    "filesProcessed",
+    "recordsWritten",
+  ]) {
+    assert.match(activityDecoder, new RegExp(`progress\\["${field}"\\]`, "u"));
+  }
+  assert.match(activityDecoder, /guard progress\["kind"\] == nil/u);
+  assert.match(
+    activityDecoder,
+    /progress\["kind"\][\s\S]*?"accounting"[\s\S]*?Set\(progress\.keys\) == Set\(\["kind", "status"\]\)[\s\S]*?"calculating"[\s\S]*?phase: \.accounting[\s\S]*?filesSelected: nil[\s\S]*?filesProcessed: nil/u,
+  );
+  assert.match(activityDecoder, /phase != \.accounting/u);
+  assert.doesNotMatch(activityDecoder, /progress\["message"\]/u);
+  assert.match(
+    refreshPoll,
+    /case let \.running\(refreshID, progress, _\):[\s\S]*?progress\?\.nativeToolbarTitle\(\s*hasUsableHeadlineEvidence: false\s*\)[\s\S]*?pollNativeRefresh/u,
+  );
+  assert.match(
+    source,
+    /quick_result` is only a collector checkpoint[\s\S]*?hasUsableHeadlineEvidence: false/u,
+  );
+  assert.match(
+    source,
+    /nativeRefreshMaximumPollSeconds = 4 \* 60 \* 60 \+ 60[\s\S]*?remainingAttempts: Self\.nativeRefreshMaximumPollAttempts/u,
+  );
+  assert.match(
+    source,
+    /let pollIntervalMilliseconds = remainingAttempts > 0\s*\n\s*\? Self\.nativeRefreshPollIntervalMilliseconds\s*\n\s*: Self\.nativeRefreshSettlementPollIntervalMilliseconds/u,
+  );
+  assert.match(
+    refreshPoll,
+    /if remainingAttempts <= 0 \{[\s\S]*?launcherDashboardTakingLonger[\s\S]*?isRefreshing: true,[\s\S]*?refreshEnabled: false[\s\S]*?remainingAttempts: 0[\s\S]*?return/u,
+  );
+  assert.match(
+    source,
+    /nativeRefreshSettlementPollIntervalMilliseconds = 5_000/u,
+  );
+  assert.match(
+    refreshPoll,
+    /case \.none:[\s\S]*?nativeEvidenceState = \.readFailed[\s\S]*?isRefreshing: true,[\s\S]*?refreshEnabled: false[\s\S]*?remainingAttempts: max\(0, remainingAttempts - 1\)[\s\S]*?return/u,
+  );
+  assert.match(
+    source,
+    /nativeRefreshStartWatchdogMilliseconds = 12_000[\s\S]*?let startWatchdog = DispatchWorkItem[\s\S]*?nativeRefreshSequence == refreshSequence[\s\S]*?pollNativeRefresh\(/u,
+  );
+  assert.match(
+    refreshPoll,
+    /nativeRefreshReadWatchdogMilliseconds[\s\S]*?nativeRefreshReadEpoch == readEpoch[\s\S]*?pollNativeRefresh\(/u,
+  );
+  assert.match(
+    source,
+    /private func handleNativeRefreshTerminal\([\s\S]*?settleNativeRefresh\([\s\S]*?nativeEvidenceReader\.readOverview/u,
+  );
+  assert.match(source, /nativeRefreshStartFence\.begin\(\)[\s\S]*?nativeEvidenceReader\.startAnalysis[\s\S]*?nativeRefreshStartFence\.resolve\(\)/u);
+  assert.match(refreshPoll, /let startObservation = self\.nativeRefreshStartFence\.observation\(\)[\s\S]*?readAnalysisActivity[\s\S]*?case let \.idle[\s\S]*?allowsTerminal\(\s*startObservation\s*\)/u);
+  assert.match(menuBarStatusSource, /readAnalysisActivity[\s\S]*?NativeDetailedRefreshCadence\.observe\(activity\?\.attempt\)/u);
+  assert.match(menuBarStatusSource, /LocalAnalysisMode\(rawValue: rawMode\)[\s\S]*?rawStartedAt\.utf8\.count == 24[\s\S]*?formatter\.string\(from: startedAt\) == rawStartedAt/u);
+  assert.match(
+    source,
+    /func applicationDidBecomeActive[\s\S]*?reconcileNativeRefreshStatus\(\)/u,
+  );
+  assert.match(source, /NSWorkspace\.didWakeNotification[\s\S]*?reconcileNativeRefreshStatus\(\)/u);
+  assert.match(
+    source,
+    /private func reconcileNativeRefreshStatus\([\s\S]*?case let \.running\(refreshID, progress, _\):[\s\S]*?nativeRefreshInFlight = true[\s\S]*?case let \.idle\(refreshID, _, _\):[\s\S]*?handleNativeRefreshTerminal[\s\S]*?case \.none:\s*\n\s*return/u,
+  );
+  assert.doesNotMatch(source, /remainingAttempts: 120/u);
+  assert.match(source, /--native-analysis-progress-contract-smoke-test/u);
 });
 
 test("unified toolbar preserves the rich loopback report and single authority", async () => {
@@ -1645,7 +2476,58 @@ test("unified toolbar preserves the rich loopback report and single authority", 
   assert.match(source, /case \.live:[\s\S]*?nativeDashboardFresh/u);
   assert.match(toolbar, /toolbarShareIdentifier/u);
   assert.match(toolbar, /toolbarSettingsIdentifier/u);
-  assert.match(toolbar, /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false\)/u);
+  const immovableToolbarItems = [...source.matchAll(
+    /func toolbarImmovableItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> Set<NSToolbarItem\.Identifier> \{([\s\S]*?)\n    \}/gu,
+  )]
+    .map((match) => match[1])
+    .find((body) => body.includes("Self.mandatoryDashboardToolbarItemIdentifiers"));
+  assert.ok(
+    immovableToolbarItems,
+    "the dashboard's mandatory toolbar policy should be present",
+  );
+  assert.match(
+    immovableToolbarItems,
+    /Self\.mandatoryDashboardToolbarItemIdentifiers/u,
+  );
+  const mandatoryToolbarItems = source.match(
+    /static let mandatoryDashboardToolbarItemIdentifiers: Set<\s*\n\s*NSToolbarItem\.Identifier\s*\n\s*> = \[([\s\S]*?)\n    \]/u,
+  )?.[1];
+  assert.ok(mandatoryToolbarItems, "the mandatory toolbar identifiers should be declared");
+  for (const identifier of [
+    ".toggleSidebar",
+    "toolbarStatusRefreshIdentifier",
+    "toolbarShareIdentifier",
+    "toolbarSettingsIdentifier",
+  ]) {
+    assert.ok(mandatoryToolbarItems.includes(identifier), identifier);
+  }
+  assert.equal(mandatoryToolbarItems.includes(".flexibleSpace"), false);
+  assert.match(
+    source,
+    /private enum NativeSettingsToolbarPolicy \{[\s\S]*?static let mandatoryTabIdentifiers/u,
+  );
+  assert.match(
+    source,
+    /private final class NativeSettingsToolbarDelegate: NSObject,[\s\S]*?NSToolbarDelegate[\s\S]*?func toolbarImmovableItemIdentifiers\([\s\S]*?NativeSettingsToolbarPolicy\.mandatoryTabIdentifiers/u,
+  );
+  assert.match(source, /let tabs = NSTabViewController\(\)/u);
+  assert.match(source, /let item = NSTabViewItem\(identifier: identifier\)/u);
+  assert.match(source, /toolbar\.delegate = toolbarDelegate/u);
+  assert.match(source, /settingsToolbarDelegate = toolbarDelegate/u);
+  assert.match(
+    toolbar,
+    /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false, mode: \.detailed\)/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /recalculateDetailedAccounting|nativeDashboardRecalculateDetailedAccounting/u,
+    "one manual Refresh action replaces the duplicate detailed-accounting menu action",
+  );
+  assert.match(
+    source,
+    /let refresh = NSMenuItem\([\s\S]*?nativeDashboardRefreshUsage[\s\S]*?#selector\(refreshDashboardFromToolbar\),\s*keyEquivalent: "r"/u,
+    "Command-R uses the same manual full refresh as the toolbar",
+  );
   assert.match(
     toolbar,
     /@objc private func showShareCardFromToolbar\(\) \{[\s\S]*?document\.getElementById\('share-panel'\)\?\.scrollIntoView/u,
@@ -1658,7 +2540,131 @@ test("unified toolbar preserves the rich loopback report and single authority", 
   );
 });
 
-test("toolbar pill narrates the real index build and terminal refresh failure", async () => {
+test("toolbar Share opens the page that owns the share card before scrolling", async () => {
+  const [source, dashboardHTML] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(join(REPOSITORY_ROOT, "apps", "web", "public", "index.html"), "utf8"),
+  ]);
+  const sharePanelIndex = dashboardHTML.indexOf('id="share-panel"');
+  assert.notEqual(sharePanelIndex, -1, "the dashboard should contain the share panel");
+  const ownerPages = [
+    ...dashboardHTML.slice(0, sharePanelIndex).matchAll(
+      /data-dashboard-page="([^"]+)"/gu,
+    ),
+  ];
+  const ownerPage = ownerPages.at(-1)?.[1];
+  assert.ok(ownerPage, "the share panel should belong to a dashboard page");
+
+  const handler = source.match(
+    /@objc private func showShareCardFromToolbar\(\) \{([\s\S]*?)\n    \}\n\n    \/\/\/ Puts the native chrome/u,
+  )?.[1];
+  assert.ok(handler, "the toolbar Share handler should be present");
+  const selectedPage = handler.match(
+    /nativeDashboardChrome\?\.select\(\.(\w+)\)/u,
+  )?.[1];
+  assert.equal(
+    selectedPage,
+    ownerPage,
+    "the native sidebar should select the page that contains the share card",
+  );
+  const script = handler.match(
+    /webView\.evaluateJavaScript\("""\n([\s\S]*?)\n        """\)/u,
+  )?.[1];
+  assert.ok(script, "the toolbar Share navigation script should be present");
+
+  function exerciseShareNavigation(initialHash) {
+    let currentHash = initialHash;
+    let activePage = initialHash.slice(1);
+    const listeners = new Map();
+    const hashTasks = [];
+    const timerTasks = [];
+    const frameTasks = [];
+    const scrolls = [];
+    class FakeHashChangeEvent {
+      constructor(type) {
+        this.type = type;
+      }
+    }
+    const windowRef = {
+      addEventListener(type, callback, options = {}) {
+        const registered = listeners.get(type) ?? [];
+        registered.push({ callback, once: options.once === true });
+        listeners.set(type, registered);
+      },
+      dispatchEvent(event) {
+        const registered = [...(listeners.get(event.type) ?? [])];
+        for (const listener of registered) {
+          listener.callback(event);
+          if (listener.once) {
+            listeners.set(
+              event.type,
+              (listeners.get(event.type) ?? []).filter(
+                (candidate) => candidate !== listener,
+              ),
+            );
+          }
+        }
+      },
+      requestAnimationFrame(callback) {
+        frameTasks.push(callback);
+      },
+    };
+    const location = {};
+    Object.defineProperty(location, "hash", {
+      get() {
+        return currentHash;
+      },
+      set(value) {
+        currentHash = value;
+        hashTasks.push(() => {
+          windowRef.dispatchEvent(new FakeHashChangeEvent("hashchange"));
+        });
+      },
+    });
+    windowRef.location = location;
+    windowRef.addEventListener("hashchange", () => {
+      activePage = currentHash.slice(1);
+    });
+    const documentRef = {
+      getElementById(id) {
+        if (id !== "share-panel") return null;
+        return {
+          scrollIntoView(options) {
+            scrolls.push({ activePage, options });
+          },
+        };
+      },
+    };
+    runInNewContext(script, {
+      document: documentRef,
+      HashChangeEvent: FakeHashChangeEvent,
+      setTimeout(callback) {
+        timerTasks.push(callback);
+      },
+      window: windowRef,
+    });
+    for (const task of hashTasks) task();
+    for (const task of timerTasks) task();
+    for (const task of frameTasks) task();
+    return { activePage, currentHash, scrolls };
+  }
+
+  for (const initialHash of ["#overview", `#${ownerPage}`]) {
+    const result = exerciseShareNavigation(initialHash);
+    assert.equal(result.currentHash, `#${ownerPage}`);
+    assert.equal(result.activePage, ownerPage);
+    assert.equal(result.scrolls.length, 1);
+    assert.equal(
+      result.scrolls[0].activePage,
+      ownerPage,
+      "the card must be visible before the toolbar scrolls to it",
+    );
+    assert.equal(result.scrolls[0].options.behavior, "smooth");
+    assert.equal(result.scrolls[0].options.block, "start");
+  }
+});
+
+test("toolbar pill narrates index progress, terminal gaps, and refresh failure without automatic retry", async () => {
   const source = await readFile(SWIFT_SOURCE, "utf8");
   // Deliberately re-pinned pill vocabulary: while the unified history index
   // is incomplete the idle pill says "Indexing <n> of <m>", and a refresh the
@@ -1673,12 +2679,13 @@ test("toolbar pill narrates the real index build and terminal refresh failure", 
     source,
     /private enum NativeToolbarStatusText \{[\s\S]*?decimalNumberFormatter\(\s*maximumFractionDigits: 0\s*\)/u,
   );
-  // Failure identity first, then real indexing progress, outrank the
-  // evidence prose; complete coverage plus a non-failed refresh restores
-  // the existing "Fresh"/"Stale"/"Status" vocabulary untouched.
+  // An attested partial-coverage result is named before a generic failure;
+  // hard failure identity and real indexing progress still outrank the
+  // evidence prose. Complete coverage plus a non-failed refresh restores the
+  // existing "Fresh"/"Stale"/"Status" vocabulary untouched.
   assert.match(
     source,
-    /private func nativeToolbarEvidenceTitle\(fallback: String\) -> String \{[\s\S]*?if let failure = nativeRefreshFailure \{[\s\S]*?if let coverage = nativeHistoryIndexingCoverage, !coverage\.isComplete \{[\s\S]*?switch nativeEvidenceState \{/u,
+    /private func nativeToolbarEvidenceTitle\(fallback: String\) -> String \{[\s\S]*?coverage\.partialTerminal \{[\s\S]*?NativeToolbarStatusText\.historyPartial[\s\S]*?if let failure = nativeRefreshFailure \{[\s\S]*?if let coverage = nativeHistoryIndexingCoverage, !coverage\.isComplete \{[\s\S]*?switch nativeEvidenceState \{/u,
   );
   // The step vocabulary is closed on the client as well: an unrecognized
   // step renders as plain "Refresh failed".
@@ -1694,11 +2701,29 @@ test("toolbar pill narrates the real index build and terminal refresh failure", 
     /\(root\["coverage"\] as\? \[String: Any\]\)\?\["history"\][\s\S]*?\(root\["pricing"\] as\? \[String: Any\]\)\?\["historyCoverage"\]/u,
   );
   assert.match(source, /\["demo", "synthetic"\]\.contains\(mode\)/u);
-  // The failure receipt comes from /api/local/refresh, and only a "failed"
-  // status may claim a failure.
+  // The failure receipt comes from /api/local/refresh. Both a hard failure and
+  // the controller's explicit degraded terminal state may carry the closed
+  // step/code pair; an ordinary success may not.
   assert.match(
     source,
-    /guard status == "failed" else \{ return \.notFailed \}/u,
+    /guard \["failed", "degraded"\]\.contains\(status\) else \{\s*return \.notFailed\s*\}/u,
+  );
+  assert.match(source, /let sourceNoun = skippedSourceCount == 1 \? "source" : "sources"/u);
+  assert.equal(source.includes(
+    '"History coverage · \\(skippedSourceCount) \\(sourceNoun) unavailable"',
+  ), true);
+  assert.match(source, /history\["phase"\] as\? String\s*== "partial_terminal"/u);
+  assert.match(
+    source,
+    /dashboardURL != nil,\s*\n\s*nativeRefreshFailure\?\.suppressesAutomaticRetry != true/u,
+  );
+  assert.match(
+    source,
+    /!\(automatic\s*\n\s*&& nativeRefreshFailure\?\.suppressesAutomaticRetry == true\)/u,
+  );
+  assert.match(
+    source,
+    /let coverage = nativeHistoryIndexingCoverage,\s*\n\s*!coverage\.isComplete,\s*\n\s*!coverage\.partialTerminal/u,
   );
   // Both reads reuse the already-audited loopback reader rather than adding
   // a second session or network route.
@@ -1706,7 +2731,7 @@ test("toolbar pill narrates the real index build and terminal refresh failure", 
   // A refresh terminal re-reads both facts before the pill claims a state.
   assert.match(
     source,
-    /readNativeToolbarStatusFacts\(base: base\) \{ \[weak self\] in\s*\n\s*self\?\.finishNativeRefresh\(/u,
+    /handleNativeRefreshTerminal\([\s\S]*?settleNativeRefresh\([\s\S]*?readNativeToolbarStatusFacts\(base: base\) \{ \[weak self\] in[\s\S]*?updateNativeToolbar\(/u,
   );
   // While coverage is incomplete the idle pill re-reads it on a bounded
   // 30-second foreground cadence; a refresh start, coverage completion,
@@ -1728,7 +2753,10 @@ test("toolbar pill narrates the real index build and terminal refresh failure", 
 });
 
 test("dashboard sidebar resizes for real, wears the brand palette, and the titlebar carries the brand row", async () => {
-  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const [source, palette] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(NATIVE_BRAND_PALETTE_SOURCE, "utf8"),
+  ]);
   // 1. The divider is a real control. AppKit applies a divider drag at
   // priority 490 (dragThatCannotResizeWindow); the previous .defaultHigh
   // (750) holding priority outranked the user's own drag, which is the
@@ -1773,14 +2801,18 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
   // The system toolbar toggle, in both the allowed and the default sets, so
   // it is present on a fresh install and cannot be customized away without
   // the menu command below still existing.
-  const toolbarDefaults = source.match(
-    /func toolbarDefaultItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/u,
-  )?.[1];
+  const toolbarDefaults = [...source.matchAll(
+    /func toolbarDefaultItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/gu,
+  )]
+    .map((match) => match[1])
+    .find((body) => body.includes(".toggleSidebar"));
   assert.ok(toolbarDefaults, "the toolbar default identifiers are available");
   assert.match(toolbarDefaults, /\.toggleSidebar/u);
-  const toolbarAllowed = source.match(
-    /func toolbarAllowedItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/u,
-  )?.[1];
+  const toolbarAllowed = [...source.matchAll(
+    /func toolbarAllowedItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/gu,
+  )]
+    .map((match) => match[1])
+    .find((body) => body.includes(".toggleSidebar"));
   assert.ok(toolbarAllowed, "the toolbar allowed identifiers are available");
   assert.match(toolbarAllowed, /\.toggleSidebar/u);
   // The standard macOS command and key equivalent, on the responder chain so
@@ -1811,18 +2843,39 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
     source,
     /private func rescueStrandedSidebar\(_ defaults: UserDefaults\) \{\s*\n\s*guard !defaults\.bool\(forKey: Self\.sidebarRescuedDefaultsKey\) else \{\s*\n\s*return\s*\n\s*\}\s*\n\s*defaults\.set\(true, forKey: Self\.sidebarRescuedDefaultsKey\)/u,
   );
-  // 2. The sidebar carries the web report's warm-paper palette over the
-  // system material, and the selected row uses the brand's deep green
-  // instead of the user's system accent. Both mirror the web tokens
-  // --paper #f5f1e8 and --green #174f45 and resolve per appearance.
-  assert.match(source, /private enum NativeBrandPalette/u);
+  // 2. The sidebar and report carry the exact light and Forest Ink tokens over
+  // native material instead of inheriting the user's unrelated system accent.
+  const nativeBrandPalette = palette.match(
+    /enum NativeBrandPalette \{[\s\S]*?\n\}/u,
+  )?.[0];
+  assert.ok(nativeBrandPalette, "native brand palette should be present");
   assert.match(
-    source,
-    /srgbRed: 245 \/ 255,\s*\n\s*green: 241 \/ 255,\s*\n\s*blue: 232 \/ 255/u,
+    nativeBrandPalette,
+    /static let accent = NSColor\(name: nil\)[\s\S]*?srgbRed: 118 \/ 255,[\s\S]*?green: 170 \/ 255,[\s\S]*?blue: 156 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let accent = NSColor\(name: nil\)[\s\S]*?srgbRed: 23 \/ 255,[\s\S]*?green: 79 \/ 255,[\s\S]*?blue: 69 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let reportPaper = NSColor\(name: nil\)[\s\S]*?srgbRed: 20 \/ 255,[\s\S]*?green: 26 \/ 255,[\s\S]*?blue: 23 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let reportPaper = NSColor\(name: nil\)[\s\S]*?srgbRed: 245 \/ 255,[\s\S]*?green: 241 \/ 255,[\s\S]*?blue: 232 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let sidebarWash = NSColor\(name: nil\)[\s\S]*?srgbRed: 45 \/ 255,[\s\S]*?green: 116 \/ 255,[\s\S]*?blue: 102 \/ 255,[\s\S]*?alpha: 0\.22/u,
   );
   assert.match(
     source,
-    /srgbRed: 23 \/ 255,\s*\n\s*green: 79 \/ 255,\s*\n\s*blue: 69 \/ 255/u,
+    /private final class NativeDashboardReportPane[\s\S]*?override var wantsUpdateLayer: Bool \{ true \}[\s\S]*?NativeBrandPalette\.reportPaper\.cgColor/u,
+  );
+  assert.match(
+    source,
+    /override func viewDidChangeEffectiveAppearance\(\)[\s\S]*?onAppearanceChange\?\(\)/u,
   );
   assert.match(source, /private final class NativeSidebarBrandWash: NSView/u);
   assert.match(source, /sidebar\.addSubview\(sidebarWash\)/u);
@@ -1877,7 +2930,14 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
 });
 
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
-  const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
+  const [source, popupSource, modelSource, paceSource, localizationSource, appSource] = await Promise.all([
+    readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+    readFile(MENU_BAR_POPOVER_SOURCE, "utf8"),
+    readFile(MENU_BAR_POPUP_MODEL_SOURCE, "utf8"),
+    readFile(MENU_BAR_PACE_OUTLOOK_SOURCE, "utf8"),
+    readFile(LOCALIZATION_SOURCE, "utf8"),
+    readFile(SWIFT_SOURCE, "utf8"),
+  ]);
   assert.match(source, /import AppKit/u);
   // Variable-length item with the branded app mark, sized for the native
   // status bar rather than a generic system chart glyph.
@@ -1933,13 +2993,21 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /configure\(\s*aboutItem,/u);
   assert.match(source, /#selector\(showAbout\)/u);
 
-  // The compact title shows a number only for live evidence; stale, absent,
-  // starting, failed, and analyzing states all collapse to a placeholder.
+  // The compact title keeps a verified live number visible while a refresh is
+  // running. Analysis gets its own placeholder only when no live number is
+  // available; stale, absent, starting, and failed states remain non-numeric.
   assert.match(
     source,
-    /guard phase == \.ready, evidence == \.live, let lane = primaryLane else \{\s*return unknownPlaceholder/u,
+    /if companionReachable,\s*let lane = currentPrimaryLane\(\) \{\s*return TiboTattleLocalization\.percentString\(\s*lane\.roundedRemainingPercent\s*\)/u,
   );
-  assert.match(source, /if phase == \.analyzing \{ return analyzingPlaceholder \}/u);
+  assert.match(
+    source,
+    /return phase == \.analyzing\s*\? analyzingPlaceholder\s*:\s*unknownPlaceholder/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /if phase == \.analyzing \{ return analyzingPlaceholder \}/u,
+  );
   assert.match(source, /private let analyzingPlaceholder = "…"/u);
   assert.match(source, /private let unknownPlaceholder = "–"/u);
   assert.match(
@@ -1951,7 +3019,10 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     /TiboTattleLocalization\.string\(\.menuBarLocalEvidenceStale\)/u,
   );
   assert.match(source, /func resetCountdown\(_ date: Date\?, now: Date = Date\(\)\) -> String\?/u);
-  assert.match(source, /guard companionReachable, evidence == \.live else/u);
+  assert.match(source, /func laneIsCurrent\(_ lane: ObservedQuotaLane,[\s\S]*?evidence == \.live/u);
+  assert.match(source, /now\.timeIntervalSince\(observedAt\) >= 0/u);
+  assert.match(source, /now\.timeIntervalSince\(observedAt\) <= freshnessLimit/u);
+  assert.match(source, /let resetAt = lane\.resetAt,[\s\S]*?resetAt > now/u);
 
   // Only the normal Codex allowance track is projected with fixed
   // privacy-safe labels; a separate product can never become the title.
@@ -1962,7 +3033,7 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /private let codexPrimaryLimitId = "codex"/u);
   assert.match(
     source,
-    /private let supportedCodexAllowanceWindowDurations\s*=\s*\n\s*1\.\.\.CodexQuotaWindowDuration\.maximumMinutes/u,
+    /private let supportedCodexAllowanceWindowDurations: Set<Int> = \[[\s\S]*?fiveHourWindowDurationMinutes,[\s\S]*?weeklyWindowDurationMinutes,[\s\S]*?\]/u,
   );
   assert.match(source, /let candidates = rows\.compactMap/u);
   assert.match(source, /guard Self\.isSupportedCodexAllowance\(/u);
@@ -1985,16 +3056,18 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     source,
     /return TiboTattleLocalization\.string\(\.menuBarSevenDayAllowance\)/u,
   );
-  assert.match(source, /left\.durationMinutes > right\.durationMinutes/u);
-  assert.match(source, /left\.isExplicitPrimary != right\.isExplicitPrimary/u);
+  assert.match(source, /candidates\.filter \{ \$0\.durationMinutes == duration \}/u);
+  assert.match(source, /left\.preferredSlot != right\.preferredSlot/u);
+  assert.match(source, /left\.observedAt > right\.observedAt/u);
   assert.match(source, /return left\.stableKey < right\.stableKey/u);
-  assert.match(source, /isPrimary: index == 0/u);
-  assert.match(source, /TiboTattleLocalization\.quotaWindowLabel\(/u);
+  assert.match(source, /isPrimary: candidate\.durationMinutes\s*\n\s*== weeklyWindowDurationMinutes/u);
+  assert.doesNotMatch(source, /TiboTattleLocalization\.quotaWindowLabel\(/u);
+  assert.match(source, /abs\(\(remaining \+ used\) - 100\) <= 0\.001/u);
   assert.match(source, /let observedAt = lanes\.compactMap\(\\\.observedAt\)\.max\(\)/u);
   assert.doesNotMatch(source, /codex_bengalfox|Secondary observed allowance|Observed quota lane/u);
   assert.match(
     source,
-    /guard overview\.freshnessStatus == "live" else \{ return \.stale \}/u,
+    /guard overview\.evidenceAvailable,[\s\S]*?overview\.freshnessStatus == "live"[\s\S]*?else \{ return \.stale \}/u,
   );
 
   // Menu contract: every information lane is a standard native text item.
@@ -2046,52 +3119,130 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.doesNotMatch(source, /openDashboardItem/u);
   assert.match(
     source,
-    /analyzeItem\.isEnabled = snapshot\.phase == \.ready\s*\n\s*\|\| \(snapshot\.phase == \.unavailable && dashboardURL != nil\)/u,
+    /analyzeItem\.isEnabled = snapshot\.analysisAvailable[\s\S]*?snapshot\.phase == \.ready \|\| snapshot\.phase == \.unavailable/u,
   );
 
-  // Keep the standard NSStatusItem menu lifecycle intact. Escape and app
-  // deactivation both cancel native menu tracking, and every action clears
-  // tracking before it can open another app surface.
-  assert.match(source, /statusItem\.menu = menu/u);
+  // Left-click owns one transient popover. Right-click or Control-click opens
+  // the same standard native actions menu; assigning statusItem.menu would
+  // consume the left click and make this routing impossible.
+  assert.doesNotMatch(source, /statusItem\.menu = menu/u);
+  assert.match(source, /popover\.behavior = \.transient/u);
+  assert.match(source, /popover\.contentViewController = popoverController/u);
+  assert.match(source, /button\.target = self/u);
+  assert.match(source, /button\.action = #selector\(statusItemActivated\)/u);
   assert.match(
     source,
-    /NSEvent\.addLocalMonitorForEvents\(matching: \.keyDown\)[\s\S]*?event\.keyCode == 53[\s\S]*?self\.dismissMenu\(\)/u,
+    /button\.sendAction\(on: \[\.leftMouseUp, \.rightMouseUp\]\)/u,
   );
   assert.match(
     source,
-    /NSEvent\.addLocalMonitorForEvents\([\s\S]*?\.leftMouseDown[\s\S]*?event\.window[\s\S]*?NSApp\.windows\.contains[\s\S]*?self\.dismissMenu\(\)/u,
+    /func menuBarStatusActivationIntent\([\s\S]*?eventType == \.rightMouseUp[\s\S]*?modifierFlags\.contains\(\.control\)/u,
+  );
+  assert.match(source, /popover\.show\([\s\S]*?preferredEdge: \.minY/u);
+  assert.match(
+    source,
+    /popoverController\.prepareForPresentation\(from: sender\)\s*\n\s*popoverController\.update\(snapshot: snapshot\)\s*\n\s*popover\.show/u,
+  );
+  assert.match(popupSource, /private let scrollView = NSScrollView\(\)/u);
+  assert.match(popupSource, /scrollView\.hasVerticalScroller = true/u);
+  assert.match(popupSource, /scrollView\.hasHorizontalScroller = false/u);
+  assert.match(popupSource, /scrollView\.horizontalScrollElasticity = \.none/u);
+  assert.match(
+    popupSource,
+    /func menuBarPopoverMaximumViewportHeight\([\s\S]*?anchorMinY[\s\S]*?- visibleFrame\.minY[\s\S]*?- MenuBarPopoverMetrics\.popoverVerticalClearance[\s\S]*?return min\(screenMaximum, max\(1, anchorMaximum\)\)/u,
+  );
+  assert.equal(
+    popupSource.match(/menuBarPopoverMaximumViewportHeight\(/gu)?.length,
+    3,
+    "one cap helper definition must serve production and the compiled smoke seam",
+  );
+  assert.match(
+    popupSource,
+    /let previousVerticalOffset = scrollView\.contentView\.bounds\.minY[\s\S]*?setVerticalScrollOffset\(previousVerticalOffset\)/u,
+  );
+  assert.match(
+    popupSource,
+    /func prepareForPresentation\(from anchor: NSView\)[\s\S]*?updatePreferredContentSize\(\)\s*\n\s*scrollToTop\(\)/u,
+  );
+  assert.match(
+    popupSource,
+    /func isFullyVisibleInViewport\(_ candidate: NSView\)[\s\S]*?scrollView\.contentView\.convert\([\s\S]*?visibleBounds\.contains\(frameInClipView\)/u,
+  );
+  assert.match(
+    popupSource,
+    /func scrollToBottomForSmokeTest\(\)[\s\S]*?setVerticalScrollOffset\(maximumVerticalScrollOffset\(\)\)/u,
+  );
+  assert.match(source, /menu\.popUp\(positioning: nil, at: screenPoint, in: nil\)/u);
+  assert.match(source, /func popoverDidClose\(_ notification: Notification\)/u);
+  const showActionMenu = source.match(
+    /private func showActionMenu\(from anchor: NSView\)[\s\S]*?(?=\n    func popoverDidShow)/u,
+  )?.[0] ?? "";
+  const popoverDidClose = source.match(
+    /func popoverDidClose\(_ notification: Notification\)[\s\S]*?(?=\n    \/\/\/ AppKit normally)/u,
+  )?.[0] ?? "";
+  assert.match(
+    showActionMenu,
+    /defersPopoverRefreshUntilMenuCloses = popover\.isShown\s*\n\s*popover\.performClose\(nil\)/u,
+  );
+  assert.match(
+    popoverDidClose,
+    /guard !stopped else \{ return \}[\s\S]*?suppressesNextPopoverCloseRefresh[\s\S]*?return[\s\S]*?defersPopoverRefreshUntilMenuCloses[\s\S]*?refreshAfterMenuCloses = true[\s\S]*?return[\s\S]*?refreshStaleEvidenceIfNeeded\(\)/u,
+  );
+
+  // Escape and app deactivation dismiss the active transient surface, and
+  // every action clears both surfaces before changing focus or ownership.
+  assert.match(
+    source,
+    /NSEvent\.addLocalMonitorForEvents\(matching: \.keyDown\)[\s\S]*?menuBarShouldDismissForEscape[\s\S]*?isPopoverShown: self\.popover\.isShown[\s\S]*?self\.dismissSurfaces\(\)/u,
   );
   assert.match(
     source,
-    /NSApplication\.didResignActiveNotification[\s\S]*?self\?\.dismissMenu\(\)/u,
+    /NSEvent\.addLocalMonitorForEvents\([\s\S]*?\.leftMouseDown[\s\S]*?event\.window[\s\S]*?NSApp\.windows\.contains[\s\S]*?self\.dismissSurfaces\(\)/u,
   );
-  assert.match(source, /private func dismissMenu\(\) \{\s*menu\.cancelTracking\(\)/u);
   assert.match(
     source,
-    /func shutDown\(\) \{[\s\S]*?dismissMenu\(\)[\s\S]*?removeInteractionMonitoring\(\)/u,
+    /NSApplication\.didResignActiveNotification[\s\S]*?self\?\.dismissSurfaces\(\)/u,
+  );
+  assert.match(
+    source,
+    /private func dismissSurfaces\(suppressRefresh: Bool = false\) \{[\s\S]*?suppressRefresh[\s\S]*?menu\.cancelTracking\(\)[\s\S]*?popover\.performClose\(nil\)/u,
+  );
+  assert.match(
+    source,
+    /func shutDown\(\) \{[\s\S]*?dismissSurfaces\(\)[\s\S]*?removeInteractionMonitoring\(\)/u,
   );
   for (const action of [
     "openTiboTattle",
     "analyzeLocalUsage",
-    "quit",
     "showSettings",
     "showAbout",
     "checkForUpdates",
   ]) {
     assert.match(
       source,
-      new RegExp(`@objc private func ${action}\\(\\) \\{[\\s\\S]*?dismissMenu\\(\\)`, "u"),
+      new RegExp(`@objc private func ${action}\\(\\) \\{[\\s\\S]*?dismissSurfaces\\(\\)`, "u"),
       action,
     );
   }
+  assert.match(
+    source,
+    /@objc private func quit\(\) \{\s*dismissSurfaces\(suppressRefresh: true\)\s*\n\s*actions\.quit\(\)/u,
+  );
+  assert.match(
+    source,
+    /func shutDown\(\) \{[\s\S]*?stopped = true\s*\n\s*dismissSurfaces\(\)/u,
+  );
 
-  // Restart/failure/read errors clear numeric evidence before rendering. A
-  // callback from an older URL or start cannot cross the generation boundary.
+  // Restart/source replacement clears all evidence. Same-source read failures
+  // clear current quota and forecast, but retain explicitly labelled history.
+  // A callback from an older URL/start cannot cross the generation boundary.
   assert.match(source, /private var companionGeneration: UInt64 = 0/u);
-  assert.match(source, /private func invalidateObservedEvidence\(\) \{[\s\S]*?snapshot\.lanes = \[\][\s\S]*?snapshot\.observedAt = nil[\s\S]*?snapshot\.evidence = \.none/u);
+  assert.match(source, /mutating func invalidateObservedEvidence\(keepingHistory: Bool = false\) \{\s*lanes = \[\]\s*observedAt = nil\s*evidence = \.none\s*history = keepingHistory \? history\.retainingLastVerified\(\) : \.unavailable\s*weeklyPaceOutlook = nil\s*staleAfterSeconds = nil/u);
+  assert.match(source, /private func invalidateObservedEvidence\(keepingHistory: Bool = false\) \{[\s\S]*?snapshot\.invalidateObservedEvidence\(keepingHistory: keepingHistory\)/u);
+  assert.match(source, /func companionReady\(dashboardURL: URL\) \{[\s\S]*?invalidateObservedEvidence\(\)/u);
   assert.match(source, /func companionStarting\(\) \{[\s\S]*?invalidateObservedEvidence\(\)/u);
   assert.match(source, /func companionUnavailable\(summary: String\?\) \{[\s\S]*?invalidateObservedEvidence\(\)/u);
-  assert.match(source, /guard let overview else \{[\s\S]*?invalidateObservedEvidence\(\)[\s\S]*?snapshot\.phase = \.unavailable/u);
+  assert.match(source, /guard let overview else \{[\s\S]*?invalidateObservedEvidence\(keepingHistory: true\)[\s\S]*?snapshot\.phase = \.unavailable/u);
   assert.match(source, /self\.companionGeneration == generation/u);
   assert.match(source, /self\.dashboardURL == dashboardURL/u);
 
@@ -2103,12 +3254,295 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   );
   assert.match(
     source,
-    /func menuDidClose\(_ menu: NSMenu\) \{[\s\S]*?structuralRebuildPending[\s\S]*?render\(\)/u,
+    /func menuDidClose\(_ menu: NSMenu\) \{[\s\S]*?suppressesNextMenuCloseRefresh = false[\s\S]*?defersPopoverRefreshUntilMenuCloses = false[\s\S]*?structuralRebuildPending[\s\S]*?render\(\)/u,
   );
   assert.match(source, /if isMenuTracking && structureChanged/u);
   assert.match(source, /structuralRebuildPending = true/u);
   assert.match(source, /deferredLaneTitle/u);
   assert.match(source, /private func expireCachedEvidenceIfNeeded\(\)/u);
+  assert.match(source, /private func scheduleEvidenceExpiry\(\)/u);
+  assert.match(
+    source,
+    /nextEvidencePresentationBoundary\([\s\S]*?staleAfterSeconds: snapshot\.staleAfterSeconds/u,
+  );
+
+  // Weekly pace is one closed, content-free DTO produced by the companion's
+  // canonical projection. Swift accepts only the exact versioned shape and
+  // validates its internal arithmetic before binding it to the current weekly
+  // lane. It never derives a competing forecast from raw allowance values.
+  assert.match(
+    paceSource,
+    /struct MenuBarWeeklyPaceOutlook: Equatable/u,
+  );
+  assert.match(
+    paceSource,
+    /private static let schemaVersion = "local-weekly-pace-outlook-v0\.1"/u,
+  );
+  for (const exactObjectGuard of [
+    /Set\(outlook\.keys\) == topLevelKeys/u,
+    /Set\(rawRates\.keys\) == rateKeys/u,
+    /Set\(rawProjection\.keys\) == projectionKeys/u,
+    /Set\(rawTrack\.keys\) == trackKeys/u,
+  ]) {
+    assert.match(paceSource, exactObjectGuard);
+  }
+  assert.match(
+    paceSource,
+    /CFGetTypeID\(number\) == CFBooleanGetTypeID\(\)/u,
+  );
+  assert.match(
+    paceSource,
+    /CFGetTypeID\(number\) != CFBooleanGetTypeID\(\)/u,
+  );
+  assert.match(
+    paceSource,
+    /formatter\.string\(from: date\) == text/u,
+  );
+  assert.match(
+    paceSource,
+    /approximatelyEqual\(\s*sustainable,\s*remainingPercent \/ hoursToReset\s*\)/u,
+  );
+  assert.match(paceSource, /standingMatchesRatio\(standing, ratio: ratio\)/u);
+  assert.match(
+    paceSource,
+    /critical == \(standing == \.over && ratio >= 2\)/u,
+  );
+  assert.match(
+    paceSource,
+    /func isBound\(to lane: ObservedQuotaLane, now: Date\) -> Bool \{[\s\S]*?lane\.durationMinutes == CodexQuotaWindowDuration\.sevenDayMinutes[\s\S]*?abs\(laneReset\.timeIntervalSince\(resetsAt\)\) < 0\.001[\s\S]*?abs\(lane\.remainingPercent - remainingPercent\) <= 0\.001[\s\S]*?resetsAt > now/u,
+  );
+  assert.match(
+    source,
+    /func currentWeeklyPaceOutlook\([\s\S]*?currentLanes\(now: now\)[\s\S]*?outlook\.isBound\(to: weeklyLane, now: now\)/u,
+  );
+  assert.match(
+    source,
+    /let preferredSlot = slot == "primary"/u,
+  );
+  assert.match(
+    appSource,
+    /dualWeeklySnapshot\.currentWeeklyPaceOutlook\(now: now\) != nil/u,
+  );
+  const crossSurfacePaceSmoke = appSource.match(
+    /private enum NativeWeeklyPaceProjectionContractSmokeTest \{[\s\S]*?(?=\n\}\n\n\/\/\/ Exercises the real AppKit status item)/u,
+  )?.[0] ?? "";
+  assert.ok(
+    crossSurfacePaceSmoke,
+    "the JS-to-Swift weekly pace contract smoke should be present",
+  );
+  assert.match(
+    crossSurfacePaceSmoke,
+    /MenuBarWeeklyPaceOutlookProjection\.decode\(data\)[\s\S]*?outlook\.status == \.available[\s\S]*?outlook\.isBound\(to: exactLane, now: now\)[\s\S]*?rejectsSchemaMutation\(data\)/u,
+  );
+  assert.match(
+    appSource,
+    /of: "--native-weekly-pace-projection-contract-smoke-test"[\s\S]*?BundledProduct\.buildChannel == "development"[\s\S]*?NativeWeeklyPaceProjectionContractSmokeTest\.run/u,
+  );
+
+  // The extra read shares the existing ephemeral, loopback-only transport. It
+  // begins only after a valid overview supplies the lane to bind against.
+  const weeklyPaceReader = source.match(
+    /func readWeeklyPaceOutlook\([\s\S]*?(?=\n    func readAnalysisActivity\()/u,
+  )?.[0] ?? "";
+  assert.ok(weeklyPaceReader, "weekly pace reader should be present");
+  assert.match(
+    weeklyPaceReader,
+    /path: "\/api\/local\/weekly-pace-outlook"/u,
+  );
+  assert.match(
+    weeklyPaceReader,
+    /maximumBytes: Self\.maximumPaceOutlookResponseBytes/u,
+  );
+  assert.match(
+    weeklyPaceReader,
+    /MenuBarWeeklyPaceOutlookProjection\.decode\(\$0\)/u,
+  );
+  assert.match(source, /URLSessionConfiguration\.ephemeral/u);
+  assert.match(
+    source,
+    /self\.snapshot\.lanes = overview\.lanes[\s\S]*?self\.reader\.readWeeklyPaceOutlook\(base: dashboardURL\)/u,
+  );
+
+  // Opening either native surface can supersede an in-flight cadence poll.
+  // Every callback is generation-, URL-, and sequence-bound, and the next poll
+  // is scheduled only after both activity and overview-plus-outlook legs settle.
+  assert.match(source, /private var pollSequence: UInt64 = 0/u);
+  assert.match(source, /pollSequence &\+= 1\s*\n\s*let sequence = pollSequence/u);
+  assert.ok(
+    (source.match(/self\.pollSequence == sequence/gu) ?? []).length >= 3,
+    "every asynchronous poll leg should reject superseded responses",
+  );
+  const pollCoordinator = source.match(
+    /private func finishPollLeg\([\s\S]*?(?=\n    private func schedulePoll\()/u,
+  )?.[0] ?? "";
+  assert.ok(pollCoordinator, "two-leg poll coordinator should be present");
+  assert.match(pollCoordinator, /pollActivityFinished = true/u);
+  assert.match(pollCoordinator, /pollEvidenceFinished = true/u);
+  assert.match(
+    pollCoordinator,
+    /if pollActivityFinished && pollEvidenceFinished \{\s*schedulePoll\(\)/u,
+  );
+  assert.match(source, /finishPollLeg\(\.activity, sequence: sequence\)/u);
+  const weeklyPaceCompletion = source.match(
+    /self\.reader\.readWeeklyPaceOutlook\(base: dashboardURL\) \{[\s\S]*?self\.finishPollLeg\(\.evidence, sequence: sequence\)\s*\n\s*\}/u,
+  )?.[0] ?? "";
+  assert.ok(weeklyPaceCompletion, "weekly pace completion should be present");
+  assert.match(
+    weeklyPaceCompletion,
+    /else \{\s*self\.snapshot\.weeklyPaceOutlook = nil/u,
+  );
+  assert.doesNotMatch(
+    weeklyPaceCompletion,
+    /invalidateObservedEvidence|snapshot\.lanes =|snapshot\.history =|snapshot\.evidence =|snapshot\.phase =/u,
+    "an optional pace failure must not erase independently valid allowance or history",
+  );
+
+  // Forecast claims expire at reset or, for over-pace states, the earlier
+  // projected exhaustion instant. Freshness and exact-lane binding are checked
+  // again at render time so no cached prediction survives changed evidence.
+  assert.match(
+    paceSource,
+    /var nextPresentationBoundary: Date \{[\s\S]*?standing == \.over[\s\S]*?return min\(resetsAt, exhaustion\)[\s\S]*?return resetsAt/u,
+  );
+  assert.match(
+    source,
+    /let outlookBoundaries = weeklyPaceOutlook\.map \{\s*\[\$0\.nextPresentationBoundary\]/u,
+  );
+  assert.match(
+    source,
+    /if snapshot\.currentWeeklyPaceOutlook\(now: now\) == nil \{\s*snapshot\.weeklyPaceOutlook = nil/u,
+  );
+  assert.match(
+    source,
+    /weeklyPaceOutlook: snapshot\.weeklyPaceOutlook,/u,
+  );
+
+  // The rich popup is a real AppKit surface with fixed width, vertical-only
+  // overflow, two native history ranges, and companion-projected pace states.
+  assert.match(popupSource, /final class MenuBarPopoverViewController: NSViewController/u);
+  assert.match(popupSource, /static let width: CGFloat = 400/u);
+  assert.match(popupSource, /private let scrollView = NSScrollView\(\)/u);
+  assert.match(popupSource, /scrollView\.hasVerticalScroller = true/u);
+  assert.match(popupSource, /scrollView\.hasHorizontalScroller = false/u);
+  assert.match(popupSource, /let rangeControl = NSSegmentedControl\(\)/u);
+  assert.match(modelSource, /case sevenDays = "7d"/u);
+  assert.match(modelSource, /case thirtyDays = "30d"/u);
+  assert.match(popupSource, /private final class MenuBarWeeklyPaceView: NSView/u);
+  assert.match(
+    popupSource,
+    /enum MenuBarPopoverPaceState: Equatable \{[\s\S]*?case collecting[\s\S]*?case under[\s\S]*?case on[\s\S]*?case over[\s\S]*?case critical/u,
+  );
+  assert.match(
+    popupSource,
+    /func configure\(\s*outlook: MenuBarWeeklyPaceOutlook,[\s\S]*?outlook\.status == \.collecting[\s\S]*?switch outlook\.standing[\s\S]*?outlook\.critical \? \.critical : \.over/u,
+  );
+  assert.match(
+    popupSource,
+    /trackView\.coveredFraction = outlook\.track\.coveredFraction/u,
+  );
+  assert.match(
+    popupSource,
+    /trackView\.activeFraction = outlook\.track\.activeExhaustionFraction/u,
+  );
+  assert.match(
+    popupSource,
+    /let weeklyPaceVisible: Bool\s*\n\s*let weeklyPaceState: MenuBarPopoverPaceState\?/u,
+  );
+  assert.match(
+    popupSource,
+    /if let outlook = snapshot\.currentWeeklyPaceOutlook\(now: now\) \{[\s\S]*?weeklyPaceView\.configure\(outlook: outlook, now: now\)[\s\S]*?weeklySection\.isHidden = false[\s\S]*?else \{[\s\S]*?weeklySection\.isHidden = true/u,
+  );
+  assert.doesNotMatch(popupSource, /MenuBarWeeklyPositionView/u);
+  assert.doesNotMatch(popupSource, /weeklyWindowPosition|difference <= -2|difference >= 2/u);
+  assert.match(popupSource, /MenuBarDailyTokenBarsView/u);
+  assert.match(popupSource, /day\.totalTokens/u);
+  assert.match(popupSource, /day\.evidence == \.partial[\s\S]*?drawPartialBar/u);
+  assert.match(popupSource, /menuBarPopupNotSubscriptionBill/u);
+  assert.match(popupSource, /menuBarPopupCoverageMixed/u);
+  assert.match(popupSource, /menuBarPopupCoverageAccessible/u);
+  assert.match(popupSource, /historyCoverageLabel\.isHidden = historyChart\.coverageState == \.complete/u);
+  assert.match(popupSource, /history\.accountingStatus == \.retained[\s\S]*?currentSnapshot\.phase == \.analyzing[\s\S]*?menuBarPopupRetainedHistory/u);
+  assert.match(popupSource, /refreshButton\.isEnabled = snapshot\.analysisAvailable/u);
+  assert.match(popupSource, /selectHistoryRangeForSmokeTest/u);
+  assert.match(popupSource, /renderPNG\(to url: URL, appearance: NSAppearance\.Name\)/u);
+  assert.match(appSource, /of: "--menu-bar-overview-render-smoke-test"[\s\S]*?BundledProduct\.buildChannel == "development"[\s\S]*?MenuBarContractSmokeTest\.renderOverview/u);
+
+  // Accounting is independently fail-closed. Calendar-day aggregation uses
+  // Calendar arithmetic for DST, preserves gaps, and admits authoritative
+  // zeros only inside complete coverage.
+  assert.match(modelSource, /freshness\["accountingStatus"\] as\? String == "available"/u);
+  assert.match(modelSource, /sourceMode != "unified"[\s\S]*?generationMatched/u);
+  assert.match(modelSource, /projection\["status"\] as\? String == "retained"[\s\S]*?sourceMode == "unified"[\s\S]*?exactBoolean\(accounting\["generationMatched"\]\) == false[\s\S]*?startAt < endAt[\s\S]*?endAt <= retainedAt[\s\S]*?retainedAt <= now/u);
+  assert.match(modelSource, /enum Evidence: Equatable \{[\s\S]*?case available[\s\S]*?case partial[\s\S]*?case unavailable/u);
+  assert.match(modelSource, /calendar\.date\([\s\S]*?byAdding: \.day/u);
+  assert.match(modelSource, /let fullCivilDayCovered/u);
+  assert.match(modelSource, /guard !matching\.isEmpty else/u);
+  assert.match(modelSource, /source != "insufficient_evidence"/u);
+  const popupCatalogs = await Promise.all(
+    ["en", "es", "zh-Hans"].map((locale) => readFile(join(
+      REPOSITORY_ROOT,
+      "apps",
+      "macos",
+      "Resources",
+      `${locale}.lproj`,
+      "Localizable.strings",
+    ), "utf8")),
+  );
+  const popupLocalization = popupCatalogs.map((catalog) => catalog
+    .split("\n")
+    .filter((line) => line.includes('"menuBarPopup.'))
+    .join("\n"))
+    .join("\n");
+  const weeklyPaceLocalizationKeys = [
+    ["menuBarPopupWeeklyPace", "menuBarPopup.weeklyPace"],
+    ["menuBarPopupPaceCollecting", "menuBarPopup.paceCollecting"],
+    ["menuBarPopupPaceUnder", "menuBarPopup.paceUnder"],
+    ["menuBarPopupPaceOn", "menuBarPopup.paceOn"],
+    ["menuBarPopupPaceOver", "menuBarPopup.paceOver"],
+    ["menuBarPopupPaceCritical", "menuBarPopup.paceCritical"],
+    ["menuBarPopupPaceCollectingDetail", "menuBarPopup.paceCollectingDetail"],
+    ["menuBarPopupPaceRatioOutcome", "menuBarPopup.paceRatioOutcome"],
+    ["menuBarPopupPaceDryBeforeReset", "menuBarPopup.paceDryBeforeReset"],
+    ["menuBarPopupPaceSpareAtReset", "menuBarPopup.paceSpareAtReset"],
+    ["menuBarPopupPaceReachesReset", "menuBarPopup.paceReachesReset"],
+    ["menuBarPopupPaceNow", "menuBarPopup.paceNow"],
+    ["menuBarPopupPaceResetIn", "menuBarPopup.paceResetIn"],
+    ["menuBarPopupPaceEvidenceOne", "menuBarPopup.paceEvidenceOne"],
+    ["menuBarPopupPaceEvidenceMany", "menuBarPopup.paceEvidenceMany"],
+    ["menuBarPopupPaceEarlyEstimate", "menuBarPopup.paceEarlyEstimate"],
+    ["menuBarPopupPaceActiveMarker", "menuBarPopup.paceActiveMarker"],
+  ];
+  for (const [swiftKey, catalogKey] of weeklyPaceLocalizationKeys) {
+    assert.equal(
+      localizationSource.includes(`case ${swiftKey} = "${catalogKey}"`),
+      true,
+      swiftKey,
+    );
+    assert.equal(
+      localizationSource.includes(`case .${swiftKey}:`),
+      true,
+      `${swiftKey} English fallback`,
+    );
+    for (const [index, catalog] of popupCatalogs.entries()) {
+      assert.equal(
+        catalog.includes(`"${catalogKey}" = `),
+        true,
+        `${catalogKey} locale ${index}`,
+      );
+    }
+  }
+  for (const privacyForbidden of [
+    /reset.?credit/iu,
+    /redeem/iu,
+    /buy.?credit/iu,
+    /account.?email/iu,
+  ]) {
+    assert.doesNotMatch(source, privacyForbidden);
+    assert.doesNotMatch(popupSource, privacyForbidden);
+    assert.doesNotMatch(modelSource, privacyForbidden);
+    assert.doesNotMatch(paceSource, privacyForbidden);
+    assert.doesNotMatch(popupLocalization, privacyForbidden);
+  }
 
   // The analyze item drives the companion's own refresh route with the exact
   // same-origin proof the dashboard button sends.
@@ -2138,6 +3572,75 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   ]) {
     assert.equal(source.includes(forbidden), false, forbidden);
   }
+});
+
+test("menu-bar click-away monitoring is mouse-only, popover-scoped, and preserves status-button routing", async () => {
+  const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
+  const method = (name) => {
+    const body = source.match(new RegExp(
+      `func ${name}\\([^)]*\\)[\\s\\S]*?\\n    \\}`,
+      "u",
+    ))?.[0];
+    assert.ok(body, `${name} must remain an explicit lifecycle boundary`);
+    return body;
+  };
+  const mouseDecision = source.match(
+    /func menuBarShouldDismissForMouse\([\s\S]*?\n\}/u,
+  )?.[0] ?? "";
+  const mouseTargets = source.match(
+    /enum MenuBarMouseTarget[^\n]*\{[\s\S]*?\n\}/u,
+  )?.[0] ?? "";
+  assert.match(mouseTargets, /enum MenuBarMouseTarget: Equatable, CaseIterable \{\s*case popover\s*case statusItem\s*case applicationWindow\s*case outside\s*\}/u);
+  assert.match(mouseDecision, /case \.popover, \.statusItem:\s*return false/u);
+  assert.match(mouseDecision, /case \.applicationWindow:\s*return isMenuTracking \|\| isPopoverShown/u);
+  assert.match(mouseDecision, /case \.outside:\s*return isPopoverShown/u);
+
+  const interactionMonitoring = method("installInteractionMonitoring");
+  const localMouseMonitor = interactionMonitoring.match(
+    /localMouseMonitor = NSEvent\.addLocalMonitorForEvents\([\s\S]*?(?=\n        appDeactivationObserver =)/u,
+  )?.[0] ?? "";
+  assert.match(localMouseMonitor,
+    /matching: \[\.leftMouseDown, \.rightMouseDown, \.otherMouseDown\]/u);
+  assert.match(localMouseMonitor,
+    /guard let self, !self\.stopped,\s*self\.isMenuTracking \|\| self\.popover\.isShown/u);
+  assert.match(localMouseMonitor,
+    /eventWindow === self\.popover\.contentViewController\?\.view\.window \{\s*target = \.popover/u);
+  assert.match(localMouseMonitor,
+    /let button = self\.statusItem\.button,[\s\S]*?eventWindow === button\.window,\s*button\.bounds\.contains\(button\.convert\(event\.locationInWindow, from: nil\)\) \{[\s\S]*?target = \.statusItem/u);
+  assert.match(localMouseMonitor,
+    /NSApp\.windows\.contains\(where: \{ \$0 === eventWindow \}\) \{\s*target = \.applicationWindow\s*\} else \{\s*target = \.outside/u);
+  assert.match(localMouseMonitor,
+    /menuBarShouldDismissForMouse\(\s*target: target,\s*isMenuTracking: self\.isMenuTracking,\s*isPopoverShown: self\.popover\.isShown\s*\) \{\s*self\.dismissSurfaces\(\)\s*\}\s*return event/u);
+  assert.doesNotMatch(localMouseMonitor, /return nil|\.characters|\.keyCode/u);
+  assert.doesNotMatch(interactionMonitoring, /addGlobalMonitorForEvents|startOutsideClickMonitoring/u);
+
+  const outsideMonitoring = method("startOutsideClickMonitoring");
+  assert.equal(source.match(/NSEvent\.addGlobalMonitorForEvents/gu)?.length, 1,
+    "the sole global monitor must stay in the popover-only mouse listener");
+  assert.match(outsideMonitoring,
+    /guard !stopped, popover\.isShown, outsideMouseMonitor == nil else \{ return \}/u);
+  assert.match(outsideMonitoring,
+    /outsideMouseMonitor = NSEvent\.addGlobalMonitorForEvents\(\s*matching: \[\.leftMouseDown, \.rightMouseDown, \.otherMouseDown\]\s*\) \{ \[weak self\] _ in/u);
+  assert.match(outsideMonitoring,
+    /MainActor\.assumeIsolated \{\s*guard let self, !self\.stopped, self\.popover\.isShown else \{ return \}\s*self\.dismissSurfaces\(\)/u);
+  assert.doesNotMatch(outsideMonitoring,
+    /\.keyDown|\.keyUp|\.flagsChanged|\.mouseMoved|\.scrollWheel|\.characters|\.keyCode|\bevent\.|print\(|FileHandle/u);
+  assert.match(method("stopOutsideClickMonitoring"),
+    /if let outsideMouseMonitor \{\s*NSEvent\.removeMonitor\(outsideMouseMonitor\)\s*self\.outsideMouseMonitor = nil/u);
+  assert.match(method("statusItemActivated"),
+    /popover\.show\([\s\S]*?preferredEdge: \.minY\s*\)\s*startOutsideClickMonitoring\(\)/u);
+  assert.match(method("popoverDidShow"), /startOutsideClickMonitoring\(\)/u);
+  assert.match(method("popoverDidClose"),
+    /stopOutsideClickMonitoring\(\)[\s\S]*?guard !stopped/u);
+  assert.match(method("showActionMenu"),
+    /stopOutsideClickMonitoring\(\)[\s\S]*?popover\.performClose\(nil\)/u);
+  assert.match(method("dismissSurfaces"),
+    /stopOutsideClickMonitoring\(\)\s*menu\.cancelTracking\(\)[\s\S]*?popover\.performClose\(nil\)/u);
+  assert.match(method("removeInteractionMonitoring"), /stopOutsideClickMonitoring\(\)/u);
+  assert.match(method("shutDown"),
+    /stopped = true\s*dismissSurfaces\(\)[\s\S]*?removeInteractionMonitoring\(\)/u);
+  assert.match(source, /popoverIsShown: popover\.isShown/u);
+  assert.match(source, /outsideClickAwayMonitorInstalled: outsideMouseMonitor != nil/u);
 });
 
 test("native quota duration and reset scheduling stay bounded and provider-aware", async () => {
@@ -2207,57 +3710,15 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     "contribution-device-binding-v1.json",
   );
   const exportResidue = join(stateRoot, "export-participant-secret");
-  const stored = new Map([
-    // Both contribution-device storage generations: the app-minted broker
-    // item and the companion-minted legacy item are one credential surface
-    // and the reset must clear whichever exist. Only the legacy item is
-    // reachable through the decrypting backend — the app-minted item's ACL
-    // names the signed app alone, so this helper never reads it and the map
-    // below deliberately offers no way to.
-    [
-      "app-usagemonitor.contribution-device.v1",
-      Buffer.alloc(32, 0x31),
-    ],
-    [
-      "app-usagemonitor.export-identity.v1",
-      Buffer.alloc(32, 0x32),
-    ],
-    [
-      "app-usagemonitor.account-observation.v1",
-      Buffer.alloc(32, 0x33),
-    ],
-  ]);
-  // The app-minted generation, addressed only by service and account. An
-  // attribute delete never decrypts, so nothing here is a secret.
+  // Every retired and app-owned generation is represented only by attributes;
+  // the reset helper never loads a native binding or decrypts a value.
   const attributeItems = new Set([
+    "app-usagemonitor.contribution-device.v1",
     "app-usagemonitor.contribution-device.app.v1",
-  ]);
-  const partialStored = new Map([
-    [
-      "app-usagemonitor.contribution-device.v1",
-      Buffer.alloc(32, 0x41),
-    ],
-    [
-      "app-usagemonitor.export-identity.v1",
-      Buffer.alloc(32, 0x42),
-    ],
+    "app-usagemonitor.export-identity.v1",
+    "app-usagemonitor.export-identity.app.v1",
   ]);
   const calls = [];
-  const backend = {
-    async read(capability) {
-      calls.push(["read", capability.service]);
-      const value = stored.get(capability.service);
-      return value ? Buffer.from(value) : null;
-    },
-    async deleteExact(capability, expected) {
-      calls.push(["deleteExact", capability.service]);
-      const current = stored.get(capability.service);
-      if (!current || !current.equals(expected)) return "conflict";
-      current.fill(0);
-      stored.delete(capability.service);
-      return "deleted";
-    },
-  };
   const attributeProbe = (capability) => {
     calls.push(["attributeProbe", capability.service]);
     return attributeItems.has(capability.service) ? "present" : "missing";
@@ -2276,7 +3737,6 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     await writeFile(retained, "{\"retained\":true}\n", { mode: 0o600 });
 
     const result = await resetLocalKeychainIdentityAndDevice({
-      backend,
       stateRoot,
       attributeProbe,
       attributeDelete,
@@ -2300,28 +3760,21 @@ test("targeted local Keychain reset removes only exact local capabilities and re
         deviceRevoked: false,
       },
     });
-    // The app-minted generation is cleared by attribute and the legacy one by
-    // exact value. The helper must never decrypt the app generation: reading
-    // it would require the very node trusted-application entry that
-    // `designatedReaderAccess()` no longer mints, and a keytar read of an item
-    // this process is not trusted for is precisely what raises a dialog.
+    // Both generations are fixed attribute deletes. No runtime can ask for a
+    // stored secret, so the broker-less helper has no keytar dependency.
     assert.deepEqual(
       calls.filter(([method]) => method === "attributeDelete"),
-      [["attributeDelete", "app-usagemonitor.contribution-device.app.v1"]],
-    );
-    assert.deepEqual(
-      calls.filter(([method]) => method === "deleteExact"),
       [
-        ["deleteExact", "app-usagemonitor.contribution-device.v1"],
-        ["deleteExact", "app-usagemonitor.export-identity.v1"],
+        ["attributeDelete", "app-usagemonitor.contribution-device.v1"],
+        ["attributeDelete", "app-usagemonitor.contribution-device.app.v1"],
+        ["attributeDelete", "app-usagemonitor.export-identity.v1"],
+        ["attributeDelete", "app-usagemonitor.export-identity.app.v1"],
       ],
     );
     assert.equal(
-      calls.some(([method, service]) =>
-        method === "read"
-        && service === "app-usagemonitor.contribution-device.app.v1"),
+      calls.some(([method]) => method === "read" || method === "deleteExact"),
       false,
-      "the app-minted generation is never decrypted",
+      "no Keychain generation is decrypted",
     );
     // Every attribute probe is a preflight: none may run after the first
     // mutation, so the read-only phase stays complete before anything changes.
@@ -2329,16 +3782,11 @@ test("targeted local Keychain reset removes only exact local capabilities and re
       calls.findLast(([method]) => method === "attributeProbe") !== undefined
         && calls.indexOf(calls.findLast(([method]) =>
           method === "attributeProbe"))
-          < calls.findIndex(([method]) =>
-            method === "attributeDelete" || method === "deleteExact"),
+          < calls.findIndex(([method]) => method === "attributeDelete"),
       true,
       "attribute probes complete before any deletion",
     );
     assert.equal(attributeItems.size, 0);
-    assert.equal(
-      stored.has("app-usagemonitor.account-observation.v1"),
-      true,
-    );
     assert.equal(await readFile(retained, "utf8"), "{\"retained\":true}\n");
     await assert.rejects(lstat(deviceState), { code: "ENOENT" });
     await assert.rejects(lstat(exportResidue), { code: "ENOENT" });
@@ -2353,22 +3801,13 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     const partialDeletes = [];
     const partial = await resetLocalKeychainIdentityAndDevice({
       stateRoot,
-      backend: {
-        async read(capability) {
-          const value = partialStored.get(capability.service);
-          return value ? Buffer.from(value) : null;
-        },
-        async deleteExact(capability) {
-          partialDeletes.push(capability.service);
-          const error = new Error("must not escape");
-          error.code = "export_identity_keychain_locked";
-          throw error;
-        },
+      attributeProbe: () => "present",
+      attributeDelete: (capability) => {
+        partialDeletes.push(capability.service);
+        const error = new Error("must not escape");
+        error.code = "export_identity_keychain_locked";
+        throw error;
       },
-      // This install predates the app generation: the attribute leg is a
-      // clean miss, and the locked legacy delete is what makes it partial.
-      attributeProbe: () => "missing",
-      attributeDelete: () => "missing",
     });
     assert.deepEqual(partial, {
       schemaVersion: "usage-monitor-local-keychain-reset-v1",
@@ -2400,7 +3839,6 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     await symlink(unsafeTarget, deviceState);
     await assert.rejects(
       resetLocalKeychainIdentityAndDevice({
-        backend,
         stateRoot,
         attributeProbe,
         attributeDelete,
@@ -2409,28 +3847,109 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     );
     assert.equal(await readFile(unsafeTarget, "utf8"), "outside");
   } finally {
-    for (const secret of stored.values()) secret.fill(0);
-    for (const secret of partialStored.values()) secret.fill(0);
     await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
 
-test("the app Keychain broker mints the contribution credential app-side over the spawn socketpair", async () => {
-  const [source, brokerSource] = await Promise.all([
+test("preview Keychain reset addresses no stable credential pair", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-preview-keychain-reset-"),
+  );
+  const stateRoot = join(temporaryRoot, "state");
+  const calls = [];
+  try {
+    await mkdir(stateRoot, { mode: 0o700 });
+    const result = await resetLocalKeychainIdentityAndDevice({
+      stateRoot,
+      keychainEnvironment: {
+        USAGE_MONITOR_KEYCHAIN_NAMESPACE: "app-usagemonitor.preview",
+        USAGE_MONITOR_KEYCHAIN_ACCOUNT: "preview-installation",
+      },
+      attributeProbe(capability, options) {
+        return exportIdentityKeychainItemPresenceByAttributes(capability, {
+          ...options,
+          platform: "darwin",
+          runCommand(command, arguments_) {
+            calls.push(["attributeProbe", command, ...arguments_]);
+            return { status: 44 };
+          },
+        });
+      },
+      attributeDelete(capability, options) {
+        return deleteExportIdentityKeychainItemByAttributes(capability, {
+          ...options,
+          platform: "darwin",
+          runCommand(command, arguments_) {
+            calls.push(["attributeDelete", command, ...arguments_]);
+            return { status: 44 };
+          },
+        });
+      },
+    });
+    assert.equal(result.status, "reset");
+    assert.ok(calls.length > 0);
+    for (const [, command, operation, serviceFlag, service, accountFlag, account]
+      of calls) {
+      assert.equal(command, "/usr/bin/security");
+      assert.match(operation, /^(?:find|delete)-generic-password$/u);
+      assert.equal(serviceFlag, "-s");
+      assert.equal(accountFlag, "-a");
+      assert.match(service, /^app-usagemonitor\.preview\./u);
+      assert.equal(account, "preview-installation");
+      assert.equal(service.startsWith("app-usagemonitor.contribution"), false);
+      assert.equal(service.startsWith("app-usagemonitor.export"), false);
+    }
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("the app Keychain broker owns a closed capability set and migrates legacy items safely", async () => {
+  const [source, brokerSource, migrationSource] = await Promise.all([
     readFile(SWIFT_SOURCE, "utf8"),
     readFile(KEYCHAIN_BROKER_SOURCE, "utf8"),
+    readFile(join(REPOSITORY_ROOT, "apps/macos/Sources/KeychainMigration.swift"), "utf8"),
   ]);
 
-  // The Swift storage generation and channel announcement stay in lockstep
-  // with the companion-side broker client.
-  const appCapability = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
-  assert.equal(
-    brokerSource.includes(`static let service = "${appCapability.service}"`),
-    true,
+  assert.match(
+    brokerSource,
+    /case exportIdentity = "export_identity"[\s\S]*?case accountObservation = "account_observation"[\s\S]*?case claudeSessionPseudonym = "claude_session_pseudonym"[\s\S]*?case contributionDevice = "contribution_device"/u,
   );
-  assert.equal(
-    brokerSource.includes(`static let account = "${appCapability.account}"`),
-    true,
+  for (const serviceStem of [
+    "export-identity",
+    "account-observation",
+    "claude-session-pseudonym",
+    "contribution-device",
+  ]) {
+    assert.equal(
+      brokerSource.includes(`"${serviceStem}"`),
+      true,
+      serviceStem,
+    );
+  }
+  assert.match(brokerSource, /private static let protocolVersion = 2/u);
+  assert.match(brokerSource, /private static let legacyProtocolVersion = 1/u);
+  assert.match(
+    brokerSource,
+    /guard request\["capability"\] == nil else \{ return nil \}[\s\S]*?return \.contributionDevice/u,
+  );
+  assert.match(
+    brokerSource,
+    /BrokerKeychainCapability\(rawValue: raw\)/u,
+  );
+  // The native bundle selects only one of two reviewed Keychain identities;
+  // neither plist text nor a companion request becomes an arbitrary address.
+  assert.match(
+    brokerSource,
+    /case \("app-usagemonitor", "installation"\):\s*self = \.stable/u,
+  );
+  assert.match(
+    brokerSource,
+    /case \("app-usagemonitor\.preview", "preview-installation"\):\s*self = \.preview/u,
+  );
+  assert.match(
+    brokerSource,
+    /"\\\(identity\.namespace\)\.\\\(serviceStem\)\.app\.v1"/u,
   );
   assert.equal(
     brokerSource.includes(
@@ -2439,17 +3958,11 @@ test("the app Keychain broker mints the contribution credential app-side over th
     true,
   );
 
-  // The channel is a kernel socketpair: close-on-exec on both raw ends, a
-  // dead peer surfaces as a write error rather than SIGPIPE, and frames are
-  // bounded so anything that is not this protocol fails the channel closed.
   assert.match(brokerSource, /socketpair\(AF_UNIX, SOCK_STREAM, 0, &endpoints\)/u);
   assert.match(brokerSource, /F_SETFD, FD_CLOEXEC/u);
   assert.match(brokerSource, /SO_NOSIGPIPE/u);
   assert.match(brokerSource, /maximumFrameBytes = 4_096/u);
   assert.match(brokerSource, /storedSecretPattern = "\^\[A-Za-z0-9_-\]\{43\}\$"/u);
-  // Reads, Keychain operations, and teardown share one dispatch queue, and
-  // only the read source's cancellation handler closes the descriptor — a
-  // read can therefore never race the close.
   assert.match(
     brokerSource,
     /DispatchSource\.makeReadSource\(\s*fileDescriptor: descriptor,\s*queue: queue\s*\)/u,
@@ -2459,133 +3972,114 @@ test("the app Keychain broker mints the contribution credential app-side over th
     /source\.setCancelHandler \{\s*close\(descriptor\)\s*\}/u,
   );
 
-  // Mint and read happen through SecItem in the login keychain; the
-  // data-protection keychain is rejected until the app carries the
-  // provisioning-profile entitlement it requires.
-  assert.match(brokerSource, /SecItemAdd\(/u);
-  assert.match(brokerSource, /SecItemCopyMatching\(/u);
-  assert.match(brokerSource, /SecItemDelete\(/u);
-  assert.doesNotMatch(brokerSource, /kSecUseDataProtectionKeychain/u);
-  // Never SecItemUpdate: Apple's implementation answers an update that hits
-  // errSecVerifyFailed by recreating the item with a DEFAULT access control
-  // list (_ReplaceKeychainItem → SecKeychainItemCreateFromContent with
-  // initialAccess = NULL), silently widening the app-only ACL to the system
-  // default — a change nothing would observe, because this app keeps access
-  // either way. Every ~25-day rotation takes the duplicate path, so the
-  // replacement must be a delete followed by an add that carries the access
-  // object again.
   assert.doesNotMatch(brokerSource, /SecItemUpdate\(/u);
+  assert.doesNotMatch(brokerSource, /kSecUseDataProtectionKeychain/u);
   assert.match(
     brokerSource,
-    /guard status == errSecDuplicateItem else \{\s*return Self\.failureCode\(status\)\s*\}/u,
+    /readSecret\(capability, generation: \.modern\)[\s\S]*?legacyPresence\(capability\)/u,
   );
   assert.match(
     brokerSource,
-    /let removal = SecItemDelete\(baseQuery\(\) as CFDictionary\)[\s\S]*?let replacement = SecItemAdd\(attributes as CFDictionary, nil\)/u,
+    /generation: \.legacy,\s*allowInteraction: true/u,
+  );
+  const automaticMigration = brokerSource.slice(
+    brokerSource.indexOf("private func readOrMigrateSecret"),
+    brokerSource.indexOf("private func readSilentMigration"),
+  );
+  assert.doesNotMatch(automaticMigration, /allowInteraction: true/u);
+  assert.match(automaticMigration, /claimAttempt[\s\S]*?readSilentMigration/u);
+  assert.match(automaticMigration, /\[0, 0\.25, 0\.75\]/u);
+  assert.match(brokerSource, /entry\.retrying, entry\.attempts < 3/u);
+  assert.match(brokerSource, /private static let processMigrationState = MigrationState\(\)/u);
+  assert.match(brokerSource, /migrationState = injectedMigrationState[\s\S]*?Self\.processMigrationState/u);
+  assert.match(brokerSource, /let deniedMigrationState = MigrationState\(\)[\s\S]*?let deniedBroker[\s\S]*?let relaunchedDeniedBroker[\s\S]*?migrationState: deniedMigrationState/u);
+  assert.match(brokerSource, /KeychainMigrationAdoption\.adopt\([\s\S]*?addMigratedSecret\(stored[\s\S]*?readSecret\(capability, generation: \.modern\)[\s\S]*?rollbackMigratedSecret/u);
+  assert.match(brokerSource, /SecItemDelete\(\[kSecValuePersistentRef as String: reference\]/u);
+  assert.match(migrationSource, /guard readBack\(\) == secret else \{\s*if created \{ removeCreated\(\) \}/u);
+  assert.doesNotMatch(migrationSource, /SecItemDelete|SecItemUpdate|allowInteraction: true/u);
+  assert.match(migrationSource, /kSecGuestAttributeAudit/u);
+  assert.match(migrationSource, /audit_token_to_pid\(token\) == expectedPID/u);
+  assert.match(migrationSource, /audit_token_to_euid\(token\) == geteuid\(\)/u);
+  assert.match(migrationSource, /expectedCDHash: expected\.cdhash/u);
+  assert.match(migrationSource, /SecKeychainSetUserInteractionAllowed\(false\) == errSecSuccess/u);
+  assert.match(brokerSource, /SecKeychainGetUserInteractionAllowed\(&previous\)[\s\S]*?SecKeychainSetUserInteractionAllowed\(previous\.boolValue\)/u);
+  assert.match(
+    brokerSource,
+    /private static let nativeSmokeArguments = Set\(\[[\s\S]*?"--keychain-broker-contract-smoke-test"[\s\S]*?"--smoke-test"[\s\S]*?\]\)/u,
+  );
+  assert.match(
+    brokerSource,
+    /"--native-weekly-pace-projection-contract-smoke-test"/u,
+  );
+  assert.match(
+    brokerSource,
+    /!Self\.nativeSmokeArguments\.isDisjoint\(\s*with: CommandLine\.arguments\.dropFirst\(\)\s*\)/u,
+  );
+  assert.doesNotMatch(brokerSource, /hasSuffix\("-smoke-test"\)/u);
+  assert.match(
+    brokerSource,
+    /private init\([\s\S]*?smokeStorage: EphemeralSmokeStorage\?[\s\S]*?migrationState injectedMigrationState:[\s\S]*?MigrationState\? = nil[\s\S]*?\) throws[\s\S]*?ephemeralSmokeStorage = selectedSmokeStorage/u,
+  );
+  assert.match(
+    brokerSource,
+    /static func runContractSmokeTest\(\) -> Int32[\s\S]*?smokeResponse\(capabilityBroker,[\s\S]*?"v": 1[\s\S]*?migrationStorage\.legacy\[\.exportIdentity\][\s\S]*?deniedStorage\.deniedLegacyReads\.insert\(\.accountObservation\)[\s\S]*?failedMigrationReadbacks\.insert\([\s\S]*?requireMalformedFrameClosure/u,
+  );
+  assert.match(
+    source,
+    /arguments\.contains\("--keychain-broker-contract-smoke-test"\)[\s\S]*?ContributionDeviceKeychainBroker\.runContractSmokeTest\(\)/u,
   );
 
-  // No SecItem call may raise a dialog. This queue serializes reads, Keychain
-  // work, responses, and teardown, so a modal prompt would block the channel
-  // until the companion's timeout poisoned its transport permanently — the
-  // user answering correctly would find it already dead. Suppressed, those
-  // states return errSecInteractionNotAllowed and take the existing locked
-  // path instead.
-  assert.match(
-    brokerSource,
-    /SecKeychainSetUserInteractionAllowed\(false\)\s*\n\s*defer \{ SecKeychainSetUserInteractionAllowed\(true\) \}/u,
-  );
-  // Every SecItem call site sits after the withoutUserInteraction that opens
-  // its enclosing function, so none can be added outside the suppression.
-  for (const call of ["SecItemCopyMatching(", "SecItemAdd(", "SecItemDelete("]) {
-    let index = brokerSource.indexOf(call);
-    assert.notEqual(index, -1, call);
-    while (index !== -1) {
-      const preceding = brokerSource.slice(0, index);
-      assert.equal(
-        preceding.lastIndexOf("withoutUserInteraction")
-          > preceding.lastIndexOf("private func "),
-        true,
-        `${call} at ${index} is outside withoutUserInteraction`,
-      );
-      index = brokerSource.indexOf(call, index + call.length);
-    }
-  }
-  // Items address only the app-managed service; the legacy `.v1` item is
-  // structurally unreachable from app-side code.
-  assert.match(brokerSource, /kSecAttrService as String: Self\.service/u);
-
-  // Every fresh item trusts THIS APP AND NOTHING ELSE by designated
-  // requirement, and a mint without that access object fails closed.
-  //
-  // This is the broker's whole confidentiality claim, so it is pinned
-  // exactly. `runtime/bin/node` was in this list until 2026-08-20 for the
-  // reset helper's keytar read, and while it was, the claim was false: node
-  // is a world-executable general-purpose interpreter inside the bundle, so
-  // ANY same-user process could run it, satisfy the designated requirement,
-  // and read the credential silently. The reset helper now clears the
-  // app-minted generation by attribute (never decrypting, so never consulting
-  // an ACL), which is what allows exactly one entry here.
-  assert.match(
-    brokerSource,
-    /SecTrustedApplicationCreateFromPath\(nil, &trustedSelf\)/u,
-  );
   const accessSource = brokerSource.slice(
     brokerSource.indexOf("private func designatedReaderAccess"),
-    brokerSource.indexOf("private func storeSecret"),
+    brokerSource.indexOf("private func attributes"),
   );
-  assert.notEqual(accessSource, "");
-  // Exactly one trusted application is created, and the array handed to
-  // SecAccessCreate holds exactly that one.
   assert.equal(
     accessSource.match(/SecTrustedApplicationCreateFromPath\(/gu)?.length,
     1,
   );
-  assert.match(
-    accessSource,
-    /SecAccessCreate\(\s*Self\.service as CFString,\s*\[appTrust\] as CFArray,\s*&access\s*\)/u,
-  );
-  // Nothing in the broker may name a second reader: no node runtime path may
-  // reach the access object, by any route.
-  assert.doesNotMatch(brokerSource, /nodeRuntimePath/u);
-  assert.doesNotMatch(brokerSource, /trustedReader/u);
+  assert.match(accessSource, /\[appTrust\] as CFArray/u);
+  assert.doesNotMatch(accessSource, /nodeRuntimePath|trustedReader/u);
   assert.match(brokerSource, /kSecAttrAccess as String/u);
-  assert.match(
-    brokerSource,
-    /guard let access = designatedReaderAccess\(\) else \{\s*return "operation_failed"/u,
-  );
 
-  // Failure classification keeps the companion's locked/denied identities.
+  const launchSource = source.slice(
+    source.indexOf("    func launch("),
+    source.indexOf("    private func consumeStandardOutput"),
+  );
+  assert.match(launchSource, /child\.standardInput = childEndpoint/u);
   assert.match(
-    brokerSource,
-    /case errSecInteractionNotAllowed:\s*return "locked"/u,
+    launchSource,
+    /makeBroker: \(\) throws -> ContributionDeviceKeychainBroker = \{\s*try ContributionDeviceKeychainBroker\(\s*namespace: BundledProduct\.keychainNamespace,\s*account: BundledProduct\.keychainAccount\s*\)/u,
   );
   assert.match(
-    brokerSource,
-    /case errSecAuthFailed, errSecUserCanceled:\s*return "denied"/u,
+    launchSource,
+    /broker = try makeBroker\(\)\s*\} catch \{\s*throw LauncherError\.companionLaunch\("keychain"\)/u,
   );
-
-  // Spawn wiring: the companion's standard input is the broker endpoint, the
-  // environment names only the descriptor, the parent drops its copy of the
-  // child end after the spawn, and termination tears the broker down.
+  assert.match(
+    launchSource,
+    /defer \{\s*if !brokerOwnedByCompanion \{ broker\.shutdown\(\) \}\s*\}\s*guard let childEndpoint = broker\.childEndpoint else \{\s*throw LauncherError\.companionLaunch\("keychain"\)\s*\}\s*let resources = try CompanionResources\.bundled\(\)/u,
+  );
+  assert.match(
+    launchSource,
+    /environment\[\s*ContributionDeviceKeychainBroker\.environmentVariable\s*\] = "0"\s*for name in/u,
+  );
+  assert.match(
+    launchSource,
+    /keychainBroker = broker\s*brokerOwnedByCompanion = true[\s\S]*?try child\.run\(\)[\s\S]*?broker\.closeChildEndpoint\(\)/u,
+  );
+  assert.doesNotMatch(launchSource, /try\? ContributionDeviceKeychainBroker|broker\?\.|FileHandle\.nullDevice/u);
   assert.match(
     source,
-    /child\.standardInput = broker\?\.childEndpoint \?\? FileHandle\.nullDevice/u,
+    /static func verifyKeychainLaunchContract[\s\S]*?case construction, missingEndpoint[\s\S]*?try companion\.launch\(makeBroker:[\s\S]*?throw ContributionDeviceKeychainBrokerUnavailable\(\)[\s\S]*?healthyEndpointObserved = broker\.childEndpoint != nil[\s\S]*?broker\.closeChildEndpoint\(\)[\s\S]*?companion\.process == nil, companion\.keychainBroker == nil[\s\S]*?stoppedCalls == 2/u,
   );
   assert.match(
     source,
-    /let broker = try\? ContributionDeviceKeychainBroker\(\)/u,
+    /arguments\.contains\("--keychain-broker-contract-smoke-test"\)[\s\S]*?guard CompanionProcess\.verifyKeychainLaunchContract\(\) else \{ exit\(1\) \}/u,
   );
-  assert.match(
-    source,
-    /if broker\?\.childEndpoint != nil \{\s*environment\[\s*ContributionDeviceKeychainBroker\.environmentVariable\s*\] = "0"/u,
-  );
-  assert.match(source, /broker\?\.closeChildEndpoint\(\)/u);
   const terminationSource = source.slice(
     source.indexOf("private func didTerminate"),
     source.indexOf("func stop(completion:"),
   );
-  assert.match(terminationSource, /broker\?\.shutdown\(\)/u);
-
+  assert.match(terminationSource, /broker\.shutdown\(completion: finish\)/u);
   // The one-shot reset helper runs without a broker: its standard input
   // stays the null device and its environment never announces a channel.
   const resetHelperSource = source.slice(
@@ -2600,98 +4094,98 @@ test("the app Keychain broker mints the contribution credential app-side over th
     resetHelperSource.includes(CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV),
     false,
   );
-});
-
-test("the app-minted credential's only reader is the app, and the reset helper needs no ACL", async () => {
-  // The load-bearing pair, pinned together because either half alone is a
-  // trap. The app-only ACL is only safe while nothing outside the app needs
-  // to decrypt the item; the reset helper is the only such candidate, and it
-  // is a broker-less node process (pinned above: null stdin, no announcement).
-  // If someone re-adds the app generation to the helper's decrypting list, its
-  // keytar read would fail or prompt on every reset — so this test fails
-  // instead, naming the fix.
-  const [brokerSource, helperSource] = await Promise.all([
-    readFile(KEYCHAIN_BROKER_SOURCE, "utf8"),
-    readFile(
-      new URL("../apps/macos/reset-local-keychain.js", import.meta.url),
-      "utf8",
-    ),
-  ]);
-  const appService =
-    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp.service;
-  const legacyService =
-    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice.service;
-
-  // One trusted application on the app-minted item, and it is this app.
-  const accessSource = brokerSource.slice(
-    brokerSource.indexOf("private func designatedReaderAccess"),
-    brokerSource.indexOf("private func storeSecret"),
-  );
-  assert.equal(
-    accessSource.match(/SecTrustedApplicationCreateFromPath\(/gu)?.length,
-    1,
+  assert.match(
+    resetHelperSource,
+    /"USAGE_MONITOR_KEYCHAIN_NAMESPACE":\s*BundledProduct\.keychainNamespace/u,
   );
   assert.match(
-    accessSource,
-    /SecTrustedApplicationCreateFromPath\(nil, &trustedSelf\)/u,
+    resetHelperSource,
+    /"USAGE_MONITOR_KEYCHAIN_ACCOUNT":\s*BundledProduct\.keychainAccount/u,
   );
-  assert.match(accessSource, /\[appTrust\] as CFArray/u);
+});
 
-  // The helper's target table: the app generation is attribute-addressed
-  // only, the legacy generation keeps its decrypting read + exact delete.
+test("native full reset drains every retiring writer before deletion or restart", async () => {
+  const [source, broker] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(KEYCHAIN_BROKER_SOURCE, "utf8"),
+  ]);
+  const shutdown = broker.slice(broker.indexOf("func shutdown(completion:"), broker.indexOf("private func teardown"));
+  assert.match(shutdown, /queue\.async \{\s*self\.teardown\(\)\s*completion\(\)/u);
+  assert.doesNotMatch(shutdown, /weak self/u);
+  const observe = broker.slice(broker.indexOf("func observe("), broker.indexOf("func removeObserver("));
+  assert.match(observe, /lock\.lock\(\)[\s\S]*?DispatchQueue\.main\.async \{ callback\(current\) \}\s*lock\.unlock\(\)/u);
+
+  const stop = source.slice(source.indexOf("func stop(completion:"), source.indexOf("static func verifyKeychainShutdownContract"));
+  assert.match(stop, /if terminationComplete[\s\S]*?completion\(\)/u);
+  assert.match(stop, /stopCompletions\.append\(completion\)[\s\S]*?stopRetention = self[\s\S]*?guard !terminationInProgress/u);
+  assert.match(stop, /guard let child = process[\s\S]*?didTerminate\(success: true, notifyExit: false\)/u);
+  assert.doesNotMatch(stop, /guard let child = process, child\.isRunning else[\s\S]*?completion\(\)/u);
+  const termination = source.slice(source.indexOf("private func didTerminate"), source.indexOf("func stop(completion:"));
+  assert.match(termination, /terminationInProgress = true[\s\S]*?process = nil[\s\S]*?broker\.shutdown\(completion: finish\)/u);
+  assert.match(termination, /private func finishTermination[\s\S]*?terminationComplete = true[\s\S]*?stopCompletions\.removeAll\(\)[\s\S]*?stopRetention = nil[\s\S]*?completion\(\)/u);
+
+  const retire = source.slice(source.indexOf("private func retireCompanion"), source.indexOf("private func startCompanion"));
+  assert.match(retire, /retiringCompanions\[identifier\] = previous[\s\S]*?previous\.stop[\s\S]*?DispatchQueue\.main\.async[\s\S]*?retiringCompanions\[identifier\] === previous[\s\S]*?removeValue\(forKey: identifier\)[\s\S]*?completion\(\)/u);
+  for (const start of ["private func startCompanion", "@objc private func retryCompanion"]) {
+    const beginning = source.slice(source.indexOf(start), source.indexOf(start) + 500);
+    assert.match(beginning, /keychainResetGeneration == nil, keychainResetProcess == nil/u);
+  }
+  const reset = source.slice(source.indexOf("private func performLocalKeychainReset"), source.indexOf("private func launchLocalKeychainResetHelper"));
+  assert.match(reset, /guard !quitting, keychainResetGeneration == nil, keychainResetProcess == nil/u);
+  assert.match(reset, /keychainResetGeneration = resetGeneration[\s\S]*?companion = nil[\s\S]*?pendingCompanions = retiringCompanions[\s\S]*?pendingCompanions\[ObjectIdentifier\(previous\)\] = previous/u);
+  assert.match(reset, /keychainResetGeneration == resetGeneration[\s\S]*?!self\.quitting, self\.launchGeneration == resetGeneration[\s\S]*?launchLocalKeychainResetHelper\(generation: resetGeneration\)/u);
+  assert.match(reset, /DispatchGroup\(\)[\s\S]*?for previous in pendingCompanions\.values[\s\S]*?stopped\.enter\(\)[\s\S]*?retireCompanion\(previous\) \{ stopped\.leave\(\) \}[\s\S]*?stopped\.notify\(queue: \.main, execute: runReset\)/u);
+  assert.doesNotMatch(reset, /previous\.isRunning|\.wait\(/u);
+  const resetResult = source.slice(source.indexOf("private func launchLocalKeychainResetHelper"), source.indexOf("private func eraseLocalData"));
+  assert.match(resetResult, /self\.keychainResetProcess === terminated[\s\S]*?self\.keychainResetGeneration == generation[\s\S]*?self\.launchGeneration == generation/u);
+  assert.match(resetResult, /result\.runModal\(\)\s*guard !quitting, launchGeneration == generation[\s\S]*?startCompanion\(\)/u);
+  assert.match(source, /static func keychainResetContract\(\)[\s\S]*?guard CompanionProcess\.verifyKeychainShutdownContract\(\)/u);
+  assert.match(source, /enum Phase: CaseIterable \{ case alreadyAbsent, handlerPending, brokerDraining \}/u);
+  assert.match(source, /verifyExternalResetOrder[\s\S]*?callbackCount == 2[\s\S]*?retainedCompanion == nil/u);
+  assert.match(broker, /static func verifyExternalResetOrder[\s\S]*?resetFinished\.wait\(timeout: \.now\(\)\) == \.timedOut[\s\S]*?storage\.modern\.isEmpty && storage\.legacy\.isEmpty/u);
+});
+
+test("the broker-less reset helper deletes fixed legacy and app generations without keytar", async () => {
+  const helperSource = await readFile(
+    new URL("../apps/macos/reset-local-keychain.js", import.meta.url),
+    "utf8",
+  );
   const targets = helperSource.match(
     /const TARGETS = Object\.freeze\(\[([\s\S]*?)\n\]\);/u,
   )?.[1];
-  assert.ok(targets, "the reset helper's target table is available");
-  const decrypting = targets.slice(
-    targets.indexOf("capabilities: Object.freeze(["),
-    targets.indexOf("attributeCapabilities: Object.freeze(["),
-  );
-  assert.equal(decrypting.includes("contributionDeviceApp"), false);
-  assert.equal(decrypting.includes("contributionDevice,"), true);
-  assert.match(
-    targets,
-    /attributeCapabilities: Object\.freeze\(\[\s*EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES\.contributionDeviceApp,\s*\]\)/u,
-  );
-  // The helper reaches the attribute-addressed platform operations, which are
-  // the ones that never decrypt.
-  assert.match(
-    helperSource,
-    /deleteExportIdentityKeychainItemByAttributes,\s*\n\s*exportIdentityKeychainItemPresenceByAttributes,/u,
-  );
+  assert.ok(targets);
+  for (const capability of [
+    "EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice",
+    "EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp",
+    "EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity",
+    "MACOS_APP_KEYCHAIN_CAPABILITIES.exportIdentity",
+  ]) {
+    assert.equal(targets.includes(capability), true, capability);
+  }
+  assert.doesNotMatch(helperSource, /createExportIdentityKeychainBackend|deleteExact\(|\.read\(/u);
   assert.match(
     helperSource,
     /attributeProbe = exportIdentityKeychainItemPresenceByAttributes,\s*\n\s*attributeDelete = deleteExportIdentityKeychainItemByAttributes,/u,
   );
-
-  // Those operations address the item by service and account and carry no
-  // -w/-g, which is what makes them decryption-free — the property the whole
-  // arrangement rests on (owner-verified live on a fresh account 2026-08-20:
-  // the attribute delete of an app-minted item succeeds with no prompt).
-  for (const [args, service] of [
-    [
-      exportIdentityKeychainAttributeDeleteArguments(
-        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
-      ),
-      appService,
-    ],
-    [
-      exportIdentityKeychainAttributeProbeArguments(
-        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
-      ),
-      appService,
-    ],
-  ]) {
-    assert.deepEqual(args.slice(1), ["-s", service, "-a", "installation"]);
-    assert.equal(args.includes("-w"), false);
-    assert.equal(args.includes("-g"), false);
-  }
-  assert.equal(
-    exportIdentityKeychainAttributeDeleteArguments(
-      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
-    )[2],
-    legacyService,
+  assert.match(
+    helperSource,
+    /keychainEnvironment = undefined[\s\S]*?Object\.freeze\(\{ environment: keychainEnvironment \}\)/u,
   );
+  for (const capability of [
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
+  ]) {
+    for (const args of [
+      exportIdentityKeychainAttributeDeleteArguments(capability),
+      exportIdentityKeychainAttributeProbeArguments(capability),
+    ]) {
+      assert.deepEqual(
+        args.slice(1),
+        ["-s", capability.service, "-a", capability.account],
+      );
+      assert.equal(args.includes("-w") || args.includes("-g"), false);
+    }
+  }
 });
 
 test("reviewed dogfood is configured with shared service and isolated updates", () => {
@@ -2788,7 +4282,7 @@ test("generic external builders reject env and CLI marker spoofing", async () =>
         externalDistribution: true,
         releaseChannel: STABLE_RELEASE_CHANNEL,
       }),
-      { code: "MACOS_BUNDLE_VERSION_REQUIRED" },
+      { code: "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION" },
     );
     await assert.rejects(lstat(output), { code: "ENOENT" });
   } finally {
@@ -2829,6 +4323,57 @@ test("external app output is fresh-only and rejects a TOCTOU target", async () =
   }
 });
 
+test("external Finder metadata failure happens before output claim", {
+  skip: process.platform === "darwin"
+    ? false
+    : "requires macOS SetFile",
+}, async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-external-finder-output-"),
+  );
+  const stagedApp = join(temporaryRoot, "staged", "TiboTattle.app");
+  const output = join(temporaryRoot, "output", "TiboTattle.app");
+  const missingStagedApp = join(
+    temporaryRoot,
+    "missing",
+    "TiboTattle.app",
+  );
+  const failedOutput = join(
+    temporaryRoot,
+    "failed-output",
+    "TiboTattle.app",
+  );
+  const finderMetadata = { birthTimeSeconds: 1_700_000_000 };
+  try {
+    await mkdir(join(stagedApp, "Contents"), { recursive: true });
+    await writeFile(join(stagedApp, "Contents", "marker.txt"), "staged");
+    await mkdir(dirname(output), { recursive: true });
+    await installMacOSExternalBuildOutput(stagedApp, output, {
+      finderMetadata,
+    });
+    const outputMetadata = await lstat(output);
+    assert.equal(
+      Math.trunc(outputMetadata.birthtimeMs / 1_000),
+      finderMetadata.birthTimeSeconds,
+    );
+    assert.equal(
+      Math.trunc(outputMetadata.mtimeMs / 1_000),
+      finderMetadata.birthTimeSeconds,
+    );
+
+    await mkdir(dirname(failedOutput), { recursive: true });
+    await assert.rejects(
+      installMacOSExternalBuildOutput(missingStagedApp, failedOutput, {
+        finderMetadata,
+      }),
+      /SetFile|No such file/u,
+    );
+    await assert.rejects(lstat(failedOutput), { code: "ENOENT" });
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("release authorization is programmatic and does not apply to development or preview", async () => {
   const source = await readFile(RELEASE_CORE, "utf8");
   assert.match(
@@ -2849,7 +4394,7 @@ test("release authorization is programmatic and does not apply to development or
   ], {
     USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN: "https://preview.usage.example",
     USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
-      "https://updates.usage.example/appcast.xml",
+      "https://updates.usage.example/preview/appcast.xml",
     USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY:
       Buffer.alloc(32, 4).toString("base64"),
   });
@@ -2904,6 +4449,7 @@ test("generic DMG packaging requires an explicit visible non-release mode", () =
     ]),
     {
       appPath: resolve(".release-build/macos/TiboTattle.app"),
+      architecture: "arm64",
       output: resolve(
         `.release-build/macos/TiboTattle-${RELEASE_VERSION}`
           + "-macOS-arm64-development.dmg",
@@ -2912,13 +4458,18 @@ test("generic DMG packaging requires an explicit visible non-release mode", () =
       distribution: "development",
     },
   );
-  assert.deepEqual(
-    parseMacOSDMGArguments([
-      "--app",
-      ".release-build/macos-preview/current/TiboTattle.app",
-      "--preview",
-    ]).distribution,
-    "preview",
+  const previewDMG = parseMacOSDMGArguments([
+    "--app",
+    ".release-build/macos-preview/current/TiboTattle Preview.app",
+    "--preview",
+  ]);
+  assert.equal(previewDMG.distribution, "preview");
+  assert.equal(
+    previewDMG.output,
+    resolve(
+      `.release-build/macos/TiboTattle Preview-${RELEASE_VERSION}`
+        + "-macOS-arm64-preview.dmg",
+    ),
   );
   assert.throws(
     () => parseMacOSDMGArguments([
@@ -2959,7 +4510,6 @@ test("stable external bundle inputs remain bound to the reviewed production poli
   );
   assert.deepEqual(
     readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
       USAGE_MONITOR_PRODUCTION_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
       USAGE_MONITOR_SPARKLE_APPCAST_URL:
         DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
@@ -2968,7 +4518,7 @@ test("stable external bundle inputs remain bound to the reviewed production poli
         Buffer.alloc(32, 1).toString("base64"),
     }, STABLE_RELEASE_CHANNEL),
     {
-      bundleVersion: "42.7",
+      bundleVersion: STABLE_SIGNED_BUNDLE_VERSION,
       productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
       provisioningProfile: null,
       sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
@@ -3048,12 +4598,160 @@ test("development and preview builds treat the release-channel policy as optiona
   assert.match(source, /if \(selectedPublicEdKeySha256 !== null/u);
 });
 
+test("corrected 0.1.18 RC3 orders after signed RC1 and RC2 and before stable", () => {
+  const correctedRC3 = resolveSignedMacOSBundleVersion("0.1.18", INTERNAL_DOGFOOD_RELEASE_CHANNEL);
+  const stable = resolveSignedMacOSBundleVersion("0.1.18", STABLE_RELEASE_CHANNEL);
+  assert.equal(correctedRC3, "1025.2");
+  assert.equal(stable, "1026");
+  for (const previous of ["1025", "1025.1"]) {
+    assert.equal(compareMacOSBundleVersions(previous, correctedRC3), -1);
+    assert.equal(compareMacOSBundleVersions(correctedRC3, previous), 1);
+  }
+  assert.equal(compareMacOSBundleVersions(correctedRC3, stable), -1);
+  assert.equal(compareMacOSBundleVersions(stable, correctedRC3), 1);
+});
+
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
-  assert.equal(normalizeMacOSBundleVersion(), "1");
-  for (const value of ["1", "1.2", "1.2.3", "0.0.0", "123456789"]) {
+  // Historical native allocations stay fixed as the current Electron version advances.
+  const historicalDogfoodBundleVersion = resolveSignedMacOSBundleVersion(
+    "0.1.18", INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  );
+  assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
+  assert.equal(historicalDogfoodBundleVersion, "1025.2");
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.18", STABLE_RELEASE_CHANNEL), "1026");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, null);
+  assert.throws(
+    () => readMacOSReleaseBuildConfiguration({}, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
+    { code: "MACOS_SIGNED_BUNDLE_VERSION_UNPLANNED" },
+    "the current Electron release must not invent a native dogfood allocation",
+  );
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.17", INTERNAL_DOGFOOD_RELEASE_CHANNEL), "1023.7");
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.17", STABLE_RELEASE_CHANNEL), "1024");
+  assert.equal(
+    normalizeMacOSBundleVersion(historicalDogfoodBundleVersion),
+    "1025.2",
+  );
+  assert.equal(
+    compareMacOSBundleVersions(
+      historicalDogfoodBundleVersion,
+      "1022",
+    ) > 0,
+    true,
+  );
+  assert.equal(
+    compareMacOSBundleVersions("1023", historicalDogfoodBundleVersion),
+    -1,
+    "the corrective dogfood must be strictly newer than the retained RC2",
+  );
+  assert.equal(
+    compareMacOSBundleVersions("1023.1", historicalDogfoodBundleVersion),
+    -1,
+    "the corrective dogfood must be strictly newer than the installed RC3",
+  );
+  assert.equal(
+    compareMacOSBundleVersions("1023.2", historicalDogfoodBundleVersion),
+    -1,
+    "the final integrated dogfood must be strictly newer than startup-recovery RC4",
+  );
+  assert.equal(
+    compareMacOSBundleVersions("1023.3", historicalDogfoodBundleVersion),
+    -1,
+    "the accounting-deadline correction must be strictly newer than installed RC5",
+  );
+  assert.equal(
+    compareMacOSBundleVersions("1023.4", historicalDogfoodBundleVersion),
+    -1,
+    "the retired-checkpoint correction must be strictly newer than installed RC6",
+  );
+  assert.equal(
+    compareMacOSBundleVersions("1023.5", historicalDogfoodBundleVersion),
+    -1,
+    "the fitted-transition correction must be strictly newer than installed RC7",
+  );
+  assert.equal(
+    compareMacOSBundleVersions("1023.6", historicalDogfoodBundleVersion),
+    -1,
+    "the refresh-policy RC9 allocation must be strictly newer than RC8",
+  );
+  assert.equal(
+    compareMacOSBundleVersions(
+      STABLE_SIGNED_BUNDLE_VERSION,
+      historicalDogfoodBundleVersion,
+    ) > 0,
+    true,
+  );
+  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2", "1023.2.0", "1023.3", "1023.3.0", "1023.4", "1023.4.0", "1023.5", "1023.5.0", "1023.6", "1023.6.0", "1023.7.0", "1024", "1025", "1025.0", "1025.1", "1025.1.0", "1025.2.0", "1026", "2000.1.17"]) {
+    assert.throws(
+      () => readMacOSReleaseBuildConfiguration({
+        USAGE_MONITOR_BUNDLE_VERSION: unallocated,
+      }, STABLE_RELEASE_CHANNEL),
+      { code: "MACOS_BUNDLE_VERSION_MISMATCH" },
+      "operator overrides cannot reuse an earlier RC, alias the allocation, or consume stable/preview builds",
+    );
+  }
+  assert.equal(
+    resolveSignedMacOSBundleVersion("0.1.19", STABLE_RELEASE_CHANNEL),
+    null,
+    "a future signed version requires an explicit owner-reviewed allocation",
+  );
+  assert.equal(deriveMacOSBundleVersion("0.1.17"), "2000.1.17");
+  assert.equal(
+    compareMacOSBundleVersions(deriveMacOSBundleVersion("0.1.17"), "1") > 0,
+    true,
+  );
+  assert.equal(
+    compareMacOSBundleVersions(
+      deriveMacOSBundleVersion("0.1.17"),
+      "1022",
+    ) > 0,
+    true,
+    "the migration epoch must not strand the installed legacy dogfood build",
+  );
+  for (const [earlier, later] of [
+    ["0.1.17", "0.1.18"],
+    ["0.1.99", "0.2.0"],
+    ["0.99.99", "1.0.0"],
+  ]) {
+    assert.equal(
+      compareMacOSBundleVersions(
+        deriveMacOSBundleVersion(earlier),
+        deriveMacOSBundleVersion(later),
+      ) < 0,
+      true,
+      `${earlier} must remain ordered before ${later}`,
+    );
+  }
+  assert.equal(deriveMacOSBundleVersion("0.0.0"), "2000.0.0");
+  assert.equal(deriveMacOSBundleVersion("7999.99.99"), "9999.99.99");
+  for (const releaseVersion of [
+    "8000.0.0",
+    "9999.0.1",
+    "0.100.1",
+    "0.1.100",
+    "0.1.17-beta.1",
+  ]) {
+    assert.throws(
+      () => deriveMacOSBundleVersion(releaseVersion),
+      { code: "MACOS_BUNDLE_VERSION_DERIVATION_FAILED" },
+      releaseVersion,
+    );
+  }
+  for (const value of ["1", "1.2", "1.2.3", "1234", "1234.99.99"]) {
     assert.equal(normalizeMacOSBundleVersion(value), value);
   }
-  for (const value of ["", "01", "1.", "1.2.3.4", "-1", "1a"]) {
+  for (const value of [
+    "",
+    "0",
+    "0.0.0",
+    "01",
+    "1.",
+    "1.2.3.4",
+    "12345",
+    "1.100",
+    "1.2.100",
+    "-1",
+    "1a",
+  ]) {
     assert.throws(
       () => normalizeMacOSBundleVersion(value),
       { code: "MACOS_APP_BUILD_FAILED" },
@@ -3119,8 +4817,11 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     { code: "MACOS_DISTRIBUTION_CHANNEL_CONFLICT" },
   );
   assert.equal(
-    validateMacOSPreviewOutputPath(".release-build/macos-preview/current/TiboTattle.app")
-      .endsWith("/.release-build/macos-preview/current/TiboTattle.app"),
+    validateMacOSPreviewOutputPath(
+      ".release-build/macos-preview/current/TiboTattle Preview.app",
+    ).endsWith(
+      "/.release-build/macos-preview/current/TiboTattle Preview.app",
+    ),
     true,
   );
   assert.throws(
@@ -3129,7 +4830,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
   assert.throws(
     () => validateMacOSPreviewOutputPath(
-      ".release-build/macos-preview/other/TiboTattle.app",
+      ".release-build/macos-preview/other/TiboTattle Preview.app",
     ),
     { code: "MACOS_PREVIEW_OUTPUT_FORBIDDEN" },
   );
@@ -3168,7 +4869,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
   assert.deepEqual(
     readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PRODUCTION_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
       USAGE_MONITOR_SPARKLE_APPCAST_URL:
         DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
@@ -3177,7 +4878,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
         Buffer.alloc(32, 1).toString("base64"),
     }),
     {
-      bundleVersion: "42.7",
+      bundleVersion: STABLE_SIGNED_BUNDLE_VERSION,
       productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
       // Absent when no provisioning profile is supplied. Restricted
       // entitlements are the only reason to embed one, and Developer ID
@@ -3190,7 +4891,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
   assert.deepEqual(
     readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PROVISIONING_PROFILE:
         "/tmp/embedded.provisionprofile",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
@@ -3198,7 +4899,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
         Buffer.alloc(32, 1).toString("base64"),
     }),
     {
-      bundleVersion: "42.7",
+      bundleVersion: STABLE_SIGNED_BUNDLE_VERSION,
       productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
       // A supplied profile reaches the release as an exact path, because it
       // is copied into the bundle before signing so the signature seals it.
@@ -3212,7 +4913,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   // release embeds the same file whatever directory the build was invoked in.
   assert.equal(
     readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PROVISIONING_PROFILE:
         "release/embedded.provisionprofile",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
@@ -3226,7 +4927,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   for (const unusable of ["", "release/embedded\0.provisionprofile"]) {
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
-        USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+        USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
         USAGE_MONITOR_PROVISIONING_PROFILE: unusable,
         USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
         USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
@@ -3237,7 +4938,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   }
   assert.throws(
     () => readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PRODUCTION_ORIGIN: "http://usage.example",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
@@ -3252,11 +4953,11 @@ test("macOS release metadata validates versions, production mode, and Keychain r
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
         Buffer.alloc(32, 1).toString("base64"),
     }),
-    { code: "MACOS_BUNDLE_VERSION_REQUIRED" },
+    { code: "MACOS_BUNDLE_VERSION_MISMATCH" },
   );
   assert.throws(
     () => readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
@@ -3266,7 +4967,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
   assert.throws(
     () => readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_SPARKLE_APPCAST_URL:
         "https://updates.example/appcast.xml",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
@@ -3325,7 +5026,7 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   const environment = {
     USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN: "https://preview.usage.example",
     USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
-      "https://updates.usage.example/appcast.xml",
+      "https://updates.usage.example/preview/appcast.xml",
     USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY:
       Buffer.alloc(32, 4).toString("base64"),
   };
@@ -3370,8 +5071,9 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
     "/.release-deps/Sparkle.framework",
   ), true);
   assert.equal(preview.output.endsWith(
-    "/.release-build/macos-preview/current/TiboTattle.app",
+    "/.release-build/macos-preview/current/TiboTattle Preview.app",
   ), true);
+  assert.equal(preview.bundleVersion, DERIVED_MACOS_BUNDLE_VERSION);
   assert.throws(
     () => parseMacOSBuildArguments([
       "--preview-distribution",
@@ -3389,7 +5091,56 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   );
   assert.equal(
     defaultPreview.sparkleAppcastURL,
+    DEPLOYMENT_ENDPOINTS.sparkle.previewAppcastURL,
+  );
+  assert.notEqual(
+    defaultPreview.sparkleAppcastURL,
     DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--preview-distribution",
+    ], {
+      USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
+        DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+    }),
+    { code: "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN" },
+  );
+  for (const appcastURL of [
+    "https://updates.tibotattle.com/%61ppcast.xml",
+    "https://updates.usage.example/appcast.xml",
+    "https://updates.usage.example/preview/%61ppcast.xml",
+  ]) {
+    assert.throws(
+      () => parseMacOSBuildArguments([
+        "--preview-distribution",
+      ], {
+        USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL: appcastURL,
+      }),
+      { code: "MACOS_PREVIEW_FEED_PATH_INVALID" },
+      appcastURL,
+    );
+  }
+  const isolatedRoot = join(tmpdir(), "tibotattle-preview-feed-boundary");
+  await assert.rejects(
+    buildMacOSApp({
+      centralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+      output: join(isolatedRoot, PREVIEW_PRODUCT_BRAND.bundleName),
+      previewDistribution: true,
+      previewStagingRoot: isolatedRoot,
+      sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+    }),
+    { code: "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN" },
+  );
+  await assert.rejects(
+    buildMacOSApp({
+      centralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+      output: join(isolatedRoot, PREVIEW_PRODUCT_BRAND.bundleName),
+      previewDistribution: true,
+      previewStagingRoot: isolatedRoot,
+      sparkleAppcastURL: "https://updates.tibotattle.com/%61ppcast.xml",
+    }),
+    { code: "MACOS_PREVIEW_FEED_PATH_INVALID" },
   );
   assert.equal(
     defaultPreview.sparklePublicEdKey,
@@ -3399,11 +5150,11 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
     parseMacOSBuildArguments([
       "--validate-preview",
       "--app",
-      ".release-build/macos-preview/current/TiboTattle.app",
+      ".release-build/macos-preview/current/TiboTattle Preview.app",
     ], environment),
     {
       appPath: resolve(
-        ".release-build/macos-preview/current/TiboTattle.app",
+        ".release-build/macos-preview/current/TiboTattle Preview.app",
       ),
       validatePreview: true,
     },
@@ -3453,7 +5204,7 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
     () => parseMacOSBuildArguments([
       "--validate-preview",
       "--app",
-      ".release-build/macos-preview/current/TiboTattle.app",
+      ".release-build/macos-preview/current/TiboTattle Preview.app",
       "--test-build",
     ], environment),
     { code: "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID" },
@@ -3469,70 +5220,153 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   );
 });
 
-test("Login Item release rehearsal requires the installed signed-app lifecycle evidence", () => {
-  const checks = {
-    firstRunConsentIsVisibleAndAffirmative: true,
-    settingsReconcileAfterSystemSettingsChange: true,
-    enableDisableAndPendingRemoval: true,
-    automaticLoginLaunch: true,
-    upgradeRetainsSingleMainAppLoginItem: true,
-    moveAndReinstallLeavesNoStaleDuplicate: true,
-    uninstallAndReinstallLeavesNoStaleDuplicate: true,
-    duplicateLaunchExplainsExistingApp: true,
-    windowCloseKeepsMenuBarAndQuitStopsApp: true,
-    noAgentDaemonOrBackgroundUpload: true,
+function syntheticLoginItemRehearsal({ architecture = "arm64", channel = "stable" } = {}) {
+  const application = {
+    bundleIdentifier: "com.usagemonitor.local",
+    bundleVersion: "1025.1",
+    shortVersion: "0.1.18",
+    architecture,
+    channel,
+    sourceCommit: "c".repeat(40),
+    payloadSha256: (architecture === "arm64" ? "a" : "b").repeat(64),
   };
-  const rehearsal = {
-    schemaVersion: "usage-monitor-macos-login-item-release-rehearsal-v1",
+  const receipt = {
+    schemaVersion: "usage-monitor-macos-login-item-release-rehearsal-v2",
+    evidenceKind: "manual_observation",
     recordedOn: "2026-08-04",
     environment: {
       cleanDisposableProfile: true,
       installedInApplications: true,
+      hardwareArchitecture: architecture,
+      macosVersion: "14.0",
+      rosetta: false,
     },
-    application: {
-      bundleIdentifier: "com.usagemonitor.local",
-      bundleVersion: "17",
-      shortVersion: "0.1.0",
+    application,
+    checks: {
+      firstRunConsentIsVisibleAndAffirmative: true,
+      settingsReconcileAfterSystemSettingsChange: true,
+      enableDisableAndPendingRemoval: true,
+      automaticLoginLaunch: true,
+      upgradeRetainsSingleMainAppLoginItem: true,
+      moveAndReinstallLeavesNoStaleDuplicate: true,
+      uninstallAndReinstallLeavesNoStaleDuplicate: true,
+      duplicateLaunchExplainsExistingApp: true,
+      windowCloseKeepsMenuBarAndQuitStopsApp: true,
+      noAgentDaemonOrBackgroundUpload: true,
     },
-    checks,
   };
-  const validated = validateMacOSLoginItemReleaseRehearsal(rehearsal, {
-    bundleVersion: "17",
-    shortVersion: "0.1.0",
-  });
-  assert.equal(validated.bundleIdentifier, "com.usagemonitor.local");
-  assert.equal(validated.bundleVersion, "17");
-  assert.equal(validated.requiredChecks.length, 10);
-  assert.throws(
-    () => validateMacOSLoginItemReleaseRehearsal({
-      ...rehearsal,
-      checks: {
-        ...checks,
-        automaticLoginLaunch: false,
+  return {
+    receipt,
+    expected: { ...application, minimumMacos: "14.0" },
+    inspected: {
+      bundleIdentifier: application.bundleIdentifier,
+      bundleVersion: application.bundleVersion,
+      shortVersion: application.shortVersion,
+      architecture,
+      minimumMacos: "14.0",
+      buildManifest: {
+        release: { channelName: channel, source: { commit: application.sourceCommit } },
+        payload: { payloadSha256: application.payloadSha256 },
       },
-    }, {
-      bundleVersion: "17",
-      shortVersion: "0.1.0",
-    }),
+    },
+  };
+}
+
+test("Login Item release rehearsal requires the exact signed artifact and manual native-runtime evidence", () => {
+  const { receipt, expected } = syntheticLoginItemRehearsal();
+  const validated = validateMacOSLoginItemReleaseRehearsal(receipt, expected);
+  assert.equal(validated.bundleIdentifier, "com.usagemonitor.local");
+  assert.equal(validated.bundleVersion, "1025.1");
+  assert.equal(validated.architecture, "arm64");
+  assert.equal(validated.channel, "stable");
+  assert.equal(validated.sourceCommit, expected.sourceCommit);
+  assert.equal(validated.payloadSha256, expected.payloadSha256);
+  assert.equal(validated.evidenceKind, "manual_observation");
+  assert.deepEqual(validated.environment, receipt.environment);
+  assert.equal(validated.requiredChecks.length, 10);
+  const refuse = (candidate, identity = expected) => assert.throws(
+    () => validateMacOSLoginItemReleaseRehearsal(candidate, identity),
     { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
   );
-  assert.throws(
-    () => validateMacOSLoginItemReleaseRehearsal(rehearsal, {
-      bundleVersion: "18",
-      shortVersion: "0.1.0",
-    }),
-    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
-  );
-  assert.throws(
-    () => validateMacOSLoginItemReleaseRehearsal({
-      ...rehearsal,
-      recordedOn: "2026-02-30",
-    }, {
-      bundleVersion: "17",
-      shortVersion: "0.1.0",
-    }),
-    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
-  );
+  for (const [key, mismatch] of Object.entries({
+    bundleIdentifier: "com.usagemonitor.other",
+    bundleVersion: "1026",
+    shortVersion: "0.1.19",
+    architecture: "x64",
+    channel: "internal-dogfood",
+    sourceCommit: "d".repeat(40),
+    payloadSha256: "e".repeat(64),
+  })) {
+    refuse({ ...receipt, application: { ...receipt.application, [key]: mismatch } });
+    refuse(receipt, { ...expected, [key]: mismatch });
+    const missing = structuredClone(receipt);
+    delete missing.application[key];
+    refuse(missing);
+  }
+  for (const key of Object.keys(expected)) {
+    const missing = { ...expected };
+    delete missing[key];
+    refuse(receipt, missing);
+    refuse(receipt, { ...expected, [key]: undefined });
+  }
+  refuse(receipt, {});
+  refuse(receipt, null);
+  assert.throws(() => validateMacOSLoginItemReleaseRehearsal(receipt), {
+    code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID",
+  });
+  for (const [key, invalid] of [
+    ["bundleVersion", "candidate"], ["shortVersion", "0.1.18 extra"],
+    ["architecture", "universal"], ["channel", "preview_distribution"],
+    ["sourceCommit", "c".repeat(41)], ["sourceCommit", "C".repeat(40)],
+    ["payloadSha256", "a".repeat(63)], ["payloadSha256", "g".repeat(64)],
+  ]) {
+    refuse({ ...receipt, application: { ...receipt.application, [key]: invalid } }, {
+      ...expected, [key]: invalid,
+    });
+  }
+  for (const key of Object.keys(receipt.checks)) {
+    const missing = structuredClone(receipt);
+    delete missing.checks[key];
+    refuse(missing);
+    refuse({ ...receipt, checks: { ...receipt.checks, [key]: false } });
+  }
+  for (const key of Object.keys(receipt.environment)) {
+    const missing = structuredClone(receipt);
+    delete missing.environment[key];
+    refuse(missing);
+  }
+  for (const [key, invalid] of [
+    ["cleanDisposableProfile", false], ["installedInApplications", false],
+    ["hardwareArchitecture", "x64"], ["hardwareArchitecture", "unknown"],
+    ["rosetta", true], ["rosetta", "false"], ["rosetta", null],
+    ["macosVersion", "13.6"], ["macosVersion", "14"], ["macosVersion", "14.0.0.1"],
+    ["macosVersion", "014.0"], ["macosVersion", "14.-1"], ["macosVersion", " 14.0"],
+    ["macosVersion", "14.100"], ["macosVersion", 14], ["macosVersion", null],
+  ]) {
+    refuse({ ...receipt, environment: { ...receipt.environment, [key]: invalid } });
+  }
+  for (const minimumMacos of ["13.0", "14", "14.0.0.1", null, 14, "14.0.1", "14.1", "15.0"]) {
+    refuse(receipt, { ...expected, minimumMacos });
+  }
+  for (const macosVersion of ["14.0.0", "14.1", "26.0.1"]) {
+    assert.doesNotThrow(() => validateMacOSLoginItemReleaseRehearsal({
+      ...receipt, environment: { ...receipt.environment, macosVersion },
+    }, expected));
+  }
+  assert.doesNotThrow(() => validateMacOSLoginItemReleaseRehearsal({
+    ...receipt, environment: { ...receipt.environment, macosVersion: "14.0.1" },
+  }, { ...expected, minimumMacos: "14.0.1" }));
+  refuse({ ...receipt, schemaVersion: "usage-monitor-macos-login-item-release-rehearsal-v1" });
+  refuse({ ...receipt, evidenceKind: "automatic_physical_proof" });
+  refuse({ ...receipt, recordedOn: "2026-02-30" });
+  refuse({ ...receipt, extra: "unexpected" });
+  for (const section of ["environment", "application", "checks"]) {
+    refuse({ ...receipt, [section]: { ...receipt[section], extra: "unexpected" } });
+  }
+  const intel = syntheticLoginItemRehearsal({ architecture: "x64", channel: "internal-dogfood" });
+  assert.doesNotThrow(() => validateMacOSLoginItemReleaseRehearsal(intel.receipt, intel.expected));
+  refuse(receipt, intel.expected);
+  refuse(intel.receipt);
 });
 
 test("Login Item release tooling validates only the fake seam and an Applications receipt", async () => {
@@ -3561,7 +5395,8 @@ test("Login Item release tooling validates only the fake seam and an Application
     gateSource,
     /const REQUIRED_APPLICATION_PATH\s*=\s*`\/Applications\/\$\{PRODUCT_BRAND\.bundleName\}`/u,
   );
-  assert.match(gateSource, /validateInstalledMacOSApp\(appPath, \{ production: true \}\)/u);
+  assert.match(gateSource,
+    /validateInstalled\(appPath, \{ architecture, channel, production: true \}\)/u);
   assert.match(gateSource, /validateMacOSLoginItemReleaseRehearsal/u);
   assert.equal(gateSource.includes("register()"), false);
   assert.equal(gateSource.includes("unregister()"), false);
@@ -3587,7 +5422,113 @@ test("Login Item release tooling validates only the fake seam and an Application
   );
 });
 
+test("Login Item release CLI validates architecture and channel with legacy defaults", () => {
+  const required = [
+    "--app", "/Applications/TiboTattle.app",
+    "--rehearsal", "/tmp/synthetic-login-item-rehearsal.json",
+  ];
+  assert.deepEqual(parseMacOSLoginItemReleaseArguments(required), {
+    appPath: "/Applications/TiboTattle.app",
+    architecture: "arm64",
+    channel: "stable",
+    rehearsalPath: "/tmp/synthetic-login-item-rehearsal.json",
+  });
+  assert.deepEqual(parseMacOSLoginItemReleaseArguments([
+    "--channel", "internal-dogfood", ...required, "--architecture", "x64",
+  ]), {
+    appPath: "/Applications/TiboTattle.app",
+    architecture: "x64",
+    channel: "internal-dogfood",
+    rehearsalPath: "/tmp/synthetic-login-item-rehearsal.json",
+  });
+  for (const options of [
+    ["--architecture", "universal"],
+    ["--architecture", ""],
+    ["--architecture"],
+    ["--architecture", "x64", "--architecture", "arm64"],
+    ["--channel", "preview_distribution"],
+    ["--channel", "unknown"],
+    ["--channel", ""],
+    ["--channel"],
+    ["--channel", "stable", "--channel", "internal-dogfood"],
+  ]) {
+    assert.throws(() => parseMacOSLoginItemReleaseArguments([...required, ...options]));
+  }
+});
+
+test("Login Item release CLI carries release identity to both validators and refuses invalid options first", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-login-item-cli-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const selection of [
+    { arguments: [], architecture: "arm64", channel: "stable" },
+    {
+      arguments: ["--architecture", "x64", "--channel", "internal-dogfood"],
+      architecture: "x64",
+      channel: "internal-dogfood",
+    },
+  ]) {
+    const { receipt, inspected } = syntheticLoginItemRehearsal(selection);
+    const rehearsalPath = join(root, `synthetic-${selection.architecture}-${selection.channel}.json`);
+    await writeFile(rehearsalPath, JSON.stringify(receipt), { mode: 0o600 });
+    const calls = [];
+    const dependencies = {
+      validateInstalledMacOSApp: async (...args) => { calls.push(["validate", ...args]); },
+      inspectMacOSApp: async (...args) => {
+        calls.push(["inspect", ...args]);
+        return inspected;
+      },
+    };
+    await validateMacOSLoginItemRelease([
+      "--app", "/Applications/TiboTattle.app", "--rehearsal", rehearsalPath,
+      ...selection.arguments,
+    ], dependencies);
+    assert.deepEqual(calls, [
+      ["validate", "/Applications/TiboTattle.app", {
+        architecture: selection.architecture,
+        channel: selection.channel,
+        production: true,
+      }],
+      ["inspect", "/Applications/TiboTattle.app", {
+        architecture: selection.architecture,
+        channel: selection.channel,
+        requireExternalDistribution: true,
+      }],
+    ]);
+    const mismatchedReceipt = syntheticLoginItemRehearsal({
+      architecture: selection.architecture === "arm64" ? "x64" : "arm64",
+      channel: selection.channel === "stable" ? "internal-dogfood" : "stable",
+    }).receipt;
+    await writeFile(rehearsalPath, JSON.stringify(mismatchedReceipt), { mode: 0o600 });
+    await assert.rejects(validateMacOSLoginItemRelease([
+      "--app", "/Applications/TiboTattle.app", "--rehearsal", rehearsalPath,
+      ...selection.arguments,
+    ], dependencies), { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" });
+  }
+  const refusedCalls = [];
+  const dependencies = {
+    validateInstalledMacOSApp: async () => { refusedCalls.push("validate"); },
+    inspectMacOSApp: async () => { refusedCalls.push("inspect"); return {}; },
+  };
+  for (const invalid of [
+    ["--architecture", "universal"], ["--channel", "preview_distribution"],
+  ]) {
+    await assert.rejects(validateMacOSLoginItemRelease([
+      "--app", "/Applications/TiboTattle.app", "--rehearsal", join(root, "unused.json"),
+      ...invalid,
+    ], dependencies));
+  }
+  assert.deepEqual(refusedCalls, []);
+});
+
 test("signed updater replacement contract validates upgrade and rollback artifacts", async () => {
+  // This fixture exercises the retained native dogfood upgrade, not a new dogfood release.
+  const RELEASE_VERSION = "0.1.18";
+  const INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION = resolveSignedMacOSBundleVersion(
+    RELEASE_VERSION, INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  );
+  const STABLE_SIGNED_BUNDLE_VERSION = resolveSignedMacOSBundleVersion(
+    RELEASE_VERSION, STABLE_RELEASE_CHANNEL,
+  );
   assert.equal(compareMacOSBundleVersions("1", "1.0.0"), 0);
   assert.equal(compareMacOSBundleVersions("1.2", "1.1.99"), 1);
   assert.equal(compareMacOSBundleVersions("2", "2.0.1"), -1);
@@ -3664,9 +5605,14 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
       publicEdKeySha256: sparklePublicKeySha256,
     }),
+    source: {
+      commit: "a".repeat(40),
+      repository: "https://github.com/adamallcock/tibotattle",
+      tag: `v${RELEASE_VERSION}`,
+    },
     assurances: { ...assurances },
     updater: {
-      appcastURL: "https://usage.example/appcast.xml",
+      appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
       automaticChecks: true,
       automaticUpdateOptInAvailable: true,
       automaticUpdatesEnabledByDefault: true,
@@ -3691,6 +5637,68 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     "UsageMonitor-candidate.dmg",
     candidateBytes,
   );
+  const intelManifest = (manifest) => {
+    const result = structuredClone(manifest);
+    result.application.architecture = "x64";
+    result.artifact.fileName = `TiboTattle-${RELEASE_VERSION}-macOS-x64.dmg`;
+    result.channel = createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
+      architecture: "x64", publicEdKeySha256: sparklePublicKeySha256,
+    });
+    result.updater.appcastURL = getReleaseChannel(STABLE_RELEASE_CHANNEL, { architecture: "x64" }).sparkle.appcastURL;
+    return result;
+  };
+  const intelPrevious = intelManifest(previousManifest);
+  const intelCandidate = intelManifest(candidateManifest);
+  assert.equal(macOSReleaseManifestArchitecture(previousManifest), "arm64");
+  assert.equal(macOSReleaseManifestArchitecture(intelCandidate), "x64");
+  assert.equal(validateMacOSSignedReplacementPair({
+    previousManifest: intelPrevious, candidateManifest: intelCandidate,
+  }).previousBundleVersion, "10");
+  assert.throws(() => validateMacOSSignedReplacementPair({
+    previousManifest, candidateManifest: intelCandidate,
+  }), { code: "MACOS_RELEASE_ARCHITECTURE_MISMATCH" });
+  assert.throws(() => assertStableSparkleKeyContinuity({
+    architecture: "x64", channel: STABLE_RELEASE_CHANNEL,
+    candidateBundleVersion: "11", candidatePublicEdKeySha256: sparklePublicKeySha256,
+    previousManifest,
+  }), { code: "MACOS_RELEASE_ARCHITECTURE_MISMATCH" });
+  assert.equal(assertStableSparkleKeyContinuity({
+    architecture: "x64", channel: STABLE_RELEASE_CHANNEL,
+    candidateBundleVersion: "11", candidatePublicEdKeySha256: sparklePublicKeySha256,
+    previousManifest: intelPrevious,
+  }).mode, "previous_manifest");
+  assert.equal(assertStableSparkleKeyContinuity({
+    architecture: "x64", channel: STABLE_RELEASE_CHANNEL,
+    candidateBundleVersion: "11", candidatePublicEdKeySha256: sparklePublicKeySha256,
+    stableBootstrap: true,
+  }).mode, "bootstrap");
+  const mislabeledIntel = structuredClone(intelCandidate);
+  mislabeledIntel.artifact.fileName = `TiboTattle-${RELEASE_VERSION}-macOS-arm64.dmg`;
+  assert.throws(() => macOSReleaseManifestArchitecture(mislabeledIntel), {
+    code: "MACOS_RELEASE_ARCHITECTURE_MISMATCH",
+  });
+  const legacyStableManifest = {
+    ...previousManifest,
+    application: {
+      ...previousManifest.application,
+      bundleVersion: "0.1.16",
+      shortVersion: "0.1.16",
+    },
+  };
+  delete legacyStableManifest.source;
+  const epochCandidateManifest = {
+    ...candidateManifest,
+    application: {
+      ...candidateManifest.application,
+      bundleVersion: deriveMacOSBundleVersion("0.1.16"),
+      shortVersion: "0.1.16",
+    },
+    source: {
+      commit: "b".repeat(40),
+      repository: "https://github.com/adamallcock/tibotattle",
+      tag: "v0.1.16",
+    },
+  };
   const previousManifestPath = join(
     temporaryRoot,
     "UsageMonitor-previous.dmg.release.json",
@@ -3752,6 +5760,74 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         previousBundleVersion: "10",
       },
     );
+    assert.deepEqual(
+      assertStableSparkleKeyContinuity({
+        candidateBundleVersion:
+          epochCandidateManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        previousManifest: legacyStableManifest,
+      }),
+      {
+        mode: "previous_manifest",
+        policy: "previous_stable_manifest_required",
+        previousBundleVersion: "0.1.16",
+      },
+    );
+    assert.throws(() => validateMacOSSignedReplacementPair({
+      previousManifest: legacyStableManifest,
+      candidateManifest: epochCandidateManifest,
+    }), { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+    "a legacy version alone remains a continuity input, not exact previous-artifact proof");
+    for (const rejectedLegacySource of ["0.1.17", "0.2.0"]) {
+      const rejectedManifest = {
+        ...legacyStableManifest,
+        application: {
+          ...legacyStableManifest.application,
+          bundleVersion: rejectedLegacySource,
+          shortVersion: rejectedLegacySource,
+        },
+        source: {
+          commit: "a".repeat(40),
+          repository: "https://github.com/adamallcock/tibotattle",
+          tag: `v${rejectedLegacySource}`,
+        },
+      };
+      assert.throws(
+        () => assertStableSparkleKeyContinuity({
+          candidateBundleVersion:
+            epochCandidateManifest.application.bundleVersion,
+          candidatePublicEdKeySha256: sparklePublicKeySha256,
+          channel: STABLE_RELEASE_CHANNEL,
+          previousManifest: rejectedManifest,
+        }),
+        { code: "MACOS_STABLE_PREVIOUS_MANIFEST_INVALID" },
+        rejectedLegacySource,
+      );
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest: rejectedManifest,
+          candidateManifest: epochCandidateManifest,
+        }),
+        { code: "MACOS_REPLACEMENT_VERSION_INVALID" },
+        rejectedLegacySource,
+      );
+    }
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: epochCandidateManifest,
+        candidateManifest: {
+          ...legacyStableManifest,
+          source: {
+            commit: "a".repeat(40),
+            repository: "https://github.com/adamallcock/tibotattle",
+            tag: "v0.1.16",
+          },
+        },
+      }),
+      { code: "MACOS_REPLACEMENT_VERSION_INVALID" },
+      "the legacy zero-first form must never be accepted as a new candidate",
+    );
     assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
       previousManifest: {
         ...previousManifest,
@@ -3793,6 +5869,197 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         candidateManifest,
       }),
       { code: "MACOS_RELEASE_SOURCE_INVALID" },
+    );
+    const dogfoodChannel = getReleaseChannel(
+      INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    );
+    const dogfoodManifest = (manifest, bundleVersion, rc) => ({
+      ...manifest,
+      application: {
+        ...manifest.application,
+        bundleVersion,
+      },
+      channel: createReleaseChannelProvenance(
+        INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        {
+          publicEdKeySha256: dogfoodChannel.sparkle.publicEdKeySha256,
+        },
+      ),
+      source: {
+        repository: "https://github.com/adamallcock/tibotattle",
+        tag: `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+          + `-rc${rc}-source-20260827`,
+        commit: "c".repeat(40),
+      },
+      updater: {
+        ...manifest.updater,
+        appcastURL: dogfoodChannel.sparkle.appcastURL,
+        publicEdKeySha256: dogfoodChannel.sparkle.publicEdKeySha256,
+      },
+    });
+    const previousDogfoodManifest = dogfoodManifest(
+      previousManifest,
+      "1022",
+      1,
+    );
+    const candidateDogfoodManifest = dogfoodManifest(
+      candidateManifest,
+      INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
+      2,
+    );
+    // Public release metadata for the one pre-channel-tag dogfood artifact.
+    // Tests never read its real DMG, installed app, or private local state.
+    const historicalDogfoodManifest = {
+      ...previousDogfoodManifest,
+      application: {
+        bundleIdentifier: "com.usagemonitor.local",
+        bundleVersion: "1022",
+        shortVersion: "0.1.16",
+      },
+      artifact: {
+        bytes: 49_341_249,
+        fileName: "TiboTattle-0.1.16-macOS-arm64.dmg",
+        sha256:
+          "2b32964c8b3bc2912620dbbe078aaf4e2fd49f1725a4e94a62dff184cdc9f8c1",
+      },
+      build: {
+        sourceSha256:
+          "ff7f59ec074705f8ecb3d78810177a8e8a4795a1e58c2df24faa9b3e6e26fae7",
+        payloadSha256:
+          "a5740aac152d95b638989462584774c0e3039ecd7db511692bd8fe690d8d37c4",
+      },
+      source: {
+        repository: "https://github.com/adamallcock/tibotattle",
+        commit: "5adaca5fdc8f981c391144e0d29b6f4c764f0f96",
+        tag: "v0.1.16",
+      },
+      updater: {
+        ...previousDogfoodManifest.updater,
+        frameworkSha256:
+          "2a43f8c41a29b195982354d7580036c178ed89e3b3e5dc0d8ab295290d91a0ac",
+        publicEdKeySha256:
+          "77d5717947da768e7e96a1b1e6225d2cae4748a556f109f2a30444a5f41ff3d2",
+        verifyBeforeExtraction: true,
+      },
+    };
+    assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
+      previousManifest: historicalDogfoodManifest,
+      candidateManifest: candidateDogfoodManifest,
+    }));
+    for (const [section, key, value] of [
+      ["application", "bundleIdentifier", "com.example.changed"],
+      ["application", "bundleVersion", "1021"],
+      ["application", "shortVersion", "0.1.15"],
+      ["artifact", "bytes", 49_341_248],
+      ["artifact", "fileName", "repacked.dmg"],
+      ["artifact", "sha256", "0".repeat(64)],
+      ["source", "repository", "https://github.com/example/changed"],
+      ["source", "commit", "a".repeat(40)],
+      ["source", "tag", "tibotattle-internal-dogfood-0.1.16-rc1-source-20260827"],
+      ["build", "sourceSha256", "a".repeat(64)],
+      ["build", "payloadSha256", "b".repeat(64)],
+      ["updater", "appcastURL", "https://updates.example/changed.xml"],
+      ["updater", "publicEdKeySha256", "c".repeat(64)],
+      ["updater", "frameworkSha256", "d".repeat(64)],
+      ["updater", "verifyBeforeExtraction", false],
+      ...Object.keys(assurances).map((key) => ["assurances", key, false]),
+    ]) {
+      const altered = structuredClone(historicalDogfoodManifest);
+      altered[section][key] = value;
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest: altered,
+          candidateManifest: candidateDogfoodManifest,
+        }),
+        (error) => typeof error.code === "string"
+          && error.code.startsWith("MACOS_"),
+        `the historical exception must refuse changed ${section}.${key}`,
+      );
+    }
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: historicalDogfoodManifest,
+        candidateManifest: {
+          ...candidateDogfoodManifest,
+          application: {
+            ...candidateDogfoodManifest.application,
+            bundleVersion: "1022",
+          },
+        },
+      }),
+      { code: "MACOS_REPLACEMENT_VERSION_NOT_NEWER" },
+    );
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: {
+          ...previousDogfoodManifest,
+          application: {
+            ...previousDogfoodManifest.application,
+            bundleVersion: "1021",
+          },
+        },
+        candidateManifest: historicalDogfoodManifest,
+      }),
+      { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+      "the historical dogfood can never be a candidate",
+    );
+    const historicalManifestPath = join(temporaryRoot, "historical.json");
+    const historicalPublicManifestPath = join(temporaryRoot, "historical-public.json");
+    for (const manifest of [
+      historicalDogfoodManifest,
+      {
+        ...historicalDogfoodManifest,
+        channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
+          publicEdKeySha256: historicalDogfoodManifest.updater.publicEdKeySha256,
+        }),
+        updater: {
+          ...historicalDogfoodManifest.updater,
+          appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+        },
+      },
+    ]) {
+      await writeFile(historicalPublicManifestPath, JSON.stringify(manifest));
+      await assert.rejects(
+        validateMacOSSignedReleaseArtifact({
+          releaseManifestPath: historicalPublicManifestPath,
+          async validateArtifact() {
+            assert.fail("historical compatibility cannot reach public artifact validation");
+          },
+        }),
+        { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+      );
+    }
+    await writeFile(historicalManifestPath, JSON.stringify(historicalDogfoodManifest));
+    await writeFile(
+      join(temporaryRoot, historicalDogfoodManifest.artifact.fileName),
+      "not-the-historical-dmg",
+    );
+    await assert.rejects(
+      validateMacOSSignedReplacementArtifacts({
+        previousReleaseManifestPath: historicalManifestPath,
+        candidateReleaseManifestPath: candidateManifestPath,
+        async validateArtifact() {
+          assert.fail("the previous DMG bytes must match before native validation");
+        },
+      }),
+      { code: "MACOS_REPLACEMENT_ARTIFACT_INVALID" },
+    );
+    assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
+      previousManifest: previousDogfoodManifest,
+      candidateManifest: candidateDogfoodManifest,
+    }));
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: previousDogfoodManifest,
+        candidateManifest: {
+          ...candidateDogfoodManifest,
+          source: {
+            ...candidateDogfoodManifest.source,
+            tag: `v${RELEASE_VERSION}`,
+          },
+        },
+      }),
+      { code: "MACOS_RELEASE_SOURCE_VERSION_MISMATCH" },
     );
     assert.deepEqual(
       assertStableSparkleKeyContinuity({
@@ -3867,13 +6134,49 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     assert.deepEqual(validatedArtifacts, [
       [
         join(temporaryRoot, previousManifest.artifact.fileName),
-        { production: true },
+        {
+          allowLegacyUnsealedSource: false,
+          architecture: "arm64",
+          channel: STABLE_RELEASE_CHANNEL,
+          production: true,
+        },
       ],
       [
         join(temporaryRoot, candidateManifest.artifact.fileName),
-        { production: true },
+        {
+          allowLegacyUnsealedSource: false,
+          architecture: "arm64",
+          channel: STABLE_RELEASE_CHANNEL,
+          production: true,
+        },
       ],
     ]);
+    await writeFile(
+      previousManifestPath,
+      JSON.stringify(legacyStableManifest),
+    );
+    await writeFile(
+      candidateManifestPath,
+      JSON.stringify(epochCandidateManifest),
+    );
+    const legacyValidatedArtifacts = [];
+    await assert.rejects(validateMacOSSignedReplacementArtifacts({
+      previousReleaseManifestPath: previousManifestPath,
+      candidateReleaseManifestPath: candidateManifestPath,
+      async validateArtifact(path, options) {
+        legacyValidatedArtifacts.push([path, options]);
+      },
+    }), { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" });
+    assert.deepEqual(legacyValidatedArtifacts, [],
+      "unbound legacy artifacts cannot reach native validation or obtain compatibility");
+    await writeFile(
+      previousManifestPath,
+      JSON.stringify(previousManifest),
+    );
+    await writeFile(
+      candidateManifestPath,
+      JSON.stringify(candidateManifest),
+    );
     const command = spawnSync(process.execPath, [
       join(REPOSITORY_ROOT, "scripts", "validate-macos-replacement.js"),
       "--help",
@@ -4080,7 +6383,126 @@ test("signed updater replacement contract validates upgrade and rollback artifac
   }
 });
 
-test("signed macOS releases require a clean, annotated source tag and minimal Node entitlements", async () => {
+test("legacy dogfood capability rejects Proxy-forged identities before any artifact access", async () => {
+  const structuralFake = new Proxy({}, {
+    get() {
+      assert.fail("capability authorization must not inspect caller-controlled properties");
+    },
+  });
+  for (const forged of [true, false, {}, Object.freeze({}), structuralFake]) {
+    for (const [name, validate] of [
+      ["candidate inspection", inspectMacOSApp],
+      ["installed validation", validateInstalledMacOSApp],
+      ["DMG validation", validateMacOSDMG],
+    ]) {
+      let symbolReads = 0;
+      const observedSymbols = [];
+      const baseOptions = {
+        allowLegacyUnsealedSource: false,
+        channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        requireExternalDistribution: true,
+        production: true,
+      };
+      const options = new Proxy(baseOptions, {
+        get(target, key, receiver) {
+          if (typeof key === "symbol") {
+            symbolReads += 1;
+            observedSymbols.push(key);
+            return forged;
+          }
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      // A null path would fail resolution if authorization reached the FS path.
+      // No fixture, installed application, native tool, or real user state is used.
+      await assert.rejects(
+        validate(null, options),
+        { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+        `${name} must reject a supplied non-member identity before path resolution`,
+      );
+      assert.equal(symbolReads, 3, "all private compatibility reads were exercised");
+      assert.equal(new Set(observedSymbols).size, 3);
+      for (const [index, observedSymbol] of observedSymbols.entries()) {
+        await assert.rejects(
+          validate(null, { ...baseOptions, [observedSymbol]: forged }),
+          { code: index === 1 ? "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID"
+            : "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+          `${name} must reject a forged value replayed with each captured Symbol`,
+        );
+      }
+    }
+  }
+});
+
+test("replacement CLI reports the actual automatic-updater result", async () => {
+  const source = await readFile(
+    join(REPOSITORY_ROOT, "scripts", "validate-macos-replacement.js"),
+    "utf8",
+  );
+  const importStatement = /import \{\s*validateMacOSSignedReplacementArtifacts,\s*\} from "\.\/macos-release-core\.js";/u;
+  assert.match(source, importStatement);
+  const executable = source.replace(/^#![^\n]*\n/u, "")
+    .replace(importStatement, "");
+  for (const automaticUpdaterPresent of [true, false]) {
+    const output = [];
+    const processFixture = {
+      argv: ["node", "validator.js", "--previous", "previous.json", "--candidate", "candidate.json"],
+      exitCode: 0,
+    };
+    await runInNewContext(`(async () => { ${executable}\n })()`, {
+      console: {
+        log: (line) => output.push(line),
+        error: (line) => assert.fail(line),
+      },
+      process: processFixture,
+      validateMacOSSignedReplacementArtifacts: async () => ({
+        bundleIdentifier: "com.usagemonitor.local",
+        previousBundleVersion: "1022",
+        candidateBundleVersion: "1023",
+        automaticUpdaterPresent,
+      }),
+    });
+    assert.equal(processFixture.exitCode, 0);
+    assert.ok(output.includes(
+      `Automatic updater: ${automaticUpdaterPresent ? "present" : "absent"}`,
+    ));
+  }
+});
+
+test("signed macOS source tags are strict and channel-specific", () => {
+  const dogfoodTag =
+    `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+    + "-rc1-source-20260827";
+  assert.equal(isMacOSReleaseSourceTagForChannel(RELEASE_MANIFEST.tag, {
+    channel: STABLE_RELEASE_CHANNEL,
+    expectedVersion: RELEASE_VERSION,
+  }), true);
+  assert.equal(isMacOSReleaseSourceTagForChannel(dogfoodTag, {
+    channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    expectedVersion: RELEASE_VERSION,
+  }), true);
+  for (const tag of [
+    `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc01-source-20260827`,
+    `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc1-source-20260230`,
+    `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc1/source-20260827`,
+    "tibotattle-internal-dogfood-9.9.9-rc1-source-20260827",
+  ]) {
+    assert.equal(isMacOSReleaseSourceTagForChannel(tag, {
+      channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+      expectedVersion: RELEASE_VERSION,
+    }), false, tag);
+  }
+  assert.equal(isMacOSReleaseSourceTagForChannel(dogfoodTag, {
+    channel: STABLE_RELEASE_CHANNEL,
+    expectedVersion: RELEASE_VERSION,
+  }), false);
+  assert.equal(isMacOSReleaseSourceTagForChannel(RELEASE_MANIFEST.tag, {
+    channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    expectedVersion: RELEASE_VERSION,
+  }), false);
+});
+
+test("signed macOS releases require a clean, annotated channel source tag and minimal Node entitlements", async () => {
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-release-provenance-test-"),
   );
@@ -4130,6 +6552,67 @@ test("signed macOS releases require a clean, annotated source tag and minimal No
       }),
       { code: "MACOS_RELEASE_SOURCE_VERSION_MISMATCH" },
     );
+
+    const dogfoodTag =
+      `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+      + "-rc1-source-20260827";
+    execFileSync("/usr/bin/git", ["tag", "-a", dogfoodTag, "-m", "dogfood source"], {
+      cwd: temporaryRoot,
+    });
+    assert.equal(
+      readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        expectedVersion: RELEASE_VERSION,
+      }).tag,
+      dogfoodTag,
+    );
+    assert.equal(
+      readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        channel: STABLE_RELEASE_CHANNEL,
+        expectedVersion: RELEASE_VERSION,
+      }).tag,
+      RELEASE_MANIFEST.tag,
+      "the stable tag remains unambiguous when the tested commit also has a dogfood source tag",
+    );
+    execFileSync("/usr/bin/git", [
+      "tag",
+      "-a",
+      `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc2-source-20260827`,
+      "-m",
+      "ambiguous dogfood source",
+    ], { cwd: temporaryRoot });
+    assert.throws(
+      () => readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        expectedVersion: RELEASE_VERSION,
+      }),
+      { code: "MACOS_RELEASE_PROVENANCE_INVALID" },
+    );
+    execFileSync("/usr/bin/git", [
+      "tag",
+      "-d",
+      `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc2-source-20260827`,
+    ], { cwd: temporaryRoot, stdio: "ignore" });
+    execFileSync("/usr/bin/git", ["tag", "-d", dogfoodTag], {
+      cwd: temporaryRoot,
+      stdio: "ignore",
+    });
+    execFileSync("/usr/bin/git", ["tag", dogfoodTag], { cwd: temporaryRoot });
+    assert.throws(
+      () => readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        expectedVersion: RELEASE_VERSION,
+      }),
+      { code: "MACOS_RELEASE_TAG_REQUIRED" },
+    );
+    execFileSync("/usr/bin/git", ["tag", "-d", dogfoodTag], {
+      cwd: temporaryRoot,
+      stdio: "ignore",
+    });
 
     execFileSync("/usr/bin/git", [
       "remote",
@@ -4263,7 +6746,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     for (const relativePath of [
       "Contents/MacOS/TiboTattle",
       "Contents/Resources/runtime/bin/node",
-      "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
+      MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
       "Contents/Resources/AppIcon.icns",
       "Contents/Resources/licenses/app-icon-provenance.txt",
       `Contents/Resources/licenses/sparkle-${SPARKLE_VERSION}.txt`,
@@ -4309,6 +6792,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         CFBundleIdentifier: "com.usagemonitor.local",
         CFBundleName: PRODUCT_BRAND.displayName,
         CFBundleShortVersionString: "0.0.1",
+        LSMinimumSystemVersion: "14.0",
         CFBundleVersion: "1",
         CFBundleIconFile: "AppIcon",
         CFBundleURLTypes: [{
@@ -4329,6 +6813,8 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         UsageMonitorMonitoredAppDisplayName:
           PRODUCT_BRAND.monitoredAppDisplayName,
         UsageMonitorStateDirectoryName: PRODUCT_BRAND.stateDirectoryName,
+        UsageMonitorKeychainNamespace: PRODUCT_BRAND.keychainNamespace,
+        UsageMonitorKeychainAccount: PRODUCT_BRAND.keychainAccount,
         UsageMonitorUpdaterEnabled: true,
         UsageMonitorUpdaterFrameworkVersion: SPARKLE_VERSION,
         SUAllowsAutomaticUpdates: true,
@@ -4340,12 +6826,21 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         SUVerifyUpdateBeforeExtraction: true,
       }),
     );
-    const writeBuildManifest = async () => await writeFile(
+    const writeBuildManifest = async ({ includeSource = true } = {}) => await writeFile(
       join(resources, "build-manifest.json"),
       JSON.stringify({
         schemaVersion: "usage-monitor-macos-app-build-v0.1",
         application: {
           bundleIdentifier: "com.usagemonitor.local",
+          minimumMacOSVersion: "14.0",
+        },
+        runtime: {
+          node: { architecture: "arm64" },
+          keychainMigrationHelper: { ...MACOS_KEYCHAIN_MIGRATION_HELPER },
+        },
+        inputs: {
+          swiftSources: ["apps/macos/Sources/KeychainMigration.swift", "apps/macos/UsageMonitorApp.swift"],
+          keychainMigrationHelperSources: [...MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES],
         },
         release: {
           appOpenHost: "open",
@@ -4365,6 +6860,12 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
             )
             .digest("hex"),
           requiresDeveloperIDAndNotarization: true,
+          ...(includeSource ? {
+            source: {
+              commit: "a".repeat(40),
+              tag: "v0.0.1",
+            },
+          } : {}),
           updater: {
             appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
             automaticChecks: true,
@@ -4389,47 +6890,97 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     );
     await writeBuildManifest();
 
-    // The synthetic keytar.node staged above is not the audited npm
-    // artifact, and Developer ID signing must refuse to sign it: the
-    // runtime loader trusts a signed binding through its designated
-    // requirement, so the byte audit has to happen here, before signing.
+    assert.deepEqual(
+      (await inspectMacOSApp(app, {
+        requireExternalDistribution: true,
+      })).source,
+      { commit: "a".repeat(40), tag: "v0.0.1" },
+    );
+    const buildManifestPath = join(resources, "build-manifest.json");
+    const mismatchedSourceManifest = JSON.parse(
+      await readFile(buildManifestPath, "utf8"),
+    );
+    mismatchedSourceManifest.release.source = {
+      commit: "b".repeat(40),
+      tag: "v0.0.2",
+    };
+    await writeFile(
+      buildManifestPath,
+      JSON.stringify(mismatchedSourceManifest),
+    );
     await assert.rejects(
-      developerIDSignMacOSApp(app, {
-        commandRunner: (command) => {
-          if (command === "/usr/bin/security") {
-            return { stderr: "", stdout: `1) HASH "${identity}"\n` };
-          }
-          return { stderr: "", stdout: "" };
-        },
-        identity,
-      }),
-      { code: "MACOS_KEYTAR_BINDING_UNAUDITED" },
+      inspectMacOSApp(app, { requireExternalDistribution: true }),
+      { code: "MACOS_RELEASE_SOURCE_INVALID" },
     );
+    await writeBuildManifest({ includeSource: false });
+    for (const attemptedCompatibility of [
+      {},
+      { allowLegacyDogfoodPreviousSource: true },
+      { [Symbol("verified legacy dogfood previous artifact")]: true },
+    ]) {
+      await assert.rejects(
+        inspectMacOSApp(app, {
+          ...attemptedCompatibility,
+          requireExternalDistribution: true,
+        }),
+        { code: "MACOS_RELEASE_SOURCE_INVALID" },
+        "unsealed candidate builds cannot request historical compatibility",
+      );
+    }
+    await writeBuildManifest();
 
-    // With the audited bytes staged, signing proceeds — and additionally
-    // proves the signed binding against the exact designated requirement
-    // the runtime loader tests.
-    const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
-    const keytarBindingPath = join(
-      app,
-      "Contents",
-      "Resources",
-      "app",
-      "node_modules",
-      "@github",
-      "keytar",
-      "prebuilds",
-      "darwin-arm64",
-      "keytar.node",
+    const plistPath = join(app, "Contents", "Info.plist");
+    const completePlist = JSON.parse(await readFile(plistPath, "utf8"));
+    for (const missing of [
+      ["UsageMonitorKeychainNamespace", "UsageMonitorKeychainAccount"],
+      ["UsageMonitorKeychainNamespace"],
+      ["UsageMonitorKeychainAccount"],
+    ]) {
+      const incomplete = { ...completePlist };
+      for (const key of missing) delete incomplete[key];
+      await writeFile(plistPath, JSON.stringify(incomplete));
+      await writeBuildManifest();
+      await assert.rejects(
+        inspectMacOSApp(app, {
+          requireExternalDistribution: true,
+          allowLegacyDogfoodPreviousSource: true,
+        }),
+        /Application bundle metadata is incomplete/u,
+        "a candidate must not inherit historical missing-Keychain-field compatibility",
+      );
+    }
+    for (const key of ["UsageMonitorKeychainNamespace", "UsageMonitorKeychainAccount"]) {
+      await writeFile(plistPath, JSON.stringify({ ...completePlist, [key]: "different" }));
+      await writeBuildManifest();
+      await assert.rejects(
+        inspectMacOSApp(app, { requireExternalDistribution: true }),
+        /Application bundle metadata is incomplete/u,
+        "a candidate must declare the exact stable Keychain identity",
+      );
+    }
+    await writeFile(plistPath, JSON.stringify(completePlist));
+    const syntheticLegacyPath = "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node";
+    const syntheticLegacyBinary = join(app, ...syntheticLegacyPath.split("/"));
+    await mkdir(dirname(syntheticLegacyBinary), { recursive: true });
+    await copyFile(syntheticMachO, syntheticLegacyBinary);
+    await chmod(syntheticLegacyBinary, 0o555);
+    await writeBuildManifest();
+    const legacyNormalizationManifest = JSON.parse(await readFile(buildManifestPath, "utf8"));
+    legacyNormalizationManifest.payload.files.find((entry) =>
+      entry.path === syntheticLegacyPath).normalization = "mach_o_without_code_signature";
+    await writeFile(buildManifestPath, JSON.stringify(legacyNormalizationManifest));
+    await assert.rejects(
+      inspectMacOSApp(app, {
+        requireExternalDistribution: true,
+        allowLegacyDogfoodPreviousSource: true,
+      }),
+      {
+        code: "MACOS_PAYLOAD_INTEGRITY_FAILED",
+        message: "Application build manifest contains an invalid payload entry",
+      },
+      "a candidate cannot request the historical Keytar normalization inventory",
     );
-    await chmod(keytarBindingPath, 0o700);
-    await copyFile(
-      rootRequire.resolve(
-        "@github/keytar/prebuilds/darwin-arm64/keytar.node",
-      ),
-      keytarBindingPath,
-    );
-    await chmod(keytarBindingPath, 0o555);
+    await rm(join(resources, "app"), { recursive: true });
     await writeBuildManifest();
 
     const calls = [];
@@ -4443,9 +6994,16 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       }
       if (command === "/usr/bin/codesign"
           && arguments_.includes("-d")) {
+        const identifier = arguments_.at(-1) === app
+          || arguments_.at(-1).endsWith("/MacOS/TiboTattle")
+          ? PRODUCT_BRAND.bundleIdentifier : "node";
         return {
-          stderr:
-            "Authority=Developer ID Application: Example Owner (A1B2C3D4E5)\nflags=0x10000(runtime)\n",
+          stderr: `Identifier=${identifier}\nAuthority=${identity}\n`
+            + "TeamIdentifier=A1B2C3D4E5\nflags=0x10000(runtime)\n"
+            + `designated => identifier "${identifier}" and anchor apple generic `
+            + "and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ "
+            + "and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ "
+            + 'and certificate leaf[subject.OU] = "A1B2C3D4E5"\n',
           stdout: "",
         };
       }
@@ -4470,14 +7028,17 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     assert.match(signing[2].arguments_.at(-1), /Versions\/B\/Autoupdate$/u);
     assert.match(signing[3].arguments_.at(-1), /Updater\.app$/u);
     assert.match(signing[4].arguments_.at(-1), /Sparkle\.framework$/u);
-    assert.match(signing[5].arguments_.at(-1), /keytar\.node$/u);
-    assert.match(signing[6].arguments_.at(-1), /runtime\/bin\/node$/u);
+    assert.match(signing[5].arguments_.at(-1), /runtime\/bin\/node$/u);
     assert.match(
-      signing[6].arguments_[
-        signing[6].arguments_.indexOf("--entitlements") + 1
+      signing[5].arguments_[
+        signing[5].arguments_.indexOf("--entitlements") + 1
       ],
       /NodeRuntime\.entitlements$/u,
     );
+    assert.equal(signing[6].arguments_.at(-1), join(app, MACOS_KEYCHAIN_MIGRATION_HELPER.executable));
+    assert.equal(signing[6].arguments_[signing[6].arguments_.indexOf("--identifier") + 1], "node");
+    assert.equal(signing[6].arguments_.includes("--entitlements"), false);
+    assert.equal(signing[6].arguments_.includes("--preserve-metadata=entitlements"), false);
     assert.match(signing[7].arguments_.at(-1), /MacOS\/TiboTattle$/u);
     assert.equal(signing[8].arguments_.at(-1), app);
     for (const call of signing) {
@@ -4492,22 +7053,22 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       && arguments_.includes("--verify"));
     assert.equal(verify.arguments_.includes("--deep"), true);
     assert.equal(verify.arguments_.includes("--strict"), true);
-    // The freshly signed binding is proven against the exact requirement
-    // the runtime loader will test on every launch: same team, same
-    // identifier, nothing build-specific.
-    const requirementVerify = calls.find(({ command, arguments_ }) =>
+    // No keytar/interpreter credential fallback: the narrow helper alone
+    // preserves the exact old Node requirement, verified cryptographically.
+    const requirementVerifications = calls.filter(({ command, arguments_ }) =>
       command === "/usr/bin/codesign"
       && arguments_.some((argument) =>
         typeof argument === "string" && argument.startsWith("-R=")));
-    assert.deepEqual(requirementVerify.arguments_, [
-      "--verify",
-      "--strict",
-      "-R=anchor apple generic"
-        + ' and certificate leaf[subject.OU] = "43RTH622SB"'
-        + ' and identifier "keytar"',
-      "--",
-      keytarBindingPath,
+    assert.equal(requirementVerifications.length, 2);
+    assert.deepEqual(requirementVerifications.map(({ arguments_ }) => arguments_.at(-1)), [
+      join(app, "Contents/Resources/runtime/bin/node"),
+      join(app, MACOS_KEYCHAIN_MIGRATION_HELPER.executable),
     ]);
+    assert.equal(
+      signing.some(({ arguments_ }) =>
+        arguments_.at(-1).endsWith("keytar.node")),
+      false,
+    );
 
     const dmg = join(temporaryRoot, "TiboTattle.dmg");
     await writeFile(dmg, "signed-DMG-fixture");
@@ -4677,13 +7238,13 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     ...MACOS_RUNTIME_STATIC_ASSETS,
     ...webModules.relativeFiles,
   ].sort();
-  assert.equal(graph.relativeFiles[0], "apps/local/server.js");
+  assert.equal(graph.relativeFiles[0], "apps/local/accountless-contribution.js");
+  assert.equal(graph.relativeFiles.includes("apps/local/server.js"), true);
   assert.deepEqual(graph.externalSpecifiers, [
     "@app-usagemonitor/accounting",
     "@app-usagemonitor/identity-core",
     "@app-usagemonitor/quota-analysis",
     "@app-usagemonitor/telemetry-contract",
-    "@github/keytar",
     "ajv",
     "runcost/browser",
   ]);
@@ -4699,35 +7260,67 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "src/application/local-contribution-preparation.js",
     "src/application/local-export-set-verification.js",
     "src/application/local-prepared-contribution.js",
+    "src/application/work-usage.js",
+    "src/contribution/telemetry-v11-chunks.js",
+    "src/contribution/telemetry-v11-sync.js",
     "src/export/compression.js",
     "src/export/set-schema.js",
     "src/export/set-verification.js",
     "src/platform/export-set-verification-storage.js",
     "src/platform/owner-only-prepared-contribution-storage.js",
+    "src/platform/telemetry-v11-envelope.js",
+    "src/local-unified-contribution-attribution.js",
+    "src/local-work-usage-source.js",
+    "src/platform/work-usage-projects.js",
+    "src/reporting/work-usage.js",
     "src/prepared-contribution-compatibility-internal.js",
   ]) {
     assert.equal(graph.relativeFiles.includes(ownedFile), true, ownedFile);
   }
+  for (const relativeFile of [
+    "src/telemetry-v1.1-domain.js",
+    "src/telemetry-v1.1-schemas.js",
+    "src/telemetry-v1.1.js",
+  ]) {
+    assert.equal(MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES.includes(relativeFile), true, relativeFile);
+  }
+  assert.equal(MACOS_QUOTA_ANALYSIS_RUNTIME_FILES.includes("src/plan-attribution.js"), true);
   assert.equal(
     MACOS_RUNTIME_STATIC_ASSETS.includes("apps/macos/reset-local-keychain.js"),
     true,
   );
   assert.deepEqual(MACOS_WEB_MODULE_ENTRYPOINTS, [
     "apps/web/public/app.js",
+    "apps/web/public/desktop-shell.js",
+    "apps/web/public/electron-tray-popup.js",
+    "apps/web/public/electron-settings.js",
+    "apps/web/public/electron-tray-settings.js",
+    "apps/web/public/electron-tray-preferences.js",
   ]);
-  // The dashboard entry plus the modules it shares with the public community
-  // entry. The community entry itself is website-only and is not bundled.
+  // Shared dashboard, tray-popup, and settings entries plus their
+  // dependencies. The Electron bridge is inert without its preload; the
+  // community entry stays website-only.
   assert.deepEqual(webModules.relativeFiles, [
     "apps/web/public/app.js",
     "apps/web/public/community-data.js",
     "apps/web/public/data-client.js",
+    "apps/web/public/desktop-shell.js",
+    "apps/web/public/electron-settings.js",
+    "apps/web/public/electron-tray-popup.js",
+    "apps/web/public/electron-tray-preferences.js",
+    "apps/web/public/electron-tray-settings.js",
+    "apps/web/public/i18n.generated.js",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
     "apps/web/public/localization.js",
+    "apps/web/public/model-catalog.generated.js",
+    "apps/web/public/model-performance.js",
+    "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
     "apps/web/public/ui-format.js",
+    "apps/web/public/work-usage-view.js",
   ]);
   assert.equal(
     webModules.relativeFiles.includes("apps/web/public/community.js"),
@@ -4735,11 +7328,17 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   );
   assert.deepEqual(swiftSources.relativeFiles, [
     "apps/macos/Sources/KeychainBroker.swift",
+    "apps/macos/Sources/KeychainMigration.swift",
     "apps/macos/Sources/Localization.swift",
     "apps/macos/Sources/LoginItemManager.swift",
+    "apps/macos/Sources/MenuBarPaceOutlook.swift",
+    "apps/macos/Sources/MenuBarPopover.swift",
+    "apps/macos/Sources/MenuBarPopupModel.swift",
     "apps/macos/Sources/MenuBarStatus.swift",
+    "apps/macos/Sources/NativeBrandPalette.swift",
     "apps/macos/Sources/QuotaNotifications.swift",
     "apps/macos/Sources/SemanticOpenTarget.swift",
+    "apps/macos/Sources/TrayCustomization.swift",
     "apps/macos/UsageMonitorApp.swift",
   ]);
   const localizationResources = await collectMacOSLocalizationResources();
@@ -4754,16 +7353,34 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/app.js",
     "apps/web/public/community-data.js",
     "apps/web/public/data-client.js",
+    "apps/web/public/desktop-shell.js",
+    "apps/web/public/electron-settings.css",
+    "apps/web/public/electron-settings.html",
+    "apps/web/public/electron-settings.js",
+    "apps/web/public/electron-tray-popup.css",
+    "apps/web/public/electron-tray-popup.html",
+    "apps/web/public/electron-tray-popup.js",
+    "apps/web/public/electron-tray-preferences.js",
+    "apps/web/public/electron-tray-settings.js",
+    "apps/web/public/i18n.generated.js",
+    "apps/web/public/icon-panel-left.svg",
+    "apps/web/public/icon-refresh-cw.svg",
+    "apps/web/public/icon-settings.svg",
     "apps/web/public/index.html",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
     "apps/web/public/localization.js",
+    "apps/web/public/model-catalog.generated.js",
+    "apps/web/public/model-performance.css",
+    "apps/web/public/model-performance.js",
+    "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
     "apps/web/public/styles.css",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
     "apps/web/public/tibotattle-icon.png",
     "apps/web/public/ui-format.js",
+    "apps/web/public/work-usage-view.js",
   ]);
   assert.deepEqual(
     graph.relativeFiles.filter((path) =>
@@ -5607,10 +8224,9 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
           name: "@app-usagemonitor/telemetry-contract",
           version: RELEASE_VERSION,
         },
-        { name: "@github/keytar", version: "7.10.6" },
         { name: "ajv", version: "8.20.0" },
         { name: "fast-deep-equal", version: "3.1.3" },
-        { name: "fast-uri", version: "3.1.5" },
+        { name: "fast-uri", version: "3.1.6" },
         { name: "json-schema-traverse", version: "1.0.0" },
         { name: "require-from-string", version: "2.0.2" },
         { name: "runcost", version: "0.2.1" },
@@ -5680,6 +8296,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       "apps/macos/Assets/AppIcon.icns",
       "apps/macos/Assets/AppIcon.provenance.txt",
       ...swiftSources.relativeFiles,
+      ...MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES,
     ]);
     assert.deepEqual(
       manifest.inputs.localizationResources,
@@ -5778,6 +8395,32 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.equal(payloadHash.digest("hex"), manifest.payload.payloadSha256);
     assert.equal(manifest.payload.payloadSha256, first.payloadSha256);
 
+    const migrationHelperPath = join(outputA, MACOS_KEYCHAIN_MIGRATION_HELPER.executable);
+    const retainedHelperPath = join(temporaryRoot, "retained-migration-helper");
+    const migrationHelperBytes = await readFile(migrationHelperPath);
+    assert.ok(migrationHelperBytes.length > 4096, "the real Swift helper must be packaged");
+    await rename(migrationHelperPath, retainedHelperPath);
+    try {
+      await assert.rejects(inspectMacOSApp(outputA), { code: "MACOS_PAYLOAD_INTEGRITY_FAILED" },
+        "a missing built helper must fail installed-payload verification");
+    } finally {
+      await rename(retainedHelperPath, migrationHelperPath);
+    }
+    const changedHelperBytes = Buffer.from(migrationHelperBytes);
+    changedHelperBytes[4096] ^= 1;
+    await chmod(migrationHelperPath, 0o700);
+    try {
+      await writeFile(migrationHelperPath, changedHelperBytes);
+      await chmod(migrationHelperPath, 0o555);
+      await assert.rejects(inspectMacOSApp(outputA), { code: "MACOS_PAYLOAD_INTEGRITY_FAILED" },
+        "a changed built helper must fail its normalized payload digest");
+    } finally {
+      await chmod(migrationHelperPath, 0o700);
+      await writeFile(migrationHelperPath, migrationHelperBytes);
+      await chmod(migrationHelperPath, 0o555);
+    }
+    await assert.doesNotReject(inspectMacOSApp(outputA), "restored helper passes full payload verification");
+
     for (const { entry, relativePath } of bundleFiles) {
       assert.equal(entry.isSymbolicLink(), false, relativePath);
       assert.doesNotMatch(
@@ -5849,6 +8492,39 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       loginItemSmoke.stdout,
       /^USAGE_MONITOR_MACOS_LOGIN_ITEM_CONTRACT fake=true register=affirmative-only unregister=explicit status=enabled,not-registered,requires-approval,unavailable outcomes=confirmed,requires-approval,not-confirmed,unavailable,failed pending_removal=true real_service_calls=0 daemon=false$/mu,
     );
+    const keychainBrokerSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--keychain-broker-contract-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      keychainBrokerSmoke.status,
+      0,
+      keychainBrokerSmoke.stderr || keychainBrokerSmoke.stdout,
+    );
+    assert.match(
+      keychainBrokerSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_KEYCHAIN_BROKER_CONTRACT protocols=v1,v2 capabilities=4 migration=silent,third-attempt,bounded-restart,explicit-only,denied-preserved,conflict-preserved,readback-rollback,retired-cancelled malformed=closed keychain_access=0$/mu,
+    );
+    assert.match(
+      keychainBrokerSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_KEYCHAIN_LAUNCH_CONTRACT required=true failures=construction,endpoint child_started=false stop_callbacks=once keychain_access=0$/mu,
+    );
+    const migrationUISmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-keychain-migration-ui-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(migrationUISmoke.status, 0, migrationUISmoke.stderr || migrationUISmoke.stdout);
+    assert.match(migrationUISmoke.stdout,
+      /^USAGE_MONITOR_MACOS_KEYCHAIN_MIGRATION_UI_CONTRACT automatic_prompt=false retrying=quiet cancel=preserved denial=preserved approval=explicit duplicate_ignored=true refresh=transition_only keychain_access=false$/mu);
+    const trayCustomizationSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--tray-customization-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(trayCustomizationSmoke.status, 0, trayCustomizationSmoke.stderr || trayCustomizationSmoke.stdout);
+    assert.match(trayCustomizationSmoke.stdout, /TIBOTATTLE_TRAY_CUSTOMIZATION preferences=closed,migrated,future-protected,atomic,undo/u);
     const menuBarSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
       ["--menu-bar-contract-smoke-test"],
@@ -5857,11 +8533,134 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.equal(
       menuBarSmoke.status,
       0,
-      menuBarSmoke.stderr || menuBarSmoke.stdout,
+      menuBarSmoke.error?.message
+        ?? (menuBarSmoke.stderr
+          || menuBarSmoke.stdout
+          || `signal=${menuBarSmoke.signal ?? "none"}`),
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT popover=true width=400 bars=7,30 pace=canonical-outlook native_actions=true states=live,starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q routing=left-popover,right-menu,control-menu dismissal=escape,transient,same-app,outside,deactivation weekly_position=factual-menu-only pace_outlook=collecting,under,on,over,critical,fail-closed history=authoritative,coverage-named,fail-closed pricing=complete,partial,unavailable model=dst,overlap,future,per-lane reset_credits=absent analysis_title=live-fallback history_retention=refresh,failure,source-reset overflow=screen-capped,vertical-only,top-reset,poll-preserved$/mu,
+    );
+    const analysisProgressSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-analysis-progress-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      analysisProgressSmoke.status,
+      0,
+      analysisProgressSmoke.stderr || analysisProgressSmoke.stdout,
+    );
+    assert.match(
+      analysisProgressSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning unified=scanning accounting=calculating counts=bounded quick_result=evidence-gated contradictory=generic unknown=generic free_text=ignored idle=unchanged terminal=automatic-backoff attempt=mode-and-actual-start percent=false eta=false$/mu,
+    );
+    const popupRenderDirectory = join(temporaryRoot, "menu-bar-popover-render");
+    const popupRenderSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--menu-bar-popover-render-smoke-test", popupRenderDirectory],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      popupRenderSmoke.status,
+      0,
+      popupRenderSmoke.stderr || popupRenderSmoke.stdout,
+    );
+    assert.match(
+      popupRenderSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_POPOVER_RENDER locales=en,es,zh-Hans appearances=light,dark ranges=7d,30d states=live,pace-collecting,pace-under,pace-on,pace-over,pace-critical,partial-pricing,unpriced,unavailable,updating-7d,updating-30d,read-failure-30d width=400 source=synthetic-content-free$/mu,
+    );
+    const popupRenders = (await readdir(popupRenderDirectory)).sort();
+    assert.equal(popupRenders.length, 18);
+    for (const state of ["updating-7d", "updating-30d", "read-failure-30d"]) {
+      assert.equal(popupRenders.includes(`menu-bar-popover-en-${state}-light.png`), true);
+    }
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-en-30d-light.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-zh-Hans-dark.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-es-partial-pricing-light.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-es-unpriced-light.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-es-unavailable-light.png"),
+      true,
+    );
+    for (const paceState of ["collecting", "under", "on", "critical"]) {
+      assert.equal(
+        popupRenders.includes(
+          `menu-bar-popover-en-pace-${paceState}-light.png`,
+        ),
+        true,
+      );
+    }
+    const popupRenderDigests = new Map();
+    for (const popupRender of popupRenders) {
+      const renderBytes = await readFile(join(popupRenderDirectory, popupRender));
+      assert.ok(
+        renderBytes.length > 1_000,
+        popupRender,
+      );
+      assert.equal(
+        renderBytes.subarray(0, 8).toString("hex"),
+        "89504e470d0a1a0a",
+        popupRender,
+      );
+      assert.equal(renderBytes.readUInt32BE(16), 800, popupRender);
+      const pixelHeight = renderBytes.readUInt32BE(20);
+      assert.ok(pixelHeight >= 600, popupRender);
+      if (!popupRender.includes("unavailable") && !popupRender.includes("read-failure")) {
+        assert.ok(pixelHeight >= 1_000, popupRender);
+      }
+      popupRenderDigests.set(
+        popupRender,
+        createHash("sha256").update(renderBytes).digest("hex"),
+      );
+    }
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-en-light.png"),
+      popupRenderDigests.get("menu-bar-popover-en-dark.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-en-light.png"),
+      popupRenderDigests.get("menu-bar-popover-en-30d-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-en-light.png"),
+      popupRenderDigests.get("menu-bar-popover-es-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-es-light.png"),
+      popupRenderDigests.get("menu-bar-popover-zh-Hans-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-es-partial-pricing-light.png"),
+      popupRenderDigests.get("menu-bar-popover-es-unpriced-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-es-unpriced-light.png"),
+      popupRenderDigests.get("menu-bar-popover-es-unavailable-light.png"),
+    );
+    const paceRenderNames = [
+      "menu-bar-popover-en-light.png",
+      "menu-bar-popover-en-pace-collecting-light.png",
+      "menu-bar-popover-en-pace-under-light.png",
+      "menu-bar-popover-en-pace-on-light.png",
+      "menu-bar-popover-en-pace-critical-light.png",
+    ];
+    assert.equal(
+      new Set(paceRenderNames.map((name) => popupRenderDigests.get(name))).size,
+      paceRenderNames.length,
     );
     const quotaNotificationSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
@@ -5889,7 +8688,21 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       refreshSettingsSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 picker_action=true picker_persisted=true scheduler=300->900 invalid_ignored=true$/mu,
+      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 picker_action=true picker_persisted=true scheduler=300->900 detailed_attempt_cadence=3600 startup=quick quick_join=restored newer_attempt=preserved external_attempt=actual-start stale_idle=ignored invalid_ignored=true$/mu,
+    );
+    const appearanceSettingsSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-appearance-settings-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      appearanceSettingsSmoke.status,
+      0,
+      appearanceSettingsSmoke.stderr || appearanceSettingsSmoke.stdout,
+    );
+    assert.match(
+      appearanceSettingsSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_APPEARANCE_SETTINGS_CONTRACT default=system persisted=light,dark,system invalid=system system_resolution=light,dark explicit_resolution=light,dark appkit=system,aqua,darkAqua$/mu,
     );
     // The settings window is sized from what its pages measure. Source text
     // cannot show whether a page then fits, so this measures the real frames:
@@ -5924,6 +8737,10 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       nativeDashboardLayoutSmoke.stdout,
       /^USAGE_MONITOR_MACOS_NATIVE_DASHBOARD_LAYOUT web_width=[6-9][0-9]{2,} web_height=[6-9][0-9]{2,}$/mu,
     );
+    assert.match(
+      nativeDashboardLayoutSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_DASHBOARD_READINESS early=true late=true once=true stale_callbacks=ignored cancelled=true hung_renderer=bounded hard_deadline=120$/mu,
+    );
     // A sidebar that cannot be reopened is a window with no navigation: the
     // rows live only here, because the web report hides its own sidebar in
     // native mode. Source text can show a toolbar item and a menu command
@@ -5943,6 +8760,20 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       sidebarRecoverySmoke.stdout,
       /^USAGE_MONITOR_MACOS_SIDEBAR_RECOVERY collapse=true responds=true menu_enabled=true reveal=true width=[12][0-9]{2} rescue_once=true respects_choice=true$/mu,
+    );
+    const interactionSafetySmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-dashboard-interaction-safety-smoke-test"],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(
+      interactionSafetySmoke.status,
+      0,
+      interactionSafetySmoke.stderr || interactionSafetySmoke.stdout,
+    );
+    assert.match(
+      interactionSafetySmoke.stdout,
+      /^USAGE_MONITOR_MACOS_NATIVE_INTERACTION_SAFETY back=false forward=false reload=true download_link=false open_link=true link_preview=false toolbar_immovable=true settings_tabs_immovable=true settings_delegate=true codex_thread_links_safe=true$/mu,
     );
     const generatedFiles = bundleFiles
       .map(({ relativePath }) => relativePath)
@@ -5996,9 +8827,9 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       "--input-type=module",
       "--eval",
       [
-        "import { TELEMETRY_SCHEMA_VERSION }",
+        "import { TELEMETRY_SCHEMA_VERSION, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION }",
         "from '@app-usagemonitor/telemetry-contract';",
-        "process.stdout.write(TELEMETRY_SCHEMA_VERSION);",
+        "process.stdout.write(JSON.stringify([TELEMETRY_SCHEMA_VERSION, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION]));",
       ].join(" "),
     ], {
       cwd: join(outputA, "Contents", "Resources", "app"),
@@ -6009,17 +8840,32 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       0,
       telemetryContractProbe.stderr || telemetryContractProbe.stdout,
     );
-    assert.equal(
-      telemetryContractProbe.stdout,
-      "telemetry-contribution-v0.1",
+    assert.deepEqual(
+      JSON.parse(telemetryContractProbe.stdout),
+      ["telemetry-contribution-v0.1", "telemetry-contribution-v1.1"],
     );
+    const planAttributionProbe = spawnSync(node, [
+      "--input-type=module",
+      "--eval",
+      [
+        "import { PLAN_ATTRIBUTION_POLICY, buildPlanAttributionIndex }",
+        "from '@app-usagemonitor/quota-analysis';",
+        "buildPlanAttributionIndex([]);",
+        "process.stdout.write(PLAN_ATTRIBUTION_POLICY.methodVersion);",
+      ].join(" "),
+    ], {
+      cwd: join(outputA, "Contents", "Resources", "app"),
+      encoding: "utf8",
+    });
+    assert.equal(planAttributionProbe.status, 0, planAttributionProbe.stderr || planAttributionProbe.stdout);
+    assert.equal(planAttributionProbe.stdout, "plan-attribution-v1");
     const accountingProbe = spawnSync(node, [
       "--input-type=module",
       "--eval",
       [
-        "import { LOCAL_API_PRICING_METHOD_VERSION }",
+        "import { apiPriceResolutionSummary }",
         "from '@app-usagemonitor/accounting';",
-        "process.stdout.write(LOCAL_API_PRICING_METHOD_VERSION);",
+        "process.stdout.write(apiPriceResolutionSummary().methodVersion);",
       ].join(" "),
     ], {
       cwd: join(outputA, "Contents", "Resources", "app"),
@@ -6108,7 +8954,6 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       );
     }
     for (const relativePath of [
-      "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
       "Contents/Resources/runtime/bin/node",
       "Contents/MacOS/TiboTattle",
     ]) {
@@ -6179,6 +9024,14 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.equal(
       plistJson.UsageMonitorStateDirectoryName,
       PRODUCT_BRAND.stateDirectoryName,
+    );
+    assert.equal(
+      plistJson.UsageMonitorKeychainNamespace,
+      PRODUCT_BRAND.keychainNamespace,
+    );
+    assert.equal(
+      plistJson.UsageMonitorKeychainAccount,
+      PRODUCT_BRAND.keychainAccount,
     );
     assert.equal(
       plistJson.UsageMonitorMonitoredAppDisplayName,
@@ -6511,7 +9364,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.equal(
       resetContract.stdout,
-      "USAGE_MONITOR_MACOS_KEYCHAIN_RESET_CONTRACT targets=2 app_state=targeted hosted_mutation=false secure_erasure=false confirmations=2\n",
+      "USAGE_MONITOR_MACOS_KEYCHAIN_RESET_CONTRACT targets=2 app_state=targeted hosted_mutation=false secure_erasure=false confirmations=2 writer_barrier=drained callbacks=once reset_resurrection=false keychain_access=0\n",
     );
 
     await mkdir(smokeHome, { recursive: true, mode: 0o700 });
@@ -6612,6 +9465,8 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.deepEqual(
       await validateMacOSDMG(dmg, { production: false }),
       {
+        architecture: "arm64",
+        minimumMacos: "14.0",
         bundleIdentifier: "com.usagemonitor.local",
         production: false,
         shortVersion: RELEASE_VERSION,
@@ -6694,9 +9549,12 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
   }
 });
 
-macOSArtifactTest("preview distribution builds retain the normal identity and reject production validation", {
+macOSArtifactTest("preview distribution builds use an isolated identity and reject production validation", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
-  timeout: 120_000,
+  // This performs two complete preview builds plus DMG packaging. A warm
+  // arm64 development host can legitimately approach two minutes, so retain
+  // enough margin for CI load without weakening any build assertion.
+  timeout: 240_000,
 }, async (context) => {
   const preparedFramework = join(
     REPOSITORY_ROOT,
@@ -6715,7 +9573,11 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-macos-preview-test-"),
   );
-  const output = join(temporaryRoot, "preview", "TiboTattle.app");
+  const output = join(
+    temporaryRoot,
+    "preview",
+    PREVIEW_PRODUCT_BRAND.bundleName,
+  );
   const publicEdKey = Buffer.alloc(32, 9).toString("base64");
   try {
     const build = await buildMacOSApp({
@@ -6724,7 +9586,7 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       output,
       previewDistribution: true,
       previewStagingRoot: dirname(output),
-      sparkleAppcastURL: "https://updates.usage.example/appcast.xml",
+      sparkleAppcastURL: "https://updates.usage.example/preview/appcast.xml",
       sparkleFramework: preparedFramework,
       sparklePublicEdKey: publicEdKey,
     });
@@ -6748,8 +9610,20 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       "Resources",
       "build-manifest.json",
     ), "utf8"));
-    assert.equal(manifest.application.bundleIdentifier, PRODUCT_BRAND.bundleIdentifier);
+    assert.equal(
+      manifest.application.bundleIdentifier,
+      PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+    );
+    assert.equal(manifest.application.name, PREVIEW_PRODUCT_BRAND.displayName);
     assert.equal(manifest.application.bundleVersion, "42");
+    assert.equal(
+      manifest.runtime.stateRoot,
+      `~/Library/Application Support/${PREVIEW_PRODUCT_BRAND.stateDirectoryName}`,
+    );
+    assert.deepEqual(manifest.runtime.keychain, {
+      account: PREVIEW_PRODUCT_BRAND.keychainAccount,
+      namespace: PREVIEW_PRODUCT_BRAND.keychainNamespace,
+    });
     assert.equal(manifest.release.channel, MACOS_PREVIEW_DISTRIBUTION_CHANNEL);
     assert.equal(
       manifest.release.channelName,
@@ -6760,9 +9634,12 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
     assert.equal(manifest.release.requiresDeveloperIDAndNotarization, false);
     assert.deepEqual(await validateMacOSPreviewApp(output), {
       appPath: resolve(output),
-      bundleIdentifier: PRODUCT_BRAND.bundleIdentifier,
+      architecture: "arm64",
+      minimumMacos: "14.0",
+      bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
       bundleVersion: "42",
       channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      shortVersion: RELEASE_VERSION,
       updaterEnabled: true,
     });
     const previewDMG = join(
@@ -6778,9 +9655,25 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
     assert.equal(packagedPreview.distribution, "preview");
     assert.equal(packagedPreview.output, previewDMG);
     assert.equal(packagedPreview.bytes > 0, true);
+    assert.deepEqual(
+      await validateMacOSDMG(previewDMG, {
+        distribution: "preview",
+        expectedBundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+        expectedBundleVersion: "42",
+        expectedShortVersion: RELEASE_VERSION,
+        production: false,
+      }),
+      {
+        bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+        architecture: "arm64",
+        minimumMacos: "14.0",
+        production: false,
+        shortVersion: RELEASE_VERSION,
+      },
+    );
     await assert.rejects(
       inspectMacOSApp(output, { requireExternalDistribution: true }),
-      { code: "MACOS_UPDATER_CONFIGURATION_INVALID" },
+      { code: "MACOS_RELEASE_FAILED" },
     );
     const plist = JSON.parse(execFileSync("/usr/bin/plutil", [
       "-convert",
@@ -6789,7 +9682,30 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       "-",
       join(output, "Contents", "Info.plist"),
     ], { encoding: "utf8" }));
-    assert.equal(plist.CFBundleIdentifier, PRODUCT_BRAND.bundleIdentifier);
+    assert.equal(
+      plist.CFBundleIdentifier,
+      PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+    );
+    assert.equal(
+      plist.CFBundleDisplayName,
+      PREVIEW_PRODUCT_BRAND.displayName,
+    );
+    assert.equal(
+      plist.UsageMonitorAppOpenURL,
+      PREVIEW_PRODUCT_BRAND.appOpenURL,
+    );
+    assert.equal(
+      plist.UsageMonitorStateDirectoryName,
+      PREVIEW_PRODUCT_BRAND.stateDirectoryName,
+    );
+    assert.equal(
+      plist.UsageMonitorKeychainNamespace,
+      PREVIEW_PRODUCT_BRAND.keychainNamespace,
+    );
+    assert.equal(
+      plist.UsageMonitorKeychainAccount,
+      PREVIEW_PRODUCT_BRAND.keychainAccount,
+    );
     assert.equal(
       plist.UsageMonitorPublicWebsiteOrigin,
       DEPLOYMENT_ENDPOINTS.public.origin,
@@ -6820,6 +9736,126 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       updaterSmoke.stdout,
       /^USAGE_MONITOR_MACOS_UPDATER_CONTRACT runtime=sparkle_2_9_3_enabled state=feed_unverified$/mu,
     );
+    const previewPlistPath = join(output, "Contents", "Info.plist");
+    const pristinePreviewPlist = await readFile(previewPlistPath);
+    const previewLauncher = join(output, "Contents", "MacOS", "TiboTattle");
+    const rejectedRuntimeIdentityMutations = [
+      {
+        label: "stable state directory",
+        replacements: [
+          [
+            "UsageMonitorStateDirectoryName",
+            "-string",
+            PRODUCT_BRAND.stateDirectoryName,
+          ],
+        ],
+      },
+      {
+        label: "stable semantic-open target",
+        replacements: [
+          [
+            "UsageMonitorAppOpenScheme",
+            "-string",
+            PRODUCT_BRAND.appOpenScheme,
+          ],
+          ["UsageMonitorAppOpenURL", "-string", PRODUCT_BRAND.appOpenURL],
+        ],
+      },
+      {
+        label: "stable LaunchServices registration",
+        replacements: [
+          [
+            "CFBundleURLTypes.0.CFBundleURLName",
+            "-string",
+            `${PRODUCT_BRAND.bundleIdentifier}.${PRODUCT_BRAND.appOpenHost}`,
+          ],
+          [
+            "CFBundleURLTypes.0.CFBundleURLSchemes.0",
+            "-string",
+            PRODUCT_BRAND.appOpenScheme,
+          ],
+        ],
+      },
+      {
+        label: "alternate LaunchServices registration",
+        replacements: [
+          [
+            "CFBundleURLTypes.0.CFBundleURLSchemes.0",
+            "-string",
+            "alternate-preview",
+          ],
+        ],
+      },
+      {
+        label: "malformed LaunchServices registration",
+        replacements: [
+          [
+            "CFBundleURLTypes.0.CFBundleURLSchemes",
+            "-string",
+            PREVIEW_PRODUCT_BRAND.appOpenScheme,
+          ],
+        ],
+      },
+      {
+        label: "stable build channel",
+        replacements: [
+          ["UsageMonitorBuildChannel", "-string", "production"],
+          ["UsageMonitorReleaseChannel", "-string", STABLE_RELEASE_CHANNEL],
+        ],
+      },
+      {
+        label: "non-preview marker",
+        replacements: [
+          ["UsageMonitorPreviewDistribution", "-bool", "false"],
+        ],
+      },
+      {
+        label: "stable appcast",
+        replacements: [
+          ["SUFeedURL", "-string", DEPLOYMENT_ENDPOINTS.sparkle.appcastURL],
+        ],
+      },
+      {
+        label: "automatic preview updates",
+        replacements: [
+          ["SUEnableAutomaticChecks", "-bool", "true"],
+          ["SUAllowsAutomaticUpdates", "-bool", "true"],
+          ["SUAutomaticallyUpdate", "-bool", "true"],
+        ],
+      },
+    ];
+    try {
+      await chmod(previewPlistPath, 0o644);
+      for (const mutation of rejectedRuntimeIdentityMutations) {
+        await writeFile(previewPlistPath, pristinePreviewPlist);
+        for (const [key, type, value] of mutation.replacements) {
+          execFileSync("/usr/bin/plutil", [
+            "-replace",
+            key,
+            type,
+            value,
+            previewPlistPath,
+          ]);
+        }
+        const rejectedLaunch = spawnSync(
+          previewLauncher,
+          ["--updater-contract-smoke-test"],
+          { encoding: "utf8" },
+        );
+        assert.equal(
+          rejectedLaunch.status !== 0 || rejectedLaunch.signal !== null,
+          true,
+          mutation.label,
+        );
+        assert.match(
+          `${rejectedLaunch.stderr}\n${rejectedLaunch.stdout}`,
+          /Invalid bundled runtime identity/u,
+          mutation.label,
+        );
+      }
+    } finally {
+      await writeFile(previewPlistPath, pristinePreviewPlist);
+    }
     const failedFeedSmoke = spawnSync(
       join(output, "Contents", "MacOS", "TiboTattle"),
       ["--updater-feed-contract-smoke-test", "404"],
@@ -6855,12 +9891,139 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
         output,
         previewDistribution: true,
         previewStagingRoot: dirname(output),
-        sparkleAppcastURL: "https://updates.usage.example/appcast.xml",
+        sparkleAppcastURL: "https://updates.usage.example/preview/appcast.xml",
         sparkleFramework: preparedFramework,
         sparklePublicEdKey: publicEdKey,
       }),
       { code: "MACOS_PREVIEW_REPLACE_REQUIRED" },
     );
+    const retiredKeytarPath = join(
+      output,
+      ...RETIRED_PREVIEW_KEYTAR_PATH.split("/"),
+    );
+    await mkdir(dirname(retiredKeytarPath), {
+      recursive: true,
+      mode: 0o755,
+    });
+    await copyFile(previewLauncher, retiredKeytarPath);
+    await chmod(retiredKeytarPath, 0o555);
+    const retiredPayloadManifestPath = join(
+      output,
+      "Contents",
+      "Resources",
+      "build-manifest.json",
+    );
+    await chmod(retiredPayloadManifestPath, 0o644);
+    const retiredPayloadManifest = JSON.parse(await readFile(
+      retiredPayloadManifestPath,
+      "utf8",
+    ));
+    retiredPayloadManifest.payload = await testPayloadInventory(
+      output,
+      temporaryRoot,
+      { normalizedCodePaths: LEGACY_PREVIEW_NORMALIZED_TEST_CODE_PATHS },
+    );
+    const pristineRetiredPayloadManifest = JSON.stringify(
+      retiredPayloadManifest,
+    );
+    await writeFile(
+      retiredPayloadManifestPath,
+      pristineRetiredPayloadManifest,
+    );
+    execFileSync("/usr/bin/codesign", [
+      "--force",
+      "--sign",
+      "-",
+      "--options",
+      "runtime",
+      "--timestamp=none",
+      output,
+    ], { stdio: "ignore" });
+    assert.deepEqual(await validateMacOSPreviewApp(output), {
+      appPath: resolve(output),
+      architecture: "arm64",
+      minimumMacos: "14.0",
+      bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+      bundleVersion: "42",
+      channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      shortVersion: RELEASE_VERSION,
+      updaterEnabled: true,
+    });
+
+    const invalidNormalizationManifest = JSON.parse(
+      pristineRetiredPayloadManifest,
+    );
+    const retiredKeytarEntry = invalidNormalizationManifest.payload.files
+      .find(({ path }) => path === RETIRED_PREVIEW_KEYTAR_PATH);
+    assert.notEqual(retiredKeytarEntry, undefined);
+    retiredKeytarEntry.normalization = "raw";
+    await writeFile(
+      retiredPayloadManifestPath,
+      JSON.stringify(invalidNormalizationManifest),
+    );
+    await assert.rejects(
+      validateMacOSPreviewApp(output),
+      { code: "MACOS_PAYLOAD_INTEGRITY_FAILED" },
+    );
+    await writeFile(
+      retiredPayloadManifestPath,
+      pristineRetiredPayloadManifest,
+    );
+
+    const pristineRetiredKeytar = await readFile(retiredKeytarPath);
+    const retiredKeytarMode = (await lstat(retiredKeytarPath)).mode & 0o777;
+    await chmod(retiredKeytarPath, 0o755);
+    await appendFile(retiredKeytarPath, "tampered");
+    await assert.rejects(
+      validateMacOSPreviewApp(output),
+      {
+        code: "MACOS_APP_BUILD_FAILED",
+        message: /codesign failed/u,
+      },
+    );
+    await writeFile(retiredKeytarPath, pristineRetiredKeytar);
+    await chmod(retiredKeytarPath, retiredKeytarMode);
+    execFileSync("/usr/bin/codesign", [
+      "--force",
+      "--sign",
+      "-",
+      "--options",
+      "runtime",
+      "--timestamp=none",
+      output,
+    ], { stdio: "ignore" });
+    await validateMacOSPreviewApp(output);
+
+    await buildMacOSApp({
+      bundleVersion: "42",
+      centralOrigin: "https://preview.usage.example",
+      output,
+      previewDistribution: true,
+      previewStagingRoot: dirname(output),
+      replacePreviewOutput: true,
+      sparkleAppcastURL: "https://updates.usage.example/preview/appcast.xml",
+      sparkleFramework: preparedFramework,
+      sparklePublicEdKey: publicEdKey,
+    });
+    await assert.rejects(
+      lstat(retiredKeytarPath),
+      { code: "ENOENT" },
+    );
+    const replacementManifest = JSON.parse(await readFile(
+      retiredPayloadManifestPath,
+      "utf8",
+    ));
+    assert.equal(
+      replacementManifest.payload.files.some(
+        ({ path }) => path === RETIRED_PREVIEW_KEYTAR_PATH,
+      ),
+      false,
+    );
+    await assert.rejects(
+      lstat(join(dirname(output), "retired")),
+      { code: "ENOENT" },
+    );
+
     const legacyManifestPath = join(
       output,
       "Contents",
@@ -6888,20 +10051,26 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       previewDistribution: true,
       previewStagingRoot: dirname(output),
       replacePreviewOutput: true,
-      sparkleAppcastURL: "https://updates.usage.example/appcast.xml",
+      sparkleAppcastURL: "https://updates.usage.example/preview/appcast.xml",
       sparkleFramework: preparedFramework,
       sparklePublicEdKey: publicEdKey,
     });
     assert.deepEqual(await validateMacOSPreviewApp(output), {
       appPath: resolve(output),
-      bundleIdentifier: PRODUCT_BRAND.bundleIdentifier,
+      architecture: "arm64",
+      minimumMacos: "14.0",
+      bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
       bundleVersion: "42",
       channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      shortVersion: RELEASE_VERSION,
       updaterEnabled: true,
     });
     const retired = await readdir(join(dirname(output), "retired"));
     assert.equal(retired.length, 1);
-    assert.match(retired[0], /^TiboTattle-legacy-preview-[a-f0-9]{16}\.app$/u);
+    assert.match(
+      retired[0],
+      /^TiboTattle Preview-legacy-preview-[a-f0-9]{16}\.app$/u,
+    );
     const archivedManifest = JSON.parse(await readFile(join(
       dirname(output),
       "retired",
@@ -6916,9 +10085,12 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
   }
 });
 
-macOSArtifactTest("signed app relays central readiness to an explicitly connected loopback lab", {
+macOSArtifactTest("signed app relays central health to an explicitly connected loopback lab", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
-  timeout: 60_000,
+  // The contract builds and signs both loopback and production variants.
+  // Keep the child and overall budgets above observed full-app compile time;
+  // the readiness and origin assertions below remain independently bounded.
+  timeout: 180_000,
 }, async () => {
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-macos-central-test-"),
@@ -6928,12 +10100,12 @@ macOSArtifactTest("signed app relays central readiness to an explicitly connecte
   const requests = [];
   const central = createServer((request, response) => {
     requests.push(`${request.method} ${request.url}`);
-    if (request.method === "GET" && request.url === "/api/ready") {
+    if (request.method === "GET" && request.url === "/api/health") {
       response.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      response.end(JSON.stringify({ status: "ready" }));
+      response.end(JSON.stringify({ status: "ok" }));
       return;
     }
     response.writeHead(404, { "Content-Type": "application/json" });
@@ -6957,7 +10129,7 @@ macOSArtifactTest("signed app relays central readiness to an explicitly connecte
     ], {
       cwd: REPOSITORY_ROOT,
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: 90_000,
     });
     assert.equal(build.status, 0, build.stderr || build.stdout);
     assert.match(build.stdout, /^Central service: development_loopback$/mu);
@@ -7018,9 +10190,9 @@ macOSArtifactTest("signed app relays central readiness to an explicitly connecte
     assert.equal(smoke.signal, null);
     assert.match(
       smoke.stdout,
-      /^USAGE_MONITOR_MACOS_CENTRAL_SMOKE_READY host=127\.0\.0\.1 port=[0-9]+ central=development_loopback$/mu,
+      /^USAGE_MONITOR_MACOS_CENTRAL_SMOKE_HEALTHY host=127\.0\.0\.1 port=[0-9]+ central=development_loopback$/mu,
     );
-    assert.deepEqual(requests, ["GET /api/ready"]);
+    assert.deepEqual(requests, ["GET /api/health"]);
 
     const productionOrigin = "https://usage-monitor.example";
     const productionBuild = spawnSync(process.execPath, [
@@ -7032,7 +10204,7 @@ macOSArtifactTest("signed app relays central readiness to an explicitly connecte
     ], {
       cwd: REPOSITORY_ROOT,
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: 90_000,
     });
     assert.equal(
       productionBuild.status,
@@ -7125,6 +10297,15 @@ test("build script itself does not admit private output trees", async () => {
 // bytes into the signed app. It now also verifies a reviewed deterministic
 // file-tree digest of the installed package, rejecting tampered bytes before
 // any copy or signing.
+test("the macOS fast-uri security pin matches the actual AJV runtime dependency", async () => {
+  const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
+  const ajvRequire = createRequire(rootRequire.resolve("ajv/package.json"));
+  const packagePath = ajvRequire.resolve("fast-uri/package.json");
+  const accepted = await pinnedPackage("fast-uri", packagePath);
+  assert.equal(accepted.version, "3.1.6");
+  assert.equal(accepted.treeDigest, await pinnedPackageTreeDigest(dirname(packagePath)));
+});
+
 test("pinnedPackage authenticates external packages by reviewed file-tree digest, not just name and version", async (t) => {
   const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
 
@@ -7166,4 +10347,161 @@ test("pinnedPackage authenticates external packages by reviewed file-tree digest
   await writeFile(join(tamperedRoot, "index.js"), "module.exports = 1;\n");
   const after = await pinnedPackageTreeDigest(tamperedRoot);
   assert.notEqual(before, after);
+});
+
+const output = ".release-build/intel-test/TiboTattle.app";
+const nodeRuntime = ".release-build/verified-intel/bin/node";
+
+test("bundle architecture verification covers launcher, Node, helper and every Sparkle executable", async () => {
+  const header = (architecture) => {
+    const bytes = Buffer.alloc(32);
+    bytes.writeUInt32LE(0xfeedfacf, 0);
+    bytes.writeUInt32LE(architecture === "x64" ? 0x01000007 : 0x0100000c, 4);
+    return bytes;
+  };
+  for (const architecture of ["arm64", "x64"]) {
+    assertMacOSMachOArchitecture(header(architecture), architecture);
+    assert.throws(() => assertMacOSMachOArchitecture(header(architecture === "x64" ? "arm64" : "x64"), architecture), {
+      code: "MACOS_BUNDLE_ARCHITECTURE_MISMATCH",
+    });
+    assert.throws(() => assertMacOSMachOArchitecture(Buffer.alloc(32), architecture), {
+      code: "MACOS_BUNDLE_ARCHITECTURE_MISMATCH",
+    });
+  }
+  const scratch = await mkdtemp(join(await realpath(tmpdir()), "macos-architecture-fixture-"));
+  try {
+    const paths = [
+      "Contents/MacOS/TiboTattle", "Contents/Resources/runtime/bin/node",
+      MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
+      ...SPARKLE_MACH_O_PATHS.map((path) => `Contents/Frameworks/Sparkle.framework/${path}`),
+    ];
+    for (const path of paths) {
+      await mkdir(dirname(join(scratch, path)), { recursive: true });
+      await writeFile(join(scratch, path), header("x64"));
+    }
+    await assertMacOSBundleArchitecture(scratch, { architecture: "x64", updaterEnabled: true });
+    for (const path of paths) {
+      await writeFile(join(scratch, path), header("arm64"));
+      await assert.rejects(assertMacOSBundleArchitecture(scratch, {
+        architecture: "x64", updaterEnabled: true,
+      }), { code: "MACOS_BUNDLE_ARCHITECTURE_MISMATCH" });
+      await writeFile(join(scratch, path), header("x64"));
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("Intel signed build configuration selects only its architecture's reviewed feed", () => {
+  const environment = {
+    USAGE_MONITOR_SPARKLE_FRAMEWORK: ".release-deps/Sparkle.framework",
+    USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY: Buffer.alloc(32, 1).toString("base64"),
+  };
+  const configuration = readMacOSReleaseBuildConfiguration(environment, STABLE_RELEASE_CHANNEL, { architecture: "x64" });
+  assert.equal(new URL(configuration.sparkleAppcastURL).pathname, "/intel/appcast.xml");
+  assert.throws(() => readMacOSReleaseBuildConfiguration({
+    ...environment, USAGE_MONITOR_SPARKLE_APPCAST_URL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+  }, STABLE_RELEASE_CHANNEL, { architecture: "x64" }), { code: "MACOS_RELEASE_ENDPOINTS_MISMATCH" });
+});
+
+test("macOS architecture selection is explicit and leaves ARM defaults intact", () => {
+  const defaults = parseMacOSBuildArguments(["--output", output], {});
+  assert.equal(defaults.architecture, "arm64");
+  assert.equal(defaults.nodeRuntime, null);
+  assert.equal(defaults.buildProfile, "release");
+  const intel = parseMacOSBuildArguments([
+    "--output", output, "--test-build", "--architecture", "x64",
+    "--node-runtime", nodeRuntime,
+  ], {});
+  assert.equal(intel.architecture, "x64");
+  assert.equal(intel.nodeRuntime, resolve(nodeRuntime));
+  assert.equal(intel.buildProfile, "test");
+  assert.equal(intel.sparkleFramework, null);
+  assert.equal(intel.externalDistribution, false);
+  assert.equal(intel.previewDistribution, false);
+  for (const architecture of ["x86_64", "universal", "ia32", "", null]) {
+    assert.throws(() => normalizeMacOSBuildArchitecture(architecture), {
+      code: "MACOS_BUILD_ARCHITECTURE_INVALID",
+    });
+  }
+  assert.throws(() => parseMacOSBuildArguments([
+    "--output", output, "--architecture", "x64",
+  ], {}), { code: "MACOS_INTEL_NODE_RUNTIME_REQUIRED" });
+  assert.throws(() => parseMacOSBuildArguments([
+    "--output", output, "--node-runtime", nodeRuntime,
+  ], {}), { code: "MACOS_NODE_RUNTIME_OVERRIDE_FORBIDDEN" });
+  for (const arguments_ of [
+    ["--architecture", "arm64", "--architecture", "x64"],
+    ["--architecture"],
+    ["--architecture", "x64", "--node-runtime"],
+    ["--architecture", "x64", "--node-runtime", "--test-build"],
+    ["--architecture", "x64", "--node-runtime", nodeRuntime, "--node-runtime", nodeRuntime],
+  ]) {
+    assert.throws(() => parseMacOSBuildArguments(["--output", output, ...arguments_], {}));
+  }
+  assert.equal(parseMacOSBuildArguments([
+    "--validate-preview", "--app", output, "--architecture", "x64",
+  ], {}).architecture, "x64");
+});
+
+test("Intel Preview is isolated while external builds retain release-core authorization", async () => {
+  const preview = parseMacOSBuildArguments([
+    "--preview-distribution", "--architecture", "x64", "--node-runtime", nodeRuntime,
+  ], {});
+  assert.equal(preview.architecture, "x64");
+  assert.match(preview.output, /\/macos-preview\/intel\/current\/TiboTattle Preview\.app$/u);
+  assert.equal(new URL(preview.sparkleAppcastURL).pathname, "/preview/intel/appcast.xml");
+  assert.throws(() => parseMacOSBuildArguments([
+    "--external-distribution", "--architecture", "x64", "--node-runtime", nodeRuntime,
+  ], {}), { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" });
+  await assert.rejects(buildMacOSApp({
+    output, architecture: "x64", nodeRuntime, externalDistribution: true,
+  }), { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" });
+  assert.throws(() => parseMacOSBuildArguments([
+    "--preview-distribution", "--architecture", "x64", "--node-runtime", nodeRuntime, "--test-build",
+  ], {}), { code: "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN" });
+  for (const builder of [buildMacOSReleaseCandidate, buildMacOSAppForRelease]) {
+    await assert.rejects(builder({
+      output, candidateAppPath: output, architecture: "x64", nodeRuntime,
+      externalDistribution: true, environment: {},
+    }), { code: "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION" });
+  }
+});
+
+test("Intel runtime verification rejects wrong bytes without executing them or creating build output", async () => {
+  const scratch = await mkdtemp(join(await realpath(tmpdir()), "macos-intel-runtime-"));
+  try {
+    const bin = join(scratch, "bin");
+    await mkdir(bin);
+    const executable = join(bin, "node");
+    const marker = join(scratch, "executed");
+    await writeFile(executable, `#!/bin/sh\ntouch '${marker}'\n`);
+    await chmod(executable, 0o755);
+    await writeFile(join(scratch, "LICENSE"), "Synthetic runtime license\n");
+    await assert.rejects(validateMacOSNodeRuntimeInput({
+      architecture: "x64", nodeRuntime: executable,
+    }), { code: "MACOS_NODE_RUNTIME_DIGEST_MISMATCH" });
+    await assert.rejects(access(marker), { code: "ENOENT" });
+    const linked = join(bin, "linked-node");
+    await symlink(executable, linked);
+    await assert.rejects(validateMacOSNodeRuntimeInput({
+      architecture: "x64", nodeRuntime: linked,
+    }), { code: "MACOS_NODE_RUNTIME_INPUT_INVALID" });
+    const missingPath = join(scratch, "private-runtime-path");
+    await assert.rejects(validateMacOSNodeRuntimeInput({
+      architecture: "x64", nodeRuntime: missingPath,
+    }), (error) => error.code === "MACOS_NODE_RUNTIME_INPUT_INVALID"
+      && !error.message.includes(scratch));
+    if (process.platform === "darwin" && process.arch === "arm64"
+        && process.version === "v26.2.0") {
+      const candidate = join(scratch, "uncreated", "TiboTattle.app");
+      await assert.rejects(buildMacOSApp({
+        output: candidate, architecture: "x64", nodeRuntime: executable,
+        buildProfile: "test",
+      }), { code: "MACOS_NODE_RUNTIME_DIGEST_MISMATCH" });
+      await assert.rejects(access(join(scratch, "uncreated")), { code: "ENOENT" });
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
 });

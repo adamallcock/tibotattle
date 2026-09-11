@@ -5,7 +5,6 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
-import { createEmptyCodexCheckpointState } from "../src/export-checkpoint-state.js";
 import { deriveParticipantId } from "../src/export-identity.js";
 import { createCodexExportSourcePlan } from "../src/export-source-plan.js";
 import {
@@ -13,7 +12,11 @@ import {
   ExportSupplementalSourcePlanError,
   summarizeSupplementalSourcePlan,
 } from "../src/export-supplemental-source-plan.js";
-import {
+import { localCodexCheckpointState, localExportWorkspace } from
+  "../src/local-node-runtime.js";
+import { stableJson } from "../src/storage.js";
+
+const {
   buildExportWorkspaceDescriptor,
   createExportWorkspace,
   ExportWorkspaceError,
@@ -21,8 +24,8 @@ import {
   openExportWorkspace,
   sourceCheckpointBatchSha256,
   supplementalSourceCheckpointBatchSha256,
-} from "../src/export-workspace.js";
-import { stableJson } from "../src/storage.js";
+} = localExportWorkspace;
+const { createEmptyCodexCheckpointState } = localCodexCheckpointState;
 
 const SECRET = Buffer.alloc(32, 79);
 

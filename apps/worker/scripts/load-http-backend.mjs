@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   closeSync,
   fsyncSync,
@@ -19,8 +19,12 @@ import {
   mapConcurrent,
   readOwnerOnlyInvitation,
 } from "./load-profile-lib.mjs";
+import {
+  LocalOwnerErasureError,
+  assertRetiredDeletionHealth,
+  createLocalOwnerEraser,
+} from "./local-owner-erasure.mjs";
 
-const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const FIXED_FATAL_MESSAGE =
   "The backend load runner stopped at a fixed configuration or receipt boundary\n";
 process.on("uncaughtException", () => {
@@ -113,17 +117,11 @@ if (profileOnly) {
 }
 
 const origin = loopbackOrigin(optionValue("--origin", "http://127.0.0.1:8792"));
-const exerciseAggregate = process.argv.includes("--exercise-aggregate");
 const receiptFileValue = optionValue("--receipt-file");
 const receiptFile = receiptFileValue ? resolve(receiptFileValue) : null;
 const invitePaths = optionValues("--invite-file").map((value) => resolve(value));
 if (invitePaths.length !== 0 && invitePaths.length !== profile.participants) {
   throw new Error("Pass exactly one owner-only invitation file per participant");
-}
-if (exerciseAggregate && invitePaths.length !== profile.participants) {
-  throw new Error(
-    "Aggregate load evidence requires independently issued owner-only invitations",
-  );
 }
 
 class LoadFailure extends Error {
@@ -135,8 +133,10 @@ class LoadFailure extends Error {
 }
 
 class Session {
+  participantId = null;
   cookie = null;
   csrfToken = null;
+  deviceAuthorization = null;
   deleted = false;
 
   applyCookie(setCookie) {
@@ -155,13 +155,14 @@ class Session {
 }
 
 const sessions = [];
+let ownerEraser;
 const latencies = {
   enrollment: [],
   registration: [],
   upload: [],
   privateResults: [],
-  deletion: [],
-  scheduledRebuild: [],
+  selfServiceDeletionRefusal: [],
+  ownerErasure: [],
 };
 const failureCounts = new Map();
 const counters = {
@@ -172,11 +173,13 @@ const counters = {
   acceptedRecords: 0,
   deduplicatedRecords: 0,
   participantResults: 0,
-  participantsDeleted: 0,
+  participantDeletionRefusalsVerified: 0,
+  participantsErasedByOwner: 0,
 };
 
 function recordFailure(error) {
-  const code = error instanceof LoadFailure ? error.code : "UNEXPECTED_CLIENT_FAILURE";
+  const code = error instanceof LoadFailure || error instanceof LocalOwnerErasureError
+    ? error.code : "UNEXPECTED_CLIENT_FAILURE";
   failureCounts.set(code, (failureCounts.get(code) ?? 0) + 1);
 }
 
@@ -327,6 +330,7 @@ async function enroll(inviteCode = null) {
   const body = {
     consentVersion: "privacy-safe-telemetry-v0.1",
     syntheticOnly: false,
+    deviceBootstrap: true,
   };
   if (inviteCode) body.inviteCode = inviteCode;
   const result = await timed("enrollment", () => request("/api/v1/enroll", {
@@ -338,22 +342,45 @@ async function enroll(inviteCode = null) {
   if (typeof result?.csrfToken !== "string"
       || typeof result?.recoveryCode !== "string"
       || typeof result?.participantId !== "string"
+      || typeof result?.pairing?.pairingCode !== "string"
       || !session.cookie) {
     throw new LoadFailure("ENROLLMENT_CONTRACT_INVALID");
   }
   session.csrfToken = result.csrfToken;
+  session.participantId = result.participantId;
   sessions.push(session);
   counters.enrollments += 1;
+  ownerEraser.trackParticipant(session);
+  const deviceId = randomUUID();
+  const rawSecret = randomBytes(32);
+  const encodedSecret = rawSecret.toString("base64url");
+  let deviceSecretHash;
+  try {
+    deviceSecretHash = createHash("sha256")
+      .update("app-usagemonitor/device/v1\0")
+      .update(deviceId)
+      .update("\0")
+      .update(rawSecret)
+      .digest("hex");
+  } finally {
+    rawSecret.fill(0);
+  }
+  await request("/api/v1/device-pairings/claim", {
+    method: "POST",
+    authorization: `Pairing ${result.pairing.pairingCode}`,
+    body: JSON.stringify({ deviceId, deviceSecretHash }),
+    expectStatus: 201,
+  });
+  session.deviceAuthorization = `um_device_${deviceId}.${encodedSecret}`;
   return session;
 }
 
 async function registerUpload(session, serializedEnvelope) {
   const result = await timed("registration", () => request(
-    "/api/v1/me/upload-authorizations",
+    "/api/v1/device/upload-authorizations",
     {
       method: "POST",
-      session,
-      csrf: true,
+      authorization: `Device ${session.deviceAuthorization}`,
       body: JSON.stringify({
         envelopeDigest: sha256Hex(serializedEnvelope),
         contentLengthBytes: Buffer.byteLength(serializedEnvelope, "utf8"),
@@ -363,7 +390,7 @@ async function registerUpload(session, serializedEnvelope) {
     },
   ));
   if (typeof result?.uploadAuthorization !== "string"
-      || !result.uploadAuthorization.startsWith("um_upload_")) {
+      || !result.uploadAuthorization.startsWith("um_device_upload_")) {
     throw new LoadFailure("UPLOAD_REGISTRATION_CONTRACT_INVALID");
   }
   counters.uploadRegistrations += 1;
@@ -392,63 +419,19 @@ async function upload(session, serializedEnvelope, expectedAccepted) {
 }
 
 async function verifyPrivateResults(session, expectedContributions) {
-  const [stats, participant] = await timed("privateResults", () => Promise.all([
-    request("/api/v1/me/stats", { session }),
-    request("/api/v1/me", { session }),
-  ]));
-  if (stats?.totals?.contributions !== expectedContributions
-      || stats?.totals?.usageEvents !== profile.recordsPerAttempt
-      || participant?.schemaVersion !== "participant-profile-v0.2"
-      || participant?.contributionCount !== expectedContributions
-      || !Array.isArray(participant?.contributions)
-      || participant.contributions.length !== expectedContributions) {
+  const participantExport = await timed("privateResults", () =>
+    request("/api/v1/me/export", { session }));
+  if (!Array.isArray(participantExport?.contributions)
+      || participantExport.contributions.length !== expectedContributions) {
     throw new LoadFailure("PRIVATE_RESULTS_CONTRACT_INVALID");
   }
   counters.participantResults += 1;
 }
 
-async function deleteParticipant(session) {
-  if (session.deleted || !session.cookie || !session.csrfToken) return;
-  const result = await timed("deletion", () => request("/api/v1/me", {
-    method: "DELETE",
-    session,
-    csrf: true,
-  }));
-  if (result?.deleted !== true) throw new LoadFailure("DELETION_CONTRACT_INVALID");
-  session.deleted = true;
-  counters.participantsDeleted += 1;
-}
-
-function scheduledSnapshotTime(baseEpoch) {
-  const first = new Date(baseEpoch);
-  first.setUTCHours(0, 0, 0, 0);
-  const daysSinceMonday = (first.getUTCDay() + 6) % 7;
-  return first.getTime() - daysSinceMonday * DAY_MILLISECONDS
-    + 9 * DAY_MILLISECONDS;
-}
-
-async function triggerScheduledSnapshot(scheduledTime) {
-  const url = new URL("/cdn-cgi/handler/scheduled", origin);
-  url.searchParams.set("format", "json");
-  url.searchParams.set("time", String(scheduledTime));
-  const result = await timed("scheduledRebuild", async () => {
-    let response;
-    try {
-      response = await fetch(url, {
-        redirect: "error",
-        signal: AbortSignal.timeout(profile.requestTimeoutMilliseconds),
-      });
-    } catch {
-      throw new LoadFailure("SCHEDULED_TRIGGER_TRANSPORT_FAILED");
-    }
-    if (!response.ok) throw new LoadFailure("SCHEDULED_TRIGGER_FAILED");
-    try {
-      return await response.json();
-    } catch {
-      throw new LoadFailure("SCHEDULED_TRIGGER_JSON_INVALID");
-    }
-  });
-  if (result?.outcome !== "ok") throw new LoadFailure("SCHEDULED_TRIGGER_CONTRACT_INVALID");
+async function eraseParticipant(session) {
+  if (session.deleted) return;
+  await timed("ownerErasure", () => ownerEraser.eraseParticipant(session, { retry: true }));
+  counters.participantsErasedByOwner += 1;
 }
 
 async function prepareEnvelopes(publicJwk, keyId, maximumAttempts, baseEpoch) {
@@ -479,6 +462,8 @@ async function runParticipant(session, index, envelopes) {
       );
     }
     await verifyPrivateResults(session, attempts);
+    await timed("selfServiceDeletionRefusal", () => ownerEraser.verifyParticipantRefusal(session));
+    counters.participantDeletionRefusalsVerified += 1;
     return true;
   } catch (error) {
     recordFailure(error);
@@ -525,7 +510,7 @@ async function enrollCohort() {
 async function cleanupParticipants() {
   await mapConcurrent(sessions, profile.concurrency, async (session) => {
     try {
-      await deleteParticipant(session);
+      await eraseParticipant(session);
     } catch (error) {
       recordFailure(error);
     }
@@ -534,19 +519,14 @@ async function cleanupParticipants() {
 
 const startedAt = new Date().toISOString();
 const started = performance.now();
-let aggregateEvidence = {
-  exercised: false,
-  initialReleaseStatus: null,
-  initialRevision: null,
-  afterMassDeletionStatus: null,
-  afterMassDeletionRevision: null,
-  afterFullDeletionStatus: null,
-  afterFullDeletionRevision: null,
-};
-let scheduledSnapshotEpoch = null;
-
 try {
+  ownerEraser = await createLocalOwnerEraser({
+    origin: origin.origin,
+    ownerAccessFile: optionValue("--owner-access-file"),
+    requestTimeoutMilliseconds: profile.requestTimeoutMilliseconds,
+  });
   const health = await request("/api/health");
+  assertRetiredDeletionHealth(health);
   const expectedEnrollmentMode = invitePaths.length > 0 ? "invite_only" : "local_open";
   if (health?.enrollmentMode !== expectedEnrollmentMode) {
     throw new LoadFailure("ENROLLMENT_MODE_MISMATCH");
@@ -579,89 +559,27 @@ try {
     throw new LoadFailure("PARTICIPANT_WORKLOAD_FAILED");
   }
 
-  if (exerciseAggregate) {
-    if (profile.participants < 20) throw new LoadFailure("AGGREGATE_REQUIRES_20_PARTICIPANTS");
-    scheduledSnapshotEpoch = scheduledSnapshotTime(baseEpoch);
-    await triggerScheduledSnapshot(scheduledSnapshotEpoch);
-    const initial = await request("/api/v1/stats/aggregate");
-    if (initial?.releaseStatus !== "published" || !Array.isArray(initial?.cells)) {
-      throw new LoadFailure("INITIAL_AGGREGATE_NOT_PUBLISHED");
-    }
-    const initialRevision = initial.snapshotRevision;
-    if (!Number.isSafeInteger(initialRevision) || initialRevision < 1) {
-      throw new LoadFailure("INITIAL_AGGREGATE_REVISION_INVALID");
-    }
-    const massDeleteCount = Math.max(1, Math.ceil(profile.participants / 10));
-    await mapConcurrent(
-      sessions.slice(0, massDeleteCount),
-      profile.concurrency,
-      async (session) => {
-        try {
-          await deleteParticipant(session);
-        } catch (error) {
-          recordFailure(error);
-        }
-      },
-    );
-    if (failureCounts.size > 0) throw new LoadFailure("MASS_DELETION_FAILED");
-    const withdrawn = await request("/api/v1/stats/aggregate");
-    if (withdrawn?.releaseStatus !== "withdrawn") {
-      throw new LoadFailure("AGGREGATE_NOT_WITHDRAWN");
-    }
-    await triggerScheduledSnapshot(scheduledSnapshotEpoch + 60 * 60 * 1_000);
-    const rebuilt = await request("/api/v1/stats/aggregate");
-    const expectedRebuiltStatus = profile.participants - massDeleteCount >= 20
-      ? "published"
-      : "suppressed";
-    if (rebuilt?.releaseStatus !== expectedRebuiltStatus
-        || rebuilt?.snapshotRevision !== initialRevision + 1) {
-      throw new LoadFailure("MASS_DELETION_REBUILD_INVALID");
-    }
-    aggregateEvidence = {
-      exercised: true,
-      initialReleaseStatus: initial.releaseStatus,
-      initialRevision,
-      afterMassDeletionStatus: rebuilt.releaseStatus,
-      afterMassDeletionRevision: rebuilt.snapshotRevision,
-      afterFullDeletionStatus: null,
-      afterFullDeletionRevision: null,
-    };
-  }
 } catch (error) {
   recordFailure(error);
 } finally {
   await cleanupParticipants();
 }
 
-if (exerciseAggregate && aggregateEvidence.exercised && failureCounts.size === 0) {
-  try {
-    await triggerScheduledSnapshot(scheduledSnapshotEpoch + 2 * 60 * 60 * 1_000);
-    const finalAggregate = await request("/api/v1/stats/aggregate");
-    if (finalAggregate?.releaseStatus !== "suppressed"
-        || finalAggregate?.snapshotRevision !== aggregateEvidence.initialRevision + 2) {
-      throw new LoadFailure("FULL_DELETION_REBUILD_INVALID");
-    }
-    aggregateEvidence.afterFullDeletionStatus = finalAggregate.releaseStatus;
-    aggregateEvidence.afterFullDeletionRevision = finalAggregate.snapshotRevision;
-  } catch (error) {
-    recordFailure(error);
-  }
-}
-
 const elapsedMilliseconds = Number((performance.now() - started).toFixed(3));
 const failed = failureCounts.size > 0
   || counters.enrollments !== profile.participants
   || counters.uploads !== profile.bundleAttempts
-  || counters.participantsDeleted !== counters.enrollments;
+  || counters.participantDeletionRefusalsVerified !== counters.enrollments
+  || counters.participantsErasedByOwner !== counters.enrollments;
 const receipt = {
-  schemaVersion: "backend-load-receipt-v0.1",
+  schemaVersion: "backend-load-receipt-v0.2",
   status: failed ? "failed" : "passed",
   startedAt,
   completedAt: new Date().toISOString(),
   originClass: "loopback_http",
   workload: profile,
   counters,
-  aggregateEvidence,
+  erasureAuthority: "dedicated_local_owner_fixture",
   elapsedMilliseconds,
   throughput: {
     bundleAttemptsPerSecond: elapsedMilliseconds > 0
@@ -680,7 +598,7 @@ const receipt = {
     .map(([code, count]) => ({ code, count })),
   privacy: {
     contentFreeFixture: true,
-    aggregateOnlyDiagnostics: true,
+    publicResultsOnly: true,
     credentialsPrinted: false,
     participantIdentifiersPrinted: false,
     responseBodiesPrinted: false,

@@ -62,6 +62,7 @@ async function writeFakeAppBundle(root, { bundleVersion, shortVersion }) {
 }
 
 function officialToolOutput({
+  architecture = "arm64",
   artifactBytes,
   bundleVersion,
   downloadURLPrefix,
@@ -92,8 +93,8 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <pubDate>Sun, 10 Aug 2026 12:00:00 -0400</pubDate>
             <sparkle:version>${bundleVersion}</sparkle:version>
             <sparkle:shortVersionString>${shortVersion}</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <sparkle:minimumSystemVersion>${architecture === "x64" ? "14.0" : "13.0"}</sparkle:minimumSystemVersion>
+            ${architecture === "arm64" ? "<sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>" : ""}
             <enclosure url="${url}" length="${artifactBytes.length}" type="application/octet-stream" sparkle:edSignature="${artifactSignature}"></enclosure>
         </item>
     </channel>
@@ -110,16 +111,17 @@ length: ${Buffer.byteLength(prefix, "utf8")}
 `;
 }
 
-async function createStableFixture({ bundleVersion = "3", shortVersion = "0.1.3" } = {}) {
+async function createStableFixture({ architecture = "arm64", bundleVersion = "3", shortVersion = "0.1.3" } = {}) {
   const root = await mkdtemp(
     join(await realpath(tmpdir()), "tibotattle-stable-feed-generator-test-"),
   );
   const appPath = await writeFakeAppBundle(root, { bundleVersion, shortVersion });
-  const dmgFileName = `TiboTattle-${shortVersion}-macOS-arm64.dmg`;
+  const dmgFileName = `TiboTattle-${shortVersion}-macOS-${architecture}.dmg`;
   const dmgBytes = Buffer.from(`stable-signed-dmg-${bundleVersion}`);
   const dmgPath = join(root, dmgFileName);
   await writeFile(dmgPath, dmgBytes);
   return {
+    architecture,
     appPath,
     bundleVersion,
     cleanup: () => rm(root, { recursive: true, force: true }),
@@ -155,6 +157,7 @@ function fakeGenerateAppcastTool(fixture, { calls, mutateOutput = null } = {}) {
     const stagedBytes = await readFile(join(stagingDirectory, fixture.dmgFileName));
     assert.deepEqual(stagedBytes, fixture.dmgBytes);
     let output = officialToolOutput({
+      architecture: fixture.architecture,
       artifactBytes: stagedBytes,
       bundleVersion: fixture.bundleVersion,
       downloadURLPrefix,
@@ -339,6 +342,42 @@ test("--account refuses unsafe names and combination with --ed-key-file", async 
   }
 });
 
+test("appcast CLI rejects bundle versions outside Apple's component bounds", () => {
+  const argumentsFor = (bundleVersion) => [
+    "--channel", "stable",
+    "--app", "/tmp/TiboTattle.app",
+    "--dmg", "/tmp/TiboTattle.dmg",
+    "--bundle-version", bundleVersion,
+  ];
+  for (const bundleVersion of [
+    "0",
+    "0.1.16",
+    "0.1.17",
+    "0.2.0",
+    "01",
+    "12345",
+    "1.100",
+    "1.2.100",
+    "1.2.3.4",
+  ]) {
+    assert.throws(
+      () => parseGenerateSparkleAppcastArguments(
+        argumentsFor(bundleVersion),
+      ),
+      /Apple-compatible CFBundleVersion/u,
+      bundleVersion,
+    );
+  }
+  for (const bundleVersion of ["1", "1.2", "1.2.3", "1234.99.99"]) {
+    assert.equal(
+      parseGenerateSparkleAppcastArguments(
+        argumentsFor(bundleVersion),
+      ).bundleVersion,
+      bundleVersion,
+    );
+  }
+});
+
 test("stable path passes --ed-key-file through to the official tool", async () => {
   const fixture = await createStableFixture();
   const keyFilePath = join(fixture.root, "test-sparkle-ed-key");
@@ -435,4 +474,72 @@ test("stable path fails closed when the tool reports a different bundle version"
   } finally {
     await fixture.cleanup();
   }
+});
+
+
+test("Intel generation retains the ARM archive and signs its own namespace", async () => {
+  const fixture = await createStableFixture({ architecture: "x64" });
+  try {
+    const archive = join(fixture.root, "release-archive");
+    const armMarker = join(archive, "stable", fixture.bundleVersion, "preserve.txt");
+    await mkdir(join(archive, "stable", fixture.bundleVersion), { recursive: true });
+    await writeFile(armMarker, "existing-arm-release");
+    const result = await generateSparkleAppcast({
+      ...stableOptions(fixture, ["--architecture", "x64"]),
+      runGenerateAppcastTool: fakeGenerateAppcastTool(fixture),
+    });
+    assert.match(result.full.url, /\/intel\/releases\//u);
+    const written = await readFile(result.appcastPath, "utf8");
+    assert.doesNotMatch(written, /hardwareRequirements/u);
+    const metadata = JSON.parse(await readFile(join(archive, "stable-x64", fixture.bundleVersion, RETAINED_ARCHIVE_METADATA_FILE), "utf8"));
+    assert.equal(metadata.architecture, "x64");
+    assert.equal(await readFile(armMarker, "utf8"), "existing-arm-release");
+    assert.throws(() => validateCandidateAppcastShape(written, "stable"));
+  } finally { await fixture.cleanup(); }
+});
+
+for (const selfClosing of [false, true]) test(`Electron transition signs ${selfClosing ? 'self-closing' : 'paired'} official enclosure without changing app bytes`, async () => {
+  const fixture = await createStableFixture({ bundleVersion: '1028', shortVersion: '0.1.21' });
+  const calls = [];
+  try {
+    const plistPath = join(fixture.appPath, 'Contents/Info.plist');
+    const plist = (await readFile(plistPath, 'utf8')).replace('<key>SURequireSignedFeed</key><true/>', '');
+    await writeFile(plistPath, plist);
+    const options = stableOptions(fixture, ['--electron-transition', '--account', 'ed25519', '--skip-retain',
+      '--electron-transition-test-source', 'b'.repeat(40)]);
+    const result = await generateSparkleAppcast({ ...options,
+      runGenerateAppcastTool: fakeGenerateAppcastTool(fixture, { mutateOutput: text => text
+        .replace(/<!-- sparkle-sign-warning:[\s\S]*?-->/u, '')
+        .replace(/<!-- sparkle-signatures:[\s\S]*$/u, '')
+        .replace(/ sparkle:edSignature="[^"]+"/u, '')
+        .replace(/(<enclosure\b[^>]*?)><\/enclosure>/u, selfClosing ? '$1/>' : '$1></enclosure>') }),
+      runSignUpdate: async (_path, args) => {
+        calls.push(args);
+        const path = args.at(-1);
+        if (args.includes('-p')) return sign(null, await readFile(path), TEST_KEY_PAIR.privateKey).toString('base64');
+        const text = (await readFile(path, 'utf8')).replace('<?xml version="1.0" standalone="yes"?>',
+          '<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:\nOfficial fixture signing warning\n-->');
+        const signature = sign(null, Buffer.from(text), TEST_KEY_PAIR.privateKey).toString('base64');
+        await writeFile(path, `${text}<!-- sparkle-signatures:\nedSignature: ${signature}\nlength: ${Buffer.byteLength(text)}\n-->\n`);
+      } });
+    assert.equal(result.feedSigned, true);
+    assert.equal(result.retained, null);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls.map(call => call.slice(0, 2)), [['--account', 'ed25519'], ['--account', 'ed25519']]);
+    assert.equal(result.full.url, `https://updates.tibotattle.com/electron/test/native-sparkle/${'b'.repeat(40)}/1028/${sha256(fixture.dmgBytes)}/${fixture.dmgFileName}`);
+    assert.equal(await readFile(plistPath, 'utf8'), plist);
+    assert.deepEqual(await readFile(fixture.dmgPath), fixture.dmgBytes);
+  } finally { await fixture.cleanup(); }
+});
+
+test('transition rehearsal refuses arbitrary destinations, missing stable key, retention and non-Apple version', async () => {
+  const fixture = await createStableFixture();
+  try {
+    for (const args of [['--electron-transition-test-source', 'b'.repeat(40)],
+      ['--electron-transition', '--electron-transition-test-source', 'b'.repeat(40)],
+      ['--electron-transition', '--skip-retain', '--electron-transition-test-source', '../stable'],
+      ['--electron-transition', '--download-url-prefix', 'https://elsewhere.invalid']]) {
+      assert.throws(() => stableOptions(fixture, args));
+    }
+  } finally { await fixture.cleanup(); }
 });

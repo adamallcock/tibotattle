@@ -2,7 +2,7 @@
 title: Windows portability qualification environments
 date: 2026-08-17
 type: runbook
-status: qualified-and-restorable
+status: maintained
 ---
 
 # Windows portability qualification environments

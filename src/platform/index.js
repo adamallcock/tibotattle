@@ -1,15 +1,29 @@
 export {
+  attachAccountlessParentChannel,
+  createAccountlessChildChannel,
+} from "./accountless-contribution-channel.js";
+export {
   readBoundedJsonLines,
   readBoundedUtf8LineEntries,
   readBoundedUtf8Lines,
 } from "./bounded-jsonl-reader.js";
 export { readBoundedDirectoryEntries } from "./bounded-directory-reader.js";
 export {
+  COMPRESSED_ROLLOUT_LIMITS,
+  compressedRolloutHandle,
+  inspectCompressedRollout,
+  isCompressedRolloutSource,
+  readCompressedRolloutBytes,
+  supportsCompressedRollouts,
+} from "./bounded-rollout-bytes.js";
+export { createTelemetryV11Envelope } from "./telemetry-v11-envelope.js";
+export {
   CODEX_CONFIG_RETAINED_KEYS,
   CODEX_CONFIG_SERVICE_TIER_STATUSES,
   readCodexConfigServiceTier,
 } from "./codex-config-service-tier.js";
 export { createLocalCodexLogPorts } from "./local-codex-log-ports.js";
+export { readCodexLocalThreadMetadata, readCodexLocalThreadAncestry, readCodexLocalRepositoryOrigins } from "./local-codex-thread-store.js";
 export {
   createLocalExportSourcePorts,
   localIsProxy,
@@ -30,9 +44,74 @@ export {
   createWindowsProductionReadinessAttestation,
 } from "./windows-production-readiness.js";
 export {
+  assertWindowsFilesystemProductionSafe,
+  createWindowsFilesystemAdapter,
+  isWindowsFilesystemAdapter,
+  isWindowsFilesystemIdentity,
+} from "./windows-filesystem.js";
+export {
+  windowsNativeUnsignedContentDigest,
+} from "./windows-native-unsigned-content.js";
+export {
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
+  WindowsAccountObservationBrokerError,
+  attachWindowsAccountObservationBrokerIpcServer,
+  createWindowsAccountObservationBrokerBackend,
+  createWindowsAccountObservationBrokerBackendFromEnvironment,
+  createWindowsAccountObservationBrokerTransport,
+  decodeWindowsAccountObservationBrokerSecret,
+  encodeWindowsAccountObservationBrokerSecret,
+  isWindowsAccountObservationBrokerBackend,
+  isWindowsAccountObservationBrokerError,
+  isWindowsAccountObservationBrokerIpcChannel,
+  windowsAccountObservationBrokerConfiguration,
+} from "./windows-account-observation-broker.js";
+export {
+  LINUX_ACCOUNT_OBSERVATION_BROKER_CAPABILITY,
+  LINUX_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS,
+  LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+  LinuxAccountObservationBrokerError,
+  attachLinuxAccountObservationBrokerIpcServer,
+  createLinuxAccountObservationBrokerBackendFromEnvironment,
+  isLinuxAccountObservationBrokerBackend,
+  isLinuxAccountObservationBrokerIpcChannel,
+} from "./linux-account-observation-broker.js";
+export {
+  assertWindowsQualificationResourceAuthority,
+  createWindowsQualificationModeContext,
+  isWindowsQualificationModeContext,
+  isWindowsQualificationModeContextFor,
+  WINDOWS_QUALIFICATION_MODE_ACCOUNTING_SOURCE_MODE,
+  WINDOWS_QUALIFICATION_MODE_CONTRACT_VERSION,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VARIABLE,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VALUE,
+  WINDOWS_QUALIFICATION_MODE_PRODUCTION_SAFE,
+  WINDOWS_QUALIFICATION_MODE_QUALIFICATION_ONLY,
+  WINDOWS_QUALIFICATION_MODE_TEST_LANE,
+  WindowsQualificationModeError,
+} from "./windows-qualification-mode.js";
+export {
+  WINDOWS_PROTECTED_STATE_STORE_CONTRACT_VERSION,
+  WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES,
+  WindowsProtectedStateStoreError,
+  createWindowsProtectedStateStore,
+  isWindowsProtectedStateStore,
+  isWindowsProtectedStateStoreError,
+  isWindowsQualificationProtectedStateStoreFor,
+} from "./windows-protected-state-store.js";
+export {
   CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
   CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  MACOS_APP_KEYCHAIN_CAPABILITIES,
   ExportIdentityKeychainError,
   KEYTAR_DARWIN_ARM64_SHA256,
   KEYTAR_SIGNING_CODE_IDENTIFIER,
@@ -44,11 +123,16 @@ export {
   deleteExportIdentityKeychainItemByAttributes,
   exportIdentityKeychainAttributeDeleteArguments,
   exportIdentityKeychainAttributeProbeArguments,
+  exportIdentityKeychainCapabilitiesForEnvironment,
   exportIdentityKeychainItemPresenceByAttributes,
   keytarSignedBindingRequirement,
   keytarSignedBindingVerificationArguments,
   loadExportIdentityKeychainBinding,
 } from "./export-identity-keychain.js";
+export {
+  MACOS_KEYCHAIN_BROKER_CAPABILITY_NAMES,
+  macOSKeychainBrokerCapabilityName,
+} from "./keychain-capabilities.js";
 // The contribution-device Keychain broker is deliberately absent: it lives at
 // src/contribution-device-keychain-broker.js with the other contribution
 // modules, not under this owner. This barrel is the reviewed platform-adapter
@@ -129,3 +213,7 @@ export {
   rotateParticipantSecret,
   withParticipantSecretLease,
 } from "./participant-identity.js";
+export { createWorkUsageProjectResolver, normalizeWorkUsageRepositoryOrigin } from "./work-usage-projects.js";
+
+export { openTimingStore, ingestTimingFile, timingReport, readTimingRows } from './inference-timing-store.js';
+export { forEachRolloutLine, ROLLOUT_LINE_BYTES } from './rollout-line-reader.js';

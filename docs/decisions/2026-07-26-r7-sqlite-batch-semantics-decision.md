@@ -2,7 +2,7 @@
 title: R7 SQLite Batch Semantics Decision
 date: 2026-07-26
 type: decision-record
-status: implemented
+status: complete
 ---
 
 # R7 SQLite batch semantics decision

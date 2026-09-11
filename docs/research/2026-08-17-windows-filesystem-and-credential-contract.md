@@ -2,7 +2,7 @@
 title: Windows filesystem and credential security contract
 date: 2026-08-17
 type: research
-status: implementation-in-progress
+status: active
 ---
 
 # Windows filesystem and credential security contract
@@ -21,10 +21,14 @@ single-link refusal, flush/reopen validation, and exact-handle deletion. The
 participant identity integration deliberately refuses that adapter on a real
 Windows host. The current slice walks components with `NtCreateFile` relative
 to held parent directory handles and includes a same-directory replacement
-primitive, but the final destination check and replacement are not one atomic
-compare-and-swap operation. Native compilation, adversarial coverage, and that
-last replacement race remain open. This is an intentional fail-closed state,
-not a production Windows support claim.
+primitive reserved to qualification; no production selector calls it today.
+For cooperating writers, the reviewed per-capability `Local\` mutex holds the
+mutation lease over the full transaction in one interactive Windows session.
+That is not a hostile same-UID conditional-replacement/CAS guarantee, and the
+manager reports `crossSessionSafe: false`. Native Windows x64 physical and
+adversarial qualification, cross-session policy, protected-state and audit
+lifecycle, and authenticated binding/installer evidence remain open. This is
+an intentional fail-closed state, not a production Windows support claim.
 
 The native build now emits a content-free sidecar manifest containing the exact
 binary byte count, SHA-256, fixed contract/method set, native capability claims,
@@ -71,6 +75,18 @@ Windows implementation must satisfy all of the following on native Windows:
    user path, SID, credential, prompt, response, or raw account identifier in a
    diagnostic receipt.
 
+### Cooperating-writer scope
+
+`replaceFile` is a qualification-only primitive, not a production storage
+selection path. Its ordinary race behavior is meaningful only while cooperating
+writers retain the opaque, native per-capability mutation lease. The current
+lease uses a `Local\` named mutex and therefore covers one interactive Windows
+session, not every session for the same user. A process that deliberately
+bypasses that lease can alter a final name; that hostile same-UID boundary is
+outside the cooperation contract rather than a generic requirement for an
+unavailable compare-and-swap replacement API. It does not relax the remaining
+native physical/adversarial, signing/binding, audit, or cross-session gates.
+
 Primary Microsoft references:
 
 - [GetSecurityInfo](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo)
@@ -89,12 +105,16 @@ their surrounding lock, metadata, and lifecycle files have not yet passed the
 Windows filesystem contract. Native qualification may use disposable hosted
 runner entries; this does not enable production behavior.
 
-The mutation lease introduced for portable qualification is deliberately
-in-process, synchronous, and non-durable. It rejects forged lease objects and
-coordinates backend instances within one Node process, but it is not a
-production concurrency primitive. A named Win32 mutex or equivalent must span
-the full read/expected-check/write/readback transaction before any selector is
-enabled.
+The Windows qualification composition supplies an opaque native `Local\`
+named mutex to the operation lease. When composed, it spans the full
+read/expected-check/write/readback transaction for each mutation and serializes
+cooperating writers per capability within one interactive session. The
+JavaScript layer still rejects forged lease objects and supplies the
+same-process guard needed for recursive Win32-mutex ownership. This does not
+enable a production selector: the current manager reports
+`crossSessionSafe: false`, and the native filesystem, durable audit, binding,
+signing, installed-lifecycle, and physical qualification gates remain
+independent.
 
 The milestone probe is intentionally narrower than a production backend:
 

@@ -2,12 +2,13 @@ import { createCodexLogIngestion } from "./log-ingestion.js";
 import { createCodexLogParser } from "./log-parser.js";
 import { createCodexLogSources } from "./log-sources.js";
 
-export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v5";
+export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v9";
 
 const FILESYSTEM_METHODS = Object.freeze([
   "defaultCodexHome",
   "joinPath",
   "currentUid",
+  "readSelectedRolloutNames",
   "openDirectory",
   "statPath",
   "lstatPath",
@@ -50,6 +51,13 @@ function normalizePorts(options) {
   const filesystem = readPortOwner(options, "filesystem");
   const lineReader = readPortOwner(options, "lineReader");
   const normalizedFilesystem = {};
+  const compressedReader = {};
+  if (Object.hasOwn(lineReader ?? {}, "supportsCompressedRollouts")) {
+    for (const method of ["compressedRolloutHandle", "inspectCompressedRollout",
+      "readCompressedRolloutBytes", "supportsCompressedRollouts"]) {
+      compressedReader[method] = requireMethod(lineReader, "lineReader", method);
+    }
+  }
   for (const method of FILESYSTEM_METHODS) {
     normalizedFilesystem[method] = requireMethod(
       filesystem,
@@ -60,6 +68,7 @@ function normalizePorts(options) {
   return Object.freeze({
     filesystem: Object.freeze(normalizedFilesystem),
     lineReader: Object.freeze({
+      ...compressedReader,
       readBoundedUtf8Lines: requireMethod(
         lineReader,
         "lineReader",
@@ -80,7 +89,7 @@ export function createCodexLogScanner(options) {
   const { filesystem, lineReader } = normalizePorts(options);
 
   const sources = createCodexLogSources({ filesystem, lineReader });
-  const parser = createCodexLogParser({ lineReader });
+  const parser = createCodexLogParser({ lineReader, createSha256: filesystem.createSha256 });
   const scanCodexLogEvents = createCodexLogIngestion({
     parserVersion: CODEX_LOG_SCAN_VERSION,
     sources,
@@ -91,6 +100,7 @@ export function createCodexLogScanner(options) {
     readRolloutLineage: sources.readRolloutLineage,
     hasForkReplayPrefix: sources.hasForkReplayPrefix,
     discoverCodexRolloutInfos: sources.discoverCodexRolloutInfos,
+    codexRolloutDiscoveryReceipt: sources.codexRolloutDiscoveryReceipt,
     discoverCodexRollouts: sources.discoverCodexRollouts,
     summarizeCodexRolloutSources: sources.summarizeCodexRolloutSources,
     codexLogSourceFingerprint: sources.codexLogSourceFingerprint,
@@ -102,8 +112,10 @@ export function createCodexLogScanner(options) {
 export {
   canonicalComponentAvailability,
   canonicalComponents,
+  canonicalRateLimitSnapshot,
   canonicalRateLimitWindows,
   classifyToolCall,
+  codexSessionMetaIdentity,
   createLeadingRateLimitGate,
   createSnapshotLineage,
   cumulativeSnapshotKey,
@@ -115,7 +127,11 @@ export {
   tokenComponentPresence,
 } from "./log-normalization.js";
 
-export { CodexLogSourceChangedError } from "./log-sources.js";
+export {
+  CodexLogSourceChangedError,
+  codexRolloutDiscoveryReceipt,
+  parseCodexRolloutFilename,
+} from "./log-sources.js";
 export { classifySessionSurface } from "./surface-classification.js";
 export {
   isCodexSpeedMode,
@@ -123,3 +139,5 @@ export {
   unknownCodexTier,
   validateTierDeclaration,
 } from "./tier-normalization.js";
+
+export { createParser, digest, METHOD, MAX_STATE_BYTES } from './inference-timing.js';

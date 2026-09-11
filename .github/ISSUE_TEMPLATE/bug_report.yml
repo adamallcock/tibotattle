@@ -13,8 +13,8 @@ body:
     id: app-version
     attributes:
       label: App version
-      description: From the About panel or menu bar item (for example, v0.1.1).
-      placeholder: v0.1.1
+      description: From Settings → About or the menu bar item (for example, vX.Y.Z).
+      placeholder: vX.Y.Z
     validations:
       required: true
   - type: dropdown
@@ -49,8 +49,8 @@ body:
       label: Actual behavior
       description: |
         What happened instead. If relevant, include output from the built-in
-        diagnostics: `npm run diagnose:dashboard` (review it for anything
-        personal before pasting).
+        diagnostics: `npm run diagnose:dashboard` from a source checkout.
+        Review it and any screenshot for private data before sharing.
     validations:
       required: true
   - type: checkboxes

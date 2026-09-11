@@ -1,34 +1,62 @@
 import { canonicalJson } from "./canonical-json";
+import { readCommunityRefreshLane, recordCommunityRefreshLane,
+  type CommunityRefreshLanePin } from "./community-refresh-lanes";
 import {
+  COMMUNITY_ALLOWANCE_BASIS,
+  COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   collectCommunityAllowanceFits,
+  readCachedCommunityAllowanceFits,
   summarizeCommunityAllowanceDay,
-  summarizeCommunityCapacityByPlanType,
 } from "./community-allowance";
-import type { CommunityAllowanceFit } from "./community-allowance";
+import type { CommunityAllowanceFit, CommunityModelCacheReadBudget } from "./community-allowance";
+import { advanceCommunityPublication, readCapturedCommunityPublication,communityPublicationAuthoritySql,
+  type CapturedCommunityPublication } from "./community-publication";
+import { COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL, PREVIEW_CACHE_JSON_LIMIT_BYTES } from "./admin-community-allowance";
+import type { PublicAllowanceBreakdownsCacheRow } from "./public-allowance-breakdowns";
 import { sha256Hex } from "./crypto";
-import { V1_ANALYSIS_WINDOW_DAYS } from "./quota-analysis-v1";
+import {
+  DAILY_SPEND_CHUNKS_PER_PASS,
+  DAILY_SPEND_EVENTS_PER_PASS,
+  isCurrentCommunityDailySpend,
+  priceCommunityDailySpend,
+} from "./community-daily-spend";
+import type { DailySpendBudget } from "./community-daily-spend";
+import {
+  loadV1SourcePin,
+  V1_WINNER_FILTER_SQL,
+} from "./telemetry-v1-source-selection";
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 
+function driftReconcileToDay(nowMs: number): string {
+  return new Date(nowMs).toISOString().slice(0, 10);
+}
+
 /**
- * The lowest UTC day the drift reconciler still reconciles, given the analyzer's
- * trailing read horizon. Days that age past it RETIRE (keep their last published
- * value) rather than churn to a null block every pass: the v1 analyzer reads
- * only the trailing horizon, so recomputing a long-aged day would find no
- * in-window fits and republish it empty, erasing the historical series. Bounding
- * the enumeration to the SAME horizon keeps the reconciler and the analyzer in
- * lockstep. (No regression today — the band is still all-null — but this must
- * land with the windowed read before the series grows long.)
+ * The lowest UTC day whose complete trailing evidence window still fits inside
+ * the analyzer corpus. The analyzer exposes 100 days, while each point needs
+ * the preceding 30 days, so a methodology change may honestly rebuild the most
+ * recent 70 calendar days only. Older points retire with their last published
+ * value and the public read gate omits blocks on the superseded basis.
  */
 function driftReconcileFromDay(nowMs: number): string {
-  return new Date(nowMs - V1_ANALYSIS_WINDOW_DAYS * MILLISECONDS_PER_DAY)
+  const todayStartMs = Date.parse(
+    `${driftReconcileToDay(nowMs)}T00:00:00.000Z`,
+  );
+  return new Date(
+    todayStartMs
+      - (COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS - 1) * MILLISECONDS_PER_DAY,
+  )
     .toISOString()
     .slice(0, 10);
 }
 
 /**
- * Day-partitioned community aggregates for telemetry-contribution-v1.0
- * (docs/design/2026-08-07-incremental-contribution-model.md, section 4).
+ * Day-partitioned community aggregates for telemetry-contribution-v1.0.
+ * Maintained publication and operational boundaries live in
+ * docs/reference/api-surface.md and
+ * docs/runbooks/2026-08-13-community-allowance-band-diagnosis.md.
  *
  * This deliberately reuses the revisioned pattern migration 0012 established
  * for weekly snapshots — published revisions are immutable rows, recomputation
@@ -40,6 +68,13 @@ function driftReconcileFromDay(nowMs: number): string {
 export const COMMUNITY_DAILY_POLICY_VERSION = "community-daily-v1.0";
 const DAILY_AGGREGATE_SCHEMA_VERSION = "community-daily-aggregate-v1.0";
 const MAX_DAILY_AGGREGATE_CELLS = 100;
+
+function publicDailySourceScope(day: string): { day: string; ownerKind: "social" } {
+  // The scope is part of the source pin fingerprint. This filter must apply
+  // before the bounded source-journal read so private accountless volume can
+  // never exhaust the public day's chunk budget.
+  return { day, ownerKind: "social" };
+}
 
 interface DailyRebuildRow {
   day: string;
@@ -81,15 +116,45 @@ interface DailyCellRow {
  * (participant deletion) invalidates the cache and the next build recollects
  * against the surviving corpus.
  */
-type AllowanceFitsForEpoch = (epoch: number) => Promise<CommunityAllowanceFit[]>;
+type PublicationIdentity = Pick<CapturedCommunityPublication,"generation"|"sourceEpoch"|"hardEpoch">;
+type AllowanceFitsForEpoch = ((epoch: number) => Promise<CommunityAllowanceFit[] | null>) & {
+  captured?: PublicationIdentity;
+};
+
+export interface CommunityDailyCacheRecovery {
+  /** Activity-only admits new/unpublished days and retains their rebuild journal. */
+  mode: "cache-only" | "activity-only";
+  /** Conservative phase allocation; the root separately meters actual D1 statements. */
+  budget: CommunityModelCacheReadBudget;
+}
 
 function memoizedAllowanceFits(
   db: D1Database,
   nowMs: number,
+  recovery?: CommunityDailyCacheRecovery,
+  initial?: { epoch: number; fits: CommunityAllowanceFit[];captured?:PublicationIdentity },
 ): AllowanceFitsForEpoch {
-  let cached: { epoch: number; fits: CommunityAllowanceFit[] } | null = null;
+  if(initial?.captured) {
+    // Captured allowance inputs are independent of the raw activity epoch.
+    // Every downstream publication statement includes this generation's hard
+    // authority fence, so a later withdrawal cannot reuse these fits.
+    const read:AllowanceFitsForEpoch=async()=>initial.fits;
+    read.captured=initial.captured;return read;
+  }
+  let cached: { epoch: number; fits: CommunityAllowanceFit[] } | null = initial ?? null;
   return async (epoch: number) => {
     if (cached === null || cached.epoch !== epoch) {
+      if (recovery) {
+        // One complete cohort per recovery pass. A later source change defers
+        // the remaining days instead of restarting analysis or mixing epochs.
+        if (cached !== null) return null;
+        const fits = await readCachedCommunityAllowanceFits(db, nowMs, { budget: recovery.budget });
+        const current = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1")
+          .first<{ mutation_epoch: number }>();
+        if (fits === null || current?.mutation_epoch !== epoch) return null;
+        cached = { epoch, fits };
+        return fits;
+      }
       // The analyzer's trailing read horizon is anchored to this pass's
       // scheduled time, so the reconciler and the day builds it feeds share one
       // horizon.
@@ -119,7 +184,8 @@ async function enqueueCommunityAllowanceDriftRebuilds(
   db: D1Database,
   allowanceFitsForEpoch: AllowanceFitsForEpoch,
   nowMs: number,
-): Promise<void> {
+  cacheOnly = false,
+): Promise<boolean> {
   const epochRow = await db.prepare(
     `SELECT mutation_epoch FROM community_snapshot_mutation_control
       WHERE singleton_id = 1`,
@@ -129,21 +195,30 @@ async function enqueueCommunityAllowanceDriftRebuilds(
     throw new Error("community daily aggregate mutation control unavailable");
   }
   const fits = await allowanceFitsForEpoch(reconcileEpoch);
+  if (fits === null) return false;
   // Reconcile only days inside the analyzer's trailing read horizon; aged days
   // keep their last published value instead of churning to a null block.
   const reconcileFromDay = driftReconcileFromDay(nowMs);
+  const reconcileToDay = driftReconcileToDay(nowMs);
   const published = await db.prepare(
-    `SELECT a.day, a.payload_json
+    `SELECT a.day, ${cacheOnly ? "CASE WHEN length(CAST(a.payload_json AS BLOB)) <= 262144 THEN a.payload_json ELSE NULL END" : "a.payload_json"} AS payload_json
        FROM community_daily_aggregates a
        JOIN (
          SELECT day, MAX(revision) AS revision
            FROM community_daily_aggregates
-          WHERE release_state = 'published' AND day >= ?1
+          WHERE release_state = 'published'
+            AND day >= ?1 AND day <= ?2
           GROUP BY day
        ) latest ON latest.day = a.day AND latest.revision = a.revision
-      WHERE a.release_state = 'published' AND a.day >= ?1
-      ORDER BY a.day ASC`,
-  ).bind(reconcileFromDay).all<{ day: string; payload_json: string }>();
+      WHERE a.release_state = 'published'
+        AND a.day >= ?1 AND a.day <= ?2
+      ORDER BY a.day ASC ${cacheOnly ? "LIMIT 71" : ""}`,
+  ).bind(reconcileFromDay, reconcileToDay).all<{
+    day: string;
+    payload_json: string | null;
+  }>();
+  if (cacheOnly && (published.results.length > COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS
+      || published.results.some(row => row.payload_json === null))) return false;
   const drifted: string[] = [];
   for (const row of published.results) {
     const expected = canonicalJson(
@@ -151,7 +226,7 @@ async function enqueueCommunityAllowanceDriftRebuilds(
     );
     let current: string | null = null;
     try {
-      const payload = JSON.parse(row.payload_json) as { allowance?: unknown };
+      const payload = JSON.parse(row.payload_json!) as { allowance?: unknown };
       if (payload.allowance !== undefined) {
         current = canonicalJson(payload.allowance);
       }
@@ -160,73 +235,108 @@ async function enqueueCommunityAllowanceDriftRebuilds(
     }
     if (current !== expected) drifted.push(row.day);
   }
+  const publicationState = published.results.length > 0
+      && drifted.length === 0
+    ? "ready"
+    : "updating";
+  // This singleton is the only global cutover evidence public requests read.
+  // The WHERE clause avoids rewriting it every hour: it changes only with the
+  // state, basis, or UTC safe window (normally once per day when settled).
+  const captured=allowanceFitsForEpoch.captured;
+  const capturedValues=captured?[captured.generation,captured.sourceEpoch,captured.hardEpoch,COMMUNITY_ATTRIBUTION_METHOD_VERSION]:[];
+  await db.prepare(
+    `INSERT INTO community_allowance_publication_state (
+       singleton, publication_state, expected_basis,
+       safe_from_day, safe_to_day, changed_at, attribution_method_version
+     ) SELECT 1, ?1, ?2, ?3, ?4, ?5, ?7
+       WHERE ${captured?communityPublicationAuthoritySql(8):`EXISTS (
+         SELECT 1 FROM community_snapshot_mutation_control
+          WHERE singleton_id = 1 AND mutation_epoch = ?6
+       )`}
+     ON CONFLICT(singleton) DO UPDATE SET
+       publication_state = excluded.publication_state,
+       expected_basis = excluded.expected_basis,
+       safe_from_day = excluded.safe_from_day,
+       safe_to_day = excluded.safe_to_day,
+       changed_at = excluded.changed_at,
+       attribution_method_version = excluded.attribution_method_version
+     WHERE community_allowance_publication_state.publication_state
+             <> excluded.publication_state
+        OR community_allowance_publication_state.expected_basis
+             <> excluded.expected_basis
+        OR community_allowance_publication_state.safe_from_day
+             <> excluded.safe_from_day
+        OR community_allowance_publication_state.safe_to_day
+             <> excluded.safe_to_day
+        OR community_allowance_publication_state.attribution_method_version
+             IS NOT excluded.attribution_method_version`,
+  ).bind(
+    publicationState,
+    COMMUNITY_ALLOWANCE_BASIS,
+    reconcileFromDay,
+    reconcileToDay,
+    new Date(nowMs).toISOString(),
+    reconcileEpoch,
+    COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+    ...capturedValues,
+  ).run();
   for (const day of drifted) {
     await db.prepare(
       `INSERT INTO community_daily_aggregate_rebuilds (
         day, requested_epoch, requested_at
-      ) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      ) SELECT ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE ${captured?communityPublicationAuthoritySql(3):`EXISTS (SELECT 1 FROM community_snapshot_mutation_control
+          WHERE singleton_id = 1 AND mutation_epoch = ?2)`}
       ON CONFLICT(day) DO UPDATE SET
         requested_epoch = excluded.requested_epoch,
-        requested_at = excluded.requested_at`,
-    ).bind(day, reconcileEpoch).run();
+        requested_at = excluded.requested_at
+      WHERE community_daily_aggregate_rebuilds.requested_epoch<=excluded.requested_epoch`,
+    ).bind(day, reconcileEpoch,...capturedValues).run();
   }
+  return true;
 }
 
-/**
- * Cross-device dedupe: for one participant and one day, count that day's
- * records exactly once.
- *
- * Sync state and chunk supersession are per-(participant, device), so a
- * participant whose device credential is irrecoverably lost re-pairs a fresh
- * device that reads an empty per-device cursor and re-uploads its entire
- * history — while the lost device's chunks stay current forever. Devices are
- * an upload transport, not a data partition: two devices of one participant
- * observe the SAME underlying local index, so summing records across devices
- * would double-count every overlapping day. The honest general rule applied
- * here: per (participant, day), aggregate only the records of the winning
- * device — the device whose current chunks holding records for that day have
- * the newest created_at (freshest evidence wins, across all streams), with a
- * deterministic tiebreak on the larger device_id. Records only ever belong
- * to current chunks (supersession deletes the superseded revision's records
- * in the same transaction), so joining records to their owning chunk is the
- * exact current-evidence set. The rule is self-healing and direction-free: a
- * newer upload by ANY device of the participant flips the winner at the next
- * rebuild, and a single-device participant is always its own winner, leaving
- * single-device aggregation unchanged.
- */
-const WINNING_DEVICE_CTE = `
-  WITH day_device_evidence AS (
-    SELECT r.participant_id AS participant_id,
-           r.device_id AS device_id,
-           MAX(c.created_at) AS newest_chunk_created_at
-      FROM telemetry_v1_records r
-      JOIN telemetry_v1_chunks c ON c.id = r.chunk_row_id
-     WHERE r.observed_day = ?
-     GROUP BY r.participant_id, r.device_id
-  ),
-  winning_devices AS (
-    SELECT participant_id, device_id
-      FROM day_device_evidence winner
-     WHERE NOT EXISTS (
-       SELECT 1 FROM day_device_evidence rival
-        WHERE rival.participant_id = winner.participant_id
-          AND (
-            rival.newest_chunk_created_at > winner.newest_chunk_created_at
-            OR (
-              rival.newest_chunk_created_at = winner.newest_chunk_created_at
-              AND rival.device_id > winner.device_id
-            )
-          )
-     )
-  )`;
+/** Additive price-cache backfill covers the displayed year, not fit lookback. */
+async function readCommunitySpendDriftDays(
+  db: D1Database, nowMs: number,
+): Promise<Set<string>> {
+  const to = driftReconcileToDay(nowMs);
+  const from = new Date(Date.parse(`${to}T00:00:00.000Z`) - 365 * MILLISECONDS_PER_DAY)
+    .toISOString().slice(0, 10);
+  const published = await db.prepare(`SELECT a.day,
+      CASE WHEN json_valid(a.payload_json)
+        THEN json_extract(a.payload_json, '$.apiEquivalentSpend') ELSE NULL END AS spend_json,
+      CASE WHEN json_valid(a.payload_json)
+        THEN json_extract(a.payload_json, '$.totals.usageEvents') ELSE NULL END AS usage_events
+    FROM community_daily_aggregates a JOIN (
+      SELECT day, MAX(revision) AS revision FROM community_daily_aggregates
+      WHERE release_state = 'published' AND day >= ?1 AND day <= ?2 GROUP BY day
+    ) latest ON latest.day = a.day AND latest.revision = a.revision
+    WHERE a.release_state = 'published' ORDER BY a.day LIMIT 366`)
+    .bind(from, to).all<{ day: string; spend_json: string | null; usage_events: number | null }>();
+  const drifted = new Set<string>();
+  for (const row of published.results) {
+    let spend: unknown;
+    try { spend = row.spend_json === null ? undefined : JSON.parse(row.spend_json); } catch { spend = undefined; }
+    if (!isCurrentCommunityDailySpend(spend) || spend.usageEvents !== row.usage_events) drifted.add(row.day);
+  }
+  // Missing/stale price blocks themselves are the convergent backfill journal.
+  // Do not mix synthetic requests with source-correction requests: preserving
+  // an aged allowance is valid only for a positively price-only rebuild.
+  return drifted;
+}
 
 async function buildCommunityDailyAggregate(
   db: D1Database,
-  rebuild: DailyRebuildRow,
+  rebuild: DailyRebuildRow | { day: string },
   scheduledTime: number,
   allowanceFitsForEpoch: AllowanceFitsForEpoch,
-): Promise<{ state: "built" | "conflicted"; aggregateId: string }> {
+  spendBudget: DailySpendBudget,
+  cacheOnly = false,
+  activityOnly = false,
+): Promise<{ state: "built" | "conflicted" | "deferred"; aggregateId: string }> {
   const { day } = rebuild;
+  const priceBackfill = !("requested_at" in rebuild);
   // Bind the build to the mutation epoch it read its sources under, exactly
   // as the weekly builder does: a participant deletion bumps the epoch (0012
   // trigger), so a build racing a deletion cannot publish the deleted data —
@@ -239,14 +349,23 @@ async function buildCommunityDailyAggregate(
   if (!Number.isSafeInteger(buildEpoch) || buildEpoch < 0) {
     throw new Error("community daily aggregate mutation control unavailable");
   }
+  if (activityOnly && await db.prepare(`SELECT 1 AS published FROM community_daily_aggregates
+      WHERE day = ? AND release_state = 'published' LIMIT 1`).bind(day).first()) {
+    return { state: "deferred", aggregateId: "" };
+  }
+  const cachedFits = cacheOnly ? await allowanceFitsForEpoch(buildEpoch) : undefined;
+  if (cachedFits === null) return { state: "deferred", aggregateId: "" };
+  // Resolve once for BOTH totals and cells. This is the same analytical-stream
+  // winner policy as calibration, with explicit session-only fallback.
+  const sourceScope = publicDailySourceScope(day);
+  const sourcePin = await loadV1SourcePin(db, sourceScope);
   const [totals, cells, revisionRow] = await Promise.all([
     // contributing_devices deliberately counts only winning devices — the
     // devices whose records the published numbers actually include (one per
     // participant per day). A losing transport duplicate is not a
     // contribution.
     db.prepare(
-      `${WINNING_DEVICE_CTE}
-      SELECT
+      `SELECT
         COUNT(DISTINCT r.participant_id) AS contributing_participants,
         COUNT(DISTINCT r.participant_id || ':' || r.device_id)
           AS contributing_devices,
@@ -267,16 +386,13 @@ async function buildCommunityDailyAggregate(
           COALESCE(r.output_text_tokens, 0)
             + COALESCE(r.output_reasoning_tokens, 0))), 0)
           AS output_combined_tokens
-       FROM telemetry_v1_records r
-       JOIN winning_devices w
-         ON w.participant_id = r.participant_id
-        AND w.device_id = r.device_id
+       FROM telemetry_analytical_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-       WHERE r.observed_day = ?`,
-    ).bind(day, day).first<DailyTotalsRow>(),
+         AND p.owner_kind = 'social'
+       WHERE ${V1_WINNER_FILTER_SQL} AND r.observed_day = ?`,
+    ).bind(sourcePin.winnersJson, day).first<DailyTotalsRow>(),
     db.prepare(
-      `${WINNING_DEVICE_CTE}
-      SELECT r.provider, r.model_id,
+      `SELECT r.provider, r.model_id,
         COUNT(*) AS usage_events,
         COALESCE(SUM(r.input_uncached_tokens), 0) AS input_uncached_tokens,
         COALESCE(SUM(r.input_cache_read_tokens), 0)
@@ -290,20 +406,20 @@ async function buildCommunityDailyAggregate(
           COALESCE(r.output_text_tokens, 0)
             + COALESCE(r.output_reasoning_tokens, 0))), 0)
           AS output_combined_tokens
-       FROM telemetry_v1_records r
-       JOIN winning_devices w
-         ON w.participant_id = r.participant_id
-        AND w.device_id = r.device_id
+       FROM telemetry_analytical_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-       WHERE r.observed_day = ? AND r.stream = 'usage'
+         AND p.owner_kind = 'social'
+       WHERE ${V1_WINNER_FILTER_SQL} AND r.observed_day = ? AND r.stream = 'usage'
        GROUP BY r.provider, r.model_id
        ORDER BY r.provider, r.model_id
        LIMIT ?`,
-    ).bind(day, day, MAX_DAILY_AGGREGATE_CELLS + 1).all<DailyCellRow>(),
+    ).bind(sourcePin.winnersJson, day, MAX_DAILY_AGGREGATE_CELLS + 1).all<DailyCellRow>(),
     db.prepare(
-      `SELECT COALESCE(MAX(revision), 0) + 1 AS revision
-         FROM community_daily_aggregates WHERE day = ?`,
-    ).bind(day).first<{ revision: number }>(),
+      `SELECT COALESCE(MAX(revision), 0) + 1 AS revision,
+         (SELECT payload_json FROM community_daily_aggregates
+           WHERE day = ?1 AND release_state = 'published' ORDER BY revision DESC LIMIT 1) AS previous_payload_json
+         FROM community_daily_aggregates WHERE day = ?1`,
+    ).bind(day).first<{ revision: number; previous_payload_json: string | null }>(),
   ]);
   const revision = Number(revisionRow?.revision ?? 1);
   if (!Number.isSafeInteger(revision) || revision < 1) {
@@ -312,14 +428,21 @@ async function buildCommunityDailyAggregate(
   // The allowance block is additive on schema v1.0: the site normalizer
   // treats a missing or invalid block as per-day-absent, so older published
   // revisions without it stay renderable and old clients ignore it entirely.
-  const fits = await allowanceFitsForEpoch(buildEpoch);
-  const allowance = summarizeCommunityAllowanceDay(fits, day);
-  // Additive per-plan_type capacity monitor: median observed capacity per plan
-  // over the same window, so the pro:prolite:plus ratios can be watched against
-  // the stated multipliers (pro = 20x, prolite = 5x). Rides the same fits and
-  // the same drift rebuild; read-side observability only, never gates the band.
-  const capacityByPlanType = summarizeCommunityCapacityByPlanType(fits, day);
   const aggregateId = `community-daily:${day}:r${revision}`;
+  const spendResult = await priceCommunityDailySpend(
+    db, day, sourcePin.winnersJson, Number(totals?.usage_events ?? 0), spendBudget,
+  );
+  if (spendResult.state !== "priced") return { state: spendResult.state, aggregateId };
+  const fits = activityOnly ? null : cachedFits ?? await allowanceFitsForEpoch(buildEpoch);
+  if (!activityOnly && fits === null) return { state: "deferred", aggregateId };
+  let allowance = fits === null ? undefined : summarizeCommunityAllowanceDay(fits, day);
+  if (priceBackfill && day < driftReconcileFromDay(scheduledTime) && revisionRow?.previous_payload_json) {
+    // A price-only backfill must not erase a historical estimate whose full
+    // trailing fit corpus is no longer reconstructable. Its original basis is
+    // retained; the existing public allowance gate still decides eligibility.
+    const previous = JSON.parse(revisionRow.previous_payload_json) as { allowance?: typeof allowance };
+    if (previous.allowance !== undefined) allowance = previous.allowance;
+  }
   const releasedAt = new Date(scheduledTime).toISOString();
   const cellRows = cells.results.slice(0, MAX_DAILY_AGGREGATE_CELLS);
   const payload = {
@@ -337,8 +460,8 @@ async function buildCommunityDailyAggregate(
     // Aggregate dollar-equivalent estimates and participant counts are
     // explicitly owner-approved for publication; no per-account identifier
     // exists anywhere in this block.
-    allowance,
-    capacityByPlanType,
+    ...(allowance === undefined ? {} : { allowance }),
+    apiEquivalentSpend: spendResult.spend,
     totals: {
       contributingParticipants: Number(totals?.contributing_participants ?? 0),
       contributingDevices: Number(totals?.contributing_devices ?? 0),
@@ -367,6 +490,9 @@ async function buildCommunityDailyAggregate(
   };
   const payloadJson = canonicalJson(payload);
   const payloadHash = await sha256Hex(payloadJson);
+  if ((await loadV1SourcePin(db, sourceScope)).fingerprint !== sourcePin.fingerprint) {
+    return { state: "conflicted", aggregateId };
+  }
   const results = await db.batch([
     // The finalization predicate mirrors the weekly builder's: the build is
     // cancelled outright when the mutation epoch moved after its source
@@ -384,7 +510,14 @@ async function buildCommunityDailyAggregate(
       AND EXISTS (
         SELECT 1 FROM community_snapshot_mutation_control
          WHERE singleton_id = 1 AND mutation_epoch = ?
-      )`,
+      )
+      AND (? = 0 OR (
+        NOT EXISTS (SELECT 1 FROM community_daily_aggregate_rebuilds WHERE day = ?)
+        AND EXISTS (SELECT 1 FROM community_daily_aggregates WHERE day = ? AND release_state = 'published')
+      ))
+      AND (? = 0 OR NOT EXISTS (SELECT 1 FROM community_daily_aggregates
+        WHERE day = ? AND release_state = 'published'))
+      AND ${allowanceFitsForEpoch.captured?communityPublicationAuthoritySql(17):"1"}`,
     ).bind(
       aggregateId,
       day,
@@ -397,12 +530,21 @@ async function buildCommunityDailyAggregate(
       day,
       revision,
       buildEpoch,
+      priceBackfill ? 1 : 0,
+      day,
+      day,
+      activityOnly ? 1 : 0,
+      day,
+      ...(allowanceFitsForEpoch.captured?[allowanceFitsForEpoch.captured.generation,
+        allowanceFitsForEpoch.captured.sourceEpoch,allowanceFitsForEpoch.captured.hardEpoch,COMMUNITY_ATTRIBUTION_METHOD_VERSION]:[]),
     ),
     // Clear exactly the request this build answered, and only when this
     // build's revision actually published. A cancelled build leaves the row
     // queued for the next pass; a concurrent arrival upserts a fresh
     // requested_at and the delete no-ops — convergent, never lossy.
-    db.prepare(
+    // Activity-only recovery deliberately retains the request: it is the
+    // durable allowance-rehydration journal once the whole fit cohort is ready.
+    ...(!activityOnly && "requested_at" in rebuild ? [db.prepare(
       `DELETE FROM community_daily_aggregate_rebuilds
         WHERE day = ? AND requested_at = ? AND requested_epoch = ?
           AND EXISTS (
@@ -417,7 +559,7 @@ async function buildCommunityDailyAggregate(
       day,
       revision,
       buildEpoch,
-    ),
+    )] : []),
   ]);
   if (results[0]?.meta.changes === 1) {
     return { state: "built", aggregateId };
@@ -429,41 +571,136 @@ export async function rebuildPendingCommunityDailyAggregates(
   db: D1Database,
   scheduledTime: number,
   maximumRebuilds = 24,
-): Promise<{ processed: number; remaining: boolean; aggregateIds: string[] }> {
+  spendLimits: { chunks?: number; events?: number } = {},
+  recovery?: CommunityDailyCacheRecovery,
+): Promise<{ processed: number; remaining: boolean; aggregateIds: string[]; deferred?: true }> {
   if (!Number.isFinite(scheduledTime)
       || !Number.isSafeInteger(maximumRebuilds)
       || maximumRebuilds < 1
       || maximumRebuilds > 48) {
     throw new Error("invalid community daily aggregate rebuild request");
   }
-  const allowanceFitsForEpoch = memoizedAllowanceFits(db, scheduledTime);
+  const spendBudget: DailySpendBudget = {
+    remainingChunks: spendLimits.chunks ?? DAILY_SPEND_CHUNKS_PER_PASS,
+    remainingEvents: spendLimits.events ?? DAILY_SPEND_EVENTS_PER_PASS,
+  };
+  if (!Number.isSafeInteger(spendBudget.remainingChunks) || spendBudget.remainingChunks < 0
+      || spendBudget.remainingChunks > DAILY_SPEND_CHUNKS_PER_PASS
+      || !Number.isSafeInteger(spendBudget.remainingEvents) || spendBudget.remainingEvents < 0
+      || spendBudget.remainingEvents > DAILY_SPEND_EVENTS_PER_PASS) {
+    throw new Error("invalid community daily spend budget");
+  }
+  const deferred = { processed: 0, remaining: true, aggregateIds: [], deferred: true } as const;
+  const activityOnly = recovery?.mode === "activity-only";
+  let lane: CommunityRefreshLanePin | undefined;
+  let initialFits: { epoch: number; fits: CommunityAllowanceFit[];captured?:PublicationIdentity } | undefined;
+  if (recovery) {
+    const budget = recovery.budget;
+    const now = (budget.now ?? Date.now)();
+    const reserve = budget.reserveQueries ?? 0;
+    if (!["cache-only", "activity-only"].includes(recovery.mode) || !Number.isSafeInteger(budget.remainingQueries)
+        || !Number.isSafeInteger(reserve) || reserve < 0 || !Number.isFinite(now)
+        || !Number.isFinite(budget.deadlineMs) || now >= budget.deadlineMs) return { ...deferred, aggregateIds: [] };
+    if (!activityOnly) {
+      if (budget.remainingQueries - reserve < 2) return { ...deferred, aggregateIds: [] };
+      budget.remainingQueries -= 2; // Metadata lookup and final fenced receipt.
+      lane = await readCommunityRefreshLane(db, "daily", scheduledTime);
+      if (lane.current) return { processed: 0, remaining: false, aggregateIds: [] };
+    }
+    const fixedQueries = activityOnly ? 2 : 77;
+    if (!activityOnly) {
+      // Read the COMPLETE captured cohort in bounded multi-account pages before
+      // allocating optional days/chunks. Ordinary newer inputs queue the next
+      // generation; the immutable selected fits need no per-account raw reads.
+      // Keep only the fixed publication work and one day in reserve while the
+      // cache reader charges its actual queries. Its final generation/hard
+      // fence replaces the old whole-corpus global quiet-period requirement.
+      const minimumPublicationQueries = fixedQueries + 12;
+      if (budget.remainingQueries - reserve < minimumPublicationQueries) return { ...deferred, aggregateIds: [] };
+      const originalReserve = budget.reserveQueries;
+      budget.reserveQueries = reserve + minimumPublicationQueries;
+      try {
+        let captured = await readCapturedCommunityPublication(db,scheduledTime,{budget});
+        if (!captured) {
+          if ((await advanceCommunityPublication(db,scheduledTime,{budget})).status !== "ready") return { ...deferred, aggregateIds: [] };
+          captured = await readCapturedCommunityPublication(db,scheduledTime,{budget});
+        }
+        if (!captured) return { ...deferred, aggregateIds: [] };
+        initialFits = { epoch: captured.sourceEpoch, fits: [...captured.corpus.fits],captured };
+      } catch {
+        return { ...deferred, aggregateIds: [] };
+      } finally {
+        if (originalReserve === undefined) delete budget.reserveQueries;
+        else budget.reserveQueries = originalReserve;
+      }
+    }
+    // Size optional work only after cache acquisition. Unfinished days and
+    // chunks remain queued; this changes work per pass, never fit admission.
+    const available = budget.remainingQueries - reserve;
+    maximumRebuilds = Math.min(maximumRebuilds, Math.floor((available - fixedQueries) / 12));
+    if (maximumRebuilds < 1) return { ...deferred, aggregateIds: [] };
+    spendBudget.remainingChunks = Math.min(spendBudget.remainingChunks,
+      Math.max(0, available - fixedQueries - maximumRebuilds * 12) * 8);
+    budget.remainingQueries -= fixedQueries + maximumRebuilds * 12 + Math.ceil(spendBudget.remainingChunks / 8);
+  }
+  const allowanceFitsForEpoch = memoizedAllowanceFits(db, scheduledTime, recovery, initialFits);
   // Reconcile before draining, so days a late v0.2 contribution drifted are
   // enqueued in time for this same pass to rebuild them.
-  await enqueueCommunityAllowanceDriftRebuilds(
-    db, allowanceFitsForEpoch, scheduledTime,
-  );
+  try {
+    if (!activityOnly && !await enqueueCommunityAllowanceDriftRebuilds(
+      db, allowanceFitsForEpoch, scheduledTime, Boolean(recovery),
+    )) return { ...deferred, aggregateIds: [] };
+  } catch (error) {
+    if (recovery) return { ...deferred, aggregateIds: [] };
+    throw error;
+  }
+  const priceBackfills = activityOnly ? new Set<string>() : await readCommunitySpendDriftDays(db, scheduledTime);
   const rows = await db.prepare(
     `SELECT day, requested_epoch, requested_at
        FROM community_daily_aggregate_rebuilds
+       ${activityOnly ? "WHERE NOT EXISTS (SELECT 1 FROM community_daily_aggregates a WHERE a.day = community_daily_aggregate_rebuilds.day AND a.release_state = 'published')" : ""}
       ORDER BY day ASC
       LIMIT ?`,
   ).bind(maximumRebuilds + 1).all<DailyRebuildRow>();
   const aggregateIds: string[] = [];
   let processed = 0;
+  let deferredWork = false;
   for (const row of rows.results.slice(0, maximumRebuilds)) {
     const result = await buildCommunityDailyAggregate(
       db,
       row,
       scheduledTime,
       allowanceFitsForEpoch,
+      spendBudget,
+      Boolean(recovery) && !activityOnly,
+      activityOnly,
     );
-    processed += 1;
-    aggregateIds.push(result.aggregateId);
+    if (result.state === "deferred") deferredWork = true;
+    if (result.state !== "deferred") {
+      processed += 1;
+      aggregateIds.push(result.aggregateId);
+    }
+    if (result.state === "built") priceBackfills.delete(row.day);
+  }
+  // A real source journal always has priority. A concurrently queued correction
+  // also fences the price-only INSERT itself, so it cannot inherit old fits.
+  const queuedDays = new Set(rows.results.map(row => row.day));
+  for (const day of [...priceBackfills].filter(day => !queuedDays.has(day)).slice(0, maximumRebuilds - processed)) {
+    const result = await buildCommunityDailyAggregate(db, { day }, scheduledTime, allowanceFitsForEpoch, spendBudget, Boolean(recovery));
+    if (result.state === "deferred") deferredWork = true;
+    if (result.state !== "deferred") {
+      processed += 1;
+      aggregateIds.push(result.aggregateId);
+    }
+    if (result.state === "built") priceBackfills.delete(day);
   }
   const pending = await db.prepare(
     "SELECT 1 AS pending FROM community_daily_aggregate_rebuilds LIMIT 1",
   ).first<{ pending: number }>();
-  return { processed, remaining: Boolean(pending), aggregateIds };
+  if (lane) await recordCommunityRefreshLane(db, lane,
+    !pending && priceBackfills.size === 0 && !deferredWork, scheduledTime);
+  return { processed, remaining: Boolean(pending) || priceBackfills.size > 0, aggregateIds,
+    ...(recovery && deferredWork ? { deferred: true as const } : {}) };
 }
 
 export interface LatestCommunityDailyAggregateRow {
@@ -492,6 +729,145 @@ export interface PublishedCommunityDailyAggregateRow {
   revision: number;
   payload_json: string;
   released_at: string;
+}
+
+export interface CommunityAllowancePublicationStateRow {
+  publication_state: "updating" | "ready";
+  expected_basis: string;
+  attribution_method_version: string | null;
+  safe_from_day: string;
+  safe_to_day: string;
+}
+
+/** Shared by the public payload and operator gauges; old publication is not
+ * current merely because an immutable daily row still says 'published'. */
+export function isCurrentCommunityAllowancePublication(
+  state: CommunityAllowancePublicationStateRow | null | undefined,
+  nowMs: number,
+): boolean {
+  return Number.isFinite(nowMs) && state?.publication_state === "ready"
+    && state.expected_basis === COMMUNITY_ALLOWANCE_BASIS
+    && state.attribution_method_version === COMMUNITY_ATTRIBUTION_METHOD_VERSION
+    && state.safe_from_day === driftReconcileFromDay(nowMs)
+    && state.safe_to_day === driftReconcileToDay(nowMs);
+}
+
+export interface PublishedCommunityDailyRead {
+  rows: PublishedCommunityDailyAggregateRow[];
+  allowancePublicationState: CommunityAllowancePublicationStateRow | null;
+  allowanceBreakdownsCache: PublicAllowanceBreakdownsCacheRow | null;
+  allowanceReadState: "confirmed" | "temporarily_unavailable";
+}
+
+interface PublishedCommunityDailyQueryRow {
+  day: string | null;
+  revision: number | null;
+  payload_json: string | null;
+  released_at: string | null;
+  publication_state: "updating" | "ready" | null;
+  expected_basis: string | null;
+  attribution_method_version: string | null;
+  safe_from_day: string | null;
+  safe_to_day: string | null;
+}
+
+/**
+ * One atomic read-only batch keeps requested publication, readiness, and preview
+ * source epoch on the same snapshot. The bounded preview is read once, not
+ * joined and repeated for every daily row. A sentinel LEFT JOIN preserves
+ * activity when readiness is absent; callers fail allowance closed as updating.
+ */
+export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
+  db: D1Database,
+  fromDay: string,
+  toDay: string,
+): Promise<PublishedCommunityDailyRead> {
+  const dailyStatement = db.prepare(
+    `WITH latest AS (
+       SELECT day, MAX(revision) AS revision
+         FROM community_daily_aggregates
+        WHERE day >= ?1 AND day <= ?2 AND release_state = 'published'
+        GROUP BY day
+     ),
+     requested AS (
+       SELECT a.day, a.revision, a.payload_json, a.released_at
+         FROM community_daily_aggregates a
+         JOIN latest
+           ON latest.day = a.day AND latest.revision = a.revision
+        WHERE a.release_state = 'published'
+     )
+     SELECT requested.day,
+            requested.revision,
+            requested.payload_json,
+            requested.released_at,
+            state.publication_state,
+            state.expected_basis,
+            state.attribution_method_version,
+            state.safe_from_day,
+            state.safe_to_day
+       FROM (SELECT 1 AS singleton) gate
+       LEFT JOIN community_allowance_publication_state state
+         ON state.singleton = gate.singleton
+       LEFT JOIN requested ON 1 = 1
+      ORDER BY requested.day ASC`,
+  ).bind(fromDay, toDay);
+  let queryRows: PublishedCommunityDailyQueryRow[];
+  let allowanceBreakdownsCache: PublicAllowanceBreakdownsCacheRow | null = null;
+  let allowanceReadState: PublishedCommunityDailyRead["allowanceReadState"] = "confirmed";
+  try {
+    const previewStatement = db.prepare(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL)
+      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION);
+    const results = await db.batch<PublishedCommunityDailyQueryRow | PublicAllowanceBreakdownsCacheRow>([
+      dailyStatement,
+      previewStatement,
+    ]);
+    queryRows = (results[0]?.results ?? []).filter(
+      (row): row is PublishedCommunityDailyQueryRow => "publication_state" in row,
+    );
+    const cache = results[1]?.results[0];
+    if (cache && "generated_at" in cache
+        && typeof cache.generated_at === "string"
+        && typeof cache.payload_json === "string") {
+      allowanceBreakdownsCache = {
+        generated_at: cache.generated_at,
+        payload_json: cache.payload_json,
+      };
+    }
+  } catch {
+    // An unavailable optional cache/schema cannot hide existing activity. This
+    // fallback has no preview, so it cannot combine rows from different epochs.
+    // An unavailable daily store still fails normally; no source work is tried.
+    allowanceReadState = "temporarily_unavailable";
+    queryRows = (await dailyStatement.all<PublishedCommunityDailyQueryRow>()).results;
+  }
+  const first = queryRows[0];
+  const allowancePublicationState = first?.publication_state !== null
+      && first?.publication_state !== undefined
+      && typeof first.expected_basis === "string"
+      && typeof first.safe_from_day === "string"
+      && typeof first.safe_to_day === "string"
+    ? {
+        publication_state: first.publication_state,
+        expected_basis: first.expected_basis,
+        attribution_method_version: first.attribution_method_version,
+        safe_from_day: first.safe_from_day,
+        safe_to_day: first.safe_to_day,
+      }
+    : null;
+  const rows = queryRows.flatMap((row) => (
+    typeof row.day === "string"
+      && typeof row.revision === "number"
+      && typeof row.payload_json === "string"
+      && typeof row.released_at === "string"
+      ? [{
+          day: row.day,
+          revision: row.revision,
+          payload_json: row.payload_json,
+          released_at: row.released_at,
+        }]
+      : []
+  ));
+  return { rows, allowancePublicationState, allowanceBreakdownsCache, allowanceReadState };
 }
 
 /**

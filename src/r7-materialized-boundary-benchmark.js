@@ -28,7 +28,10 @@ import {
 import { runR7FilesystemHighWaterSampler } from "./r7-filesystem-high-water.js";
 import { runR7WorkerWatchdog } from "./r7-worker-watchdog.js";
 import { stableJson } from "./storage.js";
-import { createR7StructuralFixture } from "./r7-resource-benchmark-fixture.js";
+import {
+  createR7StructuralFixture,
+  R7_FIXTURE_START_AT,
+} from "./r7-resource-benchmark-fixture.js";
 
 export const R7_MATERIALIZED_BOUNDARY_BENCHMARK_VERSION =
   "g1-r7-materialized-boundary-benchmark-v0.1";
@@ -299,9 +302,13 @@ export async function runR7MaterializedBoundaryBenchmark({
       join(
         fixture.paths.codexHome,
         "archived_sessions",
-        "rollout-2026-07-24T11-00-00-empty.jsonl",
+        "rollout-2026-07-24T11-00-00-70000000-0000-4000-8000-000000000099.jsonl",
       ),
-      "\n",
+      `${JSON.stringify({
+        timestamp: R7_FIXTURE_START_AT,
+        type: "session_meta",
+        payload: { id: "70000000-0000-4000-8000-000000000099" },
+      })}\n`,
       { mode: 0o600 },
     );
     const first = await runPass(join(root, "pass-1"), fixture.paths, timeoutMs);

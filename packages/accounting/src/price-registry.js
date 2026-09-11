@@ -1,5 +1,5 @@
 // Reviewed provider price evidence shared by local and edge accounting adapters.
-export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-08-01T13:47:00Z";
+export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-09-04T02:30:56Z";
 // First official-page review. This is the review boundary, not a lower bound
 // on the reviewed model rates: recognized OpenAI/Codex events before this date
 // remain priceable unless a card has an explicit vendor-effective boundary.
@@ -10,7 +10,7 @@ export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
 // lower bound on the reviewed model rates.
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.4";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.7";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -25,16 +25,28 @@ export const OPENAI_LONG_CONTEXT_SOURCE_URLS = Object.freeze([
   "https://developers.openai.com/api/docs/models/gpt-5.4",
 ]);
 
+// Codex model variants are absent from the official pricing page but carry
+// explicit first-party rates on their own model pages, reviewed 2026-08-30.
+// They are standalone models with standalone cards, not routing aliases.
+export const OPENAI_CODEX_MODEL_SOURCE_URLS = Object.freeze([
+  "https://developers.openai.com/api/docs/models/gpt-5.3-codex",
+  "https://developers.openai.com/api/docs/models/gpt-5.2-codex",
+  "https://developers.openai.com/api/docs/models/gpt-5.1-codex",
+  "https://developers.openai.com/api/docs/models/gpt-5.1-codex-mini",
+  "https://developers.openai.com/api/docs/models/gpt-5-codex",
+]);
+
 const SOURCE_DEFINITIONS = Object.freeze({
   openai: Object.freeze({
     provider: "openai",
     name: "openai-official-api-pricing",
     url: OFFICIAL_PRICE_SOURCE_URLS.openai,
-    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
-    evidenceVersion: "openai-api-pricing-reviewed-2026-08-01",
+    observedAt: "2026-08-30T06:01:00Z",
+    evidenceVersion: "openai-api-pricing-reviewed-2026-08-30",
     evidenceUrls: Object.freeze([
       OFFICIAL_PRICE_SOURCE_URLS.openai,
       ...OPENAI_LONG_CONTEXT_SOURCE_URLS,
+      ...OPENAI_CODEX_MODEL_SOURCE_URLS,
     ]),
   }),
   anthropic: Object.freeze({
@@ -45,24 +57,75 @@ const SOURCE_DEFINITIONS = Object.freeze({
     evidenceVersion: "anthropic-api-pricing-reviewed-2026-07-25",
     evidenceUrls: Object.freeze([OFFICIAL_PRICE_SOURCE_URLS.anthropic]),
   }),
+  openaiAstra: Object.freeze({
+    provider: "openai",
+    name: "openai-official-astra-api-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.openai,
+    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    evidenceVersion: "openai-astra-api-pricing-reviewed-2026-09-03",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.openai,
+      "https://developers.openai.com/api/docs/models/gpt-6-astra",
+      "https://learn.chatgpt.com/docs/changelog",
+    ]),
+  }),
 });
+
+// Astra's release-date lower bound is independent of the later review time.
+// These eight cells were each reviewed on the official pricing tabs. Unlike
+// legacy cards, Astra's documented long band starts strictly above 272K.
+const OPENAI_ASTRA_ROWS = Object.freeze([
+  ["gpt-6-astra", "standard", "10", "1", "12.5", "50", "short", "from-2026-09-03"],
+  ["gpt-6-astra", "standard", "20", "2", "25", "75", "long", "from-2026-09-03"],
+  ["gpt-6-astra", "batch", "5", "0.5", "6.25", "25", "short", "from-2026-09-03"],
+  ["gpt-6-astra", "batch", "10", "1", "12.5", "37.5", "long", "from-2026-09-03"],
+  ["gpt-6-astra", "flex", "5", "0.5", "6.25", "25", "short", "from-2026-09-03"],
+  ["gpt-6-astra", "flex", "10", "1", "12.5", "37.5", "long", "from-2026-09-03"],
+  ["gpt-6-astra", "priority", "20", "2", "25", "100", "short", "from-2026-09-03"],
+  ["gpt-6-astra", "priority", "40", "4", "50", "150", "long", "from-2026-09-03"],
+]);
 
 const OPENAI_ROWS = Object.freeze([
   // Values are model, API tier, input, cache read, cache write, output
   // USD/MTok, optional context band, and optional dated validity period. The
   // 272K boundary is inclusive on the long side to preserve the monitor's
   // established threshold contract. GPT-5.6 Terra and Luna were officially
-  // repriced effective 2026-07-30; Sol was not changed. The pre-change rows
-  // retain the explicit vendor validity window so historical pricing is
-  // preserved. Undated rows remain open to reviewed historical events; the
-  // review date is provenance, not an invented model-rate start date.
-  ["gpt-5.6-sol", "standard", "5", "0.5", "6.25", "30", "short"],
-  ["gpt-5.6-sol", "standard", "10", "1", "12.5", "45", "long"],
-  ["gpt-5.6-sol", "batch", "2.5", "0.25", "3.125", "15", "short"],
-  ["gpt-5.6-sol", "batch", "5", "0.5", "6.25", "22.5", "long"],
-  ["gpt-5.6-sol", "flex", "2.5", "0.25", "3.125", "15", "short"],
-  ["gpt-5.6-sol", "flex", "5", "0.5", "6.25", "22.5", "long"],
-  ["gpt-5.6-sol", "priority", "10", "1", "12.5", "60", "short"],
+  // repriced effective 2026-07-30. GPT-5.6 Sol was officially repriced
+  // effective 2026-08-21 (owner-stated vendor boundary); its pre-change rows
+  // keep the explicit validity window so historical pricing is preserved.
+  // Undated rows remain open to reviewed historical events; the review date
+  // is provenance, not an invented model-rate start date.
+  //
+  // 2026-08-30 review notes: the official page states "Priority processing
+  // was renamed Fast mode on July 30, 2026" and accepts either
+  // service_tier "priority" or "fast" on API requests; "priority" remains
+  // this registry's canonical tier name for those rows. The review was made
+  // from owner-supplied captures of all four flagship tabs (Standard, Batch,
+  // Flex, Fast) plus the first-party Codex model pages. Priority long-context
+  // rows exist on the page only for the GPT-5.6 family; GPT-5.5 / GPT-5.4 /
+  // GPT-5.4-mini show "-" there, and the page's pro models and GPT-5.4-nano
+  // do not support Fast mode at all, so none of them carries a priority row.
+  ["gpt-5.6-sol", "standard", "5", "0.5", "6.25", "30", "short", "through-2026-08-20"],
+  ["gpt-5.6-sol", "standard", "10", "1", "12.5", "45", "long", "through-2026-08-20"],
+  ["gpt-5.6-sol", "batch", "2.5", "0.25", "3.125", "15", "short", "through-2026-08-20"],
+  ["gpt-5.6-sol", "batch", "5", "0.5", "6.25", "22.5", "long", "through-2026-08-20"],
+  ["gpt-5.6-sol", "flex", "2.5", "0.25", "3.125", "15", "short", "through-2026-08-20"],
+  ["gpt-5.6-sol", "flex", "5", "0.5", "6.25", "22.5", "long", "through-2026-08-20"],
+  ["gpt-5.6-sol", "priority", "10", "1", "12.5", "60", "short", "through-2026-08-20"],
+  // Sol from 2026-08-21: every tier is read directly from the captured
+  // official tabs (the Standard rows were first triangulated from Batch x2
+  // == Fast /2 and then confirmed exactly by the captured Standard tab).
+  // The page calls this Sol's promotional pricing, "available at least
+  // through November 21, 2026" - an assurance floor, not a published end
+  // date, so the rows stay open-ended until the vendor publishes a change.
+  ["gpt-5.6-sol", "standard", "4", "0.4", "5", "20", "short", "from-2026-08-21"],
+  ["gpt-5.6-sol", "standard", "8", "0.8", "10", "30", "long", "from-2026-08-21"],
+  ["gpt-5.6-sol", "batch", "2", "0.2", "2.5", "10", "short", "from-2026-08-21"],
+  ["gpt-5.6-sol", "batch", "4", "0.4", "5", "15", "long", "from-2026-08-21"],
+  ["gpt-5.6-sol", "flex", "2", "0.2", "2.5", "10", "short", "from-2026-08-21"],
+  ["gpt-5.6-sol", "flex", "4", "0.4", "5", "15", "long", "from-2026-08-21"],
+  ["gpt-5.6-sol", "priority", "8", "0.8", "10", "40", "short", "from-2026-08-21"],
+  ["gpt-5.6-sol", "priority", "16", "1.6", "20", "60", "long", "from-2026-08-21"],
   ["gpt-5.6-terra", "standard", "2.5", "0.25", "3.125", "15", "short", "through-2026-07-29"],
   ["gpt-5.6-terra", "standard", "2", "0.2", "2.5", "12", "short", "from-2026-07-30"],
   ["gpt-5.6-terra", "standard", "5", "0.5", "6.25", "22.5", "long", "through-2026-07-29"],
@@ -77,6 +140,12 @@ const OPENAI_ROWS = Object.freeze([
   ["gpt-5.6-terra", "flex", "2", "0.2", "2.5", "9", "long", "from-2026-07-30"],
   ["gpt-5.6-terra", "priority", "5", "0.5", "6.25", "30", "short", "through-2026-07-29"],
   ["gpt-5.6-terra", "priority", "4", "0.4", "5", "24", "short", "from-2026-07-30"],
+  // Priority (Fast) long-context rows first appeared in the 2026-08-30
+  // review. Their values are consistent only with the from-2026-07-30
+  // Standard long rates (exactly 2x on every component), so the boundary is
+  // inherited from that published repricing rather than invented; earlier
+  // priority long-context events stay deliberately unpriced.
+  ["gpt-5.6-terra", "priority", "8", "0.8", "10", "36", "long", "from-2026-07-30"],
   ["gpt-5.6-luna", "standard", "1", "0.1", "1.25", "6", "short", "through-2026-07-29"],
   ["gpt-5.6-luna", "standard", "0.2", "0.02", "0.25", "1.2", "short", "from-2026-07-30"],
   ["gpt-5.6-luna", "standard", "2", "0.2", "2.5", "9", "long", "through-2026-07-29"],
@@ -91,6 +160,8 @@ const OPENAI_ROWS = Object.freeze([
   ["gpt-5.6-luna", "flex", "0.2", "0.02", "0.25", "0.9", "long", "from-2026-07-30"],
   ["gpt-5.6-luna", "priority", "2", "0.2", "2.5", "12", "short", "through-2026-07-29"],
   ["gpt-5.6-luna", "priority", "0.4", "0.04", "0.5", "2.4", "short", "from-2026-07-30"],
+  // Same provenance as the Terra priority long row above.
+  ["gpt-5.6-luna", "priority", "0.8", "0.08", "1", "3.6", "long", "from-2026-07-30"],
   ["gpt-5.5", "standard", "5", "0.5", null, "30", "short"],
   ["gpt-5.5", "standard", "10", "1", null, "45", "long"],
   ["gpt-5.5", "batch", "2.5", "0.25", null, "15", "short"],
@@ -122,6 +193,86 @@ const OPENAI_ROWS = Object.freeze([
   // The official Batch row contains "-" for cached input, so it is absent.
   ["gpt-4.1", "batch", "1", null, null, "4"],
   ["gpt-4.1", "priority", "3.5", "0.875", null, "14"],
+  // Flagship models below the main table, reviewed 2026-08-30 from the
+  // captured Standard, Batch, and Flex tabs. The pro models and GPT-5.4-nano
+  // do not support Fast mode, so they carry no priority row. The pro models
+  // publish long-context Standard rates (and GPT-5.4-pro long Batch/Flex),
+  // while their other long cells and every GPT-5.4-nano long cell read "-".
+  ["gpt-5.5-pro", "standard", "30", null, null, "180", "short"],
+  ["gpt-5.5-pro", "standard", "60", null, null, "270", "long"],
+  ["gpt-5.5-pro", "batch", "15", null, null, "90", "short"],
+  ["gpt-5.5-pro", "flex", "15", null, null, "90", "short"],
+  ["gpt-5.4-nano", "standard", "0.2", "0.02", null, "1.25"],
+  ["gpt-5.4-nano", "batch", "0.1", "0.01", null, "0.625"],
+  ["gpt-5.4-nano", "flex", "0.1", "0.01", null, "0.625"],
+  ["gpt-5.4-pro", "standard", "30", null, null, "180", "short"],
+  ["gpt-5.4-pro", "standard", "60", null, null, "270", "long"],
+  ["gpt-5.4-pro", "batch", "15", null, null, "90", "short"],
+  ["gpt-5.4-pro", "batch", "30", null, null, "135", "long"],
+  ["gpt-5.4-pro", "flex", "15", null, null, "90", "short"],
+  ["gpt-5.4-pro", "flex", "30", null, null, "135", "long"],
+  // Non-flagship models from the official pricing page's second table,
+  // reviewed 2026-08-30 (Standard and Batch tabs; the Fast tab lists a
+  // priority row only for the models that carry one below). A "-" cell on
+  // the page is an absent component here, never a zero.
+  ["gpt-5.2", "standard", "1.75", "0.175", null, "14"],
+  ["gpt-5.2", "batch", "0.875", "0.0875", null, "7"],
+  ["gpt-5.2", "flex", "0.875", "0.0875", null, "7"],
+  ["gpt-5.2", "priority", "3.5", "0.35", null, "28"],
+  ["gpt-5.2-pro", "standard", "21", null, null, "168"],
+  ["gpt-5.2-pro", "batch", "10.5", null, null, "84"],
+  ["gpt-5.1", "standard", "1.25", "0.125", null, "10"],
+  ["gpt-5.1", "batch", "0.625", "0.0625", null, "5"],
+  ["gpt-5.1", "flex", "0.625", "0.0625", null, "5"],
+  ["gpt-5.1", "priority", "2.5", "0.25", null, "20"],
+  ["gpt-5-mini", "standard", "0.25", "0.025", null, "2"],
+  ["gpt-5-mini", "batch", "0.125", "0.0125", null, "1"],
+  ["gpt-5-mini", "priority", "0.45", "0.045", null, "3.6"],
+  ["gpt-5-nano", "standard", "0.05", "0.005", null, "0.4"],
+  ["gpt-5-nano", "batch", "0.025", "0.0025", null, "0.2"],
+  ["gpt-5-pro", "standard", "15", null, null, "120"],
+  ["gpt-5-pro", "batch", "7.5", null, null, "60"],
+  ["gpt-4.1-mini", "standard", "0.4", "0.1", null, "1.6"],
+  ["gpt-4.1-mini", "batch", "0.2", null, null, "0.8"],
+  ["gpt-4.1-mini", "priority", "0.7", "0.175", null, "2.8"],
+  ["gpt-4.1-nano", "standard", "0.1", "0.025", null, "0.4"],
+  ["gpt-4.1-nano", "batch", "0.05", null, null, "0.2"],
+  ["gpt-4.1-nano", "priority", "0.2", "0.05", null, "0.8"],
+  ["gpt-4o", "standard", "2.5", "1.25", null, "10"],
+  ["gpt-4o", "batch", "1.25", null, null, "5"],
+  ["gpt-4o", "priority", "4.25", "2.125", null, "17"],
+  ["gpt-4o-mini", "standard", "0.15", "0.075", null, "0.6"],
+  ["gpt-4o-mini", "batch", "0.075", null, null, "0.3"],
+  ["o4-mini", "standard", "1.1", "0.275", null, "4.4"],
+  ["o4-mini", "batch", "0.55", null, null, "2.2"],
+  ["o3", "standard", "2", "0.5", null, "8"],
+  ["o3", "batch", "1", null, null, "4"],
+  ["o3-mini", "standard", "1.1", "0.55", null, "4.4"],
+  ["o3-mini", "batch", "0.55", null, null, "2.2"],
+  ["o3-pro", "standard", "20", null, null, "80"],
+  ["o3-pro", "batch", "10", null, null, "40"],
+  ["o1", "standard", "15", "7.5", null, "60"],
+  ["o1", "batch", "7.5", null, null, "30"],
+  ["o1-pro", "standard", "150", null, null, "600"],
+  ["o1-pro", "batch", "75", null, null, "300"],
+  ["gpt-4o-2024-05-13", "standard", "5", null, null, "15"],
+  ["gpt-4o-2024-05-13", "batch", "2.5", null, null, "7.5"],
+  ["gpt-4-turbo-2024-04-09", "standard", "10", null, null, "30"],
+  ["gpt-4-turbo-2024-04-09", "batch", "5", null, null, "15"],
+  // Codex model variants, priced from their first-party model pages reviewed
+  // 2026-08-30 (see OPENAI_CODEX_MODEL_SOURCE_URLS). The pages list Standard
+  // rates only - no Batch, Flex, or long-context tiering - and gpt-5-codex is
+  // documented as sharing gpt-5.1-codex rates. gpt-5.5-codex remains a
+  // routing alias of gpt-5.5 above rather than a row here.
+  ["gpt-5.3-codex", "standard", "1.75", "0.175", null, "14"],
+  ["gpt-5.2-codex", "standard", "1.75", "0.175", null, "14"],
+  ["gpt-5.1-codex", "standard", "1.25", "0.125", null, "10"],
+  // Owner-stated 2026-08-30: gpt-5.1-codex offered Priority (Fast) at these
+  // rates - exactly 2x its Standard row and identical to base gpt-5.1's
+  // Priority row - although the current model page no longer lists tiers.
+  ["gpt-5.1-codex", "priority", "2.5", "0.25", null, "20"],
+  ["gpt-5.1-codex-mini", "standard", "0.25", "0.025", null, "2"],
+  ["gpt-5-codex", "standard", "1.25", "0.125", null, "10"],
 ]);
 
 const ANTHROPIC_ROWS = Object.freeze([
@@ -158,14 +309,16 @@ const ANTHROPIC_TOOL_ROWS = Object.freeze([
 export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
   openai: [OPENAI_ROWS, OPENAI_TOOL_ROWS],
   anthropic: [ANTHROPIC_ROWS, ANTHROPIC_TOOL_ROWS],
+  openaiAstra: [OPENAI_ASTRA_ROWS],
 });
 
 // These hashes are generated from the normalized reviewed rows during an
 // evidence refresh and checked independently in Node-side registry tests. They
 // are constants here so the production registry has no Node crypto dependency.
 const EVIDENCE_HASHES = Object.freeze({
-  openai: "a43ddf0fce53caeb2cebcd331961ff24c734a0af7f9047d11ef8f34a10a825e2",
+  openai: "ec99367fb7d91dc68f1501e325384eda7a5cf885c763deebd28e1eff594dad57",
   anthropic: "7653380aa58230fef8a39a17f141fe04bd763ca39390a69671825e6f6109d76e",
+  openaiAstra: "546af74276392ac5cd4f3faab783fff6d2b62235c7a5288012e8a24fd309301b",
 });
 
 function component(usageComponent, amount, conditions) {
@@ -221,7 +374,7 @@ function source(provider) {
 
 function cardId(provider, model, tier, suffix = "current") {
   const observedDate = SOURCE_DEFINITIONS[provider].observedAt.slice(0, 10);
-  return `${provider}:${model}:${tier}:${suffix}:official-observed-${observedDate}`;
+  return `${SOURCE_DEFINITIONS[provider].provider}:${model}:${tier}:${suffix}:official-observed-${observedDate}`;
 }
 
 // Effective-window helpers. The review dates remain provenance metadata for
@@ -229,21 +382,26 @@ function cardId(provider, model, tier, suffix = "current") {
 // so all reviewed history stays priceable as far back as events go.
 
 function openAiEffective(period) {
-  if (period === "through-2026-07-29") {
+  const through = typeof period === "string" && /^through-(\d{4}-\d{2}-\d{2})$/.exec(period);
+  if (through) {
     return {
-      effective: { to: "2026-07-29" },
+      effective: { to: through[1] },
       vendorEffectiveFrom: null,
-      vendorEffectiveTo: "2026-07-29",
-      suffix: "through-2026-07-29",
+      vendorEffectiveTo: through[1],
+      suffix: period,
     };
   }
-  if (period === "from-2026-07-30") {
+  const from = typeof period === "string" && /^from-(\d{4}-\d{2}-\d{2})$/.exec(period);
+  if (from) {
     return {
-      effective: { from: "2026-07-30" },
-      vendorEffectiveFrom: "2026-07-30",
+      effective: { from: from[1] },
+      vendorEffectiveFrom: from[1],
       vendorEffectiveTo: null,
-      suffix: "from-2026-07-30",
+      suffix: period,
     };
+  }
+  if (period !== null && period !== undefined) {
+    throw new TypeError(`Unrecognized OpenAI price validity period: ${String(period)}`);
   }
   return {
     // No vendor-effective date was published for this row. An open effective
@@ -279,17 +437,19 @@ const OPENAI_ALIAS_ASSUMPTIONS = Object.freeze({
 });
 
 function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null, period = null]) {
+  const isAstra = model === "gpt-6-astra";
+  const sourceKey = isAstra ? "openaiAstra" : "openai";
   const contextConditions = contextBand === "short"
-    ? { max_total_input_tokens: "271999" }
+    ? { max_total_input_tokens: isAstra ? "272000" : "271999" }
     : contextBand === "long"
-      ? { min_total_input_tokens: "272000" }
+      ? { min_total_input_tokens: isAstra ? "272001" : "272000" }
       : null;
   const aliases = OPENAI_MODEL_ALIASES[model];
   const validity = openAiEffective(period);
   const bandSuffix = contextBand ?? "current";
   return {
     schema_version: "0.1",
-    id: cardId("openai", model, tier, period ? `${bandSuffix}-${validity.suffix}` : bandSuffix),
+    id: cardId(sourceKey, model, tier, period ? `${bandSuffix}-${validity.suffix}` : bandSuffix),
     provider: "openai",
     model,
     ...(aliases ? { aliases } : {}),
@@ -304,20 +464,22 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
       providerUnitComponent("web_search_units", "10", "search", "1000", contextConditions),
       providerUnitComponent("file_search_units", "2.5", "call", "1000", contextConditions),
     ].filter(Boolean),
-    source: source("openai"),
+    source: source(sourceKey),
     metadata: {
       pricing_basis: "official_api_price_not_subscription_allowance",
       api_service_tier: tier,
       subscription_speed_tier: null,
       total_input_context_band: contextBand,
-      provenance: provenance("openai", validity),
+      provenance: provenance(sourceKey, validity),
       ...(aliases ? {
         alias_assumptions: Object.fromEntries(
           aliases.map((alias) => [alias, OPENAI_ALIAS_ASSUMPTIONS[alias]]),
         ),
       } : {}),
       ...(contextBand ? {
-        coverage_note: contextBand === "short"
+        coverage_note: isAstra
+          ? "Astra short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request."
+          : contextBand === "short"
           ? "Short-context prices apply through 271,999 total input tokens; the long band begins at 272,000."
           : "Long-context prices apply from 272,000 total input tokens using the official 2x input and 1.5x output rule.",
       } : {}),
@@ -413,7 +575,7 @@ function providerToolCard(provider, model, rows) {
   };
 }
 
-export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze(OPENAI_ROWS.map(openAiCard));
+export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze([...OPENAI_ROWS, ...OPENAI_ASTRA_ROWS].map(openAiCard));
 export const ANTHROPIC_OFFICIAL_PRICE_CARDS = deepFreeze(ANTHROPIC_ROWS.map(anthropicCard));
 export const PROVIDER_TOOL_PRICE_CARDS = deepFreeze([
   providerToolCard("openai", "openai-provider-tools", OPENAI_TOOL_ROWS),
@@ -426,7 +588,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
 ]);
 
 export const APP_PRICE_REGISTRY_SHA256 =
-  "6a99c2fb93c6999c6b7ee9b841403855672df7c556e22c636291366828da2c09";
+  "303374d522e7ef695beefe1fbf6f3d2b5c84b8b9c6130921a70bc5e8ec1d56e0";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,
@@ -434,13 +596,13 @@ export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
   priceBasis: "official_api_price_not_subscription_allowance",
   historicalDefault: "event_time_when_official_effective_window_matches",
-  sources: Object.values(SOURCE_DEFINITIONS).map((definition) => ({
+  sources: Object.entries(SOURCE_DEFINITIONS).map(([sourceKey, definition]) => ({
     provider: definition.provider,
     url: definition.url,
     observedAt: definition.observedAt,
     evidenceVersion: definition.evidenceVersion,
     evidenceUrls: definition.evidenceUrls,
-    evidenceSha256: EVIDENCE_HASHES[definition.provider],
+    evidenceSha256: EVIDENCE_HASHES[sourceKey],
   })),
 });
 
@@ -518,12 +680,12 @@ export function validateOfficialPriceRegistry(cards = APP_OFFICIAL_PRICE_CARDS) 
       assertDecimalString(priceComponent.price?.amount, `${card.id} component price amount`);
       assertDecimalString(priceComponent.price?.per, `${card.id} component price divisor`);
       if (contextBand === "short"
-        && (priceComponent.conditions?.max_total_input_tokens !== "271999"
+        && (priceComponent.conditions?.max_total_input_tokens !== (card.model === "gpt-6-astra" ? "272000" : "271999")
           || priceComponent.conditions?.min_total_input_tokens !== undefined)) {
         throw new TypeError(`${card.id} has a malformed short-context component boundary.`);
       }
       if (contextBand === "long"
-        && (priceComponent.conditions?.min_total_input_tokens !== "272000"
+        && (priceComponent.conditions?.min_total_input_tokens !== (card.model === "gpt-6-astra" ? "272001" : "272000")
           || priceComponent.conditions?.max_total_input_tokens !== undefined)) {
         throw new TypeError(`${card.id} has a malformed long-context component boundary.`);
       }
@@ -563,7 +725,7 @@ export function addOfficialPriceRegistry(resolution, cards = APP_OFFICIAL_PRICE_
     retrieved_at: definition.observedAt,
     version: definition.evidenceVersion,
     evidence_urls: definition.evidenceUrls,
-    card_count: cards.filter((card) => card.provider === definition.provider).length,
+    card_count: cards.filter((card) => card.source?.name === definition.name).length,
     selected: true,
   }));
 

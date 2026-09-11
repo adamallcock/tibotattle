@@ -177,35 +177,15 @@ export interface PriceUsageOptions {
   pricingContext?: PricingContext;
 }
 
-export const APP_PRICE_REGISTRY_OBSERVED_AT: string;
-export const APP_PRICE_REGISTRY_VERSION: string;
-export const OFFICIAL_PRICE_SOURCE_URLS: Readonly<Record<string, string>>;
-export const OPENAI_LONG_CONTEXT_SOURCE_URLS: readonly string[];
-export const NORMALIZED_PRICE_EVIDENCE_ROWS: Readonly<Record<string, unknown>>;
-export const OPENAI_OFFICIAL_PRICE_CARDS: readonly PriceCard[];
 export const OPENAI_PRICE_EVIDENCE_START_DATE: string;
-export const ANTHROPIC_OFFICIAL_PRICE_CARDS: readonly PriceCard[];
-export const PROVIDER_TOOL_PRICE_CARDS: readonly PriceCard[];
 export const APP_OFFICIAL_PRICE_CARDS: readonly PriceCard[];
-export const APP_PRICE_REGISTRY_SHA256: string;
 export const APP_PRICE_REGISTRY_MANIFEST: OfficialPriceRegistryManifest;
-export const LOCAL_API_PRICING_METHOD_VERSION: string;
 
 export function addUsdStrings(...values: Array<string | number>): DecimalString;
 export function priceUsageEvent(
   event: NormalizedUsageEvent,
   options?: PriceUsageOptions,
 ): PriceUsageResult;
-export function aggregateCostResults(
-  results: readonly PriceUsageResult[],
-): AggregateCostResult;
-export function validateOfficialPriceRegistry(
-  cards?: readonly PriceCard[],
-): readonly PriceCard[];
-export function addOfficialPriceRegistry(
-  resolution?: Readonly<Record<string, unknown>> | null,
-  cards?: readonly PriceCard[],
-): Record<string, unknown>;
 
 export interface CodexUsageEvent {
   model: string;
@@ -240,9 +220,6 @@ export function priceClaudeUsageRecord(
   record: ClaudeUsageRecord,
   options?: LocalPricingOptions,
 ): PriceUsageResult;
-export function codexProviderBillableToolUnits(
-  serverBillableUnits: Readonly<Record<string, unknown>> | null | undefined,
-): NormalizedUsageEvent["billableToolUnits"];
 export function priceCodexProviderToolUnits(
   serverBillableUnits: Readonly<Record<string, unknown>> | null | undefined,
   options?: Pick<LocalPricingOptions, "priceCards" | "priceEpochBasis" | "eventTime">,
@@ -250,24 +227,24 @@ export function priceCodexProviderToolUnits(
 export function aggregateLocalApiPriceResults(
   results: readonly PriceUsageResult[],
 ): AggregateCostResult;
-export function summarizeClaudeApiPriceRecords(
-  records: readonly ClaudeUsageRecord[],
-  options?: LocalPricingOptions,
-): AggregateCostResult & Readonly<Record<string, unknown>>;
 export function costWarningCodes(result: PriceUsageResult): string[];
 export function apiPriceResolutionSummary(options?: {
   priceCards?: readonly PriceCard[] | null;
   apiServiceTier?: string;
 }): Readonly<Record<string, unknown>>;
 
-export type FastModeModelFamily = "gpt-5.6" | "gpt-5.5" | "gpt-5.4";
+export type FastModeModelFamily =
+  | "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" | "gpt-4o"
+  | "gpt-5" | "gpt-5-mini" | "gpt-5.1" | "gpt-5.1-codex" | "gpt-5.2"
+  | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5"
+  | "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra";
 export type FastModeModelFamilyKey = FastModeModelFamily | "unsupported";
 export type ObservedSpeedMode = "standard" | "fast" | "unknown";
-export type FastModePreference = "standard" | "fast" | "mixed_unknown";
 export type SpeedModeProvenance =
   | "observed"
   | "declared_codex_config"
-  | "assumed_from_preference"
+  | "assumed_standard_default"
+  | "assumed_fast_scenario"
   | "inferred"
   | "unknown";
 
@@ -298,21 +275,27 @@ export type SpeedWeightingCrossing = Record<
   Record<FastModeModelFamilyKey, SpeedWeightingCell>
 >;
 
+export type UnresolvedSpeedScenario =
+  | "unresolved_as_standard"
+  | "unresolved_as_fast";
+
 export interface QuotaWeightedAccountingSummary {
   metric: QuotaWeightedApiPriceMetric;
   multiplierSource: Readonly<Record<string, string>>;
+  assumedMultiplierSource: Readonly<Record<string, string>>;
   declarationSource: CodexSpeedModeDeclaration;
-  preference: FastModePreference;
+  unresolvedScenario: UnresolvedSpeedScenario;
   standardApiPriceEquivalentUsd: number;
   quotaWeightedApiPriceEquivalentUsd: number | null;
   unweightedUnknownApiPriceEquivalentUsd: number;
+  assumedRatioStandardApiPriceEquivalentUsd: number;
   weightingStatus: "complete" | "partial" | "unknown";
   appliedMultipliers: Readonly<Record<string, number>>;
   coverage: {
     totalEvents: number;
     observedEvents: number;
     declaredFromConfigEvents: number;
-    assumedFromPreferenceEvents: number;
+    assumedEvents: number;
     inferredEvents: number;
     unknownEvents: number;
     observedSharePercent: number | null;
@@ -379,36 +362,45 @@ export const FAST_MODE_QUOTA_MULTIPLIERS: Readonly<
 >;
 export const FAST_MODE_MODEL_FAMILY_KEYS: readonly FastModeModelFamilyKey[];
 export const OBSERVED_SPEED_MODE_KEYS: readonly ObservedSpeedMode[];
-export const FAST_MODE_PREFERENCE_VALUES: readonly FastModePreference[];
-export const DEFAULT_FAST_MODE_PREFERENCE: FastModePreference;
+export const FAST_MODE_ASSUMED_MULTIPLIER: number;
+export const FAST_MODE_ASSUMED_MULTIPLIER_SOURCE: Readonly<Record<string, string>>;
 export const SPEED_MODE_PROVENANCE_VALUES: readonly SpeedModeProvenance[];
 export const CODEX_SPEED_MODE_DECLARATION: CodexSpeedModeDeclaration;
 export const QUOTA_WEIGHTED_API_PRICE_METRIC: QuotaWeightedApiPriceMetric;
-export const FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS: Readonly<
-  Record<string, number>
->;
-export const FAST_MODE_RESIDUAL_INFERENCE_REASON_CODES: readonly string[];
 
-export function fastModeModelFamily(model: unknown): FastModeModelFamily | null;
-export function fastModeModelFamilyKey(model: unknown): FastModeModelFamilyKey;
-export function fastModeQuotaMultiplier(model: unknown): number | null;
-export function isFastModePreference(value: unknown): value is FastModePreference;
+export interface FastModePriceEvidence {
+  eventTime?: string | null;
+  totalInputContextTokens?: number | null;
+  standardPriceCardIds?: readonly string[];
+}
+export function fastModeModelFamilyKey(
+  model: unknown, evidence?: FastModePriceEvidence,
+): FastModeModelFamilyKey;
+export function fastModeQuotaMultiplier(
+  model: unknown, evidence?: FastModePriceEvidence,
+): number | null;
+export function deriveFastModePriorityRatiosFromRegistry(
+  cards?: readonly PriceCard[],
+): Readonly<Record<string, number>>;
 export function emptySpeedWeightingCrossing(): SpeedWeightingCrossing;
+export const DEFAULT_UNRESOLVED_SPEED_SCENARIO: UnresolvedSpeedScenario;
 export function resolveEffectiveSpeedMode(input?: {
   observedMode?: string;
   declaredMode?: string;
-  preference?: string;
-  inferredMode?: string;
-}): { mode: ObservedSpeedMode; provenance: SpeedModeProvenance };
+  unresolvedScenario?: string;
+}): { mode: "standard" | "fast"; provenance: SpeedModeProvenance };
 export function quotaWeightedApiPriceEquivalent(input?: {
   apiPriceEquivalentUsd?: number;
   model?: string;
   mode?: string;
+  eventTime?: string | null;
+  totalInputContextTokens?: number | null;
+  standardPriceCardIds?: readonly string[];
 }): { usd: number | null; multiplier: number | null; status: string };
 export function summarizeQuotaWeightedAccounting(input?: {
   speedWeighting?: SpeedWeightingCrossing | null;
   declaredSpeedWeighting?: SpeedWeightingCrossing | null;
-  preference?: string;
+  unresolvedScenario?: string;
   inferredFastEvents?: number;
   inference?: FastModeInferenceResult | null;
 }): QuotaWeightedAccountingSummary;

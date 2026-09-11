@@ -105,10 +105,73 @@ test("native catalogs have complete language parity and preserve placeholders", 
       );
     }
   }
+  for (const [locale, catalog] of catalogs) {
+    const disclosure = catalog.get("launcher.firstRunDisclosure");
+    for (const sourceMarker of [
+      "state_5.sqlite",
+      "config.toml",
+      "account/read",
+      "account/rateLimits/read",
+      "account/usage/read",
+    ]) {
+      assert.match(
+        disclosure,
+        new RegExp(sourceMarker.replaceAll("/", "\\/"), "u"),
+        `${locale} first-run disclosure names ${sourceMarker}`,
+      );
+    }
+    assert.doesNotMatch(
+      disclosure,
+      /plan-usage-history\.json/u,
+      `${locale} first-run disclosure omits the retired Claude Desktop plan-history source`,
+    );
+  }
   assert.equal(english.get("settings.language"), "Language");
+  assert.equal(
+    english.get("nativeDashboard.refreshUsageTooltip"),
+    "Refresh the current allowance, local history, and detailed accounting. Reuses valid cached results; all processing stays on this Mac.",
+  );
+  assert.equal(
+    english.get("settings.refreshIntervalDetail"),
+    "Checks current allowance while TiboTattle is open. Detailed accounting updates automatically at most hourly; choose Refresh to update everything now.",
+  );
+  assert.equal(english.has("nativeDashboard.recalculateDetailedAccounting"), false,
+    "the removed duplicate action leaves no unused native localization key");
+  assert.equal(
+    english.get("nativeDashboard.progressAccounting"),
+    "Calculating accounting…",
+  );
   assert.equal(
     english.get("settings.languageSummary"),
     "Uses your Mac language by default.",
+  );
+  assert.equal(
+    english.get("settings.updateCheckUnavailableTitle"),
+    "Couldn't check for updates",
+  );
+  assert.equal(
+    english.get("settings.updateCheckUnavailableMessage"),
+    "TiboTattle couldn't complete the update check. Check your internet connection and try again.",
+  );
+  assert.equal(
+    english.get("launcher.dashboardTakingLonger"),
+    "Dashboard is taking longer than expected",
+  );
+  assert.equal(
+    english.get("launcher.errorDashboardReadinessTimeout"),
+    "The local dashboard page loaded, but it did not become ready during the initial wait.",
+  );
+  assert.equal(
+    english.get("launcher.recoveryDashboardWebView"),
+    "Choose Open Dashboard to try the local view again. If it still does not open, choose Retry.",
+  );
+  assert.equal(
+    catalogs.get("es").get("launcher.recoveryDashboardWebView"),
+    "Elige Abrir panel para volver a intentar la vista local. Si aún no se abre, elige Reintentar.",
+  );
+  assert.equal(
+    catalogs.get("zh-Hans").get("launcher.recoveryDashboardWebView"),
+    "请选择“打开仪表板”再次尝试本地视图。如果仍无法打开，请选择“重试”。",
   );
   assert.match(swiftSource, /LanguagePreference: String, CaseIterable/u);
   assert.match(swiftSource, /UserDefaults\.standard\.set/u);
@@ -147,6 +210,22 @@ test("native catalogs have complete language parity and preserve placeholders", 
   assert.match(swiftSource, /case nativeDashboardFresh =/u);
   assert.match(swiftSource, /case nativeDashboardNeedsRefresh =/u);
   assert.match(appSource, /settingsUpdateDisclosureDevelopment/u);
+  assert.match(
+    appSource,
+    /alert\.informativeText = TiboTattleLocalization\.format\([\s\S]*?\.launcherFirstRunDisclosure[\s\S]*?updater\.firstRunUpdatesDisclosure[\s\S]*?\.firstRunLoginItemDisclosure/u,
+  );
+  assert.doesNotMatch(
+    appSource,
+    /Reads: timestamps, model and speed labels/u,
+  );
+  assert.match(
+    swiftSource,
+    /settingsUpdateDisclosureAutomaticOn:[\s\S]*Settings → About/u,
+  );
+  assert.doesNotMatch(
+    swiftSource,
+    /settingsUpdateDisclosureAutomatic(?:On|Off):[\s\S]{0,420}Settings → General/u,
+  );
   assert.match(appSource, /launcherErrorInvalidCentralService/u);
   assert.match(appSource, /launcherRecoveryReinstall/u);
   assert.match(appSource, /nativeDashboardCurrentEvidenceTooltip/u);
@@ -173,6 +252,62 @@ test("native catalogs have complete language parity and preserve placeholders", 
     menuBarSource,
     /"The local companion could not accept an analysis request\."/u,
   );
+});
+
+test("native reset copy keeps hosted history and points to support guidance for separate owner erasure", async () => {
+  const [swiftSource, sharedCatalog, browserMirror, ...catalogTexts] = await Promise.all([
+    readFile(LOCALIZATION_SOURCE, "utf8"),
+    readFile(join(REPOSITORY_ROOT, "packages", "i18n", "index.js"), "utf8"),
+    readFile(join(REPOSITORY_ROOT, "apps", "web", "public", "i18n.generated.js"), "utf8"),
+    ...NATIVE_RESOURCE_LOCALES.map((locale) => readFile(
+      join(RESOURCE_ROOT, `${locale}.lproj`, "Localizable.strings"),
+      "utf8",
+    )),
+  ]);
+  for (const source of [swiftSource, sharedCatalog, browserMirror, ...catalogTexts]) {
+    assert.doesNotMatch(source, /hosted privacy workflow|flujo de privacidad alojado|托管隐私工作流/u);
+  }
+  const resetKeys = [
+    ["dialogIdentityDeviceResetCompleteDescription", "dialog.identityDeviceResetCompleteDescription"],
+    ["dialogIdentityDeviceResetDescription", "dialog.identityDeviceResetDescription"],
+  ];
+  const requiredCopy = {
+    en: [
+      /Hosted history is kept\./u,
+      /See project support guidance for information about separate owner-handled erasure\./u,
+      /no (?:registered )?device (?:was|is) revoked/u,
+      /Secure erasure is not claimed\./u,
+    ],
+    es: [
+      /Se conserva el historial alojado\./u,
+      /Consulta la guía de soporte del proyecto para informarte sobre el borrado por separado a cargo del propietario del servicio\./u,
+      /no se revoc(?:ó|a) ningún dispositivo/u,
+      /No se afirma un borrado seguro\./u,
+    ],
+    "zh-Hans": [
+      /托管历史记录会保留。/u,
+      /有关由服务所有者单独处理的擦除，请参阅项目支持指南。/u,
+      /未撤销任何设备|不会撤销已注册设备/u,
+      /我们不声称安全擦除。/u,
+    ],
+  };
+  const catalogs = new Map(NATIVE_RESOURCE_LOCALES.map((locale, index) => [
+    locale, parseStrings(catalogTexts[index]),
+  ]));
+  for (const [locale, catalog] of catalogs) {
+    for (const [, key] of resetKeys) {
+      const value = catalog.get(key);
+      assert.deepEqual(placeholderSignature(value), ["%@"], `${locale}: ${key}`);
+      for (const pattern of requiredCopy[locale]) assert.match(value, pattern, `${locale}: ${key}`);
+      assert.doesNotMatch(value, /mailto:|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/u, "no invented contact address");
+    }
+  }
+  for (const [swiftCase, key] of resetKeys) {
+    const fallback = swiftSource.match(new RegExp(
+      `case \\.${swiftCase}:\\s*"([^\\n]+)"`, "u",
+    ))?.[1];
+    assert.equal(fallback, catalogs.get("en").get(key), `${key} fallback matches native English`);
+  }
 });
 
 test("localization resources stage for AppKit and the embedded dashboard", async () => {

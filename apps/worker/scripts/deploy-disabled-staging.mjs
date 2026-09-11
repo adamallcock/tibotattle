@@ -66,10 +66,11 @@ async function validStagingSecretsFile(filename) {
     return false;
   }
   const lines = contents.trim().split("\n");
-  if (lines.length !== 2) return false;
+  if (lines.length !== 3) return false;
   const privateMatch = /^ENVELOPE_PRIVATE_JWK='([^'\r\n]+)'$/u.exec(lines[0]);
   const publicMatch = /^ENVELOPE_PUBLIC_JWK='([^'\r\n]+)'$/u.exec(lines[1]);
-  if (!privateMatch?.[1] || !publicMatch?.[1]) return false;
+  const identityMatch = /^IDENTITY_LINK_SECRET='([A-Za-z0-9_-]{43})'$/u.exec(lines[2]);
+  if (!privateMatch?.[1] || !publicMatch?.[1] || !identityMatch) return false;
   let privateJwk;
   let publicJwk;
   try {
@@ -102,7 +103,7 @@ function closedHealth(value) {
     && value?.contracts?.accountScopedContribution
       ?.externalParticipantsAuthorized === false
     && value?.capabilities?.encryptedUpload === false
-    && value?.capabilities?.delayedAggregateStats === false
+    && value?.capabilities?.communityDaily === false
     && value?.capabilities?.ongoingDeviceUploadRegistration === false;
 }
 
@@ -277,11 +278,35 @@ export async function runDisabledStagingDeployment({
         code: "STAGING_SOURCE_REVISION_UNAVAILABLE",
       };
     }
+    let bootstrapSecrets = [];
+    if (secretsFile !== null) {
+      const installed = spawn(wrangler, ["secret", "list", "--env", "staging"], {
+        cwd: workerDirectory, encoding: "utf8", maxBuffer: 1024 * 1024,
+      });
+      // Only first creation may install this file. Existing Workers retain
+      // their installed keys; an uncertain inventory must never rotate them.
+      const inventoryOutput = `${installed.stdout ?? ""}\n${installed.stderr ?? ""}`;
+      const absent = !installed.error && installed.status !== 0
+        && (/\b10007\b/u.test(inventoryOutput)
+          || inventoryOutput.includes(
+            `Worker "${config.env.staging.name}" (env: staging) not found.`,
+          ));
+      if (installed.error || (installed.status !== 0 && !absent)) {
+        return { ok: false, code: "STAGING_SECRET_INVENTORY_FAILED" };
+      }
+      if (absent) {
+        if (!await validStagingSecretsFile(secretsFile)) {
+          return { ok: false, code: "STAGING_SECRETS_FILE_INVALID" };
+        }
+        bootstrapSecrets = ["--secrets-file", secretsFile];
+      }
+    }
     const deployment = spawn(
       wrangler,
       [
         "deploy", "--env", "staging", "--strict",
         "--var", `DEPLOYMENT_SOURCE_COMMIT:${sourceCommit}`,
+        ...bootstrapSecrets,
       ],
       {
         cwd: workerDirectory,
@@ -428,6 +453,7 @@ export async function runDisabledStagingDeployment({
         readiness.checks.remoteMigrationInventoryCurrent,
       migrationsCurrent: readiness.checks.migrationsCurrent,
       pilotSchemaCurrent: readiness.checks.pilotSchemaCurrent,
+      attributionSchemaCurrent: readiness.checks.attributionSchemaCurrent,
       primaryReenrollmentSchemaCurrent:
         readiness.checks.primaryReenrollmentSchemaCurrent,
       deletionLedgerSchemaCurrent:

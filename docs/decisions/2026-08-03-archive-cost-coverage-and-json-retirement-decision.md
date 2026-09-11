@@ -2,7 +2,7 @@
 title: Archive Cost Coverage and JSON Retirement Decision
 date: 2026-08-03
 type: decision-record
-status: implemented
+status: complete
 ---
 
 # Archive cost coverage and JSON retirement decision

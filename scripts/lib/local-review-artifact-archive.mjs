@@ -32,6 +32,14 @@ const EXPECTED_COMPONENTS = Object.freeze([
     name: "@app-usagemonitor/identity-core",
     version: RELEASE_VERSION,
   }),
+  Object.freeze({
+    name: "@app-usagemonitor/quota-analysis",
+    version: RELEASE_VERSION,
+  }),
+  Object.freeze({
+    name: "@app-usagemonitor/telemetry-contract",
+    version: RELEASE_VERSION,
+  }),
   Object.freeze({ name: "@github/keytar", version: "7.10.6" }),
   Object.freeze({ name: "ajv", version: "8.20.0" }),
   Object.freeze({ name: "fast-deep-equal", version: "3.1.3" }),

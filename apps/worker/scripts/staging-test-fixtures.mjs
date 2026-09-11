@@ -18,11 +18,22 @@ export function provisionedConfig() {
   return config;
 }
 
+export function unprovisionedConfig() {
+  const config = structuredClone(checkedInConfig);
+  config.env.staging.d1_databases[0].database_id =
+    "00000000-0000-4000-8000-000000000010";
+  config.env.staging.d1_databases[1].database_id =
+    "00000000-0000-4000-8000-000000000011";
+  return config;
+}
+
 export function successSpawn(
   config,
   calls,
   {
     missingPrimarySchema = false,
+    missingAttributionSchema = false,
+    missingScaleSchema = false,
     missingDeletionLedgerSchema = false,
     primarySchemaError = false,
     deletionLedgerSchemaError = false,
@@ -71,6 +82,7 @@ export function successSpawn(
         stdout: JSON.stringify([
           { name: "ENVELOPE_PRIVATE_JWK", type: "secret_text" },
           { name: "ENVELOPE_PUBLIC_JWK", type: "secret_text" },
+          { name: "IDENTITY_LINK_SECRET", type: "secret_text" },
         ]),
         stderr: "",
       };
@@ -110,6 +122,10 @@ export function successSpawn(
             admission_counter: 1,
             quarantine_reconciliation: 1,
             lifecycle_status: 1,
+            attribution_objects: missingAttributionSchema ? 0 : 1,
+            attribution_columns: missingAttributionSchema ? 0 : 1,
+            scale_objects: missingScaleSchema ? 0 : 1,
+            scale_columns: missingScaleSchema ? 0 : 1,
             primary_cooldown_table: missingPrimarySchema ? 0 : 1,
             primary_participant_cooldown_digest: missingPrimarySchema ? 0 : 1,
             primary_cooldown_digest: missingPrimarySchema ? 0 : 1,

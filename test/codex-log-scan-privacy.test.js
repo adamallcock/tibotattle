@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import {
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
+
+const {
   codexLogSourceFingerprint,
   scanCodexLogEvents,
-} from "../src/codex-log-scan.js";
+} = localCodexLogScanner;
 
 const START_AT = "2000-01-01T00:00:00.000Z";
 const END_AT = "2100-01-01T00:00:00.000Z";
@@ -26,6 +28,7 @@ const RAW_CANARIES = Object.freeze({
   toolName: "private_tool_name_canary_f430b1de",
   callId: "call-id-canary-156ed54c",
   turnId: "turn-id-canary-685b2b47",
+  threadSource: "automated_review_canary-a862d77c",
 });
 
 const USAGE_CALLBACK_KEYS = [
@@ -107,6 +110,7 @@ async function privacyFixture() {
         source_path: rolloutPath,
         source_basename: basename(rolloutPath),
         origin: "terminal",
+        thread_source: RAW_CANARIES.threadSource,
       },
     },
     {
@@ -201,6 +205,17 @@ async function privacyFixture() {
 test("raw Codex scan callbacks and result retain accounting semantics without exposing source content", async () => {
   const fixture = await privacyFixture();
   try {
+    // The fork-parent canary must resolve to a real (content-free) rollout:
+    // an unresolvable inline-fork parent now fails accounting closed by
+    // design, and this test is probing privacy, not orphan-fork semantics.
+    await writeFile(
+      join(fixture.codexHome, "archived_sessions", "rollout-2026-07-30T11-00-00-parent-canary.jsonl"),
+      `${JSON.stringify({
+        timestamp: EVENT_AT,
+        type: "session_meta",
+        payload: { id: RAW_CANARIES.parentId },
+      })}\n`,
+    );
     const usageEvents = [];
     const rateLimitSnapshots = [];
     const toolCalls = [];
@@ -237,6 +252,21 @@ test("raw Codex scan callbacks and result retain accounting semantics without ex
     assert.equal(toolCalls[0].toolClass, "other");
     assert.equal(toolCalls[0].sourceKind, "client_function_call");
     assert.deepEqual(result.toolCallsByClass, { other: 1 });
+    assert.deepEqual(usageEvents[0].surfaceClassification, {
+      schemaVersion: "0.1",
+      threadSource: "unknown",
+      surface: "cli_exec",
+      agentScope: "unknown",
+      lineageDisposition: "forked",
+    });
+    assert.deepEqual(
+      rateLimitSnapshots[0].surfaceClassification,
+      usageEvents[0].surfaceClassification,
+    );
+    assert.deepEqual(
+      toolCalls[0].surfaceClassification,
+      usageEvents[0].surfaceClassification,
+    );
 
     const prohibited = [
       fixture.codexHome,

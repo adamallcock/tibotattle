@@ -1,7 +1,7 @@
 /**
  * Reviewed production endpoint manifest.
  *
- * This is intentionally the sole source for public deployment identifiers.
+ * This is intentionally the sole source for reviewed deployment identifiers.
  * Consumers which cannot import JavaScript (for example Wrangler JSONC and
  * native Swift) are checked by `apps/worker/scripts/check-deployment-endpoints.mjs`.
  */
@@ -41,11 +41,14 @@ function exactStringList(value, expected, label) {
 
 const publicOrigin = "https://tibotattle.com";
 const sparkleUpdateOrigin = "https://updates.tibotattle.com";
+const stagingWorkerName = "app-usagemonitor-staging";
+const stagingOrigin = `https://${stagingWorkerName}.adamallcock.workers.dev`;
 const publicOriginURL = canonicalHttpsOrigin(publicOrigin, "public origin");
 const sparkleUpdateOriginURL = canonicalHttpsOrigin(
   sparkleUpdateOrigin,
   "Sparkle update origin",
 );
+const stagingOriginURL = canonicalHttpsOrigin(stagingOrigin, "staging origin");
 // The owner-only operations hostname. It is served by the same Worker but is
 // deliberately not a public route host: the admin surface exists only here,
 // behind the Cloudflare Access application for this exact hostname.
@@ -70,7 +73,25 @@ export const DEPLOYMENT_ENDPOINTS = Object.freeze({
   sparkle: Object.freeze({
     appcastURL: new URL("/appcast.xml", sparkleUpdateOriginURL).href,
     origin: sparkleUpdateOriginURL.origin,
+    intelAppcastURL: new URL("/intel/appcast.xml", sparkleUpdateOriginURL).href,
+    intelPreviewAppcastURL: new URL("/preview/intel/appcast.xml", sparkleUpdateOriginURL).href,
+    // Preview is a separately identified client and must never consume the
+    // stable appcast. Keeping the dedicated path in the reviewed endpoint
+    // manifest prevents the native build and deployment checks from drifting.
+    previewAppcastURL: new URL(
+      "/preview/appcast.xml",
+      sparkleUpdateOriginURL,
+    ).href,
     r2Bucket: "tibotattle-updates",
+  }),
+  // This is a fixed nonproduction Worker hostname observed from the account's
+  // Workers subdomain configuration. It is never supplied by Electron,
+  // renderer input, or a rehearsal receipt.
+  staging: Object.freeze({
+    origin: stagingOriginURL.origin,
+    previewUrls: false,
+    workerName: stagingWorkerName,
+    workersDev: true,
   }),
 });
 
@@ -88,6 +109,10 @@ export function assertDeploymentEndpoints(
   const reviewedSparkleOrigin = canonicalHttpsOrigin(
     endpoints.sparkle?.origin,
     "Sparkle update origin",
+  );
+  const reviewedStagingOrigin = canonicalHttpsOrigin(
+    endpoints.staging?.origin,
+    "staging origin",
   );
   exactStringList(
     endpoints.public?.routeHosts,
@@ -108,11 +133,33 @@ export function assertDeploymentEndpoints(
       !== new URL("/appcast.xml", reviewedSparkleOrigin).href) {
     throw new TypeError("Sparkle appcast URL must be derived from its origin");
   }
+  if (endpoints.sparkle?.previewAppcastURL
+      !== new URL("/preview/appcast.xml", reviewedSparkleOrigin).href) {
+    throw new TypeError(
+      "Sparkle preview appcast URL must be derived from its origin",
+    );
+  }
+  for (const [field, path] of [
+    ["intelAppcastURL", "/intel/appcast.xml"],
+    ["intelPreviewAppcastURL", "/preview/intel/appcast.xml"],
+  ]) {
+    if (endpoints.sparkle?.[field] !== new URL(path, reviewedSparkleOrigin).href) {
+      throw new TypeError("Sparkle Intel appcast URL must match its reviewed path");
+    }
+  }
   if (typeof endpoints.sparkle?.r2Bucket !== "string"
       || !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/u.test(
         endpoints.sparkle.r2Bucket,
       )) {
     throw new TypeError("Sparkle R2 bucket must be a valid reviewed bucket name");
+  }
+  if (endpoints.staging?.workerName !== stagingWorkerName
+      || reviewedStagingOrigin.origin !== stagingOriginURL.origin
+      || endpoints.staging?.workersDev !== true
+      || endpoints.staging?.previewUrls !== false
+      || [reviewedPublicOrigin.origin, reviewedAdminOrigin.origin,
+        reviewedSparkleOrigin.origin].includes(reviewedStagingOrigin.origin)) {
+    throw new TypeError("staging endpoint must match the reviewed nonproduction Worker");
   }
   return endpoints;
 }
