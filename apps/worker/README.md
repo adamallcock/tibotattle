@@ -187,6 +187,16 @@ requires separate owner authorization and rehearsal; source tests are not a
 production cutover receipt.
 
 The current public product series is `GET /api/v1/community/daily`.
+Its current activity, allowance and model calculations admit both signed-in
+and accountless contribution sources. Migration `0060` defines the exact
+durable accountless owner/device/v1.1 authority chain, immediate withdrawal
+fences and bounded retained-source bootstrap. It does not grant social consent
+or verify a person/provider account. Upload credential expiry is independent
+of retained-data eligibility. See the
+[public sample decision](../../docs/decisions/2026-09-11-public-contribution-sources.md)
+for source identity, overlap and activation gates. Legacy sealed weekly
+snapshots keep their original transport and cohort policy.
+
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
 legacy personal statistics, weekly aggregate, recovery,

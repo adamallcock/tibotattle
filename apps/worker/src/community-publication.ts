@@ -7,6 +7,7 @@ import {
 } from "./community-allowance";
 import { V1_ANALYSIS_WINDOW_DAYS, V1_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "./quota-analysis-v1";
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "./quota-analysis-v11";
+import { COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION } from "./telemetry-v1-source-selection";
 
 /** Bounds are per invocation/page, not a physical participant admission limit. */
 export const COMMUNITY_PUBLICATION_PAGE_SIZE = 64;
@@ -20,7 +21,7 @@ interface Head {
   phase: "capturing" | "loading" | "ready" | "retiring"; published: number;
   member_count: number; prepared_count: number; payload_bytes: number; progress_revision: number;
 }
-interface Control { mutation_epoch: number; graph_invalidation_epoch: number; cache_revision: number; }
+interface Control { mutation_epoch: number; graph_invalidation_epoch: number; cache_revision: number; bootstrap_completed: number; }
 export interface CommunityPublicationOptions { budget: CommunityModelCacheReadBudget; maxPages?: number; }
 export interface CommunityPublicationProgress {
   status: "ready" | "deferred" | "unavailable";
@@ -56,7 +57,10 @@ function validHead(head: Head): boolean {
     && ["capturing", "loading", "ready", "retiring"].includes(head.phase)
     && [0, 1].includes(head.published);
 }
-const CONTROL_SQL = `SELECT s.mutation_epoch,s.graph_invalidation_epoch,c.revision AS cache_revision
+const PUBLIC_SOURCE_READY_SQL = `EXISTS (SELECT 1 FROM community_public_source_bootstrap b
+  WHERE b.singleton=1 AND b.policy_version='${COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION}' AND b.completed=1)`;
+const CONTROL_SQL = `SELECT s.mutation_epoch,s.graph_invalidation_epoch,c.revision AS cache_revision,
+    ${PUBLIC_SOURCE_READY_SQL} AS bootstrap_completed
   FROM community_snapshot_mutation_control s,community_publication_changes c
   WHERE s.singleton_id=1 AND c.singleton=1`;
 const HEAD_SQL = "SELECT * FROM community_publication_generation WHERE singleton=1";
@@ -67,7 +71,8 @@ export const COMMUNITY_PUBLICATION_AUTHORITY_SQL = `EXISTS (
   WHERE g.singleton=1 AND g.generation=?1 AND g.phase='ready'
     AND g.source_epoch=?2 AND g.hard_epoch=?3 AND g.method_version=?4
     AND s.singleton_id=1 AND s.graph_invalidation_epoch=g.hard_epoch
-    AND s.mutation_epoch>=g.source_epoch AND g.prepared_count=g.member_count)`;
+    AND s.mutation_epoch>=g.source_epoch AND g.prepared_count=g.member_count
+    AND ${PUBLIC_SOURCE_READY_SQL})`;
 
 export function communityPublicationAuthoritySql(firstParameter: number): string {
   if (!count(firstParameter) || firstParameter < 1 || firstParameter > 90) throw new TypeError("invalid publication SQL offset");
@@ -77,7 +82,8 @@ export function communityPublicationAuthoritySql(firstParameter: number): string
 function guard(head: Head): string {
   return `EXISTS (SELECT 1 FROM community_publication_generation g,community_snapshot_mutation_control s
     WHERE g.singleton=1 AND g.generation='${head.generation}' AND g.progress_revision=${head.progress_revision}
-      AND s.singleton_id=1 AND s.graph_invalidation_epoch=${head.hard_epoch})`;
+      AND s.singleton_id=1 AND s.graph_invalidation_epoch=${head.hard_epoch}
+      AND ${PUBLIC_SOURCE_READY_SQL})`;
 }
 // UUIDs enter SQL only after this stricter internal check; all external/cache
 // strings remain bound parameters. Progress revisions are safe integers.
@@ -100,9 +106,11 @@ interface MembershipRow {
 }
 const CAPTURE_SQL = `WITH candidates AS MATERIALIZED (
   SELECT q.id AS member_id,p.id AS participant_id,v.revision AS input_revision,${SOURCE_FLAGS}
-  FROM community_current_analysis_queue q JOIN participants p ON p.id=q.participant_id AND p.state='active' AND p.owner_kind='social'
+  FROM community_current_analysis_queue q JOIN participants p ON p.id=q.participant_id
   JOIN community_analytical_input_versions v ON v.participant_id=p.id
-  WHERE q.id>?1 AND q.id<=?2 AND (
+  WHERE q.id>?1 AND q.id<=?2
+    AND p.state='active' AND (p.owner_kind='social' OR EXISTS (
+      SELECT 1 FROM community_public_source_owners public_source WHERE public_source.participant_id=p.id)) AND (
     EXISTS (SELECT 1 FROM telemetry_v1_chunks c INDEXED BY telemetry_v1_chunks_current_identity
       WHERE c.participant_id=p.id AND c.superseded_at IS NULL)
     OR EXISTS (SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id=p.id)
@@ -165,11 +173,13 @@ const LOAD_SQL = `WITH page AS MATERIALIZED (
     c.source_method_version AS composition_method,
     COALESCE(length(CAST(f.fits_json AS BLOB)),0)+CASE WHEN m.composition_supported=1
       THEN COALESCE(length(CAST(c.composition_json AS BLOB)),0) ELSE 0 END AS row_bytes
-  FROM community_publication_members m JOIN participants p ON p.id=m.participant_id AND p.state='active' AND p.owner_kind='social'
+  FROM community_publication_members m JOIN participants p ON p.id=m.participant_id
   JOIN community_analytical_input_versions v ON v.participant_id=m.participant_id
   LEFT JOIN community_allowance_fit_cache f ON f.participant_id=m.participant_id
   LEFT JOIN community_model_composition_cache c ON c.participant_id=m.participant_id
   WHERE m.generation=?1 AND m.selected_revision IS NULL AND m.member_id>?2
+    AND p.state='active' AND (p.owner_kind='social' OR EXISTS (
+      SELECT 1 FROM community_public_source_owners public_source WHERE public_source.participant_id=p.id))
   ORDER BY m.member_id LIMIT ?3
 ), weighted AS MATERIALIZED (SELECT *,SUM(row_bytes) OVER (ORDER BY member_id) AS running_bytes,
     ROW_NUMBER() OVER (ORDER BY member_id) AS page_rank FROM page)
@@ -290,6 +300,9 @@ export async function advanceCommunityPublication(db: D1Database, nowMs: number,
       const control = controls!.results[0] as unknown as Control | undefined;
       if (!control || ![control.mutation_epoch,control.graph_invalidation_epoch,control.cache_revision].every(count)
           || control.graph_invalidation_epoch > control.mutation_epoch || (head && !writableHead(head))) return { status: "unavailable" };
+      // Capture only after retained accountless sources have joined the queue.
+      // The fixed watermark must never certify a partly discovered cohort.
+      if (control.bootstrap_completed !== 1) return { status: "deferred" };
       if (head === null) {
         if (!charge(budget)) return { status: "deferred" };
         await db.prepare(`INSERT INTO community_publication_generation
@@ -298,7 +311,8 @@ export async function advanceCommunityPublication(db: D1Database, nowMs: number,
           SELECT 1,?1,?2,?3,?4,s.mutation_epoch,s.graph_invalidation_epoch,c.revision,
             COALESCE((SELECT MAX(id) FROM community_current_analysis_queue),0),0,0,'capturing',0,0,0,0,?5
           FROM community_snapshot_mutation_control s,community_publication_changes c
-          WHERE s.singleton_id=1 AND c.singleton=1 ON CONFLICT(singleton) DO NOTHING`)
+          WHERE s.singleton_id=1 AND c.singleton=1 AND ${PUBLIC_SOURCE_READY_SQL}
+          ON CONFLICT(singleton) DO NOTHING`)
           .bind(crypto.randomUUID(),utcDay,fromDay,COMMUNITY_ATTRIBUTION_METHOD_VERSION,new Date(nowMs).toISOString()).run();
         continue;
       }

@@ -24,6 +24,8 @@ import {
 import type { DailySpendBudget } from "./community-daily-spend";
 import {
   loadV1SourcePin,
+  communityPublicAnalyticalSourceSql,
+  COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION,
   V1_WINNER_FILTER_SQL,
 } from "./telemetry-v1-source-selection";
 
@@ -69,11 +71,10 @@ export const COMMUNITY_DAILY_POLICY_VERSION = "community-daily-v1.0";
 const DAILY_AGGREGATE_SCHEMA_VERSION = "community-daily-aggregate-v1.0";
 const MAX_DAILY_AGGREGATE_CELLS = 100;
 
-function publicDailySourceScope(day: string): { day: string; ownerKind: "social" } {
-  // The scope is part of the source pin fingerprint. This filter must apply
-  // before the bounded source-journal read so private accountless volume can
-  // never exhaust the public day's chunk budget.
-  return { day, ownerKind: "social" };
+function publicDailySourceScope(day: string): { day: string; publicSourcePolicy: typeof COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION } {
+  // Scope eligibility before the bounded journal read. Ineligible retained
+  // records cannot consume the public chunk budget or enter the source pin.
+  return { day, publicSourcePolicy: COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION };
 }
 
 interface DailyRebuildRow {
@@ -126,6 +127,7 @@ export interface CommunityDailyCacheRecovery {
   mode: "cache-only" | "activity-only";
   /** Conservative phase allocation; the root separately meters actual D1 statements. */
   budget: CommunityModelCacheReadBudget;
+  maintenanceLease?: string;
 }
 
 function memoizedAllowanceFits(
@@ -388,7 +390,7 @@ async function buildCommunityDailyAggregate(
           AS output_combined_tokens
        FROM telemetry_analytical_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-         AND p.owner_kind = 'social'
+         AND ${communityPublicAnalyticalSourceSql("r")}
        WHERE ${V1_WINNER_FILTER_SQL} AND r.observed_day = ?`,
     ).bind(sourcePin.winnersJson, day).first<DailyTotalsRow>(),
     db.prepare(
@@ -408,7 +410,7 @@ async function buildCommunityDailyAggregate(
           AS output_combined_tokens
        FROM telemetry_analytical_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-         AND p.owner_kind = 'social'
+         AND ${communityPublicAnalyticalSourceSql("r")}
        WHERE ${V1_WINNER_FILTER_SQL} AND r.observed_day = ? AND r.stream = 'usage'
        GROUP BY r.provider, r.model_id
        ORDER BY r.provider, r.model_id
@@ -567,12 +569,96 @@ async function buildCommunityDailyAggregate(
   return { state: "conflicted", aggregateId };
 }
 
+/** One finite metadata page; never scans records or expands manifest JSON. */
+export async function drainCommunityPublicSourceBootstrap(db: D1Database, options: {
+  budget?: CommunityModelCacheReadBudget; maintenanceLease?: string; pageSize?: number;
+} = {}): Promise<{ completed: boolean; enqueued: number }> {
+  const pageSize = options.pageSize ?? 32;
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 32) throw new TypeError("invalid public source bootstrap page");
+  const budget = options.budget;
+  const charge = (queries: number): boolean => {
+    if (!budget) return true;
+    const now = (budget.now ?? Date.now)();
+    const reserve = budget.reserveQueries ?? 0;
+    if (!Number.isSafeInteger(budget.remainingQueries) || !Number.isSafeInteger(reserve) || reserve < 0
+        || !Number.isFinite(now) || !Number.isFinite(budget.deadlineMs) || now >= budget.deadlineMs
+        || budget.remainingQueries - reserve < queries) return false;
+    budget.remainingQueries -= queries;
+    return true;
+  };
+  const pending = { completed: false, enqueued: 0 };
+  if (!charge(1)) return pending;
+  const cursor = await db.prepare(`SELECT b.policy_version,b.participant_cursor,b.source_day_cursor,b.completed,c.mutation_epoch
+    FROM community_public_source_bootstrap b JOIN community_snapshot_mutation_control c ON c.singleton_id=1
+    WHERE b.singleton=1`).first<{ policy_version: string; participant_cursor: string; source_day_cursor: string; completed: number; mutation_epoch: number }>();
+  if (!cursor || cursor.policy_version !== COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION
+      || ![0,1].includes(cursor.completed) || !Number.isSafeInteger(cursor.mutation_epoch) || cursor.mutation_epoch < 0) {
+    throw new Error("public source bootstrap unavailable");
+  }
+  if (cursor.completed === 1) return { completed: true, enqueued: 0 };
+  if (!charge(1)) return pending;
+  // First select one owner from bounded enrollment metadata, then seek within
+  // its domain-day primary key. A page cannot sort the full retained corpus.
+  const owner = await db.prepare(`SELECT o.participant_id,h.generation_id
+    FROM accountless_upload_owners o
+    JOIN community_public_source_owners eligible ON eligible.participant_id=o.participant_id
+    JOIN telemetry_v11_domain_heads h ON h.participant_id=o.participant_id
+    WHERE o.participant_id >= ?1 AND eligible.owner_kind='accountless'
+      AND EXISTS (SELECT 1 FROM telemetry_v11_domain_days d WHERE d.generation_id=h.generation_id
+        AND (o.participant_id > ?1 OR d.observed_day > ?2))
+    ORDER BY o.participant_id LIMIT 1`).bind(cursor.participant_cursor,cursor.source_day_cursor)
+    .first<{ participant_id: string; generation_id: string }>();
+  const fence = `EXISTS (SELECT 1 FROM community_public_source_bootstrap b
+    JOIN community_snapshot_mutation_control c ON c.singleton_id=1
+    WHERE b.singleton=1 AND b.policy_version=?1 AND b.completed=0
+      AND b.participant_cursor=?2 AND b.source_day_cursor=?3 AND c.mutation_epoch=?4)
+    AND (?5 IS NULL OR EXISTS (SELECT 1 FROM retention_state WHERE singleton=1
+      AND maintenance_lease_token=?5 AND maintenance_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')))`;
+  const bindings = [COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION,cursor.participant_cursor,cursor.source_day_cursor,
+    cursor.mutation_epoch,options.maintenanceLease ?? null];
+  if (!owner) {
+    if (!charge(1)) return pending;
+    const done = await db.prepare(`UPDATE community_public_source_bootstrap SET completed=1
+      WHERE singleton=1 AND ${fence}`).bind(...bindings).run();
+    return { completed: done.meta.changes === 1, enqueued: 0 };
+  }
+  if (!charge(1)) return pending;
+  const days = await db.prepare(`SELECT observed_day FROM telemetry_v11_domain_days
+    WHERE generation_id=? AND observed_day>? ORDER BY observed_day LIMIT ?`)
+    .bind(owner.generation_id,owner.participant_id === cursor.participant_cursor ? cursor.source_day_cursor : "",pageSize)
+    .all<{ observed_day: string }>();
+  if (!days.results.length) return pending;
+  const last = days.results.at(-1)!.observed_day;
+  if (days.results.some(row => !/^\d{4}-\d{2}-\d{2}$/u.test(row.observed_day))) throw new Error("public source bootstrap day invalid");
+  if (!charge(3)) return pending;
+  const ownerFence = `${fence}
+    AND EXISTS (SELECT 1 FROM community_current_analysis_queue_state WHERE singleton_id=1)
+    AND EXISTS (SELECT 1 FROM community_public_source_owners o
+    JOIN telemetry_v11_domain_heads h ON h.participant_id=o.participant_id
+    WHERE o.participant_id=?7 AND o.owner_kind='accountless' AND h.generation_id=?9)`;
+  const args = [...bindings,JSON.stringify(days.results.map(row => row.observed_day)),owner.participant_id,last,owner.generation_id];
+  const result = await db.batch([
+    db.prepare(`INSERT INTO community_daily_aggregate_rebuilds(day,requested_epoch,requested_at)
+      SELECT value,?4,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM json_each(?6)
+      WHERE ${ownerFence}
+      ON CONFLICT(day) DO UPDATE SET requested_epoch=MAX(requested_epoch,excluded.requested_epoch),requested_at=excluded.requested_at`).bind(...args),
+    db.prepare(`INSERT INTO community_current_analysis_queue(participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+      SELECT ?7,1,s.window_generation,1,0 FROM community_current_analysis_queue_state s
+      WHERE s.singleton_id=1 AND ${ownerFence}
+      ON CONFLICT(participant_id) DO UPDATE SET pending=1`).bind(...args),
+    db.prepare(`UPDATE community_public_source_bootstrap SET participant_cursor=?7,source_day_cursor=?8
+      WHERE singleton=1 AND ${ownerFence}`).bind(...args),
+  ]);
+  return { completed: false, enqueued: result[2]?.meta.changes === 1 ? days.results.length : 0 };
+}
+
 export async function rebuildPendingCommunityDailyAggregates(
   db: D1Database,
   scheduledTime: number,
   maximumRebuilds = 24,
   spendLimits: { chunks?: number; events?: number } = {},
   recovery?: CommunityDailyCacheRecovery,
+  maintenanceLease?: string,
 ): Promise<{ processed: number; remaining: boolean; aggregateIds: string[]; deferred?: true }> {
   if (!Number.isFinite(scheduledTime)
       || !Number.isSafeInteger(maximumRebuilds)
@@ -608,6 +694,22 @@ export async function rebuildPendingCommunityDailyAggregates(
       if (lane.current) return { processed: 0, remaining: false, aggregateIds: [] };
     }
     const fixedQueries = activityOnly ? 2 : 77;
+    const minimumPublicationQueries = fixedQueries + 12;
+    // Admit the phase before any bootstrap mutation, and protect its fixed
+    // work while the bounded bootstrap charges its own actual queries. Root
+    // maintenance also drains bootstrap independently before optional work.
+    if (budget.remainingQueries - reserve < minimumPublicationQueries + 1) return { ...deferred, aggregateIds: [] };
+    const bootstrapReserve = budget.reserveQueries;
+    budget.reserveQueries = reserve + minimumPublicationQueries;
+    try {
+      const bootstrap = await drainCommunityPublicSourceBootstrap(db, {
+        budget, maintenanceLease: recovery.maintenanceLease ?? maintenanceLease,
+      });
+      if (!bootstrap.completed) return { ...deferred, aggregateIds: [] };
+    } finally {
+      if (bootstrapReserve === undefined) delete budget.reserveQueries;
+      else budget.reserveQueries = bootstrapReserve;
+    }
     if (!activityOnly) {
       // Read the COMPLETE captured cohort in bounded multi-account pages before
       // allocating optional days/chunks. Ordinary newer inputs queue the next
@@ -615,8 +717,6 @@ export async function rebuildPendingCommunityDailyAggregates(
       // Keep only the fixed publication work and one day in reserve while the
       // cache reader charges its actual queries. Its final generation/hard
       // fence replaces the old whole-corpus global quiet-period requirement.
-      const minimumPublicationQueries = fixedQueries + 12;
-      if (budget.remainingQueries - reserve < minimumPublicationQueries) return { ...deferred, aggregateIds: [] };
       const originalReserve = budget.reserveQueries;
       budget.reserveQueries = reserve + minimumPublicationQueries;
       try {
@@ -642,6 +742,9 @@ export async function rebuildPendingCommunityDailyAggregates(
     spendBudget.remainingChunks = Math.min(spendBudget.remainingChunks,
       Math.max(0, available - fixedQueries - maximumRebuilds * 12) * 8);
     budget.remainingQueries -= fixedQueries + maximumRebuilds * 12 + Math.ceil(spendBudget.remainingChunks / 8);
+  } else {
+    const bootstrap = await drainCommunityPublicSourceBootstrap(db, { maintenanceLease });
+    if (!bootstrap.completed) return { ...deferred, aggregateIds: [] };
   }
   const allowanceFitsForEpoch = memoizedAllowanceFits(db, scheduledTime, recovery, initialFits);
   // Reconcile before draining, so days a late v0.2 contribution drifted are

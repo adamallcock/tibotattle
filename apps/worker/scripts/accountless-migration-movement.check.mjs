@@ -8,7 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { seedStatements } from './rehearse-release-migrations.mjs';
 import { prepareAccountlessMovement, moveAccountlessBatch, transitionAccountlessMovement, accountlessMovementSelection, planAccountlessMovementBatch, planAccountlessMovementSetup, planAccountlessMovementTransition } from './accountless-migration-movement.mjs';
 const worker = join(dirname(fileURLToPath(import.meta.url)), '..');
-const sources = readdirSync(join(worker,'migrations')).sort().map(name => ({name,sql:readFileSync(join(worker,'migrations',name),'utf8')}));
+// This fixture qualifies only the historical 0057–0059 movement algorithm.
+const sources = readdirSync(join(worker,'migrations')).filter(name=>/^\d{4}.*\.sql$/.test(name)&&Number(name.slice(0,4))<=59).sort().map(name => ({name,sql:readFileSync(join(worker,'migrations',name),'utf8')}));
+assert.equal(sources.at(-1).name, '0059_accountless_upload_renewal.sql');
 const bigRows = (db,sql) => { const statement=db.prepare(sql); statement.setReadBigInts(true); return statement.all(); };
 const q = value => '"'+value.replaceAll('"','""')+'"';
 function open(path) { const db=new DatabaseSync(path); db.exec('PRAGMA foreign_keys=ON'); return db; }

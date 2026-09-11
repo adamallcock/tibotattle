@@ -1,3 +1,4 @@
+import { PUBLIC_SOURCE_SCHEMA_SQL } from "./public-source-schema-contract.mjs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -13,6 +14,10 @@ import {
   COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
   COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
   POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  CURRENT_SCALE_SCHEMA_PROBE_SQL,
+  PUBLIC_SOURCE_SCHEMA_PROBE_SQL,
+  publicSourceSchemaComplete,
   POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
   PRE_INCREMENTAL_ANALYSIS_WORK_SCHEMA_PROBE_SQL,
   PRE_INCREMENTAL_MODEL_HISTORY_SCHEMA_PROBE_SQL,
@@ -82,7 +87,7 @@ test("checked-in staging resources remain closed and require live qualification"
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-17), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-18), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
@@ -100,6 +105,7 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
     "0057_accountless_enrollment_ledger.sql",
     "0058_accountless_upload_ownership.sql",
     "0059_accountless_upload_renewal.sql",
+    "0060_public_contribution_sources.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -175,11 +181,11 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0048_accountless_upload_renewal.sql": "82297298f937489275756da93d9b116a7b83b280482000b0df51abd5c598d9b7",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 59);
+  assert.equal(names.length, 60);
   assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests).slice(0, 5));
-  assert.deepEqual(names.slice(-3), Object.keys(expectedDigests).slice(-3));
+  assert.deepEqual(names.slice(56, 59), Object.keys(expectedDigests).slice(-3));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 59 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 60 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -298,7 +304,7 @@ test("reviewed scale migrations are independently byte-pinned and separately bou
     "the two independent required proofs must not be concatenated into one oversized query");
 });
 
-test("historical production prefix upgrades forward without losing source rows or legacy schema", () => {
+test("historical production prefix upgrades through 0059 without losing source rows or legacy schema", () => {
   const database = new DatabaseSync(":memory:");
   const apply = (name) => {
     const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
@@ -310,7 +316,8 @@ test("historical production prefix upgrades forward without losing source rows o
   };
   const rows = (sql) => database.prepare(sql).all().map((row) => ({ ...row }));
   try {
-    const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
+    const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 59);
+    assert.equal(names.at(-1), "0059_accountless_upload_renewal.sql");
     for (const name of names.slice(0, 41)) apply(name);
     assert.equal(names[40], "0041_community_model_composition_cache.sql");
     assert.equal(database.prepare("SELECT count(*) AS count FROM sqlite_master WHERE name = 'community_model_composition_cache'").get().count, 0);
@@ -398,7 +405,7 @@ test("historical production prefix upgrades forward without losing source rows o
   }
 });
 
-test("fresh reconciled schema and attribution metadata probe cover every new guard, view, index and persisted column", () => {
+test("historical 0059 schema probes cover every then-current guard, view, index and persisted column", () => {
   const database = new DatabaseSync(":memory:");
   try {
     const objectNames = () => database.prepare(
@@ -406,7 +413,9 @@ test("fresh reconciled schema and attribution metadata probe cover every new gua
     ).all().map(({ type, name }) => `${type}:${name}`);
     let oldObjects;
     let accountlessObjectsBefore;
-    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+    const historicalNames = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 59);
+    assert.equal(historicalNames.at(-1), "0059_accountless_upload_renewal.sql");
+    for (const name of historicalNames) {
       if (name === "0043_analytical_input_fencing.sql") oldObjects = new Set(objectNames());
       if (name === "0057_accountless_enrollment_ledger.sql") {
         accountlessObjectsBefore = new Set(objectNames());
@@ -1576,8 +1585,8 @@ test("current migration labels cannot substitute for the separate scale schema p
   assert.equal(result.checks.attributionSchemaCurrent, false);
   assert.equal(result.blockers.includes("REMOTE_ATTRIBUTION_SCHEMA_INCOMPLETE"), true);
   assert.equal(result.collectionAuthorized, false);
-  assert.equal(calls.filter(args => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
-  assert.equal(calls.filter(args => args.includes(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL)).length, 1);
+  assert.equal(calls.filter(args => args.includes(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
+  assert.equal(calls.filter(args => args.includes(CURRENT_SCALE_SCHEMA_PROBE_SQL)).length, 1);
   assert.equal(calls.some(args => args.includes("apply") || args.includes("deploy")), false);
 });
 
@@ -1600,7 +1609,7 @@ test("staging requires pending attribution migrations before its schema probe", 
   assert.equal(result.state, "blocked");
   assert.equal(result.checks.migrationsCurrent, false);
   assert.equal(result.checks.attributionSchemaCurrent, false);
-  assert.equal(calls.some((args) => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
+  assert.equal(calls.some((args) => args.includes(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
   assert.equal(calls.some((args) => args.includes("apply")), false);
 });
 
@@ -1641,8 +1650,8 @@ test("staging blocks incomplete canonical prefixes and unreviewed successors bef
     assert.equal(result.checks.attributionSchemaCurrent, false);
     assert.equal(result.collectionAuthorized, false);
     assert.equal(calls.some((args) => args.includes("apply")), false);
-    assert.equal(calls.some((args) => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
-    assert.equal(calls.some((args) => args.includes(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL)), false);
+    assert.equal(calls.some((args) => args.includes(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
+    assert.equal(calls.some((args) => args.includes(CURRENT_SCALE_SCHEMA_PROBE_SQL)), false);
   }
 });
 
@@ -1671,7 +1680,7 @@ test("staging treats the historical prefix as pending but rejects an alternate a
     assert.equal(result.checks.remoteMigrationInventoryCurrent, false);
     assert.equal(result.collectionAuthorized, false);
     assert.equal(calls.some((args) => args.includes("apply")), false);
-    assert.equal(calls.some((args) => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
+    assert.equal(calls.some((args) => args.includes(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
   }
 });
 
@@ -1701,8 +1710,8 @@ test("retained divergent staging lineage requires an approved replacement and ne
     "legacy_replacement_required");
   assert.equal(result.collectionAuthorized, false);
   assert.equal(calls.some((args) => args.includes("apply") || args.includes("deploy")), false);
-  assert.equal(calls.some((args) => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
-  assert.equal(calls.some((args) => args.includes(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL)), false);
+  assert.equal(calls.some((args) => args.includes(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
+  assert.equal(calls.some((args) => args.includes(CURRENT_SCALE_SCHEMA_PROBE_SQL)), false);
 
   const altered = [...RETAINED_LEGACY_STAGING_MIGRATION_LINEAGE];
   altered[45] = "0046_other_rehearsal.sql";
@@ -1725,7 +1734,7 @@ test("retained divergent staging lineage requires an approved replacement and ne
   assert.equal(drift.state, "blocked");
   assert.equal(drift.blockers.includes("REMOTE_MIGRATION_INVENTORY_DRIFT"), true);
   assert.equal(drift.blockers.includes("REMOTE_MIGRATION_LEGACY_LINEAGE_REPLACEMENT_REQUIRED"), false);
-  assert.equal(driftCalls.some((args) => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
+  assert.equal(driftCalls.some((args) => args.includes(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
 });
 
 test("staging readiness rejects production resources and custom-domain targets", () => {
@@ -1880,9 +1889,9 @@ test("live readiness proves resources, secrets, migrations, and containment", ()
     true,
   );
   assert.deepEqual(result.blockers, []);
-  assert.equal(calls.filter((args) => args[0] === "d1").length, 9);
-  assert.equal(calls.filter((args) => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
-  assert.equal(calls.filter((args) => args.includes(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL)).length, 1);
+  assert.equal(calls.filter((args) => args[0] === "d1").length, 10);
+  assert.equal(calls.filter((args) => args.includes(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
+  assert.equal(calls.filter((args) => args.includes(CURRENT_SCALE_SCHEMA_PROBE_SQL)).length, 1);
   assert.equal(calls.some((args) => args.includes("migrations")), false);
   assert.equal(
     calls.filter((args) => args.some((value) =>
@@ -2236,4 +2245,62 @@ test("live readiness reports R2 account enablement without leaking command outpu
   assert.equal(result.blockers.includes("R2_NOT_ENABLED"), true);
   assert.equal(JSON.stringify(result).includes("private account details"), false);
   assert.equal(JSON.stringify(result).includes("Dashboard"), false);
+});
+
+
+test("current 0060 readiness binds the exact eligibility, bootstrap and withdrawal schema", async () => {
+  const { unstable_splitSqlQuery } = await import("wrangler");
+  const database = new DatabaseSync(":memory:");
+  try {
+    const snapshot = () => Object.fromEntries(database.prepare(
+      "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
+    ).all().map(({ name, sql }) => [name, sql]));
+    const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
+    for (const name of names.slice(0, 59)) {
+      const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
+      database.exec(name.startsWith("0058_") ? `BEGIN;${sql}COMMIT;` : sql);
+    }
+    const before = snapshot();
+    assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false);
+    database.exec("SAVEPOINT public_source_format;");
+    for (const sql of unstable_splitSqlQuery(readFileSync(join(workerDirectory, "migrations", "0060_public_contribution_sources.sql"), "utf8"))) database.exec(sql);
+    assert.deepEqual(Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)), PUBLIC_SOURCE_SCHEMA_SQL);
+    for (const probe of [CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
+      assert.ok(Buffer.byteLength(probe) < 100_000, "separate bounded metadata queries");
+    }
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(scaleSchemaComplete(database.prepare(CURRENT_SCALE_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), true);
+    for (const [name, sql] of Object.entries(PUBLIC_SOURCE_SCHEMA_SQL)) {
+      const type = /^CREATE (TABLE|VIEW|TRIGGER)/u.exec(sql)[1];
+      database.exec(`SAVEPOINT missing_public_source; DROP ${type} ${name};`);
+      assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `missing ${name}`);
+      const altered = type === "TRIGGER" ? sql.slice(0, sql.indexOf("BEGIN")) + "BEGIN SELECT 1; END"
+        : type === "VIEW" ? `CREATE VIEW ${name}(participant_id, owner_kind, device_id) AS SELECT 'synthetic', 'social', NULL`
+        : `CREATE TABLE ${name}(singleton INTEGER PRIMARY KEY)`;
+      database.exec(altered);
+      assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `altered ${name}`);
+      database.exec("ROLLBACK TO missing_public_source; RELEASE missing_public_source;");
+    }
+    for (const row of [undefined, {}, { public_source_objects: true }, { public_source_objects: 0 }]) {
+      assert.equal(publicSourceSchemaComplete(row), false);
+    }
+    database.exec("ROLLBACK TO public_source_format; RELEASE public_source_format;");
+    // D1's remote migration path keeps inline comments, unlike local Wrangler.
+    database.exec(readFileSync(join(workerDirectory, "migrations", "0060_public_contribution_sources.sql"), "utf8"));
+    assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), true);
+    const remoteDefinitions = Object.fromEntries(Object.entries(snapshot()).filter(([name]) => name in PUBLIC_SOURCE_SCHEMA_SQL));
+    assert.equal(Object.values(remoteDefinitions).filter(sql => sql.includes("-- Count only this OLD source")).length, 11);
+    for (const [name, sql] of Object.entries(remoteDefinitions)) {
+      const type = /^CREATE (TABLE|VIEW|TRIGGER)/u.exec(sql)[1];
+      database.exec(`SAVEPOINT altered_remote_source; DROP ${type} ${name};`);
+      assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `remote missing ${name}`);
+      const altered = type === "TRIGGER" ? sql.slice(0, sql.indexOf("BEGIN")) + "BEGIN SELECT 1; END"
+        : type === "VIEW" ? sql.replace("'accountless-opt-out-v1'", "'accountless-opt-out-v1 '")
+        : `CREATE TABLE ${name}(singleton INTEGER PRIMARY KEY)`;
+      database.exec(altered);
+      assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `remote altered ${name}`);
+      database.exec("ROLLBACK TO altered_remote_source; RELEASE altered_remote_source;");
+    }
+  } finally { database.close(); }
 });

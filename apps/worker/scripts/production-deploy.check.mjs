@@ -543,6 +543,19 @@ test("deployment CLI separates exact predecessor deployment from stopped-executo
   }
 });
 
+test("deployment CLI captures the current clean candidate when no candidate override is supplied", async () => {
+  const configured = readyOptions();
+  delete configured.expectedSourceCommit;
+  Object.assign(configured, parseProductionDeploymentArgs([
+    "--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT,
+  ]));
+  const result = await runProductionDeployment(configured);
+  assert.equal(result.ok, true);
+  const journal = await readOperation(configured.operationDirectory);
+  assert.equal(journal.state.sourceCommit, FIXTURE_SOURCE_COMMIT);
+  assert.equal(journal.state.outcome, "verified");
+});
+
 test("dependency digest ignores only root Wrangler runtime state", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-dependency-digest-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1362,6 +1375,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     "USAGE_MONITOR_DB:0057_accountless_enrollment_ledger.sql",
     "USAGE_MONITOR_DB:0058_accountless_upload_ownership.sql",
     "USAGE_MONITOR_DB:0059_accountless_upload_renewal.sql",
+    "USAGE_MONITOR_DB:0060_public_contribution_sources.sql",
   ];
   const ledgerRows = (names) => names.map((name, index) => ({ id: index + 1, name }));
   const historicalPrefix = expected.USAGE_MONITOR_DB.slice(0, 41);
@@ -1439,7 +1453,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     [...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"],
     [...expected.USAGE_MONITOR_DB.slice(0, 47), "0048_unreviewed_model_history.sql"],
     [...expected.USAGE_MONITOR_DB.slice(0, 48), "0049_unreviewed_graph_preservation.sql"],
-    ...[50, 51, 52, 53, 54, 55, 56, 57, 58, 59].map(number => [...expected.USAGE_MONITOR_DB.slice(0, number - 1),
+    ...[50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60].map(number => [...expected.USAGE_MONITOR_DB.slice(0, number - 1),
       `${String(number).padStart(4, "0")}_unreviewed.sql`]),
   ]) {
     const index = applied.findIndex((name, item) => name !== expected.USAGE_MONITOR_DB[item]);
@@ -1449,7 +1463,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 59,
+        localCount: 60,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });
@@ -1470,7 +1484,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 59,
+        localCount: 60,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });

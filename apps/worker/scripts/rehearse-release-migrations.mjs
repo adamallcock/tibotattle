@@ -14,7 +14,7 @@ const STREAMS = Object.freeze({ USAGE_MONITOR_DB: "migrations", DELETION_LEDGER:
 const SCHEMA = "release-migration-rehearsal-v1";
 const PREFIX_SCHEMA = "release-migration-prefix-v1";
 export const LOCAL_SCALE_PROFILE = Object.freeze({
-  name: "production-scale-5gib", targetBytes: 5 * 2 ** 30, maxDatabaseBytes: 10_000_000_000,
+  name: "production-scale-5gib", throughMigration: "0059_accountless_upload_renewal.sql", targetBytes: 5 * 2 ** 30, maxDatabaseBytes: 10_000_000_000,
   maxScratchBytes: 20 * 2 ** 30, minInitialFreeBytes: 22 * 2 ** 30, minFreeBytes: 2 * 2 ** 30,
   maxRssBytes: 2 ** 31, timeoutMs: 600_000, accounts: 1000, events: 100_000,
   paddingCharacters: 26 * 1024, blockRows: 200, maxOvershootBytes: 64 * 2 ** 20,
@@ -81,7 +81,7 @@ const quote = name => `"${name.replaceAll('"', '""')}"`;
 const literal = value => value === null ? "NULL" : Buffer.isBuffer(value) ? `X'${value.toString("hex")}'`
   : typeof value === "number" ? String(value) : `'${String(value).replaceAll("'", "''")}'`;
 
-async function bundles(workerRoot) {
+async function bundles(workerRoot, throughMigration = null) {
   const result = {}, inventory = {};
   for (const [binding, directory] of Object.entries(STREAMS)) {
     const entries = await readdir(join(workerRoot, directory), { withFileTypes: true });
@@ -98,6 +98,14 @@ async function bundles(workerRoot) {
   }
   const validation = validateMigrationInventory(inventory);
   if (!validation.ok) fail(validation.code);
+  // The fixed scale profile remains the historical 0057–0059 qualification.
+  // Validate every current source first; the receipt binds only its explicit target.
+  if (throughMigration !== null) {
+    if (throughMigration !== LOCAL_SCALE_PROFILE.throughMigration) fail("REHEARSAL_TARGET_INVALID");
+    const end = result.USAGE_MONITOR_DB.findIndex(row => row.name === throughMigration);
+    if (end !== 58) fail("REHEARSAL_TARGET_INVALID");
+    result.USAGE_MONITOR_DB = result.USAGE_MONITOR_DB.slice(0, end + 1);
+  }
   return result;
 }
 
@@ -124,8 +132,8 @@ function admissionForSources(sources, prefix) {
       { applied: prefix.migrations[key].length, pending: rows.slice(prefix.migrations[key].length).map(({ name, sha256 }) => ({ name, sha256 })) }])) };
 }
 
-export async function inspectMigrationPrefix({ workerRoot = WORKER_ROOT, prefix }) {
-  return admissionForSources(await bundles(workerRoot), prefix);
+export async function inspectMigrationPrefix({ workerRoot = WORKER_ROOT, prefix, throughMigration = null }) {
+  return admissionForSources(await bundles(workerRoot, throughMigration), prefix);
 }
 
 function decodeImportResult(stdout) {
@@ -259,7 +267,7 @@ export async function runMigrationRehearsal({ workerRoot = WORKER_ROOT, prefix, 
         || ![2 ** 30, 2 ** 31].includes(maxRssBytes)) fail("REHEARSAL_PROFILE_OVERRIDES_FORBIDDEN");
     maxDurationMs = LOCAL_SCALE_PROFILE.timeoutMs; maxDatabaseBytes = LOCAL_SCALE_PROFILE.maxDatabaseBytes; maxRssBytes = LOCAL_SCALE_PROFILE.maxRssBytes;
   }
-  const sources = await bundles(workerRoot), admission = admissionForSources(sources, prefix);
+  const sources = await bundles(workerRoot, scale ? LOCAL_SCALE_PROFILE.throughMigration : null), admission = admissionForSources(sources, prefix);
   if (scale) validateScaleAdmission(admission);
   if (!Number.isInteger(accounts) || accounts < 2 || accounts > 1000 || !Number.isInteger(events) || events < accounts || events > 1_000_000
       || ![maxDurationMs, maxDatabaseBytes, maxRssBytes].every(n => Number.isSafeInteger(n) && n > 0)
@@ -382,7 +390,7 @@ export async function runMigrationRehearsalProcess({ prefix, accounts = 1000, ev
       || !Number.isSafeInteger(maxRssBytes) || maxRssBytes < 1 || maxRssBytes > 2 ** 31
       || !Number.isSafeInteger(terminationGraceMs) || terminationGraceMs < 1 || terminationGraceMs > 5000) fail("REHEARSAL_LIMITS_INVALID");
   // Validate lineage before starting a subprocess; no malformed source observation is reused.
-  const admission = await inspectMigrationPrefix({ prefix });
+  const admission = await inspectMigrationPrefix({ prefix, throughMigration: scale ? LOCAL_SCALE_PROFILE.throughMigration : null });
   if (scale) validateScaleAdmission(admission);
   const directory = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-migration-rehearsal-")));
   await chmod(directory, 0o700);

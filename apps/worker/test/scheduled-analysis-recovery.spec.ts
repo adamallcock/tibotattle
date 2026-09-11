@@ -335,6 +335,33 @@ describe("actual scheduled resumable analysis recovery", () => {
     assertMeter(observation); await released();
   });
 
+  it("finishes pending source discovery before current analysis consumes the optional deadline", async () => {
+    await seedQuota(200);
+    // This retained social-only database still has a pending migration cursor.
+    // Completing its exact empty accountless census must not wait behind work.
+    await db().prepare("UPDATE community_public_source_bootstrap SET completed=0").run();
+    const started = Date.now(); let currentTime = started, crossed = false;
+    let completedAtAnalysis: unknown = null;
+    vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+    const observation = observe(async (entry, moment) => {
+      if (crossed || moment !== "after" || !entry.sql.includes("FROM telemetry_v1_quota_fit_backfill")) return;
+      crossed = true;
+      completedAtAnalysis = await db().prepare("SELECT completed FROM community_public_source_bootstrap WHERE singleton=1").first();
+      currentTime = started + 40_001;
+    });
+    expect(await runScheduledMaintenance(bindings(observation), NOW + 60_000))
+      .toMatchObject({outcome:"success",lifecycleComplete:true,aggregateRebuildComplete:false});
+    expect(crossed).toBe(true);
+    expect(completedAtAnalysis).toEqual({completed:1});
+    expect(await db().prepare("SELECT completed FROM community_public_source_bootstrap WHERE singleton=1").first())
+      .toEqual({completed:1});
+    const reads = observation.queries.filter(entry => entry.sql.includes("FROM community_public_source_bootstrap b JOIN community_snapshot_mutation_control"));
+    expect(reads).toHaveLength(1);
+    expect(observation.queries.filter(entry => entry.sql.includes("UPDATE community_public_source_bootstrap SET completed=1"))).toHaveLength(1);
+    assertMeter(observation); await released();
+    expect(inspection.rawFits).not.toHaveBeenCalled(); expect(inspection.rawModels).not.toHaveBeenCalled();
+  });
+
   it("preserves completed acquisition and queue at the shared optional deadline, then resumes and publishes both caches", async () => {
     await seedQuota(2050); const queued = await queue();
     const started = Date.now(); let currentTime = started, crossed = false;
@@ -370,10 +397,14 @@ describe("actual scheduled resumable analysis recovery", () => {
     expect(second.queries.slice(0, payloadRead).some(entry => entry.sql.includes("FROM admin_community_allowance_preview_cache"))).toBe(false);
     // Queue prepare/claim replaces the single census statement with five
     // bounded statements, adding four queries without growing with membership.
-    expect(setupReceipt).toEqual({ fixedSetupQueries: 59, primary: 56, ledger: 3 });
+    // The completed public-source bootstrap contributes one bounded primary
+    // metadata read before optional reconstruction; no retained rows are scanned.
+    expect(second.queries.slice(0, fixedSetupQueries).filter(entry =>
+      entry.sql.includes("FROM community_public_source_bootstrap b JOIN community_snapshot_mutation_control"))).toHaveLength(1);
+    expect(setupReceipt).toEqual({ fixedSetupQueries: 60, primary: 57, ledger: 3 });
     // Worst legal 1024-part head:384 reads,3 final pin/head checks,407 finish
     // reserve,24 combined warmer/scheduler headroom. Heavy sustained required
-    // housekeeping can exceed the remaining 23 queries and safely defer finish.
+    // housekeeping can exceed the remaining 22 queries and safely defer finish.
     expect(fixedSetupQueries + 384 + 3 + 407 + 24).toBeLessThanOrEqual(900);
     expect(await db().prepare("SELECT fixed_now,run_id,phase FROM community_analysis_work WHERE participant_id=?").bind(PARTICIPANT).first())
       .toMatchObject({ fixed_now: before!.fixed_now, run_id: before!.run_id, phase: "complete" });

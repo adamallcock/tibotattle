@@ -3,6 +3,7 @@ import { sha256Hex } from "./crypto";
 
 /** Device transport dedupe, not account identity or proof of complete history. */
 export const V1_SOURCE_SELECTION_METHOD_VERSION = "legacy-day-or-complete-domain-3";
+export const COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION = "community-public-sources-v1";
 export const MAX_V1_SOURCE_CHUNKS = 30_000;
 
 function compareText(left: string, right: string): number {
@@ -11,7 +12,7 @@ function compareText(left: string, right: string): number {
 
 export type V1SourceScope =
   | { participantId: string; fromDay?: string; throughDay?: string }
-  | { day: string; ownerKind?: "social" };
+  | { day: string; ownerKind?: "social"; publicSourcePolicy?: typeof COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION };
 
 export interface V1SourceChunk {
   readonly id: string;
@@ -129,6 +130,21 @@ export async function selectV1SourceDayDependencies(chunks: readonly V1SourceChu
   return Object.freeze(result);
 }
 
+/** Public eligibility is evaluated before source budgets and again at record reads. */
+export function communityPublicAnalyticalSourceSql(alias: "c" | "r"): string {
+  return `EXISTS (SELECT 1 FROM community_public_source_owners public_owner
+    WHERE public_owner.participant_id = ${alias}.participant_id
+      AND (public_owner.owner_kind = 'social' OR (
+        public_owner.owner_kind = 'accountless'
+        AND public_owner.device_id = ${alias}.device_id
+        AND EXISTS (SELECT 1 FROM telemetry_v11_domain_heads public_head
+          JOIN telemetry_v11_domains public_domain ON public_domain.id = public_head.generation_id
+          WHERE public_head.participant_id = ${alias}.participant_id
+            AND public_domain.participant_id = ${alias}.participant_id
+            AND public_domain.device_id = public_owner.device_id)
+      )))`;
+}
+
 function sourceScope(scope: V1SourceScope): {
   sql: string;
   bindings: string[];
@@ -165,12 +181,18 @@ function sourceScope(scope: V1SourceScope): {
   if (scope.ownerKind !== undefined && scope.ownerKind !== "social") {
     throw new TypeError("v1 source owner scope invalid");
   }
+  if (scope.publicSourcePolicy !== undefined
+      && (scope.publicSourcePolicy !== COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION || scope.ownerKind !== undefined)) {
+    throw new TypeError("v1 public source policy invalid");
+  }
   return {
     sql: "c.chunk_day = ?",
     bindings: [scope.day],
     // Public consumers must constrain the source vector before the bounded
     // chunk read, rather than filtering winners or records afterwards.
-    participantOwnerSql: scope.ownerKind === "social" ? " AND p.owner_kind = 'social'" : "",
+    participantOwnerSql: scope.publicSourcePolicy === COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION
+      ? ` AND ${communityPublicAnalyticalSourceSql("c")}`
+      : scope.ownerKind === "social" ? " AND p.owner_kind = 'social'" : "",
   };
 }
 

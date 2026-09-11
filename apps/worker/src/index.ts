@@ -345,6 +345,7 @@ import {
 import {
   readPublishedCommunityDailyAggregatesWithAllowanceState,
   isCurrentCommunityAllowancePublication,
+  drainCommunityPublicSourceBootstrap,
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
 import { isCurrentCommunityDailySpend } from "./community-daily-spend";
@@ -4397,6 +4398,12 @@ export async function runScheduledMaintenance(
         queryMeter.reserveQueries = 12;
         try {
           await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+          // Historic source discovery gates the public cohort. Give one
+          // bounded page priority so sustained analysis cannot starve it.
+          await drainCommunityPublicSourceBootstrap(env.USAGE_MONITOR_DB, {
+            budget: { remainingQueries: Math.max(0, queryMeter.remainingQueries), deadlineMs: optionalDeadlineMs },
+            maintenanceLease: ownedMaintenanceLease,
+          });
           if (reconstructionMode === "resumable") {
             // Budget admissions refresh from actual queries used. Helpers share
             // their conservative allocation within each phase, while this one
@@ -4485,21 +4492,22 @@ export async function runScheduledMaintenance(
             }
             const dailyStartedQueries = queryMeter.queriesUsed;
             const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
-              24, undefined, {mode:"cache-only",budget:phaseBudget()});
+              24, undefined, {mode:"cache-only",budget:phaseBudget(),maintenanceLease:ownedMaintenanceLease});
             console.log(JSON.stringify({level:"info",event:"scheduled_daily_publication",
               outcome:dailyRebuild.deferred ? "deferred" : "complete",code:"BOUNDED_DAILY_PUBLICATION_PROGRESS",
               processed:dailyRebuild.processed,remaining:dailyRebuild.remaining,
               phaseQueries:queryMeter.queriesUsed-dailyStartedQueries,...phaseTiming()}));
             if (dailyRebuild.deferred && queryMeter.remainingQueries >= 100 && Date.now() < optionalDeadlineMs) {
               await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
-                4, undefined, {mode:"activity-only",budget:phaseBudget()});
+                4, undefined, {mode:"activity-only",budget:phaseBudget(),maintenanceLease:ownedMaintenanceLease});
             }
             rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
             // Use spare resources in the other slots, but never retry an early
             // history attempt in this invocation, including after a failure.
             if (!historyFirst) await rebuildModelHistory("after_publication");
           } else {
-            const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime);
+            const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
+              24, undefined, undefined, ownedMaintenanceLease);
             rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
             const allowanceCache = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime);
             if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {

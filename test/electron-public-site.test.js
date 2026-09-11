@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readElectronSitePublication } from '../scripts/lib/electron-public-site.mjs';
+import { readElectronSitePublication, renderElectronSiteDocumentation } from '../scripts/lib/electron-public-site.mjs';
 import { identityDigest } from '../scripts/lib/release-operation.mjs';
 import { buildPublicReleaseSite, parseArgs } from '../scripts/build-public-release-site.js';
 
@@ -55,6 +55,7 @@ test('actual public generator renders four targets and automatic native replacem
   assert.match(html,/<meta property="og:image:alt" content="TiboTattle logo">/u);assert.doesNotMatch(html,/Your existing data and credentials are preserved/u);
   assert.doesNotMatch(html,/brew install|not available yet|src="\.\/app.js"/u);
   assert.equal(await readFile(join(output,'community.html'),'utf8'),html);
+  const privacy=await readFile(join(output,'privacy.html'),'utf8');assert.match(privacy,/<body[^>]*data-i18n-root/u);assert.match(privacy,/<script type="module" src="\.\/localization\.js"><\/script>/u);assert.match(privacy,/data-i18n="community\.privacy\.sample"/u);
   const docs=await readFile(join(output,'docs.html'),'utf8');assert.match(docs,/<body[^>]*data-i18n-root/u);assert.match(docs,/<script type="module" src="\.\/localization\.js"><\/script>/u);assert.match(docs,/Electron downloads are available/u);assert.match(docs,/automatically transfers retained history and settings/u);assert.match(docs,/In native Mac version 0\.1\.18, choose Check for Updates to install the Electron app/u);assert.doesNotMatch(docs,/Signed releases use the Sparkle feed|local-first Mac app/);assert.doesNotMatch(docs,/macOS is the currently available lane/u);
   const manifest=JSON.parse(await readFile(join(output,'release-site-manifest.json'),'utf8'));assert.equal(manifest.electronRelease.downloads.length,4);assert.equal(manifest.electronRelease.publishedInstallersVerified,false);assert.doesNotMatch(JSON.stringify(manifest.electronRelease.verificationScope),/published-installer/u);assert.equal(manifest.installer,undefined);
   await assert.rejects(buildPublicReleaseSite({...args,installerUrl:'https://tibotattle.com/a.dmg'}),/excludes native/u);
@@ -68,4 +69,16 @@ test('automatic replacement copy cannot be built against the legacy 0.1.19 relea
   const f = await fixture(t); f.plan.version = '0.1.19';
   await writeFile(f.planPath, JSON.stringify(f.plan));
   await assert.rejects(readElectronSitePublication({...f.options, approvedPlanSha256: identityDigest(f.plan), verifyPublishedInstaller: async () => assert.fail('legacy release must fail before any download')}), /exact reviewed/u);
+});
+
+test('Electron Privacy localization preserves all source content and uses only the existing local module', async () => {
+  const source = await readFile(new URL('../apps/web/public/privacy.html', import.meta.url), 'utf8');
+  const rendered = renderElectronSiteDocumentation(source);
+  assert.match(rendered, /<body[^>]*data-i18n-root/u);
+  assert.equal((rendered.match(/<script\b/gu) ?? []).length, 1);
+  assert.match(rendered, /<script type="module" src="\.\/localization\.js"><\/script>/u);
+  assert.equal(rendered.replace(' data-i18n-root', '').replace('<script type="module" src="./localization.js"></script>\n', ''), source,
+    'privacy sections and content must not receive the Docs-specific rewrites');
+  for (const key of ['sample', 'smallSample', 'publicationRules']) assert.ok(rendered.includes(`data-i18n="community.privacy.${key}"`));
+  assert.equal(renderElectronSiteDocumentation('<body><p>Unrelated resource</p></body>'), '<body><p>Unrelated resource</p></body>');
 });

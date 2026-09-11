@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-09
+date: 2026-09-11
 type: status
 status: current
-source_commit: bdfce5a32da113b48a4c05f60a2363111e304961
-observation_date: 2026-09-09
+source_commit: 03d4217fe4d42d9d342b6ad34b73905c025b9ead
+observation_date: 2026-09-11
 ---
 
 # Current product and release status
@@ -14,30 +14,56 @@ applications, public downloads, update feeds and hosted service behavior are
 independent observations. Re-check their own source of truth for a later
 operational decision.
 
-## Source boundary and reconciliation status
+## Current release and hosted boundary
 
-`bdfce5a3` is the local Electron integration boundary for this status update.
-It is a source boundary only: it does not identify a published native artifact,
-deployed Worker, update feed, or hosted observation.
+[Electron 0.1.21](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.21)
+is the public stable release. On 2026-09-11 its GitHub release was verified as
+neither draft nor prerelease, with 20 assets covering macOS Apple silicon,
+macOS Intel, Windows x64 and Linux x64, including native Mac transition feeds.
+This hosted-policy change does not rebuild or republish those installers.
 
-The incoming hosted and release-tooling work from PR #114 is being reconciled
-with this Electron line. The reconciliation preserves the deployed canonical
-migration lineage through `0056`; accountless migrations `0057`–`0059` are
-source-only and are not deployed. The earlier synthetic staging-only
+Live production health on 2026-09-11 returned `ok` at source `03d4217f`;
+the public daily API returned HTTP 200. Accountless enrollment and ownership
+are enabled in that deployed source. The completed `0057`–`0059` migration
+must not be repeated. The earlier synthetic staging-only
 accountless `0046`–`0048` lineage remains retained evidence and requires a
 separately approved replacement target. It must not be replayed, renamed in a
 remote ledger, or treated as current.
 
-Accountless contribution remains excluded from public aggregate publication and
-ordinary scheduler paths. No source merge authorizes remote migrations,
-enrollment, contribution, deployment, or public release.
+The owner approved accountless inclusion in the current public community sample
+on 2026-09-11. The [shared-source decision](./decisions/2026-09-11-public-contribution-sources.md)
+tracks implementation and activation. Migration `0060` is applied and its 43
+new/replaced objects were verified against exact local and remote SQL forms.
+The guarded Worker/site deployment completed, both deployment and maintenance
+ownership were released, and ordinary scheduled maintenance resumed. Collection
+remains operational at revision 3. Current public figures now admit eligible
+accountless v1.1 sources under the same existing analytical rules.
 
-Published-native facts below are carried forward from the 2026-09-05 release
-record. This reconciliation did not rerun native source-to-artifact, signing,
-notarization, Gatekeeper, installed-runtime, update-feed, public-site, or live
-hosted checks.
+The policy change invalidated derived publications. Scheduled rebuilding has
+prepared all 15 source members and published 319 daily rows, with no retained
+days left in the rebuild queue. The public API for September 5–11 returns a
+ready allowance result and four daily entries. A real accountless source has
+not yet appeared in the public figures. Local HTTP lifecycle tests prove
+enrollment, accepted upload, replay, publication, renewal, withdrawal and erasure.
+The service suite passed 1,026 tests; the populated migration rehearsal preserved
+1,000 synthetic source chains and 100,000 records in each telemetry table.
 
-## Published native release
+An installed 0.1.21 diagnostic then found a separate desktop preparation defect:
+history above one million quota observations hits a fixed acquisition limit
+and retries without reaching upload. Enrollment and the versioned upload
+authorization were valid. The bounded streaming reader repair is integrated
+with the requested Projects, model-performance and progress-layout changes in
+[PR #121](https://github.com/adamallcock/tibotattle/pull/121), based on the released
+0.1.21 source. The proposed 0.1.22 app still requires completed release
+qualification, packaging and installed upload proof.
+
+The earlier native facts below are carried forward from the 2026-09-05 release
+record. This hosted-policy change did not rerun native source-to-artifact,
+signing, notarization, Gatekeeper or installed-runtime qualification. Public
+release/feed identity, generated assets, rendered privacy content and live
+hosted health were checked separately for this deployment.
+
+## Earlier native release (historical)
 
 [TiboTattle 0.1.18](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18)
 is public and immutable. Both macOS 14+ installers are stable build `1026`,
