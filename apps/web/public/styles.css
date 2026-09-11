@@ -4890,3 +4890,12 @@ html[data-theme="dark"] .noscript {
 .cache-impact-bullets li + li { margin-top: var(--space-1); }
 .model-identity .model-usage-icon { width: 1.25rem; height: 1.25rem; display: inline-block; vertical-align: middle; margin-inline-end: .45rem; }
 .allowance-model-spark { --allowance-color: #996315; }
+
+/* Keep release checksum copying discreet without reducing keyboard visibility. */
+.community-site .electron-checksum-copy,
+.community-site .electron-checksum-copy:hover:not(:disabled),
+.community-site .electron-checksum-copy[data-copy-state="copied"] {
+  border: 0;
+  background: transparent;
+  padding-inline: 0;
+}

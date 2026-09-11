@@ -65,7 +65,7 @@ export async function readElectronSitePublication({ planPath, artifactRoot, appr
       } finally { await handle.close(); }
     }
     const object = selected[0];
-    const url = `${plan.origin}/${object.objectKey}`;
+    const url = `https://github.com/adamallcock/tibotattle/releases/download/v${plan.version}/${name}`;
     const verified = await verifyPublishedInstaller({ installerUrl: url, expectedBytes: object.bytes, expectedSha256: object.sha256 });
     if (verified?.bytes !== object.bytes || verified?.sha256 !== object.sha256) fail();
     if (verified.published === false) publishedInstallersVerified = false;
@@ -92,18 +92,20 @@ export function renderElectronSiteDownloads(html, release) {
     const mac = item.target.startsWith('darwin-');
     const pattern = new RegExp(`<section\\b[^>]*data-platform-panel="${platform}"[^>]*>[\\s\\S]*?<\\/section>`, 'u');
     if (!pattern.test(output)) throw new TypeError('Missing exact platform panel');
-    const handover = mac ? `<details class="electron-handover"><summary>${text('electron.site.handoverTitle')}</summary>
-      <p>${text('electron.site.handoverIntro')}</p><ol>
-      <li>${text('electron.site.handoverQuit')}</li>
-      <li>${text('electron.site.handoverInstall')}</li>
-      </ol><p>${text('electron.site.handoverKeep')}</p></details>` : '';
+    const prefix = { macos: '', 'macos-intel': 'intel-', windows: 'windows-', linux: 'linux-' }[platform];
+    const icon = mac ? '<img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">'
+      : platform === 'windows' ? '<svg class="download-platform-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M2 3h9v8H2zm11 0h9v8h-9zM2 13h9v8H2zm11 0h9v8h-9z"/></svg>'
+        : '<span class="download-platform-icon" aria-hidden="true">🐧</span>';
     output = output.replace(pattern, `<section class="platform-panel" id="platform-panel-${platform}" role="tabpanel" aria-labelledby="platform-tab-${platform}" data-platform-panel="${platform}" tabindex="0"${platform === 'macos' ? '' : ' hidden'}>
       ${release.publishedInstallersVerified ? '' : '<p><strong>Local preview — publication has not been verified.</strong></p>'}
-      <a class="button mac-download-button" href="${escape(item.url)}" data-electron-download="${item.target}">${text(`electron.site.download.${platform}`)}</a>
-      <p>${escape(release.version)} · ${text(`electron.site.requirements.${platform}`)}</p>
-      <p>${text(mac ? 'electron.site.macTrust' : item.target === 'win32-x64' ? 'electron.site.windowsTrust' : 'electron.site.linuxInstall')}</p>
-      <details><summary>${text('electron.site.verify')}</summary><p>${escape(item.bytes)} bytes</p><code style="overflow-wrap:anywhere">${escape(item.sha256)}</code></details>
-      ${handover}
+      <div class="install-actions"><a class="button mac-download-button" href="${escape(item.url)}" data-electron-download="${item.target}">${icon}${text(`electron.site.download.${platform}`)}</a></div>
+      <div class="installer-details installer-details-compact">
+        <span class="installer-summary">${escape(release.version)} <span class="installer-summary-divider" aria-hidden="true">·</span> ${text(`electron.site.requirements.${platform}`)}</span>
+        <button class="installer-checksum-copy electron-checksum-copy" id="${prefix}installer-sha256-copy" type="button" data-checksum="${escape(item.sha256)}" aria-describedby="${prefix}installer-sha256-copy-status"><span id="${prefix}installer-sha256-copy-label" data-i18n="installer.sha256.copy">Copy SHA-256</span></button>
+        <code class="installer-checksum-fallback" id="${prefix}installer-sha256" data-i18n-skip hidden>${escape(item.sha256)}</code>
+        <span class="sr-only" id="${prefix}installer-sha256-copy-status" role="status" aria-live="polite" aria-atomic="true"></span>
+      </div>
+      <p class="download-assurance"><span class="download-assurance-mark" aria-hidden="true"></span><strong>${text(mac ? 'electron.site.macTrust' : item.target === 'win32-x64' ? 'electron.site.windowsTrust' : 'electron.site.linuxInstall')}</strong> <a href="./docs.html#download-security">${text('electron.site.security')}</a></p>
       </section>`);
   }
   return output;
@@ -121,5 +123,12 @@ export function renderElectronSiteDocumentation(html) {
     `<article class="resource-card" id="platforms"><h2>Platform support</h2><p>Electron downloads are available for macOS 14 or later on Apple silicon and Intel, Windows 10 or later on x64, and Linux x86_64 as an AppImage. See the download page for platform-specific installation requirements.</p></article>`);
   output = output.replace(/macOS is the currently available lane\.[\s\S]*?repository or a checksum\./u,
     'The download page lists the exact final Electron artifacts. macOS installers are Developer ID signed and notarized; the Windows installer is signed. The Linux AppImage is identified by its checksum. Source/build provenance is never inferred from a public repository or a checksum.');
+  output = output.replace(/<p class="resource-lede">[\s\S]*?<\/p>/u,
+    `<p class="resource-lede">${text('electron.site.docs.intro')}</p>`);
+  output = output.replace(/<article\b[^>]*id="local-first"[^>]*>[\s\S]*?<\/article>/u,
+    `<article class="resource-card" id="local-first"><h2>Local state and uninstall</h2><p>${text('electron.site.docs.state')}</p></article>`);
+  output = output.replace(/<article\b[^>]*id="updates"[^>]*>[\s\S]*?<\/article>/u,
+    `<article class="resource-card" id="updates"><h2>Updates and channels</h2><p>${text('electron.site.docs.updates')}</p></article>`);
+  output = output.replace('</body>', '<script type="module" src="./localization.js"></script>\n</body>');
   return output;
 }

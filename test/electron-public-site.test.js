@@ -24,7 +24,8 @@ async function fixture(t) {
 }
 test('Electron intake binds the reviewed identity and all target bytes before exposing exact downloads',async t=>{
   const f=await fixture(t), calls=[];const release=await readElectronSitePublication({...f.options,verifyPublishedInstaller:async value=>{calls.push(value);return {bytes:value.expectedBytes,sha256:value.expectedSha256};}});
-  assert.equal(calls.length,4);assert.equal(release.downloads.length,4);assert.match(release.downloads[1].url,/mac-x64.dmg$/u);
+  assert.equal(calls.length,4);assert.equal(release.downloads.length,4);
+  for (const call of calls) assert.match(call.installerUrl,/^https:\/\/github.com\/adamallcock\/tibotattle\/releases\/download\/v0\.1\.20\/TiboTattle-/u);assert.match(release.downloads[1].url,/mac-x64.dmg$/u);
   await assert.rejects(readElectronSitePublication({...f.options,approvedPlanSha256:'0'.repeat(64)}),/exact reviewed/u);
   await writeFile(join(f.root,f.plan.targets[0].artifacts[0].localPath),'modified');
   await assert.rejects(readElectronSitePublication({...f.options,verifyPublishedInstaller:async()=>assert.fail('must not GET tampered artifact')}),/exact reviewed/u);
@@ -42,16 +43,19 @@ test('actual public generator renders four targets and automatic native replacem
   let calls=0;await buildPublicReleaseSite(args,{verifyPublishedInstaller:async value=>{calls++;return {bytes:value.expectedBytes,sha256:value.expectedSha256,published:false};}});
   assert.equal(calls,4);const html=await readFile(join(output,'index.html'),'utf8');
   assert.equal((html.match(/data-electron-download=/gu)||[]).length,4);
-  assert.match(html,/automatically carries over your retained history and settings/u);
+  assert.doesNotMatch(html,/electron-handover|Updating an existing Mac installation|Download size| bytes<\/p>/u);
+  assert.equal((html.match(/class="installer-checksum-copy electron-checksum-copy"/gu)||[]).length,4);
+  assert.equal((html.match(/href="https:\/\/github.com\/adamallcock\/tibotattle\/releases\/download\/v0\.1\.20\//gu)||[]).length,4);
+  assert.doesNotMatch(html,/href="https:\/\/updates\.tibotattle\.com\/electron/);
   assert.doesNotMatch(html,/native-app|Keep the old app|install native 0\.1\.18/u);
   assert.equal((html.match(/private desktop app for macOS, Windows and Linux/gu)||[]).length,3);
   assert.match(html,/<meta property="og:image:width" content="1024">/u);
   assert.match(html,/<meta property="og:image:height" content="1024">/u);
   assert.match(html,/<meta name="twitter:card" content="summary">/u);
-  assert.match(html,/<meta property="og:image:alt" content="TiboTattle logo">/u);assert.match(html,/Your existing data and credentials are preserved/u);
+  assert.match(html,/<meta property="og:image:alt" content="TiboTattle logo">/u);assert.doesNotMatch(html,/Your existing data and credentials are preserved/u);
   assert.doesNotMatch(html,/brew install|not available yet|src="\.\/app.js"/u);
   assert.equal(await readFile(join(output,'community.html'),'utf8'),html);
-  const docs=await readFile(join(output,'docs.html'),'utf8');assert.match(docs,/Electron downloads are available/u);assert.doesNotMatch(docs,/macOS is the currently available lane/u);
+  const docs=await readFile(join(output,'docs.html'),'utf8');assert.match(docs,/Electron downloads are available/u);assert.match(docs,/automatically transfers retained history and settings/u);assert.match(docs,/Electron uses its signed desktop update channel/u);assert.doesNotMatch(docs,/Signed releases use the Sparkle feed|local-first Mac app/);assert.doesNotMatch(docs,/macOS is the currently available lane/u);
   const manifest=JSON.parse(await readFile(join(output,'release-site-manifest.json'),'utf8'));assert.equal(manifest.electronRelease.downloads.length,4);assert.equal(manifest.electronRelease.publishedInstallersVerified,false);assert.doesNotMatch(JSON.stringify(manifest.electronRelease.verificationScope),/published-installer/u);assert.equal(manifest.installer,undefined);
   await assert.rejects(buildPublicReleaseSite({...args,installerUrl:'https://tibotattle.com/a.dmg'}),/excludes native/u);
 });

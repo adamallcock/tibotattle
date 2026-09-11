@@ -614,6 +614,8 @@ if (typeof document !== "undefined") {
   wireHomebrewInstallCommand("intel-");
   wireInstallerChecksumCopy();
   wireInstallerChecksumCopy("intel-");
+  wireInstallerChecksumCopy("windows-");
+  wireInstallerChecksumCopy("linux-");
   wireAllowanceRangeControls();
   wireAllowanceDialog();
   const refresh = createCommunityRefresh({
@@ -641,6 +643,9 @@ if (typeof document !== "undefined") {
     renderInstallerChecksumCopyState(
       $("#intel-installer-sha256-copy")?.dataset.copyState ?? "idle", "intel-",
     );
+    for (const prefix of ["windows-", "linux-"]) {
+      renderInstallerChecksumCopyState($(`#${prefix}installer-sha256-copy`)?.dataset.copyState ?? "idle", prefix);
+    }
     if (communityDailySettled) {
       renderCommunityDailyResult({
         payload: lastCommunityDailyPayload,

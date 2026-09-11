@@ -162,12 +162,18 @@ or reperform the separate native-trust/source review. The public site manifest
 records only download metadata and verification scope, never the private plan
 or its local paths. Native 0.1.18 generation remains unchanged.
 
-Publish the exact installer objects before generating a production site with
-this mode. The generated Electron panels omit the native Homebrew shortcut,
-include platform requirements and checksums, and explain preserving the signed
-native Mac predecessor before replacing it. Neither this generator nor those
-instructions replace native Sparkle feeds. The existing guided-handover app
-coordinator owns state/credential migration after installation.
+Publish the exact canonical GitHub release assets before generating a production
+site. Every manual download button uses the exact GitHub release URL, and the
+site generator independently verifies its HTTPS bytes against the reviewed
+plan digest and size. The updates.tibotattle.com origin is reserved for app
+updater transport; never use its object URLs for manual website downloads.
+
+The download section uses compact platform buttons, requirements, a discreet
+checksum-copy control and accurate platform trust descriptions. It shows no
+file size or migration procedure. Docs explains normal Mac replacement and
+automatic retained-state transfer for 0.1.20 or later. Native Sparkle feeds do
+not perform that move. Keep the Homebrew shortcut absent until the tap points
+to a qualified automatic-replacement release, rather than the older native app.
 
 A test-injected verifier may explicitly return `published: false` for a local
 preview using the frozen local bytes. Such output displays a preview warning
@@ -185,10 +191,10 @@ Electron mode uses an exact copy of the existing 1024×1024 public brand PNG
 against `tibotattle-icon.png` and emits square Open Graph dimensions, logo alt
 text, and a summary Twitter card. Native generation retains its 1200×630 card.
 This avoids presenting an older native-version screenshot as the Electron
-release. The guided text directs native 0.1.16 users through the old app's
-Check for Updates to native 0.1.18 before preservation; unsupported or unavailable
-upgrade paths stop at support. The handover admission remains exactly 0.1.17
-and 0.1.18.
+release. Retained-state admission uses the app's schema compatibility check;
+users do not need an intermediate native version or a preserved predecessor
+executable. The 0.1.19 release cannot use these automatic-upgrade instructions.
+
 
 The exact public evidence controls `config/release-evidence.js`,
 `schemas/release-evidence-v1/manifest.schema.json`, the descriptor/policy/output

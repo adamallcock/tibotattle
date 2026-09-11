@@ -2666,3 +2666,8 @@ export function createBrowserLocalization({
     translateText: (value) => legacyText(value, locale),
   });
 }
+
+// Static public resources share the language chosen on the download page.
+if (typeof document !== "undefined" && document.body?.classList.contains("resource-site")) {
+  createBrowserLocalization();
+}
