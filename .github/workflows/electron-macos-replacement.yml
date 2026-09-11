@@ -95,7 +95,7 @@ jobs:
           root=pathlib.Path(e['RUNNER_TEMP'])/'signed-replacement-intake'; root.mkdir(mode=0o700)
           archive=root/'app.zip'
           result=subprocess.run(['/usr/bin/curl','--disable','--fail','--silent','--show-error','--proto','=https',
-            '--max-time','120','--max-filesize',str(1024**3),'--output',str(archive),'--write-out','%{http_code}',url],
+            '--max-time','120','--max-filesize',str(1024**3),'--output',str(archive),'--write-out','%{http_code}',url+'?sha256='+digest],
             capture_output=True,text=True,check=True,timeout=130)
           assert result.stdout=='200' and archive.stat().st_size<=1024**3
           with archive.open('rb') as stream: assert hashlib.file_digest(stream,'sha256').hexdigest()==digest
