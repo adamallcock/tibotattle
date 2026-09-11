@@ -510,6 +510,11 @@ export const REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION =
 const DEFAULT_ACCOUNTING_INDEX_WORKERS = 4;
 const COMPACT_USAGE_RETAINED_BYTES = 352;
 const COMPACT_SNAPSHOT_RETAINED_BYTES = 192;
+// Exact typed-buffer storage: two Float64 stamp columns, then Uint8 +
+// Int32 + Float64 + Uint8 attribution memo columns. SQLite page objects,
+// dictionaries and decoded batches remain covered by the unchanged RSS guard.
+const STREAMED_USAGE_STAMP_BYTES = 16;
+const STREAMED_USAGE_MEMO_BYTES = 14;
 const DEFAULT_TRANSITION_RESOURCE_LIMITS = Object.freeze({
   usageEvents: CODEX_TRANSITION_DERIVATION_CEILINGS.usageEvents,
   weeklySnapshots:
@@ -2931,6 +2936,7 @@ async function deriveBoundedWeeklyCalibrationSeries({
   signal,
   resourceCheck,
   planAttributionIndex,
+  limits = DEFAULT_TRANSITION_RESOURCE_LIMITS,
 }) {
   if ((rawUsageEvents === null) === (usageCorpus === null)) {
     throw new TypeError(
@@ -2945,21 +2951,29 @@ async function deriveBoundedWeeklyCalibrationSeries({
       ? []
       : usageCorpus.readSlice(low, high)
   );
-  const derive = (usage, snapshots) => deriveCodexTransitionSeriesCooperatively({
-    startAt,
-    endAt,
-    rawUsageEvents: usage,
-    rateLimitSnapshots: snapshots,
-    diagnostics,
-    includeSnapshotIntervals: false,
-    windowDurationMins: WEEKLY_WINDOW_MINUTES,
-    signal,
-    consumeInputs: true,
-    includeNormalizedInputs: false,
-    inputEncoding: "accounting_prepriced_compact_v3",
-    planAttributionIndex,
-    resourceCheck,
-  });
+  const batchUsageBudget = Math.min(CALIBRATION_BATCH_USAGE_BUDGET, limits.usageEvents);
+  const derive = (usage, snapshots) => {
+    if (usage.length > limits.usageEvents
+        || snapshots.length > limits.weeklySnapshots
+        || usage.length + snapshots.length > limits.combinedInputs) {
+      throw fixedError("accounting_transition_derivation_limit_exceeded");
+    }
+    return deriveCodexTransitionSeriesCooperatively({
+      startAt,
+      endAt,
+      rawUsageEvents: usage,
+      rateLimitSnapshots: snapshots,
+      diagnostics,
+      includeSnapshotIntervals: false,
+      windowDurationMins: WEEKLY_WINDOW_MINUTES,
+      signal,
+      consumeInputs: true,
+      includeNormalizedInputs: false,
+      inputEncoding: "accounting_prepriced_compact_v3",
+      planAttributionIndex,
+      resourceCheck,
+    });
+  };
 
   // Group the compact snapshots exactly as the miner will, and count the
   // transitions each group will derive: within a group the miner walks
@@ -3042,7 +3056,7 @@ async function deriveBoundedWeeklyCalibrationSeries({
   resourceCheck?.();
 
   if (totalTransitions <= CALIBRATION_BATCH_TRANSITION_BUDGET
-      && usageEventCount <= CALIBRATION_BATCH_USAGE_BUDGET) {
+      && usageEventCount <= batchUsageBudget) {
     const usage = usageCorpus === null
       ? rawUsageEvents
       : await readUsageSlice(0, usageEventCount);
@@ -3104,7 +3118,7 @@ async function deriveBoundedWeeklyCalibrationSeries({
         || (current.groups.length > 0
           && (current.transitions + group.transitions
               > CALIBRATION_BATCH_TRANSITION_BUDGET
-            || nextUsageRows > CALIBRATION_BATCH_USAGE_BUDGET))) {
+            || nextUsageRows > batchUsageBudget))) {
       current = {
         groups: [],
         transitions: 0,
@@ -3524,12 +3538,10 @@ function publishedUnifiedGenerationTokens(database) {
  *
  * This is what removes the calibration's data window: `usage_event` and
  * `quota_observation` have no lower time bound, so the corpus spans everything
- * ever indexed. The only remaining bound is the transition miner's structural
- * input ceiling (750k usage events — count-based memory safety owned by
- * codex-transition-miner.js, not a day window; it covers years of typical use
- * and 130+ days of the heaviest observed usage). When the corpus exceeds it,
- * the newest rows are retained and the returned `coveredAt` names the span
- * honestly.
+ * ever indexed. The transition miner's input ceiling applies per reset batch,
+ * never to the complete historical corpus. Typed metadata and quota snapshots
+ * retain their byte/count budgets, and the RSS guard remains authoritative.
+ * A budget miss defers the complete rebuild rather than truncating history.
  *
  * Residency: the priced compact rows are NEVER all resident at once. A full
  * corpus at the 750k ceiling measured ~635 real bytes per materialized row —
@@ -3858,97 +3870,66 @@ async function openUnifiedIndexCalibrationCorpus({
       dispose();
       return null;
     }
-    let retainedStartMs = null;
-    if (usageCount > limits.usageEvents) {
-      const cutoff = database.prepare(`
-        SELECT observed_at_ms AS ms FROM usage_event
-        WHERE observed_at_ms <= ?
-        ORDER BY observed_at_ms DESC
-        LIMIT 1 OFFSET ?`).get(usageGraceMs, limits.usageEvents - 1);
-      retainedStartMs = Number(cutoff?.ms);
-      if (!Number.isSafeInteger(retainedStartMs)) {
-        dispose();
-        return null;
-      }
+    // The corpus streams decoded rows in reset-sized batches. The miner's
+    // per-call row ceiling is not a history-retention rule. Keep every date,
+    // bound exact typed-buffer residency before allocation, and fail closed
+    // on budget pressure instead of silently deleting the oldest evidence.
+    const stampBytes = usageCount * STREAMED_USAGE_STAMP_BYTES;
+    if (!Number.isSafeInteger(stampBytes) || stampBytes > limits.retainedBytes) {
+      throw fixedError("accounting_transition_memory_budget_exceeded");
     }
-
-    // The unary `+` on observed_at_ms is a deliberate planner hint, not
-    // arithmetic: it stops SQLite from choosing the observed_at_ms index for
-    // the (usually unbounded) time range and then sorting the ENTIRE range in
-    // a temp b-tree to serve each 20k-row keyset page. Measured on a 727k-row
-    // index that plan cost ~2 s per page (~37 pages); the rowid primary-key
-    // walk this forces satisfies ORDER BY u.rowid directly and serves a page
-    // in single-digit milliseconds. The predicate, the row set and the row
-    // order are identical either way (SQLite evaluates the same comparison,
-    // it just cannot use the index for it).
+    checkRuntimeMemory(stampBytes);
+    const stampedMs = new Float64Array(usageCount);
+    const stampedRowid = new Float64Array(usageCount);
+    // The timestamp index already orders ties by SQLite rowid. Keyset pages
+    // avoid a resident JS sort/index array and never use OFFSET pagination.
     const usageStatement = database.prepare(`${USAGE_COLUMNS}
-      WHERE u.rowid > ? AND +u.observed_at_ms >= ? AND +u.observed_at_ms <= ?
-      ORDER BY u.rowid
+      WHERE (u.observed_at_ms, u.rowid) > (?, ?) AND +u.observed_at_ms <= ?
+      ORDER BY u.observed_at_ms, u.rowid
       LIMIT ${UNIFIED_CALIBRATION_READ_BATCH_ROWS}`);
-    // Discovery pass: thin (observedMs, rowid) stamps for the rows the corpus
-    // retains, in the same rowid stream order the one-shot reader walked.
-    const stampedMs = [];
-    const stampedRowid = [];
+    let afterMs = -1;
     let afterRowId = -1;
-    const lowerBoundMs = retainedStartMs ?? -1;
+    let retainedUsageEvents = 0;
     for (;;) {
-      const batch = usageStatement.all(afterRowId, lowerBoundMs, usageGraceMs);
+      const batch = usageStatement.all(afterMs, afterRowId, usageGraceMs);
       if (batch.length === 0) break;
       for (const row of batch) {
         await cadence();
         if (!retainedByLightFilter(row)) continue;
-        stampedMs.push(Number(row.observed_at_ms));
-        stampedRowid.push(Number(row.row_id));
-        // Projected-bytes accounting per retained row, mirroring the windowed
-        // path's reserveTransitionInput: the byte budget bounds what the
-        // derivation may RETAIN, so the moment the discovered working set
-        // projects past it the read refuses — it never finishes discovering a
-        // corpus the final gate was always going to reject. (The retention
-        // cutoff bounds the row COUNT up to timestamp ties; only this check
-        // bounds bytes.)
-        if (stampedMs.length * COMPACT_USAGE_RETAINED_BYTES
-            > limits.retainedBytes) {
-          dispose();
-          return null;
+        if (retainedUsageEvents >= usageCount) {
+          throw fixedError("accounting_unified_generation_changed");
         }
+        stampedMs[retainedUsageEvents] = Number(row.observed_at_ms);
+        stampedRowid[retainedUsageEvents] = Number(row.row_id);
+        retainedUsageEvents += 1;
       }
+      afterMs = Number(batch.at(-1).observed_at_ms);
       afterRowId = Number(batch.at(-1).row_id);
       if (batch.length < UNIFIED_CALIBRATION_READ_BATCH_ROWS) break;
     }
-    if (stampedMs.length === 0) {
+    if (retainedUsageEvents === 0) {
       dispose();
       return null;
     }
-    // Retained order is (observedMs, rowid): the one-shot reader's stable
-    // ms-sort over a rowid-ordered stream produced exactly this order.
-    const order = stampedMs.map((_, index) => index);
-    order.sort((left, right) => stampedMs[left] - stampedMs[right]
-      || stampedRowid[left] - stampedRowid[right]);
-    const dropped = Math.max(0, order.length - limits.usageEvents);
-    const usageMs = new Array(order.length - dropped);
-    const usageRowid = new Array(order.length - dropped);
-    for (let index = dropped; index < order.length; index += 1) {
-      usageMs[index - dropped] = stampedMs[order[index]];
-      usageRowid[index - dropped] = stampedRowid[order[index]];
-    }
-    order.length = 0;
-    stampedMs.length = 0;
-    stampedRowid.length = 0;
-    const retainedUsageEvents = usageMs.length;
+    const usageMs = stampedMs.subarray(0, retainedUsageEvents);
+    const usageRowid = stampedRowid.subarray(0, retainedUsageEvents);
     const firstUsageMs = usageMs[0];
-    if (attributionReader !== null) {
-      checkRuntimeMemory(retainedUsageEvents * 14);
-      memoBasis = new Uint8Array(retainedUsageEvents);
-      memoPlan = new Int32Array(retainedUsageEvents);
-      memoIntervalMs = new Float64Array(retainedUsageEvents);
-      memoIntervalBasis = new Uint8Array(retainedUsageEvents);
-      throwIfAborted(signal);
-      checkRuntimeMemory();
+    const memoBytes = retainedUsageEvents * STREAMED_USAGE_MEMO_BYTES;
+    if (stampBytes + memoBytes > limits.retainedBytes) {
+      throw fixedError("accounting_transition_memory_budget_exceeded");
     }
+    checkRuntimeMemory(memoBytes);
+    memoBasis = new Uint8Array(retainedUsageEvents);
+    memoPlan = new Int32Array(retainedUsageEvents);
+    memoIntervalMs = new Float64Array(retainedUsageEvents);
+    memoIntervalBasis = new Uint8Array(retainedUsageEvents);
+    const usageMetadataBytes = stampedMs.byteLength + stampedRowid.byteLength
+      + memoBasis.byteLength + memoPlan.byteLength + memoIntervalMs.byteLength
+      + memoIntervalBasis.byteLength;
+    throwIfAborted(signal);
+    checkRuntimeMemory();
 
-    const snapshotLowerMs = retainedStartMs === null
-      ? -1
-      : firstUsageMs;
+    const snapshotLowerMs = -1;
     const snapshotStatement = generationId === null
       // Explicit legacy/unpublished fixture/import mode only. Production
       // schema-11 reads MUST use occurrences; a canonical winner can belong
@@ -3981,13 +3962,11 @@ async function openUnifiedIndexCalibrationCorpus({
     // stops consuming the snapshot stream entirely and reports the corpus
     // unusable (null -> the caller's typed
     // accounting_calibration_corpus_unavailable).
-    const retainedUsageBytes =
-      retainedUsageEvents * COMPACT_USAGE_RETAINED_BYTES;
+    const retainedUsageBytes = usageMetadataBytes;
     let retainedInputBudgetExceeded = false;
     const reserveSnapshotRetention = () => {
       const retainedSnapshots = weeklyRateLimitSnapshots.length + 1;
       if (retainedSnapshots > limits.weeklySnapshots
-          || retainedUsageEvents + retainedSnapshots > limits.combinedInputs
           || retainedUsageBytes
             + retainedSnapshots * COMPACT_SNAPSHOT_RETAINED_BYTES
             > limits.retainedBytes) {
@@ -4075,9 +4054,7 @@ async function openUnifiedIndexCalibrationCorpus({
       return null;
     }
     if (weeklyRateLimitSnapshots.length > limits.weeklySnapshots
-        || retainedUsageEvents + weeklyRateLimitSnapshots.length
-          > limits.combinedInputs
-        || retainedUsageEvents * COMPACT_USAGE_RETAINED_BYTES
+        || usageMetadataBytes
           + weeklyRateLimitSnapshots.length * COMPACT_SNAPSHOT_RETAINED_BYTES
           > limits.retainedBytes) {
       dispose();
@@ -4174,6 +4151,8 @@ async function openUnifiedIndexCalibrationCorpus({
         endAt: new Date(endMs).toISOString(),
       },
       retainedUsageEvents,
+      usageMetadataCapacity: usageCount,
+      usageMetadataBytes,
       weeklyRateLimitSnapshots,
       planAttribution: planEvidence.finish(),
       usageMs,
@@ -4195,6 +4174,10 @@ async function openUnifiedIndexCalibrationCorpus({
             || low < 0 || high > retainedUsageEvents || low >= high) {
           throw new TypeError("Calibration usage slice bounds are invalid");
         }
+        if (high - low > limits.usageEvents) {
+          throw fixedError("accounting_transition_derivation_limit_exceeded");
+        }
+        checkRuntimeMemory((high - low) * COMPACT_USAGE_RETAINED_BYTES);
         const rows = [];
         await streamProjectedRange(low, high, (row) => rows.push(row));
         return rows;
@@ -4753,7 +4736,7 @@ export async function buildReplaySafeAccountingCache({
     : calibrationCorpus.weeklyRateLimitSnapshots.length;
   const calibrationRetainedBytes = retainWindowedCalibrationInputs
     ? retainedTransitionBytes
-    : retainedUsageEvents * COMPACT_USAGE_RETAINED_BYTES
+    : calibrationCorpus.usageMetadataBytes
       + retainedWeeklySnapshots * COMPACT_SNAPSHOT_RETAINED_BYTES;
   const calibrationCoveredAt = {
     startAt: retainWindowedCalibrationInputs
@@ -4829,6 +4812,7 @@ export async function buildReplaySafeAccountingCache({
         signal,
         resourceCheck: checkRuntimeMemory,
         planAttributionIndex: calibrationAttribution.index,
+        limits,
       });
     } catch (error) {
       if (error?.name === "AbortError"
@@ -4977,7 +4961,12 @@ export async function buildReplaySafeAccountingCache({
     allowanceCapacityByScenario,
     weeklyCalibrationInput: {
       status: "complete",
-      encoding: "accounting_compact_v3",
+      encoding: retainWindowedCalibrationInputs
+        ? "accounting_compact_v3" : "accounting_streamed_v1",
+      ...(!retainWindowedCalibrationInputs ? {
+        usageMetadataCapacity: calibrationCorpus.usageMetadataCapacity,
+        usageMetadataBytes: calibrationCorpus.usageMetadataBytes,
+      } : {}),
       // Which corpus fed the calibration: the whole unified index when it is
       // present, the scan window only as the fallback. `coveredAt` states the
       // span that corpus actually reaches, so a reader can tell full history
@@ -5006,18 +4995,22 @@ export async function buildReplaySafeAccountingCache({
 const SUBPROCESS_FAILURE_CODE_PATTERN = /^[a-z0-9_]{1,64}$/u;
 const SUBPROCESS_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 
-// The child inherits almost nothing. TMPDIR is the one passthrough: inside the
-// sandboxed macOS app it names the container's writable temp root, which
-// SQLite may need for spill files. Deliberately absent: NODE_OPTIONS (nothing
-// may override the child's pinned old-space cap or preload code into the
-// rebuild), HOME (every path the child touches arrives resolved in the
-// request), and PATH (the child execs nothing).
-function minimalRebuildChildEnvironment() {
-  const environment = {};
-  if (typeof process.env.TMPDIR === "string" && process.env.TMPDIR.length > 0) {
-    environment.TMPDIR = process.env.TMPDIR;
+// The child inherits almost nothing. TMPDIR is the one ordinary passthrough:
+// inside the sandboxed macOS app it names the container's writable temp root,
+// which SQLite may need for spill files. The packaged Electron executable also
+// needs its exact node-mode switch to run the child entrypoint. Deliberately
+// absent: NODE_OPTIONS (nothing may override the child's pinned old-space cap
+// or preload code into the rebuild), HOME (every path the child touches arrives
+// resolved in the request), and PATH (the child execs nothing).
+export function minimalRebuildChildEnvironment(environment = process.env) {
+  const selected = {};
+  if (typeof environment?.TMPDIR === "string" && environment.TMPDIR.length > 0) {
+    selected.TMPDIR = environment.TMPDIR;
   }
-  return environment;
+  if (environment?.ELECTRON_RUN_AS_NODE === "1") {
+    selected.ELECTRON_RUN_AS_NODE = "1";
+  }
+  return selected;
 }
 
 function parseRebuildChildEnvelope(stdoutText) {
@@ -5528,7 +5521,7 @@ export async function refreshReplaySafeAccountingCache({
 function validWeeklyCalibrationInput(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.status !== "complete"
-      || value.encoding !== "accounting_compact_v3"
+      || !["accounting_compact_v3", "accounting_streamed_v1"].includes(value.encoding)
       || !["unified_index", "windowed_scan"].includes(value.source)
       || canonicalInstant(value.coveredAt?.startAt) === null
       || canonicalInstant(value.coveredAt?.endAt) === null
@@ -5548,6 +5541,18 @@ function validWeeklyCalibrationInput(value) {
     limits = transitionResourceLimits(value.limits);
   } catch {
     return false;
+  }
+  if (value.encoding === "accounting_streamed_v1") {
+    return value.source === "unified_index"
+      && Number.isSafeInteger(value.usageMetadataCapacity)
+      && value.usageMetadataCapacity >= value.retainedUsageEvents
+      && Number.isSafeInteger(value.usageMetadataBytes)
+      && value.usageMetadataBytes === value.usageMetadataCapacity * STREAMED_USAGE_STAMP_BYTES
+        + value.retainedUsageEvents * STREAMED_USAGE_MEMO_BYTES
+      && value.retainedWeeklySnapshots <= limits.weeklySnapshots
+      && value.estimatedRetainedBytes === value.usageMetadataBytes
+        + value.retainedWeeklySnapshots * COMPACT_SNAPSHOT_RETAINED_BYTES
+      && value.estimatedRetainedBytes <= limits.retainedBytes;
   }
   return value.retainedUsageEvents <= limits.usageEvents
     && value.retainedWeeklySnapshots <= limits.weeklySnapshots

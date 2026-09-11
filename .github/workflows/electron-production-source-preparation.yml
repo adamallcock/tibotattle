@@ -1,0 +1,278 @@
+name: Electron four-target production source preparation
+
+# This manual workflow stops at a reviewable, unsigned source candidate. It
+# never invokes the final packager, signing, notarization, a release API, or an
+# update feed. A build number has no default so a fixture value cannot become a
+# release allocation through automation.
+on:
+  # Register this manual preparer from the integration branch; no source build
+  # runs on push. The four candidate jobs remain dispatch-only.
+  push:
+    branches: [codex/unified-desktop-accountless]
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: Exact positive candidate build number approved for this source preparation
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: electron-production-source-preparation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  registration:
+    if: github.event_name == 'push'
+    name: Register manual production source preparer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Record registration only
+        run: printf '%s\n' 'ELECTRON_SOURCE_PREPARATION_WORKFLOW_REGISTERED'
+  darwin-arm64:
+    if: github.event_name == 'workflow_dispatch'
+    name: darwin-arm64 unsigned production source
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      TIBOTATTLE_ELECTRON_BUILD_NUMBER: ${{ inputs.build_number }}
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: arm64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(pnpm --version)" = "11.9.0"
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='arm64')process.exit(1)"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Validate the production source and enclosing-bundle helper contracts
+        run: node --test test/electron-production-distribution.test.js test/electron-native-handover-helper.test.js test/electron-native-handover-bundle-context.test.js test/electron-macos-keychain-adapter.test.js test/macos-keychain-search-scope-policy.test.mjs test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js apps/electron/test/desktop-macos-keychain.test.mjs
+      - name: Prepare unsigned production source only
+        run: |
+          set -euo pipefail
+          node scripts/package-electron-production.mjs \
+            --target darwin-arm64 \
+            --source-revision "$GITHUB_SHA" \
+            --build-number "$TIBOTATTLE_ELECTRON_BUILD_NUMBER" \
+            --replace-staging
+      - name: Retain the reviewable unsigned source candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-production-source-darwin-arm64-${{ github.sha }}
+          path: .release-build/electron-production/darwin-arm64/
+          if-no-files-found: error
+          retention-days: 7
+
+  darwin-x64:
+    if: github.event_name == 'workflow_dispatch'
+    name: darwin-x64 unsigned production source
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      TIBOTATTLE_ELECTRON_BUILD_NUMBER: ${{ inputs.build_number }}
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(pnpm --version)" = "11.9.0"
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='x64')process.exit(1)"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Validate the production source and enclosing-bundle helper contracts
+        run: node --test test/electron-production-distribution.test.js test/electron-native-handover-helper.test.js test/electron-native-handover-bundle-context.test.js test/electron-macos-keychain-adapter.test.js test/macos-keychain-search-scope-policy.test.mjs test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js apps/electron/test/desktop-macos-keychain.test.mjs
+      - name: Prepare unsigned production source only
+        run: |
+          set -euo pipefail
+          node scripts/package-electron-production.mjs \
+            --target darwin-x64 \
+            --source-revision "$GITHUB_SHA" \
+            --build-number "$TIBOTATTLE_ELECTRON_BUILD_NUMBER" \
+            --replace-staging
+      - name: Retain the reviewable unsigned source candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-production-source-darwin-x64-${{ github.sha }}
+          path: .release-build/electron-production/darwin-x64/
+          if-no-files-found: error
+          retention-days: 7
+
+  win32-x64:
+    if: github.event_name == 'workflow_dispatch'
+    name: win32-x64 unsigned production source
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      TIBOTATTLE_ELECTRON_BUILD_NUMBER: ${{ inputs.build_number }}
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_INSTALL_FAILED' }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_ENABLE_FAILED' }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'PNPM_PREPARE_FAILED' }
+          if ((pnpm --version).Trim() -ne '11.9.0') { throw 'PNPM_VERSION_MISMATCH' }
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='win32'||process.arch!=='x64')process.exit(1)"
+          if ($LASTEXITCODE -ne 0) { throw 'NATIVE_RUNTIME_REQUIRED' }
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
+      - name: Build the reviewed Windows filesystem binding
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $npmCommand = (Get-Command npm.cmd).Source
+          $nodeRoot = Split-Path $npmCommand -Parent
+          $nodeGypScript = Join-Path $nodeRoot 'node_modules/npm/node_modules/node-gyp/bin/node-gyp.js'
+          if (-not (Test-Path -LiteralPath $nodeGypScript -PathType Leaf)) { throw 'WINDOWS_BINDING_BUILDER_UNAVAILABLE' }
+          node $nodeGypScript rebuild --directory native/windows-filesystem
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_BUILD_FAILED' }
+          node scripts/build-windows-filesystem-manifest.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_MANIFEST_FAILED' }
+      - name: Validate production source contracts
+        run: node --test test/electron-production-distribution.test.js test/windows-electron-release-config.test.js
+      - name: Prepare unsigned production source only
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/package-electron-production.mjs `
+            --target win32-x64 `
+            --source-revision $env:GITHUB_SHA `
+            --build-number $env:TIBOTATTLE_ELECTRON_BUILD_NUMBER `
+            --windows-binding native/windows-filesystem/build/Release/windows_filesystem.node `
+            --windows-manifest native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json `
+            --replace-staging
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_PRODUCTION_SOURCE_PREPARATION_FAILED' }
+      - name: Retain the reviewable unsigned source candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-production-source-win32-x64-${{ github.sha }}
+          path: .release-build/electron-production/win32-x64/
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-x64:
+    if: github.event_name == 'workflow_dispatch'
+    name: linux-x64 unsigned production source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      TIBOTATTLE_ELECTRON_BUILD_NUMBER: ${{ inputs.build_number }}
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(pnpm --version)" = "11.9.0"
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='linux'||process.arch!=='x64')process.exit(1)"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install native Linux credential build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libsecret-1-dev pkg-config
+      - name: Build and qualify the native Linux credential mutex
+        run: |
+          set -euo pipefail
+          node_gyp_script="$(npm root --global)/npm/node_modules/node-gyp/bin/node-gyp.js"
+          test -f "$node_gyp_script"
+          node "$node_gyp_script" rebuild --directory native/linux-credential-mutex
+          node scripts/stage-linux-credential-mutex-binding.mjs
+          node scripts/build-linux-credential-mutex-manifest.mjs
+          node scripts/qualify-linux-credential-mutex.mjs
+      - name: Validate production source contracts
+        run: node --test test/electron-production-distribution.test.js
+      - name: Prepare unsigned production source only
+        run: |
+          set -euo pipefail
+          node scripts/package-electron-production.mjs \
+            --target linux-x64 \
+            --source-revision "$GITHUB_SHA" \
+            --build-number "$TIBOTATTLE_ELECTRON_BUILD_NUMBER" \
+            --replace-staging
+      - name: Retain the reviewable unsigned source candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-production-source-linux-x64-${{ github.sha }}
+          path: .release-build/electron-production/linux-x64/
+          if-no-files-found: error
+          retention-days: 7

@@ -163,6 +163,7 @@ const ARCHIVE_INDEX_ERROR_CODES = new Set([
 const ARCHIVE_INDEX_PROGRESS_KIND = "archive_index";
 const UNIFIED_INDEX_PROGRESS_KIND = "unified_index";
 const ACCOUNTING_PROGRESS_KIND = "accounting";
+const MACOS_ELECTRON_LOCAL_QA_TEST_LANE = "macos-electron-local-qa-v1";
 const REFRESH_FAILURE_STEPS = new Set([
   "collector",
   "accounting",
@@ -886,6 +887,7 @@ export function createLocalCollectorRefreshRunner({
   stateFile = null,
   accountObservationOperationLockFile = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
+  environment = process.env,
   readAccountAttributionBinding = null,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
@@ -921,6 +923,10 @@ export function createLocalCollectorRefreshRunner({
 } = {}) {
   if (typeof selectAccountObservationSecret !== "function") {
     throw new TypeError("selectAccountObservationSecret must be a function");
+  }
+  if (environment === null || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    throw new TypeError("environment must be an object");
   }
   if (readAccountAttributionBinding !== null && typeof readAccountAttributionBinding !== "function") {
     throw new TypeError("readAccountAttributionBinding must be a function or null");
@@ -969,6 +975,12 @@ export function createLocalCollectorRefreshRunner({
       || recentIndexWindowMs > 31 * 24 * 60 * 60 * 1_000) {
     throw new TypeError("recent index window is invalid");
   }
+  // The packaged macOS real-history QA lane runs against a copied profile and
+  // must not read or mint the account-observation Keychain secret. Keep the
+  // ordinary quota result but leave its account scope unavailable; the
+  // development export identity is deliberately not an account-scope secret.
+  const accountObservationSecretDisabled =
+    environment.USAGE_MONITOR_TEST_LANE === MACOS_ELECTRON_LOCAL_QA_TEST_LANE;
   // Cross-invocation backoff for a memory-budget miss. Held in the runner
   // closure so it survives between the external scheduler's ticks: once a
   // rebuild defers, the FULL rebuild is skipped (the retained cache is served)
@@ -1046,18 +1058,20 @@ export function createLocalCollectorRefreshRunner({
       refreshClaudeUsageShadow,
       signal,
     );
-    let selection;
-    try {
-      selection = selectAccountObservationSecret(
-        accountObservationOperationLockFile === null
-          ? {}
-          : {
-            operationLockFile:
-              accountObservationOperationLockFile,
-          },
-      );
-    } catch {
-      selection = { loadAccountObservationSecret: null };
+    let selection = { loadAccountObservationSecret: null };
+    if (!accountObservationSecretDisabled) {
+      try {
+        selection = selectAccountObservationSecret(
+          accountObservationOperationLockFile === null
+            ? {}
+            : {
+              operationLockFile:
+                accountObservationOperationLockFile,
+            },
+        );
+      } catch {
+        selection = { loadAccountObservationSecret: null };
+      }
     }
     const collectorOptions = {
       codexHome,
@@ -1950,6 +1964,11 @@ export class LocalCompanionRefreshController {
     let timeout;
     let cancellationSettlementTimeout;
     let accountingDeadlineApplied = false;
+    // A successful quick-result reload already publishes the complete quick
+    // snapshot for a quick-mode run. Remember that publication so terminal
+    // settlement does not rebuild the same snapshot again; a failed or absent
+    // progress reload deliberately leaves this false and gets a terminal retry.
+    let quickResultReloadPublished = false;
     const timeoutStartedAt = this.#monotonicClock();
     const controller = new AbortController();
     this.#abortController = controller;
@@ -2020,15 +2039,18 @@ export class LocalCompanionRefreshController {
             armTimeoutFromStart(this.#accountingTimeoutMs);
           }
           let quickResultAt = this.#state.quickResultAt;
+          let quickResultReloaded = false;
           if (projected.kind !== ARCHIVE_INDEX_PROGRESS_KIND
               && projected.phase === "quick_result"
               && !this.#cancelRequested) {
             try {
               await this.#dataStore.reload({
                 purpose: "quick",
+                returnOverview: false,
                 signal: controller.signal,
               });
               quickResultAt = new Date(this.#clock()).toISOString();
+              quickResultReloaded = true;
             } catch {
               // Keep the previous good dashboard. Deep accounting can still
               // complete and publish a fully verified replacement.
@@ -2040,6 +2062,7 @@ export class LocalCompanionRefreshController {
             progress: projected,
             quickResultAt,
           };
+          if (quickResultReloaded) quickResultReloadPublished = true;
         },
       }));
     const work = Promise.race([runnerWork, cancellationSettlement])
@@ -2088,13 +2111,16 @@ export class LocalCompanionRefreshController {
           this.#notifyTerminalFailure();
           return;
         }
-        await this.#dataStore.reload({
-          purpose: mode === "quick" ? "quick" : "full",
-          signal: controller.signal,
-          ...(mode === "detailed"
-            ? { unifiedProjectionReuse: reusableUnifiedProjection(result) }
-            : {}),
-        });
+        if (!(mode === "quick" && quickResultReloadPublished)) {
+          await this.#dataStore.reload({
+            purpose: mode === "quick" ? "quick" : "full",
+            returnOverview: false,
+            signal: controller.signal,
+            ...(mode === "detailed"
+              ? { unifiedProjectionReuse: reusableUnifiedProjection(result) }
+              : {}),
+          });
+        }
         const finalProgress = publicIndexingResult(result?.indexing);
         const degradation = unifiedIndexDegradation(result);
         this.#state = {
@@ -2141,6 +2167,7 @@ export class LocalCompanionRefreshController {
           try {
             await this.#dataStore.reload({
               purpose: "full",
+              returnOverview: false,
               signal: controller.signal,
             });
           } catch {

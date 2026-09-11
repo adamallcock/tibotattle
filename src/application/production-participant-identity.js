@@ -13,6 +13,7 @@ export function selectProductionParticipantIdentity({
   architecture,
   appStateSecretFile,
   createKeychainBackend,
+  createLinuxBackend,
   keychainCapability,
   allowedKeychainCapability,
 } = {}) {
@@ -36,6 +37,36 @@ export function selectProductionParticipantIdentity({
         environmentSecret: null,
         secretFile: explicitSecretFile,
         legacySecretFile: null,
+      }),
+    });
+  }
+  // Linux has no implicit credential loader. Only the companion's explicitly
+  // injected, fixed-capability parent broker can supply this source-only path.
+  if (platform === "linux") {
+    if (architecture !== "x64" || typeof createLinuxBackend !== "function") {
+      throw selectionError("EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE");
+    }
+    if (allowedKeychainCapability === undefined || keychainCapability !== allowedKeychainCapability) {
+      throw selectionError("EXPORT_IDENTITY_PRODUCTION_BACKEND_INVALID");
+    }
+    let participantSecretBackend;
+    try {
+      participantSecretBackend = createLinuxBackend();
+      if (participantSecretBackend === null || typeof participantSecretBackend !== "object"
+          || ["read", "createIfMissing", "replaceExact", "deleteExact", "describe"].some(
+            (method) => typeof participantSecretBackend[method] !== "function")) {
+        throw new Error("Unavailable broker");
+      }
+    } catch {
+      throw selectionError("EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE");
+    }
+    return Object.freeze({
+      mode: "linux_secret_service_broker",
+      identityOptions: Object.freeze({
+        environmentSecret: null,
+        secretFile: appStateSecretFile,
+        participantSecretBackend,
+        participantSecretCapability: keychainCapability,
       }),
     });
   }

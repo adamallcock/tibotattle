@@ -134,6 +134,42 @@ test("both recent tables resolve exact adjacency identities without mutating ano
   assert.doesNotMatch(JSON.stringify(result), /ignoredPrivateField|must-not-be-emitted|session_local/u);
 });
 
+test("auto-review navigation metadata retains the matched session while projecting only its parent", async (t) => {
+  const f = await fixture(t);
+  const beforeOverview = structuredClone(f.overview);
+  const result = await f.run({ readThreadMetadata: async () => new Map([
+    [ROOT, { id: ROOT, name: "Synthetic root", nickname: null, parent: null }],
+    [WORKER, {
+      id: WORKER,
+      name: "Internal review session",
+      nickname: null,
+      parent: { id: ROOT, name: "Synthetic root" },
+      origin: "auto_review",
+    }],
+  ]) });
+  const entry = result.entries.find((value) => value.thread.id === WORKER);
+  assert.deepEqual(entry?.thread, {
+    id: WORKER,
+    name: "Internal review session",
+    nickname: null,
+    parent: { id: ROOT, name: "Synthetic root" },
+    origin: "auto_review",
+  });
+  assert.deepEqual(f.overview, beforeOverview,
+    "navigation metadata does not reassign cache-drop attribution");
+
+  const unavailableParent = await f.run({ readThreadMetadata: async () => new Map([
+    [WORKER, {
+      id: WORKER, name: "Internal review session", nickname: null,
+      parent: null, origin: "auto_review",
+    }],
+  ]) });
+  assert.deepEqual(unavailableParent.entries.find((value) => value.thread.id === WORKER)?.thread, {
+    id: WORKER, name: "Internal review session", nickname: null,
+    parent: null, origin: "auto_review",
+  });
+});
+
 test("real cache-impact analyzer rows match the resolver's keys and exact session proof", async (t) => {
   const f = await fixture(t);
   const impacts = readCacheImpacts(f.database, { nowMs: NOW });

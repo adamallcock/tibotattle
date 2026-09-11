@@ -14,12 +14,28 @@ function productionFunction(name) {
   return match[0];
 }
 
-function refreshHarness({ rejection = null, native = false } = {}) {
+function refreshHarness({
+  rejection = null,
+  native = false,
+  electron = false,
+  bridge = undefined,
+  detailedSnapshot = false,
+} = {}) {
   const calls = [];
+  const routes = [];
   const notices = [];
   const timers = [];
   const buttons = new Map();
-  const priorDashboard = { mode: "local", state: "stale", activity: { lastScanAt: "2026-09-02T00:00:00.000Z" } };
+  const priorDashboard = {
+    mode: "local",
+    state: "stale",
+    activity: { lastScanAt: "2026-09-02T00:00:00.000Z" },
+    accounting: {
+      projection: detailedSnapshot
+        ? { status: "available", reason: null, terminal: false }
+        : { status: "unavailable", reason: "local_unified_index_deferred", terminal: true },
+    },
+  };
   const context = createContext({
     dashboard: priorDashboard,
     localActionBusy: false,
@@ -30,6 +46,11 @@ function refreshHarness({ rejection = null, native = false } = {}) {
     lastReindexProgressReceipt: null,
     returnRefreshScheduled: false,
     returnRefreshDeferrals: 0,
+    electronStartupRefreshTriggered: false,
+    electronStartupRefreshDeferred: false,
+    activeLocalDashboardLoad: null,
+    ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS: 1_000,
+    tibotattleDesktop: bridge,
     $: (selector) => {
       if (!buttons.has(selector)) buttons.set(selector, {
         textContent: "Refresh",
@@ -38,8 +59,16 @@ function refreshHarness({ rejection = null, native = false } = {}) {
       return buttons.get(selector);
     },
     localClient: {
-      async refresh() { calls.push("quick"); if (rejection) throw rejection; },
-      async recalculateDetailedAccounting() { calls.push("detailed"); if (rejection) throw rejection; },
+      async refresh() {
+        calls.push("quick");
+        routes.push("/api/local/refresh/quick");
+        if (rejection) throw rejection;
+      },
+      async recalculateDetailedAccounting() {
+        calls.push("detailed");
+        routes.push("/api/local/refresh");
+        if (rejection) throw rejection;
+      },
       async refreshStatus() { calls.push("status"); return { refresh: { status: "succeeded" } }; },
     },
     createRefreshPollingBudget: () => ({ hasTime: () => true }),
@@ -47,9 +76,11 @@ function refreshHarness({ rejection = null, native = false } = {}) {
     currentHistoryContinuationDecision: () => ({ terminalGap: false }),
     localAnalysisAllowed: () => true,
     runsInsideNativeDashboard: () => native,
+    runsInsideElectronDashboard: () => electron,
     updateLocalActionButtons() {},
     setGlobalState() {},
     setTimeout: (resolve) => resolve(),
+    clearTimeout() {},
     window: { setTimeout: (callback) => timers.push(callback) },
     showConnectionNotice: (notice) => notices.push(notice),
     refreshNeedsContinuation: () => false,
@@ -58,9 +89,10 @@ function refreshHarness({ rejection = null, native = false } = {}) {
     describeFailure: async () => { calls.push("diagnostic"); return { text: "An update could not be started." }; },
     t: (key) => translate(key, {}, "en-US"),
   });
+  runInContext(productionFunction("signalElectronRefreshLifecycle"), context);
   runInContext(productionFunction("requestRefresh"), context);
   runInContext(productionFunction("scheduleReturningUserRefresh"), context);
-  return { context, calls, notices, timers, buttons, priorDashboard };
+  return { context, calls, routes, notices, timers, buttons, priorDashboard };
 }
 
 test("both visible manual refresh controls request detailed accounting once", async (t) => {
@@ -76,6 +108,7 @@ test("both visible manual refresh controls request detailed accounting once", as
       harness.buttons.get(selector).click({ type: "click", detailed: false });
       await new Promise(setImmediate);
       assert.deepEqual(harness.calls, ["detailed", "status", "reload", "continuation-check"]);
+      assert.deepEqual(harness.routes, ["/api/local/refresh"]);
       assert.equal(harness.context.localActionBusy, false);
       assert.equal(harness.context.localRefreshInProgress, false);
       assert.equal(harness.context.dashboard, harness.priorDashboard,
@@ -88,6 +121,7 @@ test("the shared default and automatic browser return refresh stay quick", async
   const direct = refreshHarness();
   await direct.context.requestRefresh();
   assert.deepEqual(direct.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(direct.routes, ["/api/local/refresh/quick"]);
 
   const returning = refreshHarness();
   returning.context.scheduleReturningUserRefresh();
@@ -95,11 +129,166 @@ test("the shared default and automatic browser return refresh stay quick", async
   returning.timers[0]();
   await new Promise(setImmediate);
   assert.deepEqual(returning.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(returning.routes, ["/api/local/refresh/quick"]);
 
   const native = refreshHarness({ native: true });
   native.context.scheduleReturningUserRefresh();
   assert.deepEqual(native.timers, [], "the native host retains sole cadence ownership");
   assert.deepEqual(native.calls, []);
+});
+
+test("Electron automatic refresh events honor the host-selected mode", async () => {
+  const quick = refreshHarness({ electron: true });
+  runInContext(productionFunction("handleElectronAutomaticRefresh"), quick.context);
+  runInContext(
+    "handleElectronAutomaticRefresh({ detail: { mode: 'quick' } });",
+    quick.context,
+  );
+  await new Promise(setImmediate);
+  assert.deepEqual(quick.routes, ["/api/local/refresh/quick"]);
+
+  const detailed = refreshHarness({ electron: true });
+  runInContext(productionFunction("handleElectronAutomaticRefresh"), detailed.context);
+  runInContext(
+    "handleElectronAutomaticRefresh({ detail: { mode: 'detailed' } });",
+    detailed.context,
+  );
+  await new Promise(setImmediate);
+  assert.deepEqual(detailed.routes, ["/api/local/refresh"]);
+
+  const ignored = refreshHarness({ electron: true });
+  runInContext(productionFunction("handleElectronAutomaticRefresh"), ignored.context);
+  for (const expression of [
+    "handleElectronAutomaticRefresh({ detail: { mode: 'quick', extra: true } });",
+    "handleElectronAutomaticRefresh({ detail: { mode: 'background' } });",
+    "handleElectronAutomaticRefresh({ detail: ['quick'] });",
+  ]) {
+    runInContext(expression, ignored.context);
+  }
+  await new Promise(setImmediate);
+  assert.deepEqual(ignored.calls, []);
+});
+
+test("Electron startup performs one guarded detailed refresh without a trusted projection", async () => {
+  const harness = refreshHarness({ electron: true });
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  assert.equal(harness.context.electronStartupRefreshTriggered, true);
+  assert.equal(harness.context.startElectronStartupRefresh(), false);
+  await new Promise(setImmediate);
+
+  assert.deepEqual(harness.calls, ["detailed", "status", "reload", "continuation-check"]);
+  assert.deepEqual(harness.routes, ["/api/local/refresh"]);
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.context.localRefreshInProgress, false);
+});
+
+test("Electron startup stays quick when a trusted detailed projection is present", async () => {
+  const harness = refreshHarness({ electron: true, detailedSnapshot: true });
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  await new Promise(setImmediate);
+
+  assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(harness.routes, ["/api/local/refresh/quick"]);
+});
+
+test("qualified Electron startup waits for the preload smoke barrier", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const harness = refreshHarness({ electron: true });
+  harness.context.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__ = {
+    version: "v1",
+    waitForStartupRefresh: () => gate,
+  };
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.calls, [], "the renderer waits for qualified observation");
+
+  release();
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.calls, ["detailed", "status", "reload", "continuation-check"]);
+  assert.deepEqual(harness.routes, ["/api/local/refresh"]);
+});
+
+test("qualified Electron startup deferred by the initial dashboard lock runs once it clears", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const harness = refreshHarness({ electron: true });
+  harness.context.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__ = {
+    version: "v1",
+    waitForStartupRefresh: () => gate,
+  };
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+
+  harness.context.localActionBusy = true;
+  harness.context.activeLocalDashboardLoad = { pending: true };
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  release();
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.calls, [], "the lock cannot consume the one startup pass");
+  assert.equal(harness.context.electronStartupRefreshTriggered, false);
+  assert.equal(harness.context.electronStartupRefreshDeferred, true);
+
+  harness.context.localActionBusy = false;
+  harness.context.electronStartupRefreshDeferred = false;
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.routes, ["/api/local/refresh"]);
+  assert.equal(harness.context.electronStartupRefreshTriggered, true);
+
+  const startupFinalizer = source.match(/localActionBusy = load\.previousBusy;\n\s*updateLocalActionButtons\(\);\n\s*if \(electronStartupRefreshDeferred\) \{\n\s*electronStartupRefreshDeferred = false;\n\s*startElectronStartupRefresh\(\);/u);
+  assert.ok(startupFinalizer,
+    "the real dashboard owner retries the deferred launch pass after releasing its lock");
+});
+
+test("a non-bootstrap busy owner keeps Electron's existing one-shot suppression", async () => {
+  const harness = refreshHarness({ electron: true });
+  harness.context.localActionBusy = true;
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.calls, []);
+  assert.equal(harness.context.electronStartupRefreshTriggered, true);
+  assert.equal(harness.context.electronStartupRefreshDeferred, false);
+});
+
+test("a deferred Electron startup pass suppresses the browser return timer", () => {
+  const harness = refreshHarness({ electron: true });
+  harness.context.electronStartupRefreshDeferred = true;
+  harness.context.scheduleReturningUserRefresh();
+  assert.deepEqual(harness.timers, []);
+});
+
+test("accepted Electron refreshes acquire and settle the main-process lease", async () => {
+  const lifecycle = [];
+  const harness = refreshHarness({
+    electron: true,
+    bridge: {
+      refreshStarted() {
+        lifecycle.push("started");
+        return 41;
+      },
+      refreshSettled({ lease }) {
+        lifecycle.push(["settled", lease]);
+        return true;
+      },
+    },
+  });
+
+  await harness.context.requestRefresh();
+  await new Promise(setImmediate);
+
+  assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(lifecycle, ["started", ["settled", 41]]);
 });
 
 test("an initial controller conflict is informational and cannot queue detailed work", async () => {

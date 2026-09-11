@@ -19,6 +19,7 @@ const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
   "community-data.js",
   "community-refresh.js",
   "community-view.js",
+  "model-visuals.js",
   "community.html",
   "community.js",
   "docs.html",
@@ -38,6 +39,16 @@ const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
 const WEB_RELEASE_TOOLING_PATHS = new Set([
   "package.json",
   "scripts/build-public-release-site.js",
+  "scripts/lib/electron-public-site.mjs",
+  "test/electron-public-site.test.js",
+  "packages/i18n/index.js",
+  "tools/tool-inventory.json",
+  "config/release-evidence.js",
+  "schemas/release-evidence-v1/manifest.schema.json",
+  "scripts/release-evidence-descriptor.js",
+  "scripts/release-evidence-policy.js",
+  "scripts/release-evidence-output.js",
+  "test/release-evidence.test.js",
   "scripts/deploy-web-release.js",
   "scripts/prepare-web-release.js",
   "scripts/preview-public-release-site.js",
@@ -64,7 +75,7 @@ const WEB_RELEASE_TOOLING_PATHS = new Set([
 ]);
 const WEB_RELEASE_PACKAGE_SCRIPTS = Object.freeze({
   "product:release-site:test":
-    "node --test test/public-release-site.test.js test/public-release-site-preview.test.js test/web-release-lane.test.js",
+    "node --test test/public-release-site.test.js test/public-release-site-preview.test.js test/web-release-lane.test.js test/electron-public-site.test.js",
   "product:release-site:preview": "node ./scripts/preview-public-release-site.js",
   "product:web-release:prepare": "node ./scripts/prepare-web-release.js",
   "product:web-release:deploy": "node ./scripts/deploy-web-release.js",
@@ -224,6 +235,15 @@ function assertPackageJsonScope({ repositoryRoot, baseCommit, sourceCommit, git 
   }
 }
 
+/** Only literal Electron-site catalog entries may change in the shared i18n file. */
+export function assertElectronSiteCatalogScope({ repositoryRoot, baseCommit, sourceCommit, git }) {
+  const strip = value => value.split("\n").filter(line =>
+    !/^  "electron\.site\.[A-Za-z0-9.-]+": "(?:[^"\\]|\\.)*",$/u.test(line)).join("\n");
+  const before = git(repositoryRoot, ["show", `${baseCommit}:packages/i18n/index.js`]);
+  const after = git(repositoryRoot, ["show", `${sourceCommit}:packages/i18n/index.js`]);
+  if (strip(before) !== strip(after)) throw new Error("Web-only release changed i18n outside Electron site copy.");
+}
+
 /**
  * Proves the committed candidate differs from its declared deployed base only
  * in the public-site closure or the release controls that protect that closure.
@@ -264,6 +284,9 @@ export function inspectWebReleaseScope({
     throw new Error(
       `Web-only release candidate changed an unsupported path: ${unsupported.path}`,
     );
+  }
+  if (changes.some((change) => change.path === "packages/i18n/index.js")) {
+    assertElectronSiteCatalogScope({ repositoryRoot: root, baseCommit, sourceCommit, git });
   }
   if (changes.some((change) => change.path === "package.json")) {
     assertPackageJsonScope({
@@ -341,7 +364,8 @@ async function releaseManifestForCandidate({ repositoryRoot }) {
     throw new Error("Generated web-release manifest is not valid JSON.");
   }
   if (manifest?.schemaVersion !== PUBLIC_RELEASE_MANIFEST_SCHEMA
-      || !validSourceProvenance(manifest.source)) {
+      || !validSourceProvenance(manifest.source)
+      || (manifest.electronRelease && manifest.electronRelease.publishedInstallersVerified !== true)) {
     throw new Error(
       "Generated web-release manifest is not bound to the selected public source closure.",
     );

@@ -241,6 +241,72 @@ test("quick refresh publishes quota/headline data without deep index, accounting
   );
 });
 
+test("macOS real-history QA leaves quota evidence unattributed without account Keychain access", async () => {
+  let qaKeychainBackendFactoryCalls = 0;
+  let qaSecretLoads = 0;
+  let qaCollectorOptions = null;
+  const qaRunner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    environment: { USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1" },
+    selectAccountObservationSecret: () => {
+      qaKeychainBackendFactoryCalls += 1;
+      return {
+        loadAccountObservationSecret: async () => {
+          qaSecretLoads += 1;
+          return Buffer.alloc(32, 1);
+        },
+      };
+    },
+    runCollector: async (options) => {
+      qaCollectorOptions = options;
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        refresh: { attempted: true, recordWritten: true, errorCode: null },
+        indexing: COMPLETE_INDEX,
+      };
+    },
+  });
+
+  const qaResult = await qaRunner({ mode: "quick" });
+  assert.equal(qaKeychainBackendFactoryCalls, 0);
+  assert.equal(qaSecretLoads, 0);
+  assert.equal(qaCollectorOptions.loadAccountObservationSecret, null);
+  assert.equal(qaResult.quotaRefresh.recordWritten, true);
+
+  let normalSelectionCalls = 0;
+  let normalSecretLoads = 0;
+  let normalCollectorOptions = null;
+  const normalRunner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    environment: {},
+    selectAccountObservationSecret: () => {
+      normalSelectionCalls += 1;
+      return {
+        loadAccountObservationSecret: async () => {
+          normalSecretLoads += 1;
+          return Buffer.alloc(32, 2);
+        },
+      };
+    },
+    runCollector: async (options) => {
+      normalCollectorOptions = options;
+      await options.loadAccountObservationSecret();
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        refresh: { attempted: true, recordWritten: true, errorCode: null },
+        indexing: COMPLETE_INDEX,
+      };
+    },
+  });
+
+  await normalRunner({ mode: "quick" });
+  assert.equal(normalSelectionCalls, 1);
+  assert.equal(normalSecretLoads, 1);
+  assert.equal(typeof normalCollectorOptions.loadAccountObservationSecret, "function");
+});
+
 test("quick legacy refresh skips rollout backfill and a bounded collector continuation", async () => {
   const collectorCalls = [];
   const deepCalls = { unified: 0, accounting: 0, archive: 0 };
@@ -313,8 +379,10 @@ test("refresh controller forwards mode and reloads quick and detailed results di
   }
   assert.deepEqual(modes, ["quick", "detailed"]);
   assert.equal(reloads[0].purpose, "quick");
+  assert.equal(reloads[0].returnOverview, false);
   assert.equal(Object.hasOwn(reloads[0], "unifiedProjectionReuse"), false);
   assert.equal(reloads[1].purpose, "full");
+  assert.equal(reloads[1].returnOverview, false);
   assert.equal(Object.hasOwn(reloads[1], "unifiedProjectionReuse"), true);
   assert.throws(
     () => controller.start({ mode: "automatic" }),
@@ -3643,7 +3711,7 @@ test("cancellation after the early headline does not start the normal continuati
 });
 
 test("refresh controller reloads a quick result while deep accounting continues", async () => {
-  let reloads = 0;
+  const reloads = [];
   let releaseAccounting;
   const accountingGate = new Promise((resolve) => {
     releaseAccounting = resolve;
@@ -3674,8 +3742,8 @@ test("refresh controller reloads a quick result while deep accounting continues"
       };
     },
     dataStore: {
-      async reload() {
-        reloads += 1;
+      async reload(options) {
+        reloads.push(options);
       },
     },
     clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
@@ -3690,7 +3758,7 @@ test("refresh controller reloads a quick result while deep accounting continues"
   assert.equal(quick.status, "running");
   assert.equal(quick.progress.phase, "quick_result");
   assert.equal(quick.quickResultAt, "2026-07-23T12:00:00.000Z");
-  assert.equal(reloads, 1);
+  assert.equal(reloads.length, 1);
 
   releaseAccounting();
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -3698,7 +3766,83 @@ test("refresh controller reloads a quick result while deep accounting continues"
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.equal(controller.getStatus().status, "succeeded");
-  assert.equal(reloads, 2);
+  assert.deepEqual(
+    reloads.map(({ purpose, returnOverview }) => ({ purpose, returnOverview })),
+    [
+      { purpose: "quick", returnOverview: false },
+      { purpose: "full", returnOverview: false },
+    ],
+  );
+});
+
+test("quick refresh skips the terminal reload after a published quick result", async () => {
+  const reloads = [];
+  const controller = new LocalCompanionRefreshController({
+    runner: async ({ onProgress }) => {
+      await onProgress({
+        ...COMPLETE_INDEX,
+        phase: "quick_result",
+      });
+      return { indexing: COMPLETE_INDEX };
+    },
+    dataStore: {
+      async reload(options) {
+        reloads.push(options);
+      },
+    },
+    clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+  });
+
+  assert.equal(controller.start({ mode: "quick" }), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controller.getStatus().status === "succeeded") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const status = controller.getStatus();
+  assert.equal(status.status, "succeeded");
+  assert.equal(status.quickResultAt, "2026-07-23T12:00:00.000Z");
+  assert.deepEqual(
+    reloads.map(({ purpose, returnOverview }) => ({ purpose, returnOverview })),
+    [{ purpose: "quick", returnOverview: false }],
+  );
+});
+
+test("quick refresh retries terminal reload after a failed quick-result publication", async () => {
+  const reloads = [];
+  const controller = new LocalCompanionRefreshController({
+    runner: async ({ onProgress }) => {
+      await onProgress({
+        ...COMPLETE_INDEX,
+        phase: "quick_result",
+      });
+      return { indexing: COMPLETE_INDEX };
+    },
+    dataStore: {
+      async reload(options) {
+        reloads.push(options);
+        if (reloads.length === 1) throw new Error("quick snapshot unavailable");
+      },
+    },
+    clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+  });
+
+  assert.equal(controller.start({ mode: "quick" }), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controller.getStatus().status === "succeeded") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const status = controller.getStatus();
+  assert.equal(status.status, "succeeded");
+  assert.equal(status.quickResultAt, null);
+  assert.deepEqual(
+    reloads.map(({ purpose, returnOverview }) => ({ purpose, returnOverview })),
+    [
+      { purpose: "quick", returnOverview: false },
+      { purpose: "quick", returnOverview: false },
+    ],
+  );
 });
 
 test("refresh controller keeps a bounded-pause headline observable after the pass settles", async () => {
@@ -4026,7 +4170,7 @@ test("refresh controller projects a fixed safety-limit state while retaining the
 });
 
 test("refresh controller reloads archive progress after the collector limit settles", async () => {
-  let reloads = 0;
+  const reloads = [];
   const controller = new LocalCompanionRefreshController({
     runner: async () => {
       const error = new Error("collector limit");
@@ -4034,8 +4178,8 @@ test("refresh controller reloads archive progress after the collector limit sett
       throw error;
     },
     dataStore: {
-      async reload() {
-        reloads += 1;
+      async reload(options) {
+        reloads.push(options);
       },
     },
     clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
@@ -4049,7 +4193,10 @@ test("refresh controller reloads archive progress after the collector limit sett
 
   assert.equal(controller.getStatus().status, "failed");
   assert.equal(controller.getStatus().errorCode, "refresh_resource_limited");
-  assert.equal(reloads, 1);
+  assert.deepEqual(
+    reloads.map(({ purpose, returnOverview }) => ({ purpose, returnOverview })),
+    [{ purpose: "full", returnOverview: false }],
+  );
 });
 
 test("refresh controller classifies transition-derivation limits as fixed safety stops", async () => {

@@ -1,6 +1,6 @@
 # TiboTattle
 
-Privacy-first, local-first monitoring for coding-agent usage. TiboTattle
+Local-first monitoring for coding-agent usage. TiboTattle
 processes local Codex usage metadata and provider-reported quota evidence to
 show where your allowance stands, what observed work would have cost at
 standard API prices, and where the available evidence does not support a
@@ -8,16 +8,20 @@ confident answer.
 
 Personal analysis runs locally and works without an account. Raw source logs do
 not leave your machine, and prompts, responses, file paths, and raw account
-identifiers do not enter TiboTattle's derived artifacts. The optional hosted
-community contribution service is a separate, off-by-default capability with
-an exact local review and explicit send step.
+identifiers do not enter TiboTattle's derived artifacts. The released Electron
+app uses
+[accountless automatic sharing](docs/decisions/2026-09-04-accountless-sharing-policy.md):
+fresh installs default on, existing users receive three notices, and a persistent
+opt-out is available without sign-in. Enrollment and upload follow the saved
+sharing choice. [Current status](docs/current-status.md) separates the released
+source from live contribution rehearsal evidence.
 
 
 > **The name:** TiboTattle is named with affection for the Codex community and
 > its patron saint of quota resets. It is not affiliated with or endorsed by
 > OpenAI or Thibault Sottiaux, and we will happily rename it if asked. Your
-> tokens tattle only to you: personal analysis stays local and nothing is
-> contributed without your explicit, reviewed consent.
+> personal analysis stays local, and sharing follows the applicable versioned
+> policy and your saved preference.
 
 ## What it shows
 
@@ -42,7 +46,18 @@ an exact local review and explicit send step.
 - **A menu bar item** — where the allowance stands without opening the app,
   including a Check for Updates entry in builds that ship the updater.
 
-## Install (macOS, Apple silicon or Intel)
+<a id="install-macos-apple-silicon-or-intel"></a>
+
+## Install
+
+Electron 0.1.21 is released for macOS Apple silicon, macOS Intel, Windows x64
+and Linux x86_64. Choose the matching installer at
+[tibotattle.com](https://tibotattle.com) or
+[GitHub Releases](https://github.com/adamallcock/tibotattle/releases). See
+[platform support](docs/reference/platform-support.md) for requirements and
+retained acceptance limits.
+
+### macOS
 
 Requires **macOS 14 or later**, on either Apple silicon or Intel. With
 [Homebrew](https://brew.sh/) installed, one command selects the correct signed,
@@ -61,9 +76,10 @@ Alternatively, choose the **macOS Apple silicon** or **macOS Intel** DMG from
 If you are unsure, **Apple menu → About This Mac** shows either an Apple chip or
 an Intel processor. Open the DMG, drag TiboTattle to Applications, and launch it.
 When both refer to the same published version, those channels point to the same
-architecture-specific Developer ID artifact; the app continues to use its signed Sparkle feed for
-updates. A missing website slot is not a release claim—use the GitHub release
-page for the exact version and digest. A v1 release manifest may explicitly
+architecture-specific Developer ID artifact. Native 0.1.18 uses its existing
+Sparkle feed to update to Electron; Electron uses its own updater thereafter.
+A missing website slot is not a release claim—use the GitHub release page for
+the exact version and digest. A v1 release manifest may explicitly
 leave SBOM or provenance fields `null`; source-to-binary provenance is claimed
 only when a trusted hosted workflow generated/finalized and cryptographically
 verified the exact final bytes for that specific release. This repository is
@@ -77,6 +93,11 @@ GitHub provenance evidence yourself.
 ## Build from source (developers)
 
 These requirements are for development, not installation of the released app.
+The [Electron packaging lane](docs/runbooks/2026-08-18-cross-platform-release-publication.md#normal-electron-stable-feed-preparation)
+describes the released shell’s packaging and qualification entry points.
+The native macOS commands below maintain the predecessor and migration tooling;
+they do not build the released Electron app.
+
 The native app builder runs on macOS 14 or later on Apple silicon. Repository
 tooling requires Node.js ≥ 22.13,
 [pnpm](https://pnpm.io) 11, and the Xcode command-line tools. The app-bundle
@@ -95,7 +116,7 @@ pnpm install
 npm --prefix apps/worker ci
 ```
 
-Build and open the self-contained desktop app:
+Build and open the legacy native macOS app:
 
 ```bash
 npm run product:macos:build
@@ -129,7 +150,7 @@ only from the app's two-confirmation **Identity & Device Reset…** flow.
 
 ## Languages
 
-TiboTattle ships English, Simplified Chinese, and Spanish for its native shell,
+TiboTattle ships English, Simplified Chinese, and Spanish for its desktop shell,
 local dashboard, and public community/install surface. New users follow a safe
 system-language match with English fallback; General settings and the web
 header both provide a persisted override. Language choice does not change
@@ -236,8 +257,9 @@ pnpm container:portable:build
 pnpm container:portable:test
 ```
 
-These commands are preparation evidence only. The shipping application remains
-macOS-only. See the [current status matrix](docs/current-status.md) for the
+These portable-core commands do not replace installed-app qualification. The
+released Electron app covers macOS Apple silicon, macOS Intel, Windows x64 and
+Linux x86_64. See the [current status matrix](docs/current-status.md) for the
 separate source, native, installed, release, updater, and platform gates.
 
 ```bash
@@ -289,8 +311,8 @@ vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Status
 
-TiboTattle is a published macOS product with an operational optional hosted
-service. The current published version and user-facing history are listed in
+TiboTattle is a published desktop product for macOS, Windows and Linux with an
+operational optional hosted service. The current published version and user-facing history are listed in
 the [changelog](CHANGELOG.md) and on the
 [GitHub Releases page](https://github.com/adamallcock/tibotattle/releases).
 TiboTattle is not a provider-authoritative billing dashboard: quota estimates

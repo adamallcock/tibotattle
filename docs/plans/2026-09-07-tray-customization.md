@@ -327,3 +327,39 @@ remain separate. These development packages are not signed/notarized production
 releases, and no stable installation or public release was changed. Source integration is tracked by the native main-branch PR and the Electron
 PR into `codex/unified-desktop-accountless`; it does not publish or install a
 new app version.
+
+
+### Integration verification (2026-09-07)
+
+The native changes merged into main in [PR #112](https://github.com/adamallcock/tibotattle/pull/112).
+The Electron branch integrated destination revision
+`ae8f5bb60f011d3d14300beb026560d417eb2370` without rewriting history.
+Its final application source is `963d07916afbc6655b820f355e9b8d0c862ea14e`;
+the fresh ARM development package has ASAR SHA-256
+`623da9ca504da541399f91388905c9754de02d7a8d85f52a9fef54f297c8cc38`.
+The source-bound packaged smoke passed save, preview, undo, defaults, Settings
+reopen, full-process relaunch, popup history persistence and clean shutdown.
+A test-only rendering wait replaced an immediate assertion during Settings
+startup; no application behavior was changed for that stabilization.
+
+Integration validation passed 507 Electron/core/package/smoke contracts
+(including the runtime recheck), 564 UI tests, 329 local companion tests,
+17 updater finalization tests and 27 final smoke contracts. These runs overlap.
+Architecture and localization checks passed. The packaged popup was visually
+inspected with synthetic data. This is development qualification; the installed
+0.1.18 application and production release remain unchanged.
+
+### Native main-line reconciliation status (2026-09-07)
+
+The local reconciliation of the upstream native tray source remains
+source-unqualified at this point. Its macOS source lane stops before compiling
+the tray changes because the current base has a separate helper-inventory
+mismatch. That repair is deliberately separate from this merge; this record
+makes no app-build, signing, installation, or release claim.
+
+The separate helper-selector correction then restored source qualification. It
+allows the exact Electron handover helper beside the Keychain helper while
+keeping both compilation closures fixed and refusing any other helper file.
+The macOS source, development-bundle, and test-build contracts passed locally.
+They remain source/test-profile evidence only and do not change the installed
+0.1.18 app, signing, notarization, installation, or release state.

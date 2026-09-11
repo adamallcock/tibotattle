@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   appendFile,
   chmod,
@@ -74,6 +75,90 @@ import {
 import { readLocalUnifiedWindowBreakdown } from "../src/local-unified-window-breakdown.js";
 
 const CONTRACT = "usage-event-v0.2";
+
+function runWindowsPublicationChild({ failPublishedFileSync = false } = {}) {
+  const moduleUrl = new URL("../src/local-unified-index.js", import.meta.url).href;
+  const source = `
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import { lstat, mkdtemp, rm, writeFile } from "node:fs/promises";
+    import { tmpdir } from "node:os";
+    import { basename, join } from "node:path";
+
+    const require = createRequire(import.meta.url);
+    const promises = require("node:fs/promises");
+    const originalOpen = promises.open;
+    const syncedFiles = [];
+    const failPublishedFileSync = ${JSON.stringify(failPublishedFileSync)};
+    promises.open = async (path, ...rest) => {
+      const metadata = await promises.lstat(path);
+      if (metadata.isDirectory()) {
+        const error = new Error("directory open unavailable");
+        error.code = "EPERM";
+        throw error;
+      }
+      const handle = await originalOpen(path, ...rest);
+      const sync = handle.sync.bind(handle);
+      handle.sync = async (...syncArguments) => {
+        const fileName = basename(path);
+        syncedFiles.push(fileName);
+        if (failPublishedFileSync && fileName === "published-index.sqlite") {
+          const error = new Error("published file sync failed");
+          error.code = "EIO";
+          throw error;
+        }
+        return sync(...syncArguments);
+      };
+      return handle;
+    };
+    syncBuiltinESMExports();
+    Object.defineProperty(process, "platform", {
+      value: "win32",
+      configurable: true,
+    });
+    const { publishStagedUnifiedIndex } = await import(${JSON.stringify(moduleUrl)});
+    const root = await mkdtemp(join(tmpdir(), "unified-index-win-publish-"));
+    const stageFile = join(root, "stage.sqlite");
+    const indexFile = join(root, "published-index.sqlite");
+    try {
+      await writeFile(stageFile, "synthetic");
+      await publishStagedUnifiedIndex(stageFile, indexFile);
+      process.stdout.write(\`published:\${syncedFiles.join(",")}\`);
+    } catch (error) {
+      const target = await lstat(indexFile).then(
+        () => "target_present",
+        (failure) => failure?.code === "ENOENT" ? "target_absent" : "target_unknown",
+      );
+      const stage = await lstat(stageFile).then(
+        () => "stage_present",
+        (failure) => failure?.code === "ENOENT" ? "stage_absent" : "stage_unknown",
+      );
+      process.stdout.write(
+        \`failed:\${error?.code ?? "unclassified"}:\${error?.published === true ? "published" : "unpublished"}:\${target}:\${stage}:\${syncedFiles.join(",")}\`,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  `;
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  });
+}
+
+test("Windows staged publication records exact file flushes when directory fsync is unavailable", () => {
+  const result = runWindowsPublicationChild();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "published:stage.sqlite,published-index.sqlite");
+});
+
+test("a post-rename unified-index file sync failure remains durability uncertainty", () => {
+  const result = runWindowsPublicationChild({ failPublishedFileSync: true });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    result.stdout,
+    "failed:local_unified_index_publication_durability_uncertain:published:target_present:stage_absent:stage.sqlite,published-index.sqlite",
+  );
+});
 
 test("worker batches bound synchronous companion write turns", () => {
   assert.equal(LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS, 500);

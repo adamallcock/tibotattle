@@ -22,6 +22,12 @@ import {
   createTelemetryV11Envelope,
 } from "./platform/index.js";
 import {
+  accountlessDeviceUnavailableCode,
+  accountlessTransportOrigin,
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
   createTelemetryV11Day,
   readTelemetryV11Capabilities,
   runTelemetryV11Sync,
@@ -91,6 +97,7 @@ const V11_PROGRESS_KEYS = Object.freeze(["schemaVersion", "contextDigest", "prev
 
 const ERROR_CODES = new Set([
   "invalid_configuration",
+  "authorization_invalid",
   "consent_invalid",
 ]);
 
@@ -215,7 +222,8 @@ async function readJson(response, {
   const backendCode = payload?.error?.code;
   if (deviceAuthorized
       && ["DEVICE_AUTH_INVALID", "PARTICIPANT_DELETING", "UPLOAD_AUTH_INVALID"]
-        .includes(backendCode)) {
+        .includes(backendCode)
+      || (deviceAuthorized && accountlessDeviceUnavailableCode(backendCode))) {
     interrupt("device_unavailable", { deviceUnavailable: true });
   }
   // Both admission limits mean the same thing to the client: the service is
@@ -373,6 +381,36 @@ function explicitV11Consent(consent, origin) {
     fail("consent_invalid");
   }
   return required;
+}
+
+function exactKeys(record, keys) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(record);
+    return (prototype === Object.prototype || prototype === null)
+      && Reflect.ownKeys(record).length === keys.length
+      && keys.every((key) => Object.hasOwn(record, key));
+  } catch {
+    return false;
+  }
+}
+
+function accountlessV11Authorization(authorization, origin, laboratory, rehearsal, production) {
+  if (accountlessTransportOrigin({ laboratory, rehearsal, production, origin }) === null
+      || !exactKeys(authorization, [
+    "authorizationBasis",
+    "policyVersion",
+    "schemaVersion",
+    "telemetrySchemaVersion",
+  ])
+      || authorization.schemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION
+      || authorization.policyVersion !== ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION
+      || authorization.authorizationBasis !== ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS
+      || authorization.telemetrySchemaVersion
+        !== ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION) {
+    fail("authorization_invalid");
+  }
+  return Object.freeze({ ...authorization });
 }
 
 function v11Publication(database) {
@@ -546,13 +584,16 @@ function v11Failure(error, { daysTotal = 0, networkActivity = false } = {}) {
   });
 }
 
-/** The old uploader remains the default. A successor consent is never inferred. */
+/** The old uploader remains the default. A successor authorization is never inferred. */
 export async function runIncrementalContributionSyncOnce(options = {}) {
-  if (options.consent?.telemetrySchemaVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+  const hasAccountlessAuthorization = options !== null && typeof options === "object"
+    && Object.hasOwn(options, "authorization");
+  if (!hasAccountlessAuthorization
+      && options.consent?.telemetrySchemaVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
     return runTelemetryV1SyncOnce(options);
   }
   const {
-    indexFile, origin, backend, stateFile, consent, signal, fetchImpl = globalThis.fetch,
+    indexFile, origin, backend, stateFile, consent, authorization = undefined, laboratory = undefined, rehearsal = false, production = false, signal, fetchImpl = globalThis.fetch,
     cryptoImpl = globalThis.crypto, withDeviceSecret = withContributionDeviceSecret,
     openIndex = openLocalUnifiedIndex, maximumChunks = DEFAULT_MAXIMUM_CHUNKS_PER_PASS,
     requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
@@ -564,7 +605,11 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
     progressStore = undefined, progressFile = null,
   } = options;
   const selectedOrigin = canonicalOrigin(origin);
-  const selectedConsent = explicitV11Consent(consent, selectedOrigin);
+  const selectedConsent = hasAccountlessAuthorization ? null : explicitV11Consent(consent, selectedOrigin);
+  const selectedAuthorization = hasAccountlessAuthorization
+    ? accountlessV11Authorization(authorization, selectedOrigin, laboratory, rehearsal, production)
+    : null;
+  if (hasAccountlessAuthorization && consent !== undefined) fail("authorization_invalid");
   if (typeof indexFile !== "string" || !indexFile || !backend || typeof backend !== "object"
       || [fetchImpl, withDeviceSecret, openIndex, now, createV11Envelope, runV11Sync,
         readAccountMarkers, loadExistingAccountObservationSecret].some((value) => typeof value !== "function")
@@ -604,7 +649,10 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
           const result = await runV11Sync({
             serverBaseUrl: selectedOrigin,
             deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
-            consent: selectedConsent, days: preparation.days, fetchImpl: fetch, signal, clock: now,
+            ...(selectedAuthorization === null
+              ? { consent: selectedConsent }
+              : { authorization: selectedAuthorization, laboratory, rehearsal, production }),
+            days: preparation.days, fetchImpl: fetch, signal, clock: now,
             sourcePublication: preparation.sourcePublication,
             progressStore: progress,
             revalidateProgress: preparation.revalidateProgress,

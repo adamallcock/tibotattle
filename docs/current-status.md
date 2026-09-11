@@ -1,295 +1,151 @@
 ---
 title: Current product and release status
-date: 2026-09-08
+date: 2026-09-11
 type: status
 status: current
-source_commit: 32cd6317622c9aef9b7bf015b376b4cdb93c91fc
-observation_date: 2026-09-08
+source_commit: a651ea130dd1460e4443a037c4434f57b911fec4
+observation_date: 2026-09-11
 ---
 
 # Current product and release status
 
-This is the maintained starting point for “what is current?” Source, installed
-applications, public downloads, update feeds and hosted service behavior are
-independent observations. Re-check their own source of truth for a later
-operational decision.
+Electron 0.1.21 is released for macOS Apple silicon, macOS Intel, Windows x64
+and Linux x86_64. GitHub, Homebrew, the website, both native Sparkle feeds and
+all four Electron feeds are verified. Native 0.1.18 can update through its
+normal Check for Updates control; manual backup-folder choreography is no
+longer the update path.
 
-## Published release
+This is the maintained status snapshot. Source, signed artifacts, deployed
+service, actual installed updates and owner acceptance remain separate claims.
+Recheck the relevant live surface before a later operational decision. The
+[release closure plan](./plans/2026-09-11-electron-upgrade-release-closure.md)
+retains recovery details and failed-run provenance.
 
-[TiboTattle 0.1.18](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18)
-is public and immutable. Both macOS 14+ installers are stable build `1026`,
-bound to annotated tag `v0.1.18` at exact source
-`55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
-[PR #104](https://github.com/adamallcock/tibotattle/pull/104) merged that source
-normally; the release tag and public artifacts must not be rewritten.
+## Published release and delivery
 
-| Distribution boundary | Verified on 2026-09-05 |
-|---|---|
-| GitHub release | All seven public assets independently re-downloaded and matched to the canonical manifest and checksums; immutable release and asset attestations verified |
-| Apple silicon installer | 49,908,061 bytes; SHA-256 `2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae` |
-| Intel installer | 52,128,441 bytes; SHA-256 `70630ba90e92a1cd8cb904e66e1aebe85b04e9d23a50bef7e4e41aca84c4d2f6` |
-| Native trust | Both final artifacts pass their own Developer ID signing, Apple notarization/stapling, Gatekeeper, source/payload and architecture checks |
-| Update feeds | [Apple silicon](https://updates.tibotattle.com/appcast.xml) and [Intel](https://updates.tibotattle.com/intel/appcast.xml) both publish 0.1.18 / 1026; independent signed-XML and streamed enclosure checksum checks passed at 19:38 UTC |
-| Homebrew | Apple silicon cask updated to 0.1.18 with the exact ARM checksum; [update workflow](https://github.com/adamallcock/homebrew-tap/actions/runs/33973076582) succeeded and the live cask was checked |
-| Website | [Both macOS tabs](https://tibotattle.com/#download) show 0.1.18 and their own correct public installer URL, minimum OS and architecture |
-| Installed ARM application | Final stable 1026 passes installed-artifact validation, ordinary launch, detailed replay-safe accounting refresh and restart, with matching generation and zero fallback |
+[TiboTattle 0.1.21](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.21)
+is public and immutable. Application source is
+`a651ea130dd1460e4443a037c4434f57b911fec4`, provenance build `2026091107`,
+Mac bundle version `1028`. Annotated tag object
+`bdeb3770c065e2c4c2901a8ddae909a1c15550b5` points to that source. Later
+release-tooling and website commits do not alter these application bytes.
 
-Homebrew update verified on **2026-09-07**: the
-[dual-architecture cask](https://github.com/adamallcock/homebrew-tap/pull/2)
-adds Intel with its independent published checksum. Both native Mac
-[audit/install/uninstall lanes](https://github.com/adamallcock/homebrew-tap/actions/runs/34141158444)
-passed. This supersedes the Apple-silicon-only Homebrew row in the dated
-2026-09-05 release snapshot above; it does not change the desktop artifacts or
-claim completion of the waived manual tests.
+| Boundary | Verified observation on 2026-09-11 |
+| --- | --- |
+| GitHub | All 20 public assets freshly downloaded and checked against frozen hashes and immutable release/asset attestations |
+| macOS trust | Both apps and final DMGs Developer ID signed, notarized and stapled; exact architecture and Gatekeeper checks passed |
+| Native update feeds | Apple silicon and Intel each advertise 0.1.21 / 1028 with their own verified signed enclosure |
+| Electron update feeds | All four stable feeds and their exact artifacts passed fresh public readback after activation |
+| Homebrew | [PR4](https://github.com/adamallcock/homebrew-tap/pull/4) merged after both native architecture audit/install/uninstall jobs passed; main cask and workflow bytes verified |
+| Website | [tibotattle.com](https://tibotattle.com/) serves source `9accd6f08a8bc519868f24a970b619e5e0e2a5f0`; all 24 public files match the prepared bytes |
+| Website interactions | All four immutable GitHub download links, actual checksum copies, three languages, desktop/mobile, community rendering and social metadata checked |
+| Operational closure | Original publication coordinator completed with every surface matching, no further publications attempted and its owner released; website and Electron feed journals are also verified and released |
 
-The manifest honestly leaves optional SBOM, source-to-binary provenance and
-store fields unset. GitHub's immutable release/asset attestations are not
-substitutes for SLSA build provenance. Follow
-[verify-release.md](./verify-release.md) for independent artifact verification.
+Manual website downloads use GitHub release URLs. Updater URLs remain on the
+update origin because they serve each application's automatic update mechanism.
+Only the Mac artifacts claim Apple signing and notarization; Windows uses its
+own signing and Linux its declared integrity/distribution evidence.
 
-## Hosted service and community graphs
+The manifest leaves optional SBOM and source-to-binary provenance fields null.
+GitHub immutable-release attestations do not substitute for SLSA build
+provenance. See [release verification](./verify-release.md) for independent
+checks. Published 0.1.18 and 0.1.20 artifacts and tags remain unchanged.
 
-### Current presentation and live-data availability
+## Actual installed Mac update evidence
 
-The thousand-contributor calculator changes are deployed at
-`32cd6317622c9aef9b7bf015b376b4cdb93c91fc`, at 14:39:51 UTC on 2026-09-08.
-The owner-approved migrations 0054–0056 applied successfully. Exact schema
-checks and both migration ledgers passed, with no pending migrations. Normal
-guarded deployment, exact-source health, public asset checks and rendered
-public/admin views passed. See the
-[scale publication receipt](./receipts/2026-09-08-thousand-contributor-publication.md)
-and [local scale qualification](./reviews/2026-09-08-thousand-contributor-qualification.md).
+| Normal production update | Apple silicon | Intel |
+| --- | --- | --- |
+| Native 0.1.18 to Electron 0.1.21 | [34568465222](https://github.com/adamallcock/tibotattle/actions/runs/34568465222) passed | [34569099253](https://github.com/adamallcock/tibotattle/actions/runs/34569099253) passed |
+| Electron 0.1.20 to 0.1.21 | [34568883471](https://github.com/adamallcock/tibotattle/actions/runs/34568883471) passed | [34568884736](https://github.com/adamallcock/tibotattle/actions/runs/34568884736) passed |
 
-Current refreshes use a durable dirty-account queue; publication captures a
-finite cohort without restarting on ordinary new contributions. Admin source
-preparation reads transactionally maintained counters. Existing authorized
-graphs remain available during work. At 14:41 UTC, the admin showed 31 of 69
-historical days resolved and all 738 retained source days prepared. Historical
-work then advanced August 7 from 7 to 10 of 15 accounts in a successful natural
-refresh; unchanged current work was skipped and daily publication used one
-query. Backfill remains incomplete. Local qualification covers 1,000 contributors,
-not simultaneous production traffic or a fast initial-backfill SLA. Consent,
-retention, v1.1 activation and desktop distribution remain unchanged.
+Each unchanged signed predecessor used its bundled production feed. The updater
+installed and relaunched the exact successor; the runner did not copy it or
+override the feed. Retained rows, identity salt, settings, opt-out, duplicate-free
+restart and owned-process cleanup passed. These disposable fixtures contained
+no existing contribution credential, so they do not claim credential migration.
 
-### Earlier incremental-refresh deployment
+Separate signed empty-profile installs passed on both Macs before publication,
+including automatic-sharing defaults, Settings interaction and persistent
+opt-out. These are not additional live upload rehearsals.
 
-The hosted incremental-refresh repair and owner progress detail were deployed at
-`080142f65918b7abdd6e346332cbad42bcb31fbc`. The final guarded deployment completed
-at 02:52:46 UTC on 2026-09-08, following core deployment `2e3fbdc7` and reviewed
-forward migrations 0050–0053. Both migration ledgers have no pending migrations;
-health, exact public asset bytes, public-route isolation and live public/admin
-rendering passed. See the
-[publication receipt](./receipts/2026-09-08-incremental-refresh-publication.md).
+## Hosted migration and automatic contribution evidence
 
-Authorized published graphs remain visible while ordinary uploads and accepted
-same-device corrections prepare a successor. Erasure, withdrawal, changed
-authority and policy invalidation still take effect immediately; temporary
-request failure does not masquerade as confirmed invalidation. There is no new
-"last good" label or age-only expiry. All allowance modes use one complete
-published snapshot, separate from daily activity.
+The approved production migration and activation completed on **2026-09-10**.
+Retained final-contract evidence verifies the canonical `0057`–`0059` transition
+and restoration of the retained records. One timed-out batch was
+independently reconciled as committed and counted once. Final cleanup reports
+zero owned temporary objects, no in-flight step and the coordination lock
+released. The earlier failed/restored-prefix attempt remains retained history;
+it is not the final outcome and must not be replayed.
 
-Historical work now reuses exact, prepared daily inputs across overlapping
-windows. Unaffected work can continue after unrelated contributions; unchanged
-current/daily lanes avoid raw reads, calculations and publication. Three natural
-core refreshes and a final-deployment refresh completed without exceptions,
-skipped unchanged current calculations and used one query for the daily lane.
-The final observed history pass used 225 queries in 17.027 seconds; the entire
-optional phase used 268 queries in 20.693 seconds, within the existing
-900-statement/40-second limits. This is bounded live evidence, not a throughput
-guarantee or a claim that all historical processing has finished.
+The v1.1 staged-to-accepted transition passed exact readback. Accountless
+enrollment and ownership activation were deployed at source
+`f496494ca317f60d92c73aa7d16b786fdb702cda`, with that deployment verified and
+released. The later website source above preserves the enabled production
+settings; staging remains disabled. The application qualification checkout is
+not itself evidence of the deployed Worker configuration. Do not redeploy a
+stale configuration over the activated production settings.
 
-The owner Graph reconstruction panel independently shows requested/published
-generations, historical completion and reusable-source preparation. Live saved
-steps increased from 448 at 02:35 UTC to 2,048 at 03:00 UTC, while completed
-source days increased from 13 to 42. Historical completion still read 11 of 69
-days, with 14 of 15 accounts complete for August 27: preparation can advance
-before that account count changes. The original query-free progress contract
-remains compatible; the new detail is opt-in, owner-only and read-only. The
-user's selected refresh interval is preserved; 15 seconds is the request
-timeout, not the polling interval.
+The signed **0.1.19 Apple silicon** production canary completed on
+2026-09-10 in [run 34523883586](https://github.com/adamallcock/tibotattle/actions/runs/34523883586).
+It verified automatic encrypted upload, installation-credential reuse across
+controlled restart, persistent opt-out and usage/quota linkage. The scoped
+server proof contained two usage and two quota records, with no bad links or
+duplicate groups. Owner erasure removed all scoped records and authority;
+revocation, deletion tombstone and separate object cleanup were verified.
 
-The preserved public snapshot contains 69 allowance dates from July 1 through
-September 7. Identified GPT-5.5 and GPT-5.6 histories now cover August 28 through
-September 7; Astra covers September 5–7. Earlier backfill remains in progress,
-and unsupported or unstable estimates remain gaps. Public Aggregate, By plan
-and By model and the authenticated admin chart all render. Both 0.1.18 downloads,
-the architecture-selecting Homebrew cask, consent, retention and v1.1 staging
-remain unchanged. No desktop app was rebuilt or republished.
+| Retained private receipt | SHA-256 |
+| --- | --- |
+| Final migration phase state | `5cccf9652d773480e7b77cf4090c3d5b7783f5fc86cb1202c2f012d9d4e8b6a4` |
+| Restoration audit | `a1d1dfd7986488c71b9a3e988e00cf5510aa034692d3211223ffc87aac79fb81` |
+| Final migration/schema/control contract | `822f54aec2905b58ae48e1bf77a9fb52a1842efe809fd1a7b9deddd934cdd3cd` |
+| v1.1 acceptance readback | `869d5c2f7f30dab2197461f22b3d2f0f0b65a7f593de78a421424e5c1bdb2a6b` |
+| Signed 0.1.19 canary completion and erasure | `e0ec0e6fad72e3e2123c4048bb28ffe4486f4696246734649974cd47bfb681dd` |
 
-Earlier milestones retain their dated boundaries in the
-[history repair](./receipts/2026-09-07-historical-model-progress.md),
-[initial incremental publication](./receipts/2026-09-07-incremental-graph-publication.md)
-and [scheduler recovery](./receipts/2026-09-07-cache-publisher-repair.md) receipts.
+Those receipt hashes and their linked evidence were rechecked on 2026-09-11.
+No migration or live upload was repeated for this status update. The canary is
+one synthetic installation with unchanged-input restart; it does not prove
+packet-loss retries, global duplicate suppression, every operating system or a
+new 0.1.21 upload. Accountless contributions remain excluded from public
+community figures. Public-sample activation is a separate decision.
 
-### Earlier verified public graph state
+Fresh Electron installations share automatically under the
+[accepted policy](./decisions/2026-09-04-accountless-sharing-policy.md).
+Existing undecided users receive three notices; an explicit decision cancels
+remaining notices. Opt-out persists and no social sign-in is required.
 
-On 2026-09-07 the guarded deployment published
-`3f82d9aca1c5de73b63f929b61a3f0b5fa842cad`. Independent health, public response
-validation and rendered Chrome checks confirm Aggregate, By plan, and By model
-views on [the public website](https://tibotattle.com/), including Astra. Expanded
-and inline selections stay synchronized; all comparisons use the same Pro 20x
-weekly reference basis. Cards are ordered Astra, Sol, Terra, Luna, GPT-5.5 with
-compact shared-unit captions and matching restrained model themes. All-history
-dates fit the selected view's actual evidence, while dollar scales stay shared;
-dense markers are thinned without discarding inspection points and legends can
-focus one series. See the [presentation receipt](./receipts/2026-09-07-public-graph-polish.md)
-and the [original view deployment](./receipts/2026-09-07-public-allowance-views-deployment.md).
+## Platform support and acceptance limits
 
-The earlier inspected public cache supplied 69 closed-date breakdown rows. Identified
-GPT-5.5 and GPT-5.6 history covered September 2–6; Astra covered September 5–6.
-Read-only metadata confirms September 1 completed at 13:21:16 UTC, after the
-13:05:41 public snapshot; August 31 is next. Automatic backfill targets the
-rolling 70-day preview, not unlimited history; on September 7 the closed target
-is June 30–September 6. The historical observation above predates the dedicated
-history priority slot and prompt new-day refresh repair. Public response caching
-can still briefly delay visibility. Missing/unstable model estimates remain
-gaps. This establishes real
-public history and working views, not unlimited retrospective coverage or a
-provider-authoritative allowance. The owner explicitly approved small-sample
-dollar estimates and counts, including one account; the page explains the
-associated capacity-inference risk while excluding account identifiers and
-private admin diagnostics.
+- **macOS 14+ Apple silicon and Intel:** released signed/notarized artifacts;
+  exact production updater journeys above passed independently. Physical Intel
+  acceptance remains owner supplied, separate from hosted Intel execution.
+- **Windows x64:** signed, timestamped NSIS installer and feed released.
+  [34561980268](https://github.com/adamallcock/tibotattle/actions/runs/34561980268)
+  passed installed processing, restart and uninstall for the 0.1.21 candidate.
+  Update replacement and notification appearance remain owner acceptance;
+  this latest journey did not retest credential persistence.
+- **Linux x86_64:** AppImage and feed released.
+  [34561981708](https://github.com/adamallcock/tibotattle/actions/runs/34561981708)
+  passed 0.1.21 packaging. Earlier packaged startup, credential and restart
+  evidence retains its original scope. Physical desktop/update acceptance is
+  owner supplied, not a new executed qualification result.
 
-The activity graph still measures all tokens. Its live spend card explicitly
-labels the priced portion: USD 100,671.8 across 279 of 318 shared days at this
-observation, not complete historical spend. Both 0.1.18 Mac downloads, exact
-asset bytes, private-route isolation and social-image metadata passed independent
-checks. No migrations, telemetry rewrites, consent changes, v1.1 activation,
-desktop rebuilds or updater changes accompanied this feature deployment.
+The owner's current acceptance is separate from the historical
+[0.1.18-only waiver](./decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
+Neither converts missing tests into passes. Data preservation, exact artifact
+identity and native trust remain required. The
+[platform support authority](./reference/platform-support.md) defines the
+continuing evidence requirements.
 
-### Recovery history and retained qualification boundaries
-
-All approved forward migrations `0042`–`0045` are applied. Exact migration
-prefix 45, complete schema and the preservation reconciliation were verified
-without deleting telemetry, restoring production, changing consent or
-activating v1.1 transport. Applied migration files must not be rewritten.
-
-[PR #105](https://github.com/adamallcock/tibotattle/pull/105) repaired the
-authenticated admin module dependency and atomic weekly revision replacement.
-Its merged source `26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad` is the
-then-schema-compatible code rollback target, with both 0.1.18 website downloads.
-It is not a rollback target for the subsequently upgraded prepared-work protocol;
-current recovery requires the compatibility checks in the operations runbook.
-Public downloads and the optional hosted analyzer have separate gates.
-
-[PR #106](https://github.com/adamallcock/tibotattle/pull/106) deployed quota
-sampling source `39e35686480ec0c41a54f29ec42a469a80491fc5`. Its dense synthetic
-memory checks passed, but production exposed quadratic work on sparse quota
-partitions. Cloudflare reported database CPU exhaustion/reset (7429), and some
-public data and health requests returned 503. The earlier memory failure is
-not resolved by replacing it with this timeout.
-
-At 15:48 UTC on 2026-09-06, source
-`1a14a9efb443914b965a84dd1143b036178b10e0` deployed the narrowly scoped
-allowance-reconstruction pause. Normal pre/post health and source checks
-passed; the approved emergency health exception was not used. Natural
-scheduled runs completed essential maintenance without exceptions, and the
-authenticated Operations view recovered. The allowance graph was still a
-separate, unfinished recovery gate.
-
-The [restartable calculator replacement](./decisions/2026-09-06-hosted-calculator-recovery.md)
-deployed as `91171029fb5a16255502b380677fac27df18a70a`, with exact source
-confirmed at 19:00 UTC on 2026-09-06. Approved migrations `0046`–`0047` are
-applied and verified; the normal guarded deployment passed with no health
-exception. The lookup backfill had completed, and natural scheduled runs were
-advancing restartable calculations without exceptions at that observation. The
-authenticated Operations view loaded. The main allowance graph was unavailable
-while fresh caches and historical publications rebuilt: that receipt established
-deployment and progress, not completed graph recovery. See the
-[deployment receipt](./receipts/2026-09-06-hosted-calculator-deployment.md).
-
-The two root R7 evidence checks are stale after the shared-library change.
-They remain open for future desktop qualification, not a requirement of the
-maintained hosted deployment gate. The hosted repair neither reads private
-local usage history nor rebuilds the published desktop app.
-
-The requested [all-token detail and API-equivalent spend](./decisions/2026-09-06-community-detail-totals.md)
-are deployed. Live Chrome rendering confirms the all-token activity chart and
-replacement spend card. At 20:34 UTC on 2026-09-06, one published day had partial
-price data (USD 114.9153), while 316 published days still lacked repriced totals;
-the displayed partial amount is not the complete historical spend. Recovery preserves pricing and analytical
-refusal rules, with no historical telemetry rewrite or statistical-policy change.
-
-The scoped [admin progress and useful-work scheduling change](./plans/2026-09-06-admin-reconstruction-progress.md)
-deployed as `daa82a939020cb74ad5054c4ee7e6091019502be`, independently confirmed
-healthy at 21:11 UTC on 2026-09-06. The normal guarded deployment required no
-migrations or health exception. Live authenticated Chrome shows calculation
-phases and publication backlog even while the admin graph preview is unavailable:
-13 of 15 tracked account checkpoints acquired, one account preparing, one
-scanning, and 266 pending daily rebuilds. Current accounts no longer consume
-unfinished-work slots; concurrency, query limits and calculation budgets are
-unchanged. This closes progress visibility and useful-work scheduling, not the
-separate graph-recovery gate.
-
-The owner-approved [historical model reconstruction](./receipts/2026-09-07-model-allowance-history-deployment.md)
-deployed as `0207a3c1f728ae6682d4423cf31540f72cc4d19c` at 00:08:54 UTC on
-2026-09-07. Migration `0048` and the complete stored schema passed read-back;
-both migration ledgers have no pending source migrations. The normal guarded
-deployment and independent exact-source health checks passed, preserving source
-telemetry, consent and transport activation. This supersedes the older source
-observations above, not their point-in-time qualification boundaries.
-
-Live authenticated Chrome renders the per-model chart and its retrospective
-history explanation, including Astra's existing September 6 point. At the first
-observation, no earlier historical points had been produced: low-priority
-history selected September 5 but deferred behind current-day calculation. A
-later scheduled run was canceled without a recorded exception. Its ordinary
-maintenance lease expired and natural schedules resumed successfully; the
-00:38 UTC read confirmed no held lease and 11 complete current-account heads,
-with four still acquiring. No lease override was used. Historical checkpoint,
-day-publication and rendered-series verification were open at that observation.
-The public all-token activity chart then rendered 317 days and labeled USD
-101,954.04 as the priced portion across 262 of them; the separate public allowance
-graph reported that merged history was updating. The verified public graph state
-above supersedes those earlier availability and coverage observations.
-
-The existing dated social preview was temporarily retained to prioritize the
-verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;
-do not describe that retained image as a new release preview.
-
-The admin per-model view supports the reviewed model catalog, including Astra
-and older model families. Its live preview is available at the observation
-above; that does not establish completed historical backfill. Contribution
-consent and staged v1.1 activation remain
-unchanged. The source health contract retains `participantDeletion: false`
-and `deletionSafeRestoreReplay: true`; these flags do not prove every route.
-
-## Platform support and qualification limits
-
-- **Supported:** macOS 14+ Apple silicon and Intel through the published 0.1.18
-  artifacts and their independent update feeds.
-- **Not released or supported:** Windows, Linux or Electron.
-- The live first-party Homebrew cask was rechecked on 2026-09-08: version 0.1.18
-  selects Apple silicon or Intel with each release's exact checksum. Both use
-  `brew install --cask adamallcock/tap/tibotattle`.
-  Both DMGs also remain available through the website and GitHub release.
-
-The owner explicitly accepted the unavailable disposable-profile/manual Login
-Item matrix and formal physical Intel install/runtime/update/upload evidence
-**for 0.1.18 only**. These observations are waived, not passed. User-reported
-tester success is not a retained hardware-bound qualification receipt.
-See the [release-specific decision](./decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
-and [platform support authority](./reference/platform-support.md).
-
-Data preservation, exact source/artifact binding, native trust, updater
-integrity and unexpected automatic Keychain prompts were not waived.
-Fresh R7 evidence and both pinned-runtime checks were retained; the existing
-open resource decisions are not relabeled as `release_ready`. The supported
-paginated-history reset subset is documented in the
-[qualification review](./reviews/2026-09-04-paginated-export-qualification.md);
-physical-base continuations remain refused.
-
-Private RC1, RC2 and RC3 candidates, the first pre-repair stable attempt, and
-compatible application/state recovery pairs remain preserved historical
-evidence. They are not the published stable bytes. Do not downgrade upgraded
-state by replacing only its application with an older writer.
+The live website retains previously reported narrow-screen header clipping and
+an optional provider beacon blocked by the existing content security policy.
+Download controls and the stated release journeys passed; those small website
+follow-ups did not change signed artifacts or justify relaxing the policy.
 
 ## Maintaining this snapshot
 
-Update each boundary from exact source, artifact checks, read-only public
-responses, signed feed bytes and actual rendered behavior. Preserve any
-disagreement instead of inferring publication from a build, service recovery
-from health, or physical qualification from a simulated lane. The
-[documentation index](./README.md) and
-[release execution plan](./plans/2026-09-05-public-0-1-18-release.md) retain the
-implementation and historical qualification context.
+Use exact source, signed artifacts, retained receipts, fresh public readback and
+rendered observations for later updates. Current health alone does not establish
+migration preservation, contribution scheduling or physical desktop behavior.
+The [documentation index](./README.md) identifies operational authorities;
+historical receipts retain the claims and dates they originally recorded.

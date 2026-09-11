@@ -1,7 +1,7 @@
 /**
  * Reviewed production endpoint manifest.
  *
- * This is intentionally the sole source for public deployment identifiers.
+ * This is intentionally the sole source for reviewed deployment identifiers.
  * Consumers which cannot import JavaScript (for example Wrangler JSONC and
  * native Swift) are checked by `apps/worker/scripts/check-deployment-endpoints.mjs`.
  */
@@ -41,11 +41,14 @@ function exactStringList(value, expected, label) {
 
 const publicOrigin = "https://tibotattle.com";
 const sparkleUpdateOrigin = "https://updates.tibotattle.com";
+const stagingWorkerName = "app-usagemonitor-staging";
+const stagingOrigin = `https://${stagingWorkerName}.adamallcock.workers.dev`;
 const publicOriginURL = canonicalHttpsOrigin(publicOrigin, "public origin");
 const sparkleUpdateOriginURL = canonicalHttpsOrigin(
   sparkleUpdateOrigin,
   "Sparkle update origin",
 );
+const stagingOriginURL = canonicalHttpsOrigin(stagingOrigin, "staging origin");
 // The owner-only operations hostname. It is served by the same Worker but is
 // deliberately not a public route host: the admin surface exists only here,
 // behind the Cloudflare Access application for this exact hostname.
@@ -81,6 +84,15 @@ export const DEPLOYMENT_ENDPOINTS = Object.freeze({
     ).href,
     r2Bucket: "tibotattle-updates",
   }),
+  // This is a fixed nonproduction Worker hostname observed from the account's
+  // Workers subdomain configuration. It is never supplied by Electron,
+  // renderer input, or a rehearsal receipt.
+  staging: Object.freeze({
+    origin: stagingOriginURL.origin,
+    previewUrls: false,
+    workerName: stagingWorkerName,
+    workersDev: true,
+  }),
 });
 
 export function assertDeploymentEndpoints(
@@ -97,6 +109,10 @@ export function assertDeploymentEndpoints(
   const reviewedSparkleOrigin = canonicalHttpsOrigin(
     endpoints.sparkle?.origin,
     "Sparkle update origin",
+  );
+  const reviewedStagingOrigin = canonicalHttpsOrigin(
+    endpoints.staging?.origin,
+    "staging origin",
   );
   exactStringList(
     endpoints.public?.routeHosts,
@@ -136,6 +152,14 @@ export function assertDeploymentEndpoints(
         endpoints.sparkle.r2Bucket,
       )) {
     throw new TypeError("Sparkle R2 bucket must be a valid reviewed bucket name");
+  }
+  if (endpoints.staging?.workerName !== stagingWorkerName
+      || reviewedStagingOrigin.origin !== stagingOriginURL.origin
+      || endpoints.staging?.workersDev !== true
+      || endpoints.staging?.previewUrls !== false
+      || [reviewedPublicOrigin.origin, reviewedAdminOrigin.origin,
+        reviewedSparkleOrigin.origin].includes(reviewedStagingOrigin.origin)) {
+    throw new TypeError("staging endpoint must match the reviewed nonproduction Worker");
   }
   return endpoints;
 }

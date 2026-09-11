@@ -1,0 +1,129 @@
+name: Electron signed staging scheduler
+on:
+  push:
+    branches: [codex/unified-desktop-accountless]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Probe the disposable account or execute a verified signed staging app
+        type: choice
+        options: [probe, native-ui-probe, execute, fresh-install]
+        default: probe
+        required: true
+      source_revision:
+        description: Exact signed source commit (required for execution)
+        type: string
+      runner_revision:
+        description: Exact reviewed workflow and rehearsal-runner commit (required for execution)
+        type: string
+      archive_sha256:
+        description: Exact signed ZIP SHA-256 (required for execution)
+        type: string
+      asar_sha256:
+        description: Exact enclosed ASAR SHA-256 (required for execution)
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: electron-signed-staging
+  cancel-in-progress: false
+jobs:
+  rehearsal:
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_SOURCE: ${{ inputs.source_revision }}
+      SELECTED_RUNNER: ${{ inputs.runner_revision }}
+      SELECTED_ARCHIVE: ${{ inputs.archive_sha256 }}
+      SELECTED_ASAR: ${{ inputs.asar_sha256 }}
+    steps:
+      - name: Check out the reviewed workflow source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: arm64
+          package-manager-cache: false
+      - name: Record disposable account binding
+        run: |
+          mkdir -m 700 staging-receipts
+          node --input-type=module -e 'import {userInfo} from "node:os"; import {writeFileSync} from "node:fs"; const u=userInfo(); if(process.platform!=="darwin"||process.arch!=="arm64")process.exit(1); writeFileSync("staging-receipts/account.json",JSON.stringify({uid:u.uid,username:u.username,platform:process.platform,architecture:process.arch}),{mode:0o600});'
+      - name: Probe native UI automation on the disposable Mac
+        if: inputs.mode == 'native-ui-probe'
+        run: |
+          python3 - <<'PYPROBE'
+          import json,pathlib,subprocess
+          try:
+            p=subprocess.run(['/usr/bin/osascript','-e','tell application "System Events" to return UI elements enabled'],capture_output=True,text=True,timeout=15)
+            available=p.returncode==0 and p.stdout.strip()=='true'
+            reason=None if available else 'native_ui_automation_unavailable'
+          except subprocess.TimeoutExpired:
+            available=False;reason='native_ui_automation_timeout'
+          pathlib.Path('staging-receipts/native-ui.json').write_text(json.dumps({'schemaVersion':'tibotattle-signed-staging-native-ui-v1','available':available,'failureStage':reason,'applicationDataRead':False})+'\n')
+          raise SystemExit(0 if available else 1)
+          PYPROBE
+      - name: Install locked verification dependencies
+        if: inputs.mode == 'execute' || inputs.mode == 'fresh-install'
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify and extract the exact signed test artifact
+        if: inputs.mode == 'execute' || inputs.mode == 'fresh-install'
+        run: |
+          python3 - <<'PY'
+          import os,re,hashlib,json,pathlib,zipfile,subprocess
+          revision=os.environ['SELECTED_SOURCE']; digest=os.environ['SELECTED_ARCHIVE']; asar=os.environ['SELECTED_ASAR']
+          assert re.fullmatch('[0-9a-f]{40}',revision) and re.fullmatch('[0-9a-f]{64}',digest) and re.fullmatch('[0-9a-f]{64}',asar)
+          runner=os.environ['SELECTED_RUNNER']
+          assert re.fullmatch('[0-9a-f]{40}',runner) and runner==os.environ['GITHUB_SHA'], 'runner must equal reviewed workflow source'
+          # The sealed app and test harness have separate immutable identities.
+          # Harness repairs must not require signing unchanged application code again.
+          url='https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/signed-staging/'+revision+'/'+digest+'.zip'
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'signed-staging-intake';root.mkdir(mode=0o700)
+          archive=root/'app.zip'
+          # No redirects, no caller-controlled origin, bounded download and exact digest.
+          result=subprocess.run(['/usr/bin/curl','--disable','--fail','--silent','--show-error',
+            '--proto','=https','--max-time','120','--max-filesize',str(1024**3),
+            '--output',str(archive),'--write-out','%{http_code}',url],
+            capture_output=True,text=True,check=True,timeout=130)
+          assert result.stdout=='200' and archive.stat().st_size<=1024**3
+          with archive.open('rb') as stream: h=hashlib.file_digest(stream,'sha256')
+          assert h.hexdigest()==digest
+          with zipfile.ZipFile(archive) as z:
+            assert len(z.infolist())<20000 and sum(x.file_size for x in z.infolist())<3*1024**3
+            for item in z.infolist():
+              path=pathlib.PurePosixPath(item.filename)
+              assert not path.is_absolute() and '..' not in path.parts and path.parts[0]=='TiboTattle.app'
+          extracted=root/'verified';extracted.mkdir(mode=0o700)
+          subprocess.run(['/usr/bin/ditto','-x','-k',str(archive),str(extracted)],check=True,timeout=120)
+          pathlib.Path('staging-receipts/intake.json').write_text(json.dumps({
+            'runnerRevision':runner,'sourceRevision':revision,'archiveSha256':digest,
+            'asarSha256':asar,'archiveVerified':True})+'\n')
+          PY
+      - name: Run real signed scheduler, credential restart and opt-out rehearsal
+        if: inputs.mode == 'execute' || inputs.mode == 'fresh-install'
+        run: |
+          command=--execute-staging
+          if [[ "$SELECTED_MODE" == fresh-install ]]; then command=--execute-fresh-install; fi
+          node scripts/run-signed-electron-staging.mjs "$command" \
+            --app "$RUNNER_TEMP/signed-staging-intake/verified/TiboTattle.app" \
+            --source-revision "$SELECTED_SOURCE" --asar-sha256 "$SELECTED_ASAR" \
+            > staging-receipts/execution.json
+      - name: Retain only content-free evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-staging-evidence-${{ github.run_id }}
+          path: staging-receipts/*.json
+          if-no-files-found: error
+          retention-days: 14

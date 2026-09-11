@@ -167,8 +167,15 @@ function interpolate(message, values = {}) {
 // product-owned legacy nodes only.
 export const WEB_MESSAGES = Object.freeze({
   ...Object.fromEntries(Object.keys(CATALOGS[DEFAULT_LOCALE])
-    .filter((key) => key.startsWith("contribution."))
+    .filter((key) => key.startsWith("contribution.")
+      || key.startsWith("appearance.")
+      || key.startsWith("electron.")
+      || key.startsWith("weekly.controls.")
+      || key.startsWith("accounting.cacheImpact.bullet"))
     .map((key) => [key, SUPPORTED_LOCALES.map((locale) => CATALOGS[locale][key])])),
+  "dashboard.title": ["Usage overview", "使用概览", "Resumen de uso"],
+  "usage.events": ["Usage events: {count}", "使用事件：{count}", "Eventos de uso: {count}"],
+  "usage.tokens": ["Tokens: {count}", "令牌：{count}", "Tokens: {count}"],
   "language.label": ["Language", "语言", "Idioma"],
   "language.system": ["System", "跟随系统", "Sistema"],
   "language.english": ["English", "English", "English"],
@@ -1831,7 +1838,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Each model consumes the weekly allowance at its own rate, so the headline blends these over your recent mix.": ["每个模型以各自的速率消耗每周额度，因此标题按你近期的模型组合对这些费率加权混合。", "Cada modelo consume la asignación semanal a su propia tasa, así que el titular las combina según tu mezcla reciente."],
   "Indexed history": ["已索引历史", "Historial indexado"],
   "Model usage": ["模型使用情况", "Uso por modelo"],
-  "A model on a separate allowance is listed on its own row and carries no API equivalent, because that figure cannot be compared with the main allowance. Nothing unavailable is replaced with an invented cost.": ["使用独立额度的模型会单独列为一行，并且不显示 API 等价值，因为该数值无法与主额度比较。任何不可用的数据都不会被虚构成本替代。", "Un modelo con una cuota independiente aparece en su propia fila y no lleva equivalente de API, porque esa cifra no se puede comparar con la cuota principal. Nada que no esté disponible se sustituye por un coste inventado."],
+  "A model on a separate allowance is listed on its own row and carries no API equivalent, because that figure cannot be compared with the main allowance.": ["使用独立额度的模型会单独列为一行，并且不显示 API 等价值，因为该数值无法与主额度比较。", "Un modelo con una cuota independiente aparece en su propia fila y no lleva equivalente de API, porque esa cifra no se puede comparar con la cuota principal."],
   "Replay-safe usage grouped by model, across every allowance. Each model expands into its token components as rows of the same table.": ["按模型分组的可安全重放使用情况，涵盖所有额度。每个模型可展开为同一表格中的令牌组成行。", "Uso seguro para reproducción agrupado por modelo, en todas las cuotas. Cada modelo se expande en sus componentes de tokens como filas de la misma tabla."],
   "Review before sending": ["发送前审阅", "Revisar antes de enviar"],
   "Prepare and review a contribution": ["准备并审阅贡献", "Preparar y revisar una contribución"],
@@ -1935,8 +1942,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Open TiboTattle and let it calculate your Codex usage locally.": ["打开 TiboTattle，让它在本地计算你的 Codex 使用情况。", "Abre TiboTattle y deja que calcule tu uso de Codex de forma local."],
   "See your week": ["查看你的一周", "Consulta tu semana"],
   "View your allowance estimate and history in the app.": ["在应用中查看额度估计和历史记录。", "Consulta en la app la estimación de tu límite y su historial."],
-  "Share only if you choose": ["仅在你选择时分享", "Comparte solo si quieres"],
-  "Review a content-free summary before any optional community contribution.": ["在选择向社区贡献之前，先查看不含内容的摘要。", "Revisa un resumen sin contenido antes de cualquier contribución opcional a la comunidad."],
   "When available, this leads with one combined Pro 20x-equivalent allowance from delayed, anonymous personal-plan contributions. The daily activity series sits below. A late contribution never edits history: it publishes a replacement revision for its day.": ["如有可用数据，这里会首先展示一个合并后的 Pro 20x 等值额度，数据来自延迟的匿名个人方案贡献。每日活动序列位于下方。迟到的贡献绝不会改写历史：它会为对应日期发布替代修订。", "Cuando está disponible, aquí se muestra primero una única asignación combinada equivalente a Pro 20x a partir de contribuciones anónimas y diferidas de planes personales. La serie de actividad diaria está debajo. Una contribución tardía nunca edita el historial: publica una revisión de reemplazo para su día."],
   "What the Codex allowance is really worth": ["Codex 额度到底值多少", "Cuánto vale realmente la asignación de Codex"],
   "Community view": ["社区视图", "Vista de la comunidad"],

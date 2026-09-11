@@ -31,7 +31,7 @@ import {
   runRemotePilotSql,
 } from "./pilot-operations-lib.mjs";
 import {
-  checkedInConfig,
+  unprovisionedConfig,
   provisionedConfig,
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
@@ -274,6 +274,7 @@ function fakeRemote({
         status: 0,
         stdout: JSON.stringify([
           { name: "ENVELOPE_PRIVATE_JWK", type: "secret_text" },
+          { name: "IDENTITY_LINK_SECRET", type: "secret_text" },
           ...(!missingRequiredSecrets
             ? [{ name: "ENVELOPE_PUBLIC_JWK", type: "secret_text" }]
             : []),
@@ -570,7 +571,7 @@ test("local path and configured-resource gates fail before remote inspection", a
     const unprovisioned = await runRemoteInvitationOperation({
       action: "issue",
       confirmation: INVITATION_CONFIRMATIONS.issue,
-      config: checkedInConfig,
+      config: unprovisionedConfig(),
       invitationFile: join(root, "unprovisioned.secret"),
       receiptFile: join(root, "unprovisioned.receipt.json"),
       origin: STAGING_ORIGIN,

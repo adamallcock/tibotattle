@@ -9,31 +9,30 @@ status: maintained
 
 This is the authority for public operating-system support claims. It defines
 what must be proven before a platform moves from source work to supported use.
-macOS 14+ on Apple silicon and Intel is supported through the published 0.1.18
-release. Intel support is covered by the narrow, owner-approved
-[manual-qualification waiver](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
-This support declaration does not assert that the missing physical/manual
-tests passed. Windows and Linux remain unsupported; Electron is not a released
-desktop surface.
+Electron 0.1.21 is released for macOS 14+ on Apple silicon and Intel, Windows
+x64, and Linux x86_64. The [current status matrix](../current-status.md) records
+the exact release, artifact identities, production updater results and retained
+acceptance limits. Public installers, feeds, website and Homebrew are separate
+verified surfaces; their publication does not turn an owner-accepted desktop
+check into an executed test.
 
 ## Status matrix
 
 | Platform | Source and contract | Native/physical qualification | Install, trust, update, release | Public status |
 |---|---|---|---|---|
-| macOS 14+ arm64 | Implemented | Native macOS product and retained qualification paths; 0.1.18 disposable-profile/manual matrix explicitly waived, not passed | Stable 0.1.18 / 1026 published with exact final native trust, installed refresh/restart, signed update feed and public-delivery checks | **Supported** |
-| macOS 14+ x86_64 | Explicit thin Intel build, native broker, packaging and isolated updater contracts | Cross-compilation and Rosetta checks; formal physical Intel/manual matrix explicitly waived for 0.1.18, not passed | Stable 0.1.18 / 1026 published with its own final native trust, independent signed update feed and public-delivery checks | **Supported under the release-specific waiver** |
-| Windows x64 | Portable core and fail-closed native filesystem/credential adapter exist | Partial qualification evidence; not a standing release gate | No supported signed installer, clean install/upgrade/uninstall receipt, updater, or stable artifact | **Unsupported** |
-| Linux x86_64 | Portable/core and container checks may run | Contract or container results are not physical desktop qualification | No supported signed package/repository, clean install/uninstall receipt, updater boundary, or stable artifact | **Unsupported** |
-
-“Unsupported” is not “known broken.” It means the repository does not hold the
-complete, current evidence required to ask users to rely on that platform.
+| macOS 14+ arm64 | Released Electron shell and native migration bridge | Exact signed installed-app and retained-data checks passed | Stable 0.1.21 / 1028 signed and notarized; native 0.1.18 and Electron 0.1.20 production updates passed | **Supported** |
+| macOS 14+ x86_64 | Separate thin Intel Electron artifact and migration bridge | Exact native hosted Intel installed-app checks passed; physical Intel acceptance is owner-supplied | Stable 0.1.21 / 1028 signed and notarized; native 0.1.18 and Electron 0.1.20 production updates passed independently | **Supported with recorded owner acceptance** |
+| Windows x64 | Released Electron shell and native filesystem/credential adapter | Signed 0.1.21 installed processing passed; retain the exact credential and lifecycle receipt boundaries | Signed, timestamped NSIS installer and Electron feed published; update replacement and notification appearance remain owner acceptance | **Supported with recorded owner acceptance** |
+| Linux x86_64 | Released Electron AppImage and Secret Service credential composition | 0.1.21 packaging passed; prior packaged startup, credential and cold-restart evidence retained; desktop acceptance is owner-supplied | AppImage, checksums and Electron feed published; physical desktop/update behavior is not promoted to executed proof | **Supported with recorded owner acceptance** |
 
 ## Evidence ladder
 
 A platform support claim requires every applicable gate below. Evidence at one
-level never substitutes for a later level. The documented 0.1.18 exception
-accepts only the absent manual/physical observations named in that release's
-waiver. It is not a passing result or a standing exception to this ladder.
+level never substitutes for a later level. Any release-specific owner acceptance
+must name the unperformed observation in the current status record; it is not a
+passing test or a standing exception. The historical
+[0.1.18 waiver](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+remains limited to that release.
 
 1. **Source contract:** platform selectors, filesystem and credential rules,
    local-only networking, schemas, and negative behavior are explicit.
@@ -67,11 +66,11 @@ Intel's first release has separately identified final bytes and an independent
 update feed. The owner accepted the unavailable physical Intel and formal
 manual matrix for 0.1.18 only, with user-reported tester success explicitly
 unverified by a retained receipt. Rosetta behavior alone is not qualification.
-The pinned Apple silicon builder accepts an explicit Intel runtime and target.
+The legacy native Apple silicon builder accepts an explicit Intel runtime and target.
 Packaging and update contracts identify Intel independently; every artifact must
-pass its own native trust and update gates. The website has a separate macOS
-Intel tab that remains unavailable unless validated Intel release evidence is
-supplied. Source implementation does not establish a supported download. See the
+pass its own native trust and update gates. The website's separate macOS
+Intel tab now resolves the validated 0.1.21 Intel artifact. Source implementation
+alone does not establish a supported download. See the
 [native developer build](../../apps/macos/README.md#developer-build) and
 [Intel release plan](../plans/2026-09-03-macos-intel-release.md).
 The [signed combined RC3 candidates](../receipts/2026-09-04-macos-combined-rc3-signed-candidates.md)
@@ -90,22 +89,35 @@ physical Intel, update or upload observations. See the
 
 ## Windows
 
-The Windows native security adapter is deliberately fail-closed and remains a
-readiness component. Source-level portability, a local Electron run, or an alpha
-artifact may inform development but does not create a supported product. Before
-changing the status, select one installer/package, qualify it on native Windows
-x64, sign and timestamp final nested and outer subjects, prove upgrade/uninstall
-and local-data behavior, define updates, publish immutable evidence, and repeat
-the public-document sweep.
+On 2026-09-09, source `dcf2d6ca` passed normal packaged UI/refresh/settings and
+opt-out persistence, plus an unsigned NSIS install/two-launch/uninstall journey
+in [run 34337369739](https://github.com/adamallcock/tibotattle/actions/runs/34337369739).
+The installer receipt confirms a synthetic observation credential was read
+across the two launches. It explicitly does not establish existing application
+credential continuity or exhaustive descendant ownership after process exit.
+This historical unsigned receipt is not the qualification for the signed 0.1.21 installer.
+
+The released 0.1.21 NSIS installer is signed and timestamped, and installed
+processing passed on Windows x64. The native security adapter remains
+fail-closed. Update replacement and notification appearance retain the owner's
+acceptance boundary; do not infer either from packaging or a synthetic
+credential fixture. See [current status](../current-status.md) for the exact
+signed release and installed receipts.
 
 ## Linux
 
-Linux container checks validate only the contracts they execute. They do not
-prove a graphical desktop, native key storage, packaging, signing, distribution
-repository, desktop integration, upgrade, or uninstall. Before changing the
-status, qualify a selected native x86_64 artifact and distribution path on a
-physical Linux desktop, then satisfy the complete evidence ladder. ARM64 Linux
-is a later, independent matrix entry.
+Linux container checks validate only the contracts they execute. On 2026-09-09,
+source `dcf2d6ca` passed the real packaged normal-app journey with isolated
+Secret Service, unavailable-service handling, a cold process restart retaining
+settings and opt-out, and owned-session cleanup in
+[run 34337369739](https://github.com/adamallcock/tibotattle/actions/runs/34337369739).
+That proves the named container journey; it does not establish a user's desktop
+session, distribution trust, tray/notification/login integration, upgrade or
+uninstall. The released 0.1.21 x86_64 AppImage passed packaging and uses the
+recorded owner acceptance for desktop behavior; that acceptance does not turn
+this earlier container receipt into a physical desktop or production update
+test. See [current status](../current-status.md) for the exact artifact and
+remaining limits. ARM64 Linux remains an independent, unreleased matrix entry.
 
 ## Maintenance rule
 

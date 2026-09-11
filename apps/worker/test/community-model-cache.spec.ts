@@ -26,7 +26,11 @@ async function statements(sql: string) {
 }
 async function fixture() {
   await statements(`
-    CREATE TABLE participants(id TEXT PRIMARY KEY NOT NULL,state TEXT NOT NULL);
+    CREATE TABLE participants(
+      id TEXT PRIMARY KEY NOT NULL,
+      state TEXT NOT NULL,
+      owner_kind TEXT NOT NULL CHECK (owner_kind IN ('social', 'accountless'))
+    );
     CREATE TABLE community_snapshot_mutation_control(singleton_id INTEGER PRIMARY KEY,mutation_epoch INTEGER NOT NULL);
     INSERT INTO community_snapshot_mutation_control VALUES(1,1);
     CREATE TABLE community_analytical_input_versions(participant_id TEXT PRIMARY KEY,revision INTEGER);
@@ -46,7 +50,7 @@ async function fixture() {
 }
 async function participant(id: string, source: "v1" | "legacy" | "mixed" | "v1.1" | "none" = "v1", state = "active") {
   await db().batch([
-    db().prepare("INSERT INTO participants VALUES(?,?)").bind(id,state),
+    db().prepare("INSERT INTO participants(id,state,owner_kind) VALUES(?,?,'social')").bind(id,state),
     db().prepare("INSERT INTO community_analytical_input_versions VALUES(?,1)").bind(id),
     db().prepare("INSERT INTO community_current_analysis_queue(participant_id) VALUES(?)").bind(id),
   ]);
@@ -193,7 +197,8 @@ describe("bounded SELECT-only community composition cache", () => {
   it("excludes physical noncontributor prefixes before the eligible-account page limit", async () => {
     await fixture();
     await db().prepare(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1025)
-      INSERT INTO participants SELECT printf('participant-%04d',x),'active' FROM n`).run();
+      INSERT INTO participants(id,state,owner_kind)
+      SELECT printf('participant-%04d',x),'active','social' FROM n`).run();
     await db().prepare("INSERT INTO community_current_analysis_queue(participant_id) SELECT id FROM participants").run();
     const observer=monitored(),complete=budget();
     expect((await readCachedCommunityModelCompositions(observer.database,NOW,{budget:complete}))?.compositions).toEqual([]);

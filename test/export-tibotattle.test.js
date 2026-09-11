@@ -53,6 +53,8 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     // index/archive modules in the reviewed runtime inventory while rollback
     // remains supported; this test makes both halves of that boundary explicit.
     for (const path of [
+      "config/electron-production-distribution.cjs",
+      "src/desktop-shell-status.js",
       "scripts/lib/release-operation.mjs",
       "scripts/macos-release-journal.js",
       "scripts/validate-macos-login-item-release.js",
@@ -66,6 +68,15 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
       "apps/web/test/community-refresh.test.mjs",
       "src/local-unified-accounting-source.js",
       "src/local-analysis-index.js",
+      "src/local-collector-projection.js",
+      "src/local-collector-projection-off-main.js",
+      "src/local-collector-projection-off-main-worker.js",
+      "src/local-collector-state-integrity-off-main.js",
+      "src/local-collector-state-integrity-off-main-worker.js",
+      "src/platform/linux-secret-service-broker.js",
+      "src/platform/linux-account-observation-broker.js",
+      "src/platform/windows-account-observation-broker.js",
+      "src/platform/account-observation-broker-ipc.js",
       "src/local-archive-accounting-index.js",
       "src/replay-safe-accounting-cache.js",
       "src/local-unified-contribution-attribution.js",

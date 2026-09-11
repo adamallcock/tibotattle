@@ -1,4 +1,5 @@
 import { beginAdminOperation, finishAdminOperation } from "./admin-operations";
+import { revokeAccountlessEnrollment } from "./accountless-enrollment";
 import { MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT } from "./constants";
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
@@ -69,10 +70,19 @@ async function eraseParticipantData(
   operationId: string,
 ): Promise<ErasureResult> {
   const participant = await env.USAGE_MONITOR_DB.prepare(
-    "SELECT state, deletion_session_id FROM participants WHERE id = ?",
+    `SELECT participant.state,
+            participant.deletion_session_id,
+            participant.owner_kind,
+            owner.enrollment_device_id
+       FROM participants participant
+       LEFT JOIN accountless_upload_owners owner
+         ON owner.participant_id = participant.id AND owner.state = 'active'
+      WHERE participant.id = ?`,
   ).bind(participantId).first<{
     state: string;
     deletion_session_id: string | null;
+    owner_kind: "social" | "accountless";
+    enrollment_device_id: string | null;
   }>();
   if (participant === null) {
     if (!await hasDeletionTombstone(env.DELETION_LEDGER, participantId)) {
@@ -84,6 +94,18 @@ async function eraseParticipantData(
   }
   if (participant.state !== "active" && participant.state !== "deleting") {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+  // An accountless owner has no social session or consent to revoke. Its
+  // enrollment ledger is the authority root, so revoke it before entering the
+  // deletion state; that batched cascade revokes the owner, direct v1.1 grant,
+  // device credential, and any pending device-upload authorizations.
+  if (participant.owner_kind === "accountless"
+      && typeof participant.enrollment_device_id === "string") {
+    await revokeAccountlessEnrollment(
+      env.USAGE_MONITOR_DB,
+      participant.enrollment_device_id,
+      "security_reset",
+    );
   }
   if (identityRequired(env)) {
     await assertPinnedIdentityLinkSecretConfiguration(

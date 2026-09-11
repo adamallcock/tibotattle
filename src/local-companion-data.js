@@ -14,15 +14,10 @@ import {
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
-import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
-  addTimelineUsage,
-  addUsageToPeriod,
   deterministicSample,
   emptyComponents,
   emptyDimension,
-  finalizeQuotaTimeline,
-  finalizeTimelineBuckets,
   finalizeUsagePeriod,
   finiteNumber,
   KNOWN_AGENT_SCOPES,
@@ -33,14 +28,7 @@ import {
   KNOWN_SURFACES,
   KNOWN_TOOL_CLASSES,
   newUsagePeriod,
-  orderQuotaWindows,
-  quotaWindowProjection,
-  safeSpeed,
   safeSpeedWeighting,
-  SPARK_QUOTA_LIMIT_IDS,
-  TIMELINE_BUCKET_MS,
-  usageProjection,
-  validObservedAt,
 } from "./local-companion-usage-model.js";
 import {
   defaultLocalUnifiedIndexPath,
@@ -54,7 +42,6 @@ import {
   readLocalUnifiedCompanionProjection,
 } from "./local-unified-companion-source.js";
 import {
-  createAccountingPricer,
   decodePlanScopedTimelineRow,
   readReplaySafeAccountingCache,
 } from "./replay-safe-accounting-cache.js";
@@ -65,20 +52,23 @@ import {
 } from "./local-archive-accounting-index.js";
 import {
   defaultLocalCollectorStatePath,
-  forEachLocalCollectorRecord,
   prepareLocalCollectorState,
-  readLocalCollectorRecordSummary,
   readLocalCollectorState,
 } from "./local-collector-state.js";
+import {
+  RECENT_COLLECTOR_PERIOD_LABEL,
+  RECENT_TIMELINE_DAYS,
+} from "./local-collector-projection.js";
+import {
+  readLocalCollectorProjectionOffMain,
+} from "./local-collector-projection-off-main.js";
 import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
   validWeeklyPlanPopulations,
 } from "./reporting/index.js";
 import {
   isExactWeeklyPaceForecast,
-  projectWeeklyPaceForecast,
   projectWeeklyPaceOutlook,
-  weeklyPaceSnapshotsFromCollectorRecord,
 } from "./weekly-pace-projection.js";
 import {
   resolveLocalLegacyReportReadPath,
@@ -92,7 +82,6 @@ import {
 
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
-const MAX_LEDGER_RECORDS = 5_000_000;
 const MAX_ARTIFACT_BYTES = 4 * 1024 * 1024;
 const MAX_SAFE_TEXT_LENGTH = 2_000;
 
@@ -101,12 +90,8 @@ const MAX_SAFE_TEXT_LENGTH = 2_000;
 // store, and the timeline it can honestly draw is capped at this many days.
 // With the unified index available the timeline and the "all" period cover
 // the index's whole span instead.
-const RECENT_TIMELINE_DAYS = 31;
-const RECENT_COLLECTOR_PERIOD_LABEL =
-  `Cached ${RECENT_TIMELINE_DAYS}-day collector window`;
 const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
 const MAX_COLLECTOR_LIVE_AGE_MS = MAX_REPLAY_SAFE_CACHE_AGE_MS;
-const MAX_WEEKLY_PACE_OBSERVATIONS = 8_192;
 export const INFORMATIONAL_HISTORY_GAP_MAX_SHARE = 0.01;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
@@ -1537,262 +1522,6 @@ function cacheContinuityImpactProjection(
   };
 }
 
-async function readCollectorProjection(
-  stateFile,
-  nowMs,
-  { summarizeUsageEvents = true, declaredSpeedBaselines = [] } = {},
-) {
-  let state;
-  try {
-    state = await readLocalCollectorState({ stateFile, includeRecords: false });
-  } catch {
-    throw fixedError("collector_unavailable");
-  }
-  if (state.status === "missing") {
-    const paceForecast = projectWeeklyPaceForecast({ nowMs });
-    return {
-      status: "missing",
-      recordCount: 0,
-      malformedLines: 0,
-      firstRecordAt: null,
-      latestRecordAt: null,
-      firstExportableRecordAt: null,
-      latestExportableRecordAt: null,
-      usage: summarizeUsage([], nowMs),
-      quota: latestQuotaProjection([]),
-      tools: summarizeToolClasses([]),
-      timeline: {
-        bucketMinutes: 15,
-        usage: [],
-        quota: [],
-        sparkUsage: [],
-        sparkQuota: [],
-      },
-      recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
-      paceForecast,
-      paceOutlook: projectWeeklyPaceOutlook({ forecast: paceForecast, nowMs }),
-    };
-  }
-  const periods = [
-    { summary: newUsagePeriod("24h", "Last 24 hours"), start: nowMs - 24 * 60 * 60 * 1_000 },
-    { summary: newUsagePeriod("7d", "Last 7 days"), start: nowMs - 7 * 24 * 60 * 60 * 1_000 },
-    { summary: newUsagePeriod("30d", "Last 30 days"), start: nowMs - 30 * 24 * 60 * 60 * 1_000 },
-    // The collector is a bounded recent state store, not an all-history source.
-    // Keep its broadest selectable period explicit even if the state happens
-    // to contain older rows from an earlier run.
-    {
-      summary: newUsagePeriod("all", RECENT_COLLECTOR_PERIOD_LABEL),
-      start: nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000,
-    },
-  ];
-  const indexedSummary = summarizeUsageEvents
-    ? null
-    : await readLocalCollectorRecordSummary({
-      stateFile,
-      maximumUsageObservedAtMs: nowMs + 5 * 60_000,
-    });
-  if (indexedSummary?.status === "missing") throw fixedError("collector_unavailable");
-  if (indexedSummary !== null && indexedSummary.recordCount > MAX_LEDGER_RECORDS) {
-    throw fixedError("collector_invalid_size");
-  }
-  const toolCounts = Object.fromEntries([...KNOWN_TOOL_CLASSES].map((toolClass) => [toolClass, 0]));
-  const recordCounts = indexedSummary?.recordCounts
-    ?? { usage: 0, quota: 0, tools: 0, other: 0 };
-  const pricer = createAccountingPricer();
-  const recentStartMs = nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000;
-  const timelineBuckets = new Map();
-  const sparkTimelineBuckets = new Map();
-  const quotaTimeline = [];
-  const weeklyPaceSnapshots = [];
-  let toolTotal = 0;
-  let recordCount = indexedSummary?.recordCount ?? 0;
-  const malformedLines = Number.isSafeInteger(state.migration?.source?.malformedLines)
-    ? state.migration.source.malformedLines
-    : 0;
-  let firstRecordAt = indexedSummary?.firstObservedAtMs ?? null;
-  let latestRecordAt = indexedSummary?.latestObservedAtMs ?? null;
-  let firstExportableRecordAt = indexedSummary?.firstUsageObservedAtMs ?? null;
-  let latestExportableRecordAt = indexedSummary?.latestUsageObservedAtMs ?? null;
-  let latestQuotaRecord = null;
-  await forEachLocalCollectorRecord({
-    stateFile,
-    // When replay-safe usage already exists, only records that still feed the
-    // live quota, pace, and tool projections need JSON parsing. Counts and
-    // time bounds above come from the same indexed collector rows.
-    kinds: indexedSummary === null
-      ? null
-      : ["codex_quota_snapshot", "codex_tool_class_event"],
-    onRecord: (value) => {
-      if (indexedSummary === null) {
-        recordCount += 1;
-        if (recordCount > MAX_LEDGER_RECORDS) {
-          throw fixedError("collector_invalid_size");
-        }
-      }
-      const observedMs = validObservedAt(value);
-      if (indexedSummary === null) {
-        if (observedMs !== null
-            && (firstRecordAt === null || observedMs < firstRecordAt)) {
-          firstRecordAt = observedMs;
-        }
-        if (observedMs !== null
-            && (latestRecordAt === null || observedMs > latestRecordAt)) {
-          latestRecordAt = observedMs;
-        }
-        if (value.kind === "codex_quota_snapshot") {
-          recordCounts.quota += 1;
-        } else if (value.kind === "codex_rollout_usage_snapshot") {
-          recordCounts.usage += 1;
-        } else if (value.kind === "codex_tool_class_event") {
-          recordCounts.tools += 1;
-        } else {
-          recordCounts.other += 1;
-        }
-      }
-      if (value.kind === "codex_quota_snapshot" && observedMs !== null) {
-        if (latestQuotaRecord === null
-            || value.observedAt.localeCompare(latestQuotaRecord.observedAt) > 0) {
-          latestQuotaRecord = value;
-        }
-        if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
-          weeklyPaceSnapshots.push(
-            ...weeklyPaceSnapshotsFromCollectorRecord(value),
-          );
-          if (weeklyPaceSnapshots.length > MAX_WEEKLY_PACE_OBSERVATIONS * 2) {
-            weeklyPaceSnapshots.sort((left, right) => (
-              left.observedAt.localeCompare(right.observedAt)
-              || left.receivedAt.localeCompare(right.receivedAt)
-              || left.accountTrackId.localeCompare(right.accountTrackId)
-              || left.slot.localeCompare(right.slot)
-            ));
-            weeklyPaceSnapshots.splice(
-              0,
-              weeklyPaceSnapshots.length - MAX_WEEKLY_PACE_OBSERVATIONS,
-            );
-          }
-        }
-        if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
-          for (const window of Array.isArray(value.windows) ? value.windows : []) {
-            const projected = quotaWindowProjection(window);
-            if (projected === null) continue;
-            quotaTimeline.push({
-              observedAt: new Date(observedMs).toISOString(),
-              ...projected,
-              accountAttribution: value.accountScope?.status === "available"
-                ? "attributed_pseudonymous"
-                : "unattributed",
-            });
-          }
-        }
-      }
-      if (value.kind === "codex_rollout_usage_snapshot"
-          && observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
-        if (firstExportableRecordAt === null
-            || observedMs < firstExportableRecordAt) {
-          firstExportableRecordAt = observedMs;
-        }
-        if (latestExportableRecordAt === null
-            || observedMs > latestExportableRecordAt) {
-          latestExportableRecordAt = observedMs;
-        }
-        if (summarizeUsageEvents) {
-          const observedSpeed = safeSpeed(value.tierSemantics?.codexSpeedMode);
-          // An observed tier always wins, so a declaration is only ever looked
-          // up for the turns the rollout log left unobserved.
-          const projection = usageProjection(
-            value,
-            observedSpeed === "unknown"
-              ? declaredSpeedModeAt(declaredSpeedBaselines, observedMs) ?? "unknown"
-              : "unknown",
-            pricer,
-          );
-          for (const period of periods) {
-            if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
-          }
-          if (observedMs >= recentStartMs) {
-            addTimelineUsage(
-              projection?.isSpark ? sparkTimelineBuckets : timelineBuckets,
-              observedMs,
-              projection,
-            );
-          }
-        }
-      }
-      if (value.kind === "codex_tool_class_event") {
-        if (observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
-          if (firstExportableRecordAt === null
-              || observedMs < firstExportableRecordAt) {
-            firstExportableRecordAt = observedMs;
-          }
-          if (latestExportableRecordAt === null
-              || observedMs > latestExportableRecordAt) {
-            latestExportableRecordAt = observedMs;
-          }
-        }
-        const toolClass = KNOWN_TOOL_CLASSES.has(value.toolClass) ? value.toolClass : "other";
-        toolCounts[toolClass] += 1;
-        toolTotal += 1;
-      }
-    },
-  });
-  if (weeklyPaceSnapshots.length > MAX_WEEKLY_PACE_OBSERVATIONS) {
-    weeklyPaceSnapshots.sort((left, right) => (
-      left.observedAt.localeCompare(right.observedAt)
-      || left.receivedAt.localeCompare(right.receivedAt)
-      || left.accountTrackId.localeCompare(right.accountTrackId)
-      || left.slot.localeCompare(right.slot)
-    ));
-    weeklyPaceSnapshots.splice(
-      0,
-      weeklyPaceSnapshots.length - MAX_WEEKLY_PACE_OBSERVATIONS,
-    );
-  }
-  const paceForecast = projectWeeklyPaceForecast({
-    currentRecord: latestQuotaRecord,
-    observations: weeklyPaceSnapshots,
-    nowMs,
-  });
-  const paceOutlook = projectWeeklyPaceOutlook({ forecast: paceForecast, nowMs });
-  const projection = {
-    status: "available",
-    recordCount,
-    malformedLines,
-    firstRecordAt,
-    latestRecordAt,
-    firstExportableRecordAt,
-    latestExportableRecordAt,
-    usage: periods.map((period) => finalizeUsagePeriod(period.summary)),
-    quota: latestQuotaProjection(latestQuotaRecord === null ? [] : [latestQuotaRecord]),
-    tools: { total: toolTotal, counts: toolCounts },
-    timeline: {
-      bucketMinutes: TIMELINE_BUCKET_MS / 60_000,
-      coveredAt: {
-        startAt: timelineBuckets.size === 0
-          ? null
-          : new Date(Math.min(...timelineBuckets.keys())).toISOString(),
-        endAt: timelineBuckets.size === 0
-          ? null
-          : new Date(Math.max(...timelineBuckets.keys()) + TIMELINE_BUCKET_MS).toISOString(),
-      },
-      usage: finalizeTimelineBuckets(timelineBuckets),
-      sparkUsage: finalizeTimelineBuckets(sparkTimelineBuckets),
-      quota: finalizeQuotaTimeline(
-        quotaTimeline.filter((row) => row.limitId === "codex"),
-      ),
-      sparkQuota: finalizeQuotaTimeline(
-        // The Spark limit is reported as `codex_bengalfox` in practice;
-        // `codex-spark` is the reserved marketing token. Match both so the
-        // series cannot be permanently empty against real captures.
-        quotaTimeline.filter((row) => SPARK_QUOTA_LIMIT_IDS.includes(row.limitId)),
-      ),
-    },
-    recordCounts,
-    paceForecast,
-    paceOutlook,
-  };
-  return projection;
-}
-
 function safeIndexCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
@@ -1940,40 +1669,6 @@ async function readCollectorIndexProjection(stateFile, collector) {
   };
 }
 
-function latestQuotaProjection(records) {
-  const latest = records
-    .filter((record) => record.kind === "codex_quota_snapshot" && validObservedAt(record) !== null)
-    .sort((left, right) => left.observedAt.localeCompare(right.observedAt))
-    .at(-1);
-  if (!latest) return { status: "unavailable", observedAt: null, windows: [] };
-  const windows = Array.isArray(latest.windows)
-    ? orderQuotaWindows(latest.windows.flatMap((window) => {
-      const projected = quotaWindowProjection(window);
-      return projected === null ? [] : [projected];
-    }))
-    : [];
-  return {
-    status: windows.length > 0 ? "available" : "unavailable",
-    observedAt: safeText(latest.observedAt),
-    accountAttribution: latest.accountScope?.status === "available"
-      ? "attributed_pseudonymous"
-      : "unattributed",
-    windows,
-  };
-}
-
-function summarizeToolClasses(records) {
-  const counts = Object.fromEntries([...KNOWN_TOOL_CLASSES].map((toolClass) => [toolClass, 0]));
-  let total = 0;
-  for (const record of records) {
-    if (record.kind !== "codex_tool_class_event") continue;
-    const toolClass = KNOWN_TOOL_CLASSES.has(record.toolClass) ? record.toolClass : "other";
-    counts[toolClass] += 1;
-    total += 1;
-  }
-  return { total, counts };
-}
-
 function unavailableToolClasses(reason) {
   return {
     status: "unavailable",
@@ -1983,29 +1678,6 @@ function unavailableToolClasses(reason) {
       [...KNOWN_TOOL_CLASSES].map((toolClass) => [toolClass, null]),
     ),
   };
-}
-
-function summarizeUsage(records, nowMs) {
-  const periods = [
-    { summary: newUsagePeriod("24h", "Last 24 hours"), start: nowMs - 24 * 60 * 60 * 1_000 },
-    { summary: newUsagePeriod("7d", "Last 7 days"), start: nowMs - 7 * 24 * 60 * 60 * 1_000 },
-    { summary: newUsagePeriod("30d", "Last 30 days"), start: nowMs - 30 * 24 * 60 * 60 * 1_000 },
-    {
-      summary: newUsagePeriod("all", RECENT_COLLECTOR_PERIOD_LABEL),
-      start: nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000,
-    },
-  ];
-  const pricer = createAccountingPricer();
-  for (const record of records) {
-    if (record.kind !== "codex_rollout_usage_snapshot") continue;
-    const observedMs = validObservedAt(record);
-    if (observedMs === null || observedMs > nowMs + 5 * 60_000) continue;
-    const projection = usageProjection(record, "unknown", pricer);
-    for (const period of periods) {
-      if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
-    }
-  }
-  return periods.map((period) => finalizeUsagePeriod(period.summary));
 }
 
 // Accounting period identifiers mapped to their trailing window. "all" has no
@@ -2576,6 +2248,11 @@ export async function buildLocalCompanionSnapshot({
   sideChatHistoricalGapCollector = collectHistoricalSideChatGapProbe,
   unifiedProjectionReader = readLocalUnifiedCompanionProjection,
   unifiedProjectionReuse = null,
+  // The bounded collector read can synchronously traverse a large SQLite
+  // state even when replay-safe accounting already supplies usage totals.
+  // Keep that traversal off the companion control plane while retaining a
+  // narrow injectable seam for source-level contract tests.
+  collectorProjectionReader = readLocalCollectorProjectionOffMain,
   signal = null,
   now = () => Date.now(),
 } = {}) {
@@ -2599,6 +2276,9 @@ export async function buildLocalCompanionSnapshot({
   }
   if (typeof unifiedProjectionReader !== "function") {
     throw new TypeError("unifiedProjectionReader must be a function");
+  }
+  if (typeof collectorProjectionReader !== "function") {
+    throw new TypeError("collectorProjectionReader must be a function");
   }
   if (signal !== null
       && (typeof signal !== "object"
@@ -2783,7 +2463,9 @@ export async function buildLocalCompanionSnapshot({
   const [gradient, quality, collector] = await Promise.all([
     projectArtifact(root, "gradient"),
     projectArtifact(root, "quality"),
-    readCollectorProjection(collectorStateFile, nowMs, {
+    collectorProjectionReader({
+      stateFile: collectorStateFile,
+      nowMs,
       // The unified index replaces the collector-row usage replay entirely;
       // re-summarizing 600k+ JSON rows here was the old startup cost, and the
       // raw collector projection also counts fork replay the owner has ruled
@@ -2793,7 +2475,7 @@ export async function buildLocalCompanionSnapshot({
         && replaySafeCache === null
         && !unifiedAvailable,
       declaredSpeedBaselines,
-    }),
+    }, { signal }),
   ]);
   // Serve-stale-labeled (2026-08-19): when the prior cache was refused ONLY
   // because the accounting semantics version changed — the state every
@@ -3843,6 +3525,118 @@ export const RETAINED_PROJECTION_SURFACE_PATHS = Object.freeze(
   PROJECTION_SURFACES.map((surface) => surface.path.join(".")),
 );
 
+// The desktop shell is intentionally not another dashboard consumer. Keep a
+// cache of only the two normal Codex allowance lanes it can render, so its
+// five-second poll neither clones nor walks the large published overview.
+const DESKTOP_SHELL_DISPLAY_DURATIONS = Object.freeze([300, 10_080]);
+const DESKTOP_SHELL_DISPLAY_DURATION_SET = new Set(
+  DESKTOP_SHELL_DISPLAY_DURATIONS,
+);
+
+function canonicalDesktopShellDisplayInstant(value) {
+  if (typeof value !== "string") return null;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+      && new Date(milliseconds).toISOString() === value
+    ? value
+    : null;
+}
+
+function desktopShellDisplayCandidate(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || value.limitId !== "codex"
+      || !DESKTOP_SHELL_DISPLAY_DURATION_SET.has(value.durationMinutes)
+      || !["primary", "secondary"].includes(value.slot)
+      || typeof value.usedPercent !== "number"
+      || !Number.isFinite(value.usedPercent)
+      || value.usedPercent < 0
+      || value.usedPercent > 100
+      || typeof value.remainingPercent !== "number"
+      || !Number.isFinite(value.remainingPercent)
+      || value.remainingPercent < 0
+      || value.remainingPercent > 100
+      || Math.abs((value.usedPercent + value.remainingPercent) - 100) > 0.001) {
+    return null;
+  }
+  const observedAt = canonicalDesktopShellDisplayInstant(value.observedAt);
+  const resetAt = canonicalDesktopShellDisplayInstant(value.resetAt);
+  if (observedAt === null || resetAt === null) return null;
+  const observedAtMs = Date.parse(observedAt);
+  const resetAtMs = Date.parse(resetAt);
+  if (resetAtMs <= observedAtMs
+      || resetAtMs - observedAtMs > value.durationMinutes * 60_000) {
+    return null;
+  }
+  return Object.freeze({
+    durationMinutes: value.durationMinutes,
+    slot: value.slot,
+    usedPercent: Object.is(value.usedPercent, -0) ? 0 : value.usedPercent,
+    remainingPercent: Object.is(value.remainingPercent, -0)
+      ? 0
+      : value.remainingPercent,
+    observedAt,
+    resetAt,
+  });
+}
+
+function desktopShellCandidateWins(candidate, previous) {
+  if (previous === null) return true;
+  if (candidate.slot !== previous.slot) return candidate.slot === "primary";
+  const candidateObservedAt = Date.parse(candidate.observedAt);
+  const previousObservedAt = Date.parse(previous.observedAt);
+  if (candidateObservedAt !== previousObservedAt) {
+    return candidateObservedAt > previousObservedAt;
+  }
+  // Match the native reader's final deterministic tie-break without carrying
+  // provider names, plans, account labels, or any other dashboard field.
+  return [
+    candidate.slot,
+    candidate.resetAt,
+    candidate.observedAt,
+    String(candidate.remainingPercent),
+  ].join("\0") < [
+    previous.slot,
+    previous.resetAt,
+    previous.observedAt,
+    String(previous.remainingPercent),
+  ].join("\0");
+}
+
+function desktopShellDisplayEvidence(snapshot) {
+  const overview = snapshot?.overview;
+  const freshness = overview?.freshness;
+  const sourceWindows = Array.isArray(overview?.quotaWindows)
+    ? overview.quotaWindows
+    : [];
+  const selected = new Map();
+  for (const sourceWindow of sourceWindows) {
+    const candidate = desktopShellDisplayCandidate(sourceWindow);
+    if (candidate === null) continue;
+    const previous = selected.get(candidate.durationMinutes) ?? null;
+    if (desktopShellCandidateWins(candidate, previous)) {
+      selected.set(candidate.durationMinutes, candidate);
+    }
+  }
+  const staleAfterSeconds = typeof freshness?.staleAfterSeconds === "number"
+      && Number.isFinite(freshness.staleAfterSeconds)
+      && freshness.staleAfterSeconds >= 0
+    ? freshness.staleAfterSeconds
+    : null;
+  return Object.freeze({
+    evidenceStatus: snapshot?.mode === "real_local_evidence"
+        && overview?.evidenceStatus === "available"
+      ? "available"
+      : "unavailable",
+    freshness: Object.freeze({
+      status: ["live", "stale"].includes(freshness?.status) ? freshness.status : "unavailable",
+      staleAfterSeconds,
+    }),
+    windows: Object.freeze(DESKTOP_SHELL_DISPLAY_DURATIONS
+      .map((durationMinutes) => selected.get(durationMinutes))
+      .filter((candidate) => candidate !== undefined)),
+  });
+}
+
 export class LocalCompanionDataStore {
   #builder;
   #snapshotFile;
@@ -3852,6 +3646,7 @@ export class LocalCompanionDataStore {
   #snapshotWriteIntervalMs;
   #lastSnapshotPersistedAt = null;
   #snapshot = null;
+  #desktopShellDisplayEvidence = null;
 
   constructor({
     builder = buildLocalCompanionSnapshot,
@@ -3890,7 +3685,7 @@ export class LocalCompanionDataStore {
     if (this.#snapshot === null) {
       const restored = await this.#restoreLastAuthoritativeSnapshot();
       try {
-        await this.reload(options);
+        await this.reload({ ...options, returnOverview: false });
       } catch (error) {
         if (!restored) throw error;
         this.#markRestoredSnapshotUnavailable();
@@ -3900,7 +3695,11 @@ export class LocalCompanionDataStore {
   }
 
   async reload(options) {
-    const signal = options?.signal ?? null;
+    const { returnOverview = true, ...builderOptions } = options ?? {};
+    if (typeof returnOverview !== "boolean") {
+      throw new TypeError("options.returnOverview must be a boolean");
+    }
+    const signal = builderOptions.signal ?? null;
     if (signal !== null
         && (typeof signal !== "object"
           || typeof signal.aborted !== "boolean"
@@ -3910,7 +3709,7 @@ export class LocalCompanionDataStore {
     if (signal?.aborted === true) {
       throw fixedError("local_companion_snapshot_reload_aborted");
     }
-    const candidate = await this.#builder(options);
+    const candidate = await this.#builder(builderOptions);
     // Cancellation may arrive while an off-main projection is finishing. Do
     // not publish the candidate after the controller has cancelled its run.
     if (signal?.aborted === true) {
@@ -3921,10 +3720,14 @@ export class LocalCompanionDataStore {
     }
     this.#snapshot = this.#withRetainedProjection(
       structuredClone(candidate),
-      options,
+      builderOptions,
     );
+    this.#desktopShellDisplayEvidence = desktopShellDisplayEvidence(this.#snapshot);
     await this.#persistAuthoritativeSnapshot(candidate);
-    return this.getOverview();
+    // Refresh orchestration needs publication, not another deep copy of the
+    // retained timeline. Accessors and ordinary reload callers still receive
+    // isolated copies; the builder never sees this presentation-only option.
+    return returnOverview ? this.getOverview() : undefined;
   }
 
   async #restoreLastAuthoritativeSnapshot() {
@@ -3943,6 +3746,7 @@ export class LocalCompanionDataStore {
       return false;
     }
     this.#snapshot = structuredClone(retained.snapshot);
+    this.#desktopShellDisplayEvidence = desktopShellDisplayEvidence(this.#snapshot);
     this.#lastSnapshotPersistedAt = persistedAt;
     return true;
   }
@@ -3977,6 +3781,10 @@ export class LocalCompanionDataStore {
   }
 
   #markRestoredSnapshotUnavailable() {
+    // A cross-launch receipt can retain derived history, but it cannot prove
+    // that a quota observation is current after this launch's source read
+    // failed. Never carry that display claim across the failure boundary.
+    this.#desktopShellDisplayEvidence = null;
     const accounting = this.#snapshot?.overview?.accounting;
     if (accounting && typeof accounting === "object") {
       accounting.generationMatched = false;
@@ -4184,6 +3992,13 @@ export class LocalCompanionDataStore {
       generatedAt: snapshot.generatedAt,
       ...structuredClone(snapshot.overview),
     };
+  }
+
+  // The shell poller uses this frozen, cache-only projection rather than
+  // `getOverview()`: a dashboard snapshot can contain large timeline arrays,
+  // while this value contains at most two scalar allowance lanes and no I/O.
+  getDesktopShellDisplayEvidence() {
+    return this.#desktopShellDisplayEvidence;
   }
 
   getGradient() {

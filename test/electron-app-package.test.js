@@ -1,0 +1,497 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import {
+  access,
+  lstat,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import test from "node:test";
+
+import {
+  buildElectronApp,
+  DEFAULT_ELECTRON_APP_OUTPUT,
+  parseElectronAppArguments,
+} from "../scripts/build-electron-app.mjs";
+import {
+  assertStagedElectronShellModuleLinkage,
+  assertStagedElectronShellNodeLinkage,
+  buildElectronRuntime,
+  ELECTRON_TARGETS,
+  ELECTRON_SHELL_RUNTIME_FILES,
+} from "../scripts/build-electron-runtime.mjs";
+import { RELEASE_VERSION } from "../config/release-manifest.js";
+import { writeSyntheticLinuxBindingPair } from "./helpers/linux-packaging-binding.js";
+import {
+  LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH as LINUX_BINDING,
+  LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH as LINUX_MANIFEST,
+} from "../src/platform/linux-credential-mutex.js";
+
+const require = createRequire(import.meta.url);
+const BUILDER_CONFIG = require("../apps/electron/electron-builder.config.cjs");
+const BUILDER_CONFIG_PATH = resolve("apps/electron/electron-builder.config.cjs");
+
+function loadBuilderConfigForTarget(target) {
+  const source = [
+    `const config = require(${JSON.stringify(BUILDER_CONFIG_PATH)});`,
+    "process.stdout.write(JSON.stringify(config));",
+  ].join("\n");
+  return JSON.parse(execFileSync(process.execPath, ["-e", source], {
+    cwd: resolve("."),
+    env: { ...process.env, TIBOTATTLE_ELECTRON_TARGET: target },
+    encoding: "utf8",
+  }));
+}
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+async function withTemporaryDirectory(run) {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-app-"));
+  try {
+    return await run(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("Electron app staging includes the shell and keeps the companion manifest valid", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const result = await buildElectronApp({ output: join(root, "app") });
+    const packageJson = JSON.parse(await readFile(join(result.output, "package.json"), "utf8"));
+    const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+    const paths = manifest.files.map(({ path }) => path);
+
+    assert.equal(result.output, resolve(root, "app"));
+    assert.equal(packageJson.main, "apps/electron/main.js");
+    assert.equal(manifest.entrypoint, "apps/electron/main.js");
+    assert.equal(manifest.target, "darwin");
+    assert.equal(manifest.architecture, "arm64");
+    for (const relativePath of ELECTRON_SHELL_RUNTIME_FILES) {
+      await access(join(result.output, relativePath));
+      assert.ok(paths.includes(relativePath), relativePath);
+    }
+    assert.ok(paths.includes("src/platform/windows-credential-manager-probe.js"));
+    const shellClosure = await assertStagedElectronShellModuleLinkage(result.output);
+    assert.ok(shellClosure.includes("apps/electron/desktop-linux-accountless-credential.js"));
+    assert.ok(shellClosure.includes("src/platform/linux-accountless-installation-credential.js"));
+    assert.ok(shellClosure.includes("src/platform/windows-credential-manager-probe.js"));
+    assert.ok(shellClosure.includes("src/platform/windows-native-unsigned-content.js"));
+    await access(join(result.output, "apps/local/server.js"));
+    await access(join(result.output, "apps/web/public/index.html"));
+    assert.ok(paths.every((path) => !/(^|\/)(?:docs?|tests?)(?:\/|$)/iu.test(path)));
+    assert.ok(!paths.some((path) => path.includes("windows_filesystem_qualification")));
+    assert.ok(!paths.some((path) => path.startsWith("native/windows-filesystem/")));
+  });
+});
+
+test("Electron builder configuration is an unsigned macOS arm64 directory build", async () => {
+  assert.equal(BUILDER_CONFIG.appId, "com.adamallcock.tibotattle.electron.dev");
+  assert.equal(BUILDER_CONFIG.productName, "TiboTattle Dev");
+  assert.equal(BUILDER_CONFIG.extraMetadata.name, "app-usagemonitor");
+  assert.equal(BUILDER_CONFIG.extraMetadata.productName, "TiboTattle Dev");
+  assert.equal(BUILDER_CONFIG.directories.app, DEFAULT_ELECTRON_APP_OUTPUT);
+  assert.deepEqual(BUILDER_CONFIG.files, [
+    {
+      from: ".",
+      to: ".",
+      filter: [
+        "package.json",
+        "electron-runtime-manifest.json",
+        "apps/electron/**",
+        "apps/local/**",
+        "apps/web/public/**",
+        "config/**",
+        "contracts/**",
+        "native/macos-keychain/contract.js",
+        "native/windows-filesystem/build/Release/windows_filesystem.node",
+        "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+        LINUX_BINDING,
+        LINUX_MANIFEST,
+        "schemas/**",
+        "src/**",
+        "generated/**",
+      ],
+    },
+    {
+      from: "node_modules",
+      to: "node_modules",
+      filter: ["**/*"],
+    },
+  ]);
+  assert.deepEqual(BUILDER_CONFIG.asar, { smartUnpack: false });
+  assert.deepEqual(BUILDER_CONFIG.asarUnpack, [
+    "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
+  ]);
+  assert.equal(BUILDER_CONFIG.extraMetadata.main, "apps/electron/main.js");
+  assert.equal(BUILDER_CONFIG.publish, null);
+  assert.equal(BUILDER_CONFIG.forceCodeSigning, false);
+  assert.equal(BUILDER_CONFIG.beforeBuild(), false);
+  assert.equal(BUILDER_CONFIG.npmRebuild, true);
+  assert.equal(BUILDER_CONFIG.buildDependenciesFromSource, false);
+  assert.equal(BUILDER_CONFIG.nodeGypRebuild, false);
+  assert.deepEqual(BUILDER_CONFIG.mac.target, [{ target: "dir", arch: ["arm64"] }]);
+  const expectedMacIcon = resolve("apps/macos/Assets/AppIcon.icns");
+  assert.equal(BUILDER_CONFIG.mac.icon, expectedMacIcon);
+  const macIconMetadata = await lstat(expectedMacIcon);
+  assert.ok(macIconMetadata.isFile());
+  assert.ok(!macIconMetadata.isSymbolicLink());
+  assert.equal(BUILDER_CONFIG.mac.identity, null);
+  assert.equal(BUILDER_CONFIG.mac.notarize, false);
+  assert.equal(BUILDER_CONFIG.mac.protocols, undefined);
+});
+
+test("Electron builder configuration exposes an unsigned Windows x64 directory target", () => {
+  const config = loadBuilderConfigForTarget("win32");
+  assert.match(config.directories.app, /\.release-build[\\/]electron-dev[\\/]win32-x64[\\/]app$/u);
+  assert.match(config.directories.output, /\.release-build[\\/]electron-dev[\\/]win32-x64[\\/]artifacts$/u);
+  assert.deepEqual(config.asarUnpack, [
+    "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
+    "native/windows-filesystem/build/Release/windows_filesystem.node",
+  ]);
+  assert.deepEqual(config.asar, { smartUnpack: false });
+  assert.deepEqual(config.win.target, [{ target: "dir", arch: ["x64"] }]);
+  assert.equal(config.win.signAndEditExecutable, false);
+  assert.equal(config.win.signExecutable, false);
+  assert.equal(config.publish, null);
+  assert.equal(config.forceCodeSigning, false);
+});
+
+test("Electron builder configuration maps every development target to its native closure", () => {
+  const expected = {
+    "darwin-arm64": {
+      app: /electron-dev[\\/]darwin-arm64[\\/]app$/u,
+      artifact: /electron-dev[\\/]darwin-arm64[\\/]artifacts$/u,
+      keytar: "darwin-arm64",
+      platform: "mac",
+      architecture: "arm64",
+    },
+    "darwin-x64": {
+      app: /electron-dev[\\/]darwin-x64[\\/]app$/u,
+      artifact: /electron-dev[\\/]darwin-x64[\\/]artifacts$/u,
+      keytar: "darwin-x64",
+      platform: "mac",
+      architecture: "x64",
+    },
+    "win32-x64": {
+      app: /electron-dev[\\/]win32-x64[\\/]app$/u,
+      artifact: /electron-dev[\\/]win32-x64[\\/]artifacts$/u,
+      keytar: "win32-x64",
+      platform: "win",
+      architecture: "x64",
+    },
+    "linux-x64": {
+      app: /electron-dev[\\/]linux-x64[\\/]app$/u,
+      artifact: /electron-dev[\\/]linux-x64[\\/]artifacts$/u,
+      keytar: "linux-x64",
+      platform: "linux",
+      architecture: "x64",
+    },
+  };
+  for (const [target, expectation] of Object.entries(expected)) {
+    const config = loadBuilderConfigForTarget(target);
+    assert.match(config.directories.app, expectation.app, target);
+    assert.match(config.directories.output, expectation.artifact, target);
+    assert.equal(config.publish, null, target);
+    assert.equal(config.artifactName, "TiboTattle-Dev-${version}-${os}-${arch}.${ext}", target);
+    assert.match(config.icon, /apps[\\/]web[\\/]public[\\/]tibotattle-icon\.png$/u, target);
+    assert.deepEqual(config.asarUnpack.filter((value) => value.includes("keytar.node")), [
+      `node_modules/@github/keytar/prebuilds/${expectation.keytar}/keytar.node`,
+    ], target);
+    assert.deepEqual(
+      config[expectation.platform].target,
+      [{ target: "dir", arch: [expectation.architecture] }],
+      target,
+    );
+    if (target === "linux-x64") {
+      assert.equal(config.linux.category, "Utility");
+      assert.equal(config.linux.syncDesktopName, true);
+      // electron-builder 26 otherwise supplies a legacy --no-sandbox default
+      // for AppImage desktop entries when executableArgs is omitted.
+      assert.deepEqual(config.linux.executableArgs, []);
+      assert.deepEqual(config.asarUnpack, [
+        "node_modules/@github/keytar/prebuilds/linux-x64/keytar.node",
+        LINUX_BINDING,
+        LINUX_MANIFEST,
+      ]);
+    }
+    else assert.equal(config.linux, undefined);
+    if (target === "linux-x64") assert.equal(config.linux.executableName, "tibotattle-dev");
+  }
+});
+
+test("Electron app staging supports the non-Windows target-specific shell inputs", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const linuxInputs = await writeSyntheticLinuxBindingPair(root);
+    for (const target of ["darwin-x64", "linux-x64"]) {
+      const result = await buildElectronApp({
+        output: join(root, target),
+        target,
+        ...(target === "linux-x64" ? linuxInputs : {}),
+      });
+      const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+      assert.equal(manifest.target, ELECTRON_TARGETS[target].platform, target);
+      assert.equal(manifest.architecture, ELECTRON_TARGETS[target].architecture, target);
+      assert.equal(manifest.entrypoint, "apps/electron/main.js", target);
+      assert.equal(manifest.windowsBinding.included, false, target);
+      assert.ok(manifest.files.some(({ path }) => path
+        === `node_modules/@github/keytar/prebuilds/${ELECTRON_TARGETS[target].keytarArchitecture}/keytar.node`), target);
+      assert.ok(manifest.files.some(({ path }) => path === "apps/electron/main.js"), target);
+      if (target === "linux-x64") {
+        for (const path of [LINUX_BINDING, LINUX_MANIFEST]) {
+          assert.equal(manifest.files.find((row) => row.path === path)?.kind, "linux_native_binding");
+        }
+        assert.equal(JSON.stringify(manifest).includes(linuxInputs.linuxBindingPath), false);
+      }
+    }
+  });
+});
+
+test("staged Electron main links in isolated plain Node for every target", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const linuxInputs = await writeSyntheticLinuxBindingPair(root);
+    for (const target of Object.keys(ELECTRON_TARGETS)) {
+      const result = await buildElectronRuntime({
+        output: join(root, target),
+        target,
+        includeElectronShell: true,
+        ...(target === "linux-x64" ? linuxInputs : {}),
+      });
+      const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+      assert.equal(manifest.windowsBinding.included, false, target);
+      const shellClosure = await assertStagedElectronShellModuleLinkage(result.output);
+      assert.ok(shellClosure.includes("apps/electron/desktop-contribution-credential.js"), target);
+      assert.ok(shellClosure.includes("apps/electron/desktop-tray-preferences.js"), target);
+      assert.ok(shellClosure.includes("src/platform/windows-credential-manager.js"), target);
+      assert.ok(shellClosure.includes("src/platform/windows-credential-operation-audit.js"), target);
+      // buildElectronRuntime runs the same isolated plain-Node linkage check
+      // before publishing the staged tree for every target.
+      await rm(join(result.output, "src/platform/windows-credential-mutex.js"));
+      await assert.rejects(assertStagedElectronShellModuleLinkage(result.output), {
+        code: "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+      }, "a dormant platform entrypoint must not hide a missing dependency");
+    }
+  });
+});
+
+test("Linux shell staging refuses mismatched native sidecars and foreign-target input", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const inputs = await writeSyntheticLinuxBindingPair(root);
+    await assert.rejects(buildElectronRuntime({
+      output: join(root, "foreign"), target: "darwin-arm64", includeElectronShell: true, ...inputs,
+    }), { code: "ELECTRON_RUNTIME_LINUX_BINDING_TARGET" });
+    const manifest = JSON.parse(await readFile(inputs.linuxManifestPath, "utf8"));
+    manifest.sha256 = "f".repeat(64);
+    await writeFile(inputs.linuxManifestPath, JSON.stringify(manifest));
+    await assert.rejects(buildElectronRuntime({
+      output: join(root, "mismatch"), target: "linux-x64", includeElectronShell: true, ...inputs,
+    }), { code: "ELECTRON_RUNTIME_LINUX_BINDING_MANIFEST" });
+    await assert.rejects(access(join(root, "mismatch")), { code: "ENOENT" });
+  });
+});
+
+test("staged Electron linkage fails closed for missing modules and packages", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const relative = await buildElectronRuntime({
+      output: join(root, "missing-relative"),
+      includeElectronShell: true,
+    });
+    await rm(join(relative.output, "apps/electron/desktop-contribution-credential.js"));
+    await assert.rejects(
+      () => assertStagedElectronShellModuleLinkage(relative.output),
+      (error) => error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+    );
+    await assert.rejects(
+      () => assertStagedElectronShellNodeLinkage(relative.output),
+      (error) => error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+    );
+
+    const packageManifest = await buildElectronRuntime({
+      output: join(root, "missing-workspace-manifest"),
+      includeElectronShell: true,
+    });
+    await rm(join(
+      packageManifest.output,
+      "node_modules/@app-usagemonitor/telemetry-contract/package.json",
+    ));
+    await assert.rejects(
+      () => assertStagedElectronShellModuleLinkage(packageManifest.output),
+      (error) => error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+    );
+
+    const workspaceFile = await buildElectronRuntime({
+      output: join(root, "missing-workspace-file"),
+      includeElectronShell: true,
+    });
+    await rm(join(
+      workspaceFile.output,
+      "node_modules/@app-usagemonitor/telemetry-contract/src/constants.js",
+    ));
+    await assert.rejects(
+      () => assertStagedElectronShellNodeLinkage(workspaceFile.output),
+      (error) => error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+    );
+  });
+});
+
+test("Windows Electron staging requires the reviewed native binding pair", async () => {
+  await withTemporaryDirectory(async (root) => {
+    await assert.rejects(
+      () => buildElectronApp({
+        output: join(root, "missing-inputs"),
+        target: "win32",
+        windowsBindingPath: join(root, "missing.node"),
+        windowsManifestPath: join(root, "missing.node.manifest.json"),
+      }),
+      (error) => error.code === "ELECTRON_APP_WINDOWS_INPUT_REQUIRED",
+    );
+  });
+});
+
+test("Windows Electron staging includes the exact binding pair and shell", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const bindingPath = join(root, "windows_filesystem.node");
+    const manifestPath = join(root, "windows_filesystem.node.manifest.json");
+    const binding = Buffer.from("synthetic reviewed Windows binding\n", "utf8");
+    await writeFile(bindingPath, binding, { mode: 0o600 });
+    await writeFile(manifestPath, `${JSON.stringify({
+      bindingFile: "windows_filesystem.node",
+      platform: "win32",
+      architecture: "x64",
+      bytes: binding.byteLength,
+      sha256: sha256(binding),
+    })}\n`, { mode: 0o600 });
+
+    const result = await buildElectronApp({
+      output: join(root, "windows-app"),
+      target: "windows",
+      packagingProfile: "windows-production",
+      packageVersion: RELEASE_VERSION,
+      windowsBindingPath: bindingPath,
+      windowsManifestPath: manifestPath,
+    });
+    const packageJson = JSON.parse(await readFile(join(result.output, "package.json"), "utf8"));
+    const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+    const paths = manifest.files.map(({ path }) => path);
+
+    assert.equal(packageJson.main, "apps/electron/main.js");
+    assert.equal(packageJson.productName, "TiboTattle");
+    assert.equal(packageJson.version, RELEASE_VERSION);
+    assert.equal(manifest.target, "win32");
+    assert.equal(manifest.architecture, "x64");
+    assert.equal(manifest.entrypoint, "apps/electron/main.js");
+    assert.equal(manifest.windowsBinding.included, true);
+    assert.equal(manifest.windowsBinding.verified, false);
+    assert.equal(manifest.windowsBinding.status, "included_unverified");
+    assert.ok(paths.includes("native/windows-filesystem/build/Release/windows_filesystem.node"));
+    assert.ok(paths.includes("native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json"));
+    for (const relativePath of ELECTRON_SHELL_RUNTIME_FILES) {
+      await access(join(result.output, relativePath));
+      assert.ok(paths.includes(relativePath), relativePath);
+    }
+    const shellClosure = await assertStagedElectronShellModuleLinkage(result.output);
+    assert.ok(shellClosure.includes("src/platform/windows-credential-manager-probe.js"));
+    assert.ok(shellClosure.includes("src/platform/windows-native-unsigned-content.js"));
+    assert.ok(!paths.some((path) => path.includes("windows_filesystem_qualification")));
+    assert.ok(!paths.some((path) => /(^|\/)(?:docs?|tests?)(?:\/|$)/iu.test(path)));
+  });
+});
+
+test("Electron app argument parsing selects macOS or Windows inputs explicitly", () => {
+  assert.deepEqual(parseElectronAppArguments([]), {
+    output: DEFAULT_ELECTRON_APP_OUTPUT,
+    target: "darwin-arm64",
+    replace: false,
+  });
+  assert.deepEqual(parseElectronAppArguments(["--target", "windows"]), {
+    output: resolve(".release-build/electron-dev/win32-x64/app"),
+    target: "win32-x64",
+    replace: false,
+  });
+  assert.deepEqual(parseElectronAppArguments([
+    "--target", "windows",
+    "--profile", "windows-production",
+    "--version", RELEASE_VERSION,
+  ]), {
+    output: resolve(".release-build/electron-dev/win32-x64/app"),
+    target: "win32-x64",
+    replace: false,
+    packagingProfile: "windows-production",
+    packageVersion: RELEASE_VERSION,
+  });
+  assert.deepEqual(
+    parseElectronAppArguments([
+      "--output", "/private/tmp/tibotattle-electron-app",
+      "--platform", "macos",
+      "--replace",
+    ]),
+    {
+      output: "/private/tmp/tibotattle-electron-app",
+      target: "darwin-arm64",
+      replace: true,
+    },
+  );
+  assert.deepEqual(
+    parseElectronAppArguments([
+      "--target", "windows",
+      "--output", "/private/tmp/tibotattle-electron-windows-app",
+      "--windows-binding", "/private/tmp/windows_filesystem.node",
+      "--windows-manifest", "/private/tmp/windows_filesystem.node.manifest.json",
+      "--replace",
+    ]),
+    {
+      output: "/private/tmp/tibotattle-electron-windows-app",
+      target: "win32-x64",
+      replace: true,
+      windowsBindingPath: "/private/tmp/windows_filesystem.node",
+      windowsManifestPath: "/private/tmp/windows_filesystem.node.manifest.json",
+    },
+  );
+  assert.throws(
+    () => parseElectronAppArguments(["--target", "windows", "--windows-binding", "/tmp/binding.node"]),
+    (error) => error.code === "ELECTRON_APP_WINDOWS_INPUT_PAIR",
+  );
+  assert.throws(
+    () => parseElectronAppArguments(["--profile", "unknown"]),
+    (error) => error.code === "ELECTRON_APP_INVALID_PROFILE",
+  );
+});
+
+test("Electron app rejects production profile outside the Windows shell release boundary", async () => {
+  await withTemporaryDirectory(async (root) => {
+    await assert.rejects(
+      () => buildElectronApp({
+        output: join(root, "unknown-profile"),
+        packagingProfile: "unknown",
+      }),
+      (error) => error.code === "ELECTRON_APP_INVALID_PROFILE",
+    );
+    await assert.rejects(
+      () => buildElectronApp({
+        output: join(root, "mac-production-profile"),
+        packagingProfile: "windows-production",
+      }),
+      (error) => error.code === "ELECTRON_RUNTIME_PACKAGING_PROFILE_TARGET",
+    );
+    await assert.rejects(
+      () => buildElectronApp({
+        output: join(root, "wrong-version"),
+        packagingProfile: "development",
+        packageVersion: "9.9.9",
+      }),
+      (error) => error.code === "ELECTRON_RUNTIME_INVALID_PACKAGE_VERSION",
+    );
+  });
+});
+
+test("Electron app staging default remains a disposable reviewed destination", () => {
+  assert.match(DEFAULT_ELECTRON_APP_OUTPUT, /\.release-build[\\/]electron-dev[\\/]darwin-arm64[\\/]app$/u);
+  assert.doesNotMatch(DEFAULT_ELECTRON_APP_OUTPUT, /(?:docs?|tests?)(?:\/|$)/iu);
+});

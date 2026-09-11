@@ -1,0 +1,305 @@
+name: Native Sparkle to Electron installed upgrade
+on:
+  push:
+    branches: [codex/electron-sparkle-transition-021]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Verify signed intake or execute on a disposable hosted Mac
+        type: choice
+        options: [plan, execute]
+        default: plan
+        required: true
+      target:
+        description: Native predecessor and Electron target architecture
+        type: choice
+        options: [darwin-arm64, darwin-x64]
+        default: darwin-arm64
+        required: true
+      feed_scope:
+        description: Verify the isolated signed test feed or actual published native feed
+        type: choice
+        options: [isolated_test_feed, production_feed]
+        default: isolated_test_feed
+        required: true
+      runner_revision:
+        description: Exact reviewed qualification commit
+        type: string
+        required: true
+      source_revision:
+        description: Exact signed Electron source commit
+        type: string
+        required: true
+      build_number:
+        description: Exact Electron provenance build number
+        type: string
+        required: true
+      dmg_sha256:
+        description: Exact final signed and notarized Electron DMG
+        type: string
+        required: true
+      asar_sha256:
+        description: Exact signed application ASAR
+        type: string
+        required: true
+      feed_sha256:
+        description: Exact selected appcast signed with the existing native stable key
+        type: string
+        required: true
+      confirmation:
+        description: Execute requires RUN_DISPOSABLE_NATIVE_SPARKLE_TRANSITION
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: native-sparkle-electron-installed-upgrade-${{ inputs.target }}-${{ inputs.feed_scope }}
+  cancel-in-progress: false
+jobs:
+  registration:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Register without executing a signed upgrade
+        run: echo "Only an explicit reviewed workflow dispatch executes the hosted upgrade."
+  upgrade_arm64:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-arm64'
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_TARGET: ${{ inputs.target }}
+      SELECTED_FEED_SCOPE: ${{ inputs.feed_scope }}
+      SELECTED_RUNNER: ${{ inputs.runner_revision }}
+      SELECTED_SOURCE: ${{ inputs.source_revision }}
+      SELECTED_BUILD: ${{ inputs.build_number }}
+      SELECTED_DMG: ${{ inputs.dmg_sha256 }}
+      SELECTED_ASAR: ${{ inputs.asar_sha256 }}
+      SELECTED_FEED: ${{ inputs.feed_sha256 }}
+      SELECTED_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Check out exact qualification source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: arm64
+          package-manager-cache: false
+      - name: Install locked verification dependencies
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify exact signed test intake and unchanged native predecessor
+        shell: bash
+        run: |
+          umask 077
+          mkdir -m 700 sparkle-transition-receipts
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess
+          e=os.environ
+          source=e['SELECTED_SOURCE']; runner=e['SELECTED_RUNNER']
+          assert re.fullmatch('[0-9a-f]{40}',source)
+          assert re.fullmatch('[0-9a-f]{40}',runner) and runner==e['GITHUB_SHA']
+          assert re.fullmatch('[1-9][0-9]{0,9}',e['SELECTED_BUILD'])
+          for name in ['SELECTED_DMG','SELECTED_ASAR','SELECTED_FEED']:
+            assert re.fullmatch('[0-9a-f]{64}',e[name])
+          assert e['SELECTED_MODE'] in ['plan','execute']
+          assert e['SELECTED_CONFIRMATION']==('RUN_DISPOSABLE_NATIVE_SPARKLE_TRANSITION' if e['SELECTED_MODE']=='execute' else '')
+          root=pathlib.Path(e['RUNNER_TEMP'])/'native-sparkle-intake'; root.mkdir(mode=0o700)
+          target=e['SELECTED_TARGET']; scope=e['SELECTED_FEED_SCOPE']
+          assert target in ['darwin-arm64','darwin-x64']
+          assert scope in ['isolated_test_feed','production_feed']
+          intel=target=='darwin-x64'
+          architecture='x64' if intel else 'arm64'
+          prefix='intel/' if intel else ''
+          native=('70630ba90e92a1cd8cb904e66e1aebe85b04e9d23a50bef7e4e41aca84c4d2f6' if intel else
+            '2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae')
+          origin='https://updates.tibotattle.com'
+          if scope=='isolated_test_feed':
+            base=f"{origin}/electron/test/native-sparkle/{source}/1028/{e['SELECTED_DMG']}"
+            feed=base+'/appcast.xml'
+          else:
+            base=f"{origin}/{prefix}releases/1028/{e['SELECTED_DMG']}"
+            feed=f'{origin}/{prefix}appcast.xml'
+          candidate_name='TiboTattle-0.1.21-macOS-x64.dmg' if intel else 'TiboTattle-0.1.21-mac-arm64.dmg'
+          files=[
+            ('native.dmg',f'{origin}/{prefix}releases/1026/{native}/TiboTattle-0.1.18-macOS-{architecture}.dmg',native,1024**3),
+            ('candidate.dmg',base+'/'+candidate_name,e['SELECTED_DMG'],1024**3),
+            ('appcast.xml',feed,e['SELECTED_FEED'],1024**2),
+          ]
+          for name,url,digest,limit in files:
+            path=root/name
+            result=subprocess.run(['/usr/bin/curl','--disable','--fail','--silent','--show-error','--proto','=https',
+              '--max-time','180','--max-filesize',str(limit),'--output',str(path),'--write-out','%{http_code}',url],
+              capture_output=True,text=True,check=True,timeout=190)
+            assert result.stdout=='200' and 0<path.stat().st_size<=limit
+            with path.open('rb') as stream: assert hashlib.file_digest(stream,'sha256').hexdigest()==digest
+          for name in ['native','candidate']:
+            mount=root/(name+'-mount'); mount.mkdir(mode=0o700)
+            subprocess.run(['/usr/bin/hdiutil','attach','-readonly','-nobrowse','-noautoopen','-mountpoint',str(mount),str(root/(name+'.dmg'))],
+              stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
+            try:
+              app=mount/'TiboTattle.app'
+              assert app.is_dir() and not app.is_symlink()
+              assert [p.name for p in mount.glob('*.app')]==['TiboTattle.app']
+              extracted=root/name; extracted.mkdir(mode=0o700)
+              subprocess.run(['/usr/bin/ditto',str(app),str(extracted/'TiboTattle.app')],check=True,timeout=120)
+            finally:
+              subprocess.run(['/usr/bin/hdiutil','detach',str(mount)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
+          intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,
+            'target':target,'feedScope':scope,'version':'0.1.21','buildNumber':e['SELECTED_BUILD'],'bundleVersion':'1028',
+            'dmgSha256':e['SELECTED_DMG'],'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],
+            'nativeDmgSha256':native,'directory':str(root)}
+          (root/'intake.json').write_text(json.dumps(intake)+'\n')
+          pathlib.Path('sparkle-transition-receipts/intake.json').write_text(json.dumps({
+            'runnerRevision':runner,'sourceRevision':source,'target':target,'feedScope':scope,'dmgSha256':e['SELECTED_DMG'],
+            'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],'nativeDmgSha256':native,
+            'downloadsVerified':True,'signedBundlesModified':False})+'\n')
+          PY
+      - name: Exercise native Check for Updates and retained state
+        shell: bash
+        run: |
+          umask 077
+          args=(--plan)
+          if [[ "$SELECTED_MODE" == execute ]]; then
+            args=(--execute)
+          fi
+          args+=(--intake "$RUNNER_TEMP/native-sparkle-intake/intake.json")
+          if [[ "$SELECTED_MODE" == execute ]]; then
+            args+=(--confirm "$SELECTED_CONFIRMATION")
+          fi
+          node scripts/smoke-electron-macos-sparkle-transition.mjs "${args[@]}" > sparkle-transition-receipts/execution.json
+      - name: Retain content-free proof only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-sparkle-electron-${{ inputs.target }}-${{ inputs.feed_scope }}-${{ github.run_id }}
+          path: sparkle-transition-receipts/*.json
+          if-no-files-found: error
+          retention-days: 14
+  upgrade_x64:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-x64'
+    runs-on: macos-15-intel
+    timeout-minutes: 25
+    env:
+      SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_TARGET: ${{ inputs.target }}
+      SELECTED_FEED_SCOPE: ${{ inputs.feed_scope }}
+      SELECTED_RUNNER: ${{ inputs.runner_revision }}
+      SELECTED_SOURCE: ${{ inputs.source_revision }}
+      SELECTED_BUILD: ${{ inputs.build_number }}
+      SELECTED_DMG: ${{ inputs.dmg_sha256 }}
+      SELECTED_ASAR: ${{ inputs.asar_sha256 }}
+      SELECTED_FEED: ${{ inputs.feed_sha256 }}
+      SELECTED_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Check out exact qualification source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          package-manager-cache: false
+      - name: Install locked verification dependencies
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify exact signed test intake and unchanged native predecessor
+        shell: bash
+        run: |
+          umask 077
+          mkdir -m 700 sparkle-transition-receipts
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess
+          e=os.environ
+          source=e['SELECTED_SOURCE']; runner=e['SELECTED_RUNNER']
+          assert re.fullmatch('[0-9a-f]{40}',source)
+          assert re.fullmatch('[0-9a-f]{40}',runner) and runner==e['GITHUB_SHA']
+          assert re.fullmatch('[1-9][0-9]{0,9}',e['SELECTED_BUILD'])
+          for name in ['SELECTED_DMG','SELECTED_ASAR','SELECTED_FEED']:
+            assert re.fullmatch('[0-9a-f]{64}',e[name])
+          assert e['SELECTED_MODE'] in ['plan','execute']
+          assert e['SELECTED_CONFIRMATION']==('RUN_DISPOSABLE_NATIVE_SPARKLE_TRANSITION' if e['SELECTED_MODE']=='execute' else '')
+          root=pathlib.Path(e['RUNNER_TEMP'])/'native-sparkle-intake'; root.mkdir(mode=0o700)
+          target=e['SELECTED_TARGET']; scope=e['SELECTED_FEED_SCOPE']
+          assert target in ['darwin-arm64','darwin-x64']
+          assert scope in ['isolated_test_feed','production_feed']
+          intel=target=='darwin-x64'
+          architecture='x64' if intel else 'arm64'
+          prefix='intel/' if intel else ''
+          native=('70630ba90e92a1cd8cb904e66e1aebe85b04e9d23a50bef7e4e41aca84c4d2f6' if intel else
+            '2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae')
+          origin='https://updates.tibotattle.com'
+          if scope=='isolated_test_feed':
+            base=f"{origin}/electron/test/native-sparkle/{source}/1028/{e['SELECTED_DMG']}"
+            feed=base+'/appcast.xml'
+          else:
+            base=f"{origin}/{prefix}releases/1028/{e['SELECTED_DMG']}"
+            feed=f'{origin}/{prefix}appcast.xml'
+          candidate_name='TiboTattle-0.1.21-macOS-x64.dmg' if intel else 'TiboTattle-0.1.21-mac-arm64.dmg'
+          files=[
+            ('native.dmg',f'{origin}/{prefix}releases/1026/{native}/TiboTattle-0.1.18-macOS-{architecture}.dmg',native,1024**3),
+            ('candidate.dmg',base+'/'+candidate_name,e['SELECTED_DMG'],1024**3),
+            ('appcast.xml',feed,e['SELECTED_FEED'],1024**2),
+          ]
+          for name,url,digest,limit in files:
+            path=root/name
+            result=subprocess.run(['/usr/bin/curl','--disable','--fail','--silent','--show-error','--proto','=https',
+              '--max-time','180','--max-filesize',str(limit),'--output',str(path),'--write-out','%{http_code}',url],
+              capture_output=True,text=True,check=True,timeout=190)
+            assert result.stdout=='200' and 0<path.stat().st_size<=limit
+            with path.open('rb') as stream: assert hashlib.file_digest(stream,'sha256').hexdigest()==digest
+          for name in ['native','candidate']:
+            mount=root/(name+'-mount'); mount.mkdir(mode=0o700)
+            subprocess.run(['/usr/bin/hdiutil','attach','-readonly','-nobrowse','-noautoopen','-mountpoint',str(mount),str(root/(name+'.dmg'))],
+              stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
+            try:
+              app=mount/'TiboTattle.app'
+              assert app.is_dir() and not app.is_symlink()
+              assert [p.name for p in mount.glob('*.app')]==['TiboTattle.app']
+              extracted=root/name; extracted.mkdir(mode=0o700)
+              subprocess.run(['/usr/bin/ditto',str(app),str(extracted/'TiboTattle.app')],check=True,timeout=120)
+            finally:
+              subprocess.run(['/usr/bin/hdiutil','detach',str(mount)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
+          intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,
+            'target':target,'feedScope':scope,'version':'0.1.21','buildNumber':e['SELECTED_BUILD'],'bundleVersion':'1028',
+            'dmgSha256':e['SELECTED_DMG'],'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],
+            'nativeDmgSha256':native,'directory':str(root)}
+          (root/'intake.json').write_text(json.dumps(intake)+'\n')
+          pathlib.Path('sparkle-transition-receipts/intake.json').write_text(json.dumps({
+            'runnerRevision':runner,'sourceRevision':source,'target':target,'feedScope':scope,'dmgSha256':e['SELECTED_DMG'],
+            'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],'nativeDmgSha256':native,
+            'downloadsVerified':True,'signedBundlesModified':False})+'\n')
+          PY
+      - name: Exercise native Check for Updates and retained state
+        shell: bash
+        run: |
+          umask 077
+          args=(--plan)
+          if [[ "$SELECTED_MODE" == execute ]]; then
+            args=(--execute)
+          fi
+          args+=(--intake "$RUNNER_TEMP/native-sparkle-intake/intake.json")
+          if [[ "$SELECTED_MODE" == execute ]]; then
+            args+=(--confirm "$SELECTED_CONFIRMATION")
+          fi
+          node scripts/smoke-electron-macos-sparkle-transition.mjs "${args[@]}" > sparkle-transition-receipts/execution.json
+      - name: Retain content-free proof only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-sparkle-electron-${{ inputs.target }}-${{ inputs.feed_scope }}-${{ github.run_id }}
+          path: sparkle-transition-receipts/*.json
+          if-no-files-found: error
+          retention-days: 14

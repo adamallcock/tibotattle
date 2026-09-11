@@ -472,6 +472,19 @@ test("the data store restores only the last authoritative receipt across launche
   const files = await fixture();
   try {
     const authoritative = authoritativeSnapshot();
+    Object.assign(authoritative.overview, {
+      evidenceStatus: "available",
+      freshness: { status: "live", staleAfterSeconds: 1_800 },
+      quotaWindows: [{
+        limitId: "codex",
+        slot: "primary",
+        usedPercent: 100,
+        remainingPercent: 0,
+        durationMinutes: 10_080,
+        observedAt: "2026-08-27T11:59:00.000Z",
+        resetAt: "2026-08-27T15:00:00.000Z",
+      }],
+    });
     const first = new LocalCompanionDataStore({
       snapshotFile: files.snapshotFile,
       builder: async () => structuredClone(authoritative),
@@ -518,6 +531,11 @@ test("the data store restores only the last authoritative receipt across launche
       retainedAt: "2026-08-27T12:00:00.000Z",
       coveredAt: null,
     });
+    assert.equal(
+      third.getDesktopShellDisplayEvidence(),
+      null,
+      "a retained receipt is not current quota display evidence after a failed live read",
+    );
   } finally {
     await rm(files.root, { recursive: true });
   }
@@ -789,4 +807,60 @@ test("a persistence clock failure cannot fail an authoritative dashboard reload"
   const overview = await store.reload({ purpose: "full" });
   assert.equal(overview.accounting.events, 12);
   assert.equal(writes, 0);
+});
+
+test("publication-only reload preserves persistence and isolated access without a discarded overview", async () => {
+  let reads = 0;
+  let writes = 0;
+  const calls = [];
+  class ObservedStore extends LocalCompanionDataStore {
+    getOverview() { reads += 1; return super.getOverview(); }
+  }
+  const store = new ObservedStore({
+    snapshotFile: "/synthetic/dashboard.json",
+    snapshotWriter: async () => { writes += 1; return true; },
+    builder: async (options) => { calls.push(options); return authoritativeSnapshot(); },
+  });
+  const result = await store.reload({ purpose: "full", returnOverview: false });
+  assert.equal(result, undefined);
+  assert.equal(reads, 0, "publication does not allocate an unused overview copy");
+  assert.equal(writes, 1, "publication still persists the authoritative snapshot");
+  assert.deepEqual(calls, [{ purpose: "full" }], "the builder receives only its own options");
+  const first = store.getOverview();
+  first.timeline.usage[0].events = 999;
+  assert.equal(store.getOverview().timeline.usage[0].events, 12);
+  const ordinary = await store.reload({ purpose: "full" });
+  assert.equal(ordinary.accounting.events, 12, "the default return contract is unchanged");
+  await assert.rejects(store.reload({ returnOverview: "false" }), TypeError);
+  assert.equal(calls.length, 2, "invalid publication mode is rejected before building");
+});
+
+test("initialize returns exactly one overview copy after publication", async () => {
+  let reads = 0;
+  class ObservedStore extends LocalCompanionDataStore {
+    getOverview() { reads += 1; return super.getOverview(); }
+  }
+  const store = new ObservedStore({ builder: async () => authoritativeSnapshot() });
+  const value = await store.initialize({ purpose: "full" });
+  assert.equal(reads, 1);
+  assert.equal(value.accounting.events, 12);
+});
+
+test("publication-only quick reload keeps the same retained evidence as ordinary reload", async () => {
+  const builder = async ({ purpose }) => {
+    const snapshot = authoritativeSnapshot();
+    if (purpose === "quick") {
+      snapshot.overview.usage = [];
+      snapshot.overview.timeline.usage = [];
+    }
+    return snapshot;
+  };
+  const ordinary = new LocalCompanionDataStore({ builder });
+  const publishing = new LocalCompanionDataStore({ builder });
+  await ordinary.reload({ purpose: "full" });
+  await publishing.reload({ purpose: "full", returnOverview: false });
+  const expected = await ordinary.reload({ purpose: "quick" });
+  await publishing.reload({ purpose: "quick", returnOverview: false });
+  assert.deepEqual(publishing.getOverview(), expected);
+  assert.equal(expected.timeline.usage[0].events, 12);
 });

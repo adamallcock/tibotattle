@@ -59,7 +59,8 @@ function cache(encoding = "accounting_compact_v3") {
       capabilities: { readsRawSources: false } },
     weeklyCalibrationInput: { status: "complete", encoding, source: "unified_index",
       coveredAt: { startAt: START, endAt: END }, retainedUsageEvents: 2, retainedWeeklySnapshots: 1,
-      estimatedRetainedBytes: encoding === "accounting_compact_v2" ? 704 : 896,
+      estimatedRetainedBytes: encoding === "accounting_compact_v2" ? 704
+        : encoding === "accounting_streamed_v1" ? 252 : 896,
       limits: { usageEvents: 1_000_000, weeklySnapshots: 1_000_000, combinedInputs: 2_000_000, retainedBytes: 335_544_320 } },
     periods: [{ private: "SYNTHETIC_PRIVATE" }], timeline: [], sparkUsageTimeline: [], quotaTimeline: [], sparkQuotaTimeline: [],
     extraDiagnostic: "SYNTHETIC_PRIVATE" };
@@ -128,11 +129,12 @@ test("production request preserves the reviewed first-parent and current native 
   }
 });
 
-test("projection preserves both production compact encodings and reports no raw row material", () => {
-  for (const encoding of ["accounting_compact_v2", "accounting_compact_v3"]) {
+test("projection preserves compact and streamed encodings without raw row material", () => {
+  for (const encoding of ["accounting_compact_v2", "accounting_compact_v3", "accounting_streamed_v1"]) {
     const projected = projectPr94ProductionCache(cache(encoding), CONTEXT);
     assert.equal(projected.weeklyInput.encoding, encoding);
-    assert.equal(projected.weeklyInput.estimatedRetainedBytes, encoding === "accounting_compact_v2" ? 704 : 896);
+    assert.equal(projected.weeklyInput.estimatedRetainedBytes, encoding === "accounting_compact_v2" ? 704
+      : encoding === "accounting_streamed_v1" ? 252 : 896);
     assert.equal(projected.rows.periods, 1);
     assert.equal(projected.source.readsRawSources, false);
     assert.ok(!JSON.stringify(projected).includes("SYNTHETIC_PRIVATE"));
@@ -620,4 +622,15 @@ test("query plans are required before timed work and must match the untimed post
       { code: phase === "initial" ? "pr94_production_invalid" : "pr94_production_query_plan_changed" });
     assert.equal(calls.length, phase === "initial" ? 0 : 2);
   });
+});
+
+
+test("streamed resource receipts distinguish corpus count from per-batch ceilings", () => {
+  const value = cache("accounting_streamed_v1");
+  value.weeklyCalibrationInput.retainedUsageEvents = 1_000_001;
+  value.weeklyCalibrationInput.estimatedRetainedBytes = 30_000_222;
+  const projected = projectPr94ProductionCache(value, CONTEXT);
+  assert.equal(projected.weeklyInput.retainedUsageEvents, 1_000_001);
+  value.weeklyCalibrationInput.estimatedRetainedBytes = 335_544_321;
+  assert.throws(() => projectPr94ProductionCache(value, CONTEXT));
 });

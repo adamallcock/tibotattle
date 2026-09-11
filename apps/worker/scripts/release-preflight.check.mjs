@@ -29,11 +29,11 @@ import {
 import {
   ATTRIBUTION_SCHEMA_COLUMNS,
   ATTRIBUTION_SCHEMA_OBJECTS,
-  ATTRIBUTION_SCHEMA_PROBE_SQL,
   EXPECTED_STAGING_MIGRATIONS,
+  POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
   SCALE_SCHEMA_COLUMNS,
   SCALE_SCHEMA_OBJECTS,
-  SCALE_SCHEMA_PROBE_SQL,
+  POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
 } from "./staging-readiness-lib.mjs";
 
 const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -326,7 +326,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
   assert.equal(result.checks.collectionControlsCoherent, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
-  assert.equal(result.evidence.migrationWindow, "0001-0056");
+  assert.equal(result.evidence.migrationWindow, "0001-0059");
   assert.ok(statePath);
   await assert.rejects(access(statePath));
   assert.equal(calls.filter((args) => args.includes("migrations")).length, 4);
@@ -546,8 +546,8 @@ test("release preflight independently requires every scale object and exact meta
     assert.equal(result.checks.requiredSchemaPresent, false);
     assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"]);
     assert.equal(result.collectionAuthorized, false);
-    assert.equal(calls.filter(args => args.includes(SCALE_SCHEMA_PROBE_SQL)).length, 1);
-    assert.equal(calls.filter(args => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
+    assert.equal(calls.filter(args => args.includes(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL)).length, 1);
+    assert.equal(calls.filter(args => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
     assert.equal(calls.some(args => args.includes("--remote") || args.includes("deploy")), false);
   }
 });
@@ -556,13 +556,14 @@ test("release preflight uses the real independent scale column proof, including 
   const database = new DatabaseSync(":memory:");
   try {
     for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
-      database.exec(await readFile(join(workerDirectory, "migrations", name), "utf8"));
+      const sql = await readFile(join(workerDirectory, "migrations", name), "utf8");
+      database.exec(name.startsWith("0058_") ? `BEGIN;\n${sql}\nCOMMIT;` : sql);
     }
     for (const [table, column] of Object.entries(SCALE_SCHEMA_COLUMNS).flatMap(([table, columns]) =>
       columns.map(column => [table, column]))) {
       database.exec(`SAVEPOINT missing_scale_column;
         ALTER TABLE ${table} RENAME COLUMN ${column} TO synthetic_missing_column;`);
-      const actualProbe = { ...database.prepare(SCALE_SCHEMA_PROBE_SQL).get() };
+      const actualProbe = { ...database.prepare(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL).get() };
       assert.equal(actualProbe.scale_columns, 0, `${table}.${column}`);
       const { spawn } = await standardFixture({ scaleSchemaRows: [actualProbe] });
       const result = await runReleasePreflight({
@@ -583,13 +584,14 @@ test("release preflight requires every staged checkpoint column without authoriz
   const database = new DatabaseSync(":memory:");
   try {
     for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
-      database.exec(await readFile(join(workerDirectory, "migrations", name), "utf8"));
+      const sql = await readFile(join(workerDirectory, "migrations", name), "utf8");
+      database.exec(name.startsWith("0058_") ? `BEGIN;\n${sql}\nCOMMIT;` : sql);
     }
-    assert.equal(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get().attribution_columns, 1);
+    assert.equal(database.prepare(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL).get().attribution_columns, 1);
     for (const column of ATTRIBUTION_SCHEMA_COLUMNS.community_analysis_work_stage) {
       database.exec(`SAVEPOINT missing_stage_column;
         ALTER TABLE community_analysis_work_stage RENAME COLUMN "${column}" TO synthetic_missing_column;`);
-      const actualProbe = { ...database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get() };
+      const actualProbe = { ...database.prepare(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL).get() };
       assert.equal(actualProbe.attribution_columns, 0, column);
       const { calls, spawn } = await standardFixture({ attributionSchemaRows: [actualProbe] });
       const result = await runReleasePreflight({

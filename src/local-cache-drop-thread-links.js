@@ -135,18 +135,24 @@ function safeName(value, maximumLength = 512) {
 }
 
 function safeThread(id, metadata) {
+  const selected = metadata?.id === id;
   const parentId = typeof metadata?.parent?.id === "string"
       && THREAD_ID.test(metadata.parent.id)
     ? metadata.parent.id.toLowerCase()
     : null;
-  return {
+  const thread = {
     id,
-    name: metadata?.id === id ? safeName(metadata.name) : null,
-    nickname: metadata?.id === id ? safeName(metadata.nickname, 80) : null,
-    parent: metadata?.id !== id || parentId === null || parentId === id
+    name: selected ? safeName(metadata.name) : null,
+    nickname: selected ? safeName(metadata.nickname, 80) : null,
+    parent: !selected || parentId === null || parentId === id
       ? null
       : { id: parentId, name: safeName(metadata.parent.name) },
   };
+  // This is source classification supplied only by the bounded local Codex
+  // metadata resolver. It changes navigation presentation, never cache-drop
+  // matching or any accounting DTO.
+  if (selected && metadata.origin === "auto_review") thread.origin = "auto_review";
+  return thread;
 }
 
 function sameObservedDimension(left, right) {

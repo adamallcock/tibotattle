@@ -1,9 +1,18 @@
-# Native Windows security guidance
+# Native platform security guidance
 
-Scope: all files under `native/`, currently the Windows filesystem binding.
-Apply the repository root guidance first.
+Scope: all files under `native/`. Apply the repository root guidance first.
 
-## Security boundary
+## macOS Keychain adapter
+
+- For `macos-keychain/`, read its README and `apps/macos/AGENTS.md`.
+- Keep only the fixed logical credential capabilities. The signed Electron
+  main process owns the adapter; renderer input cannot select Keychain items.
+- Preserve existing credential bytes and ACLs. Locked, denied, unknown and
+  legacy-only items must never become proof of absence or a fresh identity.
+- Source compilation and injected tests must not access real Keychain items.
+  Signed, prompt-free native-to-Electron continuity is a separate release gate.
+
+## Windows security boundary
 
 - Read `native/windows-filesystem/README.md` before changing the binding, loader,
   manifest, or credential-mutex integration.
@@ -22,7 +31,7 @@ Apply the repository root guidance first.
   and production selection as distinct capabilities. Passing one cannot enable
   another.
 
-## Qualification and release truth
+## Windows qualification and release truth
 
 - The current binding and manifest deliberately leave overall production/path
   safety disabled. Do not flip an approval flag, add a JavaScript fallback, or
@@ -37,7 +46,7 @@ Apply the repository root guidance first.
 - Never log private paths, SIDs, credentials, file bytes, or raw Windows error
   context. Return fixed content-free categories to JavaScript.
 
-## Validation
+## Windows validation
 
 - Run portable JavaScript contract tests for loader/refusal behavior, but label
   them partial. macOS, Linux, Wine, and cross-compilation do not qualify Windows

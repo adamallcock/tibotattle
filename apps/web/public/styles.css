@@ -124,6 +124,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 }
 [hidden] { display: none !important; }
 
+/* The desktop shell adds Settings to the shared dashboard only after its
+ * preload marker lands. Keep the control out of the browser dashboard while
+ * leaving the same current page and styles usable in Electron. */
+.electron-only-control { display: none !important; }
+html.electron-dashboard .electron-only-control,
+body.electron-dashboard .electron-only-control { display: inline-flex !important; }
+.electron-settings-control { flex: 0 0 auto; }
+
 .skip-link {
   position: fixed;
   z-index: 100;
@@ -312,6 +320,7 @@ html.native-dashboard #setup-card,
 body.native-dashboard #setup-card { display: none !important; }
 .top-actions { display: flex; flex: 0 1 auto; align-items: center; justify-content: flex-end; gap: .55rem; }
 .language-picker { display: inline-flex; align-items: center; }
+.electron-dashboard .topbar .language-picker { display: none; }
 .language-picker select {
   min-height: 37px;
   max-width: 10.5rem;
@@ -553,6 +562,7 @@ h1 {
 .notice-info { border-color: rgba(49, 95, 132, .25); background: var(--blue-soft); }
 .notice-info p { color: #31536d; }
 .notice-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.electron-sharing-notice .notice-actions { display: grid; flex: 0 0 auto; min-width: 10rem; }
 
 .companion-setup {
   display: grid;
@@ -773,6 +783,7 @@ h1 {
     var(--surface-raised);
   box-shadow: 0 18px 46px rgba(21, 40, 35, .07);
 }
+.contribution-cta > .electron-accountless-community,
 .contribution-cta > .community-public-evidence,
 .contribution-cta > .journey-stages {
   grid-column: 1 / -1;
@@ -2104,7 +2115,7 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .cache-reuse-summary {
   display: grid;
-  grid-template-columns: minmax(250px, .9fr) minmax(500px, 1.55fr);
+  grid-template-columns: minmax(0, .9fr) minmax(0, 1.55fr);
   align-items: start;
   gap: var(--space-7);
   padding-bottom: var(--space-5);
@@ -2153,7 +2164,7 @@ tbody tr:last-child td { border-bottom: 0; }
   font-weight: var(--weight-display);
   line-height: 1.1;
   letter-spacing: -.02em;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .cache-reuse-metrics span {
   color: var(--muted);
@@ -2310,7 +2321,8 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 @media (max-width: 700px) {
   .cache-reuse-outcome { padding: var(--space-4); }
-  .cache-reuse-metrics { gap: 6px; }
+  .cache-reuse-metrics { gap: 6px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cache-reuse-metric-overhead { grid-column: 1 / -1; }
   .cache-reuse-metrics > div {
     min-height: 88px;
     padding: 8px 5px;
@@ -3762,6 +3774,8 @@ footer p { margin: 0; }
 .allowance-model-terra { --allowance-color: #586a3b; }
 .allowance-model-luna { --allowance-color: #676b8c; }
 .allowance-model-classic { --allowance-color: #68665f; }
+.allowance-model-review { --allowance-color: #365f54; }
+.allowance-model-mini { --allowance-color: #68665f; }
 .allowance-series-0 { --allowance-color: #42636c; }
 .allowance-series-1 { --allowance-color: #ac4b16; }
 .allowance-series-2 { --allowance-color: #7542a0; }
@@ -4851,3 +4865,28 @@ html[data-theme="dark"] .noscript {
 #attribution-consent { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 #attribution-review-inventory dd { margin: .25rem 0 1rem; overflow-wrap: anywhere; }
 #attribution-review-contract { overflow-wrap: anywhere; }
+
+.electron-accountless-sharing-control {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 44px;
+  padding: var(--space-2) 0;
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+}
+.electron-accountless-sharing-control input {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--green);
+  flex: 0 0 auto;
+}
+
+/* Compact evidence cards keep the qualifiers beside the amount. */
+.cache-impact-card { min-width: 0; }
+.cache-impact-card .metric-value { overflow-wrap: anywhere; font-size: clamp(1.6rem, 3vw, 2rem); line-height: 1.1; }
+.cache-impact-bullets { padding-inline-start: 1.1rem; margin: var(--space-2) 0 0; color: var(--muted); font-size: .78rem; line-height: 1.5; }
+.cache-impact-bullets li + li { margin-top: var(--space-1); }
+.model-identity .model-usage-icon { width: 1.25rem; height: 1.25rem; display: inline-block; vertical-align: middle; margin-inline-end: .45rem; }
+.allowance-model-spark { --allowance-color: #996315; }

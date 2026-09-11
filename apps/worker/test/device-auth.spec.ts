@@ -846,6 +846,7 @@ describe("device lifecycle primitives", () => {
         expiresAt: new Date(t0).toISOString(),
         credentialGeneration: 1,
         socialVerifiedAt: new Date(t0).toISOString(),
+        authorityKind: "social",
       },
       "a".repeat(64),
       1,

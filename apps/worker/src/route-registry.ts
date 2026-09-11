@@ -4,6 +4,8 @@ export type WorkerRouteAuthority =
   | "none"
   | "public"
   | "enrollment"
+  | "accountless_enrollment"
+  | "accountless_ownership"
   | "handoff"
   | "session"
   | "device"
@@ -46,6 +48,26 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     id: "enroll",
     methods: ["POST"],
     authority: "enrollment",
+  },
+  {
+    pathname: "/api/v1/accountless/enrollment",
+    id: "accountless_enrollment",
+    methods: ["POST"],
+    authority: "accountless_enrollment",
+  },
+  {
+    pathname: "/api/v1/accountless/ownership",
+    id: "accountless_ownership",
+    methods: ["POST"],
+    authority: "accountless_ownership",
+  },
+  {
+    // This is separate from enrollment replay: only the existing device
+    // bearer can extend the same accountless owner graph after its lease.
+    pathname: "/api/v1/accountless/renewal",
+    id: "accountless_renewal",
+    methods: ["POST"],
+    authority: "accountless_ownership",
   },
   {
     pathname: "/api/v1/internal/release/appcast",

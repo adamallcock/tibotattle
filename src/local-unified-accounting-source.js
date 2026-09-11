@@ -3,6 +3,8 @@ import { lstat } from "node:fs/promises";
 import { isValidQuotaWindowDuration } from "@app-usagemonitor/quota-analysis";
 
 import {
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
@@ -312,8 +314,16 @@ function parserCompatibility(database, contractVersion, generationId) {
   }
   const uniqueParserVersions = [...new Set(parserVersions)];
   const uniqueContractVersions = [...new Set(contractVersions)];
+  // The inherited-model stamp records row provenance within the current
+  // parser, not a different counter/replay algorithm. Preserve both stamps
+  // in the receipt while accepting that exact pair. Mixed sets containing
+  // partial salvage stamps, older parsers or unknown variants stay blocked.
+  const currentModelProvenanceOnly = uniqueParserVersions.every((version) => (
+    version === LOCAL_UNIFIED_INDEX_PARSER_VERSION
+      || version === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION
+  ));
   return {
-    status: uniqueParserVersions.length === 1
+    status: uniqueParserVersions.length === 1 || currentModelProvenanceOnly
       ? "compatible"
       : "mixed_parser_versions",
     parserVersions: uniqueParserVersions,

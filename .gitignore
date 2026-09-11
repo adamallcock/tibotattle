@@ -64,6 +64,9 @@ apps/macos/.build/
 # Native Windows qualification output.
 native/windows-filesystem/build/
 
+# Native Linux qualification output.
+native/linux-credential-mutex/build/
+
 # Package manager store
 .pnpm-store/
 

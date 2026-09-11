@@ -5,6 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { telemetryV11RequiredConsent } from "@app-usagemonitor/telemetry-contract";
 import { readIncrementalContributionV11Review, runIncrementalContributionSyncOnce } from "../src/contribution-incremental-sync.js";
+import {
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+} from "../src/contribution/index.js";
 import { beginUnifiedIndexGeneration, openLocalUnifiedIndex } from "../src/local-unified-index.js";
 import {
   ATTRIBUTION_FIXTURE_BINDING as binding, ATTRIBUTION_FIXTURE_START as start,
@@ -49,6 +55,52 @@ test("v11 dispatcher requires the exact consent and destination before index, ne
   ]) await assert.rejects(runIncrementalContributionSyncOnce({ ...options, consent }), {
     code: "contribution_incremental_sync_consent_invalid",
   });
+  assert.deepEqual(service.calls, []);
+});
+
+test("the normal local dispatcher cannot turn policy authorization into a hosted upload path", async (t) => {
+  const { options, service } = await fixture(t);
+  const { consent: ignoredConsent, ...withoutConsent } = options;
+  void ignoredConsent;
+  const authorization = {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  };
+  await assert.rejects(runIncrementalContributionSyncOnce({
+    ...withoutConsent,
+    laboratory: true,
+    authorization,
+  }), { code: "contribution_incremental_sync_authorization_invalid" });
+  assert.deepEqual(service.calls, []);
+});
+
+test("accountless dispatcher validates closed policy authority on an allowed local origin before reading state", async (t) => {
+  const { options, service } = await fixture(t);
+  const { consent: ignoredConsent, ...withoutConsent } = options;
+  void ignoredConsent;
+  const authority = {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  };
+  for (const authorization of [
+    null,
+    [],
+    Object.create(authority),
+    { ...authority, policyVersion: "stale-policy" },
+    { ...authority, extra: true },
+    { ...authority, [Symbol("extra")]: true },
+  ]) {
+    await assert.rejects(runIncrementalContributionSyncOnce({
+      ...withoutConsent,
+      origin: "http://127.0.0.1:4179",
+      laboratory: true,
+      authorization,
+    }), { code: "contribution_incremental_sync_authorization_invalid" });
+  }
   assert.deepEqual(service.calls, []);
 });
 

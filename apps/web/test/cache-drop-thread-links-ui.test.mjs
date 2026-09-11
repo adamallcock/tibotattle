@@ -156,6 +156,34 @@ test("workers have distinct parent and worker links and never infer a missing pa
   assert.equal(cell.querySelector("a").href, `codex://threads/${THREAD_ID}`);
 });
 
+test("auto review links only a verified parent and stays visibly non-linkable without one", () => {
+  const harness = createHarness();
+  const cell = new harness.Element("td");
+  const autoReview = {
+    id: THREAD_ID,
+    name: "Internal review session",
+    nickname: null,
+    parent: { id: PARENT_ID, name: "Synthetic parent" },
+    origin: "auto_review",
+  };
+  harness.fill(cell, autoReview, OBSERVED_AT);
+  assert.equal(cell.textContent, "Synthetic parent [Auto review]");
+  assert.deepEqual(cell.querySelectorAll("a").map((link) => [link.textContent, link.href]), [
+    ["Synthetic parent", `codex://threads/${PARENT_ID}`],
+  ]);
+  assert.equal(cell.querySelectorAll("a")[0].getAttribute("aria-label").includes("Synthetic parent"), true);
+  assert.equal(cell.querySelectorAll("a")[0].getAttribute("aria-label").includes("Internal review session"), false);
+
+  for (const parent of [null, { id: `https://example.test/${PARENT_ID}`, name: "Unsafe parent" }]) {
+    harness.fill(cell, { ...autoReview, parent }, OBSERVED_AT);
+    assert.equal(cell.textContent, "Auto review: Thread unavailable");
+    assert.equal(cell.querySelectorAll("a").length, 0);
+    const unavailable = cell.querySelector(".cache-drop-thread-unavailable");
+    assert.equal(unavailable.tabIndex, 0);
+    assert.match(unavailable.getAttribute("aria-label"), /Auto review.*local\(/u);
+  }
+});
+
 test("unsafe, malformed and absent thread IDs never become links", () => {
   const harness = createHarness();
   const cell = new harness.Element("td");

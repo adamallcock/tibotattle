@@ -28,6 +28,26 @@ import {
   type BoundedBodyReadPolicy,
 } from "./bounded-body";
 import {
+  ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
+  configuredAccountlessEnrollmentMode,
+  enrollAccountlessDevice,
+  parseAccountlessEnrollmentJson,
+  type AccountlessEnrollmentRequest,
+} from "./accountless-enrollment";
+import {
+  ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+  assertAccountlessOwnershipEnabled,
+  createAccountlessUploadOwner,
+  parseAccountlessOwnershipJson,
+  type AccountlessOwnershipRequest,
+} from "./accountless-ownership";
+import {
+  ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+  parseAccountlessRenewalJson,
+  renewAccountlessUploadOwner,
+  type AccountlessRenewalRequest,
+} from "./accountless-renewal";
+import {
   assertAccountScopedLocalPreview,
   configuredAccountScopedIngestMode,
 } from "./account-scoped-ingest";
@@ -100,12 +120,19 @@ import {
   revokeParticipantDevice,
   rotateDeviceCredential,
   type DeviceTransportConsentVersion,
+  type DevicePrincipal,
 } from "./device-auth";
 import {
   ApiError,
   errorResponse,
   jsonResponse,
 } from "./errors";
+import {
+  MIGRATION_MUTATION_BARRIER_ENABLED,
+  MUTATION_BARRIER_ERROR_CODE,
+  mutationBarrierBlocksDynamicRequest,
+  mutationBarrierSkipsScheduledMaintenance,
+} from "./mutation-barrier";
 import {
   contributionCount,
   contributionForResponse,
@@ -224,6 +251,7 @@ import {
 export { UploadIngressBudget } from "./ingress-budget";
 
 const DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{7,64}$/u;
+const EXACT_DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
 
 function configuredDeploymentSourceCommit(env: Env): string | null {
   const configured = (env as Env & {
@@ -235,6 +263,42 @@ function configuredDeploymentSourceCommit(env: Env): string | null {
     throw new ApiError(503, "DEPLOYMENT_SOURCE_COMMIT_INVALID");
   }
   return configured;
+}
+
+/**
+ * The reviewed migration-only snapshot has one deliberately storage-free
+ * liveness response. It lets the normal deployment wrapper bind the immutable
+ * source it just installed, while its explicit maintenance shape prevents the
+ * response from being interpreted as a D1/R2/DO qualification. Every other
+ * dynamic route remains behind the mutation barrier.
+ */
+function migrationMutationBarrierHealthResponse(env: Env): Response {
+  const configured = (env as Env & {
+    DEPLOYMENT_SOURCE_COMMIT?: unknown;
+  }).DEPLOYMENT_SOURCE_COMMIT;
+  const sourceCommit = typeof configured === "string"
+    && EXACT_DEPLOYMENT_SOURCE_COMMIT_PATTERN.test(configured)
+    ? configured
+    : null;
+  if (sourceCommit === null) {
+    return noStore(jsonResponse({
+      status: "unavailable",
+      mode: "migration-mutation-barrier",
+      maintenance: {
+        state: "fenced",
+        storageQualified: false,
+      },
+    }, 503));
+  }
+  return noStore(jsonResponse({
+    status: "ok",
+    mode: "migration-mutation-barrier",
+    maintenance: {
+      state: "fenced",
+      storageQualified: false,
+    },
+    deployment: { sourceCommit },
+  }));
 }
 
 function telemetryContributionLimitError(
@@ -346,6 +410,107 @@ async function readBoundedJson(
   }
 }
 
+/**
+ * The accountless enrollment body is a small closed contract. Keep its cap
+ * independent from contribution envelopes so a future upload schema change
+ * cannot widen this unauthenticated admission boundary accidentally.
+ */
+async function readBoundedAccountlessJson(
+  request: Request,
+): Promise<AccountlessEnrollmentRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    const raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })
+      .decode(combined);
+    return parseAccountlessEnrollmentJson(raw);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
+async function readBoundedAccountlessOwnershipJson(
+  request: Request,
+): Promise<AccountlessOwnershipRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    return parseAccountlessOwnershipJson(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined),
+    );
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
+async function readBoundedAccountlessRenewalJson(
+  request: Request,
+): Promise<AccountlessRenewalRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    return parseAccountlessRenewalJson(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined),
+    );
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
 const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
   /^Upload um_device_upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 
@@ -433,6 +598,95 @@ function assertWorkerRouteMethod(
   if (!route.methods.includes(request.method as WorkerRouteMethod)) {
     methodNotAllowed(route.methods);
   }
+}
+
+async function handleAccountlessEnrollment(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  // Accountless enrollment has no ambient browser authority. Reject an
+  // existing participant cookie rather than allowing a browser session to be
+  // mistaken for the installation's stable device proof.
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  if (configuredAccountlessEnrollmentMode(env) !== "enabled") {
+    throw new ApiError(503, "ACCOUNTLESS_ENROLLMENT_DISABLED");
+  }
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
+  await assertAttemptAllowed(
+    env.ENROLLMENT_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "enrollment",
+  );
+  const body = await readBoundedAccountlessJson(request);
+  const result = await enrollAccountlessDevice(
+    env.USAGE_MONITOR_DB,
+    // The bounded reader performs duplicate-key rejection and the helper
+    // validates the closed request shape; no raw body or secret is logged.
+    body,
+  );
+  return jsonResponse(result.response, result.status);
+}
+
+async function handleAccountlessOwnership(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  assertAccountlessOwnershipEnabled(env);
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "accountless_ownership",
+  );
+  const body = await readBoundedAccountlessOwnershipJson(request);
+  const result = await createAccountlessUploadOwner(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+    body,
+  );
+  return jsonResponse(result.response, result.status);
+}
+
+async function handleAccountlessRenewal(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  if (configuredAccountlessEnrollmentMode(env) !== "enabled") {
+    throw new ApiError(503, "ACCOUNTLESS_ENROLLMENT_DISABLED");
+  }
+  assertAccountlessOwnershipEnabled(env);
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "accountless_renewal",
+  );
+  const body = await readBoundedAccountlessRenewalJson(request);
+  return jsonResponse(await renewAccountlessUploadOwner(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+    body,
+  ));
 }
 
 function allowedHeader(error: ApiError): HeadersInit | undefined {
@@ -1876,7 +2130,7 @@ function handleEnvelopeKey(request: Request, env: Env): Response {
 
 async function handleSyntheticContribution(
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: { id: string; consentVersion: string | null },
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
@@ -1971,7 +2225,7 @@ async function handleSyntheticContribution(
 async function handleTelemetryContribution(
   request: Request,
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: { id: string; consentVersion: string | null },
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
@@ -2198,12 +2452,19 @@ async function telemetryV1ChunkReceipt(
 
 async function handleTelemetryV11Contribution(
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: {
+    id: string;
+    consentVersion: string | null;
+    ownerKind: "social" | "accountless";
+  },
   deviceId: string,
   authorizationId: string,
   env: Env,
 ): Promise<Response> {
-  if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+  if ((participant.ownerKind === "social"
+      && participant.consentVersion !== TELEMETRY_CONSENT_VERSION)
+      || (participant.ownerKind === "accountless"
+        && participant.consentVersion !== null)) {
     throw new ApiError(400, "TELEMETRY_REQUIRED");
   }
   const principal = { participantId: participant.id, deviceId };
@@ -2274,7 +2535,7 @@ async function handleTelemetryV11Contribution(
  */
 async function handleTelemetryV1Contribution(
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: { id: string; consentVersion: string | null },
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
@@ -2473,7 +2734,7 @@ async function deviceSyncPrincipal(
   request: Request,
   env: Env,
   method: "GET" | "POST" = "GET",
-): Promise<{ participantId: string; deviceId: string }> {
+): Promise<DevicePrincipal> {
   if (request.method !== method) methodNotAllowed([method]);
   assertAdmissionBindings(env);
   await assertAttemptAllowed(
@@ -2493,7 +2754,7 @@ async function deviceSyncPrincipal(
   if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
-  return { participantId: device.participantId, deviceId: device.deviceId };
+  return device;
 }
 
 async function handleDeviceSyncState(
@@ -2501,6 +2762,9 @@ async function handleDeviceSyncState(
   env: Env,
 ): Promise<Response> {
   const device = await deviceSyncPrincipal(request, env);
+  if (device.authorityKind !== "social") {
+    throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  }
   const [state, admission] = await Promise.all([
     telemetryV1SyncState(
       env.USAGE_MONITOR_DB,
@@ -2579,6 +2843,9 @@ async function handleDeviceSyncManifest(
   env: Env,
 ): Promise<Response> {
   const device = await deviceSyncPrincipal(request, env);
+  if (device.authorityKind !== "social") {
+    throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  }
   const url = new URL(request.url);
   const fromDay = url.searchParams.get("fromDay");
   const toDay = url.searchParams.get("toDay");
@@ -2651,9 +2918,13 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       throw new ApiError(400, "ENVELOPE_INVALID");
     }
     const participant = await env.USAGE_MONITOR_DB.prepare(
-      `SELECT id, consent_version AS consentVersion
+      `SELECT id, consent_version AS consentVersion, owner_kind AS ownerKind
          FROM participants WHERE id = ? AND state = 'active'`,
-    ).bind(claimed.participantId).first<{ id: string; consentVersion: string }>();
+    ).bind(claimed.participantId).first<{
+      id: string;
+      consentVersion: string | null;
+      ownerKind: "social" | "accountless";
+    }>();
     if (!participant) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     if (await hasDeletionTombstone(env.DELETION_LEDGER, participant.id)) {
       throw new ApiError(401, "UPLOAD_AUTH_INVALID");
@@ -3402,6 +3673,12 @@ async function routeApi(
       return handleRetiredAppleDomainAssociation();
     case "enroll":
       return handleEnroll(request, env);
+    case "accountless_enrollment":
+      return handleAccountlessEnrollment(request, env);
+    case "accountless_ownership":
+      return handleAccountlessOwnership(request, env);
+    case "accountless_renewal":
+      return handleAccountlessRenewal(request, env);
     case "sparkle_appcast_guard":
       return handleSparkleAppcastGuard(request, env);
     case "identity_google_start":
@@ -3472,10 +3749,38 @@ async function routeApi(
   return unreachableApiRoute(routeId);
 }
 
-export async function handleRequest(request: Request, env: Env): Promise<Response> {
+/** The optional override is test-only; deployed fetch always uses the constant. */
+export async function handleRequest(
+  request: Request,
+  env: Env,
+  testMutationBarrierEnabled = MIGRATION_MUTATION_BARRIER_ENABLED,
+): Promise<Response> {
   const requestId = crypto.randomUUID();
   const url = new URL(request.url);
   const route = matchWorkerRoute(url.pathname);
+  const configuredAdminHostname = adminHostname(env);
+  const adminSurface = isAdminSurfacePath(url.pathname)
+    || configuredAdminHostname === url.hostname;
+  if (testMutationBarrierEnabled
+      && route.id === "health"
+      && request.method === "GET"
+      && !adminSurface) {
+    return migrationMutationBarrierHealthResponse(env);
+  }
+  // A migration-only source snapshot changes the constant in mutation-barrier.
+  // This return intentionally precedes redirect, admin identity, and every
+  // D1/R2/DO path. It fences new dynamic work but cannot prove an older
+  // already-admitted reader has finished.
+  if (mutationBarrierBlocksDynamicRequest(
+    route.id,
+    adminSurface,
+    testMutationBarrierEnabled,
+  )) {
+    return noStore(errorResponse(
+      new ApiError(503, MUTATION_BARRIER_ERROR_CODE),
+      requestId,
+    ));
+  }
   try {
     const canonicalRedirectUrl = canonicalPublicRedirectUrl(url, env);
     if (canonicalRedirectUrl !== null) {
@@ -3487,7 +3792,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // carry a verifiable Cf-Access-Jwt-Assertion (defense in depth beneath
     // the edge policy), and the public origin keeps its deliberate 404s.
     // Development environments pin no PUBLIC_ORIGIN and are unchanged.
-    const configuredAdminHostname = adminHostname(env);
     if (configuredAdminHostname !== null) {
       if (url.hostname === configuredAdminHostname) {
         // Authenticate + owner-pin ONCE, at the chokepoint, before the UI or
@@ -3706,8 +4010,24 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }));
       return noStore(errorResponse(apiError, requestId));
     }
+    // A migration snapshot deliberately still serves ordinary public assets,
+    // but an asset-layer failure must not turn that permitted read into a D1
+    // diagnostic write while the mutation barrier is active.
+    if (testMutationBarrierEnabled && route.id === "asset") {
+      console.warn(JSON.stringify({
+        level: "warn",
+        event: "migration_barrier_static_asset_unavailable",
+        requestId,
+        method: request.method,
+        routeClass: route.routeClass,
+        code: apiError.code,
+        status: apiError.status,
+      }));
+      return noStore(errorResponse(apiError, requestId));
+    }
     const expectedContainment = [
       "COLLECTION_ENROLLMENT_DISABLED",
+      "ACCOUNTLESS_ENROLLMENT_DISABLED",
       "UPLOAD_REGISTRATION_DISABLED",
       "PROCESSING_DISABLED",
       "PUBLICATION_DISABLED",
@@ -3742,7 +4062,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 interface ScheduledMaintenanceLog {
   level: "info" | "error";
   event: "scheduled_backend_maintenance";
-  outcome: "success" | "failure";
+  outcome: "success" | "failure" | "skipped";
   code: string;
   lifecycleComplete: boolean;
   quarantineRetentionComplete: boolean;
@@ -3826,7 +4146,39 @@ async function ownsRenewedMaintenanceLease(
 export async function runScheduledMaintenance(
   env: Env,
   scheduledTime: number,
+  testMutationBarrierEnabled = MIGRATION_MUTATION_BARRIER_ENABLED,
 ): Promise<ScheduledMaintenanceLog> {
+  if (mutationBarrierSkipsScheduledMaintenance(testMutationBarrierEnabled)) {
+    const log: ScheduledMaintenanceLog = {
+      level: "info",
+      event: "scheduled_backend_maintenance",
+      outcome: "skipped",
+      code: MUTATION_BARRIER_ERROR_CODE,
+      lifecycleComplete: false,
+      quarantineRetentionComplete: false,
+      restoreReplayComplete: false,
+      quarantineReconciliationComplete: false,
+      expiredIdentityHandoffsPurged: 0,
+      expiredIdentityHandoffPurgeComplete: false,
+      expiredDeletionTombstonesPurged: 0,
+      deletionTombstonePurgeComplete: false,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged: 0,
+      primaryIdentityReenrollmentCooldownPurgeComplete: false,
+      expiredIdentityReenrollmentCooldownsPurged: 0,
+      identityReenrollmentCooldownPurgeComplete: false,
+      expiredSignInAdmissionsPurged: 0,
+      signInAdmissionPurgeComplete: false,
+      staleDevicePairingsRevoked: 0,
+      staleDeviceCredentialsRevoked: 0,
+      staleDeviceUploadAuthorizationsRevoked: 0,
+      expiredDeviceCredentialRotationsPurged: 0,
+      expiredDevicePairingEventsPurged: 0,
+      aggregateRebuildComplete: false,
+      publicationEnabled: null,
+    };
+    console.warn(JSON.stringify(log));
+    return log;
+  }
   const reconstructionMode = allowanceReconstructionMode(env);
   const queryMeter = createD1InvocationBudget();
   queryMeter.reserveQueries = 1;

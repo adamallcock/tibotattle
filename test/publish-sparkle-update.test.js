@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { createHash, createHmac, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -22,6 +22,7 @@ import {
   CANONICAL_APPCAST_URL,
   CANONICAL_UPDATE_ORIGIN,
   IMMUTABLE_CACHE_CONTROL,
+  createAppcastAtomicGuardFromEnvironment,
   parseSparkleUpdatePublisherArguments,
   publishSparkleUpdate as publishSparkleUpdateProduction,
   verifyReleaseManifestSourceProvenance,
@@ -1526,6 +1527,59 @@ test("publishes through the explicit owner guard endpoint without exposing its t
     } else {
       process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = previousToken;
     }
+    await fixture.cleanup();
+  }
+});
+
+test("a private environment guard supports consecutive canonical publications without restoring its credential", async () => {
+  const fixture = await createReleaseFixture();
+  const token = "synthetic-reusable-guard-token-0123456789";
+  const previousToken = process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+  process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = token;
+  const guardCalls = [];
+  try {
+    assert.throws(() => createAppcastAtomicGuardFromEnvironment({ endpoint: "https://example.invalid/guard" }),
+      { code: "SPARKLE_UPDATE_ATOMIC_GUARD_ENDPOINT_INVALID" });
+    assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], token);
+    const guard = createAppcastAtomicGuardFromEnvironment({
+      endpoint: `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+      fetchGuard: async (url, options) => {
+        guardCalls.push({ url, options });
+        assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
+        const timestamp = options.headers["x-usage-monitor-release-timestamp"];
+        const nonce = options.headers["x-usage-monitor-release-nonce"];
+        const signedRequest = `${APPCAST_ATOMIC_GUARD_SCHEMA}\0POST\0${APPCAST_ATOMIC_GUARD_ROUTE}\0${timestamp}\0${nonce}\0${sha256(Buffer.from(options.body))}`;
+        assert.equal(options.headers["x-usage-monitor-release-signature"],
+          createHmac("sha256", token).update(signedRequest).digest("base64url"));
+        return Response.json({ schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA, status: "committed" });
+      },
+    });
+    assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
+    const receipts = [];
+    for (let index = 0; index < 2; index += 1) {
+      const runner = missingRemoteObjectRunner();
+      receipts.push(await publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath, atomicAppcastGuard: guard,
+        bucket: APPROVED_R2_BUCKET, channel: "stable", dmgPath: fixture.dmgPath,
+        publish: true, releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY, stableBootstrap: true,
+        runWrangler: async (...args) => {
+          assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
+          return runner.run(...args);
+        },
+        fetchPublic: publicReadbackFixture(fixture).fetch,
+        validateDMG: async () => assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined),
+      }));
+    }
+    assert.deepEqual(receipts.map(receipt => receipt.status), ["published", "published"]);
+    assert.equal(guardCalls.length, 2);
+    assert.ok(!JSON.stringify({ guard, guardCalls, receipts }).includes(token));
+    assert.throws(() => createAppcastAtomicGuardFromEnvironment({
+      endpoint: `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+    }), { code: "SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_REQUIRED" });
+  } finally {
+    if (previousToken === undefined) delete process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+    else process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = previousToken;
     await fixture.cleanup();
   }
 });
@@ -3318,4 +3372,45 @@ test("Intel first publication bootstraps only its empty feed and cannot reuse AR
       intelObjectPath,
     ]);
   } finally { await arm.cleanup(); await intel.cleanup(); }
+});
+
+test('canonical publisher accepts explicit Electron transition only with bound Sparkle journey and native predecessor', async () => {
+  const previous = await createReleaseFixture({ bundleVersion: '1026', shortVersion: '0.1.18' });
+  const fixture = await createReleaseFixture({ bundleVersion: '1028', shortVersion: '0.1.21' });
+  try {
+    const native = JSON.parse(await readFile(fixture.releaseManifestPath));
+    const proof = { schemaVersion: 'tibotattle-signed-macos-sparkle-transition-v1', status: 'passed',
+    target: 'darwin-arm64', version: '0.1.21', buildNumber: '2026091105', bundleVersion: '1028',
+    feedScope: 'isolated_test_feed', feedSha256: '1'.repeat(64), feedOverrideApplied: true, productionFeedVerified: false,
+    candidateCopiedByRunner: false, signedArtifactVerified: true, disposableAccountVerified: true,
+    checkForUpdatesClicked: true, installUpdateClicked: true, updaterRelaunchedCandidate: true,
+      sourceRevision: native.source.commit, dmgSha256: native.artifact.sha256, asarSha256: 'c'.repeat(64),
+      nativeVersion: '0.1.18', nativeDmgSha256: sha256(previous.dmgBytes), nativeSparkleUpdateCompleted: true,
+      migrationCompleted: true, retainedRowsPreserved: true, saltPreserved: true, preferencesPreserved: true,
+      optOutPreserved: true, restartNoDuplicates: true, sourceUntouched: true, ownedProcessesStopped: true };
+    const proofPath = join(dirname(fixture.releaseManifestPath), 'sparkle-journey.json');
+    const bytes = Buffer.from(JSON.stringify(proof));
+    await writeFile(proofPath, bytes);
+    const receipt = { schemaVersion: 'tibotattle-electron-sparkle-transition-v1',
+      application: { ...native.application, architecture: 'arm64' }, artifact: native.artifact,
+      source: native.source, channel: native.channel,
+      sparkle: { appcastURL: native.updater.appcastURL, publicEdKeySha256: native.updater.publicEdKeySha256 },
+      electron: { buildNumber: '2026091105', asarSha256: proof.asarSha256, updaterConfigurationSha256: 'd'.repeat(64) },
+      evidence: { scope: 'local_qualification', nativeSparkleJourney: { localPath: 'sparkle-journey.json', bytes: bytes.length, sha256: sha256(bytes) } } };
+    await writeFile(fixture.releaseManifestPath, JSON.stringify(receipt));
+    let inspections = 0, remoteCalls = 0;
+    const options = { channel: 'stable', bucket: APPROVED_R2_BUCKET, dmgPath: fixture.dmgPath,
+      appcastPath: fixture.appcastPath, releaseManifestPath: fixture.releaseManifestPath,
+      previousStableManifestPath: previous.releaseManifestPath, stableBootstrap: false, sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      validateDMG: async () => { throw Error('Native payload validator must not inspect Electron'); },
+      validateElectronDMG: async (_path, input) => { inspections++; assert.deepEqual(input.manifest, receipt);
+        return { source: { commit: receipt.source.commit, tag: receipt.source.tag } }; },
+      runWrangler: async () => { remoteCalls++; throw Error('No remote writes in validation'); } };
+    const result = await publishSparkleUpdate(options);
+    assert.equal(result.status, 'validated'); assert.equal(result.published, false);
+    assert.equal(inspections, 1); assert.equal(remoteCalls, 0);
+    await writeFile(proofPath, JSON.stringify({ ...proof, nativeSparkleUpdateCompleted: false }));
+    await assert.rejects(publishSparkleUpdate(options), { code: 'SPARKLE_ELECTRON_TRANSITION_EVIDENCE_MISMATCH' });
+    assert.equal(inspections, 1); assert.equal(remoteCalls, 0);
+  } finally { await previous.cleanup(); await fixture.cleanup(); }
 });

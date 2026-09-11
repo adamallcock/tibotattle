@@ -37,6 +37,8 @@ import { SPARKLE_FRAMEWORK_SHA256, SPARKLE_VERSION } from "../scripts/macos-upda
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SHARED_SOURCE = "apps/macos/Sources/KeychainMigration.swift";
 const ENTRYPOINT_SOURCE = "apps/macos/Helpers/KeychainMigrationHelper.swift";
+const ELECTRON_HANDOVER_ENTRYPOINT_SOURCE =
+  "apps/macos/Helpers/NativeElectronHandoverHelper.swift";
 const SIGNATURE_ERROR = { code: "MACOS_KEYCHAIN_MIGRATION_SIGNATURE_INVALID" };
 const ARTIFACT_ERROR = { code: "MACOS_KEYCHAIN_MIGRATION_ARTIFACT_INVALID" };
 const TEAM = "A1B2C3D4E5";
@@ -105,10 +107,23 @@ test("migration helper source inventory is closed and its @main never enters the
     assert.deepEqual((await collectMacOSSwiftSources(options)).relativeFiles, [
       SHARED_SOURCE, "apps/macos/UsageMonitorApp.swift",
     ]);
+    await writeFile(
+      join(root, ELECTRON_HANDOVER_ENTRYPOINT_SOURCE),
+      "@main struct NativeElectronHandover { static func main() {} }\n",
+    );
+    // The Electron handover entrypoint may share Helpers, but must never enter
+    // the native launcher or Keychain helper compilation closure.
+    assert.deepEqual(
+      (await collectMacOSKeychainMigrationHelperSources(options)).relativeFiles,
+      [ENTRYPOINT_SOURCE, SHARED_SOURCE],
+    );
+    assert.deepEqual((await collectMacOSSwiftSources(options)).relativeFiles, [
+      SHARED_SOURCE, "apps/macos/UsageMonitorApp.swift",
+    ]);
     await writeFile(join(options.sourceRoot, "Helpers/Extra.swift"), "struct Unreviewed {}\n");
     await assert.rejects(collectMacOSKeychainMigrationHelperSources(options),
-      /only its reviewed entrypoint/u);
-    await assert.rejects(collectMacOSSwiftSources(options), /only its reviewed entrypoint/u);
+      /only reviewed helper entrypoints/u);
+    await assert.rejects(collectMacOSSwiftSources(options), /only reviewed helper entrypoints/u);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -120,10 +135,10 @@ test("migration helper discovery refuses missing and symlinked inputs", async ()
     const entrypoint = join(root, ENTRYPOINT_SOURCE);
     await rm(entrypoint);
     await assert.rejects(collectMacOSKeychainMigrationHelperSources(options),
-      /only its reviewed entrypoint/u);
+      /only reviewed helper entrypoints/u);
     await symlink(join(root, SHARED_SOURCE), entrypoint);
     await assert.rejects(collectMacOSKeychainMigrationHelperSources(options),
-      /only its reviewed entrypoint/u);
+      /only reviewed helper entrypoints/u);
     await rm(entrypoint);
     await writeFile(entrypoint, "@main struct MigrationHelper { static func main() {} }\n");
     await rm(join(root, SHARED_SOURCE));

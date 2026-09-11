@@ -20,9 +20,10 @@ version labels; it does not imply API stability before 1.0.
   bodies on 2026-08-23. Their body text is verbatim, with only a conventional
   terminal newline normalized for checked-in Markdown; no retrospective claims
   were added. Existing v0.1.13-v0.1.16 notes were left unchanged.
-- Releases v0.1.13 and later publish a DMG together with an appcast, release
-  manifest, `SHA256SUMS`, and a verification guide. Earlier release pages
-  preserve the DMG that was actually published at the time.
+- Native releases v0.1.13-v0.1.18 publish a DMG together with an appcast,
+  release manifest, `SHA256SUMS`, and a verification guide. Electron releases
+  publish platform installers, updater metadata and their verification evidence.
+  Earlier release pages preserve the artifacts actually published at the time.
 
 Thanks to the early pilot users who shared observations and reproduction steps.
 To preserve privacy and avoid invented attribution, people are named here only
@@ -34,7 +35,56 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-No changes recorded after 0.1.18.
+No further changes recorded.
+
+## [0.1.21](./release-notes/0.1.21.md) - 2026-09-11
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.21) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.21) ·
+[changes since v0.1.20](https://github.com/adamallcock/tibotattle/compare/v0.1.20...v0.1.21)
+
+Complete native 0.1.18's update path to Electron, preserving local history,
+settings and contribution choice. Retain the public key needed by the incoming
+native update and declare macOS 14 correctly in both Mac installers. Restore
+compact website download controls with GitHub asset links. See the
+[release notes](./release-notes/0.1.21.md).
+
+## [0.1.20](./release-notes/0.1.20.md) - 2026-09-11
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.20) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.20) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/f518126a05a6d165b9617f6417a87219d7047273) ·
+[changes since v0.1.19](https://github.com/adamallcock/tibotattle/compare/v0.1.19...v0.1.20)
+
+- Replacing the native Mac application automatically imports compatible retained
+  history and settings, without manually preserving the old application bundle.
+- Makes a recoverable backup and preserves identity, sharing choices and selected
+  activity folders; reopening the app does not duplicate the import.
+- Keeps recovery explicit for damaged or incompatible data and preserves unknown
+  startup registration without changing it.
+
+## [0.1.19](./release-notes/0.1.19.md) - 2026-09-10
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.19) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.19) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/178315c49f432c8c1ed84f8c982d1c57aed8a094) ·
+[changes since v0.1.18](https://github.com/adamallcock/tibotattle/compare/v0.1.18...v0.1.19)
+
+- Introduces the shared Electron desktop app for Apple silicon and Intel Macs,
+  Windows x64 and Linux x86_64, with customizable tray displays, notifications
+  and automatic updates.
+- Improves usage summaries, model icons, allowance history and cache-detail
+  limits; retained tray observations show when they are stale.
+- Enables accountless, content-free contributions with persistent sharing
+  choices and opt-out controls. Existing unselected installations receive three
+  visible notices before delayed automatic activation.
+- Publishes application build `2026091002`; the release manifest and verification
+  guide identify the final artifacts and platform acceptance boundaries.
+
+This release's native Mac handover requires preserving the old app and does not
+provide an ordinary replacement upgrade. Native Sparkle updates remain separate.
+The 0.1.20 candidate above addresses that limitation; the checked-in 0.1.19 notes
+preserve the published release wording.
 
 ## [0.1.18](./release-notes/0.1.18.md) - 2026-09-05
 

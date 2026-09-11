@@ -69,6 +69,13 @@ export const COMMUNITY_DAILY_POLICY_VERSION = "community-daily-v1.0";
 const DAILY_AGGREGATE_SCHEMA_VERSION = "community-daily-aggregate-v1.0";
 const MAX_DAILY_AGGREGATE_CELLS = 100;
 
+function publicDailySourceScope(day: string): { day: string; ownerKind: "social" } {
+  // The scope is part of the source pin fingerprint. This filter must apply
+  // before the bounded source-journal read so private accountless volume can
+  // never exhaust the public day's chunk budget.
+  return { day, ownerKind: "social" };
+}
+
 interface DailyRebuildRow {
   day: string;
   requested_epoch: number;
@@ -350,7 +357,8 @@ async function buildCommunityDailyAggregate(
   if (cachedFits === null) return { state: "deferred", aggregateId: "" };
   // Resolve once for BOTH totals and cells. This is the same analytical-stream
   // winner policy as calibration, with explicit session-only fallback.
-  const sourcePin = await loadV1SourcePin(db, { day });
+  const sourceScope = publicDailySourceScope(day);
+  const sourcePin = await loadV1SourcePin(db, sourceScope);
   const [totals, cells, revisionRow] = await Promise.all([
     // contributing_devices deliberately counts only winning devices — the
     // devices whose records the published numbers actually include (one per
@@ -380,6 +388,7 @@ async function buildCommunityDailyAggregate(
           AS output_combined_tokens
        FROM telemetry_analytical_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
+         AND p.owner_kind = 'social'
        WHERE ${V1_WINNER_FILTER_SQL} AND r.observed_day = ?`,
     ).bind(sourcePin.winnersJson, day).first<DailyTotalsRow>(),
     db.prepare(
@@ -399,6 +408,7 @@ async function buildCommunityDailyAggregate(
           AS output_combined_tokens
        FROM telemetry_analytical_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
+         AND p.owner_kind = 'social'
        WHERE ${V1_WINNER_FILTER_SQL} AND r.observed_day = ? AND r.stream = 'usage'
        GROUP BY r.provider, r.model_id
        ORDER BY r.provider, r.model_id
@@ -480,7 +490,7 @@ async function buildCommunityDailyAggregate(
   };
   const payloadJson = canonicalJson(payload);
   const payloadHash = await sha256Hex(payloadJson);
-  if ((await loadV1SourcePin(db, { day })).fingerprint !== sourcePin.fingerprint) {
+  if ((await loadV1SourcePin(db, sourceScope)).fingerprint !== sourcePin.fingerprint) {
     return { state: "conflicted", aggregateId };
   }
   const results = await db.batch([

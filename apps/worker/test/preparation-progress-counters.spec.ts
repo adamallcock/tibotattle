@@ -12,20 +12,39 @@ const migrations = () => (env as Env & { TEST_MIGRATIONS: D1Migration[] }).TEST_
 const EMPTY = { trackedDays: 0, completeDays: 0, buildingDays: 0, retiringDays: 0,
   checkpointSteps: 0, quotaObservations: 0, usageEvents: 0 };
 const OWNER = "synthetic-preparation-counter-owner";
+const ACCOUNTLESS_OWNER = "synthetic-preparation-accountless-owner";
 const DAY = "2026-09-01";
 const HEAD_INSERT = `INSERT INTO community_prepared_source_days
   (participant_id,source_day,generation,source_fingerprint,method_version,device_id,phase,progress_revision,
    cursor_time,cursor_id,quota_count,usage_count,plan_count,fit_count,fragment_count,control_json,control_sha256)
   VALUES (?1,?2,?3,?3,'synthetic-counter-fixture','synthetic-device',?4,?5,?2||'T00:00:00.000Z',0,?6,?7,0,0,0,'{}',?3)`;
-function head(day = DAY, phase = "quota", steps = 2, quota = 3, usage = 4) {
+function head(day = DAY, phase = "quota", steps = 2, quota = 3, usage = 4, participantId = OWNER) {
   return db().prepare(`${HEAD_INSERT} ON CONFLICT(participant_id,source_day) DO NOTHING`)
-    .bind(OWNER, day, "a".repeat(64), phase, steps, quota, usage);
+    .bind(participantId, day, "a".repeat(64), phase, steps, quota, usage);
 }
 async function owner() {
   await db().prepare(`INSERT INTO participants
     (id,access_token_id,access_token_hash,recovery_token_id,recovery_token_hash,consent_version,consented_at,created_at)
     VALUES(?1,?1,X'00',?1,X'00','synthetic-consent','2026-09-01T00:00:00.000Z','2026-09-01T00:00:00.000Z')`)
     .bind(OWNER).run();
+}
+async function accountlessOwner() {
+  await db().prepare(`INSERT INTO participants (
+    id,owner_kind,access_token_id,access_token_hash,recovery_token_id,recovery_token_hash,
+    state,consent_version,consented_at,created_at,deletion_session_id,identity_link_key,
+    identity_cooldown_digest
+  ) VALUES (?,'accountless',NULL,NULL,NULL,NULL,'active',NULL,NULL,
+    '2026-09-01T00:00:00.000Z',NULL,NULL,NULL)`).bind(ACCOUNTLESS_OWNER).run();
+}
+async function seedLegacyPreparedHeads() {
+  await owner();
+  await db().batch([
+    head("2026-08-28", "complete", 1, 12, 24),
+    head("2026-08-29", "complete", 2, 12, 24),
+    head("2026-08-30", "complete", 3, 12, 24),
+    head("2026-08-31", "complete", 4, 12, 24),
+    head(DAY, "complete", 5, 13, 24),
+  ]);
 }
 async function census() {
   return db().prepare(`SELECT COUNT(*) AS trackedDays,TOTAL(phase='complete') AS completeDays,
@@ -51,7 +70,10 @@ describe("transactional preparation progress counters", () => {
   it("bootstraps existing prepared work exactly and remains unavailable before migration", async () => {
     await reset();
     await applyD1Migrations(db(), migrations().filter(migration => Number(migration.name.slice(0, 4)) < 56));
-    await prepareRealFixture();
+    // This is deliberately a pre-0056 database. The real preparation helper
+    // exercises current runtime contracts, so seed only persisted source
+    // heads here and keep the bootstrap migration boundary under test.
+    await seedLegacyPreparedHeads();
     const before = await census();
     expect(before).toMatchObject({ trackedDays: 5, completeDays: 5, quotaObservations: 61, usageEvents: 120 });
     expect(await readAdminPreparationProgress(db())).toBeNull();
@@ -101,6 +123,16 @@ describe("transactional preparation progress counters", () => {
       head(DAY, "complete", 3, 2, 1)]);
     expect(await readAdminPreparationProgress(db())).toEqual({ ...initial, completeDays: 1, buildingDays: 0,
       checkpointSteps: 3, quotaObservations: 2, usageEvents: 1 });
+  });
+
+  it("keeps populated accountless prepared heads outside public progress through erasure", async () => {
+    await accountlessOwner();
+    await head(DAY, "complete", 3, 2, 1, ACCOUNTLESS_OWNER).run();
+    expect(await readAdminPreparationProgress(db())).toEqual(EMPTY);
+    await db().prepare("DELETE FROM participants WHERE id=?").bind(ACCOUNTLESS_OWNER).run();
+    expect(await readAdminPreparationProgress(db())).toEqual(EMPTY);
+    expect(await db().prepare("SELECT COUNT(*) AS n FROM community_prepared_source_days WHERE participant_id=?")
+      .bind(ACCOUNTLESS_OWNER).first()).toEqual({ n: 0 });
   });
 
   it("tracks real source corrections, bounded derived cleanup and cascading owner erasure without counting child rows twice", async () => {

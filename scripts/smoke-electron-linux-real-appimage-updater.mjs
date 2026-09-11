@@ -1,0 +1,327 @@
+#!/usr/bin/env node
+/** Real normal-app update; fixed production URL resolves only inside network-none. */
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { createServer } from "node:https";
+import { lookup } from "node:dns/promises";
+import { chmod, copyFile, lstat, mkdir, readFile, readdir, readlink, rename } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { assertContainerContract, connectCdp, freeTcpPort, terminateLinuxSmokeChild } from "./smoke-electron-linux.mjs";
+import { createLinuxNormalPackagedSmokeFixture, normalPackagedSmokeEnvironment } from "./smoke-electron-linux-packaged.mjs";
+import { linuxAppImageIdentity } from "./build-linux-updater-rehearsal.mjs";
+import { createDesktopSharingBackend, createDesktopSharingCoordinator } from "../apps/electron/desktop-sharing.js";
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const EXEC = "/opt/tibotattle-updater-exec";
+const HOST = "updates.tibotattle.com";
+const FEED = `https://${HOST}/electron/stable/linux-x64`;
+const fail = (code) => { throw Object.assign(new Error(code), { code: `LINUX_REAL_APPIMAGE_${code}` }); };
+const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+async function waitFor(read, timeout = 60000) {
+  const until = Date.now() + timeout;
+  while (Date.now() < until) { const value = await read(); if (value) return value; await delay(200); }
+  fail("TIMEOUT");
+}
+export function validateLinuxRealUpdaterPair(pair, revision) {
+  if (pair?.schemaVersion !== "tibotattle-linux-real-updater-pair-v1" || pair.sourceRevision !== revision
+      || pair.scope !== "private_test_version_override" || pair.feed !== FEED || pair.publication !== "not_performed") fail("PAIR_INVALID");
+  for (const role of ["current", "next"]) {
+    const image = pair.images?.[role];
+    if (!image || typeof image.file !== "string" || !new RegExp(`^${role}/[A-Za-z0-9_.-]+\\.AppImage$`, "u").test(image.file)
+        || !/^[0-9a-f]{64}$/u.test(image.sha256 ?? "") || !/^[0-9a-f]{64}$/u.test(image.asarSha256 ?? "")
+        || !/^[A-Za-z0-9+/]{86}==$/u.test(image.sha512 ?? "") || !Number.isSafeInteger(image.bytes) || image.bytes < 4096 || image.bytes > 1024 ** 3
+        || !/^\d+\.\d+\.\d+$/u.test(image.version ?? "")) fail("PAIR_INVALID");
+  }
+  const a = pair.images.current.version.split(".").map(Number); const b = pair.images.next.version.split(".").map(Number);
+  if ([...a, ...b].some((value) => !Number.isSafeInteger(value)) || a[0] !== b[0] || a[1] !== b[1] || b[2] !== a[2] + 1) fail("PAIR_INVALID");
+  return pair;
+}
+export function realUpdaterFeed(pair) {
+  const next = pair.images.next;
+  return `version: ${next.version}\nfiles:\n  - url: next.AppImage\n    sha512: ${next.sha512}\n    size: ${next.bytes}\npath: next.AppImage\nsha512: ${next.sha512}\nreleaseDate: '2026-09-09T00:00:00.000Z'\n`;
+}
+export function isLinuxUpdaterSettingsURL(value, dashboardOrigin) {
+  try {
+    const url = new URL(value); const dashboard = new URL(dashboardOrigin);
+    return dashboard.protocol === "http:" && dashboard.hostname === "127.0.0.1"
+      && url.origin === dashboard.origin && url.pathname === "/electron-settings.html"
+      && url.search === "" && url.username === "" && url.password === "";
+  } catch { return false; }
+}
+
+/** Normal automatic startup may finish before Settings opens. Do not wait for
+ * a Check button that correctly stays disabled after a completed download. */
+export async function prepareLinuxUpdaterDownload({ readUpdate, click, automaticDownload, wait = waitFor }) {
+  let update = await readUpdate();
+  let check = "automatic"; let download = "automatic";
+  if (update.canCheck && !update.canDownload && !update.canInstall) {
+    await click("check"); check = "settings_button";
+  }
+  update = await wait(async () => {
+    const value = await readUpdate();
+    return value.canDownload || value.canInstall || value.status === "downloading" ? value : null;
+  });
+  if (update.canDownload && !automaticDownload) {
+    await click("download"); download = "settings_button";
+  }
+  await wait(async () => (await readUpdate()).canInstall === true, 120000);
+  return { check, download };
+}
+
+export function linuxUpdaterFixedStatus(value) {
+  const statuses = new Set(["unavailable", "ready", "checking", "available", "downloading", "downloaded", "current", "installing", "error"]);
+  const errors = new Set(["none", "configuration_failed", "check_failed", "download_failed", "install_failed", "preferences_unavailable", "shutdown_failed", "unavailable"]);
+  return { status: statuses.has(value?.status) ? value.status : "unavailable",
+    error: errors.has(value?.error) ? value.error : "unavailable" };
+}
+export function linuxUpdaterRuntimeErrorCategories(text) {
+  // Synthetic app output stays in memory; only these fixed classifiers leave.
+  return ["EACCES", "ENOENT", "EXDEV", "EROFS", "ENOSPC"].filter((code) => new RegExp(`\\b${code}\\b`, "u").test(text));
+}
+function command(name, args, options = {}) {
+  const result = spawnSync(name, args, { stdio: "ignore", timeout: 15000, shell: false, ...options });
+  if (result.error || result.status !== 0 || result.signal) fail("LOCAL_TRUST_SETUP_FAILED");
+}
+async function targets(port) {
+  try { const r = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2000) }); return await r.json(); }
+  catch { return []; }
+}
+async function connectPage(port, predicate) {
+  return waitFor(async () => {
+    const rows = await targets(port);
+    const page = rows.find((row) => row.type === "page" && predicate(row.url)
+      && typeof row.webSocketDebuggerUrl === "string" && row.webSocketDebuggerUrl.startsWith(`ws://127.0.0.1:${port}/`));
+    return page ? connectCdp(page) : null;
+  });
+}
+export function isOwnedLinuxUpdaterExecutable(value) {
+  return typeof value === "string" && resolve(value) === value
+    && value.startsWith(`${EXEC}/tmp/`) && basename(value) === "tibotattle";
+}
+async function processExecutable(pid) {
+  // /proc/environ is an initial process environment view, not an authority for
+  // AppImage runtime variables set later by a loader. Bind the executable in
+  // this test's private extraction mount instead. A proc link is preferred;
+  // the argv fallback is confined to those same owned, hash-checked bytes.
+  const args = (await readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0");
+  if (args.some((arg) => arg.startsWith("--type="))) return null;
+  const executable = await readlink(`/proc/${pid}/exe`).catch(() => args[0]);
+  if (!isOwnedLinuxUpdaterExecutable(executable)) return null;
+  const stat = await lstat(executable);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid()) return null;
+  return executable;
+}
+async function appPids(image) {
+  if (image !== join(EXEC, "TiboTattle.AppImage")) fail("ISOLATION_REQUIRED");
+  const selected = [];
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/u.test(entry)) continue;
+    try { if (await processExecutable(Number(entry))) selected.push(Number(entry)); }
+    catch { /* Exited or unrelated process. */ }
+  }
+  return selected;
+}
+async function processIdentityDiagnostics() {
+  const result = { executableLinksUnavailable: 0, productExecutables: 0, productExecutablesInsidePrivateMount: 0, productArgv: 0 };
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/u.test(entry)) continue;
+    try {
+      const args = (await readFile(`/proc/${entry}/cmdline`, "utf8")).split("\0");
+      if (args.some((arg) => arg.startsWith("--type="))) continue;
+      if (basename(args[0] ?? "") === "tibotattle") result.productArgv++;
+      const executable = await readlink(`/proc/${entry}/exe`).catch(() => null);
+      if (executable === null) { result.executableLinksUnavailable++; continue; }
+      if (basename(executable) === "tibotattle") {
+        result.productExecutables++;
+        if (isOwnedLinuxUpdaterExecutable(executable)) result.productExecutablesInsidePrivateMount++;
+      }
+    } catch {}
+  }
+  return result;
+}
+async function processHealth(pid) {
+  // Read only socket identities for this process and its children; never
+  // probe unrelated ports or export command lines/environment material.
+  const pids = new Set([pid]);
+  for (let pass = 0; pass < 3; pass++) {
+    for (const entry of await readdir("/proc")) {
+      if (!/^\d+$/u.test(entry)) continue;
+      try { const status = await readFile(`/proc/${entry}/status`, "utf8");
+        if (pids.has(Number(/^PPid:\s+(\d+)/mu.exec(status)?.[1]))) pids.add(Number(entry));
+      } catch {}
+    }
+  }
+  const sockets = new Set();
+  for (const child of pids) {
+    try { for (const fd of await readdir(`/proc/${child}/fd`)) {
+      try { const target = await readlink(`/proc/${child}/fd/${fd}`); const match = /^socket:\[(\d+)\]$/u.exec(target); if (match) sockets.add(match[1]); } catch {}
+    } } catch {}
+  }
+  const lines = (await readFile("/proc/net/tcp", "utf8")).trim().split("\n").slice(1);
+  for (const line of lines) {
+    const cols = line.trim().split(/\s+/u); const [address, port] = cols[1].split(":");
+    if (cols[3] !== "0A" || address !== "0100007F" || !sockets.has(cols[9])) continue;
+    try { const response = await fetch(`http://127.0.0.1:${Number.parseInt(port, 16)}/api/local/health`, { signal: AbortSignal.timeout(1000) });
+      if ((await response.json())?.status === "ready") return true;
+    } catch {}
+  }
+  return false;
+}
+async function digest(path) { const hash = createHash("sha256"); for await (const chunk of createReadStream(path)) hash.update(chunk); return hash.digest("hex"); }
+export async function runRealLinuxAppImageUpdater() {
+  const contract = assertContainerContract();
+  if (process.arch !== "x64" || process.getuid() !== 1000 || (await lookup(HOST)).address !== "127.0.0.1") fail("ISOLATION_REQUIRED");
+  const execStat = await lstat(EXEC);
+  if (!execStat.isDirectory() || execStat.isSymbolicLink() || execStat.uid !== 1000 || (execStat.mode & 0o777) !== 0o700) fail("ISOLATION_REQUIRED");
+  const pairRoot = join(ROOT, ".release-build/electron-linux-updater-rehearsal");
+  const pair = validateLinuxRealUpdaterPair(JSON.parse(await readFile(join(pairRoot, "pair.json"), "utf8")), contract.sourceRevision);
+  for (const role of ["current", "next"]) {
+    const identity = await linuxAppImageIdentity(join(pairRoot, pair.images[role].file));
+    if (identity.sha256 !== pair.images[role].sha256 || identity.sha512 !== pair.images[role].sha512 || identity.bytes !== pair.images[role].bytes) fail("INPUT_CHANGED");
+  }
+  const original = await createLinuxNormalPackagedSmokeFixture();
+  const config = join(original.home, ".config"); await mkdir(config, { mode: 0o700 });
+  const profile = join(config, "TiboTattle"); await rename(original.userData, profile);
+  const fixture = { ...original, userData: profile, stateFile: join(profile, "companion-state/local-collector-state-v1.sqlite") };
+  const sharing = createDesktopSharingCoordinator({ backend: createDesktopSharingBackend({ rootPath: join(profile, "desktop-settings") }), installationState: "fresh", destinationOrigin: "https://tibotattle.com" });
+  await sharing.initialize(); await sharing.setEnabled(false);
+  const image = join(EXEC, "TiboTattle.AppImage"); await copyFile(join(pairRoot, pair.images.current.file), image); await chmod(image, 0o700);
+  const temp = join(EXEC, "tmp"); await mkdir(temp, { mode: 0o700 });
+  const key = join(fixture.root, "loopback.key"); const cert = join(fixture.root, "loopback.crt");
+  command("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", `/CN=${HOST}`,
+    "-addext", `subjectAltName=DNS:${HOST}`, "-keyout", key, "-out", cert]);
+  const nss = join(fixture.home, ".pki/nssdb"); await mkdir(nss, { recursive: true, mode: 0o700 });
+  command("certutil", ["-N", "--empty-password", "-d", `sql:${nss}`]);
+  command("certutil", ["-A", "-d", `sql:${nss}`, "-n", "TiboTattle isolated loopback CA", "-t", "C,,", "-i", cert]);
+  let servedFeed = 0; let servedImage = 0; let unexpectedRequests = 0;
+  const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
+    const path = new URL(request.url, FEED).pathname;
+    if (request.headers.host !== HOST || request.method !== "GET") { unexpectedRequests++; response.writeHead(404).end(); return; }
+    if (path === "/electron/stable/linux-x64/latest-linux.yml") { servedFeed++; response.writeHead(200, { "content-type": "application/yaml" }).end(realUpdaterFeed(pair)); return; }
+    if (path === "/electron/stable/linux-x64/next.AppImage") { servedImage++; response.writeHead(200, { "content-length": pair.images.next.bytes, "content-type": "application/octet-stream" }); createReadStream(join(pairRoot, pair.images.next.file)).pipe(response); return; }
+    unexpectedRequests++; response.writeHead(404).end();
+  });
+  let child; let dashboard; let settings; let updatedPid; let runtimeErrors = "";
+  const receipt = { schemaVersion: "tibotattle-linux-real-appimage-updater-v1", sourceRevision: contract.sourceRevision,
+    versions: { current: pair.images.current.version, next: pair.images.next.version }, images: { current: pair.images.current.sha256, next: pair.images.next.sha256 },
+    scope: "normal_product_AppImages_with_private_next_version", feed: "fixed_production_URL_simulated_inside_network_none", ca: "disposable_profile_only", publication: "not_performed" };
+  let stage = "loopback_tls";
+  try {
+    await new Promise((done, reject) => { server.once("error", reject); server.listen(443, "127.0.0.1", done); });
+    const port = await freeTcpPort();
+    const environment = { ...normalPackagedSmokeEnvironment({ fixture, service: "unavailable" }),
+      XDG_CONFIG_HOME: config, XDG_CACHE_HOME: join(fixture.home, ".cache"), XDG_DATA_HOME: join(fixture.home, ".local/share"),
+      APPIMAGE_EXTRACT_AND_RUN: "1", TMPDIR: temp, NODE_EXTRA_CA_CERTS: cert };
+    stage = "current_launch";
+    child = spawn(image, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", "--disable-gpu"], { env: environment, stdio: ["ignore", "ignore", "pipe"] });
+    child.stderr.on("data", (chunk) => { runtimeErrors = (runtimeErrors + chunk.toString("utf8")).slice(-16384); });
+    child.on("error", () => {});
+    dashboard = await connectPage(port, (url) => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url));
+    stage = "dashboard_ready";
+    await waitFor(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"));
+    await dashboard.evaluate("globalThis.tibotattleDesktop.openSettings()");
+    stage = "settings_ready";
+    const dashboardOrigin = await dashboard.evaluate("location.origin");
+    settings = await connectPage(port, (url) => isLinuxUpdaterSettingsURL(url, dashboardOrigin));
+    await waitFor(() => settings.evaluate("typeof globalThis.tibotattleDesktop?.getSettings === 'function' && document.querySelector('#settings-tab-about') !== null"));
+    stage = "current_preferences";
+    const before = await settings.evaluate("globalThis.tibotattleDesktop.getSettings()");
+    if (before.about.version !== pair.images.current.version) fail("CURRENT_VERSION_MISMATCH");
+    await settings.evaluate("globalThis.tibotattleDesktop.setRefreshInterval(900)");
+    if ((await settings.evaluate("globalThis.tibotattleDesktop.getSharingPreference()")).enabled !== false) fail("OPT_OUT_MISSING");
+    stage = "update_download";
+    await settings.evaluate("document.querySelector('#settings-tab-about').click()");
+    receipt.updateInitiation = await prepareLinuxUpdaterDownload({
+      readUpdate: async () => (await settings.evaluate("globalThis.tibotattleDesktop.getSettings()")).about.update,
+      automaticDownload: before.about.automaticUpdates.enabled === true,
+      click: async (action) => settings.evaluate(action === "check"
+        ? "document.querySelector('#settings-check-for-updates').click()"
+        : "document.querySelector('#settings-download-update').click()"),
+    });
+    stage = "current_process_identity";
+    const oldPids = new Set(await appPids(image));
+    if (!oldPids.size) { receipt.processIdentityDiagnostics = await processIdentityDiagnostics(); fail("CURRENT_PROCESS_MISSING"); }
+    const currentPid = [...oldPids].sort((a, b) => a - b)[0];
+    const currentExecutable = await processExecutable(currentPid);
+    try {
+      const env = (await readFile(`/proc/${currentPid}/environ`, "utf8")).split("\0");
+      const value = env.find((item) => item.startsWith("APPIMAGE="))?.slice(9);
+      receipt.appImageEnvironment = value === image ? "original_private_image"
+        : value === undefined ? "absent_in_proc_environment"
+        : value.startsWith(`${EXEC}/tmp/`) ? "private_extracted_path" : "other_path";
+    } catch { receipt.appImageEnvironment = "proc_environment_unavailable"; }
+    if (await digest(join(dirname(currentExecutable), "resources/app.asar")) !== pair.images.current.asarSha256) fail("CURRENT_ASAR_MISMATCH");
+    stage = "install_button_ready";
+    await waitFor(() => settings.evaluate("(() => { const button = document.querySelector('#settings-install-update'); return button !== null && button.disabled === false && button.hidden === false; })()"));
+    receipt.installButtonReady = true;
+    stage = "update_install";
+    await settings.evaluate("setTimeout(() => document.querySelector('#settings-install-update').click(), 25)");
+    let checkedImageStamp;
+    let nextStatusRead = 0;
+    await waitFor(async () => {
+      if (Date.now() >= nextStatusRead) {
+        nextStatusRead = Date.now() + 1000;
+        try { receipt.lastInstallStatus = linuxUpdaterFixedStatus((await settings.evaluate("globalThis.tibotattleDesktop.getSettings()")).about.update); }
+        catch { /* Expected once the current app exits. */ }
+        if (receipt.lastInstallStatus?.status === "error") fail("INSTALLER_REPORTED_ERROR");
+      }
+      const stat = await lstat(image).catch(() => null);
+      receipt.originalImage = stat ? "present" : "missing";
+      if (!stat || stat.size !== pair.images.next.bytes) return false;
+      const stamp = `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+      if (stamp === checkedImageStamp) return false;
+      checkedImageStamp = stamp;
+      const hash = await digest(image).catch(() => null);
+      receipt.originalImage = hash === pair.images.next.sha256 ? "exact_next_image"
+        : hash === pair.images.current.sha256 ? "exact_current_image" : "other_bytes";
+      return hash === pair.images.next.sha256;
+    }, 60000);
+    stage = "automatic_restart";
+    updatedPid = await waitFor(async () => {
+      const rows = await appPids(image);
+      for (const pid of rows) {
+        if (oldPids.has(pid)) continue;
+        try { const executable = await processExecutable(pid);
+          if (executable === null) continue;
+          if (await digest(join(dirname(executable), "resources/app.asar")) !== pair.images.next.asarSha256) continue;
+          if (await processHealth(pid)) return pid;
+        } catch {}
+      }
+      return null;
+    }, 90000);
+    await waitFor(async () => {
+      for (const pid of oldPids) {
+        try { await lstat(`/proc/${pid}`); return false; }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
+      return true;
+    }, 10000);
+    stage = "persisted_preferences";
+    const persisted = JSON.parse(await readFile(join(profile, "desktop-settings/desktop-settings-v1.json"), "utf8"));
+    if ((persisted.settings ?? persisted).refreshIntervalSeconds !== 900 || (await sharing.inspect()).enabled !== false) fail("PREFERENCES_NOT_PRESERVED");
+    if (servedFeed < 1 || servedImage < 1) fail("UPDATE_TRANSFER_MISSING");
+    receipt.status = "passed"; receipt.replacement = "exact_next_image"; receipt.restart = "automatic_next_ASAR_and_companion_ready";
+    receipt.preferences = "refresh_interval_and_opt_out_preserved"; receipt.extraction = "AppImage_extract_and_run";
+    receipt.desktopNotificationBanner = "requires_user_test"; receipt.feedRequests = servedFeed; receipt.imageRequests = servedImage; receipt.unexpectedRequests = unexpectedRequests;
+    return receipt;
+  } catch (error) {
+    const code = error.code?.startsWith("LINUX_REAL_APPIMAGE_") ? error.code : "LINUX_REAL_APPIMAGE_FAILED";
+    error.receipt = { ...receipt, runtimeErrorCategories: linuxUpdaterRuntimeErrorCategories(runtimeErrors), status: "failed", stage, code, feedRequests: servedFeed, imageRequests: servedImage, unexpectedRequests };
+    throw error;
+  } finally {
+    dashboard?.close(); settings?.close();
+    for (const pid of await appPids(image).catch(() => [])) { try { process.kill(pid, "SIGUSR2"); } catch {} }
+    if (child) await terminateLinuxSmokeChild(child).catch(() => {});
+    server.closeAllConnections(); await new Promise((done) => server.close(done));
+    // The whole container is disposable. Leave profile/CA intact until Docker
+    // destroys it so a late child cannot escape cleanup by recreating paths.
+  }
+}
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.argv.length !== 2) fail("ARGUMENT_INVALID");
+  runRealLinuxAppImageUpdater().then((value) => console.log(JSON.stringify(value))).catch((error) => {
+    if (error.receipt) console.log(JSON.stringify(error.receipt));
+    console.error(error.code?.startsWith("LINUX_REAL_APPIMAGE_") ? error.code : "LINUX_REAL_APPIMAGE_FAILED"); process.exitCode = 1;
+  });
+}

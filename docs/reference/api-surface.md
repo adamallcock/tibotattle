@@ -24,6 +24,8 @@ actions.
 | --- | --- |
 | Public | No participant credential; bounded admission and publication controls can still apply. |
 | Enrollment | Same-origin enrollment plus the configured identity or invitation proof. |
+| Accountless enrollment | Native installation enrollment proof with a bounded device-hash body and no ambient participant/session authority. |
+| Accountless ownership | Device-secret proof against an active versioned installation enrollment; no session, social identity or pairing. |
 | Handoff | Short-lived, state-bound hosted identity handoff; provider callbacks terminate at the Worker. |
 | Session | Secure, HTTP-only participant session cookie and CSRF on mutations. |
 | Device | Rotating device bearer stored by the native app in the platform credential store. |
@@ -44,9 +46,12 @@ site.
 | Method | Path | Caller | Authority | Storage or network effect | Owner |
 | --- | --- | --- | --- | --- | --- |
 | all | `/.well-known/apple-developer-domain-association.txt` | Legacy crawler | None | Always returns 404 so the SPA cannot masquerade as configuration. | Worker |
-| `GET` | `/api/health` | App and operator probes | Public | Reads D1, deletion ledger, R2, ingress state, controls, and contract configuration; no mutation. | Worker operations |
+| `GET` | `/api/health` | App and operator probes | Public | Reads D1, deletion ledger, R2, controls and contract configuration; ingress-budget probing persists its lease housekeeping. A source-bound temporary migration fence serves storage-free liveness with `storageQualified: false`. | Worker operations |
 | `GET` | `/api/ready` | Deployment probes | Public | Reads lifecycle, retention, reconciliation, and rebuild readiness; no mutation. | Worker operations |
 | `POST` | `/api/v1/enroll` | Website or loopback relay | Enrollment | Validates identity/consent, creates or reattaches a D1 participant, and may bootstrap a device pairing. | Identity and contribution |
+| `POST` | `/api/v1/accountless/enrollment` | Native installation | Accountless enrollment | When the separately configured accountless enrollment gate is enabled, atomically records one versioned enrollment-only ledger row keyed by device ID and a 256-bit device-secret hash. It creates no participant, session, pairing, device credential, upload authority, identity link, or community eligibility. | Accountless enrollment pilot |
+| `POST` | `/api/v1/accountless/ownership` | Native installation | Accountless ownership | With accountless ownership enabled, proves the enrolled device secret and atomically creates one installation owner, credential and versioned v1.1 upload authorization, or returns the same existing receipt. Rejects ambient sessions and revoked/expired enrollment; creates no social consent or public-fit eligibility. | Accountless contribution |
+| `POST` | `/api/v1/accountless/renewal` | Native installation | Accountless ownership | Proves the same installation secret and renews only its active, policy-matched owner graph near or after lease expiry. Preserves identity and upload receipts; rejects revoked, erased or inconsistent state. | Accountless contribution |
 | `POST` | `/api/v1/internal/release/appcast` | Release publisher | Operator | Authenticated conditional appcast write to R2 with nonce/replay state in D1. | Release operations |
 | `POST` | `/api/v1/identity/google/start` | Website or loopback relay | Handoff | Creates a short-lived D1 handoff and returns the Google authorization URL. | Hosted identity |
 | `GET` | `/api/v1/identity/google/callback` | Google | Handoff | Exchanges the provider code, verifies identity, and completes the bounded D1 handoff. | Hosted identity |
@@ -213,6 +218,7 @@ is never an arbitrary local proxy.
 | Method | Path | Caller | Authority | Storage or network effect | Owner |
 | --- | --- | --- | --- | --- | --- |
 | `GET` | `/api/local/health` | Dashboard/native shell | Loopback read | Reports companion/snapshot readiness and enabled local capabilities. | Local companion |
+| `GET` | `/api/local/desktop-status` | Electron shell | Loopback read | Projects closed lifecycle, schema-v2 current display lanes with observation/reset times from bounded published-overview metadata, and receipt-only strict v2 notification evidence; no account identifiers or filesystem paths. Available before the first snapshot. | Local companion |
 | `GET` | `/api/local/diagnostics/contribution` | Dashboard/native shell | Loopback read | Reads a content-free local support projection. | Diagnostics |
 | `POST` | `/api/local/diagnostics/note` | Native shell | Loopback mutation | Records a bounded, fixed-vocabulary diagnostic reference; no prompt or path content. | Diagnostics |
 | `GET`, `POST` | `/api/local/identity/hosted-signin-handoff` | Dashboard/native shell | Loopback mutation | Inspects, stores, or clears the bounded local OAuth restart handle. | Hosted identity |

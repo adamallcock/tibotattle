@@ -1,3 +1,4 @@
+import { modelUsagePresentation, modelThemeIcon } from "../public/model-visuals.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -47,7 +48,7 @@ async function modelTable(locale) {
     localizedNode: (tag, className, key, values) => element(tag, className, t(key, values)),
     setRawText: (node, text) => { node.textContent = text; },
     setLocalizedText: (node, key) => { node.textContent = t(key); },
-    t, finite, formatModelName,
+    t, finite, formatModelName, modelUsagePresentation, modelThemeIcon,
     formatSharePercent: (part, whole) => whole > 0 ? `${(part / whole * 100).toFixed(1)}%` : null,
     formatCount: String,
     formatApiMoney: (value) => `$${value.toFixed(2)}`,
@@ -82,11 +83,13 @@ test("model table preserves unavailable, unreviewed, separate-allowance and pric
     const modelRows = body.children.filter((row) => !row.dataset.componentOf);
     const byName = (name) => modelRows.find((row) => contents(row.children[0]).replace("*", "") === name);
     const astra = byName("GPT-6 Astra");
-    assert.equal(astra.children[0].children[1].title, "gpt-6-astra");
+    assert.equal(astra.children[0].children[2].title, "gpt-6-astra");
     assert.equal(contents(astra.children[4]), "$5.00");
     const unavailable = byName(t("accounting.model.identityUnavailable"));
     assert.ok(unavailable, locale);
-    assert.equal(unavailable.children[0].children[1].title, t("accounting.model.identityUnavailableTitle"));
+    assert.equal(unavailable.children[0].children[1].tag, "svg");
+    assert.equal(unavailable.children[0].children[1].attributes["aria-hidden"], "true");
+    assert.equal(unavailable.children[0].children[2].title, t("accounting.model.identityUnavailableTitle"));
     assert.equal(unavailable.children[4].title, t("accounting.model.identityUnavailableTitle"));
     assert.equal(contents(unavailable.children[4]), t("accounting.model.notPricedUnknown"));
     assert.equal(contents(unavailable.children[5]), t("accounting.model.shareWithheld"));

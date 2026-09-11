@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  chmod, link, mkdtemp, readFile, rm, symlink, writeFile,
+  chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import { readCodexLocalThreadMetadata } from "../src/platform/index.js";
 const ROOT = "11111111-1111-4111-8111-111111111111";
 const WORKER = "22222222-2222-4222-8222-222222222222";
 const ABSENT = "33333333-3333-4333-8333-333333333333";
+const AUTO_REVIEW = "44444444-4444-4444-8444-444444444444";
 const PRIVATE_PROMPT_CANARY = "prompt-content-must-not-become-a-display-title";
 const SOURCE = JSON.stringify({ subagent: { thread_spawn: {
   parent_thread_id: ROOT, depth: 1, agent_path: null,
@@ -21,6 +22,19 @@ function named(id, name, updatedAt = "2026-08-30T10:00:00.000Z") {
   return JSON.stringify({ id, thread_name: name, updated_at: updatedAt });
 }
 
+function autoReviewSession(id, parentId, source = { subagent: { other: "guardian" } }) {
+  return JSON.stringify({
+    type: "session_meta",
+    payload: {
+      id,
+      parent_thread_id: parentId,
+      thread_source: "guardian_review",
+      source,
+      ignored_private_field: PRIVATE_PROMPT_CANARY,
+    },
+  });
+}
+
 async function fixture(t, { explicitName = false } = {}) {
   const home = await mkdtemp(join(tmpdir(), "local-thread-metadata-"));
   t.after(() => rm(home, { recursive: true, force: true }));
@@ -28,19 +42,38 @@ async function fixture(t, { explicitName = false } = {}) {
   const database = new DatabaseSync(databaseFile);
   database.exec(`CREATE TABLE threads (
     id TEXT PRIMARY KEY, title TEXT, source TEXT, thread_source TEXT,
-    agent_nickname TEXT${explicitName ? ", name TEXT" : ""}) STRICT;`);
+    agent_nickname TEXT, rollout_path TEXT${explicitName ? ", name TEXT" : ""}) STRICT;`);
   const insert = database.prepare(`INSERT INTO threads(
-    id, title, source, thread_source, agent_nickname${explicitName ? ", name" : ""})
-    VALUES (?, ?, ?, ?, ?${explicitName ? ", ?" : ""})`);
-  insert.run(ROOT, PRIVATE_PROMPT_CANARY, '"cli"', "user", null,
+    id, title, source, thread_source, agent_nickname, rollout_path${explicitName ? ", name" : ""})
+    VALUES (?, ?, ?, ?, ?, ?${explicitName ? ", ?" : ""})`);
+  insert.run(ROOT, PRIVATE_PROMPT_CANARY, '"cli"', "user", null, null,
     ...(explicitName ? ["Explicit root name"] : []));
-  insert.run(WORKER, PRIVATE_PROMPT_CANARY, SOURCE, "subagent", "Ada",
+  insert.run(WORKER, PRIVATE_PROMPT_CANARY, SOURCE, "subagent", "Ada", null,
     ...(explicitName ? [null] : []));
   database.close();
   await chmod(databaseFile, 0o600);
   const namesFile = join(home, "session_index.jsonl");
   await writeFile(namesFile, `${named(ROOT, "Plan synthetic app")}\n`, { mode: 0o600 });
   return { home, databaseFile, namesFile };
+}
+
+async function addAutoReview(t, { source } = {}) {
+  const fixtureValue = await fixture(t);
+  const directory = join(fixtureValue.home, "sessions", "2026", "08", "30");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const rolloutPath = join(directory,
+    "rollout-2026-08-30T10-00-00-44444444-4444-4444-8444-444444444444.jsonl");
+  await writeFile(rolloutPath, `${autoReviewSession(AUTO_REVIEW, ROOT, source)}\n`, {
+    mode: 0o600,
+  });
+  const database = new DatabaseSync(fixtureValue.databaseFile);
+  database.prepare(`INSERT INTO threads(
+    id, title, source, thread_source, agent_nickname, rollout_path)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(AUTO_REVIEW, PRIVATE_PROMPT_CANARY, JSON.stringify({ subagent: { other: "guardian" } }),
+      "guardian_review", null, rolloutPath);
+  database.close();
+  return { ...fixtureValue, rolloutPath };
 }
 
 test("selected metadata resolves display names and explicit worker parents without reading prompt titles", async (t) => {
@@ -54,6 +87,106 @@ test("selected metadata resolves display names and explicit worker parents witho
   ]);
   assert.doesNotMatch(JSON.stringify([...result]), new RegExp(PRIVATE_PROMPT_CANARY, "u"));
   assert.deepEqual(await Promise.all([readFile(databaseFile), readFile(namesFile)]), before);
+});
+
+test("guardian review uses only its own verified session parent and an accessible local parent record", async (t) => {
+  const { home, databaseFile, namesFile, rolloutPath } = await addAutoReview(t);
+  const before = await Promise.all([readFile(databaseFile), readFile(namesFile), readFile(rolloutPath)]);
+  let result = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.deepEqual(result.get(AUTO_REVIEW), {
+    id: AUTO_REVIEW,
+    name: null,
+    nickname: null,
+    parent: { id: ROOT, name: "Plan synthetic app" },
+    origin: "auto_review",
+  });
+  assert.doesNotMatch(JSON.stringify([...result]), new RegExp(PRIVATE_PROMPT_CANARY, "u"));
+  assert.deepEqual(await Promise.all([readFile(databaseFile), readFile(namesFile), readFile(rolloutPath)]), before);
+
+  let database = new DatabaseSync(databaseFile);
+  database.prepare("UPDATE threads SET source = ?, thread_source = ? WHERE id = ?")
+    .run(JSON.stringify({ subagent: { other: "guardian" } }), "guardian_review", ROOT);
+  database.close();
+  result = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW, ROOT]);
+  assert.deepEqual(result.get(AUTO_REVIEW), {
+    id: AUTO_REVIEW, name: null, nickname: null, parent: null, origin: "auto_review",
+  }, "an internal guardian-review parent is not a user-visible navigation target");
+  assert.equal(result.get(ROOT).origin, "auto_review",
+    "a separately requested guardian parent cannot restore an internal target");
+
+  database = new DatabaseSync(databaseFile);
+  database.prepare("UPDATE threads SET source = ?, thread_source = ? WHERE id = ?")
+    .run('"cli"', "user", ROOT);
+  database.close();
+
+  database = new DatabaseSync(databaseFile);
+  database.prepare("UPDATE threads SET thread_source = NULL WHERE id = ?").run(AUTO_REVIEW);
+  database.close();
+  result = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.deepEqual(result.get(AUTO_REVIEW), {
+    id: AUTO_REVIEW, name: null, nickname: null, parent: null, origin: "auto_review",
+  }, "a positive guardian source without a thread-store class stays visibly non-linkable");
+
+  database = new DatabaseSync(databaseFile);
+  database.prepare("UPDATE threads SET source = ?, thread_source = NULL WHERE id = ?")
+    .run(JSON.stringify({ subagent: { other: "unknown" } }), AUTO_REVIEW);
+  database.close();
+  result = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.equal(result.get(AUTO_REVIEW).origin, undefined,
+    "an ambiguous source without either exact guardian classification remains ordinary");
+  assert.equal(result.get(AUTO_REVIEW).parent, null);
+
+  database = new DatabaseSync(databaseFile);
+  database.prepare("UPDATE threads SET source = ?, thread_source = ? WHERE id = ?")
+    .run(JSON.stringify({ subagent: { other: "guardian" } }), "guardian_review", AUTO_REVIEW);
+  database.close();
+
+  database = new DatabaseSync(databaseFile);
+  database.prepare("UPDATE threads SET source = ? WHERE id = ?")
+    .run(JSON.stringify({ subagent: { other: "not-guardian" } }), AUTO_REVIEW);
+  database.close();
+  result = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.deepEqual(result.get(AUTO_REVIEW), {
+    id: AUTO_REVIEW, name: null, nickname: null, parent: null, origin: "auto_review",
+  }, "a thread-store source mismatch must not create a parent link");
+
+  database = new DatabaseSync(databaseFile);
+  database.prepare("UPDATE threads SET source = ? WHERE id = ?")
+    .run(JSON.stringify({ subagent: { other: "guardian" } }), AUTO_REVIEW);
+  database.close();
+  await writeFile(rolloutPath, `${autoReviewSession(AUTO_REVIEW, ROOT, {
+    subagent: { other: "not-guardian" },
+  })}\n`, { mode: 0o600 });
+  result = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.deepEqual(result.get(AUTO_REVIEW), {
+    id: AUTO_REVIEW, name: null, nickname: null, parent: null, origin: "auto_review",
+  }, "a source-classification mismatch must not create a parent link");
+
+  await writeFile(rolloutPath, `${" ".repeat(65_537)}\n`, { mode: 0o600 });
+  result = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.deepEqual(result.get(AUTO_REVIEW), {
+    id: AUTO_REVIEW, name: null, nickname: null, parent: null, origin: "auto_review",
+  }, "an oversized metadata record is unavailable rather than partially scanned");
+
+  await writeFile(rolloutPath, `${autoReviewSession(AUTO_REVIEW, ROOT)}\n`, { mode: 0o600 });
+  database = new DatabaseSync(databaseFile);
+  database.prepare("UPDATE threads SET rollout_path = ? WHERE id = ?")
+    .run(databaseFile, AUTO_REVIEW);
+  database.close();
+  result = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.deepEqual(result.get(AUTO_REVIEW), {
+    id: AUTO_REVIEW, name: null, nickname: null, parent: null, origin: "auto_review",
+  }, "only the selected Codex sessions directory may supply a review parent");
+
+  database = new DatabaseSync(databaseFile);
+  database.prepare("UPDATE threads SET rollout_path = ? WHERE id = ?")
+    .run(rolloutPath, AUTO_REVIEW);
+  database.prepare("DELETE FROM threads WHERE id = ?").run(ROOT);
+  database.close();
+  result = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.deepEqual(result.get(AUTO_REVIEW), {
+    id: AUTO_REVIEW, name: null, nickname: null, parent: null, origin: "auto_review",
+  }, "a parent UUID without an accessible Codex thread record is not navigation evidence");
 });
 
 test("the newest valid display name wins independently of physical row order", async (t) => {

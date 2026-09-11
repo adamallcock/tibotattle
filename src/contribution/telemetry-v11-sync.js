@@ -16,6 +16,14 @@ import {
   TELEMETRY_V11_DOMAIN_MANIFEST_SCHEMA_VERSION,
 } from "@app-usagemonitor/telemetry-contract";
 import { sanitizeTelemetryAttributionBinding } from "./account-track.js";
+import {
+  accountlessDeviceUnavailableCode,
+  accountlessTransportOrigin,
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+} from "./accountless-transport-contract.js";
 
 // One foreground pass, one immutable day and one envelope in flight. The
 // application injects an already-reviewed reader and a leased secret adapter;
@@ -138,7 +146,8 @@ async function boundedBody(response, maximumBytes, signal) {
 
 function classifyResponse(response, body, clock, deviceAuthorized) {
   const backend = body?.error?.code;
-  if (["DEVICE_AUTH_INVALID", "PARTICIPANT_DELETING"].includes(backend)) {
+  if (["DEVICE_AUTH_INVALID", "PARTICIPANT_DELETING"].includes(backend)
+      || accountlessDeviceUnavailableCode(backend)) {
     stop("device_unavailable", { deviceUnavailable: true });
   }
   if (backend === "TELEMETRY_CONSENT_INVALID" || backend === "TELEMETRY_TRANSPORT_BLOCKED") stop("consent_rejected");
@@ -224,8 +233,13 @@ function transport(options, maxDurationMs) {
 }
 
 function capabilities(value, origin) {
-  if (!exact(value, ["schemaVersion", "destinationOrigin", "enrollmentNamespace", "identityVersion",
-    "minimumWriteRank", "policyRevision", "requiredConsent", "consentCurrent", "formats"])
+  const accountless = value?.authorityKind === "accountless";
+  const keys = ["schemaVersion", "destinationOrigin", "enrollmentNamespace", "identityVersion",
+    "minimumWriteRank", "policyRevision", "requiredConsent", "consentCurrent", "formats"];
+  if (accountless) keys.push("authorityKind", "authorizationCurrent");
+  if (!exact(value, keys)
+      || (accountless && (value.consentCurrent !== false
+        || typeof value.authorizationCurrent !== "boolean"))
       || value.schemaVersion !== "device-sync-capabilities-v1.1" || value.destinationOrigin !== origin
       || value.identityVersion !== "account-track-v2" || !Object.values(FORMATS).includes(value.minimumWriteRank)
       || !integer(value.policyRevision) || typeof value.consentCurrent !== "boolean"
@@ -243,10 +257,49 @@ function capabilities(value, origin) {
   }
   return freeze(JSON.parse(JSON.stringify(value)));
 }
-function requireConsent(capability) {
+function requireTransportAdmission(capability, accountless) {
   const format = capability.formats.find((item) => item.schemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION);
-  if (!capability.consentCurrent || format.lifecycle !== "accepted"
+  const authorized = accountless
+    ? capability.authorityKind === "accountless" && capability.authorizationCurrent === true
+    : capability.authorityKind === undefined && capability.consentCurrent === true;
+  if (!authorized || format.lifecycle !== "accepted"
       || format.rank < capability.minimumWriteRank) stop("consent_rejected");
+}
+
+function accountlessAuthorization(value, laboratory, rehearsal, production, serverBaseUrl) {
+  if (accountlessTransportOrigin({ laboratory, rehearsal, production, origin: serverBaseUrl }) === null
+      || !exact(value, ["authorizationBasis", "policyVersion", "schemaVersion", "telemetrySchemaVersion"])
+      || value.schemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION
+      || value.policyVersion !== ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION
+      || value.authorizationBasis !== ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS
+      || value.telemetrySchemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION) {
+    const error = new TypeError("Accountless contribution authorization is invalid");
+    error.code = "contribution_incremental_sync_authorization_invalid";
+    throw error;
+  }
+  return freeze({ ...value });
+}
+
+// The fixed v1.1 field dictionary stays on the wire for both modes. In the
+// accountless mode it describes the content contract only: authorization is
+// the separately versioned policy record checked by the service, never a
+// fabricated local consent event.
+function transportAuthorization({ consent, authorization, laboratory, rehearsal, production, serverBaseUrl }) {
+  if (authorization !== undefined) {
+    if (consent !== undefined) {
+      const error = new TypeError("Accountless contribution authorization is invalid");
+      error.code = "contribution_incremental_sync_authorization_invalid";
+      throw error;
+    }
+    const accountless = accountlessAuthorization(authorization, laboratory, rehearsal, production, serverBaseUrl);
+    return Object.freeze({ journalBinding: Object.freeze({ mode: "accountless_policy", accountless }) });
+  }
+  if (!isTelemetryV11ConsentCurrent(consent)) {
+    const error = new TypeError("Explicit attribution contribution consent is required");
+    error.code = "contribution_incremental_sync_consent_invalid";
+    throw error;
+  }
+  return Object.freeze({ journalBinding: consent });
 }
 
 /** Read-only, authenticated review preflight; it never grants consent. */
@@ -360,10 +413,10 @@ function publicationSnapshot(value) {
 // immutable manifest identities already staged for an exact local publication.
 // The root secret, upload authority and short-lived predecessor token never
 // enter it. Every resumed vector still needs the server's full activation proof.
-function progressContext(publication, capability, deviceAuthorization, consent) {
+function progressContext(publication, capability, deviceAuthorization, journalBinding) {
   const deviceId = deviceAuthorization.slice("Device um_device_".length,
     "Device um_device_".length + 36);
-  return hash(canonicalTelemetryV11Json({
+  const context = {
     schemaVersion: PROGRESS_VERSION,
     parserVersion: publication.parserVersion,
     destinationOrigin: capability.destinationOrigin,
@@ -371,8 +424,15 @@ function progressContext(publication, capability, deviceAuthorization, consent) 
     enrollmentNamespace: capability.enrollmentNamespace,
     identityVersion: capability.identityVersion,
     policyRevision: capability.policyRevision,
-    consent,
-  }));
+  };
+  if (journalBinding?.mode === "accountless_policy") {
+    context.authorization = journalBinding.accountless;
+  } else {
+    // Retain the historical key for the explicit-consent path so existing
+    // resumability journals remain valid under the same authorization.
+    context.consent = journalBinding;
+  }
+  return hash(canonicalTelemetryV11Json(context));
 }
 
 function progressSnapshot(value, expected, revalidateProgress) {
@@ -400,19 +460,15 @@ function progressSnapshot(value, expected, revalidateProgress) {
   return { days, validatedDays: reset ? 0 : value.validatedDays, reset };
 }
 
-/** Explicit v1.1 consent is required before even the first authenticated read. */
+/** A closed explicit consent or accountless policy authorization is required. */
 export async function runTelemetryV11Sync({
-  serverBaseUrl, deviceAuthorization, consent, days, readDay, createEnvelope,
+  serverBaseUrl, deviceAuthorization, consent, authorization = undefined, laboratory = undefined, rehearsal = false, production = false, days, readDay, createEnvelope,
   fetchImpl = globalThis.fetch, signal, clock = Date.now,
   maxChunks = 500, maxDurationMs = 60_000, requestTimeoutMs = 30_000,
   maxDays = MAX_TELEMETRY_V11_DOMAIN_DAYS,
   progressStore = null, sourcePublication = null, revalidateProgress = false,
 } = {}) {
-  if (!isTelemetryV11ConsentCurrent(consent)) {
-    const error = new TypeError("Explicit attribution contribution consent is required");
-    error.code = "contribution_incremental_sync_consent_invalid";
-    throw error;
-  }
+  const selectedAuthorization = transportAuthorization({ consent, authorization, laboratory, rehearsal, production, serverBaseUrl });
   if (!integer(maxChunks, 2_000) || maxChunks < 1 || !integer(maxDurationMs, 300_000) || maxDurationMs < 1
       || !integer(maxDays, MAX_TELEMETRY_V11_DOMAIN_DAYS) || maxDays < 1
       || !Array.isArray(days) || days.length > maxDays || typeof readDay !== "function" || typeof createEnvelope !== "function"
@@ -451,7 +507,7 @@ export async function runTelemetryV11Sync({
   }
   try {
     const capability = capabilities(await client.request("/api/v1/device/sync-capabilities"), client.origin);
-    requireConsent(capability);
+    requireTransportAdmission(capability, authorization !== undefined);
     const binding = Object.freeze({ destinationOrigin: capability.destinationOrigin, enrollmentNamespace: capability.enrollmentNamespace });
     let before = predecessor(await client.request("/api/v1/me/telemetry-v11/domain-predecessor", { body: {} }), clock);
     const fromDay = localDays.length ? [before.fromDay, localDays[0]].sort()[0] : before.fromDay;
@@ -461,7 +517,8 @@ export async function runTelemetryV11Sync({
     if (!integer(count, maxDays) || count < 1) stop("index_unavailable");
     daysTotal = count;
     const scope = progressStore === null ? null : {
-      contextDigest: progressContext(publication, capability, deviceAuthorization, consent),
+      contextDigest: progressContext(publication, capability, deviceAuthorization,
+        selectedAuthorization.journalBinding),
       sourceFingerprint: hash(publication.fingerprint),
       previousGenerationId: before.previousGenerationId, legacyFingerprint: before.legacyFingerprint,
       fromDay, throughDay, count, first,
@@ -560,7 +617,7 @@ export async function runTelemetryV11Sync({
       await client.bounded(() => new Promise((resolve) => setImmediate(resolve)));
     }
     const after = capabilities(await client.request("/api/v1/device/sync-capabilities"), client.origin);
-    requireConsent(after);
+    requireTransportAdmission(after, authorization !== undefined);
     if (after.enrollmentNamespace !== capability.enrollmentNamespace
         || after.policyRevision !== capability.policyRevision) stop("revision_conflict", { retryable: true });
     // A resumed prefix is trusted only for the pinned predecessor, not merely

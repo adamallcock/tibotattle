@@ -12,7 +12,7 @@ const suffix = `${APP_PRICE_REGISTRY_MANIFEST.sha256}:v1-fit-7:${SERVER_PRICING_
 const budget = (remainingQueries=30) => ({remainingQueries, deadlineMs:1, now:()=>0});
 async function fixture() {
   await db().batch([
-    "CREATE TABLE participants(id TEXT PRIMARY KEY,state TEXT)",
+    "CREATE TABLE participants(id TEXT PRIMARY KEY,state TEXT,owner_kind TEXT NOT NULL CHECK (owner_kind IN ('social','accountless')))",
     "CREATE TABLE community_snapshot_mutation_control(singleton_id INTEGER PRIMARY KEY,mutation_epoch INTEGER)",
     "INSERT INTO community_snapshot_mutation_control VALUES(1,1)",
     "CREATE TABLE community_analytical_input_versions(participant_id TEXT PRIMARY KEY,revision INTEGER)",
@@ -27,7 +27,7 @@ async function fixture() {
 }
 function fit(participantId: string) { return {participantId,planType:"pro",capacityNanousd:123_000_000_000,lastObservedAt:"2026-08-20T00:00:00.000Z"}; }
 async function participant(id: string, source="v1", state="active") {
-  const statements = [db().prepare("INSERT INTO participants VALUES(?,?)").bind(id,state),
+  const statements = [db().prepare("INSERT INTO participants(id,state,owner_kind) VALUES(?,?,'social')").bind(id,state),
     db().prepare("INSERT INTO community_analytical_input_versions VALUES(?,1)").bind(id),
     db().prepare("INSERT INTO community_current_analysis_queue(participant_id) VALUES(?)").bind(id)];
   if (["v1","mixed","v1.1"].includes(source)) statements.push(db().prepare("INSERT INTO telemetry_v1_chunks VALUES(?,NULL)").bind(id));

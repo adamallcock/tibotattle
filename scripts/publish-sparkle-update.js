@@ -47,6 +47,11 @@ import {
   validateSignedSparkleFeed,
 } from "./sparkle-signed-feed-validation.js";
 
+import {
+  isElectronSparkleTransition, validateElectronSparkleTransitionManifest,
+  validateElectronSparkleDMG, readElectronSparkleJourney, assertElectronSparkleContinuity,
+} from "./electron-sparkle-transition.js";
+
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
 const WRANGLER_PATH = join(
@@ -414,6 +419,29 @@ function readAppcastAtomicGuardToken(envName) {
   return normalizeAppcastAtomicGuardToken(value);
 }
 
+// Multi-target callers retain this private guard, not the credential or its
+// environment variable. Standalone publication keeps its one-call behavior.
+export function createAppcastAtomicGuardFromEnvironment({
+  channel = "stable",
+  architecture = "arm64",
+  endpoint,
+  tokenEnv = APPCAST_ATOMIC_GUARD_TOKEN_ENV,
+  fetchGuard = defaultPublicFetch,
+} = {}) {
+  const releaseChannel = resolveReleaseChannel(channel, { architecture });
+  const normalizedEndpoint = normalizeAppcastAtomicGuardEndpoint(endpoint, releaseChannel);
+  const normalizedTokenEnv = normalizeAppcastAtomicGuardTokenEnv(tokenEnv);
+  if (normalizedEndpoint === null || normalizedTokenEnv === null || typeof fetchGuard !== "function") {
+    fail("Remote appcast guard options are required", "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_REQUIRED");
+  }
+  return Object.freeze(createRemoteAppcastAtomicGuard({
+    channel: releaseChannel,
+    endpoint: normalizedEndpoint,
+    token: readAppcastAtomicGuardToken(normalizedTokenEnv),
+    fetchGuard,
+  }));
+}
+
 async function readRegularInput(path, { label, maximumBytes }) {
   const selected = resolve(requiredOption(path, label));
   const metadata = await lstat(selected).catch((error) => {
@@ -492,6 +520,9 @@ function validateReleaseManifest(
   sparklePublicKey,
   channel,
 ) {
+  if (isElectronSparkleTransition(manifest)) {
+    return validateElectronSparkleTransitionManifest(manifest, dmg, sparklePublicKey, channel);
+  }
   if (manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA
       || normalizeReleaseArchitecture(manifest.application?.architecture) !== channel.architecture
       || manifest.application?.bundleIdentifier !== PRODUCT_BRAND.bundleIdentifier
@@ -2135,6 +2166,7 @@ export async function publishSparkleUpdate({
   fetchPublic = defaultPublicFetch,
   fetchGuard = defaultPublicFetch,
   validateDMG = validateMacOSDMG,
+  validateElectronDMG = validateElectronSparkleDMG,
 } = {}) {
   if (typeof publish !== "boolean" || typeof replaceAppcast !== "boolean"
       || typeof stableBootstrap !== "boolean"
@@ -2146,6 +2178,7 @@ export async function publishSparkleUpdate({
       || typeof fetchPublic !== "function"
       || typeof fetchGuard !== "function"
       || typeof validateDMG !== "function"
+      || typeof validateElectronDMG !== "function"
       || typeof sourceRepositoryRoot !== "string"
       || sourceRepositoryRoot.length === 0
       || sourceRepositoryRoot.includes("\0")
@@ -2221,7 +2254,11 @@ export async function publishSparkleUpdate({
       runSourceGit,
     },
   );
-  const validatedDMG = await validateDMG(dmg.path, {
+  const electronTransition = isElectronSparkleTransition(manifest.manifest);
+  const transitionJourney = electronTransition ? await readElectronSparkleJourney(manifest.manifest, releaseManifest.path) : null;
+  const validatedDMG = electronTransition
+    ? await validateElectronDMG(dmg.path, { manifest: manifest.manifest, manifestPath: releaseManifest.path })
+    : await validateDMG(dmg.path, {
     architecture: releaseChannel.architecture,
     expectedBundleIdentifier: manifest.manifest.application.bundleIdentifier,
     expectedBundleVersion: manifest.bundleVersion,
@@ -2290,6 +2327,9 @@ export async function publishSparkleUpdate({
   const previousStableManifest = previousStableManifestPath === null
     ? null
     : await readStableReleaseManifest(previousStableManifestPath);
+  if (electronTransition) {
+    assertElectronSparkleContinuity({ manifest: manifest.manifest, previousManifest: previousStableManifest, journey: transitionJourney, stableBootstrap });
+  } else {
   assertStableSparkleKeyContinuity({
     architecture: releaseChannel.architecture,
     candidateBundleVersion: manifest.bundleVersion,
@@ -2298,6 +2338,7 @@ export async function publishSparkleUpdate({
     previousManifest: previousStableManifest,
     stableBootstrap,
   });
+  }
   const publication = Object.freeze({
     architecture: releaseChannel.architecture,
     appcast: Object.freeze({

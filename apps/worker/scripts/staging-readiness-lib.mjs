@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 
 export const STAGING_READINESS_SCHEMA_VERSION =
   "usage-monitor-staging-readiness-v0.1";
@@ -15,6 +16,7 @@ export const STAGING_PROOF_TYPES = Object.freeze({
 export const REQUIRED_STAGING_SECRETS = Object.freeze([
   "ENVELOPE_PRIVATE_JWK",
   "ENVELOPE_PUBLIC_JWK",
+  "IDENTITY_LINK_SECRET",
 ]);
 export const REQUIRED_D1_BINDINGS = Object.freeze([
   Object.freeze({
@@ -111,12 +113,31 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0054_current_analysis_queue.sql",
     "0055_captured_community_publication.sql",
     "0056_preparation_progress_counters.sql",
+    // Accountless enrollment is a source-only, disabled-by-default boundary.
+    // These are forward successors to the deployed canonical 0046–0056
+    // lineage; the earlier staging-only 0046–0048 names are retained below
+    // solely as non-deployable rehearsal evidence.
+    "0057_accountless_enrollment_ledger.sql",
+    "0058_accountless_upload_ownership.sql",
+    "0059_accountless_upload_renewal.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
     "0002_identity_reenrollment_cooldown.sql",
   ]),
 });
+
+// A prior synthetic-only staging rehearsal applied a divergent 0046–0048
+// accountless lineage. It must never be replayed or treated as current: its
+// database remains retained evidence until a separately approved canonical
+// replacement is prepared. Keep this closed sequence so unrelated drift is
+// never misclassified as that retained lineage.
+export const RETAINED_LEGACY_STAGING_MIGRATION_LINEAGE = Object.freeze([
+  ...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 45),
+  "0046_accountless_enrollment_ledger.sql",
+  "0047_accountless_upload_ownership.sql",
+  "0048_accountless_upload_renewal.sql",
+]);
 
 // A current migration ledger is necessary, but not proof that its integrity
 // objects still exist. Both local release rehearsal and read-only staging
@@ -1009,12 +1030,77 @@ BEGIN
 END`,
 });
 
-function exactStoredSchemaProbe(objects) {
-  return Object.entries(objects).map(([name, sql]) => `EXISTS (
+// Migration 0059 deliberately replaces these previously exact DDL objects to
+// add the social-owner predicate. Preserve exact checks for every unaffected
+// object and make the replacement set a closed, explicit post-accountless
+// contract. A current 0059 ledger without these predicates is not ready.
+const ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES = Object.freeze({
+  history: Object.freeze([
+    "community_analytical_input_legacy_update",
+    "community_model_history_v1_insert",
+    "community_model_history_v1_update",
+    "community_model_history_v1_delete",
+    "community_model_history_legacy_insert",
+    "community_model_history_legacy_update",
+    "community_model_history_legacy_delete",
+    "community_model_history_successor_insert",
+    "community_model_history_successor_update",
+    "community_model_history_successor_delete",
+    "community_model_history_participant_state",
+    "community_model_history_participant_delete",
+  ]),
+  graph: Object.freeze([
+    "community_analytical_input_v1_insert",
+    "community_analytical_input_v1_update",
+  ]),
+  refresh: Object.freeze([
+    "community_refresh_fit_insert",
+    "community_refresh_fit_delete",
+    "community_refresh_fit_update",
+    "community_refresh_model_insert",
+    "community_refresh_model_delete",
+    "community_refresh_model_update",
+  ]),
+  scale: Object.freeze([
+    "community_current_analysis_revision_insert",
+    "community_current_analysis_revision_update",
+    "community_current_analysis_fit_insert",
+    "community_current_analysis_fit_delete",
+    "community_current_analysis_fit_update",
+    "community_current_analysis_model_insert",
+    "community_current_analysis_model_delete",
+    "community_current_analysis_model_update",
+    "community_publication_fit_insert",
+    "community_publication_fit_delete",
+    "community_publication_fit_update",
+    "community_publication_model_insert",
+    "community_publication_model_delete",
+    "community_publication_model_update",
+    "community_preparation_progress_insert",
+    "community_preparation_progress_update",
+    "community_preparation_progress_delete",
+  ]),
+});
+
+const ACCOUNTLESS_SOCIAL_OWNER_COMPACT_SQL =
+  "replace(replace(replace(replace(lower(sql), char(10), ''), char(13), ''), char(9), ''), ' ', '')";
+
+function exactStoredSchemaProbe(objects, omittedNames = []) {
+  const omitted = new Set(omittedNames);
+  return Object.entries(objects).filter(([name]) => !omitted.has(name)).map(([name, sql]) => `EXISTS (
   SELECT 1 FROM sqlite_master WHERE name = ${sqlStringLiteral(name)}
     AND type = ${sqlStringLiteral(sql.startsWith("CREATE TABLE") ? "table"
       : sql.startsWith("CREATE INDEX") ? "index" : "trigger")}
     AND sql IS ${sqlStringLiteral(sql)}
+)`).join(" AND ");
+}
+
+function socialOwnerGatedTriggerProbe(names) {
+  return names.map((name) => `EXISTS (
+  SELECT 1 FROM sqlite_master WHERE name = ${sqlStringLiteral(name)}
+    AND type = 'trigger'
+    AND instr(${ACCOUNTLESS_SOCIAL_OWNER_COMPACT_SQL},
+      ${sqlStringLiteral("owner_kind='social'")}) > 0
 )`).join(" AND ");
 }
 
@@ -1071,6 +1157,31 @@ export const REFRESH_LANE_SCHEMA_PROBE_SQL = `
 SELECT ${exactStoredSchemaProbe(REFRESH_LANE_SCHEMA_SQL)} AS refresh_lane_schema
 `;
 
+export const POST_ACCOUNTLESS_COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(
+  CURRENT_MODEL_HISTORY_SCHEMA_SQL,
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history,
+)} AND ${socialOwnerGatedTriggerProbe(
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history,
+)} AS community_model_history_schema
+`;
+export const POST_ACCOUNTLESS_COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(
+  CURRENT_GRAPH_PRESERVATION_SCHEMA_SQL,
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.graph,
+)} AND ${socialOwnerGatedTriggerProbe(
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.graph,
+)} AS community_graph_preservation_schema
+`;
+export const POST_ACCOUNTLESS_REFRESH_LANE_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(
+  REFRESH_LANE_SCHEMA_SQL,
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.refresh,
+)} AND ${socialOwnerGatedTriggerProbe(
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.refresh,
+)} AS refresh_lane_schema
+`;
+
 // One bounded metadata query: no contribution, identity, token or policy-state
 // values leave the database, and no table-per-column remote round trips.
 export const ATTRIBUTION_SCHEMA_PROBE_SQL = `
@@ -1093,6 +1204,33 @@ AND (${COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL})
 AND (${COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL})
 AND (${PREPARED_SOURCE_DAY_SCHEMA_PROBE_SQL})
 AND (${REFRESH_LANE_SCHEMA_PROBE_SQL}) AS attribution_objects,
+NOT EXISTS (
+  SELECT 1 FROM required_columns expected
+   WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual
+     WHERE actual.name = expected.column_name)
+) AS attribution_columns;
+`;
+
+export const POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL = `
+WITH required_objects(type, name) AS (VALUES
+  ${ATTRIBUTION_SCHEMA_OBJECTS.map((entry) =>
+    `(${entry.map(sqlStringLiteral).join(", ")})`).join(",\n  ")}
+), required_columns(table_name, column_name) AS (VALUES
+  ${Object.entries(ATTRIBUTION_SCHEMA_COLUMNS).flatMap(([table, columns]) =>
+    columns.map((column) => `(${sqlStringLiteral(table)}, ${sqlStringLiteral(column)})`))
+    .join(",\n  ")}
+)
+SELECT NOT EXISTS (
+  SELECT 1 FROM required_objects expected
+   WHERE NOT EXISTS (SELECT 1 FROM sqlite_master actual
+     WHERE actual.type = expected.type AND actual.name = expected.name)
+) AND (${V1_USAGE_CURSOR_INDEX_PROBE_SQL})
+AND (${V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL})
+AND (${COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL})
+AND (${POST_ACCOUNTLESS_COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL})
+AND (${POST_ACCOUNTLESS_COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL})
+AND (${PREPARED_SOURCE_DAY_SCHEMA_PROBE_SQL})
+AND (${POST_ACCOUNTLESS_REFRESH_LANE_SCHEMA_PROBE_SQL}) AS attribution_objects,
 NOT EXISTS (
   SELECT 1 FROM required_columns expected
    WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual
@@ -1394,6 +1532,27 @@ NOT EXISTS (
      AND dflt_value IS NULL AND pk = 0
 ) AS scale_columns;
 `;
+export const POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL = `
+WITH required_columns(table_name, column_name) AS (VALUES
+  ${Object.entries(SCALE_SCHEMA_COLUMNS).flatMap(([table, columns]) =>
+    columns.map(column => `(${sqlStringLiteral(table)}, ${sqlStringLiteral(column)})`)).join(",\n  ")}
+)
+SELECT ${exactStoredSchemaProbe(
+  SCALE_SCHEMA_SQL,
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale,
+)} AND ${socialOwnerGatedTriggerProbe(
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale,
+)} AS scale_objects,
+NOT EXISTS (
+  SELECT 1 FROM required_columns expected
+   WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual
+     WHERE actual.name = expected.column_name)
+) AND EXISTS (
+  SELECT 1 FROM pragma_table_info('admin_community_allowance_preview_cache')
+   WHERE name = 'publication_generation' AND type = 'TEXT' AND "notnull" = 0
+     AND dflt_value IS NULL AND pk = 0
+) AS scale_columns;
+`;
 export function scaleSchemaComplete(row) {
   return row?.scale_objects === 1 && row?.scale_columns === 1;
 }
@@ -1410,6 +1569,8 @@ export const REQUIRED_RATE_LIMITS = Object.freeze([
 export const REQUIRED_STAGING_VARIABLES = Object.freeze({
   ENVIRONMENT: "staging",
   ENROLLMENT_MODE: "disabled",
+  ACCOUNTLESS_ENROLLMENT_MODE: "disabled",
+  ACCOUNTLESS_OWNERSHIP_MODE: "disabled",
   ACCOUNT_SCOPED_INGEST_MODE: "disabled",
   UPLOAD_INGRESS_QUEUE_MODE: "disabled",
   UPLOAD_INGRESS_MAX_CONCURRENT: "8",
@@ -1420,6 +1581,7 @@ export const REQUIRED_STAGING_VARIABLES = Object.freeze({
   UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
   SIGN_IN_START_MAX_PER_MINUTE: "5",
   IDENTITY_LINK_SECRET_VERSION: "staging-v1",
+  PUBLIC_ORIGIN: DEPLOYMENT_ENDPOINTS.staging.origin,
 });
 export const REQUIRED_INGRESS_DURABLE_OBJECT_BINDING = Object.freeze({
   name: "UPLOAD_INGRESS_BUDGET",
@@ -2023,7 +2185,7 @@ export function assessStagingConfiguration(
     workersDevHttpsEnabled: environment?.workers_dev === true,
     originBoundaryClosed: environment?.workers_dev === true
       && !Object.hasOwn(environment ?? {}, "routes")
-      && !Object.hasOwn(environment?.vars ?? {}, "PUBLIC_ORIGIN"),
+      && environment?.vars?.PUBLIC_ORIGIN === DEPLOYMENT_ENDPOINTS.staging.origin,
     previewUrlsDisabled: environment?.preview_urls === false,
     observabilityEnabled: environment?.observability?.enabled === true
       && environment?.observability?.head_sampling_rate === 1,
@@ -2036,6 +2198,9 @@ export function assessStagingConfiguration(
       && environment.triggers.crons[0] === "* * * * *",
     enrollmentDisabled: environment?.vars?.ENVIRONMENT === "staging"
       && environment?.vars?.ENROLLMENT_MODE === "disabled",
+    accountlessAdmissionDisabled:
+      environment?.vars?.ACCOUNTLESS_ENROLLMENT_MODE === "disabled"
+      && environment?.vars?.ACCOUNTLESS_OWNERSHIP_MODE === "disabled",
     accountScopedIngestDisabled:
       environment?.vars?.ACCOUNT_SCOPED_INGEST_MODE === "disabled",
     noUnexpectedVariables: exactStringMap(
@@ -2129,7 +2294,11 @@ function migrationNames(value) {
     : null;
 }
 
-function classifyMigrationProbe(result, expectedNames) {
+function classifyMigrationProbe(
+  result,
+  expectedNames,
+  { legacyLineage = null } = {},
+) {
   if (!result.ok) {
     const output = `${result.stdout}${result.stderr}`;
     if (/no such table[\s:]+.*d1_migrations|d1_migrations.*no such table/iu.test(
@@ -2151,6 +2320,12 @@ function classifyMigrationProbe(result, expectedNames) {
   }
   if (sameStringArray(names, expectedNames)) {
     return { status: "current", code: null };
+  }
+  if (legacyLineage !== null && sameStringArray(names, legacyLineage)) {
+    return {
+      status: "legacy_replacement_required",
+      code: "REMOTE_MIGRATION_LEGACY_LINEAGE_REPLACEMENT_REQUIRED",
+    };
   }
   if (names.every((name, index) => name === expectedNames[index])) {
     return { status: "pending", code: "REMOTE_MIGRATIONS_PENDING" };
@@ -2648,6 +2823,9 @@ export function probeStagingLive({
       const state = classifyMigrationProbe(
         result,
         EXPECTED_STAGING_MIGRATIONS[entry.binding],
+        entry.binding === "USAGE_MONITOR_DB"
+          ? { legacyLineage: RETAINED_LEGACY_STAGING_MIGRATION_LINEAGE }
+          : undefined,
       );
       return Object.freeze({
         binding: entry.binding,
@@ -2749,7 +2927,7 @@ export function probeStagingLive({
         [
           "d1", "execute", "USAGE_MONITOR_DB",
           "--remote", "--env", "staging",
-          "--command", ATTRIBUTION_SCHEMA_PROBE_SQL,
+          "--command", POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
           "--json",
         ],
         spawn,
@@ -2764,7 +2942,7 @@ export function probeStagingLive({
         [
           "d1", "execute", "USAGE_MONITOR_DB",
           "--remote", "--env", "staging",
-          "--command", SCALE_SCHEMA_PROBE_SQL,
+          "--command", POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
           "--json",
         ],
         spawn,

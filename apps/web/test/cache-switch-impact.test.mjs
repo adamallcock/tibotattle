@@ -903,9 +903,9 @@ test("cache-impact money rendering keeps Standard continuity evidence visible", 
       allowanceWeighting: premiumWeighting(15, 20, 3),
     }),
   };
-  assert.equal(metricValues.cacheSwitchMetricValue(subtotal), "Subtotal $15.00");
-  assert.equal(metricValues.cacheContinuityMetricValue(subtotal), "Subtotal $15.00");
-  assert.equal(metricValues.cacheContinuityStandardMetricValue(subtotal), "Subtotal $10.00");
+  assert.equal(metricValues.cacheSwitchMetricValue(subtotal), "$15.00");
+  assert.equal(metricValues.cacheContinuityMetricValue(subtotal), "$15.00");
+  assert.equal(metricValues.cacheContinuityStandardMetricValue(subtotal), "$10.00");
   assert.equal(metricValues.cacheContinuityUsesStandardFallback(subtotal), false);
   const standardOnlySubtotal = {
     ...subtotal,
@@ -913,7 +913,7 @@ test("cache-impact money rendering keeps Standard continuity evidence visible", 
       allowanceWeighting: unavailablePremiumWeighting(),
     }),
   };
-  assert.equal(metricValues.cacheSwitchMetricValue(standardOnlySubtotal), "Subtotal $10.00");
+  assert.equal(metricValues.cacheSwitchMetricValue(standardOnlySubtotal), "$10.00");
   assert.equal(metricValues.cacheContinuityUsesStandardFallback(standardOnlySubtotal), true);
   for (const unavailable of [
     { ...subtotal, coveredSubtotal: null, pricedDrops: 0, unpricedDrops: 4 },
@@ -1007,7 +1007,7 @@ test("cache-switch mobile cards carry their translated column labels", async () 
     element,
     (key) => `translated:${key}`,
   );
-  const disclosure = { hidden: true, open: false };
+  const disclosure = { hidden: true, open: false, querySelector: () => null };
   const rows = element("tbody");
   const render = Function(
     "$",

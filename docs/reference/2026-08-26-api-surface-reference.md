@@ -39,11 +39,11 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 26 paths, 28 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 27 paths, 29 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 36 API paths, 37 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 39 API paths, 40 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
@@ -148,7 +148,7 @@ enforce their closed JSON shape and byte ceiling.
 
 `GET /api/local/timeline/window-breakdown` is the sole local API route that
 accepts a query string, and only `from` and `to` as bounded base-ten safe
-integers. Health, contribution diagnostics, diagnostic notes, and the
+integers. Health, desktop status, contribution diagnostics, diagnostic notes, and the
 hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 
 ### Local route inventory
@@ -156,6 +156,7 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/local/health` | Companion readiness, refresh state, schema versions, and configured capabilities |
+| `GET` | `/api/local/desktop-status` | Closed lifecycle plus a current direct display allowance from bounded published-overview metadata; strict v2 notification evidence remains receipt-only. Available before the first snapshot and without account identifiers or filesystem paths. |
 | `GET` | `/api/local/diagnostics/contribution` | Closed, path-free contribution support diagnostics for the native shell |
 | `POST` | `/api/local/diagnostics/note` | Record one bounded fixed-vocabulary local diagnostic note |
 | `GET`, `POST` | `/api/local/identity/hosted-signin-handoff` | Read or update the bounded local recovery handle for an in-flight hosted sign-in |
@@ -303,6 +304,12 @@ Authority vocabulary:
 - **Handoff / reattachment** — a Handoff proof establishes identity; an
   identity already bound to a participant reattaches that participant. It does
   not accept a recovery code.
+- **Accountless enrollment** — a bounded native-installation request records a
+  versioned enrollment-only ledger row keyed by the stable device ID and its
+  256-bit secret hash. It does not create participant or upload authority.
+- **Accountless ownership** — device-secret proof against that active enrollment
+  creates or renews one installation owner and versioned upload authority. It
+  does not create social consent, a session, a pairing or public-fit eligibility.
 - **Session** — hardened hosted cookie; mutations also require same-origin
   CSRF authority.
 - **Pairing code** — an expiring, one-use claim minted under Session authority
@@ -324,6 +331,9 @@ Authority vocabulary:
 | `GET` | `/api/health` | Public | Service posture and declared capabilities; not dependency readiness |
 | `GET` | `/api/ready` | Public | D1, lifecycle, reconciliation, rebuild, and upload-budget readiness |
 | `POST` | `/api/v1/enroll` | Handoff / reattachment | Consume a one-use identity proof and create a participant or reattach the identity's existing participant; recovery codes are not accepted |
+| `POST` | `/api/v1/accountless/enrollment` | Accountless enrollment | Record one bounded, versioned enrollment-only installation row when the separately configured enrollment gate is enabled; exact replays are idempotent and no participant, session, pairing, device credential, upload authority, or community eligibility is created |
+| `POST` | `/api/v1/accountless/ownership` | Accountless ownership | Prove the active enrolled device secret, then atomically create one installation owner, credential and versioned v1.1 upload authorization, or return the same existing receipt when accountless ownership is enabled; reject ambient sessions and revoked/expired enrollment without creating social consent or public-fit eligibility |
+| `POST` | `/api/v1/accountless/renewal` | Accountless ownership | Renew the same authenticated installation graph within seven days of expiry or after an offline period; preserve identity and accepted receipts, and refuse revoked, erased, policy-mismatched or inconsistent state |
 | `POST` | `/api/v1/internal/release/appcast` | Operator | Validate and atomically publish the exact Sparkle appcast object |
 | `POST` | `/api/v1/identity/google/start` | Handoff | Create state, binding, PKCE material, and a Google authorization URL |
 | `GET` | `/api/v1/identity/google/callback` | Handoff | State-bound Google OAuth callback and server-side token exchange |
@@ -607,6 +617,88 @@ operation failures return a fixed error code and matching `id`. Native smoke
 modes use process-memory storage and never inspect or migrate the developer's
 login Keychain.
 
+The Electron macOS production adapter has a fifth native capability,
+`accountless_installation`, distinct from the four-capability broker. Only its
+main-process accountless backend can select that capability; `store` and
+`remove` reject it, leaving `createIfMissing` and `deleteExact` as the permitted
+mutations. The separate inherited FD3 accountless channel carries closed
+preference, credential and status operations for the owned companion. Its
+`credential_recovery_required` marker contains no path, secret or native
+error detail and pauses the scheduler. Neither native capability names nor
+secret operations are exposed through renderer IPC or HTTP. The
+[adapter contract](../../native/macos-keychain/README.md) defines the source
+boundary; it is not installed or signed-candidate qualification.
+
+The Linux Electron companion now has a separate, source-only Secret Service
+broker at inherited FD4. Its main-owned factory must provide the existing
+native backend with a qualified cross-process mutation lease; the child never
+loads Secret Service or keytar. Protocol v1 admits only `export_identity` and
+`account_observation`, with `read`, `create_if_missing`, `replace_exact`, and
+`delete_exact`. Requests carry strictly increasing IDs and canonical 32-byte
+secrets, with a 4096-byte per-frame limit and at most 32 pending operations.
+Malformed replies or transport failure permanently refuse further requests.
+The Linux descriptor announcement is mutually exclusive with the Mac broker.
+The three local-server identity/observation entrypoints share one cached
+transport and preserve explicit development overrides. An absent or malformed
+broker cannot select a child-side credential fallback. Conditional mutations
+execute under the parent-owned lease; locked account observation stays
+unattributed with its fixed diagnostic. This does not change the private FD3
+upload-only authority, enable production selection, or establish installed
+Linux qualification. Abandoned mutations require recovery and the underlying
+backend still reports `crashRecoveryComplete: false` and `productionSafe: false`.
+
+The Linux shell package requires the exact native mutex `.node` and sidecar
+from `native/linux-credential-mutex/build/qualification`, alongside the pinned
+Linux Keytar prebuild. Both mutex files are unpacked physical files so the
+loader's descriptor-based checks remain effective. Module-owned path mapping
+handles only the fixed `app.asar` to `app.asar.unpacked` layout; source paths
+remain unchanged. Staging and artifact verification use
+`validateLinuxCredentialMutexBindingManifest` for the closed sidecar schema,
+then independently compare its size/digest against captured bytes. The runtime
+manifest keeps its existing schema and records the pair as `linux_native_binding`
+inventory rows. These three exact unpacked files are required for Linux and
+cannot broaden another target's native inventory. Native execution and
+installed qualification remain separate.
+
+The dormant Linux accountless adapter uses a separate owner-private XDG-state
+record, not the legacy provider or social credential store. Its
+[fixed native boundary](../../native/linux-credential-mutex/README.md) exposes
+only `readAccountlessInstallationCredential`,
+`createAccountlessInstallationCredentialIfMissing`, and
+`deleteAccountlessInstallationCredentialExact`, with no caller-supplied path
+or capability number. The record is exactly 32 bytes under owner-only file
+permissions; it is not encrypted at rest and remains accessible to an
+authorized process while the desktop is locked. The native-private slot `4`
+does not expand the generic `0..3` lease API or the legacy FD4 protocol. Only
+the main-owned adapter can compose this record into the existing private FD3
+accountless channel. Invalid fixed records and uncertain mutations preserve
+recovery state instead of permitting silent identity replacement. The source
+keeps `productionSafe: false` and leaves runtime selection disabled; native
+qualification, installed lifecycle and release remain separate gates.
+
+The dormant Windows accountless adapter likewise owns a separate,
+owner-private protected-state record, not a fifth legacy Credential Manager
+capability. Its [fixed native boundary](../../native/windows-filesystem/README.md)
+exposes only `read`, `createIfMissing`, and `deleteExact` for an upload-only
+32-byte installation secret; callers cannot select a capability, record name,
+or path. The fixed record and `active`/`normal` journal are plaintext at rest.
+The two private native mutex methods,
+`acquireAccountlessInstallationCredentialMutex()` and
+`releaseAccountlessInstallationCredentialMutex(lease)`, have no capability
+argument and sit outside generic IDs `0..3` and FD4. They serialize cooperating
+processes only in the current owner's `Local\` Windows session: backup copies,
+same-owner processes that bypass the contract, and other sessions remain outside
+that protection. Before a create or exact delete, the backend writes `active`;
+an uncertain mutation, malformed record, failed release, or interruption retains
+it when the write can be verified and then returns fixed recovery rather than
+silently replacing identity. If it cannot retain that marker, it returns a
+content-free operation failure without a restart-persistence claim. The
+main-owned adapter may carry the secret only through the existing private FD3
+accountless channel, never renderer IPC or HTTP. `productionSafe` remains
+`false` and runtime selection remains disabled pending native Windows x64 build,
+manifest, security, physical-runner, installed-lifecycle, signing, and release
+evidence.
+
 ### Codex app-server subprocess protocol
 
 **Sources of truth:**
@@ -816,7 +908,7 @@ is not treated as permission for arbitrary cross-owner queries.
 
 | Store | Schema authority | Contract |
 |---|---|---|
-| Hosted primary D1 | [`apps/worker/migrations`](../../apps/worker/migrations) — 40 ordered SQL migrations | Participant/session/device state, contribution metadata, aggregate revisions, retention/reconciliation, controls, and admin caches |
+| Hosted primary D1 | [`apps/worker/migrations`](../../apps/worker/migrations) — 48 ordered SQL migrations | Participant/session/device state, contribution metadata, aggregate revisions, retention/reconciliation, controls, and admin caches |
 | Hosted deletion-ledger D1 | [`apps/worker/deletion-ledger-migrations`](../../apps/worker/deletion-ledger-migrations) — 2 ordered SQL migrations | Deletion tombstones and identity re-enrollment cooldowns, segregated from the primary store |
 | Dogfood guard D1 | [`apps/worker/dogfood-update-guard-migrations`](../../apps/worker/dogfood-update-guard-migrations) — 1 SQL migration | Appcast operator nonce replay ledger only |
 | Hosted `QUARANTINE` R2 | Worker quarantine/reconciliation owners | Encrypted contribution objects addressed by fixed stored keys and reconciled against accepted metadata |

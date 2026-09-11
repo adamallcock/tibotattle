@@ -23,6 +23,40 @@ text have no allowed destination in contribution schemas, diagnostics, or
 public aggregates. Unknown fields are omitted; an input that cannot be safely
 projected is refused or shown as unavailable.
 
+## Electron sharing transition
+
+The [accepted accountless policy](../decisions/2026-09-04-accountless-sharing-policy.md)
+applies to the unified Electron workstream. Fresh installations default to
+sharing; existing installations with no prior choice receive three visible
+notices before activation. A persistent Settings choice enables sharing now or
+keeps it off, cancelling all remaining reminders. Known off, paused and
+disconnected states remain off. Uncertain or unreadable state does not enable
+sharing. No social sign-in is required by this new mode.
+
+Electron stores the policy version, destination, basis and notice timestamps
+in the protected `desktop-settings/accountless-sharing-v1.json` profile record.
+It distinguishes automatic activation from affirmative choice and never invents
+an explicit-consent event. Classification reads metadata for a fixed set of
+managed files, not their contents or provider histories. Removing every app
+state marker can make a reinstall indistinguishable from a fresh installation;
+an upgrade or ordinary reinstall preserving the profile preserves the choice.
+
+The integration source connects preferences, notices, protected installation
+credentials and while-open scheduling to the encrypted v1.1 upload transport.
+Enrollment alone grants no upload permission: the server separately binds an
+accountless owner and current versioned authorization to that installation.
+Usage and quota records retain the same owner, provider/account track and
+domain-generation boundaries. Revocation blocks future admission; it is
+separate from private owner erasure of previously accepted records. Accountless
+owners remain excluded from public fits under the current eligibility policy.
+
+Only a validated production distribution manifest enables the hosted client;
+development/QA packages keep it disabled. The server's separate ownership flag
+also defaults to disabled. Local synthetic end-to-end tests do not establish a
+deployed service or released client. The native and standalone review/consent
+path described below remains compatible. Production privacy disclosures must
+match the new policy before a build that sends automatically is distributed.
+
 ## Normal refresh sources
 
 | Provider | Exact source | What is read | What is retained by TiboTattle | Network boundary | Removal/reset |
@@ -52,7 +86,7 @@ for runtime and resource limits.
 | --- | --- | --- | --- |
 | Managed Claude status-line callback | Explicit standalone CLI install/repair lifecycle | Bounded JSON status input through the managed local broker; projected status/usage fields only. | Managed callback state plus provider-isolated pseudonym capability. This is not an installed-app feature. |
 | Custom Codex home | User chooses a directory in Settings | It replaces the default Codex home anchor; the same fixed subpaths and allowlists apply. | Owner-only launcher setting. |
-| Local cache-drop thread links | Local interactive dashboard, for recent displayed drops only | Read-only bounded `session_index.jsonl` (`id`, `thread_name`, `updated_at`) and `state_5.sqlite` (`id`, explicit `name`, worker nickname, and allowlisted `source.subagent.thread_spawn` ancestry). Never uses prompt-bearing `threads.title`, first messages, or transcripts. | Names and IDs exist only in a separate `no-store`, same-origin local response and transient UI memory, reused for unchanged displayed event pairs during refresh. No snapshot/cache/report/share-card/diagnostic/contribution persistence. Clicking hands only the canonical thread UUID to the local Codex URL handler. |
+| Local cache-drop thread links | Local interactive dashboard, for recent displayed drops only | Read-only bounded `session_index.jsonl` (`id`, `thread_name`, `updated_at`) and `state_5.sqlite` (`id`, explicit `name`, worker nickname, and allowlisted source ancestry). For a `guardian_review` row only, the first bounded `session_meta` header in its selected owner-controlled session may supply its matching explicit parent UUID after source and path validation. Never uses prompt-bearing `threads.title`, first messages, or transcripts. | Names and IDs exist only in a separate `no-store`, same-origin local response and transient UI memory, reused for unchanged displayed event pairs during refresh. No snapshot/cache/report/share-card/diagnostic/contribution persistence. Clicking hands only the canonical thread UUID to the local Codex URL handler. |
 | Export workspace | Explicit CLI or review flow | Only allowlisted metadata for the selected time range and sources. | Journaled workspace, chunks, manifest, and verification/deletion receipts at explicit paths. |
 | Contribution preparation | Explicit review/consent flow | Closed telemetry schema; exact payload is locally reviewable before first approval. | Prepared spool/review archive and replay-safe sync state under the app state root. |
 
@@ -104,6 +138,22 @@ does not authorize a new identity or inferred success. Signed synthetic
 qualification is recorded in that decision; this source description does not
 qualify an installed upgrade.
 
+The Electron macOS production source serves the four legacy broker capabilities
+through its signed main process and the inherited FD4 channel. A fifth,
+separate installation credential supports accountless sharing. Its native
+capability cannot be selected through FD4: the main process exposes only the
+closed accountless operations over the owned companion's private FD3 channel.
+Secret bytes never enter renderer IPC, local HTTP responses or diagnostics.
+
+That accountless credential uses the noninteractive native Keychain adapter,
+with create-if-missing and exact-value deletion as its only mutations. Existing
+encrypted Electron credential files are inspected without decryption. A present
+legacy ciphertext requires explicit recovery and is preserved; an unreadable
+store never becomes permission to create a replacement identity. The sharing
+page reports recovery while local analysis remains available. These are source
+and synthetic-test contracts; signed installation continuity and prompt-free
+first use still require qualification on the actual candidate.
+
 **Reset identity and device** is a separate two-step action from local data
 erase. It removes the selected local Keychain capabilities and associated app
 state; it does not represent hosted participant deletion. A locked Keychain is
@@ -111,7 +161,8 @@ a temporary availability condition, not evidence of a corrupt credential.
 
 ## Optional hosted contribution
 
-Contribution is off until the person completes the review, identity, consent,
+In the released native and standalone flow, contribution is off until the
+person completes the review, identity, consent,
 and pairing flow. A contribution can include closed-schema derived fields such
 as:
 
@@ -213,7 +264,8 @@ promise that every data class is deleted on the same schedule:
 | Web session | 30 minutes |
 | One-use upload authorization | 5 minutes |
 | Device pairing claim | 10 minutes |
-| Device credential | 30 days, silently renewable by the same valid device |
+| Paired social device credential | 30 days, silently renewable by the same valid device |
+| Accountless enrollment and derived upload authority | 30-day lease. Same-secret authenticated renewal extends the same active installation graph within seven days of expiry or after an offline period. Revoked or erased authority cannot renew; no replacement identity is created. |
 | Hosted identity authorization handoff | 10 minutes |
 | Completed identity-result delivery window | 5 minutes |
 | Sign-in admission rows | 24 hours |
