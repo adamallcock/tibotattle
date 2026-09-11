@@ -1,7 +1,7 @@
 name: Electron production synthetic canary
 on:
   push:
-    branches: [codex/unified-desktop-accountless, codex/electron-release-tooling-022]
+    branches: [codex/unified-desktop-accountless, codex/electron-release-tooling-022, codex/electron-022-qualified-runner]
   workflow_dispatch:
     inputs:
       mode:
@@ -107,12 +107,12 @@ jobs:
           assert e['SELECTED_MODE'] in ['plan','execute']
           assert e['EXECUTION_CONFIRMATION']==('RUN_ONE_SYNTHETIC_PRODUCTION_CANARY' if e['SELECTED_MODE']=='execute' else '')
           url=e['SELECTED_URL']
-          # Final022 pins are deliberately unfilled. A reviewed runner commit must
-          # bind final bytes before either plan or execute may contact the host.
-          approved_source=None
-          approved_build=None
-          approved_archive=None
-          approved_asar=None
+          # Exact final022 signed bytes, independently enclosed-verified before
+          # qualification. Plan and execution both reject different inputs.
+          approved_source='16a0d4dffad4b1213b28adaae139fc9ee6705837'
+          approved_build='2026091108'
+          approved_archive='d1b35690c2b4afc7a225e64f25ad201fd18bda936e96220f7ee080c1791f7651'
+          approved_asar='e176d0d763b11f9aa90073b90d0bdd7fbdbb17cc61740331fb47e33899007579'
           assert all(v is not None for v in [approved_source,approved_build,approved_archive,approved_asar]), 'FINAL_022_INPUTS_PENDING'
           assert source==approved_source and e['SELECTED_BUILD']==approved_build
           assert re.fullmatch('[0-9]{10}',e['SELECTED_BUILD'])

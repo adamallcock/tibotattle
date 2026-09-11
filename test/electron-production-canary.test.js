@@ -85,11 +85,12 @@ test('dispatch intake rejects unapproved source, destination, key and execution 
   const workflow = await readFile(new URL('../.github/workflows/electron-production-canary.yml', import.meta.url), 'utf8');
   const unfilledPython = workflow.match(/python3 - <<'PY'\n([\s\S]*?)\n          PY/u)?.[1].replace(/^          /gmu, '');
   assert.ok(unfilledPython);
-  for (const name of ['source','build','archive','asar']) assert.ok(unfilledPython.includes(`approved_${name}=None`));
-  const python=unfilledPython.replace('approved_source=None', `approved_source='${'a'.repeat(40)}'`)
-    .replace('approved_build=None', "approved_build='2026091111'")
-    .replace('approved_archive=None', `approved_archive='${'b'.repeat(64)}'`)
-    .replace('approved_asar=None', `approved_asar='${'c'.repeat(64)}'`);
+  const finalPins = { source: '16a0d4dffad4b1213b28adaae139fc9ee6705837', build: '2026091108', archive: 'd1b35690c2b4afc7a225e64f25ad201fd18bda936e96220f7ee080c1791f7651', asar: 'e176d0d763b11f9aa90073b90d0bdd7fbdbb17cc61740331fb47e33899007579' };
+  for (const [name, value] of Object.entries(finalPins)) assert.ok(unfilledPython.includes(`approved_${name}='${value}'`));
+  const python=unfilledPython.replace("approved_source='16a0d4dffad4b1213b28adaae139fc9ee6705837'", `approved_source='${'a'.repeat(40)}'`)
+    .replace("approved_build='2026091108'", "approved_build='2026091111'")
+    .replace("approved_archive='d1b35690c2b4afc7a225e64f25ad201fd18bda936e96220f7ee080c1791f7651'", `approved_archive='${'b'.repeat(64)}'`)
+    .replace("approved_asar='e176d0d763b11f9aa90073b90d0bdd7fbdbb17cc61740331fb47e33899007579'", `approved_asar='${'c'.repeat(64)}'`);
   execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "intake", "exec")'], { input: python });
   assert.equal(workflow.includes('secrets.'), false);
   assert.ok(workflow.includes("canary:\n    if: github.event_name == 'workflow_dispatch'"));
