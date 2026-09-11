@@ -362,6 +362,39 @@ test("untrusted plan and marker extras cannot enter content-free prepared record
   assert.equal(JSON.stringify(result).includes("rawPath"), false);
 });
 
+test("private projection evidence is stable for equivalent markers and binds every effective attribution input", async (t) => {
+  const { file } = await writeFixture(t, { records: [
+    { at: 0, quotas: [{ plan: "pro" }] }, { at: 1_000, quotas: [{ plan: "pro" }] },
+  ] });
+  const markers = [marker(), marker({ capturedAt: stamp(500) })];
+  const readEvidence = (accountMarkers, selectedBinding = binding) => {
+    const { reader } = readFixture(t, file, { accountMarkers });
+    return reader.projectionEvidence({ binding: selectedBinding });
+  };
+  const evidence = readEvidence(markers);
+  assert.deepEqual(Object.keys(evidence).sort(), ["boundDays", "fingerprint"]);
+  assert.match(evidence.fingerprint, /^[0-9a-f]{64}$/u);
+  assert.deepEqual(evidence.boundDays, [DAY]);
+  assert.ok(Object.isFrozen(evidence) && Object.isFrozen(evidence.boundDays));
+  assert.deepEqual(readEvidence([...markers].reverse().map((value) => ({ ...value,
+    source: "active-account", rawPath: "/PRIVATE_SYNTHETIC_CONTENT",
+    accountScope: { ...value.accountScope, rawEmail: "PRIVATE_SYNTHETIC_CONTENT@example.test" },
+  }))), evidence);
+  assert.equal(readEvidence([...markers, marker({ observationBinding: null })]).fingerprint, evidence.fingerprint);
+  for (const changed of [
+    [marker({ accountScope: scope(8) }), markers[1]],
+    [marker({ receivedAt: stamp(1_500) }), markers[1]],
+    [marker({ observationBinding: { ...binding, enrollmentNamespace: "synthetic_enrollment_0002" } }), markers[1]],
+    [markers[0]],
+  ]) assert.notEqual(readEvidence(changed).fingerprint, evidence.fingerprint);
+  assert.deepEqual(readEvidence(markers, { ...binding, enrollmentNamespace: "synthetic_enrollment_0002" }).boundDays, []);
+  assert.deepEqual(readEvidence([marker({ accountScope: scope(7, "plus") })]), readEvidence([]),
+    "a marker contradicted by indexed quota cannot affect projection");
+  const { reader } = readFixture(t, file, { accountMarkers: markers });
+  assert.throws(() => reader.projectionEvidence({ binding: null }), { code: "local_telemetry_v11_invalid_binding" });
+  assert.doesNotMatch(JSON.stringify(evidence), /PRIVATE|scopeId|accountScope|enrollment|destination|account:v1/iu);
+});
+
 test("old, future, expired, conflicting, and reversed-clock markers do not acquire historical ownership", async (t) => {
   const { file } = await writeFixture(t, { records: [
     { at: 0, quotas: [{ plan: "pro" }] }, { at: 1_000, quotas: [{ plan: "pro" }] },

@@ -366,6 +366,31 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
   }
 
   return Object.freeze({
+    projectionEvidence({ binding } = {}) {
+      const captured = sanitizeTelemetryAttributionBinding(binding);
+      if (captured === null) fail("invalid_binding");
+      return snapshot((current) => {
+        // Only normalized, quota-consistent evidence can affect projection.
+        // Keep its content inside the reader; the private resume journal gets
+        // one digest, never scopes, marker brackets or enrollment identifiers.
+        const material = current.markers.map((marker) => JSON.stringify([
+          marker.start, marker.end, marker.accountScope.scopeId,
+          knownPlan(marker.accountScope.planType), marker.observationBinding,
+        ])).sort();
+        const days = new Set();
+        for (const marker of current.markers) {
+          if (marker.observationBinding.destinationOrigin !== captured.destinationOrigin
+              || marker.observationBinding.enrollmentNamespace !== captured.enrollmentNamespace) continue;
+          // A validated bracket is at most five minutes, hence at most two
+          // calendar days. The caller checks actual record evidence there
+          // before requesting an existing-only account-root lease.
+          days.add(new Date(marker.start).toISOString().slice(0, 10));
+          days.add(new Date(marker.end).toISOString().slice(0, 10));
+        }
+        return Object.freeze({ fingerprint: hash(["telemetry-v11-marker-evidence-v1", material]),
+          boundDays: Object.freeze([...days].sort()) });
+      });
+    },
     days() {
       return snapshot((current, descriptor) => [...new Set([
         ...current.base.days(), ...quotaDays.all(descriptor.id).map((row) => row.day),

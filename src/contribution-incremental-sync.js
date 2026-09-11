@@ -504,18 +504,9 @@ async function createV11Preparation(database, {
     fallbackParserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
     accountMarkers,
   });
-  // Staged projections also depend on whether captured marker evidence exists.
-  // Losing the last marker must revalidate an earlier marker-bearing prefix,
-  // even though the next pass no longer forces marker/root revalidation. Keep
-  // the actual index publication separate for mutation fencing and review.
-  const sourcePublication = Object.freeze({
-    fingerprint: createHash("sha256").update(JSON.stringify([
-      "telemetry-v11-local-projection-v1", publication.fingerprint, accountMarkers.length > 0,
-    ])).digest("hex"),
-    parserVersion: publication.parserVersion,
-  });
   let root = null;
-  let rootLoaded = false;
+  let selectedBinding = null;
+  let projection = null;
   let closed = false;
   const assertCurrent = () => {
     if (closed) interrupt("index_unavailable", { retryable: true });
@@ -529,33 +520,55 @@ async function createV11Preparation(database, {
   };
   const days = reader.days();
   assertCurrent();
-  return Object.freeze({
-    days: Object.freeze(days), publication, sourcePublication, assertCurrent,
-    // A root becoming readable (or a new captured marker) may alter the
-    // projection without changing indexed facts. Recheck saved day digests
-    // under the current evidence; do not probe an identity just to resume.
-    revalidateProgress: accountMarkers.length > 0,
-    async readDay(day, { binding }) {
-      assertCurrent();
-      const hydrated = reader.readDay(day);
-      // A historical plan does not need an account root. Only an already
-      // captured matching marker can request an existing-only secret lease.
-      // A missing/locked root retains useful history as account-unknown.
-      const hasBoundMarker = ["usage", "quota"].some((stream) => hydrated.recordsByStream[stream].some((record) => {
-        const evidence = hydrated.attributionForRecord(stream, record);
-        const captured = sanitizeTelemetryAttributionBinding(evidence?.observationBinding);
-        return evidence?.accountBasis === "provisional_marker" && captured !== null
-          && captured.destinationOrigin === binding.destinationOrigin && captured.enrollmentNamespace === binding.enrollmentNamespace;
-      }));
-      if (!rootLoaded && hasBoundMarker) {
-        rootLoaded = true;
-        try {
-          const loaded = await loadExistingAccountObservationSecret();
-          if (Buffer.isBuffer(loaded) && loaded.length === 32 && !closed) root = loaded;
-          else if (Buffer.isBuffer(loaded)) loaded.fill(0);
-        } catch { /* Missing account identity is explicit, not an upload failure. */ }
+  const daySet = new Set(days);
+  const hasBoundMarker = (hydrated, binding) =>
+    ["usage", "quota"].some((stream) => hydrated.recordsByStream[stream].some((record) => {
+      const evidence = hydrated.attributionForRecord(stream, record);
+      const captured = sanitizeTelemetryAttributionBinding(evidence?.observationBinding);
+      return evidence?.accountBasis === "provisional_marker" && captured !== null
+        && captured.destinationOrigin === binding.destinationOrigin && captured.enrollmentNamespace === binding.enrollmentNamespace;
+    }));
+  async function preparePublication({ binding }) {
+    assertCurrent();
+    const captured = sanitizeTelemetryAttributionBinding(binding);
+    if (captured === null || (selectedBinding !== null
+        && (captured.destinationOrigin !== selectedBinding.destinationOrigin
+          || captured.enrollmentNamespace !== selectedBinding.enrollmentNamespace))) interrupt("local_index_changed", { retryable: true });
+    selectedBinding ??= captured;
+    projection ??= (async () => {
+      const evidence = reader.projectionEvidence({ binding: selectedBinding });
+      let rootRequired = false;
+      for (const day of evidence.boundDays) {
+        assertCurrent();
+        if (daySet.has(day) && hasBoundMarker(reader.readDay(day), selectedBinding)) {
+          rootRequired = true;
+          try {
+            const loaded = await loadExistingAccountObservationSecret();
+            if (Buffer.isBuffer(loaded) && loaded.length === 32 && !closed) root = loaded;
+            else if (Buffer.isBuffer(loaded)) loaded.fill(0);
+          } catch { /* Missing/locked identity stays explicitly unattributed. */ }
+          break;
+        }
+        await new Promise((resolve) => setImmediate(resolve));
       }
       assertCurrent();
+      // A stable projection resumes validatedDays across bounded passes. A
+      // marker/root change resets validation once, then checkpoints against
+      // its exact new fingerprint. No raw identity or secret enters storage.
+      const rootFingerprint = root === null ? (rootRequired ? "unavailable" : "not-required")
+        : createHash("sha256").update("telemetry-v11-projection-root-v1\0").update(root).digest("hex");
+      return Object.freeze({ fingerprint: createHash("sha256").update(JSON.stringify([
+        "telemetry-v11-local-projection-v2", publication.fingerprint, evidence.fingerprint, rootFingerprint,
+      ])).digest("hex"), parserVersion: publication.parserVersion });
+    })();
+    return projection;
+  }
+  return Object.freeze({
+    days: Object.freeze(days), publication, preparePublication, assertCurrent,
+    async readDay(day, { binding }) {
+      await preparePublication({ binding });
+      assertCurrent();
+      const hydrated = reader.readDay(day);
       const result = createTelemetryV11Day({
         day, ...hydrated, binding, accountObservationSecret: root,
         parserVersion: publication.parserVersion,
@@ -653,9 +666,8 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
               ? { consent: selectedConsent }
               : { authorization: selectedAuthorization, laboratory, rehearsal, production }),
             days: preparation.days, fetchImpl: fetch, signal, clock: now,
-            sourcePublication: preparation.sourcePublication,
+            preparePublication: preparation.preparePublication,
             progressStore: progress,
-            revalidateProgress: preparation.revalidateProgress,
             maxChunks: maximumChunks, maxDurationMs: maximumDurationMilliseconds,
             requestTimeoutMs: requestTimeoutMilliseconds,
             readDay: async (day, { binding }) => {
