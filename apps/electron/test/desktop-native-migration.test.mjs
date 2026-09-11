@@ -492,3 +492,54 @@ test("startup preference survives interruption after OS disable before prepared 
     assert.equal(startupEnabled, true);
   } finally { await state.dispose(); }
 });
+
+test("unknown startup registration stays untouched across interrupted import and restart", async () => {
+  const state = await fixture();
+  let first = true;
+  const preservedFlags = [];
+  const phases = [];
+  const boundary = {
+    async prepareNativeHandover({ checkpointPreferences, preserveStartupRegistration }) {
+      preservedFlags.push(preserveStartupRegistration);
+      const reply = { ...bridgeResult({ startAtLogin: null }), loginItemDisabled: false, startupRegistration: "preserved" };
+      await checkpointPreferences({ ...reply.preferences, credentialState: reply.credentialState });
+      if (first) { first = false; throw new Error("interruption after checkpoint"); }
+      return reply;
+    },
+    async claimElectronLoginItem({ startAtLogin }) {
+      assert.equal(startAtLogin, null);
+      return "preserved";
+    },
+  };
+  try {
+    const options = migrationOptions(state, [], { control: boundary, afterCheckpoint: (phase) => phases.push(phase) });
+    const original = await readFile(join(state.nativeStateRoot, "local-unified-index-v1.sqlite"));
+    await assert.rejects(runNativeElectronHandover(options));
+    assert.equal((await runNativeElectronHandover(options)).status, "migrated");
+    assert.deepEqual(preservedFlags, [false, true]);
+    assert.ok(phases.includes("electron_login_preserved"));
+    assert.ok(!phases.includes("electron_login_owned"));
+    const journal = JSON.parse(await readFile(join(state.userDataRoot, ".native-electron-handover-v1", NATIVE_ELECTRON_HANDOVER_JOURNAL_FILE)));
+    assert.equal(journal.preferences.startAtLogin, null);
+    assert.equal(journal.phase, "completed");
+    assert.deepEqual(await readFile(join(state.userDataRoot, "companion-state", "local-unified-index-v1.sqlite")), original);
+    assert.deepEqual(await readFile(join(state.nativeStateRoot, "local-unified-index-v1.sqlite")), original);
+    assert.equal((await runNativeElectronHandover(options)).status, "already_migrated");
+    assert.equal(preservedFlags.length, 2);
+  } finally { await state.dispose(); }
+});
+
+test("unknown startup choice cannot be passed off as disabled or owned", async () => {
+  for (const extra of [
+    { loginItemDisabled: true },
+    { loginItemDisabled: false },
+    { loginItemDisabled: false, startupRegistration: "preserved", preferences: bridgeResult().preferences },
+  ]) {
+    const state = await fixture();
+    try {
+      const boundary = { ...control([]), async prepareNativeHandover() { return { ...bridgeResult({ startAtLogin: null }), ...extra }; } };
+      await assert.rejects(runNativeElectronHandover(migrationOptions(state, [], { control: boundary })), { code: "native_electron_handover_native_bridge_invalid" });
+      assert.equal((await readdir(state.backupRoot)).length, 0);
+    } finally { await state.dispose(); }
+  }
+});

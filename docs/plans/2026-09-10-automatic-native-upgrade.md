@@ -73,3 +73,24 @@ Windows diagnostic run 34552043838 showed the frozen signed installer completing
 successfully in approximately 196 seconds, beyond the old 180-second harness
 budget. The bounded budget is now 300 seconds; the full signed installed journey
 is rerunning without re-signing or weakening correctness assertions.
+
+The 7fc6f0ef signed rehearsal (34553531272) still reports
+`TRANSFER_LOGIN_ITEM_NOT_FOUND` from the actual main-app API. The initial helper
+location explanation alone was therefore insufficient. Its boundary fix and
+crash-safe snapshot remain valid improvements, but are not installed success.
+Run 34553921574 separately tests LaunchServices registration of the copied bundle
+before launch. No unavailable startup state has been reclassified as success and
+no public installer/feed/site has changed.
+
+The LaunchServices registration run also failed at the same unchanged checkpoint.
+Apple DTS documents that a valid, unseen service can report `notFound`; Electron
+then derives `openAtLogin: false` from that status rather than a separate setting.
+See https://developer.apple.com/forums/thread/719862 and Electron 43.2.0's
+`shell/browser/browser_mac.mm` implementation. We therefore preserve unknown or
+approval-pending startup registration without OS writes while allowing authenticated,
+writer-stopped, journaled data import. The durable original startup snapshot is
+nullable; retries retain that untouched decision, and completion records a distinct
+`electron_login_preserved` phase rather than claiming ownership. The ordinary
+settings UI continues to read actual OS status; the stored default is never applied
+at launch. Known startup choices retain snapshot-before-disable and verified restore.
+Signed installed proof of this updated contract remains required before publication.

@@ -65,6 +65,7 @@ const JOURNAL_PHASES = new Set([
   "published_state",
   "published",
   "electron_login_owned",
+  "electron_login_preserved",
   "completed",
 ]);
 const SAFE_LINEAGE = /^[A-Za-z0-9._:+-]{1,256}$/u;
@@ -590,7 +591,7 @@ function normalizePreferences(value) {
   if (!["system", "en", "zh-Hans", "es"].includes(language)
       || !["system", "light", "dark"].includes(value.appearance)
       || ![60, 300, 900, 1800].includes(value.refreshIntervalSeconds)
-      || typeof value.startAtLogin !== "boolean") {
+      || (value.startAtLogin !== null && typeof value.startAtLogin !== "boolean")) {
     fail("native_bridge_invalid");
   }
   return Object.freeze({
@@ -652,7 +653,9 @@ async function stageSettings({ stageSettingsRoot, sourceStateRoot, preferences }
       language: preferences.language,
       appearance: preferences.appearance,
       refreshIntervalSeconds: preferences.refreshIntervalSeconds,
-      startAtLogin: preferences.startAtLogin,
+      // This local Boolean is only an unapplied preference. The settings UI
+      // reads actual OS status; null remains explicit in the migration journal.
+      ...(preferences.startAtLogin === null ? {} : { startAtLogin: preferences.startAtLogin }),
     });
   } catch {
     fail("native_settings_invalid");
@@ -728,11 +731,15 @@ async function renameStagedRoot(stageRoot, targetRoot) {
 }
 
 function normalizeBridgeResult(value) {
+  const preserved = value?.startupRegistration === "preserved";
+  const keys = ["status", "nativeWriterStopped", "loginItemDisabled", "preferences", "credentialState"];
+  if (preserved) keys.push("startupRegistration");
   if (!plainRecord(value)
-      || !exactKeys(value, ["status", "nativeWriterStopped", "loginItemDisabled", "preferences", "credentialState"])
+      || !exactKeys(value, keys)
       || value.status !== "prepared"
       || value.nativeWriterStopped !== true
-      || value.loginItemDisabled !== true
+      || value.loginItemDisabled !== !preserved
+      || (preserved ? value.preferences?.startAtLogin !== null : typeof value.preferences?.startAtLogin !== "boolean")
       || !["unchanged", "unavailable"].includes(value.credentialState)) {
     fail("native_bridge_invalid");
   }
@@ -1081,6 +1088,7 @@ export async function runNativeElectronHandover(options = {}) {
       bridge = normalizeBridgeResult(await selected.control.prepareNativeHandover({
         nativeAppPath: selected.nativeAppPath,
         candidate: selected.candidate,
+        preserveStartupRegistration: journal.preferences?.startAtLogin === null,
         checkpointPreferences: async (preferences) => {
           if (!plainRecord(preferences) || !exactKeys(preferences, [
             "language", "appearance", "refreshIntervalSeconds", "startAtLogin", "credentialState",
@@ -1114,9 +1122,9 @@ export async function runNativeElectronHandover(options = {}) {
       };
       await writeJournal(journalPath, journal);
       await checkpointHook(selected.afterCheckpoint, journal.phase);
-    } else if (journal.phase === "electron_login_owned") {
-      // The bridge just withdrew the same-identity login registration again.
-      // Reclaim it before writing completion, including after a late crash.
+    } else if (["electron_login_owned", "electron_login_preserved"].includes(journal.phase)) {
+      // Reconfirm the original startup disposition after a late crash. The
+      // preserved route never changes registration; the known route restores it.
       journal = { ...journal, phase: "published" };
       await writeJournal(journalPath, journal);
     }
@@ -1259,13 +1267,14 @@ export async function runNativeElectronHandover(options = {}) {
         if (isNativeElectronHandoverError(error)) throw error;
         fail("electron_login_item_unavailable");
       }
-      if (claimed !== "owned") fail("electron_login_item_unavailable");
-      journal = { ...journal, phase: "electron_login_owned" };
+      const expected = preferences.startAtLogin === null ? "preserved" : "owned";
+      if (claimed !== expected) fail("electron_login_item_unavailable");
+      journal = { ...journal, phase: expected === "preserved" ? "electron_login_preserved" : "electron_login_owned" };
       await writeJournal(journalPath, journal);
       await checkpointHook(selected.afterCheckpoint, journal.phase);
     }
 
-    if (journal.phase === "electron_login_owned") {
+    if (["electron_login_owned", "electron_login_preserved"].includes(journal.phase)) {
       await writeMarker(markerPath, journal);
       journal = { ...journal, phase: "completed" };
       await writeJournal(journalPath, journal);

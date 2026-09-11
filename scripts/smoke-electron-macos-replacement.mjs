@@ -186,8 +186,8 @@ export async function runSignedReplacement(options) {
     execFileSync('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
       ['-f', installedApp], { timeout: 30000, stdio: 'ignore' });
     proof.applicationRegistrationPerformed = true;
-    for (const [key, service] of [['backgroundTaskDaemonAvailable', 'system/com.apple.backgroundtaskmanagementdaemon'],
-      ['backgroundTaskAgentAvailable', 'gui/501/com.apple.backgroundtaskmanagementagent']]) {
+    for (const [key, service] of [['backgroundTaskDaemonAvailable', 'system/com.apple.backgroundtaskmanagementd'],
+      ['backgroundTaskAgentAvailable', 'gui/501/com.apple.backgroundtaskmanagement.agent']]) {
       try { execFileSync('/bin/launchctl', ['print', service], { timeout: 10000, stdio: 'ignore' }); proof[key] = true; }
       catch { proof[key] = false; }
     }
@@ -241,6 +241,10 @@ export async function runSignedReplacement(options) {
       await absent(bindingPath);
       const completion = await inspectNativeElectronHandoverCompletion({ userDataRoot: profile });
       if (completion.status !== 'completed') fail('migration_incomplete');
+      const migrationJournal = JSON.parse(await readFile(join(profile, '.native-electron-handover-v1', 'journal-v1.json'), 'utf8'));
+      if (migrationJournal.preferences?.startAtLogin === null) proof.startupRegistration = 'preserved_untouched';
+      else if (typeof migrationJournal.preferences?.startAtLogin === 'boolean') proof.startupRegistration = 'verified_restored';
+      else fail('startup_disposition_invalid');
       proof.migrationCompleted = true;
       await stopOwnedMacSharingApp(active); active = null;
       if (run === 0) {
@@ -265,7 +269,7 @@ export async function runSignedReplacement(options) {
       proof.migrationInspection = (await inspectNativeElectronHandoverCompletion({ userDataRoot: diagnosticProfile }).catch(() => ({ status: 'unavailable' }))).status;
       try {
         const journal = JSON.parse(await readFile(join(diagnosticProfile, '.native-electron-handover-v1', 'journal-v1.json'), 'utf8'));
-        if (['started', 'prepared', 'backed_up', 'staged', 'published_state', 'published', 'electron_login_owned', 'completed'].includes(journal.phase)) proof.journalPhase = journal.phase;
+        if (['started', 'prepared', 'backed_up', 'staged', 'published_state', 'published', 'electron_login_owned', 'electron_login_preserved', 'completed'].includes(journal.phase)) proof.journalPhase = journal.phase;
       } catch { proof.journalPhase = 'absent_or_unreadable'; }
     }
   } finally {

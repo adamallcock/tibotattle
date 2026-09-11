@@ -585,16 +585,110 @@ test("actual main application owns startup transfer and helper cannot forge star
   assert.deepEqual(order, ["read-main"], "invalid helper data cannot change main-app startup registration");
 });
 
-test("unavailable main-app startup state blocks before stopping native writers", async () => {
-  for (const [status, stage] of [["not-found", "login_item_not_found"], ["requires-approval", "login_item_requires_approval"], ["unexpected", "login_item_status_unknown"]]) {
+test("unavailable or pending main-app registration is preserved through preflight, preparation and claim", async () => {
+  for (const status of ["not-found", "requires-approval"]) {
+    for (const candidate of [CANDIDATE, retainedCandidate()]) {
+      const calls = [];
+      const snapshots = [];
+      let reads = 0;
+      const nativeAppPath = candidate.route === "automatic_retained_state" ? null : "/Applications/TiboTattle-old.app";
+      const app = {
+        getLoginItemSettings() { reads += 1; return { openAtLogin: false, status }; },
+        setLoginItemSettings: () => assert.fail("preserved registration must never be mutated"),
+      };
+      const adapter = createMacNativeHandoverAdapter({ platform: "darwin",
+        helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+        electronApp: app,
+        spawnProcess: (command, args, options) => responseSpawn(args[0].endsWith("preflight") ? {
+          schemaVersion: "tibotattle-native-electron-handover-bridge-v1", status: "preflight_ready",
+        } : preparedReply(), calls)(command, args, options),
+      });
+      assert.deepEqual(await adapter.preflightNativeHandover({ nativeAppPath, candidate }), { status: "preflight_ready" });
+      const prepared = await adapter.prepareNativeHandover({ nativeAppPath, candidate,
+        checkpointPreferences: async (value) => snapshots.push(value),
+      });
+      assert.deepEqual(prepared, {
+        status: "prepared", nativeWriterStopped: true, loginItemDisabled: false,
+        startupRegistration: "preserved",
+        preferences: { language: "en", appearance: "light", refreshIntervalSeconds: 300, startAtLogin: null },
+        credentialState: "unchanged",
+      });
+      assert.deepEqual(snapshots, [{ ...prepared.preferences, credentialState: "unchanged" }]);
+      assert.equal(await adapter.claimElectronLoginItem({ startAtLogin: null, candidate }), "preserved");
+      assert.equal(reads, 2, "claim leaves the registration alone, even if its status may have changed");
+      assert.equal(calls.length, 2);
+    }
+  }
+});
+
+test("preserved startup retries never disable a now-readable registration", async () => {
+  const snapshots = [];
+  const adapter = createMacNativeHandoverAdapter({ platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: {
+      getLoginItemSettings: () => ({ openAtLogin: true, status: "enabled" }),
+      setLoginItemSettings: () => assert.fail("a durable unknown choice cannot become a startup mutation on retry"),
+    },
+    spawnProcess: responseSpawn(preparedReply(), []),
+  });
+  const prepared = await adapter.prepareNativeHandover({ nativeAppPath: null, candidate: retainedCandidate(),
+    preserveStartupRegistration: true, checkpointPreferences: async (value) => snapshots.push(value),
+  });
+  assert.equal(prepared.startupRegistration, "preserved");
+  assert.equal(prepared.preferences.startAtLogin, null);
+  assert.equal(snapshots[0].startAtLogin, null);
+  for (const value of [null, "true", 1]) {
+    await assert.rejects(adapter.prepareNativeHandover({ nativeAppPath: null, candidate: retainedCandidate(),
+      preserveStartupRegistration: value, checkpointPreferences: async () => assert.fail("invalid option cannot checkpoint"),
+    }), { code: "native_electron_mac_bridge_invalid_login_item_request" });
+  }
+});
+
+test("preserved startup still requires authentic candidate, valid helper reply and durable preferences", async () => {
+  const app = {
+    getLoginItemSettings: () => ({ openAtLogin: false, status: "not-found" }),
+    setLoginItemSettings: () => assert.fail("unexpected startup mutation"),
+  };
+  const makeAdapter = (reply = preparedReply()) => createMacNativeHandoverAdapter({ platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: app, spawnProcess: responseSpawn(reply, []),
+  });
+  const forged = preparedReply(); forged.preferences.startAtLogin = null;
+  await assert.rejects(makeAdapter(forged).prepareNativeHandover({ nativeAppPath: null, candidate: retainedCandidate(),
+    checkpointPreferences: async () => assert.fail("forged reply cannot checkpoint"),
+  }), { code: "native_electron_mac_bridge_invalid_reply" });
+  await assert.rejects(makeAdapter().prepareNativeHandover({ nativeAppPath: null, candidate: retainedCandidate() }),
+    { code: "native_electron_mac_bridge_prepare_preferences" });
+  const checkpointFailure = new Error("synthetic checkpoint failure");
+  await assert.rejects(makeAdapter().prepareNativeHandover({ nativeAppPath: null, candidate: retainedCandidate(),
+    checkpointPreferences: async () => { throw checkpointFailure; },
+  }), (error) => error === checkpointFailure);
+  const candidate = retainedCandidate(); candidate.signatureEvidence.helperCodeHash = "invalid";
+  await assert.rejects(makeAdapter().claimElectronLoginItem({ startAtLogin: null, candidate }),
+    { code: "native_electron_handover_signature_evidence_invalid" });
+  for (const startAtLogin of [undefined, "false", 0]) {
+    await assert.rejects(makeAdapter().claimElectronLoginItem({ startAtLogin, candidate: retainedCandidate() }),
+      { code: "native_electron_mac_bridge_invalid_login_item_request" });
+  }
+});
+
+test("malformed or contradictory main-app startup states block before stopping native writers", async () => {
+  for (const value of [
+    { openAtLogin: false, status: "unexpected" },
+    { openAtLogin: true, status: "not-found" },
+    { openAtLogin: true, status: "requires-approval" },
+    { status: "not-found" },
+    { openAtLogin: false, status: "enabled" },
+    null,
+  ]) {
     const calls = [];
     const adapter = createMacNativeHandoverAdapter({ platform: "darwin",
       helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
-      electronApp: { getLoginItemSettings: () => ({ openAtLogin: false, status }), setLoginItemSettings: () => assert.fail("unexpected startup mutation") },
+      electronApp: { getLoginItemSettings: () => value, setLoginItemSettings: () => assert.fail("unexpected startup mutation") },
       spawnProcess: responseSpawn(preparedReply(), calls),
     });
     await assert.rejects(adapter.prepareNativeHandover({ nativeAppPath: null, candidate: retainedCandidate() }),
-      (error) => error.code === `native_electron_mac_bridge_prepare_${stage}`);
+      (error) => error.code === "native_electron_mac_bridge_prepare_login_item_status_unknown");
     assert.equal(calls.length, 0);
   }
 });
@@ -607,4 +701,26 @@ test("startup disable must be verified before the coordinator can copy retained 
   });
   await assert.rejects(adapter.prepareNativeHandover({ nativeAppPath: null, candidate: retainedCandidate(), checkpointPreferences: async () => {} }),
     (error) => error.code === "native_electron_mac_bridge_prepare_login_item_status");
+});
+
+
+test("claiming a known startup choice requires explicit matching OS status", async () => {
+  for (const [startAtLogin, status] of [
+    [false, { openAtLogin: false, status: "not-found" }],
+    [false, { openAtLogin: false, status: "requires-approval" }],
+    [false, { openAtLogin: false }],
+    [false, { openAtLogin: false, status: "not-registered", executableWillLaunchAtLogin: true }],
+    [true, { openAtLogin: true, status: "unexpected" }],
+    [true, { openAtLogin: true, status: "enabled", executableWillLaunchAtLogin: false }],
+  ]) {
+    const writes = [];
+    const adapter = createMacNativeHandoverAdapter({ platform: "darwin",
+      helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+      electronApp: { getLoginItemSettings: () => status, setLoginItemSettings: (value) => writes.push(value) },
+      spawnProcess: () => assert.fail("claim must not invoke the helper"),
+    });
+    await assert.rejects(adapter.claimElectronLoginItem({ startAtLogin, candidate: retainedCandidate() }),
+      { code: "native_electron_mac_bridge_login_item_unavailable" });
+    assert.deepEqual(writes, [{ openAtLogin: startAtLogin }]);
+  }
 });
