@@ -3,7 +3,7 @@ import { Worker } from 'node:worker_threads';
 import './model-performance-worker.js';
 
 const PERIODS = ['7', '30', 'all'];
-export function createModelPerformanceController({ directory, codexHome,
+export function createModelPerformanceController({ directory, codexHome, platform = process.platform,
   idleMs = 60_000, workerFactory = options => new Worker(new URL('./model-performance-worker.js', import.meta.url), options) }) {
   const cache = new Map();
   let worker = null, idle = null, closed = false, failedAt = 0, stopping = null;
@@ -48,7 +48,9 @@ export function createModelPerformanceController({ directory, codexHome,
   return {
     async read(period) {
       if (!PERIODS.includes(period)) throw new Error('invalid_timing_period');
-      if (closed) return empty(period, 'unavailable');
+      // The timing sidecar currently requires POSIX owner protection. Report
+      // this fixed platform boundary without starting a worker or retry timer.
+      if (closed || platform === 'win32') return empty(period, 'unavailable');
       start();
       clearTimeout(idle);
       idle = setTimeout(() => { void stop(); }, idleMs); idle.unref?.();

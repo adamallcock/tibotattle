@@ -655,13 +655,37 @@ function localAnalysisLabel() {
     : "Analyze local usage";
 }
 
+// Keep phase, count and elapsed time in stable slots across refresh updates.
+function renderRefreshProgress(button, phase, { processed = null, selected = null, elapsedSeconds = null } = {}) {
+  button.classList.add("refresh-progress");
+  const label = node("span", "refresh-progress-phase", phase);
+  const count = node("span", "refresh-progress-count");
+  if (processed !== null && selected !== null) {
+    const current = node("span", "refresh-progress-current", String(processed));
+    current.style.minWidth = `${String(selected).length}ch`;
+    count.append(current, document.createTextNode(`/${selected}`));
+  }
+  const elapsed = elapsedSeconds === null ? "" :
+    `${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+  const timer = node("span", "refresh-progress-time", elapsed);
+  const description = [phase, count.textContent, elapsed].filter(Boolean).join(" · ");
+  button.title = description;
+  button.setAttribute("aria-label", description);
+  button.replaceChildren(label, count, timer);
+}
+
 function updateLocalActionButtons() {
   const allowed = localAnalysisAllowed();
   const label = localAnalysisLabel();
   for (const selector of ["#refresh-button", "#setup-refresh"]) {
     const button = $(selector);
     button.disabled = localActionBusy || !allowed;
-    if (!localActionBusy) button.textContent = label;
+    if (!localActionBusy) {
+      button.textContent = label;
+      button.classList.remove("refresh-progress");
+      button.removeAttribute("aria-label");
+      button.removeAttribute("title");
+    }
   }
   const setupCheck = $("#setup-check-again");
   if (setupCheck) setupCheck.disabled = localActionBusy;
@@ -11863,7 +11887,8 @@ async function loadLocalDashboard() {
   let primaryAvailable = false;
   localActionBusy = true;
   const button = $("#refresh-button");
-  button.textContent = "Connecting…";
+  if (localRefreshInProgress) renderRefreshProgress(button, "Loading evidence…");
+  else button.textContent = "Connecting…";
   updateLocalActionButtons();
   try {
     const loadDashboardData = async () => {
@@ -12132,9 +12157,9 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = detailed
+  renderRefreshProgress(button, detailed
     ? "Starting detailed accounting…"
-    : "Starting local analysis…";
+    : "Starting local analysis…");
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
@@ -12171,7 +12196,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         consecutiveStatusFailures = 0;
       } catch (error) {
         consecutiveStatusFailures += 1;
-        button.textContent = "Update running; reconnecting…";
+        renderRefreshProgress(button, "Update running; reconnecting…");
         if (consecutiveStatusFailures >= 8) throw error;
         continue;
       }
@@ -12205,11 +12230,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         0,
         Math.floor((Date.now() - activePassStartedMs) / 1_000),
       );
-      const elapsedLabel = elapsedSeconds >= 60
-        ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
-        : `${elapsedSeconds}s`;
       const accountingStatus = outcome === "running"
-        ? refreshAccountingStatus({ progress, elapsedLabel })
+        ? refreshAccountingStatus({ progress })
         : null;
       const countedProgress = collectorProgress || unifiedIndexScanning;
       const processed = countedProgress
@@ -12218,24 +12240,24 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       const selected = countedProgress
           && Number.isSafeInteger(progress?.filesSelected)
         ? progress.filesSelected : null;
-      button.textContent = outcome === "cancelling"
+      const phase = outcome === "cancelling"
         ? "Stopping safely…"
         : accountingStatus !== null
           ? accountingStatus
         : archiveScanning
-          ? `Indexing archive history… ${elapsedLabel}`
+          ? "Indexing archive history…"
         : collectorProgress && progress?.phase === "quick_result"
           ? refreshQuickResultStatus({
               dashboardLoaded: quickResultLoaded,
-              elapsedLabel,
             })
         : unifiedIndexScanning && (selected === null || selected === 0)
-          ? `Scanning local history… ${elapsedLabel}`
+          ? "Scanning local history…"
         : processed !== null && selected !== null
         ? selected > 0 && processed >= selected
-          ? `Calculating usage and allowance… ${elapsedLabel}`
-          : `Analyzing ${processed}/${selected} files… ${elapsedLabel}`
-        : pollCount < 3 ? "Analyzing local evidence…" : `Analyzing… ${elapsedLabel}`;
+          ? "Calculating usage and allowance…"
+          : "Analyzing files…"
+        : pollCount < 3 ? "Analyzing local evidence…" : "Analyzing…";
+      renderRefreshProgress(button, phase, { processed, selected, elapsedSeconds });
       if (refreshNeedsContinuation({
         outcome,
         errorCode: refresh.errorCode,
@@ -12252,7 +12274,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
-          button.textContent = "Continuing local analysis…";
+          renderRefreshProgress(button, "Continuing local analysis…");
         } catch (error) {
           // A 409 means a timed-out pass is still finishing its durable
           // checkpoint. Keep polling until it becomes resumable.
@@ -12267,7 +12289,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        button.textContent = "Finalizing bounded pause…";
+        renderRefreshProgress(button, "Finalizing bounded pause…");
         if (!timeoutSettlementNoted) {
           pollingBudget.noteSettling();
           timeoutSettlementNoted = true;
@@ -12277,7 +12299,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     cancelled = outcome === "cancelled";
     if (cancelled) {
-      button.textContent = "Loading saved results…";
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "Local analysis cancelled",
@@ -12288,7 +12310,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     if (outcome === "failed"
         && finalErrorCode === "refresh_resource_limited") {
-      button.textContent = "Loading saved results…";
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "This scan paused to protect your Mac",
@@ -12298,7 +12320,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       return;
     }
     if (outcome === "degraded") {
-      button.textContent = t("refresh.degradedLoading");
+      renderRefreshProgress(button, t("refresh.degradedLoading"));
       await loadLocalDashboard();
       lastReindexProgressReceipt = historyProgressReceipt();
       const history = dashboard?.pricing?.historyCoverage
@@ -12347,7 +12369,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       throw failure;
     }
     archiveHistoryScanActive = false;
-    button.textContent = "Loading updated evidence…";
+    renderRefreshProgress(button, "Loading updated evidence…");
     await loadLocalDashboard();
     if (detailed) scheduleReindexAutoContinuation();
   } catch (error) {

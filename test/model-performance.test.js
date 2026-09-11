@@ -44,7 +44,7 @@ test('controller is lazy, coalesces reads, retains good snapshots on failure, an
     unref() {} postMessage(message) { assert.equal(message.type, 'stop'); queueMicrotask(() => this.emit('exit', 0)); }
   }
   let made = 0, worker;
-  const c = createModelPerformanceController({ directory: 'unused', codexHome: 'unused',
+  const c = createModelPerformanceController({ directory: 'unused', codexHome: 'unused', platform: 'darwin',
     workerFactory: () => { made++; return worker = new FakeWorker(); } });
   assert.equal(made, 0); assert.equal((await c.read('all')).status, 'loading');
   await c.read('7'); assert.equal(made, 1);
@@ -57,6 +57,33 @@ test('controller is lazy, coalesces reads, retains good snapshots on failure, an
   await c.close(); assert.equal((await c.read('all')).status, 'unavailable');
   await assert.rejects(c.read('90'));
 });
+test('Windows returns the closed unavailable DTO immediately without a timing worker', async () => {
+  let workers = 0;
+  const controller = createModelPerformanceController({
+    directory: 'unused', codexHome: 'unused', platform: 'win32',
+    workerFactory: () => { workers++; throw new Error('must not start'); },
+  });
+  try {
+    for (const period of ['7', '30', 'all', 'all']) {
+      const result = await controller.read(period);
+      assert.deepEqual(Object.keys(result).sort(), [
+        'schemaVersion', 'method', 'status', 'collecting', 'stale', 'updatedAt',
+        'period', 'interval', 'start', 'end', 'models',
+      ].sort());
+      assert.equal(result.status, 'unavailable');
+      assert.equal(result.collecting, false);
+      assert.equal(result.stale, false);
+      assert.equal(result.period, period);
+      assert.equal(result.updatedAt, null);
+      assert.deepEqual(result.models, []);
+    }
+    await assert.rejects(controller.read('90'), /invalid_timing_period/u);
+    assert.equal(workers, 0);
+  } finally { await controller.close(); }
+  assert.equal((await controller.read('all')).status, 'unavailable');
+  assert.equal(workers, 0);
+});
+
 test('actual worker reconstructs synthetic logs off-main, persists, and shuts down', async t => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'model-speed-')));
   t.after(() => rm(root, { recursive: true, force: true }));

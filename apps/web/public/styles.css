@@ -319,6 +319,25 @@ body.native-dashboard #cancel-refresh { display: none; }
 html.native-dashboard #setup-card,
 body.native-dashboard #setup-card { display: none !important; }
 .top-actions { display: flex; flex: 0 1 auto; align-items: center; justify-content: flex-end; gap: .55rem; }
+/* Numeric tracks and the active control retain their width across phases. */
+#refresh-button.refresh-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 13ch 7ch;
+  gap: .6em;
+  inline-size: clamp(19rem, 32vw, 26rem);
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: start;
+}
+.refresh-progress-phase, .refresh-progress-count, .refresh-progress-time {
+  min-block-size: 1lh;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.refresh-progress-count, .refresh-progress-time { text-align: end; }
+.refresh-progress-current { display: inline-block; text-align: end; }
+#cancel-refresh { min-inline-size: 7.5em; font-variant-numeric: tabular-nums; }
 .language-picker { display: inline-flex; align-items: center; }
 .electron-dashboard .topbar .language-picker { display: none; }
 .language-picker select {
@@ -1888,7 +1907,7 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .weekly-table-panel { margin-top: 18px; }
 .weekly-history-panel { margin-top: 18px; }
-.weekly-history-panel .panel-heading { align-items: flex-start; }
+.weekly-history-panel .panel-heading { align-items: flex-start; flex-wrap: wrap; }
 .weekly-chart-controls {
   display: flex;
   flex-wrap: wrap;
@@ -2762,6 +2781,7 @@ footer p { margin: 0; }
   .topbar .history-index-badge { display: none; }
   /* Only the crowded top toolbar sheds its compact buttons on narrow screens. */
   .topbar .button.compact { display: none; }
+  #refresh-button.refresh-progress { display: none; }
   .dashboard-sidebar { padding-inline: 14px; }
   .page-heading, .section-heading, .section-heading.split, .weekly-hero, .weekly-pace-forecast, .setup-card, .companion-setup, .contribution-cta { grid-template-columns: 1fr; gap: 24px; }
   .companion-setup-actions { grid-column: 1; }

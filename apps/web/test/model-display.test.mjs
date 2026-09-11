@@ -107,7 +107,10 @@ test("model table preserves unavailable, unreviewed, separate-allowance and pric
     assert.equal(contents(byName("Codex Auto Review").children[4]), t("accounting.model.noPublishedPrice"));
     assert.equal(contents(byName("GPT-5.5").children[4]), "$0.00");
     for (const name of [t("accounting.model.identityUnavailable"), t("accounting.model.unrecognized"), "Codex Auto Review"]) {
-      assert.equal(byName(name).children[0].children.some((child) => child.getAttribute("class") === "allowance-model-icon"), false, name);
+      const icon = byName(name).children[0].children.find((child) => child.getAttribute("class") === "allowance-model-icon");
+      assert.ok(icon, name);
+      assert.equal(icon.getAttribute("aria-hidden"), "true");
+      assert.equal(icon.getAttribute("focusable"), "false");
     }
     assert.ok(byName("GPT-5.3 Codex Spark").children[0].children.some((child) => child.getAttribute("class") === "allowance-model-icon"));
     render({ modelUsage: [] }, { unavailable: true });
@@ -128,7 +131,10 @@ test("shared model icons preserve established aliases without inventing unknown 
     assert.equal(presentation.theme, theme);
     assert.equal(modelThemeIcon(documentRef, presentation.theme).tag, "svg");
   }
-  for (const id of ["unknown", "gpt-6-unreviewed", "codex-auto-review", null]) {
-    assert.equal(modelThemeIcon(documentRef, modelUsagePresentation(id).theme), null);
+  for (const id of ["unknown", "gpt-6-unreviewed", null]) {
+    assert.equal(modelUsagePresentation(id).theme, "generic");
+    assert.equal(modelThemeIcon(documentRef, modelUsagePresentation(id).theme).tag, "svg");
   }
+  assert.equal(modelUsagePresentation("codex-auto-review").theme, "review");
+  assert.equal(modelThemeIcon(documentRef, "review").tag, "svg");
 });
