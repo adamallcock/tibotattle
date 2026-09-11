@@ -40,10 +40,10 @@ remains operational at revision 3. Current public figures now admit eligible
 accountless v1.1 sources under the same existing analytical rules.
 
 The policy change invalidated derived publications. Scheduled rebuilding has
-prepared all 15 source members and published the first 48 daily rows; 271
-retained days remained queued at that observation. Recent graphs still need
-their corresponding days rebuilt. A real accountless source has not yet
-appeared in the public figures. Local HTTP lifecycle tests prove
+prepared all 15 source members and published 319 daily rows, with no retained
+days left in the rebuild queue. The public API for September 5–11 returns a
+ready allowance result and four daily entries. A real accountless source has
+not yet appeared in the public figures. Local HTTP lifecycle tests prove
 enrollment, accepted upload, replay, publication, renewal, withdrawal and erasure.
 The service suite passed 1,026 tests; the populated migration rehearsal preserved
 1,000 synthetic source chains and 100,000 records in each telemetry table.
@@ -51,10 +51,11 @@ The service suite passed 1,026 tests; the populated migration rehearsal preserve
 An installed 0.1.21 diagnostic then found a separate desktop preparation defect:
 history above one million quota observations hits a fixed acquisition limit
 and retries without reaching upload. Enrollment and the versioned upload
-authorization were valid. A bounded streaming reader repair is being integrated
+authorization were valid. The bounded streaming reader repair is integrated
 with the requested Projects, model-performance and progress-layout changes in
-a separate checkout based on the released 0.1.21 source. That app repair still
-requires combined qualification, packaging and installed upload proof.
+[PR #121](https://github.com/adamallcock/tibotattle/pull/121), based on the released
+0.1.21 source. The proposed 0.1.22 app still requires completed release
+qualification, packaging and installed upload proof.
 
 The earlier native facts below are carried forward from the 2026-09-05 release
 record. This hosted-policy change did not rerun native source-to-artifact,

@@ -46,7 +46,7 @@ are separate gates; the checklist below records their actual state.
   before caps, and withdrawal/erasure fences with populated local tests.
 - [x] Update public labels and privacy disclosure; inspect rendered results.
 - [x] Complete Worker, documentation, architecture, and deployment dry-run gates.
-- [ ] Apply the reviewed forward migration and guarded deployment; verify live
+- [x] Apply the reviewed forward migration and guarded deployment; verify live
   health, policy state, public responses, and ordinary scheduled publication.
 
 This is a hosted-service and website change. It does not require another desktop
@@ -100,7 +100,9 @@ owner. The owned maintenance hold was released after independently matching the
 live source and changed website asset hashes. Collection stayed operational;
 scheduled maintenance resumed. The first 48 daily rows were published and 271
 retained days remained queued; the current cohort was ready with 15 of 15
-source members prepared. Recent public graphs still await their days.
+source members prepared. A later read on the same day verified 319 published
+daily rows and an empty rebuild queue. The public daily API for September 5–11
+returned a ready allowance result and four daily entries.
 No active accountless analytical head existed at the first post-deployment read;
 that does not weaken admission rules or justify synthetic public measurements.
 
