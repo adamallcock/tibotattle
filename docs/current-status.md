@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-11
 type: status
 status: current
-source_commit: 9accd6f08a8bc519868f24a970b619e5e0e2a5f0
+source_commit: 03d4217fe4d42d9d342b6ad34b73905c025b9ead
 observation_date: 2026-09-11
 ---
 
@@ -22,7 +22,7 @@ neither draft nor prerelease, with 20 assets covering macOS Apple silicon,
 macOS Intel, Windows x64 and Linux x64, including native Mac transition feeds.
 This hosted-policy change does not rebuild or republish those installers.
 
-Live production health on 2026-09-11 returned `ok` at source `9accd6f0`;
+Live production health on 2026-09-11 returned `ok` at source `03d4217f`;
 the public daily API returned HTTP 200. Accountless enrollment and ownership
 are enabled in that deployed source. The completed `0057`–`0059` migration
 must not be repeated. The earlier synthetic staging-only
@@ -32,16 +32,35 @@ remote ledger, or treated as current.
 
 The owner approved accountless inclusion in the current public community sample
 on 2026-09-11. The [shared-source decision](./decisions/2026-09-11-public-contribution-sources.md)
-tracks implementation and activation. Migration `0060` changes metadata and
-publication rules, with exact authority, withdrawal fences and bounded retained
-history discovery; it does not move the retained telemetry tables. Until that
-migration and its matching Worker deploy are verified, the live `9accd6f0`
-public figures retain their previous social-only eligibility.
+tracks implementation and activation. Migration `0060` is applied and its 43
+new/replaced objects were verified against exact local and remote SQL forms.
+The guarded Worker/site deployment completed, both deployment and maintenance
+ownership were released, and ordinary scheduled maintenance resumed. Collection
+remains operational at revision 3. Current public figures now admit eligible
+accountless v1.1 sources under the same existing analytical rules.
+
+The policy change invalidated derived publications. Scheduled rebuilding has
+prepared all 15 source members and published the first 48 daily rows; 271
+retained days remained queued at that observation. Recent graphs still need
+their corresponding days rebuilt. A real accountless source has not yet
+appeared in the public figures. Local HTTP lifecycle tests prove
+enrollment, accepted upload, replay, publication, renewal, withdrawal and erasure.
+The service suite passed 1,026 tests; the populated migration rehearsal preserved
+1,000 synthetic source chains and 100,000 records in each telemetry table.
+
+An installed 0.1.21 diagnostic then found a separate desktop preparation defect:
+history above one million quota observations hits a fixed acquisition limit
+and retries without reaching upload. Enrollment and the versioned upload
+authorization were valid. A bounded streaming reader repair is being integrated
+with the requested Projects, model-performance and progress-layout changes in
+a separate checkout based on the released 0.1.21 source. That app repair still
+requires combined qualification, packaging and installed upload proof.
 
 The earlier native facts below are carried forward from the 2026-09-05 release
-record. This reconciliation did not rerun native source-to-artifact, signing,
-notarization, Gatekeeper, installed-runtime, update-feed, public-site, or live
-hosted checks.
+record. This hosted-policy change did not rerun native source-to-artifact,
+signing, notarization, Gatekeeper or installed-runtime qualification. Public
+release/feed identity, generated assets, rendered privacy content and live
+hosted health were checked separately for this deployment.
 
 ## Earlier native release (historical)
 

@@ -45,7 +45,7 @@ are separate gates; the checklist below records their actual state.
 - [x] Prove mixed-source inclusion, replay behavior, ineligible-source filtering
   before caps, and withdrawal/erasure fences with populated local tests.
 - [x] Update public labels and privacy disclosure; inspect rendered results.
-- [ ] Complete Worker, documentation, architecture, and deployment dry-run gates.
+- [x] Complete Worker, documentation, architecture, and deployment dry-run gates.
 - [ ] Apply the reviewed forward migration and guarded deployment; verify live
   health, policy state, public responses, and ordinary scheduled publication.
 
@@ -84,3 +84,29 @@ If a migration response is uncertain, inspect its ledger and schema without
 retrying or restoring data. If migration succeeds but deployment fails, retain
 and renew the owned maintenance hold while reconciling the deployment. Never
 replay 0057–0059 or clear an unknown deployment journal to unblock this change.
+
+## Observed activation
+
+On 2026-09-11, 0060 applied once with its reviewed bytes unchanged. Primary
+migrations now end at 0060; the deletion ledger remains at 0002. Exact schema
+verification passed for all 43 new/replaced objects. Remote D1 retains inline
+comments that local Wrangler strips, so the readiness probe accepts the two
+exact expected definitions without normalizing observed SQL. Missing and altered
+guards remain rejected in both representations.
+
+The guarded deployment of `03d4217fe4d42d9d342b6ad34b73905c025b9ead`
+returned verified health/public-surface results and released its Git coordination
+owner. The owned maintenance hold was released after independently matching the
+live source and changed website asset hashes. Collection stayed operational;
+scheduled maintenance resumed. The first 48 daily rows were published and 271
+retained days remained queued; the current cohort was ready with 15 of 15
+source members prepared. Recent public graphs still await their days.
+No active accountless analytical head existed at the first post-deployment read;
+that does not weaken admission rules or justify synthetic public measurements.
+
+A subsequent installed 0.1.21 check identified an independent desktop reader
+limit above one million quota observations. Its active accountless credential
+and upload authorization were intact, but preparation failed before upload.
+The bounded desktop repair and new app qualification are separate from this
+completed policy migration and deployment; they must not be inferred from
+the hosted test results.
