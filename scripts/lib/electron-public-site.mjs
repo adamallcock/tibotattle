@@ -129,6 +129,7 @@ export function renderElectronSiteDocumentation(html) {
     `<article class="resource-card" id="local-first"><h2>Local state and uninstall</h2><p>${text('electron.site.docs.state')}</p></article>`);
   output = output.replace(/<article\b[^>]*id="updates"[^>]*>[\s\S]*?<\/article>/u,
     `<article class="resource-card" id="updates"><h2>Updates and channels</h2><p>${text('electron.site.docs.updates')}</p></article>`);
+  output = output.replace('<body class="community-site resource-site">', '<body class="community-site resource-site" data-i18n-root>');
   output = output.replace('</body>', '<script type="module" src="./localization.js"></script>\n</body>');
   return output;
 }
