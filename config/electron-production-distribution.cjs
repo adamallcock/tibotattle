@@ -17,6 +17,12 @@ const PRODUCTION_ELECTRON_APP_ID = "com.usagemonitor.local";
 const PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID =
   "FDA705D7-5644-50E8-8CD2-3005D51B98C5";
 const PRODUCTION_ELECTRON_CHANNEL = "stable";
+// Public verification key retained from the signed native stable predecessor.
+// Sparkle checks its preservation while installing an incoming upgrade, even
+// when the archive and Developer ID signatures are valid. This passive plist
+// value does not enable Sparkle or change Electron's outgoing updater.
+const PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY =
+  "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw=";
 const PRODUCTION_ELECTRON_CONTRIBUTION_POLICY = "accountless-opt-out-v1";
 const PRODUCTION_ELECTRON_UPDATE_ORIGIN = "https://updates.tibotattle.com";
 // This is a separately packaged, unsigned development-only selection for
@@ -353,6 +359,15 @@ function assertProductionElectronMacOSBundleMetadata({
   return Object.freeze({ bundleVersion, bundleShortVersion });
 }
 
+/** Validate the actual mounted stable Mac app's incoming-upgrade trust key. */
+function assertProductionElectronMacOSIncomingUpgradeMetadata({ target, publicEDKey } = {}) {
+  if (!["darwin-arm64", "darwin-x64"].includes(target)
+      || publicEDKey !== PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY) {
+    throw new TypeError("macOS incoming upgrade must retain the native stable public key");
+  }
+  return Object.freeze({ publicEDKey });
+}
+
 /**
  * electron-updater reads the packaged semantic version, while the guided
  * native handover reads the numeric CFBundleShortVersionString. A rehearsal
@@ -373,6 +388,7 @@ function productionElectronMacOSBundleShortVersionForTarget({ target, version } 
 }
 
 module.exports = Object.freeze({
+  PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY,
   ACCOUNTLESS_HOSTED_REHEARSAL_APP_ID,
   ACCOUNTLESS_HOSTED_REHEARSAL_CHANNEL,
   ACCOUNTLESS_HOSTED_REHEARSAL_CREDENTIAL_STORAGE,
@@ -406,6 +422,7 @@ module.exports = Object.freeze({
   accountlessSignedStagingRehearsalStagingPathSegments,
   productionElectronBuildVersionForTarget,
   assertProductionElectronMacOSBundleMetadata,
+  assertProductionElectronMacOSIncomingUpgradeMetadata,
   productionElectronDistributionForTarget,
   productionElectronFeedForTarget,
   productionElectronMacOSBundleShortVersionForTarget,

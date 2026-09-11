@@ -35,9 +35,19 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-The [0.1.21 candidate](./release-notes/0.1.21.md) corrects the Mac installers'
-minimum-system metadata to match their supported macOS 14 requirement. Final
-installer verification and publication remain pending.
+No further changes recorded.
+
+## [0.1.21](./release-notes/0.1.21.md) - 2026-09-11
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.21) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.21) ·
+[changes since v0.1.20](https://github.com/adamallcock/tibotattle/compare/v0.1.20...v0.1.21)
+
+Complete native 0.1.18's update path to Electron, preserving local history,
+settings and contribution choice. Retain the public key needed by the incoming
+native update and declare macOS 14 correctly in both Mac installers. Restore
+compact website download controls with GitHub asset links. See the
+[release notes](./release-notes/0.1.21.md).
 
 ## [0.1.20](./release-notes/0.1.20.md) - 2026-09-11
 

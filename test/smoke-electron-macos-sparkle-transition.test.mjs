@@ -120,6 +120,32 @@ test('the runner never installs the candidate directly or changes either signed 
   assert.match(script, /await verifyCandidate\(input, installedApp\)/u);
 });
 
+test('waiting for a delayed About item does not toggle its menu closed', () => {
+  let expanded = false, ready = false, opens = 0, presses = 0;
+  const about = { name: () => 'Acerca de TiboTattle', click: () => { presses++; } };
+  const menu = { name: () => 'TiboTattle', click: () => { expanded = !expanded; opens++; },
+    menus: () => expanded ? [{ menuItems: () => ready ? [about] : [] }] : [] };
+  const context = { Application: () => ({ applicationProcesses: { whose: () => () => [{ menuBars: () => [{ menuBarItems: () => [menu] }] }] } }) };
+  const run = action => runInNewContext(runner.sparkleTransitionUiScript(321, action) + '\nrun();', context);
+  assert.equal(run('openmenu'), 'clicked');
+  for (let i = 0; i < 3; i++) assert.equal(run('about'), 'target_absent');
+  assert.equal(opens, 1); assert.equal(expanded, true);
+  ready = true; assert.equal(run('about'), 'clicked'); assert.equal(presses, 1);
+});
+
+test('synthetic UI diagnostics return closed counts rather than unknown labels or text', () => {
+  const element = (name, value) => ({ name: () => name, value: () => value, enabled: () => true });
+  const context = { Application: () => ({ applicationProcesses: { whose: () => () => [{
+    frontmost: () => true, menuBars: () => [], windows: () => [{ entireContents: () => [
+      element('Private session name', 'Private arbitrary text'), element('Install Update', '')] }],
+  }] } }) };
+  const text = runInNewContext(runner.sparkleTransitionDiagnosticScript(321) + '\nrun();', context);
+  const value = JSON.parse(text);
+  assert.equal(value.processPresent, true); assert.equal(value.unknownLabelCount, 1);
+  assert.deepEqual(value.controls.install, { count: 1, enabled: 1 });
+  assert.doesNotMatch(text, /Private|session|arbitrary/u);
+});
+
 test('production proof refuses a user feed override instead of silently testing a different feed', async () => {
   const script = await readFile(new URL('../scripts/smoke-electron-macos-sparkle-transition.mjs', import.meta.url), 'utf8');
   const body = script.slice(script.indexOf("    if (input.feedScope === 'isolated_test_feed') {"),

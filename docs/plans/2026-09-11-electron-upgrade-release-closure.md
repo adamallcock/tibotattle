@@ -24,17 +24,36 @@ installed evidence.
   Electron transition receipt, separate from embedded application updater
   metadata. Native receipt validation, key continuity, artifact validation and
   atomic feed replacement remain in use.
-- Corrected application source is frozen at
+- The first Sparkle candidate used application source
   dd9e99f38b3802746de88b76160fdbb56051edeb, version 0.1.21,
-  provenance build 2026091106, Mac bundle version 1028. Previous signed
-  0.1.21 candidates remain historical evidence; they will not be published.
-- Both final Mac applications and outer disk images are signed, notarized and
-  stapled. The final Windows installer passed its hosted install, processing,
+  provenance build 2026091106, Mac bundle version 1028. It is superseded by the
+  public-key compatibility correction below and will not be published.
+- That candidate's Mac applications and outer disk images are signed, notarized
+  and stapled. Its Windows installer passed the hosted install, processing,
   restart and uninstall journey (run 34559592872). Linux packaging passed
   (run 34559594120); this is not a new installed Linux acceptance run.
 - Both installed Mac update runners are prepared: native 0.1.18 through Sparkle,
   and released Electron 0.1.20 through its unchanged production updater.
   Their contract tests passed; actual installed execution remains below.
+
+## Installed findings and correction
+
+Apple Silicon run 34561060979 reached the actual Check and Install controls,
+then Sparkle rejected the successor. Pinned Sparkle 2.9.3 forbids removing the
+predecessor's public update key; the signed Electron bundle omitted it. Both
+old and new signing identities match and their signatures are valid. The
+correction retains the exact public SUPublicEDKey as passive signed metadata.
+Electron remains the only outgoing updater. No signature checks are relaxed.
+
+Intel run 34561079561 stopped at the About menu; no update was attempted. Its
+runner now opens the app menu once and waits for its item, with bounded
+diagnostics from only the synthetic process. Repeated clicks previously could
+toggle the menu while accessibility information was still arriving.
+
+The corrected source will be recorded by the frozen application tag and fresh
+four-target receipts, using provenance build 2026091107. Both failed receipts
+and the superseded installers remain preserved. Public publication remains
+held until the corrected installed journeys succeed.
 
 ## Remaining sequence
 

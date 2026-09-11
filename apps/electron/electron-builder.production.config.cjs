@@ -388,6 +388,14 @@ if (INPUTS.targetSpec.platform === "darwin") {
     to: nativeMacOSKeychainAdapterResourcesPath,
   }];
   configuration.mac = {
+    // Preserve the native predecessor's archive-verification identity for its
+    // incoming Sparkle upgrade. No Sparkle framework/feed is installed, and
+    // electron-updater remains the only outgoing updater. Isolated rehearsal
+    // and signed staging packages do not inherit this stable trust metadata.
+    ...(!INPUTS.signedStaging
+      && INPUTS.distributionSelection.channel === distribution.PRODUCTION_ELECTRON_CHANNEL
+      ? { extendInfo: { SUPublicEDKey: distribution.PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY } }
+      : {}),
     // Match the supported platform floor in the signed bundle metadata, so
     // macOS and package managers can reject unsupported systems accurately.
     minimumSystemVersion: "14.0",

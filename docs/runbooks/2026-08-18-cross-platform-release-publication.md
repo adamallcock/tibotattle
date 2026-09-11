@@ -675,6 +675,23 @@ the user-facing explanation and commands.
 
 ## Normal Electron stable feed preparation
 
+An Electron cutover also has an incoming native update obligation. Follow the
+[native Sparkle transition procedure](macos-stable-release-runbook.md#native-sparkle-to-electron-transition)
+before activation. The writer below intentionally leaves both native appcasts
+unchanged; a green Electron feed publication does not complete that obligation.
+Publish the exact GitHub assets first, then coordinate both native appcasts,
+the four Electron feeds, Homebrew and the website. Verify both native and
+Electron installed update paths against their real production feeds afterwards.
+
+Website manual download buttons use the canonical GitHub release asset URLs.
+The updates host remains the transport for installed updaters. Keep all four
+buttons compact, retain unobtrusive checksum controls, and derive version,
+platform, minimum OS and native trust claims from the final manifest. Only Mac
+artifacts can be described as Developer ID signed and Apple notarized. Verify
+the rendered desktop/mobile and translated pages after deployment, as well as
+live bytes and social metadata. Homebrew must resolve the same Mac installer
+digests before its installation command is shown.
+
 `scripts/prepare-electron-stable-publication.mjs` prepares a local, journaled
 four-target publication contract. It does not upload, sign, deploy, create a
 release or change any feed. Its optional public verification mode performs only

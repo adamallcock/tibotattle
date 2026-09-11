@@ -139,7 +139,7 @@ async function until(check, timeout, stage) {
 
 // Targets only the already identity-checked synthetic process. No global keystrokes or prompt approval.
 export function sparkleTransitionUiScript(pid, action) {
-  if (!Number.isSafeInteger(pid) || pid < 2 || !['about', 'check', 'install', 'relaunch', 'quit', 'inspect'].includes(action)) fail('ui_arguments');
+  if (!Number.isSafeInteger(pid) || pid < 2 || !['activate', 'openmenu', 'about', 'check', 'install', 'relaunch', 'quit', 'inspect'].includes(action)) fail('ui_arguments');
   return [
     'function run() {',
     'const matches = Application("System Events").applicationProcesses.whose({unixId:' + pid + '})();',
@@ -148,11 +148,13 @@ export function sparkleTransitionUiScript(pid, action) {
     'const action = ' + JSON.stringify(action) + ';',
     'function label(e) { try { return String(e.name()); } catch (_) { try { return String(e.title()); } catch (_) { return ""; } } }',
     'function press(e) { e.click(); return "clicked"; }',
-    'if (action === "about" || action === "quit") {',
-    '  p.frontmost = true;',
+    'if (action === "activate") { p.frontmost = true; return p.frontmost() ? "activated" : "target_absent"; }',
+    'if (action === "openmenu" || action === "about" || action === "quit") {',
     '  const bars = p.menuBars(); if (bars.length < 1) return "menu_absent";',
-    '  const items = bars[0].menuBarItems().filter(e => label(e) === "TiboTattle");',
-    '  if (items.length !== 1) return "menu_absent"; items[0].click();',
+    '  const items = bars.flatMap(b => b.menuBarItems()).filter(e => label(e) === "TiboTattle");',
+    '  if (items.length !== 1) return "menu_absent";',
+    '  if (action === "openmenu") return press(items[0]);',
+    '  if (action === "quit") { p.frontmost = true; items[0].click(); }',
     '  const menus = items[0].menus(); if (menus.length !== 1) return "menu_absent";',
     '  const names = action === "about" ? ["About TiboTattle","Acerca de TiboTattle"] : ["Quit TiboTattle","Salir de TiboTattle"];',
     '  const targets = menus[0].menuItems().filter(e => names.includes(label(e)));',
@@ -178,11 +180,34 @@ function ui(executable, pid, action) {
   const current = appProcess(executable);
   if (!current || current.pid !== pid) return 'process_absent';
   const result = command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', sparkleTransitionUiScript(pid, action)], 10000);
-  const allowed = ['clicked', 'process_absent', 'menu_absent', 'target_absent', 'ambiguous_target',
+  const allowed = ['clicked', 'activated', 'process_absent', 'menu_absent', 'target_absent', 'ambiguous_target',
     'signature_error', 'no_update', 'keychain_dialog'];
   if (!allowed.includes(result)) fail('ui_result');
   if (['ambiguous_target', 'signature_error', 'no_update', 'keychain_dialog'].includes(result)) fail(result);
   return result;
+}
+
+export function sparkleTransitionDiagnosticScript(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 2) fail('ui_arguments');
+  return [
+    'function run() {',
+    'const matches = Application("System Events").applicationProcesses.whose({unixId:' + pid + '})();',
+    'if (matches.length !== 1) return JSON.stringify({processPresent:false});',
+    'const p=matches[0], bars=p.menuBars(), windows=p.windows();',
+    'const result={processPresent:true,frontmost:Boolean(p.frontmost()),menuBars:Math.min(bars.length,8),windows:Math.min(windows.length,8),appMenus:0,controls:{},unknownLabelCount:0};',
+    'function label(e){try{return String(e.name());}catch(_){return "";}}',
+    'const known={"About TiboTattle":"about","Acerca de TiboTattle":"about","Check for Updates…":"check","Buscar actualizaciones…":"check","Install Update":"install","Instalar actualización":"install","Install and Relaunch":"relaunch","Instalar y volver a abrir":"relaunch","Get Started":"first_run"};',
+    'let elements=[];',
+    'for(const b of bars.slice(0,8)){for(const i of b.menuBarItems()){if(label(i)==="TiboTattle"){result.appMenus++;for(const m of i.menus())elements=elements.concat(m.menuItems());}}}',
+    'for(const w of windows.slice(0,8))elements=elements.concat(w.entireContents());',
+    'let text="";',
+    'for(const e of elements.slice(0,2000)){const name=label(e),id=known[name];if(id){const c=result.controls[id]??{count:0,enabled:0};c.count++;try{if(e.enabled())c.enabled++;}catch(_){}result.controls[id]=c;}else if(name)result.unknownLabelCount++;try{text+=" "+String(e.value());}catch(_){}}',
+    'result.keychainDialog=/Keychain|keychain|llavero/.test(text);',
+    'result.signatureError=/improperly signed|could not be validated/i.test(text);',
+    'result.noUpdate=/up.to.date|versión más reciente/i.test(text);',
+    'return JSON.stringify(result);',
+    '}',
+  ].join('\n');
 }
 function processFingerprint(row) {
   try { return row.command + '\n' + command('/bin/ps', ['-p', String(row.pid), '-o', 'lstart=']); }
@@ -379,15 +404,26 @@ export async function runSparkleTransition(options) {
     const original = await until(() => appProcess(installedExecutable), 60000, 'native_process');
     ownedPid = original.pid;
     captureMacTransitionProcesses(installedApp, ownedPid, knownProcesses);
-    await until(() => ui(installedExecutable, ownedPid, 'about') === 'clicked', 60000, 'about_menu');
+    proof.uiResultCounts = {};
+    const interact = (action) => {
+      const result = ui(installedExecutable, ownedPid, action);
+      proof.lastUiResult = result;
+      proof.uiResultCounts[result] = (proof.uiResultCounts[result] ?? 0) + 1;
+      return result;
+    };
+    // Open once, then wait for AX to expose the menu. Repeated clicks can
+    // toggle it closed on slower hosts before the About item is available.
+    await until(() => interact('activate') === 'activated', 30000, 'native_activate');
+    await until(() => interact('openmenu') === 'clicked', 30000, 'app_menu');
+    await until(() => interact('about') === 'clicked', 60000, 'about_menu');
     stage = 'check_for_updates';
-    await until(() => ui(installedExecutable, ownedPid, 'check') === 'clicked', 60000, 'check_button');
+    await until(() => interact('check') === 'clicked', 60000, 'check_button');
     proof.checkForUpdatesClicked = true;
     // Let the native startup collector settle before measuring retained rows.
     stage = 'update_offer';
     await until(() => {
       captureMacTransitionProcesses(installedApp, ownedPid, knownProcesses);
-      return ui(installedExecutable, ownedPid, 'install') === 'clicked';
+      return interact('install') === 'clicked';
     }, 90000, 'update_offer');
     proof.installUpdateClicked = true;
     const before = await readSignedReplacementState(nativeRoot);
@@ -444,7 +480,14 @@ export async function runSparkleTransition(options) {
     if (JSON.stringify(sourceHashes) !== JSON.stringify(await Promise.all(sourceFiles.map((name) => fileHash(join(nativeRoot, name)))))) fail('native_source_changed');
     proof.sourceUntouched = true; proof.ownedProcessesStopped = true;
     proof.productionFeedVerified = input.feedScope === 'production_feed'; proof.status = 'passed';
-  } catch (error) { proof.failureStage = error?.transitionStage ?? stage; }
+  } catch (error) {
+    proof.failureStage = error?.transitionStage ?? stage;
+    try {
+      if (installedExecutable && ownedPid && appProcess(installedExecutable)?.pid === ownedPid) {
+        proof.uiDiagnostic = JSON.parse(command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', sparkleTransitionDiagnosticScript(ownedPid)], 10000));
+      }
+    } catch { proof.uiDiagnostic = { unavailable: true }; }
+  }
   finally {
     if (active) {
       try { proof.ownedProcessesStopped = await stopOwnedMacSharingApp(active); }
