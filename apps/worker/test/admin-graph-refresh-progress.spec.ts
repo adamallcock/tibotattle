@@ -74,12 +74,24 @@ describe("independent owner refresh progress", () => {
     expect(Object.hasOwn(legacy, "preparation")).toBe(false);
   });
 
-  it("returns closed content-free metadata without advancing or inventing completion", async () => {
-    const result = await readAdminGraphRefreshProgress(db(), NOW, "resumable");
+  it("reports the migration policy invalidation without advancing or inventing completion", async () => {
+    // 0060 deliberately retires the old public policy, even on an otherwise
+    // empty database. An invalidation marker is distinct from never published.
+    const before = await db().prepare("SELECT * FROM community_snapshot_mutation_control WHERE singleton_id=1").first();
+    expect(before?.graph_last_invalidated_at).toEqual(expect.any(String));
+    const statements: string[] = [];
+    const database = new Proxy(db(), { get(target, key) {
+      if (key === "prepare") return (sql: string) => { statements.push(sql); return target.prepare(sql); };
+      const value = Reflect.get(target,key,target); return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const result = await readAdminGraphRefreshProgress(database, NOW, "resumable");
+    expect(statements.every(sql => /^\s*(?:SELECT|WITH)\b/u.test(sql))).toBe(true);
+    for (const sql of statements) expect(sql).not.toMatch(/\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/u);
+    expect(await db().prepare("SELECT * FROM community_snapshot_mutation_control WHERE singleton_id=1").first()).toEqual(before);
     const epoch = (await readCommunityRefreshLane(db(), "current", NOW)).sourceEpoch;
     expect(Object.keys(result).sort()).toEqual(["generatedAt", "history", "publication", "schemaVersion", "work"]);
     expect(result.schemaVersion).toBe(1);
-    expect(result.publication).toEqual({ state: "empty", requestedGeneration: epoch, preparedGeneration: null,
+    expect(result.publication).toEqual({ state: "invalidated", requestedGeneration: epoch, preparedGeneration: null,
       publishedGeneration: null, publishedAt: null });
     expect(result.work).toMatchObject({ state: "queued", phase: "current", trigger: null, restartReason: null });
     expect(result.history.resolvedDays).toBe(0);

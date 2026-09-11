@@ -112,6 +112,12 @@ export function renderElectronSiteDownloads(html, release) {
 }
 
 export function renderElectronSiteDocumentation(html) {
+  // Privacy keeps its source-owned content; only enable the same local catalog
+  // used by Docs so the explicit publication disclosures follow the saved locale.
+  if (html.includes('id="hosted-identity"') && html.includes('id="publication"')) {
+    return html.replace('<body class="community-site resource-site">', '<body class="community-site resource-site" data-i18n-root>')
+      .replace('</body>', '<script type="module" src="./localization.js"></script>\n</body>');
+  }
   // Only the existing documentation page has these source-owned sections.
   if (!html.includes('id="download-security"')) return html;
   let output = html.replace(/<article\b[^>]*id="start"[^>]*>[\s\S]*?<\/article>/u,

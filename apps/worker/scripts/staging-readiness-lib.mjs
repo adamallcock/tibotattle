@@ -1,3 +1,4 @@
+import { PUBLIC_SOURCE_SCHEMA_SQL } from "./public-source-schema-contract.mjs";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -120,6 +121,7 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0057_accountless_enrollment_ledger.sql",
     "0058_accountless_upload_ownership.sql",
     "0059_accountless_upload_renewal.sql",
+    "0060_public_contribution_sources.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
@@ -1090,7 +1092,7 @@ function exactStoredSchemaProbe(objects, omittedNames = []) {
   return Object.entries(objects).filter(([name]) => !omitted.has(name)).map(([name, sql]) => `EXISTS (
   SELECT 1 FROM sqlite_master WHERE name = ${sqlStringLiteral(name)}
     AND type = ${sqlStringLiteral(sql.startsWith("CREATE TABLE") ? "table"
-      : sql.startsWith("CREATE INDEX") ? "index" : "trigger")}
+      : sql.startsWith("CREATE INDEX") ? "index" : sql.startsWith("CREATE VIEW") ? "view" : "trigger")}
     AND sql IS ${sqlStringLiteral(sql)}
 )`).join(" AND ");
 }
@@ -1553,6 +1555,32 @@ NOT EXISTS (
      AND dflt_value IS NULL AND pk = 0
 ) AS scale_columns;
 `;
+// Current 0060 probes retain all unaffected 0059 contracts. Every replaced or
+// new object is checked separately against exact stored DDL in a third bounded
+// metadata query, including the eligibility view and withdrawal/bootstrap guards.
+function unaffectedPublicSourceProbe(objects, historicalSocialNames = []) {
+  const replacements = Object.keys(PUBLIC_SOURCE_SCHEMA_SQL);
+  const remainingSocialNames = historicalSocialNames.filter(name => !replacements.includes(name));
+  return exactStoredSchemaProbe(objects, [...replacements, ...historicalSocialNames])
+    + (remainingSocialNames.length ? ` AND ${socialOwnerGatedTriggerProbe(remainingSocialNames)}` : "");
+}
+const publicSourceComponentProbe = (objects, socialNames, field) =>
+  `SELECT ${unaffectedPublicSourceProbe(objects, socialNames)} AS ${field}`;
+export const CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL
+  .replace(POST_ACCOUNTLESS_COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
+    publicSourceComponentProbe(CURRENT_MODEL_HISTORY_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history, "community_model_history_schema"))
+  .replace(POST_ACCOUNTLESS_COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
+    publicSourceComponentProbe(CURRENT_GRAPH_PRESERVATION_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.graph, "community_graph_preservation_schema"))
+  .replace(POST_ACCOUNTLESS_REFRESH_LANE_SCHEMA_PROBE_SQL,
+    publicSourceComponentProbe(REFRESH_LANE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.refresh, "refresh_lane_schema"));
+export const CURRENT_SCALE_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL.replace(
+  exactStoredSchemaProbe(SCALE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale)
+    + " AND " + socialOwnerGatedTriggerProbe(ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale),
+  unaffectedPublicSourceProbe(SCALE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale),
+);
+export const PUBLIC_SOURCE_SCHEMA_PROBE_SQL = `SELECT ${exactStoredSchemaProbe(PUBLIC_SOURCE_SCHEMA_SQL)} AS public_source_objects`;
+export const publicSourceSchemaComplete = row => row?.public_source_objects === 1;
+
 export function scaleSchemaComplete(row) {
   return row?.scale_objects === 1 && row?.scale_columns === 1;
 }
@@ -2927,7 +2955,7 @@ export function probeStagingLive({
         [
           "d1", "execute", "USAGE_MONITOR_DB",
           "--remote", "--env", "staging",
-          "--command", POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+          "--command", CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
           "--json",
         ],
         spawn,
@@ -2942,7 +2970,7 @@ export function probeStagingLive({
         [
           "d1", "execute", "USAGE_MONITOR_DB",
           "--remote", "--env", "staging",
-          "--command", POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
+          "--command", CURRENT_SCALE_SCHEMA_PROBE_SQL,
           "--json",
         ],
         spawn,
@@ -2950,6 +2978,13 @@ export function probeStagingLive({
       checks.attributionSchemaCurrent = checks.attributionSchemaCurrent
         && scaleSchemaProbe.ok
         && scaleSchemaComplete(collectionControlRow(parseJson(scaleSchemaProbe.stdout)));
+      const publicSourceSchemaProbe = runWrangler(wrangler, workerDirectory, [
+        "d1", "execute", "USAGE_MONITOR_DB", "--remote", "--env", "staging",
+        "--command", PUBLIC_SOURCE_SCHEMA_PROBE_SQL, "--json",
+      ], spawn);
+      checks.attributionSchemaCurrent = checks.attributionSchemaCurrent
+        && publicSourceSchemaProbe.ok
+        && publicSourceSchemaComplete(collectionControlRow(parseJson(publicSourceSchemaProbe.stdout)));
       if (!checks.attributionSchemaCurrent) {
         blockers.push("REMOTE_ATTRIBUTION_SCHEMA_INCOMPLETE");
       }

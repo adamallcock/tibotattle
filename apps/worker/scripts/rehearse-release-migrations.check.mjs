@@ -335,6 +335,13 @@ test("file import refuses malformed, partial, false and arbitrary progress resul
 
 test("fixed scale admission rejects unknown profiles, override dimensions and wrong lineage before spawning", async () => {
   const p = await prefix(56, 2);
+  assert.equal(LOCAL_SCALE_PROFILE.throughMigration, "0059_accountless_upload_renewal.sql");
+  const historical = await inspectMigrationPrefix({ prefix: p, throughMigration: LOCAL_SCALE_PROFILE.throughMigration });
+  assert.equal(historical.migrations.USAGE_MONITOR_DB.pending.length, 3);
+  assert.equal(historical.migrations.USAGE_MONITOR_DB.pending.at(-1).name, LOCAL_SCALE_PROFILE.throughMigration);
+  const current = await inspectMigrationPrefix({ prefix: p });
+  assert.equal(current.migrations.USAGE_MONITOR_DB.pending.at(-1).name, "0060_public_contribution_sources.sql");
+  await assert.rejects(inspectMigrationPrefix({ prefix: p, throughMigration: "0058_accountless_upload_ownership.sql" }), /REHEARSAL_TARGET_INVALID/);
   for (const options of [{ profile: "unknown" }, { profile: LOCAL_SCALE_PROFILE.name, accounts: 2 },
     { profile: LOCAL_SCALE_PROFILE.name, timeoutMs: 1 }, { profile: LOCAL_SCALE_PROFILE.name, maxDatabaseBytes: 3 * 2 ** 30 }]) {
     await assert.rejects(runMigrationRehearsalProcess({ prefix: p, ...options, spawn: () => assert.fail("must not spawn") }), /PROFILE_/);

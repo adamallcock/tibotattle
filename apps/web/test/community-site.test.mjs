@@ -18,6 +18,7 @@ import {
   renderCommunityAllowanceSection,
   renderCommunityDailySeries,
 } from "../public/community-view.js";
+import { translate } from "../public/localization.js";
 import {
   HOMEBREW_INSTALL_COMMAND,
   copyInstallerChecksum,
@@ -1201,7 +1202,10 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   assert.match(privacy, /Known off, paused, or\s+disconnected installations stay off/u);
   assert.match(privacy, /Unreadable or uncertain preference state does not\s+enable sharing/u);
   assert.match(privacy, /does not prove a unique person/u);
-  assert.match(privacy, /Accountless contributions are currently excluded from public/u);
+  assert.match(privacy, /Eligible contributions from signed-in or accountless installations can enter the public community sample/u);
+  assert.match(privacy, /Separate installations may submit overlapping history/u);
+  assert.match(privacy, /Previously released sealed weekly snapshots retain their original eligibility rules/u);
+  assert.doesNotMatch(privacy, /Accountless contributions are currently excluded/u);
   assert.doesNotMatch(privacy, /Nothing is contributed unless|one-person account boundary/u);
   assert.doesNotMatch(docs, /Contribution stays off until|one pseudonymous person|delete the complete hosted participation/u);
   for (const page of [docs, privacy]) {
@@ -2223,9 +2227,9 @@ test("the allowance section renders the estimate with its visible caveat", () =>
   // The plausible range is spelled out beside the central number.
   assert.match(container.text, /\$1,500/u);
   assert.match(container.text, /\$2,300/u);
-  // The participant count is visible copy, not a tooltip: with one account
-  // contributing, the page says so plainly.
-  assert.match(container.text, /from 1 contributing account\b/u);
+  // The source count is visible copy, not a tooltip; it does not imply a
+  // unique person or verified provider account.
+  assert.match(container.text, /from 1 contribution source\b/u);
   assert.match(container.text, /5 qualifying reset fits in the trailing 30 days/u);
   assert.match(container.text, /Latest published estimate \(Aug 7, 2026\)/u);
   assert.doesNotMatch(container.text, /Latest published estimate \(Aug 6, 2026\)/u);
@@ -2347,7 +2351,45 @@ test("the allowance section follows the active UI language", () => {
     }),
   });
   assert.equal(stateNode.textContent, "额度估计可用");
-  assert.match(container.text, /来自 1 个贡献账户/u);
+  assert.match(container.text, /来自 1 个贡献来源/u);
+});
+
+test("source-count labels and overlap disclosure render in every public language", () => {
+  for (const [locale, sourceLabel, pluralLabel, identity, overlap] of [
+    ["en-US", "contribution source", "contribution sources", "not a unique person or verified OpenAI account", "overlapping history"],
+    ["zh-Hans", "个贡献来源", "个贡献来源", "不代表唯一用户或经验证的 OpenAI 账户", "重叠历史"],
+    ["es", "fuente de contribución", "fuentes de contribución", "no una persona única ni una cuenta de OpenAI verificada", "historial solapado"],
+  ]) {
+    for (const count of [1, 3]) {
+      const documentRef = fakeDocument();
+      documentRef.documentElement.lang = locale;
+      const container = documentRef.createElement("div");
+      const payload = publishedDailySeries({ days: [allowanceDay("2026-08-07", allowanceBlock({ participantCount: count }))] });
+      const before = structuredClone(payload);
+      assert.equal(renderCommunityAllowanceSection({ documentRef, container, payload }), "published");
+      assert.ok(container.text.includes(`${count} ${count === 1 ? sourceLabel : pluralLabel}`), locale);
+      assert.ok(container.text.includes(identity), locale);
+      assert.ok(container.text.includes(overlap), locale);
+      assert.deepEqual(payload, before, "presentation must not change sample counts or estimates");
+      const daily = documentRef.createElement("div");
+      renderCommunityDailySeries({ documentRef, container: daily, payload });
+      assert.ok(daily.text.includes(identity), locale);
+      assert.ok(daily.text.includes(overlap), locale);
+    }
+  }
+});
+
+test("public sample privacy paragraphs have explicit translations and retain the legacy snapshot boundary", async () => {
+  const privacy = await readFile(PRIVACY_HTML, "utf8");
+  for (const key of ["community.privacy.heading", "community.privacy.sample", "community.privacy.smallSample", "community.privacy.publicationRules"]) {
+    assert.ok(privacy.includes(`data-i18n="${key}"`));
+    for (const locale of ["en-US", "es", "zh-Hans"]) {
+      const copy = translate(key, {}, locale);
+      assert.notEqual(copy, key);
+      assert.ok(copy.length > (key === "community.privacy.heading" ? 2 : 30));
+      if (locale !== "en-US") assert.notEqual(copy, translate(key, {}, "en-US"));
+    }
+  }
 });
 
 test("Intel download rendering stays independent and refuses partial or ARM metadata", () => {

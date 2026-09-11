@@ -17,7 +17,7 @@ export const RETAINED_QUALIFICATION_CODE_FILES=Object.freeze([
  'scripts/accountless-migration-movement.mjs','scripts/accountless-migration-range.mjs','scripts/accountless-migration-operator.mjs','src/mutation-barrier.ts',
  'scripts/wrangler-query-launcher.mjs','scripts/wrangler-query-preload.cjs',
  'scripts/rehearse-release-migrations.mjs','scripts/release-preflight.mjs',
- 'scripts/staging-readiness-lib.mjs','../../config/deployment-endpoints.js',
+ 'scripts/staging-readiness-lib.mjs','scripts/public-source-schema-contract.mjs','../../config/deployment-endpoints.js',
 ]);
 const retained=['contributions','device_credentials','device_pairings','device_upload_authorizations','participants','telemetry_contributions','telemetry_v11_chunks','telemetry_v11_day_manifests','telemetry_v1_chunks','upload_authorizations','web_sessions'];
 const operation='reference58-20260909-01',sha=value=>createHash('sha256').update(value).digest('hex');
@@ -36,9 +36,10 @@ const combinedRead=`SELECT journal.metadata,journal.permissions,refs.* FROM (${m
 export async function prepareRetainedReferenceQualification({outputDirectory}={}) {
  check(typeof outputDirectory==='string'&&outputDirectory.length>0,'OUTPUT_REQUIRED');
  try{await lstat(resolve(outputDirectory));const error=new Error('RETAINED_QUALIFICATION_OUTPUT_EXISTS');error.code='EEXIST';throw error;}catch(error){if(error.code!=='ENOENT')throw error;}
- const names=(await readdir(join(root,'migrations'))).filter(n=>/^\d{4}.*\.sql$/.test(n)).sort();check(names.length===59,'SOURCE_COUNT');
+ // This retained qualification proves only the original 0057–0059 transition.
+ const names=(await readdir(join(root,'migrations'))).filter(n=>/^\d{4}.*\.sql$/.test(n)&&Number(n.slice(0,4))<=59).sort();check(names.length===59,'SOURCE_COUNT');
  const head=spawnSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8',timeout:5000,maxBuffer:1024});check(head.status===0&&/^[a-f0-9]{40}\s*$/.test(head.stdout),'SOURCE_REVISION');const sourceRevision=head.stdout.trim();
- const tree=spawnSync('git',['ls-tree','--full-tree','--name-only',`${sourceRevision}:apps/worker/migrations`],{cwd:root,encoding:'utf8',timeout:5000,maxBuffer:32768});check(tree.status===0&&JSON.stringify(tree.stdout.trim().split('\n').sort())===JSON.stringify(names),'CANONICAL_NAMES');
+ const tree=spawnSync('git',['ls-tree','--full-tree','--name-only',`${sourceRevision}:apps/worker/migrations`],{cwd:root,encoding:'utf8',timeout:5000,maxBuffer:32768});check(tree.status===0&&JSON.stringify(tree.stdout.trim().split('\n').filter(n=>Number(n.slice(0,4))<=59).sort())===JSON.stringify(names),'CANONICAL_NAMES');
  const sources=await Promise.all(names.map(async name=>{const sql=await readFile(join(root,'migrations',name),'utf8');const committed=spawnSync('git',['show',`${sourceRevision}:apps/worker/migrations/${name}`],{cwd:root,timeout:5000,maxBuffer:2*1024*1024});return{name,sql,sha256:sha(sql),matchesCommit:committed.status===0&&sha(committed.stdout)===sha(sql)};}));
  check(sources[57].sha256==='b435fd92d41e7ce8067cc183d7ac153359a9c130a971cba2e1b8b8c1c9cab61b'&&sources[58].sha256==='98afb99dd91e56a96960e6d99096e44c41eec0cd52d5a1e2969dea4ddee3d312','CANONICAL_HASH');
  const db=new DatabaseSync(':memory:'),control=new DatabaseSync(':memory:');db.exec('PRAGMA foreign_keys=ON;PRAGMA max_page_count=24576;PRAGMA cache_size=-4096');control.exec('PRAGMA foreign_keys=ON');

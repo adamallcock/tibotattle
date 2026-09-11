@@ -19,7 +19,11 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
 } from "../src/accountless-ownership";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
-import { handleRequest } from "../src/index";
+import { handleRequest, runScheduledMaintenance } from "../src/index";
+import { authenticateDevice, createDeviceUploadAuthorization, purgeStaleDeviceLifecycleRows } from "../src/device-auth";
+import { makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
+import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "../src/telemetry-v11-domain";
+import { telemetryV11DomainManifestDigestInput } from "@app-usagemonitor/telemetry-contract";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
 
 interface TestBindings extends Env {
@@ -323,6 +327,60 @@ describe("accountless owner lease renewal", () => {
       clock.mockRestore();
       secret.fill(0);
     }
+  });
+
+  it("keeps accepted public data through scheduled lease expiry, renews, then withdraws on explicit disconnect", async () => {
+    const wallClock = Date.now();
+    const deviceId = crypto.randomUUID();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const clock = vi.spyOn(Date, "now").mockReturnValue(wallClock - 23 * DAY);
+    try {
+      const { authorization, participantId } = await enrollAndOwn(deviceId, secret);
+      clock.mockReturnValue(wallClock);
+      const sourceDay = new Date(wallClock).toISOString().slice(0,10);
+      const fixture = { authorization, participantId, deviceId, nowEpoch:wallClock, sessionId:"", cookie:"", csrfToken:"" };
+      const acceptedDay = await stageV11Day(db(), fixture, await makeV11Day(sourceDay, {usage:[v11UsageRecord(sourceDay)]}));
+      const prior = await createTelemetryV11DomainPredecessor(db(), fixture);
+      const manifest = {schemaVersion:"telemetry-domain-manifest-v1.1" as const, fromDay:sourceDay, throughDay:sourceDay,
+        predecessor:{token:prior.token,previousGenerationId:prior.previousGenerationId,legacyFingerprint:prior.legacyFingerprint},
+        days:[{day:sourceDay,manifestId:acceptedDay.manifestId,manifestDigest:acceptedDay.manifestDigest}],manifestDigest:"0".repeat(64)};
+      manifest.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
+      await activateTelemetryV11Domain(db(), fixture, manifest);
+      const principal = await authenticateDevice(db(),authorization);
+      await createDeviceUploadAuthorization(db(),principal,"d".repeat(64),200);
+      const eligible = () => db().prepare("SELECT participant_id,device_id FROM community_public_source_owners WHERE participant_id=?")
+        .bind(participantId).first();
+      const head = await db().prepare("SELECT generation_id,revision FROM telemetry_v11_domain_heads WHERE participant_id=?")
+        .bind(participantId).first();
+      expect(await eligible()).toEqual({participant_id:participantId,device_id:deviceId});
+      expect(await purgeStaleDeviceLifecycleRows(db(), {nowEpoch:wallClock+1_000,policy:{idleMilliseconds:1}}))
+        .toMatchObject({devicesRevoked:0});
+      expect(await eligible()).toEqual({participant_id:participantId,device_id:deviceId});
+      // The lease has expired and the old upload grant is unusable. A scheduled
+      // purge must not turn renewable expiry into irreversible disconnection.
+      clock.mockReturnValue(wallClock + 8 * DAY);
+      await expect(authenticateDevice(db(),authorization)).rejects.toMatchObject({code:"DEVICE_AUTH_INVALID"});
+      const maintenance = await runScheduledMaintenance(runtime({ALLOWANCE_RECONSTRUCTION_MODE:"paused"}),wallClock + 8 * DAY);
+      expect(maintenance).toMatchObject({outcome:"success",lifecycleComplete:true,staleDeviceCredentialsRevoked:0});
+      expect(maintenance.staleDeviceUploadAuthorizationsRevoked).toBeGreaterThan(0);
+      expect(await eligible()).toEqual({participant_id:participantId,device_id:deviceId});
+      expect(await db().prepare("SELECT generation_id,revision FROM telemetry_v11_domain_heads WHERE participant_id=?")
+        .bind(participantId).first()).toEqual(head);
+      expect(await db().prepare("SELECT state,revoked_at FROM device_credentials WHERE id=?")
+        .bind(deviceId).first()).toEqual({state:"active",revoked_at:null});
+      const renewed = await api("/api/v1/accountless/renewal", {method:"POST",
+        headers:{authorization,"content-type":"application/json"},body:JSON.stringify(RENEWAL_BODY)});
+      expect(renewed.status,await renewed.clone().text()).toBe(200);
+      expect(await renewed.json()).toMatchObject({state:"renewed",deviceId,renewalGeneration:1});
+      await expect(authenticateDevice(db(),authorization)).resolves.toMatchObject({participantId,deviceId,authorityKind:"accountless"});
+      expect(await eligible()).toEqual({participant_id:participantId,device_id:deviceId});
+      const disconnected = await api("/api/v1/device/disconnect", {method:"POST",headers:{authorization}});
+      expect(disconnected.status,await disconnected.clone().text()).toBe(200);
+      expect(await eligible()).toBeNull();
+      await expect(authenticateDevice(db(),authorization)).rejects.toMatchObject({code:"DEVICE_AUTH_INVALID"});
+      expect(await db().prepare("SELECT maintenance_lease_token FROM retention_state WHERE singleton=1").first())
+        .toEqual({maintenance_lease_token:null});
+    } finally { clock.mockRestore(); secret.fill(0); }
   });
 
   it("keeps enrollment expiry finite, then renews the same expired graph through HTTP", async () => {

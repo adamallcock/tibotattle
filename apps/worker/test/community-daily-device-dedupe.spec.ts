@@ -2,19 +2,24 @@ import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { telemetryV11RequiredConsent } from "@app-usagemonitor/telemetry-contract";
+import { telemetryV11RequiredConsent, telemetryV11DomainManifestDigestInput } from "@app-usagemonitor/telemetry-contract";
 
 import {
+  enrollAccountlessDevice,
+  revokeAccountlessEnrollment,
   ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
   ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
   ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
 } from "../src/accountless-enrollment";
 import {
+  createAccountlessUploadOwner,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
   ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
 } from "../src/accountless-ownership";
 
 import {
+  drainCommunityPublicSourceBootstrap,
   readLatestCommunityDailyAggregate,
   rebuildPendingCommunityDailyAggregates,
 } from "../src/community-daily-aggregates";
@@ -22,10 +27,57 @@ import {
   assertV1SourcePinCurrent,
   loadV1SourcePin,
   MAX_V1_SOURCE_CHUNKS,
+  COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION,
 } from "../src/telemetry-v1-source-selection";
 import { DAILY_SPEND_RECORDS_SQL, isCurrentCommunityDailySpend, priceCommunityDailySpend } from "../src/community-daily-spend";
 import type { CommunityDailySpend } from "../src/community-daily-spend";
 import { priceChunkUsageRecord } from "../src/quota-analysis-v1";
+
+import { deviceHash } from "../src/device-auth";
+import { encodeBase64Url, sha256Hex } from "../src/crypto";
+import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
+import { makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
+
+async function seedAcceptedAccountlessDay(sourceDays = [DAY]) {
+  const deviceId = crypto.randomUUID();
+  const secret = encodeBase64Url(new Uint8Array(32).fill(19));
+  const authorization = `Device um_device_${deviceId}.${secret}`;
+  await db().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();
+  await enrollAccountlessDevice(db(), {
+    schemaVersion: ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION, deviceId,
+    deviceSecretHash: await deviceHash(deviceId, secret),
+    policyVersion: ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
+  });
+  await createAccountlessUploadOwner(db(), authorization, {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion: "telemetry-contribution-v1.1",
+  });
+  const owner = await db().prepare("SELECT participant_id FROM accountless_upload_owners WHERE enrollment_device_id=?")
+    .bind(deviceId).first<{ participant_id: string }>();
+  if (!owner) throw new Error("synthetic accountless owner missing");
+  const fixture = { participantId: owner.participant_id, deviceId, authorization,
+    nowEpoch: Date.now(), sessionId: "", cookie: "", csrfToken: "" };
+  const acceptedDays = [];
+  const domainDays: string[] = [];
+  const throughDay = new Date().toISOString().slice(0,10);
+  for (let at = Date.parse(sourceDays[0]!); at <= Date.parse(throughDay); at += 86_400_000) domainDays.push(new Date(at).toISOString().slice(0,10));
+  for (const sourceDay of domainDays) {
+    const prepared = await makeV11Day(sourceDay, sourceDays.includes(sourceDay) ? { usage: [v11UsageRecord(sourceDay, "a", { eventId: `event:v2:${await sha256Hex(sourceDay)}` })] } : {});
+    acceptedDays.push(await stageV11Day(db(), fixture, prepared));
+  }
+  const prior = await createTelemetryV11DomainPredecessor(db(), fixture);
+  const manifest = { schemaVersion: "telemetry-domain-manifest-v1.1" as const,
+    fromDay: domainDays[0]!, throughDay: domainDays.at(-1)!,
+    predecessor: { token: prior.token, previousGenerationId: prior.previousGenerationId, legacyFingerprint: prior.legacyFingerprint },
+    days: acceptedDays.map(day => ({ day: day.day, manifestId: day.manifestId, manifestDigest: day.manifestDigest })),
+    manifestDigest: "0".repeat(64) };
+  manifest.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
+  await activateTelemetryV11Domain(db(), fixture, manifest);
+  return fixture;
+}
 
 /**
  * Cross-device dedupe in the daily community aggregates.
@@ -351,6 +403,9 @@ async function rebuildAndReadDay(scheduledAt: string): Promise<{
   cells: Array<Record<string, unknown>>;
   apiEquivalentSpend: CommunityDailySpend;
 }> {
+  for (let page = 0; page < 4; page++) {
+    if ((await drainCommunityPublicSourceBootstrap(db())).completed) break;
+  }
   const outcome = await rebuildPendingCommunityDailyAggregates(
     db(),
     Date.parse(scheduledAt),
@@ -640,7 +695,7 @@ describe("community daily aggregate cross-device dedupe", () => {
     await expect(loadV1SourcePin(db(), scope, { maxChunks: 1 })).rejects.toThrow("v1 source chunk limit exceeded");
   });
 
-  it("bounds the public source after social ownership filtering", async () => {
+  it("excludes impossible accountless legacy journals before the public source cap", async () => {
     const socialParticipant = await seedParticipant("public-source-cap-social");
     await seedDevice(socialParticipant, "device-public-source-cap-social");
     await seedChunk({
@@ -664,13 +719,13 @@ describe("community daily aggregate cross-device dedupe", () => {
     });
     const publicPin = await loadV1SourcePin(db(), {
       day: DAY,
-      ownerKind: "social",
+      publicSourcePolicy: COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION,
     });
     expect(unscoped.winners).toEqual(expect.arrayContaining([
       expect.objectContaining({ participant_id: accountlessParticipant }),
       expect.objectContaining({ participant_id: socialParticipant }),
     ]));
-    expect(publicPin.scope).toEqual({ day: DAY, ownerKind: "social" });
+    expect(publicPin.scope).toEqual({ day: DAY, publicSourcePolicy: COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION });
     expect(publicPin.fingerprint).not.toBe(unscoped.fingerprint);
     expect(publicPin.winners).toEqual([{
       participant_id: socialParticipant,
@@ -686,6 +741,92 @@ describe("community daily aggregate cross-device dedupe", () => {
       usageEvents: 1,
       inputUncachedTokens: 42,
     });
+  });
+
+  it("bootstraps actual retained days in finite resumable pages without inventing empty dates", async () => {
+    const today = Date.parse(new Date().toISOString().slice(0,10));
+    const sourceDays = [2,1,0].map(offset => new Date(today-offset*86_400_000).toISOString().slice(0,10));
+    const fixture = await seedAcceptedAccountlessDay(sourceDays);
+    await db().prepare("UPDATE community_public_source_bootstrap SET completed=0").run();
+    await db().prepare("DELETE FROM community_daily_aggregate_rebuilds").run();
+    await db().prepare("DELETE FROM community_current_analysis_queue WHERE participant_id=?").bind(fixture.participantId).run();
+    const budget = { remainingQueries: 6, deadlineMs: Date.now() + 60_000 };
+    expect(await drainCommunityPublicSourceBootstrap(db(), { pageSize: 2, budget })).toEqual({ completed: false, enqueued: 2 });
+    expect(budget.remainingQueries).toBe(0);
+    expect((await db().prepare("SELECT day FROM community_daily_aggregate_rebuilds ORDER BY day").all<{day:string}>()).results)
+      .toEqual(sourceDays.slice(0,2).map(day => ({day})));
+    expect(await db().prepare("SELECT pending FROM community_current_analysis_queue WHERE participant_id=?")
+      .bind(fixture.participantId).first()).toEqual({pending:1});
+    expect(await drainCommunityPublicSourceBootstrap(db(), {pageSize:2})).toEqual({completed:false,enqueued:1});
+    expect(await drainCommunityPublicSourceBootstrap(db(), {pageSize:2})).toEqual({completed:true,enqueued:0});
+    expect(await drainCommunityPublicSourceBootstrap(db(), {pageSize:2})).toEqual({completed:true,enqueued:0});
+    expect((await db().prepare("SELECT day FROM community_daily_aggregate_rebuilds ORDER BY day").all<{day:string}>()).results)
+      .toEqual(sourceDays.map(day => ({day})));
+  });
+
+  it("does not advance bootstrap or queue work without sufficient budget or the owned lease", async () => {
+    await seedAcceptedAccountlessDay();
+    await db().prepare("UPDATE community_public_source_bootstrap SET completed=0").run();
+    await db().prepare("DELETE FROM community_daily_aggregate_rebuilds").run();
+    expect(await drainCommunityPublicSourceBootstrap(db(), {budget:{remainingQueries:0,deadlineMs:Date.now()+60_000}}))
+      .toEqual({completed:false,enqueued:0});
+    expect(await drainCommunityPublicSourceBootstrap(db(), {maintenanceLease:"synthetic-unowned-lease"}))
+      .toEqual({completed:false,enqueued:0});
+    expect(await db().prepare("SELECT participant_cursor,source_day_cursor,completed FROM community_public_source_bootstrap").first())
+      .toEqual({participant_cursor:"",source_day_cursor:"",completed:0});
+    expect((await db().prepare("SELECT day FROM community_daily_aggregate_rebuilds").all()).results).toEqual([]);
+  });
+
+  it("includes genuine accountless v1.1 alongside the elected social device and withdraws it on revocation", async () => {
+    const accountless = await seedAcceptedAccountlessDay();
+    // Other required domain manifests are empty; this test isolates the target day.
+    await db().prepare("DELETE FROM community_daily_aggregate_rebuilds WHERE day<>?").bind(DAY).run();
+    const participantId = await seedParticipant("mixed-public");
+    for (const deviceId of ["mixed-old", "mixed-new"]) await seedDevice(participantId, deviceId);
+    await seedChunk({ participantId, deviceId: "mixed-old", createdAt: "2026-08-02T01:00:00.000Z",
+      records: [{ occurrenceId: "mixed-old-event", inputUncachedTokens: 9000 }] });
+    await seedChunk({ participantId, deviceId: "mixed-new", createdAt: "2026-08-02T02:00:00.000Z",
+      records: [{ occurrenceId: "mixed-new-event", inputUncachedTokens: 42 }] });
+    const scope = { day: DAY, publicSourcePolicy: COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION } as const;
+    const pin = await loadV1SourcePin(db(), scope);
+    expect(pin.winners).toEqual(expect.arrayContaining([
+      expect.objectContaining({ participant_id: accountless.participantId, device_id: accountless.deviceId }),
+      expect.objectContaining({ participant_id: participantId, device_id: "mixed-new" }),
+    ]));
+    expect(pin.winners).toHaveLength(2);
+    const socialPin = await loadV1SourcePin(db(), { day: DAY, ownerKind: "social" });
+    expect(socialPin.winners).toHaveLength(1);
+    expect(socialPin.fingerprint).not.toBe(pin.fingerprint);
+    expect((await rebuildAndReadDay("2026-08-03T12:00:00.000Z")).totals).toMatchObject({
+      contributingParticipants: 2, contributingDevices: 2, usageEvents: 2, inputUncachedTokens: 142,
+    });
+    await revokeAccountlessEnrollment(db(), accountless.deviceId, "user_opt_out");
+    expect((await readLatestCommunityDailyAggregate(db(), DAY))?.release_state).toBe("withdrawn");
+    await db().prepare("DELETE FROM community_daily_aggregate_rebuilds WHERE day<>?").bind(DAY).run();
+    await expect(assertV1SourcePinCurrent(db(), pin)).rejects.toThrow("v1 source changed during analysis");
+    expect((await loadV1SourcePin(db(), scope)).winners).toEqual(socialPin.winners);
+    expect((await rebuildAndReadDay("2026-08-03T13:00:00.000Z")).totals).toMatchObject({
+      contributingParticipants: 1, usageEvents: 1, inputUncachedTokens: 42,
+    });
+  });
+
+  it("filters a revoked oversized prefix before the chunk budget and preserves policy identity for unchanged winners", async () => {
+    const participantId = await seedParticipant("revoked-prefix-social");
+    await seedDevice(participantId, "revoked-prefix-device");
+    await seedChunk({ participantId, deviceId: "revoked-prefix-device", createdAt: "2026-08-02T01:00:00.000Z",
+      records: [{ occurrenceId: "revoked-prefix-event", inputUncachedTokens: 42 }] });
+    const accountlessId = await seedOversizedAccountlessSourceJournal();
+    const owner = await db().prepare("SELECT device_credential_id FROM accountless_upload_owners WHERE participant_id=?")
+      .bind(accountlessId).first<{ device_credential_id: string }>();
+    await revokeAccountlessEnrollment(db(), owner!.device_credential_id, "user_opt_out");
+    const scope = { day: DAY, publicSourcePolicy: COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION } as const;
+    const publicPin = await loadV1SourcePin(db(), scope, { maxChunks: 1 });
+    const oldPin = await loadV1SourcePin(db(), { day: DAY, ownerKind: "social" }, { maxChunks: 1 });
+    expect(publicPin.winners).toEqual(oldPin.winners);
+    expect(publicPin.fingerprint).not.toBe(oldPin.fingerprint);
+    await expect(loadV1SourcePin(db(), { ...scope, ownerKind: "social" })).rejects.toThrow("v1 public source policy invalid");
+    await expect(loadV1SourcePin(db(), { day: DAY, publicSourcePolicy: "unknown" } as never))
+      .rejects.toThrow("v1 public source policy invalid");
   });
 
   it("counts an overlapping participant-day once, the newest device winning across streams", async () => {
