@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeModelPerformance, performanceSegments, performanceDomain, performanceYScale, performanceDateTicks, performanceHoverBin, performanceTableRows, mountModelPerformance } from '../public/model-performance.js';
+import { normalizeModelPerformance, performanceSegments, performanceDomain, performanceYScale, performanceDateTicks, performanceHoverBin, mountModelPerformance } from '../public/model-performance.js';
 import { LocalCompanionClient } from '../public/data-client.js';
 import { translate, SUPPORTED_LOCALES } from '../public/localization.js';
 const DAY = 86400000;
@@ -137,7 +137,7 @@ function focusHarness() {
     find: key => root.all().find(node => node.dataset.performanceFocus === key) };
 }
 
-test('loading and background renders retain heading and disclosure keyboard focus', async () => {
+test('loading and background renders retain heading and About keyboard focus without a duplicate table', async () => {
   const dom = focusHarness();
   let response = { ...payload(), status: 'loading', models: [] };
   const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => response },
@@ -158,13 +158,12 @@ test('loading and background renders retain heading and disclosure keyboard focu
   controller.render();
   assert.notEqual(dom.documentRef.activeElement, previousAbout);
   assert.equal(dom.documentRef.activeElement, dom.find('about'), 'locale render retains About focus');
-  dom.find('table').focus();
-  const previousTable = dom.documentRef.activeElement;
   response = structuredClone(response); response.models[0].turns++;
   await controller.refresh();
-  assert.notEqual(dom.documentRef.activeElement, previousTable);
-  assert.equal(dom.documentRef.activeElement, dom.find('table'), 'new background data retains table disclosure focus');
+  assert.equal(dom.documentRef.activeElement, dom.find('about'), 'new background data retains About disclosure focus');
   assert.deepEqual(dom.documentRef.activeElement.focusOptions, { preventScroll: true });
+  assert.equal(dom.root.all().some(node => node.tagName === 'table'), false, 'chart aggregates are not duplicated in a table');
+  assert.equal(dom.find('table'), undefined);
   controller.destroy();
 });
 
@@ -194,39 +193,6 @@ test('horizontal hover bins are calendar-aligned including unobserved days and e
   assert.equal(performanceHoverBin(1, domain, 'day'), 9*DAY);
   assert.equal(performanceHoverBin(.5, domain, 'day'), 6*DAY);
   assert.equal((performanceHoverBin(.5, domain, 'week') - 4*DAY) % (7*DAY), 0);
-});
-test('measurement table selection keeps every returned bin and sorts newest first', () => {
-  const model = payload().models[0];
-  model.speed = [{ method: 'receipt', points: Array.from({ length: 17 }, (_, index) => point((index + 1) * DAY, 1)) }];
-  model.ttft = Array.from({ length: 13 }, (_, index) => point((index + 1) * DAY, 1));
-  const rows = performanceTableRows(model);
-  assert.equal(rows.length, 30, 'pagination never caps or truncates the selected rows');
-  assert.equal(rows[0].point.at, 17 * DAY);
-  assert.equal(rows.at(-1).point.at, DAY);
-});
-test('measurement table renders standard ten-row pages without exposing log methods', async () => {
-  const dom = focusHarness();
-  const data = payload();
-  const points = Array.from({ length: 25 }, (_, index) => point((index + 1) * DAY, 1));
-  data.end = 25 * DAY; data.models[0] = { ...data.models[0], turns: 25, speedTurns: 25,
-    ttftTurns: 0, timedResponses: 25, speed: [{ method: 'receipt', points }], ttft: [] };
-  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
-    t: (key, values) => translate(key, values, 'en-US') });
-  dom.show(); await controller.refresh();
-  const tableBody = () => dom.root.all().find(node => node.tagName === 'tbody');
-  const pageStatus = () => dom.root.all().find(node => node.className === 'table-pagination-status');
-  assert.equal(tableBody().children.length, 10);
-  assert.equal(pageStatus().textContent, '1–10 of 25');
-  assert.ok(tableBody().children.every(row => row.children[1].textContent.startsWith('Output speed')));
-  assert.equal(dom.root.all().some(node => /Newer logs|Older logs/u.test(node.textContent ?? '')), false);
-  dom.find('table-next').listeners.click();
-  assert.equal(tableBody().children.length, 10);
-  assert.equal(pageStatus().textContent, '11–20 of 25');
-  dom.find('table-next').listeners.click();
-  assert.equal(tableBody().children.length, 5);
-  assert.equal(pageStatus().textContent, '21–25 of 25');
-  assert.equal(dom.find('table-next').disabled, true);
-  controller.destroy();
 });
 test('plot-area sweep works away from points, clears on exit, and keyboard order follows dates', async () => {
   const dom = focusHarness();

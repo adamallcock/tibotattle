@@ -109,10 +109,9 @@ The hover/focus readout shows the date interval, model, metric, median and band,
 eligible turns. Covered responses are shown in the selected-model coverage strip,
 not fabricated as per-bin counts. For example, use “23 measured turns,” not
 “n = 23.” TTFT gets its own eligible-turn count; the cursor must not imply paired
-observations when populations differ. Support keyboard focus and a table view.
-The table uses user-facing metric names, includes every returned aggregate bin,
-sorts newest first, and renders ten rows at a time with Previous/Next controls.
-Pagination must not cap or truncate the selected row set.
+observations when populations differ. The charts support keyboard focus and expose
+each plotted point through an accessible description; do not duplicate the same
+aggregates in a measurement table.
 
 ## Coverage is part of the measurement
 
