@@ -290,10 +290,14 @@ test("streamed unified calibration is byte-identical to the same corpus held res
       streamed.weeklyCalibrationInput.retainedWeeklySnapshots,
       resident.weeklyCalibrationInput.retainedWeeklySnapshots,
     );
-    assert.equal(
-      streamed.weeklyCalibrationInput.estimatedRetainedBytes,
-      resident.weeklyCalibrationInput.estimatedRetainedBytes,
-    );
+    // Streaming retains exact typed stamp/memo columns (30 bytes per row),
+    // while the resident oracle retains decoded compact rows (352 bytes).
+    // Their accounting outputs match; their memory representations do not.
+    assert.equal(streamed.weeklyCalibrationInput.usageMetadataBytes, corpus.usage.length * 30);
+    assert.equal(streamed.weeklyCalibrationInput.estimatedRetainedBytes,
+      corpus.usage.length * 30 + streamed.weeklyCalibrationInput.retainedWeeklySnapshots * 192);
+    assert.equal(resident.weeklyCalibrationInput.estimatedRetainedBytes,
+      corpus.usage.length * 352 + resident.weeklyCalibrationInput.retainedWeeklySnapshots * 192);
     // The calibration artifacts — reset series, estimate, validation,
     // composition fit, and every allowance scenario — must be identical to
     // the resident-array build. This is the exact seam the streaming corpus
@@ -316,14 +320,14 @@ test("streamed unified calibration is byte-identical to the same corpus held res
   }
 });
 
-test("retention trim keeps the newest rows across timestamp ties, identically to a resident corpus of those rows", async () => {
+test("streamed timestamp ties retain all rows and refuse an undersized derivation batch", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-corpus-stream-trim-"));
   try {
     const resetStartMs = Date.parse("2026-06-04T00:00:00.000Z");
     const tieMs = resetStartMs + 30 * 60 * 60_000;
-    // Twelve usage rows share one timestamp; retention keeps the newest five
-    // by insertion (rowid) order. The streamed re-reads must honor the same
-    // (observedMs, rowid) cursor through the tie.
+    // Twelve usage rows share one timestamp. A per-derivation ceiling cannot
+    // truncate this history: refuse five, then compare all twelve with the
+    // resident oracle under a batch limit that admits the complete tie.
     const usage = Array.from({ length: 12 }, (_, index) => corpusUsageRow(index, tieMs));
     const quota = Array.from({ length: 6 }, (_, boundary) => ({
       observedAtMs: resetStartMs + (boundary + 30) * 60 * 60_000,
@@ -335,23 +339,26 @@ test("retention trim keeps the newest rows across timestamp ties, identically to
     const indexFile = join(directory, "local-unified-index-v1.sqlite");
     await writeCorpusIndex(indexFile, { usage, quota });
 
-    const streamed = await buildReplaySafeAccountingCache({
+    const input = {
       now: () => NOW,
       unifiedIndexFile: indexFile,
-      transitionResourceLimits: { usageEvents: 5 },
       declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
       scan: async () => ({ diagnostics: {} }),
+    };
+    await assert.rejects(buildReplaySafeAccountingCache({
+      ...input, transitionResourceLimits: { usageEvents: 5 },
+    }), error => error?.code === "accounting_transition_derivation_limit_exceeded");
+    const streamed = await buildReplaySafeAccountingCache({
+      ...input, transitionResourceLimits: { usageEvents: 12 },
     });
     const resident = await buildReplaySafeAccountingCache({
       now: () => NOW,
       unifiedIndexFile: join(directory, "never-written.sqlite"),
       declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
-      // The oracle receives only the rows the trim retains: the last five
-      // inserted (highest rowids) of the tied twelve.
-      scan: oracleScan({ usage: usage.slice(7), quota }),
+      scan: oracleScan({ usage, quota }),
     });
 
-    assert.equal(streamed.weeklyCalibrationInput.retainedUsageEvents, 5);
+    assert.equal(streamed.weeklyCalibrationInput.retainedUsageEvents, 12);
     assert.equal(
       streamed.weeklyCalibrationInput.retainedWeeklySnapshots,
       resident.weeklyCalibrationInput.retainedWeeklySnapshots,
@@ -884,17 +891,24 @@ test("an oversized optional precompute falls back without changing retained cali
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-precompute-fallback-"));
   try {
     const fixture = await writeCompleteGenerationIndex(join(directory, "index.sqlite"), {
-      resetStarts: Array.from({ length: 3 }, (_, week) => Date.parse("2026-05-07T00:00:00.000Z") + week * WEEK_MS),
-      boundariesPerReset: 100, usagePerBoundary: 8, scannedBytes: 1 << 20,
+      // 3,072 retained rows across twelve small reset slices. Required
+      // typed metadata fits while the optional whole-corpus columns may not;
+      // no history is trimmed to make either path fit.
+      resetStarts: Array.from({ length: 12 }, (_, week) => Date.parse("2026-04-02T00:00:00.000Z") + week * WEEK_MS),
+      boundariesPerReset: 2, usagePerBoundary: 128, scannedBytes: 1 << 20,
     });
+    assert.ok(fixture.usageRows * 30 + 24 * 192 < 95 * 1024,
+      "required full-history metadata fits the smaller policy");
+    assert.ok(fixture.usageRows * 32 > 95 * 1024,
+      "optional whole-corpus attribution columns exceed that policy");
     const metrics = [];
     const results = [];
-    for (const retainedBytes of [64 * 1024, 128 * 1024]) {
+    for (const retainedBytes of [95 * 1024, 128 * 1024]) {
       results.push(await buildReplaySafeAccountingCache({
         sourceMode: "unified", expectedGeneration: fixture.expectedGeneration,
         unifiedIndexFile: fixture.indexFile, now: () => NOW,
         declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
-        transitionResourceLimits: { usageEvents: 100, retainedBytes },
+        transitionResourceLimits: { usageEvents: 256, retainedBytes },
         onCalibrationCorpusMetrics: (value) => { metrics.push(value); },
       }));
     }
@@ -904,9 +918,9 @@ test("an oversized optional precompute falls back without changing retained cali
     assert.equal(metrics[0].attributionPrecomputeBytes, 0);
     assert.equal(metrics[1].attributionPrecomputeUsed, true);
     assert.equal(metrics[1].attributionPrecomputeRows, fixture.usageRows);
-    for (const value of metrics) assert.equal(value.retainedUsageEvents, 100);
+    for (const value of metrics) assert.equal(value.retainedUsageEvents, fixture.usageRows);
     const [fallback, optimized] = results;
-    assert.equal(fallback.weeklyCalibrationInput.limits.retainedBytes, 64 * 1024);
+    assert.equal(fallback.weeklyCalibrationInput.limits.retainedBytes, 95 * 1024);
     assert.equal(optimized.weeklyCalibrationInput.limits.retainedBytes, 128 * 1024);
     // The named policy value is intentionally different; every derived field
     // (including exact decimals, attribution, plan lanes and diagnostics) is not.
@@ -928,13 +942,18 @@ test("insufficient RSS headroom for optional precompute completes through the po
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-precompute-headroom-"));
   try {
     const fixture = await writeCompleteGenerationIndex(join(directory, "index.sqlite"), {
-      resetStarts: Array.from({ length: 3 }, (_, week) => Date.parse("2026-05-07T00:00:00.000Z") + week * WEEK_MS),
-      boundariesPerReset: 100, usagePerBoundary: 8, scannedBytes: 1 << 20,
+      // 3,072 retained rows across twelve small reset slices. Required
+      // typed metadata fits while the optional whole-corpus columns may not;
+      // no history is trimmed to make either path fit.
+      resetStarts: Array.from({ length: 12 }, (_, week) => Date.parse("2026-04-02T00:00:00.000Z") + week * WEEK_MS),
+      boundariesPerReset: 2, usagePerBoundary: 128, scannedBytes: 1 << 20,
     });
     const baselineRss = 1024 * 1024;
-    const availableHeadroom = 2048;
+    const availableHeadroom = 64 * 1024;
     assert.ok(availableHeadroom < fixture.usageRows * 32, "the optional live-row columns cannot fit");
-    assert.ok(availableHeadroom > 100 * 14, "the required retained-position memo still fits");
+    assert.ok(availableHeadroom > fixture.usageRows * 16, "all required timestamp/rowid stamps fit");
+    assert.ok(availableHeadroom > fixture.usageRows * 14, "all required attribution memo columns fit");
+    assert.ok(availableHeadroom > 129 * 352, "a complete reset slice fits without truncating it");
     const metrics = [];
     const deferrals = [];
     const caches = [];
@@ -944,7 +963,7 @@ test("insufficient RSS headroom for optional precompute completes through the po
         stateFile, sourceMode: "unified", expectedGeneration: fixture.expectedGeneration,
         unifiedIndexFile: fixture.indexFile, now: () => NOW,
         declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
-        transitionResourceLimits: { usageEvents: 100 },
+        transitionResourceLimits: { usageEvents: 256 },
         rebuildIsolation: "in_process",
         rss: () => baselineRss, maximumRssBytes: baselineRss + headroom,
         onCalibrationCorpusMetrics: (value) => { metrics.push(value); },
@@ -965,7 +984,7 @@ test("insufficient RSS headroom for optional precompute completes through the po
     assert.equal(metrics[0].attributionPrecomputeBytes, 0);
     assert.equal(metrics[1].attributionPrecomputeUsed, true);
     assert.equal(metrics[1].attributionPrecomputeRows, fixture.usageRows);
-    for (const value of metrics) assert.equal(value.retainedUsageEvents, 100);
+    for (const value of metrics) assert.equal(value.retainedUsageEvents, fixture.usageRows);
     assert.equal(stableJson(caches[0]), stableJson(caches[1]));
   } finally {
     await rm(directory, { recursive: true, force: true });

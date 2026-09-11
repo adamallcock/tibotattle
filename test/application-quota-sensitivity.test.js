@@ -42,6 +42,7 @@ const APPLICATION_PUBLIC_EXPORTS = [
   "createLocalExportResourceContext",
   "createLocalMetadataExportContext",
   "createLocalMetadataBundleVerificationContext",
+  "createModelPerformanceContext",
   "createWorkUsageService",
   "validateWorkUsageQuery",
   "selectProductionParticipantIdentity",

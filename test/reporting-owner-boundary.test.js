@@ -43,6 +43,7 @@ const REPORTING_PUBLIC_EXPORTS = Object.freeze([
   "classifyMonitoringInterval",
   "createCollectorQualityAccumulator",
   "createWorkUsageAccumulator",
+  "modelPerformanceProjection",
   "projectBoundedWeeklyCalibrationSummary",
   "projectRecordedTokenComponents",
   "queryWorkUsageSnapshot",

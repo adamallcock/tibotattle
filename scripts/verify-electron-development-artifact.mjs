@@ -72,6 +72,7 @@ const TARGETS = Object.freeze(Object.fromEntries(
 ));
 export const ELECTRON_SHELL_FILES = Object.freeze([
   "config/electron-production-distribution.cjs",
+  "config/macos-bundle-version-plan.cjs",
   "config/deployment-endpoints.js",
   "native/macos-keychain/contract.js",
   "apps/electron/companion-supervisor.js",

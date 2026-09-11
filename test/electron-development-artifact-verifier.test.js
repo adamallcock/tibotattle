@@ -46,6 +46,7 @@ const require = createRequire(import.meta.url);
 const asar = createRequire(require.resolve("electron-builder"))("@electron/asar");
 const SHELL_FILES = [
   "config/electron-production-distribution.cjs",
+  "config/macos-bundle-version-plan.cjs",
   "native/macos-keychain/contract.js",
   "apps/electron/companion-supervisor.js",
   "apps/electron/desktop-automatic-refresh-cadence.js",

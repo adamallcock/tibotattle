@@ -35,7 +35,9 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-No further changes recorded.
+Prepared for [0.1.22](./release-notes/0.1.22.md): Projects & threads, local model
+performance, large-history contribution preparation, and stable refresh and
+allowance-history controls. Candidate qualification and publication are pending.
 
 ## [0.1.21](./release-notes/0.1.21.md) - 2026-09-11
 

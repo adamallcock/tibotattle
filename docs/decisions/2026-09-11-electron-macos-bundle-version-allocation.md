@@ -54,3 +54,13 @@ The validator rejects a missing value, stale marketing version, wrong
 allocation, or timestamp substituted for `1028`. Final updater metadata must
 still bind the exact final signed ZIP/DMG bytes; this change does not weaken
 that separate check or publish any artifact.
+
+
+## 0.1.22 allocation
+
+The combined desktop follow-up reserves stable `0.1.22` → `1029` for both Mac
+architectures. It strictly follows the released `0.1.21` → `1028` allocation;
+all earlier allocations remain unchanged. The semantic version is `0.1.22`,
+while the independently selected provenance build number continues to bind
+source candidates and artifact receipts. Allocation is not evidence of a build,
+signature, installed update, or publication.

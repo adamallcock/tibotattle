@@ -4612,61 +4612,71 @@ test("corrected 0.1.18 RC3 orders after signed RC1 and RC2 and before stable", (
 });
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
+  // Historical native allocations stay fixed as the current Electron version advances.
+  const historicalDogfoodBundleVersion = resolveSignedMacOSBundleVersion(
+    "0.1.18", INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  );
   assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
-  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1025.2");
-  assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1026");
+  assert.equal(historicalDogfoodBundleVersion, "1025.2");
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.18", STABLE_RELEASE_CHANNEL), "1026");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, null);
+  assert.throws(
+    () => readMacOSReleaseBuildConfiguration({}, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
+    { code: "MACOS_SIGNED_BUNDLE_VERSION_UNPLANNED" },
+    "the current Electron release must not invent a native dogfood allocation",
+  );
   assert.equal(resolveSignedMacOSBundleVersion("0.1.17", INTERNAL_DOGFOOD_RELEASE_CHANNEL), "1023.7");
   assert.equal(resolveSignedMacOSBundleVersion("0.1.17", STABLE_RELEASE_CHANNEL), "1024");
   assert.equal(
-    normalizeMacOSBundleVersion(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    normalizeMacOSBundleVersion(historicalDogfoodBundleVersion),
     "1025.2",
   );
   assert.equal(
     compareMacOSBundleVersions(
-      INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
+      historicalDogfoodBundleVersion,
       "1022",
     ) > 0,
     true,
   );
   assert.equal(
-    compareMacOSBundleVersions("1023", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023", historicalDogfoodBundleVersion),
     -1,
     "the corrective dogfood must be strictly newer than the retained RC2",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.1", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.1", historicalDogfoodBundleVersion),
     -1,
     "the corrective dogfood must be strictly newer than the installed RC3",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.2", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.2", historicalDogfoodBundleVersion),
     -1,
     "the final integrated dogfood must be strictly newer than startup-recovery RC4",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.3", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.3", historicalDogfoodBundleVersion),
     -1,
     "the accounting-deadline correction must be strictly newer than installed RC5",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.4", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.4", historicalDogfoodBundleVersion),
     -1,
     "the retired-checkpoint correction must be strictly newer than installed RC6",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.5", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.5", historicalDogfoodBundleVersion),
     -1,
     "the fitted-transition correction must be strictly newer than installed RC7",
   );
   assert.equal(
-    compareMacOSBundleVersions("1023.6", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    compareMacOSBundleVersions("1023.6", historicalDogfoodBundleVersion),
     -1,
     "the refresh-policy RC9 allocation must be strictly newer than RC8",
   );
   assert.equal(
     compareMacOSBundleVersions(
       STABLE_SIGNED_BUNDLE_VERSION,
-      INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
+      historicalDogfoodBundleVersion,
     ) > 0,
     true,
   );
@@ -4674,7 +4684,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
         USAGE_MONITOR_BUNDLE_VERSION: unallocated,
-      }, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
+      }, STABLE_RELEASE_CHANNEL),
       { code: "MACOS_BUNDLE_VERSION_MISMATCH" },
       "operator overrides cannot reuse an earlier RC, alias the allocation, or consume stable/preview builds",
     );
@@ -5511,6 +5521,14 @@ test("Login Item release CLI carries release identity to both validators and ref
 });
 
 test("signed updater replacement contract validates upgrade and rollback artifacts", async () => {
+  // This fixture exercises the retained native dogfood upgrade, not a new dogfood release.
+  const RELEASE_VERSION = "0.1.18";
+  const INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION = resolveSignedMacOSBundleVersion(
+    RELEASE_VERSION, INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  );
+  const STABLE_SIGNED_BUNDLE_VERSION = resolveSignedMacOSBundleVersion(
+    RELEASE_VERSION, STABLE_RELEASE_CHANNEL,
+  );
   assert.equal(compareMacOSBundleVersions("1", "1.0.0"), 0);
   assert.equal(compareMacOSBundleVersions("1.2", "1.1.99"), 1);
   assert.equal(compareMacOSBundleVersions("2", "2.0.1"), -1);

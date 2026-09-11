@@ -245,8 +245,7 @@ async function createReleaseFixture({
   );
   const selectedChannel = getReleaseChannel("stable", { architecture });
   appcastURL ??= selectedChannel.sparkle.appcastURL;
-  const fileName = architecture === "x64"
-    ? RELEASE_MANIFEST.macOS.x64DmgFileName : RELEASE_MANIFEST.macOS.arm64DmgFileName;
+  const fileName = `TiboTattle-${shortVersion}-macOS-${architecture}.dmg`;
   const dmgPath = join(root, fileName);
   const appcastPath = join(root, "appcast.xml");
   const releaseManifestPath = join(root, `${fileName}.release.json`);
