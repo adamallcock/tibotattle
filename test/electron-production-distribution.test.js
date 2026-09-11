@@ -21,6 +21,11 @@ import {
 } from "../scripts/package-electron-production.mjs";
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
+import {
+  resolveSignedMacOSBundleVersion,
+  isAppleMacOSBundleVersion,
+  compareAppleMacOSBundleVersions,
+} from "../scripts/macos-bundle-version.js";
 
 const require = createRequire(import.meta.url);
 const POLICY = require("../config/electron-production-distribution.cjs");
@@ -37,6 +42,57 @@ const BUILD_NUMBER = "20260906";
 const REHEARSAL_VERSION_CORE = RELEASE_VERSION.replace(/\d+$/u, (patch) => String(Number(patch) + 1));
 const REHEARSAL_CURRENT_VERSION = `${REHEARSAL_VERSION_CORE}-native-to-electron-handover.1`;
 const REHEARSAL_NEXT_VERSION = `${REHEARSAL_VERSION_CORE}-native-to-electron-handover.2`;
+
+test("signed Mac allocation is independent of candidate provenance and advances native 018", () => {
+  const nativeVersion = resolveSignedMacOSBundleVersion("0.1.18", "stable");
+  assert.equal(nativeVersion, "1026");
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.21", "stable"), "1028");
+  assert.equal(compareAppleMacOSBundleVersions(nativeVersion, "1028"), -1);
+  assert.equal(isAppleMacOSBundleVersion("1028"), true);
+  assert.equal(isAppleMacOSBundleVersion("2026091105"), false);
+  for (const target of ["darwin-arm64", "darwin-x64"]) {
+    for (const buildNumber of ["2026091105", "2026091106"]) {
+      const input = { target, version: "0.1.21", buildNumber };
+      assert.equal(POLICY.productionElectronBuildVersionForTarget(input), "1028");
+      assert.deepEqual(POLICY.assertProductionElectronMacOSBundleMetadata({
+        ...input, bundleVersion: "1028", bundleShortVersion: "0.1.21",
+      }), { bundleVersion: "1028", bundleShortVersion: "0.1.21" });
+      for (const bundleVersion of [undefined, "1026", "1028.0", buildNumber]) {
+        assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({
+          ...input, bundleVersion, bundleShortVersion: "0.1.21",
+        }), /reviewed production allocation/u);
+      }
+      for (const bundleShortVersion of [undefined, "0.1.20", "1028"]) {
+        assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({
+          ...input, bundleVersion: "1028", bundleShortVersion,
+        }), /reviewed production allocation/u);
+      }
+      assert.throws(() => POLICY.productionElectronBuildVersionForTarget({
+        ...input, version: "0.1.22",
+      }), /explicit signed bundle version allocation/u);
+    }
+  }
+});
+
+test("historical Electron receipts keep their frozen bundle ordering without allocating future stable releases", () => {
+  for (const version of ["0.1.19", "0.1.20", REHEARSAL_CURRENT_VERSION]) {
+    assert.equal(POLICY.productionElectronBuildVersionForTarget({
+      target: "darwin-arm64", version, buildNumber: "2026091104",
+    }), "2026091104");
+  }
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.19", "stable"), null);
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.20", "stable"), null);
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.22", "stable"), null);
+  const { AppUpdater } = require("electron-updater/out/AppUpdater");
+  const updaterRequire = createRequire(require.resolve("electron-updater/package.json"));
+  const updaterSemver = updaterRequire("semver");
+  return AppUpdater.prototype.isUpdateAvailable.call({
+    currentVersion: updaterSemver.parse("0.1.20"),
+    allowDowngrade: false,
+    isUpdateSupported: async () => true,
+    isUserWithinRollout: async () => true,
+  }, { version: "0.1.21" }).then((available) => assert.equal(available, true));
+});
 
 async function withTemporaryDirectory(run) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-production-"));
@@ -561,7 +617,7 @@ test("Windows candidate mapping is lossless, ordered, and accepted by the pinned
   assert.equal(POLICY.productionElectronWindowsFileVersion(BUILD_NUMBER), "0.0.309.10282");
   assert.equal(POLICY.productionElectronBuildVersionForTarget({
     target: "darwin-arm64", version: RELEASE_VERSION, buildNumber: BUILD_NUMBER,
-  }), BUILD_NUMBER);
+  }), resolveSignedMacOSBundleVersion(RELEASE_VERSION, "stable"));
 
   const config = loadProductionBuilderConfig("win32-x64");
   const appInfo = new AppInfo({

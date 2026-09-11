@@ -317,9 +317,9 @@ const configuration = {
   artifactName: "TiboTattle-${version}-${os}-${arch}.${ext}",
   buildNumber: INPUTS.buildNumber,
   // electron-builder uses this for CFBundleVersion and PE FileVersion. The
-  // closed policy maps the same explicit candidate input to each platform's
-  // accepted numeric representation; ambient CI build-number variables cannot
-  // affect it.
+  // closed policy uses the canonical signed allocation on macOS and encodes
+  // the separate candidate identifier on Windows; ambient CI variables cannot
+  // affect either value.
   buildVersion: targetBuildVersion,
   directories: {
     app: path.join(targetDirectory, "app"),

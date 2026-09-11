@@ -1,5 +1,7 @@
 "use strict";
 
+const { SIGNED_MACOS_BUNDLE_VERSION_PLAN } = require("./macos-bundle-version-plan.cjs");
+
 /**
  * Closed production distribution policy shared by the Electron builder and
  * the main-process updater.  Development packages intentionally do not read
@@ -73,11 +75,9 @@ const PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CANDIDATES = Obj
   current: "current",
   next: "next",
 });
-// This is deliberately a supplied candidate input rather than a release
-// allocation in source control. It is limited to ten decimal digits because
-// the macOS handover validator compares CFBundleVersion components as bounded
-// numeric values. A candidate still has to prove it is newer than the actual
-// installed native application before a handover can proceed.
+// Immutable artifact/source-candidate identity, independent of the canonical
+// macOS bundle allocation. Retain the historical ten-digit bound for receipt
+// compatibility; a timestamp must not become a new Apple CFBundleVersion.
 const PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN = /^[1-9][0-9]{0,9}$/u;
 const PRODUCTION_ELECTRON_RELEASE_VERSION_PATTERN =
   /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
@@ -310,7 +310,7 @@ function productionElectronWindowsFileVersion(buildNumber) {
 
 /**
  * Return the target-specific value passed to electron-builder's buildVersion.
- * macOS retains the supplied integer as CFBundleVersion for native handover
+ * macOS uses the reviewed signed release allocation for native Sparkle
  * ordering. Windows receives four valid PE components, and AppImage carries
  * both the release version and exact candidate identifier.
  */
@@ -322,11 +322,35 @@ function productionElectronBuildVersionForTarget({ target, version, buildNumber 
     throw new TypeError("target and release version are required");
   }
   const selectedBuildNumber = assertProductionBuildNumber(buildNumber);
-  if (targetSpec.platform === "darwin") return selectedBuildNumber;
+  if (targetSpec.platform === "darwin") {
+    const allocation = SIGNED_MACOS_BUNDLE_VERSION_PLAN[version]?.stable;
+    if (allocation !== undefined) return allocation;
+    // Retain already-frozen Electron 019/020 receipts and named private
+    // rehearsal fixtures. These historical timestamps are not allocations
+    // for future stable releases or native Sparkle publication.
+    if (["0.1.19", "0.1.20"].includes(version)
+        || parseNativeToElectronHandoverRehearsalVersion(version) !== null) {
+      return selectedBuildNumber;
+    }
+    throw new TypeError("macOS release requires an explicit signed bundle version allocation");
+  }
   if (targetSpec.platform === "win32") {
     return productionElectronWindowsFileVersion(selectedBuildNumber);
   }
   return `${version}.${selectedBuildNumber}`;
+}
+
+/** Validate actual signed/installed plist values without confusing provenance
+ * buildNumber with the platform's bundle allocation. */
+function assertProductionElectronMacOSBundleMetadata({
+  target, version, buildNumber, bundleVersion, bundleShortVersion,
+} = {}) {
+  const expectedShortVersion = productionElectronMacOSBundleShortVersionForTarget({ target, version });
+  const expectedBundleVersion = productionElectronBuildVersionForTarget({ target, version, buildNumber });
+  if (bundleVersion !== expectedBundleVersion || bundleShortVersion !== expectedShortVersion) {
+    throw new TypeError("macOS bundle metadata does not match the reviewed production allocation");
+  }
+  return Object.freeze({ bundleVersion, bundleShortVersion });
 }
 
 /**
@@ -381,6 +405,7 @@ module.exports = Object.freeze({
   accountlessSignedStagingRehearsalForTarget,
   accountlessSignedStagingRehearsalStagingPathSegments,
   productionElectronBuildVersionForTarget,
+  assertProductionElectronMacOSBundleMetadata,
   productionElectronDistributionForTarget,
   productionElectronFeedForTarget,
   productionElectronMacOSBundleShortVersionForTarget,
