@@ -3046,6 +3046,15 @@ export async function buildLocalCompanionSnapshot({
       accounting: {
         projection: accountingProjection,
         sourceMode: accountingSourceMode,
+        // Cache-drop rows come from the unified diagnostic projection, not the
+        // optional replay-safe accounting cache. Bind local navigation to that
+        // projection even while the separate accounting cache is unavailable.
+        cacheDiagnosticsSource: unifiedGenerationReady
+          ? {
+            generation: unified.generation.id,
+            generationFingerprint: unified.generation.fingerprint,
+          }
+          : null,
         readerVersion: accountingDescriptor?.readerVersion ?? null,
         compatibilityBehavior:
           accountingDescriptor?.contextBehavior ?? null,

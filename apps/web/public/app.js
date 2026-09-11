@@ -202,6 +202,7 @@ let dashboard = null;
 const cacheDropThreadLinks = {
   dashboard: null,
   generation: null,
+  generationFingerprint: null,
   requestToken: 0,
   loadToken: 0,
   requested: false,
@@ -1520,9 +1521,11 @@ function renderLocalOnboarding(value) {
 function renderDashboard(data) {
   dashboardUnavailableState = null;
   dashboard = data;
-  if (!isCacheDropThreadDashboard(data) || data?.accounting?.generationMatched !== true
+  if (!isCacheDropThreadDashboard(data) || !data?.accounting?.cacheDiagnosticsSource
       || cacheDropThreadLinks.dashboard !== data
-      || cacheDropThreadLinks.generation !== data?.accounting?.generation) {
+      || cacheDropThreadLinks.generation !== data?.accounting?.cacheDiagnosticsSource?.generation
+      || cacheDropThreadLinks.generationFingerprint
+        !== data?.accounting?.cacheDiagnosticsSource?.generationFingerprint) {
     resetCacheDropThreadLinks(data);
   }
   if (data.mode === "demo") {
@@ -8853,9 +8856,11 @@ function resetCacheDropThreadLinks(data = null) {
   cacheDropThreadLinks.requestToken += 1;
   cacheDropThreadLinks.dashboard = data;
   cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
-      && typeof data.accounting?.generation === "string"
-    ? data.accounting.generation
+      && typeof data.accounting?.cacheDiagnosticsSource?.generation === "string"
+    ? data.accounting.cacheDiagnosticsSource.generation
     : null;
+  cacheDropThreadLinks.generationFingerprint =
+    data?.accounting?.cacheDiagnosticsSource?.generationFingerprint ?? null;
   cacheDropThreadLinks.requested = false;
   // A new accounting generation does not change an already resolved thread.
   // Reuse only exact event-pair keys still present in the local snapshot, across
@@ -8870,10 +8875,13 @@ function resetCacheDropThreadLinks(data = null) {
 
 async function loadCacheDropThreadLinks(data) {
   const generation = cacheDropThreadLinks.generation;
+  const fingerprint = cacheDropThreadLinks.generationFingerprint;
   if (data !== dashboard || data !== cacheDropThreadLinks.dashboard
       || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
       || generation === null || generation === ""
-      || data.accounting?.generationMatched !== true
+      || fingerprint === null
+      || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+      || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
       || cacheDropThreadLinks.requested
       || typeof localClient.cacheDropThreadLinks !== "function") return;
   cacheDropThreadLinks.requested = true;
@@ -8886,8 +8894,8 @@ async function loadCacheDropThreadLinks(data) {
         || loadToken !== cacheDropThreadLinks.loadToken
         || data !== dashboard || data !== cacheDropThreadLinks.dashboard
         || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
-        || generation !== data.accounting?.generation
-        || data.accounting?.generationMatched !== true
+        || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+        || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
         || result?.status !== "available"
         || result.generation !== generation) return;
     const selectedKeys = cacheDropThreadKeys(data);

@@ -2686,6 +2686,17 @@ function normalizeAccountingGeneration(value) {
   return Number.isSafeInteger(numeric) && numeric > 0 ? String(numeric) : null;
 }
 
+function normalizeCacheDiagnosticsSource(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "generation,generationFingerprint"
+      || typeof value.generationFingerprint !== "string"
+      || !/^generation-v2-[a-f0-9]{64}$/u.test(value.generationFingerprint)) return null;
+  const generation = normalizeAccountingGeneration(value.generation);
+  return generation === null ? null : {
+    generation, generationFingerprint: value.generationFingerprint
+  };
+}
+
 /** Mirrors the companion's content-free event-pair key, never an identity. */
 export function cacheDropThreadLookupKey(kind, row) {
   if (!["switch", "continuity"].includes(kind)
@@ -5187,6 +5198,7 @@ function normalizeLocalAccounting(value = {}, {
   const normalized = {
     generation: normalizeAccountingGeneration(value.generation),
     generationMatched: value.generationMatched === true,
+    cacheDiagnosticsSource: normalizeCacheDiagnosticsSource(value.cacheDiagnosticsSource),
     projection: normalizeAccountingProjection(value.projection, {
       allowImplicitDemoProjection
     }),

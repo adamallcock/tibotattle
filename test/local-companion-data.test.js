@@ -2079,6 +2079,8 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
     assert.equal(partialSnapshot.overview.timeline.history.status, "partial");
+    assert.equal(partialSnapshot.overview.accounting.cacheDiagnosticsSource, null,
+      "an incomplete diagnostic generation cannot authorize thread lookup");
     assert.equal(
       partialSnapshot.overview.timeline.history.reason,
       "unified_index_partial",
@@ -2314,6 +2316,22 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       toolPartialDatabase,
     );
     toolPartialDatabase.close();
+    // The current diagnostic projection remains independently attested while
+    // the prior replay cache no longer matches the changed generation proof.
+    const beforeReplayRebuild = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      archiveIndexFile,
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(beforeReplayRebuild.overview.accounting.generationMatched, false);
+    assert.equal(beforeReplayRebuild.overview.accounting.cacheSwitchImpact.status, "available");
+    assert.deepEqual(beforeReplayRebuild.overview.accounting.cacheDiagnosticsSource, {
+      generation: toolPartialGeneration.id,
+      generationFingerprint: toolPartialGeneration.fingerprint,
+    });
     await refreshReplaySafeAccountingCache({
       stateFile: collectorStateFile,
       sourceMode: "unified",

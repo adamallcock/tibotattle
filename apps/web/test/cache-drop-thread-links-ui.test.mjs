@@ -97,6 +97,7 @@ function createHarness({ locale = "en-US", lookup, local = true } = {}) {
 function localDashboard(generation = "35") {
   return { mode: "local", accounting: {
     generation, generationMatched: true,
+    cacheDiagnosticsSource: { generation, generationFingerprint: `generation-v2-${"a".repeat(64)}` },
     cacheSwitchImpact: { status: "available", recent: [row()] },
     cacheContinuityImpact: { status: "available", recent: [row("continuity")] },
   } };
@@ -243,16 +244,30 @@ test("the real local companion mode loads thread names as well as the default lo
   assert.equal(cell.querySelector("a").href, `codex://threads/${THREAD_ID}`);
 });
 
+test("cache-drop titles resolve while the independent replay accounting cache is unavailable", async () => {
+  const harness = createHarness({ lookup: async () => lookupResult() });
+  const data = localDashboard();
+  data.accounting.generationMatched = false;
+  data.accounting.generation = "unavailable";
+  harness.setDashboard(data);
+  const cell = harness.cell("switch", row());
+  await harness.load(data);
+  assert.equal(cell.textContent, "Synthetic thread");
+  assert.equal(cell.querySelector("a").href, `codex://threads/${THREAD_ID}`);
+  assert.equal(data.accounting.generationMatched, false);
+});
+
 test("late lookup is fenced by generation, match attestation, dashboard identity and load token", async () => {
-  for (const scenario of ["foreign-generation", "generation-mutated", "attestation-changed", "new-dashboard", "new-load", "demo", "mode-mutated"]) {
+  for (const scenario of ["foreign-generation", "generation-mutated", "attestation-changed", "fingerprint-changed", "new-dashboard", "new-load", "demo", "mode-mutated"]) {
     const ready = Promise.withResolvers();
     const harness = createHarness({ lookup: () => ready.promise });
     const data = localDashboard();
     harness.setDashboard(data);
     const cell = harness.cell("switch", row());
     const pending = harness.load(data);
-    if (scenario === "generation-mutated") data.accounting.generation = "36";
-    if (scenario === "attestation-changed") data.accounting.generationMatched = false;
+    if (scenario === "generation-mutated") data.accounting.cacheDiagnosticsSource.generation = "36";
+    if (scenario === "fingerprint-changed") data.accounting.cacheDiagnosticsSource.generationFingerprint = `generation-v2-${"b".repeat(64)}`;
+    if (scenario === "attestation-changed") data.accounting.cacheDiagnosticsSource = null;
     if (scenario === "new-dashboard") harness.setDashboard(localDashboard());
     if (scenario === "new-load") harness.state.loadToken += 1;
     if (scenario === "demo") harness.setDashboard({ ...localDashboard(), mode: "demo" });
@@ -277,7 +292,7 @@ test("unchanged rows retain names and links through indexing, failed lookup and 
     harness.setDashboard(data);
     await harness.load(data);
     const indexing = localDashboard("36");
-    indexing.accounting.generationMatched = false;
+    indexing.accounting.cacheDiagnosticsSource = null;
     harness.setDashboard(indexing);
     const retained = harness.cell(kind, row(kind));
     assert.equal(retained.textContent, "Synthetic thread");
