@@ -154,7 +154,7 @@ export function assertSignedStagingFreshProjection(sharing, receipt) {
   return true;
 }
 
-async function launch(verified, environment, { untouched = false } = {}) {
+async function launch(verified, environment, { untouched = false, onFailure } = {}) {
   // Same-identity handover/SingleInstanceLock must never attach to a pre-existing app.
   if (processTable().some((row) => /\/TiboTattle(?: Dev)?\.app\/Contents\/MacOS\/TiboTattle(?: Dev)?$/u.test(row.command))) fail('preexisting_app');
   const port = await freePort();
@@ -166,6 +166,7 @@ async function launch(verified, environment, { untouched = false } = {}) {
   child.once('error', () => { spawnFailed = true; });
   const state = { child, pid: child.pid, sessions: [], groupVerified: false,
     stopped: () => exited || spawnFailed };
+  let launchStage = 'process_group';
   try {
     await waitFor(() => {
       if (state.stopped()) fail('startup');
@@ -174,21 +175,28 @@ async function launch(verified, environment, { untouched = false } = {}) {
     }, OPERATION, 'process group');
     state.groupVerified = true;
     if (untouched) await continueNativeIntro(state, verified);
+    launchStage = 'owned_debugger';
     await waitFor(() => listenerOwned(child.pid, port), STARTUP, 'owned debugger');
+    launchStage = 'dashboard_target';
     const target = await waitFor(async () => selectMacDashboardTarget(await json(`http://127.0.0.1:${port}/json/list`), port), STARTUP, 'dashboard target');
     const dashboard = await connectCdp(target);
     state.sessions.push(dashboard);
+    launchStage = 'dashboard_ready';
     await waitFor(() => dashboard.evaluate('document.readyState === "complete" && document.title === "TiboTattle" && typeof globalThis.tibotattleDesktop?.getSharingPreference === "function"'), STARTUP, 'dashboard ready');
     // Settings methods remain restricted to the actual Settings frame.
     await dashboard.evaluate('globalThis.tibotattleDesktop.openSettings()');
     const origin = new URL(target.url).origin;
+    launchStage = 'settings_target';
     const settingsTarget = await waitFor(async () => selectMacSettingsTarget(await json(`http://127.0.0.1:${port}/json/list`), origin, port), STARTUP, 'settings target');
     state.settings = await connectCdp(settingsTarget);
     state.sessions.push(state.settings);
+    launchStage = 'settings_ready';
     await waitFor(() => state.settings.evaluate('typeof globalThis.tibotattleDesktop?.getSharingPreference === "function"'), STARTUP, 'settings ready');
     state.readSharing = () => state.settings.evaluate('globalThis.tibotattleDesktop.getSharingPreference()');
     return state;
   } catch (error) {
+    error.signedLaunchStage = launchStage;
+    if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage }); } catch {} }
     const stopped = await stop(state);
     error.ownedMacProcessesStopped = stopped === true;
     throw error;

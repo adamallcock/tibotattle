@@ -149,6 +149,7 @@ export async function runSignedReplacement(options) {
     optOutPreserved: false, restartNoDuplicates: false, sourceUntouched: false,
     enrollmentBindingAbsent: false, ownedProcessesStopped: false, failureStage: null };
   let active;
+  let diagnosticProfile;
   let stage = 'artifact';
   try {
     let verified = await verifySignedReplacementArtifact(options);
@@ -165,6 +166,7 @@ export async function runSignedReplacement(options) {
     await safePath(appData);
     const nativeRoot = join(appData, 'Usage Monitor');
     const profile = join(appData, 'TiboTattle');
+    diagnosticProfile = profile;
     const codex = join(home, '.codex');
     for (const path of [nativeRoot, profile, codex, join(appData, 'app-usagemonitor'),
       '/Applications/TiboTattle.app', join(home, 'Applications', 'TiboTattle.app'), join(appData, 'TiboTattle Native Handover')]) await absent(path);
@@ -200,7 +202,23 @@ export async function runSignedReplacement(options) {
     let initialSettings;
     for (let run = 0; run < 2; run += 1) {
       stage = run === 0 ? 'first_launch' : 'restart';
-      active = await launchVerifiedMacSharingApp(verified, environment);
+      active = await launchVerifiedMacSharingApp(verified, environment, { onFailure: async ({ pid }) => {
+        // Read only closed dialog classifications from our synthetic process.
+        const script = `function run() {
+          const matches = Application('System Events').applicationProcesses.whose({ unixId: ${pid} })();
+          if (matches.length !== 1) return 'process_absent';
+          const content = matches[0].windows().map(w => w.entireContents().map(e => { try { return String(e.value()); } catch { return ''; } }).join(' ')).join(' ');
+          if (content.includes('could not finish transferring')) return 'migration_blocked';
+          if (content.includes('secure startup checks')) return 'credential_preflight_blocked';
+          if (content.includes('Keychain') || content.includes('keychain')) return 'keychain_dialog';
+          return 'unclassified';
+        }`;
+        try {
+          const result = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', script],
+            { encoding: 'utf8', timeout: 10000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+          proof.dialogClassification = ['process_absent', 'migration_blocked', 'credential_preflight_blocked', 'keychain_dialog', 'unclassified'].includes(result) ? result : 'unavailable';
+        } catch { proof.dialogClassification = 'unavailable'; }
+      } });
       const sharing = await waitFor(async () => { const value = await active.readSharing(); return value?.available && value?.current ? value : null; }, 30000, 'retained opt out');
       const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
       const after = await readSignedReplacementState(join(profile, 'companion-state'));
@@ -229,6 +247,15 @@ export async function runSignedReplacement(options) {
     proof.status = 'passed';
   } catch (error) {
     proof.failureStage = error?.replacementStage ?? stage;
+    if (['process_group', 'owned_debugger', 'dashboard_target', 'dashboard_ready', 'settings_target', 'settings_ready'].includes(error?.signedLaunchStage)) proof.launchStage = error.signedLaunchStage;
+    if (error?.ownedMacProcessesStopped === true) proof.ownedProcessesStopped = true;
+    if (diagnosticProfile) {
+      proof.migrationInspection = (await inspectNativeElectronHandoverCompletion({ userDataRoot: diagnosticProfile }).catch(() => ({ status: 'unavailable' }))).status;
+      try {
+        const journal = JSON.parse(await readFile(join(diagnosticProfile, '.native-electron-handover-v1', 'journal-v1.json'), 'utf8'));
+        if (['started', 'prepared', 'backed_up', 'staged', 'published_state', 'published', 'electron_login_owned', 'completed'].includes(journal.phase)) proof.journalPhase = journal.phase;
+      } catch { proof.journalPhase = 'absent_or_unreadable'; }
+    }
   } finally {
     if (active) {
       try { proof.ownedProcessesStopped = await stopOwnedMacSharingApp(active); }
