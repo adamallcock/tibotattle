@@ -447,3 +447,113 @@ test("a durable completed marker skips old-native discovery for later Electron u
   });
   assert.deepEqual(result, { status: "already_migrated" });
 });
+
+function retainedCandidate() {
+  return {
+    route: "automatic_retained_state",
+    native: { appId: "com.usagemonitor.local", source: "retained_state" },
+    electron: CANDIDATE.electron,
+    signatureEvidence: {
+      electronCodeHash: CANDIDATE.signatureEvidence.electronCodeHash,
+      helperCodeHash: CANDIDATE.signatureEvidence.helperCodeHash,
+    },
+  };
+}
+
+test("ordinary replacement inspects retained state without a predecessor executable or fabricated metadata", async () => {
+  const commands = [];
+  const electronAppPath = "/Applications/TiboTattle.app";
+  const result = await inspectNativeMacHandover({
+    homeDirectory: "/Users/synthetic",
+    electronAppPath,
+    helperPath: `${electronAppPath}/Contents/MacOS/TiboTattleNativeHandover`,
+    lstatPath: async (path) => {
+      if (path.endsWith("Usage Monitor") || path === electronAppPath || path.endsWith("TiboTattleNativeHandover")) {
+        return inspectionLstat(path);
+      }
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    },
+    commandRunner: async (command, args) => {
+      commands.push({ command, args });
+      return inspectionCommand(command, args);
+    },
+  });
+  assert.equal(result.status, "ready");
+  assert.equal(result.nativeAppPath, null);
+  assert.equal(result.candidate.route, "automatic_retained_state");
+  assert.deepEqual(result.candidate.native, { appId: "com.usagemonitor.local", source: "retained_state" });
+  assert.deepEqual(Object.keys(result.candidate.signatureEvidence).sort(), ["electronCodeHash", "helperCodeHash"]);
+  assert.ok(commands.every(({ args }) => args.at(-1).startsWith(electronAppPath)));
+});
+
+test("a verified 0.1.16 predecessor uses retained schema compatibility instead of requiring an intermediate app", async () => {
+  const result = await inspectNativeMacHandover({
+    homeDirectory: "/Users/synthetic",
+    nativeAppPath: "/Applications/TiboTattle-old.app",
+    electronAppPath: "/Applications/TiboTattle.app",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    lstatPath: async (path) => inspectionLstat(path),
+    commandRunner: async (command, args) => {
+      if (command === "/usr/bin/plutil" && args.at(-1).includes("old") && args[1] === "CFBundleShortVersionString") {
+        return { code: 0, signal: null, stdout: "0.1.16\n", stderr: "" };
+      }
+      return inspectionCommand(command, args);
+    },
+  });
+  assert.equal(result.status, "ready");
+  assert.equal(result.nativeAppPath, null);
+  assert.equal(result.candidate.route, "automatic_retained_state");
+});
+
+test("retained-state helper operations never accept or forward a caller path", async () => {
+  const calls = [];
+  const adapter = createMacNativeHandoverAdapter({
+    platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: runtimeApp(),
+    spawnProcess: responseSpawn(preparedReply(), calls),
+  });
+  await adapter.prepareNativeHandover({ nativeAppPath: null, candidate: retainedCandidate() });
+  assert.deepEqual(calls[0].args, ["--prepare-retained-state"]);
+  await assert.rejects(adapter.prepareNativeHandover({
+    nativeAppPath: "/Applications/unrelated.app", candidate: retainedCandidate(),
+  }), (error) => error.code === "native_electron_mac_bridge_invalid_native_app");
+  assert.equal(calls.length, 1);
+  const preflightCalls = [];
+  const preflight = createMacNativeHandoverAdapter({
+    platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: runtimeApp(),
+    spawnProcess: responseSpawn({
+      schemaVersion: "tibotattle-native-electron-handover-bridge-v1", status: "preflight_ready",
+    }, preflightCalls),
+  });
+  await preflight.preflightNativeHandover({ nativeAppPath: null, candidate: retainedCandidate() });
+  assert.deepEqual(preflightCalls[0].args, ["--prepare-retained-state-preflight"]);
+});
+
+test("retained-state discovery still rejects an unverified current application or foreign helper", async () => {
+  for (const failure of ["signature", "helper-team"]) {
+    const operation = inspectNativeMacHandover({
+      homeDirectory: "/Users/synthetic",
+      electronAppPath: "/Applications/TiboTattle.app",
+      helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+      lstatPath: async (path) => {
+        if (path.includes("Native Handover") || path.includes("/synthetic/Applications")) {
+          throw Object.assign(new Error("missing"), { code: "ENOENT" });
+        }
+        return inspectionLstat(path);
+      },
+      commandRunner: async (command, args) => {
+        const result = inspectionCommand(command, args);
+        if (failure === "signature" && args[0] === "--verify") return { ...result, code: 1 };
+        if (failure === "helper-team" && args.at(-1).endsWith("TiboTattleNativeHandover")) {
+          return { ...result, stderr: result.stderr.replace("TEAM123", "OTHERTEAM") };
+        }
+        return result;
+      },
+    });
+    if (failure === "signature") await assert.rejects(operation, { code: "native_electron_mac_inspection_code_unverified" });
+    else assert.deepEqual(await operation, { status: "signature_or_build_mismatch" });
+  }
+});

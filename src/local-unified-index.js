@@ -7,6 +7,9 @@ import {
 import { closeSync, constants, lstatSync, openSync } from "node:fs";
 import {
   chmod,
+  copyFile,
+  mkdtemp,
+  rm,
   lstat,
   mkdir,
   open,
@@ -14,7 +17,8 @@ import {
   rename,
   unlink,
 } from "node:fs/promises";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, resolve, join, isAbsolute } from "node:path";
+import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 
 import { syncDirectory } from "./platform/index.js";
@@ -1294,6 +1298,69 @@ function assertWritableLocalUnifiedIndexPreflight(database) {
     throw fixedError("local_unified_index_schema_invalid");
   }
   return compatibility;
+}
+
+/** Check retained native data using the authoritative writer compatibility
+ * policy. SQLite may write shared-memory bytes even for a read-only WAL reader;
+ * inspect a disposable clone so the verified backup remains byte-for-byte intact.
+ */
+export async function validateRetainedNativeState({ stateRoot } = {}) {
+  if (typeof stateRoot !== "string" || !isAbsolute(stateRoot) || stateRoot.includes("\0")) {
+    throw new TypeError("Native state root must be absolute");
+  }
+  const indexFile = join(stateRoot, "local-unified-index-v1.sqlite");
+  captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  if (safeLocalUnifiedIndexTargetSync(indexFile, { allowMissing: true }) === null) return true;
+  assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
+  const scratch = await mkdtemp(join(tmpdir(), "tibotattle-native-compatibility-"));
+  try {
+    await chmod(scratch, 0o700);
+    const copiedIndex = join(scratch, "index.sqlite");
+    for (const suffix of ["", "-wal"]) {
+      const source = `${indexFile}${suffix}`;
+      const before = safeLocalUnifiedIndexTargetSync(source, { allowMissing: suffix !== "" });
+      if (before === null) continue;
+      await copyFile(source, `${copiedIndex}${suffix}`, constants.COPYFILE_EXCL | constants.COPYFILE_FICLONE);
+      await chmod(`${copiedIndex}${suffix}`, 0o600);
+      if (!sameLocalUnifiedIndexTarget(before, safeLocalUnifiedIndexTargetSync(source))) {
+        throw fixedError("local_unified_index_file_invalid");
+      }
+    }
+    return validateLocalUnifiedIndexForMigration(copiedIndex);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
+/** Read-only compatibility check for an owner-private migration backup.
+ * Reuses the writer preflight so all supported historical schemas are admitted
+ * without opening a writable connection or migrating the preserved backup.
+ */
+export function validateLocalUnifiedIndexForMigration(indexFile) {
+  const path = resolve(indexFile);
+  let chain = captureSafeLocalUnifiedIndexDirectoryChain(path);
+  const before = safeLocalUnifiedIndexTargetSync(path, { allowMissing: true });
+  if (before === null) return true;
+  assertLocalUnifiedIndexRecoveryUnlocked(path);
+  let database;
+  try {
+    database = new DatabaseSync(path, { readOnly: true, timeout: 5_000 });
+    chain = recheckLocalUnifiedIndexDirectoryChain(path, chain);
+    if (!sameLocalUnifiedIndexTarget(before, safeLocalUnifiedIndexTargetSync(path))) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    assertWritableLocalUnifiedIndexPreflight(database);
+    recheckLocalUnifiedIndexDirectoryChain(path, chain);
+    if (!sameLocalUnifiedIndexTarget(before, safeLocalUnifiedIndexTargetSync(path))) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    return true;
+  } catch (error) {
+    if (error?.code?.startsWith("local_unified_index_")) throw error;
+    throw fixedError("local_unified_index_unavailable");
+  } finally {
+    database?.close();
+  }
 }
 
 export function assertLocalUnifiedIndexRecoveryUnlocked(indexFile) {

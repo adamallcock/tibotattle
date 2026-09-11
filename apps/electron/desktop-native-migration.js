@@ -16,9 +16,9 @@ import {
 import { PRODUCTION_ELECTRON_APP_ID } from "./desktop-updater.js";
 
 /**
- * Source-level native-to-Electron handover.  This intentionally supports only
- * a guided, signed install: current 0.1.17 and 0.1.18 native artifacts do not
- * contain a general handover command, so it is not a direct Sparkle updater.
+ * Native-to-Electron handover for retained local state or a preserved signed
+ * predecessor. Ordinary replacement installs use the signed Electron helper;
+ * they do not require keeping the old application bundle.
  *
  * The coordinator is deliberately invoked before the Electron runtime opens
  * its companion state.  It copies an already-stopped native state root into a
@@ -29,6 +29,7 @@ import { PRODUCTION_ELECTRON_APP_ID } from "./desktop-updater.js";
 export const NATIVE_ELECTRON_HANDOVER_SCHEMA_VERSION =
   "tibotattle-native-electron-handover-v1";
 export const NATIVE_ELECTRON_HANDOVER_ROUTE = "guided_signed_install";
+export const NATIVE_ELECTRON_RETAINED_STATE_ROUTE = "automatic_retained_state";
 // Shared with the Electron updater's closed production policy. This import is
 // an identity consistency check, not updater or signed-artifact evidence.
 export const NATIVE_ELECTRON_APP_ID = PRODUCTION_ELECTRON_APP_ID;
@@ -150,6 +151,28 @@ function normalizedCandidate(candidate) {
   if (!plainRecord(candidate)
       || !exactKeys(candidate, ["route", "native", "electron", "signatureEvidence"])) {
     fail("invalid_candidate");
+  }
+  if (candidate.route === NATIVE_ELECTRON_RETAINED_STATE_ROUTE) {
+    const { native, electron, signatureEvidence } = candidate;
+    if (!exactKeys(native, ["appId", "source"])
+        || !exactKeys(electron, ["appId", "version", "build", "signingLineage"])
+        || !exactKeys(signatureEvidence, ["electronCodeHash", "helperCodeHash"])) {
+      fail("invalid_candidate");
+    }
+    if (native.appId !== NATIVE_ELECTRON_APP_ID || native.source !== "retained_state"
+        || electron.appId !== NATIVE_ELECTRON_APP_ID) fail("app_identity_mismatch");
+    if (!safeString(electron.build, SAFE_VERSION) || !safeString(electron.version, SAFE_VERSION)
+        || !safeString(electron.signingLineage)) fail("signing_lineage_mismatch");
+    if (!safeString(signatureEvidence.electronCodeHash, CODE_HASH)
+        || !safeString(signatureEvidence.helperCodeHash, CODE_HASH)) fail("signature_evidence_invalid");
+    // The old executable may already have been replaced. Do not invent a
+    // predecessor version or signature: compatibility is checked on the copy.
+    return Object.freeze({
+      route: candidate.route,
+      native: Object.freeze({ ...native }),
+      electron: Object.freeze({ ...electron }),
+      signatureEvidence: Object.freeze({ ...signatureEvidence }),
+    });
   }
   if (candidate.route !== NATIVE_ELECTRON_HANDOVER_ROUTE) {
     // Sparkle does not have a verified native-to-Electron replacement route.
@@ -916,13 +939,18 @@ function config(options) {
   if (!plainRecord(options)) fail("invalid_configuration");
   const allowed = new Set([
     "nativeStateRoot", "userDataRoot", "backupRoot", "nativeAppPath", "candidate", "control",
-    "maximumEntries", "maximumBytes", "controlRoot", "pidAlive", "afterCheckpoint",
+    "maximumEntries", "maximumBytes", "controlRoot", "pidAlive", "afterCheckpoint", "validateRetainedState",
   ]);
   if (Reflect.ownKeys(options).some((key) => !allowed.has(key))) fail("invalid_configuration");
   const nativeStateRoot = assertAbsolutePath(options.nativeStateRoot);
   const userDataRoot = assertAbsolutePath(options.userDataRoot);
   const backupRoot = assertAbsolutePath(options.backupRoot);
-  const nativeAppPath = assertAbsolutePath(options.nativeAppPath);
+  const candidate = normalizedCandidate(options.candidate);
+  if (candidate.route === NATIVE_ELECTRON_RETAINED_STATE_ROUTE
+      && typeof options.validateRetainedState !== "function") fail("invalid_configuration");
+  const nativeAppPath = candidate.route === NATIVE_ELECTRON_RETAINED_STATE_ROUTE
+    ? (options.nativeAppPath === null ? null : fail("invalid_configuration"))
+    : assertAbsolutePath(options.nativeAppPath);
   const controlRoot = options.controlRoot === undefined
     ? join(userDataRoot, CONTROL_DIRECTORY)
     : assertAbsolutePath(options.controlRoot);
@@ -945,7 +973,7 @@ function config(options) {
     controlRoot,
     companionRoot,
     settingsRoot,
-    candidate: normalizedCandidate(options.candidate),
+    candidate,
     control: requireControl(options.control),
     maximumEntries: assertCount(options.maximumEntries ?? NATIVE_ELECTRON_HANDOVER_MAX_ENTRIES,
       NATIVE_ELECTRON_HANDOVER_MAX_ENTRIES),
@@ -953,6 +981,7 @@ function config(options) {
       NATIVE_ELECTRON_HANDOVER_MAX_BYTES),
     pidAlive: options.pidAlive ?? defaultPidAlive,
     afterCheckpoint: options.afterCheckpoint,
+    validateRetainedState: options.validateRetainedState,
   });
 }
 
@@ -1117,6 +1146,16 @@ export async function runNativeElectronHandover(options = {}) {
       const backup = await collectTree(backupStateRoot, limits);
       if (before.digest !== after.digest || before.digest !== backup.digest) fail("source_changed");
       await validateSalt(backupStateRoot);
+      if (selected.candidate.route === NATIVE_ELECTRON_RETAINED_STATE_ROUTE) {
+        // Inspect only the private verified copy. The compatibility owner must
+        // not create, migrate, repair or otherwise change source evidence.
+        let compatible = false;
+        try { compatible = await selected.validateRetainedState(backupStateRoot); } catch { /* closed failure */ }
+        if (compatible !== true) fail("native_state_incompatible");
+        if ((await collectTree(backupStateRoot, limits)).digest !== backup.digest) {
+          fail("copy_verification_failed");
+        }
+      }
       journal = { ...journal, phase: "backed_up", backupDigest: backup.digest };
       await writeJournal(journalPath, journal);
       await checkpointHook(selected.afterCheckpoint, journal.phase);

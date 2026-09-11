@@ -951,7 +951,7 @@ test("native handover blocks before settings writes and companion start when exi
   assert.equal(settingsReads, 0);
   assert.equal(settingsWrites, 0);
   assert.equal(app.quitCalls, 1);
-  assert.match(notices[0].detail, /existing data has been preserved/u);
+  assert.match(notices[0].detail, /history and settings have been preserved/u);
 });
 
 test("credential preflight blocks before settings writes without mislabeling it as migration", {

@@ -4,9 +4,12 @@ import { lstat as defaultLstat } from "node:fs/promises";
 import { homedir as defaultHomeDirectory } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
+import { validateRetainedNativeState } from "../../src/local-unified-index.js";
+
 import {
   NATIVE_ELECTRON_APP_ID,
   NATIVE_ELECTRON_HANDOVER_ROUTE,
+  NATIVE_ELECTRON_RETAINED_STATE_ROUTE,
   SUPPORTED_NATIVE_HANDOVER_VERSIONS,
   inspectNativeElectronHandoverCompletion,
   runNativeElectronHandover,
@@ -340,15 +343,20 @@ export function createMacNativeHandoverAdapter(options = {}) {
   const configuration = normalizeOptions(options);
   return Object.freeze({
     async preflightNativeHandover({ nativeAppPath, candidate } = {}) {
-      if (!validPath(nativeAppPath)) throw bridgeFailure("invalid_native_app");
       const qualified = validateNativeElectronHandoverCandidate(candidate);
+      const retained = qualified.route === NATIVE_ELECTRON_RETAINED_STATE_ROUTE;
+      if (retained ? nativeAppPath !== null : !validPath(nativeAppPath)) {
+        throw bridgeFailure("invalid_native_app");
+      }
       if (qualified.native.appId !== NATIVE_ELECTRON_APP_ID
           || qualified.electron.appId !== NATIVE_ELECTRON_APP_ID) {
         throw bridgeFailure("identity_mismatch");
       }
       let reply;
       try {
-        reply = await invokeBridge(configuration, ["--prepare-preflight", "--native-app", nativeAppPath]);
+        reply = await invokeBridge(configuration, retained
+          ? ["--prepare-retained-state-preflight"]
+          : ["--prepare-preflight", "--native-app", nativeAppPath]);
       } catch (error) {
         if (typeof error?.code === "string" && error.code.startsWith("native_electron_mac_bridge_")) {
           throw error;
@@ -359,15 +367,20 @@ export function createMacNativeHandoverAdapter(options = {}) {
     },
 
     async prepareNativeHandover({ nativeAppPath, candidate } = {}) {
-      if (!validPath(nativeAppPath)) throw bridgeFailure("invalid_native_app");
       const qualified = validateNativeElectronHandoverCandidate(candidate);
+      const retained = qualified.route === NATIVE_ELECTRON_RETAINED_STATE_ROUTE;
+      if (retained ? nativeAppPath !== null : !validPath(nativeAppPath)) {
+        throw bridgeFailure("invalid_native_app");
+      }
       if (qualified.native.appId !== NATIVE_ELECTRON_APP_ID
           || qualified.electron.appId !== NATIVE_ELECTRON_APP_ID) {
         throw bridgeFailure("identity_mismatch");
       }
       let reply;
       try {
-        reply = await invokeBridge(configuration, ["--prepare", "--native-app", nativeAppPath]);
+        reply = await invokeBridge(configuration, retained
+          ? ["--prepare-retained-state"]
+          : ["--prepare", "--native-app", nativeAppPath]);
       } catch (error) {
         if (typeof error?.code === "string" && error.code.startsWith("native_electron_mac_bridge_")) {
           throw error;
@@ -680,15 +693,40 @@ export async function inspectNativeMacHandover({
       break;
     }
   }
-  if (selectedNativePath === null) return Object.freeze({ status: "no_supported_predecessor" });
-
-  const [native, electron, helper] = await Promise.all([
-    signedApplicationMetadata({ path: selectedNativePath, commandRunner: runner, lstatPath }),
+  const [electron, helper] = await Promise.all([
     signedApplicationMetadata({ path: resolve(electronAppPath), commandRunner: runner, lstatPath }),
     signedCodeMetadata({ path: helperPath, commandRunner: runner, lstatPath }),
   ]);
+  if (helper.teamIdentifier !== electron.teamIdentifier) {
+    return Object.freeze({ status: "signature_or_build_mismatch" });
+  }
+  const retainedCandidate = () => Object.freeze({
+    status: "ready",
+    nativeStateRoot,
+    nativeAppPath: null,
+    candidate: validateNativeElectronHandoverCandidate({
+      route: NATIVE_ELECTRON_RETAINED_STATE_ROUTE,
+      native: { appId: NATIVE_ELECTRON_APP_ID, source: "retained_state" },
+      electron: {
+        appId: electron.identifier,
+        version: electron.version,
+        build: electron.build,
+        signingLineage: electron.signingLineage,
+      },
+      signatureEvidence: { electronCodeHash: electron.codeHash, helperCodeHash: helper.codeHash },
+    }),
+  });
+  if (selectedNativePath === null) return retainedCandidate();
+  const native = await signedApplicationMetadata({ path: selectedNativePath, commandRunner: runner, lstatPath });
   if (!SUPPORTED_NATIVE_HANDOVER_VERSIONS.includes(native.version)) {
-    return Object.freeze({ status: "no_supported_predecessor" });
+    // Compatibility depends on retained schemas, not a guessed app version.
+    // A discovered bundle still has to pass signature checks below.
+    if (native.signingLineage !== electron.signingLineage
+        || native.teamIdentifier !== electron.teamIdentifier
+        || compareBuilds(electron.build, native.build) !== 1) {
+      return Object.freeze({ status: "signature_or_build_mismatch" });
+    }
+    return retainedCandidate();
   }
   if (native.signingLineage !== electron.signingLineage
       || native.teamIdentifier !== electron.teamIdentifier
@@ -737,8 +775,9 @@ function runtimePath(electronApp, name) {
 
 /**
  * Production composition called before Electron opens companion or settings
- * state. It makes no profile write when a bridge, predecessor, or signed-code
- * evidence is absent. It is deliberately unavailable outside macOS.
+ * state. Retained state does not require a predecessor application bundle.
+ * It makes no profile write when the bridge or signed-code evidence is absent.
+ * It is deliberately unavailable outside macOS.
  */
 export async function runProductionNativeMacHandover({
   electronApp,
@@ -805,6 +844,7 @@ export async function runProductionNativeMacHandover({
       backupRoot,
       nativeAppPath: inspection.nativeAppPath,
       candidate: inspection.candidate,
+      validateRetainedState: (stateRoot) => validateRetainedNativeState({ stateRoot }),
       control: createMacNativeHandoverAdapter({ helperPath: bridge.path, electronApp }),
     });
     return result;

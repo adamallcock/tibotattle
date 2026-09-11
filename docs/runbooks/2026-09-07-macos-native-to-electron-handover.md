@@ -7,80 +7,48 @@ status: draft
 
 # Status and boundary
 
-This is the source contract for moving a supported native TiboTattle install
-(`0.1.17` or `0.1.18`) to a later signed Electron candidate. It is not an
-installed-update procedure and does not qualify a direct Sparkle replacement.
-The released native applications do not include a general handover command.
+The automatic replacement path is implemented for the 0.1.20 candidate. Signed
+installed qualification and publication must complete before presenting it as
+available. Released 0.1.19 requires the earlier guided procedure; it is not proof
+of ordinary replacement compatibility.
 
-The selected route is a **guided signed install**. It keeps the production
-bundle identifier, `com.usagemonitor.local`, and leaves the retired native app
-available at a deterministic backup location. A source build, a development
-package, copied profile, `app.isPackaged`, or a passing contract test does not
-qualify a signed artifact, Keychain continuity, replacement, or update.
-
-# Fixed discovery and install route
-
-The macOS coordinator probes only these locations. It does not scan an
-Applications directory or infer the old state from Electron `userData`.
-
-| Purpose | Exact location |
-| --- | --- |
-| Native stable state | `~/Library/Application Support/Usage Monitor` |
-| Guided-handover backup root | `~/Library/Application Support/TiboTattle Native Handover` |
-| Preserved native bundle | `~/Library/Application Support/TiboTattle Native Handover/native-app/TiboTattle.app` |
-| Native source candidates | preserved bundle, `/Applications/TiboTattle.app`, then `~/Applications/TiboTattle.app` |
-| Final same-identity Electron location | the native source's `TiboTattle.app` location |
-| Handover bridge resource | `TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover` |
-| Main-process credential adapter | `TiboTattle.app/Contents/Resources/native/macos-keychain.node` |
-
-[`scripts/plan-macos-native-electron-guided-handover.mjs`](../../scripts/plan-macos-native-electron-guided-handover.mjs)
-returns this concrete route for an exact old bundle and home directory. It is a
-planning interface only: it does not move an app, replace a bundle, modify a
-profile, sign code, or invoke the handover bridge.
+The required user journey is: quit the old app, replace TiboTattle in Applications
+with the new signed app, and open it. The app transfers compatible retained state
+and settings automatically. No manual directory creation or saved predecessor
+bundle is required. Users who already replaced the old app use the same path.
 
 # Runtime decision contract
 
-Production startup first validates the signed enclosing app and loads its
-fixed credential adapter. Before invoking any handover operation, it reads and
-discards the active account-observation and contribution-device credentials.
-Optional legacy export and reserved Claude credentials retain migration guards
-when first used; they do not block an unrelated handover. Accountless installation
-credentials remain main-process-only and are accessed on demand. Missing modern credentials are accepted
-only after a fixed, attribute-only legacy lookup also proves absence. Locked,
-denied, indeterminate or legacy-only credentials stop startup without modifying
-the predecessor, credentials or data. This preflight also runs after a completed
-handover and on fresh installations; an absent migration helper is distinct
-from missing credential authority. No legacy ACL is broadened and no identity
-is replaced to avoid a security prompt.
+Startup verifies the current signed Electron app and bundled helper, silently
+preflights existing credential access, and inspects the retained native state in
+`~/Library/Application Support/Usage Monitor`. Missing old app code is expected.
+No predecessor version or signature is fabricated to authorize migration.
 
-[`runProductionNativeMacHandover`](../../apps/electron/desktop-native-migration-macos.js)
-runs before Electron opens companion or settings state. It has three normal
-results:
+A verified preserved 0.1.17/0.1.18 bundle may still use the compatible guided
+journal route. Without that bundle, compatibility is determined from the retained
+data's actual supported schema, including supported older native schemas. Unknown
+or newer schemas preserve the source and refuse migration rather than starting
+an empty profile. No intermediate native app update is required for a compatible
+schema.
 
-| Result | Runtime behavior |
-| --- | --- |
-| `no_legacy_state` | Start normally. This is returned before bridge or signature checks, so a fresh Electron profile is never blocked by an absent migration resource. |
-| `migrated` | Start with the published `companion-state` and `desktop-settings` roots. |
-| `already_migrated` | Start normally. A valid durable completion marker is checked before predecessor discovery, so later Electron updates do not require the retired native app. |
+The retained-state helper authenticates its current signed Electron parent and
+stops only a running predecessor at the same bundle path whose running code
+matches the parent's designated signing requirement. It refuses other same-ID
+application paths, unregisters the old startup item and reads existing preferences.
+It never copies or resets credentials, broadens Keychain access, or enables sharing.
 
-For an existing native state root, `bridge_unavailable`,
-`no_supported_predecessor`, `signature_or_build_mismatch`,
-`signature_unverified`, and `migration_blocked` stop startup with the guided
-migration message. They never fall back to an empty Electron state. A malformed
-completion marker also blocks startup.
+A verified private backup is checked using the index owner's existing migration
+compatibility policy. SQLite inspection uses a disposable clone so retained WAL
+or shared-memory files cannot change the backup. The normal transaction below
+publishes the copied state and preferences, preserves opt-outs, and claims startup
+ownership. Completed profiles bypass predecessor discovery on subsequent launches.
 
-Before calling the bridge, the coordinator performs read-only local inspection:
-
-1. It verifies the old app, Electron app, and future bundled helper with
-   `/usr/bin/codesign --verify --deep --strict`.
-2. It reads each code signature's identifier, Team ID, CDHash, and designated
-   requirement, plus the app bundles' numeric version and build values.
-3. It requires the production identifier, native `0.1.17` or `0.1.18`, equal
-   designated-requirement digest and Team ID for the two apps, a helper signed
-   by that Team ID, and a strictly greater Electron build.
-
-These are runtime checks of installed local code. They do not assert that a
-future archive, notarization, or updater payload is qualified.
+The normal outcomes remain `no_legacy_state`, `migrated`, and `already_migrated`.
+Unknown data, unavailable credentials, signature failures and incomplete unsafe
+state stop startup with a recoverable error; they never discard history. An
+interrupted transaction resumes only when bound to its verified journal and
+candidate. Changing builds during an incomplete prior transaction is not an
+automatically approved journal rebind.
 
 # State transaction and recovery
 
@@ -98,7 +66,8 @@ on the native source.
 
 The helper in
 [`NativeElectronHandoverHelper.swift`](../../apps/macos/Helpers/NativeElectronHandoverHelper.swift)
-accepts one mutating operation: `--prepare --native-app <absolute bundle path>`.
+accepts the legacy `--prepare --native-app <absolute bundle path>` operation and
+the pathless `--prepare-retained-state` replacement operation.
 It verifies the enclosing Electron app identity and selected old app, asks
 `NSRunningApplication` to terminate only processes with the exact old bundle
 URL, unregisters the same-identity native login item and confirms removal, and

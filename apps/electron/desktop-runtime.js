@@ -1080,13 +1080,13 @@ export async function launchDesktopRuntime({
         type: "warning",
         title: credentialPreflightBlocked
           ? "Unable to prepare secure storage"
-          : "Finish moving to TiboTattle",
+          : "Unable to finish updating TiboTattle",
         message: credentialPreflightBlocked
           ? "TiboTattle could not complete its secure startup checks."
-          : "Your Mac app data needs to be transferred before TiboTattle can start.",
+          : "TiboTattle could not finish transferring your existing data.",
         detail: credentialPreflightBlocked
           ? "Your existing app data has not been changed. Quit and try again."
-          : "Run the guided migration again. Your existing data has been preserved.",
+          : "Your history and settings have been preserved. Quit and reopen TiboTattle to try again. If this continues, contact support.",
         buttons: ["Quit"], defaultId: 0, cancelId: 0, noLink: true,
       });
       deepLinkIntakeCleanup();

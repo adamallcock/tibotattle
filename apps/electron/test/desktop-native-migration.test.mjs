@@ -365,3 +365,79 @@ test("future native tray preferences block migration without replacing their sou
   await assert.rejects(runNativeElectronHandover(migrationOptions(state, [])), { code: "native_electron_handover_native_settings_invalid" });
   assert.deepEqual(JSON.parse(await readFile(source, "utf8")), future);
 });
+
+function retainedStateCandidate() {
+  const signed = candidate();
+  return {
+    route: "automatic_retained_state",
+    native: { appId: signed.native.appId, source: "retained_state" },
+    electron: signed.electron,
+    signatureEvidence: {
+      electronCodeHash: signed.signatureEvidence.electronCodeHash,
+      helperCodeHash: signed.signatureEvidence.helperCodeHash,
+    },
+  };
+}
+
+test("replacement migration validates the preserved copy, keeps credentials and resumes without an old app", async (t) => {
+  const state = await fixture();
+  t.after(() => state.dispose());
+  await rm(state.nativeAppPath, { recursive: true });
+  const calls = [];
+  const inspected = [];
+  const options = migrationOptions(state, calls, {
+    nativeAppPath: null,
+    candidate: retainedStateCandidate(),
+    async validateRetainedState(root) {
+      inspected.push(root);
+      assert.notEqual(root, state.nativeStateRoot);
+      assert.ok(root.startsWith(state.backupRoot));
+      assert.equal(await readFile(join(root, "local-unified-index-device-salt-v1")).then((bytes) => bytes.length), 32);
+      return true;
+    },
+    afterCheckpoint(phase) { if (phase === "staged") throw new Error("synthetic interruption"); },
+  });
+  await assert.rejects(runNativeElectronHandover(options));
+  const result = await runNativeElectronHandover({ ...options, afterCheckpoint: undefined });
+  assert.equal(result.status, "migrated");
+  assert.equal(inspected.length, 1);
+  assert.equal(await readFile(join(result.stateRoot, "private", "automatic-contribution-v0.1.json"), "utf8"), '{"enabled":false}\n');
+  assert.equal(await readFile(join(state.nativeStateRoot, "local-unified-index-v1.sqlite"), "utf8"), "sqlite-fixture");
+  assert.equal((await runNativeElectronHandover(options)).status, "already_migrated");
+});
+
+test("retained migration fails before publication on unknown schema or a mutating compatibility probe", async (t) => {
+  for (const behavior of ["unknown", "mutating", "missing"]) {
+    await t.test(behavior, async () => {
+      const state = await fixture();
+      try {
+        const options = migrationOptions(state, [], {
+          nativeAppPath: null,
+          candidate: retainedStateCandidate(),
+          validateRetainedState: behavior === "missing" ? undefined : async (root) => {
+            if (behavior === "unknown") return false;
+            await privateFile(join(root, "mutation"), "unexpected");
+            return true;
+          },
+        });
+        await assert.rejects(runNativeElectronHandover(options), (error) => error.code === (
+          behavior === "missing" ? "native_electron_handover_invalid_configuration"
+            : behavior === "unknown" ? "native_electron_handover_native_state_incompatible"
+              : "native_electron_handover_copy_verification_failed"
+        ));
+        await assert.rejects(lstat(join(state.userDataRoot, "companion-state")), { code: "ENOENT" });
+        assert.equal(await readFile(join(state.nativeStateRoot, "local-unified-index-v1.sqlite"), "utf8"), "sqlite-fixture");
+      } finally { await state.dispose(); }
+    });
+  }
+});
+
+test("retained candidate rejects invented predecessor identity evidence and paths", async () => {
+  const valid = retainedStateCandidate();
+  assert.deepEqual(validateNativeElectronHandoverCandidate(valid), valid);
+  for (const invalid of [
+    { ...valid, native: { ...valid.native, version: "0.1.18" } },
+    { ...valid, signatureEvidence: { ...valid.signatureEvidence, nativeCodeHash: "a".repeat(40) } },
+    { ...valid, native: { ...valid.native, source: "unknown" } },
+  ]) assert.throws(() => validateNativeElectronHandoverCandidate(invalid));
+});

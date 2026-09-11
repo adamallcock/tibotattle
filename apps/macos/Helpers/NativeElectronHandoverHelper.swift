@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import ServiceManagement
+import Security
 import Darwin
 
 /// A deliberately narrow bridge carried by a future signed Electron candidate.
@@ -8,7 +9,9 @@ import Darwin
 /// The released native 0.1.17 and 0.1.18 applications do not contain this
 /// executable. It is therefore not a general command channel or a direct
 /// Sparkle replacement: the Electron coordinator invokes it only during a
-/// reviewed guided signed-install handover, before it opens the copied state.
+/// signed-install handover, before it opens the copied state. Ordinary replacement
+/// uses retained state and the current signed app; it never invents evidence
+/// about a predecessor bundle that is no longer present.
 @main
 enum NativeElectronHandoverHelper {
     private static let schemaVersion =
@@ -89,6 +92,9 @@ enum NativeElectronHandoverHelper {
         case "--process-classifier-smoke-test":
             guard arguments.count == 2 else { throw BridgeFailure.invalidRequest }
             return try processClassifierSmokeTest()
+        case "--prepare-retained-state", "--prepare-retained-state-preflight":
+            guard arguments.count == 2 else { throw BridgeFailure.invalidRequest }
+            return try prepareRetainedState(preflight: arguments[1] == "--prepare-retained-state-preflight")
         case "--prepare":
             guard arguments.count == 4, arguments[2] == "--native-app" else {
                 throw BridgeFailure.invalidRequest
@@ -171,6 +177,96 @@ enum NativeElectronHandoverHelper {
             "schemaVersion": schemaVersion,
             "status": "preflight_ready",
         ]
+    }
+
+    /// A replaced .app is not required to prove the provenance of the user's
+    /// retained local state. The coordinator separately validates and backs up
+    /// that state. This bridge only transfers process/login-item ownership and
+    /// preferences, without reading or changing any credential.
+    private static func prepareRetainedState(preflight: Bool) throws -> [String: Any] {
+        guard Bundle.main.bundleIdentifier == productIdentifier,
+              enclosingApplicationBundleIdentifier() == productIdentifier else {
+            throw BridgeFailure.identity
+        }
+        let appPath = Bundle.main.bundleURL.standardizedFileURL.path
+        let parentRequirement = try validatedParentRequirement(appPath: appPath)
+        let service = SMAppService.mainApp
+        try validatePreparationLoginItemStatus(service)
+        let preferences = try readPreferences(startAtLogin: service.status == .enabled)
+        try assertNoOtherSameIdentityApplications(appPath)
+        // NSRunningApplication's bundle URL may now refer to the replacement.
+        // Check the running code by PID, never its replaced on-disk executable.
+        for application in nativeApplications(appPath) {
+            try validateRunningCode(application.processIdentifier, requirement: parentRequirement)
+        }
+        if preflight {
+            return ["schemaVersion": schemaVersion, "status": "preflight_ready"]
+        }
+        for application in nativeApplications(appPath) {
+            // Recheck immediately before requesting graceful termination; no
+            // kill-by-name, force termination, or unrelated app is permitted.
+            try validateRunningCode(application.processIdentifier, requirement: parentRequirement)
+            guard application.terminate() else { throw BridgeFailure.nativeWriter }
+        }
+        let deadline = Date().addingTimeInterval(nativeStopTimeout)
+        while !nativeApplications(appPath).isEmpty && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        try assertNativeApplicationsStopped(appPath)
+        try assertNoOtherSameIdentityApplications(appPath)
+        if service.status != .notRegistered {
+            do { try service.unregister() } catch { throw BridgeFailure.loginItemUnregister }
+        }
+        guard service.status == .notRegistered else { throw BridgeFailure.loginItemStatus }
+        return [
+            "schemaVersion": schemaVersion,
+            "status": "prepared",
+            "nativeWriterStopped": true,
+            "loginItemDisabled": true,
+            "preferences": preferences,
+            "credentialState": "unchanged",
+        ]
+    }
+
+    private static func runningCode(_ pid: pid_t) throws -> SecCode {
+        var code: SecCode?
+        let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
+        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
+              let code else { throw BridgeFailure.identity }
+        return code
+    }
+
+    private static func validatedParentRequirement(appPath: String) throws -> SecRequirement {
+        guard let parent = NSRunningApplication(processIdentifier: getppid()),
+              parent.bundleIdentifier == productIdentifier,
+              parent.bundleURL?.standardizedFileURL.path == appPath else {
+            throw BridgeFailure.identity
+        }
+        let code = try runningCode(getppid())
+        var trustedProduct: SecRequirement?
+        guard SecRequirementCreateWithString(
+            "anchor apple generic and identifier \"com.usagemonitor.local\"" as CFString,
+            [], &trustedProduct
+        ) == errSecSuccess,
+              let trustedProduct,
+              SecCodeCheckValidity(code, [], trustedProduct) == errSecSuccess else {
+            throw BridgeFailure.identity
+        }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+              let staticCode else { throw BridgeFailure.identity }
+        var requirement: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirement) == errSecSuccess,
+              let requirement else { throw BridgeFailure.identity }
+        return requirement
+    }
+
+    private static func validateRunningCode(_ pid: pid_t, requirement: SecRequirement) throws {
+        let code = try runningCode(pid)
+        // Exact current app designated requirement, not merely its Team ID.
+        guard SecCodeCheckValidity(code, [], requirement) == errSecSuccess else {
+            throw BridgeFailure.identity
+        }
     }
 
     private static func validatePreparationLoginItemStatus(_ service: SMAppService) throws {
@@ -370,7 +466,8 @@ enum NativeElectronHandoverHelper {
         // response retain it. Preparation alone gets a fixed private stage
         // code; no OS error, path, preference value, PID, or credential data
         // crosses this boundary.
-        guard command == "--prepare" || command == "--prepare-preflight" else {
+        guard command == "--prepare" || command == "--prepare-preflight"
+                || command == "--prepare-retained-state" || command == "--prepare-retained-state-preflight" else {
             return [
                 "schemaVersion": schemaVersion,
                 "status": "failed",

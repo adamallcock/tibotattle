@@ -35,6 +35,31 @@ test("compiled handover helper recognizes the enclosing app only in the producti
   assert.deepEqual(JSON.parse(correct.stdout), {
     schemaVersion: "tibotattle-native-electron-handover-bridge-v1", status: "bundle_context_ok",
   });
+  // Retained-state preparation must reject a lookalike bundle launched by an
+  // unsigned/test parent before it can stop processes or change login items.
+  // Supplying no predecessor is valid syntax, but is not identity evidence.
+  for (const command of ["--prepare-retained-state", "--prepare-retained-state-preflight"]) {
+    const rejected = spawnSync(executable, [command], {
+      encoding: "utf8", timeout: 10_000, maxBuffer: 8 * 1024,
+      env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+    });
+    assert.equal(rejected.status, 1);
+    assert.deepEqual(JSON.parse(rejected.stdout), {
+      schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+      status: "failed",
+      failureStage: "identity",
+    });
+    const unexpectedArgument = spawnSync(executable, [command, "--native-app", "/synthetic.app"], {
+      encoding: "utf8", timeout: 10_000, maxBuffer: 8 * 1024,
+      env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+    });
+    assert.equal(unexpectedArgument.status, 1);
+    assert.deepEqual(JSON.parse(unexpectedArgument.stdout), {
+      schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+      status: "failed",
+      failureStage: "invalid_request",
+    });
+  }
   const wrong = run(wrongExecutable);
   assert.equal(wrong.status, 1, "Resources must not qualify as the app's executable context");
   assert.deepEqual(JSON.parse(wrong.stdout), {
