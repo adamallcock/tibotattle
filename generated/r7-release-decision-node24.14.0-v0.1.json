@@ -481,8 +481,8 @@
     "resourcePolicySourceSha256": "d9748895468534062e9c8c436db75cbf5acf4ccf54f84319db37e88197627870",
     "resourcePolicyValuesSha256": "3cbe7853c8f75e96912885f64ba4ad1aeb13aff8a22e4ffbd51806b27c73b418",
     "schemaModuleSha256": "9437252c19967d1baab279dd1b1dc7947bb33a1d12f42d3e4d30fff47ee3d456",
-    "workloadCodeFileCount": 392,
-    "workloadCodeSha256": "a0d3f6e46523576ef3f47db93147450a64c28fd4fce67f99f817699445748fd5"
+    "workloadCodeFileCount": 401,
+    "workloadCodeSha256": "abe67da896c87b61b4bdf10483be95a36a1c4373d1cc8016cd88670c73a2c31c"
   },
   "determinism": {
     "comparisons": {
@@ -839,7 +839,7 @@
         "decision": "unresolved",
         "dimension": "source_files",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 4124,
+        "realHistoryValue": 4125,
         "selectionBasis": "not_identified",
         "unit": "files"
       },
@@ -849,7 +849,7 @@
         "decision": "unresolved",
         "dimension": "source_bytes",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 12452805125,
+        "realHistoryValue": 12456779903,
         "selectionBasis": "not_identified",
         "unit": "bytes"
       },
@@ -939,7 +939,7 @@
         "decision": "unresolved",
         "dimension": "export_set_encoded_bytes",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 30250566,
+        "realHistoryValue": 30252460,
         "selectionBasis": "not_identified",
         "unit": "bytes"
       },
@@ -989,7 +989,7 @@
         "decision": "unresolved",
         "dimension": "elapsed_time",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 311573,
+        "realHistoryValue": 446707,
         "selectionBasis": "not_identified",
         "unit": "milliseconds"
       },
@@ -999,7 +999,7 @@
         "decision": "unresolved",
         "dimension": "rss",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 955023360,
+        "realHistoryValue": 1185497088,
         "selectionBasis": "not_identified",
         "unit": "bytes"
       }
@@ -1007,20 +1007,20 @@
     "headroomBasisPoints": 2000,
     "inputReceipts": {
       "materializedBoundaries": {
-        "node24Sha256": "4f30d33a41dc039c55d3149d0fef35fb0229dd566698d0b64fb3c3702fdcd8e9",
-        "node26Sha256": "040a07780b3fa45aafab28f95c3c4c63dceb2dd277a917664b09a40e75184cac"
+        "node24Sha256": "b69e3a7bd50bfc375cb598a4ef344b7c63902e262f640212b3ab54f2ab06886d",
+        "node26Sha256": "c89004e2bbb683657a8d8062fc7e39645c5f5ba78841f15d3b646445b82dd113"
       },
       "realLocalHistory": {
-        "node24Sha256": "f0a12813c2b3470ab7c4a104ea43d0ecae87191272dd283c419509737e800d28",
-        "node26Sha256": "5d86658f7a8bd930dcf7f720489eb3c844317b3ab5a990f4c8556bdb6a267c79"
+        "node24Sha256": "b2637bda3f0809156d058d70225f5afcb66c328fbad51035c5d6b57c3c2567d1",
+        "node26Sha256": "9e47b4916593e6f7c558f7bfd09af59a395ccb02c0d8a151246e97bc01d649b4"
       },
       "syntheticPressure": {
-        "node24Sha256": "0dfebdeb116f1ec1c72d28e5d4baf64ee02c777dea7a37aa982c795130c96953",
-        "node26Sha256": "ab1c888fa8549f657465253a094cfcd1c2606d63860142203a5248156e49372f"
+        "node24Sha256": "60aa453ce7882ae41c0e4e8164a68d4e430370b3b15460904b0f3fe68aaf1909",
+        "node26Sha256": "7236a009598ee7d28e9e6854d76cc4e5b14afe283c9d8ab91a153b971fc7a284"
       },
       "syntheticSemantics": {
-        "node24Sha256": "b167a18bcc018a6e2b197511260a477cec32358962bb3781d4635c591c979c1b",
-        "node26Sha256": "aa9e9a1682924a663e9c6f493e9b3ae543b1eef30b6698febbebcf77a260d50d"
+        "node24Sha256": "669807ddfea4d244df61857b1484e690d6ee657101ea01cca417c2baea0a3d10",
+        "node26Sha256": "50b6f696b71a71c72b60062c6438eaf8fcfcbe149869ace3c2f79e87055afa72"
       }
     },
     "kind": "release_decision",
@@ -1039,7 +1039,7 @@
     "singleMachineLimitation": true
   },
   "protocolVersion": "g1-r7-release-evidence-v0.1",
-  "receiptSha256": "f515a20c45daca2c261354e4d59d5f65ac0c97b73acfd6d6d1faa770bda60c6e",
+  "receiptSha256": "1d0be84f39a38cec8417bbdab7c3fac15bbdecd2e4ef87207fefb34d0466e976",
   "runtimeProvenance": {
     "architecture": "arm64",
     "elapsedClock": "parent_monotonic",
