@@ -6,7 +6,9 @@ import { advanceV1QuotaAcquisition, type V1QuotaPageReader, type V1PlanSourceRow
 import { createV1QuotaPageReader } from "../src/quota-fit-projection";
 import { createPreparedV1EvidenceReader, ensurePreparedV1Window,
   retireV1PreparedEvidence, V1_PREPARED_FIT_PAGE_SQL,
-  V1PreparedEvidenceUnavailableError, V1_PREPARATION_METHOD_VERSION } from "../src/prepared-v1-evidence";
+  V1PreparedEvidenceUnavailableError, V1_PREPARATION_METHOD_VERSION,
+  type V1PreparedEvidenceUnavailableReason } from "../src/prepared-v1-evidence";
+import { sha256Hex } from "../src/crypto";
 import { prepareQuotaPage, type PreparationQuotaRow, type PreparedQuotaRuns } from "../src/prepared-v1-day";
 import { loadV1SourcePin, type V1SourcePin } from "../src/telemetry-v1-source-selection";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
@@ -48,9 +50,27 @@ async function prepare(source: V1SourcePin, pageSize = 256) {
   }
   throw new Error("synthetic preparation must complete");
 }
+async function expectUnavailable(result: Promise<unknown>, reason: V1PreparedEvidenceUnavailableReason) {
+  await expect(result).rejects.toBeInstanceOf(V1PreparedEvidenceUnavailableError);
+  await expect(result).rejects.toMatchObject({
+    code: "V1_PREPARED_EVIDENCE_UNAVAILABLE", message: "v1 prepared evidence unavailable", reason,
+  });
+}
 beforeEach(async () => { await reset(); await applyD1Migrations(db(), migrations()); });
 
 describe("reusable elected source-day preparation", () => {
+  it("preserves the existing error contract and confines diagnostic reasons to fixed values", () => {
+    const error = new V1PreparedEvidenceUnavailableError();
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({ code: "V1_PREPARED_EVIDENCE_UNAVAILABLE",
+      message: "v1 prepared evidence unavailable", reason: "invalid_evidence" });
+    for (const reason of ["invalid_evidence", "source_not_current", "control_invalid", "day_count_mismatch"] as const) {
+      expect(new V1PreparedEvidenceUnavailableError(reason).reason).toBe(reason);
+    }
+    expect(new V1PreparedEvidenceUnavailableError("untrusted runtime detail" as V1PreparedEvidenceUnavailableReason).reason)
+      .toBe("invalid_evidence");
+  });
+
   it("reuses neighbouring days without reading or repricing source rows, preserving exact fits and counts", async () => {
     await seedModelHistoryFixture();
     const source = await pin(), prepared = await prepare(source, 7);
@@ -106,14 +126,17 @@ describe("reusable elected source-day preparation", () => {
     const fixture = await seedModelHistoryFixture(); const original = await pin(); await prepare(original);
     const headsBefore = (await db().prepare("SELECT source_day,generation FROM community_prepared_source_days ORDER BY source_day").all<{source_day:string;generation:string}>()).results;
     await insertModelHistoryRecords(fixture, "late-one-day", [pricedModelHistoryUsage("gpt-5.6-terra", 1, time(60)).record]);
-    await expect(prepare(original)).rejects.toBeInstanceOf(V1PreparedEvidenceUnavailableError);
+    await expectUnavailable(prepare(original), "source_not_current");
+    // Repinning omitted dependencies must reject the same stale source before
+    // looking up prepared heads; supplied dependencies use the source guard.
+    await expectUnavailable(prepare({ ...original, dayDependencies: undefined }), "source_not_current");
     const next = await pin(); await prepare(next);
     const headsAfter = (await db().prepare("SELECT source_day,generation FROM community_prepared_source_days ORDER BY source_day").all<{source_day:string;generation:string}>()).results;
     expect(headsAfter.slice(1)).toEqual(headsBefore.slice(1)); expect(headsAfter[0]?.generation).not.toBe(headsBefore[0]?.generation);
     expect((await createPreparedV1EvidenceReader(db(), next)).usageBins.totalRowCount).toBe(121);
     expect(await db().prepare("SELECT COUNT(*) AS count FROM community_prepared_usage_rows").first()).toEqual({ count: 121 });
     await db().prepare("UPDATE participants SET state='deleting' WHERE id=?").bind(PID).run();
-    await expect(createPreparedV1EvidenceReader(db(), next)).rejects.toBeInstanceOf(V1PreparedEvidenceUnavailableError);
+    await expectUnavailable(createPreparedV1EvidenceReader(db(), next), "source_not_current");
   });
 
   it("owner erasure cascades every allowlisted derived table and retains no raw payload JSON", async () => {
@@ -134,9 +157,50 @@ describe("reusable elected source-day preparation", () => {
     await seedModelHistoryFixture(); const source = await pin();
     await ensurePreparedV1Window(db(), source, { maxPages: 1, pageSize: 3, deadlineMs: Date.now() + 60000 });
     await db().prepare("UPDATE community_prepared_source_days SET control_json='{}' WHERE participant_id=?").bind(PID).run();
-    await expect(prepare(source)).rejects.toBeInstanceOf(V1PreparedEvidenceUnavailableError);
+    await expectUnavailable(prepare(source), "control_invalid");
     expect(V1_PREPARATION_METHOD_VERSION).toContain("server-api-price-equivalent-v0.5");
   });
+
+  it.each(["control shape", "run shape", "plan row", "fit row"] as const)(
+    "classifies invalid saved %s even when its persisted digest matches", async (corruption) => {
+      await seedModelHistoryFixture(); const source = await pin();
+      await ensurePreparedV1Window(db(), source, { maxPages: 1, pageSize: 3, deadlineMs: Date.now() + 60000 });
+      const head = await db().prepare(`SELECT source_day,control_json,progress_revision FROM community_prepared_source_days
+        WHERE participant_id=? ORDER BY source_day LIMIT 1`).bind(PID)
+        .first<{ source_day: string; control_json: string; progress_revision: number }>();
+      expect(head).not.toBeNull();
+      const control = JSON.parse(head!.control_json);
+      expect(control.plan).not.toBeNull(); expect(control.fit).not.toBeNull();
+      if (corruption === "control shape") control.equalTimeChanged = "invalid";
+      else if (corruption === "run shape") control.plan.extra = true;
+      else if (corruption === "plan row") control.plan.first.observed_day = "2026-08-31";
+      else control.fit.last.window_duration_minutes = 300;
+      const json = JSON.stringify(control), digest = await sha256Hex(json);
+      await db().prepare(`UPDATE community_prepared_source_days SET control_json=?,control_sha256=?
+        WHERE participant_id=? AND source_day=?`).bind(json, digest, PID, head!.source_day).run();
+      await expectUnavailable(prepare(source), "control_invalid");
+      expect(await db().prepare(`SELECT control_json,control_sha256,progress_revision FROM community_prepared_source_days
+        WHERE participant_id=? AND source_day=?`).bind(PID, head!.source_day).first())
+        .toEqual({ control_json: json, control_sha256: digest, progress_revision: head!.progress_revision });
+    });
+
+  it.each(["quota_count", "usage_count"] as const)(
+    "classifies an EOF %s mismatch without publishing the incomplete day", async (counter) => {
+      await seedModelHistoryFixture(); const source = await pin();
+      await ensurePreparedV1Window(db(), source, { maxPages: 1, deadlineMs: Date.now() + 60000 });
+      const day = source.winners[0]!.observed_day;
+      expect(await db().prepare(`SELECT phase FROM community_prepared_source_days
+        WHERE participant_id=? AND source_day=?`).bind(PID, day).first()).toEqual({ phase: "usage" });
+      await db().prepare(`UPDATE community_prepared_source_days SET ${counter}=${counter}+1
+        WHERE participant_id=? AND source_day=?`).bind(PID, day).run();
+      const before = await db().prepare(`SELECT phase,quota_count,usage_count,progress_revision FROM community_prepared_source_days
+        WHERE participant_id=? AND source_day=?`).bind(PID, day).first();
+      await expectUnavailable(prepare(source), "day_count_mismatch");
+      expect(await db().prepare(`SELECT phase,quota_count,usage_count,progress_revision FROM community_prepared_source_days
+        WHERE participant_id=? AND source_day=?`).bind(PID, day).first()).toEqual(before);
+      expect(await db().prepare(`SELECT COUNT(*) AS count FROM community_prepared_usage_rows
+        WHERE participant_id=? AND source_day=?`).bind(PID, day).first()).toEqual({ count: 0 });
+    });
 
   it("never converts a concurrently retired generation into EOF and drains retained derivatives in bounded pages", async () => {
     await seedModelHistoryFixture(); const source = await pin(); await prepare(source);

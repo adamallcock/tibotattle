@@ -57,6 +57,7 @@ import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
 import { createV11DeviceFixture } from "./helpers/telemetry-v11";
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
 import { V1_PLAN_QUOTA_PAGE_SQL, V1_FIT_QUOTA_PAGE_SQL, V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL } from "../src/quota-fit-projection";
+import { V1PreparedEvidenceUnavailableError } from "../src/prepared-v1-evidence";
 
 interface Bindings extends Env { TEST_MIGRATIONS: D1Migration[]; TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[] }
 const runtime = env as Bindings, db = () => runtime.USAGE_MONITOR_DB;
@@ -385,10 +386,49 @@ describe("actual scheduled resumable analysis recovery", () => {
       .map(([message]) => JSON.parse(String(message)) as { event: string });
     expect(logs.filter(log => log.event === "scheduled_model_history")).toEqual([
       { level: "warn", event: "scheduled_model_history", phase: "before_analysis", outcome: "deferred",
-        code: "MODEL_HISTORY_UNAVAILABLE", phaseQueries: 0, phaseElapsedMs: expect.any(Number),
+        code: "MODEL_HISTORY_UNAVAILABLE", failureReason: "unknown_error", phaseQueries: 0, phaseElapsedMs: expect.any(Number),
         queriesUsed: expect.any(Number), elapsedMs: expect.any(Number), deadlineRemainingMs: expect.any(Number) },
     ]);
     expect(JSON.stringify(logs)).not.toContain("synthetic private historical detail");
+    assertMeter(observation); await released();
+  });
+
+  it.each([
+    [() => new V1PreparedEvidenceUnavailableError("source_not_current"), "prepared_source_not_current"],
+    [() => new V1PreparedEvidenceUnavailableError("control_invalid"), "prepared_control_invalid"],
+    [() => new V1PreparedEvidenceUnavailableError("day_count_mismatch"), "prepared_day_count_mismatch"],
+    [() => new V1PreparedEvidenceUnavailableError(), "prepared_invalid_evidence"],
+    [() => new Error("v1 source changed during analysis"), "source_changed"],
+    [() => new Error("D1_ERROR: UNIQUE constraint failed: synthetic-private-detail"), "database_constraint"],
+    [() => new Error("D1_ERROR: synthetic-private-detail"), "database_error"],
+    [() => new TypeError("synthetic-private-detail"), "type_error"],
+    [() => Object.assign(new Error("synthetic-private-detail"), { reason: "control_invalid" }), "unknown_error"],
+  ] as const)("classifies both calculation failures as %s without exposing error contents", async (makeError, reason) => {
+    await seedQuota(200); await queue();
+    const fail = () => { throw makeError(); };
+    inspection.modelHistory.mockImplementation(fail);
+    inspection.backfill.mockImplementation(fail);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const observation = observe();
+    const result = await runScheduledMaintenance(bindings(observation), NOW + 120_000);
+    expect(result).toMatchObject({ outcome: "success", lifecycleComplete: true, aggregateRebuildComplete: false });
+    expect(inspection.modelHistory).toHaveBeenCalledOnce();
+    expect(inspection.backfill).toHaveBeenCalledOnce();
+    const logs = [...logSpy.mock.calls, ...warnSpy.mock.calls].map(([message]) => JSON.parse(String(message)));
+    const failures = logs.filter(log => log.code === "MODEL_HISTORY_UNAVAILABLE" || log.code === "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE");
+    expect(failures).toEqual(expect.arrayContaining([
+      { level: "warn", event: "scheduled_model_history", phase: "before_analysis", outcome: "deferred",
+        code: "MODEL_HISTORY_UNAVAILABLE", failureReason: reason, phaseQueries: 0,
+        phaseElapsedMs: expect.any(Number), queriesUsed: expect.any(Number), elapsedMs: expect.any(Number),
+        deadlineRemainingMs: expect.any(Number) },
+      { level: "warn", event: "scheduled_allowance_reconstruction", stage: "analysis", outcome: "deferred",
+        code: "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE", failureReason: reason, queriesUsed: expect.any(Number),
+        elapsedMs: expect.any(Number), deadlineRemainingMs: expect.any(Number) },
+    ]));
+    expect(failures).toHaveLength(2);
+    expect(JSON.stringify(logs)).not.toContain("synthetic-private-detail");
+    expect(JSON.stringify(logs)).not.toContain(PARTICIPANT);
     assertMeter(observation); await released();
   });
 

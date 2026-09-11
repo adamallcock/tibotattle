@@ -78,7 +78,7 @@ import {
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
 import { readAdminReconstructionProgress } from "./admin-reconstruction-progress";
 import { readAdminGraphRefreshProgress } from "./admin-graph-refresh-progress";
-import { retireV1PreparedEvidence } from "./prepared-v1-evidence";
+import { retireV1PreparedEvidence, V1PreparedEvidenceUnavailableError } from "./prepared-v1-evidence";
 import { readDistributionAnalytics } from "./distribution-analytics";
 import {
   githubUnavailable,
@@ -4144,6 +4144,29 @@ async function ownsRenewedMaintenanceLease(
   }
 }
 
+// Emit only a closed classification. Error messages, causes, stack traces and
+// participant/source identifiers must never enter scheduled diagnostics.
+function reconstructionFailureReason(error: unknown): string {
+  if (error instanceof V1PreparedEvidenceUnavailableError) {
+    switch (error.reason) {
+      case "source_not_current": return "prepared_source_not_current";
+      case "control_invalid": return "prepared_control_invalid";
+      case "day_count_mismatch": return "prepared_day_count_mismatch";
+      default: return "prepared_invalid_evidence";
+    }
+  }
+  if (error instanceof D1InvocationBudgetExceededError) return "query_budget";
+  if (error instanceof Error) {
+    if (error.message === "v1 source changed during analysis") return "source_changed";
+    if (/\bD1_(?:EXEC_)?ERROR\b/u.test(error.message)) {
+      return /SQLITE_CONSTRAINT|constraint failed/iu.test(error.message)
+        ? "database_constraint" : "database_error";
+    }
+    if (error instanceof TypeError) return "type_error";
+  }
+  return "unknown_error";
+}
+
 export async function runScheduledMaintenance(
   env: Env,
   scheduledTime: number,
@@ -4497,6 +4520,7 @@ export async function runScheduledMaintenance(
               } catch (error) {
                 console.warn(JSON.stringify({level:"warn",event:"scheduled_model_history",phase,outcome:"deferred",
                   code:error instanceof D1InvocationBudgetExceededError ? error.code : "MODEL_HISTORY_UNAVAILABLE",
+                  failureReason:reconstructionFailureReason(error),
                   ...timing()}));
               }
             };
@@ -4552,6 +4576,7 @@ export async function runScheduledMaintenance(
               // publishing other already-complete evidence or new activity.
               console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
                 stage:"analysis",code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+                failureReason:reconstructionFailureReason(error),
                 ...phaseTiming()}));
             }
             if (priorPreview === null || priorPreview.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
@@ -4586,6 +4611,7 @@ export async function runScheduledMaintenance(
           // All incomplete work/cache/publication writes are independently fenced.
           console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
             code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+            failureReason:reconstructionFailureReason(error),
             queriesUsed:queryMeter.queriesUsed}));
         }
       } else {
