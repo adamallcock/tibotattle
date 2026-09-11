@@ -498,7 +498,7 @@ test("Intel generation retains the ARM archive and signs its own namespace", asy
   } finally { await fixture.cleanup(); }
 });
 
-test('Electron transition uses official signing tools for archive and feed without changing app bytes', async () => {
+for (const selfClosing of [false, true]) test(`Electron transition signs ${selfClosing ? 'self-closing' : 'paired'} official enclosure without changing app bytes`, async () => {
   const fixture = await createStableFixture({ bundleVersion: '1028', shortVersion: '0.1.21' });
   const calls = [];
   try {
@@ -511,7 +511,8 @@ test('Electron transition uses official signing tools for archive and feed witho
       runGenerateAppcastTool: fakeGenerateAppcastTool(fixture, { mutateOutput: text => text
         .replace(/<!-- sparkle-sign-warning:[\s\S]*?-->/u, '')
         .replace(/<!-- sparkle-signatures:[\s\S]*$/u, '')
-        .replace(/ sparkle:edSignature="[^"]+"/u, '') }),
+        .replace(/ sparkle:edSignature="[^"]+"/u, '')
+        .replace(/(<enclosure\b[^>]*?)><\/enclosure>/u, selfClosing ? '$1/>' : '$1></enclosure>') }),
       runSignUpdate: async (_path, args) => {
         calls.push(args);
         const path = args.at(-1);

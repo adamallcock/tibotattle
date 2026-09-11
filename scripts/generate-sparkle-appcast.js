@@ -541,9 +541,12 @@ export async function signElectronTransitionFeed({ appcastOutputPath, dmgPath, a
     fail("Transition requires one unsigned official enclosure", "SPARKLE_TRANSITION_FEED_INVALID");
   }
   const enclosure = enclosures[0][0];
-  if (enclosure.endsWith("/>")) fail("Unexpected official enclosure", "SPARKLE_TRANSITION_FEED_INVALID");
+  // The pinned tool emits a self-closing enclosure for unsigned Electron
+  // archives. Normalize it to the existing signed-feed validator's paired
+  // form before the official tool signs the resulting XML.
+  const ending = enclosure.endsWith("/>") ? "/>" : ">";
   await writeFile(appcastOutputPath, text.replace(enclosure,
-    `${enclosure.slice(0, -1)} sparkle:edSignature="${signature}">`));
+    `${enclosure.slice(0, -ending.length)} sparkle:edSignature="${signature}">${ending === "/>" ? "</enclosure>" : ""}`));
   await runSignUpdate(signUpdatePath, [...keys, appcastOutputPath]);
 }
 
