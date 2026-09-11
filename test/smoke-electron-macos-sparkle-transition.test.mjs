@@ -58,6 +58,20 @@ test('both Mac architectures require matching hosted runner identity', () => {
   }
 });
 
+test('same-executable companions belong to one app; independent app roots remain ambiguous', () => {
+  const executable = '/Users/runner/Applications/TiboTattle.app/Contents/MacOS/TiboTattle';
+  const process = (pid, parent, command = executable) => ({ pid, parent, group: pid, command });
+  const main = process(30, 1);
+  const rows = [process(1, 0, '/sbin/launchd'), main, process(31, 30),
+    process(32, 31, '/synthetic/helper'), process(33, 32)];
+  assert.deepEqual(runner.selectMacTransitionApplicationProcess(rows, executable), main);
+  assert.deepEqual(runner.selectMacTransitionApplicationProcess([...rows].reverse(), executable), main);
+  assert.equal(runner.selectMacTransitionApplicationProcess([], executable), null);
+  assert.throws(() => runner.selectMacTransitionApplicationProcess([...rows, process(50, 1)], executable));
+  assert.throws(() => runner.selectMacTransitionApplicationProcess([...rows, main], executable));
+  assert.throws(() => runner.selectMacTransitionApplicationProcess([process(30, 31), process(31, 30)], executable));
+});
+
 test('intake binds the architecture, exact native predecessor and closed feed scope', () => {
   for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed']) {
     const value = intake(target, scope), result = runner.validateSparkleTransitionIntake(value);

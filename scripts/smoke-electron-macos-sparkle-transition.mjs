@@ -18,6 +18,7 @@ import { inspectNativeElectronHandoverCompletion } from '../apps/electron/deskto
 import { macOSCredentialApplicationVerificationArguments } from '../apps/electron/desktop-macos-keychain.js';
 import { validateProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 import distributionPolicy from '../config/electron-production-distribution.cjs';
+import { collectMacOSTransitionUIDiagnostics } from './lib/macos-transition-ui-diagnostics.mjs';
 
 export const NATIVE_SPARKLE_TRANSITION_SCHEMA = 'tibotattle-signed-macos-sparkle-transition-v1';
 export const NATIVE_018_DMG_SHA256 = '2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae';
@@ -126,11 +127,29 @@ function processes() {
     return { pid: +m[1], parent: +m[2], group: +m[3], command: m[4] };
   });
 }
-function appProcess(executable) {
-  const found = processes().filter((row) => row.command === executable);
-  if (found.length > 1) fail('multiple_owned_apps');
-  return found[0] ?? null;
+export function selectMacTransitionApplicationProcess(rows, executable) {
+  const inventory = new Map(rows.map(row => [row.pid, row]));
+  if (inventory.size !== rows.length) fail('process_inventory');
+  const matches = rows.filter(row => row.command === executable);
+  // The signed Electron companion uses the same executable in Node mode.
+  // It is an owned descendant, not a second independently launched app.
+  const roots = matches.filter(row => {
+    const visited = new Set([row.pid]);
+    let parent = row.parent;
+    while (inventory.has(parent)) {
+      if (visited.has(parent)) fail('process_inventory');
+      visited.add(parent);
+      const ancestor = inventory.get(parent);
+      if (ancestor.command === executable) return false;
+      parent = ancestor.parent;
+    }
+    return true;
+  });
+  if (roots.length > 1 || (matches.length && roots.length === 0)) fail('multiple_owned_apps');
+  return roots[0] ?? null;
 }
+export const findMacTransitionApplicationProcess = executable => selectMacTransitionApplicationProcess(processes(), executable);
+const appProcess = findMacTransitionApplicationProcess;
 async function until(check, timeout, stage) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) { const result = await check(); if (result) return result; await sleep(500); }
@@ -321,6 +340,8 @@ export async function verifySparkleTransitionCandidate(input, appPath) {
   distributionPolicy.assertProductionElectronMacOSBundleMetadata({ target: input.target,
     version: input.version, buildNumber: input.buildNumber, bundleVersion: value.CFBundleVersion,
     bundleShortVersion: value.CFBundleShortVersionString });
+  distributionPolicy.assertProductionElectronMacOSIncomingUpgradeMetadata({ target: input.target,
+    publicEDKey: value.SUPublicEDKey });
   if (value.CFBundleIdentifier !== 'com.usagemonitor.local' || value.LSMinimumSystemVersion !== '14.0'
     || verified.distribution.buildNumber !== input.buildNumber) fail('candidate_identity');
   return verified;
@@ -482,6 +503,13 @@ export async function runSparkleTransition(options) {
     proof.productionFeedVerified = input.feedScope === 'production_feed'; proof.status = 'passed';
   } catch (error) {
     proof.failureStage = error?.transitionStage ?? stage;
+    if (ownedPid) {
+      proof.uiState = collectMacOSTransitionUIDiagnostics({ pid: ownedPid, verifyOwnedProcess: pid => {
+        const expected = knownProcesses.get(pid);
+        const row = processes().find(p => p.pid === pid && p.command === installedExecutable);
+        return typeof expected === 'string' && Boolean(row) && processFingerprint(row) === expected;
+      } });
+    }
     try {
       if (installedExecutable && ownedPid && appProcess(installedExecutable)?.pid === ownedPid) {
         proof.uiDiagnostic = JSON.parse(command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', sparkleTransitionDiagnosticScript(ownedPid)], 10000));

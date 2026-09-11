@@ -50,10 +50,33 @@ runner now opens the app menu once and waits for its item, with bounded
 diagnostics from only the synthetic process. Repeated clicks previously could
 toggle the menu while accessibility information was still arriving.
 
-The corrected source will be recorded by the frozen application tag and fresh
-four-target receipts, using provenance build 2026091107. Both failed receipts
-and the superseded installers remain preserved. Public publication remains
-held until the corrected installed journeys succeed.
+The corrected application source is
+a651ea130dd1460e4443a037c4434f57b911fec4, provenance build 2026091107.
+Both Mac applications and disk images are signed, notarized, stapled and retain
+the verified native public key. Windows run 34561980268 passed signing and
+the installed processing/restart/uninstall journey. Linux packaging run
+34561981708 passed; it does not add a new installed Linux acceptance claim.
+
+The corrected isolated feeds and their exact installers were uploaded with
+all four R2 and public readbacks verified; the shared owner was released.
+Native ARM run 34562927824 passed actual Check, Install, updater relaunch and
+first migration, then stopped because the runner misclassified the signed
+same-executable companion as a second independent app. The runner now selects
+the unique process-tree root, retains descendant ownership checks and still
+refuses independent app roots. Restart and final preservation remain unproven.
+Intel run 34562929758 lost its accessibility menu before Check; the prior
+diagnostic reached Check but lost all accessibility windows afterwards.
+Bounded direct Accessibility and window-count diagnostics now distinguish API
+failure from an empty UI. Neither failed run is a release qualification.
+
+The publication coordinator now reuses the established release-evidence
+contract from the website verifier and reconciles the exact four-target
+Electron inventory plus incoming native feeds. Its 24 owning tests pass.
+The native runner and diagnostic fixes pass 25 tests. These are tooling
+checks; the frozen application artifacts remain unchanged.
+All failed receipts and superseded installers remain preserved. The local
+annotated v0.1.21 tag has not been pushed, and public publication remains held
+until the corrected installed journeys succeed.
 
 ## Remaining sequence
 

@@ -8,7 +8,8 @@ import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateSparkleTransitionHost, captureMacTransitionProcesses, stopVerifiedMacTransitionProcesses,
-  assertExtractedSignedMacBundle, verifySparkleTransitionCandidate, signedMacTransitionEnvironment } from './smoke-electron-macos-sparkle-transition.mjs';
+  assertExtractedSignedMacBundle, verifySparkleTransitionCandidate, signedMacTransitionEnvironment,
+  findMacTransitionApplicationProcess } from './smoke-electron-macos-sparkle-transition.mjs';
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp } from './run-signed-electron-staging.mjs';
 import { seedSignedReplacementNativeState, readSignedReplacementState,
   assertSignedReplacementContinuity } from './smoke-electron-macos-replacement.mjs';
@@ -106,10 +107,7 @@ async function until(check, timeout, stage) {
   fail(stage);
 }
 function appPid(app) {
-  const executable = join(app, 'Contents', 'MacOS', 'TiboTattle');
-  const matches = command('/bin/ps', ['-axo', 'pid=,comm=']).split('\n')
-    .map(line => /^\s*(\d+)\s+(.+)$/u.exec(line)).filter(m => m && m[2] === executable);
-  if (matches.length > 1) fail('duplicate_process'); return matches.length ? +matches[0][1] : null;
+  return findMacTransitionApplicationProcess(join(app, 'Contents', 'MacOS', 'TiboTattle'))?.pid ?? null;
 }
 async function verifyPredecessor(input, appPath) {
   const asar = join(appPath, 'Contents', 'Resources', 'app.asar');
