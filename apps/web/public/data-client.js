@@ -5440,11 +5440,24 @@ function normalizeHistoryCoverage(value = {}) {
     "local_unified_index_schema_invalid",
     "local_unified_index_schema_newer",
     "local_unified_index_unavailable",
+    "accounting_unified_history_unavailable",
+    "cache_missing",
+    "cache_unavailable",
+    "cache_generation_unavailable",
+    "cache_generation_mismatch",
+    "cache_fallback_disallowed",
+    "cache_source_mode_mismatch",
+    "cache_context_behavior_mismatch",
+    "cache_accounting_semantics_outdated",
+    "cache_price_registry_outdated",
+    "cache_invalid",
+    "cache_from_future",
+    "cache_stale",
   ].includes(value?.errorCode)
     ? value.errorCode
     : null;
-  // `partial_terminal` is the one non-progress state whose missing sources
-  // remain intentionally visible. Admit it only with a coherent quarantine
+  // `partial_terminal` keeps excluded sources visible alongside available
+  // accounting. Admit it only with a coherent quarantine
   // receipt: otherwise an arbitrary partial payload could turn off automatic
   // refreshes or manufacture a skipped-source explanation in the browser.
   const terminalGap = value?.status === "partial"
@@ -5464,7 +5477,30 @@ function normalizeHistoryCoverage(value = {}) {
     && indexedBytes !== null
     && skippedSourceBytes !== null
     && indexedBytes + skippedSourceBytes === sourceBytes;
-  const phase = terminalGap ? "partial_terminal" : admittedPhase;
+  // A finished source scan can precede the separate accounting summary. Keep
+  // that unavailable summary distinct from both an unstarted scan and an
+  // available aggregate. As for terminal gaps, the counts must balance.
+  const aggregateUnavailable = value?.status === "partial"
+    && value?.phase === "aggregate_unavailable"
+    && value?.sourceMode === "unified"
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedThreadCount !== null
+    && (skippedSourceCount === 0
+      ? skippedThreadCount === 0
+      : skippedThreadCount > 0 && skippedThreadCount <= skippedSourceCount)
+    && sourceBytes !== null
+    && indexedBytes !== null
+    && skippedSourceBytes !== null
+    && indexedBytes + skippedSourceBytes === sourceBytes;
+  const phase = terminalGap
+    ? "partial_terminal"
+    : aggregateUnavailable ? "aggregate_unavailable" : admittedPhase;
+  const explainedSkippedSources = terminalGap || aggregateUnavailable;
   const coherent = sourceCount !== null
     && indexedSourceCount !== null
     && pendingSourceCount !== null
@@ -5495,9 +5531,9 @@ function normalizeHistoryCoverage(value = {}) {
     pendingSourceCount: sourceCount === null || pendingSourceCount === null
       ? 0
       : Math.min(pendingSourceCount, sourceCount),
-    skippedSourceCount: terminalGap ? skippedSourceCount : 0,
-    skippedSourceBytes: terminalGap ? skippedSourceBytes : 0,
-    skippedThreadCount: terminalGap ? skippedThreadCount : 0,
+    skippedSourceCount: explainedSkippedSources ? skippedSourceCount : 0,
+    skippedSourceBytes: explainedSkippedSources ? skippedSourceBytes : 0,
+    skippedThreadCount: explainedSkippedSources ? skippedThreadCount : 0,
     sourceBytes: sourceBytes ?? 0,
     indexedBytes: sourceBytes === null || indexedBytes === null
       ? 0

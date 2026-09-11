@@ -914,7 +914,9 @@ function renderHistoryIndexBadge(data) {
   const total = finite(history?.sourceCount, null);
   const complete = history?.status === "complete"
     || (indexed !== null && total !== null && total > 0 && indexed >= total);
-  const partialTerminal = history?.phase === "partial_terminal";
+  const partialTerminal = history?.phase === "partial_terminal"
+    || (history?.phase === "aggregate_unavailable"
+      && finite(history?.skippedSourceCount, 0) > 0);
   if (data?.mode === "demo" || complete
       || indexed === null || total === null || total <= 0) {
     badge.hidden = true;
@@ -1940,8 +1942,8 @@ function formatBytes(value) {
  * sources it discovered and how many it has indexed, and the share is that
  * division. Nothing estimates a finish time, because none is known — a
  * progress bar that implied one would be the same invention this product
- * refuses everywhere else. The block is absent entirely once the index is
- * complete, and absent when there is no denominator to divide by.
+ * refuses everywhere else. The block is absent once both indexed history and
+ * its accounting summary are available, or there is no measured denominator.
  *
  * It sits with the API-price-equivalent total because that total, and every
  * figure derived from it, covers only the indexed share.
@@ -1955,6 +1957,7 @@ function renderHistoryProgress(data) {
   const total = finite(history?.sourceCount, 0);
   const indexed = finite(history?.indexedSourceCount, 0);
   const partialTerminal = history?.phase === "partial_terminal";
+  const aggregateUnavailable = history?.phase === "aggregate_unavailable";
   if (history === null || history.status === "complete" || total <= 0) {
     container.hidden = true;
     return false;
@@ -1967,7 +1970,12 @@ function renderHistoryProgress(data) {
     skippedSourceCount,
     { count: formatNumber(skippedSourceCount) },
   );
-  if (partialTerminal) {
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-headline"),
+      "dashboard.history.scanFinished",
+    );
+  } else if (partialTerminal) {
     setRawText(
       $("#history-progress-headline"),
       t("dashboard.history.partialHeadline", {
@@ -1985,12 +1993,17 @@ function renderHistoryProgress(data) {
       { percent: formatPercent(percent, 1) },
     );
   }
-  container.classList.toggle("active", archiveHistoryScanActive);
+  container.classList.toggle(
+    "active", archiveHistoryScanActive && !aggregateUnavailable,
+  );
   const track = $("#history-progress-track");
   track.setAttribute("aria-valuenow", String(Math.round(percent)));
   const coverageKey = partialTerminal
+      || (aggregateUnavailable && skippedSourceCount > 0)
     ? "dashboard.history.partialSources"
-    : "dashboard.history.indexingSources";
+    : aggregateUnavailable
+      ? "dashboard.history.indexedSources"
+      : "dashboard.history.indexingSources";
   const coverageValues = {
     bytesIndexed: formatBytes(history.indexedBytes),
     bytesTotal: formatBytes(history.sourceBytes),
@@ -2006,7 +2019,12 @@ function renderHistoryProgress(data) {
   $("#history-progress-fill").style.width =
     `${indexed > 0 ? Math.max(1.5, percent) : 0}%`;
   setLocalizedText($("#history-progress-detail"), coverageKey, coverageValues);
-  if (partialTerminal) {
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-note"),
+      "dashboard.history.summaryUnavailable",
+    );
+  } else if (partialTerminal) {
     const affectedThreads = finite(history?.skippedThreadCount, 0);
     setRawText(
       $("#history-progress-note"),

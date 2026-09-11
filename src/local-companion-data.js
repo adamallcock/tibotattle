@@ -2102,6 +2102,8 @@ const UNIFIED_SCHEMA_NEWER_WARNING =
   "This local history was created by a newer TiboTattle build. This build cannot refresh its usage totals or timelines; install a compatible newer build. The retained local history has not been deleted.";
 const HISTORY_TOTALS_HIDDEN_WARNING =
   "History indexing is still advancing. Complete historical totals stay hidden until an indexed aggregate is available.";
+const HISTORY_AGGREGATE_UNAVAILABLE_WARNING =
+  "The history scan is complete, but the current accounting summary is unavailable. Update local usage to retry.";
 export const RETAINED_EVIDENCE_RELABELED_WARNINGS = Object.freeze([
   UNIFIED_DEFERRED_LOADING_WARNING,
   UNIFIED_WITHHELD_PARTIAL_WARNING,
@@ -2115,7 +2117,7 @@ export const RETAINED_EVIDENCE_RELABELED_WARNINGS = Object.freeze([
 export const RETAINED_EVIDENCE_REFRESH_WARNING =
   "The full history projection is still being recalculated in the background. The figures shown are the most recent completed projection and are replaced automatically when it finishes.";
 
-function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
+function unifiedHistoryState({ cache, unified, cacheErrorCode, generationReady }) {
   const history = cache?.history;
   const descriptor = cache?.sourceDescriptor;
   const generationMatched = descriptor?.generationMatched === true;
@@ -2170,6 +2172,13 @@ function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
         ? cacheErrorCode
         : "accounting_unified_history_unavailable";
   const terminalUnavailable = !available && unified?.status === "unavailable";
+  // Source ingestion and the generation-bound accounting cache are separate
+  // publications. A missing cache does not undo a completed, validated scan;
+  // its unified usage projection may already supply the displayed figures.
+  const aggregateUnavailable = !available
+    && generationReady === true
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && indexedSourceBytes + skippedSourceBytes === sourceBytes;
   return {
     accounting: available
       ? {
@@ -2192,9 +2201,11 @@ function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
         ? "partial_terminal"
         : available
           ? "complete"
-          : terminalUnavailable
-            ? "invalid"
-            : cache === null ? "not_started" : "unavailable",
+          : aggregateUnavailable
+            ? "aggregate_unavailable"
+            : terminalUnavailable
+              ? "invalid"
+              : cache === null ? "not_started" : "unavailable",
       errorCode,
       generatedAt: available ? history.coverage.generatedAt : null,
       coveredAt,
@@ -2450,6 +2461,7 @@ export async function buildLocalCompanionSnapshot({
       cache: replaySafeCache,
       unified,
       cacheErrorCode: replaySafeAccounting.errorCode,
+      generationReady: unifiedGenerationReady,
     })
     : {
       accounting: archiveAccounting,
@@ -2938,6 +2950,13 @@ export async function buildLocalCompanionSnapshot({
       } else {
         warnings.push(
           `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`,
+        );
+      }
+    } else if (historyCoverage.phase === "aggregate_unavailable") {
+      warnings.push(HISTORY_AGGREGATE_UNAVAILABLE_WARNING);
+      if (historyCoverage.skippedSourceCount > 0) {
+        warnings.push(
+          `Excluded from indexed history: ${historyCoverage.skippedSourceCount} ${historyCoverage.skippedSourceCount === 1 ? "source" : "sources"} across ${historyCoverage.skippedThreadCount} ${historyCoverage.skippedThreadCount === 1 ? "thread" : "threads"} did not pass local validation. Their usage remains unavailable.`,
         );
       }
     } else if (historyCoverage.phase !== "invalid") {
