@@ -44,13 +44,32 @@ export function assertEmptyProfileSharing(value, { optedOut = false } = {}) {
     || (optedOut && value.transportStatus !== 'off') || value.lastAcceptedAt !== null) fail(optedOut ? 'opt_out' : 'fresh_projection');
   return true;
 }
-export function emptyProfileSettingsScript(tab) {
-  if (!['general', 'data', 'about'].includes(tab)) fail('settings_tab');
+export function emptyProfileSettingsScript(tab, operation = 'selected') {
+  if (!['general', 'data', 'about'].includes(tab) || !['ready', 'click', 'selected'].includes(operation)) fail('settings_tab');
   return `(() => { const button = document.getElementById('settings-tab-${tab}');
     const panel = document.getElementById('settings-panel-${tab}');
-    if (!button || !panel || button.disabled) return false;
-    button.click(); return button.getAttribute('aria-selected') === 'true' && panel.hidden === false;
+    if (document.readyState !== 'complete' || !button || !panel || button.disabled) return false;
+    ${operation === 'ready' ? "return true;" : operation === 'click' ? "button.click(); return true;"
+      : "return button.getAttribute('aria-selected') === 'true' && panel.hidden === false;"}
   })()`;
+}
+export async function exerciseEmptyProfileSettings(settings, { now = Date.now, wait = delay } = {}) {
+  const until = async (expression, stage) => {
+    const deadline = now() + 10000;
+    do {
+      if (await settings.evaluate(expression) === true) return;
+      await wait(100);
+    } while (now() < deadline);
+    fail(stage);
+  };
+  for (const tab of ['about', 'general', 'data']) {
+    // Preload exists before the deferred Settings module has installed its handlers.
+    // Complete document readiness precedes the one actual click; polling never clicks.
+    await until(emptyProfileSettingsScript(tab, 'ready'), 'settings_ready');
+    if (await settings.evaluate(emptyProfileSettingsScript(tab, 'click')) !== true) fail('settings_click');
+    await until(emptyProfileSettingsScript(tab, 'selected'), 'settings_effect');
+  }
+  return true;
 }
 async function absent(path) { try { await lstat(path); } catch (error) { if (error.code === 'ENOENT') return; throw error; } fail('profile_not_empty'); }
 async function safeDirectory(path) {
@@ -127,7 +146,7 @@ export async function runEmptyProfileSmoke({ intake, execute = false }) {
     assertSignedStagingFreshProjection(sharing, await smallJson(join(profile, 'desktop-settings', 'desktop-first-run-v1.json')));
     proof.freshDefaultSharingObserved = true;
     stage = 'settings';
-    for (const tab of ['about', 'general', 'data']) if (await active.settings.evaluate(emptyProfileSettingsScript(tab)) !== true) fail('settings_interaction');
+    await exerciseEmptyProfileSettings(active.settings);
     proof.settingsTabsInteractive = true;
     await absent(codex);
     await stopOwnedMacSharingApp(active); active = null;

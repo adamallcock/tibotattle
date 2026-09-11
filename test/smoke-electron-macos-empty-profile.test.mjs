@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
 import { validateEmptyProfileIntake, parseEmptyProfileArguments, assertEmptyProfileSharing,
-  emptyProfileSettingsScript, runEmptyProfileSmoke, EMPTY_PROFILE_CONFIRMATION } from '../scripts/smoke-electron-macos-empty-profile.mjs';
+  emptyProfileSettingsScript, exerciseEmptyProfileSettings, runEmptyProfileSmoke, EMPTY_PROFILE_CONFIRMATION } from '../scripts/smoke-electron-macos-empty-profile.mjs';
 const intake = { runnerRevision: 'e'.repeat(40), target: 'darwin-arm64' };
 test('intake pins candidate bytes and rejects caller-selected source, paths, origins or extra fields', () => {
   const value = validateEmptyProfileIntake(intake);
@@ -36,18 +36,45 @@ test('fresh projection refuses stale, unavailable, implicit prior choice or acce
   assert.equal(assertEmptyProfileSharing({ ...value, enabled: false, transportStatus: 'off' }, { optedOut: true }), true);
   assert.throws(() => assertEmptyProfileSharing({ ...value, enabled: false, transportStatus: 'uploading' }, { optedOut: true }));
 });
-test('settings interaction executes existing tab handler and verifies its effect', () => {
-  for (const tab of ['about', 'general', 'data']) {
-    const panel = { hidden: true };
-    let selected = 'false', clicks = 0;
-    const button = { disabled: false, click() { clicks++; selected = 'true'; panel.hidden = false; }, getAttribute() { return selected; } };
-    const document = { getElementById(id) { return id === `settings-tab-${tab}` ? button : panel; } };
-    assert.equal(vm.runInNewContext(emptyProfileSettingsScript(tab), { document }), true);
-    assert.equal(clicks, 1);
-    button.click = () => {}; panel.hidden = true;
-    assert.equal(vm.runInNewContext(emptyProfileSettingsScript(tab), { document }), false);
+test('settings waits for deferred module readiness, clicks once, and polls the real tab effect', async () => {
+  let time = 0;
+  const clicks = { about: 0, general: 0, data: 0 }, panels = {}, buttons = {};
+  for (const tab of Object.keys(clicks)) {
+    panels[tab] = { hidden: true };
+    buttons[tab] = { disabled: false, selected: 'false',
+      click() { assert.ok(time >= 200); clicks[tab]++; this.applyAt = time + 200; },
+      getAttribute() { return this.selected; } };
   }
+  const document = { readyState: 'loading', getElementById(id) {
+    const tab = id.split('-').at(-1); return id.startsWith('settings-tab-') ? buttons[tab] : panels[tab];
+  } };
+  const settings = { evaluate: async expression => vm.runInNewContext(expression, { document }) };
+  const wait = async milliseconds => {
+    time += milliseconds;
+    if (time >= 200) document.readyState = 'complete';
+    for (const tab of Object.keys(clicks)) if (buttons[tab].applyAt <= time) {
+      buttons[tab].selected = 'true'; panels[tab].hidden = false;
+    }
+  };
+  assert.equal(await exerciseEmptyProfileSettings(settings, { now: () => time, wait }), true);
+  assert.deepEqual(clicks, { about: 1, general: 1, data: 1 });
+  assert.ok(time >= 800);
   assert.throws(() => emptyProfileSettingsScript("data');process.exit()"));
+  assert.throws(() => emptyProfileSettingsScript('about', 'mutate'));
+});
+test('missing readiness or a broken tab effect fails within the budget without retrying clicks', async () => {
+  for (const ready of [false, true]) {
+    let time = 0, clicks = 0;
+    const button = { disabled: false, click() { clicks++; }, getAttribute() { return 'false'; } };
+    const panel = { hidden: true };
+    const document = { readyState: ready ? 'complete' : 'loading',
+      getElementById(id) { return id.startsWith('settings-tab-') ? button : panel; } };
+    const settings = { evaluate: async expression => vm.runInNewContext(expression, { document }) };
+    await assert.rejects(exerciseEmptyProfileSettings(settings, {
+      now: () => time, wait: async milliseconds => { time += milliseconds; },
+    }), error => error.emptyProfileStage === (ready ? 'settings_effect' : 'settings_ready'));
+    assert.equal(time, 10000); assert.equal(clicks, ready ? 1 : 0);
+  }
 });
 test('manual workflow has static architecture hosts and no native fixtures or publication', async () => {
   const workflow = await readFile(new URL('../.github/workflows/electron-macos-empty-profile.yml', import.meta.url), 'utf8');
