@@ -95,12 +95,15 @@ observed dates with arrows/Home/End, and dismiss inspection with Escape.
 
 
 Newer-log and older-log TPS estimates remain separate series within each model:
-circles versus triangles, with a short visible legend “Newer logs / Older logs.”
-If a summary includes both methods, show two labelled median values rather
-than a pooled number. The detail explains their different endpoint evidence.
+circles versus triangles. The visible legend describes “Median speed” and
+“Middle 50% of turns”; reconstruction details belong in the expandable
+measurement explanation and table. Hover rows retain matching circle/triangle
+symbols and separate median values when both methods occur on the same day.
+Accessible point descriptions retain method identity. The detail explains the
+shapes and their different endpoint evidence.
 Do not imply a logging-format transition is necessarily a model-speed change.
 Do not describe newer logs as inherently more accurate. Both TPS methods are
-estimates. The newer/older-method legend applies only to TPS, not recorded TTFT.
+estimates. Method distinctions apply only to TPS, not recorded TTFT.
 
 The hover/focus readout shows the date interval, model, method, median and band,
 eligible turns. Covered responses are shown in the selected-model coverage strip,

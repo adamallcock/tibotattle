@@ -255,7 +255,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       if (!matches.length) tooltip.append(element("p", "", translate("noBin")));
       for (const { point, method } of matches) {
         const row = element("div", "performance-tooltip-row");
-        row.append(element("span", "performance-tooltip-method", method === "ttft" ? translate("latency") : translate(method)),
+        row.append(element("span", "performance-tooltip-method", method === "ttft" ? translate("latency") : `${method === "legacy" ? "△" : "○"} ${translate("medianSpeed")}`),
           element("strong", "performance-tooltip-value", `${number(point.median)} ${translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit")}`),
           element("span", "performance-tooltip-detail", `${translate("spread")}: ${point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`} · ${translate("turns")}: ${number(point.n)}`));
         tooltip.append(row);
@@ -334,13 +334,13 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       const card = element("article", "performance-card"); card.append(element("h4", "", translate(metric)), element("p", "performance-unit", translate(`${metric}Unit`)));
       card.append(plot(metric === "speed" ? selected.speed : [{ method: "ttft", points: selected.ttft }], metric, COLORS[modelId] ?? "var(--green)", domain));
       const legend = element("div", "performance-legend");
-      for (const method of metric === "speed" ? ["receipt", "legacy", "band"] : ["band"]) {
+      for (const method of metric === "speed" ? ["medianSpeed", "band"] : ["median", "band"]) {
         const entry = element("span", "performance-legend-item");
         const swatch = svgElement("svg", { width: 18, height: 16, viewBox: "0 0 18 16", "aria-hidden": "true" });
         const color = COLORS[modelId] ?? "var(--green)";
-        swatch.append(svgElement(method === "band" ? "rect" : method === "legacy" ? "polygon" : "circle", {
-          ...(method === "band" ? { x: 1, y: 3, width: 16, height: 10, rx: 2, opacity: .22 } : method === "legacy" ? { points: "9,3 4,12 14,12" } : { cx: 9, cy: 8, r: 4 }),
-          fill: method === "band" ? color : "var(--white)", stroke: color, "stroke-width": method === "band" ? 0 : 2,
+        swatch.append(svgElement(method === "band" ? "rect" : "line", {
+          ...(method === "band" ? { x: 1, y: 3, width: 16, height: 10, rx: 2, opacity: .22 } : { x1: 1, y1: 8, x2: 17, y2: 8 }),
+          fill: color, stroke: color, "stroke-width": method === "band" ? 0 : 2,
         }));
         entry.append(swatch, element("span", "", translate(method))); legend.append(entry);
       }
