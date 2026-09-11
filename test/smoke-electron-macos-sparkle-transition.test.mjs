@@ -186,6 +186,33 @@ test('workflow download planning matches the runner for both architectures and s
         : `https://updates.tibotattle.com/electron/test/native-sparkle/${source}/1028/${value.dmgSha256}/`;
       assert.equal(files[1][1], candidatePrefix + normalized.dmgFileName);
       assert.ok(files[0][1].startsWith(`https://updates.tibotattle.com/${prefix}releases/1026/${nativeDigests[target]}/`));
+      // Exercise the actual extraction and JSON-writing block with only OS commands
+      // substituted. This catches an architecture variable overwritten by a Path.
+      const extraction = [
+        'import pathlib,json,shutil',
+        'root=pathlib.Path(' + JSON.stringify(root) + ')',
+        'e=' + JSON.stringify({ SELECTED_DMG: value.dmgSha256, SELECTED_ASAR: value.asarSha256,
+          SELECTED_FEED: value.feedSha256, SELECTED_BUILD: value.buildNumber }),
+        'source=' + JSON.stringify(source), 'runner=source',
+        'target=' + JSON.stringify(target), 'scope=' + JSON.stringify(scope),
+        'native=' + JSON.stringify(nativeDigests[target]),
+        "pathlib.Path('sparkle-transition-receipts').mkdir()",
+        'class Commands:',
+        '  DEVNULL=None',
+        '  def run(self,args,**options):',
+        "    if args[:2]==['/usr/bin/hdiutil','attach']:",
+        "      (pathlib.Path(args[args.index('-mountpoint')+1])/'TiboTattle.app').mkdir()",
+        "    elif args[0]=='/usr/bin/ditto': shutil.copytree(args[1],args[2])",
+        "    elif args[:2]!=['/usr/bin/hdiutil','detach']: raise AssertionError('unexpected command')",
+        'subprocess=Commands()',
+        python.slice(python.indexOf("for name in ['native','candidate']:")),
+      ].join('\n');
+      execFileSync('python3', ['-c', extraction], { cwd: root, encoding: 'utf8' });
+      const generated = JSON.parse(await readFile(join(root, 'intake.json'), 'utf8'));
+      assert.equal(generated.target, target);
+      assert.equal(runner.validateSparkleTransitionIntake(generated).target, target);
+      const receipt = JSON.parse(await readFile(join(root, 'sparkle-transition-receipts', 'intake.json'), 'utf8'));
+      assert.equal(receipt.target, target);
     } finally { await rm(root, { recursive: true, force: true }); }
   }
 });

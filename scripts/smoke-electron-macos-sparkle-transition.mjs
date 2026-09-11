@@ -11,7 +11,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { seedSignedReplacementNativeState,
   readSignedReplacementState, assertSignedReplacementContinuity } from './smoke-electron-macos-replacement.mjs';
-import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp, signedStagingChildEnvironment } from './run-signed-electron-staging.mjs';
+import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp } from './run-signed-electron-staging.mjs';
 import { validateSignedSparkleFeed } from './sparkle-signed-feed-validation.js';
 import { inspectNativeElectronHandoverCompletion } from '../apps/electron/desktop-native-migration.js';
 import { macOSCredentialApplicationVerificationArguments } from '../apps/electron/desktop-macos-keychain.js';
@@ -72,6 +72,17 @@ export function validateSparkleTransitionHost({ target, platform, architecture, 
     || account.uid !== 501 || account.username !== 'runner' || account.homedir !== '/Users/runner'
     || !isAbsolute(environment.RUNNER_TEMP ?? '')) fail('disposable_account');
   return account.homedir;
+}
+
+export function signedMacTransitionEnvironment({ target, home, temporaryDirectory }) {
+  const selectedHome = validateSparkleTransitionHost({ target, platform: process.platform, architecture: process.arch,
+    nodeVersion: process.version, environment: process.env, account: userInfo() });
+  if (home !== selectedHome || !isAbsolute(temporaryDirectory ?? '')) fail('runtime_environment');
+  const child = relative(resolve(process.env.RUNNER_TEMP), resolve(temporaryDirectory));
+  if (!child || child === '..' || child.startsWith('..' + sep) || isAbsolute(child)) fail('runtime_environment');
+  return { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: home, TMPDIR: temporaryDirectory, LANG: 'en_US.UTF-8',
+    GITHUB_ACTIONS: 'true', RUNNER_ARCH: target === 'darwin-arm64' ? 'ARM64' : 'X64',
+    RUNNER_ENVIRONMENT: 'github-hosted', RUNNER_OS: 'macOS' };
 }
 
 async function safePath(path) {
@@ -401,7 +412,7 @@ export async function runSparkleTransition(options) {
     await stopVerifiedMacTransitionProcesses({ appPath: installedApp, knownProcesses,
       verifyApp: (path) => verifyCandidate(input, path) }); ownedPid = null;
     const temporary = join(input.directory, 'runtime'); await mkdir(temporary, { mode: 0o700 });
-    const environment = signedStagingChildEnvironment(process.env, home, temporary);
+    const environment = signedMacTransitionEnvironment({ target: input.target, home, temporaryDirectory: temporary });
     const verified = await verifyCandidate(input, installedApp);
     for (let iteration = 0; iteration < 2; iteration += 1) {
       stage = 'electron_restart';

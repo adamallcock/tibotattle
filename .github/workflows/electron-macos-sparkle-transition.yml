@@ -147,8 +147,8 @@ jobs:
               app=mount/'TiboTattle.app'
               assert app.is_dir() and not app.is_symlink()
               assert [p.name for p in mount.glob('*.app')]==['TiboTattle.app']
-              target=root/name; target.mkdir(mode=0o700)
-              subprocess.run(['/usr/bin/ditto',str(app),str(target/'TiboTattle.app')],check=True,timeout=120)
+              extracted=root/name; extracted.mkdir(mode=0o700)
+              subprocess.run(['/usr/bin/ditto',str(app),str(extracted/'TiboTattle.app')],check=True,timeout=120)
             finally:
               subprocess.run(['/usr/bin/hdiutil','detach',str(mount)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
           intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,
@@ -268,8 +268,8 @@ jobs:
               app=mount/'TiboTattle.app'
               assert app.is_dir() and not app.is_symlink()
               assert [p.name for p in mount.glob('*.app')]==['TiboTattle.app']
-              target=root/name; target.mkdir(mode=0o700)
-              subprocess.run(['/usr/bin/ditto',str(app),str(target/'TiboTattle.app')],check=True,timeout=120)
+              extracted=root/name; extracted.mkdir(mode=0o700)
+              subprocess.run(['/usr/bin/ditto',str(app),str(extracted/'TiboTattle.app')],check=True,timeout=120)
             finally:
               subprocess.run(['/usr/bin/hdiutil','detach',str(mount)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
           intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,

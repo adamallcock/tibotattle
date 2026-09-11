@@ -28,12 +28,18 @@ installed evidence.
   dd9e99f38b3802746de88b76160fdbb56051edeb, version 0.1.21,
   provenance build 2026091106, Mac bundle version 1028. Previous signed
   0.1.21 candidates remain historical evidence; they will not be published.
+- Both final Mac applications and outer disk images are signed, notarized and
+  stapled. The final Windows installer passed its hosted install, processing,
+  restart and uninstall journey (run 34559592872). Linux packaging passed
+  (run 34559594120); this is not a new installed Linux acceptance run.
+- Both installed Mac update runners are prepared: native 0.1.18 through Sparkle,
+  and released Electron 0.1.20 through its unchanged production updater.
+  Their contract tests passed; actual installed execution remains below.
 
 ## Remaining sequence
 
-1. Build and sign the four candidates from that source; finalize the Mac
-   installer and updater metadata after notarization. Keep the resulting
-   artifact identities immutable.
+1. Collect the finalized four-target artifact receipts from the completed
+   packaging and signing jobs. Keep the resulting artifact identities immutable.
 2. Generate isolated Sparkle test feeds with the existing native stable key
    and pinned official Sparkle tools. Only the disposable hosted accounts
    receive a test-feed preference; signed application bundles remain unchanged.
