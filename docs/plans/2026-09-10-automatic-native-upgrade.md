@@ -41,3 +41,22 @@ Implementation in progress on the Electron release lineage, based on 0941dcbb.
 Existing production app source is 178315c4; native repository main does not yet
 contain the Electron implementation. No release or production state changed by
 this repair as of this entry.
+
+### Signed qualification, 2026-09-11
+
+Application source `754fa1bbee6176c85ed96272b3582686f37a44d9` is packaged
+as 0.1.20 / build 2026091101. Both Mac architectures are signed and notarized;
+Linux packaging passed. Windows signed installation is being retried after an
+initial installer timeout, before app launch.
+
+The first signed Mac replacement run (34550480600) failed during first launch.
+Run 34551085835 narrowed this to the transfer helper: migration remained at the
+`started` checkpoint, before a data copy. Owned processes were stopped; no success
+claim is made. Run 34551358882 adds a fixed, read-only helper preflight diagnostic
+from the authenticated signed Electron parent on the disposable synthetic host.
+Runner diagnostics are separate commits; the signed application bytes are unchanged.
+
+Website and Homebrew 0.1.20 changes are prepared but unpublished. Stable 0.1.19
+and its accurate manual migration warning remain in place until replacement is
+verified. Final publication staging is under
+`.release-build/stable020-publication-20260911` (local, ignored evidence).

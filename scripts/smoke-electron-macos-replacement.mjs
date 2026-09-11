@@ -144,7 +144,7 @@ export async function runSignedReplacement(options) {
   const proof = { schemaVersion: 'tibotattle-signed-macos-replacement-v1', status: 'failed',
     sourceRevision: options.sourceRevision, archiveSha256: options.archiveSha256, asarSha256: options.asarSha256,
     signedArtifactVerified: false, disposableAccountVerified: false, nativeAppAbsent: false,
-    ordinaryApplicationLocation: false, migrationCompleted: false,
+    ordinaryApplicationLocation: false, launchServices: true, migrationCompleted: false,
     retainedRowsPreserved: false, saltPreserved: false, preferencesPreserved: false,
     optOutPreserved: false, restartNoDuplicates: false, sourceUntouched: false,
     enrollmentBindingAbsent: false, ownedProcessesStopped: false, failureStage: null };
@@ -202,7 +202,7 @@ export async function runSignedReplacement(options) {
     let initialSettings;
     for (let run = 0; run < 2; run += 1) {
       stage = run === 0 ? 'first_launch' : 'restart';
-      active = await launchVerifiedMacSharingApp(verified, environment, { diagnoseNativePreflight: true, onFailure: async ({ pid }) => {
+      active = await launchVerifiedMacSharingApp(verified, environment, { launchServices: true, onFailure: async ({ pid }) => {
         // Read only closed dialog classifications from our synthetic process.
         const script = `function run() {
           const matches = Application('System Events').applicationProcesses.whose({ unixId: ${pid} })();
@@ -248,7 +248,6 @@ export async function runSignedReplacement(options) {
   } catch (error) {
     proof.failureStage = error?.replacementStage ?? stage;
     if (['process_group', 'owned_debugger', 'dashboard_target', 'dashboard_ready', 'settings_target', 'settings_ready'].includes(error?.signedLaunchStage)) proof.launchStage = error.signedLaunchStage;
-    if (error?.nativePreflightStage) proof.nativePreflightStage = error.nativePreflightStage;
     if (error?.ownedMacProcessesStopped === true) proof.ownedProcessesStopped = true;
     if (diagnosticProfile) {
       proof.migrationInspection = (await inspectNativeElectronHandoverCompletion({ userDataRoot: diagnosticProfile }).catch(() => ({ status: 'unavailable' }))).status;

@@ -154,13 +154,16 @@ export function assertSignedStagingFreshProjection(sharing, receipt) {
   return true;
 }
 
-async function launch(verified, environment, { untouched = false, onFailure, diagnoseNativePreflight = false } = {}) {
+async function launch(verified, environment, { untouched = false, onFailure, launchServices = false } = {}) {
   // Same-identity handover/SingleInstanceLock must never attach to a pre-existing app.
   if (processTable().some((row) => /\/TiboTattle(?: Dev)?\.app\/Contents\/MacOS\/TiboTattle(?: Dev)?$/u.test(row.command))) fail('preexisting_app');
   const port = await freePort();
-  const mainPort = diagnoseNativePreflight ? await freePort() : null;
-  const child = spawn(verified.executable, ['--remote-debugging-port=' + port, '--remote-debugging-address=127.0.0.1', ...(mainPort ? ['--inspect=127.0.0.1:' + mainPort] : [])],
-    { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' });
+  const argumentsList = ['--remote-debugging-port=' + port, '--remote-debugging-address=127.0.0.1'];
+  const child = launchServices
+    ? spawn('/usr/bin/open', ['-W', '-n', verified.appPath, '--args', ...argumentsList],
+      { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' })
+    : spawn(verified.executable, argumentsList,
+      { cwd: verified.appPath, env: environment, detached: true, stdio: 'ignore' });
   let exited = false;
   let spawnFailed = false;
   child.once('exit', () => { exited = true; });
@@ -171,13 +174,20 @@ async function launch(verified, environment, { untouched = false, onFailure, dia
   try {
     await waitFor(() => {
       if (state.stopped()) fail('startup');
-      const row = processTable().find((entry) => entry.pid === child.pid);
+      const entries = processTable();
+      if (launchServices) {
+        const matches = entries.filter((entry) => entry.command === verified.executable);
+        if (matches.length !== 1 || matches[0].group !== matches[0].pid) return false;
+        state.pid = matches[0].pid;
+        return true;
+      }
+      const row = entries.find((entry) => entry.pid === child.pid);
       return row?.group === child.pid && row.command === verified.executable;
     }, OPERATION, 'process group');
     state.groupVerified = true;
     if (untouched) await continueNativeIntro(state, verified);
     launchStage = 'owned_debugger';
-    await waitFor(() => listenerOwned(child.pid, port), STARTUP, 'owned debugger');
+    await waitFor(() => listenerOwned(state.pid, port), STARTUP, 'owned debugger');
     launchStage = 'dashboard_target';
     const target = await waitFor(async () => selectMacDashboardTarget(await json(`http://127.0.0.1:${port}/json/list`), port), STARTUP, 'dashboard target');
     const dashboard = await connectCdp(target);
@@ -197,28 +207,6 @@ async function launch(verified, environment, { untouched = false, onFailure, dia
     return state;
   } catch (error) {
     error.signedLaunchStage = launchStage;
-    // Disposable synthetic replacement diagnostics only: invoke the fixed
-    // read-only helper command from its actual authenticated Electron parent.
-    if (mainPort && listenerOwned(state.pid, mainPort)) {
-      let inspector;
-      try {
-        const targets = await json(`http://127.0.0.1:${mainPort}/json/list`);
-        if (targets.length !== 1) throw new Error();
-        const target = targets[0];
-        const socket = new URL(target.webSocketDebuggerUrl);
-        if (socket.hostname !== '127.0.0.1' || +socket.port !== mainPort) throw new Error();
-        inspector = await connectCdp(target);
-        const result = await inspector.evaluate(`(async () => {
-          const cp = await import('node:child_process');
-          let output;
-          try { output = cp.execFileSync(process.resourcesPath + '/../MacOS/TiboTattleNativeHandover', ['--prepare-retained-state-preflight'], { cwd: '/', env: {PATH:'/usr/bin:/bin:/usr/sbin:/sbin'}, encoding:'utf8', timeout:10000, maxBuffer:16384, stdio:['ignore','pipe','ignore'] }); }
-          catch(e) { output = e.stdout; }
-          try { const value=JSON.parse(output); return value.status==='preflight_ready' ? 'preflight_ready' : value.failureStage; } catch { return 'unavailable'; }
-        })()`);
-        if (['preflight_ready', 'identity', 'native_application', 'login_item_unregister', 'login_item_status', 'login_item_requires_approval', 'login_item_not_found', 'login_item_status_unknown', 'native_writer', 'other_same_identity_running', 'preferences', 'invalid_request', 'unknown', 'unavailable'].includes(result)) error.nativePreflightStage = result;
-      } catch { error.nativePreflightStage = 'diagnostic_unavailable'; }
-      finally { inspector?.close(); }
-    }
     if (onFailure) { try { await onFailure({ pid: state.pid, stage: launchStage }); } catch {} }
     const stopped = await stop(state);
     error.ownedMacProcessesStopped = stopped === true;
