@@ -79,3 +79,30 @@ test('both workflow bodies parse as JavaScript and preserve fixed targets withou
   assert.match(workflow, /runs-on: macos-26\n/);
   assert.doesNotMatch(workflow, /contents: write|secrets\.|pull_request_target/);
 });
+
+test('failure classification emits fixed content-free fields and preserves command versus file failures', () => {
+  assert.deepEqual(runner.classifyProductionUpdateFailure({code:'ENOENT',message:'/private/path',stderr:'secret'}),
+    {code:'ENOENT',exitCode:null,signal:null,kind:'system_error'});
+  assert.deepEqual(runner.classifyProductionUpdateFailure({status:1,cmd:'private command'}),
+    {code:null,exitCode:1,signal:null,kind:'command_exit'});
+  assert.deepEqual(runner.classifyProductionUpdateFailure({signal:'SIGKILL'}),
+    {code:null,exitCode:null,signal:'SIGKILL',kind:'command_signal'});
+  assert.deepEqual(runner.classifyProductionUpdateFailure({code:'/secret',status:'1',signal:'private'}),
+    {code:null,exitCode:null,signal:null,kind:'unclassified'});
+});
+
+test('updater successor excludes an orphaned old companion but keeps new main and descendant semantics', () => {
+  const executable = '/qualified/TiboTattle.app/Contents/MacOS/TiboTattle';
+  const row = (pid, parent, command = executable) => ({pid, parent, group:pid, command});
+  const old = new Set([100, 101]);
+  assert.equal(runner.selectProductionUpdateSuccessor([row(100,1), row(101,100)], executable, 100, old), null);
+  // This was incorrectly accepted as a new main solely because PID101 != PID100.
+  assert.equal(runner.selectProductionUpdateSuccessor([row(101,1)], executable, 100, old), null);
+  const successor = runner.selectProductionUpdateSuccessor([row(101,1),row(200,1),row(201,200)], executable,100,old);
+  assert.equal(successor.pid,200);
+  // No successor is admitted while the old main remains alive.
+  assert.equal(runner.selectProductionUpdateSuccessor([row(100,1),row(200,1)],executable,100,old),null);
+  // Unknown independent roots remain ambiguous; they are not ignored for a green result.
+  assert.throws(() => runner.selectProductionUpdateSuccessor([row(101,1),row(200,1),row(300,1)],executable,100,old));
+  assert.throws(() => runner.selectProductionUpdateSuccessor([row(200,1)],executable,100,new Set()));
+});
