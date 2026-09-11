@@ -113,7 +113,7 @@ test('UI automation is PID-scoped, refuses ambiguous buttons, and returns fixed 
       assert.equal(name, 'System Events');
       return { applicationProcesses: { whose(filter) {
         assert.equal(filter.unixId, 321);
-        return () => [{ windows: () => [{ entireContents: () => buttons }] }];
+        return () => [{ windows: () => [{ role: () => 'AXWindow', uiElements: () => buttons }] }];
       } } };
     },
   });
@@ -122,6 +122,22 @@ test('UI automation is PID-scoped, refuses ambiguous buttons, and returns fixed 
   assert.equal(evaluate([]), 'target_absent');
   assert.equal(evaluate([button('Instalar y volver a abrir')], runner.sparkleTransitionUiScript(321, 'relaunch')), 'clicked');
   assert.doesNotMatch(code, /keystroke|keyCode|System Settings|security authorizationdb/u);
+});
+
+test('native updater controls exclude web trees and refuse incomplete native traversals', () => {
+  let clicks = 0, webReads = 0;
+  const button = { name: () => 'Install and Relaunch', role: () => 'AXButton', enabled: () => true,
+    click: () => { clicks++; } };
+  const group = children => ({ role: () => 'AXGroup', uiElements: () => children });
+  const web = { role: () => 'AXWebArea', uiElements: () => { webReads++; throw new Error('Web tree must not be read'); } };
+  const run = children => runInNewContext(runner.sparkleTransitionUiScript(321, 'relaunch') + '\nrun();', {
+    Application: () => ({ applicationProcesses: { whose: () => () => [{ windows: () => [group(children)] }] } }),
+  });
+  assert.equal(run([web, group([button])]), 'clicked'); assert.equal(clicks, 1); assert.equal(webReads, 0);
+  assert.equal(run([web, group([button, button])]), 'ambiguous_target'); assert.equal(clicks, 1);
+  const cycle = group([]); cycle.uiElements = () => [cycle];
+  assert.equal(run([button, cycle]), 'ui_tree_limit'); assert.equal(clicks, 1);
+  assert.equal(run(Array.from({ length: 513 }, () => group([]))), 'ui_tree_limit'); assert.equal(clicks, 1);
 });
 
 test('the runner never installs the candidate directly or changes either signed bundle', async () => {
@@ -152,7 +168,7 @@ test('closing updater windows can be reread, but an uncertain click is never ret
   const button = { name: () => 'Install and Relaunch', role: () => 'AXButton', enabled: () => true,
     click: () => { clicks++; if (rejectClick) throw new Error('Action outcome unavailable'); } };
   const context = { Application: () => ({ applicationProcesses: { whose: () => () => [{ windows: () => [
-    { entireContents: () => { if (closing) throw new Error('Window no longer exists'); return [button]; } },
+    { role: () => 'AXWindow', uiElements: () => { if (closing) throw new Error('Window no longer exists'); return [button]; } },
   ] }] } }) };
   const run = () => runInNewContext(runner.sparkleTransitionUiScript(321, 'relaunch') + '\nrun();', context);
   assert.equal(run(), 'snapshot_unavailable'); assert.equal(clicks, 0);
@@ -161,9 +177,9 @@ test('closing updater windows can be reread, but an uncertain click is never ret
 });
 
 test('synthetic UI diagnostics return closed counts rather than unknown labels or text', () => {
-  const element = (name, value) => ({ name: () => name, value: () => value, enabled: () => true });
+  const element = (name, value) => ({ role: () => 'AXStaticText', name: () => name, value: () => value, enabled: () => true });
   const context = { Application: () => ({ applicationProcesses: { whose: () => () => [{
-    frontmost: () => true, menuBars: () => [], windows: () => [{ entireContents: () => [
+    frontmost: () => true, menuBars: () => [], windows: () => [{ role: () => 'AXWindow', uiElements: () => [
       element('Private session name', 'Private arbitrary text'), element('Install Update', '')] }],
   }] } }) };
   const text = runInNewContext(runner.sparkleTransitionDiagnosticScript(321) + '\nrun();', context);
