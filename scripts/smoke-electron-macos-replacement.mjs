@@ -181,6 +181,16 @@ export async function runSignedReplacement(options) {
     execFileSync('/usr/bin/ditto', [options.appPath, installedApp], { timeout: 120000, stdio: 'ignore' });
     verified = await verifySignedReplacementArtifact({ ...options, appPath: installedApp });
     proof.ordinaryApplicationLocation = true;
+    // Finder registers copied app bundles. ditto alone does not reproduce that
+    // installation step on an otherwise empty hosted account.
+    execFileSync('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
+      ['-f', installedApp], { timeout: 30000, stdio: 'ignore' });
+    proof.applicationRegistrationPerformed = true;
+    for (const [key, service] of [['backgroundTaskDaemonAvailable', 'system/com.apple.backgroundtaskmanagementdaemon'],
+      ['backgroundTaskAgentAvailable', 'gui/501/com.apple.backgroundtaskmanagementagent']]) {
+      try { execFileSync('/bin/launchctl', ['print', service], { timeout: 10000, stdio: 'ignore' }); proof[key] = true; }
+      catch { proof[key] = false; }
+    }
     stage = 'seed';
     await mkdir(codex, { mode: 0o700 });
     await mkdir(join(codex, 'sessions'), { mode: 0o700 });
