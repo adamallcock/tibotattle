@@ -8871,6 +8871,8 @@ function cacheDropThreadKeys(data) {
 
 function resetCacheDropThreadLinks(data = null) {
   const sameDashboard = cacheDropThreadLinks.dashboard === data;
+  const previousGeneration = cacheDropThreadLinks.generation;
+  const previousFingerprint = cacheDropThreadLinks.generationFingerprint;
   cacheDropThreadLinks.requestToken += 1;
   cacheDropThreadLinks.dashboard = data;
   cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
@@ -8880,9 +8882,13 @@ function resetCacheDropThreadLinks(data = null) {
   cacheDropThreadLinks.generationFingerprint =
     data?.accounting?.cacheDiagnosticsSource?.generationFingerprint ?? null;
   cacheDropThreadLinks.requested = false;
-  // A new accounting generation does not change an already resolved thread.
-  // Reuse only exact event-pair keys still present in the local snapshot, across
-  // all selectable periods. New/changed rows must resolve independently.
+  // An unchanged tuple can become ambiguous when another source is indexed.
+  // Reuse navigation only within the same attested diagnostic publication;
+  // a changed or missing proof requires a new successful identity lookup.
+  if (previousGeneration !== cacheDropThreadLinks.generation
+      || previousFingerprint !== cacheDropThreadLinks.generationFingerprint) {
+    cacheDropThreadLinks.entries.clear();
+  }
   const retainedKeys = cacheDropThreadKeys(data);
   for (const key of cacheDropThreadLinks.entries.keys()) {
     if (!retainedKeys.has(key)) cacheDropThreadLinks.entries.delete(key);
@@ -8917,12 +8923,13 @@ async function loadCacheDropThreadLinks(data) {
         || result?.status !== "available"
         || result.generation !== generation) return;
     const selectedKeys = cacheDropThreadKeys(data);
+    const resolvedEntries = new Map();
     for (const { key, thread } of result.entries) {
       if (!selectedKeys.has(key)) continue;
       const previous = cacheDropThreadLinks.entries.get(key);
       // Optional name-store failures must not erase details already known for
       // this UUID. A newly resolved identity replaces the old entry outright.
-      cacheDropThreadLinks.entries.set(key, previous?.id === thread.id ? {
+      resolvedEntries.set(key, previous?.id === thread.id ? {
         ...thread,
         name: thread.name ?? previous.name,
         nickname: thread.nickname ?? previous.nickname,
@@ -8933,6 +8940,9 @@ async function loadCacheDropThreadLinks(data) {
         },
       } : thread);
     }
+    // A qualified empty/partial result withdraws unresolved identities. It is
+    // different from a failed lookup, which leaves same-publication UI intact.
+    cacheDropThreadLinks.entries = resolvedEntries;
     completed = true;
     updateCacheDropThreadCells();
   } catch {
