@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import { resolveReleaseChannel } from "../config/release-channels.js";
 import { isAppleMacOSBundleVersion } from "./macos-bundle-version.js";
-import { publishSparkleUpdate, verifyReleaseManifestSourceProvenance } from "./publish-sparkle-update.js";
+import { createAppcastAtomicGuardFromEnvironment, publishSparkleUpdate, verifyReleaseManifestSourceProvenance } from "./publish-sparkle-update.js";
 import { deployWebRelease } from "./deploy-web-release.js";
 import { verifyWebReleaseReceipt } from "./web-release-lane.js";
 import { isElectronSparkleTransition } from "./electron-sparkle-transition.js";
@@ -174,12 +174,37 @@ export async function preparePublication(plan, { repositoryRoot = ROOT, publishF
       || site.site?.canonicalUrl !== `${DEPLOYMENT_ENDPOINTS.public.origin}/`
       || !Array.isArray(site.files) || site.files.length < 1 || site.files.length > 500) fail("RELEASE_PUBLICATION_SITE_IDENTITY_MISMATCH");
   await verifySite({ repositoryRoot: plan.website.repositoryRoot, receiptPath: plan.website.receipt.path });
-  for (const target of plan.targets) {
-    const row = target.architecture === "arm64" ? site.installer : site.intelInstaller;
-    const dmg = asset(target.dmgName);
-    if (row?.version !== plan.version || row.sha256 !== dmg.sha256 || row.bytes !== dmg.bytes
-        || row.minimumMacos !== "14.0" || !row.architectures?.includes(target.architecture)
-        || row.url !== `https://github.com/${REPOSITORY}/releases/download/${plan.source.tag}/${dmg.name}`) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+  if (electron) {
+    // The reviewed Electron site generator emits four download rows, not the
+    // native site's legacy installer/intelInstaller objects.
+    const release = site.electronRelease;
+    if (!exact(release, ["version", "buildNumber", "publishedInstallersVerified", "verificationScope", "downloads"])
+        || release.version !== plan.version || release.publishedInstallersVerified !== true
+        || !Array.isArray(release.verificationScope)
+        || release.verificationScope.join() !== "reviewed-publication-plan,local-artifact-bytes,published-installer-bytes"
+        || !Array.isArray(release.downloads) || release.downloads.length !== 4
+        || new Set(release.downloads.map(row => row?.target)).size !== 4) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+    for (const target of plan.targets) {
+      const manifest = await jsonFile(target.feedManifest);
+      if (release.buildNumber !== manifest.electron?.buildNumber) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+    }
+    for (const artifact of canonical.artifacts) {
+      const platform = { macos: "darwin", windows: "win32", linux: "linux" }[artifact.platform];
+      const row = release.downloads.find(value => value?.target === `${platform}-${artifact.architecture}`);
+      if (!exact(row, ["target", "url", "bytes", "sha256"])
+          || row.sha256 !== artifact.sha256 || row.bytes !== artifact.bytes
+          || row.url !== `https://github.com/${REPOSITORY}/releases/download/${plan.source.tag}/${artifact.fileName}`) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+    }
+    // Mac minimum OS and architecture are established by the signed native
+    // publisher validation above, not nonexistent download-row fields.
+  } else {
+    for (const target of plan.targets) {
+      const row = target.architecture === "arm64" ? site.installer : site.intelInstaller;
+      const dmg = asset(target.dmgName);
+      if (row?.version !== plan.version || row.sha256 !== dmg.sha256 || row.bytes !== dmg.bytes
+          || row.minimumMacos !== "14.0" || !row.architectures?.includes(target.architecture)
+          || row.url !== `https://github.com/${REPOSITORY}/releases/download/${plan.source.tag}/${dmg.name}`) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+    }
   }
   const siteFiles = [];
   for (const file of site.files) {
@@ -188,7 +213,11 @@ export async function preparePublication(plan, { repositoryRoot = ROOT, publishF
         || !Number.isSafeInteger(file.bytes) || file.bytes < 1 || file.bytes > 16 * MAX_SMALL) fail("RELEASE_PUBLICATION_SITE_FILES_INVALID");
     const spec = { ...file, path: join(dirname(plan.website.manifest.path), file.path) };
     await verifyFile(spec);
-    siteFiles.push({ ...file, url: `${DEPLOYMENT_ENDPOINTS.public.origin}/${file.path === "index.html" ? "" : file.path}` });
+    // Workers Assets serves HTML at canonical extensionless routes. Read those
+    // directly so unexpected redirects still fail closed in publicBytes.
+    const publicPath = file.path.replace(/(^|\/)index\.html$/, "$1").replace(/\.html$/, "");
+    if (publicPath.split("/").some((part) => part === "." || part === "..")) fail("RELEASE_PUBLICATION_SITE_FILES_INVALID");
+    siteFiles.push({ ...file, url: `${DEPLOYMENT_ENDPOINTS.public.origin}/${publicPath}` });
   }
   if (new Set(siteFiles.map((file) => file.url)).size !== siteFiles.length || !site.files.some((file) => file.path === "index.html")) fail("RELEASE_PUBLICATION_SITE_FILES_INVALID");
   const cask = await readFile(plan.tap.path, "utf8");
@@ -215,6 +244,7 @@ function command(spawn, commandName, args, options = {}) {
 export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawnSync, fetchImpl = fetch, publishFeed = publishSparkleUpdate, deploySite = deployWebRelease } = {}) {
   const downloaded = new Map();
   const attested = new Set();
+  let appcastGuard;
   const api = (route, { method = "GET", body, allow404 = false } = {}) => {
     const value = command(spawn, "gh", ["api", "--method", method, route, ...(body ? ["--input", "-"] : [])], { input: body ? JSON.stringify(body) : undefined, allow404 });
     if (value === null) return null;
@@ -349,8 +379,14 @@ export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawn
       await verifyFile(target.previousManifest); await verifyFile(target.feedManifest);
       if (target.sparkleDmg) await verifyFile(target.sparkleDmg);
       const channel = resolveReleaseChannel("stable", { architecture });
+      // Consume once on the first authorized write. Both architectures use the
+      // same owner guard; its credential stays private and absent from children.
+      appcastGuard ??= createAppcastAtomicGuardFromEnvironment({
+        channel: "stable", architecture, endpoint: channel.sparkle.atomicGuardURL,
+        fetchGuard: fetchImpl,
+      });
       return publishFeed({ ...options, publish: true, replaceAppcast: true,
-        atomicAppcastGuardEndpoint: channel.sparkle.atomicGuardURL, atomicAppcastGuardTokenEnv: "SPARKLE_APPCAST_GUARD_TOKEN" });
+        atomicAppcastGuard: appcastGuard });
     },
     async tap(prepared) {
       // GitHub contents API, not potentially stale raw.githubusercontent.com.
@@ -404,15 +440,27 @@ async function inspect(prepared, adapters, { fresh = false } = {}) {
   return surfaces;
 }
 function safeCode(error) { return /^[A-Z][A-Z0-9_]{2,100}$/.test(error?.code) ? error.code : "RELEASE_PUBLICATION_CHECK_FAILED"; }
+const MUTATION_FAILURE_CODES = new Set([
+  "SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_REQUIRED", "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+  "SPARKLE_UPDATE_ATOMIC_GUARD_FAILED", "SPARKLE_UPDATE_APPCAST_ATOMIC_CONFLICT",
+  "SPARKLE_UPDATE_APPCAST_STATE_CHANGED", "SPARKLE_UPDATE_WRANGLER_FAILED",
+  "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED", "SPARKLE_UPDATE_IMMUTABLE_OBJECT_MISMATCH",
+  "SPARKLE_UPDATE_SOURCE_CHANGED", "RELEASE_PUBLICATION_LOCAL_BYTES_MISMATCH",
+]);
+function mutationFailure(step, error) {
+  return { step, code: MUTATION_FAILURE_CODES.has(error?.code) ? error.code : "RELEASE_PUBLICATION_MUTATION_FAILED" };
+}
 
 export async function reconcilePublication({ plan, repositoryRoot = ROOT, apply = false, confirmation = null, expectedPlanDigest = null,
   operationDirectory = null, resume = false, executorStopped = false, adapters = createPublicationAdapters({ repositoryRoot }), prepare = preparePublication } = {}) {
   const prepared = await prepare(plan, { repositoryRoot });
   const planDigest = identityDigest(prepared.plan);
   let surfaces = await inspect(prepared, adapters);
+  let lastMutationFailure;
   const result = (extra = {}) => ({ schemaVersion: 1, planDigest, sourceCommit: prepared.plan.source.commit,
     tag: prepared.plan.source.tag, channel: prepared.plan.channel, version: prepared.plan.version, build: prepared.plan.build,
-    surfaces, complete: Object.values(surfaces).every((surface) => surface.status === "matches"), ...extra });
+    surfaces, complete: Object.values(surfaces).every((surface) => surface.status === "matches"),
+    ...(lastMutationFailure ? { mutationFailure: lastMutationFailure } : {}), ...extra });
   if (!apply) return result({ mode: "inspect", writesAttempted: false });
   if (confirmation !== PUBLICATION_CONFIRMATION || expectedPlanDigest !== planDigest || !operationDirectory) fail("RELEASE_PUBLICATION_EXPLICIT_AUTHORIZATION_REQUIRED");
   if (resume && !executorStopped) fail("RELEASE_PUBLICATION_EXECUTOR_STOP_CONFIRMATION_REQUIRED");
@@ -430,7 +478,8 @@ export async function reconcilePublication({ plan, repositoryRoot = ROOT, apply 
     if (await observed()) { state.steps[name] = "verified"; await save(); return; }
     if (state.steps[name]) fail(state.steps[name] === "submitted" ? "RELEASE_PUBLICATION_REMOTE_PENDING" : "RELEASE_PUBLICATION_UNCERTAIN_RECONCILE_REQUIRED");
     state.steps[name] = "intent"; await save(); writesAttempted = true;
-    try { await mutate(); state.steps[name] = "submitted"; await save(); } catch { /* Read back before classifying a lost response. */ }
+    try { await mutate(); state.steps[name] = "submitted"; await save(); }
+    catch (error) { lastMutationFailure = mutationFailure(name, error); }
     requireOwner();
     if (!await observed()) fail(state.steps[name] === "submitted" ? "RELEASE_PUBLICATION_REMOTE_PENDING" : "RELEASE_PUBLICATION_UNCERTAIN_RECONCILE_REQUIRED");
     state.steps[name] = "verified"; await save();
@@ -470,7 +519,8 @@ export async function reconcilePublication({ plan, repositoryRoot = ROOT, apply 
     if ((await adapters.website(prepared)).status !== "matches") {
       if (state.steps.website) fail("RELEASE_PUBLICATION_UNCERTAIN_RECONCILE_REQUIRED");
       state.steps.website = "intent"; await save(); writesAttempted = true;
-      try { await adapters.publishWebsite(prepared); } catch { /* Live readback is decisive. */ }
+      try { await adapters.publishWebsite(prepared); }
+      catch (error) { lastMutationFailure = mutationFailure("website", error); }
       if ((await adapters.website(prepared)).status !== "matches") fail("RELEASE_PUBLICATION_UNCERTAIN_RECONCILE_REQUIRED");
     }
     state.steps.website = "verified"; await save();

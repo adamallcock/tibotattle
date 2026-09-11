@@ -99,13 +99,14 @@ for the standard canonical GitHub installers.
 
 Prepare the website through the existing [web-only lane](./2026-08-17-web-only-release.md)
 in its exact clean source checkout. Retain its web-release receipt and generated
-`release-site-manifest.json`. Both website installer rows must identify the exact
+`release-site-manifest.json`. Each website installer row must identify the exact
 GitHub assets in the canonical release manifest. Website publication can use a
 different, explicitly receipt-bound source commit from the application release.
 For the four-platform transition, also inspect the rendered desktop/mobile
 download section and open all four manual download links: each must select the
-matching immutable GitHub release asset. This coordinator checks the two Mac
-installer rows; retain the Windows/Linux rendered-link evidence separately.
+matching immutable GitHub release asset. This coordinator checks all four
+Electron download rows, including published-byte verification, source build,
+URLs, sizes and hashes. Retain rendered-link and interaction evidence separately.
 
 ### Closed plan schema
 
@@ -188,6 +189,9 @@ The tap is read through GitHub's contents API, not a potentially stale raw-conte
 URL. Website readback fetches the exact manifest and every generated public file
 with a cache-busting query, then requires healthy production at the receipt's
 exact source commit. A successful HTTP response alone does not pass these gates.
+HTML files are checked at their Workers Assets canonical routes (`index.html`
+at `/`, other `.html` files without that suffix). Unexpected redirects still
+fail; response bytes are hashed without normalization or injected-code removal.
 
 ## Explicit publication invocation
 
@@ -211,9 +215,11 @@ assets stop publication; nothing is overwritten or deleted.
 
 The existing Sparkle publisher handles each feed's immutable object checks,
 signatures, previous-version/key continuity, compare-and-swap update and public
-readback. The guard credential remains in its existing
+readback. The guard credential enters through the existing
 `SPARKLE_APPCAST_GUARD_TOKEN` environment path, used only for the explicitly
-authorized feed mutation.
+authorized feed mutations. The coordinator consumes it once into a private
+guard shared by both architecture publications and removes it from the
+environment before spawning storage tools. It never records the raw credential.
 
 The existing tap workflow is asynchronous and may take several minutes to verify
 both native installers. An acknowledged dispatch is recorded as `submitted`;

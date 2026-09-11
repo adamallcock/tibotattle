@@ -108,7 +108,7 @@ jobs:
           retention-days: 30
   acceptance_x64:
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-x64'
-    runs-on: macos-26-intel
+    runs-on: macos-15-intel
     timeout-minutes: 25
     env:
       SELECTED_MODE: ${{ inputs.mode }}

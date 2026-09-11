@@ -9,7 +9,11 @@ status: maintained
 
 This runbook restores the four-day Windows-readiness test environments. It is
 not a Windows installation or release runbook. All commands use synthetic
-fixtures; none should be pointed at a real Codex or Claude home.
+fixtures; none should be pointed at a real Codex or Claude home. Electron
+0.1.21 is released for Windows x64; see [current status](../current-status.md)
+and [platform support](../reference/platform-support.md) for installed-release
+evidence and remaining owner acceptance. The environments and dated runs below
+are portability evidence, not the latest release qualification.
 
 ## Recorded environment
 
@@ -75,7 +79,7 @@ credential cleanup result. Any failure or unexplained skip keeps the milestone
 open. The clean matrix job intentionally skips only the pnpm store cache; the
 hosted runner itself is still a Microsoft-provided runner image.
 
-The latest completed qualification is
+The recorded portability qualification is
 [run 32085366833](https://github.com/adamallcock/tibotattle/actions/runs/32085366833):
 restored/primed-store job `95556686783` and clean-store job `95556687033` both
 passed on revision `b8811349b5b38df0319684ebc0b4377f9d404c94`.

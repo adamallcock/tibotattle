@@ -193,6 +193,26 @@ test("one feed failure preserves earlier successes and never blindly retries unc
   assert.equal(third.complete, true); assert.equal(server.writes.filter((step) => step === "feed-arm64").length, 1);
 });
 
+test("mutation diagnostics retain only closed error codes without relaxing uncertain recovery", async (t) => {
+  for (const code of ["SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_REQUIRED", "PRIVATE_SYNTHETIC_SECRET_ABC123"]) {
+    const f = await fixture(t), server = remote(f.plan);
+    server.adapters.publishFeed = async (_prepared, architecture) => {
+      server.writes.push(`feed-${architecture}`);
+      if (architecture === "arm64") { server.state.arm64 = true; return; }
+      throw Object.assign(new Error("private synthetic diagnostics"), { code });
+    };
+    const result = await reconcilePublication(options(f, server));
+    assert.equal(result.code, "RELEASE_PUBLICATION_UNCERTAIN_RECONCILE_REQUIRED");
+    assert.deepEqual(result.mutationFailure, { step: "feed-x64", code: code.startsWith("SPARKLE_") ? code : "RELEASE_PUBLICATION_MUTATION_FAILED" });
+    assert.equal((await readOperation(f.operationDirectory)).state.steps["feed-x64"], "intent");
+    const resumed = await reconcilePublication({ ...options(f, server), resume: true, executorStopped: true });
+    assert.equal(resumed.complete, false);
+    assert.equal(server.writes.filter(step => step === "feed-x64").length, 1);
+    assert.ok(!JSON.stringify(result).includes("private synthetic diagnostics"));
+    assert.ok(!JSON.stringify(result).includes("PRIVATE_SYNTHETIC_SECRET_ABC123"));
+  }
+});
+
 test("asynchronous tap dispatch is recorded once and read back on resume", async (t) => {
   const f = await fixture(t), server = remote(f.plan);
   server.adapters.publishTap = async () => { server.writes.push("tap-dispatch"); };
@@ -324,36 +344,74 @@ test("tap adapter detects stale Intel bytes and dispatches only the pinned exist
 
 test("real feed and website adapters delegate current guarded entrypoint contracts", async (t) => {
   const f = await fixture(t), prepared = await preparePublication(f.plan, f.prepareOptions), feedCalls = [], siteCalls = [];
+  const previousToken = process.env.SPARKLE_APPCAST_GUARD_TOKEN;
+  const token = "synthetic-two-target-guard-token-0123456789";
+  process.env.SPARKLE_APPCAST_GUARD_TOKEN = token;
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.SPARKLE_APPCAST_GUARD_TOKEN;
+    else process.env.SPARKLE_APPCAST_GUARD_TOKEN = previousToken;
+  });
   const adapter = createPublicationAdapters({ publishFeed: async (options) => { feedCalls.push(options); return { verified: true }; },
     deploySite: async (options) => { siteCalls.push(options); return { deployment: { ok: true } }; } });
+  assert.equal(process.env.SPARKLE_APPCAST_GUARD_TOKEN, token); // Read-only construction does not consume it.
+  await adapter.publishFeed(prepared, "arm64");
+  assert.equal(process.env.SPARKLE_APPCAST_GUARD_TOKEN, undefined);
   await adapter.publishFeed(prepared, "x64");
-  assert.equal(feedCalls[0].architecture, "x64"); assert.equal(feedCalls[0].publish, true); assert.equal(feedCalls[0].replaceAppcast, true);
-  assert.equal(feedCalls[0].atomicAppcastGuardEndpoint, "https://tibotattle.com/api/v1/internal/release/appcast");
-  assert.equal(feedCalls[0].atomicAppcastGuardTokenEnv, "SPARKLE_APPCAST_GUARD_TOKEN");
-  assert.equal(feedCalls[0].releaseManifestPath, f.plan.targets[1].feedManifest.path);
+  assert.deepEqual(feedCalls.map(call => call.architecture), ["arm64", "x64"]);
+  assert.equal(feedCalls[1].publish, true); assert.equal(feedCalls[1].replaceAppcast, true);
+  assert.equal(feedCalls[0].atomicAppcastGuard, feedCalls[1].atomicAppcastGuard);
+  assert.equal(typeof feedCalls[1].atomicAppcastGuard.compareAndSwap, "function");
+  assert.equal(feedCalls[1].atomicAppcastGuardTokenEnv, undefined);
+  assert.ok(!JSON.stringify(feedCalls).includes(token));
+  assert.equal(feedCalls[1].releaseManifestPath, f.plan.targets[1].feedManifest.path);
   await adapter.publishWebsite(prepared);
   assert.equal(siteCalls[0].repositoryRoot, f.root); assert.equal(siteCalls[0].receiptPath, f.plan.website.receipt.path);
   assert.ok(siteCalls[0].confirmation.includes("PRODUCTION"));
   await writeFile(f.plan.targets[1].feedManifest.path, "changed local feed manifest");
-  await assert.rejects(adapter.publishFeed(prepared, "x64"), /LOCAL_BYTES_MISMATCH/); assert.equal(feedCalls.length, 1);
+  await assert.rejects(adapter.publishFeed(prepared, "x64"), /LOCAL_BYTES_MISMATCH/); assert.equal(feedCalls.length, 2);
 });
 
 test("website readback checks every prepared file and current healthy deployment source", async (t) => {
-  const f = await fixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+  const f = await fixture(t);
+  const site = JSON.parse(await readFile(f.plan.website.manifest.path, "utf8"));
+  for (const path of ["docs.html", "privacy.html", "community.html", "404.html", "styles.css"]) {
+    site.files.push({ ...await f.file(path, `Synthetic ${path} bytes`), path });
+  }
+  f.plan.website.manifest = await f.file("release-site-manifest.json", JSON.stringify(site));
+  f.plan.website.receipt = await f.file("web-release-receipt.json", JSON.stringify({ sourceCommit: "c".repeat(40), site: { manifestSha256: f.plan.website.manifest.sha256 } }));
+  const prepared = await preparePublication(f.plan, f.prepareOptions);
   let healthySource = prepared.websiteSourceCommit;
   const reads = [];
-  const adapter = createPublicationAdapters({ fetchImpl: async (input) => {
+  const adapter = createPublicationAdapters({ fetchImpl: async (input, options) => {
     const url = new URL(input); reads.push(url.pathname);
+    assert.equal(options.redirect, "error");
+    // The live host redirects .html requests; the verifier must request the
+    // canonical route rather than following arbitrary remote locations.
+    if (url.pathname.endsWith(".html")) throw new TypeError("unexpected redirect");
     if (url.pathname === "/api/health") {
       const response = new Response(JSON.stringify({ status: "ok", deployment: { sourceCommit: healthySource } }), { headers: { "content-type": "application/json", "cache-control": "no-store", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff" } });
       Object.defineProperty(response, "url", { value: String(input) }); return response;
     }
-    const path = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
+    const path = url.pathname === "/" ? "index.html"
+      : ["/docs", "/privacy", "/community", "/404"].includes(url.pathname) ? `${url.pathname.slice(1)}.html` : url.pathname.slice(1);
     return new Response(await readFile(join(f.root, path)));
   } });
   assert.equal((await adapter.website(prepared)).status, "matches");
-  assert.deepEqual(reads, ["/release-site-manifest.json", "/", "/api/health"]);
+  assert.deepEqual(reads, ["/release-site-manifest.json", "/", "/docs", "/privacy", "/community", "/404", "/styles.css", "/api/health"]);
   healthySource = "e".repeat(40); assert.equal((await adapter.website(prepared)).status, "pending");
+  healthySource = prepared.websiteSourceCommit;
+  await writeFile(join(f.root, "docs.html"), "Different published documentation");
+  assert.equal((await adapter.website(prepared)).status, "pending");
+});
+
+test("website admission refuses canonical route collisions and transformed dot paths", async (t) => {
+  for (const paths of [["docs", "docs.html"], ["..html"], ["...html"]]) {
+    const f = await fixture(t), site = JSON.parse(await readFile(f.plan.website.manifest.path, "utf8"));
+    for (const path of paths) site.files.push({ ...await f.file(path, `Synthetic ${path}`), path });
+    f.plan.website.manifest = await f.file("release-site-manifest.json", JSON.stringify(site));
+    f.plan.website.receipt = await f.file("web-release-receipt.json", JSON.stringify({ sourceCommit: "c".repeat(40), site: { manifestSha256: f.plan.website.manifest.sha256 } }));
+    await assert.rejects(preparePublication(f.plan, f.prepareOptions), /SITE_FILES_INVALID/);
+  }
 });
 
 async function electronFixture(t) {
@@ -372,7 +430,7 @@ async function electronFixture(t) {
     const metadata = await put(`TiboTattle-1.2.3-darwin-${target.architecture}-update.yml`, 'synthetic Electron updater metadata');
     a.updater = { enabled: true, mechanism: 'electron-updater', metadata: { fileName: metadata.name, bytes: metadata.bytes, sha256: metadata.sha256, subjectSha256: dmg.sha256 } };
     for (const suffix of ['zip', 'zip.blockmap', 'dmg.blockmap']) await put(`TiboTattle-1.2.3-mac-${target.architecture}.${suffix}`, `synthetic ${suffix}`);
-    const manifest = JSON.parse(await readFile(target.feedManifest.path));manifest.schemaVersion = 'tibotattle-electron-sparkle-transition-v1';
+    const manifest = JSON.parse(await readFile(target.feedManifest.path));manifest.schemaVersion = 'tibotattle-electron-sparkle-transition-v1';manifest.electron={buildNumber:'2026091107'};
     target.feedManifest = await file(`feed-manifest-${target.architecture}.json`, JSON.stringify(manifest));
   }
   for (const platform of ['windows', 'linux']) {
@@ -389,7 +447,10 @@ async function electronFixture(t) {
   const { compareArtifactIdentity } = await import('../scripts/release-evidence.js');canonical.artifacts.sort(compareArtifactIdentity);
   await put('release-manifest.json', `${stableStringify(canonical)}\n`);await put('SHA256SUMS',buildSha256Sums(canonical));
   const all = plan.assets.filter(a => !['release-manifest.json','SHA256SUMS','verify-release.md'].includes(a.name)).map(a => `${a.sha256}  ${a.name}`).sort().join('\n')+'\n';await put('SHA256SUMS-ALL-RELEASE-FILES',all);
-  const site = JSON.parse(await readFile(plan.website.manifest.path));for(const row of [site.installer,site.intelInstaller])row.url=row.url.replace('-macOS-','-mac-');
+  const site = JSON.parse(await readFile(plan.website.manifest.path));delete site.installer;delete site.intelInstaller;
+  site.electronRelease={version:'1.2.3',buildNumber:'2026091107',publishedInstallersVerified:true,
+    verificationScope:['reviewed-publication-plan','local-artifact-bytes','published-installer-bytes'],
+    downloads:canonical.artifacts.map(a=>({target:`${{macos:'darwin',windows:'win32',linux:'linux'}[a.platform]}-${a.architecture}`,url:a.downloadUrl,bytes:a.bytes,sha256:a.sha256}))};
   plan.website.manifest=await file('release-site-manifest.json',JSON.stringify(site));plan.website.receipt=await file('web-release-receipt.json',JSON.stringify({sourceCommit:'c'.repeat(40),site:{manifestSha256:plan.website.manifest.sha256}}));
   plan.tap={...await file('tibotattle.rb',(await readFile(plan.tap.path,'utf8')).replace('-macOS-','-mac-')),workflowSha256:plan.tap.workflowSha256};
   return {...f,put};
@@ -411,5 +472,27 @@ test('Electron transition refuses alias substitution, missing incoming XML, unsi
     if(change==='sums')await f.put('SHA256SUMS-ALL-RELEASE-FILES','wrong');
     if(change==='discriminator'){const m=JSON.parse(await readFile(f.plan.targets[0].feedManifest.path));delete m.schemaVersion;f.plan.targets[0].feedManifest=await f.file('feed-manifest-arm64.json',JSON.stringify(m));}
     await assert.rejects(preparePublication(f.plan,f.prepareOptions),/RELEASE_PUBLICATION_/);
+  }
+});
+
+
+test('Electron website binds the actual four-download schema and rejects stale or unverified rows', async t => {
+  for(const change of ['legacy','version','build','unverified','scope','duplicate','missing','extra','windows_hash','linux_url','arm_size','intel_hash']) {
+    const f=await electronFixture(t), site=JSON.parse(await readFile(f.plan.website.manifest.path)), release=site.electronRelease;
+    if(change==='legacy'){delete site.electronRelease;site.installer={version:'1.2.3'};}
+    if(change==='version')release.version='1.2.2';
+    if(change==='build')release.buildNumber='2026091106';
+    if(change==='unverified')release.publishedInstallersVerified=false;
+    if(change==='scope')release.verificationScope.pop();
+    if(change==='duplicate')release.downloads[1]={...release.downloads[0]};
+    if(change==='missing')release.downloads.pop();
+    if(change==='extra')release.downloads[0].unreviewed=true;
+    if(change==='windows_hash')release.downloads.find(r=>r.target==='win32-x64').sha256=sha('wrong');
+    if(change==='linux_url')release.downloads.find(r=>r.target==='linux-x64').url='https://updates.tibotattle.com/wrong';
+    if(change==='arm_size')release.downloads.find(r=>r.target==='darwin-arm64').bytes++;
+    if(change==='intel_hash')release.downloads.find(r=>r.target==='darwin-x64').sha256=sha('wrong');
+    f.plan.website.manifest=await f.file('release-site-manifest.json',JSON.stringify(site));
+    f.plan.website.receipt=await f.file('web-release-receipt.json',JSON.stringify({sourceCommit:'c'.repeat(40),site:{manifestSha256:f.plan.website.manifest.sha256}}));
+    await assert.rejects(preparePublication(f.plan,f.prepareOptions),{code:'RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH'},change);
   }
 });

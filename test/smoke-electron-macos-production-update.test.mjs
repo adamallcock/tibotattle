@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, writeFile, rm, realpath } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { mkdtemp, readFile, writeFile, rm, realpath, mkdir, copyFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as runner from '../scripts/smoke-electron-macos-production-update.mjs';
@@ -74,7 +75,61 @@ test('both workflow bodies parse as JavaScript and preserve fixed targets withou
     assert.match(script, /env\.SELECTED_RUNNER !== env\.GITHUB_SHA/);
     assert.doesNotMatch(script, /\$\{\{/);
   }
-  assert.match(workflow, /runs-on: macos-26-intel/);
+  assert.match(workflow, /acceptance_x64:[\s\S]*?runs-on: macos-15-intel\n/);
+  assert.doesNotMatch(workflow, /runs-on: macos-26-intel/);
   assert.match(workflow, /runs-on: macos-26\n/);
   assert.doesNotMatch(workflow, /contents: write|secrets\.|pull_request_target/);
+});
+
+test('failure classification emits fixed content-free fields and preserves command versus file failures', () => {
+  assert.deepEqual(runner.classifyProductionUpdateFailure({code:'ENOENT',message:'/private/path',stderr:'secret'}),
+    {code:'ENOENT',exitCode:null,signal:null,kind:'system_error'});
+  assert.deepEqual(runner.classifyProductionUpdateFailure({status:1,cmd:'private command'}),
+    {code:null,exitCode:1,signal:null,kind:'command_exit'});
+  assert.deepEqual(runner.classifyProductionUpdateFailure({signal:'SIGKILL'}),
+    {code:null,exitCode:null,signal:'SIGKILL',kind:'command_signal'});
+  assert.deepEqual(runner.classifyProductionUpdateFailure({code:'/secret',status:'1',signal:'private'}),
+    {code:null,exitCode:null,signal:null,kind:'unclassified'});
+});
+
+test('updater successor excludes an orphaned old companion but keeps new main and descendant semantics', () => {
+  const executable = '/qualified/TiboTattle.app/Contents/MacOS/TiboTattle';
+  const row = (pid, parent, command = executable) => ({pid, parent, group:pid, command});
+  const old = new Set([100, 101]);
+  assert.equal(runner.selectProductionUpdateSuccessor([row(100,1), row(101,100)], executable, 100, old), null);
+  // This was incorrectly accepted as a new main solely because PID101 != PID100.
+  assert.equal(runner.selectProductionUpdateSuccessor([row(101,1)], executable, 100, old), null);
+  const successor = runner.selectProductionUpdateSuccessor([row(101,1),row(200,1),row(201,200)], executable,100,old);
+  assert.equal(successor.pid,200);
+  // No successor is admitted while the old main remains alive.
+  assert.equal(runner.selectProductionUpdateSuccessor([row(100,1),row(200,1)],executable,100,old),null);
+  // Unknown independent roots remain ambiguous; they are not ignored for a green result.
+  assert.throws(() => runner.selectProductionUpdateSuccessor([row(101,1),row(200,1),row(300,1)],executable,100,old));
+  assert.throws(() => runner.selectProductionUpdateSuccessor([row(200,1)],executable,100,new Set()));
+});
+
+test('replacement verification refreshes the real ASAR path cache after an updater swaps bytes', async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-asar-replacement-')));
+  const app = join(directory, 'TiboTattle.app'), resource = join(app, 'Contents', 'Resources');
+  const archive = join(resource, 'app.asar');
+  const req = createRequire(import.meta.url), loaded = createRequire(req.resolve('electron-builder'))('@electron/asar');
+  const api = loaded.default ?? loaded;
+  try {
+    await mkdir(resource, { recursive: true });
+    for (const [version, padding] of [['0.1.20', 'old'], ['0.1.21', 'new'.repeat(200)]]) {
+      const source = join(directory, version); await mkdir(source);
+      await writeFile(join(source, 'a.txt'), padding);
+      await writeFile(join(source, 'package.json'), JSON.stringify({name:'app-usagemonitor',version}));
+      await api.createPackage(source, join(directory, version + '.asar'));
+    }
+    await copyFile(join(directory, '0.1.20.asar'), archive);
+    assert.equal(JSON.parse(api.extractFile(archive,'package.json').toString()).version, '0.1.20');
+    await copyFile(join(directory, '0.1.21.asar'), archive);
+    // Cached offsets refer to the predecessor, although the entire file was replaced.
+    assert.throws(() => JSON.parse(api.extractFile(archive,'package.json').toString()));
+    const signedBytesBefore = hash(await readFile(archive));
+    runner.refreshProductionUpdateArchiveIndex(app);
+    assert.equal(JSON.parse(api.extractFile(archive,'package.json').toString()).version, '0.1.21');
+    assert.equal(hash(await readFile(archive)), signedBytesBefore);
+  } finally { api.uncache(archive); await rm(directory, { recursive:true, force:true }); }
 });

@@ -15,7 +15,7 @@ an informal archive.
 
 | Area | Authority | Boundary |
 |---|---|---|
-| 0.1.19 patches | [Model attribution and labels](./plans/2026-09-06-v0.1.19-model-attribution-and-labels.md) | Prepared model-inheritance and display patches; private history conservation verified, release pending |
+| 0.1.19 patches | [Model attribution and labels](./plans/2026-09-06-v0.1.19-model-attribution-and-labels.md) | Retained model-inheritance and display patch plan; current release state is in the status matrix |
 | Status | [Current product and release status](./current-status.md) | Commit- and date-stamped source, live-service, published-release, updater, and support snapshot; reverify before relying on it later |
 | User help | [User guide](./user-guide.md) | Installation, first run, uncertainty, refresh/recovery, optional contribution, data, updates, and support |
 | Architecture | [System architecture](./reference/system-architecture.md) | Current components, trust boundaries, stores, identities, and data flow |
@@ -30,7 +30,7 @@ an informal archive.
 | Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current schema family, physical/parser versions, tables, generation, and migration rules; includes the accepted schema-11 cleanup indexes |
 | Local recovery | [Unified index preservation and recovery](./runbooks/unified-index-recovery.md) | Preservation-first diagnosis and candidate rebuild; never relabel or destroy the only index |
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
-| Platform support | [Platform support and qualification](./reference/platform-support.md) | Published native macOS 14+ Apple silicon and Intel support, plus the evidence ladder Windows, Linux and Electron must satisfy before any claim |
+| Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.21 on macOS Apple silicon/Intel, Windows x64 and Linux x86_64; exact proof and retained owner-acceptance limits |
 | Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, private owner erasure, containment, rollback, and recovery boundaries |
 | Community diagnostics | [Community allowance-band diagnosis](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Current fit-cache and aggregate diagnosis; production writes remain owner-run |
 | Retired hosted APIs | [Hosted API retirement data gates](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks required before any future deletion of data retained after source-route retirement |
@@ -46,7 +46,7 @@ an informal archive.
 | macOS distribution | [Homebrew distribution and macOS support](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party tap, uninstall boundary, and supported macOS floor |
 | Public-site preview | [Public site local preview](./runbooks/2026-08-17-public-site-local-preview.md) | Maintained local rendering/inspection path; not deployment proof |
 | Web-only release | [Web-only release](./runbooks/2026-08-17-web-only-release.md) | Maintained website publication lane and its release boundaries |
-| Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environments only; Windows remains unsupported |
+| Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environment restoration only; released Windows status and acceptance limits are in the support matrix |
 | R7 evidence | [R7 release-evidence receipt maintenance](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | Staleness rule and protected dual-runtime regeneration; not a routine documentation check |
 
 ## Lifecycle evidence

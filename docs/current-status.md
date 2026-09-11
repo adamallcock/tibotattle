@@ -1,150 +1,151 @@
 ---
 title: Current product and release status
-date: 2026-09-09
+date: 2026-09-11
 type: status
 status: current
-source_commit: bdfce5a32da113b48a4c05f60a2363111e304961
-observation_date: 2026-09-09
+source_commit: a651ea130dd1460e4443a037c4434f57b911fec4
+observation_date: 2026-09-11
 ---
 
 # Current product and release status
 
-This is the maintained starting point for “what is current?” Source, installed
-applications, public downloads, update feeds and hosted service behavior are
-independent observations. Re-check their own source of truth for a later
-operational decision.
+Electron 0.1.21 is released for macOS Apple silicon, macOS Intel, Windows x64
+and Linux x86_64. GitHub, Homebrew, the website, both native Sparkle feeds and
+all four Electron feeds are verified. Native 0.1.18 can update through its
+normal Check for Updates control; manual backup-folder choreography is no
+longer the update path.
 
-## Source boundary and reconciliation status
+This is the maintained status snapshot. Source, signed artifacts, deployed
+service, actual installed updates and owner acceptance remain separate claims.
+Recheck the relevant live surface before a later operational decision. The
+[release closure plan](./plans/2026-09-11-electron-upgrade-release-closure.md)
+retains recovery details and failed-run provenance.
 
-`bdfce5a3` is the local Electron integration boundary for this status update.
-It is a source boundary only: it does not identify a published native artifact,
-deployed Worker, update feed, or hosted observation.
+## Published release and delivery
 
-The incoming hosted and release-tooling work from PR #114 is being reconciled
-with this Electron line. The reconciliation preserves the deployed canonical
-migration lineage through `0056`; accountless migrations `0057`–`0059` are
-source-only and are not deployed. The earlier synthetic staging-only
-accountless `0046`–`0048` lineage remains retained evidence and requires a
-separately approved replacement target. It must not be replayed, renamed in a
-remote ledger, or treated as current.
+[TiboTattle 0.1.21](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.21)
+is public and immutable. Application source is
+`a651ea130dd1460e4443a037c4434f57b911fec4`, provenance build `2026091107`,
+Mac bundle version `1028`. Annotated tag object
+`bdeb3770c065e2c4c2901a8ddae909a1c15550b5` points to that source. Later
+release-tooling and website commits do not alter these application bytes.
 
-Accountless contribution remains excluded from public aggregate publication and
-ordinary scheduler paths. No source merge authorizes remote migrations,
-enrollment, contribution, deployment, or public release.
+| Boundary | Verified observation on 2026-09-11 |
+| --- | --- |
+| GitHub | All 20 public assets freshly downloaded and checked against frozen hashes and immutable release/asset attestations |
+| macOS trust | Both apps and final DMGs Developer ID signed, notarized and stapled; exact architecture and Gatekeeper checks passed |
+| Native update feeds | Apple silicon and Intel each advertise 0.1.21 / 1028 with their own verified signed enclosure |
+| Electron update feeds | All four stable feeds and their exact artifacts passed fresh public readback after activation |
+| Homebrew | [PR4](https://github.com/adamallcock/homebrew-tap/pull/4) merged after both native architecture audit/install/uninstall jobs passed; main cask and workflow bytes verified |
+| Website | [tibotattle.com](https://tibotattle.com/) serves source `9accd6f08a8bc519868f24a970b619e5e0e2a5f0`; all 24 public files match the prepared bytes |
+| Website interactions | All four immutable GitHub download links, actual checksum copies, three languages, desktop/mobile, community rendering and social metadata checked |
+| Operational closure | Original publication coordinator completed with every surface matching, no further publications attempted and its owner released; website and Electron feed journals are also verified and released |
 
-Published-native facts below are carried forward from the 2026-09-05 release
-record. This reconciliation did not rerun native source-to-artifact, signing,
-notarization, Gatekeeper, installed-runtime, update-feed, public-site, or live
-hosted checks.
+Manual website downloads use GitHub release URLs. Updater URLs remain on the
+update origin because they serve each application's automatic update mechanism.
+Only the Mac artifacts claim Apple signing and notarization; Windows uses its
+own signing and Linux its declared integrity/distribution evidence.
 
-## Published native release
+The manifest leaves optional SBOM and source-to-binary provenance fields null.
+GitHub immutable-release attestations do not substitute for SLSA build
+provenance. See [release verification](./verify-release.md) for independent
+checks. Published 0.1.18 and 0.1.20 artifacts and tags remain unchanged.
 
-[TiboTattle 0.1.18](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18)
-is public and immutable. Both macOS 14+ installers are stable build `1026`,
-bound to annotated tag `v0.1.18` at exact source
-`55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
-[PR #104](https://github.com/adamallcock/tibotattle/pull/104) merged that source
-normally; the release tag and public artifacts must not be rewritten.
+## Actual installed Mac update evidence
 
-| Distribution boundary | Verified on 2026-09-05 release record |
-|---|---|
-| GitHub release | All seven public assets independently re-downloaded and matched to the canonical manifest and checksums; immutable release and asset attestations verified |
-| Apple silicon installer | 49,908,061 bytes; SHA-256 `2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae` |
-| Intel installer | 52,128,441 bytes; SHA-256 `70630ba90e92a1cd8cb904e66e1aebe85b04e9d23a50bef7e4e41aca84c4d2f6` |
-| Native trust | Both final artifacts pass their own Developer ID signing, Apple notarization/stapling, Gatekeeper, source/payload and architecture checks |
-| Update feeds | [Apple silicon](https://updates.tibotattle.com/appcast.xml) and [Intel](https://updates.tibotattle.com/intel/appcast.xml) both publish 0.1.18 / 1026; independent signed-XML and streamed enclosure checksum checks passed at 19:38 UTC |
-| Homebrew | Apple silicon cask updated to 0.1.18 with the exact ARM checksum; [update workflow](https://github.com/adamallcock/homebrew-tap/actions/runs/33973076582) succeeded and the live cask was checked |
-| Website | [Both macOS tabs](https://tibotattle.com/#download) show 0.1.18 and their own correct public installer URL, minimum OS and architecture |
-| Installed ARM application | Final stable 1026 passes installed-artifact validation, ordinary launch, detailed replay-safe accounting refresh and restart, with matching generation and zero fallback |
+| Normal production update | Apple silicon | Intel |
+| --- | --- | --- |
+| Native 0.1.18 to Electron 0.1.21 | [34568465222](https://github.com/adamallcock/tibotattle/actions/runs/34568465222) passed | [34569099253](https://github.com/adamallcock/tibotattle/actions/runs/34569099253) passed |
+| Electron 0.1.20 to 0.1.21 | [34568883471](https://github.com/adamallcock/tibotattle/actions/runs/34568883471) passed | [34568884736](https://github.com/adamallcock/tibotattle/actions/runs/34568884736) passed |
 
-Homebrew update verified on **2026-09-07**: the
-[dual-architecture cask](https://github.com/adamallcock/homebrew-tap/pull/2)
-adds Intel with its independent published checksum. Both native Mac
-[audit/install/uninstall lanes](https://github.com/adamallcock/homebrew-tap/actions/runs/34141158444)
-passed. This supersedes the Apple-silicon-only Homebrew row in the dated
-2026-09-05 release snapshot above; it does not change the desktop artifacts or
-claim completion of the waived manual tests.
+Each unchanged signed predecessor used its bundled production feed. The updater
+installed and relaunched the exact successor; the runner did not copy it or
+override the feed. Retained rows, identity salt, settings, opt-out, duplicate-free
+restart and owned-process cleanup passed. These disposable fixtures contained
+no existing contribution credential, so they do not claim credential migration.
 
-The manifest honestly leaves optional SBOM, source-to-binary provenance and
-store fields unset. GitHub's immutable release/asset attestations are not
-substitutes for SLSA build provenance. Follow
-[verify-release.md](./verify-release.md) for independent artifact verification.
-The private [RC3 signed-candidate](./receipts/2026-09-04-macos-combined-rc3-signed-candidates.md)
-and [ARM installed-runtime](./receipts/2026-09-05-macos-rc3-installed-runtime.md)
-receipts retain their own point-in-time scope; neither is relabeled as the
-published stable artifact.
+Separate signed empty-profile installs passed on both Macs before publication,
+including automatic-sharing defaults, Settings interaction and persistent
+opt-out. These are not additional live upload rehearsals.
 
-## Dated hosted evidence
+## Hosted migration and automatic contribution evidence
 
-The [thousand-contributor publication receipt](./receipts/2026-09-08-thousand-contributor-publication.md)
-records a guarded deployment and rendered public/admin checks on 2026-09-08,
-including the canonical `0054`–`0056` migration boundary. It is retained
-point-in-time evidence, not a new observation made by this reconciliation.
+The approved production migration and activation completed on **2026-09-10**.
+Retained final-contract evidence verifies the canonical `0057`–`0059` transition
+and restoration of the retained records. One timed-out batch was
+independently reconciled as committed and counted once. Final cleanup reports
+zero owned temporary objects, no in-flight step and the coordination lock
+released. The earlier failed/restored-prefix attempt remains retained history;
+it is not the final outcome and must not be replayed.
 
-The [incremental refresh publication receipt](./receipts/2026-09-08-incremental-refresh-publication.md)
-records the earlier 2026-09-08 deployment and its `0050`–`0053` migration
-boundary. The retained receipts describe that point in time; cache state,
-backfill progress, and rendered behavior require a new live check.
+The v1.1 staged-to-accepted transition passed exact readback. Accountless
+enrollment and ownership activation were deployed at source
+`f496494ca317f60d92c73aa7d16b786fdb702cda`, with that deployment verified and
+released. The later website source above preserves the enabled production
+settings; staging remains disabled. The application qualification checkout is
+not itself evidence of the deployed Worker configuration. Do not redeploy a
+stale configuration over the activated production settings.
 
-## Retained hosted recovery boundary
+The signed **0.1.19 Apple silicon** production canary completed on
+2026-09-10 in [run 34523883586](https://github.com/adamallcock/tibotattle/actions/runs/34523883586).
+It verified automatic encrypted upload, installation-credential reuse across
+controlled restart, persistent opt-out and usage/quota linkage. The scoped
+server proof contained two usage and two quota records, with no bad links or
+duplicate groups. Owner erasure removed all scoped records and authority;
+revocation, deletion tombstone and separate object cleanup were verified.
 
-The published 2026-09-05 release record states that approved forward migrations
-`0042`–`0045` are applied. Exact migration prefix 45, complete schema and the
-preservation reconciliation were verified without deleting telemetry, restoring
-production, changing consent or activating v1.1 transport. Applied migration
-files must not be rewritten.
+| Retained private receipt | SHA-256 |
+| --- | --- |
+| Final migration phase state | `5cccf9652d773480e7b77cf4090c3d5b7783f5fc86cb1202c2f012d9d4e8b6a4` |
+| Restoration audit | `a1d1dfd7986488c71b9a3e988e00cf5510aa034692d3211223ffc87aac79fb81` |
+| Final migration/schema/control contract | `822f54aec2905b58ae48e1bf77a9fb52a1842efe809fd1a7b9deddd934cdd3cd` |
+| v1.1 acceptance readback | `869d5c2f7f30dab2197461f22b3d2f0f0b65a7f593de78a421424e5c1bdb2a6b` |
+| Signed 0.1.19 canary completion and erasure | `e0ec0e6fad72e3e2123c4048bb28ffe4486f4696246734649974cd47bfb681dd` |
 
-[PR #105](https://github.com/adamallcock/tibotattle/pull/105) repaired the
-authenticated admin module dependency and atomic weekly revision replacement.
-Its merged source `26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad` is the
-then-schema-compatible code rollback target, with both 0.1.18 website downloads.
-It is not a rollback target for the subsequently upgraded prepared-work protocol;
-current recovery requires the compatibility checks in the operations runbook.
-Public downloads and the optional hosted analyzer have separate gates.
+Those receipt hashes and their linked evidence were rechecked on 2026-09-11.
+No migration or live upload was repeated for this status update. The canary is
+one synthetic installation with unchanged-input restart; it does not prove
+packet-loss retries, global duplicate suppression, every operating system or a
+new 0.1.21 upload. Accountless contributions remain excluded from public
+community figures. Public-sample activation is a separate decision.
 
-Earlier recovery records, including [PR #106](https://github.com/adamallcock/tibotattle/pull/106),
-remain dated evidence. They do not substitute for current public cache,
-rendered-view, or scheduler verification.
+Fresh Electron installations share automatically under the
+[accepted policy](./decisions/2026-09-04-accountless-sharing-policy.md).
+Existing undecided users receive three notices; an explicit decision cancels
+remaining notices. Opt-out persists and no social sign-in is required.
 
-Detailed recovery history remains in its dated receipts and decisions. It is
-not current hosted evidence and does not authorize accountless activation,
-remote migration, or a desktop release.
+## Platform support and acceptance limits
 
-## Platform support and qualification limits
+- **macOS 14+ Apple silicon and Intel:** released signed/notarized artifacts;
+  exact production updater journeys above passed independently. Physical Intel
+  acceptance remains owner supplied, separate from hosted Intel execution.
+- **Windows x64:** signed, timestamped NSIS installer and feed released.
+  [34561980268](https://github.com/adamallcock/tibotattle/actions/runs/34561980268)
+  passed installed processing, restart and uninstall for the 0.1.21 candidate.
+  Update replacement and notification appearance remain owner acceptance;
+  this latest journey did not retest credential persistence.
+- **Linux x86_64:** AppImage and feed released.
+  [34561981708](https://github.com/adamallcock/tibotattle/actions/runs/34561981708)
+  passed 0.1.21 packaging. Earlier packaged startup, credential and restart
+  evidence retains its original scope. Physical desktop/update acceptance is
+  owner supplied, not a new executed qualification result.
 
-- **Supported:** macOS 14+ Apple silicon and Intel through the published 0.1.18
-  artifacts and their independent update feeds.
-- **Not released or supported:** Windows, Linux or Electron.
-- The live first-party Homebrew cask was rechecked on 2026-09-08: version 0.1.18
-  selects Apple silicon or Intel with each release's exact checksum. Both use
-  `brew install --cask adamallcock/tap/tibotattle`.
-  Both DMGs also remain available through the website and GitHub release.
+The owner's current acceptance is separate from the historical
+[0.1.18-only waiver](./decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
+Neither converts missing tests into passes. Data preservation, exact artifact
+identity and native trust remain required. The
+[platform support authority](./reference/platform-support.md) defines the
+continuing evidence requirements.
 
-The owner explicitly accepted the unavailable disposable-profile/manual Login
-Item matrix and formal physical Intel install/runtime/update/upload evidence
-**for 0.1.18 only**. These observations are waived, not passed. User-reported
-tester success is not a retained hardware-bound qualification receipt.
-See the [release-specific decision](./decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
-and [platform support authority](./reference/platform-support.md).
-
-Data preservation, exact source/artifact binding, native trust, updater
-integrity and unexpected automatic Keychain prompts were not waived.
-Fresh R7 evidence and both pinned-runtime checks were retained; the existing
-open resource decisions are not relabeled as `release_ready`. The supported
-paginated-history reset subset is documented in the
-[qualification review](./reviews/2026-09-04-paginated-export-qualification.md);
-physical-base continuations remain refused.
-
-The Electron development CI and unsigned development packages at the source
-review base do not expand any native platform-support claim. Accountless sharing
-remains source-only and is not activated in a released Electron or hosted
-surface.
+The live website retains previously reported narrow-screen header clipping and
+an optional provider beacon blocked by the existing content security policy.
+Download controls and the stated release journeys passed; those small website
+follow-ups did not change signed artifacts or justify relaxing the policy.
 
 ## Maintaining this snapshot
 
-Update each boundary from exact source, artifact checks, read-only public
-responses, signed feed bytes and actual rendered behavior. Preserve any
-disagreement instead of inferring publication from a build, service recovery
-from health, or physical qualification from a simulated lane. The
-[documentation index](./README.md) names the maintained authorities; dated
-plans and receipts retain only the scope they state.
+Use exact source, signed artifacts, retained receipts, fresh public readback and
+rendered observations for later updates. Current health alone does not establish
+migration preservation, contribution scheduling or physical desktop behavior.
+The [documentation index](./README.md) identifies operational authorities;
+historical receipts retain the claims and dates they originally recorded.

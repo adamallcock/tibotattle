@@ -29,13 +29,13 @@ previous stable version.
 
 ## Separate Apple silicon and Intel candidates
 
-The 0.1.18 working candidate adds a separate Intel lane; it is not a public
-support declaration. The published 0.1.17 release is immutable and remains
-unchanged. Follow the [Intel qualification plan](../plans/2026-09-03-macos-intel-release.md)
-before publishing Intel, with the owner's explicit
-[0.1.18-only manual qualification waiver](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
-That release decision accepts missing physical evidence; it does not establish
-that the waived tests passed. Both installers must come from the same
+Native 0.1.18 introduced the separately published Intel lane. Its
+[Intel qualification plan](../plans/2026-09-03-macos-intel-release.md) and owner's
+[0.1.18-only manual qualification waiver](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+are historical evidence for that version. The waiver does not establish that
+the waived tests passed or carry forward to 0.1.21. See the
+[current release status](../current-status.md) for the Electron release and
+production update results. Both current installers must come from the same
 frozen annotated tag and source commit and enter the draft release before it
 is made immutable. Never append a later source build under an older tag.
 
@@ -50,8 +50,8 @@ uses `/internal-dogfood/intel/appcast.xml` and `internal-dogfood/intel/releases`
 Intel Preview uses `/preview/intel/appcast.xml`. Native runtime checks the
 compiled architecture's exact feed path. The publishing guard authenticates
 requests before selecting its allowlisted architecture target; compare-and-swap
-operates on that target's appcast key. Deploy the updated guard through the
-normal protected deployment gate before attempting Intel publication.
+operates on that target's appcast key. Both architecture routes are deployed;
+any future guard change still uses the normal protected deployment gate.
 
 Build on macOS ARM with Node 26.2.0. Supply `--architecture x64` and
 `--node-runtime <verified-node-v26.2.0-darwin-x64>/bin/node` to the builder and
