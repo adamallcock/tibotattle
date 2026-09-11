@@ -100,7 +100,7 @@ test('bounded periods preserve the complete requested domain and empty all-time 
 // A small DOM harness models the important browser behavior here: replacing a
 // focused descendant drops focus, so rendering must focus its new equivalent.
 function focusHarness() {
-  let inactive = true;
+  let inactive = true, visibilityObserver = null;
   const documentRef = { activeElement: null, hidden: false,
     addEventListener() {}, removeEventListener() {} };
   class Node {
@@ -130,9 +130,10 @@ function focusHarness() {
   const root = new Node('section');
   const windowRef = { localStorage: { getItem: () => null, setItem() {} },
     setTimeout: () => 1, clearTimeout() {},
-    MutationObserver: class { observe() {} disconnect() {} },
+    MutationObserver: class { constructor(callback) { visibilityObserver = callback; } observe() {} disconnect() {} },
   };
   return { root, documentRef, windowRef, show: () => { inactive = false; },
+    navigate: (shown) => { inactive = !shown; visibilityObserver?.(); },
     find: key => root.all().find(node => node.dataset.performanceFocus === key) };
 }
 
@@ -218,5 +219,56 @@ test('plot-area sweep works away from points, clears on exit, and keyboard order
   assert.ok(readouts().every(node => node.textContent.includes('Jan 4')));
   targets[1].listeners.keydown({ key: 'Escape' });
   assert.ok(readouts().every(node => node.textContent === ''));
+  controller.destroy();
+});
+
+
+test('revisits and background loading retain the ready period while replacements and invalidation stay authoritative', async () => {
+  const dom = focusHarness();
+  let response = payload();
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => response },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  const panel = () => dom.root.all().find(node => node.id === 'performance-model-panel');
+  assert.ok(panel());
+  const pending = Promise.withResolvers(); response = pending.promise;
+  dom.navigate(false); dom.navigate(true);
+  assert.ok(panel(), 'navigation does not blank the last valid chart');
+  pending.resolve({ ...payload(), status: 'loading', models: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(panel(), 'background loading is not a replacement measurement');
+  response = { ...payload(), status: 'ready', models: [] };
+  await controller.refresh();
+  assert.equal(panel(), undefined, 'an authoritative empty measurement replaces old values');
+  response = payload(); await controller.refresh();
+  response = { ...payload(), status: 'unavailable', models: [] };
+  await controller.refresh();
+  assert.equal(panel(), undefined);
+  response = { ...payload(), status: 'loading', models: [] };
+  await controller.refresh();
+  assert.equal(panel(), undefined, 'unavailable invalidates cached measurements');
+  controller.destroy();
+});
+
+test('period revisits reuse only their own ready data and late responses cannot replace a new period', async () => {
+  const dom = focusHarness();
+  let pending = null;
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async period => pending ?? { ...payload(), period } },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  const panel = () => dom.root.all().find(node => node.id === 'performance-model-panel');
+  const first = Promise.withResolvers(); pending = first.promise;
+  dom.find('period-7').listeners.click();
+  assert.equal(panel(), undefined, 'a new period cannot borrow all-time values');
+  pending = { ...payload(), period: 'all', status: 'loading', models: [] };
+  dom.find('period-all').listeners.click();
+  assert.ok(panel(), 'returning period renders cached values before the request settles');
+  await new Promise(resolve => setImmediate(resolve));
+  first.resolve({ ...payload(), period: '7', models: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(panel(), 'late previous-period response is fenced');
+  pending = Promise.reject(new Error('temporary connection failure'));
+  await controller.refresh();
+  assert.ok(panel(), 'transient errors leave the current period visible');
   controller.destroy();
 });

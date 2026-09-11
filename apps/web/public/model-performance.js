@@ -139,6 +139,9 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
   let period = PERIODS.includes(saved.period) ? saved.period : "all";
   let modelId = Object.hasOwn(MODEL_NAMES, saved.model) ? saved.model : null;
   let payload = null, loading = false, failed = false, request = 0, abort = null, timer = null;
+  // At most the three fixed periods, retained only for this mounted local view.
+  // No measurements or identity-bearing data enter browser storage.
+  const readyPeriods = new Map();
   let tableOpen = false, aboutOpen = false, chartCursors = [];
   let selectedInterval = null;
   const showInterval = (at) => { if (at === selectedInterval) return; selectedInterval = at; for (const update of chartCursors) update(at); };
@@ -294,7 +297,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     for (const value of PERIODS) {
       const button = element("button", value === period ? "active" : "", translate(value === "all" ? "all" : `days${value}`));
       button.type = "button"; button.setAttribute("aria-pressed", String(period === value)); button.dataset.performanceFocus = `period-${value}`;
-      button.addEventListener("click", () => { if (period === value) return; period = value; payload = null; remember(); refresh(); }); periods.append(button);
+      button.addEventListener("click", () => { if (period === value) return; period = value; payload = readyPeriods.get(value) ?? null; remember(); render(); refresh(); }); periods.append(button);
     }
     heading.append(title, periods); root.append(heading);
     const status = element("p", "performance-status"); status.setAttribute("role", "status");
@@ -377,8 +380,12 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       const result = normalizeModelPerformance(await client.modelPerformance(period, { signal: abort.signal }));
       if (request !== current) return;
       if (!result || result.period !== period) throw new Error("Invalid timing contract");
-      changed = JSON.stringify({ ...result, updatedAt: null }) !== JSON.stringify(payload ? { ...payload, updatedAt: null } : null);
-      payload = result;
+      if (result.status === "unavailable") readyPeriods.clear();
+      else if (result.status === "ready") readyPeriods.set(period, result);
+      const retained = result.status === "loading" ? readyPeriods.get(period) : null;
+      const next = retained ? { ...retained, collecting: true, stale: true } : result;
+      changed = JSON.stringify({ ...next, updatedAt: null }) !== JSON.stringify(payload ? { ...payload, updatedAt: null } : null);
+      payload = next;
     } catch { if (request !== current) return; failed = true; }
     finally {
       windowRef.clearTimeout(deadline);
@@ -396,5 +403,5 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
   observer.observe(root, { attributes: true, attributeFilter: ["class"] });
   documentRef.addEventListener("visibilitychange", visibilityChanged);
   render(); if (visible()) refresh();
-  return { render, refresh, destroy() { observer.disconnect(); abort?.abort(); request++; windowRef.clearTimeout(timer); documentRef.removeEventListener("visibilitychange", visibilityChanged); } };
+  return { render, refresh, destroy() { readyPeriods.clear(); payload = null; observer.disconnect(); abort?.abort(); request++; windowRef.clearTimeout(timer); documentRef.removeEventListener("visibilitychange", visibilityChanged); } };
 }

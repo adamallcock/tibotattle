@@ -170,6 +170,10 @@ export function mountWorkUsageView({
     pageSize: 25,
   };
   let response = null;
+  let responseQueryKey = null;
+  const queryKey = () => JSON.stringify(Object.entries(query)
+    .filter(([key]) => !["snapshotId", "sourceSnapshotId"].includes(key))
+    .sort(([left], [right]) => left.localeCompare(right)));
   let serial = 0;
   let controller = null;
   let timer = null;
@@ -429,7 +433,9 @@ export function mountWorkUsageView({
     delete query.snapshotId;
     cancel.hidden = true;
     root.removeAttribute("aria-busy");
-    body.inert = false;
+    // Retained values stay readable, but their cancelled/expired report must
+    // not regain active drill-down controls until a fresh query succeeds.
+    body.inert = response !== null;
     setStatus("cancelled");
   });
   cancel.hidden = true;
@@ -1058,7 +1064,11 @@ export function mountWorkUsageView({
     controller = new AbortController();
     setStatus("preparing");
     body.inert = true;
-    body.hidden = true;
+    // Keep the exact query's previous report visible during revalidation, but
+    // disable old snapshot controls until the replacement is authoritative.
+    // Scope, filters, grouping, period and page are all part of this key.
+    body.hidden = !response || responseQueryKey !== queryKey()
+      || Boolean(query.sourceSnapshotId && query.sourceSnapshotId !== response.snapshotId);
     cancel.hidden = false;
     root.setAttribute("aria-busy", "true");
     for (const b of views.children)
@@ -1082,6 +1092,7 @@ export function mountWorkUsageView({
         body: JSON.stringify(query),
         signal: controller.signal,
       });
+      if (token !== serial) return;
       if (!http.ok && http.status === 409 && recoverExpired) {
         const error = await http.json();
         if (token !== serial) return;
@@ -1092,8 +1103,14 @@ export function mountWorkUsageView({
           return load(false);
         }
       }
-      if (!http.ok)
+      if (!http.ok) {
+        if (http.status === 409 || http.status === 401 || http.status === 403) {
+          response = null;
+          responseQueryKey = null;
+          body.hidden = true;
+        }
         throw new Error(http.status === 409 ? "expired" : "unavailable");
+      }
       const result = validateWorkUsageResponse(await http.json());
       if (token !== serial) return;
       query.snapshotId = result.snapshotId;
@@ -1103,10 +1120,14 @@ export function mountWorkUsageView({
         return;
       }
       if (result.status !== "available") {
+        response = null;
+        responseQueryKey = null;
+        body.hidden = true;
         setStatus(result.status === "missing" ? "missing" : "unavailable");
         return;
       }
       response = result;
+      responseQueryKey = queryKey();
       setStatus("snapshot", {
         date: formatLocal(new Date(result.toMs).toISOString()),
       });

@@ -1405,3 +1405,95 @@ test("live search fences old responses during debounce and waits for composed te
     assert.equal(requests.at(-1).query.search, "项目");
   } finally { view.destroy(); }
 });
+
+
+test("returning to an expired report keeps the exact query visible during bounded rebuild", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const pending = deferred();
+  let queries = 0;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      if (JSON.parse(init.body).action === "touch") return {
+        ok: false, status: 409, json: async () => ({ error: { code: "work_usage_snapshot_expired" } }),
+      };
+      return ++queries === 1 ? httpResponse(PROJECT_ROWS_RESPONSE) : pending.promise;
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = root.children.at(-1);
+  const table = findMounted(body, node => node.tagName === "TABLE")[0];
+  root.inert = true; harness.changed();
+  root.inert = false; harness.changed();
+  await settleMountedView();
+  assert.equal(queries, 2);
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true, "old snapshot drilldowns cannot be used during rebuild");
+  assert.strictEqual(findMounted(body, node => node.tagName === "TABLE")[0], table);
+  pending.resolve(httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: "replacement-report" }));
+  await settleMountedView();
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, false);
+});
+
+test("refresh failures retain exact-query values while changed filters and authoritative invalidation hide them", async (t) => {
+  const { root, windowRef } = mountedRoot();
+  let reply = httpResponse(PROJECT_ROWS_RESPONSE);
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async () => { if (reply instanceof Error) throw reply; return reply; },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const body = root.children.at(-1);
+  reply = new Error("temporary failure"); view.refresh();
+  await settleMountedView();
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.match(body.textContent, /Project A/);
+  const pending = deferred(); reply = pending.promise;
+  findMounted(root, node => node.dataset?.grouping === "thread")[0].click();
+  assert.equal(body.hidden, true, "thread grouping cannot display project rows as current results");
+  pending.resolve(httpResponse(PROJECT_ROWS_RESPONSE));
+  await settleMountedView();
+  reply = { ok: false, status: 409, json: async () => ({ error: { code: "work_usage_snapshot_changed" } }) };
+  view.refresh(); await settleMountedView();
+  assert.equal(body.hidden, true);
+  reply = new Error("still unavailable"); view.refresh(); await settleMountedView();
+  assert.equal(body.hidden, true, "invalidated source data cannot be resurrected on retry");
+});
+
+test("late invalidation from an older request cannot hide a newer query result", async (t) => {
+  const { root, windowRef } = mountedRoot();
+  const old = deferred(); let count = 0;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async () => ++count === 2 ? old.promise : httpResponse(PROJECT_ROWS_RESPONSE),
+  });
+  t.after(() => view.destroy());
+  await settleMountedView(); view.refresh(); view.refresh(); await settleMountedView();
+  old.resolve({ ok: false, status: 403, json: async () => ({}) });
+  await settleMountedView();
+  assert.equal(root.children.at(-1).hidden, false);
+  assert.equal(root.children.at(-1).inert, false);
+});
+
+
+test("cancelling revalidation preserves read-only values and fences its late response", async (t) => {
+  const { root, windowRef } = mountedRoot();
+  const pending = deferred(); let calls = 0;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async () => ++calls === 1 ? httpResponse(PROJECT_ROWS_RESPONSE) : pending.promise,
+  });
+  t.after(() => view.destroy());
+  await settleMountedView(); view.refresh();
+  const body = root.children.at(-1);
+  findMounted(root, node => node.tagName === "BUTTON" && node.textContent === "Cancel")[0].click();
+  await settleMountedView();
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  const previous = body.textContent;
+  pending.resolve(httpResponse({ ...PROJECT_ROWS_RESPONSE, rows: [], rowCount: 0 }));
+  await settleMountedView();
+  assert.equal(body.textContent, previous);
+  assert.match(root.textContent, /cancelled/i);
+});
