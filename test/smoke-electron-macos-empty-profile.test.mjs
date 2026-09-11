@@ -52,6 +52,8 @@ test('settings interaction executes existing tab handler and verifies its effect
 test('manual workflow has static architecture hosts and no native fixtures or publication', async () => {
   const workflow = await readFile(new URL('../.github/workflows/electron-macos-empty-profile.yml', import.meta.url), 'utf8');
   assert.match(workflow, /workflow_dispatch:/u);
+  assert.match(workflow, /registration:\n    if: github\.event_name == 'push'/u);
+  assert.equal((workflow.match(/if: github\.event_name == 'workflow_dispatch' && inputs\.target/g) ?? []).length, 2);
   assert.match(workflow, /runs-on: macos-26\n/u);
   assert.match(workflow, /runs-on: macos-15-intel\n/u);
   assert.doesNotMatch(workflow, /pull_request_target|contents: write|id-token: write|runs-on: \$\{\{|macos-26-intel/u);

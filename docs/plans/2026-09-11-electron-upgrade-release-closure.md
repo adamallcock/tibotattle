@@ -69,6 +69,27 @@ diagnostic reached Check but lost all accessibility windows afterwards.
 Bounded direct Accessibility and window-count diagnostics now distinguish API
 failure from an empty UI. Neither failed run is a release qualification.
 
+Apple Silicon run 34563532865 subsequently passed the complete actual native
+update, migration, repeated restart, preservation and owned-process cleanup.
+Its source, build, DMG, ASAR and isolated feed are the corrected identities
+above. This fixture does not contain an existing credential and does not prove
+the later production-feed path.
+
+Intel macOS 26 run 34563534703 reported Accessibility `cannot_complete` despite
+permission being present. The isolated macOS 15 comparison, run 34564076590,
+reached Check and Install before the UI reader failed during installation.
+The runner now tolerates a closing window during a read, while refusing to
+repeat a click whose outcome is unknown. Run 34564895606 tests that correction
+against the same signed Intel artifact. No app rebuild or security change is
+part of this test-tool correction.
+
+Fresh-install qualification is separate from the native upgrade fixture. Its
+manual workflow starts the exact signed app without predecessor, Codex home,
+usage records or credentials, checks first-run sharing and Settings controls,
+then verifies default and opt-out persistence across controlled restarts. It
+does not claim native quit, credential persistence or successful uploads.
+Publication remains held for the pending Intel and clean-install receipts.
+
 The publication coordinator now reuses the established release-evidence
 contract from the website verifier and reconciles the exact four-target
 Electron inventory plus incoming native feeds. Its 24 owning tests pass.

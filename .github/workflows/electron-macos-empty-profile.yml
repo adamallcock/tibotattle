@@ -1,5 +1,7 @@
 name: Signed Mac empty-profile clean install
 on:
+  push:
+    branches: [codex/electron-sparkle-transition-021]
   workflow_dispatch:
     inputs:
       mode:
@@ -27,8 +29,14 @@ concurrency:
   group: signed-mac-empty-profile-${{ inputs.target }}
   cancel-in-progress: false
 jobs:
+  registration:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Register without installing an application
+        run: echo "Only an explicit reviewed workflow dispatch executes the hosted clean install."
   clean_arm64:
-    if: inputs.target == 'darwin-arm64'
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-arm64'
     runs-on: macos-26
     timeout-minutes: 15
     env:
@@ -80,7 +88,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
   clean_x64:
-    if: inputs.target == 'darwin-x64'
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-x64'
     runs-on: macos-15-intel
     timeout-minutes: 15
     env:
