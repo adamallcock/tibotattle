@@ -35,10 +35,33 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-The [0.1.20 candidate](./release-notes/0.1.20.md) fixes native Mac upgrades so
-users can replace the app and carry over their retained history and settings
-without preserving the old application bundle. Signed replacement qualification
-and publication remain pending; 0.1.19 is the current published Electron release.
+No further changes recorded.
+
+## [0.1.21](./release-notes/0.1.21.md) - 2026-09-11
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.21) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.21) ·
+[changes since v0.1.20](https://github.com/adamallcock/tibotattle/compare/v0.1.20...v0.1.21)
+
+Complete native 0.1.18's update path to Electron, preserving local history,
+settings and contribution choice. Retain the public key needed by the incoming
+native update and declare macOS 14 correctly in both Mac installers. Restore
+compact website download controls with GitHub asset links. See the
+[release notes](./release-notes/0.1.21.md).
+
+## [0.1.20](./release-notes/0.1.20.md) - 2026-09-11
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.20) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.20) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/f518126a05a6d165b9617f6417a87219d7047273) ·
+[changes since v0.1.19](https://github.com/adamallcock/tibotattle/compare/v0.1.19...v0.1.20)
+
+- Replacing the native Mac application automatically imports compatible retained
+  history and settings, without manually preserving the old application bundle.
+- Makes a recoverable backup and preserves identity, sharing choices and selected
+  activity folders; reopening the app does not duplicate the import.
+- Keeps recovery explicit for damaged or incompatible data and preserves unknown
+  startup registration without changing it.
 
 ## [0.1.19](./release-notes/0.1.19.md) - 2026-09-10
 

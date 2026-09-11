@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -21,6 +22,11 @@ import {
 } from "../scripts/package-electron-production.mjs";
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
+import {
+  resolveSignedMacOSBundleVersion,
+  isAppleMacOSBundleVersion,
+  compareAppleMacOSBundleVersions,
+} from "../scripts/macos-bundle-version.js";
 
 const require = createRequire(import.meta.url);
 const POLICY = require("../config/electron-production-distribution.cjs");
@@ -37,6 +43,77 @@ const BUILD_NUMBER = "20260906";
 const REHEARSAL_VERSION_CORE = RELEASE_VERSION.replace(/\d+$/u, (patch) => String(Number(patch) + 1));
 const REHEARSAL_CURRENT_VERSION = `${REHEARSAL_VERSION_CORE}-native-to-electron-handover.1`;
 const REHEARSAL_NEXT_VERSION = `${REHEARSAL_VERSION_CORE}-native-to-electron-handover.2`;
+
+test("stable Mac incoming upgrades retain the verified native 018 public key exactly", () => {
+  const publicEDKey = POLICY.PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY;
+  // Both hash-verified native 0.1.18 DMGs contain this decoded public-key digest.
+  assert.equal(createHash("sha256").update(Buffer.from(publicEDKey, "base64")).digest("hex"),
+    "ae8a8e00311a4cfc1e7e7f2eedcf7fa53d6bc197997c912a0b8f908e54a28fbf");
+  for (const target of ["darwin-arm64", "darwin-x64"]) {
+    assert.deepEqual(POLICY.assertProductionElectronMacOSIncomingUpgradeMetadata({ target, publicEDKey }),
+      { publicEDKey });
+    for (const invalid of [undefined, null, "", publicEDKey + "\n", "A".repeat(43) + "=", [publicEDKey]]) {
+      assert.throws(() => POLICY.assertProductionElectronMacOSIncomingUpgradeMetadata({
+        target, publicEDKey: invalid,
+      }), /retain the native stable public key/u);
+    }
+  }
+  for (const target of [undefined, "darwin", "win32-x64", "linux-x64", ["darwin-arm64"]]) {
+    assert.throws(() => POLICY.assertProductionElectronMacOSIncomingUpgradeMetadata({ target, publicEDKey }),
+      /retain the native stable public key/u);
+  }
+});
+
+test("signed Mac allocation is independent of candidate provenance and advances native 018", () => {
+  const nativeVersion = resolveSignedMacOSBundleVersion("0.1.18", "stable");
+  assert.equal(nativeVersion, "1026");
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.21", "stable"), "1028");
+  assert.equal(compareAppleMacOSBundleVersions(nativeVersion, "1028"), -1);
+  assert.equal(isAppleMacOSBundleVersion("1028"), true);
+  assert.equal(isAppleMacOSBundleVersion("2026091105"), false);
+  for (const target of ["darwin-arm64", "darwin-x64"]) {
+    for (const buildNumber of ["2026091105", "2026091106"]) {
+      const input = { target, version: "0.1.21", buildNumber };
+      assert.equal(POLICY.productionElectronBuildVersionForTarget(input), "1028");
+      assert.deepEqual(POLICY.assertProductionElectronMacOSBundleMetadata({
+        ...input, bundleVersion: "1028", bundleShortVersion: "0.1.21",
+      }), { bundleVersion: "1028", bundleShortVersion: "0.1.21" });
+      for (const bundleVersion of [undefined, "1026", "1028.0", buildNumber]) {
+        assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({
+          ...input, bundleVersion, bundleShortVersion: "0.1.21",
+        }), /reviewed production allocation/u);
+      }
+      for (const bundleShortVersion of [undefined, "0.1.20", "1028"]) {
+        assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({
+          ...input, bundleVersion: "1028", bundleShortVersion,
+        }), /reviewed production allocation/u);
+      }
+      assert.throws(() => POLICY.productionElectronBuildVersionForTarget({
+        ...input, version: "0.1.22",
+      }), /explicit signed bundle version allocation/u);
+    }
+  }
+});
+
+test("historical Electron receipts keep their frozen bundle ordering without allocating future stable releases", () => {
+  for (const version of ["0.1.19", "0.1.20", REHEARSAL_CURRENT_VERSION]) {
+    assert.equal(POLICY.productionElectronBuildVersionForTarget({
+      target: "darwin-arm64", version, buildNumber: "2026091104",
+    }), "2026091104");
+  }
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.19", "stable"), null);
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.20", "stable"), null);
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.22", "stable"), null);
+  const { AppUpdater } = require("electron-updater/out/AppUpdater");
+  const updaterRequire = createRequire(require.resolve("electron-updater/package.json"));
+  const updaterSemver = updaterRequire("semver");
+  return AppUpdater.prototype.isUpdateAvailable.call({
+    currentVersion: updaterSemver.parse("0.1.20"),
+    allowDowngrade: false,
+    isUpdateSupported: async () => true,
+    isUserWithinRollout: async () => true,
+  }, { version: "0.1.21" }).then((available) => assert.equal(available, true));
+});
 
 async function withTemporaryDirectory(run) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-production-"));
@@ -406,6 +483,13 @@ test("production builder source config binds app identity, target-specific build
     if (target.startsWith("darwin-")) {
       assert.equal(config.mac.bundleShortVersion, RELEASE_VERSION, target);
       assert.equal(config.mac.bundleVersion, config.buildVersion, target);
+      assert.equal(config.mac.minimumSystemVersion, "14.0", target);
+      assert.deepEqual(config.mac.extendInfo, {
+        SUPublicEDKey: POLICY.PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY,
+      }, target);
+      POLICY.assertProductionElectronMacOSIncomingUpgradeMetadata({
+        target, publicEDKey: config.mac.extendInfo.SUPublicEDKey,
+      });
       assert.equal(config.mac.sign, "./scripts/electron-macos-sign-order.mjs", target);
       assert.deepEqual(config.mac.target, [
         { target: "dmg", arch: [spec.architecture] },
@@ -424,6 +508,7 @@ test("production builder source config binds app identity, target-specific build
       assert.match(config.extraResources[0].from,
         new RegExp(`electron-production[\\\\/]${target}[\\\\/]native[\\\\/]macos-keychain\\.node$`, "u"), target);
     } else if (target === "win32-x64") {
+      assert.doesNotMatch(JSON.stringify(config), /SUPublicEDKey|SUFeedURL/u);
       assert.deepEqual(config.win.target, [{ target: "nsis", arch: ["x64"] }]);
       assert.equal(config.win.verifyUpdateCodeSignature, true);
       assert.equal(config.win.signExecutable, true);
@@ -432,11 +517,22 @@ test("production builder source config binds app identity, target-specific build
       assert.equal(config.extraMetadata.shortVersionWindows, config.buildVersion);
       assertWindowsResourceVersion(config.buildVersion);
     } else {
+      assert.doesNotMatch(JSON.stringify(config), /SUPublicEDKey|SUFeedURL/u);
       assert.deepEqual(config.linux.target, [{ target: "AppImage", arch: ["x64"] }]);
       assert.deepEqual(config.linux.executableArgs, []);
       assert.equal(Object.hasOwn(config.extraMetadata, "shortVersion"), false);
     }
   }
+});
+
+test("pinned macOS packager writes the configured supported system floor into Info.plist", () => {
+  const macPackagerSource = readFileSync(
+    ELECTRON_BUILDER_REQUIRE.resolve("app-builder-lib/out/macPackager"), "utf8",
+  );
+  assert.match(macPackagerSource,
+    /const minimumSystemVersion = this\.platformSpecificBuildOptions\.minimumSystemVersion/u);
+  assert.match(macPackagerSource,
+    /appPlist\.LSMinimumSystemVersion = minimumSystemVersion/u);
 });
 
 test("production macOS builder resolves the isolated signing-order hook before signing", async () => {
@@ -486,6 +582,7 @@ test("rehearsal builder config binds semantic updater versions to numeric macOS 
     assert.deepEqual(config.extraMetadata.tibotattleDistribution, metadata, candidate);
     assert.equal(config.mac.bundleShortVersion, REHEARSAL_VERSION_CORE, candidate);
     assert.equal(config.mac.bundleVersion, buildNumber, candidate);
+    assert.equal(config.mac.extendInfo, undefined, candidate);
     assert.equal(config.buildVersion, buildNumber, candidate);
     assert.deepEqual(config.publish, [{
       provider: "generic",
@@ -516,6 +613,7 @@ test("development builder retains the adapter contract but excludes the producti
     assert.ok(filter.includes("native/macos-keychain/contract.js"), target);
     assert.equal(filter.includes("native/macos-keychain.node"), false, target);
     assert.equal(Object.hasOwn(config, "extraResources"), false, target);
+    assert.doesNotMatch(JSON.stringify(config), /SUPublicEDKey|SUFeedURL/u, target);
   }
 });
 
@@ -550,7 +648,7 @@ test("Windows candidate mapping is lossless, ordered, and accepted by the pinned
   assert.equal(POLICY.productionElectronWindowsFileVersion(BUILD_NUMBER), "0.0.309.10282");
   assert.equal(POLICY.productionElectronBuildVersionForTarget({
     target: "darwin-arm64", version: RELEASE_VERSION, buildNumber: BUILD_NUMBER,
-  }), BUILD_NUMBER);
+  }), resolveSignedMacOSBundleVersion(RELEASE_VERSION, "stable"));
 
   const config = loadProductionBuilderConfig("win32-x64");
   const appInfo = new AppInfo({
@@ -658,6 +756,7 @@ test("signed staging source binds the hosted macOS account and disables the upda
   assert.equal(config.appId, POLICY.PRODUCTION_ELECTRON_APP_ID);
   assert.equal(config.forceCodeSigning, true);
   assert.equal(config.publish, undefined);
+  assert.equal(config.mac.extendInfo, undefined);
   assert.equal(Object.hasOwn(config.extraMetadata, "tibotattleDistribution"), false);
   assert.equal(config.directories.app, resolve(plan.stagingDirectory));
   assert.throws(() => loadSignedStagingBuilderConfig({ expectedTestUsername: "ci runner" }));

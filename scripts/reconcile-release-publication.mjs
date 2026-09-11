@@ -13,6 +13,7 @@ import { isAppleMacOSBundleVersion } from "./macos-bundle-version.js";
 import { publishSparkleUpdate, verifyReleaseManifestSourceProvenance } from "./publish-sparkle-update.js";
 import { deployWebRelease } from "./deploy-web-release.js";
 import { verifyWebReleaseReceipt } from "./web-release-lane.js";
+import { isElectronSparkleTransition } from "./electron-sparkle-transition.js";
 import { buildSha256Sums, validateReleaseEvidenceManifest } from "./release-evidence.js";
 import { PRODUCTION_DEPLOY_CONFIRMATION, recheckProductionHealth } from "../apps/worker/scripts/production-deploy.mjs";
 import { createProductionDeploymentLock } from "../apps/worker/scripts/production-deployment-lock.mjs";
@@ -63,11 +64,13 @@ export function validatePublicationPlan(plan) {
     fail("RELEASE_PUBLICATION_PLAN_INVALID");
   }
   for (const target of plan.targets) {
-    if (!exact(target, ["architecture", "feedManifest", "dmgName", "appcastName", "sparklePublicEdKey", "previousManifest"])
+    if (!exact(target, ["architecture", "feedManifest", "dmgName", "appcastName", "sparklePublicEdKey", "previousManifest", ...(target.sparkleDmg === undefined ? [] : ["sparkleDmg"])])
         || !fileSpec(target.feedManifest) || target.feedManifest.bytes > MAX_SMALL || !fileSpec(target.previousManifest) || target.previousManifest.bytes > MAX_SMALL
         || !/^[A-Za-z0-9+/]{43}=$/.test(target.sparklePublicEdKey)
         || ![target.dmgName, target.appcastName].every((name) => plan.assets.some((asset) => asset.name === name))
-        || target.dmgName !== `TiboTattle-${plan.version}-macOS-${target.architecture}.dmg`) fail("RELEASE_PUBLICATION_TARGET_INVALID");
+        || (target.sparkleDmg === undefined
+          ? target.dmgName !== `TiboTattle-${plan.version}-macOS-${target.architecture}.dmg`
+          : !fileSpec(target.sparkleDmg) || target.dmgName !== `TiboTattle-${plan.version}-mac-${target.architecture}.dmg`)) fail("RELEASE_PUBLICATION_TARGET_INVALID");
   }
   if (new Set(plan.targets.flatMap((target) => [target.dmgName, target.appcastName])).size !== 4) fail("RELEASE_PUBLICATION_TARGET_INVALID");
   return structuredClone(plan);
@@ -111,26 +114,51 @@ export async function preparePublication(plan, { repositoryRoot = ROOT, publishF
   const asset = (name) => plan.assets.find((entry) => entry.name === name);
   const canonical = await jsonFile(asset("release-manifest.json"));
   await validateReleaseEvidenceManifest(canonical, { artifactRoot: dirname(asset("release-manifest.json").path), manifestPath: asset("release-manifest.json").path });
+  const electron = canonical.artifacts.length === 4
+    && canonical.artifacts.every(a => a.updater?.mechanism === "electron-updater")
+    && canonical.artifacts.map(a => `${a.platform}-${a.architecture}`).sort().join() === "linux-x64,macos-arm64,macos-x64,windows-x64";
+  const macArtifacts = canonical.artifacts.filter(a => a.platform === "macos");
   if (canonical.version !== plan.version || canonical.tag !== plan.source.tag || canonical.commit !== plan.source.commit
-      || canonical.repository !== plan.source.repository || canonical.artifacts.length !== 2
-      || canonical.artifacts.some((artifact) => artifact.platform !== "macos" || artifact.channel !== "direct" || artifact.distribution !== "github-release")
-      || canonical.artifacts.map((artifact) => artifact.architecture).sort().join() !== "arm64,x64") fail("RELEASE_PUBLICATION_CANONICAL_IDENTITY_MISMATCH");
+      || canonical.repository !== plan.source.repository || (!electron && canonical.artifacts.length !== 2)
+      || canonical.artifacts.some((artifact) => (!electron && artifact.platform !== "macos") || artifact.channel !== "direct" || artifact.distribution !== "github-release")
+      || macArtifacts.map((artifact) => artifact.architecture).sort().join() !== "arm64,x64") fail("RELEASE_PUBLICATION_CANONICAL_IDENTITY_MISMATCH");
   const sums = buildSha256Sums(canonical);
   const sumsFile = asset("SHA256SUMS");
   if (digest(sums) !== sumsFile.sha256 || Buffer.byteLength(sums) !== sumsFile.bytes) fail("RELEASE_PUBLICATION_CHECKSUM_SET_MISMATCH");
-  const expectedAssets = [...sums.trimEnd().split("\n").map((row) => row.slice(66)), "SHA256SUMS", "verify-release.md"].sort();
+  let expectedAssets = [...sums.trimEnd().split("\n").map((row) => row.slice(66)), "SHA256SUMS", "verify-release.md"].sort();
+  if (electron) {
+    const extra = plan.targets.flatMap(t => [t.appcastName,
+      `TiboTattle-${plan.version}-mac-${t.architecture}.zip`,
+      `TiboTattle-${plan.version}-mac-${t.architecture}.zip.blockmap`,
+      `TiboTattle-${plan.version}-mac-${t.architecture}.dmg.blockmap`]);
+    expectedAssets = [...expectedAssets, ...extra, "SHA256SUMS-ALL-RELEASE-FILES"].sort();
+    if (new Set(expectedAssets).size !== expectedAssets.length) fail("RELEASE_PUBLICATION_CANONICAL_ASSET_SET_MISMATCH");
+    const allSums = asset("SHA256SUMS-ALL-RELEASE-FILES");
+    const summed = expectedAssets.filter(n => !["release-manifest.json", "SHA256SUMS", "SHA256SUMS-ALL-RELEASE-FILES", "verify-release.md"].includes(n));
+    if (!allSums || summed.some(n => !asset(n))) fail("RELEASE_PUBLICATION_CANONICAL_ASSET_SET_MISMATCH");
+    const expected = summed.map(n => `${asset(n).sha256}  ${n}`).sort().join("\n") + "\n";
+    if (allSums.sha256 !== digest(expected) || allSums.bytes !== Buffer.byteLength(expected)) fail("RELEASE_PUBLICATION_CHECKSUM_SET_MISMATCH");
+  }
   if (expectedAssets.join() !== plan.assets.map((entry) => entry.name).sort().join()) fail("RELEASE_PUBLICATION_CANONICAL_ASSET_SET_MISMATCH");
   const feeds = {};
   for (const target of plan.targets) {
-    const artifact = canonical.artifacts.find((entry) => entry.architecture === target.architecture);
-    if (artifact.fileName !== target.dmgName || artifact.updater.enabled !== true || artifact.updater.metadata.fileName !== target.appcastName) fail("RELEASE_PUBLICATION_CANONICAL_TARGET_MISMATCH");
+    const artifact = macArtifacts.find((entry) => entry.architecture === target.architecture);
+    if (artifact.fileName !== target.dmgName || artifact.updater.enabled !== true
+        || (electron ? target.sparkleDmg === undefined || artifact.updater.metadata.fileName !== `TiboTattle-${plan.version}-darwin-${target.architecture}-update.yml`
+          : target.sparkleDmg !== undefined || artifact.updater.metadata.fileName !== target.appcastName)) fail("RELEASE_PUBLICATION_CANONICAL_TARGET_MISMATCH");
     const manifest = await jsonFile(target.feedManifest);
+    const incomingDmg = electron ? target.sparkleDmg : asset(target.dmgName);
+    if (electron) {
+      await verifyFile(incomingDmg);
+      if (incomingDmg.sha256 !== artifact.sha256 || incomingDmg.bytes !== artifact.bytes
+          || !isElectronSparkleTransition(manifest)) fail("RELEASE_PUBLICATION_CANONICAL_TARGET_MISMATCH");
+    } else if (isElectronSparkleTransition(manifest)) fail("RELEASE_PUBLICATION_CANONICAL_TARGET_MISMATCH");
     if (manifest.source?.commit !== plan.source.commit || manifest.source?.tag !== plan.source.tag
         || manifest.application?.shortVersion !== plan.version || manifest.application?.bundleVersion !== plan.build
         || (manifest.application?.architecture ?? "arm64") !== target.architecture) fail("RELEASE_PUBLICATION_MANIFEST_IDENTITY_MISMATCH");
     const channel = resolveReleaseChannel(plan.channel, { architecture: target.architecture });
     const options = { architecture: target.architecture, channel: plan.channel, bucket: channel.sparkle.r2Bucket,
-      dmgPath: asset(target.dmgName).path, appcastPath: asset(target.appcastName).path,
+      dmgPath: incomingDmg.path, appcastPath: asset(target.appcastName).path,
       releaseManifestPath: target.feedManifest.path, sparklePublicEdKey: target.sparklePublicEdKey,
       previousStableManifestPath: target.previousManifest.path, sourceRepositoryRoot: repositoryRoot };
     // Existing validator retains native trust, both Sparkle signatures, key continuity,
@@ -170,7 +198,7 @@ export async function preparePublication(plan, { repositoryRoot = ROOT, publishF
       || !cask.includes('  arch arm: "arm64", intel: "x64"\n')
       || !cask.includes('  depends_on macos: :sonoma\n')
       || !cask.includes(`  sha256 arm:   "${arm.sha256}",\n         intel: "${intel.sha256}"\n`)
-      || !cask.includes('  url "https://github.com/adamallcock/tibotattle/releases/download/v#{version}/TiboTattle-#{version}-macOS-#{arch}.dmg"\n')) fail("RELEASE_PUBLICATION_CASK_IDENTITY_MISMATCH");
+      || !cask.includes(`  url "https://github.com/adamallcock/tibotattle/releases/download/v#{version}/TiboTattle-#{version}-${electron ? 'mac' : 'macOS'}-#{arch}.dmg"\n`)) fail("RELEASE_PUBLICATION_CASK_IDENTITY_MISMATCH");
   return { plan, feeds, siteFiles, websiteSourceCommit: receipt.sourceCommit };
 }
 
@@ -319,6 +347,7 @@ export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawn
       const target = prepared.feeds[architecture].target;
       for (const name of [target.dmgName, target.appcastName]) await verifyFile(prepared.plan.assets.find((asset) => asset.name === name));
       await verifyFile(target.previousManifest); await verifyFile(target.feedManifest);
+      if (target.sparkleDmg) await verifyFile(target.sparkleDmg);
       const channel = resolveReleaseChannel("stable", { architecture });
       return publishFeed({ ...options, publish: true, replaceAppcast: true,
         atomicAppcastGuardEndpoint: channel.sparkle.atomicGuardURL, atomicAppcastGuardTokenEnv: "SPARKLE_APPCAST_GUARD_TOKEN" });

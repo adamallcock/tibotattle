@@ -355,3 +355,61 @@ test("website readback checks every prepared file and current healthy deployment
   assert.deepEqual(reads, ["/release-site-manifest.json", "/", "/api/health"]);
   healthySource = "e".repeat(40); assert.equal((await adapter.website(prepared)).status, "pending");
 });
+
+async function electronFixture(t) {
+  const f = await fixture(t), { plan, file } = f;
+  const canonical = JSON.parse(await readFile(plan.assets.find(a => a.name === 'release-manifest.json').path));
+  const put = async (name, bytes) => { const entry = { name, ...await file(name, bytes) }; const i = plan.assets.findIndex(a => a.name === name); if (i < 0) plan.assets.push(entry); else plan.assets[i] = entry; return entry; };
+  for (const target of plan.targets) {
+    const old = plan.assets.find(a => a.name === target.dmgName), bytes = await readFile(old.path);
+    target.sparkleDmg = { path: old.path, bytes: old.bytes, sha256: old.sha256 };
+    plan.assets.splice(plan.assets.indexOf(old), 1);
+    target.dmgName = `TiboTattle-1.2.3-mac-${target.architecture}.dmg`;
+    const dmg = await put(target.dmgName, bytes);
+    const a = canonical.artifacts.find(a => a.architecture === target.architecture);
+    a.fileName = dmg.name; a.downloadUrl = `${source.repository}/releases/download/v1.2.3/${dmg.name}`;
+    a.build = { sourceManifestSha256: sha('synthetic source'), finalArtifactSha256: dmg.sha256 };
+    const metadata = await put(`TiboTattle-1.2.3-darwin-${target.architecture}-update.yml`, 'synthetic Electron updater metadata');
+    a.updater = { enabled: true, mechanism: 'electron-updater', metadata: { fileName: metadata.name, bytes: metadata.bytes, sha256: metadata.sha256, subjectSha256: dmg.sha256 } };
+    for (const suffix of ['zip', 'zip.blockmap', 'dmg.blockmap']) await put(`TiboTattle-1.2.3-mac-${target.architecture}.${suffix}`, `synthetic ${suffix}`);
+    const manifest = JSON.parse(await readFile(target.feedManifest.path));manifest.schemaVersion = 'tibotattle-electron-sparkle-transition-v1';
+    target.feedManifest = await file(`feed-manifest-${target.architecture}.json`, JSON.stringify(manifest));
+  }
+  for (const platform of ['windows', 'linux']) {
+    const windows = platform === 'windows', target = windows ? 'win32-x64' : 'linux-x64';
+    const dmg = await put(`TiboTattle-1.2.3-${windows ? 'Windows-x64.exe' : 'linux-x86_64.AppImage'}`, `synthetic ${platform}`);
+    const metadata = await put(`TiboTattle-1.2.3-${target}-update.yml`, `synthetic ${platform} metadata`);
+    canonical.artifacts.push({ ...structuredClone(canonical.artifacts[0]), platform, architecture:'x64', format:windows?'exe':'appimage', fileName:dmg.name, bytes:dmg.bytes, sha256:dmg.sha256,
+      downloadUrl:`${source.repository}/releases/download/v1.2.3/${dmg.name}`,
+      nativeTrust:windows?{publisher:'Synthetic',certificateSha256:sha('certificate')}:{scheme:'none'},
+      assurances:windows?{cleanInstallSmokePassed:true,authenticodeSigned:true,timestamped:true}:{cleanInstallSmokePassed:true,artifactIntegrityVerified:true},
+      build:{sourceManifestSha256:sha('source'),finalArtifactSha256:dmg.sha256},
+      updater:{enabled:true,mechanism:'electron-updater',metadata:{fileName:metadata.name,bytes:metadata.bytes,sha256:metadata.sha256,subjectSha256:dmg.sha256}} });
+  }
+  const { compareArtifactIdentity } = await import('../scripts/release-evidence.js');canonical.artifacts.sort(compareArtifactIdentity);
+  await put('release-manifest.json', `${stableStringify(canonical)}\n`);await put('SHA256SUMS',buildSha256Sums(canonical));
+  const all = plan.assets.filter(a => !['release-manifest.json','SHA256SUMS','verify-release.md'].includes(a.name)).map(a => `${a.sha256}  ${a.name}`).sort().join('\n')+'\n';await put('SHA256SUMS-ALL-RELEASE-FILES',all);
+  const site = JSON.parse(await readFile(plan.website.manifest.path));for(const row of [site.installer,site.intelInstaller])row.url=row.url.replace('-macOS-','-mac-');
+  plan.website.manifest=await file('release-site-manifest.json',JSON.stringify(site));plan.website.receipt=await file('web-release-receipt.json',JSON.stringify({sourceCommit:'c'.repeat(40),site:{manifestSha256:plan.website.manifest.sha256}}));
+  plan.tap={...await file('tibotattle.rb',(await readFile(plan.tap.path,'utf8')).replace('-macOS-','-mac-')),workflowSha256:plan.tap.workflowSha256};
+  return {...f,put};
+}
+
+test('Electron transition admits four platforms, exact auxiliary files, incoming alias and outgoing YAML separately', async t => {
+  const f = await electronFixture(t);assert.equal(f.plan.assets.length,20);
+  const calls=[];const prepared=await preparePublication(f.plan,{...f.prepareOptions,publishFeed:async options=>{calls.push(options);return f.prepareOptions.publishFeed(options);}});
+  assert.equal(calls.length,2);assert.equal(calls[1].dmgPath,f.plan.targets[1].sparkleDmg.path);
+  assert.equal(prepared.plan.assets.some(a=>a.name==='TiboTattle-1.2.3-darwin-arm64-update.yml'),true);
+});
+
+test('Electron transition refuses alias substitution, missing incoming XML, unsigned inventory and wrong feed discriminator', async t => {
+  for(const change of ['alias','missing_xml','extra','sums','discriminator']) {
+    const f=await electronFixture(t);
+    if(change==='alias')f.plan.targets[1].sparkleDmg=await f.file('wrong.dmg','unrelated signed bytes');
+    if(change==='missing_xml')f.plan.assets=f.plan.assets.filter(a=>a.name!==f.plan.targets[0].appcastName);
+    if(change==='extra')await f.put('unreviewed.txt','extra');
+    if(change==='sums')await f.put('SHA256SUMS-ALL-RELEASE-FILES','wrong');
+    if(change==='discriminator'){const m=JSON.parse(await readFile(f.plan.targets[0].feedManifest.path));delete m.schemaVersion;f.plan.targets[0].feedManifest=await f.file('feed-manifest-arm64.json',JSON.stringify(m));}
+    await assert.rejects(preparePublication(f.plan,f.prepareOptions),/RELEASE_PUBLICATION_/);
+  }
+});
