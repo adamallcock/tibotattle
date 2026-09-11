@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, symlink, writeFile, readFile, rm, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, symlink, writeFile, readFile, rm, realpath, chmod, truncate } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveReleaseChannel } from '../config/release-channels.js';
@@ -149,6 +149,21 @@ test('mounted Electron inspector binds signed identity, architecture, ASAR, upda
     wrongArch = false; pkg.tibotattleDistribution = { ...pkg.tibotattleDistribution, sourceRevision: 'd'.repeat(40) };
     await assert.rejects(validateElectronSparkleDMG(dmgPath, options), { code: 'SPARKLE_ELECTRON_TRANSITION_DISTRIBUTION_MISMATCH' });
     assert.equal(calls.filter(call => call.includes('detach')).length, detachedAfterKeys + 2);
+    pkg.tibotattleDistribution = { ...pkg.tibotattleDistribution, sourceRevision: manifest.source.commit };
+    const artwork = join(mount, '.background.tiff');
+    await writeFile(artwork, 'II*\0standard Finder artwork', { mode: 0o644 });
+    assert.deepEqual(await validateElectronSparkleDMG(dmgPath, options), { source: { commit: manifest.source.commit, tag: 'v0.1.21' } });
+    await chmod(artwork, 0o755);
+    await assert.rejects(validateElectronSparkleDMG(dmgPath, options), { code: 'SPARKLE_ELECTRON_TRANSITION_LAYOUT_INVALID' });
+    await chmod(artwork, 0o644); await truncate(artwork, 16 * 1024 ** 2 + 1);
+    await assert.rejects(validateElectronSparkleDMG(dmgPath, options), { code: 'SPARKLE_ELECTRON_TRANSITION_UNSAFE_FILE' });
+    await rm(artwork); await symlink(join(app, 'Contents/Resources/app.asar'), artwork);
+    await assert.rejects(validateElectronSparkleDMG(dmgPath, options), { code: 'SPARKLE_ELECTRON_TRANSITION_UNSAFE_PATH' });
+    await rm(artwork); await mkdir(artwork);
+    await assert.rejects(validateElectronSparkleDMG(dmgPath, options), { code: 'SPARKLE_ELECTRON_TRANSITION_UNSAFE_FILE' });
+    await rm(artwork, { recursive: true }); await writeFile(join(mount, '.unexpected'), 'unknown');
+    await assert.rejects(validateElectronSparkleDMG(dmgPath, options), { code: 'SPARKLE_ELECTRON_TRANSITION_LAYOUT_INVALID' });
+    assert.equal(calls.filter(call => call.includes('detach')).length, detachedAfterKeys + 8);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

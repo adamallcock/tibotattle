@@ -135,7 +135,15 @@ export async function validateElectronSparkleDMG(path, { manifest, manifestPath,
   const mount = response['system-entities']?.find(value => typeof value['mount-point'] === 'string');
   if (!mount || typeof mount['dev-entry'] !== 'string') fail('MOUNT_INVALID');
   try {
-    const names = (await readdir(mount['mount-point'])).filter(name => !['.DS_Store', '.background', '.VolumeIcon.icns', '.fseventsd', '.Trashes'].includes(name)).sort();
+    const entries = await readdir(mount['mount-point']);
+    // electron-builder writes its Finder artwork as this regular TIFF file.
+    // Accept that exact non-executable asset, not arbitrary hidden entries.
+    if (entries.includes('.background.tiff')) {
+      const artwork = join(mount['mount-point'], '.background.tiff');
+      await hashFile(artwork, 16 * 1024 ** 2);
+      if (((await lstat(artwork)).mode & 0o111) !== 0) fail('LAYOUT_INVALID');
+    }
+    const names = entries.filter(name => !['.DS_Store', '.background', '.background.tiff', '.VolumeIcon.icns', '.fseventsd', '.Trashes'].includes(name)).sort();
     if (names.join() !== ['Applications', PRODUCT_BRAND.bundleName].sort().join()) fail('LAYOUT_INVALID');
     await validateMacOSApplicationsLink(join(mount['mount-point'], 'Applications'));
     const app = join(mount['mount-point'], PRODUCT_BRAND.bundleName);
