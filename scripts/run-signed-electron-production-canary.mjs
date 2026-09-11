@@ -127,6 +127,27 @@ export async function refreshCanaryLocalUsage(active) {
     return value.status === 'succeeded'; }, 6 * 60000, 'ordinary local refresh completed');
   return true;
 }
+export async function waitForCanaryRestartAcceptance({ readSharing, restart, previousAcceptedAt }, {
+  wait = waitFor, now = Date.now,
+} = {}) {
+  const deadline = now() + 6 * 60000;
+  const label = 'fresh authenticated restart acceptance';
+  // Acceptance is process-local. Observe the restarted app before another stop,
+  // and let an in-flight/partial pass finish rather than erase its receipt.
+  const settled = await wait(async () => {
+    const value = await readSharing();
+    return value?.enabled === true && value.basis === 'default_on'
+      && value.transportStatus === 'up_to_date' ? value : null;
+  }, Math.max(0, deadline - now()), label);
+  if (acceptedDefaultOnSharing(settled, previousAcceptedAt)) return settled;
+  // Startup can finish its no-change pass before ordinary indexing completes.
+  // Only this settled case needs another startup to schedule the fresh source.
+  await restart();
+  return wait(async () => {
+    const value = await readSharing();
+    return acceptedDefaultOnSharing(value, previousAcceptedAt) ? value : null;
+  }, Math.max(0, deadline - now()), label);
+}
 export function validateCanaryReleaseIdentity(manifest, plist, { sourceRevision, buildNumber }) {
   const metadata = validateCanaryManifest(manifest, sourceRevision);
   if (manifest.version !== '0.1.22' || metadata.buildNumber !== buildNumber
@@ -234,10 +255,12 @@ export async function runProductionCanary(options) {
     proof.ownedProcessesStopped = false;
     active = await launchVerifiedMacSharingApp(verified, environment);
     proof.restartLocalRefresh = await refreshCanaryLocalUsage(active);
-    proof.ownedProcessesStopped = await stopOwnedMacSharingApp(active); active = null;
-    proof.ownedProcessesStopped = false;
-    active = await launchVerifiedMacSharingApp(verified, environment);
-    await waitFor(async () => acceptedDefaultOnSharing(await active.readSharing(), accepted.lastAcceptedAt), 6 * 60000, 'fresh authenticated restart acceptance');
+    await waitForCanaryRestartAcceptance({ readSharing: () => active.readSharing(),
+      previousAcceptedAt: accepted.lastAcceptedAt, restart: async () => {
+        proof.ownedProcessesStopped = await stopOwnedMacSharingApp(active); active = null;
+        proof.ownedProcessesStopped = false;
+        active = await launchVerifiedMacSharingApp(verified, environment);
+      } });
     proof.restartAcceptedUpload = true;
     if ((await readBinding(profile)).digest !== initial.digest) fail('binding_changed');
     proof.restartBindingRetained = true;

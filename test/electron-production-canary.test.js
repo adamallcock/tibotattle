@@ -2,8 +2,10 @@ import test from 'node:test';
 import { RELEASE_VERSION } from '../config/release-manifest.js';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, privateDecrypt, createDecipheriv } from 'node:crypto';
-import { parseProductionCanaryArguments, validateCanaryHost, validateCanaryManifest, sealCanaryCleanup, acceptedDefaultOnSharing, validateCanaryReleaseIdentity, refreshCanaryLocalUsage } from '../scripts/run-signed-electron-production-canary.mjs';
+import { parseProductionCanaryArguments, validateCanaryHost, validateCanaryManifest, sealCanaryCleanup, acceptedDefaultOnSharing, validateCanaryReleaseIdentity, refreshCanaryLocalUsage, waitForCanaryRestartAcceptance } from '../scripts/run-signed-electron-production-canary.mjs';
 import { createProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
+import { createDesktopSharingCoordinator } from '../apps/electron/desktop-sharing.js';
+import { createAccountlessContributionScheduler } from '../src/application/index.js';
 import distributionPolicy from '../config/electron-production-distribution.cjs';
 const identity = ['--build-number','2026091111','--archive-sha256','d'.repeat(64),'--app', '/tmp/TiboTattle.app', '--source-revision', 'a'.repeat(40), '--asar-sha256', 'b'.repeat(64),
   '--cleanup-public-key', '/tmp/canary.pem', '--cleanup-public-key-sha256', 'c'.repeat(64)];
@@ -146,4 +148,113 @@ test('ordinary restart refresh waits for a new completed refresh, not an old suc
   }};
   assert.equal(await refreshCanaryLocalUsage({sessions:[dashboard]}),true);
   assert.equal(clicked,true);assert.equal(reads,2);
+});
+
+test('restart acceptance survives either ordering of ordinary refresh and the startup upload', async (t) => {
+  for (const acceptedDuringRefresh of [true, false]) await t.test(
+    acceptedDuringRefresh ? 'accepted before the extra restart' : 'startup completed before indexing', async () => {
+      let savedPreference = null, now = Date.parse('2026-09-11T12:00:00.000Z');
+      let current, uploads = 0, extraRestarts = 0;
+      const origin = 'https://tibotattle.com';
+      const launch = async (chunksUploaded) => {
+        const sharing = createDesktopSharingCoordinator({
+          backend: { load: async () => savedPreference, save: async value => { savedPreference = value; } },
+          installationState: 'fresh', destinationOrigin: origin, now: () => new Date(now),
+        });
+        await sharing.initialize();
+        const pending = new Map();
+        let timer = 0;
+        const scheduler = createAccountlessContributionScheduler({ origin, now: () => now,
+          readPreference: sharing.readAuthorization, onStatus: sharing.updateTransport,
+          runner: async () => { uploads += chunksUploaded; return { status: 'complete', chunksUploaded }; },
+          setTimer: (callback, delay) => { pending.set(++timer, { callback, delay }); return timer; },
+          clearTimer: id => pending.delete(id),
+        });
+        scheduler.start();
+        await scheduler.runNow();
+        return { sharing, scheduler };
+      };
+      const wait = async (predicate, timeout) => {
+        assert.ok(timeout > 0 && timeout <= 6 * 60000);
+        const value = await predicate();
+        assert.ok(value, 'the deterministic scheduler has already settled');
+        return value;
+      };
+      current = await launch(2);
+      const initial = await current.sharing.inspect();
+      assert.equal(acceptedDefaultOnSharing(initial), true);
+      await current.scheduler.stop();
+      now += 1000;
+      current = await launch(acceptedDuringRefresh ? 2 : 0);
+      // Ordinary indexing has now completed. It does not invoke runNow; a
+      // no-change startup pass schedules its next ordinary attempt in four hours.
+      const result = await waitForCanaryRestartAcceptance({
+        readSharing: () => current.sharing.inspect(), previousAcceptedAt: initial.lastAcceptedAt,
+        restart: async () => {
+          extraRestarts++;
+          await current.scheduler.stop();
+          now += 1000;
+          current = await launch(2);
+        },
+      }, { wait, now: () => now });
+      assert.equal(acceptedDefaultOnSharing(result, initial.lastAcceptedAt), true);
+      assert.equal(extraRestarts, acceptedDuringRefresh ? 0 : 1);
+      assert.equal(uploads, 4, 'both distinct synthetic sources upload exactly once');
+      await current.scheduler.stop();
+      current = await launch(0);
+      const afterAnotherRestart = await current.sharing.inspect();
+      assert.equal(afterAnotherRestart.transportStatus, 'up_to_date');
+      assert.equal(afterAnotherRestart.lastAcceptedAt, null,
+        'a further no-change restart loses only process-local acceptance evidence');
+      assert.equal(acceptedDefaultOnSharing(afterAnotherRestart, initial.lastAcceptedAt), false);
+      await current.scheduler.stop();
+    });
+});
+
+test('restart observer lets in-flight and partial uploads settle before deciding to restart', async () => {
+  const previousAcceptedAt = '2026-09-11T12:00:00.000Z';
+  const accepted = { enabled: true, basis: 'default_on', transportStatus: 'up_to_date',
+    lastAcceptedAt: '2026-09-11T12:00:01.000Z' };
+  const observations = [
+    { ...accepted, transportStatus: 'uploading', lastAcceptedAt: null },
+    { ...accepted, transportStatus: 'pending' },
+    { ...accepted, transportStatus: 'uploading' },
+    accepted,
+  ];
+  let reads = 0;
+  const result = await waitForCanaryRestartAcceptance({
+    readSharing: async () => observations[reads++], previousAcceptedAt,
+    restart: async () => assert.fail('must not stop a pass that can still accept the new source'),
+  }, { now: () => 0, wait: async (predicate, timeout) => {
+    assert.equal(timeout, 6 * 60000);
+    for (let index = 0; index < observations.length; index++) {
+      const value = await predicate();
+      if (value) return value;
+    }
+    assert.fail('fresh acceptance was not observed');
+  } });
+  assert.equal(result, accepted);
+  assert.equal(reads, 4);
+});
+
+test('extra startup still requires a fresh accepted default-on upload and shares one timeout budget', async () => {
+  const previousAcceptedAt = '2026-09-11T12:00:00.000Z';
+  const stale = { enabled: true, basis: 'default_on', transportStatus: 'up_to_date', lastAcceptedAt: previousAcceptedAt };
+  for (const final of [stale, { ...stale, lastAcceptedAt: null },
+    { ...stale, basis: 'explicit_on', lastAcceptedAt: '2026-09-11T12:00:01.000Z' },
+    { ...stale, transportStatus: 'pending', lastAcceptedAt: '2026-09-11T12:00:01.000Z' }]) {
+    let restarted = false, now = 0;
+    const budgets = [];
+    await assert.rejects(waitForCanaryRestartAcceptance({
+      readSharing: async () => restarted ? final : stale, previousAcceptedAt,
+      restart: async () => { restarted = true; now += 2000; },
+    }, { now: () => now, wait: async (predicate, timeout) => {
+      budgets.push(timeout);
+      const value = await predicate();
+      if (!value) throw new Error('synthetic acceptance timeout');
+      return value;
+    } }), /synthetic acceptance timeout/u);
+    assert.equal(restarted, true);
+    assert.deepEqual(budgets, [360000, 358000]);
+  }
 });
