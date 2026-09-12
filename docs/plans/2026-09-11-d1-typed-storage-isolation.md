@@ -10,13 +10,30 @@ status: implementation-in-progress
 Implementation is on `codex/d1-typed-storage-isolation`, draft
 [PR #124](https://github.com/adamallcock/tibotattle/pull/124), based on
 `3de7ccd0a293e1d9b95ce14b591dbf5f1c2d1f2b`.
-September 12 integration and independent source review are complete. Final
-clean-source qualification is the next gate; its exact tested revision and logs
-are recorded in the generated owning-gate and role receipts, not inferred from
-the earlier revision receipts below.
-**No remote database, schema, binding, deployment or data has changed.**
-The existing CLI login was renewed with its previously approved scopes for
-read-only staging metadata verification.
+September 12 integration, independent source review and clean-source local
+qualification are complete at `1a2d8a360bcc5db6d9c59f5045e54c689e70948b`.
+The owning Worker gate passed all 1,389 tests across 119 files, the script and
+contract checks, and both development/staging dry builds. All three role
+qualifications and all 17 effective migration schema comparisons passed.
+The exact source, commands and hashes remain in the owning-gate and role receipts.
+
+The approved isolated cloud copy also completed, using the separately frozen
+predecessor `5ff56ab76c36da344132002979102f8b6362e6e4`. It completed 183
+checkpoints, independently verified all 35 retained authority rows, installed
+the typed role and completed bootstrap. Full before/after readback preserved
+all 95 source tables and 50 synthetic rows, including storage types, row IDs
+and sequence state. The temporary source, Queue and migration Worker were
+deleted after verification; the new ingestion and analytics databases remain.
+Cloudflare required detaching the Queue consumer before Worker deletion.
+**Production and the pre-existing staging resources remain unchanged.**
+
+The next gate is the isolated encrypted application canary. Its local HTTP
+rehearsal passed enrollment, five encrypted uploads containing 206 records,
+replay, separate-process credential reuse, independent analytics failure and
+catch-up, disconnect and owner-route erasure. Remote execution needs the
+separately prepared test ledger, bucket, Workers and keys. The base remote
+protocol ends with disconnect and disabled test Workers; it does not claim
+hosted Access-owner erasure, desktop scheduling or production activation.
 
 Use a fresh compact ingestion database and an independent analytics database,
 with a **9,000,000,000-byte operating budget for each**. Keep the original source
@@ -32,18 +49,19 @@ assigned database. New-owner placement alone cannot prevent that growth.
 
 ## Integration evidence and remaining gates
 
-All results below are synthetic local checks. Counts overlap and are not additive.
+Local qualification and isolated cloud copy are distinct evidence. Counts
+overlap and are not additive; neither qualifies production activation.
 
 | Lane | Verified behavior | Remaining gate |
 |---|---|---|
-| Ingestion | Actual v1/v1.1 HTTP admission and replay; all three streams; exact typed canonical/export reads; no raw JSON fallback | Complete frozen-source gate |
-| Restore | Bounded copy of retained evidence and authority, independent verification, original row-ID high-water, final guards, bootstrap, successful successor upload | Source-bound package |
-| Independent computation | Actual daily values, source-only allowance fits, resumable v1 history, immutable v1.1 day reuse | Final combined qualification |
-| Publication | Daily endpoint and maintained graph DTO; continuous-append historical completion; honest completed-fit snapshots; 401-cell totals without prefix publication | Final combined gate |
-| Erasure | Durable independent retry mapping; offline analytics prevents false completion; prioritized terminal fence; bounded payload cleanup; late writes rejected even with publication paused | Complete frozen-source gate |
-| Operations | Disabled migration/analytics Workers build; bounded journal runner preserves uncertain outcomes | Reviewed clean-source role packages, exact staging operation |
+| Ingestion | Actual local v1/v1.1 HTTP admission and replay; all three streams; exact typed canonical/export reads; no raw JSON fallback | Encrypted cloud application canary |
+| Restore | Qualified local restored-account runtime plus isolated cloud copy, authority verification, sequence high-water, final guards and bootstrap | Dense-page cloud throughput and production-specific operation |
+| Independent computation | Qualified local daily values, source-only allowance fits, resumable v1 history, immutable v1.1 day reuse | Cloud analytics failure/catch-up canary |
+| Publication | Qualified local daily endpoint and maintained graph DTO; continuous-append historical completion; honest completed-fit snapshots; 401-cell totals without prefix publication | Production target rebuilding and public/admin read verification |
+| Erasure | Qualified local retry mapping, offline-analytics refusal, terminal fence, bounded cleanup and late-write refusal | Production deletion-ledger reconciliation and hosted owner-route proof |
+| Operations | Exact role qualification, full-file imports, bounded journal recovery and completed isolated remote copy/cleanup | Production freeze headroom, maintenance window and reviewed cutover |
 
-The final 10,000-row local rehearsal completed 1,435 bounded restore steps in
+An earlier 10,000-row local rehearsal completed 1,435 bounded restore steps in
 102.8 seconds, followed by actual restored-target runtime verification in 4.6
 seconds. Copied accountless credentials, exact replay, new upload, analytics,
 retained tombstones, opt-out, physical erasure and original-source preservation
@@ -83,8 +101,9 @@ Additional current receipts include:
   accepted retries remain available. A consumer refuses a rolled-back or diverged
   source journal instead of silently advancing over mismatched history.
 
-Independent cross-review is complete. The final owning-gate receipt must bind
-all qualification to the exact tested source and commands. The private migration
+Independent cross-review and the owning gate are complete at the revision above.
+The owning-gate receipt binds qualification to the exact tested source and
+commands. The private migration
 Queue advances one verified bounded page per message; duplicate and delayed
 wakeups converge by checkpoint identity. Uncertain writes remain stopped.
 
@@ -143,6 +162,14 @@ maintained commands and the [schema map](../research/2026-09-11-ingestion-analyt
 for the baseline 94-table inventory.
 
 ## Storage measurement boundary
+
+The latest qualified 10,000-record complete-role fixture at `1a2d8a36`
+measured **28,352,512 bytes before versus 10,485,760 bytes after**, about a
+63% whole-file reduction. It includes authority, admission proofs, indexes and
+restore metadata, and excludes the separate analytics database. The restore
+and actual restored-account runtime completed in 73.1 seconds locally. Neither
+the storage ratio nor that timing is a production capacity or duration forecast.
+The measurements below preserve earlier implementation-stage provenance.
 
 The [earlier synthetic measurement](../research/2026-09-11-typed-storage-measurement.md)
 at frozen source `62516e878197ec9c1524a8c8a87c0344e2277677` measured
