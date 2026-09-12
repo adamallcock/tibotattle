@@ -3,6 +3,7 @@ import { open, realpath, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
+import { MIGRATION_JOURNAL_DDL } from './d1-storage-migration-worker.mjs';
 import { identityDigest, operationError } from '../../../scripts/lib/release-operation.mjs';
 import { loadStorageQualification, storageSchemaDigest, storageSha256, D1_STORAGE_SCHEMA_DIRECTORIES } from './d1-storage-plan.mjs';
 
@@ -26,7 +27,7 @@ const SQL=Object.freeze({
  sourceSnapshot:'SELECT contract_digest,namespace,snapshot_digest FROM _authority_snapshot WHERE id=1',
  sequences:'SELECT name,seq FROM sqlite_sequence ORDER BY name LIMIT 129',
  sourceCounts:"SELECT 'v1' format,count(*) records,COALESCE(max(id),0) last_id FROM telemetry_v1_records UNION ALL SELECT 'v11',count(*),COALESCE(max(rowid),0) FROM telemetry_v11_records",
- progress:'SELECT contract_digest,stage,steps,intent FROM _authority_operator_progress WHERE id=1',
+ progress:'SELECT contract_digest,execution_digest,stage,steps,intent FROM _authority_operator_progress WHERE id=1',
  restore:'SELECT run_id,contract_digest,limit_bytes,phase FROM _authority_restore_run WHERE id=1',
  tables:'SELECT name,copied,verified,copy_done,verify_done,copy_cursor,verify_cursor FROM _authority_restore_tables ORDER BY name LIMIT 129',
  typed:'SELECT format,run_id,verify_cursor,verified,done FROM _authority_restore_typed ORDER BY format LIMIT 3',
@@ -76,7 +77,7 @@ const SQL=Object.freeze({
 export const MAINTENANCE_CUTOVER_PROOF_SQL=Object.freeze([...new Set(Object.values(SQL))]);
 
 export function validateMaintenanceCutoverProof(proof){
- exact(proof,'schema restoreContractSha256 restoreContractDigest ingestionQualificationSha256 analyticsQualificationSha256 ledgerSchemaFileSha256 ledgerMigrationInputsSha256 ledgerStateSha256');
+ exact(proof,'schema restoreContractSha256 restoreContractDigest migrationExecutionDigest ingestionQualificationSha256 analyticsQualificationSha256 ledgerSchemaFileSha256 ledgerMigrationInputsSha256 ledgerStateSha256');
  if(proof.schema!=='production-maintenance-typed-proof-v1'||Object.entries(proof).some(([key,value])=>key!=='schema'&&(typeof value!=='string'||!SHA.test(value))))fail('DESCRIPTOR');
  return structuredClone(proof);
 }
@@ -106,7 +107,7 @@ async function maintained(){
  })();
  return primitives;
 }
-const operatorDDL='CREATE TABLE _authority_operator_progress(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,stage TEXT,steps INTEGER NOT NULL CHECK(steps>=0),intent TEXT) STRICT';
+const operatorDDL=MIGRATION_JOURNAL_DDL;
 const snapshotDDL='CREATE TABLE _authority_snapshot(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,namespace TEXT NOT NULL,snapshot_digest TEXT NOT NULL) STRICT';
 const bootstrapDDL="CREATE TABLE _authority_restore_bootstrap(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,\n phase TEXT NOT NULL CHECK(phase IN ('walking','complete')),participant_cursor TEXT NOT NULL,chunk_cursor TEXT NOT NULL) STRICT";
 const bootstrapAssertDDL='CREATE TABLE _authority_restore_bootstrap_assert(id INTEGER CHECK(id=0)) STRICT';
@@ -223,6 +224,7 @@ export async function verifyMaintenanceCutoverProof({plan,cutover,qualificationR
  if(identityDigest(operatorExpected)!==contract.targetOperatorLedgerDigest)fail('OPERATOR_PIN');
  const actualExpected=await rows(target,'expected',[],1024);equal(actualExpected,contract.finalSchema,'RESTORE_EXPECTED');
  const progress=one(await rows(target,'progress',[],1)),run=one(await rows(target,'restore',[],1));
+ if(progress.execution_digest!==proof.migrationExecutionDigest)fail('MIGRATION_EXECUTION');
  if(progress.contract_digest!==proof.restoreContractDigest||progress.stage!==null||progress.intent!==null||integer(progress.steps)<19)fail('COPY_PENDING');
  equal(run,{run_id:contract.runId,contract_digest:proof.restoreContractDigest,limit_bytes:contract.operatingLimitBytes,phase:'ready'},'COPY_PENDING');
  if(one(await rows(target,'permission',[],1)).n!==0)fail('COPY_PERMISSION');
@@ -295,13 +297,14 @@ export async function verifyMaintenanceCutoverProof({plan,cutover,qualificationR
  equal(await rows(target,'primaryCooldowns'),primaryCooldowns,'COOLDOWNS_CHANGED');
  equal(await ledgerFence(),beforeLedger,'LEDGER_CHANGED');
  equal(await rows(target,'schema',[],4096),targetSchema,'TARGET_SCHEMA_CHANGED');
+ equal(one(await rows(target,'progress',[],1)),progress,'MIGRATION_EXECUTION_CHANGED');
  equal(await rows(derived,'schema',[],4096),analyticsSchema,'ANALYTICS_SCHEMA_CHANGED');
  equal(await rows(ledger,'schema',[],4096),actualLedgerSchema,'LEDGER_SCHEMA_CHANGED');
  equal(await sourceFence(),beforeSource,'SOURCE_CHANGED');
  // Detect local input replacement during the provider reads as well.
  await file(restoreContractPath,proof.restoreContractSha256);await file(ledgerSchemaPath,proof.ledgerSchemaFileSha256);
  return {schema:'production-maintenance-typed-admission-v1',status:'verified',stage,analyticsCaughtUp:stage==='full',candidateSourceCommit:candidate.sourceCommit,
-  proofDigest:identityDigest(proof),restoreContractDigest:proof.restoreContractDigest,sourceSnapshotDigest:contract.sourceSnapshotDigest,
+  proofDigest:identityDigest(proof),migrationExecutionDigest:proof.migrationExecutionDigest,restoreContractDigest:proof.restoreContractDigest,sourceSnapshotDigest:contract.sourceSnapshotDigest,
   databaseBindingDigest:identityDigest(ids),sourceId:candidate.sourceId,sourceNamespace:candidate.sourceNamespace,
   sourceAuthorityEpoch:state.authority_epoch,journalSequence:sequence,ledgerStateSha256:proof.ledgerStateSha256,
   ingestionSchemaSha256:storageSchemaDigest(contract.finalSchema),analyticsSchemaSha256:analytics.schemaSha256,

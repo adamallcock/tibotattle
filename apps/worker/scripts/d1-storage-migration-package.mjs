@@ -65,6 +65,12 @@ export async function prepareStorageMigrationWorker({workerRoot,contractPath,con
   if(typeof placedTopologyPath!=='string'||!/^[a-f0-9]{64}$/.test(placedTopologyDigest??''))throw storageError('MIGRATION_TOPOLOGY_INVALID');
   topology=validatePlacedMigrationTopology(await privateJson(placedTopologyPath,4096));
   if(identityDigest(topology)!==placedTopologyDigest)throw storageError('MIGRATION_TOPOLOGY_INVALID');
+  // Never label an older worker-root bundle as the fenced protocol. The source
+  // stays independently pinned; these exact transport files must implement it.
+  for(const file of ['d1-storage-migration-worker.mjs','d1-storage-migration-placed.mjs']){
+   if(storageSha256(await readFile(join(workerRoot,'scripts',file)))!==storageSha256(await readFile(new URL(file,import.meta.url))))
+    throw storageError('MIGRATION_EXECUTION_PROTOCOL_INVALID');
+  }
  }
  if(identityDigest(contract)!==contractDigest||contract.version!=='authority-restore-v1'
   ||typeof contract.sourceId!=='string'||!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/.test(contract.sourceId)||!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/.test(contract.runId??'')
@@ -106,7 +112,7 @@ export async function prepareStorageMigrationWorker({workerRoot,contractPath,con
   files['wrangler.backend.jsonc']=JSON.stringify(backend,null,2)+'\n';
   files['topology.json']=JSON.stringify(topology,null,2)+'\n';
   files['preparation.json']=JSON.stringify({...JSON.parse(files['preparation.json']),
-   schema:'d1-storage-placed-migration-preparation-v1',executionDigest,driver:'private-fetch-queue-checkpoint-continuation',topology,
+   schema:'d1-storage-placed-migration-preparation-v1',executionFenceVersion:1,executionDigest,driver:'private-fetch-queue-checkpoint-continuation',topology,
    topologyDigest:identityDigest(topology),backendBundleSha256:storageSha256(bundles['migration-backend.mjs']),
    frontConfigSha256:storageSha256(files['wrangler.jsonc']),backendConfigSha256:storageSha256(files['wrangler.backend.jsonc'])})+'\n';
  }

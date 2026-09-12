@@ -1,9 +1,11 @@
 import { runStorageRestoreStep, STORAGE_RESTORE_STAGES } from './d1-storage-restore-runner.mjs';
 
 const TABLE='_authority_operator_progress';
-const DDL=`CREATE TABLE ${TABLE}(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,stage TEXT,steps INTEGER NOT NULL CHECK(steps>=0),intent TEXT) STRICT`;
-const JOURNAL_GUARD=`(SELECT count(*) FROM sqlite_schema WHERE tbl_name='${TABLE}')=1
+export const MIGRATION_JOURNAL_DDL=`CREATE TABLE ${TABLE}(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,execution_digest TEXT NOT NULL,stage TEXT,steps INTEGER NOT NULL CHECK(steps>=0),intent TEXT) STRICT`;
+const DDL=MIGRATION_JOURNAL_DDL;
+export const MIGRATION_JOURNAL_GUARD=`(SELECT count(*) FROM sqlite_schema WHERE tbl_name='${TABLE}')=1
  AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='${TABLE}' AND tbl_name='${TABLE}' AND sql=?)`;
+const JOURNAL_GUARD=MIGRATION_JOURNAL_GUARD;
 const fail=code=>{throw new Error(`D1_STORAGE_${code}`);};
 /** Bundled contract and API are supplied by the reviewed generated entrypoint,
  * never an HTTP request or a runtime JSON variable. Deployment/binding approval
@@ -11,9 +13,9 @@ const fail=code=>{throw new Error(`D1_STORAGE_${code}`);};
  * ledger or enable ordinary traffic; ready means restore APIs completed only.
  * A private queue advances pages immediately. Cron only repairs a lost wakeup;
  * it never replays an uncertain page or paces the whole copy one page/minute. */
-export function createStorageMigrationWorker({api,contract,contractDigest,expiresAt,frozenSource=false,clock=()=>Date.now()}){
+export function createStorageMigrationWorker({api,contract,contractDigest,executionDigest=contractDigest,expiresAt,frozenSource=false,clock=()=>Date.now()}){
  const fixed=structuredClone(contract);
- if(!/^[a-f0-9]{64}$/.test(contractDigest)||!Number.isSafeInteger(expiresAt))fail('MIGRATION_CONFIGURATION_INVALID');
+ if(!/^[a-f0-9]{64}$/.test(executionDigest)||!/^[a-f0-9]{64}$/.test(contractDigest)||!Number.isSafeInteger(expiresAt))fail('MIGRATION_CONFIGURATION_INVALID');
  const enabled=async env=>{
    if(env.STORAGE_RESTORE_MODE===undefined||env.STORAGE_RESTORE_MODE==='disabled')return;
    if(env.STORAGE_RESTORE_MODE!=='enabled'||frozenSource!==true||clock()>=expiresAt||!env.SOURCE||!env.TARGET||env.SOURCE===env.TARGET
@@ -26,10 +28,10 @@ export function createStorageMigrationWorker({api,contract,contractDigest,expire
    if(objects.length===0){
     // The first target mutation is allowed only on the exact fresh restore base.
     if(await api.authoritySchemaDigest(await api.authoritySchemaInventory(target))!==fixed.targetBaseSchemaDigest)fail('MIGRATION_TARGET_INVALID');
-    await target.batch([target.prepare(DDL),target.prepare(`INSERT INTO ${TABLE} VALUES(1,?,'freeze-source',0,NULL)`).bind(contractDigest)]);
+    await target.batch([target.prepare(DDL),target.prepare(`INSERT INTO ${TABLE} VALUES(1,?,?,'freeze-source',0,NULL)`).bind(contractDigest,executionDigest)]);
    }else if(objects.length!==1||objects[0].type!=='table'||objects[0].name!==TABLE||objects[0].sql!==DDL)fail('MIGRATION_JOURNAL_INVALID');
-   const state=await target.prepare(`SELECT contract_digest,stage,steps,intent FROM ${TABLE} WHERE id=1`).first();
-   if(!state||state.contract_digest!==contractDigest||!Number.isSafeInteger(state.steps)||state.steps<0
+   const state=await target.prepare(`SELECT contract_digest,execution_digest,stage,steps,intent FROM ${TABLE} WHERE id=1`).first();
+   if(!state||state.contract_digest!==contractDigest||state.execution_digest!==executionDigest||!Number.isSafeInteger(state.steps)||state.steps<0
     ||state.steps===Number.MAX_SAFE_INTEGER||!(state.stage===null||STORAGE_RESTORE_STAGES.includes(state.stage))
     ||!(state.intent===null||state.intent===state.stage))fail('MIGRATION_JOURNAL_INVALID');
    return state;
@@ -66,14 +68,14 @@ export function createStorageMigrationWorker({api,contract,contractDigest,expire
    if(clock()>=expiresAt)fail('MIGRATION_CONFIGURATION_INVALID');
    // This CAS is the invocation lease. A concurrent schedule can neither call a
    // second page nor clear an uncertain intent. No wall-clock lease stealing.
-   const claimed=await target.prepare(`UPDATE ${TABLE} SET intent=? WHERE id=1 AND contract_digest=? AND steps=? AND stage=? AND intent IS NULL
+   const claimed=await target.prepare(`UPDATE ${TABLE} SET intent=? WHERE id=1 AND contract_digest=? AND execution_digest=? AND steps=? AND stage=? AND intent IS NULL
     AND ${JOURNAL_GUARD} RETURNING id`)
-    .bind(state.stage,contractDigest,state.steps,state.stage,DDL).all();
+    .bind(state.stage,contractDigest,executionDigest,state.steps,state.stage,DDL).all();
    if(claimed.results.length!==1)fail('RESTORE_RECONCILE_REQUIRED');
    const result=await runStorageRestoreStep({api,source,target,contract:fixed,contractDigest,stage:state.stage});
-   const completed=await target.prepare(`UPDATE ${TABLE} SET stage=?,steps=steps+1,intent=NULL WHERE id=1 AND contract_digest=? AND steps=? AND stage=? AND intent=?
+   const completed=await target.prepare(`UPDATE ${TABLE} SET stage=?,steps=steps+1,intent=NULL WHERE id=1 AND contract_digest=? AND execution_digest=? AND steps=? AND stage=? AND intent=?
     AND ${JOURNAL_GUARD} RETURNING id`)
-    .bind(result.nextStage,contractDigest,state.steps,state.stage,state.stage,DDL).all();
+    .bind(result.nextStage,contractDigest,executionDigest,state.steps,state.stage,state.stage,DDL).all();
    if(completed.results.length!==1)fail('RESTORE_RECONCILE_REQUIRED');
    // Sending only after the progress commit leaves a safe lost-send boundary:
    // the next cron reads the exact new state and queues it without rerunning us.

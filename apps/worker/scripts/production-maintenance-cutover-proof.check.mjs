@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import { identityDigest } from '../../../scripts/lib/release-operation.mjs';
+import { MIGRATION_JOURNAL_DDL } from './d1-storage-migration-worker.mjs';
 import { storageSha256, storageSchemaDigest } from './d1-storage-plan.mjs';
 import { INGESTION_ROLE_INPUT_DIRECTORIES } from './d1-storage-role.mjs';
 import { SYNTHETIC_D1_WORKER, syntheticD1Binding, closeSyntheticD1Bindings } from './d1-storage-local-d1.mjs';
@@ -69,8 +70,8 @@ async function fixture(t){
  target.prepare('INSERT INTO typed_telemetry_namespaces(original_id) VALUES(?)').run(maintained.encodeTypedTelemetryId(namespace));
  for(const format of ['v1','v11'])target.prepare(`INSERT INTO typed_${format}_admission_state(id,source_namespace,namespace_id,next_source_row_id,runtime_contract_version) VALUES(1,?,1,1,1)`).run(namespace);
  target.prepare('INSERT INTO storage_source_state VALUES(1,?,0)').run(sourceId);
- target.exec("CREATE TABLE _authority_operator_progress(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,stage TEXT,steps INTEGER NOT NULL CHECK(steps>=0),intent TEXT) STRICT");
- target.prepare('INSERT INTO _authority_operator_progress VALUES(1,?,NULL,19,NULL)').run(contractDigest);
+ target.exec(MIGRATION_JOURNAL_DDL);
+ target.prepare('INSERT INTO _authority_operator_progress VALUES(1,?,?,NULL,19,NULL)').run(contractDigest,'d'.repeat(64));
  target.exec("CREATE TABLE _authority_restore_bootstrap(id INTEGER PRIMARY KEY CHECK(id=1),contract_digest TEXT NOT NULL,\n phase TEXT NOT NULL CHECK(phase IN ('walking','complete')),participant_cursor TEXT NOT NULL,chunk_cursor TEXT NOT NULL) STRICT");
  target.exec('CREATE TABLE _authority_restore_bootstrap_assert(id INTEGER CHECK(id=0)) STRICT');
  target.prepare("INSERT INTO _authority_restore_bootstrap VALUES(1,?,'complete','','')").run(contractDigest);
@@ -105,7 +106,7 @@ async function fixture(t){
  ledger.prepare("INSERT INTO deletion_tombstones VALUES(?,'participant-deletion-tombstone-v0.1','2026-01-01T00:00:00.000Z','2027-01-01T00:00:00.000Z')").run(deletedDigest);
  const ledgerState={tombstones:normalized(ledger.prepare('SELECT * FROM deletion_tombstones ORDER BY participant_digest').all()),cooldowns:[],jobs:[]};
  const ledgerSchemaPath=join(root,'ledger-schema.json'),ledgerSchemaBytes=JSON.stringify(schema(ledger));await writeFile(ledgerSchemaPath,ledgerSchemaBytes,{mode:0o600});
- const proof={schema:'production-maintenance-typed-proof-v1',restoreContractSha256:storageSha256(contractBytes),restoreContractDigest:contractDigest,ingestionQualificationSha256:storageSha256(qualificationBytes),analyticsQualificationSha256:storageSha256(analyticBytes),
+ const proof={schema:'production-maintenance-typed-proof-v1',migrationExecutionDigest:'d'.repeat(64),restoreContractSha256:storageSha256(contractBytes),restoreContractDigest:contractDigest,ingestionQualificationSha256:storageSha256(qualificationBytes),analyticsQualificationSha256:storageSha256(analyticBytes),
   ledgerSchemaFileSha256:storageSha256(ledgerSchemaBytes),ledgerMigrationInputsSha256:identityDigest(ledgerInputs),ledgerStateSha256:identityDigest(ledgerState)};
  const calls=[],options={plan:{databaseId:ids[0]},cutover:{candidate:{sourceCommit,ingestionDatabaseId:ids[1],analyticsDatabaseId:ids[2],deletionLedgerDatabaseId:ids[3],sourceNamespace:namespace,sourceId},proof},qualificationRoot:root,restoreContractPath,ledgerSchemaPath,
   readDatabase:async(id,sql,params)=>{assert.ok(MAINTENANCE_CUTOVER_PROOF_SQL.includes(sql));calls.push({id,sql,params});return {success:true,results:normalized(databases[ids.indexOf(id)].prepare(sql).all(...params)),meta:{size_after:8_000_000}};}};
@@ -242,4 +243,18 @@ test('fixed queries run unchanged through the existing native D1 transport', {ti
   f.options.readDatabase=(id,sql,params)=>natives[ids.indexOf(id)].prepare(sql).bind(...params).all();
   const receipt=await f.run();assert.equal(receipt.status,'verified');assert.ok(receipt.queries<100);
  }finally{await closeSyntheticD1Bindings(mf);await mf.dispose();}
+});
+
+
+test('cutover binds the exact final approved execution and refuses legacy or changed ownership',async t=>{
+ const f=await fixture(t);assert.equal((await f.run()).migrationExecutionDigest,f.proof.migrationExecutionDigest);
+ f.target.prepare('UPDATE _authority_operator_progress SET execution_digest=?').run('e'.repeat(64));
+ for(const stage of ['pre-analytics','full'])await assert.rejects(verifyMaintenanceCutoverProof({...f.options,stage}),/MIGRATION_EXECUTION/);
+ // The reviewed cutover descriptor must pin the final continuation, not its predecessor.
+ f.proof.migrationExecutionDigest='e'.repeat(64);assert.equal((await f.run()).migrationExecutionDigest,'e'.repeat(64));
+ const original=f.options.readDatabase;let reads=0;f.options.readDatabase=async(...args)=>{const result=await original(...args);if(args[1].includes('FROM _authority_operator_progress')&&++reads===2)result.results[0].execution_digest='f'.repeat(64);return result;};
+ await assert.rejects(f.run(),/MIGRATION_EXECUTION_CHANGED/);f.options.readDatabase=original;
+ f.target.exec('DROP TABLE _authority_operator_progress');f.target.exec(MIGRATION_JOURNAL_DDL.replace('execution_digest TEXT NOT NULL,',''));
+ await assert.rejects(f.run(),/RESTORE_METADATA_SCHEMA/);
+ const missing={...f.proof};delete missing.migrationExecutionDigest;assert.throws(()=>validateMaintenanceCutoverProof(missing));
 });

@@ -291,6 +291,86 @@ never relabel earlier source qualification. Unchanged migration/schema hashes
 are parity evidence only. The small synthetic 19-stage driver test proves
 transport/CAS/ack behavior, not record preservation or cloud throughput.
 
+### Explicit continuation into another window
+
+`d1-storage-migration-continuation.mjs` prepares a new disabled placed package;
+it never stops, deploys, resumes or reconciles a Worker itself. Keep the original
+source checkout clean and available. The new package must retain its exact source
+commit, role input, contract, source snapshot and resource topology. A newer
+tooling checkout may run this helper against that original `--worker-root`; this
+does not authorize changing the restoration code mid-copy.
+
+First remove the prior front schedule and Queue consumer, disable both versions,
+and retain the actual version/deployment/settings, ingress and consumer readbacks.
+Quiet tails, an expired deadline, a running tail process or `intent: null` do not
+prove that every old invocation finished. Stopping ingress is operational hygiene;
+the atomic target execution fence below is the ownership boundary. No continuation
+clears an intent.
+
+The closed `d1-storage-migration-handoff-v1` input binds those evidence file hashes
+to the prior preparation/execution digest, stopped versions, source/target IDs,
+stop/observation times and clean target checkpoint including its execution digest. Its observation must be
+at most 15 minutes old. The helper parses the raw provider responses and bounded
+SQL results itself: exact frozen source schema/triggers/snapshot/sequences and
+the unchanged target journal DDL/contract/stage/step with `intent: null`. Use the
+five exported `MIGRATION_CONTINUATION_READ_SQL` statements and retain each exact
+query hash alongside its result hash. All files must be private regular files;
+the closed input fields and evidence names are defined by
+`validateMigrationHandoff` in the maintained helper.
+
+The separate closed `d1-storage-migration-continuation-approval-v1` document has
+`originalPreparationSha256`, `previousPreparationSha256`,
+`previousContinuationSha256` (null for the first continuation), `handoffSha256`,
+`approvedAt` and `expiresAt`. Record the existing authorization explicitly for
+this window; approval is never inferred from time passing. The new expiry must
+extend the prior deadline and be no more than 24 hours after approval. Pass the
+reviewed canonical approval digest explicitly; preparation and handoff hashes
+are hashes of their retained file bytes.
+
+```sh
+node scripts/d1-storage-migration-continuation.mjs \
+  --worker-root /absolute/original-clean-checkout/apps/worker \
+  --previous-directory /absolute/private/prior-package \
+  --previous-preparation-sha256 <prior-preparation-file-sha256> \
+  --contract /absolute/private/restore-contract.json \
+  --handoff /absolute/private/stopped-handoff.json \
+  --handoff-sha256 <handoff-file-sha256> \
+  --approval /absolute/private/next-window-approval.json \
+  --approved-approval-sha256 <reviewed-canonical-approval-digest> \
+  --directory /absolute/new/private/next-window
+```
+
+The fresh directory contains `package/` and retained input hashes. Its new
+`continuation.json` links both executions and the prior continuation receipt and
+pins `rollover.sql`. Review and execute that **single** target statement explicitly
+before enabling the new pair. It changes only `execution_digest`, requiring the
+exact old execution, contract, stage, step, null intent and owned journal DDL. It
+also refuses after the approved new deadline. One returned row is required;
+anything else stops. A lost response never authorizes another write: use the
+exported read-only `migrationRolloverDisposition` with a fresh exact journal row
+to distinguish the unchanged old owner from the exact new owner. An unexpected
+stage, step, intent or digest remains unresolved.
+
+Both claim and commit compare the execution digest atomically. An old invocation
+paused before its claim cannot write after rollover. An invocation which already
+claimed work keeps its intent and prevents rollover. The new package declares
+`executionFenceVersion: 1`; legacy unfenced journals/packages are refused without
+an automatic upgrade. This changes only the temporary operator journal, not the
+restoration contract or ingestion schemas.
+
+Preserve every prior package and failure. Repeat the existing dry-build, version,
+binding and ingress checks before explicitly activating the new pair. Existing
+Queue messages remain compatible; the original journal determines the next step.
+Before cutover, pin the **final** approved package execution digest in the closed
+cutover plan's `proof.migrationExecutionDigest`. Both pre-analytics and full
+admission require the fenced journal DDL and that exact terminal execution;
+the final read repeats this ownership check. A prior window digest, missing pin
+or legacy journal cannot qualify, even when record counts and schema checks pass.
+The local two-window test uses native D1 and the maintained journal/driver with
+small synthetic copy APIs. Actual populated cloud rollover remains a separate
+rehearsal: expire after a committed page, prove the stopped handoff, explicitly fence ownership and
+activate the linked window, then verify all copied cells and unchanged source.
+
 ## Separate analytics Worker
 
 `wrangler.analytics.example.jsonc` points at the maintained separate scheduler.
