@@ -559,8 +559,10 @@ This is a destructive, private owner operation, never routine support cleanup:
    (unknown historical count, not zero), with the same response envelope and
    task. Without that proof the response is `404 NOT_FOUND`, not success.
 
-Restore replay owns `state: 'deleting'` with `deletion_session_id: null`.
-An owner request against that state also returns `409 PARTICIPANT_DELETING`;
+Social restore replay owns `state: 'deleting'` with `deletion_session_id: null`.
+Accountless restore replay instead owns the deterministic
+`restore-replay:<participantDeletionDigest>` fence. An owner request against
+either restore state also returns `409 PARTICIPANT_DELETING`;
 let maintenance finish or retry the restore instead of taking it over. Cron
 must not resume non-null owner or legacy deletion fences: those require the
 private owner path, even when an old session fence has no matching audit.
@@ -835,12 +837,15 @@ typed cutover is not a database rollback.
 - Quarantine retention and restore replay must remain deletion-safe. A deleted
   participant or tombstoned resource must not reappear through backup restore,
   delayed processing, or object replay.
-- For tombstoned participants, restore replay preserves social NULL fences and
-  uses the deterministic `restore-replay:<participantDeletionDigest>` fence for
-  accountless owners after revoking their enrollment. It resumes only that exact
-  reserved fence and refuses other reserved or owner UUID fences. Final removal
-  must match its claimed fence, so concurrent maintenance cannot finish an
-  owner's unrelated in-flight erasure.
+- For tombstoned participants, restore replay atomically claims only active
+  rows or interrupted restores with the exact same fence. Social owners retain
+  the NULL restore fence; accountless owners use the deterministic
+  `restore-replay:<participantDeletionDigest>` fence after revoking their
+  enrollment, before changing participant state. Accountless replay resumes only
+  that exact reserved fence and refuses other reserved or owner UUID fences.
+  Final removal must match the exact claimed fence: the social NULL restore
+  fence, the accountless reserved restore fence, or the owner operation UUID.
+  Concurrent maintenance cannot finish an owner's unrelated in-flight erasure.
 - A Worker rollback must still understand the live schemas and current durable
   state. If it cannot, contain the affected path and deploy a forward repair.
   After migrations 0049–0053, preserve their ledger entries, columns, triggers,
