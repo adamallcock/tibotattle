@@ -22,12 +22,14 @@ test('period coverage is independent and separates receipt/legacy distributions'
   assert.equal(m.speed[1].points[0].median, 200); assert.equal(m.ttft[0].median, 5);
   assert.equal(modelPerformanceProjection(rows, { period: 'all', now: NOW }).models[0].turns, 5);
 });
-test('median and middle50% resist extremes without manufacturing missing bins or sparse bands', () => {
+test('five percentile summary resists extremes without manufacturing missing bins or sparse bands', () => {
   const rows = [1,2,3,4,100000].map(n => row({ ttft: n * 1000 }));
   rows.push(row({ at: NOW - 2 * DAY, ttft: 0 }));
   const points = modelPerformanceProjection(rows, { now: NOW }).models[0].ttft;
-  assert.equal(points.length, 2); assert.equal(points[0].median, 0); assert.equal(points[0].p25, null);
-  assert.equal(points[1].median, 3); assert.equal(points[1].p25, 2); assert.equal(points[1].p75, 4);
+  assert.equal(points.length, 2); assert.equal(points[0].median, 0);
+  assert.deepEqual([points[0].p10, points[0].p25, points[0].p75, points[0].p90], [null, null, null, null]);
+  assert.equal(points[1].median, 3); assert.equal(points[1].p10, 1.4);
+  assert.equal(points[1].p25, 2); assert.equal(points[1].p75, 4); assert.ok(Math.abs(points[1].p90 - 60001.6) < 1e-9);
 });
 test('all history uses bounded weekly bins and excludes missing or invalid samples', () => {
   const rows = [row({ at: NOW - 400 * DAY }), row({ sample_tokens: NaN, ttft: null }),

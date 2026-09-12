@@ -17,11 +17,10 @@ app and published releases have not changed.
 Initial provider scope is Codex. Other providers should appear only when their
 measurements have a defined, supported contract.
 
-Selected direction: the second displayed image, the focused-model layout.
-The user's refinement removes reasoning-effort and custom date-range controls,
-uses the existing 7-day/30-day/All-time filter, and prioritizes a narrower app
-viewport. The revised mock targets a 1,024-pixel-wide window; final implementation
-must verify the actual supported window sizes.
+Selected direction: the refined layered-percentile design approved on 2026-09-11.
+It keeps the focused-model layout, existing 7-day/30-day/All-time filter and
+narrow app viewport while making distribution summaries the chart's primary
+visual hierarchy.
 
 ## Page hierarchy
 
@@ -66,23 +65,25 @@ turn contributes only the tokens and duration of its covered responses.
 ## Trends and variance
 
 Use two vertically aligned charts for the selected model rather than miniature
-panels. Show a light P25–P75 band by default; label it “Middle 50% of turns,” not
-a confidence interval. Keep legends short and place them below a chart when
-width is limited. Additional spread and individual-turn views can live in the
-expanded details rather than in a crowded top toolbar.
+panels. Show a subtle P10–P90 outer band, a stronger P25–P75 inner band and a
+dark P50 median curve. These are empirical percentiles of eligible turns, not a
+confidence interval or full probability density. The legend explicitly names
+both percentile spans and the median, and moves below the title on narrow views.
 
-Keep extreme observations in the calculations. The default quantile view reduces
+Keep extreme observations in the calculations. The five-percentile view reduces
 the visual influence of extremes without deleting data or classifying it as a
-retry. The current expandable table exposes aggregate bins; raw-turn drilldown is deferred.
-Any future individual-turn view may use an explicitly labelled logarithmic scale. Never silently clip observations or change scales.
+retry. Raw-turn drilldown is deferred. Any future individual-turn view may use
+an explicitly labelled logarithmic scale. Never silently clip observations or
+change scales.
 
 Use daily bins through 366 days and weekly bins for longer All-time spans.
 Label the interval and apply it consistently across models. Both All-time axes
 begin at the selected model's earliest measured bin; 7/30-day axes retain their
 whole selected calendar window. All boundaries are UTC. Require five observations per
-method/model/bin for a band. Sparse medians use hollow markers. Solid segments
-connect adjacent measured bins; dashed segments bridge limited gaps, with the
-maximum gap explained in the measurement details. Never bridge between methods.
+method/model/bin for percentile bands. Sparse medians use hollow markers. Solid
+segments connect adjacent measured bins; dashed, lower-emphasis median segments
+connect later observed bins across missing dates so a sparse series remains
+traceable. Percentile bands stop at missing dates. Never bridge between methods.
 
 Y axes begin at zero and use rounded 1/2/5 increments, with enough decimal
 precision for subsecond data. X ticks follow UTC days, Monday weeks, first/15th
@@ -95,8 +96,8 @@ observed dates with arrows/Home/End, and dismiss inspection with Escape.
 
 
 Newer-log and older-log TPS estimates remain separate series within each model:
-circles versus triangles. The visible legend describes “Median speed” and
-“Middle 50% of turns.” Logging-format and timestamp-reconstruction details are
+circles versus triangles. The visible legend describes the P10–P90 and P25–P75
+bands plus the P50 median. Logging-format and timestamp-reconstruction details are
 internal implementation provenance: do not expose them in table headings, row
 labels, tooltips, accessible descriptions, or the user-facing explanation.
 Separate median values may still appear when both internal series occur on the
@@ -105,7 +106,8 @@ Do not imply a logging-format transition is necessarily a model-speed change.
 Do not describe newer logs as inherently more accurate. Both TPS methods are
 estimates. Method distinctions apply only to TPS, not recorded TTFT.
 
-The hover/focus readout shows the date interval, model, metric, median and band,
+The hover/focus readout shows the date interval, model, metric, P10, P25, P50,
+P75, P90 and
 eligible turns. Covered responses are shown in the selected-model coverage strip,
 not fabricated as per-bin counts. For example, use “23 measured turns,” not
 “n = 23.” TTFT gets its own eligible-turn count; the cursor must not imply paired
@@ -142,8 +144,8 @@ the comparative chart. Counts reflect the same filters as the plotted values.
   in the speed panel. Avoid a page-wide empty state.
 - If no timing is collected yet, explain what future compatible sessions can
   provide; offer the existing local-analysis action if appropriate.
-- Use direct labels, marker shapes and text alongside color, visible focus,
-  sufficiently large targets, reduced-motion behavior and accessible data tables.
+- Use percentile labels, marker shapes and text alongside color, visible focus,
+  sufficiently large targets, reduced-motion behavior and accessible point descriptions.
 - In narrow windows, stack the comparison information and charts; keep units,
   method distinctions and coverage visible without horizontal page scrolling.
 

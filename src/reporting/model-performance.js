@@ -16,9 +16,13 @@ function quantile(sorted, p) {
 function points(bins) {
   return [...bins].sort(([a], [b]) => a - b).map(([at, values]) => {
     values.sort((a, b) => a - b);
-    return { at, n: values.length, median: quantile(values, .5),
-      p25: values.length >= 5 ? quantile(values, .25) : null,
-      p75: values.length >= 5 ? quantile(values, .75) : null };
+    const supported = values.length >= 5;
+    return { at, n: values.length,
+      p10: supported ? quantile(values, .1) : null,
+      p25: supported ? quantile(values, .25) : null,
+      median: quantile(values, .5),
+      p75: supported ? quantile(values, .75) : null,
+      p90: supported ? quantile(values, .9) : null };
   });
 }
 function add(bins, at, value) {
@@ -52,7 +56,7 @@ export function modelPerformanceProjection(rows, { period = 'all', now = Date.no
     }
     if (count(r.ttft)) { m.ttftTurns++; add(m.latency, at, r.ttft / 1000); }
   }
-  return { schemaVersion: 1, method: 2, status: 'ready', collecting: false, stale: false,
+  return { schemaVersion: 1, method: 3, status: 'ready', collecting: false, stale: false,
     updatedAt: new Date(now).toISOString(), period, interval, start, end,
     models: [...LABELS.keys()].filter(id => groups.has(id)).map(id => {
       const { receipt, legacy, latency, ...m } = groups.get(id);

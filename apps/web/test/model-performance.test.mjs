@@ -4,9 +4,11 @@ import { normalizeModelPerformance, performanceSegments, performanceDomain, perf
 import { LocalCompanionClient } from '../public/data-client.js';
 import { translate, SUPPORTED_LOCALES } from '../public/localization.js';
 const DAY = 86400000;
-const point = (at = 2 * DAY, n = 5) => ({ at, n, median: 50, p25: n < 5 ? null : 40, p75: n < 5 ? null : 60 });
+const point = (at = 2 * DAY, n = 5) => ({ at, n,
+  p10: n < 5 ? null : 30, p25: n < 5 ? null : 40, median: 50,
+  p75: n < 5 ? null : 60, p90: n < 5 ? null : 70 });
 function payload() {
-  return { schemaVersion: 1, method: 2, status: 'ready', collecting: false, stale: false, updatedAt: '2026-09-09T12:00:00.000Z', period: 'all', interval: 'day', start: DAY, end: 9 * DAY,
+  return { schemaVersion: 1, method: 3, status: 'ready', collecting: false, stale: false, updatedAt: '2026-09-09T12:00:00.000Z', period: 'all', interval: 'day', start: DAY, end: 9 * DAY,
     models: [{ id: 'gpt-5.6-sol', label: 'Sol', turns: 20, speedTurns: 10, ttftTurns: 15, timedResponses: 45,
       speed: [{ method: 'receipt', points: [point()] }, { method: 'legacy', points: [point(3 * DAY)] }], ttft: [point(), point(3 * DAY), point(4 * DAY)] }] };
 }
@@ -30,7 +32,9 @@ test('malformed, private, unknown, duplicate and excessive evidence fails closed
     x => { x.models[0].speedTurns = 2; },
     x => { x.models[0].ttftTurns = 30; },
     x => { x.models[0].speed[0].points[0].median = NaN; },
+    x => { x.models[0].speed[0].points[0].p10 = 45; },
     x => { x.models[0].speed[0].points[0].p75 = 30; },
+    x => { x.models[0].speed[0].points[0].p90 = 55; },
     x => { x.models[0].speed[0].points[0].n = 1; },
     x => { x.models[0].ttft[1].at = x.models[0].ttft[0].at; },
     x => { x.models[0].ttft[0].at = x.end + DAY; },
@@ -38,15 +42,15 @@ test('malformed, private, unknown, duplicate and excessive evidence fails closed
   ]) { const data = payload(); mutate(data); assert.equal(normalizeModelPerformance(data), null); }
 });
 test('zero latency is real while missing speed remains absent; sparse bins have no band', () => {
-  const data = payload(); data.models[0].ttft = [{ at: DAY, n: 1, median: 0, p25: null, p75: null }];
+  const data = payload(); data.models[0].ttft = [point(DAY, 1)]; data.models[0].ttft[0].median = 0;
   assert.equal(normalizeModelPerformance(data), data);
   data.models[0].ttft[0].p25 = 0;
   assert.equal(normalizeModelPerformance(data), null);
 });
-test('only bounded gaps are joined; sparse observation points are retained', () => {
+test('all observed medians stay connected while every missing interval is marked dashed', () => {
   const points = [point(DAY, 1), point(2 * DAY, 2), point(5 * DAY), point(20 * DAY)];
-  assert.deepEqual(performanceSegments(points, 'day').map(x => x.dashed), [false, true]);
-  assert.deepEqual(performanceSegments([point(DAY), point(8 * DAY), point(22 * DAY), point(43 * DAY)], 'week').map(x => x.dashed), [false, true]);
+  assert.deepEqual(performanceSegments(points, 'day').map(x => x.dashed), [false, true, true]);
+  assert.deepEqual(performanceSegments([point(DAY), point(8 * DAY), point(22 * DAY), point(43 * DAY)], 'week').map(x => x.dashed), [false, true, true]);
 });
 test('client requests only an enum period, is abortable, and reports endpoint failures', async () => {
   const calls = [], signal = new AbortController().signal;
@@ -62,7 +66,7 @@ test('client requests only an enum period, is abortable, and reports endpoint fa
 });
 test('every supported locale preserves coverage and measurement meaning', () => {
   for (const locale of SUPPORTED_LOCALES) {
-    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'unavailable', 'stale']) {
+    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'unavailable', 'stale']) {
       const value = translate(`performance.${key}`, {}, locale);
       assert.notEqual(value, `performance.${key}`);
     }
@@ -201,13 +205,22 @@ test('plot-area sweep works away from points, clears on exit, and keyboard order
   dom.show(); await controller.refresh();
   const svgs = dom.root.all().filter(node => node.tagName === 'svg' && node.listeners.pointermove);
   assert.equal(svgs.length, 2);
+  assert.ok(svgs[1].all().some(node => node.className === 'performance-percentile-band performance-percentile-band-outer'));
+  assert.ok(svgs[1].all().some(node => node.className === 'performance-percentile-band performance-percentile-band-inner'));
+  assert.ok(svgs[1].all().some(node => node.className === 'performance-percentile-line performance-percentile-line-p10'));
+  assert.ok(svgs[1].all().some(node => node.className === 'performance-median-line'));
+  assert.equal(svgs[1].all().filter(node => node.className?.startsWith('performance-endpoint-label')).length, 5);
   const readouts = () => dom.root.all().filter(node => node.className === 'sr-only performance-readout');
   // Jan3 = first measured day. Pointer near the top, far from its actual point.
   svgs[0].listeners.pointermove({ clientX: 52, clientY: 30 });
   assert.ok(readouts().every(node => node.textContent.includes('Median 50')));
+  assert.ok(readouts().every(node => node.textContent.includes('P10 30 · P25 40 · P75 60 · P90 70')));
+  const tooltipPercentiles = dom.root.all().filter(node => node.className === 'performance-tooltip-percentiles');
+  assert.equal(tooltipPercentiles.length, 2);
+  assert.deepEqual(tooltipPercentiles[0].children.filter(node => node.tagName === 'span').map(node => node.textContent), ['P90', 'P75', 'P25', 'P10']);
   svgs[0].listeners.pointermove({ clientX: 52, clientY: 200 });
   assert.ok(readouts().every(node => node.textContent.includes('Median 50')), 'vertical position never changes selected date');
-  svgs[0].listeners.pointermove({ clientX: 52 + 730 * 4/7, clientY: 100 });
+  svgs[0].listeners.pointermove({ clientX: 52 + 656 * 4/7, clientY: 100 });
   assert.ok(readouts().every(node => node.textContent.includes('No measurements')), 'missing day never borrows a nearby observation');
   svgs[0].listeners.pointerleave();
   assert.ok(readouts().every(node => node.textContent === ''));
@@ -218,6 +231,17 @@ test('plot-area sweep works away from points, clears on exit, and keyboard order
   assert.ok(readouts().every(node => node.textContent.includes('Jan 4')));
   targets[1].listeners.keydown({ key: 'Escape' });
   assert.ok(readouts().every(node => node.textContent === ''));
+  controller.destroy();
+});
+
+test('coincident speed methods draw one readable set of endpoint percentile labels', async () => {
+  const dom = focusHarness(), data = payload();
+  data.models[0].speed[1].points[0].at = data.models[0].speed[0].points[0].at;
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  const speed = dom.root.all().find(node => node.tagName === 'svg' && node.listeners.pointermove);
+  assert.equal(speed.all().filter(node => node.className?.startsWith('performance-endpoint-label')).length, 5);
   controller.destroy();
 });
 

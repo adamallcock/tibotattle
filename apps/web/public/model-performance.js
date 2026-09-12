@@ -17,7 +17,7 @@ const exact = (value, keys) => value !== null && typeof value === "object" && !A
 /** A closed, bounded display contract: never pass arbitrary source text to DOM. */
 export function normalizeModelPerformance(value) {
   if (!exact(value, ["schemaVersion", "method", "status", "collecting", "stale", "updatedAt", "period", "interval", "start", "end", "models"])
-      || value.schemaVersion !== 1 || value.method !== 2 || !["ready", "loading", "unavailable"].includes(value.status)
+      || value.schemaVersion !== 1 || value.method !== 3 || !["ready", "loading", "unavailable"].includes(value.status)
       || typeof value.collecting !== "boolean" || typeof value.stale !== "boolean" || !PERIODS.includes(value.period)
       || !["day", "week"].includes(value.interval) || !timestamp(value.end)
       || !(value.start === null || timestamp(value.start) && value.start <= value.end)
@@ -29,12 +29,14 @@ export function normalizeModelPerformance(value) {
     if (!Array.isArray(points) || points.length > 2048) return false;
     let previous = -1, total = 0;
     for (const point of points) {
-      if (!exact(point, ["at", "n", "median", "p25", "p75"]) || !timestamp(point.at)
+      if (!exact(point, ["at", "n", "p10", "p25", "median", "p75", "p90"]) || !timestamp(point.at)
           || point.at <= previous || point.at > value.end || (value.start !== null && point.at < value.start - step)
           || !count(point.n) || point.n < 1 || !Number.isFinite(point.median) || point.median < 0
           || point.median > 1e9) return false;
-      if (point.n < 5 ? point.p25 !== null || point.p75 !== null
-        : !Number.isFinite(point.p25) || !Number.isFinite(point.p75) || point.p25 < 0 || point.p25 > point.median || point.p75 < point.median || point.p75 > 1e9) return false;
+      if (point.n < 5 ? [point.p10, point.p25, point.p75, point.p90].some(value => value !== null)
+        : ![point.p10, point.p25, point.p75, point.p90].every(Number.isFinite)
+          || point.p10 < 0 || point.p10 > point.p25 || point.p25 > point.median
+          || point.p75 < point.median || point.p90 < point.p75 || point.p90 > 1e9) return false;
       previous = point.at;
       total += point.n;
     }
@@ -60,12 +62,11 @@ export function normalizeModelPerformance(value) {
   return value;
 }
 
-/** Separate segments at missing evidence; never join two reconstruction methods. */
+/** Connect observed medians within one method; missing bins use an honest dashed bridge. */
 export function performanceSegments(points, interval) {
   const step = interval === "week" ? 7 * DAY : DAY;
   return points.slice(1).flatMap((point, index) => {
     const previous = points[index], gap = point.at - previous.at;
-    if (gap > step + 7 * DAY) return [];
     return [{ from: previous, to: point, dashed: gap > step }];
   });
 }
@@ -179,12 +180,20 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     const svg = svgElement("svg", { viewBox: "0 0 800 256", role: "group", "aria-label": translate(metric === "speed" ? "speed" : "latency") });
     formatters();
     const { start, end } = domain;
-    const scale = performanceYScale(points.map(point => point.p75 ?? point.median));
+    const scale = performanceYScale(points.map(point => point.p90 ?? point.median));
     const axisNumber = new Intl.NumberFormat(locale(), { maximumFractionDigits: Math.min(20, scale.digits) });
-    const x = value => 52 + Math.max(0, Math.min(1, (value - start) / Math.max(1, end - start))) * 730;
+    const plotLeft = 52, plotRight = 708, plotWidth = plotRight - plotLeft;
+    const x = value => plotLeft + Math.max(0, Math.min(1, (value - start) / Math.max(1, end - start))) * plotWidth;
     const y = value => 214 - value / scale.maximum * 190;
+    const curve = (a, b, key, reverse = false) => {
+      const ax = x(a.at), ay = y(a[key]), bx = x(b.at), by = y(b[key]), control = (bx - ax) / 3;
+      return reverse
+        ? `M${bx},${by} C${bx - control},${by} ${ax + control},${ay} ${ax},${ay}`
+        : `M${ax},${ay} C${ax + control},${ay} ${bx - control},${by} ${bx},${by}`;
+    };
+    const band = (a, b, low, high) => `${curve(a, b, low)} L${x(b.at)},${y(b[high])} ${curve(a, b, high, true).slice(1)} Z`;
     for (const value of scale.ticks) {
-      svg.append(svgElement("line", { x1: 52, x2: 782, y1: y(value), y2: y(value), class: "performance-grid" }),
+      svg.append(svgElement("line", { x1: plotLeft, x2: plotRight, y1: y(value), y2: y(value), class: "performance-grid" }),
         svgElement("text", { x: 42, y: y(value) + 4, "text-anchor": "end", class: "performance-axis" }, axisNumber.format(value)));
     }
     const dateTicks = performanceDateTicks(domain);
@@ -192,23 +201,42 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     for (const at of dateTicks) {
       const px = x(at);
       svg.append(svgElement("line", { x1: px, x2: px, y1: 24, y2: 214, class: "performance-grid performance-date-grid" }),
-        svgElement("text", { x: px, y: 244, "text-anchor": px < 80 ? "start" : px > 750 ? "end" : "middle", class: "performance-axis" }, tickDate.format(at)));
+        svgElement("text", { x: px, y: 244, "text-anchor": px < 80 ? "start" : px > plotRight - 30 ? "end" : "middle", class: "performance-axis" }, tickDate.format(at)));
     }
-    svg.append(svgElement("path", { d: "M52 24V214H782", class: "performance-axis-line", fill: "none" }));
+    svg.append(svgElement("path", { d: `M${plotLeft} 24V214H${plotRight}`, class: "performance-axis-line", fill: "none" }));
     const readout = element("p", "sr-only performance-readout", "");
     readout.setAttribute("aria-live", "polite");
     const tooltip = element("div", "performance-tooltip"); tooltip.hidden = true;
     tooltip.setAttribute("aria-hidden", "true");
-    const formatPoint = (point, method) => translate("point", { date: fullDateFormat.format(point.at), method: method === "ttft" ? translate("latency") : translate("speed"), median: number(point.median), spread: point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`, count: number(point.n) });
+    const percentileValues = point => point.p10 === null ? translate("percentilesUnavailable") : translate("percentileValues", {
+      p10: number(point.p10), p25: number(point.p25), p75: number(point.p75), p90: number(point.p90),
+    });
+    const formatPoint = (point, method) => translate("point", { date: fullDateFormat.format(point.at), method: method === "ttft" ? translate("latency") : translate("speed"), median: number(point.median), percentiles: percentileValues(point), count: number(point.n) });
     const cursor = svgElement("line", { x1: 0, x2: 0, y1: 24, y2: 214, class: "performance-cursor", visibility: "hidden" });
     const markers = [];
     for (const item of series) {
+      const gradientSuffix = `${metric}-${modelId}-${item.method}`;
+      const defs = svgElement("defs");
+      for (const [name, middleOpacity] of [["outer", .12], ["inner", .22]]) {
+        const gradient = svgElement("linearGradient", { id: `performance-${name}-${gradientSuffix}`, x1: 0, y1: 0, x2: 0, y2: 1 });
+        gradient.append(svgElement("stop", { offset: "0%", "stop-color": color, "stop-opacity": .035 }),
+          svgElement("stop", { offset: "50%", "stop-color": color, "stop-opacity": middleOpacity }),
+          svgElement("stop", { offset: "100%", "stop-color": color, "stop-opacity": .035 }));
+        defs.append(gradient);
+      }
+      svg.append(defs);
       for (const segment of performanceSegments(item.points, payload.interval)) {
         const a = segment.from, b = segment.to;
-        if (!segment.dashed && a.p25 !== null && b.p25 !== null) {
-          svg.append(svgElement("polygon", { points: `${x(a.at)},${y(a.p25)} ${x(b.at)},${y(b.p25)} ${x(b.at)},${y(b.p75)} ${x(a.at)},${y(a.p75)}`, fill: color, opacity: item.method === "legacy" ? .14 : .18 }));
+        if (!segment.dashed && a.p10 !== null && b.p10 !== null) {
+          svg.append(svgElement("path", { d: band(a, b, "p10", "p90"), fill: `url(#performance-outer-${gradientSuffix})`, class: "performance-percentile-band performance-percentile-band-outer" }),
+            svgElement("path", { d: band(a, b, "p25", "p75"), fill: `url(#performance-inner-${gradientSuffix})`, class: "performance-percentile-band performance-percentile-band-inner" }));
+          for (const key of ["p10", "p25", "p75", "p90"]) svg.append(svgElement("path", {
+            d: curve(a, b, key), fill: "none", stroke: color,
+            class: `performance-percentile-line performance-percentile-line-${key}`,
+          }));
         }
-        svg.append(svgElement("line", { x1: x(a.at), y1: y(a.median), x2: x(b.at), y2: y(b.median), stroke: color, "stroke-width": 2.3, ...(segment.dashed ? { "stroke-dasharray": "5 5" } : {}) }));
+        svg.append(svgElement("path", { d: curve(a, b, "median"), fill: "none", stroke: color,
+          class: `performance-median-line${segment.dashed ? " performance-median-line-gap" : ""}` }));
       }
       for (const point of item.points) {
         const cx = x(point.at), cy = y(point.median);
@@ -221,7 +249,8 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
           ...(item.method === "legacy" ? { points: `${cx},${cy - 5} ${cx - 5},${cy + 4.5} ${cx + 5},${cy + 4.5}` } : { cx, cy, r: 4 }),
           fill: point.n < 5 ? "var(--white)" : color, stroke: color, "stroke-width": 1.8,
         }));
-        if (point.p25 !== null) svg.append(svgElement("line", { x1: cx, x2: cx, y1: y(point.p25), y2: y(point.p75), stroke: color, "stroke-width": 5, opacity: .18 }));
+        if (point.p10 !== null) svg.append(svgElement("line", { x1: cx, x2: cx, y1: y(point.p10), y2: y(point.p90), stroke: color, class: "performance-percentile-range" }),
+          svgElement("line", { x1: cx, x2: cx, y1: y(point.p25), y2: y(point.p75), stroke: color, class: "performance-quartile-range" }));
         marker.addEventListener("focus", () => {
           for (const entry of markers) entry.node.setAttribute("tabindex", entry.node === marker ? "0" : "-1");
           showInterval(point.at);
@@ -238,6 +267,26 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     }
     markers.sort((a, b) => a.at - b.at);
     markers[0]?.node.setAttribute("tabindex", "0");
+    const endpointSeries = series.map(item => ({ item, latest: [...item.points].reverse().find(point => point.p10 !== null) }))
+      .filter(entry => entry.latest)
+      .sort((a, b) => b.latest.at - a.latest.at || (a.item.method === "receipt" ? -1 : b.item.method === "receipt" ? 1 : 0))[0];
+    if (endpointSeries) {
+      const { latest } = endpointSeries;
+      const unit = translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit");
+      const labels = [["p90", "P90"], ["p75", "P75"], ["median", "P50"], ["p25", "P25"], ["p10", "P10"]]
+        .map(([key, label]) => ({ key, label, actualY: y(latest[key]), labelY: y(latest[key]) }))
+        .sort((a, b) => a.labelY - b.labelY);
+      for (let i = 1; i < labels.length; i++) labels[i].labelY = Math.max(labels[i].labelY, labels[i - 1].labelY + 13);
+      const overflow = Math.max(0, labels.at(-1).labelY - 210);
+      if (overflow) for (const label of labels) label.labelY -= overflow;
+      const underflow = Math.max(0, 28 - labels[0].labelY);
+      if (underflow) for (const label of labels) label.labelY += underflow;
+      for (const label of labels) {
+        svg.append(svgElement("line", { x1: x(latest.at) + 3, y1: label.actualY, x2: 717, y2: label.labelY, stroke: color, class: "performance-endpoint-leader", "aria-hidden": "true" }),
+          svgElement("circle", { cx: x(latest.at), cy: label.actualY, r: label.key === "median" ? 3.2 : 2.4, fill: color, class: "performance-endpoint-dot", "aria-hidden": "true" }),
+          svgElement("text", { x: 721, y: label.labelY + 4, fill: color, class: `performance-endpoint-label${label.key === "median" ? " performance-endpoint-label-median" : ""}`, "aria-hidden": "true" }, `${label.label} ${number(latest[label.key])} ${unit}`));
+      }
+    }
     const highlights = series.map(() => svgElement("circle", { r: 8, fill: "none", stroke: color, "stroke-width": 2.5, visibility: "hidden", class: "performance-highlight" }));
     svg.append(cursor, ...highlights);
     const byDate = series.map(item => new Map(item.points.map(point => [point.at, point])));
@@ -258,9 +307,15 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       if (!matches.length) tooltip.append(element("p", "", translate("noBin")));
       for (const { point, method } of matches) {
         const row = element("div", "performance-tooltip-row");
-        row.append(element("span", "performance-tooltip-method", method === "ttft" ? translate("latency") : `${method === "legacy" ? "△" : "○"} ${translate("medianSpeed")}`),
-          element("strong", "performance-tooltip-value", `${number(point.median)} ${translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit")}`),
-          element("span", "performance-tooltip-detail", `${translate("spread")}: ${point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`} · ${translate("turns")}: ${number(point.n)}`));
+        const unit = translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit");
+        row.append(element("span", "performance-tooltip-method", method === "ttft" ? translate("latency") : `${method === "legacy" ? "△" : "○"} ${translate("medianP50")}`),
+          element("strong", "performance-tooltip-value", `${number(point.median)} ${unit}`));
+        const distribution = element("div", "performance-tooltip-percentiles");
+        if (point.p10 === null) distribution.append(element("span", "performance-tooltip-detail", translate("percentilesUnavailable")));
+        else for (const [label, value] of [["P90", point.p90], ["P75", point.p75], ["P25", point.p25], ["P10", point.p10]]) {
+          distribution.append(element("span", "", label), element("strong", "", `${number(value)} ${unit}`));
+        }
+        row.append(distribution, element("span", "performance-tooltip-detail", `${translate("turns")}: ${number(point.n)}`));
         tooltip.append(row);
       }
       tooltip.style.setProperty("left", `clamp(0px, ${x(at) / 8 + 2}%, max(0px, 100% - 280px))`);
@@ -270,8 +325,8 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       if (!bounds.width || !bounds.height) return;
       const px = (event.clientX - bounds.left) * 800 / bounds.width;
       const py = (event.clientY - bounds.top) * 256 / bounds.height;
-      if (px < 52 || px > 782 || py < 24 || py > 214) { showInterval(null); return; }
-      showInterval(performanceHoverBin((px - 52) / 730, domain, payload.interval));
+      if (px < plotLeft || px > plotRight || py < 24 || py > 214) { showInterval(null); return; }
+      showInterval(performanceHoverBin((px - plotLeft) / plotWidth, domain, payload.interval));
     };
     svg.addEventListener("pointermove", sweep);
     svg.addEventListener("pointerdown", sweep);
@@ -334,20 +389,24 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     const panel = element("div", "performance-model-panel"); panel.id = "performance-model-panel"; panel.setAttribute("role", "tabpanel"); panel.setAttribute("aria-labelledby", `performance-tab-${modelId}`);
     const subheading = element("div", "performance-model-heading"); subheading.append(element("h3", "", selected.label), element("span", "", translate(payload.interval))); panel.append(subheading);
     for (const metric of ["speed", "latency"]) {
-      const card = element("article", "performance-card"); card.append(element("h4", "", translate(metric)), element("p", "performance-unit", translate(`${metric}Unit`)));
-      card.append(plot(metric === "speed" ? selected.speed : [{ method: "ttft", points: selected.ttft }], metric, COLORS[modelId] ?? "var(--green)", domain));
+      const card = element("article", "performance-card");
+      const cardHeading = element("div", "performance-card-heading"), cardTitle = element("div");
+      cardTitle.append(element("h4", "", translate(metric)), element("p", "performance-unit", translate(`${metric}Unit`)));
       const legend = element("div", "performance-legend");
-      for (const method of metric === "speed" ? ["medianSpeed", "band"] : ["median", "band"]) {
+      for (const method of ["outerBand", "innerBand", "medianP50"]) {
         const entry = element("span", "performance-legend-item");
-        const swatch = svgElement("svg", { width: 18, height: 16, viewBox: "0 0 18 16", "aria-hidden": "true" });
+        const swatch = svgElement("svg", { width: method === "medianP50" ? 24 : 22, height: 16, viewBox: "0 0 24 16", "aria-hidden": "true" });
         const color = COLORS[modelId] ?? "var(--green)";
-        swatch.append(svgElement(method === "band" ? "rect" : "line", {
-          ...(method === "band" ? { x: 1, y: 3, width: 16, height: 10, rx: 2, opacity: .22 } : { x1: 1, y1: 8, x2: 17, y2: 8 }),
-          fill: color, stroke: color, "stroke-width": method === "band" ? 0 : 2,
+        swatch.append(svgElement(method === "medianP50" ? "line" : "rect", {
+          ...(method === "medianP50" ? { x1: 1, y1: 8, x2: 23, y2: 8 } : { x: 1, y: method === "outerBand" ? 3 : 5, width: 22, height: method === "outerBand" ? 10 : 6, rx: 3 }),
+          fill: color, stroke: color, opacity: method === "outerBand" ? .1 : method === "innerBand" ? .22 : 1,
+          "stroke-width": method === "medianP50" ? 2.6 : 0,
         }));
         entry.append(swatch, element("span", "", translate(method))); legend.append(entry);
       }
-      card.append(legend); panel.append(card);
+      cardHeading.append(cardTitle, legend); card.append(cardHeading,
+        plot(metric === "speed" ? selected.speed : [{ method: "ttft", points: selected.ttft }], metric, COLORS[modelId] ?? "var(--green)", domain));
+      panel.append(card);
     }
     const coverage = element("div", "performance-coverage");
     coverage.append(element("span", "", translate("coverageSpeed", { measured: number(selected.speedTurns), total: number(selected.turns) })), element("span", "", translate("coverageTtft", { measured: number(selected.ttftTurns), total: number(selected.turns) })), element("span", "", translate("responses", { count: number(selected.timedResponses) }))); panel.append(coverage);
