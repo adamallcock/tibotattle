@@ -126,8 +126,16 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
     "0002_identity_reenrollment_cooldown.sql",
+    "0003_storage_erasure_jobs.sql",
   ]),
 });
+
+// JSON staging does not use the separate typed analytics erasure job ledger.
+// Its deployed two-migration ledger remains compatible; local source inventory
+// still requires the complete reviewed additive migration set above.
+const JSON_STAGING_LEDGER_MIGRATIONS = Object.freeze(
+  EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER.slice(0, 2),
+);
 
 // A prior synthetic-only staging rehearsal applied a divergent 0046–0048
 // accountless lineage. It must never be replayed or treated as current: its
@@ -1614,6 +1622,8 @@ export const REQUIRED_STAGING_VARIABLES = Object.freeze({
   ACCOUNTLESS_ENROLLMENT_MODE: "disabled",
   ACCOUNTLESS_OWNERSHIP_MODE: "disabled",
   ACCOUNT_SCOPED_INGEST_MODE: "disabled",
+  TELEMETRY_STORAGE_MODE: "json",
+  TELEMETRY_STORAGE_NAMESPACE: "",
   UPLOAD_INGRESS_QUEUE_MODE: "disabled",
   UPLOAD_INGRESS_MAX_CONCURRENT: "8",
   UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "120",
@@ -2339,7 +2349,7 @@ function migrationNames(value) {
 function classifyMigrationProbe(
   result,
   expectedNames,
-  { legacyLineage = null } = {},
+  { legacyLineage = null, compatibleLineage = null } = {},
 ) {
   if (!result.ok) {
     const output = `${result.stdout}${result.stderr}`;
@@ -2360,7 +2370,8 @@ function classifyMigrationProbe(
   if (!sameStringArray(names, [...new Set(names)])) {
     return { status: "drift", code: "REMOTE_MIGRATION_INVENTORY_DRIFT" };
   }
-  if (sameStringArray(names, expectedNames)) {
+  if (sameStringArray(names, expectedNames)
+      || (compatibleLineage !== null && sameStringArray(names, compatibleLineage))) {
     return { status: "current", code: null };
   }
   if (legacyLineage !== null && sameStringArray(names, legacyLineage)) {
@@ -2867,7 +2878,7 @@ export function probeStagingLive({
         EXPECTED_STAGING_MIGRATIONS[entry.binding],
         entry.binding === "USAGE_MONITOR_DB"
           ? { legacyLineage: RETAINED_LEGACY_STAGING_MIGRATION_LINEAGE }
-          : undefined,
+          : { compatibleLineage: JSON_STAGING_LEDGER_MIGRATIONS },
       );
       return Object.freeze({
         binding: entry.binding,
