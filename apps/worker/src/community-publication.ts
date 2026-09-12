@@ -100,7 +100,7 @@ interface MembershipRow {
 }
 const CAPTURE_SQL = `WITH candidates AS MATERIALIZED (
   SELECT q.id AS member_id,p.id AS participant_id,v.revision AS input_revision,${SOURCE_FLAGS}
-  FROM community_current_analysis_queue q JOIN participants p ON p.id=q.participant_id AND p.state='active'
+  FROM community_current_analysis_queue q JOIN participants p ON p.id=q.participant_id AND p.state='active' AND p.owner_kind='social'
   JOIN community_analytical_input_versions v ON v.participant_id=p.id
   WHERE q.id>?1 AND q.id<=?2 AND (
     EXISTS (SELECT 1 FROM telemetry_v1_chunks c INDEXED BY telemetry_v1_chunks_current_identity
@@ -165,7 +165,7 @@ const LOAD_SQL = `WITH page AS MATERIALIZED (
     c.source_method_version AS composition_method,
     COALESCE(length(CAST(f.fits_json AS BLOB)),0)+CASE WHEN m.composition_supported=1
       THEN COALESCE(length(CAST(c.composition_json AS BLOB)),0) ELSE 0 END AS row_bytes
-  FROM community_publication_members m JOIN participants p ON p.id=m.participant_id AND p.state='active'
+  FROM community_publication_members m JOIN participants p ON p.id=m.participant_id AND p.state='active' AND p.owner_kind='social'
   JOIN community_analytical_input_versions v ON v.participant_id=m.participant_id
   LEFT JOIN community_allowance_fit_cache f ON f.participant_id=m.participant_id
   LEFT JOIN community_model_composition_cache c ON c.participant_id=m.participant_id

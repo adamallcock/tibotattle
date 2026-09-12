@@ -25,6 +25,24 @@ For release-site coordination with GitHub, architecture feeds and Homebrew, use
 [publication reconciliation](./release-publication-reconciliation.md); it delegates
 website writes to this runbook's existing guarded deployment path.
 
+
+## Temporary migration liveness
+
+An explicitly enabled migration-only source snapshot fences dynamic HTTP and
+scheduled maintenance before storage access. Its public `GET /api/health`
+returns source-bound liveness with `mode: migration-mutation-barrier` and
+`maintenance.storageQualified: false`; it does not probe D1, R2 or Durable
+Objects. Missing exact source provenance returns 503. Other dynamic requests,
+including admin-host requests, remain fenced. Normal health behavior is unchanged
+when the source flag is disabled; its ingress-budget probe performs lease
+housekeeping and is not a storage-free read.
+
+A successful fenced health response proves the deployed source is reachable,
+not that the database migration completed. Keep exact schema/ledger/checkpoint
+readbacks and the subsequent ordinary health/canary as separate gates. The
+standard deployment wrapper can acknowledge the exact pending migrations
+without applying them; never substitute its health receipt for migration proof.
+
 ## Production topology
 
 | Surface | Authority and boundary |

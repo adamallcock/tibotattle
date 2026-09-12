@@ -63,9 +63,10 @@ export async function claimCurrentAnalysisJob(db: D1Database, pass: CurrentAnaly
     || !integer(pass.maximumServedSequence) || !maintenanceLease) return null;
   const stateGuard = `EXISTS (SELECT 1 FROM community_current_analysis_queue_state
     WHERE singleton_id=1 AND utc_day=?1 AND method_version=?2 AND window_generation=?3)`;
-  const nextJob = `SELECT id FROM community_current_analysis_queue INDEXED BY community_current_analysis_queue_ready
-    WHERE pending=1 AND window_generation=?3 AND last_served_sequence<=?5
-    ORDER BY last_served_sequence,id LIMIT 1`;
+  const nextJob = `SELECT q.id FROM community_current_analysis_queue q INDEXED BY community_current_analysis_queue_ready
+    JOIN participants p ON p.id=q.participant_id AND p.state='active' AND p.owner_kind='social'
+    WHERE q.pending=1 AND q.window_generation=?3 AND q.last_served_sequence<=?5
+    ORDER BY q.last_served_sequence,q.id LIMIT 1`;
   const result = await db.batch<{
     id: number; participant_id: string; dirty_generation: number; window_generation: number;
     last_served_sequence: number; input_revision: number; has_v1: number; has_v11: number; has_legacy: number;
@@ -105,7 +106,7 @@ const ACK_GUARD = `window_generation=?3 AND last_served_sequence=?5
   AND EXISTS (SELECT 1 FROM community_current_analysis_queue_state s
     WHERE s.singleton_id=1 AND s.window_generation=?3 AND s.utc_day=?1 AND s.method_version=?2)
   AND EXISTS (SELECT 1 FROM participants p JOIN community_analytical_input_versions v ON v.participant_id=p.id
-    WHERE p.id=community_current_analysis_queue.participant_id AND p.state='active' AND v.revision=?8)
+    WHERE p.id=community_current_analysis_queue.participant_id AND p.state='active' AND p.owner_kind='social' AND v.revision=?8)
   AND ${LIVE_LEASE}`;
 
 function claimBinds(claim: CurrentAnalysisQueueClaim, maintenanceLease: string): (string | number)[] {

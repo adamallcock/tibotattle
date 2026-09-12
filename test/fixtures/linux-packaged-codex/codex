@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+
+import { createInterface } from "node:readline";
+
+const responses = Object.freeze({
+  initialize: Object.freeze({}),
+  "account/read": Object.freeze({
+    account: Object.freeze({ email: "synthetic.fixture@example.test", planType: "pro" }),
+  }),
+  "account/rateLimits/read": Object.freeze({
+    rateLimits: Object.freeze({
+      limitId: "codex",
+      planType: "pro",
+      primary: Object.freeze({ usedPercent: 25, windowDurationMins: 300, resetsAt: 1_800_000_000 }),
+      secondary: null,
+    }),
+  }),
+  "account/usage/read": Object.freeze({
+    dailyUsageBuckets: Object.freeze([
+      Object.freeze({ startDate: "2026-09-01", tokens: 1 }),
+    ]),
+  }),
+});
+
+if (process.argv[2] === "--version") {
+  process.stdout.write("codex 0.0.0\n");
+} else if (process.argv[2] !== "app-server") {
+  process.exitCode = 1;
+} else {
+  createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
+    let request;
+    try {
+      request = JSON.parse(line);
+    } catch {
+      process.exitCode = 1;
+      return;
+    }
+    if (!Number.isInteger(request?.id)) return;
+    const result = responses[request.method];
+    process.stdout.write(`${JSON.stringify(result === undefined
+      ? { id: request.id, error: { message: "unsupported" } }
+      : { id: request.id, result })}\n`);
+  });
+}

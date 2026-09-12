@@ -42,6 +42,7 @@ async function fixture() {
     "apple.svg": "<svg></svg>\n",
     "community-data.js": "export const communityData = true;\n",
     "community-refresh.js": "export const communityRefresh = true;\n",
+    "model-visuals.js": "export const modelVisuals = true;\n",
     "community-view.js": "export const communityView = true;\n",
     "community.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
     "community.js": 'import "./install-cta.js";\nconsole.log("community");\n',
@@ -276,7 +277,7 @@ test("staging refuses a missing shared admin dependency and never publishes the 
   });
   for (const path of [
     "styles.css", "ui-format.js", "localization.js", "i18n.generated.js",
-    "community-data.js", "community-view.js", "model-catalog.generated.js",
+    "community-data.js", "community-view.js", "model-visuals.js", "model-catalog.generated.js",
   ]) {
     const manifest = JSON.parse(originalManifest);
     manifest.files = manifest.files.filter((entry) => entry.path !== path);

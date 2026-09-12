@@ -245,8 +245,7 @@ async function createReleaseFixture({
   );
   const selectedChannel = getReleaseChannel("stable", { architecture });
   appcastURL ??= selectedChannel.sparkle.appcastURL;
-  const fileName = architecture === "x64"
-    ? RELEASE_MANIFEST.macOS.x64DmgFileName : RELEASE_MANIFEST.macOS.arm64DmgFileName;
+  const fileName = `TiboTattle-${shortVersion}-macOS-${architecture}.dmg`;
   const dmgPath = join(root, fileName);
   const appcastPath = join(root, "appcast.xml");
   const releaseManifestPath = join(root, `${fileName}.release.json`);
@@ -3318,4 +3317,45 @@ test("Intel first publication bootstraps only its empty feed and cannot reuse AR
       intelObjectPath,
     ]);
   } finally { await arm.cleanup(); await intel.cleanup(); }
+});
+
+test('canonical publisher accepts explicit Electron transition only with bound Sparkle journey and native predecessor', async () => {
+  const previous = await createReleaseFixture({ bundleVersion: '1026', shortVersion: '0.1.18' });
+  const fixture = await createReleaseFixture({ bundleVersion: '1028', shortVersion: '0.1.21' });
+  try {
+    const native = JSON.parse(await readFile(fixture.releaseManifestPath));
+    const proof = { schemaVersion: 'tibotattle-signed-macos-sparkle-transition-v1', status: 'passed',
+    target: 'darwin-arm64', version: '0.1.21', buildNumber: '2026091105', bundleVersion: '1028',
+    feedScope: 'isolated_test_feed', feedSha256: '1'.repeat(64), feedOverrideApplied: true, productionFeedVerified: false,
+    candidateCopiedByRunner: false, signedArtifactVerified: true, disposableAccountVerified: true,
+    checkForUpdatesClicked: true, installUpdateClicked: true, updaterRelaunchedCandidate: true,
+      sourceRevision: native.source.commit, dmgSha256: native.artifact.sha256, asarSha256: 'c'.repeat(64),
+      nativeVersion: '0.1.18', nativeDmgSha256: sha256(previous.dmgBytes), nativeSparkleUpdateCompleted: true,
+      migrationCompleted: true, retainedRowsPreserved: true, saltPreserved: true, preferencesPreserved: true,
+      optOutPreserved: true, restartNoDuplicates: true, sourceUntouched: true, ownedProcessesStopped: true };
+    const proofPath = join(dirname(fixture.releaseManifestPath), 'sparkle-journey.json');
+    const bytes = Buffer.from(JSON.stringify(proof));
+    await writeFile(proofPath, bytes);
+    const receipt = { schemaVersion: 'tibotattle-electron-sparkle-transition-v1',
+      application: { ...native.application, architecture: 'arm64' }, artifact: native.artifact,
+      source: native.source, channel: native.channel,
+      sparkle: { appcastURL: native.updater.appcastURL, publicEdKeySha256: native.updater.publicEdKeySha256 },
+      electron: { buildNumber: '2026091105', asarSha256: proof.asarSha256, updaterConfigurationSha256: 'd'.repeat(64) },
+      evidence: { scope: 'local_qualification', nativeSparkleJourney: { localPath: 'sparkle-journey.json', bytes: bytes.length, sha256: sha256(bytes) } } };
+    await writeFile(fixture.releaseManifestPath, JSON.stringify(receipt));
+    let inspections = 0, remoteCalls = 0;
+    const options = { channel: 'stable', bucket: APPROVED_R2_BUCKET, dmgPath: fixture.dmgPath,
+      appcastPath: fixture.appcastPath, releaseManifestPath: fixture.releaseManifestPath,
+      previousStableManifestPath: previous.releaseManifestPath, stableBootstrap: false, sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      validateDMG: async () => { throw Error('Native payload validator must not inspect Electron'); },
+      validateElectronDMG: async (_path, input) => { inspections++; assert.deepEqual(input.manifest, receipt);
+        return { source: { commit: receipt.source.commit, tag: receipt.source.tag } }; },
+      runWrangler: async () => { remoteCalls++; throw Error('No remote writes in validation'); } };
+    const result = await publishSparkleUpdate(options);
+    assert.equal(result.status, 'validated'); assert.equal(result.published, false);
+    assert.equal(inspections, 1); assert.equal(remoteCalls, 0);
+    await writeFile(proofPath, JSON.stringify({ ...proof, nativeSparkleUpdateCompleted: false }));
+    await assert.rejects(publishSparkleUpdate(options), { code: 'SPARKLE_ELECTRON_TRANSITION_EVIDENCE_MISMATCH' });
+    assert.equal(inspections, 1); assert.equal(remoteCalls, 0);
+  } finally { await previous.cleanup(); await fixture.cleanup(); }
 });

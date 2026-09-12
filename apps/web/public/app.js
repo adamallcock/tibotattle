@@ -1,3 +1,6 @@
+import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { mountWorkUsageView } from "./work-usage-view.js";
+import { mountModelPerformance } from "./model-performance.js";
 import {
   CommunityClient,
   isPrimaryCodexQuotaWindow,
@@ -53,6 +56,9 @@ import {
 } from "./telemetry-shared.generated.js";
 import {
   compact,
+  formatCodexThreadParts,
+  formatApiMoney,
+  formatSharePercent,
   adaptiveChartTickCount,
   classifyTimelineEvidence,
   createDomHelpers,
@@ -103,6 +109,87 @@ setMessageLocale(localization.locale());
 const t = localization.t;
 const tPlural = localization.tPlural;
 
+// Accountless sharing is an Electron-only presentation surface. The Electron
+// main/application controller remains the policy owner; this page receives only
+// its bounded projection through the versioned preload bridge. A missing or malformed
+// projection keeps the legacy hosted contribution controls unavailable in the
+// new Electron composition and never becomes an implied permission.
+const ELECTRON_SHARING_API_VERSION = "v1";
+const ELECTRON_SHARING_BASES = new Set([
+  "default_on",
+  "default_off",
+  "migration_default_on",
+  "user_choice",
+  "legacy_preserved",
+]);
+const ELECTRON_SHARING_STATES = new Set([
+  "pending_notices",
+  "enabled",
+  "disabled",
+  "legacy_preserved",
+]);
+const ELECTRON_SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off", "uploading", "pending", "up_to_date", "retry_wait", "paused", "recovery_required"]);
+
+function electronSharingBridge(windowRef = globalThis.window) {
+  const bridge = windowRef?.tibotattleDesktop;
+  if (bridge?.version !== ELECTRON_SHARING_API_VERSION
+      || typeof bridge.getSharingPreference !== "function"
+      || typeof bridge.setSharingEnabled !== "function"
+      || typeof bridge.sharingNoticePresented !== "function") {
+    return null;
+  }
+  return bridge;
+}
+
+function validSharingTimestamp(value) {
+  if (value === null) return true;
+  if (typeof value !== "string" || value.length !== 24) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+    && new Date(milliseconds).toISOString() === value;
+}
+
+function normalizeElectronSharingPreference(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const available = raw.available === true;
+  const current = raw.current === true;
+  const state = ELECTRON_SHARING_STATES.has(raw.state) ? raw.state : null;
+  const basis = ELECTRON_SHARING_BASES.has(raw.basis) ? raw.basis : null;
+  const noticeCount = Number.isInteger(raw.noticeCount)
+    && raw.noticeCount >= 0 && raw.noticeCount <= 3
+    ? raw.noticeCount
+    : 0;
+  const nextNoticeIndex = raw.nextNoticeIndex === null
+    ? null
+    : Number.isInteger(raw.nextNoticeIndex)
+      && raw.nextNoticeIndex >= 1 && raw.nextNoticeIndex <= 3
+      ? raw.nextNoticeIndex
+      : null;
+  const nextNoticeAt = validSharingTimestamp(raw.nextNoticeAt) ? raw.nextNoticeAt : null;
+  const earliestActivationAt = validSharingTimestamp(raw.earliestActivationAt)
+    ? raw.earliestActivationAt
+    : validSharingTimestamp(raw.activatesAt) ? raw.activatesAt : null;
+  const transportStatus = ELECTRON_SHARING_TRANSPORT_STATUSES.has(raw.transportStatus)
+    ? raw.transportStatus
+    : raw.enabled === true ? "unavailable" : "off";
+  if (raw.nextNoticeAt !== undefined && !validSharingTimestamp(raw.nextNoticeAt)) return null;
+  if (raw.earliestActivationAt !== undefined && !validSharingTimestamp(raw.earliestActivationAt)) return null;
+  if (raw.activatesAt !== undefined && !validSharingTimestamp(raw.activatesAt)) return null;
+  return Object.freeze({
+    available,
+    current,
+    enabled: available && current && raw.enabled === true,
+    state,
+    basis,
+    noticeCount,
+    nextNoticeIndex,
+    noticeDue: raw.noticeDue === true,
+    nextNoticeAt,
+    earliestActivationAt,
+    transportStatus,
+  });
+}
+
 const localClient = new LocalCompanionClient();
 let communitySession = null;
 const communityClient = new CommunityClient({
@@ -115,6 +202,7 @@ let dashboard = null;
 const cacheDropThreadLinks = {
   dashboard: null,
   generation: null,
+  generationFingerprint: null,
   requestToken: 0,
   loadToken: 0,
   requested: false,
@@ -202,6 +290,15 @@ function paginateCacheImpactRows(rows, state, signature) {
 // read that loses the race lands as null. Both latch every capability gate
 // below into "this build has no v1.0 transport" for the life of the page.
 let localCompanionHealth = null;
+// Accountless sharing is deliberately page-local presentation state. Durable
+// choice, transition receipts, and transport authority stay in the companion.
+let electronSharingPreference = null;
+let electronSharingBusy = false;
+let electronSharingNoticeAcked = new Set();
+let electronSharingNoticeReceiptIndex = null;
+let electronSharingNoticeAckScheduled = null;
+let electronSharingNoticeAckCleanup = null;
+let electronSharingNoticeAckError = false;
 // The last refresh run's accounting-rebuild deferral, read from the local
 // refresh status alongside each dashboard load. A rebuild that keeps missing
 // its memory budget is otherwise invisible here: the refresh SUCCEEDS, the
@@ -339,6 +436,17 @@ let localRefreshCancelRequested = false;
 let archiveHistoryScanActive = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
+// Electron's main process owns the recurring cadence. A renderer refresh must
+// hand it a bounded lease after the companion accepts the POST, otherwise a
+// one-shot timer can fire again while the same accounting pass is still
+// running. The controller watchdog remains the outer safety bound.
+const ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS = 1_000;
+let electronStartupRefreshTriggered = false;
+// A qualified startup observer can release while the first local-dashboard
+// load still owns the action lock. Keep that one launch pass pending until the
+// owner clears the lock instead of treating its harmless early return as the
+// completed Electron refresh.
+let electronStartupRefreshDeferred = false;
 let globalState = null;
 let visibleConnectionNotice = null;
 let dashboardUnavailableState = null;
@@ -469,6 +577,8 @@ function rerenderLocalizedDashboard() {
   // writes populate. Nothing has to be named here for it to be covered.
   retranslateLocalizedNodes();
   localization.localizeTree();
+  renderElectronAccountlessCommunity();
+  renderElectronSharingNotice();
 }
 
 window.addEventListener("tibotattle:locale-change", (event) => {
@@ -546,13 +656,37 @@ function localAnalysisLabel() {
     : "Analyze local usage";
 }
 
+// Keep phase, count and elapsed time in stable slots across refresh updates.
+function renderRefreshProgress(button, phase, { processed = null, selected = null, elapsedSeconds = null } = {}) {
+  button.classList.add("refresh-progress");
+  const label = node("span", "refresh-progress-phase", phase);
+  const count = node("span", "refresh-progress-count");
+  if (processed !== null && selected !== null) {
+    const current = node("span", "refresh-progress-current", String(processed));
+    current.style.minWidth = `${String(selected).length}ch`;
+    count.append(current, document.createTextNode(`/${selected}`));
+  }
+  const elapsed = elapsedSeconds === null ? "" :
+    `${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+  const timer = node("span", "refresh-progress-time", elapsed);
+  const description = [phase, count.textContent, elapsed].filter(Boolean).join(" · ");
+  button.title = description;
+  button.setAttribute("aria-label", description);
+  button.replaceChildren(label, count, timer);
+}
+
 function updateLocalActionButtons() {
   const allowed = localAnalysisAllowed();
   const label = localAnalysisLabel();
   for (const selector of ["#refresh-button", "#setup-refresh"]) {
     const button = $(selector);
     button.disabled = localActionBusy || !allowed;
-    if (!localActionBusy) button.textContent = label;
+    if (!localActionBusy) {
+      button.textContent = label;
+      button.classList.remove("refresh-progress");
+      button.removeAttribute("aria-label");
+      button.removeAttribute("title");
+    }
   }
   const setupCheck = $("#setup-check-again");
   if (setupCheck) setupCheck.disabled = localActionBusy;
@@ -591,25 +725,6 @@ function formatMoney(value, digits = 0) {
     });
 }
 
-function formatApiMoney(value) {
-  const number = finite(value);
-  if (number === null) return "—";
-  if (number > 0 && number < .01) {
-    return `<${formatNumber(.01, {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`;
-  }
-  return formatNumber(number, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
 /**
  * A percentage near an end of the scale must not be printed as if it were at
  * that end. `Intl` rounds 99.96 to "100%" and 0.04 to "0%", and on this
@@ -644,37 +759,6 @@ function formatPercent(value, digits = 0) {
   const rendered = format(number);
   if (number > 0 && rendered === format(0)) return `<${format(step)}`;
   if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
-  return rendered;
-}
-
-/**
- * A share for a table column, always at one decimal place.
- *
- * `formatPercent` drops to whole numbers whenever the value happens to be an
- * integer, which is right for a sentence and wrong for a column: it renders
- * "20%" directly above "20.9%", so the decimal point moves down the page and
- * two figures that exist to be compared have to be read digit by digit. Here
- * the precision is fixed, and the same bounded "<" idiom keeps a sliver from
- * rendering as an exact zero it is not.
- *
- * Returns `null` when the denominator cannot carry a share at all, so callers
- * withhold the cell rather than printing a share of nothing.
- */
-function formatSharePercent(part, whole) {
-  const numerator = finite(part);
-  const denominator = finite(whole);
-  if (numerator === null || denominator === null || denominator <= 0) return null;
-  if (numerator < 0) return null;
-  const percentFormatter = numberFormatter({
-    maximumFractionDigits: 1,
-    minimumFractionDigits: 1,
-    style: "percent",
-  });
-  const format = (amount) => percentFormatter.format(amount / 100);
-  const value = numerator / denominator * 100;
-  const rendered = format(value);
-  if (value > 0 && rendered === format(0)) return `<${format(.1)}`;
-  if (value < 100 && rendered === format(100)) return `>${format(99.9)}`;
   return rendered;
 }
 
@@ -830,7 +914,9 @@ function renderHistoryIndexBadge(data) {
   const total = finite(history?.sourceCount, null);
   const complete = history?.status === "complete"
     || (indexed !== null && total !== null && total > 0 && indexed >= total);
-  const partialTerminal = history?.phase === "partial_terminal";
+  const partialTerminal = history?.phase === "partial_terminal"
+    || (history?.phase === "aggregate_unavailable"
+      && finite(history?.skippedSourceCount, 0) > 0);
   if (data?.mode === "demo" || complete
       || indexed === null || total === null || total <= 0) {
     badge.hidden = true;
@@ -921,6 +1007,340 @@ function renderConnectionNotice() {
 function hideConnectionNotice() {
   visibleConnectionNotice = null;
   $("#connection-notice").hidden = true;
+}
+
+function electronSharingStateMessageKey(preference) {
+  if (!preference?.available || !preference.current) {
+    return "electron.sharing.state.unavailable";
+  }
+  if (preference.state === "pending_notices") {
+    return "electron.sharing.state.pending";
+  }
+  if (preference.enabled && ["default_on", "migration_default_on"].includes(preference.basis)) {
+    return "electron.sharing.state.defaultOn";
+  }
+  if (preference.enabled) return "electron.sharing.state.enabled";
+  return preference.state === "legacy_preserved"
+    ? "electron.sharing.state.legacy"
+    : "electron.sharing.state.off";
+}
+
+function electronSharingTransportMessageKey(preference) {
+  switch (preference?.transportStatus) {
+    case "uploading": case "pending": case "up_to_date": case "retry_wait": case "paused": case "recovery_required":
+      return `electron.sharing.transport.${preference.transportStatus}`;
+    case "off":
+      return "electron.sharing.transport.off";
+    case "unavailable":
+    default:
+      return "electron.sharing.transport.unavailable";
+  }
+}
+
+function applyElectronAccountlessContributionMode() {
+  const electronMode = electronSharingBridge() !== null;
+  document.documentElement.classList.toggle(
+    "electron-accountless-sharing",
+    electronMode,
+  );
+  const community = document.querySelector("#community");
+  if (community) {
+    community.setAttribute(
+      "aria-labelledby",
+      electronMode ? "electron-accountless-community-title" : "contribution-cta-title",
+    );
+  }
+  const legacySurfaces = [
+    document.querySelector("#community-journey"),
+    document.querySelector("#community .contribution-cta-copy"),
+    document.querySelector("#community .contribution-cta-action"),
+  ];
+  for (const surface of legacySurfaces) {
+    if (surface) surface.hidden = electronMode;
+  }
+  const accountlessCommunity = $("#electron-accountless-community");
+  if (accountlessCommunity) accountlessCommunity.hidden = !electronMode;
+  return electronMode;
+}
+
+function clearElectronSharingNoticeAckSchedule() {
+  const cleanup = electronSharingNoticeAckCleanup;
+  electronSharingNoticeAckCleanup = null;
+  electronSharingNoticeAckScheduled = null;
+  cleanup?.();
+}
+
+function electronSharingSurfaceIsVisible() {
+  if (document.visibilityState !== "visible") return false;
+  const notice = $("#electron-sharing-notice");
+  if (!notice || notice.hidden || notice.isConnected === false) return false;
+  for (let element = notice; element; element = element.parentElement) {
+    if (element.hidden || element.inert || element.getAttribute?.("aria-hidden") === "true") {
+      return false;
+    }
+  }
+  if (typeof notice.getBoundingClientRect !== "function") return false;
+  const rectangle = notice.getBoundingClientRect();
+  const viewportWidth = Number(globalThis.window?.innerWidth);
+  const viewportHeight = Number(globalThis.window?.innerHeight);
+  const left = Number(rectangle?.left);
+  const right = Number(rectangle?.right);
+  const top = Number(rectangle?.top);
+  const bottom = Number(rectangle?.bottom);
+  const width = Number(rectangle?.width ?? right - left);
+  const height = Number(rectangle?.height ?? bottom - top);
+  if (![viewportWidth, viewportHeight, left, right, top, bottom, width, height]
+    .every(Number.isFinite)
+    || viewportWidth <= 0 || viewportHeight <= 0 || width <= 0 || height <= 0) {
+    return false;
+  }
+  const visibleWidth = Math.min(right, viewportWidth) - Math.max(left, 0);
+  const visibleHeight = Math.min(bottom, viewportHeight) - Math.max(top, 0);
+  const requiredWidth = Math.min(width, viewportWidth) / 2;
+  const requiredHeight = Math.min(height, viewportHeight) / 2;
+  return visibleWidth >= requiredWidth && visibleHeight >= requiredHeight;
+}
+
+function scheduleElectronSharingNoticeAck(index) {
+  if (electronSharingNoticeAcked.has(index)
+      || electronSharingNoticeAckScheduled === index) return;
+  const bridge = electronSharingBridge();
+  if (!bridge) return;
+  electronSharingNoticeAckScheduled = index;
+  let finished = false;
+  let framePending = false;
+  const removers = [];
+  const listen = (target, type, handler) => {
+    if (typeof target?.addEventListener !== "function") return;
+    target.addEventListener(type, handler);
+    removers.push(() => target.removeEventListener?.(type, handler));
+  };
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    for (const remove of removers.splice(0)) remove();
+    if (electronSharingNoticeAckCleanup === finish) {
+      electronSharingNoticeAckCleanup = null;
+      electronSharingNoticeAckScheduled = null;
+    }
+  };
+  electronSharingNoticeAckCleanup = finish;
+  const scheduleFrame = (callback) => {
+    const raf = globalThis.window?.requestAnimationFrame;
+    if (typeof raf === "function") {
+      raf.call(globalThis.window, callback);
+      return;
+    }
+    const schedule = globalThis.window?.setTimeout ?? globalThis.setTimeout;
+    if (typeof schedule === "function") schedule(callback, 0);
+  };
+  const attempt = () => {
+    if (finished || framePending) return;
+    const preference = electronSharingPreference;
+    if (!preference || preference.state !== "pending_notices"
+        || preference.nextNoticeIndex !== index || !preference.noticeDue) {
+      finish();
+      return;
+    }
+    // A hidden Electron renderer can run JavaScript while its BrowserWindow is
+    // backgrounded. Do not count a notice until the two-frame paint has landed
+    // while the document is visible. Visibility/focus listeners retry it.
+    if (!electronSharingSurfaceIsVisible()) return;
+    framePending = true;
+    scheduleFrame(() => scheduleFrame(async () => {
+      framePending = false;
+      if (finished || !electronSharingSurfaceIsVisible()) return;
+      const current = electronSharingPreference;
+      if (!current || current.state !== "pending_notices"
+          || current.nextNoticeIndex !== index || !current.noticeDue) {
+        finish();
+        return;
+      }
+      electronSharingNoticeAckError = false;
+      try {
+        const result = await bridge.sharingNoticePresented(index);
+        const next = normalizeElectronSharingPreference(result);
+        if (next === null) throw new Error("Sharing notice response was invalid");
+        electronSharingPreference = next;
+        electronSharingNoticeAcked.add(index);
+        electronSharingNoticeReceiptIndex = index;
+        finish();
+        renderElectronAccountlessCommunity();
+        renderElectronSharingNotice();
+      } catch {
+        // Keep the visible notice and its retry listeners. A transient bridge
+        // failure must not be turned into a false displayed receipt.
+        electronSharingNoticeAckError = true;
+        renderElectronSharingNotice();
+      }
+    }));
+  };
+  const retry = () => {
+    if (electronSharingSurfaceIsVisible()) attempt();
+  };
+  listen(document, "visibilitychange", retry);
+  listen(globalThis.window, "focus", retry);
+  listen(globalThis.window, "hashchange", retry);
+  listen(globalThis.window, "popstate", retry);
+  listen(document, "scroll", retry);
+  listen(globalThis.window, "scroll", retry);
+  listen(globalThis.window, "resize", retry);
+  attempt();
+}
+
+function renderElectronSharingNotice() {
+  const notice = $("#electron-sharing-notice");
+  if (!notice) return;
+  const bridge = electronSharingBridge();
+  const preference = electronSharingPreference;
+  const receiptIndex = electronSharingNoticeReceiptIndex;
+  const receiptStillCurrent = Number.isInteger(receiptIndex)
+    && preference?.available === true
+    && preference.current === true
+    && preference.state === "pending_notices"
+    && preference.noticeCount === receiptIndex
+    && preference.nextNoticeIndex === (receiptIndex < 3 ? receiptIndex + 1 : null)
+    && !(preference.noticeDue === true
+      && preference.nextNoticeIndex === (receiptIndex < 3 ? receiptIndex + 1 : null));
+  if (Number.isInteger(receiptIndex) && !receiptStillCurrent) {
+    electronSharingNoticeReceiptIndex = null;
+  }
+  const heldIndex = receiptStillCurrent ? receiptIndex : null;
+  const index = heldIndex ?? preference?.nextNoticeIndex;
+  const projectedNoticeEligible = preference?.noticeDue === true
+    && Number.isInteger(preference?.nextNoticeIndex)
+    && preference.noticeCount === preference.nextNoticeIndex - 1;
+  const eligible = bridge !== null
+    && dashboard !== null
+    && document.documentElement.dataset.localDashboardReady === "true"
+    && preference?.available === true
+    && preference.current === true
+    && preference.state === "pending_notices"
+    && Number.isInteger(index)
+    && index >= 1 && index <= 3
+    && (heldIndex !== null || projectedNoticeEligible);
+  if (!eligible) {
+    notice.hidden = true;
+    clearElectronSharingNoticeAckSchedule();
+    return;
+  }
+  notice.hidden = false;
+  notice.dataset.noticeIndex = String(index);
+  setLocalizedText(
+    $("#electron-sharing-notice-copy"),
+    "electron.sharing.notice.copy",
+    { index },
+  );
+  const earliest = $("#electron-sharing-notice-earliest");
+  if (earliest) {
+    if (preference.earliestActivationAt) {
+      setLocalizedText(
+        earliest,
+        "electron.sharing.notice.earliest",
+        { date: formatLocal(preference.earliestActivationAt, { dateOnly: true }) },
+      );
+      earliest.hidden = false;
+    } else {
+      earliest.hidden = true;
+    }
+  }
+  setLocalizedText(
+    $("#electron-sharing-notice-transport"),
+    electronSharingTransportMessageKey(preference),
+  );
+  const shareNow = $("#electron-sharing-share-now");
+  const keepOff = $("#electron-sharing-keep-off");
+  if (shareNow) shareNow.disabled = electronSharingBusy;
+  if (keepOff) keepOff.disabled = electronSharingBusy;
+  const status = $("#electron-sharing-notice-status");
+  if (status) {
+    status.hidden = !electronSharingNoticeAckError;
+    if (electronSharingNoticeAckError) {
+      setLocalizedText(status, "electron.sharing.notice.error");
+    }
+  }
+  if (!electronSharingNoticeAckError) scheduleElectronSharingNoticeAck(index);
+}
+
+function renderElectronAccountlessCommunity() {
+  const surface = $("#electron-accountless-community");
+  if (!surface) return;
+  const bridge = electronSharingBridge();
+  if (!bridge) {
+    surface.hidden = true;
+    return;
+  }
+  surface.hidden = false;
+  setLocalizedText(
+    $("#electron-accountless-community-state"),
+    electronSharingStateMessageKey(electronSharingPreference),
+  );
+  setLocalizedText(
+    $("#electron-accountless-community-transport"),
+    electronSharingTransportMessageKey(electronSharingPreference),
+  );
+  const enabled = $("#electron-accountless-sharing-enabled");
+  const usable = electronSharingPreference?.available === true
+    && electronSharingPreference.current === true;
+  if (enabled) {
+    enabled.checked = usable && electronSharingPreference.enabled === true;
+    enabled.disabled = !usable || electronSharingBusy;
+  }
+  const error = $("#electron-accountless-sharing-error");
+  if (error) error.hidden = !electronSharingNoticeAckError;
+}
+
+async function loadElectronSharingPreference({ dashboardReady = false } = {}) {
+  applyElectronAccountlessContributionMode();
+  const bridge = electronSharingBridge();
+  if (!bridge || !dashboardReady || dashboard === null) {
+    electronSharingPreference = null;
+    electronSharingNoticeAckError = false;
+    renderElectronAccountlessCommunity();
+    renderElectronSharingNotice();
+    return null;
+  }
+  try {
+    const next = normalizeElectronSharingPreference(
+      await bridge.getSharingPreference(),
+    );
+    electronSharingPreference = next;
+    electronSharingNoticeAckError = false;
+  } catch {
+    electronSharingPreference = null;
+    electronSharingNoticeAckError = false;
+  }
+  renderElectronAccountlessCommunity();
+  renderElectronSharingNotice();
+  return electronSharingPreference;
+}
+
+async function setElectronSharingEnabled(enabled) {
+  if (typeof enabled !== "boolean" || electronSharingBusy) return false;
+  const bridge = electronSharingBridge();
+  if (!bridge) return false;
+  electronSharingBusy = true;
+  electronSharingNoticeAckError = false;
+  renderElectronAccountlessCommunity();
+  renderElectronSharingNotice();
+  try {
+    const next = normalizeElectronSharingPreference(
+      await bridge.setSharingEnabled(enabled),
+    );
+    if (next === null) throw new Error("Sharing preference response was invalid");
+    electronSharingPreference = next;
+    renderElectronAccountlessCommunity();
+    renderElectronSharingNotice();
+    return true;
+  } catch {
+    electronSharingNoticeAckError = true;
+    renderElectronSharingNotice();
+    return false;
+  } finally {
+    electronSharingBusy = false;
+    renderElectronAccountlessCommunity();
+    renderElectronSharingNotice();
+  }
 }
 
 function renderDashboardUnavailableState(kind) {
@@ -1103,9 +1523,11 @@ function renderLocalOnboarding(value) {
 function renderDashboard(data) {
   dashboardUnavailableState = null;
   dashboard = data;
-  if (!isCacheDropThreadDashboard(data) || data?.accounting?.generationMatched !== true
+  if (!isCacheDropThreadDashboard(data) || !data?.accounting?.cacheDiagnosticsSource
       || cacheDropThreadLinks.dashboard !== data
-      || cacheDropThreadLinks.generation !== data?.accounting?.generation) {
+      || cacheDropThreadLinks.generation !== data?.accounting?.cacheDiagnosticsSource?.generation
+      || cacheDropThreadLinks.generationFingerprint
+        !== data?.accounting?.cacheDiagnosticsSource?.generationFingerprint) {
     resetCacheDropThreadLinks(data);
   }
   if (data.mode === "demo") {
@@ -1520,8 +1942,8 @@ function formatBytes(value) {
  * sources it discovered and how many it has indexed, and the share is that
  * division. Nothing estimates a finish time, because none is known — a
  * progress bar that implied one would be the same invention this product
- * refuses everywhere else. The block is absent entirely once the index is
- * complete, and absent when there is no denominator to divide by.
+ * refuses everywhere else. The block is absent once both indexed history and
+ * its accounting summary are available, or there is no measured denominator.
  *
  * It sits with the API-price-equivalent total because that total, and every
  * figure derived from it, covers only the indexed share.
@@ -1535,6 +1957,7 @@ function renderHistoryProgress(data) {
   const total = finite(history?.sourceCount, 0);
   const indexed = finite(history?.indexedSourceCount, 0);
   const partialTerminal = history?.phase === "partial_terminal";
+  const aggregateUnavailable = history?.phase === "aggregate_unavailable";
   if (history === null || history.status === "complete" || total <= 0) {
     container.hidden = true;
     return false;
@@ -1547,7 +1970,12 @@ function renderHistoryProgress(data) {
     skippedSourceCount,
     { count: formatNumber(skippedSourceCount) },
   );
-  if (partialTerminal) {
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-headline"),
+      "dashboard.history.scanFinished",
+    );
+  } else if (partialTerminal) {
     setRawText(
       $("#history-progress-headline"),
       t("dashboard.history.partialHeadline", {
@@ -1565,12 +1993,17 @@ function renderHistoryProgress(data) {
       { percent: formatPercent(percent, 1) },
     );
   }
-  container.classList.toggle("active", archiveHistoryScanActive);
+  container.classList.toggle(
+    "active", archiveHistoryScanActive && !aggregateUnavailable,
+  );
   const track = $("#history-progress-track");
   track.setAttribute("aria-valuenow", String(Math.round(percent)));
   const coverageKey = partialTerminal
+      || (aggregateUnavailable && skippedSourceCount > 0)
     ? "dashboard.history.partialSources"
-    : "dashboard.history.indexingSources";
+    : aggregateUnavailable
+      ? "dashboard.history.indexedSources"
+      : "dashboard.history.indexingSources";
   const coverageValues = {
     bytesIndexed: formatBytes(history.indexedBytes),
     bytesTotal: formatBytes(history.sourceBytes),
@@ -1586,7 +2019,12 @@ function renderHistoryProgress(data) {
   $("#history-progress-fill").style.width =
     `${indexed > 0 ? Math.max(1.5, percent) : 0}%`;
   setLocalizedText($("#history-progress-detail"), coverageKey, coverageValues);
-  if (partialTerminal) {
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-note"),
+      "dashboard.history.summaryUnavailable",
+    );
+  } else if (partialTerminal) {
     const affectedThreads = finite(history?.skippedThreadCount, 0);
     setRawText(
       $("#history-progress-note"),
@@ -1656,6 +2094,7 @@ function renderEvidenceWarnings(data) {
   ]);
   for (const message of Array.isArray(data?.warnings) ? data.warnings : []) {
     if (typeof message !== "string" || message === "") continue;
+    if (/^Quota tracking started fresh on this Mac, so its retained records begin /u.test(message)) continue;
     grouped.get(evidenceWarningTarget(message)).push(message);
   }
   for (const [selector, messages] of grouped) {
@@ -6595,6 +7034,10 @@ function lineChart({
     {
       const format = item.format ?? formatMoney;
       points.forEach((point, index) => {
+        // A classified series must not leave an invisible hover target over
+        // a point belonging to another series. Marker visibility alone is
+        // separate: dense timelines intentionally retain hover-only points.
+        if (typeof item.pointFilter === "function" && !item.pointFilter(point)) return;
         const value = finite(point[item.key]);
         if (value === null) return;
         // Both coordinates are used three times each — the attribute, the
@@ -6706,6 +7149,10 @@ function lineChart({
     {
       const format = item.format ?? ((value) => formatPercent(value, 1));
       points.forEach((point, index) => {
+        // A classified series must not leave an invisible hover target over
+        // a point belonging to another series. Marker visibility alone is
+        // separate: dense timelines intentionally retain hover-only points.
+        if (typeof item.pointFilter === "function" && !item.pointFilter(point)) return;
         const value = finite(point[item.key]);
         if (value === null) return;
         const markerX = x(index, point);
@@ -7020,6 +7467,7 @@ function renderAllowanceHistoryChart(history) {
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        pointFilter: (point) => point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
       },
       {
@@ -7030,6 +7478,7 @@ function renderAllowanceHistoryChart(history) {
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        pointFilter: (point) => !point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
     ],
@@ -7649,6 +8098,14 @@ function renderWeekly(data) {
   setLocalizedText($("#weekly-chart-timezone"), "chart.timeZoneNote", {
     timeZone: formatTimeZoneLabel(),
   });
+  // Short ranges include every fit; here the slider only classifies markers.
+  // Name that role explicitly instead of presenting an inactive minimum filter.
+  const shortRange = history.rangeDays !== null && history.rangeDays <= 7;
+  setLocalizedText($("#weekly-span-label"), shortRange
+    ? "weekly.controls.observedSpan" : "weekly.controls.minimumSpan");
+  const spanNote = $("#weekly-span-note");
+  spanNote.hidden = !shortRange;
+  setLocalizedText(spanNote, "weekly.controls.shortRangeNote");
   $("#weekly-span-value").textContent = weeklySpanLabel();
   $("#weekly-span-legend").textContent = chartText(weeklyObservedSeriesLabel());
   $("#weekly-partial-legend").hidden = !chartValues.some((row) => !row.wellObserved);
@@ -7996,9 +8453,7 @@ function cacheSwitchMetricValue(impact) {
   const cost = cacheImpactCostView(impact);
   if (cost === null) return "—";
   const weighting = cost.allowanceWeighting;
-  const display = (value) => cost.isSubtotal
-    ? t("accounting.cacheImpact.subtotalValue", { amount: value })
-    : value;
+  const display = (value) => value;
   if (weighting?.status === "complete") {
     const premium = finite(weighting.selectedPremiumUsd, null);
     return premium === null ? "—" : display(formatApiMoney(premium));
@@ -8020,9 +8475,7 @@ function cacheContinuityStandardMetricValue(impact) {
   const cost = cacheImpactCostView(impact);
   if (cost === null || cost.standardApiPremiumUsd === null) return "—";
   const amount = formatApiMoney(cost.standardApiPremiumUsd);
-  return cost.isSubtotal
-    ? t("accounting.cacheImpact.subtotalValue", { amount })
-    : amount;
+  return amount;
 }
 
 function cacheContinuityMetricValue(impact) {
@@ -8089,6 +8542,38 @@ function appendCacheImpactSubtotalNote(container, impact) {
     );
   }
   return true;
+}
+
+function cacheImpactMetricBullets(impact, appendDetails) {
+  const details = node("span");
+  appendDetails(details, impact);
+  const list = node("ul", "cache-impact-bullets");
+  // Keep the full evidence explanation reachable without crowding the card.
+  list.title = details.textContent;
+  const cost = cacheImpactCostView(impact);
+  if (cost === null) {
+    list.append(node("li", "", details.textContent));
+    return list;
+  }
+  list.append(localizedNode("li", "", cost.isSubtotal
+    ? "accounting.cacheImpact.bulletPartial" : "accounting.cacheImpact.bulletPriced", {
+    priced: formatCount(cost.pricedDrops ?? impact.pricedDrops),
+  }));
+  if (cost.standardApiPremiumUsd !== null) {
+    list.append(localizedNode("li", "", "accounting.cacheImpact.bulletStandard", {
+      amount: formatApiMoney(cost.standardApiPremiumUsd),
+    }));
+  }
+  const excluded = [];
+  for (const [count, key] of [
+    [impact.orderingCoverageGaps, "accounting.cacheImpact.bulletOrdering"],
+    [impact.unpricedDrops, "accounting.cacheImpact.bulletUnpriced"],
+    [impact.uncoveredConfigurationChanges ?? impact.uncoveredReturns, "accounting.cacheImpact.bulletUncovered"],
+  ]) {
+    if (finite(count, 0) > 0) excluded.push(t(key, { count: formatCount(count) }));
+  }
+  if (excluded.length) list.append(node("li", "", excluded.join(" · ")));
+  return list;
 }
 
 function formatCacheSwitchPercentagePoints(value) {
@@ -8270,45 +8755,10 @@ function isCacheDropThreadDashboard(data) {
   return ["local", "real_local_evidence"].includes(data?.mode);
 }
 
-function cacheDropThreadId(value) {
-  return typeof value === "string"
-      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
-    ? value.toLowerCase()
-    : null;
-}
-
-function cacheDropThreadName(thread) {
-  return typeof thread?.name === "string" && thread.name.trim()
-    ? thread.name.trim()
-    : t("accounting.cacheDropThread.fallback", {
-      id: cacheDropThreadId(thread?.id)?.slice(0, 8) ?? "",
-    });
-}
+const CACHE_DROP_AUTO_REVIEW_LABEL = "Auto review";
 
 function cacheDropThreadParts(thread) {
-  const id = cacheDropThreadId(thread?.id);
-  if (id === null) return [];
-  const parentId = cacheDropThreadId(thread.parent?.id);
-  const parent = parentId !== null && parentId !== id ? thread.parent : null;
-  const nickname = typeof thread.nickname === "string"
-    ? thread.nickname.trim()
-    : "";
-  const worker = parent !== null || nickname !== "";
-  const parts = parent === null ? [] : [{
-    name: cacheDropThreadName(parent),
-    href: `codex://threads/${parentId}`,
-    worker: false,
-  }];
-  parts.push({
-    name: worker
-      ? t("accounting.cacheDropThread.subworker", {
-        name: nickname || cacheDropThreadName(thread),
-      })
-      : cacheDropThreadName(thread),
-    href: `codex://threads/${id}`,
-    worker,
-  });
-  return parts;
+  return formatCodexThreadParts(thread, t);
 }
 
 function fillCacheDropThreadCell(cell, thread, observedAt) {
@@ -8334,6 +8784,15 @@ function fillCacheDropThreadCell(cell, thread, observedAt) {
     content.append(unavailable);
   }
   for (const part of parts) {
+    if (part.href === null) {
+      const unavailableText = `${part.name}: ${t("accounting.cacheDropThread.unavailable")}`;
+      const unavailable = rawNode("span", "cache-drop-thread-unavailable", unavailableText);
+      unavailable.tabIndex = 0;
+      unavailable.setAttribute("title", time);
+      unavailable.setAttribute("aria-label", `${unavailableText}. ${time}`);
+      content.append(unavailable);
+      continue;
+    }
     const link = rawNode("a", "cache-drop-thread-link", part.name);
     link.href = part.href;
     link.setAttribute("title", time);
@@ -8350,6 +8809,13 @@ function fillCacheDropThreadCell(cell, thread, observedAt) {
       content.append(document.createTextNode(parts.length > 1 ? " " : ""), worker);
     } else {
       content.append(link);
+      if (part.autoReview) {
+        const origin = rawNode("span", "cache-drop-subworker", "");
+        origin.append(document.createTextNode(" ["),
+          document.createTextNode(CACHE_DROP_AUTO_REVIEW_LABEL),
+          document.createTextNode("]"));
+        content.append(origin);
+      }
     }
   }
   cell.append(content);
@@ -8405,16 +8871,24 @@ function cacheDropThreadKeys(data) {
 
 function resetCacheDropThreadLinks(data = null) {
   const sameDashboard = cacheDropThreadLinks.dashboard === data;
+  const previousGeneration = cacheDropThreadLinks.generation;
+  const previousFingerprint = cacheDropThreadLinks.generationFingerprint;
   cacheDropThreadLinks.requestToken += 1;
   cacheDropThreadLinks.dashboard = data;
   cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
-      && typeof data.accounting?.generation === "string"
-    ? data.accounting.generation
+      && typeof data.accounting?.cacheDiagnosticsSource?.generation === "string"
+    ? data.accounting.cacheDiagnosticsSource.generation
     : null;
+  cacheDropThreadLinks.generationFingerprint =
+    data?.accounting?.cacheDiagnosticsSource?.generationFingerprint ?? null;
   cacheDropThreadLinks.requested = false;
-  // A new accounting generation does not change an already resolved thread.
-  // Reuse only exact event-pair keys still present in the local snapshot, across
-  // all selectable periods. New/changed rows must resolve independently.
+  // An unchanged tuple can become ambiguous when another source is indexed.
+  // Reuse navigation only within the same attested diagnostic publication;
+  // a changed or missing proof requires a new successful identity lookup.
+  if (previousGeneration !== cacheDropThreadLinks.generation
+      || previousFingerprint !== cacheDropThreadLinks.generationFingerprint) {
+    cacheDropThreadLinks.entries.clear();
+  }
   const retainedKeys = cacheDropThreadKeys(data);
   for (const key of cacheDropThreadLinks.entries.keys()) {
     if (!retainedKeys.has(key)) cacheDropThreadLinks.entries.delete(key);
@@ -8425,10 +8899,13 @@ function resetCacheDropThreadLinks(data = null) {
 
 async function loadCacheDropThreadLinks(data) {
   const generation = cacheDropThreadLinks.generation;
+  const fingerprint = cacheDropThreadLinks.generationFingerprint;
   if (data !== dashboard || data !== cacheDropThreadLinks.dashboard
       || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
       || generation === null || generation === ""
-      || data.accounting?.generationMatched !== true
+      || fingerprint === null
+      || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+      || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
       || cacheDropThreadLinks.requested
       || typeof localClient.cacheDropThreadLinks !== "function") return;
   cacheDropThreadLinks.requested = true;
@@ -8441,17 +8918,18 @@ async function loadCacheDropThreadLinks(data) {
         || loadToken !== cacheDropThreadLinks.loadToken
         || data !== dashboard || data !== cacheDropThreadLinks.dashboard
         || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
-        || generation !== data.accounting?.generation
-        || data.accounting?.generationMatched !== true
+        || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+        || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
         || result?.status !== "available"
         || result.generation !== generation) return;
     const selectedKeys = cacheDropThreadKeys(data);
+    const resolvedEntries = new Map();
     for (const { key, thread } of result.entries) {
       if (!selectedKeys.has(key)) continue;
       const previous = cacheDropThreadLinks.entries.get(key);
       // Optional name-store failures must not erase details already known for
       // this UUID. A newly resolved identity replaces the old entry outright.
-      cacheDropThreadLinks.entries.set(key, previous?.id === thread.id ? {
+      resolvedEntries.set(key, previous?.id === thread.id ? {
         ...thread,
         name: thread.name ?? previous.name,
         nickname: thread.nickname ?? previous.nickname,
@@ -8462,6 +8940,9 @@ async function loadCacheDropThreadLinks(data) {
         },
       } : thread);
     }
+    // A qualified empty/partial result withdraws unresolved identities. It is
+    // different from a failed lookup, which leaves same-publication UI intact.
+    cacheDropThreadLinks.entries = resolvedEntries;
     completed = true;
     updateCacheDropThreadCells();
   } catch {
@@ -8495,6 +8976,13 @@ function renderAccountingCacheSwitchDetails(impact) {
     return;
   }
   const recent = Array.isArray(impact.recent) ? impact.recent : [];
+  const sampleNote = disclosure.querySelector(".cache-impact-sample");
+  if (sampleNote) {
+    sampleNote.hidden = impact.cacheReadDrops <= recent.length;
+    setLocalizedText(sampleNote, "accounting.cacheImpact.bulletSample", {
+      shown: formatCount(recent.length), total: formatCount(impact.cacheReadDrops),
+    });
+  }
   const page = paginateCacheImpactRows(
     recent,
     cacheSwitchTablePagination,
@@ -9358,6 +9846,15 @@ function renderAccountingCacheReuseOutcome(impact) {
     cacheReuseSelectedBucketIndex = CACHE_REUSE_DEFAULT_BUCKET_INDEX;
   }
   const total = impact.comparableReturns;
+  // A known empty denominator is neither zero reuse nor unavailable data. The
+  // companion has evaluated the period, but no eligible follow-up can support
+  // a percentage. Keep the explicit empty state and withhold the percentage
+  // cards and their denominator-dependent interpretation.
+  const metrics = outcome.querySelector(".cache-reuse-metrics");
+  if (metrics) metrics.hidden = total === 0;
+  empty.hidden = total !== 0;
+  raster.hidden = total === 0;
+  if (total === 0) return;
   const morePercent = cacheReusePercent(impact.reusedMoreThanHalfReturns, total);
   const lessPercent = cacheReusePercent(impact.reusedHalfOrLessReturns, total);
   setRawText($("#cache-reuse-more-percent"), morePercent);
@@ -9385,9 +9882,6 @@ function renderAccountingCacheReuseOutcome(impact) {
       between: formatCount(impact.reusedBetweenHalfAndPreviousReturns),
     },
   );
-  empty.hidden = total !== 0;
-  raster.hidden = total === 0;
-  if (total === 0) return;
   const markUnit = chooseCacheReuseMarkUnit(total);
   drawCacheReuseRaster(impact, buckets, markUnit);
   ensureCacheReuseResizeObserver();
@@ -9448,6 +9942,13 @@ function renderAccountingCacheContinuityDetails(impact) {
     return;
   }
   const recent = Array.isArray(impact.recent) ? impact.recent : [];
+  const sampleNote = disclosure.querySelector(".cache-impact-sample");
+  if (sampleNote) {
+    sampleNote.hidden = impact.cacheReadDrops <= recent.length;
+    setLocalizedText(sampleNote, "accounting.cacheImpact.bulletSample", {
+      shown: formatCount(recent.length), total: formatCount(impact.cacheReadDrops),
+    });
+  }
   const page = paginateCacheImpactRows(
     recent,
     cacheContinuityTablePagination,
@@ -10220,14 +10721,13 @@ function renderAccounting(data) {
     summary.append(attributionNote);
   }
   const cacheSwitchImpact = accounting.cacheSwitchImpact;
-  const cacheSwitchCard = node("article", "metric-card compact-metric");
+  const cacheSwitchCard = node("article", "metric-card compact-metric cache-impact-card");
   const cacheSwitchLabel = node("span", "metric-name");
   cacheSwitchLabel.append(informationLabel(
     t("accounting.cacheSwitch.metricLabel"),
     t("accounting.cacheSwitch.metricExplanation"),
   ));
-  const cacheSwitchNote = node("p");
-  appendCacheSwitchMetricNote(cacheSwitchNote, cacheSwitchImpact);
+  const cacheSwitchNote = cacheImpactMetricBullets(cacheSwitchImpact, appendCacheSwitchMetricNote);
   cacheSwitchCard.append(
     cacheSwitchLabel,
     rawNode("strong", "metric-value", cacheSwitchMetricValue(cacheSwitchImpact)),
@@ -10236,17 +10736,13 @@ function renderAccounting(data) {
   summary.append(cacheSwitchCard);
 
   const cacheContinuityImpact = accounting.cacheContinuityImpact;
-  const cacheContinuityCard = node("article", "metric-card compact-metric");
+  const cacheContinuityCard = node("article", "metric-card compact-metric cache-impact-card");
   const cacheContinuityLabel = node("span", "metric-name");
   cacheContinuityLabel.append(informationLabel(
     t("accounting.cacheContinuity.metricLabel"),
     t("accounting.cacheContinuity.metricExplanation"),
   ));
-  const cacheContinuityNote = node("p");
-  appendCacheContinuityMetricNote(
-    cacheContinuityNote,
-    cacheContinuityImpact,
-  );
+  const cacheContinuityNote = cacheImpactMetricBullets(cacheContinuityImpact, appendCacheContinuityMetricNote);
   cacheContinuityCard.append(
     cacheContinuityLabel,
     rawNode(
@@ -10433,7 +10929,7 @@ function pricingCoverageNote(accounting) {
   const events = finite(accounting?.events, 0);
   if (events <= 0) return null;
   if (finite(accounting?.pricingCoverage?.unpricedEvents, 0) <= 0) {
-    return t("accounting.pricing.coverageReviewed");
+    return null;
   }
   const priced = finite(accounting?.pricingCoverage?.fullyPricedEvents, 0)
     + finite(accounting?.pricingCoverage?.partiallyPricedEvents, 0);
@@ -10586,6 +11082,14 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
   for (const model of page.rows) {
     const row = node("tr");
     const identity = node("td", "model-identity");
+    const presentation = modelUsagePresentation(
+      model.pricingStatus === "unrecognized" ? "unknown" : model.model,
+    );
+    const icon = modelThemeIcon(document, presentation.theme);
+    if (icon) {
+      icon.classList.add("model-usage-icon", presentation.className);
+      identity.append(icon);
+    }
     // The unknown aggregate combines missing attribution and unreviewed
     // identifiers. Its label must not claim either cause as established.
     if (model.model === "unknown") {
@@ -11364,8 +11868,10 @@ async function loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable })
   const onboarding = read(() => localClient.onboarding(), (value) => {
     if (value === null) return;
     renderLocalOnboarding(value);
-    // Bootstrap may have finished before this verdict arrived. Preserve the
-    // browser's existing return-visit cadence; the native shell owns its own.
+    // Bootstrap may have finished before this verdict arrived. Electron's
+    // launch pass is gated on this readiness verdict, so retry it here before
+    // preserving the browser's return-visit cadence.
+    startElectronStartupRefresh();
     scheduleReturningUserRefresh();
   });
   const refresh = read(() => localClient.refreshStatus(), (refreshState) => {
@@ -11417,7 +11923,8 @@ async function loadLocalDashboard() {
   let primaryAvailable = false;
   localActionBusy = true;
   const button = $("#refresh-button");
-  button.textContent = "Connecting…";
+  if (localRefreshInProgress) renderRefreshProgress(button, "Loading evidence…");
+  else button.textContent = "Connecting…";
   updateLocalActionButtons();
   try {
     const loadDashboardData = async () => {
@@ -11455,9 +11962,17 @@ async function loadLocalDashboard() {
       load.pending = false;
       localActionBusy = load.previousBusy;
       updateLocalActionButtons();
+      if (electronStartupRefreshDeferred) {
+        electronStartupRefreshDeferred = false;
+        startElectronStartupRefresh();
+      }
     }
   }
   if (isCurrent()) {
+    // The dashboard has painted a real local result before the accountless
+    // preference is read. This ordering is also the authorization boundary for
+    // a notice receipt: unavailable/hidden startup never counts as displayed.
+    void loadElectronSharingPreference({ dashboardReady: primaryAvailable }).catch(() => {});
     // Optional reads never own primary readiness or the action's busy state.
     void loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable }).catch(() => {
       if (isCurrent()) scheduleIncrementalSyncStatusPoll();
@@ -11579,6 +12094,61 @@ function scheduleReindexAutoContinuation() {
   }, REINDEX_AUTO_CONTINUE_DELAY_MS);
 }
 
+/**
+ * Notify Electron main that a renderer-owned refresh has crossed its accepted
+ * POST boundary, or that the leased pass reached a terminal state. The
+ * renderer never waits indefinitely for cadence bookkeeping: a delayed start
+ * response is settled after the renderer finishes through the late-value
+ * callback below.
+ */
+function signalElectronRefreshLifecycle(action, args = [], options = {}) {
+  if (!runsInsideElectronDashboard()) return Promise.resolve(null);
+  const bridge = globalThis.tibotattleDesktop;
+  if (typeof bridge?.[action] !== "function" || !Array.isArray(args)) {
+    return Promise.resolve(null);
+  }
+  const onLateValue = typeof options?.onLateValue === "function"
+    ? options.onLateValue
+    : null;
+  let call;
+  try {
+    call = Promise.resolve(bridge[action](...args));
+  } catch {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    const reportLateValue = (value) => {
+      if (!onLateValue) return;
+      try {
+        onLateValue(value);
+      } catch {
+        // Cadence cleanup is best effort and must not affect the refresh.
+      }
+    };
+    const timer = setTimeout(() => {
+      settled = true;
+      timedOut = true;
+      resolve(null);
+    }, ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS);
+    call.then((value) => {
+      if (settled) {
+        if (timedOut) reportLateValue(value);
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    }, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(null);
+    });
+  });
+}
+
 async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   if (localActionBusy) return;
   // Fence continuation against the exact coverage visible before this pass.
@@ -11601,17 +12171,31 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     return;
   }
   const button = $("#refresh-button");
+  const electronRefresh = runsInsideElectronDashboard();
   let refreshAccepted = false;
   let cancelled = false;
   let quickResultLoaded = false;
   let continuationLimitReached = false;
+  let refreshStartSignal = Promise.resolve(null);
+  let lateRefreshLease = null;
+  let refreshLifecycleFinished = false;
+  const handleLateRefreshLease = (lease) => {
+    if (!Number.isSafeInteger(lease) || lease <= 0) return;
+    if (!refreshLifecycleFinished) {
+      lateRefreshLease = lease;
+      return;
+    }
+    // The renderer may finish while the main-process start reply is still
+    // crossing its bounded bridge timeout. Settle that late lease directly.
+    void signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+  };
   localActionBusy = true;
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = detailed
+  renderRefreshProgress(button, detailed
     ? "Starting detailed accounting…"
-    : "Starting local analysis…";
+    : "Starting local analysis…");
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
@@ -11619,6 +12203,15 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       ? localClient.recalculateDetailedAccounting()
       : localClient.refresh());
     refreshAccepted = true;
+    if (electronRefresh) {
+      // Do not delay status polling on cadence bookkeeping. A late lease is
+      // settled from the finally block or its callback above.
+      refreshStartSignal = signalElectronRefreshLifecycle(
+        "refreshStarted",
+        [],
+        { onLateValue: handleLateRefreshLease },
+      );
+    }
     let activePassStartedMs = Date.now();
     const pollingBudget = createRefreshPollingBudget();
     let consecutiveStatusFailures = 0;
@@ -11639,7 +12232,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         consecutiveStatusFailures = 0;
       } catch (error) {
         consecutiveStatusFailures += 1;
-        button.textContent = "Update running; reconnecting…";
+        renderRefreshProgress(button, "Update running; reconnecting…");
         if (consecutiveStatusFailures >= 8) throw error;
         continue;
       }
@@ -11673,11 +12266,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         0,
         Math.floor((Date.now() - activePassStartedMs) / 1_000),
       );
-      const elapsedLabel = elapsedSeconds >= 60
-        ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
-        : `${elapsedSeconds}s`;
       const accountingStatus = outcome === "running"
-        ? refreshAccountingStatus({ progress, elapsedLabel })
+        ? refreshAccountingStatus({ progress })
         : null;
       const countedProgress = collectorProgress || unifiedIndexScanning;
       const processed = countedProgress
@@ -11686,24 +12276,24 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       const selected = countedProgress
           && Number.isSafeInteger(progress?.filesSelected)
         ? progress.filesSelected : null;
-      button.textContent = outcome === "cancelling"
+      const phase = outcome === "cancelling"
         ? "Stopping safely…"
         : accountingStatus !== null
           ? accountingStatus
         : archiveScanning
-          ? `Indexing archive history… ${elapsedLabel}`
+          ? "Indexing archive history…"
         : collectorProgress && progress?.phase === "quick_result"
           ? refreshQuickResultStatus({
               dashboardLoaded: quickResultLoaded,
-              elapsedLabel,
             })
         : unifiedIndexScanning && (selected === null || selected === 0)
-          ? `Scanning local history… ${elapsedLabel}`
+          ? "Scanning local history…"
         : processed !== null && selected !== null
         ? selected > 0 && processed >= selected
-          ? `Calculating usage and allowance… ${elapsedLabel}`
-          : `Analyzing ${processed}/${selected} files…`
-        : pollCount < 3 ? "Analyzing local evidence…" : `Analyzing… ${elapsedLabel}`;
+          ? "Calculating usage and allowance…"
+          : "Analyzing files…"
+        : pollCount < 3 ? "Analyzing local evidence…" : "Analyzing…";
+      renderRefreshProgress(button, phase, { processed, selected, elapsedSeconds });
       if (refreshNeedsContinuation({
         outcome,
         errorCode: refresh.errorCode,
@@ -11720,7 +12310,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
-          button.textContent = "Continuing local analysis…";
+          renderRefreshProgress(button, "Continuing local analysis…");
         } catch (error) {
           // A 409 means a timed-out pass is still finishing its durable
           // checkpoint. Keep polling until it becomes resumable.
@@ -11735,7 +12325,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        button.textContent = "Finalizing bounded pause…";
+        renderRefreshProgress(button, "Finalizing bounded pause…");
         if (!timeoutSettlementNoted) {
           pollingBudget.noteSettling();
           timeoutSettlementNoted = true;
@@ -11745,7 +12335,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     cancelled = outcome === "cancelled";
     if (cancelled) {
-      button.textContent = "Loading saved results…";
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "Local analysis cancelled",
@@ -11756,7 +12346,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     if (outcome === "failed"
         && finalErrorCode === "refresh_resource_limited") {
-      button.textContent = "Loading saved results…";
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "This scan paused to protect your Mac",
@@ -11766,7 +12356,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       return;
     }
     if (outcome === "degraded") {
-      button.textContent = t("refresh.degradedLoading");
+      renderRefreshProgress(button, t("refresh.degradedLoading"));
       await loadLocalDashboard();
       lastReindexProgressReceipt = historyProgressReceipt();
       const history = dashboard?.pricing?.historyCoverage
@@ -11815,7 +12405,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       throw failure;
     }
     archiveHistoryScanActive = false;
-    button.textContent = "Loading updated evidence…";
+    renderRefreshProgress(button, "Loading updated evidence…");
     await loadLocalDashboard();
     if (detailed) scheduleReindexAutoContinuation();
   } catch (error) {
@@ -11866,6 +12456,14 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       showDemo: !dashboard
     });
   } finally {
+    if (electronRefresh && refreshAccepted) {
+      let lease = await refreshStartSignal;
+      if (!Number.isSafeInteger(lease) || lease <= 0) lease = lateRefreshLease;
+      if (Number.isSafeInteger(lease) && lease > 0) {
+        await signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+      }
+      refreshLifecycleFinished = true;
+    }
     const wasArchiveScanning = archiveHistoryScanActive;
     archiveHistoryScanActive = false;
     if (wasArchiveScanning && dashboard) renderPricing(dashboard);
@@ -11951,6 +12549,71 @@ async function reloadLocalEvidenceAfterNativeRefresh() {
   }
 }
 
+/**
+ * Start Electron's one launch-time refresh after the local onboarding verdict
+ * is available. The qualified smoke preload may hold this call behind its
+ * CDP observation barrier; ordinary Electron renderers have no such bridge.
+ */
+function startElectronStartupRefresh() {
+  if (electronStartupRefreshTriggered
+      || !runsInsideElectronDashboard()
+      || !localAnalysisAllowed()) {
+    return false;
+  }
+  electronStartupRefreshTriggered = true;
+  // The companion's launch snapshot intentionally defers the unified history
+  // projection. A cold install therefore needs one detailed pass before the
+  // dashboard can claim retained history or accounting. Once a validated
+  // detailed projection is already present, the normal startup observation is
+  // the cheaper quick pass and the Electron controller owns later cadence.
+  const projection = dashboard?.accounting?.projection;
+  const startupRefreshOptions = projection?.status === "available"
+    && projection.reason === null
+    && projection.terminal === false
+    ? {}
+    : { detailed: true };
+  const runStartupRefresh = () => {
+    if (localActionBusy) {
+      // Only the bootstrap owner is guaranteed to call us again after it
+      // clears its lock. Preserve the established one-shot suppression for
+      // every other busy owner rather than leaving a deferred launch stuck.
+      if (activeLocalDashboardLoad?.pending) {
+        electronStartupRefreshTriggered = false;
+        electronStartupRefreshDeferred = true;
+      }
+      return;
+    }
+    void requestRefresh(startupRefreshOptions);
+  };
+  const macSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
+  const windowsSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
+  // A mixed or stale preload must not choose one platform barrier silently.
+  const smokeBridge = macSmokeBridge !== undefined
+    && windowsSmokeBridge !== undefined
+    ? null
+    : windowsSmokeBridge !== undefined
+      ? windowsSmokeBridge
+      : macSmokeBridge;
+  if (smokeBridge !== undefined) {
+    if (smokeBridge === null
+        || smokeBridge.version !== "v1"
+        || typeof smokeBridge.waitForStartupRefresh !== "function") {
+      return true;
+    }
+    let gate;
+    try {
+      gate = smokeBridge.waitForStartupRefresh();
+    } catch {
+      return true;
+    }
+    if (!gate || typeof gate.then !== "function") return true;
+    void Promise.resolve(gate).then(runStartupRefresh).catch(() => {});
+    return true;
+  }
+  runStartupRefresh();
+  return true;
+}
+
 function scheduleReturningUserRefresh() {
   // The native macOS shell owns the foreground cadence. Running both the web
   // return-visit timer and the native timer races the same bounded companion
@@ -11958,6 +12621,8 @@ function scheduleReturningUserRefresh() {
   // What the shell owes in return is a signal when its refresh finished, which
   // `tibotattle:local-evidence-updated` carries.
   if (runsInsideNativeDashboard()) return;
+  if (runsInsideElectronDashboard()
+      && (electronStartupRefreshTriggered || electronStartupRefreshDeferred)) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
       dashboard?.activity?.lastScanAt
@@ -11988,6 +12653,23 @@ function scheduleReturningUserRefresh() {
     });
     void requestRefresh();
   }, 750);
+}
+
+/**
+ * Consume only the closed automatic refresh mode sent by the Electron main
+ * process. Manual dashboard controls continue to request detailed accounting;
+ * this event keeps the host-owned foreground cadence explicit in the page.
+ */
+function handleElectronAutomaticRefresh(event) {
+  const detail = event?.detail;
+  if (detail === null
+      || typeof detail !== "object"
+      || Array.isArray(detail)
+      || Object.getPrototypeOf(detail) !== Object.prototype
+      || Reflect.ownKeys(detail).length !== 1
+      || !Object.hasOwn(detail, "mode")
+      || (detail.mode !== "quick" && detail.mode !== "detailed")) return;
+  void requestRefresh({ detailed: detail.mode === "detailed" });
 }
 
 const HOSTED_IDENTITY_ERROR_COPY = {
@@ -12690,6 +13372,15 @@ function isTransientSignInRelayError(error) {
 function runsInsideNativeDashboard() {
   return document.documentElement.classList.contains("native-dashboard")
     || document.body?.classList.contains("native-dashboard");
+}
+
+// Electron's preload stamps this marker before the dashboard module runs. It
+// is separate from the native macOS marker because Electron's main process
+// owns refresh cadence and the browser/native return scheduler must stand down
+// for it as well.
+function runsInsideElectronDashboard() {
+  return document.documentElement.classList.contains("electron-dashboard")
+    || document.body?.classList.contains("electron-dashboard");
 }
 
 function openHostedSignInInBrowser(authorizeUrl) {
@@ -14878,6 +15569,7 @@ $("#identity-signout").addEventListener("click", () => {
 $("#identity-signin-check").addEventListener("click", checkHostedSignInNow);
 $("#identity-signin-cancel").addEventListener("click", cancelHostedSignIn);
 window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow);
+window.addEventListener("tibotattle:automatic-refresh", handleElectronAutomaticRefresh);
 // Reactivation hooks for the persisted handoff (owner-reported orphaned
 // proof, 2026-08-08): the deep-link return, the page becoming visible again,
 // and the window regaining focus each try to collect a pending sign-in this
@@ -14891,6 +15583,18 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("focus", () => {
   void resumePendingHostedSignIn();
+  if (electronSharingBridge() !== null && dashboard !== null) {
+    void loadElectronSharingPreference({ dashboardReady: true }).catch(() => {});
+  }
+});
+$("#electron-sharing-share-now")?.addEventListener("click", () => {
+  void setElectronSharingEnabled(true);
+});
+$("#electron-sharing-keep-off")?.addEventListener("click", () => {
+  void setElectronSharingEnabled(false);
+});
+$("#electron-accountless-sharing-enabled")?.addEventListener("change", (event) => {
+  void setElectronSharingEnabled(event.target.checked === true);
 });
 window.addEventListener("tibotattle:local-evidence-updated", () => {
   void reloadLocalEvidenceAfterNativeRefresh();
@@ -15215,6 +15919,13 @@ document.addEventListener("scroll", () => {
   if (current) positionInformationPopover(current.popover, current.button);
 }, true);
 
+mountWorkUsageView({ root: document.querySelector("#projects"), t });
+const modelPerformance = mountModelPerformance({
+  root: document.querySelector("#performance"), client: localClient,
+  t, locale: () => localization.formatLocale(),
+});
+window.addEventListener("tibotattle:locale-change", () => modelPerformance.render());
+
 mountDashboardNavigation({
   documentRef: document,
   windowRef: window,
@@ -15225,9 +15936,11 @@ async function bootstrapDashboard() {
     formatLocale: getFormattingLocale(),
     translateMessage: t,
   });
+  applyElectronAccountlessContributionMode();
   renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();
+  startElectronStartupRefresh();
   if (
     localCompanionHealth === null
     || localCompanionHealth?.capabilities?.centralServiceProxy === true

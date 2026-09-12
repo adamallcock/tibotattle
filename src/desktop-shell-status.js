@@ -1,0 +1,515 @@
+import { isValidQuotaWindowDuration } from "@app-usagemonitor/quota-analysis";
+
+/**
+ * Content-free status projection for the cross-platform desktop shell.
+ *
+ * This boundary is deliberately smaller than the dashboard contract.  The
+ * shell may use it for a tray/menu label and for the notification policy, but
+ * it may not use it as a second dashboard API. Notification authority remains
+ * the closed v2 direct-provider evidence produced by the companion refresh
+ * boundary. A separate, bounded local-overview proof may supply a display-only
+ * allowance; it can never become notification evidence. Malformed, stale,
+ * inferred, and mixed-source inputs are projected as unavailable rather than
+ * being repaired or guessed here.
+ */
+
+export const DESKTOP_SHELL_STATUS_SCHEMA_VERSION =
+  "tibotattle-desktop-shell-status-v2";
+
+export const DESKTOP_SHELL_STATUS_STATES = Object.freeze([
+  "starting",
+  "analyzing",
+  "fresh",
+  "stale",
+  "unavailable",
+]);
+
+export const DESKTOP_SHELL_ALLOWANCE_WINDOWS = Object.freeze([
+  "five_hour",
+  "seven_day",
+]);
+
+export const DESKTOP_SHELL_NOTIFICATION_EVIDENCE_SCHEMA_VERSION =
+  "tibotattle-notification-evidence-v2";
+
+export const DESKTOP_SHELL_NOTIFICATION_EVIDENCE_MAX_AGE_MS = 5 * 60 * 1_000;
+
+const STATUS_SET = new Set(DESKTOP_SHELL_STATUS_STATES);
+const ALLOWANCE_WINDOW_SET = new Set(DESKTOP_SHELL_ALLOWANCE_WINDOWS);
+const EVIDENCE_KEYS = Object.freeze([
+  "continuityKey",
+  "freshness",
+  "observedAt",
+  "provider",
+  "schemaVersion",
+  "source",
+  "status",
+  "windows",
+]);
+const EVIDENCE_WINDOW_KEYS = Object.freeze([
+  "durationMinutes",
+  "lane",
+  "resetAt",
+  "resetProofKind",
+  "usedPercent",
+]);
+const EVIDENCE_LANES = new Set(["primary", "secondary"]);
+const DISPLAY_EVIDENCE_KEYS = Object.freeze([
+  "evidenceStatus",
+  "freshness",
+  "windows",
+]);
+const DISPLAY_FRESHNESS_KEYS = Object.freeze([
+  "staleAfterSeconds",
+  "status",
+]);
+const DISPLAY_WINDOW_KEYS = Object.freeze([
+  "durationMinutes",
+  "observedAt",
+  "remainingPercent",
+  "resetAt",
+  "slot",
+  "usedPercent",
+]);
+const DISPLAY_WINDOW_DURATIONS = new Set([300, 10_080]);
+const DISPLAY_WINDOW_SLOTS = new Set(["primary", "secondary"]);
+const DISPLAY_EVIDENCE_MAX_WINDOWS = 2;
+const REFRESH_STATES = new Set([
+  "idle",
+  "running",
+  "cancelling",
+  "succeeded",
+  "degraded",
+  "failed",
+  "cancelled",
+]);
+
+const QUARANTINE_FAILURE_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+]);
+
+function isPlainRecord(value) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function hasExactKeys(value, keys) {
+  if (!isPlainRecord(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function canonicalInstant(value) {
+  if (typeof value !== "string") return null;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+      && new Date(milliseconds).toISOString() === value
+    ? value
+    : null;
+}
+
+function validContinuityKey(value) {
+  return typeof value === "string"
+    && /^[A-Za-z0-9_-]{43}$/u.test(value);
+}
+
+function validEvidenceWindow(value, observedAt) {
+  if (!hasExactKeys(value, EVIDENCE_WINDOW_KEYS)
+      || !EVIDENCE_LANES.has(value.lane)
+      || !isValidQuotaWindowDuration(value.durationMinutes)
+      || value.resetProofKind !== "provider_reported_schedule_only"
+      || typeof value.usedPercent !== "number"
+      || !Number.isFinite(value.usedPercent)
+      || value.usedPercent < 0
+      || value.usedPercent > 100) {
+    return null;
+  }
+  const resetAt = canonicalInstant(value.resetAt);
+  if (resetAt === null || Date.parse(resetAt) <= Date.parse(observedAt)) {
+    return null;
+  }
+  return Object.freeze({
+    lane: value.lane,
+    usedPercent: Object.is(value.usedPercent, -0) ? 0 : value.usedPercent,
+    durationMinutes: value.durationMinutes,
+    resetAt,
+    resetProofKind: "provider_reported_schedule_only",
+  });
+}
+
+/**
+ * Validate and clone the already-closed v2 evidence contract.
+ *
+ * `null` is the only failure result so a route caller cannot accidentally
+ * serialize an exception message, path, account identifier, or raw provider
+ * response into the desktop surface.
+ */
+export function projectDesktopShellNotificationEvidence(value, {
+  now = Date.now(),
+} = {}) {
+  if (!hasExactKeys(value, EVIDENCE_KEYS)
+      || value.schemaVersion
+        !== DESKTOP_SHELL_NOTIFICATION_EVIDENCE_SCHEMA_VERSION
+      || value.status !== "fresh_provider_observation"
+      || value.provider !== "openai_codex"
+      || value.source !== "app_server_read"
+      || value.freshness !== "fresh"
+      || canonicalInstant(value.observedAt) === null
+      || !validContinuityKey(value.continuityKey)
+      || !Array.isArray(value.windows)
+      || value.windows.length < 1
+      || value.windows.length > 2
+      || !Number.isFinite(now)) {
+    return null;
+  }
+  const observedAtMs = Date.parse(value.observedAt);
+  const ageMs = now - observedAtMs;
+  if (!Number.isFinite(ageMs)
+      || ageMs < 0
+      || ageMs > DESKTOP_SHELL_NOTIFICATION_EVIDENCE_MAX_AGE_MS) {
+    return null;
+  }
+  const seenLanes = new Set();
+  const windows = [];
+  for (const candidate of value.windows) {
+    const window = validEvidenceWindow(candidate, value.observedAt);
+    if (window === null || seenLanes.has(window.lane)) return null;
+    seenLanes.add(window.lane);
+    windows.push(window);
+  }
+  windows.sort((left, right) => left.lane.localeCompare(right.lane));
+  return Object.freeze({
+    schemaVersion: DESKTOP_SHELL_NOTIFICATION_EVIDENCE_SCHEMA_VERSION,
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt: value.observedAt,
+    continuityKey: value.continuityKey,
+    windows: Object.freeze(windows),
+  });
+}
+
+function primaryAllowance(evidence) {
+  const primary = evidence.windows
+    .filter((window) => window.lane === "primary")
+    .sort((left, right) => right.durationMinutes - left.durationMinutes)[0];
+  if (primary === undefined) return null;
+  const window = primary.durationMinutes === 300
+    ? "five_hour"
+    : primary.durationMinutes === 10_080
+      ? "seven_day"
+      : null;
+  if (window === null || !ALLOWANCE_WINDOW_SET.has(window)) return null;
+  return Object.freeze({
+    source: "direct",
+    window,
+    remainingPercent: 100 - primary.usedPercent,
+  });
+}
+
+/**
+ * Project a compact display allowance from the already-published local
+ * overview. This proof is deliberately distinct from notification evidence:
+ * it has no continuity key, provider identity, or notification authority.
+ *
+ * The data-store accessor supplies only the two native-supported Codex window
+ * durations. We still validate every scalar here because this route is polled
+ * independently of the dashboard and must fail closed on a malformed accessor
+ * result.
+ */
+function displayWindows(displayEvidence, { now }) {
+  if (!hasExactKeys(displayEvidence, DISPLAY_EVIDENCE_KEYS)
+      || displayEvidence.evidenceStatus !== "available"
+      || !hasExactKeys(displayEvidence.freshness, DISPLAY_FRESHNESS_KEYS)
+      || !["live", "stale"].includes(displayEvidence.freshness.status)
+      || typeof displayEvidence.freshness.staleAfterSeconds !== "number"
+      || !Number.isFinite(displayEvidence.freshness.staleAfterSeconds)
+      || displayEvidence.freshness.staleAfterSeconds < 0
+      || !Array.isArray(displayEvidence.windows)
+      || displayEvidence.windows.length < 1
+      || displayEvidence.windows.length > DISPLAY_EVIDENCE_MAX_WINDOWS
+      || !Number.isFinite(now)) {
+    return null;
+  }
+
+  const selected = new Map();
+  for (const candidate of displayEvidence.windows) {
+    if (!hasExactKeys(candidate, DISPLAY_WINDOW_KEYS)
+        || !DISPLAY_WINDOW_DURATIONS.has(candidate.durationMinutes)
+        || !DISPLAY_WINDOW_SLOTS.has(candidate.slot)
+        || typeof candidate.usedPercent !== "number"
+        || !Number.isFinite(candidate.usedPercent)
+        || candidate.usedPercent < 0
+        || candidate.usedPercent > 100
+        || typeof candidate.remainingPercent !== "number"
+        || !Number.isFinite(candidate.remainingPercent)
+        || candidate.remainingPercent < 0
+        || candidate.remainingPercent > 100
+        || Math.abs((candidate.usedPercent + candidate.remainingPercent) - 100) > 0.001) {
+      return null;
+    }
+    const observedAt = canonicalInstant(candidate.observedAt);
+    const resetAt = canonicalInstant(candidate.resetAt);
+    if (observedAt === null || resetAt === null) return null;
+    const observedAtMs = Date.parse(observedAt);
+    const resetAtMs = Date.parse(resetAt);
+    if (resetAtMs <= observedAtMs
+        || resetAtMs - observedAtMs > candidate.durationMinutes * 60_000
+        || selected.has(candidate.durationMinutes)) {
+      return null;
+    }
+    // A current five-hour lane may remain usable after a weekly lane has
+    // independently expired. Match the native reader by excluding that one
+    // lane instead of letting it erase its current sibling.
+    if (observedAtMs > now
+        || resetAtMs <= now) {
+      continue;
+    }
+    selected.set(candidate.durationMinutes, Object.freeze({
+      durationMinutes: candidate.durationMinutes,
+      observedAt,
+      resetAt,
+      remainingPercent: Object.is(candidate.remainingPercent, -0)
+        ? 0
+        : candidate.remainingPercent,
+    }));
+  }
+
+  if (selected.size === 0) return null;
+  return Object.freeze({ schemaVersion: "tibotattle-display-evidence-v1", scopeKey: null,
+    staleAfterSeconds: displayEvidence.freshness.staleAfterSeconds,
+    windows: Object.freeze([...selected.values()]) });
+}
+
+/** Display-only authority; never accepted by notification evaluators. */
+export function projectDesktopShellDisplayEvidence(value, { now = Date.now() } = {}) {
+  if (!hasExactKeys(value, ["schemaVersion", "scopeKey", "staleAfterSeconds", "windows"])
+      || value.schemaVersion !== "tibotattle-display-evidence-v1"
+      || (value.scopeKey !== null && !validContinuityKey(value.scopeKey))
+      || !Number.isFinite(value.staleAfterSeconds) || value.staleAfterSeconds < 0
+      || !Array.isArray(value.windows) || value.windows.length < 1 || value.windows.length > 2) return null;
+  const seen = new Set(); const windows = [];
+  for (const item of value.windows) {
+    if (!hasExactKeys(item, ["durationMinutes", "remainingPercent", "observedAt", "resetAt"])
+        || !DISPLAY_WINDOW_DURATIONS.has(item.durationMinutes) || seen.has(item.durationMinutes)
+        || !Number.isFinite(item.remainingPercent) || item.remainingPercent < 0 || item.remainingPercent > 100
+        || canonicalInstant(item.observedAt) === null || canonicalInstant(item.resetAt) === null
+        || Date.parse(item.resetAt) <= Date.parse(item.observedAt)
+        || Date.parse(item.resetAt) - Date.parse(item.observedAt) > item.durationMinutes * 60_000) return null;
+    seen.add(item.durationMinutes);
+    if (now !== null && (!Number.isFinite(now) || now < Date.parse(item.observedAt)
+        || now >= Date.parse(item.resetAt))) continue;
+    windows.push(Object.freeze({ ...item }));
+  }
+  return windows.length === 0 ? null : Object.freeze({ ...value, windows: Object.freeze(windows) });
+}
+
+function displayAllowance(evidence) {
+  const primary = evidence?.windows.find((item) => item.durationMinutes === 10_080) ?? evidence?.windows[0];
+  return primary === undefined ? null : Object.freeze({ source: "direct", window: primary.durationMinutes === 300 ? "five_hour" : "seven_day", remainingPercent: primary.remainingPercent });
+}
+
+function cloneAllowance(value) {
+  if (value === null) return null;
+  if (!hasExactKeys(value, ["remainingPercent", "source", "window"])
+      || value.source !== "direct"
+      || typeof value.window !== "string"
+      || !ALLOWANCE_WINDOW_SET.has(value.window)
+      || typeof value.remainingPercent !== "number"
+      || !Number.isFinite(value.remainingPercent)
+      || value.remainingPercent < 0
+      || value.remainingPercent > 100) {
+    throw new TypeError("desktop shell allowance is invalid");
+  }
+  return Object.freeze({
+    source: "direct",
+    window: value.window,
+    remainingPercent: Object.is(value.remainingPercent, -0)
+      ? 0
+      : value.remainingPercent,
+  });
+}
+
+function closedOutput(state, allowance = null, notificationEvidence = null, displayEvidence = null) {
+  if (!STATUS_SET.has(state)) throw new TypeError("desktop shell state is invalid");
+  if (!["fresh", "analyzing"].includes(state)) {
+    allowance = null;
+    notificationEvidence = null;
+    if (state !== "stale") displayEvidence = null;
+  } else {
+    allowance = cloneAllowance(allowance);
+  }
+  return Object.freeze({
+    schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+    state,
+    allowance,
+    notificationEvidence,
+    ...(displayEvidence === null ? {} : { displayEvidence }),
+  });
+}
+
+function safeRefreshState(refresh) {
+  if (!isPlainRecord(refresh) || typeof refresh.status !== "string") return null;
+  return REFRESH_STATES.has(refresh.status) ? refresh.status : null;
+}
+
+function coherentQuarantinedRefresh(refresh) {
+  if (!isPlainRecord(refresh)
+      || refresh.status !== "degraded"
+      || refresh.errorCode !== "refresh_degraded"
+      || refresh.failedStep !== "unified_index"
+      || !QUARANTINE_FAILURE_CODES.has(refresh.failureCode)) {
+    return false;
+  }
+  const result = refresh.result;
+  const unifiedIndex = result?.unifiedIndex;
+  const generation = unifiedIndex?.generation;
+  const accounting = result?.accounting;
+  return unifiedIndex?.status === "ingested"
+    && generation?.status === "partial"
+    && generation?.blockReason === "codex_rollout_sources_quarantined"
+    && Number.isSafeInteger(generation.skippedSourceCount)
+    && generation.skippedSourceCount > 0
+    && Number.isSafeInteger(generation.skippedThreadCount)
+    && generation.skippedThreadCount > 0
+    && Number.isSafeInteger(generation.reasonCounts?.[refresh.failureCode])
+    && generation.reasonCounts[refresh.failureCode] > 0
+    && generation.discoveryComplete === true
+    && generation.diagnosticsComplete === true
+    && generation.usageProvenanceComplete === true
+    && generation.sourceOrderComplete === true
+    && generation.quotaProvenanceComplete === true
+    && accounting?.status === "replay_safe"
+    && accounting.sourceMode === "unified"
+    && accounting.coverageStatus === "partial"
+    && accounting.generationMatched === true
+    && accounting.fallbackCount === 0
+    && accounting.diagnosticsAvailable === true;
+}
+
+/**
+ * Project the companion lifecycle and latest closed refresh receipt.
+ *
+ * The input is intentionally limited to `snapshotStatus`, `refresh`, and a
+ * testable clock. Error classifications are read only to fail closed on the
+ * bounded degraded-quarantine case; no refresh ID, progress payload, error
+ * code, or arbitrary dashboard value is ever copied into the result.
+ */
+export function projectDesktopShellStatus({
+  snapshotStatus = "ready",
+  refresh = null,
+  displayEvidence = null,
+  now = Date.now(),
+} = {}) {
+  if (!["building", "ready", "failed"].includes(snapshotStatus)) {
+    return closedOutput("unavailable");
+  }
+  if (snapshotStatus === "building") return closedOutput("starting");
+  if (snapshotStatus === "failed") return closedOutput("unavailable");
+
+  const currentDisplayEvidence = displayWindows(displayEvidence, { now });
+  const displayIsStale = currentDisplayEvidence !== null
+    && (displayEvidence.freshness.status === "stale"
+      || currentDisplayEvidence.windows.some((item) => now - Date.parse(item.observedAt) > currentDisplayEvidence.staleAfterSeconds * 1_000));
+  const currentDisplayAllowance = displayIsStale ? null : displayAllowance(currentDisplayEvidence);
+  const displayOnlyStatus = () => currentDisplayEvidence === null
+    ? closedOutput("stale")
+    : closedOutput(displayIsStale ? "stale" : "fresh", currentDisplayAllowance, null, currentDisplayEvidence);
+  const refreshStatus = safeRefreshState(refresh);
+  if (refreshStatus === "running" || refreshStatus === "cancelling") {
+    // A refresh receipt may retain the last closed provider observation while
+    // a newer pass is running. Keep that evidence only when it is still live
+    // at this projection time; the normal current implementation leaves
+    // `result` null while running, so this is also a safe forward-compatible
+    // boundary for a retained-snapshot implementation.
+    const retainedEvidence = projectDesktopShellNotificationEvidence(
+      refresh.result?.notificationEvidence,
+      { now },
+    );
+    return retainedEvidence === null
+      ? closedOutput("analyzing", currentDisplayAllowance, null, currentDisplayEvidence)
+      : closedOutput(
+        "analyzing",
+        primaryAllowance(retainedEvidence) ?? currentDisplayAllowance,
+        retainedEvidence,
+        currentDisplayEvidence,
+      );
+  }
+  if (refreshStatus === "degraded"
+      && !coherentQuarantinedRefresh(refresh)) {
+    return closedOutput("unavailable");
+  }
+  if (refreshStatus === "idle") {
+    return currentDisplayEvidence === null ? closedOutput("unavailable") : displayOnlyStatus();
+  }
+  if (refreshStatus !== "succeeded" && refreshStatus !== "degraded") {
+    return closedOutput(
+      refreshStatus === "cancelled" ? "stale" : "unavailable",
+    );
+  }
+
+  const evidence = projectDesktopShellNotificationEvidence(
+    refresh.result?.notificationEvidence,
+    { now },
+  );
+  if (evidence !== null) {
+    return closedOutput(
+      "fresh",
+      primaryAllowance(evidence) ?? currentDisplayAllowance,
+      evidence,
+      currentDisplayEvidence,
+    );
+  }
+  return displayOnlyStatus();
+}
+
+export function validateDesktopShellStatus(value) {
+  if (!hasExactKeys(value, [
+    "allowance",
+    "notificationEvidence",
+    "schemaVersion",
+    "state",
+    ...(Object.hasOwn(value ?? {}, "displayEvidence") ? ["displayEvidence"] : []),
+  ])
+      || ![DESKTOP_SHELL_STATUS_SCHEMA_VERSION, "tibotattle-desktop-shell-status-v1"].includes(value.schemaVersion)
+      || !STATUS_SET.has(value.state)) {
+    throw new TypeError("desktop shell status is invalid");
+  }
+  const display = value.displayEvidence === undefined ? null : projectDesktopShellDisplayEvidence(value.displayEvidence, { now: null });
+  if (value.displayEvidence !== undefined && (display === null || value.schemaVersion !== DESKTOP_SHELL_STATUS_SCHEMA_VERSION || !["fresh", "analyzing", "stale"].includes(value.state))) throw new TypeError("desktop display evidence is invalid");
+  const evidence = ["fresh", "analyzing"].includes(value.state)
+    ? projectDesktopShellNotificationEvidence(
+      value.notificationEvidence,
+      { now: Date.parse(value.notificationEvidence?.observedAt) },
+    )
+    : null;
+  if (value.state === "fresh"
+      && evidence === null
+      && value.allowance === null) {
+    throw new TypeError("desktop shell status is invalid");
+  }
+  if (value.state === "analyzing"
+      && value.notificationEvidence !== null
+      && evidence === null) {
+    throw new TypeError("desktop shell status is invalid");
+  }
+  if (!["fresh", "analyzing"].includes(value.state)
+      && (value.allowance !== null || value.notificationEvidence !== null)) {
+    throw new TypeError("desktop shell status is invalid");
+  }
+  return Object.freeze({ ...closedOutput(
+    value.state,
+    ["fresh", "analyzing"].includes(value.state) ? value.allowance : null,
+    evidence,
+    display,
+  ), schemaVersion: value.schemaVersion });
+}

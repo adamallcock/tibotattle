@@ -139,6 +139,69 @@ test("native handle-bound replacement is conditional on the expected identity", 
   assert.equal(binding.pathWalkRaceSafe, false);
 }));
 
+test("native protected child operations bind the supplied root and requested byte cap", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(({ adapter, root }) => {
+  const rootIdentity = adapter.ensureDirectory(root);
+  const binding = loadWindowsFilesystemBinding();
+  const child = "protected-state.bin";
+  const initial = Buffer.from("protected-state", "utf8");
+  const replacementBytes = Buffer.from("replacement-state", "utf8");
+
+  const created = binding.createProtectedChild(root, rootIdentity, child, initial);
+  const metadata = binding.inspectProtectedChild(root, rootIdentity, child);
+  assert.deepEqual(metadata.identity, created);
+  assert.equal(metadata.isRegularFile, true);
+  assert.equal(metadata.finalPathResolved, true);
+  assert.deepEqual(
+    binding.readProtectedChild(root, rootIdentity, child, initial.byteLength),
+    { data: initial, identity: created },
+  );
+  assert.throws(
+    () => binding.readProtectedChild(root, rootIdentity, child, initial.byteLength - 1),
+    fixedNativeError("WINDOWS_FILESYSTEM_FILE_TOO_LARGE"),
+  );
+  assert.throws(
+    () => binding.inspectProtectedChild(root, {
+      ...rootIdentity,
+      fileId: "ffffffffffffffffffffffffffffffff",
+    }, child),
+    fixedNativeError("WINDOWS_FILESYSTEM_IDENTITY_MISMATCH"),
+  );
+  assert.throws(
+    () => binding.inspectProtectedChild(root, rootIdentity, "..\\outside"),
+    fixedNativeError("WINDOWS_FILESYSTEM_INVALID_PATH"),
+  );
+  assert.throws(
+    () => binding.replaceProtectedChild(root, rootIdentity, child, {
+      ...created,
+      fileId: "ffffffffffffffffffffffffffffffff",
+    }, replacementBytes),
+    fixedNativeError("WINDOWS_FILESYSTEM_IDENTITY_MISMATCH"),
+  );
+  assert.deepEqual(
+    binding.readProtectedChild(root, rootIdentity, child, initial.byteLength),
+    { data: initial, identity: created },
+  );
+
+  const replacement = binding.replaceProtectedChild(
+    root,
+    rootIdentity,
+    child,
+    created,
+    replacementBytes,
+  );
+  assert.notDeepEqual(replacement, created);
+  assert.deepEqual(
+    binding.readProtectedChild(root, rootIdentity, child, replacementBytes.byteLength),
+    { data: replacementBytes, identity: replacement },
+  );
+  assert.deepEqual(binding.deleteProtectedChild(root, rootIdentity, child, replacement), {
+    deleted: true,
+    identity: replacement,
+  });
+}));
+
 test("native adapter keeps hostile path failures fixed and content-free", {
   skip: NATIVE_SKIP,
 }, () => withSyntheticRoot(({ adapter, root }) => {

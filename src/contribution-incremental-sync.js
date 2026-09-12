@@ -22,6 +22,12 @@ import {
   createTelemetryV11Envelope,
 } from "./platform/index.js";
 import {
+  accountlessDeviceUnavailableCode,
+  accountlessTransportOrigin,
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
   createTelemetryV11Day,
   readTelemetryV11Capabilities,
   runTelemetryV11Sync,
@@ -91,6 +97,7 @@ const V11_PROGRESS_KEYS = Object.freeze(["schemaVersion", "contextDigest", "prev
 
 const ERROR_CODES = new Set([
   "invalid_configuration",
+  "authorization_invalid",
   "consent_invalid",
 ]);
 
@@ -215,7 +222,8 @@ async function readJson(response, {
   const backendCode = payload?.error?.code;
   if (deviceAuthorized
       && ["DEVICE_AUTH_INVALID", "PARTICIPANT_DELETING", "UPLOAD_AUTH_INVALID"]
-        .includes(backendCode)) {
+        .includes(backendCode)
+      || (deviceAuthorized && accountlessDeviceUnavailableCode(backendCode))) {
     interrupt("device_unavailable", { deviceUnavailable: true });
   }
   // Both admission limits mean the same thing to the client: the service is
@@ -375,6 +383,36 @@ function explicitV11Consent(consent, origin) {
   return required;
 }
 
+function exactKeys(record, keys) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(record);
+    return (prototype === Object.prototype || prototype === null)
+      && Reflect.ownKeys(record).length === keys.length
+      && keys.every((key) => Object.hasOwn(record, key));
+  } catch {
+    return false;
+  }
+}
+
+function accountlessV11Authorization(authorization, origin, laboratory, rehearsal, production) {
+  if (accountlessTransportOrigin({ laboratory, rehearsal, production, origin }) === null
+      || !exactKeys(authorization, [
+    "authorizationBasis",
+    "policyVersion",
+    "schemaVersion",
+    "telemetrySchemaVersion",
+  ])
+      || authorization.schemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION
+      || authorization.policyVersion !== ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION
+      || authorization.authorizationBasis !== ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS
+      || authorization.telemetrySchemaVersion
+        !== ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION) {
+    fail("authorization_invalid");
+  }
+  return Object.freeze({ ...authorization });
+}
+
 function v11Publication(database) {
   const descriptor = readUnifiedIndexGenerationDescriptor(database);
   if (!descriptor || !["complete", "partial"].includes(descriptor.status)
@@ -466,18 +504,9 @@ async function createV11Preparation(database, {
     fallbackParserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
     accountMarkers,
   });
-  // Staged projections also depend on whether captured marker evidence exists.
-  // Losing the last marker must revalidate an earlier marker-bearing prefix,
-  // even though the next pass no longer forces marker/root revalidation. Keep
-  // the actual index publication separate for mutation fencing and review.
-  const sourcePublication = Object.freeze({
-    fingerprint: createHash("sha256").update(JSON.stringify([
-      "telemetry-v11-local-projection-v1", publication.fingerprint, accountMarkers.length > 0,
-    ])).digest("hex"),
-    parserVersion: publication.parserVersion,
-  });
   let root = null;
-  let rootLoaded = false;
+  let selectedBinding = null;
+  let projection = null;
   let closed = false;
   const assertCurrent = () => {
     if (closed) interrupt("index_unavailable", { retryable: true });
@@ -491,33 +520,55 @@ async function createV11Preparation(database, {
   };
   const days = reader.days();
   assertCurrent();
-  return Object.freeze({
-    days: Object.freeze(days), publication, sourcePublication, assertCurrent,
-    // A root becoming readable (or a new captured marker) may alter the
-    // projection without changing indexed facts. Recheck saved day digests
-    // under the current evidence; do not probe an identity just to resume.
-    revalidateProgress: accountMarkers.length > 0,
-    async readDay(day, { binding }) {
-      assertCurrent();
-      const hydrated = reader.readDay(day);
-      // A historical plan does not need an account root. Only an already
-      // captured matching marker can request an existing-only secret lease.
-      // A missing/locked root retains useful history as account-unknown.
-      const hasBoundMarker = ["usage", "quota"].some((stream) => hydrated.recordsByStream[stream].some((record) => {
-        const evidence = hydrated.attributionForRecord(stream, record);
-        const captured = sanitizeTelemetryAttributionBinding(evidence?.observationBinding);
-        return evidence?.accountBasis === "provisional_marker" && captured !== null
-          && captured.destinationOrigin === binding.destinationOrigin && captured.enrollmentNamespace === binding.enrollmentNamespace;
-      }));
-      if (!rootLoaded && hasBoundMarker) {
-        rootLoaded = true;
-        try {
-          const loaded = await loadExistingAccountObservationSecret();
-          if (Buffer.isBuffer(loaded) && loaded.length === 32 && !closed) root = loaded;
-          else if (Buffer.isBuffer(loaded)) loaded.fill(0);
-        } catch { /* Missing account identity is explicit, not an upload failure. */ }
+  const daySet = new Set(days);
+  const hasBoundMarker = (hydrated, binding) =>
+    ["usage", "quota"].some((stream) => hydrated.recordsByStream[stream].some((record) => {
+      const evidence = hydrated.attributionForRecord(stream, record);
+      const captured = sanitizeTelemetryAttributionBinding(evidence?.observationBinding);
+      return evidence?.accountBasis === "provisional_marker" && captured !== null
+        && captured.destinationOrigin === binding.destinationOrigin && captured.enrollmentNamespace === binding.enrollmentNamespace;
+    }));
+  async function preparePublication({ binding }) {
+    assertCurrent();
+    const captured = sanitizeTelemetryAttributionBinding(binding);
+    if (captured === null || (selectedBinding !== null
+        && (captured.destinationOrigin !== selectedBinding.destinationOrigin
+          || captured.enrollmentNamespace !== selectedBinding.enrollmentNamespace))) interrupt("local_index_changed", { retryable: true });
+    selectedBinding ??= captured;
+    projection ??= (async () => {
+      const evidence = reader.projectionEvidence({ binding: selectedBinding });
+      let rootRequired = false;
+      for (const day of evidence.boundDays) {
+        assertCurrent();
+        if (daySet.has(day) && hasBoundMarker(reader.readDay(day), selectedBinding)) {
+          rootRequired = true;
+          try {
+            const loaded = await loadExistingAccountObservationSecret();
+            if (Buffer.isBuffer(loaded) && loaded.length === 32 && !closed) root = loaded;
+            else if (Buffer.isBuffer(loaded)) loaded.fill(0);
+          } catch { /* Missing/locked identity stays explicitly unattributed. */ }
+          break;
+        }
+        await new Promise((resolve) => setImmediate(resolve));
       }
       assertCurrent();
+      // A stable projection resumes validatedDays across bounded passes. A
+      // marker/root change resets validation once, then checkpoints against
+      // its exact new fingerprint. No raw identity or secret enters storage.
+      const rootFingerprint = root === null ? (rootRequired ? "unavailable" : "not-required")
+        : createHash("sha256").update("telemetry-v11-projection-root-v1\0").update(root).digest("hex");
+      return Object.freeze({ fingerprint: createHash("sha256").update(JSON.stringify([
+        "telemetry-v11-local-projection-v2", publication.fingerprint, evidence.fingerprint, rootFingerprint,
+      ])).digest("hex"), parserVersion: publication.parserVersion });
+    })();
+    return projection;
+  }
+  return Object.freeze({
+    days: Object.freeze(days), publication, preparePublication, assertCurrent,
+    async readDay(day, { binding }) {
+      await preparePublication({ binding });
+      assertCurrent();
+      const hydrated = reader.readDay(day);
       const result = createTelemetryV11Day({
         day, ...hydrated, binding, accountObservationSecret: root,
         parserVersion: publication.parserVersion,
@@ -546,13 +597,16 @@ function v11Failure(error, { daysTotal = 0, networkActivity = false } = {}) {
   });
 }
 
-/** The old uploader remains the default. A successor consent is never inferred. */
+/** The old uploader remains the default. A successor authorization is never inferred. */
 export async function runIncrementalContributionSyncOnce(options = {}) {
-  if (options.consent?.telemetrySchemaVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+  const hasAccountlessAuthorization = options !== null && typeof options === "object"
+    && Object.hasOwn(options, "authorization");
+  if (!hasAccountlessAuthorization
+      && options.consent?.telemetrySchemaVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
     return runTelemetryV1SyncOnce(options);
   }
   const {
-    indexFile, origin, backend, stateFile, consent, signal, fetchImpl = globalThis.fetch,
+    indexFile, origin, backend, stateFile, consent, authorization = undefined, laboratory = undefined, rehearsal = false, production = false, signal, fetchImpl = globalThis.fetch,
     cryptoImpl = globalThis.crypto, withDeviceSecret = withContributionDeviceSecret,
     openIndex = openLocalUnifiedIndex, maximumChunks = DEFAULT_MAXIMUM_CHUNKS_PER_PASS,
     requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
@@ -564,7 +618,11 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
     progressStore = undefined, progressFile = null,
   } = options;
   const selectedOrigin = canonicalOrigin(origin);
-  const selectedConsent = explicitV11Consent(consent, selectedOrigin);
+  const selectedConsent = hasAccountlessAuthorization ? null : explicitV11Consent(consent, selectedOrigin);
+  const selectedAuthorization = hasAccountlessAuthorization
+    ? accountlessV11Authorization(authorization, selectedOrigin, laboratory, rehearsal, production)
+    : null;
+  if (hasAccountlessAuthorization && consent !== undefined) fail("authorization_invalid");
   if (typeof indexFile !== "string" || !indexFile || !backend || typeof backend !== "object"
       || [fetchImpl, withDeviceSecret, openIndex, now, createV11Envelope, runV11Sync,
         readAccountMarkers, loadExistingAccountObservationSecret].some((value) => typeof value !== "function")
@@ -604,10 +662,12 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
           const result = await runV11Sync({
             serverBaseUrl: selectedOrigin,
             deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
-            consent: selectedConsent, days: preparation.days, fetchImpl: fetch, signal, clock: now,
-            sourcePublication: preparation.sourcePublication,
+            ...(selectedAuthorization === null
+              ? { consent: selectedConsent }
+              : { authorization: selectedAuthorization, laboratory, rehearsal, production }),
+            days: preparation.days, fetchImpl: fetch, signal, clock: now,
+            preparePublication: preparation.preparePublication,
             progressStore: progress,
-            revalidateProgress: preparation.revalidateProgress,
             maxChunks: maximumChunks, maxDurationMs: maximumDurationMilliseconds,
             requestTimeoutMs: requestTimeoutMilliseconds,
             readDay: async (day, { binding }) => {

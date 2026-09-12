@@ -93,6 +93,31 @@ uses a shortened thread ID. If attribution cannot be proven, it stays unlinked.
 Names are looked up locally and are not included in reports, share cards,
 diagnostics, or community contributions.
 
+## Model performance in development source
+
+Open **Model performance** from the dashboard sidebar, then choose a model
+and **7 days**, **30 days**, or **All time**. The web and native navigation
+include this page in development source; an installed release must contain
+these changes before the page is available there.
+
+**Output speed** estimates tokens per second from covered response windows.
+**First-token latency** uses independently available turn timing, so its sample
+count can be much larger. The plots show median trends and middle-50% bands
+where enough observations exist. Newer and older timing methods stay separate;
+missing timing is unavailable, never zero.
+
+Sweep horizontally anywhere in a chart to inspect the same date in both metrics.
+Use arrow keys after focusing a chart point, or Escape to dismiss the tooltip.
+Empty dates explicitly show no measurements. Expand **About these measurements**
+for interpretation and coverage.
+
+These diagnostics cover Codex files on this device across accounts. Tool waits
+are excluded from matched output windows, but the estimate is not a provider
+benchmark or a billing measure. All reasoning efforts remain included. Opening
+the page collects timing in bounded background passes; saved data can appear
+before collection finishes. Leaving the page lets the worker stop, and a later
+visit resumes progress. Timing failures do not block usage accounting.
+
 ## Customize the menu bar and popup
 
 Tray customization is implemented in the development source; the published
@@ -140,6 +165,47 @@ window shows a dash in its own slot and never borrows the other window's value.
 Changing presentation does not change collection, notifications, contribution,
 or dashboard filters. A save failure leaves the previous selection in use;
 settings written by a newer app are preserved rather than overwritten.
+
+## Projects and threads (development build)
+
+The development branch includes **Projects & threads** in the dashboard sidebar.
+Expand a repository to see named tasks and their grouped subworkers, then expand
+a task for model and contributor details. Worktrees share a repository group;
+folders with no identifiable repository appear under **Non-project tasks**.
+Missing source context remains **Unassigned**.
+
+Open **Projects & threads** in the dashboard sidebar, or choose
+**View → Projects and Threads** in the Electron desktop app.
+
+Search by project or task name, including subworker names, or paste a complete
+thread ID or Codex link. Name search covers the full report before pagination.
+A matching subworker brings back its task family; a matching project includes
+all its tasks. Search result rows show matching work, while summary totals,
+token mix and share denominators retain the selected period/model scope.
+Results update as you type after two characters and a short pause (300 ms).
+Deleting the text or shortening it below two characters restores the project
+list automatically. Names and search terms stay local.
+
+Small bars beside token and cost shares show their relative size. The token-mix
+strip separates cached and uncached input from recorded output categories;
+combined output stays combined when no split was recorded. Numeric labels remain
+available alongside the graphics. Model rows reuse the app's decorative icons.
+
+Choose a period and model to compare token and API-equivalent shares. These are
+estimates of recorded usage, not subscription charges or quota shares. Omitted
+cache-write counts use the explicitly approved zero assumption when the remaining
+input counters support it; **Includes assumed counts** distinguishes them from
+observed values. Other missing counts remain labelled partial.
+
+**Refresh report** updates this view from the existing local index. Use the app's
+main **Refresh** to collect new usage first. Each report displays its own as-of
+time; opening another section does not rewrite an existing report's snapshot.
+While Projects & threads is visible, a lightweight keep-alive preserves its
+cached report without recalculating usage. Reports may be released after five
+minutes away from the page; returning automatically rebuilds an expired report.
+A fresh refresh can still require accounting work when the underlying cache
+is no longer valid.
+This feature is qualified in a local development build and has not been released.
 
 ## Refresh, progress, and recovery
 

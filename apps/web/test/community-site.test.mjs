@@ -521,7 +521,8 @@ test("the first visit leads with the product, platform choice, and daily communi
   assert.match(html, /Install the desktop app/u);
   assert.doesNotMatch(html, /Install the Mac app/u);
   assert.match(html, /See your week/u);
-  assert.match(html, /Share only if you choose/u);
+  assert.match(html, /data-i18n="electron\.sharing\.publicFeatureTitle"/u);
+  assert.match(html, /Control your sharing/u);
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
   assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
   assert.match(html, /src="\.\/apple\.svg"/u);
@@ -1192,7 +1193,17 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   assert.match(verifyRelease, /does not prove safety/u);
   assert.match(privacy, /<title>TiboTattle Privacy Overview<\/title>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);
-  assert.match(privacy, /Nothing is contributed unless you review and opt in\./u);
+  assert.match(privacy, /fresh installations enable sharing\s+automatically/u);
+  assert.match(privacy, /No social sign-in is required/u);
+  assert.match(privacy, /three\s+visible notices/u);
+  assert.match(privacy, /at least seven days from the transition's start/u);
+  assert.match(privacy, /at least one day after the final notice/u);
+  assert.match(privacy, /Known off, paused, or\s+disconnected installations stay off/u);
+  assert.match(privacy, /Unreadable or uncertain preference state does not\s+enable sharing/u);
+  assert.match(privacy, /does not prove a unique person/u);
+  assert.match(privacy, /Accountless contributions are currently excluded from public/u);
+  assert.doesNotMatch(privacy, /Nothing is contributed unless|one-person account boundary/u);
+  assert.doesNotMatch(docs, /Contribution stays off until|one pseudonymous person|delete the complete hosted participation/u);
   for (const page of [docs, privacy]) {
     assert.match(page, /href="\.\/community\.html#download"/u);
     assert.match(

@@ -2686,6 +2686,17 @@ function normalizeAccountingGeneration(value) {
   return Number.isSafeInteger(numeric) && numeric > 0 ? String(numeric) : null;
 }
 
+function normalizeCacheDiagnosticsSource(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "generation,generationFingerprint"
+      || typeof value.generationFingerprint !== "string"
+      || !/^generation-v2-[a-f0-9]{64}$/u.test(value.generationFingerprint)) return null;
+  const generation = normalizeAccountingGeneration(value.generation);
+  return generation === null ? null : {
+    generation, generationFingerprint: value.generationFingerprint
+  };
+}
+
 /** Mirrors the companion's content-free event-pair key, never an identity. */
 export function cacheDropThreadLookupKey(kind, row) {
   if (!["switch", "continuity"].includes(kind)
@@ -2757,10 +2768,12 @@ export function normalizeCacheDropThreadLinks(value) {
   const entries = [];
   for (const entry of value.entries) {
     const thread = entry?.thread;
+    const autoReview = hasExactKeys(thread, ["id", "name", "nickname", "parent", "origin"])
+      && thread.origin === "auto_review";
     if (!hasExactKeys(entry, ["kind", "key", "thread"])
         || !validCacheDropThreadKey(entry.kind, entry.key)
         || seen.has(entry.key)
-        || !hasExactKeys(thread, ["id", "name", "nickname", "parent"])
+        || (!autoReview && !hasExactKeys(thread, ["id", "name", "nickname", "parent"]))
         || typeof thread.id !== "string" || !CACHE_DROP_THREAD_ID.test(thread.id)
         || !validLocalThreadName(thread.name)
         || !validLocalThreadName(thread.nickname, 80)) return unavailable;
@@ -2769,13 +2782,15 @@ export function normalizeCacheDropThreadLinks(value) {
         || typeof parent.id !== "string" || !CACHE_DROP_THREAD_ID.test(parent.id)
         || parent.id === thread.id || !validLocalThreadName(parent.name))) return unavailable;
     seen.add(entry.key);
+    const normalizedThread = {
+      id: thread.id, name: thread.name, nickname: thread.nickname,
+      parent: parent === null ? null : { id: parent.id, name: parent.name }
+    };
+    if (autoReview) normalizedThread.origin = "auto_review";
     entries.push({
       kind: entry.kind,
       key: entry.key,
-      thread: {
-        id: thread.id, name: thread.name, nickname: thread.nickname,
-        parent: parent === null ? null : { id: parent.id, name: parent.name }
-      }
+      thread: normalizedThread
     });
   }
   return { schemaVersion: LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA, status: "available", generation, entries };
@@ -4196,7 +4211,10 @@ function normalizeLocalTimeline(value = {}) {
     allowanceCapacity,
     planScoped,
     quota,
-    history: normalizeTimelineHistory(value.history)
+    history: normalizeTimelineHistory({
+      ...value.history,
+      source: value.history?.source ?? value.source,
+    })
   };
 }
 
@@ -5180,6 +5198,7 @@ function normalizeLocalAccounting(value = {}, {
   const normalized = {
     generation: normalizeAccountingGeneration(value.generation),
     generationMatched: value.generationMatched === true,
+    cacheDiagnosticsSource: normalizeCacheDiagnosticsSource(value.cacheDiagnosticsSource),
     projection: normalizeAccountingProjection(value.projection, {
       allowImplicitDemoProjection
     }),
@@ -5421,11 +5440,24 @@ function normalizeHistoryCoverage(value = {}) {
     "local_unified_index_schema_invalid",
     "local_unified_index_schema_newer",
     "local_unified_index_unavailable",
+    "accounting_unified_history_unavailable",
+    "cache_missing",
+    "cache_unavailable",
+    "cache_generation_unavailable",
+    "cache_generation_mismatch",
+    "cache_fallback_disallowed",
+    "cache_source_mode_mismatch",
+    "cache_context_behavior_mismatch",
+    "cache_accounting_semantics_outdated",
+    "cache_price_registry_outdated",
+    "cache_invalid",
+    "cache_from_future",
+    "cache_stale",
   ].includes(value?.errorCode)
     ? value.errorCode
     : null;
-  // `partial_terminal` is the one non-progress state whose missing sources
-  // remain intentionally visible. Admit it only with a coherent quarantine
+  // `partial_terminal` keeps excluded sources visible alongside available
+  // accounting. Admit it only with a coherent quarantine
   // receipt: otherwise an arbitrary partial payload could turn off automatic
   // refreshes or manufacture a skipped-source explanation in the browser.
   const terminalGap = value?.status === "partial"
@@ -5445,7 +5477,30 @@ function normalizeHistoryCoverage(value = {}) {
     && indexedBytes !== null
     && skippedSourceBytes !== null
     && indexedBytes + skippedSourceBytes === sourceBytes;
-  const phase = terminalGap ? "partial_terminal" : admittedPhase;
+  // A finished source scan can precede the separate accounting summary. Keep
+  // that unavailable summary distinct from both an unstarted scan and an
+  // available aggregate. As for terminal gaps, the counts must balance.
+  const aggregateUnavailable = value?.status === "partial"
+    && value?.phase === "aggregate_unavailable"
+    && value?.sourceMode === "unified"
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedThreadCount !== null
+    && (skippedSourceCount === 0
+      ? skippedThreadCount === 0
+      : skippedThreadCount > 0 && skippedThreadCount <= skippedSourceCount)
+    && sourceBytes !== null
+    && indexedBytes !== null
+    && skippedSourceBytes !== null
+    && indexedBytes + skippedSourceBytes === sourceBytes;
+  const phase = terminalGap
+    ? "partial_terminal"
+    : aggregateUnavailable ? "aggregate_unavailable" : admittedPhase;
+  const explainedSkippedSources = terminalGap || aggregateUnavailable;
   const coherent = sourceCount !== null
     && indexedSourceCount !== null
     && pendingSourceCount !== null
@@ -5476,9 +5531,9 @@ function normalizeHistoryCoverage(value = {}) {
     pendingSourceCount: sourceCount === null || pendingSourceCount === null
       ? 0
       : Math.min(pendingSourceCount, sourceCount),
-    skippedSourceCount: terminalGap ? skippedSourceCount : 0,
-    skippedSourceBytes: terminalGap ? skippedSourceBytes : 0,
-    skippedThreadCount: terminalGap ? skippedThreadCount : 0,
+    skippedSourceCount: explainedSkippedSources ? skippedSourceCount : 0,
+    skippedSourceBytes: explainedSkippedSources ? skippedSourceBytes : 0,
+    skippedThreadCount: explainedSkippedSources ? skippedThreadCount : 0,
     sourceBytes: sourceBytes ?? 0,
     indexedBytes: sourceBytes === null || indexedBytes === null
       ? 0
@@ -5712,6 +5767,104 @@ function normalizeWeeklyPaceForecast(value) {
   };
 }
 
+// The companion owns pace classification and geometry. Retain its newer
+// native-menu-bar DTO without recalculating a second forecast in the browser.
+function normalizeWeeklyPaceOutlook(value) {
+  const approximatelyEqual = (left, right) => Number.isFinite(left)
+    && Number.isFinite(right)
+    && Math.abs(left - right) <= 0.000_001 * Math.max(1, Math.abs(left), Math.abs(right));
+  const rateKeys = ["activePercentagePointsPerHour", "overallPercentagePointsPerHour",
+    "headlinePercentagePointsPerHour", "sustainablePercentagePointsPerHour", "ratio"];
+  const projectionKeys = ["hoursToReset", "coveredHours", "dryHours", "sparePercent", "projectedExhaustionAt"];
+  const trackKeys = ["coveredFraction", "activeExhaustionFraction"];
+  if (!hasExactKeys(value, ["schemaVersion", "status", "standing", "critical", "earlyEstimate",
+    "remainingPercent", "resetsAt", "observationCount", "elapsedHours", "rates", "projection", "track"])
+      || value.schemaVersion !== "local-weekly-pace-outlook-v0.1"
+      || !["unavailable", "collecting", "available"].includes(value.status)
+      || typeof value.critical !== "boolean" || typeof value.earlyEstimate !== "boolean"
+      || !Number.isSafeInteger(value.observationCount)
+      || value.observationCount < 0 || value.observationCount > 8_192
+      || !hasExactKeys(value.rates, rateKeys)
+      || !hasExactKeys(value.projection, projectionKeys)
+      || !hasExactKeys(value.track, trackKeys)) return null;
+  const remainingPercent = weeklyPaceNumber(value.remainingPercent, { minimum: 0, maximum: 100 });
+  const elapsedHours = weeklyPaceNumber(value.elapsedHours, { minimum: 0 });
+  const resetsAt = value.resetsAt === null ? null : canonicalInstant(value.resetsAt);
+  const projectedExhaustionAt = value.projection.projectedExhaustionAt === null
+    ? null : canonicalInstant(value.projection.projectedExhaustionAt);
+  const rates = Object.fromEntries(rateKeys.map((key) => [key, weeklyPaceNumber(value.rates[key], {
+    minimum: 0, maximum: key === "ratio" || key === "sustainablePercentagePointsPerHour" ? Infinity : 100,
+  })]));
+  const projection = Object.fromEntries(projectionKeys.slice(0, -1).map((key) => [key,
+    weeklyPaceNumber(value.projection[key], { minimum: 0, maximum: key === "sparePercent" ? 100 : Infinity })]));
+  projection.projectedExhaustionAt = projectedExhaustionAt;
+  const track = Object.fromEntries(trackKeys.map((key) => [key,
+    weeklyPaceNumber(value.track[key], { minimum: 0, maximum: 1 })]));
+  const numbers = [remainingPercent, elapsedHours, ...Object.values(rates),
+    ...Object.values(projection), ...Object.values(track)];
+  if (numbers.includes(undefined)
+      || (value.resetsAt !== null && resetsAt === null)
+      || (value.projection.projectedExhaustionAt !== null && projectedExhaustionAt === null)) return null;
+  if (value.status === "unavailable") {
+    if (value.standing !== null || value.critical || value.earlyEstimate
+        || value.observationCount !== 0 || resetsAt !== null
+        || numbers.some((number) => number !== null)) return null;
+  } else {
+    if (remainingPercent === null || resetsAt === null || elapsedHours === null
+        || !(projection.hoursToReset > 0)) return null;
+    if (value.status === "collecting") {
+      if (value.standing !== null || value.critical || value.earlyEstimate
+          || value.observationCount !== 1
+          || [...Object.values(rates), ...Object.values(track), projection.coveredHours,
+            projection.dryHours, projection.sparePercent, projectedExhaustionAt]
+            .some((number) => number !== null)) return null;
+    } else {
+      if (!["under", "on", "over"].includes(value.standing)
+          || value.observationCount < 2 || !(elapsedHours > 0) || !(remainingPercent > 0)
+          || !(rates.headlinePercentagePointsPerHour > 0)
+          || !(rates.sustainablePercentagePointsPerHour > 0) || !(rates.ratio > 0)
+          || (rates.activePercentagePointsPerHour !== null && !(rates.activePercentagePointsPerHour > 0))
+          || (rates.overallPercentagePointsPerHour !== null && !(rates.overallPercentagePointsPerHour > 0))
+          || !approximatelyEqual(rates.headlinePercentagePointsPerHour,
+            rates.overallPercentagePointsPerHour ?? rates.activePercentagePointsPerHour)
+          || projection.coveredHours === null || projection.dryHours === null
+          || projection.sparePercent === null || track.coveredFraction === null
+          || !approximatelyEqual(rates.sustainablePercentagePointsPerHour,
+            remainingPercent / projection.hoursToReset)
+          || !approximatelyEqual(rates.ratio,
+            rates.headlinePercentagePointsPerHour / rates.sustainablePercentagePointsPerHour)
+          || !approximatelyEqual(projection.coveredHours + projection.dryHours, projection.hoursToReset)
+          || !approximatelyEqual(projection.coveredHours,
+            Math.min(projection.hoursToReset, remainingPercent / rates.headlinePercentagePointsPerHour))
+          || !approximatelyEqual(projection.sparePercent,
+            Math.max(0, remainingPercent - rates.headlinePercentagePointsPerHour * projection.hoursToReset))
+          || !approximatelyEqual(track.coveredFraction, projection.coveredHours / projection.hoursToReset)
+          || !(value.standing === "under" ? rates.ratio < 0.85
+            : value.standing === "on" ? rates.ratio >= 0.85 && rates.ratio <= 1.15 : rates.ratio > 1.15)
+          || value.critical !== (value.standing === "over" && rates.ratio >= 2)
+          || (value.earlyEstimate && value.observationCount > 2 && elapsedHours >= 1)
+          || (value.standing === "over"
+            ? projectedExhaustionAt === null || Date.parse(projectedExhaustionAt) >= Date.parse(resetsAt)
+            : projectedExhaustionAt !== null)) return null;
+      const activeHours = rates.activePercentagePointsPerHour === null
+        ? null : remainingPercent / rates.activePercentagePointsPerHour;
+      const expectedActiveFraction = activeHours !== null && activeHours < projection.coveredHours * 0.95
+        ? Math.max(0, Math.min(1, activeHours / projection.hoursToReset)) : null;
+      if (expectedActiveFraction === null
+        ? track.activeExhaustionFraction !== null
+        : !approximatelyEqual(track.activeExhaustionFraction, expectedActiveFraction)) return null;
+      if (value.standing === "over"
+          && Math.abs(Date.parse(projectedExhaustionAt)
+            - (Date.parse(resetsAt) - projection.dryHours * 3_600_000)) > 10) return null;
+    }
+  }
+  return {
+    schemaVersion: value.schemaVersion, status: value.status, standing: value.standing,
+    critical: value.critical, earlyEstimate: value.earlyEstimate, remainingPercent,
+    resetsAt, observationCount: value.observationCount, elapsedHours, rates, projection, track,
+  };
+}
+
 function normalizeWeeklyPlanAttribution(value) {
   if (value?.methodVersion !== "plan-era-v1"
       || value?.status !== "historical_plan_conditional"
@@ -5780,6 +5933,7 @@ function normalizeWeeklyPopulation(envelope = {}) {
     dataClass: text(envelope?.dataClass, ""),
     stale: normalizeStaleProvenance(envelope?.stale),
     paceForecast: normalizeWeeklyPaceForecast(envelope?.paceForecast),
+    paceOutlook: normalizeWeeklyPaceOutlook(envelope?.paceOutlook),
     accountAttribution: {
       status: text(envelope?.accountAttribution?.status, ""),
       maySpanMultipleAccounts:
@@ -5864,6 +6018,7 @@ export function selectAllowancePlanPopulation(data, requestedPlanType = null) {
       planPopulations: populations,
       stale: weekly.stale,
       paceForecast: isCurrentPlan ? weekly.paceForecast : null,
+      paceOutlook: isCurrentPlan ? weekly.paceOutlook : null,
     },
     quotaWindows: isCurrentPlan
       ? array(root.quotaWindows).filter((window) => window.planType === selectedPlanType)
@@ -6159,6 +6314,13 @@ export class LocalCompanionClient {
     ]));
     if (!fragments.overview) throw new Error("The local companion did not return an overview.");
     return normalizeDashboardPayload({}, fragments);
+  }
+
+  modelPerformance(period = "all", { signal } = {}) {
+    if (!["7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/model-performance?period=${period}`, {
+      cache: "no-store", signal, headers: { "X-Usage-Monitor-Local": "1" },
+    });
   }
 
   health() {

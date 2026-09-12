@@ -66,9 +66,9 @@ function fakePage(name, { hidden = false } = {}) {
 }
 
 function fakeBrowser({ hash = "" } = {}) {
-  const links = ["overview", "weekly", "trends", "method", "community"]
+  const links = ["overview", "weekly", "trends", "performance", "method", "community"]
     .map(fakeLink);
-  const pages = ["overview", "weekly", "trends", "method", "community"]
+  const pages = ["overview", "weekly", "trends", "performance", "method", "community"]
     .map(fakePage);
   const disclosure = { open: false };
   const listeners = new Map();
@@ -154,6 +154,7 @@ test("retained deep-link aliases select their current owning page", () => {
     ["accounting", "method"],
     ["timeline", "trends"],
     ["trends", "trends"],
+    ["performance", "performance"],
     ["history", "community"],
     ["backend", "community"],
     ["data", "community"],
@@ -211,7 +212,7 @@ test("repeated transitions and a navigation remount keep exactly one page visibl
   const browser = fakeBrowser({ hash: "#overview" });
   let teardown = mountDashboardNavigation(browser);
 
-  for (const nav of ["trends", "overview", "community", "weekly", "method", "trends"]) {
+  for (const nav of ["trends", "performance", "overview", "community", "weekly", "method", "trends"]) {
     browser.links.find((link) => link.dataset.nav === nav).click();
     assertExactlyOneVisiblePage(browser, nav);
   }
@@ -226,6 +227,7 @@ test("repeated transitions and a navigation remount keep exactly one page visibl
     ["#weekly", "weekly"],
     ["#overview", "overview"],
     ["#trends", "trends"],
+    ["#performance", "performance"],
   ]) {
     browser.windowRef.location.hash = hash;
     browser.listeners.get("hashchange")();

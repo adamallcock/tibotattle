@@ -132,7 +132,7 @@ describe("migration 0031 device_pairings consent rebuild", () => {
         issued_at, expires_at, last_used_at, social_verified_at
       ) VALUES ('dev2', 'p1', 'missing-pairing', ?, 'active', ?, ?, ?, ?)`,
     ).bind(hash(10), now, future, now, now).run())
-      .rejects.toThrow(/FOREIGN KEY|pairing unavailable/u);
+      .rejects.toThrow(/FOREIGN KEY|pairing unavailable|authority unavailable/u);
 
     // No save table leaks out of the rebuild.
     const leftovers = await db().prepare(

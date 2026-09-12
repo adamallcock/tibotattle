@@ -139,7 +139,6 @@ async function seedQuota(count = 1200) {
     .bind(count, PARTICIPANT, fixture.deviceId, TIME, DAY).run();
   return fixture;
 }
-
 beforeEach(async () => {
   await reset(); await migrations(); inspection.limit = 900; inspection.meter = null;
   vi.clearAllMocks();
@@ -191,17 +190,27 @@ describe("actual scheduled resumable analysis recovery", () => {
     assertMeter(observation); await released();
   });
 
-  it("fails optional work closed before local migrations 0046/0047 without draining the queued graph day", async () => {
+  it("keeps the historical pre-0046/0047 optional schema boundary explicit", async () => {
     await reset(); await migrations(45);
+    expect((await db().prepare(`SELECT name FROM sqlite_master
+      WHERE name IN ('community_analysis_work','telemetry_v1_quota_fit_backfill')`).all()).results).toEqual([]);
+  });
+
+  it("fails unavailable optional work closed without draining the queued graph day", async () => {
     await seedQuota(200);
-    const queued = await queue(), observation = observe();
-    const result = await runScheduledMaintenance(bindings(observation), NOW);
+    const queued = await queue();
+    const unavailable = observe(async (entry, moment) => {
+      if (moment === "before" && entry.binding === "primary"
+          && entry.sql.includes("FROM telemetry_v1_quota_fit_backfill")) {
+        throw new Error("synthetic optional storage unavailable");
+      }
+    });
+    const result = await runScheduledMaintenance(bindings(unavailable), NOW);
     expect(result).toMatchObject({ outcome: "success", lifecycleComplete: true, aggregateRebuildComplete: false });
     expect((await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds ORDER BY day").all()).results).toEqual(queued);
-    expect(await db().prepare("SELECT name FROM sqlite_master WHERE name IN ('community_analysis_work','telemetry_v1_quota_fit_backfill')").all()).toMatchObject({ results: [] });
-    expect(observation.queries.some(entry => entry.sql.includes("FROM telemetry_v1_quota_fit_backfill"))).toBe(true);
+    expect(unavailable.queries.some(entry => entry.sql.includes("FROM telemetry_v1_quota_fit_backfill"))).toBe(true);
     expect(inspection.rawFits).not.toHaveBeenCalled(); expect(inspection.rawModels).not.toHaveBeenCalled();
-    assertMeter(observation); await released();
+    assertMeter(unavailable); await released();
   });
 
   it("keeps paused reconstruction inert while required maintenance still runs", async () => {

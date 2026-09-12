@@ -1069,7 +1069,7 @@ test("public static routes keep root, community, docs, privacy, and fallback out
   assert.match(root, /id="installer-unavailable-action"[\s\S]*disabled/u);
   assert.match(root, /Public download coming soon\./u);
   assert.equal(community, root, "the community route must use the public entry alias");
-  assert.match(privacy, /<h1>Your dashboard belongs on your Mac\.<\/h1>/u);
+  assert.match(privacy, /<h1>Your dashboard belongs on your device\.<\/h1>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);
   assert.doesNotMatch(privacy, /<script\b/iu);
   assert.match(docs, /<h1>TiboTattle, from download to dashboard\.<\/h1>/u);
@@ -1080,6 +1080,7 @@ test("public static routes keep root, community, docs, privacy, and fallback out
     "app.js",
     "data-client.js",
     "lib.js",
+    "work-usage-view.js",
     "navigation.js",
     "telemetry-envelope.js",
     "telemetry-shared.generated.js",
@@ -1187,7 +1188,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const result = await buildFixtureSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 23);
+  assert.equal(result.fileCount, 24);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
@@ -1210,6 +1211,7 @@ test("checked-in public source satisfies the complete release contract", async (
       "install-cta.js",
       "localization.js",
       "model-catalog.generated.js",
+      "model-visuals.js",
       "privacy.html",
       "robots.txt",
       "sitemap.xml",
@@ -1324,6 +1326,7 @@ test("checked-in public source satisfies the complete release contract", async (
     "app.js",
     "data-client.js",
     "lib.js",
+    "work-usage-view.js",
     "navigation.js",
     "telemetry-envelope.js",
     "telemetry-shared.generated.js",

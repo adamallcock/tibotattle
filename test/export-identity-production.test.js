@@ -65,6 +65,41 @@ test("Windows x64 export-identity production selection remains fail closed", () 
   assert.equal(constructions, 0);
 });
 
+test("Linux x64 participant selection uses only an explicit conditional broker and the export capability", () => {
+  const backend = fakeBackend();
+  const selected = selectProductionParticipantIdentity({
+    platform: "linux", architecture: "x64", environmentSecret: null,
+    createLinuxBackend: () => backend,
+    createKeychainBackend: () => { throw new Error("Mac fallback must not run"); },
+  });
+  assert.equal(selected.mode, "linux_secret_service_broker");
+  assert.equal(renderParticipantIdentityBackendMode(selected.mode), selected.mode);
+  assert.equal(selected.identityOptions.participantSecretBackend, backend);
+  assert.equal(selected.identityOptions.participantSecretCapability, EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity);
+  for (const createLinuxBackend of [null, () => null, () => ({ get() {}, set() {}, delete() {} }), () => { throw new Error("private-native-detail"); }]) {
+    assert.throws(() => selectProductionParticipantIdentity({
+      platform: "linux", architecture: "x64", environmentSecret: null, createLinuxBackend,
+    }), (error) => error.code === "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE"
+      && !error.stack.includes("private-native-detail"));
+  }
+  for (const keychainCapability of [EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation, {}]) {
+    assert.throws(() => selectProductionParticipantIdentity({
+      platform: "linux", architecture: "x64", environmentSecret: null, keychainCapability,
+      createLinuxBackend: () => { throw new Error("Must reject capability before construction"); },
+    }), { code: "EXPORT_IDENTITY_PRODUCTION_BACKEND_INVALID" });
+  }
+});
+
+test("Linux development overrides and unsupported architectures never construct the broker", () => {
+  const createLinuxBackend = () => { throw new Error("Must not construct"); };
+  assert.equal(selectProductionParticipantIdentity({ platform: "linux", architecture: "x64",
+    environmentSecret: "synthetic-override", createLinuxBackend }).mode, "external_environment_override");
+  assert.equal(selectProductionParticipantIdentity({ platform: "linux", architecture: "x64",
+    environmentSecret: null, explicitSecretFile: "/synthetic/identity", createLinuxBackend }).mode, "owner_file_override");
+  assert.throws(() => selectProductionParticipantIdentity({ platform: "linux", architecture: "arm64",
+    environmentSecret: null, createLinuxBackend }), { code: "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE" });
+});
+
 test("explicit file and environment development overrides never construct or mix with Keychain", () => {
   let constructions = 0;
   const createKeychainBackend = () => {

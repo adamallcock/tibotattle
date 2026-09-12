@@ -634,6 +634,27 @@ test("continuity lens has no timing floor, requires a turn boundary, and separat
   assert.equal(period.postCompactionCacheReadDrops, 1);
 });
 
+test("current cache-write assumptions preserve continuity and switch eligibility with closed provenance", () => {
+  for (const [analyze, makeRow] of [
+    [analyzeCacheContinuityRows, continuityRow], [analyzeCacheSwitchRows, row],
+  ]) {
+    const expected = analyze([makeRow()], { nowMs: NOW_MS, pricer: fullyPriced });
+    for (const suffix of ["", "-partial", "-parent-model", "-parent-model-partial"]) {
+      const version = `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}${suffix}-cache-write-zero`;
+      const actual = analyze([makeRow({ parser_version: version, previous_parser_version: version })],
+        { nowMs: NOW_MS, pricer: fullyPriced });
+      assert.deepEqual(actual, expected, version);
+    }
+    for (const version of ["unified-rollout-typed-v999-cache-write-zero",
+      `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-unexpected-cache-write-zero`]) {
+      const actual = analyze([makeRow({ parser_version: version, previous_parser_version: version })],
+        { nowMs: NOW_MS, pricer: fullyPriced }).periods.find((period) => period.periodId === "all");
+      assert.equal(actual.coverageStatus, "incomplete");
+      assert.equal(actual.estimatedPremiumUsd, null);
+    }
+  }
+});
+
 test("older parser coverage withholds both continuity and switch premiums", () => {
   const oldContinuity = continuityRow({
     parser_version: "unified-rollout-typed-v2",

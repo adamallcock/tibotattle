@@ -23,6 +23,40 @@ text have no allowed destination in contribution schemas, diagnostics, or
 public aggregates. Unknown fields are omitted; an input that cannot be safely
 projected is refused or shown as unavailable.
 
+## Electron sharing transition
+
+The [accepted accountless policy](../decisions/2026-09-04-accountless-sharing-policy.md)
+applies to the unified Electron workstream. Fresh installations default to
+sharing; existing installations with no prior choice receive three visible
+notices before activation. A persistent Settings choice enables sharing now or
+keeps it off, cancelling all remaining reminders. Known off, paused and
+disconnected states remain off. Uncertain or unreadable state does not enable
+sharing. No social sign-in is required by this new mode.
+
+Electron stores the policy version, destination, basis and notice timestamps
+in the protected `desktop-settings/accountless-sharing-v1.json` profile record.
+It distinguishes automatic activation from affirmative choice and never invents
+an explicit-consent event. Classification reads metadata for a fixed set of
+managed files, not their contents or provider histories. Removing every app
+state marker can make a reinstall indistinguishable from a fresh installation;
+an upgrade or ordinary reinstall preserving the profile preserves the choice.
+
+The integration source connects preferences, notices, protected installation
+credentials and while-open scheduling to the encrypted v1.1 upload transport.
+Enrollment alone grants no upload permission: the server separately binds an
+accountless owner and current versioned authorization to that installation.
+Usage and quota records retain the same owner, provider/account track and
+domain-generation boundaries. Revocation blocks future admission; it is
+separate from private owner erasure of previously accepted records. Accountless
+owners remain excluded from public fits under the current eligibility policy.
+
+Only a validated production distribution manifest enables the hosted client;
+development/QA packages keep it disabled. The server's separate ownership flag
+also defaults to disabled. Local synthetic end-to-end tests do not establish a
+deployed service or released client. The native and standalone review/consent
+path described below remains compatible. Production privacy disclosures must
+match the new policy before a build that sends automatically is distributed.
+
 ## Normal refresh sources
 
 | Provider | Exact source | What is read | What is retained by TiboTattle | Network boundary | Removal/reset |
@@ -52,9 +86,26 @@ for runtime and resource limits.
 | --- | --- | --- | --- |
 | Managed Claude status-line callback | Explicit standalone CLI install/repair lifecycle | Bounded JSON status input through the managed local broker; projected status/usage fields only. | Managed callback state plus provider-isolated pseudonym capability. This is not an installed-app feature. |
 | Custom Codex home | User chooses a directory in Settings | It replaces the default Codex home anchor; the same fixed subpaths and allowlists apply. | Owner-only launcher setting. |
-| Local cache-drop thread links | Local interactive dashboard, for recent displayed drops only | Read-only bounded `session_index.jsonl` (`id`, `thread_name`, `updated_at`) and `state_5.sqlite` (`id`, explicit `name`, worker nickname, and allowlisted `source.subagent.thread_spawn` ancestry). Never uses prompt-bearing `threads.title`, first messages, or transcripts. | Names and IDs exist only in a separate `no-store`, same-origin local response and transient UI memory, reused for unchanged displayed event pairs during refresh. No snapshot/cache/report/share-card/diagnostic/contribution persistence. Clicking hands only the canonical thread UUID to the local Codex URL handler. |
+| Local cache-drop thread links | Local interactive dashboard, for recent displayed drops only | Read-only bounded `session_index.jsonl` (`id`, `thread_name`, `updated_at`) and `state_5.sqlite` (`id`, explicit `name`, worker nickname, and allowlisted source ancestry). For a `guardian_review` row only, the first bounded `session_meta` header in its selected owner-controlled session may supply its matching explicit parent UUID after source and path validation. Never uses prompt-bearing `threads.title`, first messages, or transcripts. | Names and IDs exist only in a separate `no-store`, same-origin local response and transient UI memory, reused for unchanged displayed event pairs during refresh. No snapshot/cache/report/share-card/diagnostic/contribution persistence. Clicking hands only the canonical thread UUID to the local Codex URL handler. |
 | Export workspace | Explicit CLI or review flow | Only allowlisted metadata for the selected time range and sources. | Journaled workspace, chunks, manifest, and verification/deletion receipts at explicit paths. |
 | Contribution preparation | Explicit review/consent flow | Closed telemetry schema; exact payload is locally reviewable before first approval. | Prepared spool/review archive and replay-safe sync state under the app state root. |
+
+## Model performance timing in development source
+
+Opening **Model performance** (`#performance`) enables an independent worker
+for the selected Codex home's plain `.jsonl` session and archived-session files.
+This diagnostic population spans accounts on this device. It reads timestamps,
+allowlisted model metadata, token counters, and response/turn boundaries to
+reconstruct timing; raw content and raw IDs are never persisted or returned.
+Compressed-only histories and missing timing remain unavailable.
+
+Reads renew a 60-second page lease. Discovery is capped at 50,000 entries;
+scan passes target at most 32 MiB or 750 ms, checking between chunks of at most
+4 MiB and pausing five seconds between passes. The worker checkpoints progress
+and stops after the lease expires. It does not feed accounting, contribution,
+or network requests. Failures preserve available saved evidence with its
+stale/unavailable state. Windows remains unavailable until its protected-state
+adapter is qualified. These are source behavior, not installed-release proof.
 
 ## Installed local state
 
@@ -64,6 +115,7 @@ owner-only permissions. Important entries include:
 | State | Purpose | Retention behavior |
 | --- | --- | --- |
 | `local-unified-index-v1.sqlite` plus device salt | Canonical replay-safe Codex usage/quota/tool projection and source provenance. | Accumulates locally; the 30-day UI horizon is not retention. |
+| `inference-timing-v2/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB; method/SQLite user version 2. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
 | `local-collector-state-v1.sqlite` | App-server quota observations, checkpoints, dedupe, locks, and replay-safe collector state. | Accumulates until explicit local erase or a reviewed migration/retention workflow. |
 | `private/` settings/handoff state | Automatic/incremental contribution settings, bounded OAuth restart handle, fast-mode preference, and speed baselines. | Settings persist; the OAuth handle expires and is bounded. |
 | Prepared contribution/review directories and queue | Exact local review, delivery, retry, and audit state. | Retained for replay-safe completion, explicit cleanup, or local erase. |
@@ -104,6 +156,22 @@ does not authorize a new identity or inferred success. Signed synthetic
 qualification is recorded in that decision; this source description does not
 qualify an installed upgrade.
 
+The Electron macOS production source serves the four legacy broker capabilities
+through its signed main process and the inherited FD4 channel. A fifth,
+separate installation credential supports accountless sharing. Its native
+capability cannot be selected through FD4: the main process exposes only the
+closed accountless operations over the owned companion's private FD3 channel.
+Secret bytes never enter renderer IPC, local HTTP responses or diagnostics.
+
+That accountless credential uses the noninteractive native Keychain adapter,
+with create-if-missing and exact-value deletion as its only mutations. Existing
+encrypted Electron credential files are inspected without decryption. A present
+legacy ciphertext requires explicit recovery and is preserved; an unreadable
+store never becomes permission to create a replacement identity. The sharing
+page reports recovery while local analysis remains available. These are source
+and synthetic-test contracts; signed installation continuity and prompt-free
+first use still require qualification on the actual candidate.
+
 **Reset identity and device** is a separate two-step action from local data
 erase. It removes the selected local Keychain capabilities and associated app
 state; it does not represent hosted participant deletion. A locked Keychain is
@@ -111,7 +179,8 @@ a temporary availability condition, not evidence of a corrupt credential.
 
 ## Optional hosted contribution
 
-Contribution is off until the person completes the review, identity, consent,
+In the released native and standalone flow, contribution is off until the
+person completes the review, identity, consent,
 and pairing flow. A contribution can include closed-schema derived fields such
 as:
 
@@ -213,7 +282,8 @@ promise that every data class is deleted on the same schedule:
 | Web session | 30 minutes |
 | One-use upload authorization | 5 minutes |
 | Device pairing claim | 10 minutes |
-| Device credential | 30 days, silently renewable by the same valid device |
+| Paired social device credential | 30 days, silently renewable by the same valid device |
+| Accountless enrollment and derived upload authority | 30-day lease. Same-secret authenticated renewal extends the same active installation graph within seven days of expiry or after an offline period. Revoked or erased authority cannot renew; no replacement identity is created. |
 | Hosted identity authorization handoff | 10 minutes |
 | Completed identity-result delivery window | 5 minutes |
 | Sign-in admission rows | 24 hours |
@@ -287,3 +357,64 @@ behavior must update this file, the public privacy page, localized first-run
 and refresh disclosure, and source-backed privacy tests in the same change.
 Obsolete privacy documents should be deleted once this maintained inventory
 supersedes them; retaining contradictory consent boundaries is a product bug.
+
+## Projects and threads local display
+
+Owner-approved on 2026-09-08. The local reporting API can read canonical typed
+usage identities/counts and explicit `cwd` from `session_meta`, `turn_context`
+and `thread_settings_applied.thread_settings` through the existing
+bounded source reader. The same reader can qualify status-only quota records
+against canonical all-null rows; it never adds token usage. Reads stop at the
+indexed prefix, including when the stable reader accepts append-only growth.
+The initial session directory applies until a later explicit directory update.
+Sparse settings preserve the observed directory; malformed changes invalidate it.
+Later observations never backfill earlier usage.
+The owner approved Codex title fallbacks for this local view on 2026-09-08.
+Explicit session-index names and saved names take precedence. Titles are bounded
+to 512 characters inside SQLite before reaching JavaScript; whitespace is
+normalized and control-containing values are rejected. Titles can include opening
+message text, but are never exported, uploaded or persisted by this feature.
+No transcript or response bodies are read. The cache-drop tables and ancestry
+reader retain their title-free contract. A bounded local Git lookup groups worktrees
+and clones with the same normalized origin. An owner-controlled, read-only SQLite
+snapshot may read up to 25,000 rows of `cwd` and `git_origin_url`, each bounded to
+4,096 characters and UTF-8 bytes. Credentials, query strings and fragments are
+removed from recognized network origins. Unambiguous retained origins recover
+repository identity only for missing folders; existing non-Git folders override
+stale hints. Conflicting hints stay unresolved. Raw origins remain transient and
+never reach the browser, index, export or telemetry. Folders without identifiable
+repositories share Non-project tasks; missing source context stays Unassigned.
+Display labels and
+basenames are transient display decoration. No raw path, name or project handle
+is written to the index, exports, diagnostics, contributions or browser storage.
+Explicit collaboration parent links are read in a bounded local metadata pass
+to group subworkers into primary-thread families. Cycles and unresolved ancestry
+remain separate; names and title policy are independent of this grouping.
+Name search is submitted only to the loopback query route in a bounded POST
+body, never a URL. It may read up to 25,000 selected task identities through the
+same approved name/title reader; ordinary visible-row enrichment remains capped
+at 160. A lazily built search lookup stores normalized names only in private
+memory, limited to 75,000 project/task entries and 16 MiB of normalized text per
+report. It expires or is evicted with the report. Search matches are applied
+before pagination and family/project summation, preserving global share
+denominators. Neither search text nor the lookup is serialized, exported or
+uploaded. Refreshing creates a new lookup when names need to be reread.
+Attribution reports are immutable and expire after five minutes without a query
+or lease renewal, with at most two retained per process. The visible Projects &
+threads page renews its lease every minute through a closed, content-free
+`touch` request containing only the schema, action and snapshot handle. This
+performs no aggregation, enrichment or source scan, stops when the page is hidden
+or destroyed, and does not extend the separate worker cache lifetime. Returning
+to an expired report automatically obtains a new snapshot. A serial local projection worker
+may reuse extracted workspace observations and quota-status offsets in private
+memory across refreshes, under a 32 MiB estimated payload budget and a 25,000-source
+limit. It holds no database connection between jobs. The cache is scoped to one
+index/home/secret configuration and disappears on abort, worker failure, shutdown or
+five minutes of worker inactivity. Changed indexed prefixes are reread; absent
+or rejected sources are evicted. Each hit still verifies the retained source,
+and Git mappings and ancestry are resolved afresh. This cache is not serialized,
+exported or returned to the browser. Retained-source loss yields Unassigned because there is no usage-bound directory
+to associate with a current or retained repository identity. This is independent of token-count
+and event-time API-price coverage. See the
+[implementation plan](../plans/2026-09-08-thread-project-usage-implementation.md)
+for the preview's bounds and qualification status.

@@ -1,0 +1,336 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import test from "node:test";
+import { productionElectronCandidatePlan } from "../scripts/package-electron-production.mjs";
+import { createWindowsFilesystemBindingManifest } from "../scripts/build-windows-filesystem-manifest.mjs";
+import { WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS } from "../src/platform/windows-filesystem.js";
+import { windowsNativeUnsignedContentDigest } from "../src/platform/index.js";
+import {
+  MAXIMUM_WINDOWS_NATIVE_UNSIGNED_CONTENT_BYTES,
+} from "../src/platform/windows-native-unsigned-content.js";
+import { verifyStagedElectronRuntime } from "../scripts/build-electron-runtime.mjs";
+import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
+import {
+  classifyWindowsAuthenticodeForTest,
+  createWindowsAuthenticodeProbeForTest,
+  createWindowsAuthenticodePowerShellArgumentsForTest,
+  createWindowsAuthenticodePowerShellInvocationForTest,
+  inspectWindowsNativeRebinding, parseWindowsNativeRebindingArguments,
+  prepareWindowsNativeRebinding, rebindWindowsNativeModules, rebindWindowsNativeModulesForTest,
+  probeWindowsAuthenticodePreSignForTest,
+} from "../scripts/rebind-electron-windows-native-modules.mjs";
+const FS = "native/windows-filesystem/build/Release/windows_filesystem.node";
+const SIDECAR = `${FS}.manifest.json`;
+const KEYTAR = "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node";
+const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const json = (value) => `${JSON.stringify(value, null, 2)}\n`;
+function native() {
+  return { ...Object.fromEntries(WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS.map((name) => [name, () => {}])),
+    contractVersion: "windows-filesystem-v1", securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1", productionSafe: false,
+    pathWalkRaceSafe: false, credentialMutexSafe: true, credentialAuditFileGuardSafe: true };
+}
+function pe(signed = false) {
+  const bytes = Buffer.alloc(signed ? 536 : 512);
+  bytes.writeUInt16LE(0x5a4d, 0);
+  bytes.writeUInt32LE(64, 0x3c);
+  bytes.writeUInt32LE(0x4550, 64);
+  bytes.writeUInt16LE(0x8664, 68);
+  bytes.writeUInt16LE(240, 84);
+  bytes.writeUInt16LE(0x20b, 88);
+  bytes.writeUInt32LE(16, 196);
+  bytes[400] = 41;
+  if (signed) {
+    bytes.writeUInt32LE(42, 152); // PE checksum.
+    bytes.writeUInt32LE(512, 232);
+    bytes.writeUInt32LE(24, 236);
+    bytes.fill(7, 512);
+  }
+  return bytes;
+}
+function payload(rows) {
+  const digest = createHash("sha256");
+  for (const row of rows) digest.update(`F\0${row.path}\0${row.bytes}\0${row.sha256}\0${row.kind}\0`);
+  return { bytes: rows.reduce((total, row) => total + row.bytes, 0), sha256: digest.digest("hex") };
+}
+async function fixture(run) {
+  const root = await mkdtemp(join(tmpdir(), "windows-native-rebinding-"));
+  const base = join(root, ".release-build/electron-production/win32-x64");
+  const stage = join(base, "app");
+  const candidate = { ...productionElectronCandidatePlan({ target: "win32-x64", sourceRevision: "a".repeat(40),
+    buildNumber: "20260909", hostPlatform: "win32", hostArchitecture: "x64" }),
+  status: "production_source_staged", stagedManifest: "app/package.json", runtimeManifest: "app/electron-runtime-manifest.json" };
+  const candidateReceiptPath = join(base, "production-source-candidate.json");
+  const files = new Map([[FS, pe()], [KEYTAR, pe()], [SIDECAR, Buffer.from(json(createWindowsFilesystemBindingManifest({ bytes: pe(), binding: native() })))],
+    ["package.json", Buffer.from(json({ name: "app-usagemonitor", version: candidate.version,
+      tibotattleDistribution: createProductionDistributionMetadata({ target: "win32-x64", buildNumber: candidate.buildNumber, sourceRevision: candidate.sourceRevision }) }))],
+    ["apps/local/server.js", Buffer.from("export {};\n")]]);
+  const rows = [...files].map(([path, bytes]) => ({ path, bytes: bytes.length, sha256: hash(bytes),
+    kind: path === "package.json" ? "runtime_metadata" : path === FS || path === SIDECAR ? "windows_native_binding"
+      : path.startsWith("node_modules/") ? "third_party_dependency" : "companion_source" })).sort((a, b) => a.path < b.path ? -1 : 1);
+  const manifest = { schemaVersion: "usage-monitor-electron-runtime-v0.1", target: "win32", architecture: "x64",
+    releaseVersion: candidate.version, entrypoint: "apps/local/server.js", dashboardRoot: "apps/web/public", files: rows,
+    payload: payload(rows), windowsBinding: { included: true, status: "included_unverified", verified: false,
+      binding: { path: FS, bytes: pe().length, sha256: hash(pe()) }, manifest: { path: SIDECAR } } };
+  try {
+    for (const [path, bytes] of [...files, ["electron-runtime-manifest.json", json(manifest)]]) {
+      await mkdir(dirname(join(stage, path)), { recursive: true }); await writeFile(join(stage, path), bytes);
+    }
+    await chmod(join(stage, FS), 0o555);
+    await chmod(join(stage, KEYTAR), 0o555);
+    await chmod(join(stage, SIDECAR), 0o444);
+    await chmod(join(stage, "electron-runtime-manifest.json"), 0o444);
+    await writeFile(candidateReceiptPath, json(candidate));
+    const options = { candidateReceiptPath };
+    const dependencies = { repositoryRoot: root, platform: "win32", architecture: "x64", version: "v26.2.0",
+      verifySignature: async () => {}, loadBinding: () => native() };
+    await run({ root, base, stage, manifest, options, dependencies, sign: async () => {
+      await chmod(join(stage, FS), 0o644); await chmod(join(stage, KEYTAR), 0o644);
+      await chmod(join(stage, SIDECAR), 0o644); await chmod(join(stage, "electron-runtime-manifest.json"), 0o644);
+      await writeFile(join(stage, FS), pe(true)); await writeFile(join(stage, KEYTAR), pe(true));
+      await chmod(join(stage, FS), 0o555); await chmod(join(stage, KEYTAR), 0o555);
+    } });
+  } finally { await rm(root, { recursive: true, force: true }); }
+}
+
+test("native content digest permits Authenticode fields only and rejects malformed PE", () => {
+  assert.equal(windowsNativeUnsignedContentDigest(pe()), windowsNativeUnsignedContentDigest(pe(true)));
+  const altered = pe(true); altered[400] = 55;
+  assert.notEqual(windowsNativeUnsignedContentDigest(altered), windowsNativeUnsignedContentDigest(pe()));
+  const truncated = pe(true); truncated.writeUInt32LE(32, 236);
+  assert.throws(() => windowsNativeUnsignedContentDigest(truncated), { code: "WINDOWS_NATIVE_UNSIGNED_CONTENT_INVALID" });
+  assert.throws(() => windowsNativeUnsignedContentDigest(Buffer.alloc(512)), { code: "WINDOWS_NATIVE_UNSIGNED_CONTENT_INVALID" });
+  assert.throws(
+    () => windowsNativeUnsignedContentDigest(
+      Buffer.allocUnsafe(MAXIMUM_WINDOWS_NATIVE_UNSIGNED_CONTENT_BYTES + 1),
+    ),
+    { code: "WINDOWS_NATIVE_UNSIGNED_CONTENT_INVALID" },
+  );
+});
+test("Authenticode diagnostics remain closed while distinguishing trust failures", () => {
+  assert.deepEqual(
+    classifyWindowsAuthenticodeForTest("\uFEFF status=valid;signer=present;timestamp=present;publisher=match\r\n"),
+    { status: "valid", signer: "present", timestamp: "present", publisher: "match" },
+  );
+  for (const [status, code] of [
+    ["not_signed", "NOT_SIGNED"],
+    ["hash_mismatch", "HASH_MISMATCH"],
+    ["not_trusted", "NOT_TRUSTED"],
+    ["not_supported", "NOT_SUPPORTED"],
+    ["incompatible", "INCOMPATIBLE"],
+    ["not_allowed", "NOT_ALLOWED"],
+    ["other", "OTHER"],
+  ]) {
+    assert.throws(
+      () => classifyWindowsAuthenticodeForTest(`status=${status};signer=present;timestamp=present;publisher=match`),
+      { code: `WINDOWS_NATIVE_REBIND_SIGNATURE_STATUS_${code}` },
+    );
+  }
+  assert.throws(
+    () => classifyWindowsAuthenticodeForTest("status=valid;signer=absent;timestamp=present;publisher=not_checked"),
+    { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_SIGNER_ABSENT" },
+  );
+  assert.throws(
+    () => classifyWindowsAuthenticodeForTest("status=valid;signer=present;timestamp=absent;publisher=match"),
+    { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_TIMESTAMP_ABSENT" },
+  );
+  assert.throws(
+    () => classifyWindowsAuthenticodeForTest("status=valid;signer=present;timestamp=present;publisher=mismatch"),
+    { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_PUBLISHER_MISMATCH" },
+  );
+  assert.throws(
+    () => classifyWindowsAuthenticodeForTest("status=valid;signer=present;timestamp=present;publisher=unexpected-name"),
+    { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_INVALID" },
+  );
+});
+test("the native Authenticode probe uses a fixed, content-free status branch set", () => {
+  const probe = createWindowsAuthenticodeProbeForTest();
+  const invocation = createWindowsAuthenticodePowerShellArgumentsForTest();
+  assert.deepEqual(invocation.slice(0, 3), ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+  assert.equal(Buffer.from(invocation[3], "base64").toString("utf16le"), probe);
+  const fixed = createWindowsAuthenticodePowerShellInvocationForTest({
+    SystemRoot: String.raw`C:\Windows`, PATH: String.raw`C:\Windows\System32`,
+    PSModulePath: "ambient-module-path-must-not-pass", HOME: "ambient-home-must-not-pass",
+    TIBOTATTLE_NATIVE_VERIFY_PATH: String.raw`C:\stage\native.node`,
+  });
+  assert.equal(fixed.command, String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`);
+  assert.equal(fixed.environment.PSModulePath, String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\Modules`);
+  assert.equal(fixed.environment.TIBOTATTLE_NATIVE_VERIFY_PATH, String.raw`C:\stage\native.node`);
+  assert.equal(Object.hasOwn(fixed.environment, "HOME"), false);
+  assert.notEqual(fixed.environment.PSModulePath, "ambient-module-path-must-not-pass");
+  assert.doesNotMatch(probe, /switch\s*\(/iu);
+  assert.match(probe, /Import-Module Microsoft\.PowerShell\.Security -ErrorAction Stop/u);
+  assert.match(probe, /Get-AuthenticodeSignature -LiteralPath \$env:TIBOTATTLE_NATIVE_VERIFY_PATH/u);
+  for (const status of ["Valid", "NotSigned", "HashMismatch", "NotTrusted", "NotSupported", "Incompatible", "NotAllowed"]) {
+    assert.match(probe, new RegExp(`Status -ceq '${status}'`, "u"));
+  }
+  assert.match(probe, /status=\$status;signer=\$signer;timestamp=\$timestamp;publisher=\$publisher/u);
+  assert.match(probe, /failure=\$kind;exception=\$exception;id=\$identifier/u);
+  assert.doesNotMatch(probe, /Format-List|ConvertTo-Json|Subject|IssuedTo/u);
+});
+test("inspect uses the exact Windows keytar prebuild selected for packaging, then prepare is no-clobber", async () => {
+  const releaseConfig = await readFile(
+    new URL("../apps/electron/electron-builder.release.config.cjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    releaseConfig,
+    /"node_modules\/@github\/keytar\/prebuilds\/win32-x64\/keytar\.node"/u,
+  );
+  await fixture(async ({ options, dependencies, base }) => {
+    assert.equal((await inspectWindowsNativeRebinding(options, dependencies)).status, "original_stage_verified");
+    await assert.rejects(readFile(join(base, "windows-native-rebinding/journal.json")), { code: "ENOENT" });
+    await prepareWindowsNativeRebinding(options, dependencies);
+    const journal = JSON.parse(await readFile(join(base, "windows-native-rebinding/journal.json"), "utf8"));
+    assert.equal(journal.nativeReadOnly[FS], true);
+    assert.equal(journal.nativeReadOnly[KEYTAR], true);
+    assert.equal(typeof journal.nativeModes[FS], "number");
+    assert.equal(typeof journal.nativeModes[KEYTAR], "number");
+    assert.equal(journal.rebindMetadataReadOnly[SIDECAR], true);
+    assert.equal(journal.rebindMetadataReadOnly["electron-runtime-manifest.json"], true);
+    assert.equal(typeof journal.rebindMetadataModes[SIDECAR], "number");
+    assert.equal(typeof journal.rebindMetadataModes["electron-runtime-manifest.json"], "number");
+    await assert.rejects(prepareWindowsNativeRebinding(options, dependencies), { code: "EEXIST" });
+    await assert.rejects(prepareWindowsNativeRebinding({ candidateReceiptPath: join(base, "wrong.json") }, dependencies), { code: "WINDOWS_NATIVE_REBIND_CANDIDATE_PATH_INVALID" });
+  });
+});
+test("the pre-sign Authenticode probe executes the exact verifier on both fixed native paths", async () => {
+  await fixture(async ({ options, dependencies, stage }) => {
+    const invocations = [];
+    const diagnostics = [
+      "status=not_signed;signer=absent;timestamp=absent;publisher=not_checked",
+      "status=not_trusted;signer=present;timestamp=absent;publisher=mismatch",
+    ];
+    const receipt = await probeWindowsAuthenticodePreSignForTest(options, {
+      ...dependencies,
+      runAuthenticodeProbe(script, environment) {
+        invocations.push({ script, environment });
+        return { status: 0, signal: null, stderr: "", stdout: diagnostics.shift() };
+      },
+    });
+    assert.equal(receipt.status, "pre_sign_authenticode_probe_verified");
+    assert.equal(invocations.length, 2);
+    assert.deepEqual(invocations.map(({ environment }) => environment.TIBOTATTLE_NATIVE_VERIFY_PATH), [
+      join(stage, FS), join(stage, KEYTAR),
+    ]);
+    assert.ok(invocations.every(({ script }) => script === createWindowsAuthenticodeProbeForTest()));
+  });
+  for (const [result, code] of [
+    [{ error: { code: "ENOENT" } }, "TOOL_UNAVAILABLE"],
+    [{ signal: "SIGTERM" }, "INTERRUPTED"],
+    [{ status: 1, stderr: "ParserError" }, "PARSE_FAILED"],
+    [{ status: 1, stderr: "Get-AuthenticodeSignature not recognized" }, "COMMAND_UNAVAILABLE"],
+    [{ status: 1, stderr: "Access is denied" }, "ACCESS_DENIED"],
+    [{ status: 1, stderr: "unclassified" }, "EXECUTION_FAILED"],
+  ]) {
+    await fixture(async ({ options, dependencies }) => {
+      await assert.rejects(
+        probeWindowsAuthenticodePreSignForTest(options, { ...dependencies, runAuthenticodeProbe: () => result }),
+        { code: `WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_${code}` },
+      );
+    });
+  }
+  await fixture(async ({ options, dependencies }) => {
+    await assert.rejects(
+      probeWindowsAuthenticodePreSignForTest(options, {
+        ...dependencies,
+        runAuthenticodeProbe: () => ({ status: 0, signal: null, stderr: "", stdout: "unparseable" }),
+      }),
+      { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_INVALID" },
+    );
+  });
+  for (const [code, exception] of [
+    ["command_unavailable", "command_not_found"], ["access_denied", "unauthorized"],
+    ["path_unavailable", "runtime"], ["parameter_invalid", "parameter_binding"],
+    ["projection_failed", "method"], ["module_load_failed", "file_load"],
+    ["execution_failed", "other"],
+  ]) {
+    await fixture(async ({ options, dependencies }) => {
+      await assert.rejects(
+        probeWindowsAuthenticodePreSignForTest(options, {
+          ...dependencies,
+          runAuthenticodeProbe: () => ({ status: 0, signal: null, stderr: "", stdout: `failure=${code};exception=${exception};id=synthetic_failure` }),
+        }),
+        { code: `WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_${code.toUpperCase()}` },
+      );
+    });
+  }
+});
+test("rebinding changes only native rows, sidecar and payload; policy and replay remain stable", async () => {
+  await fixture(async ({ options, dependencies, stage, manifest, sign }) => {
+    await prepareWindowsNativeRebinding(options, dependencies); await sign();
+    const receipt = await rebindWindowsNativeModulesForTest(options, dependencies);
+    assert.equal(receipt.status, "native_integrity_rebound");
+    assert.equal(receipt.windowsRuntimeQualification, "required");
+    assert.equal(receipt.packagedArtifactVerification, "not_performed");
+    assert.equal(receipt.signingAlgorithmPolicy, "not_verified");
+    assert.equal(receipt.directoryDurability, "not_qualified");
+    const result = await verifyStagedElectronRuntime({ output: stage, target: "win32-x64", version: manifest.releaseVersion });
+    assert.equal(result.manifest.windowsBinding.verified, false);
+    const sidecar = JSON.parse(await readFile(join(stage, SIDECAR), "utf8"));
+    assert.equal(sidecar.approvedPolicy.productionSafe, false);
+    assert.equal(sidecar.bindingProvenance.status, "unqualified");
+    const unchanged = (rows) => rows.filter(({ path }) => ![FS, KEYTAR, SIDECAR].includes(path));
+    assert.deepEqual(unchanged(result.manifest.files), unchanged(manifest.files));
+    assert.deepEqual(await rebindWindowsNativeModulesForTest(options, dependencies), receipt);
+  });
+});
+test("rebind resumes an interruption after sidecar replacement without new trust claims", async () => {
+  await fixture(async ({ options, dependencies, stage, sign }) => {
+    await prepareWindowsNativeRebinding(options, dependencies); await sign();
+    const before = await readFile(join(stage, "electron-runtime-manifest.json"));
+    await assert.rejects(rebindWindowsNativeModulesForTest(options, { ...dependencies,
+      afterSidecar() { throw new Error("synthetic interruption"); } }), /synthetic interruption/);
+    assert.deepEqual(await readFile(join(stage, "electron-runtime-manifest.json")), before);
+    assert.equal((await rebindWindowsNativeModulesForTest(options, dependencies)).status, "native_integrity_rebound");
+  });
+});
+test("rebind refuses native payload mutation, unrelated files, and unverified signatures before metadata writes", async () => {
+  for (const fault of ["native", "extra", "signature", "policy"]) {
+    await fixture(async ({ options, dependencies, stage, sign }) => {
+      await prepareWindowsNativeRebinding(options, dependencies); await sign();
+      const before = await readFile(join(stage, "electron-runtime-manifest.json"));
+      if (fault === "native") {
+        const changed = pe(true); changed[400]++;
+        await chmod(join(stage, KEYTAR), 0o644); await writeFile(join(stage, KEYTAR), changed);
+      }
+      if (fault === "extra") await writeFile(join(stage, "extra.txt"), "unrecorded");
+      if (fault === "signature") dependencies.verifySignature = () => { throw new Error("signature refused"); };
+      if (fault === "policy") dependencies.loadBinding = () => ({ ...native(), productionSafe: true });
+      await assert.rejects(rebindWindowsNativeModulesForTest(options, dependencies));
+      assert.deepEqual(await readFile(join(stage, "electron-runtime-manifest.json")), before);
+    });
+  }
+});
+test("CLI defaults to inspection, rejects ambiguous mode, and native rebind refuses a foreign host", async () => {
+  assert.equal(parseWindowsNativeRebindingArguments(["--candidate-receipt", "a.json"]).mode, "inspect");
+  assert.equal(parseWindowsNativeRebindingArguments(["--prepare", "--candidate-receipt", "a.json"]).mode, "prepare");
+  assert.equal(parseWindowsNativeRebindingArguments(["--probe-authenticode-pre-sign", "--candidate-receipt", "a.json"]).mode, "probe");
+  assert.throws(() => parseWindowsNativeRebindingArguments(["--rebind", "--prepare", "--candidate-receipt", "a.json"]));
+  if (process.platform !== "win32") await assert.rejects(rebindWindowsNativeModules({}), { code: "WINDOWS_NATIVE_REBIND_NATIVE_WINDOWS_REQUIRED" });
+});
+test("rebinding refuses linked native files and a modified metadata journal before writing", async () => {
+  for (const fault of ["symlink", "hardlink", "journal", "metadata-access"]) {
+    await fixture(async ({ options, dependencies, base, stage, sign }) => {
+      await prepareWindowsNativeRebinding(options, dependencies); await sign();
+      const before = await readFile(join(stage, "electron-runtime-manifest.json"));
+      if (fault === "symlink") {
+        await rm(join(stage, KEYTAR)); await symlink(join(stage, FS), join(stage, KEYTAR));
+      } else if (fault === "hardlink") {
+        await link(join(stage, KEYTAR), join(base, "foreign-hardlink.node"));
+      } else {
+        const path = join(base, "windows-native-rebinding/journal.json");
+        const journal = JSON.parse(await readFile(path, "utf8"));
+        if (fault === "metadata-access") journal.rebindMetadataReadOnly[SIDECAR] = false;
+        else journal.candidate.sourceRevision = "b".repeat(40);
+        await writeFile(path, json(journal));
+      }
+      await assert.rejects(rebindWindowsNativeModulesForTest(options, dependencies));
+      assert.deepEqual(await readFile(join(stage, "electron-runtime-manifest.json")), before);
+    });
+  }
+});

@@ -36,6 +36,9 @@ import {
   readLocalCollectorCheckpoint,
   saveLocalCollectorCheckpoint,
 } from "./local-collector-state.js";
+import {
+  verifyLocalCollectorStateIntegrityOffMain,
+} from "./local-collector-state-integrity-off-main.js";
 import { SPARK_QUOTA_LIMIT_IDS } from "./local-companion-usage-model.js";
 import { sanitizeTelemetryAttributionBinding } from "./contribution/index.js";
 
@@ -1639,6 +1642,7 @@ export async function runCollectorOnce({
   readAccountAttributionBinding = null,
   commitState = commitLocalCollectorState,
   saveState = saveLocalCollectorCheckpoint,
+  integrityVerifier = verifyLocalCollectorStateIntegrityOffMain,
 } = {}) {
   if (!validSignal(signal)) throw new TypeError("signal must be an AbortSignal");
   if (onProgress !== null && typeof onProgress !== "function") {
@@ -1654,6 +1658,9 @@ export async function runCollectorOnce({
   if (typeof stateFile !== "string" || stateFile.length < 1) {
     throw new TypeError("stateFile must be a non-empty string");
   }
+  if (typeof integrityVerifier !== "function") {
+    throw new TypeError("integrityVerifier must be a function");
+  }
   // The migration lease serializes one-time JSON retirement before the normal
   // collector instance lock. Reversing that order can make a second startup
   // wait on SQLite while the first startup is still importing into it.
@@ -1667,9 +1674,17 @@ export async function runCollectorOnce({
   // with the store: 636-663 ms of a 754 ms batch on the live 1.7 GB state.
   // Only the built-in write path can be pooled this way; an injected
   // `commitState` or `saveState` keeps its exact previous behaviour.
+  // Once a pooled batch commits, its close has always owed the full integrity
+  // check even when the enclosing refresh is cancelled or fails. Deliberately
+  // do not pass `signal` to the worker verifier: cancellation cannot shorten
+  // that mandatory settle, and the lock remains held until it completes.
   const pooled = commitState === commitLocalCollectorState
     && saveState === saveLocalCollectorCheckpoint
-    ? await openLocalCollectorStateSession({ stateFile, clock })
+    ? await openLocalCollectorStateSession({
+      stateFile,
+      clock,
+      integrityVerifier,
+    })
     : null;
   let sessionSettled = false;
   try {
@@ -1778,6 +1793,13 @@ export async function runCollectorOnce({
       if (pooled !== null) {
         sessionSettled = true;
         await pooled.close();
+      }
+      // A direct SQLite scan could not observe a main-loop abort while it was
+      // running. The worker leaves that loop responsive, so recheck after the
+      // equally mandatory settled close and expose the cancellation honestly.
+      if (signal?.aborted) {
+        skippedResult.status = "bounded_pause";
+        skippedResult.pauseReason = "collector_aborted";
       }
       return resultStateProperties(skippedResult, { stateFile });
     }
@@ -2003,6 +2025,13 @@ export async function runCollectorOnce({
     if (pooled !== null) {
       sessionSettled = true;
       await pooled.close();
+    }
+    // See the quota-only branch above: the integrity gate must still finish
+    // after a cancellation, but a cancellation observed during that worker
+    // wait is a bounded pause rather than a stale successful completion.
+    if (signal?.aborted) {
+      result.status = "bounded_pause";
+      result.pauseReason = result.resourceLimit?.code ?? "collector_aborted";
     }
     return resultStateProperties(result, { stateFile });
   } finally {

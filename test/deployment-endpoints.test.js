@@ -31,6 +31,12 @@ test("reviewed deployment endpoint manifest is internally coherent", () => {
     host: "admin.tibotattle.com",
     origin: "https://admin.tibotattle.com",
   });
+  assert.deepEqual(DEPLOYMENT_ENDPOINTS.staging, {
+    origin: "https://app-usagemonitor-staging.adamallcock.workers.dev",
+    previewUrls: false,
+    workerName: "app-usagemonitor-staging",
+    workersDev: true,
+  });
   assert.equal(assertDeploymentEndpoints(), DEPLOYMENT_ENDPOINTS);
 });
 
@@ -50,6 +56,12 @@ test("Worker endpoint projection rejects an independent public origin", () => {
           ACCESS_TEAM_DOMAIN: "",
           ACCESS_AUD: "",
         },
+      },
+      staging: {
+        name: DEPLOYMENT_ENDPOINTS.staging.workerName,
+        workers_dev: DEPLOYMENT_ENDPOINTS.staging.workersDev,
+        preview_urls: DEPLOYMENT_ENDPOINTS.staging.previewUrls,
+        vars: { PUBLIC_ORIGIN: DEPLOYMENT_ENDPOINTS.staging.origin },
       },
     },
   };
@@ -86,6 +98,26 @@ test("Worker endpoint projection rejects an independent public origin", () => {
   };
   assert.throws(
     () => validateWorkerDeploymentEndpoints(withoutAccessVars),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
+
+  const wrongStagingName = structuredClone(configuration);
+  wrongStagingName.env.staging.name = "another-worker";
+  assert.throws(
+    () => validateWorkerDeploymentEndpoints(wrongStagingName),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
+  const stagingPublicOrigin = structuredClone(configuration);
+  stagingPublicOrigin.env.staging.vars.PUBLIC_ORIGIN =
+    DEPLOYMENT_ENDPOINTS.public.origin;
+  assert.throws(
+    () => validateWorkerDeploymentEndpoints(stagingPublicOrigin),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
+  const missingStagingOrigin = structuredClone(configuration);
+  delete missingStagingOrigin.env.staging.vars.PUBLIC_ORIGIN;
+  assert.throws(
+    () => validateWorkerDeploymentEndpoints(missingStagingOrigin),
     { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
   );
 });
@@ -140,6 +172,7 @@ test("checked-in deployment endpoint consumers match the reviewed manifest", asy
     DEPLOYMENT_ENDPOINTS.admin.host,
   ]);
   assert.equal(checked.worker.adminHost, DEPLOYMENT_ENDPOINTS.admin.host);
+  assert.equal(checked.worker.stagingOrigin, DEPLOYMENT_ENDPOINTS.staging.origin);
   assert.deepEqual(checked.gates.checkedScripts, [
     "deploy:dry",
     "production:deploy",

@@ -1,0 +1,318 @@
+import {
+  createWindowsAccountlessInstallationCredentialBackend,
+  isWindowsAccountlessInstallationCredentialError,
+} from "../../src/platform/windows-accountless-installation-credential.js";
+import {
+  createWindowsNormalCandidateAccountObservationCredentialBackend,
+  isWindowsAccountObservationCredentialError,
+} from "../../src/platform/windows-account-observation-credential.js";
+import {
+  isWindowsQualificationModeContextFor,
+} from "../../src/platform/index.js";
+
+import {
+  attachDesktopWindowsAccountObservationBroker,
+} from "./desktop-windows-account-observation-broker.js";
+
+const SECRET_BYTES = 32;
+const WINDOWS_PLATFORM = "win32";
+const WINDOWS_ARCHITECTURE = "x64";
+const NATIVE_OPTION_KEYS = Object.freeze([
+  "adapter",
+  "architecture",
+  "platform",
+  "resourceRoot",
+  "rootPath",
+  "windowsQualificationModeContext",
+]);
+const NORMAL_CANDIDATE_NATIVE_OPTION_KEYS = Object.freeze([
+  "architecture",
+  "platform",
+  "rootPath",
+]);
+const NORMAL_CANDIDATE_ACCOUNTLESS_OPTION_KEYS = Object.freeze([
+  "legacyCredentialProbe",
+  "rootPath",
+]);
+const NORMAL_CANDIDATE_HANDOVER_TEST_OPTION_KEYS = Object.freeze([
+  "architecture",
+  "attachBroker",
+  "createAccountlessCredentialBackend",
+  "createAccountObservationCredentialBackend",
+  "isAccountObservationBackendError",
+  "platform",
+]);
+
+function failure({ recoveryRequired = false, retryable = false, knownNonMutation = false } = {}) {
+  const error = Object.assign(new Error(recoveryRequired
+    ? "Installation credential recovery is required"
+    : "Installation credential unavailable"), {
+    code: recoveryRequired
+      ? "contribution_device_credential_recovery_required"
+      : "contribution_device_credential_unavailable",
+    retryable: recoveryRequired ? false : retryable === true,
+  });
+  if (knownNonMutation) {
+    Object.defineProperty(error, "knownNonMutation", { value: true });
+  }
+  return error;
+}
+
+function assertSecret(value) {
+  if (!Buffer.isBuffer(value) || value.byteLength !== SECRET_BYTES) throw failure();
+  return value;
+}
+
+function exactObjectKeys(value, keys) {
+  try {
+    return value !== null
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && Object.keys(value).sort().join(",") === [...keys].sort().join(",");
+  } catch {
+    return false;
+  }
+}
+
+function assertNativeBackend(backend) {
+  let valid = false;
+  try {
+    valid = backend !== null
+      && typeof backend === "object"
+      && !Array.isArray(backend)
+      && ["read", "createIfMissing", "deleteExact"].every(
+        (operation) => typeof backend[operation] === "function",
+      );
+  } catch {
+    // Collapse a malformed native facade before it could enter FD3.
+  }
+  if (!valid) throw failure();
+  return backend;
+}
+
+function wrapNativeBackend(backend, isNativeError) {
+  return Object.freeze({
+    async read() {
+      try {
+        const value = await backend.read();
+        if (value === null) return null;
+        try {
+          assertSecret(value);
+          return Buffer.from(value);
+        } finally {
+          value.fill(0);
+        }
+      } catch (error) {
+        mapFailure(error, isNativeError);
+      }
+    },
+    async createIfMissing(value) {
+      assertSecret(value);
+      const copied = Buffer.from(value);
+      try {
+        const status = await backend.createIfMissing(copied);
+        if (status !== "created" && status !== "existing") throw failure();
+        return status;
+      } catch (error) {
+        mapFailure(error, isNativeError, { knownNonMutation: true });
+      } finally {
+        copied.fill(0);
+      }
+    },
+    async deleteExact(value) {
+      assertSecret(value);
+      const copied = Buffer.from(value);
+      try {
+        const status = await backend.deleteExact(copied);
+        if (!["deleted", "missing", "mismatch"].includes(status)) throw failure();
+        return status;
+      } catch (error) {
+        mapFailure(error, isNativeError);
+      } finally {
+        copied.fill(0);
+      }
+    },
+  });
+}
+
+function mapFailure(error, isNativeError, { knownNonMutation = false } = {}) {
+  let native = false;
+  let code = "";
+  try {
+    native = isNativeError(error) === true;
+    if (native) code = error.code;
+  } catch {
+    native = false;
+  }
+  if (!native) throw failure();
+  if (code === "windows_accountless_installation_credential_recovery_required"
+      || code === "windows_accountless_installation_credential_stored_value_invalid") {
+    throw failure({ recoveryRequired: true });
+  }
+  if (code === "windows_accountless_installation_credential_unavailable") {
+    throw failure({ retryable: true, knownNonMutation });
+  }
+  throw failure();
+}
+
+function assertConfiguration(options, isQualificationContextFor) {
+  if (!exactObjectKeys(options, NATIVE_OPTION_KEYS)
+      || typeof isQualificationContextFor !== "function") {
+    throw failure();
+  }
+  const {
+    platform,
+    architecture,
+    adapter,
+    rootPath,
+    windowsQualificationModeContext,
+    resourceRoot,
+  } = options;
+  if (platform !== WINDOWS_PLATFORM || architecture !== WINDOWS_ARCHITECTURE) {
+    throw failure();
+  }
+  let validContext = false;
+  try {
+    validContext = windowsQualificationModeContext?.qualificationOnly === true
+      && windowsQualificationModeContext?.productionSafe === false
+      && isQualificationContextFor({
+        context: windowsQualificationModeContext,
+        adapter,
+        stateRoot: windowsQualificationModeContext.stateRoot,
+        resourceRoot,
+      }) === true;
+  } catch {
+    validContext = false;
+  }
+  if (!validContext) throw failure();
+  return Object.freeze({
+    platform,
+    architecture,
+    adapter,
+    rootPath,
+    windowsQualificationModeContext,
+    resourceRoot,
+  });
+}
+
+function assertNormalCandidateConfiguration(options) {
+  if (!exactObjectKeys(options, NORMAL_CANDIDATE_NATIVE_OPTION_KEYS)) throw failure();
+  const { platform, architecture, rootPath } = options;
+  if (platform !== WINDOWS_PLATFORM || architecture !== WINDOWS_ARCHITECTURE
+      || typeof rootPath !== "string" || rootPath.length === 0) {
+    throw failure();
+  }
+  return Object.freeze({ platform, architecture, rootPath });
+}
+
+/**
+ * Adapt the fixed Windows qualification-only native credential backend to the
+ * existing private FD3 accountless channel. The caller must hold the branded
+ * Windows qualification context; this module neither derives one from an
+ * Electron context nor makes a production selection. It accepts no account,
+ * record, capability, or renderer-controlled identifier.
+ */
+export function createDesktopWindowsAccountlessCredentialBackend(options = {}, {
+  createNativeBackend = createWindowsAccountlessInstallationCredentialBackend,
+  isNativeError = isWindowsAccountlessInstallationCredentialError,
+  isQualificationContextFor = isWindowsQualificationModeContextFor,
+} = {}) {
+  const configuration = assertConfiguration(options, isQualificationContextFor);
+  if (typeof createNativeBackend !== "function" || typeof isNativeError !== "function") {
+    throw failure();
+  }
+  let backend;
+  try {
+    backend = assertNativeBackend(createNativeBackend(configuration));
+  } catch (error) {
+    mapFailure(error, isNativeError);
+  }
+  return wrapNativeBackend(backend, isNativeError);
+}
+
+/**
+ * Adapt the fixed FD3 backend for the separately selected normal Windows/x64
+ * candidate. The Electron caller supplies only the already-derived protected
+ * settings root; it cannot select a native binding, credential route, or
+ * generic operation. This does not change the backend's false production
+ * safety claim.
+ */
+export function createDesktopWindowsNormalCandidateAccountlessCredentialBackend(options = {}, {
+  createNativeBackend = createWindowsAccountlessInstallationCredentialBackend,
+  isNativeError = isWindowsAccountlessInstallationCredentialError,
+} = {}) {
+  const configuration = assertNormalCandidateConfiguration(options);
+  if (typeof createNativeBackend !== "function" || typeof isNativeError !== "function") {
+    throw failure();
+  }
+  let backend;
+  try {
+    backend = assertNativeBackend(createNativeBackend(configuration));
+  } catch (error) {
+    mapFailure(error, isNativeError);
+  }
+  return wrapNativeBackend(backend, isNativeError);
+}
+
+function createWindowsNormalCandidateCredentialHandoverWithDependencies({
+  architecture,
+  attachBroker,
+  createAccountlessCredentialBackend,
+  createAccountObservationCredentialBackend,
+  isAccountObservationBackendError,
+  platform,
+}) {
+  if (platform !== WINDOWS_PLATFORM || architecture !== WINDOWS_ARCHITECTURE
+      || typeof attachBroker !== "function"
+      || typeof createAccountlessCredentialBackend !== "function"
+      || typeof createAccountObservationCredentialBackend !== "function"
+      || typeof isAccountObservationBackendError !== "function") {
+    throw failure();
+  }
+  return Object.freeze({
+    createAccountlessCredentialBackend(options) {
+      if (!exactObjectKeys(options, NORMAL_CANDIDATE_ACCOUNTLESS_OPTION_KEYS)
+          || typeof options.legacyCredentialProbe !== "function"
+          || typeof options.rootPath !== "string" || options.rootPath.length === 0) {
+        throw failure();
+      }
+      return createAccountlessCredentialBackend({
+        platform,
+        architecture,
+        rootPath: options.rootPath,
+      });
+    },
+    attachWindowsAccountObservationBroker(channel) {
+      return attachBroker({
+        channel,
+        createBackend: createAccountObservationCredentialBackend,
+        isBackendError: isAccountObservationBackendError,
+      });
+    },
+  });
+}
+
+/**
+ * Main's exact stable Windows/x64 selection is the sole normal-runtime caller.
+ * It joins the fixed FD3 installation backend with the fixed read/create-only
+ * FD4 Node-IPC broker. It does not load a generic Credential Manager route or
+ * alter any native `productionSafe`/`pathWalkRaceSafe` fact.
+ */
+export function createWindowsNormalCandidateCredentialHandover() {
+  return createWindowsNormalCandidateCredentialHandoverWithDependencies({
+    architecture: process.arch,
+    attachBroker: attachDesktopWindowsAccountObservationBroker,
+    createAccountlessCredentialBackend:
+      createDesktopWindowsNormalCandidateAccountlessCredentialBackend,
+    createAccountObservationCredentialBackend:
+      createWindowsNormalCandidateAccountObservationCredentialBackend,
+    isAccountObservationBackendError: isWindowsAccountObservationCredentialError,
+    platform: process.platform,
+  });
+}
+
+/** Explicit dependency seam for the fixed normal-Windows handover contract. */
+export function createWindowsNormalCandidateCredentialHandoverForTest(options = {}) {
+  if (!exactObjectKeys(options, NORMAL_CANDIDATE_HANDOVER_TEST_OPTION_KEYS)) throw failure();
+  return createWindowsNormalCandidateCredentialHandoverWithDependencies(options);
+}

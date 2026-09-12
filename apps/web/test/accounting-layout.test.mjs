@@ -78,7 +78,8 @@ test("short accounting headings retain Standard-rate context in every locale", a
 
 test("cache continuity rows and empty states retain five correctly aligned cells", () => {
   const element = (tagName, className = "", textContent = "") => ({ tagName, className, textContent, children: [], append(...items) { this.children.push(...items); } });
-  const disclosure = { hidden: true, open: false };
+  const sampleNote = {};
+  const disclosure = { hidden: true, open: false, querySelector: () => sampleNote };
   const rows = element("tbody");
   const linkedItems = [];
   const render = appFunction("renderAccountingCacheContinuityDetails", "sideChatConfigurationDescription", {
@@ -101,10 +102,13 @@ test("cache continuity rows and empty states retain five correctly aligned cells
     formatLocal: (value) => value,
     formatCacheContinuityGap: (value) => `${value}s`,
     cacheContinuityConfigurationDescription: () => "GPT-5.6 Sol · High",
+    setLocalizedText: (target, key, values) => { target.textContent = translate(key, values, "en-US"); },
     ...localizedDependencies(),
   });
   const recent = { observedAt: "synthetic time", gapSeconds: 60, previousCacheReadTokens: 100, currentCacheReadTokens: 20, lostCacheTokens: 80, estimatedPremiumUsd: 0.25 };
-  render({ status: "available", recent: [recent] });
+  render({ status: "available", recent: [recent], cacheReadDrops: 100 });
+  assert.equal(sampleNote.hidden, false);
+  assert.match(sampleNote.textContent, /1 most recent of 100/u);
   assert.equal(disclosure.hidden, false);
   assert.deepEqual(linkedItems, [{ kind: "continuity", item: recent }]);
   assert.deepEqual(rows.children[0].children.map((cell) => cell.textContent),
@@ -145,6 +149,87 @@ test("one chart-level note describes only actual global exclusions", () => {
       assert.match(price, /without supported prices: 3/u);
     }
   }
+});
+
+test("cache reuse keeps a known empty denominator distinct from observed zero reuse", () => {
+  const summary = { hidden: false };
+  const metrics = { hidden: false };
+  const outcome = {
+    hidden: true,
+    querySelector: (selector) => ({
+      ".cache-reuse-summary": summary,
+      ".cache-reuse-metrics": metrics,
+    })[selector] ?? null,
+  };
+  const raster = { hidden: false };
+  const empty = { hidden: true };
+  const coverage = { hidden: true, textContent: "" };
+  const metricNodes = new Map([
+    ["#cache-reuse-more-percent", { textContent: "unchanged" }],
+    ["#cache-reuse-less-percent", { textContent: "unchanged" }],
+    ["#cache-reuse-overhead", { textContent: "unchanged" }],
+    ["#cache-reuse-more-count", { textContent: "unchanged" }],
+    ["#cache-reuse-less-count", { textContent: "unchanged" }],
+    ["#cache-reuse-explanation", { textContent: "unchanged" }],
+  ]);
+  const render = appFunction(
+    "renderAccountingCacheReuseOutcome",
+    "selectCacheReuseBucketFromPointer",
+    {
+      $: (selector) => ({
+        "#cache-reuse-outcome": outcome,
+        "#cache-reuse-raster": raster,
+        "#cache-reuse-empty": empty,
+        "#cache-reuse-coverage": coverage,
+      })[selector] ?? metricNodes.get(selector) ?? null,
+      cacheReuseOutcomeBuckets: (impact) => impact?.status === "available" ? [] : null,
+      cacheReuseCoverageNote: () => "",
+      setRawText: (element, value) => { element.textContent = value; },
+      cacheReuseCurrentImpact: null,
+      cacheReuseRenderedPeriodId: null,
+      cacheReuseSelectedBucketIndex: 2,
+      CACHE_REUSE_DEFAULT_BUCKET_INDEX: 2,
+      cacheReusePercent: (count, total) => `${count / total * 100}%`,
+      cacheContinuityStandardMetricValue: () => "—",
+      setLocalizedText: (element, _key, values) => {
+        element.textContent = values?.percent ?? values?.count ?? "localized";
+      },
+      formatCount: String,
+      chooseCacheReuseMarkUnit: () => 1,
+      drawCacheReuseRaster: () => {},
+      ensureCacheReuseResizeObserver: () => {},
+    },
+  );
+
+  render({
+    status: "available", periodId: "7d", comparableReturns: 4,
+    reusedMoreThanHalfReturns: 0, reusedHalfOrLessReturns: 4,
+    matchedOrExceededReturns: 0, reusedBetweenHalfAndPreviousReturns: 0,
+  });
+  assert.equal(summary.hidden, false);
+  assert.equal(metrics.hidden, false);
+  assert.equal(empty.hidden, true);
+  assert.equal(raster.hidden, false);
+  assert.equal(metricNodes.get("#cache-reuse-more-percent").textContent, "0%");
+
+  render({
+    status: "available", periodId: "7d", comparableReturns: 0,
+    reusedMoreThanHalfReturns: 0, reusedHalfOrLessReturns: 0,
+    matchedOrExceededReturns: 0, reusedBetweenHalfAndPreviousReturns: 0,
+  });
+  assert.equal(outcome.hidden, false);
+  assert.equal(summary.hidden, false);
+  assert.equal(metrics.hidden, true);
+  assert.equal(empty.hidden, false);
+  assert.equal(raster.hidden, true);
+
+  render({
+    status: "available", periodId: "7d", comparableReturns: 4,
+    reusedMoreThanHalfReturns: 0, reusedHalfOrLessReturns: 4,
+    matchedOrExceededReturns: 0, reusedBetweenHalfAndPreviousReturns: 0,
+  });
+  assert.equal(metrics.hidden, false);
+  assert.equal(metricNodes.get("#cache-reuse-more-percent").textContent, "0%");
 });
 
 test("speed attribution occupies a disclosure row without displacing overhead cards", async () => {

@@ -116,6 +116,64 @@ publication before showing the command on either website tab.
 
 ## 0. Version lockstep and preflight
 
+### Native Sparkle to Electron transition
+
+For the 0.1.21 transition, users of native 0.1.18 must be able to use its
+existing Check for Updates and Install controls and continue with their retained
+history, settings and contribution choice. Publishing Electron installers or its
+YAML feeds alone does not update either native Sparkle feed.
+
+The final application remains the ordinary signed Electron build, with its own
+outgoing updater configuration. Follow the shared
+[Mac bundle-version allocation](../decisions/2026-09-11-electron-macos-bundle-version-allocation.md):
+0.1.21 uses bundle version 1028, above native 0.1.18's 1026. The provenance build
+number is a separate value. Retain the predecessor's exact public SUPublicEDKey
+in the signed Electron Info.plist: Sparkle refuses removal of that key even
+after a valid archive signature. This passive compatibility value does not add
+a Sparkle framework, feed configuration or second running updater. Preserve
+Apple's version grammar and the Electron inspection fuse.
+
+1. Finalize the exact signed/notarized/stapled Mac DMGs and updater ZIPs through
+   the Electron finalizer. Generate the incoming feed with the existing
+   generate-sparkle-appcast.js entrypoint and its explicit --electron-transition
+   option. This uses the pinned official generator and sign_update tool for
+   both enclosure and feed signatures with the existing native stable key.
+2. First generate an isolated feed with --electron-transition-test-source set
+   to the exact application source and --skip-retain. Its only namespace is
+   electron/test/native-sparkle/<source>/<bundleVersion>/<dmgSha256>/.
+   The production publisher refuses this test namespace. Uploading these test
+   objects requires the existing test-publication authority and shared owner.
+3. Run electron-macos-sparkle-transition.yml on both native hosted architectures
+   with exact source, installer, ASAR and feed hashes. The unchanged signed
+   native predecessor receives a test-feed preference only in its disposable
+   account. Sparkle alone installs the candidate. Require successful actual
+   update/relaunch, retained rows, settings, salt, opt-out and repeated restart.
+   A manual replacement or an ARM receipt cannot substitute for the Intel proof.
+4. Bind each passed receipt as a local qualification file in the explicit
+   tibotattle-electron-sparkle-transition-v1 publisher receipt. It includes the
+   incoming key digest and feed URL separately from the Electron ASAR and
+   outgoing updater configuration digest. The publisher revalidates the signed
+   mounted DMG, receipt, previous native manifest and annotated source tag.
+   It does not treat an arbitrary receipt path as successful qualification.
+5. Generate the final stable incoming feeds and use the existing guarded
+   publish-sparkle-update.js operation below for both architectures. Preserve
+   key continuity and atomic replacement. Intel's native route uses a
+   byte-identical TiboTattle-0.1.21-macOS-x64.dmg alias; the public GitHub download
+   retains the ordinary TiboTattle-0.1.21-mac-x64.dmg name and identical digest.
+6. Coordinate activation with the GitHub release, Electron feeds, Homebrew and
+   website through the cross-platform runbook. Then rerun the native journey
+   with production_feed and no override, and run
+   electron-macos-production-update.yml using the unchanged released Electron
+   0.1.20 app. Preserve these production receipts separately from the isolated
+   test proof. Its signed app cannot be redirected with a Node inspector.
+
+Existing-credential coverage remains an explicit receipt field; the synthetic
+opt-out fixture does not claim an existing Keychain credential rehearsal.
+The active closure plan is
+[the installed update sequence](../plans/2026-09-11-electron-upgrade-release-closure.md).
+
+### Common release preflight
+
 Start with `node scripts/release-agent.mjs doctor --json`. Supply an exact-source
 plan for target-specific checks; see [agent release operations](agent-release-operations.md).
 The doctor reads only local evidence and configured references. It does not

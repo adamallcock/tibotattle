@@ -160,12 +160,80 @@ async function warm(queries=900,nowMs=NOW,observation=observer()) {
   return {result,meter,observation};
 }
 
+/** A physical 0053 fixture. Do not call today's owner-aware source readers
+ * before 0058: that would test an impossible mixed schema rather than the
+ * migration's preservation contract. */
+async function seedHistorical0053State() {
+  const participantId="historical-0053-participant",deviceId="historical-0053-device",sessionId="historical-0053-session";
+  const pairingId="historical-0053-pairing",uploadId="historical-0053-upload",chunkId="historical-0053-chunk";
+  const hash="a".repeat(64),now=new Date(NOW).toISOString(),future="2027-01-01T00:00:00.000Z";
+  await db().batch([
+    db().prepare(`INSERT INTO participants(id,access_token_id,access_token_hash,recovery_token_id,recovery_token_hash,
+      state,consent_version,consented_at,created_at) VALUES(?,?,zeroblob(32),?,zeroblob(32),'active',?,?,?)`)
+      .bind(participantId,"historical-access","historical-recovery","privacy-safe-telemetry-v0.1",now,now),
+    db().prepare(`INSERT INTO web_sessions(id,participant_id,secret_hash,csrf_hash,scope,state,issued_at,expires_at,last_used_at)
+      VALUES(?,?,zeroblob(32),zeroblob(32),'personal','active',?,?,?)`).bind(sessionId,participantId,now,future,now),
+    db().prepare(`INSERT INTO device_pairings(id,participant_id,issued_by_session_id,secret_hash,consent_version,state,
+      issued_at,expires_at,transport_consent_version) VALUES(?,?,?,zeroblob(32),'ongoing-privacy-safe-telemetry-v1.0',
+      'unused',?,?,'ongoing-privacy-safe-telemetry-v1.0')`).bind(pairingId,participantId,sessionId,now,future),
+    db().prepare(`INSERT INTO device_credentials(id,participant_id,paired_via_pairing_id,secret_hash,state,issued_at,
+      expires_at,last_used_at,social_verified_at,credential_generation) VALUES(?,?,?,zeroblob(32),'active',?,?,?,?,1)`)
+      .bind(deviceId,participantId,pairingId,now,future,now,now),
+    db().prepare(`INSERT INTO device_upload_authorizations(id,participant_id,issued_by_device_id,secret_hash,envelope_digest,
+      body_bytes,content_type,state,issued_at,expires_at,consume_lease_expires_at) VALUES(?,?,?,zeroblob(32),?,1,
+      'application/json','consuming',?,?,?)`).bind(uploadId,participantId,deviceId,hash,now,future,future),
+    db().prepare(`INSERT INTO telemetry_v1_chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
+      chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,
+      device_upload_authorization_id,created_at) VALUES(?,?,?,'quota',?,0,1,?,?,'historical-0053',1,1,?,?,?)`)
+      .bind(chunkId,participantId,deviceId,DAY,hash,"b".repeat(64),`synthetic/${chunkId}`,uploadId,now),
+    db().prepare(`INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,device_id,stream,occurrence_id,observed_at,
+      observed_day,provider,plan_type,plan_variant,limit_id,slot,used_percent,window_duration_minutes,resets_at,record_json)
+      VALUES(?,?,?,'quota','historical-0053-observation',?,'2026-08-01','openai_codex','pro','unknown','codex','seven_day',
+      10,10080,?,'{}')`).bind(chunkId,participantId,deviceId,now,RESET),
+    db().prepare(`INSERT INTO community_allowance_fit_cache(participant_id,cache_key,fits_json,computed_at,
+      model_observations_json,input_fingerprint,source_method_version) VALUES(?,?,'[]',?,'[]',?,?)`)
+      .bind(participantId,"historical-0053-fit-cache",now,hash,"historical-0053"),
+    db().prepare(`INSERT INTO community_model_composition_cache(participant_id,cache_key,composition_json,computed_at,
+      input_fingerprint,source_method_version) VALUES(?,?,'[]',?,?,?)`)
+      .bind(participantId,"historical-0053-model-cache",now,hash,"historical-0053"),
+    db().prepare(`INSERT INTO community_analysis_work(participant_id,run_id,input_revision,input_fingerprint,source_kind,
+      source_method_version,fixed_now,observed_at_cutoff,resets_at_cutoff,window_minutes,max_quota_rows,phase,
+      progress_revision,control_json,manifest_json,state_sha256) VALUES(?,'11111111-1111-4111-8111-111111111111',1,?,'v1',
+      'historical-0053',?,?,?,10080,60000,'plan',0,'{}','[]',?)`).bind(participantId,hash,now,`${FROM}T00:00:00.000Z`,RESET,hash),
+  ]);
+  const snapshot=()=>Promise.all([
+    db().prepare("SELECT * FROM telemetry_v1_chunks ORDER BY id").all().then(value=>value.results),
+    db().prepare("SELECT * FROM telemetry_v1_records ORDER BY id").all().then(value=>value.results),
+    db().prepare("SELECT * FROM community_allowance_fit_cache ORDER BY participant_id").all().then(value=>value.results),
+    db().prepare("SELECT * FROM community_model_composition_cache ORDER BY participant_id").all().then(value=>value.results),
+    db().prepare("SELECT * FROM community_analysis_work ORDER BY participant_id").all().then(value=>value.results),
+    db().prepare(`SELECT id,access_token_id,access_token_hash,recovery_token_id,recovery_token_hash,state,consent_version,
+      consented_at,created_at,deletion_session_id,identity_link_key,identity_cooldown_digest FROM participants ORDER BY id`).all()
+      .then(value=>value.results),
+    db().prepare(`SELECT id,participant_id,paired_via_pairing_id,secret_hash,state,issued_at,expires_at,last_used_at,
+      revoked_at,social_verified_at,credential_generation FROM device_credentials ORDER BY id`).all().then(value=>value.results),
+  ]);
+  return {participantId,deviceId,snapshot};
+}
+
 describe("scheduled analysis warmer and atomic cache promotion",()=>{
-  it("forward-migrates populated 0053 without changing sources, caches or an unfinished raw checkpoint",async()=>{
+  it("forward-migrates populated 0053 state and preserves the post-migration warmer cache/checkpoint contract",async()=>{
     const all=(env as Env & {TEST_MIGRATIONS:D1Migration[]}).TEST_MIGRATIONS;
     await reset(); await applyD1Migrations(db(),all.filter(migration=>migration.name<"0054"));
     await db().prepare("UPDATE retention_state SET maintenance_lease_token=?,maintenance_lease_expires_at='2027-01-01T00:00:00.000Z'")
       .bind(LEASE).run();
+    const historical=await seedHistorical0053State(),historicalBefore=await historical.snapshot();
+    await applyD1Migrations(db(),all);
+    expect(await historical.snapshot()).toEqual(historicalBefore);
+    expect(await db().prepare("SELECT owner_kind FROM participants WHERE id=?").bind(historical.participantId).first())
+      .toEqual({owner_kind:"social"});
+    expect(await db().prepare("SELECT authority_kind,accountless_enrollment_device_id FROM device_credentials WHERE id=?")
+      .bind(historical.deviceId).first()).toEqual({authority_kind:"social",accountless_enrollment_device_id:null});
+    expect(await db().prepare("SELECT participant_id,pending FROM community_current_analysis_queue").all().then(value=>value.results))
+      .toEqual([{participant_id:historical.participantId,pending:1}]);
+    // Keep the current-runtime exercise isolated from the retained 0053
+    // fixture: it has already proved source/cache/checkpoint preservation.
+    await db().prepare("UPDATE participants SET state='deleting' WHERE id=?").bind(historical.participantId).run();
     await seed("migrated-participant",9); const pin=await identity("migrated-participant");
     expect(await publishCommunityAnalysisCaches(db(),pin,[{source:"v1",analysis:refusal}],refusal,LEASE)).toBe(true);
     const work:CommunityAnalysisWorkIdentity={participantId:pin.participantId,inputRevision:pin.sourcePin.inputRevision!,
@@ -178,8 +246,6 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
       "community_model_composition_cache","community_analysis_work","participants"];
     const snapshot=()=>Promise.all(tables.map(async table=>(await db().prepare(`SELECT * FROM ${table}`).all()).results));
     const before=await snapshot();
-    await applyD1Migrations(db(),all);
-    expect(await snapshot()).toEqual(before);
     expect(await db().prepare("SELECT participant_id,pending FROM community_current_analysis_queue").all().then(value=>value.results))
       .toEqual([{participant_id:"migrated-participant",pending:1}]);
     expect((await warm()).result).toEqual({status:"complete",visited:1,published:0,resumed:0});

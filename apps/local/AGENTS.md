@@ -46,8 +46,9 @@ compose. Apply the repository root guidance first.
 - Use same-origin opaque capabilities for privileged loopback actions and bind
   them to one operation and lifecycle. Do not place credentials or private state
   in URLs, browser storage, or rendered diagnostics.
-- Contribution routes may consume only already prepared, privacy-validated data
-  and must preserve review, consent, retry, and deletion guarantees.
+- Contribution routes may consume only prepared, privacy-validated data and
+  must preserve versioned authorization, durable opt-out, legacy review/consent,
+  retry and deletion guarantees.
 - Do not relay retired participant deletion or private owner-erasure requests.
   Device disconnect revokes this Mac's authority and preserves hosted/local
   history; browser sign-out and local identity reset are different operations.

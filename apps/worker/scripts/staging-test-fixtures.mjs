@@ -18,6 +18,15 @@ export function provisionedConfig() {
   return config;
 }
 
+export function unprovisionedConfig() {
+  const config = structuredClone(checkedInConfig);
+  config.env.staging.d1_databases[0].database_id =
+    "00000000-0000-4000-8000-000000000010";
+  config.env.staging.d1_databases[1].database_id =
+    "00000000-0000-4000-8000-000000000011";
+  return config;
+}
+
 export function successSpawn(
   config,
   calls,
@@ -73,6 +82,7 @@ export function successSpawn(
         stdout: JSON.stringify([
           { name: "ENVELOPE_PRIVATE_JWK", type: "secret_text" },
           { name: "ENVELOPE_PUBLIC_JWK", type: "secret_text" },
+          { name: "IDENTITY_LINK_SECRET", type: "secret_text" },
         ]),
         stderr: "",
       };

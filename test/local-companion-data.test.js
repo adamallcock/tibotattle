@@ -1700,6 +1700,118 @@ test("data store retains its last good snapshot when a reload fails", async () =
   assert.equal(store.getOverview().marker, "last-good");
 });
 
+test("desktop shell display evidence is a cached bounded projection of current normal Codex lanes", async () => {
+  const observedAt = "2026-09-05T11:59:00.000Z";
+  const store = new LocalCompanionDataStore({
+    builder: async () => ({
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      mode: "real_local_evidence",
+      generatedAt: "2026-09-05T12:00:00.000Z",
+      overview: {
+        evidenceStatus: "available",
+        freshness: { status: "live", staleAfterSeconds: 1_800 },
+        quotaWindows: [
+          // Another provider pool cannot become a compact-shell fallback.
+          {
+            limitId: "codex_bengalfox",
+            slot: "primary",
+            usedPercent: 1,
+            remainingPercent: 99,
+            durationMinutes: 10_080,
+            observedAt,
+            resetAt: "2026-09-05T14:00:00.000Z",
+          },
+          // The native selection prefers a primary slot when both report the
+          // same normal Codex duration, even at exactly 0% remaining.
+          {
+            limitId: "codex",
+            slot: "secondary",
+            usedPercent: 25,
+            remainingPercent: 75,
+            durationMinutes: 10_080,
+            observedAt,
+            resetAt: "2026-09-05T14:00:00.000Z",
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            usedPercent: 100,
+            remainingPercent: 0,
+            durationMinutes: 10_080,
+            observedAt,
+            resetAt: "2026-09-05T14:00:00.000Z",
+          },
+          {
+            limitId: "codex",
+            slot: "secondary",
+            usedPercent: 58,
+            remainingPercent: 42,
+            durationMinutes: 300,
+            observedAt,
+            resetAt: "2026-09-05T12:30:00.000Z",
+          },
+          // A malformed complement must not make the cache or the shell lie.
+          {
+            limitId: "codex",
+            slot: "primary",
+            usedPercent: 25,
+            remainingPercent: 76,
+            durationMinutes: 300,
+            observedAt,
+            resetAt: "2026-09-05T12:30:00.000Z",
+          },
+        ],
+        accounting: {
+          projection: { status: "retained" },
+          privateDiagnostic: "/Users/private/retained-history.json",
+        },
+        timeline: { usage: [{ private: "not projected" }] },
+      },
+      gradient: {},
+      weekly: {},
+      quality: {},
+      reports: [],
+    }),
+  });
+
+  // `reload` would normally return the full cloned overview. Suppress that
+  // response, then make any accidental accessor call fail, proving this path
+  // serves the cached small projection instead.
+  await store.reload({ returnOverview: false });
+  store.getOverview = () => {
+    throw new Error("full overview clone is forbidden in the shell poll path");
+  };
+  const evidence = store.getDesktopShellDisplayEvidence();
+
+  assert.deepEqual(evidence, {
+    evidenceStatus: "available",
+    freshness: { status: "live", staleAfterSeconds: 1_800 },
+    windows: [
+      {
+        durationMinutes: 300,
+        slot: "secondary",
+        usedPercent: 58,
+        remainingPercent: 42,
+        observedAt,
+        resetAt: "2026-09-05T12:30:00.000Z",
+      },
+      {
+        durationMinutes: 10_080,
+        slot: "primary",
+        usedPercent: 100,
+        remainingPercent: 0,
+        observedAt,
+        resetAt: "2026-09-05T14:00:00.000Z",
+      },
+    ],
+  });
+  assert.equal(Object.isFrozen(evidence), true);
+  assert.equal(Object.isFrozen(evidence.freshness), true);
+  assert.equal(Object.isFrozen(evidence.windows), true);
+  assert.equal(JSON.stringify(evidence).includes("private"), false);
+  assert.equal(JSON.stringify(evidence).includes("bengalfox"), false);
+});
+
 test("an aborted candidate cannot publish after its projection completes", async () => {
   let calls = 0;
   let releaseCandidate;
@@ -1967,11 +2079,18 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
     assert.equal(partialSnapshot.overview.timeline.history.status, "partial");
+    assert.equal(partialSnapshot.overview.accounting.cacheDiagnosticsSource, null,
+      "an incomplete diagnostic generation cannot authorize thread lookup");
     assert.equal(
       partialSnapshot.overview.timeline.history.reason,
       "unified_index_partial",
     );
     assert.equal(partialSnapshot.overview.timeline.source, "insufficient_evidence");
+    assert.notEqual(
+      partialSnapshot.overview.accounting.historyCoverage.phase,
+      "aggregate_unavailable",
+      "indexed counts alone do not prove a validated generation is complete",
+    );
     assert.equal(
       partialSnapshot.overview.accounting.accountingSource,
       "insufficient_evidence",
@@ -2117,6 +2236,32 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
     );
     await writeFile(archiveIndexFile, "rollback-sentinel", { mode: 0o600 });
     const archiveBefore = await stat(archiveIndexFile);
+    const beforeSummary = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      archiveIndexFile,
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const pendingHistory = beforeSummary.overview.accounting.historyCoverage;
+    assert.equal(pendingHistory.phase, "aggregate_unavailable");
+    assert.equal(pendingHistory.status, "partial");
+    assert.equal(pendingHistory.errorCode, "cache_missing");
+    assert.equal(pendingHistory.indexedSourceCount, pendingHistory.sourceCount);
+    assert.equal(pendingHistory.indexedBytes, pendingHistory.sourceBytes);
+    assert.equal(beforeSummary.overview.accounting.generationMatched, false);
+    assert.equal(beforeSummary.overview.accounting.historyPeriodStatus, "unavailable");
+    assert.equal(beforeSummary.overview.accounting.projection.status, "available");
+    assert.equal(beforeSummary.overview.usage.find((period) => period.id === "all").events, 3);
+    assert.ok(beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("history scan is complete")
+      && warning.includes("accounting summary is unavailable")
+    )));
+    assert.ok(!beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("History indexing is still advancing")
+      || warning.includes("Complete historical totals stay hidden")
+    )));
     await refreshReplaySafeAccountingCache({
       stateFile: collectorStateFile,
       sourceMode: "unified",
@@ -2202,6 +2347,22 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       toolPartialDatabase,
     );
     toolPartialDatabase.close();
+    // The current diagnostic projection remains independently attested while
+    // the prior replay cache no longer matches the changed generation proof.
+    const beforeReplayRebuild = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      archiveIndexFile,
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(beforeReplayRebuild.overview.accounting.generationMatched, false);
+    assert.equal(beforeReplayRebuild.overview.accounting.cacheSwitchImpact.status, "available");
+    assert.deepEqual(beforeReplayRebuild.overview.accounting.cacheDiagnosticsSource, {
+      generation: toolPartialGeneration.id,
+      generationFingerprint: toolPartialGeneration.fingerprint,
+    });
     await refreshReplaySafeAccountingCache({
       stateFile: collectorStateFile,
       sourceMode: "unified",
@@ -2590,6 +2751,30 @@ test("an attested rollout quarantine publishes verified totals as a terminal gap
     });
     assert.equal(built.generation.status, "partial");
     assert.equal(built.generation.skippedSourceCount, 2);
+
+    const beforeSummary = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const pendingHistory = beforeSummary.overview.accounting.historyCoverage;
+    assert.equal(pendingHistory.phase, "aggregate_unavailable");
+    assert.equal(pendingHistory.status, "partial");
+    assert.equal(pendingHistory.pendingSourceCount, 0);
+    assert.equal(pendingHistory.indexedSourceCount, 1);
+    assert.equal(pendingHistory.skippedSourceCount, 2);
+    assert.equal(pendingHistory.skippedThreadCount, 1);
+    assert.equal(beforeSummary.overview.accounting.historyPeriodStatus, "unavailable");
+    assert.equal(beforeSummary.overview.usage.find((period) => period.id === "all").events, 1);
+    assert.ok(beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("2 sources across 1 thread")
+      && warning.includes("did not pass local validation")
+    )));
+    assert.ok(!beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("History indexing is still advancing")
+    )));
 
     await refreshReplaySafeAccountingCache({
       stateFile: join(

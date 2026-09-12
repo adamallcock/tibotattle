@@ -180,6 +180,7 @@ export async function collectR7BenchmarkImplementationUrls() {
     ...await runtimeSourceUrls("packages/telemetry-contract/src"),
     new URL("packages/telemetry-contract/index.js", REPOSITORY_ROOT),
     new URL("packages/telemetry-contract/package.json", REPOSITORY_ROOT),
+    new URL("config/deployment-endpoints.js", REPOSITORY_ROOT),
     WORKER,
     new URL("../package.json", import.meta.url),
     new URL("../pnpm-lock.yaml", import.meta.url),

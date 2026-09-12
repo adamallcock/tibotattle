@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   buildPlanAttributionIndex,
+  PLAN_ATTRIBUTION_POLICY,
   planAttributionContextKey,
   planEraForInterval,
 } from "@app-usagemonitor/quota-analysis";
@@ -22,6 +23,7 @@ import { sanitizeAccountScope } from "./providers/codex/account.js";
 // preparation; it must never silently drop records or erase local history.
 export const LOCAL_TELEMETRY_V11_READER_LIMITS = Object.freeze({
   dayRows: 250_000,
+  // Retained plan anchors, not a cap on the admitted historical corpus.
   quotaObservations: 1_000_000,
   sessions: 125_000,
   sessionModels: 1_000_000,
@@ -98,23 +100,90 @@ function markerForInterval(markers, start, end, planType) {
 }
 
 function markersConsistentWithQuota(markers, rows) {
-  return markers.filter((marker) => {
-    const plans = new Set([knownPlan(marker.accountScope.planType)].filter((plan) => plan !== "unknown"));
-    let low = 0;
-    let high = rows.length;
-    while (low < high) {
-      const middle = (low + high) >>> 1;
-      if (rows[middle].observed_at_ms < marker.start) low = middle + 1;
-      else high = middle;
+  if (!markers.length) return markers;
+  const plans = new Map(markers.map(marker => [marker,
+    new Set([knownPlan(marker.accountScope.planType)].filter(plan => plan !== "unknown"))]));
+  let next = 0;
+  let active = [];
+  for (const row of rows) {
+    while (next < markers.length && markers[next].start <= row.observed_at_ms) active.push(markers[next++]);
+    active = active.filter(marker => marker.end >= row.observed_at_ms);
+    if (exportLimitProvider(row.limit_id) !== "openai_codex") continue;
+    const plan = knownPlan(row.plan_type);
+    if (plan !== "unknown") for (const marker of active) plans.get(marker).add(plan);
+  }
+  return markers.filter(marker => plans.get(marker).size <= 1);
+}
+
+// The shared index needs transition boundaries, not every repeated quota
+// observation. Keep exact first/last anchors of each known-plan run. Group
+// equal-time rows before compaction so ties cannot pick a winning plan or seed.
+// Unknown rows remain two endpoints per context; the shared policy ignores
+// them whenever that context also has positive named-plan evidence.
+export function compactQuotaPlanEvidence(rows, markers, maximum) {
+  const observations = [];
+  const seeds = new Map();
+  const contexts = new Map();
+  let timestamp = null;
+  let tied = new Map();
+  const append = value => {
+    if (observations.length >= maximum) fail("quota_limit_exceeded");
+    observations.push(value);
+    return value;
+  };
+  const flush = () => {
+    for (const [key, group] of tied) {
+      let context = contexts.get(key);
+      if (!context) {
+        // Match the public plan index context bound before retaining metadata.
+        if (contexts.size >= PLAN_ATTRIBUTION_POLICY.maxContexts) fail("attribution_limit_exceeded");
+        context = { current: null, unknown: null };
+        contexts.set(key, context);
+      }
+      const known = [...group.values()].filter(row => row.planType !== "unknown");
+      const unknown = group.get("unknown");
+      if (unknown) {
+        if (!context.unknown) {
+          context.unknown = { first: append(unknown), last: null };
+          seeds.set(JSON.stringify([unknown.contextKey, unknown.accountScopeId, "unknown", unknown.observedAtMs]), unknown.seed);
+        } else if (!context.unknown.last) context.unknown.last = append(unknown);
+        else context.unknown.last.observedAtMs = unknown.observedAtMs;
+      }
+      if (!known.length) continue;
+      if (known.length > 1) {
+        for (const row of known) append(row);
+        context.current = null;
+        continue;
+      }
+      const row = known[0];
+      if (!context.current || context.current.first.planType !== row.planType) {
+        context.current = { first: append(row), last: null };
+        seeds.set(JSON.stringify([row.contextKey, row.accountScopeId, row.planType, row.observedAtMs]), row.seed);
+      } else if (!context.current.last) context.current.last = append(row);
+      else context.current.last.observedAtMs = row.observedAtMs;
     }
-    for (let at = low; at < rows.length && rows[at].observed_at_ms <= marker.end; at += 1) {
-      if (exportLimitProvider(rows[at].limit_id) !== "openai_codex") continue;
-      const plan = knownPlan(rows[at].plan_type);
-      if (plan !== "unknown") plans.add(plan);
-      if (plans.size > 1) return false;
-    }
-    return true;
-  });
+    tied = new Map();
+  };
+  for (const row of rows) {
+    if (timestamp !== null && row.observed_at_ms !== timestamp) flush();
+    timestamp = row.observed_at_ms;
+    const provider = exportLimitProvider(row.limit_id);
+    const planType = knownPlan(row.plan_type);
+    const marker = provider === "openai_codex"
+      ? markerForInterval(markers, timestamp, timestamp, planType) : null;
+    const contextKey = contextFor(provider);
+    const accountScopeId = marker?.scopeKey ?? null;
+    const key = JSON.stringify([contextKey, accountScopeId]);
+    let group = tied.get(key);
+    if (!group) { group = new Map(); tied.set(key, group); }
+    const seed = sourceRecordDigest(row);
+    const prior = group.get(planType);
+    if (!prior) group.set(planType, { contextKey, accountScopeId, planType,
+      planVariant: "unknown", observedAtMs: timestamp, seed });
+    else if (prior.seed !== seed) prior.seed = null;
+  }
+  flush();
+  return { observations, seeds };
 }
 
 function sourceRecordDigest(row) {
@@ -194,7 +263,7 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
     AND q.observed_at_ms >= ? AND q.observed_at_ms < ?
     ORDER BY q.observed_at_ms, q.source_local, q.source_offset, q.slot_order LIMIT ?`);
   const allQuota = database.prepare(`${quotaSql}
-    ORDER BY q.observed_at_ms, q.source_local, q.source_offset, q.slot_order LIMIT ?`);
+    ORDER BY q.observed_at_ms, q.source_local, q.source_offset, q.slot_order`);
   const usageRaw = database.prepare(`
     SELECT event_key, source_local, source_offset, source_ordinal, session_local, observed_at_ms
     FROM usage_event WHERE observed_at_ms >= ? AND observed_at_ms < ?
@@ -232,37 +301,11 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
     if (count("SELECT COUNT(*) AS count FROM (SELECT 1 FROM usage_event GROUP BY session_local)") > bounds.sessions
         || count("SELECT COUNT(*) AS count FROM (SELECT 1 FROM usage_event GROUP BY session_local, model_id)") > bounds.sessionModels
         || count("SELECT COUNT(*) AS count FROM tool_class_count") > bounds.toolClasses) fail("corpus_limit_exceeded");
-    const rows = allQuota.all(descriptor.id, bounds.quotaObservations + 1);
-    if (rows.length > bounds.quotaObservations) fail("quota_limit_exceeded");
-    const consistentMarkers = markersConsistentWithQuota(markers, rows);
-    const observations = [];
-    for (const row of rows) {
-      const provider = exportLimitProvider(row.limit_id);
-      const planType = knownPlan(row.plan_type);
-      const marker = provider === "openai_codex"
-        ? markerForInterval(consistentMarkers, row.observed_at_ms, row.observed_at_ms, planType) : null;
-      const contextKey = contextFor(provider);
-      const scope = marker?.scopeKey ?? null;
-      observations.push({ contextKey, observedAtMs: row.observed_at_ms,
-        planType, planVariant: "unknown", accountScopeId: scope });
-    }
+    const consistentMarkers = markersConsistentWithQuota(markers, allQuota.iterate(descriptor.id));
+    const { observations, seeds } = compactQuotaPlanEvidence(
+      allQuota.iterate(descriptor.id), consistentMarkers, bounds.quotaObservations);
     const index = buildPlanAttributionIndex(observations);
     if (index.status !== "ready") fail("attribution_limit_exceeded");
-    const anchors = new Set(index.eras.map((era) => JSON.stringify([
-      era.contextKey, era.accountScopeId, era.planType, era.firstObservedAtMs,
-    ])));
-    const seeds = new Map();
-    for (let at = 0; at < rows.length; at += 1) {
-      const observation = observations[at];
-      const key = JSON.stringify([observation.contextKey, observation.accountScopeId,
-        observation.planType, observation.observedAtMs]);
-      if (!anchors.has(key)) continue;
-      const digest = sourceRecordDigest(rows[at]);
-      // Retain O(eras), not O(observations). Same-record 5h/7d rows share a
-      // seed; distinct tied records are not given an invented causal order.
-      if (!seeds.has(key)) seeds.set(key, digest);
-      else if (seeds.get(key) !== digest) seeds.set(key, null);
-    }
     return {
       base: createTelemetryV1IndexReader(database, { outcomeName, reasoningEffortName, fallbackParserVersion }),
       usage: createLocalUnifiedUsageAttributionReader({ database, generationId: descriptor.id }),
@@ -323,6 +366,31 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
   }
 
   return Object.freeze({
+    projectionEvidence({ binding } = {}) {
+      const captured = sanitizeTelemetryAttributionBinding(binding);
+      if (captured === null) fail("invalid_binding");
+      return snapshot((current) => {
+        // Only normalized, quota-consistent evidence can affect projection.
+        // Keep its content inside the reader; the private resume journal gets
+        // one digest, never scopes, marker brackets or enrollment identifiers.
+        const material = current.markers.map((marker) => JSON.stringify([
+          marker.start, marker.end, marker.accountScope.scopeId,
+          knownPlan(marker.accountScope.planType), marker.observationBinding,
+        ])).sort();
+        const days = new Set();
+        for (const marker of current.markers) {
+          if (marker.observationBinding.destinationOrigin !== captured.destinationOrigin
+              || marker.observationBinding.enrollmentNamespace !== captured.enrollmentNamespace) continue;
+          // A validated bracket is at most five minutes, hence at most two
+          // calendar days. The caller checks actual record evidence there
+          // before requesting an existing-only account-root lease.
+          days.add(new Date(marker.start).toISOString().slice(0, 10));
+          days.add(new Date(marker.end).toISOString().slice(0, 10));
+        }
+        return Object.freeze({ fingerprint: hash(["telemetry-v11-marker-evidence-v1", material]),
+          boundDays: Object.freeze([...days].sort()) });
+      });
+    },
     days() {
       return snapshot((current, descriptor) => [...new Set([
         ...current.base.days(), ...quotaDays.all(descriptor.id).map((row) => row.day),

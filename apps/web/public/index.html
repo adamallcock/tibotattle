@@ -67,7 +67,9 @@
     >
     <title>TiboTattle</title>
     <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./model-performance.css">
     <script type="module" src="./app.js"></script>
+    <script type="module" src="./desktop-shell.js"></script>
   </head>
   <body class="first-run" data-i18n-root>
     <a class="skip-link" href="#main" data-i18n-legacy-root>Skip to monitoring dashboard</a>
@@ -94,6 +96,23 @@
         <button class="button button-quiet compact" id="cancel-refresh" type="button" hidden>
           Cancel
         </button>
+        <button
+          class="button button-quiet compact electron-only-control"
+          id="electron-share-button"
+          type="button"
+          data-i18n="electron.shell.share"
+          aria-label="Share"
+          data-i18n-aria-label="electron.shell.share"
+          title="Share"
+          data-i18n-title="electron.shell.share"
+        >Share</button>
+        <button
+          class="button button-quiet compact electron-only-control electron-settings-control"
+          id="electron-settings-button"
+          type="button"
+          aria-label="Settings"
+          title="Settings"
+        >Settings</button>
       </div>
     </header>
 
@@ -103,7 +122,9 @@
           <a href="#overview" data-nav="overview" data-requires-evidence>Overview</a>
           <a href="#weekly" data-nav="weekly" data-requires-evidence>Allowance</a>
           <a href="#timeline" data-nav="trends" data-requires-evidence>Trends</a>
+          <a href="#performance" data-nav="performance" data-i18n="performance.title">Model performance</a>
           <a href="#accounting" data-nav="method" data-requires-evidence>Usage and costs</a>
+          <a href="#projects" data-nav="projects" data-i18n="workUsage.title">Projects &amp; threads</a>
           <a href="#community" data-nav="community" data-requires-evidence>Community</a>
         </nav>
       </aside>
@@ -158,6 +179,28 @@
           <button class="button button-quiet" id="demo-button" type="button">Explore labeled demo</button>
         </div>
       </div>
+
+      <section
+        class="notice notice-info electron-sharing-notice"
+        id="electron-sharing-notice"
+        role="region"
+        aria-labelledby="electron-sharing-notice-title"
+        data-dashboard-page="overview"
+        hidden
+      >
+        <div>
+          <p class="eyebrow" data-i18n="electron.sharing.notice.eyebrow">Community sharing</p>
+          <strong id="electron-sharing-notice-title" data-i18n="electron.sharing.notice.title">Share usage measurements</strong>
+          <p id="electron-sharing-notice-copy" data-i18n="electron.sharing.notice.copy">Community sharing will turn on automatically unless you choose Keep sharing off. This is notice {index} of 3. Shared measurements include token counts, model labels, quota measurements, and pseudonymous identifiers. Prompts, responses, credentials, private paths, and raw account identifiers stay on this device. No sign-in is needed.</p>
+          <p class="annotation" id="electron-sharing-notice-earliest" data-i18n="electron.sharing.notice.earliest">Earliest automatic sharing: {date}; activation also requires all three notices and at least 24 hours after the final notice.</p>
+          <p class="annotation" id="electron-sharing-notice-transport" role="status" aria-live="polite" data-i18n="electron.sharing.transport.unavailable">Uploads are not available in this build.</p>
+          <p class="participant-action-status" id="electron-sharing-notice-status" role="status" aria-live="polite" hidden></p>
+        </div>
+        <div class="notice-actions">
+          <button class="button button-primary" id="electron-sharing-share-now" type="button" data-i18n="electron.sharing.notice.shareNow">Share now</button>
+          <button class="button button-quiet" id="electron-sharing-keep-off" type="button" data-i18n="electron.sharing.notice.keepOff">Keep sharing off</button>
+        </div>
+      </section>
 
       <section class="companion-setup" id="companion-setup" aria-labelledby="companion-setup-title" data-dashboard-page="overview" hidden>
         <div class="companion-setup-copy">
@@ -430,12 +473,13 @@
                 <button type="button" data-days="36500">All</button>
               </div>
               <label class="weekly-span-control" for="weekly-span-control">
-                <span>Minimum observed quota span</span>
+                <span id="weekly-span-label">Minimum observed quota span</span>
                 <input id="weekly-span-control" type="range" min="0" max="99" step="1" value="50">
                 <output id="weekly-span-value" for="weekly-span-control">50+ pp</output>
               </label>
             </div>
           </div>
+          <p id="weekly-span-note" class="small muted" hidden></p>
           <div class="legend weekly-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
             <span><i class="legend-dot weekly-center"></i>All-data median</span>
             <span><i class="legend-dot weekly-mature"></i><span id="weekly-span-legend">Observed across 50+ points</span></span>
@@ -732,6 +776,9 @@
 
       </section>
 
+      <section class="dashboard-section dashboard-page-inactive" id="projects" aria-labelledby="work-usage-title" data-dashboard-page="projects" aria-hidden="true" inert></section>
+      <section class="dashboard-section dashboard-page-inactive model-performance" id="performance" aria-labelledby="performance-title" data-dashboard-page="performance" aria-hidden="true" inert data-i18n-skip></section>
+
       <section class="dashboard-section dashboard-page-inactive" id="accounting" aria-labelledby="accounting-title" data-dashboard-page="method" data-requires-evidence aria-hidden="true" inert>
         <div class="section-heading split">
           <div>
@@ -816,37 +863,21 @@
               <span class="table-pagination-status" id="accounting-model-page-status" role="status"></span>
               <button class="button button-quiet compact" id="accounting-model-page-next" type="button" aria-controls="accounting-models" data-i18n="table.pagination.next">Next</button>
             </div>
-            <p class="annotation" data-i18n="accounting.model.shareOfPeriod">
-              Both share columns are a share of the whole period, so components
-              add up to their model and models add up to the total.
-            </p>
             <p class="annotation" id="accounting-price-coverage" hidden></p>
             <!--
               The expansion of the marker each separately metered row carries.
               The asterisk itself is drawn by the stylesheet so this stays one
               translated sentence rather than a sentence plus a glyph.
             -->
-            <!--
-              The component rows' two withheld cells, explained where they can
-              be read rather than only in a hover title: a title is unreachable
-              on touch and easy to miss with a keyboard, and this table already
-              settles such things in a standing sentence under the rows.
-            -->
-            <p class="annotation" data-i18n="accounting.model.componentFootnote">
-              A component row shows no usage-change count, because one usage
-              change carries every component at once and cannot be divided
-              between them. Where a model states no API equivalent, its
-              components state none either.
-            </p>
             <p class="annotation model-allowance-footnote">
               A model on a separate allowance is listed on its own row and
               carries no API equivalent, because that figure cannot be compared
-              with the main allowance. Nothing unavailable is replaced with an
-              invented cost.
+              with the main allowance.
             </p>
         </article>
         <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details" id="cache-switch-details" hidden>
           <summary data-i18n="accounting.cacheSwitch.detailsSummary">See possible switch overhead</summary>
+          <p class="annotation cache-impact-sample" hidden></p>
           <p class="annotation" data-i18n="accounting.cacheSwitch.detailsExplanation">
             These recent rows pair an adjacent model or reasoning change with
             an observed material cache-read drop within five minutes. The
@@ -926,6 +957,7 @@
         </section>
         <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details cache-continuity-details" id="cache-continuity-details" hidden>
           <summary data-i18n="accounting.cacheContinuity.detailsSummary">See recent large cache drops</summary>
+          <p class="annotation cache-impact-sample" hidden></p>
           <div class="table-wrap">
             <table class="cache-continuity-recent-table">
               <caption class="sr-only" data-i18n="accounting.cacheContinuity.tableCaption">Recent covered cache-continuity comparisons at Standard API rates; not a period total</caption>
@@ -1009,6 +1041,22 @@
         aria-hidden="true"
         inert
       >
+        <section class="panel electron-accountless-community" id="electron-accountless-community" aria-labelledby="electron-accountless-community-title" hidden>
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker" data-i18n="electron.sharing.community.eyebrow">Community sharing</p>
+              <h2 id="electron-accountless-community-title" data-i18n="electron.sharing.community.title">Share usage measurements</h2>
+            </div>
+          </div>
+          <p id="electron-accountless-community-state" class="annotation" role="status" aria-live="polite" data-i18n="electron.sharing.state.unavailable">Community sharing preference unavailable; nothing will be shared.</p>
+          <p id="electron-accountless-community-transport" class="annotation" role="status" aria-live="polite" data-i18n="electron.sharing.transport.unavailable">Uploads are not available in this build.</p>
+          <p id="electron-accountless-sharing-description" class="annotation" data-i18n="electron.settings.sharing.description">Choose whether this installation may share content-free usage measurements. No sign-in is required. Shared measurements may include token counts, model labels, quota measurements, and pseudonymous continuity identifiers. Prompts, responses, credentials, private paths, and raw account identifiers stay on this device.</p>
+          <label class="electron-accountless-sharing-control">
+            <input id="electron-accountless-sharing-enabled" type="checkbox" role="switch" disabled aria-describedby="electron-accountless-sharing-description electron-accountless-community-state electron-accountless-community-transport electron-accountless-sharing-error">
+            <span data-i18n="electron.settings.sharing.label">Share usage measurements</span>
+          </label>
+          <p id="electron-accountless-sharing-error" class="annotation" role="status" aria-live="polite" hidden data-i18n="electron.sharing.notice.error">This sharing choice was not confirmed. Try again.</p>
+        </section>
         <!--
           The guided journey, stated as stages with visible state, rendered
           from measured facts. Trimmed to two boxes (owner-directed,

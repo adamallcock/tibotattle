@@ -426,6 +426,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
     range: element("#weekly-range").textContent,
     explanation: element("#weekly-explanation").textContent,
     timeZone: element("#weekly-chart-timezone").textContent,
+    spanLabel: element("#weekly-span-label").textContent,
+    spanNote: element("#weekly-span-note"),
     empty: element("#weekly-empty"),
     shared,
     paceData,
@@ -1075,7 +1077,7 @@ test("quick-result progress never turns a loaded no-numbers overview into a head
       dashboardLoaded: true,
       elapsedLabel: "7s",
     }),
-    "Local summary updated · checking full history…",
+    "Local summary updated · checking full history… 7s",
   );
   assert.equal(
     refreshQuickResultStatus({
@@ -1083,6 +1085,14 @@ test("quick-result progress never turns a loaded no-numbers overview into a head
       elapsedLabel: "7s",
     }),
     "Preparing local summary… 7s",
+  );
+  assert.equal(
+    refreshQuickResultStatus({ dashboardLoaded: true, elapsedLabel: "1m 2s" }),
+    "Local summary updated · checking full history… 1m 2s",
+  );
+  assert.equal(
+    refreshQuickResultStatus({ dashboardLoaded: true }),
+    "Local summary updated · checking full history…",
   );
 });
 
@@ -5117,6 +5127,28 @@ test("native dashboard readiness does not wait on secondary companion reads", as
   );
 });
 
+test("the primary dashboard owner resumes one deferred Electron startup pass after releasing its lock", async () => {
+  const primary = dashboardStartupDeferred();
+  const harness = await createDashboardStartupHarness({
+    client: { load: () => primary.promise },
+  });
+  harness.context.electronStartupRefreshDeferred = true;
+
+  const loading = harness.context.loadLocalDashboard();
+  await settleDashboardStartupTasks();
+  assert.equal(harness.context.localActionBusy, true);
+  assert.equal(harness.context.electronStartupRefreshDeferred, true);
+  assert.equal(harness.state.startupRefreshChecks, 0,
+    "the launch pass remains deferred while the primary owner is busy");
+
+  primary.resolve({ marker: "primary", mode: "real_local_evidence" });
+  await loading;
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.context.electronStartupRefreshDeferred, false);
+  assert.equal(harness.state.startupRefreshChecks, 1,
+    "the real loader retries exactly once after restoring its previous busy state");
+});
+
 function dashboardStartupDeferred() {
   let resolve;
   let reject;
@@ -5153,6 +5185,7 @@ async function createDashboardStartupHarness({
   const state = {
     events: [], previews: [], primaryReads: 0, statusReads: 0, polls: 0,
     preparations: 0, reviewUnavailableReports: 0, returnRefreshChecks: 0,
+    startupRefreshChecks: 0,
   };
   const elements = new Map();
   const element = (selector) => {
@@ -5171,6 +5204,8 @@ async function createDashboardStartupHarness({
     cacheDropThreadLinks: { loadToken: 0 },
     activeLocalDashboardLoad: null,
     localActionBusy: initialBusy,
+    localRefreshInProgress: false,
+    electronStartupRefreshDeferred: false,
     localCompanionHealth: initialHealth,
     localOnboarding: null,
     dashboard: null,
@@ -5210,6 +5245,14 @@ async function createDashboardStartupHarness({
     boundedOutcomeDetailCode: () => null,
     observeContributionDisconnectPause() {},
     runsInsideNativeDashboard: () => true,
+    // The extracted startup harness exercises the loader without evaluating
+    // Electron's launch coordinator. Keep that path explicitly inert so the
+    // optional onboarding callback remains faithful to the browser/native
+    // readiness tests.
+    startElectronStartupRefresh: () => {
+      state.startupRefreshChecks += 1;
+      return true;
+    },
     setJourneyState(value) { state.journey = value; },
     scheduleIncrementalSyncStatusPoll() { state.polls += 1; },
     scheduleReturningUserRefresh() { state.returnRefreshChecks += 1; },
@@ -5225,6 +5268,10 @@ async function createDashboardStartupHarness({
     renderDashboardUnavailableState(kind) { state.events.push(["unavailable", kind]); },
     renderHostedIdentity() { state.events.push(["identity"]); },
     renderAccounting() { state.events.push(["accounting"]); },
+    // The extracted startup harness has no Electron preload bridge. Keep the
+    // production loader's optional accountless-sharing read on its faithful
+    // no-bridge path while the startup assertions exercise primary readiness.
+    loadElectronSharingPreference: async () => null,
     renderContributionActionState() { state.events.push(["consent", context.incrementalConsentApproved]); },
     renderContributionSyncStatus(value) { state.events.push(["sync-status", value]); },
   });
@@ -5709,7 +5756,8 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /await loadQuickResultDashboard\(\)/u);
   assert.match(appSource, /renderDashboard\(data\)/u);
   assert.match(appSource, /refreshQuickResultStatus\(\{/u);
-  assert.match(appSource, /refreshAccountingStatus\(\{ progress, elapsedLabel \}\)/u);
+  assert.match(appSource, /refreshAccountingStatus\(\{ progress \}\)/u);
+  assert.match(appSource, /renderRefreshProgress\(button, phase, \{ processed, selected, elapsedSeconds \}\)/u);
   assert.match(appSource, /const accountingStatus = outcome === "running"/u);
   assert.match(appSource, /const collectorProgress = progress\?\.kind === undefined/u);
   assert.match(appSource, /if \(collectorProgress\s*&& progress\?\.phase === "quick_result"/u);
@@ -6038,6 +6086,12 @@ test("the weekly headline is a stable all-data median and says so on screen", as
   // sentence names the relaxed floor.
   assert.match(views[0].explanation, /drawing 2 of 52/u);
   assert.match(views[0].explanation, /any length/u);
+  assert.equal(views[0].spanLabel, "Well-observed quota span");
+  assert.equal(views[0].spanNote.hidden, false);
+  assert.match(views[0].spanNote.textContent, /includes all spans/u);
+  assert.equal(views[1].spanLabel, "Minimum observed quota span");
+  assert.equal(views[1].spanNote.hidden, true);
+
   assert.match(views[2].explanation, /drawing 34 of 52/u);
   assert.match(views[3].explanation, /drawing 52 of 52/u);
   // An empty chart names its reason with numbers instead of the generic
@@ -6261,6 +6315,7 @@ test("allowance history draws visible evidence dots while the dense usage timeli
         label: { key: "series.wellObserved" },
         connect: false,
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        pointFilter: (point) => point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
       },
       {
@@ -6269,6 +6324,7 @@ test("allowance history draws visible evidence dots while the dense usage timeli
         label: { key: "series.shortObservation" },
         connect: false,
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        pointFilter: (point) => !point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
     ],
@@ -6278,6 +6334,8 @@ test("allowance history draws visible evidence dots while the dense usage timeli
   });
   const mature = sparse.querySelectorAll("circle.chart-point-weekly-mature");
   const partial = sparse.querySelectorAll("circle.chart-point-weekly-partial");
+  assert.equal(mature.length, 3, "well-observed points have no short-series hit target");
+  assert.equal(partial.length, 1, "only the short observation can show its tooltip");
   const drawn = [...mature, ...partial].filter(
     (circle) => Number(circle.getAttribute("r")) > 0
       && !circle.getAttribute("class").includes("chart-point-hit-target"),

@@ -250,6 +250,7 @@ enum TiboTattleLocalization {
         case nativeDashboardLocalOnly = "nativeDashboard.localOnly"
         case nativeDashboardLocalOnlyTooltip = "nativeDashboard.localOnlyTooltip"
         case nativeDashboardOverview = "nativeDashboard.overview"
+        case nativeDashboardPerformance = "nativeDashboard.performance"
         case nativeDashboardProgressAccounting = "nativeDashboard.progressAccounting"
         case nativeDashboardProgressAnalyzing = "nativeDashboard.progressAnalyzing"
         case nativeDashboardProgressAnalyzingFiles = "nativeDashboard.progressAnalyzingFiles"
@@ -803,6 +804,8 @@ enum TiboTattleLocalization {
                 "Analysis and cached results stay on this Mac. Community contribution is optional."
             case .nativeDashboardOverview:
                 "Overview"
+            case .nativeDashboardPerformance:
+                "Model performance"
             case .nativeDashboardProgressAccounting:
                 "Calculating accounting…"
             case .nativeDashboardProgressAnalyzing:

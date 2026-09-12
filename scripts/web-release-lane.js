@@ -19,6 +19,7 @@ const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
   "community-data.js",
   "community-refresh.js",
   "community-view.js",
+  "model-visuals.js",
   "community.html",
   "community.js",
   "docs.html",

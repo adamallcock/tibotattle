@@ -716,6 +716,7 @@ export function createEventSink({
         totalInputContext: null,
         partial: event.partial === true,
         modelInherited: event.modelInherited === true,
+        cacheWriteAssumedZero: event.cacheWriteAssumedZero === true,
       });
       add(source, "usageEvents");
       if (onCounts !== null && onCounts !== undefined

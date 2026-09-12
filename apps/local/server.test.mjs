@@ -62,6 +62,9 @@ import {
 import {
   buildTelemetryContributionsFromBundle,
 } from "../../src/telemetry-contribution-builder.js";
+import {
+  DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+} from "../../src/desktop-shell-status.js";
 import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import {
   PREVIEW_PRODUCT_BRAND,
@@ -75,6 +78,8 @@ import {
   createCentralOutboundFetch,
   createLocalCompanionServer,
   LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+  LOCAL_STARTUP_DIAGNOSTIC_DETAILS,
+  LOCAL_STARTUP_DIAGNOSTIC_STEPS,
   localCompanionRefreshTimeoutForUnifiedIndex,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
@@ -351,11 +356,11 @@ test("refresh timeout classifier grants the cold window only to missing or prove
   }
 });
 
-test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline without extending current or uncertain state", async () => {
+test("published v10 v11 v12 v13 v14 v15 upgrades to v16 receive a cold deadline without extending current or uncertain state", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-timeout-parser-upgrade-"));
   // Deliberately pin the target: another parser release must review its
   // predecessor set, not silently keep passing a generic mismatch test.
-  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v15");
+  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v16");
   const fixtures = [
     { name: "complete", cold: true },
     { name: "quarantine-partial", cold: true, generation: {
@@ -367,7 +372,7 @@ test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline with
     // Every fixture retains an older parser/generation row. Only publication
     // provenance may select the deadline, so this stays an ordinary refresh.
     { name: "current-with-old-history", parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
-    { name: "future", parserVersion: "unified-rollout-typed-v16" },
+    { name: "future", parserVersion: "unified-rollout-typed-v17" },
     { name: "unknown", parserVersion: "unknown-parser" },
     { name: "empty", parserVersion: "" },
     { name: "malformed-version", parserVersion: "unified-rollout-typed-v011" },
@@ -377,7 +382,9 @@ test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline with
     { name: "v12-partial-parser", parserVersion: "unified-rollout-typed-v12-partial" },
     { name: "v14-partial-parser", parserVersion: "unified-rollout-typed-v14-partial" },
     { name: "v13-partial-parser", parserVersion: "unified-rollout-typed-v13-partial" },
-    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v15-partial" },
+    { name: "v15-partial-parser", parserVersion: "unified-rollout-typed-v15-partial" },
+    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v16-partial" },
+    { name: "current-assumed-parser", parserVersion: "unified-rollout-typed-v16-cache-write-zero" },
     { name: "unreviewed-predecessor", parserVersion: "unified-rollout-typed-v9" },
     { name: "missing-publication", metadata: { current_generation_id: undefined } },
     { name: "unknown-publication", metadata: { current_generation_id: "99" } },
@@ -408,7 +415,7 @@ test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline with
       .map((key) => ({ name: `incomplete-${key}`, generation: { [key]: 0 } })),
   ];
   try {
-    for (const predecessor of [10, 11, 12, 13, 14]) {
+    for (const predecessor of [10, 11, 12, 13, 14, 15]) {
       for (const fixture of fixtures) {
         const name = `v${predecessor}-${fixture.name}`;
         const indexFile = join(root, `${name}.sqlite`);
@@ -763,6 +770,9 @@ function fakeStore() {
         evidenceStatus: "available",
       };
     },
+    getDesktopShellDisplayEvidence() {
+      return null;
+    },
     getGradient() {
       return { status: "available", datasets: { rolling: [{ quota_change_pp: 3 }] } };
     },
@@ -811,6 +821,8 @@ async function fixture() {
   await writeFile(join(staticRoot, "app.js"), "export const app = true;");
   await writeFile(join(staticRoot, "data-client.js"), "export const client = true;");
   await writeFile(join(staticRoot, "lib.js"), "export const lib = true;");
+  await writeFile(join(staticRoot, "model-performance.js"), "export const performance = true;");
+  await writeFile(join(staticRoot, "model-performance.css"), ".model-performance { color: black; }");
   await writeFile(
     join(staticRoot, "localization.js"),
     "export const localization = true;",
@@ -1035,6 +1047,20 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     });
     assert.equal(health.headers.get("access-control-allow-origin"), null);
     assert.match(health.headers.get("content-security-policy"), /default-src 'none'/);
+
+    await app.snapshotReady;
+    const desktopStatus = await fetch(`${base}/api/local/desktop-status`);
+    assert.equal(desktopStatus.status, 200);
+    assert.deepEqual(await desktopStatus.json(), {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "unavailable",
+      allowance: null,
+      notificationEvidence: null,
+    });
+    assert.equal((await fetch(`${base}/api/local/desktop-status`, {
+      method: "POST",
+    })).status, 405);
+
     const retirement = app.automaticContributionRetirement();
     assert.equal(retirement.status, "retired");
     assert.equal(retirement.priorState, "absent");
@@ -1103,6 +1129,14 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.doesNotMatch(pageBody, new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"));
     assert.equal((await fetch(`${base}/data-client.js`)).status, 200);
     assert.equal((await fetch(`${base}/localization.js`)).status, 200);
+    for (const [path, type] of [
+      ["model-performance.js", "text/javascript; charset=utf-8"],
+      ["model-performance.css", "text/css; charset=utf-8"],
+    ]) {
+      const asset = await fetch(`${base}/${path}`);
+      assert.equal(asset.status, 200, path);
+      assert.equal(asset.headers.get("content-type"), type, path);
+    }
     assert.equal(
       (await fetch(`${base}/telemetry-shared.generated.js`)).status,
       200,
@@ -1579,6 +1613,177 @@ test("one state root cannot run concurrently while the retirement lock is held",
   } finally {
     await restarted?.close();
     await first?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a startup snapshot failure files one content-free server diagnostic note", async () => {
+  const files = await fixture();
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  const privateMessage = "private startup detail /Users/example/session.jsonl";
+  const initializationError = new Error(privateMessage);
+  initializationError.code = "private_startup_detail";
+  let app;
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: {
+        ...fakeStore(),
+        async initialize() {
+          throw initializationError;
+        },
+      },
+      refreshRunner: async () => ({}),
+      diagnosticsLogFile,
+      diagnosticReferenceFactory: () => "TT-4HJ7M2",
+      clock: () => Date.parse("2026-09-08T14:30:00.000Z"),
+      port: 0,
+    });
+
+    await assert.rejects(
+      app.snapshotReady,
+      (error) => error === initializationError,
+    );
+    const recorded = await readFile(diagnosticsLogFile, "utf8");
+    assert.equal(recorded.includes(privateMessage), false);
+    assert.equal(recorded.includes(initializationError.code), false);
+    assert.deepEqual(
+      recorded.trimEnd().split("\n").map((line) => JSON.parse(line)),
+      [{
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-09-08T14:30:00.000Z",
+        reference: "TT-4HJ7M2",
+        surface: "local_startup",
+        code: "snapshot_unavailable",
+        requestId: "",
+        step: "data_store",
+        detail: "unexpected_error",
+      }],
+    );
+    assert.deepEqual(LOCAL_STARTUP_DIAGNOSTIC_STEPS, [
+      "data_store",
+      "contribution_start",
+    ]);
+    assert.equal(
+      LOCAL_STARTUP_DIAGNOSTIC_DETAILS.includes(
+        "local_collector_state_migration_busy",
+      ),
+      true,
+    );
+    assert.equal(
+      LOCAL_STARTUP_DIAGNOSTIC_DETAILS.includes("unexpected_error"),
+      true,
+    );
+  } finally {
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a failed startup diagnostic recorder preserves the original error and shutdown", async () => {
+  const files = await fixture();
+  const initializationError = new Error("private source startup failure");
+  initializationError.code = "collector_invalid_size";
+  let recorderCalls = 0;
+  let stopCalls = 0;
+  let app;
+  const incrementalContributionController = {
+    async start() {},
+    async stop() {
+      stopCalls += 1;
+    },
+    async inspect() {
+      return {};
+    },
+    async approve() {
+      return {};
+    },
+    async resume() {
+      return {};
+    },
+    async pauseForDeviceDisconnect() {
+      return {};
+    },
+    async pauseForDeviceRepair() {
+      return {};
+    },
+    async resumeAfterDeviceRepair() {
+      return {};
+    },
+  };
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: {
+        ...fakeStore(),
+        async initialize() {
+          throw initializationError;
+        },
+      },
+      refreshRunner: async () => ({}),
+      diagnosticReferenceFactory: () => "TT-4HJ7M2",
+      diagnosticNoteRecorder: async (note) => {
+        recorderCalls += 1;
+        assert.deepEqual(note, {
+          reference: "TT-4HJ7M2",
+          surface: "local_startup",
+          code: "snapshot_unavailable",
+          requestId: "",
+          step: "data_store",
+          detail: "collector_invalid_size",
+        });
+        throw new Error("private recorder failure");
+      },
+      incrementalContributionController,
+      port: 0,
+    });
+
+    await assert.rejects(
+      app.snapshotReady,
+      (error) => error === initializationError,
+    );
+    assert.equal(recorderCalls, 1);
+    assert.equal(stopCalls, 1);
+    assert.deepEqual(app.snapshotStatus(), {
+      status: "failed",
+      errorCode: "collector_invalid_size",
+    });
+  } finally {
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a successful startup does not mint or file a startup diagnostic note", async () => {
+  const files = await fixture();
+  let app;
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunner: async () => ({}),
+      diagnosticReferenceFactory: () => {
+        throw new Error("startup diagnostic reference must not be minted");
+      },
+      diagnosticNoteRecorder: async () => {
+        throw new Error("startup diagnostic note must not be recorded");
+      },
+      port: 0,
+    });
+
+    await app.snapshotReady;
+    assert.deepEqual(app.snapshotStatus(), { status: "ready", errorCode: null });
+  } finally {
+    await app?.close();
     await rm(files.root, { recursive: true });
   }
 });
@@ -2281,6 +2486,168 @@ test("server rejects forged hosts and requires same-origin refresh authorization
     });
     assert.equal(JSON.stringify(completed).includes("/Users/private"), false);
     assert.equal(store.reloads, 1);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("desktop status route projects refresh lifecycle without dashboard payloads", async () => {
+  const files = await fixture();
+  const now = Date.parse("2026-08-25T12:00:00.000Z");
+  const notificationEvidence = {
+    schemaVersion: "tibotattle-notification-evidence-v2",
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt: new Date(now).toISOString(),
+    continuityKey: "a".repeat(43),
+    windows: [{
+      lane: "primary",
+      usedPercent: 26,
+      durationMinutes: 300,
+      resetAt: "2026-08-25T15:00:00.000Z",
+      resetProofKind: "provider_reported_schedule_only",
+    }],
+  };
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => {
+      await refreshGate;
+      return {
+        notificationEvidence,
+        privatePath: "/Users/private",
+      };
+    },
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+
+    const analyzing = await fetch(`${base}/api/local/desktop-status`);
+    assert.equal(analyzing.status, 200);
+    assert.deepEqual(await analyzing.json(), {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "analyzing",
+      allowance: null,
+      notificationEvidence: null,
+    });
+
+    releaseRefresh();
+    await waitFor(async () => {
+      const response = await fetch(`${base}/api/local/refresh`);
+      return (await response.json()).refresh.status === "succeeded";
+    });
+    const completed = await fetch(`${base}/api/local/refresh`)
+      .then((response) => response.json());
+    assert.deepEqual(completed.refresh.result?.notificationEvidence, notificationEvidence);
+    const fresh = await fetch(`${base}/api/local/desktop-status`);
+    assert.equal(fresh.status, 200);
+    const freshPayload = await fresh.json();
+    assert.deepEqual(freshPayload, {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "fresh",
+      allowance: {
+        source: "direct",
+        window: "five_hour",
+        remainingPercent: 74,
+      },
+      notificationEvidence,
+    });
+    assert.equal(JSON.stringify(freshPayload).includes("rollout"), false);
+    assert.equal(JSON.stringify(freshPayload).includes("/Users/private"), false);
+    assert.equal((await fetch(`${base}/api/local/desktop-status`, {
+      method: "POST",
+    })).status, 405);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("desktop status route serves cached current overview evidence without a completed refresh or notification evidence", async () => {
+  const files = await fixture();
+  const now = Date.parse("2026-09-05T12:00:00.000Z");
+  const store = fakeStore();
+  let overviewReads = 0;
+  let displayReads = 0;
+  store.getOverview = () => {
+    overviewReads += 1;
+    throw new Error("desktop status must not clone the full overview");
+  };
+  store.getDesktopShellDisplayEvidence = () => {
+    displayReads += 1;
+    return Object.freeze({
+      evidenceStatus: "available",
+      freshness: Object.freeze({ status: "live", staleAfterSeconds: 1_800 }),
+      windows: Object.freeze([Object.freeze({
+        durationMinutes: 10_080,
+        slot: "primary",
+        usedPercent: 100,
+        remainingPercent: 0,
+        observedAt: "2026-09-05T11:59:00.000Z",
+        resetAt: "2026-09-05T15:00:00.000Z",
+      })]),
+    });
+  };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: async () => ({}),
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    await app.snapshotReady;
+    const response = await fetch(
+      `http://127.0.0.1:${app.port}/api/local/desktop-status`,
+    );
+    assert.equal(response.status, 200);
+    const status = await response.json();
+    assert.deepEqual(status, {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "fresh",
+      allowance: {
+        source: "direct",
+        window: "seven_day",
+        remainingPercent: 0,
+      },
+      notificationEvidence: null,
+      displayEvidence: {
+        schemaVersion: "tibotattle-display-evidence-v1", scopeKey: null, staleAfterSeconds: 1800,
+        windows: [{ durationMinutes: 10080, remainingPercent: 0,
+          observedAt: "2026-09-05T11:59:00.000Z", resetAt: "2026-09-05T15:00:00.000Z" }],
+      },
+    });
+    assert.equal(displayReads, 1);
+    assert.equal(overviewReads, 0);
+    assert.equal(JSON.stringify(status).includes("continuity"), false);
+    assert.equal(JSON.stringify(status).includes("openai_codex"), false);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -4657,6 +5024,8 @@ test("diagnostic notes are bounded, fixed-vocabulary, and land in a local log", 
     // masquerading as a code, or an extra member can never be logged.
     for (const invalid of [
       { ...note, surface: "arbitrary_journey" },
+      // Server-minted startup evidence is never a dashboard-selectable route.
+      { ...note, surface: "local_startup" },
       { ...note, reference: "TT-ILLEGAL" },
       { ...note, reference: "not-a-reference" },
       { ...note, code: "Failed reading /Users/private/state.json" },

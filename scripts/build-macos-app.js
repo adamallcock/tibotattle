@@ -155,6 +155,13 @@ export const MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES = Object.freeze([
   "apps/macos/Helpers/KeychainMigrationHelper.swift",
   "apps/macos/Sources/KeychainMigration.swift",
 ]);
+// `NativeElectronHandoverHelper.swift` is built only by Electron's dedicated
+// handover tool. The native app builder may encounter it in Helpers, but must
+// neither compile nor include it in the Keychain helper's source closure.
+const MACOS_REVIEWED_HELPER_ENTRYPOINTS = new Set([
+  "KeychainMigrationHelper.swift",
+  "NativeElectronHandoverHelper.swift",
+]);
 const CODE_RESOURCES_PATH = "Contents/_CodeSignature/CodeResources";
 const NORMALIZED_MACH_O_PATHS = new Set([
   SIGNED_EXECUTABLE_PATH,
@@ -263,12 +270,25 @@ function assertMacOSPreviewAppcastBoundary(value, architecture = "arm64") {
 
 export const MACOS_WEB_MODULE_ENTRYPOINTS = Object.freeze([
   "apps/web/public/app.js",
+  "apps/web/public/desktop-shell.js",
+  "apps/web/public/electron-tray-popup.js",
+  "apps/web/public/electron-settings.js",
+  "apps/web/public/electron-tray-settings.js",
+  "apps/web/public/electron-tray-preferences.js",
 ]);
 
 export const MACOS_RUNTIME_STATIC_ASSETS = Object.freeze([
   "apps/macos/reset-local-keychain.js",
   "apps/web/public/index.html",
   "apps/web/public/styles.css",
+  "apps/web/public/electron-tray-popup.html",
+  "apps/web/public/electron-tray-popup.css",
+  "apps/web/public/electron-settings.html",
+  "apps/web/public/electron-settings.css",
+  "apps/web/public/icon-panel-left.svg",
+  "apps/web/public/icon-refresh-cw.svg",
+  "apps/web/public/icon-settings.svg",
+  "apps/web/public/model-performance.css",
   "apps/web/public/tibotattle-icon.png",
 ]);
 
@@ -1171,11 +1191,15 @@ export async function collectMacOSKeychainMigrationHelperSources({
     "macOS migration helper source root",
   );
   const entries = await readdir(helpersRoot, { withFileTypes: true });
-  if (entries.length !== 1
-      || entries[0].name !== "KeychainMigrationHelper.swift"
-      || !entries[0].isFile()
-      || entries[0].isSymbolicLink()) {
-    fail("macOS migration helper must contain only its reviewed entrypoint");
+  const hasKeychainEntrypoint = entries.some((entry) =>
+    entry.name === "KeychainMigrationHelper.swift"
+      && entry.isFile()
+      && !entry.isSymbolicLink());
+  if (!hasKeychainEntrypoint || entries.some((entry) =>
+    !entry.isFile()
+      || entry.isSymbolicLink()
+      || !MACOS_REVIEWED_HELPER_ENTRYPOINTS.has(entry.name))) {
+    fail("macOS helper source directory must contain only reviewed helper entrypoints");
   }
   const files = [];
   for (const relativeFile of MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES) {

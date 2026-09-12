@@ -303,19 +303,28 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 102 records / 104 executable paths: release-documentation, Codex contract,
+  // 156 records / 157 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
   // Keep these exact so any future executable still requires an ownership
   // decision.
+  // Includes the restored Electron development packaging/verifier tools, the
+  // normal Linux and Windows package proofs, macOS page-parity QA, and the
+  // protected handover-feed publisher (which defaults to a local dry run), and
+  // the native-to-Electron collector reconciliation tool (which defaults to
+  // private-copy inspection).
   // Includes the reviewed exact-output accounting child benchmark and eight
   // protected PR94 qualification entrypoints/helpers; neither is a product API.
-  // Also includes the read-only release doctor and two private release helpers.
-  // Four further records own publication reconciliation and admission reuse.
-  // Main also contributes the reviewed purchased-credit drawdown analyzer.
-  assert.equal(result.records, 102);
-  assert.equal(result.candidates.length, 104);
+  // Also includes the bounded Windows signing preflight/caller, the pinned
+  // Linux AppImage updater adapter proof, Windows native rebinding, the
+  // read-only release doctor, private release helpers,
+  // publication reconciliation, admission reuse, and the main-branch
+  // purchased-credit drawdown analyzer. The five retained 0.1.21 release tools
+  // cover incoming Sparkle validation, three disposable Mac replacement/update
+  // journeys, and qualification of an already signed Windows installer.
+  assert.equal(result.records, 156);
+  assert.equal(result.candidates.length, 157);
   assert.ok(result.aliases >= 25);
 });
 

@@ -39,14 +39,14 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 26 paths, 28 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 29 paths, 31 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 36 API paths, 37 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 39 API paths, 40 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
-| Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
+| Process protocols | Native shell, companion, analysis owners ↔ child/worker | 9 explicit runtime protocol families |
 | Cloudflare service bindings | Worker → platform-managed resources | 3 D1 bindings, 3 production R2 bindings, 1 Durable Object, 8 rate limiters, 1 assets binding, 1 cron schedule |
 | Reviewed code APIs | App/source owners → reusable modules | 5 workspace packages and 24 reviewed source-owner entrypoints |
 | JSON/wire contracts | Collectors, exports, release tooling, hosted intake | Closed versioned families, including generated staged v1.1 and frozen code-defined telemetry v1.0; see schema lifecycle inventory |
@@ -146,22 +146,27 @@ permission. Non-`GET` local mutations require the same origin and the fixed
 `X-Usage-Monitor-Local: 1` header; handlers that accept bodies additionally
 enforce their closed JSON shape and byte ceiling.
 
-`GET /api/local/timeline/window-breakdown` is the sole local API route that
-accepts a query string, and only `from` and `to` as bounded base-ten safe
-integers. Health, contribution diagnostics, diagnostic notes, and the
-hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
+`GET /api/local/timeline/window-breakdown` accepts only `from` and `to` as
+bounded base-ten safe integers. `GET /api/local/model-performance` requires
+exactly one `period` parameter with value `7`, `30`, or `all`; other query
+shapes are rejected. Health, desktop status, contribution diagnostics, diagnostic notes, the
+hosted-sign-in handoff, and model performance can answer without a completed
+Codex accounting snapshot.
 
 ### Local route inventory
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/local/health` | Companion readiness, refresh state, schema versions, and configured capabilities |
+| `GET` | `/api/local/desktop-status` | Closed lifecycle plus a current direct display allowance from bounded published-overview metadata; strict v2 notification evidence remains receipt-only. Available before the first snapshot and without account identifiers or filesystem paths. |
 | `GET` | `/api/local/diagnostics/contribution` | Closed, path-free contribution support diagnostics for the native shell |
 | `POST` | `/api/local/diagnostics/note` | Record one bounded fixed-vocabulary local diagnostic note |
 | `GET`, `POST` | `/api/local/identity/hosted-signin-handoff` | Read or update the bounded local recovery handle for an in-flight hosted sign-in |
 | `GET` | `/api/local/onboarding` | Local installation and evidence-source readiness |
 | `GET` | `/api/local/overview` | Personal dashboard headline and evidence coverage |
 | `GET` | `/api/local/cache-drop-thread-links` | Optional, generation-bound local thread-name/parent lookup for the two recent cache-drop tables; requires `X-Usage-Monitor-Local: 1` and no foreign Origin |
+| `POST` | `/api/local/work-usage/query` | Read-only local project/worktree/thread reports; closed JSON, local header and Origin/Host checks; bounded cancellable snapshots with lightweight `touch` lease renewal, transient names and bounded project/task name search before pagination |
+| `GET` | `/api/local/model-performance` | Independent device-local Codex timing aggregates for `period=7`, `period=30`, or `period=all`; reads renew a 60-second background-worker lease |
 | `GET` | `/api/local/gradient` | Quota-versus-cost gradient report data |
 | `GET` | `/api/local/weekly` | Weekly calibration report data |
 | `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
@@ -303,6 +308,12 @@ Authority vocabulary:
 - **Handoff / reattachment** — a Handoff proof establishes identity; an
   identity already bound to a participant reattaches that participant. It does
   not accept a recovery code.
+- **Accountless enrollment** — a bounded native-installation request records a
+  versioned enrollment-only ledger row keyed by the stable device ID and its
+  256-bit secret hash. It does not create participant or upload authority.
+- **Accountless ownership** — device-secret proof against that active enrollment
+  creates or renews one installation owner and versioned upload authority. It
+  does not create social consent, a session, a pairing or public-fit eligibility.
 - **Session** — hardened hosted cookie; mutations also require same-origin
   CSRF authority.
 - **Pairing code** — an expiring, one-use claim minted under Session authority
@@ -324,6 +335,9 @@ Authority vocabulary:
 | `GET` | `/api/health` | Public | Service posture and declared capabilities; not dependency readiness |
 | `GET` | `/api/ready` | Public | D1, lifecycle, reconciliation, rebuild, and upload-budget readiness |
 | `POST` | `/api/v1/enroll` | Handoff / reattachment | Consume a one-use identity proof and create a participant or reattach the identity's existing participant; recovery codes are not accepted |
+| `POST` | `/api/v1/accountless/enrollment` | Accountless enrollment | Record one bounded, versioned enrollment-only installation row when the separately configured enrollment gate is enabled; exact replays are idempotent and no participant, session, pairing, device credential, upload authority, or community eligibility is created |
+| `POST` | `/api/v1/accountless/ownership` | Accountless ownership | Prove the active enrolled device secret, then atomically create one installation owner, credential and versioned v1.1 upload authorization, or return the same existing receipt when accountless ownership is enabled; reject ambient sessions and revoked/expired enrollment without creating social consent or public-fit eligibility |
+| `POST` | `/api/v1/accountless/renewal` | Accountless ownership | Renew the same authenticated installation graph within seven days of expiry or after an offline period; preserve identity and accepted receipts, and refuse revoked, erased, policy-mismatched or inconsistent state |
 | `POST` | `/api/v1/internal/release/appcast` | Operator | Validate and atomically publish the exact Sparkle appcast object |
 | `POST` | `/api/v1/identity/google/start` | Handoff | Create state, binding, PKCE material, and a Google authorization URL |
 | `GET` | `/api/v1/identity/google/callback` | Handoff | State-bound Google OAuth callback and server-side token exchange |
@@ -607,6 +621,88 @@ operation failures return a fixed error code and matching `id`. Native smoke
 modes use process-memory storage and never inspect or migrate the developer's
 login Keychain.
 
+The Electron macOS production adapter has a fifth native capability,
+`accountless_installation`, distinct from the four-capability broker. Only its
+main-process accountless backend can select that capability; `store` and
+`remove` reject it, leaving `createIfMissing` and `deleteExact` as the permitted
+mutations. The separate inherited FD3 accountless channel carries closed
+preference, credential and status operations for the owned companion. Its
+`credential_recovery_required` marker contains no path, secret or native
+error detail and pauses the scheduler. Neither native capability names nor
+secret operations are exposed through renderer IPC or HTTP. The
+[adapter contract](../../native/macos-keychain/README.md) defines the source
+boundary; it is not installed or signed-candidate qualification.
+
+The Linux Electron companion now has a separate, source-only Secret Service
+broker at inherited FD4. Its main-owned factory must provide the existing
+native backend with a qualified cross-process mutation lease; the child never
+loads Secret Service or keytar. Protocol v1 admits only `export_identity` and
+`account_observation`, with `read`, `create_if_missing`, `replace_exact`, and
+`delete_exact`. Requests carry strictly increasing IDs and canonical 32-byte
+secrets, with a 4096-byte per-frame limit and at most 32 pending operations.
+Malformed replies or transport failure permanently refuse further requests.
+The Linux descriptor announcement is mutually exclusive with the Mac broker.
+The three local-server identity/observation entrypoints share one cached
+transport and preserve explicit development overrides. An absent or malformed
+broker cannot select a child-side credential fallback. Conditional mutations
+execute under the parent-owned lease; locked account observation stays
+unattributed with its fixed diagnostic. This does not change the private FD3
+upload-only authority, enable production selection, or establish installed
+Linux qualification. Abandoned mutations require recovery and the underlying
+backend still reports `crashRecoveryComplete: false` and `productionSafe: false`.
+
+The Linux shell package requires the exact native mutex `.node` and sidecar
+from `native/linux-credential-mutex/build/qualification`, alongside the pinned
+Linux Keytar prebuild. Both mutex files are unpacked physical files so the
+loader's descriptor-based checks remain effective. Module-owned path mapping
+handles only the fixed `app.asar` to `app.asar.unpacked` layout; source paths
+remain unchanged. Staging and artifact verification use
+`validateLinuxCredentialMutexBindingManifest` for the closed sidecar schema,
+then independently compare its size/digest against captured bytes. The runtime
+manifest keeps its existing schema and records the pair as `linux_native_binding`
+inventory rows. These three exact unpacked files are required for Linux and
+cannot broaden another target's native inventory. Native execution and
+installed qualification remain separate.
+
+The dormant Linux accountless adapter uses a separate owner-private XDG-state
+record, not the legacy provider or social credential store. Its
+[fixed native boundary](../../native/linux-credential-mutex/README.md) exposes
+only `readAccountlessInstallationCredential`,
+`createAccountlessInstallationCredentialIfMissing`, and
+`deleteAccountlessInstallationCredentialExact`, with no caller-supplied path
+or capability number. The record is exactly 32 bytes under owner-only file
+permissions; it is not encrypted at rest and remains accessible to an
+authorized process while the desktop is locked. The native-private slot `4`
+does not expand the generic `0..3` lease API or the legacy FD4 protocol. Only
+the main-owned adapter can compose this record into the existing private FD3
+accountless channel. Invalid fixed records and uncertain mutations preserve
+recovery state instead of permitting silent identity replacement. The source
+keeps `productionSafe: false` and leaves runtime selection disabled; native
+qualification, installed lifecycle and release remain separate gates.
+
+The dormant Windows accountless adapter likewise owns a separate,
+owner-private protected-state record, not a fifth legacy Credential Manager
+capability. Its [fixed native boundary](../../native/windows-filesystem/README.md)
+exposes only `read`, `createIfMissing`, and `deleteExact` for an upload-only
+32-byte installation secret; callers cannot select a capability, record name,
+or path. The fixed record and `active`/`normal` journal are plaintext at rest.
+The two private native mutex methods,
+`acquireAccountlessInstallationCredentialMutex()` and
+`releaseAccountlessInstallationCredentialMutex(lease)`, have no capability
+argument and sit outside generic IDs `0..3` and FD4. They serialize cooperating
+processes only in the current owner's `Local\` Windows session: backup copies,
+same-owner processes that bypass the contract, and other sessions remain outside
+that protection. Before a create or exact delete, the backend writes `active`;
+an uncertain mutation, malformed record, failed release, or interruption retains
+it when the write can be verified and then returns fixed recovery rather than
+silently replacing identity. If it cannot retain that marker, it returns a
+content-free operation failure without a restart-persistence claim. The
+main-owned adapter may carry the secret only through the existing private FD3
+accountless channel, never renderer IPC or HTTP. `productionSafe` remains
+`false` and runtime selection remains disabled pending native Windows x64 build,
+manifest, security, physical-runner, installed-lifecycle, signing, and release
+evidence.
+
 ### Codex app-server subprocess protocol
 
 **Sources of truth:**
@@ -663,6 +759,7 @@ module facades, but their message shapes are security- and resource-relevant:
 | Owner / source | Input boundary | Output boundary |
 |---|---|---|
 | [Replay-safe accounting rebuild child](../../src/replay-safe-accounting-rebuild-child.js) | Two owner-private temporary paths on argv: versioned JSON request and exclusive result target; parent-held stdin is the death watchdog | Canonical result file plus one bounded stdout envelope containing status and either byte count/SHA-256 or a fixed error code |
+| [Model performance worker](../../apps/local/model-performance-worker.js) | Fixed private state and Codex-home anchors, then a `stop` message; starts only through a recent timing-page reader | Bounded timing aggregate snapshots for three periods, or a fixed unavailable indication; one independent sidecar, no accounting/contribution data flow |
 | [Unified-index worker](../../src/local-unified-index-worker.js) | `workerData` with bounded lineage components, source paths/sizes, and maximum line bytes | Typed `batch` messages containing minimized events/boundaries/tools/snapshot keys, or one content-free `failed` code |
 | [Local-analysis extraction worker](../../src/local-analysis-extract-worker.js) | `workerData` with an owner-private shard path and bounded source byte-range tasks | One `{ok: true, result}` aggregate or `{ok: false, code}` fixed failure |
 
@@ -816,7 +913,7 @@ is not treated as permission for arbitrary cross-owner queries.
 
 | Store | Schema authority | Contract |
 |---|---|---|
-| Hosted primary D1 | [`apps/worker/migrations`](../../apps/worker/migrations) — 40 ordered SQL migrations | Participant/session/device state, contribution metadata, aggregate revisions, retention/reconciliation, controls, and admin caches |
+| Hosted primary D1 | [`apps/worker/migrations`](../../apps/worker/migrations) — 48 ordered SQL migrations | Participant/session/device state, contribution metadata, aggregate revisions, retention/reconciliation, controls, and admin caches |
 | Hosted deletion-ledger D1 | [`apps/worker/deletion-ledger-migrations`](../../apps/worker/deletion-ledger-migrations) — 2 ordered SQL migrations | Deletion tombstones and identity re-enrollment cooldowns, segregated from the primary store |
 | Dogfood guard D1 | [`apps/worker/dogfood-update-guard-migrations`](../../apps/worker/dogfood-update-guard-migrations) — 1 SQL migration | Appcast operator nonce replay ledger only |
 | Hosted `QUARANTINE` R2 | Worker quarantine/reconciliation owners | Encrypted contribution objects addressed by fixed stored keys and reconciled against accepted metadata |
@@ -828,6 +925,7 @@ The owned local SQLite surfaces are:
 | Domain | Storage owners |
 |---|---|
 | Local evidence and accounting | [`local-collector-state.js`](../../src/local-collector-state.js), [`local-unified-index.js`](../../src/local-unified-index.js), [`local-analysis-index.js`](../../src/local-analysis-index.js), and its private [`local-analysis-extract-worker.js`](../../src/local-analysis-extract-worker.js) shard writer |
+| Model performance timing | [`inference-timing-store.js`](../../src/platform/inference-timing-store.js): owner-only `inference-timing-v2/timing-experiment.sqlite` below the companion state root; method and SQLite user version 2, maximum 256 MiB |
 | Claude shadow pipeline | [`claude-desktop-incremental-canonicalizer.js`](../../src/claude-desktop-incremental-canonicalizer.js), [`claude-desktop-ledger-prototype.js`](../../src/claude-desktop-ledger-prototype.js), [`claude-desktop-pricing-cache.js`](../../src/claude-desktop-pricing-cache.js), [`claude-desktop-shadow-store.js`](../../src/claude-desktop-shadow-store.js) |
 | Contribution and export | [`local-contribution-sync-queue-storage.js`](../../src/platform/local-contribution-sync-queue-storage.js), [`owner-only-export-workspace-storage.js`](../../src/platform/owner-only-export-workspace-storage.js), [`export-set-verification-storage.js`](../../src/platform/export-set-verification-storage.js) |
 | Windows qualification | [`windows-credential-operation-audit.js`](../../src/platform/windows-credential-operation-audit.js), a bounded local audit store rather than a shipping credential backend |
@@ -837,6 +935,13 @@ migration or replacement. Temporary local-analysis shards are part of the
 local-analysis schema contract; the worker is not an independent public
 database API. The replay-safe accounting cache is stored through the local
 collector-state owner rather than creating another general-purpose store.
+
+The timing sidecar stores one aggregate per completed turn, local HMAC keys,
+source cursors, and bounded pending reconstruction state. It retains no raw
+session content or identifiers. Version 1 or otherwise incompatible stores
+are preserved and refused; the accounting index is not migrated. Its POSIX
+permission contract remains unavailable on Windows until a platform adapter
+is qualified. This source inventory does not qualify an installed release.
 
 Generated or mirrored schemas must be changed through their generation/check
 commands rather than edited into divergence:

@@ -19,11 +19,13 @@ the companion's derived state. See the maintained
 `GET /api/local/cache-drop-thread-links` independently resolves those recent
 rows against the same published index generation, then reads explicit display
 names from the selected Codex home's `session_index.jsonl` and bounded
-worker/parent metadata from `state_5.sqlite`. It never reads prompt-bearing
-`threads.title` or source transcripts. The endpoint requires the local custom
-header, refuses foreign origins and query strings, returns `no-store`, and
-does not persist its response or modify the source databases. Missing metadata
-does not fail an accounting refresh. See the
+worker/parent metadata from `state_5.sqlite`. For a `guardian_review` row only,
+it reads the first bounded `session_meta` header from the selected,
+owner-controlled session to verify that row's explicit parent UUID. It never
+reads prompt-bearing `threads.title`, first messages, or source transcripts.
+The endpoint requires the local custom header, refuses foreign origins and
+query strings, returns `no-store`, and does not persist its response or modify
+the source databases. Missing metadata does not fail an accounting refresh. See the
 [accepted local-link boundary](../../docs/decisions/2026-08-30-local-cache-drop-thread-links.md).
 
 ## Run
@@ -294,7 +296,11 @@ is for acquisition, downloads, documentation, and delayed public community
 aggregates; it does not receive permission to read Codex files and is not a
 substitute for the personal dashboard.
 
-Contribution is off by default. The affirmative path requires:
+The native/standalone contribution path is off by default. The Electron
+workstream uses the [accepted accountless policy](../../docs/decisions/2026-09-04-accountless-sharing-policy.md)
+and disables this legacy hosted transport while accountless upload ownership
+is completed. The following gates continue to describe the legacy path:
+
 
 1. an explicit consent choice;
 2. local preparation of a bounded content-free pseudonymous set;

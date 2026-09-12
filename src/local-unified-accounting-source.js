@@ -3,6 +3,8 @@ import { lstat } from "node:fs/promises";
 import { isValidQuotaWindowDuration } from "@app-usagemonitor/quota-analysis";
 
 import {
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
@@ -312,8 +314,19 @@ function parserCompatibility(database, contractVersion, generationId) {
   }
   const uniqueParserVersions = [...new Set(parserVersions)];
   const uniqueContractVersions = [...new Set(contractVersions)];
+  // The current writer stamps inherited models and the approved missing
+  // cache-write zero assumption independently. These four exact variants use
+  // the same counter/replay algorithm; preserve them in the receipt. Partial
+  // salvage stamps (including suffixed ones), older parsers and unknown mixed
+  // variants remain incompatible.
+  const currentUsageProvenanceOnly = uniqueParserVersions.every((version) => (
+    version === LOCAL_UNIFIED_INDEX_PARSER_VERSION
+      || version === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION
+      || version === `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-cache-write-zero`
+      || version === `${LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION}-cache-write-zero`
+  ));
   return {
-    status: uniqueParserVersions.length === 1
+    status: uniqueParserVersions.length === 1 || currentUsageProvenanceOnly
       ? "compatible"
       : "mixed_parser_versions",
     parserVersions: uniqueParserVersions,
@@ -1580,8 +1593,7 @@ export function createLocalUnifiedAccountingSource({
           provenContractVersion,
           proven.generationId,
         );
-        if (provenCompatibility.status !== "compatible"
-            && proven.status === "complete") {
+        if (provenCompatibility.status !== "compatible") {
           proven.status = "partial";
           proven.generationProof = false;
           proven.blockReason = "mixed_parser_versions";

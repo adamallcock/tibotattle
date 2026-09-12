@@ -188,6 +188,15 @@ Failure CredentialMutexContended() { return {"CREDENTIAL_MUTEX_CONTENDED"}; }
 Failure CredentialMutexAbandoned() { return {"CREDENTIAL_MUTEX_ABANDONED"}; }
 Failure CredentialMutexReleaseFailed() { return {"CREDENTIAL_MUTEX_RELEASE_FAILED"}; }
 Failure CredentialMutexForeign() { return {"CREDENTIAL_MUTEX_FOREIGN"}; }
+Failure AccountlessInstallationCredentialMutexContended() {
+  return {"ACCOUNTLESS_INSTALLATION_CREDENTIAL_MUTEX_CONTENDED"};
+}
+Failure AccountlessInstallationCredentialMutexReleaseFailed() {
+  return {"ACCOUNTLESS_INSTALLATION_CREDENTIAL_MUTEX_RELEASE_FAILED"};
+}
+Failure AccountlessInstallationCredentialMutexForeign() {
+  return {"ACCOUNTLESS_INSTALLATION_CREDENTIAL_MUTEX_FOREIGN"};
+}
 Failure CredentialAuditGuardReleaseFailed() {
   return {"CREDENTIAL_AUDIT_GUARD_RELEASE_FAILED"};
 }
@@ -299,6 +308,10 @@ struct ParsedPath {
   std::vector<std::wstring> components;
 };
 
+struct ParsedRelativePath {
+  std::vector<std::wstring> components;
+};
+
 bool IsDriveLetter(wchar_t value) {
   return (value >= L'A' && value <= L'Z') || (value >= L'a' && value <= L'z');
 }
@@ -365,6 +378,38 @@ bool ParsePath(const std::wstring& supplied, ParsedPath* result) {
     offset = 3;
   }
 
+  while (offset < path.size()) {
+    while (offset < path.size() && path[offset] == L'\\') ++offset;
+    if (offset >= path.size()) break;
+    const std::size_t start = offset;
+    while (offset < path.size() && path[offset] != L'\\') ++offset;
+    std::wstring component = path.substr(start, offset - start);
+    if (component.empty() || component == L"." || component == L".."
+        || component.back() == L'.' || component.back() == L' '
+        || IsReservedDeviceName(component)
+        || component.find_first_of(L"<>:\"|?*") != std::wstring::npos) {
+      return false;
+    }
+    result->components.push_back(std::move(component));
+  }
+  return !result->components.empty();
+}
+
+// Protected-state child operations receive a root identity separately from a
+// relative child name.  Parse that name again inside the native boundary: a
+// JavaScript lexical check is useful input hygiene, but it must not become the
+// authority that decides whether a native operation stays below its held root.
+bool ParseRelativePath(const std::wstring& supplied, ParsedRelativePath* result) {
+  if (supplied.empty() || supplied.find(L'\0') != std::wstring::npos) return false;
+  std::wstring path = supplied;
+  std::replace(path.begin(), path.end(), L'/', L'\\');
+  if (path.rfind(L"\\\\?\\", 0) == 0
+      || path.rfind(L"\\\\", 0) == 0
+      || path.front() == L'\\'
+      || (path.size() >= 2 && IsDriveLetter(path[0]) && path[1] == L':')) {
+    return false;
+  }
+  std::size_t offset = 0;
   while (offset < path.size()) {
     while (offset < path.size() && path[offset] == L'\\') ++offset;
     if (offset >= path.size()) break;
@@ -705,6 +750,20 @@ struct RelativeHandles {
   }
 };
 
+struct ScopedHandle {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+
+  ~ScopedHandle() {
+    if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+  }
+
+  HANDLE release() {
+    const HANDLE result = handle;
+    handle = INVALID_HANDLE_VALUE;
+    return result;
+  }
+};
+
 bool OpenRootDirectory(
     const std::wstring& root,
     HANDLE* result,
@@ -807,19 +866,21 @@ struct OpenRelativeOptions {
   PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
 };
 
-bool OpenRelativePath(
-    const ParsedPath& parsed,
+bool OpenRelativeComponents(
+    HANDLE startingParent,
+    const std::vector<std::wstring>& components,
     const OpenRelativeOptions& options,
     RelativeHandles* opened,
     bool* finalMissing,
     Failure* failure) {
   *finalMissing = false;
-  HANDLE root = INVALID_HANDLE_VALUE;
-  if (!OpenRootDirectory(parsed.root, &root, failure)) return false;
-  opened->parents.push_back(root);
-  HANDLE current = root;
-  for (std::size_t index = 0; index < parsed.components.size(); ++index) {
-    const bool final = index + 1 == parsed.components.size();
+  if (startingParent == INVALID_HANDLE_VALUE || components.empty()) {
+    *failure = InvalidPath();
+    return false;
+  }
+  HANDLE current = startingParent;
+  for (std::size_t index = 0; index < components.size(); ++index) {
+    const bool final = index + 1 == components.size();
     const ULONG typeOption = !final
         ? kFileDirectoryFile
         : options.finalDirectoryKnown
@@ -831,7 +892,7 @@ bool OpenRelativePath(
     // traversing ancestors.  Creation of missing directories is a separate
     // parent-handle operation in EnsureDirectoryCallback below.
     const DWORD access = final ? options.access : kDirectoryTraversalAccess;
-    const std::size_t remainingComponents = parsed.components.size() - index - 1;
+    const std::size_t remainingComponents = components.size() - index - 1;
     const bool protectedAncestor = !final
         && options.protectedAncestorDepth > 0
         && remainingComponents <= options.protectedAncestorDepth;
@@ -848,7 +909,7 @@ bool OpenRelativePath(
     ULONG_PTR information = 0;
     if (!OpenRelativeComponent(
             current,
-            parsed.components[index],
+            components[index],
             access,
             shareMode,
             disposition,
@@ -902,6 +963,24 @@ bool OpenRelativePath(
   }
   *failure = InvalidPath();
   return false;
+}
+
+bool OpenRelativePath(
+    const ParsedPath& parsed,
+    const OpenRelativeOptions& options,
+    RelativeHandles* opened,
+    bool* finalMissing,
+    Failure* failure) {
+  HANDLE root = INVALID_HANDLE_VALUE;
+  if (!OpenRootDirectory(parsed.root, &root, failure)) return false;
+  opened->parents.push_back(root);
+  return OpenRelativeComponents(
+      root,
+      parsed.components,
+      options,
+      opened,
+      finalMissing,
+      failure);
 }
 
 bool ParseAndValidatePath(
@@ -1147,13 +1226,16 @@ bool GetArguments(
     napi_callback_info info,
     std::vector<napi_value>* arguments,
     std::size_t expected) {
-  napi_value values[3] = {};
-  std::size_t count = 3;
-  if (napi_get_cb_info(env, info, &count, values, nullptr, nullptr) != napi_ok
+  // The protected child replacement primitive has five fixed arguments. Keep
+  // this capacity explicit so an oversized callback cannot silently truncate
+  // its native inputs.
+  std::array<napi_value, 5> values{};
+  std::size_t count = values.size();
+  if (napi_get_cb_info(env, info, &count, values.data(), nullptr, nullptr) != napi_ok
       || count != expected) {
     return false;
   }
-  arguments->assign(values, values + count);
+  arguments->assign(values.begin(), values.begin() + count);
   return true;
 }
 
@@ -1191,14 +1273,25 @@ bool OpenSecureExisting(
   return true;
 }
 
-bool ReadHandle(HANDLE handle, std::vector<std::uint8_t>* bytes, Failure* failure) {
+bool ReadHandleBounded(
+    HANDLE handle,
+    std::size_t maximumBytes,
+    std::vector<std::uint8_t>* bytes,
+    Failure* failure) {
+  if (maximumBytes == 0 || maximumBytes > kMaximumFileBytes) {
+    *failure = InvalidConfiguration();
+    return false;
+  }
   LARGE_INTEGER size{};
   if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0
-      || static_cast<unsigned long long>(size.QuadPart) > kMaximumFileBytes) {
-    *failure = size.QuadPart > static_cast<LONGLONG>(kMaximumFileBytes)
+      || static_cast<unsigned long long>(size.QuadPart) > maximumBytes) {
+    *failure = size.QuadPart > static_cast<LONGLONG>(maximumBytes)
         ? TooLarge() : OperationFailed();
     return false;
   }
+  // The requested bound is checked against the handle's current size before
+  // allocating the result vector. This is the native authority for protected
+  // state reads; JavaScript performs only a second defensive check.
   bytes->assign(static_cast<std::size_t>(size.QuadPart), 0);
   std::size_t offset = 0;
   while (offset < bytes->size()) {
@@ -1213,6 +1306,65 @@ bool ReadHandle(HANDLE handle, std::vector<std::uint8_t>* bytes, Failure* failur
       return false;
     }
     offset += read;
+  }
+  return true;
+}
+
+bool ReadHandle(HANDLE handle, std::vector<std::uint8_t>* bytes, Failure* failure) {
+  return ReadHandleBounded(handle, kMaximumFileBytes, bytes, failure);
+}
+
+// Open one child below an authenticated root.  The caller supplies the root
+// identity it observed before starting the operation.  We resolve that root
+// once, compare the identity while its handle is held, then resolve every
+// child component relative to that exact handle.  Subsequent string-path
+// changes cannot redirect the child operation outside this root object.
+bool OpenRootBoundChild(
+    const std::wstring& rootPath,
+    const HandleIdentity& expectedRoot,
+    const std::wstring& childPath,
+    const OpenRelativeOptions& options,
+    ScopedHandle* root,
+    ParsedRelativePath* parsed,
+    RelativeHandles* opened,
+    Failure* failure) {
+  if (root == nullptr || parsed == nullptr || opened == nullptr
+      || root->handle != INVALID_HANDLE_VALUE) {
+    *failure = InvalidConfiguration();
+    return false;
+  }
+  if (!ParseRelativePath(childPath, parsed)) {
+    *failure = InvalidPath();
+    return false;
+  }
+  HandleIdentity observedRoot;
+  if (!OpenSecureExisting(
+          rootPath,
+          true,
+          kDirectoryTraversalAccess,
+          kDirectoryShareMode,
+          &root->handle,
+          &observedRoot,
+          failure)) {
+    return false;
+  }
+  if (!EqualIdentity(observedRoot, expectedRoot)) {
+    *failure = IdentityMismatch();
+    return false;
+  }
+  bool finalMissing = false;
+  if (!OpenRelativeComponents(
+          root->handle,
+          parsed->components,
+          options,
+          opened,
+          &finalMissing,
+          failure)) {
+    return false;
+  }
+  if (finalMissing || opened->final == INVALID_HANDLE_VALUE) {
+    *failure = NotFound();
+    return false;
   }
   return true;
 }
@@ -1311,6 +1463,158 @@ std::wstring TemporaryReplacementName() {
   return stream.str();
 }
 
+// Replace an already-open file through its held parent directory.  Both the
+// ordinary path API and the protected-child API use this implementation so the
+// latter does not fall back to a path reopen after it has authenticated its
+// root handle. `target` is cleared only when this routine closes it immediately
+// before the final rename; its owner can then safely retain normal cleanup on
+// every earlier failure path.
+bool ReplaceOpenFile(
+    HANDLE* target,
+    HANDLE parent,
+    const std::wstring& targetName,
+    const HandleIdentity& expected,
+    const std::uint8_t* bytes,
+    std::size_t byteCount,
+    const ParsedPath* expectedPath,
+    HandleIdentity* result,
+    Failure* failure) {
+  if (target == nullptr || *target == INVALID_HANDLE_VALUE
+      || parent == INVALID_HANDLE_VALUE || targetName.empty()
+      || (bytes == nullptr && byteCount != 0) || byteCount > kMaximumFileBytes) {
+    *failure = InvalidConfiguration();
+    return false;
+  }
+  HandleIdentity current;
+  if (!ValidateSecurity(*target, false, failure, &current)
+      || !EqualIdentity(current, expected)) {
+    if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+    return false;
+  }
+
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlySecurity(&ownerSid, &acl, &descriptor, &attributes)) {
+    *failure = OperationFailed();
+    return false;
+  }
+  HANDLE replacement = INVALID_HANDLE_VALUE;
+  std::wstring temporaryName;
+  ULONG_PTR createInformation = 0;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    temporaryName = TemporaryReplacementName();
+    if (OpenRelativeComponent(
+            parent,
+            temporaryName,
+            FILE_READ_DATA | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
+                | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ,
+            kFileCreate,
+            kFileNonDirectoryFile,
+            attributes.lpSecurityDescriptor,
+            &replacement,
+            &createInformation,
+            failure)) {
+      break;
+    }
+    if (failure->code != AlreadyExists().code) {
+      FreeOwnerOnlySecurity(acl, descriptor);
+      return false;
+    }
+  }
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (replacement == INVALID_HANDLE_VALUE) {
+    *failure = AlreadyExists();
+    return false;
+  }
+
+  bool renamed = false;
+  bool success = WriteAndFlushHandle(replacement, bytes, byteCount, failure)
+      && SetOwnerOnlyDacl(replacement);
+  HandleIdentity replacementIdentity;
+  if (success && !ValidateSecurity(replacement, false, failure, &replacementIdentity)) {
+    success = false;
+  }
+  if (success) {
+    // Re-open the destination relative to the still-held parent immediately
+    // before rename. This closes ordinary application races; a hostile
+    // same-user process can still swap the name in the final syscall window,
+    // which is why this binding remains productionSafe=false.
+    HANDLE check = INVALID_HANDLE_VALUE;
+    ULONG_PTR checkInformation = 0;
+    if (!OpenRelativeComponent(
+            parent,
+            targetName,
+            DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            kFileOpen,
+            kFileNonDirectoryFile,
+            nullptr,
+            &check,
+            &checkInformation,
+            failure)) {
+      success = false;
+    } else {
+      HandleIdentity checkIdentity;
+      success = ValidateSecurity(check, false, failure, &checkIdentity)
+          && EqualIdentity(checkIdentity, expected);
+      if (!success && failure->code == OperationFailed().code) *failure = IdentityMismatch();
+      CloseHandle(check);
+    }
+  }
+  if (success) {
+    // Legacy FileRenameInformation rejects replacement while the destination
+    // has an open handle, even when that handle shares delete access. Keep the
+    // identity-bound handles through the final check, then close both before
+    // rename. The residual same-user swap window is why productionSafe=false.
+    CloseHandle(*target);
+    *target = INVALID_HANDLE_VALUE;
+    success = RenameHandleRelative(replacement, parent, targetName, failure);
+    renamed = success;
+  }
+  if (success) {
+    // The replacement handle remains valid after rename. Verify both content
+    // and the name-to-handle identity before exposing the new identity.
+    std::vector<std::uint8_t> persisted;
+    LARGE_INTEGER beginning{};
+    success = SetFilePointerEx(replacement, beginning, nullptr, FILE_BEGIN) != FALSE
+        && ReadHandle(replacement, &persisted, failure)
+        && persisted.size() == byteCount
+        && std::equal(persisted.begin(), persisted.end(), bytes);
+    if (success) {
+      HANDLE check = INVALID_HANDLE_VALUE;
+      ULONG_PTR checkInformation = 0;
+      if (!OpenRelativeComponent(
+              parent,
+              targetName,
+              READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+              kFileOpen,
+              kFileNonDirectoryFile,
+              nullptr,
+              &check,
+              &checkInformation,
+              failure)) {
+        success = false;
+      } else {
+        HandleIdentity checkIdentity;
+        success = ValidateSecurity(check, false, failure, &checkIdentity)
+            && EqualIdentity(checkIdentity, replacementIdentity)
+            && ResolveFinalPath(check, expectedPath);
+        if (!success && failure->code == OperationFailed().code) *failure = IdentityMismatch();
+        CloseHandle(check);
+      }
+    }
+  }
+  if (!success && !renamed && !MarkHandleForDeletion(replacement)) *failure = OperationFailed();
+  CloseHandle(replacement);
+  if (!success) return false;
+  *result = replacementIdentity;
+  return true;
+}
+
 napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
   std::vector<napi_value> arguments;
   if (!GetArguments(env, info, &arguments, 3)) return ThrowFailure(env, InvalidConfiguration());
@@ -1344,129 +1648,19 @@ napi_value ReplaceFileCallback(napi_env env, napi_callback_info info) {
       || finalMissing || opened.final == INVALID_HANDLE_VALUE) {
     return ThrowFailure(env, failure);
   }
-  HandleIdentity current;
-  if (!ValidateSecurity(opened.final, false, &failure, &current)
-      || !EqualIdentity(current, expected)) {
-    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
-    return ThrowFailure(env, failure);
-  }
   if (opened.parents.empty()) return ThrowFailure(env, OperationFailed());
   HANDLE parent = opened.parents.back();
-
-  std::vector<BYTE> ownerSid;
-  PACL acl = nullptr;
-  PSECURITY_DESCRIPTOR descriptor = nullptr;
-  SECURITY_ATTRIBUTES attributes{};
-  if (!BuildOwnerOnlySecurity(&ownerSid, &acl, &descriptor, &attributes)) {
-    return ThrowFailure(env, OperationFailed());
-  }
-  HANDLE replacement = INVALID_HANDLE_VALUE;
-  std::wstring temporaryName;
-  ULONG_PTR createInformation = 0;
-  for (int attempt = 0; attempt < 8; ++attempt) {
-    temporaryName = TemporaryReplacementName();
-    if (OpenRelativeComponent(
-            parent,
-            temporaryName,
-            FILE_READ_DATA | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
-                | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_SHARE_READ,
-            kFileCreate,
-            kFileNonDirectoryFile,
-            attributes.lpSecurityDescriptor,
-            &replacement,
-            &createInformation,
-            &failure)) {
-      break;
-    }
-    if (failure.code != AlreadyExists().code) {
-      FreeOwnerOnlySecurity(acl, descriptor);
-      return ThrowFailure(env, failure);
-    }
-  }
-  FreeOwnerOnlySecurity(acl, descriptor);
-  if (replacement == INVALID_HANDLE_VALUE) return ThrowFailure(env, AlreadyExists());
-
-  bool renamed = false;
-  bool success = WriteAndFlushHandle(replacement, bytes, byteCount, &failure)
-      && SetOwnerOnlyDacl(replacement);
   HandleIdentity replacementIdentity;
-  if (success && !ValidateSecurity(replacement, false, &failure, &replacementIdentity)) {
-    success = false;
-  }
-  if (success) {
-    // Re-open the destination relative to the still-held parent immediately
-    // before rename.  This closes ordinary application races; a hostile
-    // same-user process can still swap the name in the final syscall window,
-    // which is why this binding remains productionSafe=false.
-    HANDLE check = INVALID_HANDLE_VALUE;
-    ULONG_PTR checkInformation = 0;
-    if (!OpenRelativeComponent(
-            parent,
-            parsed.components.back(),
-            DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            kFileOpen,
-            kFileNonDirectoryFile,
-            nullptr,
-            &check,
-            &checkInformation,
-            &failure)) {
-      success = false;
-    } else {
-      HandleIdentity checkIdentity;
-      success = ValidateSecurity(check, false, &failure, &checkIdentity)
-          && EqualIdentity(checkIdentity, expected);
-      if (!success && failure.code == OperationFailed().code) failure = IdentityMismatch();
-      CloseHandle(check);
-    }
-  }
-  if (success) {
-    // Legacy FileRenameInformation rejects replacement while the destination
-    // has an open handle, even when that handle shares delete access. Keep the
-    // identity-bound handles through the final check, then close both before
-    // rename. The residual same-user swap window is why productionSafe=false.
-    opened.closeFinal();
-    success = RenameHandleRelative(replacement, parent, parsed.components.back(), &failure);
-    renamed = success;
-  }
-  if (success) {
-    // The replacement handle remains valid after rename.  Verify both content
-    // and the name-to-handle identity before exposing the new identity.
-    std::vector<std::uint8_t> persisted;
-    LARGE_INTEGER beginning{};
-    success = SetFilePointerEx(replacement, beginning, nullptr, FILE_BEGIN) != FALSE
-        && ReadHandle(replacement, &persisted, &failure)
-        && persisted.size() == byteCount
-        && std::equal(persisted.begin(), persisted.end(), bytes);
-    if (success) {
-      HANDLE check = INVALID_HANDLE_VALUE;
-      ULONG_PTR checkInformation = 0;
-      if (!OpenRelativeComponent(
-              parent,
-              parsed.components.back(),
-              READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-              kFileOpen,
-              kFileNonDirectoryFile,
-              nullptr,
-              &check,
-              &checkInformation,
-              &failure)) {
-        success = false;
-      } else {
-        HandleIdentity checkIdentity;
-        success = ValidateSecurity(check, false, &failure, &checkIdentity)
-            && EqualIdentity(checkIdentity, replacementIdentity)
-            && ResolveFinalPath(check, &parsed);
-        if (!success && failure.code == OperationFailed().code) failure = IdentityMismatch();
-        CloseHandle(check);
-      }
-    }
-  }
-  if (!success && !renamed && !MarkHandleForDeletion(replacement)) failure = OperationFailed();
-  CloseHandle(replacement);
-  if (!success) return ThrowFailure(env, failure);
+  if (!ReplaceOpenFile(
+          &opened.final,
+          parent,
+          parsed.components.back(),
+          expected,
+          bytes,
+          byteCount,
+          &parsed,
+          &replacementIdentity,
+          &failure)) return ThrowFailure(env, failure);
   return IdentityValue(env, replacementIdentity);
 }
 
@@ -1823,6 +2017,307 @@ napi_value DeleteFileCallback(napi_env env, napi_callback_info info) {
   return result;
 }
 
+// These root-bound child callbacks are used by the protected state store.
+// They deliberately receive the root identity on every operation rather than
+// caching a path-derived decision in JavaScript.  OpenRootBoundChild validates
+// that identity and then walks only below the held root handle.
+napi_value InspectProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 3)) return ThrowFailure(env, InvalidConfiguration());
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &childPath)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+
+  Failure failure = OperationFailed();
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  options.disposition = kFileOpen;
+  ScopedHandle root;
+  ParsedRelativePath parsed;
+  RelativeHandles opened;
+  if (!OpenRootBoundChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          options,
+          &root,
+          &parsed,
+          &opened,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity identity;
+  SecuritySnapshot security;
+  if (!ValidateSecurity(opened.final, false, &failure, &identity, &security)
+      || !ResolveFinalPath(opened.final)) {
+    return ThrowFailure(env, failure);
+  }
+  return MetadataValue(env, identity, security, true);
+}
+
+napi_value ReadProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) return ThrowFailure(env, InvalidConfiguration());
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  std::uint32_t maximumBytes = 0;
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &childPath)
+      || !GetUint32(env, arguments[3], &maximumBytes)
+      || maximumBytes == 0
+      || maximumBytes > kMaximumFileBytes) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+
+  Failure failure = OperationFailed();
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ;
+  options.disposition = kFileOpen;
+  ScopedHandle root;
+  ParsedRelativePath parsed;
+  RelativeHandles opened;
+  if (!OpenRootBoundChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          options,
+          &root,
+          &parsed,
+          &opened,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity identity;
+  if (!ValidateSecurity(opened.final, false, &failure, &identity)) {
+    return ThrowFailure(env, failure);
+  }
+  std::vector<std::uint8_t> bytes;
+  if (!ReadHandleBounded(opened.final, maximumBytes, &bytes, &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  napi_value result;
+  napi_value data;
+  napi_create_object(env, &result);
+  napi_create_buffer_copy(
+      env,
+      bytes.size(),
+      bytes.empty() ? nullptr : bytes.data(),
+      nullptr,
+      &data);
+  napi_set_named_property(env, result, "data", data);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, identity));
+  return result;
+}
+
+napi_value CreateProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) return ThrowFailure(env, InvalidConfiguration());
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  const std::uint8_t* bytes = nullptr;
+  std::size_t byteCount = 0;
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &childPath)
+      || !GetBuffer(env, arguments[3], &bytes, &byteCount)
+      || byteCount > kMaximumFileBytes) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+
+  OwnerOnlySecurityResources security;
+  if (!security.initialize()) return ThrowFailure(env, OperationFailed());
+  Failure failure = OperationFailed();
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC
+      | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ;
+  options.disposition = kFileCreate;
+  options.ownerOnlyOnCreate = true;
+  options.securityDescriptor = security.attributes.lpSecurityDescriptor;
+  ScopedHandle root;
+  ParsedRelativePath parsed;
+  RelativeHandles opened;
+  if (!OpenRootBoundChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          options,
+          &root,
+          &parsed,
+          &opened,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+
+  HANDLE created = opened.releaseFinal();
+  if (created == INVALID_HANDLE_VALUE) return ThrowFailure(env, OperationFailed());
+  HandleIdentity createdIdentity;
+  bool success = WriteAndFlushHandle(created, bytes, byteCount, &failure)
+      && SetOwnerOnlyDacl(created)
+      && ValidateSecurity(created, false, &failure, &createdIdentity);
+  if (!success && !MarkHandleForDeletion(created)) failure = OperationFailed();
+  CloseHandle(created);
+  if (!success) return ThrowFailure(env, failure);
+
+  // Confirm that the newly-created identity is still the child of the same
+  // held root.  This never re-resolves rootPath after the authenticated root
+  // handle has been acquired.
+  RelativeHandles reopened;
+  OpenRelativeOptions verifyOptions;
+  verifyOptions.finalDirectoryKnown = true;
+  verifyOptions.finalDirectory = false;
+  verifyOptions.access = GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  verifyOptions.shareMode = FILE_SHARE_READ;
+  verifyOptions.disposition = kFileOpen;
+  bool finalMissing = false;
+  if (!OpenRelativeComponents(
+          root.handle,
+          parsed.components,
+          verifyOptions,
+          &reopened,
+          &finalMissing,
+          &failure)
+      || finalMissing
+      || reopened.final == INVALID_HANDLE_VALUE) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity reopenedIdentity;
+  if (!ValidateSecurity(reopened.final, false, &failure, &reopenedIdentity)
+      || !ResolveFinalPath(reopened.final)) {
+    return ThrowFailure(env, failure);
+  }
+  if (!EqualIdentity(createdIdentity, reopenedIdentity)) {
+    return ThrowFailure(env, IdentityMismatch());
+  }
+  return IdentityValue(env, reopenedIdentity);
+}
+
+napi_value DeleteProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 4)) return ThrowFailure(env, InvalidConfiguration());
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  HandleIdentity expectedChild;
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &childPath)
+      || !ParseExpectedIdentity(env, arguments[3], &expectedChild)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+
+  Failure failure = OperationFailed();
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  options.disposition = kFileOpen;
+  ScopedHandle root;
+  ParsedRelativePath parsed;
+  RelativeHandles opened;
+  if (!OpenRootBoundChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          options,
+          &root,
+          &parsed,
+          &opened,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  HandleIdentity current;
+  if (!ValidateSecurity(opened.final, false, &failure, &current)) {
+    return ThrowFailure(env, failure);
+  }
+  if (!EqualIdentity(current, expectedChild)) {
+    return ThrowFailure(env, IdentityMismatch());
+  }
+  if (!MarkHandleForDeletion(opened.final)) {
+    return ThrowFailure(env, FromLastError());
+  }
+  napi_value result;
+  napi_create_object(env, &result);
+  napi_value deleted;
+  napi_get_boolean(env, true, &deleted);
+  napi_set_named_property(env, result, "deleted", deleted);
+  napi_set_named_property(env, result, "identity", IdentityValue(env, current));
+  return result;
+}
+
+napi_value ReplaceProtectedChildCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 5)) return ThrowFailure(env, InvalidConfiguration());
+  std::wstring rootPath;
+  std::wstring childPath;
+  HandleIdentity expectedRoot;
+  HandleIdentity expectedChild;
+  const std::uint8_t* bytes = nullptr;
+  std::size_t byteCount = 0;
+  if (!GetString(env, arguments[0], &rootPath)
+      || !ParseExpectedIdentity(env, arguments[1], &expectedRoot)
+      || !GetString(env, arguments[2], &childPath)
+      || !ParseExpectedIdentity(env, arguments[3], &expectedChild)
+      || !GetBuffer(env, arguments[4], &bytes, &byteCount)
+      || byteCount > kMaximumFileBytes) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+
+  Failure failure = OperationFailed();
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  options.disposition = kFileOpen;
+  ScopedHandle root;
+  ParsedRelativePath parsed;
+  RelativeHandles opened;
+  if (!OpenRootBoundChild(
+          rootPath,
+          expectedRoot,
+          childPath,
+          options,
+          &root,
+          &parsed,
+          &opened,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  const HANDLE parent = opened.parents.empty() ? root.handle : opened.parents.back();
+  HandleIdentity replacementIdentity;
+  if (!ReplaceOpenFile(
+          &opened.final,
+          parent,
+          parsed.components.back(),
+          expectedChild,
+          bytes,
+          byteCount,
+          nullptr,
+          &replacementIdentity,
+          &failure)) {
+    return ThrowFailure(env, failure);
+  }
+  return IdentityValue(env, replacementIdentity);
+}
+
 struct CredentialAuditFileGuard {
   std::vector<HANDLE> handles;
   bool active = false;
@@ -2006,10 +2501,16 @@ napi_value ReleaseCredentialAuditFileGuardCallback(
   return undefined;
 }
 
+enum class CredentialMutexLeaseKind {
+  kLegacyCapability,
+  kAccountlessInstallationCredential,
+};
+
 struct CredentialMutexLease {
   HANDLE handle = nullptr;
   DWORD ownerThreadId = 0;
   bool active = false;
+  CredentialMutexLeaseKind kind = CredentialMutexLeaseKind::kLegacyCapability;
 };
 
 std::array<CredentialMutexLease*, 256> gCredentialMutexLeases{};
@@ -2095,6 +2596,22 @@ bool CredentialMutexName(std::uint32_t capabilityId, std::wstring* name) {
   return true;
 }
 
+// This fixed name deliberately does not accept a caller capability ID. It
+// protects only the separately-owned accountless installation credential and
+// must never become a fifth route through the legacy FD4 capability map.
+bool AccountlessInstallationCredentialMutexName(std::wstring* name) {
+  std::vector<BYTE> ownerSid;
+  if (!GetCurrentUserSid(&ownerSid)) return false;
+  LPWSTR sidText = nullptr;
+  if (!ConvertSidToStringSidW(ownerSid.data(), &sidText) || sidText == nullptr) {
+    return false;
+  }
+  *name = L"Local\\TiboTattle-AccountlessInstallationCredential-v1-";
+  name->append(sidText);
+  LocalFree(sidText);
+  return true;
+}
+
 napi_value AcquireCredentialMutexCallback(napi_env env, napi_callback_info info) {
   std::vector<napi_value> arguments;
   if (!GetArguments(env, info, &arguments, 1)) {
@@ -2153,6 +2670,7 @@ napi_value AcquireCredentialMutexCallback(napi_env env, napi_callback_info info)
       handle,
       GetCurrentThreadId(),
       true,
+      CredentialMutexLeaseKind::kLegacyCapability,
   };
   if (lease == nullptr) {
     ReleaseMutex(handle);
@@ -2205,7 +2723,8 @@ napi_value ReleaseCredentialMutexCallback(napi_env env, napi_callback_info info)
   if (!IsIssuedCredentialMutexLease(lease)) {
     return ThrowFailure(env, CredentialMutexForeign());
   }
-  if (!lease->active
+  if (lease->kind != CredentialMutexLeaseKind::kLegacyCapability
+      || !lease->active
       || lease->handle == nullptr
       || lease->ownerThreadId != GetCurrentThreadId()) {
     return ThrowFailure(env, CredentialMutexForeign());
@@ -2216,6 +2735,135 @@ napi_value ReleaseCredentialMutexCallback(napi_env env, napi_callback_info info)
     lease->handle = nullptr;
     lease->active = false;
     return ThrowFailure(env, CredentialMutexReleaseFailed());
+  }
+  UnregisterCredentialMutexLease(lease);
+  CloseHandle(lease->handle);
+  lease->handle = nullptr;
+  lease->active = false;
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+napi_value AcquireAccountlessInstallationCredentialMutexCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 0)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring name;
+  if (!AccountlessInstallationCredentialMutexName(&name)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlyObjectSecurity(
+          kCredentialMutexAccess,
+          &ownerSid,
+          &acl,
+          &descriptor,
+          &attributes)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  HANDLE handle = CreateMutexExW(
+      &attributes,
+      name.c_str(),
+      0,
+      kCredentialMutexAccess);
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (handle == nullptr) return ThrowFailure(env, FromLastError());
+
+  SecuritySnapshot security;
+  if (!ReadObjectSecurity(handle, SE_KERNEL_OBJECT, &security)
+      || !IsOwnerOnlySecurity(security)) {
+    CloseHandle(handle);
+    return ThrowFailure(env, SecurityPolicy("accountless_installation_mutex_security"));
+  }
+
+  const DWORD waitResult = WaitForSingleObject(handle, 0);
+  if (waitResult == WAIT_TIMEOUT) {
+    CloseHandle(handle);
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexContended());
+  }
+  const bool abandoned = waitResult == WAIT_ABANDONED_0;
+  if (!abandoned && waitResult != WAIT_OBJECT_0) {
+    CloseHandle(handle);
+    return ThrowFailure(env, OperationFailed());
+  }
+
+  auto* lease = new (std::nothrow) CredentialMutexLease{
+      handle,
+      GetCurrentThreadId(),
+      true,
+      CredentialMutexLeaseKind::kAccountlessInstallationCredential,
+  };
+  if (lease == nullptr) {
+    ReleaseMutex(handle);
+    CloseHandle(handle);
+    return ThrowFailure(env, OperationFailed());
+  }
+  {
+    const std::lock_guard<std::mutex> lock(gCredentialMutexLeasesMutex);
+    if (!RegisterCredentialMutexLease(lease)) {
+      ReleaseMutex(handle);
+      CloseHandle(handle);
+      delete lease;
+      return ThrowFailure(env, OperationFailed());
+    }
+  }
+  napi_value external;
+  if (napi_create_external(
+          env,
+          lease,
+          FinalizeCredentialMutexLease,
+          nullptr,
+          &external) != napi_ok) {
+    FinalizeCredentialMutexLease(env, lease, nullptr);
+    return ThrowFailure(env, OperationFailed());
+  }
+  napi_value result;
+  napi_value abandonedValue;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, abandoned, &abandonedValue);
+  napi_set_named_property(env, result, "lease", external);
+  napi_set_named_property(env, result, "abandoned", abandonedValue);
+  return result;
+}
+
+napi_value ReleaseAccountlessInstallationCredentialMutexCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, arguments[0], &type) != napi_ok || type != napi_external) {
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexForeign());
+  }
+  void* data = nullptr;
+  if (napi_get_value_external(env, arguments[0], &data) != napi_ok || data == nullptr) {
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexForeign());
+  }
+  auto* lease = static_cast<CredentialMutexLease*>(data);
+  const std::lock_guard<std::mutex> lock(gCredentialMutexLeasesMutex);
+  if (!IsIssuedCredentialMutexLease(lease)
+      || lease->kind != CredentialMutexLeaseKind::kAccountlessInstallationCredential
+      || !lease->active
+      || lease->handle == nullptr
+      || lease->ownerThreadId != GetCurrentThreadId()) {
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexForeign());
+  }
+  if (!ReleaseMutex(lease->handle)) {
+    UnregisterCredentialMutexLease(lease);
+    CloseHandle(lease->handle);
+    lease->handle = nullptr;
+    lease->active = false;
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexReleaseFailed());
   }
   UnregisterCredentialMutexLease(lease);
   CloseHandle(lease->handle);
@@ -2241,6 +2889,11 @@ NAPI_MODULE_INIT() {
   DefineMethod(env, exports, "createFile", CreateFileCallback);
   DefineMethod(env, exports, "deleteFile", DeleteFileCallback);
   DefineMethod(env, exports, "replaceFile", ReplaceFileCallback);
+  DefineMethod(env, exports, "inspectProtectedChild", InspectProtectedChildCallback);
+  DefineMethod(env, exports, "readProtectedChild", ReadProtectedChildCallback);
+  DefineMethod(env, exports, "createProtectedChild", CreateProtectedChildCallback);
+  DefineMethod(env, exports, "deleteProtectedChild", DeleteProtectedChildCallback);
+  DefineMethod(env, exports, "replaceProtectedChild", ReplaceProtectedChildCallback);
   DefineMethod(
       env,
       exports,
@@ -2253,6 +2906,16 @@ NAPI_MODULE_INIT() {
       ReleaseCredentialAuditFileGuardCallback);
   DefineMethod(env, exports, "acquireCredentialMutex", AcquireCredentialMutexCallback);
   DefineMethod(env, exports, "releaseCredentialMutex", ReleaseCredentialMutexCallback);
+  DefineMethod(
+      env,
+      exports,
+      "acquireAccountlessInstallationCredentialMutex",
+      AcquireAccountlessInstallationCredentialMutexCallback);
+  DefineMethod(
+      env,
+      exports,
+      "releaseAccountlessInstallationCredentialMutex",
+      ReleaseAccountlessInstallationCredentialMutexCallback);
   napi_value version;
   napi_create_string_utf8(env, "windows-filesystem-v1", NAPI_AUTO_LENGTH, &version);
   napi_set_named_property(env, exports, "contractVersion", version);

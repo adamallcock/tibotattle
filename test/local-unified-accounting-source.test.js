@@ -11,6 +11,11 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  buildReplaySafeAccountingCache,
+  readReplaySafeAccountingCache,
+  refreshReplaySafeAccountingCache,
+} from "../src/replay-safe-accounting-cache.js";
 
 import {
   LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION,
@@ -23,6 +28,8 @@ import {
   beginUnifiedIndexGeneration,
   createUnifiedIndexWriter,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
 } from "../src/local-unified-index.js";
@@ -32,7 +39,12 @@ const END_AT = "2026-08-02T00:00:00.000Z";
 const OBSERVED_MS = Date.parse("2026-08-01T12:00:00.000Z");
 const RESET_MS = Date.parse("2026-08-08T00:00:00.000Z");
 
-async function createIndex({ status = "complete", empty = false } = {}) {
+async function createIndex({
+  status = "complete",
+  empty = false,
+  inheritedModel = false,
+  mixedCacheWriteProvenance = false,
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), "unified-accounting-source-"));
   const indexFile = join(root, "unified.sqlite");
   const database = openLocalUnifiedIndex(indexFile, { create: true });
@@ -85,7 +97,7 @@ async function createIndex({ status = "complete", empty = false } = {}) {
       resetsAtMs: RESET_MS,
       durationMins: 10_080,
     });
-    const writeUsage = (eventKeyByte, inputTokens, sourceOffset) => writer.writeUsageEvent({
+    const writeUsage = (eventKeyByte, inputTokens, sourceOffset, provenance = {}) => writer.writeUsageEvent({
       eventKey: Buffer.alloc(32, eventKeyByte),
       observedAtMs: OBSERVED_MS,
       generationId: generation.generationId,
@@ -111,10 +123,16 @@ async function createIndex({ status = "complete", empty = false } = {}) {
       tokensOutCombined: null,
       totalInputContext: null,
       partial: false,
+      modelInherited: provenance.modelInherited ?? (inheritedModel && eventKeyByte === 1),
+      cacheWriteAssumedZero: provenance.cacheWriteAssumedZero === true,
     });
     // Insert in reverse key order; the read contract must still be stable.
     writeUsage(2, 20, 2);
     writeUsage(1, 10, 1);
+    if (mixedCacheWriteProvenance) {
+      writeUsage(4, 30, 4, { cacheWriteAssumedZero: true });
+      writeUsage(5, 40, 5, { modelInherited: true, cacheWriteAssumedZero: true });
+    }
     // Quota-only token records exist in the current schema. They must not
     // become zero-token accounting usage callbacks.
     writer.writeUsageEvent({
@@ -1250,6 +1268,195 @@ test("strict metadata validation rejects missing or stale required fields", asyn
     );
   } finally {
     await rm(stale.root, { recursive: true, force: true });
+  }
+});
+
+test("current inherited-model provenance remains generation-bound through accounting", async () => {
+  const { root, indexFile } = await createIndex({ inheritedModel: true });
+  try {
+    const database = openLocalUnifiedIndex(indexFile);
+    const generation = readUnifiedIndexGenerationDescriptor(database);
+    database.close();
+    const scan = createLocalUnifiedAccountingSource({
+      indexFile,
+      expectedGeneration: generation,
+      requireComplete: true,
+      verifyPublishedGeneration: true,
+    });
+    const result = await scan({ startAt: START_AT, endAt: END_AT });
+    assert.equal(result.parserVersion, null);
+    assert.equal(result.compatibility.status, "compatible");
+    assert.deepEqual(result.compatibility.parserVersions, [
+      LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+    ]);
+    assert.equal(result.coverage.generationProof, true);
+    const cache = await buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      scan,
+      expectedGeneration: generation,
+      now: () => Date.parse(END_AT),
+      codexHome: root,
+    });
+    assert.equal(cache.sourceDescriptor.generationMatched, true);
+    assert.equal(cache.sourceDescriptor.fallbackCount, 0);
+    assert.equal(cache.history.status, "available");
+    assert.equal(cache.history.period.events, 2);
+    assert.equal(cache.history.period.totalTokens, 36);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("current mixed cache-write provenance rebuilds and reads back a generation-bound summary", async () => {
+  const { root, indexFile } = await createIndex({
+    inheritedModel: true,
+    mixedCacheWriteProvenance: true,
+  });
+  try {
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    const generation = readUnifiedIndexGenerationDescriptor(database);
+    const before = database.prepare(`
+      SELECT p.parser_version AS parserVersion, COUNT(*) AS records
+      FROM usage_event u JOIN parser_version p ON p.id = u.parser_version_id
+      GROUP BY p.parser_version ORDER BY p.parser_version
+    `).all();
+    database.close();
+    const expectedVersions = [
+      LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-cache-write-zero`,
+      LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+      `${LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION}-cache-write-zero`,
+    ].sort();
+    assert.deepEqual(before.map((row) => row.parserVersion), expectedVersions);
+    const scan = createLocalUnifiedAccountingSource({
+      indexFile,
+      expectedGeneration: generation,
+      requireComplete: true,
+      verifyPublishedGeneration: true,
+    });
+    const result = await scan({ startAt: START_AT, endAt: END_AT });
+    assert.equal(result.parserVersion, null, "mixed provenance is not collapsed to one stamp");
+    assert.equal(result.compatibility.status, "compatible");
+    assert.deepEqual(result.compatibility.parserVersions, expectedVersions);
+    assert.equal(result.coverage.generationProof, true);
+    assert.equal(result.coverage.status, "complete");
+
+    // Exercise the ordinary production rebuild, its persisted cache validator,
+    // and the following generation-bound read, not only an injected scanner.
+    const stateFile = join(root, "local-collector-state-v1.sqlite");
+    const cache = await refreshReplaySafeAccountingCache({
+      stateFile,
+      sourceMode: "unified",
+      unifiedIndexFile: indexFile,
+      expectedGeneration: generation,
+      contextBehavior: "legacy_zero",
+      now: () => Date.parse(END_AT),
+      codexHome: root,
+    });
+    assert.equal(cache.history.status, "available");
+    assert.equal(cache.history.period.events, 4);
+    assert.equal(cache.history.period.totalTokens, 112);
+    assert.equal(cache.sourceDescriptor.parserVersion, null);
+    assert.equal(cache.sourceDescriptor.generationMatched, true);
+    assert.equal(cache.sourceDescriptor.fallbackCount, 0);
+    const readback = await readReplaySafeAccountingCache({
+      stateFile,
+      sourceMode: "unified",
+      expectedGeneration: generation,
+      contextBehavior: "legacy_zero",
+      now: () => Date.parse(END_AT),
+    });
+    assert.equal(readback.status, "available");
+    assert.equal(readback.cache.history.status, "available");
+    assert.deepEqual(readback.cache.history.period, cache.history.period);
+    assert.deepEqual(readback.cache.sourceDescriptor, cache.sourceDescriptor);
+    const afterDatabase = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    const after = afterDatabase.prepare(`
+      SELECT p.parser_version AS parserVersion, COUNT(*) AS records
+      FROM usage_event u JOIN parser_version p ON p.id = u.parser_version_id
+      GROUP BY p.parser_version ORDER BY p.parser_version
+    `).all();
+    afterDatabase.close();
+    assert.deepEqual(after, before, "rebuilding never rewrites the row-level assumption stamps");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unsupported mixed parser stamps stay blocked even alongside an attested source gap", async () => {
+  for (const quarantined of [false, true]) {
+    const { root, indexFile } = await createIndex({
+      inheritedModel: true,
+      mixedCacheWriteProvenance: true,
+    });
+    try {
+      const originalVersion = `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-cache-write-zero`;
+      const database = openLocalUnifiedIndex(indexFile);
+      const parserId = database.prepare("SELECT id FROM parser_version WHERE parser_version = ?")
+        .get(originalVersion).id;
+      if (quarantined) {
+        database.prepare(`
+          UPDATE index_generation
+          SET status = 'partial', block_reason = 'codex_rollout_sources_quarantined',
+              discovered_source_count = 2, discovered_source_bytes = 8192,
+              skipped_source_count = 1, skipped_source_bytes = 4096,
+              skipped_thread_count = 1
+          WHERE id = (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'current_generation_id')
+        `).run();
+        database.prepare("UPDATE meta SET value = 'partial' WHERE key = 'status'").run();
+      }
+      database.close();
+      const strictRead = createLocalUnifiedAccountingSource({ indexFile, requireComplete: true });
+      const admitted = await strictRead({ startAt: START_AT, endAt: END_AT });
+      assert.equal(admitted.coverage.generationProof, true);
+      assert.equal(admitted.coverage.status, quarantined ? "partial" : "complete");
+
+      for (const variant of [
+        `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-partial`,
+        LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+        `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-partial-cache-write-zero`,
+        `${LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION}-cache-write-zero`,
+        "unified-rollout-typed-v15-cache-write-zero",
+        "unified-rollout-typed-v17-cache-write-zero",
+        `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-cache-write-zero-unknown`,
+        "unknown-parser-cache-write-zero",
+      ]) {
+        const mutation = openLocalUnifiedIndex(indexFile);
+        mutation.prepare("UPDATE parser_version SET parser_version = ? WHERE id = ?")
+          .run(variant, parserId);
+        mutation.close();
+        const refused = await createLocalUnifiedAccountingSource({ indexFile })({
+          startAt: START_AT, endAt: END_AT,
+        });
+        assert.equal(refused.compatibility.status, "mixed_parser_versions", variant);
+        assert.equal(refused.coverage.blockReason, "mixed_parser_versions", variant);
+        assert.equal(refused.coverage.generationProof, false, variant);
+        await assert.rejects(strictRead({ startAt: START_AT, endAt: END_AT }), {
+          code: "local_unified_index_accounting_coverage_incomplete",
+        });
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("partial inherited-model salvage is not promoted to compatible complete accounting", async () => {
+  const { root, indexFile } = await createIndex({ inheritedModel: true });
+  try {
+    const database = openLocalUnifiedIndex(indexFile);
+    database.prepare("UPDATE parser_version SET parser_version = ? WHERE parser_version = ?")
+      .run(LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+        LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION);
+    database.close();
+    await assert.rejects(createLocalUnifiedAccountingSource({
+      indexFile, requireComplete: true,
+    })({ startAt: START_AT, endAt: END_AT }), {
+      code: "local_unified_index_accounting_coverage_incomplete",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

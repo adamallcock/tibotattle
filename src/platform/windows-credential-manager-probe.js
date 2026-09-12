@@ -1,10 +1,16 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { isAbsolute, sep } from "node:path";
 
+import { windowsNativeUnsignedContentDigest } from "./windows-native-unsigned-content.js";
+
 const require = createRequire(import.meta.url);
 const BINDING_SPECIFIER = "@github/keytar/prebuilds/win32-x64/keytar.node";
+// The unsigned vendor file has no certificate table, so its full SHA-256 and
+// its Authenticode-unsigned-content SHA-256 are the same pinned value. Signed
+// release copies must preserve that content and may differ only in fields
+// Authenticode legitimately rewrites.
 export const KEYTAR_WIN32_X64_SHA256 =
   "b82625e7c713fd20b5cb57993e073076c87660652202893fad39d874d77169fc";
 
@@ -12,6 +18,14 @@ function qualificationError(code) {
   const error = new Error("Windows Credential Manager qualification failed");
   error.code = `WINDOWS_CREDENTIAL_MANAGER_${code}`;
   return error;
+}
+
+function hasPinnedKeytarContent(bytes) {
+  try {
+    return windowsNativeUnsignedContentDigest(bytes) === KEYTAR_WIN32_X64_SHA256;
+  } catch {
+    return false;
+  }
 }
 
 export function loadAuditedWindowsCredentialBinding({
@@ -36,8 +50,7 @@ export function loadAuditedWindowsCredentialBinding({
     if (error?.code?.startsWith("WINDOWS_CREDENTIAL_MANAGER_")) throw error;
     throw qualificationError("BINDING_UNAVAILABLE");
   }
-  const digest = createHash("sha256").update(bytes).digest("hex");
-  if (digest !== KEYTAR_WIN32_X64_SHA256) {
+  if (!hasPinnedKeytarContent(bytes)) {
     throw qualificationError("BINDING_INTEGRITY");
   }
   let binding;
@@ -101,7 +114,7 @@ export async function runWindowsCredentialManagerProbe({
     status: "passed",
     platform: "win32",
     architecture: "x64",
-    bindingSha256: KEYTAR_WIN32_X64_SHA256,
+    bindingUnsignedContentSha256: KEYTAR_WIN32_X64_SHA256,
     cleanup: "confirmed",
   });
 }

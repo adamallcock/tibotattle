@@ -156,6 +156,23 @@ describe("durable current-account work queue", () => {
     expect(await claimCurrentAnalysisJob(db(), initial, LEASE)).toBeNull();
   });
 
+  it("will not claim a stale accountless queue row while preserving social scheduling", async () => {
+    await db().prepare(`INSERT INTO participants (id, owner_kind, state, created_at)
+      VALUES ('accountless-stale-queue', 'accountless', 'active', ?)`)
+      .bind(new Date(NOW).toISOString()).run();
+    await db().prepare(`INSERT INTO community_current_analysis_queue
+      (participant_id, dirty_generation, window_generation, pending, last_served_sequence)
+      VALUES ('accountless-stale-queue', 1, 0, 1, 0)`).run();
+    const accountlessPass = await pass();
+    expect(accountlessPass).not.toBeNull();
+    expect(await claimCurrentAnalysisJob(db(), accountlessPass!, LEASE)).toBeNull();
+
+    await metadataJobs(1, "social-preserved");
+    const socialPass = await pass();
+    expect((await claimCurrentAnalysisJob(db(), socialPass!, LEASE))?.participantId)
+      .toBe("social-preserved-0000");
+  });
+
   it("removes revoked/erased membership immediately and rejects stale or expired authority", async () => {
     await metadataJobs(2); const initial = (await pass())!;
     const job = (await claimCurrentAnalysisJob(db(), initial, LEASE))!;

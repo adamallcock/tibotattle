@@ -206,16 +206,19 @@ const COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE = `participant_sources AS (
       SELECT c.participant_id AS participant_id, 'v0.2' AS source
         FROM telemetry_contributions c
         JOIN participants p ON p.id = c.participant_id AND p.state = 'active'
+          AND p.owner_kind = 'social'
        WHERE c.status = 'accepted'
          AND c.transport_schema_version = 'telemetry-contribution-v0.2'
       UNION ALL
       SELECT c2.participant_id, 'v1' AS source
         FROM telemetry_v1_chunks c2
         JOIN participants p2 ON p2.id = c2.participant_id AND p2.state = 'active'
+          AND p2.owner_kind = 'social'
        WHERE c2.superseded_at IS NULL
       UNION ALL
       SELECT h.participant_id, 'v1.1' AS source FROM telemetry_v11_domain_heads h
         JOIN participants p3 ON p3.id = h.participant_id AND p3.state = 'active'
+          AND p3.owner_kind = 'social'
     )
    GROUP BY participant_id
 )`;
@@ -457,6 +460,7 @@ export async function collectCommunityAllowanceFits(
            WHERE EXISTS (
              SELECT 1 FROM community_analytical_input_versions v
              JOIN participants p ON p.id = v.participant_id AND p.state = 'active'
+               AND p.owner_kind = 'social'
              WHERE v.participant_id = ?1 AND v.revision = ?6
            )
          ON CONFLICT(participant_id) DO UPDATE SET cache_key = excluded.cache_key,
@@ -748,7 +752,7 @@ export const COMMUNITY_PARTICIPANT_PAGE_CTE = `
 WITH participant_page AS MATERIALIZED (
   SELECT p.id, p.state FROM community_current_analysis_queue q
   JOIN participants p ON p.id = q.participant_id
-  WHERE q.participant_id > ?1 AND p.state != 'deleting' AND (
+  WHERE q.participant_id > ?1 AND p.state != 'deleting' AND p.owner_kind = 'social' AND (
     EXISTS (SELECT 1 FROM telemetry_v1_chunks c INDEXED BY telemetry_v1_chunks_current_identity
       WHERE c.participant_id = p.id AND c.superseded_at IS NULL)
     OR EXISTS (SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id = p.id)
@@ -1089,7 +1093,7 @@ export async function completedCommunityAnalysisCachesCurrent(db: D1Database,
       CASE WHEN length(f.input_fingerprint) = 64 THEN f.input_fingerprint END AS fit_fingerprint,
       CASE WHEN length(w.input_fingerprint) = 64 THEN w.input_fingerprint END AS input_fingerprint
     FROM community_analysis_work w
-    JOIN participants p ON p.id = w.participant_id AND p.state = 'active'
+    JOIN participants p ON p.id = w.participant_id AND p.state = 'active' AND p.owner_kind = 'social'
     JOIN community_analytical_input_versions v ON v.participant_id = w.participant_id AND v.revision = ?2
     JOIN community_allowance_fit_cache f ON f.participant_id = w.participant_id
       AND f.cache_key = ?3 AND f.source_method_version = ?5
@@ -1182,7 +1186,7 @@ export async function publishCommunityAnalysisCaches(db: D1Database,
   await assertCommunitySourcePinCurrent(db, sourcePin);
   const guard = `EXISTS (SELECT 1 FROM participants p
       JOIN community_analytical_input_versions v ON v.participant_id=p.id
-      WHERE p.id=?1 AND p.state='active' AND v.revision=?6
+      WHERE p.id=?1 AND p.state='active' AND p.owner_kind='social' AND v.revision=?6
         AND EXISTS (SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id=p.id)=?7)
     AND EXISTS (SELECT 1 FROM retention_state
       WHERE singleton=1 AND maintenance_lease_token=?8
@@ -1457,6 +1461,7 @@ export async function collectCommunityModelCompositions(
                WHERE EXISTS (
                  SELECT 1 FROM community_analytical_input_versions v
                  JOIN participants p ON p.id = v.participant_id AND p.state = 'active'
+                   AND p.owner_kind = 'social'
                  WHERE v.participant_id = ?1 AND v.revision = ?6
                )
              ON CONFLICT(participant_id) DO UPDATE SET

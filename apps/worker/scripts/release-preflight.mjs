@@ -15,11 +15,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse, printParseErrorCode } from "jsonc-parser";
 import {
   ATTRIBUTION_SCHEMA_OBJECTS,
-  ATTRIBUTION_SCHEMA_PROBE_SQL,
   attributionSchemaComplete,
+  POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
   SCALE_SCHEMA_COLUMNS,
   SCALE_SCHEMA_OBJECTS,
-  SCALE_SCHEMA_PROBE_SQL,
+  POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
   scaleSchemaComplete,
   EXPECTED_STAGING_MIGRATIONS,
 } from "./staging-readiness-lib.mjs";
@@ -730,7 +730,7 @@ export async function runReleasePreflight({
         stateDirectory,
         binding: "USAGE_MONITOR_DB",
         spawn,
-        sql: ATTRIBUTION_SCHEMA_PROBE_SQL,
+        sql: POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
       });
       const scaleRows = runQuery({
         wrangler,
@@ -739,7 +739,7 @@ export async function runReleasePreflight({
         stateDirectory,
         binding: "USAGE_MONITOR_DB",
         spawn,
-        sql: SCALE_SCHEMA_PROBE_SQL,
+        sql: POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
       });
       receipt.checks.requiredSchemaPresent = objectsPresent
         && columnsPresent.every(Boolean)

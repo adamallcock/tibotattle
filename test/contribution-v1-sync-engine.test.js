@@ -471,20 +471,27 @@ test("a revision conflict re-reads the cursor once and then succeeds", async () 
 });
 
 test("a device the service no longer recognises surfaces as device_unavailable", async () => {
-  await withIndex(async (file) => {
-    const service = createFakeService({
-      stateStatus: () => response({
-        error: { code: "DEVICE_AUTH_INVALID" },
-      }, 401),
+  for (const [status, code] of [
+    [401, "DEVICE_AUTH_INVALID"],
+    [410, "ACCOUNTLESS_ENROLLMENT_EXPIRED"],
+    [401, "ACCOUNTLESS_ENROLLMENT_REVOKED"],
+    [410, "ACCOUNTLESS_OWNERSHIP_EXPIRED"],
+    [401, "ACCOUNTLESS_OWNERSHIP_REVOKED"],
+  ]) {
+    await withIndex(async (file) => {
+      const service = createFakeService({
+        stateStatus: () => response({ error: { code } }, status),
+      });
+      const outcome = await runIncrementalContributionSyncOnce(
+        engineOptions(file, service),
+      );
+      assert.equal(outcome.status, "failed");
+      assert.equal(outcome.failure.code, "device_unavailable");
+      assert.equal(outcome.failure.deviceUnavailable, true);
+      assert.equal(outcome.failure.retryable, false);
+      assert.equal(outcome.chunksUploaded, 0);
     });
-    const outcome = await runIncrementalContributionSyncOnce(
-      engineOptions(file, service),
-    );
-    assert.equal(outcome.status, "failed");
-    assert.equal(outcome.failure.code, "device_unavailable");
-    assert.equal(outcome.failure.deviceUnavailable, true);
-    assert.equal(outcome.chunksUploaded, 0);
-  });
+  }
 });
 
 test("a missing index is a retryable typed outcome, never a crash", async () => {

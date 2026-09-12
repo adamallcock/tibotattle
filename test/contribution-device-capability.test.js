@@ -459,6 +459,7 @@ test("locked, denied, malformed, and partial states fail closed with fixed conte
     ["export_identity_keychain_locked", "credential_locked"],
     ["export_identity_keychain_denied", "credential_denied"],
     ["export_identity_keychain_migration_required", "credential_migration_required"],
+    ["contribution_device_credential_recovery_required", "credential_recovery_required"],
     ["arbitrary", "credential_unavailable"],
   ]) {
     await fixture(async ({ stateFile }) => {
@@ -499,6 +500,43 @@ test("locked, denied, malformed, and partial states fail closed with fixed conte
     await assert.rejects(
       readContributionDeviceCapability({ backend: memoryBackend(Buffer.alloc(32, 2)), stateFile }),
       fixedError("state_invalid"),
+    );
+  });
+});
+
+test("only explicitly retryable protected credential availability survives the capability boundary", async () => {
+  await fixture(async ({ stateFile }) => {
+    const backend = memoryBackend();
+    backend.read = async () => {
+      const error = new Error(CANARY);
+      error.code = "contribution_device_credential_unavailable";
+      error.retryable = true;
+      throw error;
+    };
+    await assert.rejects(
+      ensureContributionDeviceCapability({ backend, origin: ORIGIN, stateFile }),
+      (error) => {
+        assert.equal(fixedError("credential_unavailable")(error), true);
+        assert.equal(error.retryable, true);
+        return true;
+      },
+    );
+  });
+
+  await fixture(async ({ stateFile }) => {
+    const backend = memoryBackend();
+    backend.read = async () => {
+      const error = new Error(CANARY);
+      error.code = "contribution_device_credential_unavailable";
+      throw error;
+    };
+    await assert.rejects(
+      ensureContributionDeviceCapability({ backend, origin: ORIGIN, stateFile }),
+      (error) => {
+        assert.equal(fixedError("credential_unavailable")(error), true);
+        assert.equal(error.retryable, false);
+        return true;
+      },
     );
   });
 });

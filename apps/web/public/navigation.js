@@ -1,10 +1,12 @@
 const PAGE_BY_TARGET = new Map([
   ["overview", "overview"],
+  ["projects", "projects"],
   ["weekly", "weekly"],
   ["accounting", "method"],
   ["method", "method"],
   ["timeline", "trends"],
   ["trends", "trends"],
+  ["performance", "performance"],
   ["community", "community"],
   ["history", "community"],
   ["backend", "community"],

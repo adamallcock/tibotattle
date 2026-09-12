@@ -178,6 +178,39 @@ test("pre-migration compatibility requires a durable identity receipt before che
   assert.deepEqual(calls, []);
 });
 
+test("bootstrap installs isolated keys only for a confirmed absent Worker", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "staging-bootstrap-keys-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const secretsFile = join(root, ".dev.vars.staging");
+  generateEnvelopeKeys(secretsFile, { environment: "staging" });
+  for (const [name, inventory, expected, installs] of [
+    ["absent", { status: 1, stderr: "Worker not found [code: 10007]" }, true, true],
+    ["absent-cli", { status: 1, stderr: 'Worker "app-usagemonitor-staging" (env: staging) not found.' }, true, true],
+    ["other-worker", { status: 1, stderr: 'Worker "unrelated-worker" (env: staging) not found.' }, false, false],
+    ["existing", { status: 0, stdout: "[]" }, true, false],
+    ["uncertain", { status: 1, stderr: "Network error" }, false, false],
+  ]) {
+    const calls = [];
+    const result = await runDeployment({
+      config: provisionedConfig(), origin: stagingOrigin,
+      phase: "pre_migration_compatibility",
+      confirmation: COMPATIBLE_DEPLOY_CONFIRMATION,
+      identityReceiptFile: join(root, `${name}.json`),
+      expectedSourceCommit: "c26823c", secretsFile,
+      spawn: (_command, args) => {
+        calls.push(args);
+        return args[0] === "secret" ? inventory
+          : { status: 0, stdout: `Deployed ${stagingOrigin}` };
+      },
+    });
+    assert.equal(result.ok, expected, name);
+    const deployment = calls.find((args) => args[0] === "deploy");
+    assert.equal(Boolean(deployment?.includes("--secrets-file")), installs, name);
+    if (!expected) assert.equal(deployment, undefined);
+    if (installs) assert.equal(deployment.at(-1), secretsFile);
+  }
+});
+
 test("pre-migration compatibility refuses an open or unexpected staged runtime configuration", async (t) => {
   for (const scenario of [
     {
@@ -476,7 +509,7 @@ test("first deployment accepts only an owner-only validated key file", async () 
   const secretsFile = join(root, ".dev.vars.staging");
   const config = provisionedConfig();
   try {
-    generateEnvelopeKeys(secretsFile);
+    generateEnvelopeKeys(secretsFile, { environment: "staging" });
     const calls = [];
     const baseSpawn = successSpawn(config, calls);
     const spawn = (command, args, options) => {

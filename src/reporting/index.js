@@ -12,3 +12,8 @@ export {
   renderWeeklyCalibrationReport,
   validWeeklyPlanPopulations,
 } from "./weekly-calibration.js";
+export {
+  WORK_USAGE_SCHEMA, WORK_USAGE_COMPONENTS, workUsageError,
+  projectRecordedTokenComponents, createWorkUsageAccumulator, queryWorkUsageSnapshot,
+} from "./work-usage.js";
+export { modelPerformanceProjection } from './model-performance.js';

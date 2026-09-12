@@ -1,3 +1,4 @@
+import { modelUsagePresentation, modelThemeIcon } from "../public/model-visuals.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -47,7 +48,7 @@ async function modelTable(locale) {
     localizedNode: (tag, className, key, values) => element(tag, className, t(key, values)),
     setRawText: (node, text) => { node.textContent = text; },
     setLocalizedText: (node, key) => { node.textContent = t(key); },
-    t, finite, formatModelName,
+    t, finite, formatModelName, modelUsagePresentation, modelThemeIcon,
     formatSharePercent: (part, whole) => whole > 0 ? `${(part / whole * 100).toFixed(1)}%` : null,
     formatCount: String,
     formatApiMoney: (value) => `$${value.toFixed(2)}`,
@@ -82,11 +83,16 @@ test("model table preserves unavailable, unreviewed, separate-allowance and pric
     const modelRows = body.children.filter((row) => !row.dataset.componentOf);
     const byName = (name) => modelRows.find((row) => contents(row.children[0]).replace("*", "") === name);
     const astra = byName("GPT-6 Astra");
-    assert.equal(astra.children[0].children[1].title, "gpt-6-astra");
+    assert.equal(astra.children[0].children[2].title, "gpt-6-astra");
     assert.equal(contents(astra.children[4]), "$5.00");
+    const astraIcon = astra.children[0].children.find((child) => child.getAttribute("class") === "allowance-model-icon");
+    assert.equal(astraIcon.getAttribute("aria-hidden"), "true");
+    assert.equal(astraIcon.getAttribute("focusable"), "false");
     const unavailable = byName(t("accounting.model.identityUnavailable"));
     assert.ok(unavailable, locale);
-    assert.equal(unavailable.children[0].children[1].title, t("accounting.model.identityUnavailableTitle"));
+    assert.equal(unavailable.children[0].children[1].tag, "svg");
+    assert.equal(unavailable.children[0].children[1].attributes["aria-hidden"], "true");
+    assert.equal(unavailable.children[0].children[2].title, t("accounting.model.identityUnavailableTitle"));
     assert.equal(unavailable.children[4].title, t("accounting.model.identityUnavailableTitle"));
     assert.equal(contents(unavailable.children[4]), t("accounting.model.notPricedUnknown"));
     assert.equal(contents(unavailable.children[5]), t("accounting.model.shareWithheld"));
@@ -100,9 +106,35 @@ test("model table preserves unavailable, unreviewed, separate-allowance and pric
     assert.equal(contents(byName("GPT-5.3 Codex Spark").children[4]), t("accounting.model.separateAllowance"));
     assert.equal(contents(byName("Codex Auto Review").children[4]), t("accounting.model.noPublishedPrice"));
     assert.equal(contents(byName("GPT-5.5").children[4]), "$0.00");
+    for (const name of [t("accounting.model.identityUnavailable"), t("accounting.model.unrecognized"), "Codex Auto Review"]) {
+      const icon = byName(name).children[0].children.find((child) => child.getAttribute("class") === "allowance-model-icon");
+      assert.ok(icon, name);
+      assert.equal(icon.getAttribute("aria-hidden"), "true");
+      assert.equal(icon.getAttribute("focusable"), "false");
+    }
+    assert.ok(byName("GPT-5.3 Codex Spark").children[0].children.some((child) => child.getAttribute("class") === "allowance-model-icon"));
     render({ modelUsage: [] }, { unavailable: true });
     assert.equal(contents(body), t("accounting.model.unavailable"));
     render({ modelUsage: [] });
     assert.equal(contents(body), t("accounting.model.noneInPeriod"));
   }
+});
+
+test("shared model icons preserve established aliases without inventing unknown identities", () => {
+  const documentRef = { createElementNS: (_namespace, tag) => element(tag) };
+  for (const [id, theme] of [
+    ["gpt-6-astra", "astra"], ["gpt-5.6-sol-wm", "sol"],
+    ["gpt-5.6-terra", "terra"], ["gpt-5.6-luna", "luna"],
+    ["gpt-5.5-codex", "classic"], ["gpt-5.3-codex-spark", "spark"],
+  ]) {
+    const presentation = modelUsagePresentation(id);
+    assert.equal(presentation.theme, theme);
+    assert.equal(modelThemeIcon(documentRef, presentation.theme).tag, "svg");
+  }
+  for (const id of ["unknown", "gpt-6-unreviewed", null]) {
+    assert.equal(modelUsagePresentation(id).theme, "generic");
+    assert.equal(modelThemeIcon(documentRef, modelUsagePresentation(id).theme).tag, "svg");
+  }
+  assert.equal(modelUsagePresentation("codex-auto-review").theme, "review");
+  assert.equal(modelThemeIcon(documentRef, "review").tag, "svg");
 });

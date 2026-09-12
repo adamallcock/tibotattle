@@ -89,6 +89,10 @@ async function fixture(t) {
     accounting: {
       generation: "7.0", generationMatched: true,
       generationFingerprint: readUnifiedIndexGenerationDescriptor(database).fingerprint,
+      cacheDiagnosticsSource: {
+        generation: "7.0",
+        generationFingerprint: readUnifiedIndexGenerationDescriptor(database).fingerprint,
+      },
       cacheSwitchImpact: { status: "available", recent: [switchRow()], periods: [
         { periodId: "24h", recent: [switchRow()] },
         { periodId: "7d", recent: [switchRow()] },
@@ -134,6 +138,42 @@ test("both recent tables resolve exact adjacency identities without mutating ano
   assert.doesNotMatch(JSON.stringify(result), /ignoredPrivateField|must-not-be-emitted|session_local/u);
 });
 
+test("auto-review navigation metadata retains the matched session while projecting only its parent", async (t) => {
+  const f = await fixture(t);
+  const beforeOverview = structuredClone(f.overview);
+  const result = await f.run({ readThreadMetadata: async () => new Map([
+    [ROOT, { id: ROOT, name: "Synthetic root", nickname: null, parent: null }],
+    [WORKER, {
+      id: WORKER,
+      name: "Internal review session",
+      nickname: null,
+      parent: { id: ROOT, name: "Synthetic root" },
+      origin: "auto_review",
+    }],
+  ]) });
+  const entry = result.entries.find((value) => value.thread.id === WORKER);
+  assert.deepEqual(entry?.thread, {
+    id: WORKER,
+    name: "Internal review session",
+    nickname: null,
+    parent: { id: ROOT, name: "Synthetic root" },
+    origin: "auto_review",
+  });
+  assert.deepEqual(f.overview, beforeOverview,
+    "navigation metadata does not reassign cache-drop attribution");
+
+  const unavailableParent = await f.run({ readThreadMetadata: async () => new Map([
+    [WORKER, {
+      id: WORKER, name: "Internal review session", nickname: null,
+      parent: null, origin: "auto_review",
+    }],
+  ]) });
+  assert.deepEqual(unavailableParent.entries.find((value) => value.thread.id === WORKER)?.thread, {
+    id: WORKER, name: "Internal review session", nickname: null,
+    parent: null, origin: "auto_review",
+  });
+});
+
 test("real cache-impact analyzer rows match the resolver's keys and exact session proof", async (t) => {
   const f = await fixture(t);
   const impacts = readCacheImpacts(f.database, { nowMs: NOW });
@@ -154,13 +194,47 @@ test("unknown generation, a foreign fingerprint, and incomplete publications fai
   const f = await fixture(t);
   for (const patch of [
     { generation: 8 }, { generation: null }, { generation: "Infinity" },
-    { generation: "7.1" }, { generationMatched: false }, { generationFingerprint: "foreign" },
+    { generation: "7.1" }, { generationFingerprint: "foreign" },
+    { generationFingerprint: null }, { extra: true },
   ]) {
-    const result = await f.run({ overview: { accounting: { ...f.overview.accounting, ...patch } } });
+    const result = await f.run({ overview: { accounting: {
+      ...f.overview.accounting,
+      cacheDiagnosticsSource: { ...f.overview.accounting.cacheDiagnosticsSource, ...patch },
+    } } });
     assert.deepEqual(result, { schemaVersion: "local-cache-drop-thread-links-v1", status: "unavailable", generation: null, entries: [] });
+  }
+  for (const source of [null, undefined, [], {}]) {
+    assert.equal((await f.run({ overview: { accounting: {
+      ...f.overview.accounting, cacheDiagnosticsSource: source,
+    } } })).status, "unavailable", "ordinary accounting attestation cannot replace diagnostic provenance");
   }
   f.database.exec("UPDATE index_generation SET status = 'in_progress' WHERE id = 7");
   assert.equal((await f.run()).status, "unavailable");
+});
+
+test("completed diagnostic generations resolve titles without a replay accounting cache", async (t) => {
+  const f = await fixture(t);
+  f.database.exec(`UPDATE index_generation SET status = 'partial',
+    block_reason = 'tool_provenance_incomplete', tool_provenance_complete = 0 WHERE id = 7`);
+  const fingerprint = readUnifiedIndexGenerationDescriptor(f.database).fingerprint;
+  const overview = structuredClone(f.overview);
+  overview.accounting.generationMatched = false;
+  overview.accounting.generation = 999;
+  overview.accounting.generationFingerprint = "unrelated-accounting-cache";
+  overview.accounting.cacheDiagnosticsSource.generationFingerprint = fingerprint;
+  const result = await f.run({ overview });
+  assert.equal(result.status, "available");
+  assert.equal(result.generation, "7");
+  assert.equal(result.entries.length, 2);
+  assert.equal(result.entries.find((entry) => entry.kind === "switch").thread.name, "Synthetic root");
+  assert.equal(overview.accounting.generationMatched, false);
+  for (const field of ["discovery_complete", "diagnostics_complete"]) {
+    f.database.exec(`UPDATE index_generation SET ${field} = 0 WHERE id = 7`);
+    overview.accounting.cacheDiagnosticsSource.generationFingerprint =
+      readUnifiedIndexGenerationDescriptor(f.database).fingerprint;
+    assert.equal((await f.run({ overview })).status, "unavailable");
+    f.database.exec(`UPDATE index_generation SET ${field} = 1 WHERE id = 7`);
+  }
 });
 
 test("timestamp tuples ambiguous across sessions never guess a thread", async (t) => {
@@ -337,7 +411,9 @@ test("an outdated parser or contracted input cannot supply a cache-drop identity
   const f = await fixture(t);
   f.database.exec("UPDATE parser_version SET parser_version = 'unified-rollout-typed-v10'");
   let result = await f.run({ overview: { accounting: {
-    ...f.overview.accounting, generationFingerprint: null,
+    ...f.overview.accounting, cacheDiagnosticsSource: {
+      generation: 7, generationFingerprint: readUnifiedIndexGenerationDescriptor(f.database).fingerprint,
+    },
   } } });
   assert.equal(result.entries.length, 0);
   f.database.prepare("UPDATE parser_version SET parser_version = ?")
@@ -559,10 +635,12 @@ test("switch rows preserve exact prior Max/Ultra labels rather than adopting con
 });
 
 
-test("inherited-model provenance retains exact cache-drop thread links", async (t) => {
+test("current inherited-model and assumed-cache-write provenance retain exact cache-drop thread links", async (t) => {
   const f = await fixture(t);
-  for (const version of [LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
-    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION]) {
+  for (const version of [LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION]
+    .flatMap((value) => [value, `${value}-cache-write-zero`])) {
     f.database.prepare("UPDATE parser_version SET parser_version = ? WHERE id = 1").run(version);
     const result = await f.run();
     assert.equal(result.status, "available");
