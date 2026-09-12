@@ -25,14 +25,16 @@ BEGIN
  INSERT INTO analytics_community_graph_publication_state VALUES(OLD.source_id,1)
  ON CONFLICT(source_id) DO UPDATE SET model_revision=model_revision+1;
 END;
+ -- This is a completed-result snapshot, not a claim that every owner was
+ -- recalculated at publication time. Keep freshness separate from public DTOs.
 CREATE TABLE analytics_community_graph_previews (
  source_id TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>0),method TEXT NOT NULL,
  cohort_digest TEXT NOT NULL,authority_json TEXT NOT NULL CHECK(json_valid(authority_json)),
  model_revision INTEGER NOT NULL CHECK(model_revision>=0),
  payload_json TEXT NOT NULL CHECK(json_valid(payload_json) AND length(CAST(payload_json AS BLOB))<=262144),
  payload_sha256 TEXT NOT NULL,generated_at TEXT NOT NULL,
- -- This is a completed-result snapshot, not a claim that every owner was
- -- recalculated at publication time. Keep freshness separate from public DTOs.
+
+
  snapshot_source_epoch INTEGER NOT NULL CHECK(snapshot_source_epoch>=0),
  inputs_current INTEGER NOT NULL CHECK(inputs_current IN(0,1)),
  oldest_computed_ms INTEGER,newest_computed_ms INTEGER,

@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createWranglerQueryInvocation } from './wrangler-query-launcher.mjs';
 import validation from './wrangler-query-preload.cjs';
+import fileValidation from './d1-storage-file-preload.cjs';
 import { storageError, storageSha256, storageSchemaDigest, validateStoragePlan, resolveStorageApproval, assertStorageMutationApproval } from './d1-storage-plan.mjs';
 import { runStorageOperation } from './d1-storage-operator.mjs';
 
@@ -54,14 +55,57 @@ export async function createStorageWranglerAdapter({ plan, qualifications, direc
     await privateBytes(path, body);
     return { path, sha256: storageSha256(body) };
   };
-  const invoke = async (args, pin) => {
+  const retainFailure = async (result, logPath, args, pin) => {
+    const errorCode = ['ETIMEDOUT', 'ENOBUFS', 'ENOENT', 'EACCES', 'EPERM'].includes(result.error?.code) ? result.error.code : null;
+    const classification = result.invalidResponse ? 'invalid_response' : errorCode === 'ETIMEDOUT' ? 'timeout' : errorCode === 'ENOBUFS' ? 'output_limit'
+      : result.error ? 'spawn_error' : result.signal ? 'signal' : 'nonzero_exit';
+    const redact = (value) => {
+      let text = String(value ?? '');
+      for (const [key, secret] of Object.entries(process.env)) {
+        if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTHORIZATION|COOKIE/i.test(key) && typeof secret === 'string' && secret.length >= 8)
+          text = text.split(secret).join('[REDACTED]');
+      }
+      return text.replace(/(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s"',;]+/gi, '$1[REDACTED]');
+    };
+    const outputs = {};
+    for (const [name, value, limit] of [['stdout', result.stdout, 64 * 1024], ['stderr', result.stderr, 64 * 1024], ['error', result.error?.message, 4096]]) {
+      const full = Buffer.from(redact(value));
+      const marker = Buffer.from('\n[TRUNCATED]\n');
+      const half = Math.floor((limit - marker.length) / 2);
+      const bytes = full.length <= limit ? full : Buffer.concat([full.subarray(0, half), marker, full.subarray(-half)]);
+      const file = `${logPath.split('/').at(-1)}.${name}.txt`;
+      await privateBytes(join(transportRoot, file), bytes);
+      outputs[name] = { file, sha256: storageSha256(bytes), bytes: bytes.length, redactedBytes: full.length, truncated: full.length > limit };
+    }
+    const receipt = { schema: 'd1-storage-transport-failure-v1', classification, errorCode,
+      exitStatus: Number.isSafeInteger(result.status) ? result.status : null,
+      signal: ['SIGTERM', 'SIGKILL', 'SIGABRT', 'SIGINT'].includes(result.signal) ? result.signal : null,
+      outputs, configSha256: pin.sha256, cliSha256: cli.digest, invocationSha256: storageSha256(JSON.stringify(args)),
+      retryPerformed: false, outcome: 'uncertain' };
+    const bytes = `${JSON.stringify(receipt)}\n`, file = `${logPath.split('/').at(-1)}.failure.json`;
+    await privateBytes(join(transportRoot, file), bytes);
+    return { classification, file, sha256: storageSha256(bytes) };
+  };
+  const invoke = async (args, pin, decode = null) => {
     if (validation.verifyCli(cliPath).digest !== cli.digest || storageSha256(await readFile(pin.path)) !== pin.sha256) throw storageError('TRANSPORT_PIN_CHANGED');
     const logPath = join(transportRoot, `wrangler-${attempt}-${sequence++}.log`);
     await writeFile(logPath, '', { flag: 'wx', mode: 0o600 });
-    const result = spawn(process.execPath, args, { cwd: transportRoot, encoding: 'utf8', timeout: 45_000,
-      maxBuffer: 512 * 1024, env: storageWranglerEnvironment(process.env, plan.accountId, logPath),
-      stdio: ['ignore', 'pipe', 'pipe'] });
-    if (result.error || result.status !== 0) throw storageError('WRANGLER_RESULT_UNCERTAIN');
+    let result;
+    try {
+      result = spawn(process.execPath, args, { cwd: transportRoot, encoding: 'utf8', timeout: 45_000,
+        maxBuffer: 512 * 1024, env: storageWranglerEnvironment(process.env, plan.accountId, logPath),
+        stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) { result = { error, status: null }; }
+    if (result && !result.error && result.status === 0 && decode) {
+      try { return decode(String(result.stdout ?? '')); }
+      catch { result = { ...result, invalidResponse: true }; }
+    }
+    if (!result || result.error || result.status !== 0 || result.invalidResponse) {
+      const failure = storageError('WRANGLER_RESULT_UNCERTAIN');
+      try { failure.diagnostics = await retainFailure(result ?? { error: {} }, logPath, args, pin); }
+      catch { failure.diagnostics = { classification: 'unavailable' }; }
+      throw failure;
+    }
     return String(result.stdout ?? '');
   };
   const command = async (args, target = null) => {
@@ -79,6 +123,31 @@ export async function createStorageWranglerAdapter({ plan, qualifications, direc
     const response = json(await invoke(invocation.args, pin));
     if (!Array.isArray(response) || !response.length || response.some((entry) => entry?.success !== true || !Array.isArray(entry.results))) throw storageError('WRANGLER_QUERY_UNCERTAIN');
     return response;
+  };
+  const importFile = async (target, sql) => {
+    const pin = await config(target), sqlPath = join(transportRoot, `migration-${attempt}-${sequence++}.sql`);
+    await privateBytes(sqlPath, sql);
+    const invocation = createWranglerQueryInvocation({ cliPath, configPath: pin.path, binding: target.binding,
+      databaseId: target.databaseId, mode: 'remote', sqlPath, expectedSqlSha256: storageSha256(sql) });
+    // Keep read-only /query unchanged. The dedicated child preload rechecks the
+    // same pins, then selects Wrangler's provider file-import transport.
+    invocation.args[2] = fileURLToPath(new URL('./d1-storage-file-preload.cjs', import.meta.url));
+    invocation.args[invocation.args.indexOf(validation.PLACEHOLDER)] = fileValidation.PLACEHOLDER;
+    await invoke(invocation.args, pin, (stdout) => {
+      // Same closed progress/terminal shape as the maintained migration rehearsal.
+      const start = stdout.indexOf('[');
+      if (start < 0 || start > 4096) throw storageError('WRANGLER_IMPORT_UNCERTAIN');
+      const progress = stdout.slice(0, start).split('\n').filter(line => line.trim());
+      if (progress.some(line => !/^(?:├ Checking if file needs uploading|│|├ 🌀 Uploading [a-f0-9-]+\.[a-f0-9]+\.sql|│ 🌀 Uploading complete\.)$/.test(line)))
+        throw storageError('WRANGLER_IMPORT_UNCERTAIN');
+      const value = json(stdout.slice(start)), row = value?.[0];
+      if (!Array.isArray(value) || value.length !== 1 || !row || Object.keys(row).sort().join() !== 'finalBookmark,meta,results,success'
+          || row.success !== true || !Array.isArray(row.results) || typeof row.finalBookmark !== 'string'
+          || row.finalBookmark.length < 1 || row.finalBookmark.length > 256 || !row.meta || typeof row.meta !== 'object'
+          || Array.isArray(row.meta) || !Number.isFinite(row.meta.duration) || row.meta.duration < 0)
+        throw storageError('WRANGLER_IMPORT_UNCERTAIN');
+      return value;
+    });
   };
   const assertTarget = (target) => {
     if (!plan.targets.some((entry) => JSON.stringify(entry) === JSON.stringify(target))) throw storageError('TRANSPORT_TARGET_INVALID');
@@ -146,7 +215,7 @@ export async function createStorageWranglerAdapter({ plan, qualifications, direc
       // and exact prefix; a partial/unknown response never permits replay.
       await inspectLedger(target);
       assertStorageMutationApproval(plan, approval.extensions);
-      await query(target, `${LEDGER}\n${migration.sql}\nINSERT INTO d1_storage_migrations(name,sha256) VALUES('${migration.name}','${migration.sha256}');`);
+      await importFile(target, `${LEDGER}\n${migration.sql}\nINSERT INTO d1_storage_migrations(name,sha256) VALUES('${migration.name}','${migration.sha256}');`);
     },
   };
 }

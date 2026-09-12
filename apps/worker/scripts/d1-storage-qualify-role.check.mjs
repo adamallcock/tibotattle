@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createRequire } from 'node:module';
 import assert from 'node:assert/strict';
 import { mkdtemp,mkdir,writeFile,readFile,readdir,realpath,rm,symlink,lstat,access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -170,4 +171,20 @@ test('a changed next migration is refused before its intent or SQL submission',a
  assert.equal((await json(join(directory,'failure.json'))).migrationsApplied,1);
  await access(join(directory,'0001_parent.sql.result.json'));await missing(join(directory,'0002_child.sql.intent.json'));
  await missing(join(directory,'worker','routing-migrations','qualification.json'));
+});
+
+
+test('effective analytics and control migration files preserve exact split-qualified DDL at every prefix', async () => {
+ const {unstable_splitSqlQuery:split}=createRequire(join(actualWorker,'package.json'))('wrangler');
+ const inventory=db=>db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name").all();
+ for(const directory of [D1_STORAGE_SCHEMA_DIRECTORIES.analytics,D1_STORAGE_SCHEMA_DIRECTORIES.control]){
+  const whole=new DatabaseSync(':memory:'),qualified=new DatabaseSync(':memory:');
+  try {
+   for(const name of (await readdir(join(actualWorker,directory))).filter(name=>name.endsWith('.sql')).sort()){
+    const sql=await readFile(join(actualWorker,directory,name),'utf8');
+    whole.exec(sql); for(const statement of split(sql))qualified.exec(statement);
+    assert.deepEqual(inventory(whole),inventory(qualified),`${directory}/${name}: file-import DDL must equal qualification DDL, including comments and whitespace`);
+   }
+  } finally {whole.close();qualified.close();}
+ }
 });
