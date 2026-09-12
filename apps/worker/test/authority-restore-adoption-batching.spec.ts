@@ -1,12 +1,12 @@
 import { persistTypedTelemetryBatch, readTypedTelemetryPage } from '../src/typed-telemetry-repository';
 import { env, reset, applyD1Migrations, type D1Migration } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from '@app-usagemonitor/telemetry-contract';
+import { telemetryV11DayManifestDigestInput, telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from '@app-usagemonitor/telemetry-contract';
 import { createV11DeviceFixture, makeV11Day, stageV11Day, v11UsageRecord } from './helpers/telemetry-v11';
 import { canonicalTelemetryV11Json } from '@app-usagemonitor/telemetry-contract';
 import { insertTelemetryV1Chunk } from '../src/telemetry-v1-repository';
 import { parseTelemetryV1Chunk } from '../src/telemetry-v1';
-import { restoreTypedAdmissionPage } from '../src/authority-restore-adoption';
+import { AUTHORITY_ADMISSION_TABLES, restoreTypedAdmissionPage } from '../src/authority-restore-adoption';
 import { sha256Hex } from '../src/crypto';
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from '../src/telemetry-v11-domain';
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from '../src/device-auth';
@@ -14,8 +14,8 @@ import { registerTelemetryV11DayManifest } from '../src/telemetry-v11-repository
 import { prepareAuthorityRoleTarget } from '../src/authority-restore-role';
 import { AUTHORITY_OPERATOR_LEDGER_SQL,authoritySchemaInventory, authoritySchemaDigest, authorityRestoreContractDigest, authorityRestoreRetainedTableNames,
  freezeAuthorityRestoreSource,beginAuthorityRestore,copyAuthorityPage,copyAuthorityTypedPage,
- sealAuthorityRestore,type AuthorityRestoreContract } from '../src/authority-restore';
-const b=env as Env&{STORAGE_INGESTION_A:D1Database;STORAGE_INGESTION_B:D1Database;TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];TEST_TYPED_V11_ADMISSION_MIGRATIONS:D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[]};
+ sealAuthorityRestore,adoptAuthorityTypedPage,type AuthorityRestoreContract } from '../src/authority-restore';
+const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;STORAGE_INGESTION_A:D1Database;STORAGE_INGESTION_B:D1Database;TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];TEST_TYPED_V11_ADMISSION_MIGRATIONS:D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[]};
 const source=()=>b.USAGE_MONITOR_DB,target=()=>b.STORAGE_INGESTION_A,reference=()=>b.STORAGE_INGESTION_B;
 const today=()=>new Date().toISOString().slice(0,10);
 beforeEach(async()=>reset());
@@ -24,15 +24,26 @@ async function activate(db:D1Database,fixture:Awaited<ReturnType<typeof createV1
  const value:TelemetryV11DomainManifest={schemaVersion:'telemetry-domain-manifest-v1.1',fromDay:day.day,throughDay:day.day,predecessor:{token:previous.token,previousGenerationId:previous.previousGenerationId,legacyFingerprint:previous.legacyFingerprint},days:[{day:day.day,manifestId:day.manifestId,manifestDigest:day.manifestDigest}],manifestDigest:'0'.repeat(64)};
  value.manifestDigest=await sha256Hex(telemetryV11DomainManifestDigestInput(value));return activateTelemetryV11Domain(db,fixture,value);
 }
-async function prepare(withV1=false,usageCount=102){
+async function prepare(withV1=false,usageCount=102,chunkWidth=200,v1Count=32){
  await applyD1Migrations(source(),b.TEST_MIGRATIONS);
  const fixture=await createV11DeviceFixture(source(),{grant:true});
  const records=Array.from({length:usageCount},(_,i)=>v11UsageRecord(today(),'a',{eventId:`event:v2:${(i+1).toString(16).padStart(64,'0')}`}));
- const staged=await stageV11Day(source(),fixture,await makeV11Day(today(),{usage:records,quota:[{schemaVersion:'quota-observation-v1.1',observationId:`quota-occurrence:v1:${'a'.repeat(64)}`,provider:'openai_codex',observedTime:`${today()}T12:00:00.000Z`,planType:'pro',planVariant:'unknown',limitId:'codex',slot:'secondary',usedPercent:null,windowDurationMinutes:null,resetsAt:null,accountPlanAttribution:{accountBasis:'unavailable',accountTrackId:null,planBasis:'same_source_occurrence',planType:'pro',planEraId:null}}],session:[{schemaVersion:'session-dimension-v1.1',sessionUuid:'0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b',firstEventTime:`${today()}T12:00:00.000Z`,provider:'openai_codex',toolClassCounts:{shell:0,other:3}}]}));
+ const day=await makeV11Day(today(),{usage:records,quota:[{schemaVersion:'quota-observation-v1.1',observationId:`quota-occurrence:v1:${'a'.repeat(64)}`,provider:'openai_codex',observedTime:`${today()}T12:00:00.000Z`,planType:'pro',planVariant:'unknown',limitId:'codex',slot:'secondary',usedPercent:null,windowDurationMinutes:null,resetsAt:null,accountPlanAttribution:{accountBasis:'unavailable',accountTrackId:null,planBasis:'same_source_occurrence',planType:'pro',planEraId:null}}],session:[{schemaVersion:'session-dimension-v1.1',sessionUuid:'0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b',firstEventTime:`${today()}T12:00:00.000Z`,provider:'openai_codex',toolClassCounts:{shell:0,other:3}}]});
+ if(chunkWidth!==200){
+  const chunks=[];
+  for(const chunk of day.chunks)for(let offset=0;offset<chunk.records.length;offset+=chunkWidth){
+   const part=chunk.records.slice(offset,offset+chunkWidth),slot=Number(chunk.chunkId.split(':').at(-1))*200+offset;
+   chunks.push({...chunk,chunkId:chunk.chunkId.replace(/:[0-9]+$/,`:${slot/chunkWidth}`),records:part,chunkDigest:await sha256Hex(canonicalTelemetryV11Json(part))});
+  }
+  day.chunks=chunks;day.manifest.chunks=chunks.map(chunk=>({chunkId:chunk.chunkId,chunkDigest:chunk.chunkDigest,recordCount:chunk.records.length}));
+  day.manifest.manifestDigest=await sha256Hex(telemetryV11DayManifestDigestInput(day.manifest));
+  for(const chunk of chunks)chunk.manifestDigest=day.manifest.manifestDigest;
+ }
+ const staged=await stageV11Day(source(),fixture,day);
  const original=await activate(source(),fixture,staged);
  let legacyChunk:string|undefined;
  if(withV1){const legacy=await createV11DeviceFixture(source());const record={schemaVersion:'quota-observation-v1.0',observationId:`quota-occurrence:v1:${'c'.repeat(64)}`,observedTime:`${today()}T12:00:00.000Z`,provider:'openai_codex',planType:'pro',planVariant:'unknown',limitId:'codex',slot:'secondary',usedPercent:0.30000000000000004,windowDurationMinutes:10080,resetsAt:`${today()}T13:00:00.000Z`};
- const legacyRecords=Array.from({length:32},(_,i)=>({...record,observationId:`quota-occurrence:v1:${(i+128).toString(16).padStart(64,'0')}`,usedPercent:record.usedPercent}));
+ const legacyRecords=Array.from({length:v1Count},(_,i)=>({...record,observationId:`quota-occurrence:v1:${(i+128).toString(16).padStart(64,'0')}`,usedPercent:record.usedPercent}));
  const envelopeDigest=await sha256Hex('synthetic-v1-preserved');const principal=await authenticateDevice(source(),legacy.authorization);const upload=await createDeviceUploadAuthorization(source(),principal,envelopeDigest,200);const claim=await claimDeviceUploadAuthorization(source(),`Upload ${upload.uploadAuthorization}`,{envelopeDigest,bodyBytes:200,contentType:'application/json'});
  const chunk=parseTelemetryV1Chunk({schemaVersion:'telemetry-contribution-v1.0',chunkId:`quota:${today()}:0`,chunkRevision:1,chunkDigest:await sha256Hex(canonicalTelemetryV11Json(legacyRecords)),parserVersion:'synthetic-v1',consent:{telemetrySchemaVersion:'telemetry-contribution-v1.0',fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'},records:legacyRecords});legacyChunk=`chunk:${crypto.randomUUID()}`;
  await insertTelemetryV1Chunk(source(),{chunkRowId:legacyChunk,participantId:legacy.participantId,deviceId:legacy.deviceId,chunk,envelopeDigest,r2Key:'synthetic/legacy',deviceUploadAuthorizationId:claim.authorizationId,createdAt:new Date().toISOString(),supersedes:null});await source().prepare("UPDATE sqlite_sequence SET seq=500 WHERE name='telemetry_v1_records'").run();}
@@ -54,11 +65,11 @@ async function prepare(withV1=false,usageCount=102){
 async function drain(step:()=>Promise<boolean>){for(let n=0;n<256;n++)if(await step())return;throw new Error('Synthetic bounded operation did not complete');}
 
 function measured(db:D1Database,mutate?:(sql:string,row:unknown)=>unknown,mutateBatch?:(results:D1Result[])=>unknown,beforeWrite?:()=>Promise<void>,afterWrite?:()=>void){
- const stats={roundtrips:0,statements:0,writeTransactions:[] as {sql:string;args:unknown[]}[][],readQueries:[] as {sql:string;args:unknown[]}[],readBatchSizes:[] as number[]};
+ const stats={roundtrips:0,statements:0,maxParameters:0,maxBatchBytes:0,writeTransactions:[] as {sql:string;args:unknown[]}[][],readQueries:[] as {sql:string;args:unknown[]}[],readBatchSizes:[] as number[]};
  const metadata=new WeakMap<object,{inner:D1PreparedStatement;sql:string;args:unknown[]}>();
  const wrap=(inner:D1PreparedStatement,sql:string,args:unknown[]=[]):D1PreparedStatement=>{
   const proxy=new Proxy(inner,{get(o,key){
-   if(key==='bind')return(...values:unknown[])=>wrap(o.bind(...values),sql,values);
+   if(key==='bind')return(...values:unknown[])=>{stats.maxParameters=Math.max(stats.maxParameters,values.length);return wrap(o.bind(...values),sql,values);};
    if(['first','all','run','raw'].includes(String(key)))return async(...values:unknown[])=>{
     stats.roundtrips++;stats.statements++;const result=await (Reflect.get(o,key) as (...v:unknown[])=>Promise<unknown>).apply(o,values);
     return mutate&&key==='first'?mutate(sql,result):result;
@@ -71,6 +82,7 @@ function measured(db:D1Database,mutate?:(sql:string,row:unknown)=>unknown,mutate
   if(key==='batch')return async(statements:D1PreparedStatement[])=>{
    stats.roundtrips++;stats.statements+=statements.length;
    const entries=statements.map(s=>metadata.get(s)!);expect(entries.every(Boolean)).toBe(true);
+   const encoder=new TextEncoder();stats.maxBatchBytes=Math.max(stats.maxBatchBytes,entries.reduce((sum,e)=>sum+encoder.encode(e.sql).byteLength+e.args.reduce<number>((n,v)=>n+(typeof v==='string'?encoder.encode(v).byteLength:v instanceof ArrayBuffer?v.byteLength:8),0),0));
    if(entries.every(e=>/^SELECT\b/.test(e.sql))){stats.readBatchSizes.push(entries.length);stats.readQueries.push(...entries.map(e=>({sql:e.sql,args:e.args})));}
    else stats.writeTransactions.push(entries.map(e=>({sql:e.sql,args:e.args.map(v=>v instanceof ArrayBuffer?Array.from(new Uint8Array(v)):v)})));
    const writes=!entries.every(e=>/^SELECT\b/.test(e.sql));
@@ -85,11 +97,11 @@ function measured(db:D1Database,mutate?:(sql:string,row:unknown)=>unknown,mutate
  return {db:wrapped,stats};
 }
 
-async function readyForAdoption(usageCount=102){
- const f=await prepare(true,usageCount);await freezeAuthorityRestoreSource(source(),f.contract,f.pin);await beginAuthorityRestore(source(),target(),f.contract,f.pin);
+async function readyForAdoption(usageCount=102,chunkWidth=200,v1Count=32){
+ const f=await prepare(true,usageCount,chunkWidth,v1Count);await freezeAuthorityRestoreSource(source(),f.contract,f.pin);await beginAuthorityRestore(source(),target(),f.contract,f.pin);
  await drain(async()=>(await copyAuthorityPage(source(),target(),f.contract,f.pin)).state==='complete');
  for(const format of ['v1','v11'] as const)await drain(async()=>(await copyAuthorityTypedPage(source(),target(),f.contract,f.pin,format)).reachedEnd);
- return {f,options:{format:'v11' as const,sourceNamespace:f.contract.sourceNamespace,contractDigest:f.pin}};
+ return {f,options:{format:'v11' as const,sourceNamespace:f.contract.sourceNamespace,contractDigest:f.pin,limit:100}};
 }
 async function assertFirstPage(f:Awaited<ReturnType<typeof prepare>>){
  const typed=await readTypedTelemetryPage(target(),{sourceNamespace:f.contract.sourceNamespace,format:'v11',limit:100});
@@ -106,13 +118,13 @@ describe('bounded native D1 adoption reads',()=>{
  it('preserves 100 mixed records, exact proof bindings, all-page counts and replay while bounding statements and calls',async()=>{
   const {f,options}=await readyForAdoption();
   const copy=measured(target());expect(await restoreTypedAdmissionPage(copy.db,options)).toEqual({done:false,records:100});
-  expect(copy.stats.roundtrips).toBe(10);expect(copy.stats.statements).toBeLessThan(520);expect(copy.stats.readBatchSizes).toEqual([100,6]);
-  expect(copy.stats.writeTransactions.map(x=>x.length)).toEqual([402]);await assertFirstPage(f);
+  expect(copy.stats.roundtrips).toBe(10);expect(copy.stats.statements).toBeLessThan(130);expect(copy.stats.readBatchSizes).toEqual([2,6]);
+  expect(copy.stats.writeTransactions.map(x=>x.length)).toEqual([107]);await assertFirstPage(f);
   expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:false,records:4});expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:true,records:0});
   const replay=measured(target());expect(await restoreTypedAdmissionPage(replay.db,options)).toEqual({done:true,records:0});expect(replay.stats.writeTransactions).toEqual([]);
   const v1={...options,format:'v1' as const},copyV1=measured(target());
   expect(await restoreTypedAdmissionPage(copyV1.db,v1)).toEqual({done:false,records:32});
-  expect(copyV1.stats).toMatchObject({statements:138,roundtrips:9,readBatchSizes:[32,2]});expect(copyV1.stats.writeTransactions.map(x=>x.length)).toEqual([98]);
+  expect(copyV1.stats).toMatchObject({statements:45,roundtrips:9,readBatchSizes:[1,2]});expect(copyV1.stats.writeTransactions.map(x=>x.length)).toEqual([36]);
   expect(await restoreTypedAdmissionPage(target(),v1)).toEqual({done:true,records:0});
   await sealAuthorityRestore(source(),target(),f.contract,f.pin);
   const verify={...options,verify:true};
@@ -124,10 +136,10 @@ describe('bounded native D1 adoption reads',()=>{
   await expect(restoreTypedAdmissionPage(target(),{...verify,contractDigest:'e'.repeat(64)})).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
   await expect(restoreTypedAdmissionPage(target(),{...verify,verify:false})).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
   const checked=measured(target());expect(await restoreTypedAdmissionPage(checked.db,verify)).toEqual({done:false,records:100});
-  expect(checked.stats.roundtrips).toBe(10);expect(checked.stats.statements).toBeLessThan(330);expect(checked.stats.readBatchSizes).toEqual([100,6,205]);expect(checked.stats.writeTransactions.map(x=>x.length)).toEqual([2]);
+  expect(checked.stats.roundtrips).toBe(10);expect(checked.stats.statements).toBeLessThan(25);expect(checked.stats.readBatchSizes).toEqual([2,6,5]);expect(checked.stats.writeTransactions.map(x=>x.length)).toEqual([2]);
   await drain(async()=>(await restoreTypedAdmissionPage(target(),verify)).done);expect(await restoreTypedAdmissionPage(target(),verify)).toEqual({done:true,records:0});
   const checkedV1=measured(target());expect(await restoreTypedAdmissionPage(checkedV1.db,{...v1,verify:true})).toEqual({done:false,records:32});
-  expect(checkedV1.stats).toMatchObject({statements:75,roundtrips:9,readBatchSizes:[32,2,34]});expect(checkedV1.stats.writeTransactions.map(x=>x.length)).toEqual([2]);
+  expect(checkedV1.stats).toMatchObject({statements:13,roundtrips:9,readBatchSizes:[1,2,3]});expect(checkedV1.stats.writeTransactions.map(x=>x.length)).toEqual([2]);
   expect(await restoreTypedAdmissionPage(target(),{...v1,verify:true})).toEqual({done:true,records:0});
   expect((await target().prepare('SELECT format,copied,verified,done,verify_done FROM _authority_restore_adoption ORDER BY format').all()).results)
    .toEqual([{format:'v1',copied:32,verified:32,done:1,verify_done:1},{format:'v11',copied:104,verified:104,done:1,verify_done:1}]);
@@ -206,5 +218,137 @@ describe('bounded native D1 adoption reads',()=>{
   expect(await restoreTypedAdmissionPage(wrapped.db,options)).toEqual({done:false,records:100});expect(wrapped.stats.writeTransactions).toHaveLength(1);await assertFirstPage(f);
   expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:false,records:4});
   expect(await target().prepare("SELECT copied FROM _authority_restore_adoption WHERE format='v11'").first('copied')).toBe(104);
+ },30000);
+
+ it('produces identical v1/v11 proofs, source IDs and durable completion with 100 versus 200 rows',async()=>{
+  const {f,options}=await readyForAdoption(398,200,200),other=b.STORAGE_ANALYTICS_DB;
+  await prepareAuthorityRoleTarget(reference(),other,await authoritySchemaDigest(await authoritySchemaInventory(reference())));
+  await other.batch([other.prepare(AUTHORITY_OPERATOR_LEDGER_SQL),other.prepare('INSERT INTO d1_storage_migrations VALUES(?,?)').bind('0001_restore_base.sql','f'.repeat(64))]);
+  await beginAuthorityRestore(source(),other,f.contract,f.pin);
+  await drain(async()=>(await copyAuthorityPage(source(),other,f.contract,f.pin)).state==='complete');
+  for(const format of ['v1','v11'] as const)await drain(async()=>(await copyAuthorityTypedPage(source(),other,f.contract,f.pin,format)).reachedEnd);
+  const measurements=[];
+  for(const [db,limit] of [[target(),100],[other,200]] as const){
+   const wrapped=measured(db),started=performance.now();let pages=0;
+   for(const format of ['v1','v11'] as const)await drain(async()=>{const step=await restoreTypedAdmissionPage(wrapped.db,{...options,format,limit});if(step.records)pages++;return step.done;});
+   await sealAuthorityRestore(source(),db,f.contract,f.pin);
+   for(const format of ['v1','v11'] as const)await drain(async()=>{const step=await restoreTypedAdmissionPage(wrapped.db,{...options,format,limit,verify:true});if(step.records)pages++;return step.done;});
+   measurements.push({limit,pages,statements:wrapped.stats.statements,roundtrips:wrapped.stats.roundtrips,elapsedMs:performance.now()-started});
+   expect(wrapped.stats.maxParameters).toBeLessThanOrEqual(100);expect(wrapped.stats.maxBatchBytes).toBeLessThanOrEqual(4*1024*1024);
+  }
+  for(const table of [...AUTHORITY_ADMISSION_TABLES,'typed_v11_record_admissions','_authority_restore_adoption','storage_raw_copy_pages']){
+   const read=async(db:D1Database)=>(await db.prepare(`SELECT * FROM ${table}`).all()).results.map(row=>canonicalTelemetryV11Json(row)).sort();
+   expect(await read(other),table).toEqual(await read(target()));
+  }
+  expect(measurements.map(m=>m.pages)).toEqual([12,6]);
+  expect(measurements[1]!.statements).toBeLessThan(measurements[0]!.statements);
+  expect(measurements[1]!.roundtrips).toBeLessThan(measurements[0]!.roundtrips);
+  console.log('synthetic-adoption-page-comparison',JSON.stringify(measurements));
+  expect(await source().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(400);
+ },30000);
+
+ it('uses 200 rows through the public coordinator and preserves its total source/target budget',async()=>{
+  const {f}=await readyForAdoption(200),s=measured(source()),t=measured(target());
+  expect(await adoptAuthorityTypedPage(s.db,t.db,f.contract,f.pin,'v11')).toEqual({done:false,records:200});
+  expect(s.stats.statements+t.stats.statements).toBeLessThanOrEqual(900);
+  expect(t.stats.readBatchSizes).toEqual([3,6]);expect(t.stats.writeTransactions[0]).toHaveLength(207);
+  expect(await target().prepare("SELECT after_id,copied FROM _authority_restore_adoption WHERE format='v11'").first()).toEqual({after_id:200,copied:200});
+  expect(t.stats.maxParameters).toBeLessThanOrEqual(100);
+ },30000);
+
+ it('reduces a high-cardinality public page deterministically without crossing the invocation budget',async()=>{
+  const {f}=await readyForAdoption(200,1),s=measured(source()),t=measured(target());
+  const page=await adoptAuthorityTypedPage(s.db,t.db,f.contract,f.pin,'v11');
+  const remaining=900-64-2*f.contract.authoritySequences.length;
+  expect(page).toEqual({done:false,records:Math.floor((remaining-34)/4)});
+  expect(page.records).toBeLessThan(200);expect(page.records).toBeGreaterThan(0);
+  expect(s.stats.statements+t.stats.statements).toBeLessThanOrEqual(900);
+  expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(page.records);
+  await drain(async()=>(await adoptAuthorityTypedPage(source(),target(),f.contract,f.pin,'v11')).done);
+  await drain(async()=>(await adoptAuthorityTypedPage(source(),target(),f.contract,f.pin,'v1')).done);
+  await sealAuthorityRestore(source(),target(),f.contract,f.pin);
+  const checkedSource=measured(source()),checkedTarget=measured(target());
+  expect(await adoptAuthorityTypedPage(checkedSource.db,checkedTarget.db,f.contract,f.pin,'v11',true)).toEqual({done:false,records:200});
+  expect(checkedSource.stats.statements+checkedTarget.stats.statements).toBeLessThanOrEqual(900);
+ },30000);
+
+ it('shrinks a byte-limited prefix before its proof transaction and resumes every remaining row',async()=>{
+  const {options}=await readyForAdoption(200),wrapped=measured(target());
+  const maxBytes=128*1024;
+  const page=await restoreTypedAdmissionPage(wrapped.db,{...options,limit:200,maxBytes});
+  expect(page.records).toBeGreaterThan(0);expect(page.records).toBeLessThan(200);
+  expect(wrapped.stats.maxBatchBytes).toBeLessThanOrEqual(maxBytes);
+  expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(page.records);
+  await drain(async()=>(await restoreTypedAdmissionPage(target(),{...options,limit:200,maxBytes})).done);
+  expect(await target().prepare("SELECT copied FROM _authority_restore_adoption WHERE format='v11'").first('copied')).toBe(202);
+ },30000);
+
+ it('maps reordered sets exactly and refuses duplicate, foreign and wrongly typed stored-row keys',async()=>{
+  const {options}=await readyForAdoption(200);
+  for(const change of ['duplicate','foreign','wrong-type','wrong-id-type','conflicting-owner']){
+   const wrapped=measured(target(),undefined,results=>results.map(result=>{
+    const sourceRows=result.results as Record<string,unknown>[];
+    if(sourceRows[0]?.source_row_id===undefined)return result;
+    const rows=sourceRows.map(row=>({...row}));
+    if(change==='duplicate')rows[1]=rows[0]!;
+    else if(change==='foreign')rows[0]!.source_row_id=999999;
+    else if(change==='wrong-type')rows[0]!.source_row_id=String(rows[0]!.source_row_id);
+    else if(change==='wrong-id-type')rows[0]!.id=String(rows[0]!.id);
+    else rows[1]!.owner_id=Number(rows[0]!.owner_id)+100;
+    return {...result,results:rows};
+   }));
+   await expect(restoreTypedAdmissionPage(wrapped.db,{...options,limit:200}),change).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
+   expect(wrapped.stats.writeTransactions).toEqual([]);
+  }
+  const reordered=measured(target(),undefined,results=>results.map(result=>({...result,results:[...result.results].reverse()})));
+  expect(await restoreTypedAdmissionPage(reordered.db,{...options,limit:200})).toEqual({done:false,records:200});
+  expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(200);
+ },30000);
+
+ it('verifies every keyed proof despite reordering and refuses mismatched result identity or cardinality',async()=>{
+  const {f,options}=await readyForAdoption(200);
+  for(const format of ['v1','v11'] as const)await drain(async()=>(await restoreTypedAdmissionPage(target(),{...options,format,limit:200})).done);
+  await sealAuthorityRestore(source(),target(),f.contract,f.pin);
+  for(const change of ['duplicate','foreign','wrong-type','missing','failed']){
+   const wrapped=measured(target(),undefined,results=>results.map(result=>{
+    const sourceRows=result.results as Record<string,unknown>[];
+    if(sourceRows[0]?.typed_record_id===undefined)return result;
+    const rows=sourceRows.map(row=>({...row}));
+    if(change==='duplicate')rows[1]=rows[0]!;
+    else if(change==='foreign')rows[0]!.typed_record_id=999999;
+    else if(change==='wrong-type')rows[0]!.typed_record_id=String(rows[0]!.typed_record_id);
+    return {...result,success:change!=='failed',results:change==='missing'?rows.slice(1):rows};
+   }));
+   await expect(restoreTypedAdmissionPage(wrapped.db,{...options,limit:200,verify:true}),change).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
+   expect(wrapped.stats.writeTransactions).toEqual([]);
+   expect(await target().prepare("SELECT verified FROM _authority_restore_adoption WHERE format='v11'").first('verified')).toBe(0);
+  }
+  const reordered=measured(target(),undefined,results=>results.map(result=>({...result,results:[...result.results].reverse()})));
+  expect(await restoreTypedAdmissionPage(reordered.db,{...options,limit:200,verify:true})).toEqual({done:false,records:200});
+  expect(reordered.stats.readBatchSizes).toEqual([3,6,7]);
+ },30000);
+
+ it('does not acknowledge a differently sized concurrent prefix and resumes only its committed watermark',async()=>{
+  const {options}=await readyForAdoption(200);let first=true;
+  const raced=measured(target(),undefined,undefined,async()=>{if(first){first=false;await restoreTypedAdmissionPage(target(),{...options,limit:100});}});
+  await expect(restoreTypedAdmissionPage(raced.db,{...options,limit:200})).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_UNACKNOWLEDGED');
+  expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(100);
+  expect(await restoreTypedAdmissionPage(target(),{...options,limit:200})).toEqual({done:false,records:102});
+  expect(await target().prepare("SELECT copied,after_id FROM _authority_restore_adoption WHERE format='v11'").first()).toEqual({copied:202,after_id:202});
+ },30000);
+
+ it('rolls back shared writes and every proof on a late insert failure, then retries the same 200 rows',async()=>{
+  const {options}=await readyForAdoption(200);
+  await target().prepare(`CREATE TRIGGER synthetic_last_proof BEFORE INSERT ON typed_v11_record_proofs
+   WHEN NEW.typed_record_id=(SELECT id FROM typed_telemetry_records WHERE format=11 AND source_row_id=200)
+   BEGIN SELECT RAISE(ABORT,'synthetic late proof failure'); END`).run();
+  await expect(restoreTypedAdmissionPage(target(),{...options,limit:200})).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_UNACKNOWLEDGED');
+  for(const table of ['typed_v11_record_proofs','typed_v11_chunk_allocations','typed_v11_owner_memberships','typed_v11_manifest_memberships'])expect(await target().prepare(`SELECT count(*) n FROM ${table}`).first('n')).toBe(0);
+  expect(await target().prepare("SELECT copied,after_id FROM _authority_restore_adoption WHERE format='v11'").first()).toEqual({copied:0,after_id:0});
+  await target().prepare('DROP TRIGGER synthetic_last_proof').run();
+  let once=true;const lost=measured(target(),undefined,undefined,undefined,()=>{if(once){once=false;throw new Error('synthetic committed response loss');}});
+  expect(await restoreTypedAdmissionPage(lost.db,{...options,limit:200})).toEqual({done:false,records:200});
+  expect(await restoreTypedAdmissionPage(target(),{...options,limit:200})).toEqual({done:false,records:2});
+  expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(202);
  },30000);
 });
