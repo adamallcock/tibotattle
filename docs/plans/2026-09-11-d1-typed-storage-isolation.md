@@ -120,7 +120,17 @@ tests passed. Guarded development and staging dry builds then passed from the
 clean committed foundation `672043033fda15c0e3d0ed15bda5122458cac24a` using
 manifest- and source-verified existing public assets. This does not provision or
 deploy these databases. The subsequent integration adds 39 focused storage
-tests; its final complete Worker check is recorded after source freeze.
+tests. Its complete `npm run check` passed at frozen source
+`62516e878197ec9c1524a8c8a87c0344e2277677`: **1,149 tests in 88 files**, the
+27 operator checks, all script/type/package/endpoint checks, and guarded
+development/staging dry builds. The focused storage command passes 101 tests;
+architecture and the 20 documentation/preflight tests also pass.
+
+An [actual-layout synthetic measurement](../research/2026-09-11-typed-storage-measurement.md)
+at the same source revision measured **320–353 incremental bytes per record**
+against **1,834–1,845 bytes** in the baseline raw record tables and indexes. It
+preserved all rows and includes the new dictionaries/indexes. This is an
+81–83% reduction for those two fixtures, not a production capacity forecast.
 
 ## Next implementation boundary
 
