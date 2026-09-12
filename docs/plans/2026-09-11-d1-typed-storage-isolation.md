@@ -155,7 +155,12 @@ including the maximum 200 distinct session records with attribution inside the
 900-statement and 4 MiB transaction limits. Independent review confirmed that
 admitted subtype deletion and added session-tool entries cannot invalidate a
 saved preservation proof; ordinary owner/chunk cleanup remains possible.
-The complete Worker gate must still be recorded against the frozen commit.
+The complete Worker `npm run check` then passed against clean frozen source
+`28a0f44f82d7afccce392a3f9f708090acb755bb`: **1,185 tests in 92 files**, all
+27 Wrangler operator checks, package/endpoint/script/type checks, and guarded
+development/staging dry builds. Architecture (528 production files, 2,071
+imports, no approved debt) and all 20 documentation/preflight tests passed.
+The final documentation-only receipt commit does not change that tested source.
 
 Apply the authority check to **every** public daily/weekly, allowance and history
 response, and journal policy/exclusion/source withdrawal before changing any

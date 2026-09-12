@@ -32,8 +32,14 @@ npm run typecheck
 The tests use disposable local D1 databases. They exercise exact typed/legacy
 record reconstruction, owner-scoped private dictionaries, replay, copy into a
 nonempty namespace, atomic copy checkpoints, isolated analytics delivery and
-owner-move write fences. They do not qualify production HTTP admission,
-distributed erasure, or a full restored analytical publication.
+owner-move write fences. The fresh-target composition also exercises accountless
+HTTP enrollment/ownership, upload claims, typed staging and exact domain closure,
+isolated analytics outage/recovery, opt-out and owner erasure. This composition
+uses the optional `ingestion-bridge-migrations` and
+`typed-v11-admission-migrations` after the baseline and typed layouts; it is not
+the final role-specific schema accepted by the remote operator. Tests do not
+qualify production HTTP admission, distributed erasure, or a full restored
+analytical publication.
 
 The source-copy fixture uses the existing full `0001`–`0060` schema and actual
 credential/chunk repositories. It retains staged v1.1 records and all three
