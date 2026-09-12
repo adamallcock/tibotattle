@@ -10,6 +10,20 @@ status: implementation-in-progress
 Implementation is on `codex/d1-typed-storage-isolation`, draft
 [PR #124](https://github.com/adamallcock/tibotattle/pull/124), based on
 `3de7ccd0a293e1d9b95ce14b591dbf5f1c2d1f2b`.
+September 12 latest completed candidate gate is `26ba247d`: 1,402 tests across
+120 files, plus 13 documentation and 3 hosted checks passed. The independently
+frozen `77f0b5e5` optimized 1,600-row v1.1 cloud rehearsal completed 226 checkpoints;
+final proofs and unchanged source census (94 tables, 1,651 rows) passed. Metrics
+and overlapping Cron helper reconciliation remain separate retained evidence.
+Three paired fixed-read Service-binding placement trials showed a 4.98× service
+improvement; this is synthetic read latency, not migration throughput proof.
+Production main is unchanged; the additive independent deletion-ledger migration
+0003 is complete. An optional placed migration runner is now under local review;
+its new-source qualification and actual placed cloud migration remain pending.
+The obsolete larger `77f0` v1 cloud run is superseded by the planned **both-format**
+placed-candidate rehearsal after qualification. No old source receipt is relabeled.
+
+Historical completed qualification below remains pinned to its named source.
 September 12 integration, independent source review and clean-source local
 qualification are complete at `edb6cbcb04509ab1ca26f92e1215bfc41055348f`.
 The owning Worker gate passed all 1,396 tests across 120 files, the script and

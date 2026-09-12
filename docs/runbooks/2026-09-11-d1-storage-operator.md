@@ -222,6 +222,75 @@ mandatory. Keep ordinary target traffic unbound through authority/typed/bootstra
 verification, deletion-ledger reconciliation, independent analytics catch-up and
 actual HTTP/privacy/erasure/public-response qualification.
 
+### Optional private placed execution
+
+The default remains the single Worker described above. The optional placed mode
+keeps Queue and Cron ownership in a front Worker and sends one bounded private
+request to a backend which runs the **entire unchanged** journal claim, restore
+step and progress commit. Only after a validated response does the front publish
+the next Queue wakeup and acknowledge the current one. The backend has no Queue
+producer or Cron. The front has no D1 bindings. This uses
+[Service binding fetch](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/)
+and [region placement](https://developers.cloudflare.com/workers/configuration/placement/);
+placement affects the backend fetch, not the Queue handler, and does not guarantee
+execution inside the named cloud provider.
+
+Supply a private closed `d1-storage-placed-topology-v1` JSON document containing
+`frontName`, `backendName`, `queueName`, the exact 32-hex `queueId`, `source` and
+`target` each with exact `name` and UUID `id`, and `region: "gcp:us-east4"`.
+Names and IDs must be distinct where required; unknown fields and other regions
+refuse. This prepares files only; it does not discover or create resources.
+
+```sh
+node scripts/d1-storage-migration-package.mjs --worker-root "$PWD" \
+  --contract /absolute/private/restore-contract.json \
+  --contract-sha256 <reviewed-canonical-contract-digest> \
+  --placed-topology /absolute/private/topology.json \
+  --placed-topology-sha256 <reviewed-canonical-topology-digest> \
+  --expires-at <reviewed-ISO-UTC-deadline-within-24-hours> \
+  --directory /absolute/new/private/placed-migration
+```
+
+The package contains `migration-worker.mjs`/`wrangler.jsonc` for the front and
+`migration-backend.mjs`/`wrangler.backend.jsonc` for the backend. Both are disabled
+with empty schedules, no routes, workers.dev or preview ingress. Preparation pins
+the actual source commit, role input digest, both bundle and configuration hashes,
+and exact topology. An execution digest binds the source, role, contract, deadline
+and topology inside both bundles and every private response. The original Queue
+message remains unchanged. Private request and response bodies are capped at 2KiB;
+errors are content-free and never authorize a retry.
+
+Review both dry builds and actual uploaded versions, exact D1/service/Queue
+bindings, ingress closure and backend placement before activation. Journal every
+external mutation. Activate the pinned backend before the front; attach the front
+consumer and schedule only in the approved window. An expired deadline cannot be
+renewed by editing configuration. Before-effect failures, lost responses and
+pending intents need the existing stopped-executor reconciliation, not retries.
+A backend commit followed by lost fetch response or Queue send is a safe lost
+wakeup: Cron obtains the committed next step. An unknown effect before progress
+commit retains the intent and refuses further execution. Never clear it on a
+fetch timeout. Detach the front consumer and schedule before cleanup, then verify
+both Workers absent and preserve the exact retained database inventory.
+
+For local populated proof using actual restoration APIs and native Queue/Service
+bindings (no cloud placement measurement):
+
+```sh
+node scripts/d1-storage-restore.mjs --worker-root "$PWD" --rehearse \
+  --transport placed --records 1600 --directory /absolute/new/private/placed-proof
+```
+
+This existing fixture retains 1,600 v1.1 usage records and also executes the
+restored-runtime credential/replay/catch-up/withdrawal/erasure proof. It does not
+claim mixed-stream or v1 workload coverage. The separate dense cloud rehearsal
+must retain both 1,600-row v1 and v1.1 fixtures (800 usage, 600 quota, 200 sessions),
+verify all four copy/adoption/verification passes, final proof counts, foreign
+keys and full unchanged source census, and retain per-stage timing and unknown
+outcomes. Use fresh isolated resources and the **new frozen source** role packages;
+never relabel earlier source qualification. Unchanged migration/schema hashes
+are parity evidence only. The small synthetic 19-stage driver test proves
+transport/CAS/ack behavior, not record preservation or cloud throughput.
+
 ## Separate analytics Worker
 
 `wrangler.analytics.example.jsonc` points at the maintained separate scheduler.

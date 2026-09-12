@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { openOperation,identityDigest } from '../../../scripts/lib/release-operation.mjs';
 import { storageError,storageSha256,storageSchemaDigest } from './d1-storage-plan.mjs';
 import { readIngestionRoleInputs,storageRestorePreparation } from './d1-storage-role.mjs';
+import { buildStorageMigrationBundles } from './d1-storage-migration-package.mjs';
 import { runStorageRestorePage } from './d1-storage-restore-runner.mjs';
 import { createSyntheticRestoreOwner,verifyRestoredRuntime } from './d1-storage-restored-runtime.mjs';
 import { SYNTHETIC_D1_WORKER,syntheticD1Binding,syntheticRestoreQuarantine,closeSyntheticD1Bindings } from './d1-storage-local-d1.mjs';
@@ -59,9 +60,10 @@ async function applyMigrations(db,inputs,workerRoot,split){
  * cloud credential, existing persistence directory or user dataset is admitted.
  * The source fence and all old/new local evidence remain in the private output.
  * Dirty source can rehearse but can never emit qualified schema metadata. */
-export async function rehearseStorageRestore({workerRoot,directory,allowUnfrozen=false,qualify=false,records=1,onProgress=()=>{}}){
+export async function rehearseStorageRestore({workerRoot,directory,allowUnfrozen=false,qualify=false,records=1,transport='direct',onProgress=()=>{}}){
  const started=performance.now();
  workerRoot=resolve(workerRoot);directory=resolve(directory);
+ if(!['direct','placed'].includes(transport))throw storageError('REHEARSAL_TRANSPORT_INVALID');
  if(!Number.isSafeInteger(records)||records<1||records>10000)throw storageError('REHEARSAL_RECORD_LIMIT');
  const inputs=await readIngestionRoleInputs(workerRoot,{allowUnfrozen});
  if(qualify&&!inputs.frozen)throw storageError('SOURCE_NOT_FROZEN');
@@ -71,8 +73,10 @@ export async function rehearseStorageRestore({workerRoot,directory,allowUnfrozen
  const {api,sha256:runnerSha256}=await compileApi(workerRoot,directory);
  const require=createRequire(join(workerRoot,'package.json')),{Miniflare}=require('miniflare');
  const {unstable_splitSqlQuery:split}=require('wrangler');
- const mf=new Miniflare({host:'127.0.0.1',cf:false,modules:true,script:SYNTHETIC_D1_WORKER,
-  compatibilityDate:'2026-07-26',d1Databases:{SOURCE:randomUUID(),TARGET:randomUUID(),REFERENCE:randomUUID(),BASE:randomUUID(),ANALYTICS:randomUUID(),LEDGER:randomUUID()},r2Buckets:['QUARANTINE'],d1Persist:join(directory,'local-d1')});
+ const databaseIds={SOURCE:randomUUID(),TARGET:randomUUID(),REFERENCE:randomUUID(),BASE:randomUUID(),ANALYTICS:randomUUID(),LEDGER:randomUUID()};
+ const inspector={name:'inspector',modules:true,script:SYNTHETIC_D1_WORKER,compatibilityDate:'2026-07-26',d1Databases:databaseIds,r2Buckets:['QUARANTINE']};
+ const localOptions={host:'127.0.0.1',cf:false,d1Persist:join(directory,'local-d1')};
+ const mf=new Miniflare({...localOptions,workers:[inspector]});
  let operation;
  try{
   await mf.ready;
@@ -136,12 +140,47 @@ export async function rehearseStorageRestore({workerRoot,directory,allowUnfrozen
   operation=await openOperation({directory:join(directory,'operation'),kind:'qualification',binding:{sourceCommit:inputs.sourceCommit,inputSha256:inputs.inputSha256,runnerSha256,contractDigest}});
   let state={schema:'d1-storage-restore-progress-v1',contractDigest,intent:null,stage:'freeze-source',steps:0};
   await operation.save(state);
-  // Each call represents one bounded operator invocation; the synthetic CLI
-  // drives those calls in order. Real data needs its own approved operation.
-  while(state.stage!==null){
-   if(state.steps>=1024+5*Math.ceil(records/32))throw storageError('REHEARSAL_STEP_LIMIT');
-   onProgress({stage:state.stage,steps:state.steps});
-   state=await runStorageRestorePage({state,save:value=>operation.save(value),api,source,target,contract,contractDigest});
+  let transportEvidence={transport:'direct-node-api'};
+  if(transport==='placed'){
+   // Fresh synthetic databases only. This local admission is not a frozen-source
+   // claim: source status is retained below and dirty qualification still refuses.
+   const deadline=Date.now()+120000;
+   const executionDigest=identityDigest({sourceCommit:inputs.sourceCommit,inputSha256:inputs.inputSha256,contractDigest,deadline,transport:'local-synthetic-placed'});
+   const bundles=await buildStorageMigrationBundles({workerRoot,contract,contractDigest,expiresAt:deadline,frozenSource:true,executionDigest,placed:true});
+   for(const [name,bytes]of Object.entries(bundles))await privateWrite(directory,name,Buffer.from(bytes).toString('utf8'));
+   await closeSyntheticD1Bindings(mf);
+   await mf.setOptions({...localOptions,workers:[inspector,
+    {name:'restore-backend',modules:true,script:Buffer.from(bundles['migration-backend.mjs']).toString('utf8'),compatibilityDate:'2026-07-26',
+     bindings:{STORAGE_RESTORE_MODE:'enabled'},d1Databases:{SOURCE:databaseIds.SOURCE,TARGET:databaseIds.TARGET}},
+    {name:'restore-front',modules:true,script:Buffer.from(bundles['migration-worker.mjs']).toString('utf8'),compatibilityDate:'2026-07-26',
+     bindings:{STORAGE_RESTORE_MODE:'enabled'},serviceBindings:{STORAGE_RESTORE_EXECUTOR:'restore-backend'},
+     queueProducers:{STORAGE_RESTORE_QUEUE:'synthetic-restore'},queueConsumers:{'synthetic-restore':{maxBatchSize:1,maxBatchTimeout:0,maxRetries:0}}},
+   ]});
+   const queue=await mf.getQueueProducer('STORAGE_RESTORE_QUEUE','restore-front');
+   await queue.send({schema:'d1-storage-restore-wakeup-v1',contractDigest,stage:'freeze-source',steps:0});
+   let lastSteps=-1;
+   while(true){
+    if(Date.now()>=deadline)throw storageError('REHEARSAL_TRANSPORT_DEADLINE');
+    const exists=await target.prepare("SELECT count(*) n FROM sqlite_schema WHERE name='_authority_operator_progress'").first('n');
+    const progress=exists?await target.prepare('SELECT contract_digest,stage,steps,intent FROM _authority_operator_progress WHERE id=1').first():null;
+    if(progress){
+     if(progress.contract_digest!==contractDigest||progress.steps>1024+5*Math.ceil(records/32))throw storageError('REHEARSAL_PROOF_FAILED');
+     state={schema:state.schema,contractDigest,stage:progress.stage,steps:progress.steps,intent:progress.intent};
+     if(state.steps!==lastSteps){onProgress({stage:state.stage,steps:state.steps});lastSteps=state.steps;await operation.save(state);}
+     if(state.stage===null){if(state.intent!==null)throw storageError('REHEARSAL_PROOF_FAILED');break;}
+    }
+    await new Promise(resolve=>setTimeout(resolve,100));
+   }
+   transportEvidence={transport:'native-queue-service-binding-fetch',executionDigest,backendBundleSha256:storageSha256(bundles['migration-backend.mjs']),
+    frontBundleSha256:storageSha256(bundles['migration-worker.mjs']),syntheticApiStubs:false,placementMeasured:false};
+   await privateWrite(directory,'transport-evidence.json',transportEvidence);
+  }else{
+   // Each call is one bounded invocation; no remote adapter is admitted.
+   while(state.stage!==null){
+    if(state.steps>=1024+5*Math.ceil(records/32))throw storageError('REHEARSAL_STEP_LIMIT');
+    onProgress({stage:state.stage,steps:state.steps});
+    state=await runStorageRestorePage({state,save:value=>operation.save(value),api,source,target,contract,contractDigest});
+   }
   }
   const check=async(db,sql,expected)=>{if(await db.prepare(sql).first('n')!==expected)throw storageError('REHEARSAL_PROOF_FAILED');};
   await check(source,'SELECT count(*) n FROM telemetry_v11_records',records);
@@ -161,7 +200,7 @@ export async function rehearseStorageRestore({workerRoot,directory,allowUnfrozen
   if(identityDigest(await readIngestionRoleInputs(workerRoot,{allowUnfrozen}))!==identityDigest(inputs))throw storageError('ROLE_INPUT_CHANGED');
   const runtimeElapsedMs=Math.ceil(performance.now()-runtimeStarted);
   const runtimeEvidenceSha256=await privateWrite(directory,'restored-runtime-evidence.json',{...runtimeProof,elapsedMs:runtimeElapsedMs,sourceCommit:inputs.sourceCommit,frozenSource:inputs.frozen,runnerSha256,contractDigest,inputSha256:inputs.inputSha256,runtimeInputSha256:identityDigest(runtimeInputs)});
-  const proof={elapsedMs:Math.ceil(performance.now()-started),restoreElapsedMs,runtimeElapsedMs,restoredRuntimeEvidenceSha256:runtimeEvidenceSha256,measurement:{scope:'whole-role-one-data-owner-v11-usage',additionalTombstonedAuthorityOwners:1,measuredBeforeRuntimeCanary:true,records,sourceEmptyBytes,sourcePopulatedBytes,finalRoleEmptyBytes,targetPopulatedBytes,targetIncludesRestoreReceipts:true,analyticsDatabaseExcluded:true},schema:'d1-storage-restore-rehearsal-v1',status:'passed',scope:'synthetic-v11-authority-copy-and-bootstrap',
+  const proof={transportEvidence,elapsedMs:Math.ceil(performance.now()-started),restoreElapsedMs,runtimeElapsedMs,restoredRuntimeEvidenceSha256:runtimeEvidenceSha256,measurement:{scope:'whole-role-one-data-owner-v11-usage',additionalTombstonedAuthorityOwners:1,measuredBeforeRuntimeCanary:true,records,sourceEmptyBytes,sourcePopulatedBytes,finalRoleEmptyBytes,targetPopulatedBytes,targetIncludesRestoreReceipts:true,analyticsDatabaseExcluded:true},schema:'d1-storage-restore-rehearsal-v1',status:'passed',scope:'synthetic-v11-authority-copy-and-bootstrap',
    sourceCommit:inputs.sourceCommit,frozenSource:inputs.frozen,inputSha256:inputs.inputSha256,runnerSha256,contractDigest,
    sourceSnapshotDigest,sourceSchemaSha256:contract.sourceSchemaDigest,restoreBaseSchemaSha256:role.baseSchemaDigest,
    finalRoleSchemaSha256,roleInputsSha256,baseSqlSha256:baseSha256,finalSchemaSha256:storageSchemaDigest(schemaRows.results),steps:state.steps,
@@ -181,10 +220,11 @@ export function parseRestoreArguments(argv){
  const options={rehearse:false,qualify:false,allowUnfrozen:false};
  for(let i=0;i<argv.length;i++){const arg=argv[i];
   if(['--rehearse','--qualify','--allow-unfrozen'].includes(arg)){const key=arg==='--allow-unfrozen'?'allowUnfrozen':arg.slice(2);if(options[key])throw storageError('ARGUMENTS');options[key]=true;}
-  else if(['--worker-root','--directory','--records'].includes(arg)&&argv[i+1]&&!argv[i+1].startsWith('--')){const key=arg==='--worker-root'?'workerRoot':arg==='--records'?'records':'directory';if(options[key])throw storageError('ARGUMENTS');options[key]=key==='records'?Number(argv[++i]):argv[++i];}
+  else if(['--worker-root','--directory','--records','--transport'].includes(arg)&&argv[i+1]&&!argv[i+1].startsWith('--')){const key=arg==='--worker-root'?'workerRoot':arg==='--records'?'records':arg==='--transport'?'transport':'directory';if(options[key])throw storageError('ARGUMENTS');options[key]=key==='records'?Number(argv[++i]):argv[++i];}
   else throw storageError('ARGUMENTS');
  }
- if(!options.workerRoot||(!options.rehearse&&(options.directory!==undefined||options.records!==undefined))
+ if(!options.workerRoot||(!options.rehearse&&(options.directory!==undefined||options.records!==undefined||options.transport!==undefined))
+  ||(options.transport!==undefined&&!['direct','placed'].includes(options.transport))
   ||(options.records!==undefined&&(!Number.isSafeInteger(options.records)||options.records<1||options.records>10000))||(options.rehearse&&!options.directory)||(options.qualify&&(!options.rehearse||options.allowUnfrozen)))throw storageError('ARGUMENTS');return options;
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
