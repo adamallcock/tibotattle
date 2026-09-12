@@ -285,7 +285,8 @@ export async function copyAuthorityTypedPage(source:D1Database,target:D1Database
   await validate(contract,pin);await assertFrozen(source,contract,pin);if((await runState(target,contract,pin)).phase!=='copying')fail();
   const copy=contract.typedCopies.find(x=>x.format===format);if(!copy)fail();
   await checkCapacity(target,contract);
-  const result=await copyLegacyTelemetryPage(source,target,copy);await assertFrozen(source,contract,pin);await checkCapacity(target,contract);return result;
+  // Reserve both fresh source proofs, bounded receipts and driver overhead.
+  const result=await copyLegacyTelemetryPage(source,target,copy,{maxStatements:Math.min(800,900-64-2*contract.authoritySequences.length)});await assertFrozen(source,contract,pin);await checkCapacity(target,contract);return result;
 }
 export async function sealAuthorityRestore(source:D1Database,target:D1Database,contract:AuthorityRestoreContract,pin:string) {
   await validate(contract,pin);await assertFrozen(source,contract,pin);const state=await runState(target,contract,pin);if(state.phase==='sealed')return;if(state.phase!=='copying')fail();
@@ -371,6 +372,8 @@ async function finishPromotion(db:D1Database,contract:AuthorityRestoreContract,p
 export async function adoptAuthorityTypedPage(source:D1Database,target:D1Database,contract:AuthorityRestoreContract,pin:string,format:'v1'|'v11',verify=false){
  await validate(contract,pin);await assertFrozen(source,contract,pin);if(!contract.admissionContract||!contract.typedCopies.some(x=>x.format===format))fail();
  if(await target.prepare('SELECT 1 FROM _authority_restore_tables WHERE copy_done=0 LIMIT 1').first())throw new Error('AUTHORITY_RESTORE_AUTHORITY_INCOMPLETE');
- const result=await restoreTypedAdmissionPage(target,{format,sourceNamespace:contract.sourceNamespace,contractDigest:pin,verify});
+ // Worst case: each row has a distinct chunk/owner/manifest (eight reads/writes).
+ // Shared-key deduplication saves queries but never determines admission size.
+ const result=await restoreTypedAdmissionPage(target,{format,sourceNamespace:contract.sourceNamespace,contractDigest:pin,verify,limit:Math.min(100,Math.floor((900-64-2*contract.authoritySequences.length)/8))});
  await assertFrozen(source,contract,pin);await checkCapacity(target,contract);return result;
 }

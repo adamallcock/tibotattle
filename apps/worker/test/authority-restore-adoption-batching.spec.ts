@@ -27,7 +27,7 @@ async function activate(db:D1Database,fixture:Awaited<ReturnType<typeof createV1
 async function prepare(withV1=false){
  await applyD1Migrations(source(),b.TEST_MIGRATIONS);
  const fixture=await createV11DeviceFixture(source(),{grant:true});
- const records=Array.from({length:34},(_,i)=>v11UsageRecord(today(),'a',{eventId:`event:v2:${(i+1).toString(16).padStart(64,'0')}`}));
+ const records=Array.from({length:102},(_,i)=>v11UsageRecord(today(),'a',{eventId:`event:v2:${(i+1).toString(16).padStart(64,'0')}`}));
  const staged=await stageV11Day(source(),fixture,await makeV11Day(today(),{usage:records,quota:[{schemaVersion:'quota-observation-v1.1',observationId:`quota-occurrence:v1:${'a'.repeat(64)}`,provider:'openai_codex',observedTime:`${today()}T12:00:00.000Z`,planType:'pro',planVariant:'unknown',limitId:'codex',slot:'secondary',usedPercent:null,windowDurationMinutes:null,resetsAt:null,accountPlanAttribution:{accountBasis:'unavailable',accountTrackId:null,planBasis:'same_source_occurrence',planType:'pro',planEraId:null}}],session:[{schemaVersion:'session-dimension-v1.1',sessionUuid:'0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b',firstEventTime:`${today()}T12:00:00.000Z`,provider:'openai_codex',toolClassCounts:{shell:0,other:3}}]}));
  const original=await activate(source(),fixture,staged);
  let legacyChunk:string|undefined;
@@ -92,27 +92,27 @@ async function readyForAdoption(){
  return {f,options:{format:'v11' as const,sourceNamespace:f.contract.sourceNamespace,contractDigest:f.pin}};
 }
 async function assertFirstPage(f:Awaited<ReturnType<typeof prepare>>){
- const typed=await readTypedTelemetryPage(target(),{sourceNamespace:f.contract.sourceNamespace,format:'v11',limit:32});
- const raw=(await source().prepare('SELECT record_json FROM telemetry_v11_records ORDER BY rowid LIMIT 32').all<{record_json:string}>()).results;
+ const typed=await readTypedTelemetryPage(target(),{sourceNamespace:f.contract.sourceNamespace,format:'v11',limit:100});
+ const raw=(await source().prepare('SELECT record_json FROM telemetry_v11_records ORDER BY rowid LIMIT 100').all<{record_json:string}>()).results;
  expect(typed.records.map(r=>r.canonicalRecord)).toEqual(raw.map(r=>r.record_json));
  expect(typed.records.some(r=>JSON.parse(r.canonicalRecord).schemaVersion==='quota-observation-v1.1')).toBe(true);
  expect(typed.records.some(r=>JSON.parse(r.canonicalRecord).schemaVersion==='session-dimension-v1.1')).toBe(true);
- expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(32);
+ expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(100);
  expect(await target().prepare(`SELECT count(*) n FROM typed_v11_record_proofs p JOIN typed_telemetry_records r ON r.id=p.typed_record_id
   WHERE p.chunk_key!=r.chunk_id OR p.manifest_key!=r.manifest_id OR p.stream_code!=r.stream OR p.occurrence_blob!=r.occurrence_id OR p.observed_at_ms!=r.observed_at_ms`).first('n')).toBe(0);
- expect(await target().prepare("SELECT after_id,copied,done FROM _authority_restore_adoption WHERE format='v11'").first()).toEqual({after_id:32,copied:32,done:0});
+ expect(await target().prepare("SELECT after_id,copied,done FROM _authority_restore_adoption WHERE format='v11'").first()).toEqual({after_id:100,copied:100,done:0});
 }
 describe('bounded native D1 adoption reads',()=>{
- it('preserves 32 mixed records, exact proof bindings, all-page counts and replay while bounding statements and calls',async()=>{
+ it('preserves 100 mixed records, exact proof bindings, all-page counts and replay while bounding statements and calls',async()=>{
   const {f,options}=await readyForAdoption();
-  const copy=measured(target());expect(await restoreTypedAdmissionPage(copy.db,options)).toEqual({done:false,records:32});
-  expect(copy.stats).toMatchObject({statements:233,roundtrips:10,readBatchSizes:[32,64]});
-  expect(copy.stats.writeTransactions.map(x=>x.length)).toEqual([130]);await assertFirstPage(f);
+  const copy=measured(target());expect(await restoreTypedAdmissionPage(copy.db,options)).toEqual({done:false,records:100});
+  expect(copy.stats.roundtrips).toBe(10);expect(copy.stats.statements).toBeLessThan(520);expect(copy.stats.readBatchSizes).toEqual([100,6]);
+  expect(copy.stats.writeTransactions.map(x=>x.length)).toEqual([402]);await assertFirstPage(f);
   expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:false,records:4});expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:true,records:0});
   const replay=measured(target());expect(await restoreTypedAdmissionPage(replay.db,options)).toEqual({done:true,records:0});expect(replay.stats.writeTransactions).toEqual([]);
   const v1={...options,format:'v1' as const},copyV1=measured(target());
   expect(await restoreTypedAdmissionPage(copyV1.db,v1)).toEqual({done:false,records:32});
-  expect(copyV1.stats).toMatchObject({statements:200,roundtrips:9,readBatchSizes:[32,64]});expect(copyV1.stats.writeTransactions.map(x=>x.length)).toEqual([98]);
+  expect(copyV1.stats).toMatchObject({statements:138,roundtrips:9,readBatchSizes:[32,2]});expect(copyV1.stats.writeTransactions.map(x=>x.length)).toEqual([98]);
   expect(await restoreTypedAdmissionPage(target(),v1)).toEqual({done:true,records:0});
   await sealAuthorityRestore(source(),target(),f.contract,f.pin);
   const verify={...options,verify:true};
@@ -123,16 +123,16 @@ describe('bounded native D1 adoption reads',()=>{
   }
   await expect(restoreTypedAdmissionPage(target(),{...verify,contractDigest:'e'.repeat(64)})).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
   await expect(restoreTypedAdmissionPage(target(),{...verify,verify:false})).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
-  const checked=measured(target());expect(await restoreTypedAdmissionPage(checked.db,verify)).toEqual({done:false,records:32});
-  expect(checked.stats).toMatchObject({statements:264,roundtrips:10,readBatchSizes:[32,64,160]});expect(checked.stats.writeTransactions.map(x=>x.length)).toEqual([2]);
+  const checked=measured(target());expect(await restoreTypedAdmissionPage(checked.db,verify)).toEqual({done:false,records:100});
+  expect(checked.stats.roundtrips).toBe(10);expect(checked.stats.statements).toBeLessThan(330);expect(checked.stats.readBatchSizes).toEqual([100,6,205]);expect(checked.stats.writeTransactions.map(x=>x.length)).toEqual([2]);
   await drain(async()=>(await restoreTypedAdmissionPage(target(),verify)).done);expect(await restoreTypedAdmissionPage(target(),verify)).toEqual({done:true,records:0});
   const checkedV1=measured(target());expect(await restoreTypedAdmissionPage(checkedV1.db,{...v1,verify:true})).toEqual({done:false,records:32});
-  expect(checkedV1.stats).toMatchObject({statements:199,roundtrips:9,readBatchSizes:[32,64,96]});expect(checkedV1.stats.writeTransactions.map(x=>x.length)).toEqual([2]);
+  expect(checkedV1.stats).toMatchObject({statements:75,roundtrips:9,readBatchSizes:[32,2,34]});expect(checkedV1.stats.writeTransactions.map(x=>x.length)).toEqual([2]);
   expect(await restoreTypedAdmissionPage(target(),{...v1,verify:true})).toEqual({done:true,records:0});
   expect((await target().prepare('SELECT format,copied,verified,done,verify_done FROM _authority_restore_adoption ORDER BY format').all()).results)
-   .toEqual([{format:'v1',copied:32,verified:32,done:1,verify_done:1},{format:'v11',copied:36,verified:36,done:1,verify_done:1}]);
-  expect(await source().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(36);
-  expect(await target().prepare('SELECT count(*) n FROM typed_telemetry_records WHERE format=11').first('n')).toBe(36);
+   .toEqual([{format:'v1',copied:32,verified:32,done:1,verify_done:1},{format:'v11',copied:104,verified:104,done:1,verify_done:1}]);
+  expect(await source().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(104);
+  expect(await target().prepare('SELECT count(*) n FROM typed_telemetry_records WHERE format=11').first('n')).toBe(104);
   const quota=(await target().prepare('SELECT used_percent FROM typed_telemetry_quota ORDER BY used_percent').all()).results;
   expect(quota.filter(r=>r.used_percent===null)).toHaveLength(1);expect(quota.filter(r=>r.used_percent===0.30000000000000004)).toHaveLength(32);
  },30000);
@@ -144,15 +144,15 @@ describe('bounded native D1 adoption reads',()=>{
   await sealAuthorityRestore(source(),target(),f.contract,f.pin);
   const wrapped=measured(target());await expect(restoreTypedAdmissionPage(wrapped.db,{...options,verify:true})).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
   expect(wrapped.stats.writeTransactions).toEqual([]);expect(await target().prepare("SELECT verify_after,verified,verify_done FROM _authority_restore_adoption WHERE format='v11'").first()).toEqual({verify_after:0,verified:0,verify_done:0});
-  expect(await source().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(36);
-  expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(36);
+  expect(await source().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(104);
+  expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(104);
  },30000);
  for(const boundary of ['concurrent-page','lost-write-response'] as const)it(`retains exact page membership through ${boundary}`,async()=>{
   const {f,options}=await readyForAdoption();let first=true;
   const wrapped=measured(target(),undefined,undefined,boundary==='concurrent-page'?async()=>{if(first){first=false;await restoreTypedAdmissionPage(target(),options);}}:undefined,
    boundary==='lost-write-response'?()=>{if(first){first=false;throw new Error('synthetic response loss after commit');}}:undefined);
-  expect(await restoreTypedAdmissionPage(wrapped.db,options)).toEqual({done:false,records:32});expect(wrapped.stats.writeTransactions).toHaveLength(1);await assertFirstPage(f);
+  expect(await restoreTypedAdmissionPage(wrapped.db,options)).toEqual({done:false,records:100});expect(wrapped.stats.writeTransactions).toHaveLength(1);await assertFirstPage(f);
   expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:false,records:4});
-  expect(await target().prepare("SELECT copied FROM _authority_restore_adoption WHERE format='v11'").first('copied')).toBe(36);
+  expect(await target().prepare("SELECT copied FROM _authority_restore_adoption WHERE format='v11'").first('copied')).toBe(104);
  },30000);
 });

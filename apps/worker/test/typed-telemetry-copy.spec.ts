@@ -9,7 +9,7 @@ import { parseTelemetryV1Chunk } from "../src/telemetry-v1";
 import { sha256Hex } from "../src/crypto";
 import { beginRawTelemetryCopy, copyLegacyTelemetryPage, readLegacyTelemetryCopyPage,
   verifyLegacyTelemetryCopyPage, type RawCopyRun } from "../src/typed-telemetry-copy";
-import { persistTypedTelemetryBatch, readTypedTelemetryPage } from "../src/typed-telemetry-repository";
+import { prepareTypedTelemetryInsert, persistTypedTelemetryBatch, readTypedTelemetryPage } from "../src/typed-telemetry-repository";
 
 const bindings = env as Env & { STORAGE_INGESTION_A: D1Database;
   TEST_MIGRATIONS: D1Migration[]; TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[] };
@@ -80,15 +80,29 @@ describe("populated legacy-to-typed raw copy", () => {
   });
 
   it("resumes v1 pages with original row IDs and exact current bytes", async () => {
-    await seedV1(35); const spec = run("v1"); await beginRawTelemetryCopy(target(), spec);
-    expect(await copyLegacyTelemetryPage(source(), target(), spec)).toMatchObject({ copied: 32, afterSourceRowId: 32, reachedEnd: false });
+    await seedV1(200); await seedV1(3); const spec = run("v1"); await beginRawTelemetryCopy(target(), spec);
+    expect(await copyLegacyTelemetryPage(source(), target(), spec)).toMatchObject({ copied: 200, afterSourceRowId: 200, reachedEnd: false });
     await beginRawTelemetryCopy(target(), spec);
-    expect(await copyLegacyTelemetryPage(source(), target(), spec)).toMatchObject({ copied: 3, afterSourceRowId: 35 });
+    expect(await copyLegacyTelemetryPage(source(), target(), spec)).toMatchObject({ copied: 3, afterSourceRowId: 203 });
     expect(await copyLegacyTelemetryPage(source(), target(), spec)).toMatchObject({ copied: 0, reachedEnd: true });
-    expect(await verifyLegacyTelemetryCopyPage(source(), target(), spec, 0)).toMatchObject({ verified: 32, afterSourceRowId: 32 });
-    expect(await verifyLegacyTelemetryCopyPage(source(), target(), spec, 32)).toMatchObject({ verified: 3, afterSourceRowId: 35 });
-    expect(await verifyLegacyTelemetryCopyPage(source(), target(), spec, 35)).toMatchObject({ verified: 0, reachedEnd: true });
-    expect(await source().prepare("SELECT COUNT(*) n FROM telemetry_v1_records").first("n")).toBe(35);
+    expect(await verifyLegacyTelemetryCopyPage(source(), target(), spec, 0)).toMatchObject({ verified: 200, afterSourceRowId: 200 });
+    expect(await verifyLegacyTelemetryCopyPage(source(), target(), spec, 200)).toMatchObject({ verified: 3, afterSourceRowId: 203 });
+    expect(await verifyLegacyTelemetryCopyPage(source(), target(), spec, 203)).toMatchObject({ verified: 0, reachedEnd: true });
+    expect(await source().prepare("SELECT COUNT(*) n FROM telemetry_v1_records").first("n")).toBe(203);
+  });
+
+  it("selects deterministic byte/query bounded prefixes without losing original rows", async () => {
+    await seedV1(40); const spec=run("v1"); await beginRawTelemetryCopy(target(),spec);
+    const first=await readLegacyTelemetryCopyPage(source(),{sourceNamespace:spec.sourceNamespace,format:"v1",afterSourceRowId:0,maxReadBytes:16_384});
+    expect(first.length).toBeGreaterThan(0);expect(first.length).toBeLessThan(40);
+    const copied=await copyLegacyTelemetryPage(source(),target(),spec,{maxReadBytes:16_384});
+    expect(copied.copied).toBe(first.length);expect(copied.afterSourceRowId).toBe(first.at(-1)!.sourceRowId);
+    // Force preparation to split a wider page before its first mutation. Each
+    // committed receipt advances only the exact prefix that actually fit.
+    let total=copied.copied;
+    for(let i=0;i<40;i++){const page=await copyLegacyTelemetryPage(source(),target(),spec,{maxStatements:20});total+=page.copied;if(page.reachedEnd)break;expect(page.copied).toBeLessThan(40);}
+    expect(total).toBe(40);expect((await verifyLegacyTelemetryCopyPage(source(),target(),spec,0)).verified).toBe(40);
+    expect(await target().prepare("SELECT copied_rows FROM storage_raw_copy_runs").first("copied_rows")).toBe(40);
   });
 
   it("copies staged v11, all streams and nullable quota without inventing a legacy counterpart", async () => {
@@ -133,17 +147,47 @@ describe("populated legacy-to-typed raw copy", () => {
   });
 
   it("reconciles a committed page when its batch response is lost", async () => {
-    await seedV1(2); const spec = run("v1"); await beginRawTelemetryCopy(target(), spec);
+    await seedV1(200); const spec = run("v1"); await beginRawTelemetryCopy(target(), spec);
     const lostResponse = databaseWithBatch(async statements => {
       await target().batch(statements); throw new Error("Synthetic response lost after commit");
     });
-    expect(await copyLegacyTelemetryPage(source(), lostResponse, spec)).toMatchObject({ copied: 2, afterSourceRowId: 2 });
-    expect(await target().prepare("SELECT COUNT(*) n FROM typed_telemetry_records").first("n")).toBe(2);
-    expect(await target().prepare("SELECT copied_rows FROM storage_raw_copy_runs").first("copied_rows")).toBe(2);
+    expect(await copyLegacyTelemetryPage(source(), lostResponse, spec)).toMatchObject({ copied: 200, afterSourceRowId: 200 });
+    expect(await target().prepare("SELECT COUNT(*) n FROM typed_telemetry_records").first("n")).toBe(200);
+    expect(await target().prepare("SELECT copied_rows FROM storage_raw_copy_runs").first("copied_rows")).toBe(200);
+  });
+
+  it("rolls back all 200 payload rows and earlier receipts when a later receipt fails", async () => {
+    await seedV1(200); const spec = run("v1"); await beginRawTelemetryCopy(target(), spec);
+    await target().prepare(`CREATE TRIGGER synthetic_second_receipt_refusal BEFORE INSERT ON storage_raw_copy_pages
+      WHEN NEW.after_source_row_id=32 BEGIN SELECT RAISE(ABORT,'synthetic_failure'); END`).run();
+    await expect(copyLegacyTelemetryPage(source(), target(), spec)).rejects.toThrow("RAW_COPY_UNACKNOWLEDGED");
+    expect(await target().prepare("SELECT COUNT(*) n FROM typed_telemetry_records").first("n")).toBe(0);
+    expect(await target().prepare("SELECT COUNT(*) n FROM storage_raw_copy_pages").first("n")).toBe(0);
+    expect(await target().prepare("SELECT last_source_row_id,copied_rows FROM storage_raw_copy_runs").first())
+      .toEqual({last_source_row_id:0,copied_rows:0});
+    await target().exec("DROP TRIGGER synthetic_second_receipt_refusal");
+    expect(await copyLegacyTelemetryPage(source(), target(), spec)).toMatchObject({copied:200});
+    const receipts=(await target().prepare("SELECT after_source_row_id,through_source_row_id,record_count,batch_digest FROM storage_raw_copy_pages ORDER BY after_source_row_id").all()).results;
+    expect(receipts.map(r=>[r.after_source_row_id,r.through_source_row_id,r.record_count]))
+      .toEqual([[0,32,32],[32,64,32],[64,96,32],[96,128,32],[128,160,32],[160,192,32],[192,200,8]]);
+    const originals=await readLegacyTelemetryCopyPage(source(),{sourceNamespace:spec.sourceNamespace,format:"v1",afterSourceRowId:0});
+    for(let i=0;i<receipts.length;i++)expect(receipts[i]!.batch_digest)
+      .toBe((await prepareTypedTelemetryInsert(target(),originals.slice(i*32,(i+1)*32))).batchDigest);
+  });
+
+  it("does not acknowledge only the first matching subreceipt after an unknown outcome", async () => {
+    await seedV1(200); const spec=run("v1"); await beginRawTelemetryCopy(target(),spec);
+    const incomplete=databaseWithBatch(async statements=>{
+      // Simulate a damaged durable history after a successful atomic write.
+      await target().batch(statements);
+      await target().prepare("DELETE FROM storage_raw_copy_pages WHERE after_source_row_id>0").run();
+      throw new Error("Synthetic incomplete retained proof");
+    });
+    await expect(copyLegacyTelemetryPage(source(),incomplete,spec)).rejects.toThrow("RAW_COPY_UNACKNOWLEDGED");
   });
 
   it("converges concurrent callers starting from the same checkpoint", async () => {
-    await seedV1(2); const spec = run("v1"); await beginRawTelemetryCopy(target(), spec);
+    await seedV1(200); const spec = run("v1"); await beginRawTelemetryCopy(target(), spec);
     let arrived = 0, release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
     const concurrent = databaseWithBatch(async statements => {
@@ -152,10 +196,10 @@ describe("populated legacy-to-typed raw copy", () => {
     });
     const receipts = await Promise.all([copyLegacyTelemetryPage(source(), concurrent, spec),
       copyLegacyTelemetryPage(source(), concurrent, spec)]);
-    expect(receipts).toEqual([{ copied: 2, afterSourceRowId: 2, reachedEnd: false },
-      { copied: 2, afterSourceRowId: 2, reachedEnd: false }]);
-    expect(await target().prepare("SELECT copied_rows FROM storage_raw_copy_runs").first("copied_rows")).toBe(2);
-    expect(await target().prepare("SELECT COUNT(*) n FROM storage_raw_copy_pages").first("n")).toBe(1);
+    expect(receipts).toEqual([{ copied: 200, afterSourceRowId: 200, reachedEnd: false },
+      { copied: 200, afterSourceRowId: 200, reachedEnd: false }]);
+    expect(await target().prepare("SELECT copied_rows FROM storage_raw_copy_runs").first("copied_rows")).toBe(200);
+    expect(await target().prepare("SELECT COUNT(*) n FROM storage_raw_copy_pages").first("n")).toBe(7);
     await verifyLegacyTelemetryCopyPage(source(), target(), spec, 0);
   });
 

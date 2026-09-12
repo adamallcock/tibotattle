@@ -1,15 +1,16 @@
 import { canonicalTelemetryV11Json } from "@app-usagemonitor/telemetry-contract";
 import { encodeTypedTelemetryId, encodeTypedTelemetryRecord, typedTelemetryCanonicalRecords,
-  type TypedTelemetryFormat } from "./typed-telemetry-codec";
+  TypedTelemetryError, type TypedTelemetryFormat } from "./typed-telemetry-codec";
 import { prepareTypedTelemetryInsert, readTypedTelemetryPage,
-  type TypedTelemetrySourceRecord } from "./typed-telemetry-repository";
+  MAX_TYPED_TELEMETRY_BATCH_STATEMENTS, MAX_TYPED_TELEMETRY_BATCH_BYTES, type TypedTelemetrySourceRecord } from "./typed-telemetry-repository";
 
 /** Internal, bounded raw-evidence copy. This is deliberately not a cutover API.
  * Its caller must hold the source write fence for the entire copy/verification
  * and copy authority/receipts separately. A snapshot digest labels that externally
  * verified source; supplying one does not make a mutable database a snapshot.
  */
-export const MAX_RAW_COPY_PAGE = 32;
+export const MAX_RAW_COPY_PAGE = 200;
+export const MAX_RAW_COPY_READ_BYTES = 2 * 1024 * 1024;
 export interface RawCopyRun {
   runId: string; sourceNamespace: string; sourceSnapshotDigest: string;
   format: TypedTelemetryFormat;
@@ -47,10 +48,12 @@ async function state(target: D1Database, run: RawCopyRun) {
  * There is no active/eligible-owner filter on preservation reads.
  */
 export async function readLegacyTelemetryCopyPage(source: D1Database, options: {
-  sourceNamespace: string; format: TypedTelemetryFormat; afterSourceRowId: number; limit?: number;
+  sourceNamespace: string; format: TypedTelemetryFormat; afterSourceRowId: number; limit?: number; maxReadBytes?: number;
 }): Promise<TypedTelemetrySourceRecord[]> {
   encodeTypedTelemetryId(options.sourceNamespace); integer(options.afterSourceRowId);
   const limit = options.limit ?? MAX_RAW_COPY_PAGE;
+  const maxReadBytes = options.maxReadBytes ?? MAX_RAW_COPY_READ_BYTES;
+  if (!Number.isSafeInteger(maxReadBytes) || maxReadBytes < 4096 || maxReadBytes > MAX_RAW_COPY_READ_BYTES) fail();
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_RAW_COPY_PAGE) fail();
   if (!["v1", "v11"].includes(options.format)) fail();
   const table = options.format === "v1" ? "telemetry_v1_records" : "telemetry_v11_records";
@@ -66,6 +69,24 @@ export async function readLegacyTelemetryCopyPage(source: D1Database, options: {
   if (extremes.first_id !== null || extremes.last_id !== null) {
     if (integer(extremes.first_id) < 1 || integer(extremes.last_id) < 1) fail();
   }
+  // Acquire only a deterministic original-row prefix whose canonical strings
+  // fit a fixed memory envelope. Widths are read before any retained JSON.
+  const widthResult = await source.prepare(`SELECT ${key} AS original_row_id,
+    length(CAST(record_json AS BLOB)) AS current_bytes,
+    ${options.format === "v11" ? "COALESCE(length(CAST(legacy_record_json AS BLOB)),0)" : "0"} AS legacy_bytes
+    FROM ${table} WHERE ${key}>? ORDER BY ${key} LIMIT ?`)
+    .bind(options.afterSourceRowId, limit).all<Row>();
+  if (widthResult.success !== true || !Array.isArray(widthResult.results)) fail();
+  const widths = widthResult.results;
+  const selected: Row[] = []; let reserved = 0;
+  for (const width of widths) {
+    const current = integer(width.current_bytes), legacy = integer(width.legacy_bytes);
+    if (current > 100_000 || legacy > 100_000) fail();
+    const bytes = current + legacy + 4096; // Reserve identity/extracted-column overhead.
+    if (reserved + bytes > maxReadBytes) break;
+    selected.push(width); reserved += bytes;
+  }
+  if (!selected.length) { if (widths.length) fail(); return []; }
   const sql = options.format === "v1"
     ? `SELECT r.*, r.id AS original_row_id, c.chunk_day AS original_chunk_day,
         c.participant_id AS chunk_owner, c.device_id AS chunk_device, c.stream AS chunk_stream
@@ -78,7 +99,10 @@ export async function readLegacyTelemetryCopyPage(source: D1Database, options: {
         FROM telemetry_v11_records r LEFT JOIN telemetry_v11_chunks c ON c.id=r.chunk_id
         LEFT JOIN telemetry_v11_day_manifests m ON m.id=r.manifest_id
         WHERE r.rowid>? ORDER BY r.rowid LIMIT ?`;
-  const rows = (await source.prepare(sql).bind(options.afterSourceRowId, limit).all<Row>()).results;
+  const rows = (await source.prepare(sql).bind(options.afterSourceRowId, selected.length).all<Row>()).results;
+  if (rows.length !== selected.length || rows.some((row,index) => row.original_row_id !== selected[index]!.original_row_id
+      || new TextEncoder().encode(text(row,"record_json")).byteLength !== selected[index]!.current_bytes
+      || (options.format === "v11" && new TextEncoder().encode(row.legacy_record_json === null ? "" : text(row,"legacy_record_json")).byteLength !== selected[index]!.legacy_bytes))) fail();
   return rows.map(row => {
     const canonical = text(row, "record_json");
     if (new TextEncoder().encode(canonical).byteLength > 100_000) fail();
@@ -125,24 +149,52 @@ export async function readLegacyTelemetryCopyPage(source: D1Database, options: {
   });
 }
 
-export async function copyLegacyTelemetryPage(source: D1Database, target: D1Database, run: RawCopyRun): Promise<{
+export async function copyLegacyTelemetryPage(source: D1Database, target: D1Database, run: RawCopyRun, options: { maxStatements?: number; maxReadBytes?: number } = {}): Promise<{
   copied: number; afterSourceRowId: number; reachedEnd: boolean;
 }> {
   const checkpoint = await state(target, run);
-  const rows = await readLegacyTelemetryCopyPage(source, { sourceNamespace: run.sourceNamespace,
-    format: run.format, afterSourceRowId: checkpoint.after });
+  let rows = await readLegacyTelemetryCopyPage(source, { sourceNamespace: run.sourceNamespace,
+    format: run.format, afterSourceRowId: checkpoint.after, maxReadBytes: options.maxReadBytes });
   if (!rows.length) return { copied: 0, afterSourceRowId: checkpoint.after, reachedEnd: true };
-  const prepared = await prepareTypedTelemetryInsert(target, rows);
+  const maxStatements = options.maxStatements ?? MAX_TYPED_TELEMETRY_BATCH_STATEMENTS;
+  if (!Number.isSafeInteger(maxStatements) || maxStatements < 1 || maxStatements > MAX_TYPED_TELEMETRY_BATCH_STATEMENTS) fail();
+  // Preparation has no database effects. Retry a smaller deterministic prefix
+  // only for a size/query limit; invalid data and identity conflicts still fail.
+  let prepared;
+  while (true) {
+    try {
+      prepared = await prepareTypedTelemetryInsert(target, rows);
+      if (prepared.statements.length > maxStatements || prepared.byteLength > MAX_TYPED_TELEMETRY_BATCH_BYTES - 8192) throw new TypedTelemetryError("TYPED_TELEMETRY_LIMIT");
+      break;
+    } catch (error) {
+      if (!(error instanceof TypedTelemetryError) || error.code !== "TYPED_TELEMETRY_LIMIT" || rows.length === 1) throw error;
+      rows = rows.slice(0, Math.floor(rows.length / 2));
+    }
+  }
   const through = rows.at(-1)!.sourceRowId;
-  const receipt = target.prepare(`INSERT INTO storage_raw_copy_pages
+  // Retain the qualified <=32-row receipt format. All segments and payload
+  // statements commit atomically; there is no separately acknowledged prefix.
+  const receipts: { after: number; through: number; count: number; digest: string }[] = [];
+  for (let offset = 0; offset < rows.length; offset += 32) {
+    const segment = rows.slice(offset, offset + 32);
+    const digest = rows.length <= 32 ? prepared.batchDigest
+      : (await prepareTypedTelemetryInsert(target, segment)).batchDigest;
+    receipts.push({ after: offset === 0 ? checkpoint.after : rows[offset - 1]!.sourceRowId,
+      through: segment.at(-1)!.sourceRowId, count: segment.length, digest });
+  }
+  const receiptStatements = receipts.map(receipt => target.prepare(`INSERT INTO storage_raw_copy_pages
     (run_id,after_source_row_id,through_source_row_id,record_count,batch_digest) VALUES(?,?,?,?,?)`)
-    .bind(run.runId, checkpoint.after, through, rows.length, prepared.batchDigest);
-  try { await target.batch([...prepared.statements, receipt]); }
+    .bind(run.runId, receipt.after, receipt.through, receipt.count, receipt.digest));
+  try { await target.batch([...prepared.statements, ...receiptStatements]); }
   catch {
-    const durable = await target.prepare(`SELECT through_source_row_id,record_count,batch_digest FROM storage_raw_copy_pages
-      WHERE run_id=? AND after_source_row_id=?`).bind(run.runId, checkpoint.after).first<Row>();
-    if (!durable || durable.through_source_row_id !== through || durable.record_count !== rows.length
-      || durable.batch_digest !== prepared.batchDigest) throw new Error("RAW_COPY_UNACKNOWLEDGED");
+    const durable = await target.prepare(`SELECT after_source_row_id,through_source_row_id,record_count,batch_digest
+      FROM storage_raw_copy_pages WHERE run_id=? AND after_source_row_id>=? AND after_source_row_id<?
+      ORDER BY after_source_row_id LIMIT 8`).bind(run.runId, checkpoint.after, through).all<Row>();
+    if (!durable.success || durable.results.length !== receipts.length || receipts.some((receipt, index) => {
+      const row = durable.results[index]!;
+      return row.after_source_row_id !== receipt.after || row.through_source_row_id !== receipt.through
+        || row.record_count !== receipt.count || row.batch_digest !== receipt.digest;
+    })) throw new Error("RAW_COPY_UNACKNOWLEDGED");
   }
   return { copied: rows.length, afterSourceRowId: through, reachedEnd: false };
 }
@@ -156,7 +208,7 @@ export async function verifyLegacyTelemetryCopyPage(source: D1Database, target: 
   const original = await readLegacyTelemetryCopyPage(source, { sourceNamespace: run.sourceNamespace,
     format: run.format, afterSourceRowId });
   const copied = await readTypedTelemetryPage(target, { sourceNamespace: run.sourceNamespace,
-    format: run.format, afterSourceRowId, limit: MAX_RAW_COPY_PAGE });
+    format: run.format, afterSourceRowId, limit: original.length || MAX_RAW_COPY_PAGE });
   const actual = copied.records.map(({ canonicalRecord: _canonical, legacy: _legacy, ...row }) => row);
   if (canonicalTelemetryV11Json(original) !== canonicalTelemetryV11Json(actual)) fail();
   for (const row of copied.records) {
