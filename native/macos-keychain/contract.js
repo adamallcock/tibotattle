@@ -7,7 +7,7 @@
  */
 
 export const MACOS_KEYCHAIN_ADAPTER_CONTRACT_VERSION =
-  "tibotattle-macos-keychain-v2";
+  "tibotattle-macos-keychain-v3";
 
 // These four credentials remain the only capabilities that may cross the
 // inherited companion pipe. Keep this list distinct from the adapter's full
@@ -46,6 +46,7 @@ export const MACOS_KEYCHAIN_ADAPTER_ITEM_STATUSES = Object.freeze([
   "locked",
   "denied",
   "migration_required",
+  "invalid",
   "unknown",
 ]);
 
@@ -85,6 +86,9 @@ export const MACOS_KEYCHAIN_ADAPTER_DELETE_EXACT_STATUSES = Object.freeze([
 ]);
 
 const ITEM_STATUSES = new Set(MACOS_KEYCHAIN_ADAPTER_ITEM_STATUSES);
+const INSPECT_STATUSES = new Set(
+  MACOS_KEYCHAIN_ADAPTER_ITEM_STATUSES.filter((status) => status !== "invalid"),
+);
 const STORE_STATUSES = new Set(MACOS_KEYCHAIN_ADAPTER_STORE_STATUSES);
 const REMOVE_STATUSES = new Set(MACOS_KEYCHAIN_ADAPTER_REMOVE_STATUSES);
 const CREATE_IF_MISSING_STATUSES = new Set(
@@ -280,7 +284,7 @@ export function createMacOSKeychainAdapterFacade(binding) {
     },
     inspect(capability) {
       return invokeCapabilityAsync(inspect, capability)
-        .then((response) => checkedStatus(response, ITEM_STATUSES));
+        .then((response) => checkedStatus(response, INSPECT_STATUSES));
     },
     read(capability) {
       return invokeCapabilityAsync(read, capability)

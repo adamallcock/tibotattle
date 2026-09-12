@@ -74,6 +74,7 @@ const SHELL_FILES = [
   "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
   "apps/electron/desktop-macos-keychain.js",
+  "apps/electron/desktop-secure-storage-readiness.js",
   "apps/electron/desktop-native-migration.js",
   "apps/electron/desktop-native-migration-macos.js",
   "apps/electron/desktop-notification-coordinator.js",

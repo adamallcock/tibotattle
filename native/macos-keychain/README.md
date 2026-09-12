@@ -21,14 +21,14 @@ pipe, is unavailable through FD4, and is not a synonym for
 its 32-byte value can travel only over the private inherited FD3 channel to the
 owned upload companion; it never reaches a renderer, UI IPC, or an HTTP route.
 
-The binding exports contract version `tibotattle-macos-keychain-v2`, the ordered
+The binding exports contract version `tibotattle-macos-keychain-v3`, the ordered
 capability list, and these methods:
 
 | Method | Result |
 | --- | --- |
 | `identityStatus()` | synchronous `valid` or `invalid` main-bundle preflight |
 | `inspect(capability)` | Promise of `absent`, `present`, `locked`, `denied`, `migration_required`, or `unknown` |
-| `read(capability)` | Promise of `{ status, value }`; `value` is a 32-byte Buffer only when present |
+| `read(capability)` | Promise of `{ status, value }`; `value` is a 32-byte Buffer only when present; malformed stored data is `invalid` |
 | `store(capability, Buffer32)` | Promise of `stored`, `locked`, `denied`, `migration_required`, or `unknown` |
 | `remove(capability)` | Promise of `deleted`, `absent`, `locked`, `denied`, or `unknown` |
 | `createIfMissing(accountless_installation, Buffer32)` | Promise of `created`, `existing`, `locked`, `denied`, `migration_required`, or `unknown` |
@@ -50,6 +50,16 @@ Claude provider. They retain the same read, store, and migration-required
 guards at first use: a required export migration must be approved through the
 released native application's local approval flow. The main-only
 `accountless_installation` path is checked only when sharing requires it.
+
+Startup maps credential readiness to fixed, content-free reasons: locked,
+denied, migration required, timeout, invalid credential, adapter-integrity
+failure, or Security-framework unavailability. A blocked launch offers a
+user-driven Retry and the safe Quit default. Retry repeats the silent read; it
+does not enable Keychain interaction, create a replacement, change an ACL, or
+start the companion. When accountless sharing is active, Electron also reads
+and immediately clears the main-only `accountless_installation` value before
+the companion can start. A saved opt-out performs no accountless credential
+read.
 
 Each operation captures the user's Keychain search list and binds its modern
 and legacy queries to that exact list. A not-found result is trusted only when

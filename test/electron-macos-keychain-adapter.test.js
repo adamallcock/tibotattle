@@ -83,6 +83,23 @@ test("macOS Keychain adapter facade preserves migration-required outcomes", asyn
     "migration_required");
 });
 
+test("only secret reads may report an invalid stored credential", async () => {
+  const facade = createMacOSKeychainAdapterFacade(binding({
+    inspect: async () => "invalid",
+    read: async () => ({ status: "invalid", value: null }),
+  }));
+
+  await assert.rejects(
+    facade.inspect("export_identity"),
+    (error) => isMacOSKeychainAdapterContractError(error)
+      && error.code === "macos_keychain_adapter_invalid_response",
+  );
+  assert.deepEqual(await facade.read("export_identity"), {
+    status: "invalid",
+    value: null,
+  });
+});
+
 test("macOS Keychain adapter facade copies and clears native boundary secrets", async () => {
   const rawRead = Buffer.alloc(32, 23);
   let nativeStoreInput;
@@ -231,6 +248,7 @@ test("macOS Keychain adapter source retains the fixed, prompt-free modern policy
     < readImplementation.indexOf("SearchScopeStatusForAbsenceNoInteraction"),
   "a successful modern read must not be refused because another keychain is locked");
   assert.match(readImplementation, /BaseQuery\(capability, false, search_scope.value\)/u);
+  assert.match(readImplementation, /result\.status = ItemStatus::kInvalid/u);
   const storeImplementation = source.slice(
     source.indexOf("ItemStatus StoreModernSecret"),
     source.indexOf("ItemStatus RemoveModernSecret"),

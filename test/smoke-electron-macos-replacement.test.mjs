@@ -32,6 +32,12 @@ test('operator and self-hosted accounts are never eligible', () => {
   assert.throws(() => validateCanaryHost({ ...host, environment: { ...host.environment, RUNNER_ENVIRONMENT: 'self-hosted' } }));
 });
 
+test('signed replacement diagnostics recognize the closed secure-storage support-code family', async () => {
+  const source = await readFile(new URL('../scripts/smoke-electron-macos-replacement.mjs', import.meta.url), 'utf8');
+  assert.match(source, /content\.includes\('Support code: SECURE_STORAGE_'\)/u);
+  assert.doesNotMatch(source, /content\.includes\('secure startup checks'\)/u);
+});
+
 test('real native SQLite fixture has retained usage/quota rows and continuity catches loss, mutation, salt or optout changes', async (t) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'signed-replacement-unit-')));
   t.after(() => rm(root, { recursive: true, force: true }));

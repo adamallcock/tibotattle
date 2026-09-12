@@ -221,7 +221,7 @@ export async function runSignedReplacement(options) {
           const support = ['IDENTITY', 'NATIVE_APPLICATION', 'LOGIN_ITEM_UNREGISTER', 'LOGIN_ITEM_STATUS', 'LOGIN_ITEM_REQUIRES_APPROVAL', 'LOGIN_ITEM_NOT_FOUND', 'LOGIN_ITEM_STATUS_UNKNOWN', 'NATIVE_WRITER', 'OTHER_SAME_IDENTITY_RUNNING', 'PREFERENCES', 'INVALID_REQUEST', 'UNKNOWN'].find(v => content.includes('Support code: TRANSFER_' + v + '.'));
           if (support) return 'TRANSFER_' + support;
           if (content.includes('could not finish transferring')) return 'migration_blocked';
-          if (content.includes('secure startup checks')) return 'credential_preflight_blocked';
+          if (content.includes('Support code: SECURE_STORAGE_')) return 'credential_preflight_blocked';
           if (content.includes('Keychain') || content.includes('keychain')) return 'keychain_dialog';
           return 'unclassified';
         }`;
