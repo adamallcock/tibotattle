@@ -388,11 +388,12 @@ export async function revokeAccountlessEnrollment(
   }
   try {
     const now = new Date(nowEpoch).toISOString();
-    const results = await db.batch([
+    const results = await db.batch<{ device_id: string }>([
       db.prepare(`
         UPDATE accountless_enrollment_ledger
            SET state = 'revoked', revoked_at = ?, revocation_reason = ?
          WHERE device_id = ? AND state = 'active'
+         RETURNING device_id
       `).bind(now, reason, deviceId),
       db.prepare(`
         UPDATE accountless_upload_owners
@@ -432,7 +433,9 @@ export async function revokeAccountlessEnrollment(
            AND state IN ('unused', 'consuming')
       `).bind(now, deviceId),
     ]);
-    return results[0]?.meta.changes === 1;
+    // Authority-withdrawal triggers may change many rows in this transaction.
+    // Acknowledge the exact enrollment transition, not that aggregate count.
+    return results[0]?.results.length === 1 && results[0].results[0]?.device_id === deviceId;
   } catch {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }

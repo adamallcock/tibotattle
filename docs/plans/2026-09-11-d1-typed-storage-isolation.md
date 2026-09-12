@@ -25,11 +25,11 @@ is required for that later fleet; it is not an authorization substitute.
 | Lane | Responsibility | State |
 |---|---|---|
 | Typed raw storage | Complete codecs, typed fields/maps, original source-row namespace, indexes and bounded repository | Local implementation and tests pass |
-| Delivery | Ingestion-local transactional journal, independent idempotent analytics application and snapshot-bound withdrawal fences | Primitive tests pass; runtime projection still pending |
+| Delivery | Ingestion-local transactional journal, independent idempotent analytics application and snapshot-bound withdrawal fences | Local real-v1.1 activation, bounded daily projection, discard and retirement tests pass; production composition pending |
 | Routing | Single-shard adapter, explicit owner catalog, capacity reservations and fenced whole-owner moves | Local tests pass, including a typed batch and racing move |
 | Wrangler operations | Exact resource/schema plans, uncertainty reconciliation, per-database migration receipts and explicitly approved deadline extensions | Local implementation and 27 focused checks pass |
 | Raw evidence copy | Bounded old-schema reads, atomic typed copy/checkpoints, exact second-pass verification | Local populated-source tests pass; authority copy and source freeze still pending |
-| Integration | Existing admission, domain closure, readers, scheduling, erasure and public eligibility | Pending |
+| Integration | Existing admission, domain closure, readers, scheduling, erasure and public eligibility | Optional v1.1 bridge and exact typed read adapter pass locally; full role/runtime integration pending |
 | Qualification | Local D1 failure tests, complete evidence copy, query/runtime checks, protected staging and production gates | Pending |
 
 ## Required proofs
@@ -81,9 +81,28 @@ deployed schema, or release has changed in this implementation stage.
   credential/chunk repositories, including staged evidence, nonempty destination
   namespaces, concurrent retries, response loss after commit, rollback, changed
   source evidence and inadmissible original row IDs. No source is deleted.
-- Delivery tests prove separate database failures, committed checkpoints,
+- Delivery primitives prove separate database failures, committed checkpoints,
   duplicate and out-of-order events, terminal-state refusal and snapshot-bound
-  authority checks. They use a synthetic projection, not the published graph.
+  authority checks. The additional optional v1.1 bridge uses real admitted
+  domain activation and accountless revocation in local D1. It preserves every
+  baseline admission/analytics guard, journals head replacement as a hard
+  authority change, and pins older referenced source evidence until erasure.
+- The v1.1 daily projection processes at most 200 records per step, stages all
+  days before acknowledging a generation, and prices through the current
+  accounting code. It stores repeatable aggregate counters/model cells, not
+  copies of raw records. Withdrawn or erased old events receive an explicit
+  source-proven discard receipt so an ordered consumer cannot stall behind
+  deleted evidence. Head removal is immediate; physical cleanup is separately
+  bounded to four days and 200 page receipts per call, with retirement receipts.
+- Projection regressions cover response loss, rollback, multiple days, multiple
+  owners, withdrawal during a page, and delayed initialization after physical
+  retirement. Internal reads check the captured consumer authority against the
+  source. No production public route or scheduler selects this new projection.
+- Typed SQL views retain original row identities and fields. The bounded reader
+  reconstructs canonical/legacy JSON with the maintained JavaScript codec:
+  SQLite JSON numeric formatting cannot preserve every admitted binary64 value.
+  Precision, extended dates, private identifier tags, indexed cursors and
+  session pagination are checked. Active-domain authority is a separate join.
 - Routing tests include asynchronous preparation of actual typed records and
   same-batch rejection of a move racing that preparation. The shared transaction
   limit is 900 statements, leaving invocation headroom for routing/admission.
@@ -93,19 +112,32 @@ Commands and exact operation boundaries are in the
 The [schema map](../research/2026-09-11-ingestion-analytics-schema-map.md) inventories
 all 94 baseline tables and identifies the guards that must survive integration.
 
-Validation on September 11: the full Worker Vitest run passed **1,110 tests in
+Foundation validation on September 11: the full Worker Vitest run passed **1,110 tests in
 84 files**. The final focused storage run passed **62 tests**, and the final
 Wrangler operator run passed **27 checks**. TypeScript, workspace-copy guards,
 generated types, endpoint checks, documentation governance and 20 preflight
-tests passed. The dry deployment/build step requires a committed clean source
-tree; it is a separate gate and does not provision or deploy these databases.
+tests passed. Guarded development and staging dry builds then passed from the
+clean committed foundation `672043033fda15c0e3d0ed15bda5122458cac24a` using
+manifest- and source-verified existing public assets. This does not provision or
+deploy these databases. The subsequent integration adds 39 focused storage
+tests; its final complete Worker check is recorded after source freeze.
 
 ## Next implementation boundary
 
-Connect active-domain and withdrawal events to a generation-pinned projection,
-then apply the authority check to **every** public daily/weekly, allowance and
-history response. Retain synchronous guards until that full replacement passes.
+The optional bridge and daily projection are now connected in local tests.
+Apply the authority check to **every** public daily/weekly, allowance and history
+response, and journal policy/exclusion/source withdrawal before changing any
+production read binding. Retain synchronous guards until the full replacement passes.
 Finish typed transactional admission and domain preservation, indexed analytical
 read adapters, authority/receipt copy and multi-store erasure/restore. Rehearse
 the complete source freeze, copy, verification and cutover before marking any
 new target schema qualified. The raw-copy API alone cannot switch production.
+
+The bridge intentionally layers on the old full schema and reads its immutable
+records. It is not the compact fresh ingestion authority schema. The retained
+source fences currently release only for explicit owner erasure; a separately
+acknowledged source-retirement protocol must precede routine copy retirement.
+Analytics retirement receipts also do not by themselves complete the existing
+independent deletion-ledger workflow. One narrow live-path correction replaces
+trigger-inflated `meta.changes === 1` with exact enrollment `RETURNING` evidence
+when acknowledging accountless revocation.

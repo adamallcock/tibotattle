@@ -11,6 +11,7 @@ const deletionLedgerMigrations = await readD1Migrations(
 const typedIngestionMigrations = await readD1Migrations("./typed-ingestion-migrations");
 const analyticsMigrations = await readD1Migrations("./analytics-migrations");
 const routingMigrations = await readD1Migrations("./routing-migrations");
+const ingestionBridgeMigrations = await readD1Migrations("./ingestion-bridge-migrations");
 
 export default defineConfig({
   plugins: [
@@ -27,6 +28,7 @@ export default defineConfig({
           TEST_TYPED_INGESTION_MIGRATIONS: typedIngestionMigrations,
           TEST_ANALYTICS_MIGRATIONS: analyticsMigrations,
           TEST_ROUTING_MIGRATIONS: routingMigrations,
+          TEST_INGESTION_BRIDGE_MIGRATIONS: ingestionBridgeMigrations,
         },
       },
     }),

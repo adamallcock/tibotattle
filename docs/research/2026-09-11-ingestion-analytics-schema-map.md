@@ -207,9 +207,14 @@ with the existing single-shard adapter and complete unchanged admission guards:
 
 The new [analytics delivery primitive](../../apps/worker/src/analytics-delivery.ts)
 has same-batch event preparation, ordered/idempotent application and an authority
-watermark comparison. At this snapshot, `index.ts` has no imports of that module,
-the typed repository, or storage routing. The primitive does not yet implement
-raw-to-public projection, all-public-read fencing or distributed erasure.
+watermark comparison. The subsequent optional
+[v1.1 source bridge](../../apps/worker/src/v11-storage-journal.ts) and
+[daily projection](../../apps/worker/src/v11-daily-projection.ts) implement this
+activation-to-projection slice in local tests, including source-proven discard
+and separate bounded physical retirement. They retain all baseline triggers.
+At this snapshot, `index.ts` has no imports of those modules, the typed repository,
+or storage routing. Public projection composition, all-public-read fencing and
+distributed erasure completion remain unfinished.
 A pre-read watermark comparison alone is not proof against a concurrent revoke;
 qualify the complete response/publication lifecycle. No distributed transaction
 is claimed.
