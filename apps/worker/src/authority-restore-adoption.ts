@@ -57,7 +57,12 @@ export async function restoreTypedAdmissionPage(db:D1Database,options:{format:'v
   const key=canonicalTelemetryV11Json([storedRows[index]!.chunk_id,record.chunkRowId,record.participantId,record.deviceId,fieldsForPage[index]!.stream,record.chunkDay]);
   let at=headerIndices.get(key);
   if(at===undefined){at=headerReads.length;headerIndices.set(key,at);
-   headerReads.push(db.prepare('SELECT min(source_row_id) first_id,max(source_row_id) last_id,count(*) count FROM typed_telemetry_records WHERE namespace_id=? AND format=? AND chunk_id=?')
+   // The namespace/source-row index can otherwise scan the entire format.
+   // This exact core UNIQUE index starts with chunk_id. At most 201 rows
+   // prove a valid <=200-row range or force the existing overfull refusal.
+   headerReads.push(db.prepare(`SELECT min(source_row_id) first_id,max(source_row_id) last_id,count(*) count
+    FROM (SELECT source_row_id FROM typed_telemetry_records INDEXED BY sqlite_autoindex_typed_telemetry_records_2
+     WHERE namespace_id=? AND format=? AND chunk_id=? LIMIT 201)`)
     .bind(namespace,code(format),storedRows[index]!.chunk_id),
     db.prepare(`SELECT record_count FROM _authority_stage_telemetry_${format}_chunks WHERE id=? AND participant_id=? AND device_id=? AND stream=? AND chunk_day=?`)
     .bind(record.chunkRowId,record.participantId,record.deviceId,fieldsForPage[index]!.stream,record.chunkDay));

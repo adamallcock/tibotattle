@@ -1,4 +1,4 @@
-import { readTypedTelemetryPage } from '../src/typed-telemetry-repository';
+import { persistTypedTelemetryBatch, readTypedTelemetryPage } from '../src/typed-telemetry-repository';
 import { env, reset, applyD1Migrations, type D1Migration } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from '@app-usagemonitor/telemetry-contract';
@@ -24,10 +24,10 @@ async function activate(db:D1Database,fixture:Awaited<ReturnType<typeof createV1
  const value:TelemetryV11DomainManifest={schemaVersion:'telemetry-domain-manifest-v1.1',fromDay:day.day,throughDay:day.day,predecessor:{token:previous.token,previousGenerationId:previous.previousGenerationId,legacyFingerprint:previous.legacyFingerprint},days:[{day:day.day,manifestId:day.manifestId,manifestDigest:day.manifestDigest}],manifestDigest:'0'.repeat(64)};
  value.manifestDigest=await sha256Hex(telemetryV11DomainManifestDigestInput(value));return activateTelemetryV11Domain(db,fixture,value);
 }
-async function prepare(withV1=false){
+async function prepare(withV1=false,usageCount=102){
  await applyD1Migrations(source(),b.TEST_MIGRATIONS);
  const fixture=await createV11DeviceFixture(source(),{grant:true});
- const records=Array.from({length:102},(_,i)=>v11UsageRecord(today(),'a',{eventId:`event:v2:${(i+1).toString(16).padStart(64,'0')}`}));
+ const records=Array.from({length:usageCount},(_,i)=>v11UsageRecord(today(),'a',{eventId:`event:v2:${(i+1).toString(16).padStart(64,'0')}`}));
  const staged=await stageV11Day(source(),fixture,await makeV11Day(today(),{usage:records,quota:[{schemaVersion:'quota-observation-v1.1',observationId:`quota-occurrence:v1:${'a'.repeat(64)}`,provider:'openai_codex',observedTime:`${today()}T12:00:00.000Z`,planType:'pro',planVariant:'unknown',limitId:'codex',slot:'secondary',usedPercent:null,windowDurationMinutes:null,resetsAt:null,accountPlanAttribution:{accountBasis:'unavailable',accountTrackId:null,planBasis:'same_source_occurrence',planType:'pro',planEraId:null}}],session:[{schemaVersion:'session-dimension-v1.1',sessionUuid:'0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b',firstEventTime:`${today()}T12:00:00.000Z`,provider:'openai_codex',toolClassCounts:{shell:0,other:3}}]}));
  const original=await activate(source(),fixture,staged);
  let legacyChunk:string|undefined;
@@ -54,7 +54,7 @@ async function prepare(withV1=false){
 async function drain(step:()=>Promise<boolean>){for(let n=0;n<256;n++)if(await step())return;throw new Error('Synthetic bounded operation did not complete');}
 
 function measured(db:D1Database,mutate?:(sql:string,row:unknown)=>unknown,mutateBatch?:(results:D1Result[])=>unknown,beforeWrite?:()=>Promise<void>,afterWrite?:()=>void){
- const stats={roundtrips:0,statements:0,writeTransactions:[] as {sql:string;args:unknown[]}[][],readBatchSizes:[] as number[]};
+ const stats={roundtrips:0,statements:0,writeTransactions:[] as {sql:string;args:unknown[]}[][],readQueries:[] as {sql:string;args:unknown[]}[],readBatchSizes:[] as number[]};
  const metadata=new WeakMap<object,{inner:D1PreparedStatement;sql:string;args:unknown[]}>();
  const wrap=(inner:D1PreparedStatement,sql:string,args:unknown[]=[]):D1PreparedStatement=>{
   const proxy=new Proxy(inner,{get(o,key){
@@ -71,7 +71,7 @@ function measured(db:D1Database,mutate?:(sql:string,row:unknown)=>unknown,mutate
   if(key==='batch')return async(statements:D1PreparedStatement[])=>{
    stats.roundtrips++;stats.statements+=statements.length;
    const entries=statements.map(s=>metadata.get(s)!);expect(entries.every(Boolean)).toBe(true);
-   if(entries.every(e=>/^SELECT\b/.test(e.sql)))stats.readBatchSizes.push(entries.length);
+   if(entries.every(e=>/^SELECT\b/.test(e.sql))){stats.readBatchSizes.push(entries.length);stats.readQueries.push(...entries.map(e=>({sql:e.sql,args:e.args})));}
    else stats.writeTransactions.push(entries.map(e=>({sql:e.sql,args:e.args.map(v=>v instanceof ArrayBuffer?Array.from(new Uint8Array(v)):v)})));
    const writes=!entries.every(e=>/^SELECT\b/.test(e.sql));
    if(writes&&beforeWrite)await beforeWrite();
@@ -85,8 +85,8 @@ function measured(db:D1Database,mutate?:(sql:string,row:unknown)=>unknown,mutate
  return {db:wrapped,stats};
 }
 
-async function readyForAdoption(){
- const f=await prepare(true);await freezeAuthorityRestoreSource(source(),f.contract,f.pin);await beginAuthorityRestore(source(),target(),f.contract,f.pin);
+async function readyForAdoption(usageCount=102){
+ const f=await prepare(true,usageCount);await freezeAuthorityRestoreSource(source(),f.contract,f.pin);await beginAuthorityRestore(source(),target(),f.contract,f.pin);
  await drain(async()=>(await copyAuthorityPage(source(),target(),f.contract,f.pin)).state==='complete');
  for(const format of ['v1','v11'] as const)await drain(async()=>(await copyAuthorityTypedPage(source(),target(),f.contract,f.pin,format)).reachedEnd);
  return {f,options:{format:'v11' as const,sourceNamespace:f.contract.sourceNamespace,contractDigest:f.pin}};
@@ -135,6 +135,58 @@ describe('bounded native D1 adoption reads',()=>{
   expect(await target().prepare('SELECT count(*) n FROM typed_telemetry_records WHERE format=11').first('n')).toBe(104);
   const quota=(await target().prepare('SELECT used_percent FROM typed_telemetry_quota ORDER BY used_percent').all()).results;
   expect(quota.filter(r=>r.used_percent===null)).toHaveLength(1);expect(quota.filter(r=>r.used_percent===0.30000000000000004)).toHaveLength(32);
+ },30000);
+ it('uses the existing chunk index on exact role schemas and preserves 200-row, neighboring, final and empty ranges',async()=>{
+  const {f,options}=await readyForAdoption(200),wrapped=measured(target());
+  expect(await restoreTypedAdmissionPage(wrapped.db,options)).toEqual({done:false,records:100});
+  const probes=wrapped.stats.readQueries.filter(q=>q.sql.includes('min(source_row_id) first_id'));
+  expect(probes).toHaveLength(3);
+  const sql=probes[0]!.sql;
+  for(const db of [reference(),target()]){
+   const index=(await db.prepare('PRAGMA index_info(sqlite_autoindex_typed_telemetry_records_2)').all<{name:string}>()).results;
+   expect(index.map(x=>x.name)).toEqual(['chunk_id','occurrence_id']);
+   const plan=(await db.prepare('EXPLAIN QUERY PLAN '+sql).bind(...probes[0]!.args).all<{detail:string}>()).results.map(x=>x.detail).join('\n');
+   expect(plan).toMatch(/USING INDEX sqlite_autoindex_typed_telemetry_records_2 \(chunk_id=\?\)/);
+   expect(plan).not.toMatch(/USING (?:COVERING )?INDEX .*\(namespace_id=/);
+  }
+  const memberships=(await target().prepare('SELECT namespace_id,format,chunk_id,min(source_row_id) first_id,max(source_row_id) last_id,count(*) count FROM typed_telemetry_records WHERE format=11 GROUP BY chunk_id ORDER BY first_id').all<{namespace_id:number;format:number;chunk_id:number;first_id:number;last_id:number;count:number}>()).results;
+  expect(memberships.map(r=>r.count)).toEqual([1,1,200]);
+  for(const row of memberships){
+   expect(await target().prepare(sql).bind(row.namespace_id,row.format,row.chunk_id).first()).toEqual({first_id:row.first_id,last_id:row.last_id,count:row.count});
+   for(const args of [[row.namespace_id+1000,row.format,row.chunk_id],[row.namespace_id,10,row.chunk_id],[row.namespace_id,row.format,-1]])
+    expect(await target().prepare(sql).bind(...args).first()).toEqual({first_id:null,last_id:null,count:0});
+  }
+  const last=measured(target());expect(await restoreTypedAdmissionPage(last.db,options)).toEqual({done:false,records:100});
+  expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:false,records:2});
+  expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:true,records:0});
+  expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(202);
+  expect(await source().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(202);
+ },30000);
+
+ it('refuses overfull retained chunks after a bounded 201-row acquisition without advancing adoption',async()=>{
+  const {options}=await readyForAdoption(200);
+  const row=(await readTypedTelemetryPage(target(),{sourceNamespace:options.sourceNamespace,format:'v11',afterSourceRowId:2,limit:1})).records[0]!;
+  const {canonicalRecord:_canonical,legacy:_legacy,...original}=row;
+  const extra=Array.from({length:100},(_,i)=>({...original,sourceRowId:203+i,record:{...row.record,eventId:`event:v2:${(1000+i).toString(16).padStart(64,'0')}`}}));
+  await persistTypedTelemetryBatch(target(),extra);
+  const wrapped=measured(target());
+  await expect(restoreTypedAdmissionPage(wrapped.db,options)).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
+  expect(wrapped.stats.writeTransactions).toEqual([]);
+  const probe=wrapped.stats.readQueries.find(q=>q.sql.includes('min(source_row_id) first_id')&&q.args[2]===1)??wrapped.stats.readQueries.filter(q=>q.sql.includes('min(source_row_id) first_id')).at(-1)!;
+  const full=(await target().prepare('SELECT chunk_id,count(*) n FROM typed_telemetry_records WHERE format=11 GROUP BY chunk_id ORDER BY n DESC LIMIT 1').first<{chunk_id:number;n:number}>())!;
+  expect(full.n).toBe(300);
+  const result=await target().prepare(probe.sql).bind(probe.args[0],11,full.chunk_id).first<{count:number}>();
+  expect(result?.count).toBe(201);
+  expect(await target().prepare("SELECT after_id,copied FROM _authority_restore_adoption WHERE format='v11'").first()).toEqual({after_id:0,copied:0});
+  expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_proofs').first('n')).toBe(0);
+ },30000);
+
+ it('refuses a noncontiguous retained chunk without advancing its page',async()=>{
+  const {options}=await readyForAdoption(200);
+  await target().prepare('DELETE FROM typed_telemetry_records WHERE format=11 AND source_row_id=100').run();
+  const wrapped=measured(target());await expect(restoreTypedAdmissionPage(wrapped.db,options)).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
+  expect(wrapped.stats.writeTransactions).toEqual([]);
+  expect(await target().prepare("SELECT copied FROM _authority_restore_adoption WHERE format='v11'").first('copied')).toBe(0);
  },30000);
  for(const corruption of ['digest','foreign-owner'] as const)it(`refuses actual ${corruption} proof corruption without advancing verification or deleting evidence`,async()=>{
   const {f,options}=await readyForAdoption();
