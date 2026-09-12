@@ -198,16 +198,18 @@ describe("typed v1.1 exact domain closure", () => {
   });
 
   it("keeps preservation and chunk completeness probes indexed", async () => {
-    for (const sql of [
-      "SELECT base_digest FROM typed_v11_record_admissions WHERE manifest_id=? AND stream=? AND occurrence_id=?",
-      "SELECT legacy_digest FROM typed_v11_record_admissions WHERE manifest_id=? AND stream=? AND legacy_occurrence_id=?",
-      "SELECT count(*) FROM typed_v11_record_admissions WHERE chunk_id=?",
+    for (const [sql, proofIndex] of [
+      ["SELECT base_digest FROM typed_v11_record_admissions WHERE manifest_id=? AND stream=? AND occurrence_id=?", "typed_v11_proof_manifest"],
+      ["SELECT legacy_digest FROM typed_v11_record_admissions WHERE manifest_id=? AND stream=? AND legacy_occurrence_id=?", "typed_v11_admissions_legacy"],
+      ["SELECT count(*) FROM typed_v11_record_admissions WHERE chunk_id=?", "typed_v11_proof_chunk"],
     ]) {
       const rows = (await db().prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...Array(sql.split("?").length - 1).fill("synthetic"))
         .all<{ detail: string }>()).results;
       const plan = rows.map(row => row.detail).join("\n");
-      expect(plan).toMatch(/SEARCH typed_v11_record_admissions USING (?:COVERING )?INDEX/);
-      expect(plan).not.toMatch(/SCAN typed_v11_record_admissions|TEMP B-TREE/);
+      // The compatibility view must push predicates into integer-key proof
+      // indexes; decoding identifiers must never require scanning retained rows.
+      expect(plan).toMatch(new RegExp(`SEARCH p USING (?:COVERING )?INDEX ${proofIndex}\\b`));
+      expect(plan).not.toMatch(/\bSCAN (?:p|m|c|a|typed_v11_record_proofs|typed_v11_record_admissions)\b|TEMP B-TREE/);
     }
   });
 

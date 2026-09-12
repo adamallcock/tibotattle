@@ -1186,18 +1186,20 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     expect(bandResets(scalar.analysis as AnalysisLike).length).toBeGreaterThanOrEqual(3);
     expect(scalar.analysis).toMatchObject({ attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
       inputFingerprint: sourcePin.fingerprint });
-    expect(budget.remainingQueries).toBe(593);
+    // Reserve includes the two-query typed layout/namespace qualification ceiling.
+    expect(budget.remainingQueries).toBe(591);
+    expect(sql.filter(query => query.includes("name='typed_v1_admission_state'"))).toHaveLength(1);
     const composition = await finishAccountScopedModelCompositionV1(monitored, participantId, evidence!, budget, { nowMs, sourcePin });
     expect(composition.status).toBe("complete");
     if (composition.status !== "complete") throw new Error("composition unexpectedly deferred");
     expect(composition.analysis).toEqual(compositionReference.status === "ready"
       ? { ...compositionReference, attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } : compositionReference);
-    expect(budget.remainingQueries).toBe(186);
+    expect(budget.remainingQueries).toBe(182);
     const before = sql.length;
     expect(await finishAccountScopedQuotaAnalysisV1(monitored, participantId, evidence!, budget, { nowMs, sourcePin }))
       .toEqual({ status: "deferred" });
     expect(sql.length).toBe(before);
-    expect(budget.remainingQueries).toBe(186);
+    expect(budget.remainingQueries).toBe(182);
     const mismatch = { ...evidence!, identity: { ...identity, inputFingerprint: "0".repeat(64) } };
     await expect(finishAccountScopedQuotaAnalysisV1(monitored, participantId, mismatch,
       { remainingQueries: 409, deadlineMs: Date.now() + 60_000 }, { nowMs, sourcePin })).rejects.toThrow("evidence mismatch");
@@ -1222,7 +1224,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
         },
       });
       await expect(Reflect.apply(finish, undefined, [changing, participantId, freshEvidence,
-        { remainingQueries: 7, deadlineMs: Date.now() + 60_000 },
+        { remainingQueries: 9, deadlineMs: Date.now() + 60_000 },
         { nowMs, sourcePin: freshPin, maxWindowedUsageRows: 0 }])).rejects.toThrow("source changed during analysis");
       expect(batchReads).toBe(2);
     }
