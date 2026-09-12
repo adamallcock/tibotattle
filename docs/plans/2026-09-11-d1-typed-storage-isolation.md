@@ -10,18 +10,39 @@ status: implementation-in-progress
 Implementation is on `codex/d1-typed-storage-isolation`, draft
 [PR #124](https://github.com/adamallcock/tibotattle/pull/124), based on
 `3de7ccd0a293e1d9b95ce14b591dbf5f1c2d1f2b`.
-September 12 latest completed candidate gate is `26ba247d`: 1,402 tests across
-120 files, plus 13 documentation and 3 hosted checks passed. The independently
-frozen `77f0b5e5` optimized 1,600-row v1.1 cloud rehearsal completed 226 checkpoints;
-final proofs and unchanged source census (94 tables, 1,651 rows) passed. Metrics
-and overlapping Cron helper reconciliation remain separate retained evidence.
-Three paired fixed-read Service-binding placement trials showed a 4.98× service
-improvement; this is synthetic read latency, not migration throughput proof.
-Production main is unchanged; the additive independent deletion-ledger migration
-0003 is complete. An optional placed migration runner is now under local review;
-its new-source qualification and actual placed cloud migration remain pending.
-The obsolete larger `77f0` v1 cloud run is superseded by the planned **both-format**
-placed-candidate rehearsal after qualification. No old source receipt is relabeled.
+September 12 latest completed placed-runner qualification is frozen source
+`1070ee214ad0b02188468e68880df49e54c1f66e`: the owning Worker gate passed
+1,402 tests across 120 files, both dry builds and 13 documentation tests.
+Both isolated 1,600-record cloud formats completed: v1 at 216 checkpoints and
+v1.1 at 226. Each verified all 27 typed tables over 53 pages, final schema,
+admission proofs, bootstrap and foreign keys. All 94 original source tables
+remained unchanged, including copied values, SQLite types, row IDs and sequences.
+All ten temporary resources were removed after verification.
+
+The corrected metrics retain every original attempt and failed evaluation. They
+use the recorded invocation log timestamp rather than an invalid cross-clock
+interval assumption; no unknown effect was discarded. The v1 value proof keeps
+all copied deterministic cells exact and separately proves the relationships of
+16 newly generated event/owner identifier cells. It does not assert that independent
+restores generate identical random identifiers. Both final metrics have zero
+unresolved outcomes; each retains two observed pre-effect busy-journal warnings.
+The private `readiness-1070ee21/placed-dense-cloud-20260912` evidence contains the
+qualification, correction reviews, typed/source proofs and cleanup receipts.
+These bounded synthetic results do not qualify production-scale duration.
+
+Current integration adds `e2a7a34f` (200-row admission/proof batching) and
+`b243eb81` (atomic execution-fenced continuation and cutover admission). The
+batching retains exact proofs and bounded statement/byte prefixes; its local
+1,600-record duration was essentially unchanged, so no speedup is claimed.
+Continuation changes ownership only with an exact checkpoint/null-intent CAS;
+quiet logs do not prove drain. Old executions cannot claim after rollover, and
+claimed or uncertain work blocks it. The final cutover proof pins the approved
+execution digest. Independent scoped review is complete; the new combined-source
+owning gate, role/runtime qualification and both-format cloud rehearsal including
+an actual rollover remain pending. Earlier source receipts are not relabeled.
+
+Production main has not migrated. Only the additive independent deletion-ledger
+migration 0003 has been applied; production upload routing remains unchanged.
 
 Historical completed qualification below remains pinned to its named source.
 September 12 integration, independent source review and clean-source local
@@ -57,17 +78,11 @@ manifest after cooldown using the same credential and unchanged rate limits.
 This is cloud protocol proof, not a signed desktop scheduler, natural cron,
 hosted Access-owner erasure or production activation claim.
 
-The dense v1.1 cloud baseline completed on frozen `edb6cbcb`: 210 distinct
-checkpoints, 256 typed records and admission proofs, exact stream totals, final
-role/schema/bootstrap and zero foreign-key errors. Full source readback preserved
-94 application tables and 297 rows, including types, row IDs and sequences. Its
-fresh Worker, Queue and two databases were removed after verification. One
-acknowledged duplicate and four scheduled wakeups overlapping successful queue
-pages remain explicit evidence. Full 32-row phase means were 1.41–1.87 seconds;
-these small pages need optimization before a production maintenance window is
-chosen. A 200/100/200/100 bounded-page candidate is under independent review;
-its local tests do not establish cloud throughput. Legacy v1 cloud timing is
-running separately against its sealed baseline.
+Historical dense cloud baselines at `edb6cbcb` and `77f0b5e5` remain retained
+for comparison and recovery. Their timing and corrections apply only to those
+sources; the completed both-format placed `1070ee21` evidence above supersedes
+their unfinished-work statements. Earlier fixed-read placement trials measured
+synthetic Service-binding latency, not populated migration throughput.
 
 The existing production deletion ledger now has migration
 `0003_storage_erasure_jobs.sql`. Exact before/native-replay/after readback
@@ -79,18 +94,22 @@ source suppression or privacy readiness for the replacement ingestion database.
 
 Remaining execution is ordered as follows:
 
-1. Finish legacy v1 cloud timing and qualify the bounded throughput improvement
-   against fresh cloud resources; choose the production window from measured
-   throughput and a reviewed production-volume model.
-2. Complete independent review and combined-source qualification of the
-   maintenance-owned cutover/recovery operator, explicit analytics registration,
-   natural scheduling and exact source/role/copy/bootstrap/ledger admission.
-3. Prepare the production target schemas; contain source writers; preserve and
-   verify any derived-cache archive needed for freeze headroom; freeze and copy.
+1. Freeze and qualify the combined source: full owning gate, role schemas and
+   restored runtime, then fresh both-format cloud verification including explicit
+   execution rollover, retained outcomes and complete cleanup.
+2. Choose the production maintenance window from the resulting phase timings and
+   a reviewed volume model. Include continuation windows where required; local
+   elapsed time and small cloud fixtures are not a production forecast.
+3. Prepare production target schemas; contain source writers; preserve and verify
+   any derived-cache archive needed for freeze headroom; freeze and copy without
+   deleting original source records.
 4. Independently verify authority, typed records, deletion-ledger reconciliation
-   and analytics coverage, then activate under the same maintenance owner.
-5. Verify uploads, rebuilding and public/admin reads on the actual production
-   targets, retaining the legacy source and independent deletion ledger.
+   and analytics coverage. Initialize the separate runtime, then activate under
+   the same maintenance owner with the final execution digest pinned.
+5. Verify uploads, natural lifecycle/analytics scheduling, rebuilding and
+   public/admin reads on the actual production targets, retaining the legacy
+   source and independent deletion ledger. Pre-activation abort requires verified
+   source thaw/cache restoration; target writes require forward reconciliation.
 
 The user's September 12 approval covers the remaining actions, including isolated
 resources and test keys. It does not waive verification, preservation, the fixed
@@ -117,7 +136,7 @@ production activation.
 | Lane | Verified behavior | Remaining gate |
 |---|---|---|
 | Ingestion | Actual local v1/v1.1 HTTP admission and replay; all streams; exact typed/export reads; isolated encrypted accountless cloud protocol | Production target upload canary |
-| Restore | Qualified local restored-account runtime plus isolated cloud copy, authority verification, sequence high-water, final guards and bootstrap | Dense-page cloud throughput and production-specific operation |
+| Restore | Qualified local restored-account runtime and both-format placed cloud copy, exact typed/source verification, sequence high-water, final guards and bootstrap | Combined-source rollover rehearsal and production-specific operation |
 | Independent computation | Qualified local daily values, source-only allowance fits, resumable v1 history, immutable v1.1 day reuse; isolated cloud failure with continued ingestion and exact catch-up | Production independent scheduling and rebuilding |
 | Publication | Qualified local daily endpoint and maintained graph DTO; continuous-append historical completion; honest completed-fit snapshots; 401-cell totals without prefix publication | Production target rebuilding and public/admin read verification |
 | Erasure | Qualified local retry mapping, offline-analytics refusal, terminal fence, bounded cleanup and late-write refusal | Production deletion-ledger reconciliation and hosted owner-route proof |
@@ -131,7 +150,7 @@ all passed. Its dirty-source receipt is explicitly **not qualified** and does
 not authorize activation. Source-bound evidence must be regenerated after freeze.
 These local timings are not a remote migration throughput forecast.
 
-Additional current receipts include:
+Retained implementation receipts include:
 
 - Actual independent scheduling through daily and graph publication, plus
   ingestion readiness with analytics unavailable. Ingestion readiness explicitly
@@ -163,9 +182,9 @@ Additional current receipts include:
   accepted retries remain available. A consumer refuses a rolled-back or diverged
   source journal instead of silently advancing over mismatched history.
 
-Independent cross-review and the owning gate are complete at the revision above.
-The owning-gate receipt binds qualification to the exact tested source and
-commands. The private migration
+Independent cross-review and the owning gate are complete for the named frozen
+1070 source. The new combined revision still needs its own gate and receipts.
+Each owning-gate receipt binds only its exact tested source and commands. The private migration
 Queue advances one verified bounded page per message; duplicate and delayed
 wakeups converge by checkpoint identity. Uncertain writes remain stopped.
 
@@ -213,8 +232,8 @@ activation. Raising an epoch alone cannot repair sequence/event divergence.
 Read-only staging inspection on September 12 found a retained divergent
 48-migration accountless lineage, not the canonical 60-migration restore source.
 Keep that existing staging database intact; do not apply same-numbered canonical
-migrations to it. Qualify the initial remote restore against a fresh synthetic
-source with the canonical schema before planning the real-data operation. Both
+migrations to it. The isolated rehearsals used fresh synthetic sources with the canonical schema;
+they did not modify that divergent staging database. Both
 observed remote D1 stores also contain Cloudflare's exact `_cf_KV` metadata table.
 Schema normalization excludes exact reviewed provider shapes with no attached SQL;
 unknown provider-prefix tables and altered definitions remain drift.
@@ -225,13 +244,17 @@ for the baseline 94-table inventory.
 
 ## Storage measurement boundary
 
-The latest qualified 10,000-record complete-role fixture at `1a2d8a36`
-measured **28,352,512 bytes before versus 10,485,760 bytes after**, about a
+The latest qualified 10,000-record complete-role fixture at `1070ee21`
+measured **28,348,416 bytes before versus 10,493,952 bytes after**, about a
 63% whole-file reduction. It includes authority, admission proofs, indexes and
-restore metadata, and excludes the separate analytics database. The restore
-and actual restored-account runtime completed in 73.1 seconds locally. Neither
-the storage ratio nor that timing is a production capacity or duration forecast.
-The measurements below preserve earlier implementation-stage provenance.
+restore receipts, and excludes the separate analytics database. Native Queue
+and Service-binding restore completed 483 checkpoints in 19.9 seconds, followed
+by 4.7 seconds of actual restored-account runtime checks (24.6 seconds total).
+This is local qualification, not measured cloud placement. Neither its storage
+ratio nor its duration forecasts production capacity or downtime. The combined
+batching/fence source still needs fresh qualification and measurement; older
+receipts remain pinned to their original sources. The measurements below retain
+earlier implementation-stage provenance.
 
 The [earlier synthetic measurement](../research/2026-09-11-typed-storage-measurement.md)
 at frozen source `62516e878197ec9c1524a8c8a87c0344e2277677` measured
@@ -249,7 +272,7 @@ Inspection identified 902.8 bytes per record in the permanent admission proof
 table and indexes, chiefly repeated textual chunk/manifest/occurrence keys.
 The compact proof migration removes the repeated parent keys and redundant
 uniqueness indexes, preserving indexed lexical cursors through its compatibility
-view. The final complete-role 10,000-row remeasurement is **28,348,416 bytes before
+view. That earlier complete-role 10,000-row remeasurement was **28,348,416 bytes before
 versus 10,481,664 bytes after**, a **63.03% whole-file reduction**. After empty
 schema overhead, this is **2,672.23 versus 832.72 bytes per record**, a 68.84%
 reduction. It includes complete authority, admission proofs, indexes and restore
