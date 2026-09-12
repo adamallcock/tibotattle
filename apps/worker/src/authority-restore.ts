@@ -1,3 +1,4 @@
+import { D1_PROVIDER_SCHEMA_PREDICATE } from './d1-provider-schema';
 import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
 import { beginRawTelemetryCopy, copyLegacyTelemetryPage, verifyLegacyTelemetryCopyPage, readLegacyTelemetryCopyPage, type RawCopyRun } from './typed-telemetry-copy';
@@ -51,9 +52,9 @@ type EncodedRow = { cells: Cell[]; cursor: Cursor };
 interface TableState { name: string; descriptor:string; copy_cursor: string; verify_cursor: string; copied: number; verified: number; copy_done: number; verify_done: number; }
 
 export async function authoritySchemaInventory(db: D1Database): Promise<AuthoritySchemaObject[]> {
-  const rows = (await db.prepare(`SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL
-    AND name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*' AND name NOT GLOB '_authority_*'
-    ORDER BY type,name LIMIT 1025`).all<AuthoritySchemaObject>()).results;
+  const rows = (await db.prepare(`SELECT s.type,s.name,s.tbl_name,s.sql FROM sqlite_master s WHERE s.sql IS NOT NULL
+    AND s.name NOT GLOB 'sqlite_*' AND s.name NOT GLOB '_authority_*'
+    AND NOT (${D1_PROVIDER_SCHEMA_PREDICATE}) ORDER BY s.type,s.name LIMIT 1025`).all<AuthoritySchemaObject>()).results;
   if (rows.length > 1024) fail();
   return rows;
 }

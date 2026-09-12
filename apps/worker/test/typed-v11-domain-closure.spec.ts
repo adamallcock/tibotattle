@@ -202,7 +202,7 @@ describe("typed v1.1 exact domain closure", () => {
       ["SELECT base_digest FROM typed_v11_record_admissions WHERE manifest_id=? AND stream=? AND occurrence_id=?", "typed_v11_proof_manifest"],
       ["SELECT legacy_digest FROM typed_v11_record_admissions WHERE manifest_id=? AND stream=? AND legacy_occurrence_id=?", "typed_v11_admissions_legacy"],
       ["SELECT count(*) FROM typed_v11_record_admissions WHERE chunk_id=?", "typed_v11_proof_chunk"],
-    ]) {
+    ] as const) {
       const rows = (await db().prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...Array(sql.split("?").length - 1).fill("synthetic"))
         .all<{ detail: string }>()).results;
       const plan = rows.map(row => row.detail).join("\n");

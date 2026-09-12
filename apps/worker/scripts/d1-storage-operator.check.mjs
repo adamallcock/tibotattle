@@ -255,3 +255,15 @@ test('extension chains require the latest predecessor and exact replay never ren
   assert.throws(() => resolveStorageApproval({ plan: f.plan, extensions: chain.extensions, extension: missingPrevious,
     approvedExtensionSha256: identityDigest(missingPrevious), now: now + 2_000_000 }), { code: 'D1_STORAGE_EXTENSION_CHAIN_INVALID' });
 });
+
+test('provider table exclusion requires exact DDL and no attached SQL',async()=>{
+ const {default:providers}=await import('../src/d1-provider-schema.json',{with:{type:'json'}});
+ const provider=providers[0];
+ const empty=storageSchemaDigest([]);
+ for(const known of providers)assert.equal(storageSchemaDigest([known]),empty);
+ for(const rows of [
+  [{...provider,sql:provider.sql.replace('value BLOB','value TEXT')}],
+  [{...provider,name:'_cf_application',tbl_name:'_cf_application'}],
+  [provider,{type:'trigger',name:'_authority_unreviewed_provider',tbl_name:'_cf_KV',sql:'CREATE TRIGGER synthetic AFTER INSERT ON _cf_KV BEGIN SELECT 1; END'}],
+ ])assert.notEqual(storageSchemaDigest(rows),empty);
+});

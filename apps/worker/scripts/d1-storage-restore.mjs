@@ -152,7 +152,7 @@ export async function rehearseStorageRestore({workerRoot,directory,allowUnfrozen
   if((await target.prepare('PRAGMA foreign_key_check').all()).results.length)throw storageError('REHEARSAL_PROOF_FAILED');
   const after=await readIngestionRoleInputs(workerRoot,{allowUnfrozen});
   if(identityDigest(after)!==identityDigest(inputs))throw storageError('ROLE_INPUT_CHANGED');
-  const schemaRows=await target.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB '_authority_*' AND name NOT GLOB '_cf_*' AND name NOT GLOB 'sqlite_*'").all();
+  const schemaRows={results:await api.authoritySchemaInventory(target)};
   const targetPopulatedBytes=(await target.prepare('SELECT 1 AS probe').all()).meta.size_after;
   if(![sourceEmptyBytes,sourcePopulatedBytes,finalRoleEmptyBytes,targetPopulatedBytes].every(n=>Number.isSafeInteger(n)&&n>0))throw storageError('REHEARSAL_MEASUREMENT_INVALID');
   const restoreElapsedMs=Math.ceil(performance.now()-started),runtimeStarted=performance.now();

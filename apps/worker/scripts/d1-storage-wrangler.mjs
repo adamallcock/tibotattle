@@ -21,7 +21,7 @@ const LEDGER_OBJECTS = [
   { type: 'index', name: 'sqlite_autoindex_d1_storage_migrations_1', tbl_name: 'd1_storage_migrations', sql: null },
   { type: 'table', name: 'd1_storage_migrations', tbl_name: 'd1_storage_migrations', sql: LEDGER_SCHEMA_SQL },
 ];
-export const STORAGE_SCHEMA_QUERY = `SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND tbl_name <> 'd1_storage_migrations' ORDER BY type,name LIMIT 4097`;
+export const STORAGE_SCHEMA_QUERY = `SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' AND tbl_name <> 'd1_storage_migrations' ORDER BY type,name LIMIT 4097`;
 
 /** Private, one-account configs prevent environment fallback or binding-name
  * discovery. This adapter deliberately exposes no arbitrary query API. */

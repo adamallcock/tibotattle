@@ -1,3 +1,4 @@
+import providerSchemas from '../src/d1-provider-schema.json' with { type: 'json' };
 import { createHash } from 'node:crypto';
 import { lstat, readFile, realpath, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -181,7 +182,10 @@ export function storageSchemaDigest(rows) {
     if (!['table', 'index', 'trigger', 'view'].includes(row.type) || typeof row.name !== 'string'
         || typeof row.tbl_name !== 'string' || !(typeof row.sql === 'string' || row.sql === null)) throw storageError('SCHEMA_RESULT_INVALID');
     return row;
-  }).filter((row) => !row.name.startsWith('sqlite_') && row.tbl_name !== 'd1_storage_migrations');
+  }).filter((row) => !row.name.startsWith('sqlite_') && row.tbl_name !== 'd1_storage_migrations'
+    && !providerSchemas.some(providerSchema => Object.keys(providerSchema).every(key => row[key] === providerSchema[key])
+      && !rows.some(attached => attached.tbl_name === providerSchema.tbl_name
+        && attached.name !== providerSchema.name && attached.sql !== null)));
   ordered.sort((a, b) => a.type < b.type ? -1 : a.type > b.type ? 1 : a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   return identityDigest(ordered);
 }

@@ -1,3 +1,4 @@
+import { D1_PROVIDER_SCHEMA_PREDICATE } from './d1-provider-schema';
 import { authorityRestoreRetainedTableNames } from './authority-restore';
 import { bootstrapRestoredV1Chunk } from './authority-restore-adoption';
 import { bootstrapV11StorageHead } from './v11-storage-journal';
@@ -26,7 +27,7 @@ async function ready(db:D1Database,pin:string){
  if(await db.prepare(`SELECT 1 FROM _authority_restore_expected e LEFT JOIN sqlite_master s ON s.name=e.name
   WHERE s.type IS NOT e.type OR s.tbl_name IS NOT e.tbl_name OR s.sql IS NOT e.sql LIMIT 1`).first())throw fail();
  if(await db.prepare(`SELECT 1 FROM sqlite_master s WHERE s.sql IS NOT NULL AND s.name NOT GLOB 'sqlite_*'
-  AND s.name NOT GLOB '_cf_*' AND s.name NOT GLOB '_authority_*'
+  AND NOT (${D1_PROVIDER_SCHEMA_PREDICATE}) AND s.name NOT GLOB '_authority_*'
   AND NOT EXISTS(SELECT 1 FROM _authority_restore_expected e WHERE e.name=s.name) LIMIT 1`).first())throw fail();
 }
 async function exactGuards(db:D1Database,expected:Awaited<ReturnType<typeof guards>>){

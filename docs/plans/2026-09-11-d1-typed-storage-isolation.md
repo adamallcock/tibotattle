@@ -14,7 +14,9 @@ September 12 integration and independent source review are complete. Final
 clean-source qualification is the next gate; its exact tested revision and logs
 are recorded in the generated owning-gate and role receipts, not inferred from
 the earlier revision receipts below.
-**No remote resource, schema, binding, deployment or data has changed.**
+**No remote database, schema, binding, deployment or data has changed.**
+The existing CLI login was renewed with its previously approved scopes for
+read-only staging metadata verification.
 
 Use a fresh compact ingestion database and an independent analytics database,
 with a **9,000,000,000-byte operating budget for each**. Keep the original source
@@ -126,6 +128,15 @@ activation. Raising an epoch alone cannot repair sequence/event divergence.
 5. Execute and verify staging; prepare the corresponding production operation.
    Resource creation, schema migration, data migration, deployment and cutover
    remain separate evidenced steps.
+
+Read-only staging inspection on September 12 found a retained divergent
+48-migration accountless lineage, not the canonical 60-migration restore source.
+Keep that existing staging database intact; do not apply same-numbered canonical
+migrations to it. Qualify the initial remote restore against a fresh synthetic
+source with the canonical schema before planning the real-data operation. Both
+observed remote D1 stores also contain Cloudflare's exact `_cf_KV` metadata table.
+Schema normalization excludes exact reviewed provider shapes with no attached SQL;
+unknown provider-prefix tables and altered definitions remain drift.
 
 See the [operator runbook](../runbooks/2026-09-11-d1-storage-operator.md) for the
 maintained commands and the [schema map](../research/2026-09-11-ingestion-analytics-schema-map.md)

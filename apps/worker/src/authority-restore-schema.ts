@@ -1,3 +1,4 @@
+import { D1_PROVIDER_SCHEMA_PREDICATE } from './d1-provider-schema';
 /** Private restore protocol metadata, never a runtime authorization source. */
 export const AUTHORITY_RESTORE_SCHEMA = [
 `CREATE TABLE _authority_restore_run(id INTEGER PRIMARY KEY CHECK(id=1),run_id TEXT NOT NULL,contract_digest TEXT NOT NULL,limit_bytes INTEGER NOT NULL CHECK(limit_bytes BETWEEN 33554432 AND 9000000000),phase TEXT NOT NULL CHECK(phase IN ('copying','sealed','verified','installed','ready'))) STRICT`,
@@ -39,7 +40,7 @@ END`,
  EXISTS(SELECT 1 FROM _authority_restore_expected e LEFT JOIN sqlite_master s ON s.name=e.name
  WHERE s.name IS NULL OR s.type!=e.type OR s.tbl_name!=e.tbl_name OR s.sql IS NOT e.sql)
  OR EXISTS(SELECT 1 FROM sqlite_master s WHERE s.sql IS NOT NULL AND s.name NOT GLOB 'sqlite_*'
- AND s.name NOT GLOB '_cf_*' AND s.name NOT GLOB '_authority_*'
+ AND NOT (${D1_PROVIDER_SCHEMA_PREDICATE}) AND s.name NOT GLOB '_authority_*'
  AND NOT EXISTS(SELECT 1 FROM _authority_restore_expected e WHERE e.name=s.name))) THEN RAISE(ABORT,'authority_restore_final_schema_conflict') END;
 END`,
 `CREATE TRIGGER _authority_restore_run_retained BEFORE DELETE ON _authority_restore_run BEGIN SELECT RAISE(ABORT,'authority_restore_identity_retained'); END`,
