@@ -11,8 +11,8 @@ Implementation is on `codex/d1-typed-storage-isolation`, draft
 [PR #124](https://github.com/adamallcock/tibotattle/pull/124), based on
 `3de7ccd0a293e1d9b95ce14b591dbf5f1c2d1f2b`.
 September 12 integration, independent source review and clean-source local
-qualification are complete at `1a2d8a360bcc5db6d9c59f5045e54c689e70948b`.
-The owning Worker gate passed all 1,389 tests across 119 files, the script and
+qualification are complete at `edb6cbcb04509ab1ca26f92e1215bfc41055348f`.
+The owning Worker gate passed all 1,396 tests across 120 files, the script and
 contract checks, and both development/staging dry builds. All three role
 qualifications and all 17 effective migration schema comparisons passed.
 The exact source, commands and hashes remain in the owning-gate and role receipts.
@@ -25,15 +25,62 @@ all 95 source tables and 50 synthetic rows, including storage types, row IDs
 and sequence state. The temporary source, Queue and migration Worker were
 deleted after verification; the new ingestion and analytics databases remain.
 Cloudflare required detaching the Queue consumer before Worker deletion.
-**Production and the pre-existing staging resources remain unchanged.**
+This copy did not change production or pre-existing staging resources.
 
-The next gate is the isolated encrypted application canary. Its local HTTP
-rehearsal passed enrollment, five encrypted uploads containing 206 records,
-replay, separate-process credential reuse, independent analytics failure and
-catch-up, disconnect and owner-route erasure. Remote execution needs the
-separately prepared test ledger, bucket, Workers and keys. The base remote
-protocol ends with disconnect and disabled test Workers; it does not claim
-hosted Access-owner erasure, desktop scheduling or production activation.
+The isolated encrypted cloud application canary also passed at the separately
+sealed `5ff56ab7` source. It proved accountless enrollment, five exact ciphertext
+objects containing 206 typed records, contribution and domain replay prevention,
+separate-process credential reuse, an upload accepted after an injected analytics
+failure, exact catch-up in one pass, disconnect and immediate authority withdrawal.
+The two private test Workers were disabled and verified closed, with no cron.
+The synthetic databases, bucket and encrypted objects remain retained as approved.
+
+The original failed attempts remain evidence. Wrangler's administrative migration
+ledger required an exact separate schema/row proof; the application schema was
+unchanged. One initial closed-endpoint read returned 500 before later successful
+readback. The protocol stopped at a confirmed 429, then resumed the exact saved
+manifest after cooldown using the same credential and unchanged rate limits.
+This is cloud protocol proof, not a signed desktop scheduler, natural cron,
+hosted Access-owner erasure or production activation claim.
+
+The dense v1.1 cloud baseline completed on frozen `edb6cbcb`: 210 distinct
+checkpoints, 256 typed records and admission proofs, exact stream totals, final
+role/schema/bootstrap and zero foreign-key errors. Full source readback preserved
+94 application tables and 297 rows, including types, row IDs and sequences. Its
+fresh Worker, Queue and two databases were removed after verification. One
+acknowledged duplicate and four scheduled wakeups overlapping successful queue
+pages remain explicit evidence. Full 32-row phase means were 1.41–1.87 seconds;
+these small pages need optimization before a production maintenance window is
+chosen. A 200/100/200/100 bounded-page candidate is under independent review;
+its local tests do not establish cloud throughput. Legacy v1 cloud timing is
+running separately against its sealed baseline.
+
+The existing production deletion ledger now has migration
+`0003_storage_erasure_jobs.sql`. Exact before/native-replay/after readback
+preserved all three tombstones and the two prior migration records, including
+values/types/row IDs/timestamps; the sequence advanced from two to three. The new
+job table is empty and foreign-key checks pass. The main production D1 and upload
+routing are unchanged. This completed ledger upgrade does not establish final
+source suppression or privacy readiness for the replacement ingestion database.
+
+Remaining execution is ordered as follows:
+
+1. Finish legacy v1 cloud timing and qualify the bounded throughput improvement
+   against fresh cloud resources; choose the production window from measured
+   throughput and a reviewed production-volume model.
+2. Complete independent review and combined-source qualification of the
+   maintenance-owned cutover/recovery operator, explicit analytics registration,
+   natural scheduling and exact source/role/copy/bootstrap/ledger admission.
+3. Prepare the production target schemas; contain source writers; preserve and
+   verify any derived-cache archive needed for freeze headroom; freeze and copy.
+4. Independently verify authority, typed records, deletion-ledger reconciliation
+   and analytics coverage, then activate under the same maintenance owner.
+5. Verify uploads, rebuilding and public/admin reads on the actual production
+   targets, retaining the legacy source and independent deletion ledger.
+
+The user's September 12 approval covers the remaining actions, including isolated
+resources and test keys. It does not waive verification, preservation, the fixed
+per-database operating budget, or refusal of an ambiguous outcome.
 
 Use a fresh compact ingestion database and an independent analytics database,
 with a **9,000,000,000-byte operating budget for each**. Keep the original source
@@ -49,14 +96,15 @@ assigned database. New-owner placement alone cannot prevent that growth.
 
 ## Integration evidence and remaining gates
 
-Local qualification and isolated cloud copy are distinct evidence. Counts
-overlap and are not additive; neither qualifies production activation.
+Local qualification, isolated cloud copy and the cloud application canary are
+distinct evidence. Counts overlap and are not additive; none alone qualifies
+production activation.
 
 | Lane | Verified behavior | Remaining gate |
 |---|---|---|
-| Ingestion | Actual local v1/v1.1 HTTP admission and replay; all three streams; exact typed canonical/export reads; no raw JSON fallback | Encrypted cloud application canary |
+| Ingestion | Actual local v1/v1.1 HTTP admission and replay; all streams; exact typed/export reads; isolated encrypted accountless cloud protocol | Production target upload canary |
 | Restore | Qualified local restored-account runtime plus isolated cloud copy, authority verification, sequence high-water, final guards and bootstrap | Dense-page cloud throughput and production-specific operation |
-| Independent computation | Qualified local daily values, source-only allowance fits, resumable v1 history, immutable v1.1 day reuse | Cloud analytics failure/catch-up canary |
+| Independent computation | Qualified local daily values, source-only allowance fits, resumable v1 history, immutable v1.1 day reuse; isolated cloud failure with continued ingestion and exact catch-up | Production independent scheduling and rebuilding |
 | Publication | Qualified local daily endpoint and maintained graph DTO; continuous-append historical completion; honest completed-fit snapshots; 401-cell totals without prefix publication | Production target rebuilding and public/admin read verification |
 | Erasure | Qualified local retry mapping, offline-analytics refusal, terminal fence, bounded cleanup and late-write refusal | Production deletion-ledger reconciliation and hosted owner-route proof |
 | Operations | Exact role qualification, full-file imports, bounded journal recovery and completed isolated remote copy/cleanup | Production freeze headroom, maintenance window and reviewed cutover |

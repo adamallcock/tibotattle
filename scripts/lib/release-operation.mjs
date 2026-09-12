@@ -4,7 +4,7 @@ import { lstat, mkdir, open, realpath, rename } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const OPERATION_KINDS = new Set(["native", "production", "publication", "qualification"]);
+const OPERATION_KINDS = new Set(["native", "production", "publication", "qualification", "maintenance"]);
 
 export function operationError(code) {
   return Object.assign(new Error(code), { code });
