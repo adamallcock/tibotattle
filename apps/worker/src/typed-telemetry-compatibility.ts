@@ -187,83 +187,129 @@ export async function readTypedTelemetryCompatibilityPage(db: D1Database, option
     }
     const page = (await db.prepare(TYPED_TELEMETRY_COMPATIBILITY_PAGE_SQL).bind(...parameters).all<Row>()).results;
     const count = options.limit ?? 100, rows = page.slice(0, count);
-    const sessions = rows.filter((row) => row.stream === "session").map((row) => integer(row.storage_row_id, 1, Number.MAX_SAFE_INTEGER));
-    const tools = new Map<number, Record<string, number>>();
-    for (let offset = 0; offset < sessions.length; offset += 90) {
-      const group = sessions.slice(offset, offset + 90);
-      const result = await db.prepare(`SELECT storage_row_id, tool_class, count FROM typed_telemetry_compatibility_session_tools
-        WHERE storage_row_id IN (${group.map(() => "?").join(",")}) ORDER BY storage_row_id, tool_class COLLATE BINARY LIMIT ?`)
-        .bind(...group, group.length * 32 + 1).all<Row>();
-      if (result.results.length > group.length * 32) fail();
-      for (const row of result.results) {
-        const key = integer(row.storage_row_id, 1, Number.MAX_SAFE_INTEGER);
-        const values = tools.get(key) ?? Object.create(null) as Record<string, number>;
-        const tool = text(row, "tool_class");
-        if (Object.hasOwn(values, tool)) fail();
-        values[tool] = integer(row.count, 0, 1_000_000_000); tools.set(key, values);
-      }
-    }
-    const records: TypedTelemetryCompatibilityRecord[] = [];
-    for (const row of rows) {
-      const recordFormat = format(row.format);
-      const stream = STREAMS[integer(row.stream_code, 1, 3) - 1]!;
-      if (row.stream !== stream || row.source_namespace !== options.sourceNamespace || row.participant_id !== options.participantId
-          || stream !== options.stream || row.format_code !== (recordFormat === "v1" ? 10 : 11)
-          || row.id !== row.source_row_id || (stream === "usage") !== (row.usage_record_id !== null)
-          || (stream === "quota") !== (row.quota_record_id !== null)) fail();
-      for (const [raw, decoded] of [["_namespace_blob", "source_namespace"], ["_owner_blob", "participant_id"],
-        ["_device_blob", "device_id"], ["_chunk_blob", "chunk_row_id"]]) verifiedId(row, raw!, decoded!);
-      verifiedId(row, "_manifest_blob", "manifest_id", recordFormat === "v1");
-      const fields: TypedTelemetryFields = { format: recordFormat, stream,
-        occurrenceId: verifiedId(row, "_occurrence_blob", "occurrence_id")!,
-        observedAtMs: integer(row.observed_at_ms, MIN_INSTANT, MAX_INSTANT), provider: text(row, "provider"),
-        attribution: null, usage: null, quota: null, tools: null };
-      if (new Date(fields.observedAtMs).toISOString() !== row.observed_at) fail();
-      if (recordFormat === "v11" && stream !== "session") {
-        if (row.attribution_id === null) fail();
-        verifiedId(row, "_account_track_blob", "account_track_id", true);
-        verifiedId(row, "_plan_era_blob", "plan_era_id", true);
-        fields.attribution = { accountBasis: text(row, "account_basis"), accountTrackId: nullableText(row, "account_track_id"),
-          planBasis: text(row, "plan_basis"), planType: text(row, "attribution_plan_type"),
-          planEraId: nullableText(row, "plan_era_id") } as TelemetryV11Attribution;
-      } else if (["attribution_id", "account_basis", "account_track_id", "plan_basis", "attribution_plan_type", "plan_era_id"]
-        .some((key) => row[key] !== null)) fail();
-      if (stream === "usage") fields.usage = {
-        sessionId: verifiedId(row, "_session_blob", "session_uuid")!, modelId: text(row, "model_id"),
-        speedMode: text(row, "speed_mode"), apiServiceTier: text(row, "api_service_tier"), surface: text(row, "surface"),
-        billingSurface: text(row, "billing_surface"), reasoningEffort: text(row, "reasoning_effort"),
-        agentScope: text(row, "agent_scope"), outcome: text(row, "outcome"),
-        totalInputContextTokens: nullableNumber(row, "total_input_context_tokens"), components: {
-          inputUncachedTokens: nullableNumber(row, "input_uncached_tokens"), inputCacheReadTokens: nullableNumber(row, "input_cache_read_tokens"),
-          inputCacheWriteTokens: nullableNumber(row, "input_cache_write_tokens"), outputTextTokens: nullableNumber(row, "output_text_tokens"),
-          outputReasoningTokens: nullableNumber(row, "output_reasoning_tokens"), outputCombinedTokens: nullableNumber(row, "output_combined_tokens"),
-        },
-      };
-      else if (stream === "quota") {
-        fields.quota = { planType: text(row, "plan_type"), planVariant: text(row, "plan_variant"), limitId: text(row, "limit_id"),
-          slot: text(row, "slot"), usedPercent: nullableNumber(row, "used_percent"),
-          windowDurationMinutes: nullableNumber(row, "window_duration_minutes"), resetsAtMs: nullableNumber(row, "resets_at_ms") };
-        const resets = fields.quota.resetsAtMs;
-        if ((resets === null ? null : new Date(resets).toISOString()) !== row.resets_at) fail();
-      } else fields.tools = tools.get(number(row, "storage_row_id")) ?? {};
-      const canonical = typedTelemetryCanonicalRecords(fields);
-      if (await sha256Hex(canonical.canonicalRecord) !== row.canonical_sha256
-          || canonical.record.schemaVersion !== row.schema_version) throw new TypedTelemetryError("TYPED_TELEMETRY_CONFLICT");
-      const sourceId = integer(row.source_row_id, 1, Number.MAX_SAFE_INTEGER);
-      const result = { source_row_id: sourceId, id: sourceId, format: recordFormat, stream, observed_at_ms: fields.observedAtMs,
-        tool_class_counts: fields.tools, record_json: canonical.canonicalRecord,
-        legacy_occurrence_id: canonical.legacy?.occurrenceId ?? null, legacy_record_json: canonical.legacy?.canonicalRecord ?? null,
-        record: canonical.record,
-        ...Object.fromEntries(TEXT_FIELDS.map((key) => [key, text(row, key)])),
-        ...Object.fromEntries(NULLABLE_TEXT_FIELDS.map((key) => [key, nullableText(row, key)])),
-        ...Object.fromEntries(NULLABLE_NUMBER_FIELDS.map((key) => [key, nullableNumber(row, key)])),
-      } as TypedTelemetryCompatibilityRecord;
-      records.push(result);
-    }
+    const records = await decodeRows(db, rows, options);
     const last = records.at(-1);
     return { records, next: page.length > count && last ? {
       observedAtMs: last.observed_at_ms, format: last.format, sourceRowId: last.source_row_id,
     } : null };
+  } catch (error) {
+    if (error instanceof TypedTelemetryError) throw error;
+    throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
+  }
+}
+/** Shared bounded decoder. Exact source membership is checked before returning
+ * any reconstructed canonical/legacy bytes. Callers supply trusted internal
+ * IDs selected through their own immutable chunk/domain authority. */
+async function decodeRows(db: D1Database, rows: Row[], options: {
+  sourceNamespace: string; participantId: string; stream?: "usage" | "quota" | "session";
+}): Promise<TypedTelemetryCompatibilityRecord[]> {
+  const sessions = rows.filter((row) => row.stream === "session").map((row) => integer(row.storage_row_id, 1, Number.MAX_SAFE_INTEGER));
+  const tools = new Map<number, Record<string, number>>();
+  for (let offset = 0; offset < sessions.length; offset += 90) {
+    const group = sessions.slice(offset, offset + 90);
+    const result = await db.prepare(`SELECT storage_row_id, tool_class, count FROM typed_telemetry_compatibility_session_tools
+      WHERE storage_row_id IN (${group.map(() => "?").join(",")}) ORDER BY storage_row_id, tool_class COLLATE BINARY LIMIT ?`)
+      .bind(...group, group.length * 32 + 1).all<Row>();
+    if (result.results.length > group.length * 32) fail();
+    for (const row of result.results) {
+      const key = integer(row.storage_row_id, 1, Number.MAX_SAFE_INTEGER);
+      const values = tools.get(key) ?? Object.create(null) as Record<string, number>;
+      const tool = text(row, "tool_class");
+      if (Object.hasOwn(values, tool)) fail();
+      values[tool] = integer(row.count, 0, 1_000_000_000); tools.set(key, values);
+    }
+  }
+  const records: TypedTelemetryCompatibilityRecord[] = [];
+  for (const row of rows) {
+    const recordFormat = format(row.format);
+    const stream = STREAMS[integer(row.stream_code, 1, 3) - 1]!;
+    if (row.stream !== stream || row.source_namespace !== options.sourceNamespace || row.participant_id !== options.participantId
+        || (options.stream !== undefined && stream !== options.stream) || row.format_code !== (recordFormat === "v1" ? 10 : 11)
+        || row.id !== row.source_row_id || (stream === "usage") !== (row.usage_record_id !== null)
+        || (stream === "quota") !== (row.quota_record_id !== null)) fail();
+    for (const [raw, decoded] of [["_namespace_blob", "source_namespace"], ["_owner_blob", "participant_id"],
+      ["_device_blob", "device_id"], ["_chunk_blob", "chunk_row_id"]]) verifiedId(row, raw!, decoded!);
+    verifiedId(row, "_manifest_blob", "manifest_id", recordFormat === "v1");
+    const fields: TypedTelemetryFields = { format: recordFormat, stream,
+      occurrenceId: verifiedId(row, "_occurrence_blob", "occurrence_id")!,
+      observedAtMs: integer(row.observed_at_ms, MIN_INSTANT, MAX_INSTANT), provider: text(row, "provider"),
+      attribution: null, usage: null, quota: null, tools: null };
+    if (new Date(fields.observedAtMs).toISOString() !== row.observed_at) fail();
+    if (recordFormat === "v11" && stream !== "session") {
+      if (row.attribution_id === null) fail();
+      verifiedId(row, "_account_track_blob", "account_track_id", true);
+      verifiedId(row, "_plan_era_blob", "plan_era_id", true);
+      fields.attribution = { accountBasis: text(row, "account_basis"), accountTrackId: nullableText(row, "account_track_id"),
+        planBasis: text(row, "plan_basis"), planType: text(row, "attribution_plan_type"),
+        planEraId: nullableText(row, "plan_era_id") } as TelemetryV11Attribution;
+    } else if (["attribution_id", "account_basis", "account_track_id", "plan_basis", "attribution_plan_type", "plan_era_id"]
+      .some((key) => row[key] !== null)) fail();
+    if (stream === "usage") fields.usage = {
+      sessionId: verifiedId(row, "_session_blob", "session_uuid")!, modelId: text(row, "model_id"),
+      speedMode: text(row, "speed_mode"), apiServiceTier: text(row, "api_service_tier"), surface: text(row, "surface"),
+      billingSurface: text(row, "billing_surface"), reasoningEffort: text(row, "reasoning_effort"),
+      agentScope: text(row, "agent_scope"), outcome: text(row, "outcome"),
+      totalInputContextTokens: nullableNumber(row, "total_input_context_tokens"), components: {
+        inputUncachedTokens: nullableNumber(row, "input_uncached_tokens"), inputCacheReadTokens: nullableNumber(row, "input_cache_read_tokens"),
+        inputCacheWriteTokens: nullableNumber(row, "input_cache_write_tokens"), outputTextTokens: nullableNumber(row, "output_text_tokens"),
+        outputReasoningTokens: nullableNumber(row, "output_reasoning_tokens"), outputCombinedTokens: nullableNumber(row, "output_combined_tokens"),
+      },
+    };
+    else if (stream === "quota") {
+      fields.quota = { planType: text(row, "plan_type"), planVariant: text(row, "plan_variant"), limitId: text(row, "limit_id"),
+        slot: text(row, "slot"), usedPercent: nullableNumber(row, "used_percent"),
+        windowDurationMinutes: nullableNumber(row, "window_duration_minutes"), resetsAtMs: nullableNumber(row, "resets_at_ms") };
+      const resets = fields.quota.resetsAtMs;
+      if ((resets === null ? null : new Date(resets).toISOString()) !== row.resets_at) fail();
+    } else fields.tools = tools.get(number(row, "storage_row_id")) ?? {};
+    const canonical = typedTelemetryCanonicalRecords(fields);
+    if (await sha256Hex(canonical.canonicalRecord) !== row.canonical_sha256
+        || canonical.record.schemaVersion !== row.schema_version) throw new TypedTelemetryError("TYPED_TELEMETRY_CONFLICT");
+    const sourceId = integer(row.source_row_id, 1, Number.MAX_SAFE_INTEGER);
+    const result = { source_row_id: sourceId, id: sourceId, format: recordFormat, stream, observed_at_ms: fields.observedAtMs,
+      tool_class_counts: fields.tools, record_json: canonical.canonicalRecord,
+      legacy_occurrence_id: canonical.legacy?.occurrenceId ?? null, legacy_record_json: canonical.legacy?.canonicalRecord ?? null,
+      record: canonical.record,
+      ...Object.fromEntries(TEXT_FIELDS.map((key) => [key, text(row, key)])),
+      ...Object.fromEntries(NULLABLE_TEXT_FIELDS.map((key) => [key, nullableText(row, key)])),
+      ...Object.fromEntries(NULLABLE_NUMBER_FIELDS.map((key) => [key, nullableNumber(row, key)])),
+    } as TypedTelemetryCompatibilityRecord;
+    records.push(result);
+  }
+  return records;
+}
+
+/** Resolve a bounded set of physical typed row IDs after an authority-pinned
+ * index lookup. This is an internal storage primitive, never caller auth. IDs
+ * are checked individually; missing or foreign rows fail the entire page. */
+export async function readTypedTelemetryRowsByStorageIds(db: D1Database, options: {
+  sourceNamespace: string; participantId: string; storageRowIds: readonly number[];
+}): Promise<TypedTelemetryCompatibilityRecord[]> {
+  const { sourceNamespace, participantId } = options;
+  encodeTypedTelemetryId(sourceNamespace);
+  encodeTypedTelemetryId(participantId);
+  if (!Array.isArray(options.storageRowIds) || options.storageRowIds.length > MAX_TYPED_TELEMETRY_COMPATIBILITY_PAGE) fail();
+  const ids = options.storageRowIds.map(value => integer(value, 1, Number.MAX_SAFE_INTEGER));
+  if (new Set(ids).size !== ids.length) fail();
+  if (!ids.length) return [];
+  try {
+    if (await db.prepare("SELECT version FROM typed_telemetry_schema WHERE id=1").first<number>("version") !== 1) {
+      throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
+    }
+    const found = new Map<number, Row>();
+    for (let offset = 0; offset < ids.length; offset += 90) {
+      const group = ids.slice(offset, offset + 90);
+      const rows = (await db.prepare(`SELECT * FROM typed_telemetry_compatibility_records
+        WHERE storage_row_id IN (${group.map(() => "?").join(",")}) LIMIT ?`)
+        .bind(...group, group.length + 1).all<Row>()).results;
+      for (const row of rows) {
+        const id = integer(row.storage_row_id, 1, Number.MAX_SAFE_INTEGER);
+        if (!group.includes(id) || found.has(id)) fail();
+        found.set(id, row);
+      }
+    }
+    if (found.size !== ids.length) throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
+    return await decodeRows(db, ids.map(id => found.get(id)!), { sourceNamespace, participantId });
   } catch (error) {
     if (error instanceof TypedTelemetryError) throw error;
     throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");

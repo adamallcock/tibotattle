@@ -32,10 +32,11 @@ it does not establish production contributor capacity or whole-system storage.
   `0001`–`0004`, with all maps, subtype tables, indexes, triggers and empty
   delivery/copy state. The baseline uses exact raw-record table definitions,
   five explicit indexes and three implicit scoped uniqueness indexes.
-- Baseline parent, authority and analytics allocation is excluded. The new live
-  authority/admission schema is not yet integrated, so its eventual additional
-  allocation is also unmeasured. Future transactional proof indexes/digests can
-  change these results.
+- Baseline parent, authority and analytics allocation is excluded. This frozen
+  measurement predates the local typed v1.1 admission/proof bridge. Its additional
+  parent/membership mappings, digests and indexes are unmeasured here and change
+  the whole-layout result. These raw-table percentages must not be presented as
+  the savings of the complete ingestion database.
 - Empty and populated `dbstat`/page allocation were captured. Two hundred sampled
   rows per scenario reconstructed to the original canonical and legacy bytes.
   Complete preservation is separately covered by codec/copy tests; this sample

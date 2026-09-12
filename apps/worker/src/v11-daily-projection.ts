@@ -5,6 +5,10 @@ import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import { createV11DailyProjectionValues, foldV11DailyProjectionValues } from "./v11-daily-projection-values";
 import { lookupV11StorageSource } from "./v11-storage-journal";
+import { readTypedV11ManifestPage } from "./typed-v11-record-reader";
+import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
+
+export type V11ProjectionSourceLayout = { kind: "json-v11" } | { kind: "typed-v11"; sourceNamespace: string };
 
 const PAGE_SIZE = 200;
 const DAY_MS = 86_400_000;
@@ -13,6 +17,7 @@ interface Work {
   manifest_digest: string; from_day: string; through_day: string; next_day: string;
   after_stream: string; after_occurrence: string; day_records: number;
   values_json: string; revision: number; phase: "building" | "ready" | "retiring";
+  source_layout: V11ProjectionSourceLayout["kind"]; source_namespace: string | null;
 }
 interface Day {
   manifest_id: string; state: string; expected_chunk_count: number;
@@ -31,11 +36,14 @@ function readWork(target: D1Database, change: StorageChange): Promise<Work | nul
   return target.prepare("SELECT * FROM analytics_v11_projection_work WHERE source_id=? AND event_digest=?")
     .bind(change.sourceId, change.eventDigest).first<Work>();
 }
-function validateWork(work: Work, source: Generation): void {
+function validateWork(work: Work, source: Generation, layout: V11ProjectionSourceLayout): void {
   if (work.source_id !== source.sourceId || work.owner_digest !== source.ownerDigest
       || work.event_digest !== source.eventDigest || work.generation_id !== source.generationId
       || work.manifest_digest !== source.manifestDigest || work.from_day !== source.fromDay
       || work.through_day !== source.throughDay) throw new Error("V11_PROJECTION_SOURCE_CONFLICT");
+  if (work.source_layout !== layout.kind || work.source_namespace !== (layout.kind === "typed-v11" ? layout.sourceNamespace : null)) {
+    throw new Error("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT");
+  }
   int(work.day_records); int(work.revision);
   if (work.phase !== "building" && work.phase !== "ready") throw new Error("V11_PROJECTION_STATE_INVALID");
   if (work.phase === "building" && (work.next_day < work.from_day || work.next_day > work.through_day)) {
@@ -43,16 +51,17 @@ function validateWork(work: Work, source: Generation): void {
   }
 }
 
-async function initializeWork(target: D1Database, change: StorageChange, source: Generation): Promise<Work | null> {
+async function initializeWork(target: D1Database, change: StorageChange, source: Generation, layout: V11ProjectionSourceLayout): Promise<Work | null> {
   await target.prepare(`INSERT INTO analytics_v11_projection_work
-    (source_id,event_digest,owner_digest,generation_id,manifest_digest,from_day,through_day,next_day,values_json)
-    SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM analytics_applied_events WHERE source_id=? AND event_digest=?)
+    (source_id,event_digest,owner_digest,generation_id,manifest_digest,from_day,through_day,next_day,values_json,source_layout,source_namespace)
+    SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM analytics_applied_events WHERE source_id=? AND event_digest=?)
       AND ?=COALESCE((SELECT sequence+1 FROM analytics_source_cursors WHERE source_id=?),1)
       AND NOT EXISTS(SELECT 1 FROM analytics_v11_retirement_receipts WHERE source_id=? AND event_digest=?)
     ON CONFLICT(source_id,event_digest) DO NOTHING`)
     .bind(change.sourceId, change.eventDigest, change.ownerDigest, source.generationId,
       source.manifestDigest, source.fromDay, source.throughDay, source.fromDay,
-      canonicalJson(createV11DailyProjectionValues(source.fromDay)), change.sourceId, change.eventDigest,
+      canonicalJson(createV11DailyProjectionValues(source.fromDay)), layout.kind, layout.kind === "typed-v11" ? layout.sourceNamespace : null,
+      change.sourceId, change.eventDigest,
       change.sequence, change.sourceId, change.sourceId, change.eventDigest).run();
   const work = await readWork(target, change);
   if (!work || work.phase === "retiring") {
@@ -62,16 +71,16 @@ async function initializeWork(target: D1Database, change: StorageChange, source:
     await applyAnalyticsChange(target, change, async () => { throw new Error("V11_PROJECTION_STATE_MISSING"); });
     return null;
   }
-  validateWork(work, source);
+  validateWork(work, source, layout);
   return work;
 }
 
 /** Reads one immutable source day using its manifest uniqueness index. This
- * bridge reads the admitted legacy storage; the typed read adapter replaces it
- * when typed admission and the whole-role migration are qualified. No mutable
+ * layout is fixed for the lifetime of this work. The typed lane uses verified
+ * admitted typed rows without a JSON fallback. No mutable
  * newest-head lookup or all-history OFFSET scan occurs here.
  */
-async function sourcePage(source: D1Database, generation: Generation, work: Work): Promise<{ day: Day; rows: RecordRow[] }> {
+async function sourcePage(source: D1Database, generation: Generation, work: Work, layout: V11ProjectionSourceLayout): Promise<{ day: Day; rows: RecordRow[] }> {
   const day = await source.prepare(`SELECT d.manifest_id,m.state,m.expected_chunk_count,
     (SELECT COUNT(*) FROM telemetry_v11_chunks c WHERE c.manifest_id=m.id) AS actual_chunks,
     COALESCE((SELECT SUM(record_count) FROM telemetry_v11_chunks c WHERE c.manifest_id=m.id),0) AS expected_records
@@ -82,6 +91,12 @@ async function sourcePage(source: D1Database, generation: Generation, work: Work
     .first<Day>();
   if (!day || day.state !== "ready" || day.actual_chunks !== day.expected_chunk_count) throw new Error("V11_PROJECTION_SOURCE_INCOMPLETE");
   int(day.expected_records); int(day.expected_chunk_count);
+  if (layout.kind === "typed-v11") {
+    const rows = await readTypedV11ManifestPage(source, { sourceNamespace: layout.sourceNamespace,
+      participantId: generation.participantId, deviceId: generation.deviceId, manifestId: day.manifest_id,
+      afterStream: work.after_stream, afterOccurrence: work.after_occurrence, limit: PAGE_SIZE });
+    return { day, rows };
+  }
   const rows = (await source.prepare(`SELECT stream,occurrence_id,record_json FROM telemetry_v11_records
     WHERE manifest_id=? AND (stream,occurrence_id)>(?,?)
     ORDER BY stream,occurrence_id LIMIT ?`)
@@ -115,9 +130,17 @@ export interface V11DailyProjectionStep {
  * the old event must be discarded. Retries do not accumulate a page twice.
  */
 export async function advanceV11DailyProjection(options: {
-  source: D1Database; target: D1Database; sourceId: string; signal?: AbortSignal;
+  source: D1Database; target: D1Database; sourceId: string; signal?: AbortSignal; sourceLayout?: V11ProjectionSourceLayout;
 }): Promise<V11DailyProjectionStep> {
   const { source, target, sourceId } = options;
+  const requested = options.sourceLayout;
+  if (requested && requested.kind !== "typed-v11" && requested.kind !== "json-v11") {
+    throw new Error("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT");
+  }
+  // Detach the internal caller's object before asynchronous source checks.
+  const layout: V11ProjectionSourceLayout = requested?.kind === "typed-v11"
+    ? { kind: "typed-v11", sourceNamespace: requested.sourceNamespace } : { kind: "json-v11" };
+  if (layout.kind === "typed-v11") encodeTypedTelemetryId(layout.sourceNamespace);
   options.signal?.throwIfAborted();
   const cursor = await target.prepare("SELECT sequence FROM analytics_source_cursors WHERE source_id=?")
     .bind(sourceId).first<{ sequence: number }>();
@@ -131,7 +154,19 @@ export async function advanceV11DailyProjection(options: {
     await discard(target, change, input);
     return { state: "discarded", sequence: change.sequence, recordsRead: 0 };
   }
-  const work = await initializeWork(target, change, input);
+  const typedTable = await source.prepare(
+    "SELECT 1 AS present FROM sqlite_schema WHERE type='table' AND name='typed_v11_admission_state'",
+  ).first();
+  const typedNamespace = typedTable ? await source.prepare(
+    "SELECT source_namespace FROM typed_v11_admission_state WHERE id=1",
+  ).first<string>("source_namespace") : null;
+  if (layout.kind === "typed-v11" ? typedNamespace !== layout.sourceNamespace : typedNamespace !== null) {
+    // Reject wrong layout/namespace before pinning any target work. In
+    // particular, a typed empty day must not appear to pass via an empty JSON
+    // table just because the deployment forgot to select its storage adapter.
+    throw new Error("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT");
+  }
+  const work = await initializeWork(target, change, input, layout);
   if (!work) return { state: "applied", sequence: change.sequence, recordsRead: 0 };
   if (work.phase === "ready") {
     // The exact source/terminal check above precedes the final receipt. A revoke
@@ -147,7 +182,7 @@ export async function advanceV11DailyProjection(options: {
     ]);
     return { state: "applied", sequence: change.sequence, recordsRead: 0 };
   }
-  const page = await sourcePage(source, input, work);
+  const page = await sourcePage(source, input, work, layout);
   options.signal?.throwIfAborted();
   const values = foldV11DailyProjectionValues(JSON.parse(work.values_json) as Values,
     page.rows.map(row => JSON.parse(row.record_json) as TelemetryV11Record));
@@ -165,7 +200,7 @@ export async function advanceV11DailyProjection(options: {
     await discard(target, change, current);
     return { state: "discarded", sequence: change.sequence, recordsRead: page.rows.length };
   }
-  validateWork(work, current);
+  validateWork(work, current, layout);
   const ready = completeDay && work.next_day === work.through_day;
   const last = page.rows.at(-1);
   const afterStream = completeDay ? "" : last!.stream;

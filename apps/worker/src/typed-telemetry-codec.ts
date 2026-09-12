@@ -13,7 +13,7 @@ import {
   type TelemetryV1Record,
   type TelemetryV1Stream,
 } from "./telemetry-v1";
-import { telemetryV11LegacyProjection } from "./telemetry-v11-repository";
+import { telemetryV11LegacyProjection } from "./telemetry-v11-compatibility";
 
 /** A storage format, not a new upload or consent contract. */
 export type TypedTelemetryFormat = "v1" | "v11";

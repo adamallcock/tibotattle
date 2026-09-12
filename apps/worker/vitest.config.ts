@@ -12,6 +12,7 @@ const typedIngestionMigrations = await readD1Migrations("./typed-ingestion-migra
 const analyticsMigrations = await readD1Migrations("./analytics-migrations");
 const routingMigrations = await readD1Migrations("./routing-migrations");
 const ingestionBridgeMigrations = await readD1Migrations("./ingestion-bridge-migrations");
+const typedV11AdmissionMigrations = await readD1Migrations("./typed-v11-admission-migrations");
 
 export default defineConfig({
   plugins: [
@@ -29,6 +30,7 @@ export default defineConfig({
           TEST_ANALYTICS_MIGRATIONS: analyticsMigrations,
           TEST_ROUTING_MIGRATIONS: routingMigrations,
           TEST_INGESTION_BRIDGE_MIGRATIONS: ingestionBridgeMigrations,
+          TEST_TYPED_V11_ADMISSION_MIGRATIONS: typedV11AdmissionMigrations,
         },
       },
     }),

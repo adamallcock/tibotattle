@@ -47,6 +47,8 @@ export interface TypedTelemetryStoredRecord extends Omit<TypedTelemetrySourceRec
 export interface PreparedTypedTelemetryInsert {
   statements: D1PreparedStatement[];
   recordCount: number;
+  /** Exact SQL and bound-value budget used by this preparation. */
+  byteLength: number;
   /** Binds original memberships and exact current canonical records, in input order. */
   batchDigest: string;
 }
@@ -256,7 +258,7 @@ export async function prepareTypedTelemetryInsert(
   if (bytes > MAX_TYPED_TELEMETRY_BATCH_BYTES) limit();
   const batchDigest = await sha256Hex(canonicalTelemetryV11Json({ schema: "typed-telemetry-batch-v1", records: prepared.map(({ row }) => row) }));
   return { statements: statements.map((statement) => db.prepare(statement.text).bind(...statement.values)),
-    recordCount: prepared.length, batchDigest };
+    recordCount: prepared.length, byteLength: bytes, batchDigest };
 }
 
 function storageError(error: unknown): TypedTelemetryError {

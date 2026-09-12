@@ -29,7 +29,7 @@ is required for that later fleet; it is not an authorization substitute.
 | Routing | Single-shard adapter, explicit owner catalog, capacity reservations and fenced whole-owner moves | Local tests pass, including a typed batch and racing move |
 | Wrangler operations | Exact resource/schema plans, uncertainty reconciliation, per-database migration receipts and explicitly approved deadline extensions | Local implementation and 27 focused checks pass |
 | Raw evidence copy | Bounded old-schema reads, atomic typed copy/checkpoints, exact second-pass verification | Local populated-source tests pass; authority copy and source freeze still pending |
-| Integration | Existing admission, domain closure, readers, scheduling, erasure and public eligibility | Optional v1.1 bridge and exact typed read adapter pass locally; full role/runtime integration pending |
+| Integration | Existing admission, domain closure, readers, scheduling, erasure and public eligibility | Fresh-target typed v1.1 staging, exact domain closure and isolated daily projection pass locally; full role/runtime integration pending |
 | Qualification | Local D1 failure tests, complete evidence copy, query/runtime checks, protected staging and production gates | Pending |
 
 ## Required proofs
@@ -134,20 +134,52 @@ preserved all rows and includes the new dictionaries/indexes. This is an
 
 ## Next implementation boundary
 
-The optional bridge and daily projection are now connected in local tests.
+The optional bridge and daily projection are connected in local tests. The
+fresh-target typed admission slice now also uses actual manifest/chunk,
+consent, upload-grant, predecessor and head authority in the same ingestion DB.
+It allocates original numeric row IDs inside the chunk transaction, stores
+typed records without either raw JSON copy, and uses exact base/legacy digests
+for domain preservation. Attribution-only refinement remains permitted; changed
+numbers, NULLs, session maps or missing occurrences fail closure. Existing v1
+evidence needs a bounded proof tied to its exact still-current raw row.
+
+The local accountless journey exercises HTTP enrollment/ownership, claimed
+uploads, typed staging, real activation, a journal, isolated 200-record
+projection pages, analytics failure, withdrawal and owner erasure. Pending work
+pins its source layout and original namespace, and typed reads never fall back
+to an empty JSON table. This is a new-target local composition; the deployed
+HTTP upload route and scheduler still select the original implementation.
+
+The final focused run for this slice passed **137 storage tests in 12 files**,
+including the maximum 200 distinct session records with attribution inside the
+900-statement and 4 MiB transaction limits. Independent review confirmed that
+admitted subtype deletion and added session-tool entries cannot invalidate a
+saved preservation proof; ordinary owner/chunk cleanup remains possible.
+The complete Worker gate must still be recorded against the frozen commit.
+
 Apply the authority check to **every** public daily/weekly, allowance and history
 response, and journal policy/exclusion/source withdrawal before changing any
 production read binding. Retain synchronous guards until the full replacement passes.
-Finish typed transactional admission and domain preservation, indexed analytical
-read adapters, authority/receipt copy and multi-store erasure/restore. Rehearse
+Legacy weekly exclusions and policy have period-specific semantics; they are
+not new global v1.1 opt-outs. Their eventual split needs a separate scoped
+policy fence, without owner-wide fanout or changing existing eligibility rules.
+
+Finish the compact ingestion authority schema, production typed admission,
+remaining indexed analytical read adapters, authority/receipt copy and multi-store erasure/restore. Rehearse
 the complete source freeze, copy, verification and cutover before marking any
 new target schema qualified. The raw-copy API alone cannot switch production.
 
-The bridge intentionally layers on the old full schema and reads its immutable
-records. It is not the compact fresh ingestion authority schema. The retained
+The optional bridge layers on the old full authority schema. Fresh typed mode
+refuses existing unqualified v1.1 JSON/typed history and does not import or delete
+it. Its proof/membership bridge adds allocation beyond the frozen raw-storage
+measurement; that overhead needs measurement and compact parent/identifier
+integration before a whole-database capacity claim. The retained
 source fences currently release only for explicit owner erasure; a separately
 acknowledged source-retirement protocol must precede routine copy retirement.
 Analytics retirement receipts also do not by themselves complete the existing
 independent deletion-ledger workflow. One narrow live-path correction replaces
 trigger-inflated `meta.changes === 1` with exact enrollment `RETURNING` evidence
 when acknowledging accountless revocation.
+
+Implementation is published as draft [PR #124](https://github.com/adamallcock/tibotattle/pull/124),
+stacked on #123. Publication of source does not qualify a database or deployment.

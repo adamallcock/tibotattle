@@ -47,7 +47,7 @@
     "types:check": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example --check",
     "storage:plan": "node ./scripts/d1-storage-wrangler.mjs",
     "storage:scripts:check": "node --check ./scripts/d1-storage-plan.mjs && node --check ./scripts/d1-storage-operator.mjs && node --check ./scripts/d1-storage-wrangler.mjs && node --test ./scripts/d1-storage-operator.check.mjs ./scripts/d1-storage-wrangler.check.mjs",
-    "storage:test": "vitest run test/typed-telemetry.spec.ts test/typed-telemetry-copy.spec.ts test/typed-telemetry-compatibility.spec.ts test/analytics-delivery.spec.ts test/storage-routing.spec.ts test/v11-storage-journal.spec.ts test/v11-daily-projection-values.spec.ts test/v11-daily-projection.spec.ts"
+    "storage:test": "vitest run test/typed-telemetry.spec.ts test/typed-telemetry-copy.spec.ts test/typed-telemetry-compatibility.spec.ts test/analytics-delivery.spec.ts test/storage-routing.spec.ts test/v11-storage-journal.spec.ts test/v11-daily-projection-values.spec.ts test/v11-daily-projection.spec.ts test/typed-v1-preservation-proof.spec.ts test/typed-v11-admission.spec.ts test/typed-v11-domain-closure.spec.ts test/typed-v11-daily-projection.spec.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.18.8",

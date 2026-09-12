@@ -5,7 +5,8 @@ import { encodeTypedTelemetryId, encodeTypedTelemetryRecord, type TypedTelemetry
 import { persistTypedTelemetryBatch, type TypedTelemetrySourceRecord } from "../src/typed-telemetry-repository";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-repository";
 import {
-  readTypedTelemetryCompatibilityPage, TYPED_TELEMETRY_COMPATIBILITY_COLUMNS, TYPED_TELEMETRY_COMPATIBILITY_PAGE_SQL,
+  readTypedTelemetryCompatibilityPage, readTypedTelemetryRowsByStorageIds,
+  TYPED_TELEMETRY_COMPATIBILITY_COLUMNS, TYPED_TELEMETRY_COMPATIBILITY_PAGE_SQL,
   type TypedTelemetryCompatibilityOptions, type TypedTelemetryCompatibilityRecord,
 } from "../src/typed-telemetry-compatibility";
 
@@ -66,6 +67,29 @@ function expectExact(actual: TypedTelemetryCompatibilityRecord, expected: TypedT
 beforeEach(async () => { await reset(); await applyD1Migrations(db(), migrations()); });
 
 describe("typed raw SQL compatibility and exact bounded JSON reader", () => {
+  it("reconstructs authority-selected physical rows in requested order across streams", async () => {
+    const rows = [source("v11", 17, usage("v11")), source("v11", 41, quota("v11")), source("v11", 90, session("v11"))];
+    await persistTypedTelemetryBatch(db(), rows);
+    const ids = (await db().prepare("SELECT id FROM typed_telemetry_records ORDER BY source_row_id DESC").all<{ id: number }>()).results.map(row => row.id);
+    const result = await readTypedTelemetryRowsByStorageIds(db(), { sourceNamespace: namespace, participantId, storageRowIds: ids });
+    expect(result).toHaveLength(3);
+    result.forEach((actual, index) => expectExact(actual, rows[2 - index]!));
+  });
+
+  it("refuses foreign, missing, repeated and unbounded physical row selections", async () => {
+    await persistTypedTelemetryBatch(db(), [source("v11", 17, usage("v11"))]);
+    const id = (await db().prepare("SELECT id FROM typed_telemetry_records").first<number>("id"))!;
+    const read = (storageRowIds: number[], overrides = {}) => readTypedTelemetryRowsByStorageIds(db(), {
+      sourceNamespace: namespace, participantId, storageRowIds, ...overrides,
+    });
+    await expect(read([id], { participantId: "other:synthetic" })).rejects.toMatchObject({ code: "TYPED_TELEMETRY_INVALID" });
+    await expect(read([id], { sourceNamespace: "other:database" })).rejects.toMatchObject({ code: "TYPED_TELEMETRY_INVALID" });
+    await expect(read([id, id + 1])).rejects.toMatchObject({ code: "TYPED_TELEMETRY_UNAVAILABLE" });
+    await expect(read([id, id])).rejects.toMatchObject({ code: "TYPED_TELEMETRY_INVALID" });
+    await expect(read(Array.from({ length: 201 }, (_, n) => n + 1))).rejects.toMatchObject({ code: "TYPED_TELEMETRY_INVALID" });
+    expect(await read([])).toEqual([]);
+  });
+
   it("refuses a pre-view database and exposes the reviewed SQL column contract after migration", async () => {
     await db().exec("DROP VIEW typed_telemetry_compatibility_records");
     await expect(readTypedTelemetryCompatibilityPage(db(), options("usage"))).rejects.toMatchObject({ code: "TYPED_TELEMETRY_UNAVAILABLE" });
