@@ -1,3 +1,4 @@
+import { assertTypedStorageAdmissionCapacity } from './typed-storage-capacity';
 import {
   canonicalTelemetryV11Json, parseTelemetryV11ChunkId, telemetryV11RecordAnchor,
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, type TelemetryV11Chunk,
@@ -31,10 +32,18 @@ const unavailable = (): ApiError => new ApiError(503, "BACKEND_STORAGE_UNAVAILAB
 /** Only a fresh target may enter this mode. Existing v11 evidence requires a
  * separately qualified importer; this operation never imports, deletes or drops it.
  * The baseline, typed layout, delivery bridge, and typed-admission migrations
- * must all be present in this SAME database. Repeating the same pin is harmless.
+ * must all be present, including the runtime contract, in this SAME database.
+ * Repeating the same pin is harmless; the original allocator is never reset.
  */
 export async function initializeTypedV11Admission(db: D1Database, sourceNamespace: string): Promise<void> {
   const source = encoded(sourceNamespace);
+  const legacyState = await db.prepare(
+    "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='typed_v1_admission_state'").first();
+  if (legacyState) {
+    const pin = await db.prepare("SELECT source_namespace FROM typed_v1_admission_state WHERE id=1")
+      .first<{ source_namespace: string }>();
+    if (pin && pin.source_namespace !== sourceNamespace) throw new TypedTelemetryError("TYPED_TELEMETRY_CONFLICT");
+  }
   try {
     await db.batch([
       db.prepare("INSERT INTO typed_telemetry_namespaces(original_id) VALUES (?) ON CONFLICT DO NOTHING").bind(source),
@@ -42,9 +51,12 @@ export async function initializeTypedV11Admission(db: D1Database, sourceNamespac
         VALUES (1,?,(SELECT id FROM typed_telemetry_namespaces WHERE original_id=?),1)
         ON CONFLICT(id) DO UPDATE SET source_namespace=excluded.source_namespace,namespace_id=excluded.namespace_id`)
         .bind(sourceNamespace, source),
+      db.prepare(`UPDATE typed_v11_admission_state SET runtime_contract_version=1
+        WHERE id=1 AND source_namespace=? AND runtime_contract_version=0`).bind(sourceNamespace),
     ]);
   } catch (error) {
-    if (String(error).includes("typed_v11_unqualified_history") || String(error).includes("typed_v11_namespace_or_allocator_conflict")) {
+    if (String(error).includes("typed_v11_unqualified_history") || String(error).includes("typed_v11_namespace_or_allocator_conflict")
+        || String(error).includes("typed_v11_runtime_contract_unqualified")) {
       throw new TypedTelemetryError("TYPED_TELEMETRY_CONFLICT");
     }
     throw unavailable();
@@ -124,6 +136,7 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
   if (!manifest) throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
   const existing = await existingTelemetryV11StagedChunk(db, principal, chunk);
   if (existing) return replayResult(db, existing, chunk, state.namespace_id);
+  await assertTypedStorageAdmissionCapacity(db);
   const rows: TypedTelemetrySourceRecord[] = chunk.records.map((record, index) => ({
     sourceNamespace: metadata.sourceNamespace, format: "v11", sourceRowId: state.next_source_row_id + index,
     participantId: principal.participantId, deviceId: principal.deviceId, chunkRowId: metadata.chunkRowId,
@@ -158,23 +171,26 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
     SELECT ?,owner_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
     ON CONFLICT(participant_id) DO UPDATE SET typed_owner_id=excluded.typed_owner_id`)
     .bind(principal.participantId, state.namespace_id, state.next_source_row_id));
+  statements.push(prepare(`INSERT INTO typed_v11_manifest_memberships(manifest_id,typed_manifest_id)
+    SELECT ?,manifest_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
+    ON CONFLICT DO NOTHING`).bind(manifest.id,state.namespace_id,state.next_source_row_id));
   const proofs = await Promise.all(chunk.records.map(async (record, index) => {
     const anchor = telemetryV11RecordAnchor(stream, record);
     const legacy = telemetryV11LegacyProjection(stream, record);
     const base = { ...record } as Record<string, unknown>;
     delete base.accountPlanAttribution;
-    return [state.next_source_row_id + index, anchor.occurrenceId, binary(await sha256(canonicalTelemetryV11Json(base))),
-      legacy?.occurrenceId ?? null, legacy ? binary(await sha256(legacy.canonicalRecord)) : null];
+    return [state.next_source_row_id + index, encoded(anchor.occurrenceId), binary(await sha256(canonicalTelemetryV11Json(base))),
+      legacy ? encoded(legacy.occurrenceId) : null, legacy ? binary(await sha256(legacy.canonicalRecord)) : null];
   }));
-  // Five values per proof, plus four shared bindings: <=99 bindings/statement.
+  // Five values per proof, plus one shared binding: <=96 bindings/statement.
   for (let offset = 0; offset < proofs.length; offset += 19) {
     const group = proofs.slice(offset, offset + 19);
     statements.push(prepare(`WITH proof(source_row_id,occurrence_id,base_digest,legacy_occurrence_id,legacy_digest) AS
       (VALUES ${group.map(() => "(?,?,?,?,?)").join(",")})
-      INSERT INTO typed_v11_record_admissions(typed_record_id,chunk_id,manifest_id,stream,occurrence_id,base_digest,legacy_occurrence_id,legacy_digest)
-      SELECT r.id,?,?,?,p.occurrence_id,p.base_digest,p.legacy_occurrence_id,p.legacy_digest
-      FROM proof p JOIN typed_telemetry_records r ON r.namespace_id=? AND r.format=11 AND r.source_row_id=p.source_row_id`)
-      .bind(...group.flat(), metadata.chunkRowId, manifest.id, stream, state.namespace_id));
+      INSERT INTO typed_v11_record_proofs(typed_record_id,chunk_key,manifest_key,stream_code,occurrence_blob,base_digest,legacy_occurrence_blob,legacy_digest,observed_at_ms)
+      SELECT r.id,r.chunk_id,r.manifest_id,r.stream,r.occurrence_id,p.base_digest,p.legacy_occurrence_id,p.legacy_digest,r.observed_at_ms
+      FROM proof p JOIN typed_telemetry_records r ON r.namespace_id=? AND r.format=11 AND r.source_row_id=p.source_row_id AND r.occurrence_id=p.occurrence_id`)
+      .bind(...group.flat(), state.namespace_id));
   }
   statements.push(prepare(`UPDATE telemetry_v11_day_manifests SET state='ready',ready_at=?
     WHERE id=? AND state='staged' AND expected_chunk_count=(SELECT count(*) FROM telemetry_v11_chunks WHERE manifest_id=?)

@@ -1178,7 +1178,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
         { ...budget, now: () => NaN }, { nowMs, sourcePin }])).rejects.toThrow("budget clock invalid");
       expect(sql.length).toBe(before);
     }
-    expect(v1QuotaFinishQueryReserve()).toBe(407);
+    expect(v1QuotaFinishQueryReserve()).toBe(409);
     const scalar = await finishAccountScopedQuotaAnalysisV1(monitored, participantId, evidence!, budget, { nowMs, sourcePin });
     expect(scalar.status).toBe("complete");
     if (scalar.status !== "complete") throw new Error("scalar unexpectedly deferred");
@@ -1200,7 +1200,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     expect(budget.remainingQueries).toBe(186);
     const mismatch = { ...evidence!, identity: { ...identity, inputFingerprint: "0".repeat(64) } };
     await expect(finishAccountScopedQuotaAnalysisV1(monitored, participantId, mismatch,
-      { remainingQueries: 407, deadlineMs: Date.now() + 60_000 }, { nowMs, sourcePin })).rejects.toThrow("evidence mismatch");
+      { remainingQueries: 409, deadlineMs: Date.now() + 60_000 }, { nowMs, sourcePin })).rejects.toThrow("evidence mismatch");
     // A source revision can change after the initial pin check even when the
     // analysis exits early as not_testable. Such a refusal is not cache-ready.
     for (const finish of [finishAccountScopedQuotaAnalysisV1, finishAccountScopedModelCompositionV1]) {

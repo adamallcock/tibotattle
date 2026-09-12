@@ -3,7 +3,7 @@ import { analyticsAuthorityIsCurrent, applyAnalyticsChange, readIngestionChanges
   type StorageChange } from "./analytics-delivery";
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
-import { createV11DailyProjectionValues, foldV11DailyProjectionValues } from "./v11-daily-projection-values";
+import { createV11DailyProjectionValues, foldV11DailyProjectionValues, mergeV11DailyProjectionValues } from "./v11-daily-projection-values";
 import { lookupV11StorageSource } from "./v11-storage-journal";
 import { readTypedV11ManifestPage } from "./typed-v11-record-reader";
 import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
@@ -20,7 +20,7 @@ interface Work {
   source_layout: V11ProjectionSourceLayout["kind"]; source_namespace: string | null;
 }
 interface Day {
-  manifest_id: string; state: string; expected_chunk_count: number;
+  manifest_id: string; manifest_digest: string; state: string; expected_chunk_count: number;
   actual_chunks: number; expected_records: number;
 }
 interface RecordRow { stream: string; occurrence_id: string; record_json: string; }
@@ -75,13 +75,11 @@ async function initializeWork(target: D1Database, change: StorageChange, source:
   return work;
 }
 
-/** Reads one immutable source day using its manifest uniqueness index. This
- * layout is fixed for the lifetime of this work. The typed lane uses verified
- * admitted typed rows without a JSON fallback. No mutable
- * newest-head lookup or all-history OFFSET scan occurs here.
- */
-async function sourcePage(source: D1Database, generation: Generation, work: Work, layout: V11ProjectionSourceLayout): Promise<{ day: Day; rows: RecordRow[] }> {
-  const day = await source.prepare(`SELECT d.manifest_id,m.state,m.expected_chunk_count,
+/** Metadata is read before raw rows so a fully scoped immutable value can be
+ * reused without rescanning this manifest. Membership still belongs to the
+ * exact event's generation, never to a mutable newest-head lookup. */
+async function sourceDay(source: D1Database, generation: Generation, work: Work): Promise<Day> {
+  const day = await source.prepare(`SELECT d.manifest_id,m.manifest_digest,m.state,m.expected_chunk_count,
     (SELECT COUNT(*) FROM telemetry_v11_chunks c WHERE c.manifest_id=m.id) AS actual_chunks,
     COALESCE((SELECT SUM(record_count) FROM telemetry_v11_chunks c WHERE c.manifest_id=m.id),0) AS expected_records
     FROM telemetry_v11_domain_days d
@@ -91,17 +89,66 @@ async function sourcePage(source: D1Database, generation: Generation, work: Work
     .first<Day>();
   if (!day || day.state !== "ready" || day.actual_chunks !== day.expected_chunk_count) throw new Error("V11_PROJECTION_SOURCE_INCOMPLETE");
   int(day.expected_records); int(day.expected_chunk_count);
+  return day;
+}
+
+/** One keyset page, only on a cache miss. The work's admitted physical layout
+ * cannot change during resumption and typed readers never fall back to JSON. */
+async function sourcePage(source: D1Database, generation: Generation, work: Work, layout: V11ProjectionSourceLayout,
+  day: Day): Promise<RecordRow[]> {
   if (layout.kind === "typed-v11") {
-    const rows = await readTypedV11ManifestPage(source, { sourceNamespace: layout.sourceNamespace,
+    return readTypedV11ManifestPage(source, { sourceNamespace: layout.sourceNamespace,
       participantId: generation.participantId, deviceId: generation.deviceId, manifestId: day.manifest_id,
       afterStream: work.after_stream, afterOccurrence: work.after_occurrence, limit: PAGE_SIZE });
-    return { day, rows };
   }
-  const rows = (await source.prepare(`SELECT stream,occurrence_id,record_json FROM telemetry_v11_records
+  return (await source.prepare(`SELECT stream,occurrence_id,record_json FROM telemetry_v11_records
     WHERE manifest_id=? AND (stream,occurrence_id)>(?,?)
     ORDER BY stream,occurrence_id LIMIT ?`)
     .bind(day.manifest_id, work.after_stream, work.after_occurrence, PAGE_SIZE).all<RecordRow>()).results;
-  return { day, rows };
+}
+
+interface ReuseIdentity {
+  value_key: string; source_id: string; source_layout: V11ProjectionSourceLayout["kind"]; source_namespace: string;
+  owner_digest: string; device_id: string; manifest_id: string; manifest_digest: string; day: string;
+  schema_version: string; pricing_method: string; registry_sha256: string;
+}
+interface ReusableValue extends ReuseIdentity { record_count: number; values_digest: string; values_json: string }
+async function reuseIdentity(generation: Generation, layout: V11ProjectionSourceLayout, day: Day, date: string): Promise<ReuseIdentity> {
+  const method = createV11DailyProjectionValues(date);
+  const identity = { source_id: generation.sourceId, source_layout: layout.kind,
+    source_namespace: layout.kind === "typed-v11" ? layout.sourceNamespace : "", owner_digest: generation.ownerDigest,
+    device_id: generation.deviceId, manifest_id: day.manifest_id, manifest_digest: day.manifest_digest, day: date,
+    schema_version: method.schemaVersion, pricing_method: method.pricingMethodVersion, registry_sha256: method.registrySha256 };
+  return { value_key: await sha256Hex(canonicalJson(identity)), ...identity };
+}
+async function reusableValue(target: D1Database, identity: ReuseIdentity, expectedRecords: number): Promise<Values | null> {
+  const row = await target.prepare("SELECT * FROM analytics_v11_reusable_values WHERE value_key=?")
+    .bind(identity.value_key).first<ReusableValue>();
+  if (!row) return null;
+  for (const key of Object.keys(identity) as (keyof ReuseIdentity)[]) {
+    if (row[key] !== identity[key]) throw new Error("V11_PROJECTION_REUSABLE_VALUE_CONFLICT");
+  }
+  const values = foldV11DailyProjectionValues(JSON.parse(row.values_json) as Values, []);
+  if (row.record_count !== expectedRecords || values.counts.usage + values.counts.quota + values.counts.session !== expectedRecords
+      || row.values_json !== canonicalJson(values) || row.values_digest !== await sha256Hex(row.values_json)) {
+    throw new Error("V11_PROJECTION_REUSABLE_VALUE_CONFLICT");
+  }
+  const pages = await target.prepare(`SELECT COUNT(*) n,COALESCE(SUM(record_count),0) records
+    FROM analytics_v11_value_pages WHERE value_key=?`).bind(identity.value_key).first<{n:number;records:number}>();
+  if(!pages||pages.n!==Math.ceil(expectedRecords/PAGE_SIZE)||pages.records!==expectedRecords)
+    throw new Error("V11_PROJECTION_REUSABLE_VALUE_CONFLICT");
+  return values;
+}
+function reusableValueInsert(target: D1Database, identity: ReuseIdentity, recordCount: number, valuesJson: string,
+  valuesDigest: string): D1PreparedStatement {
+  return target.prepare(`INSERT INTO analytics_v11_reusable_values
+    (value_key,source_id,source_layout,source_namespace,owner_digest,device_id,manifest_id,manifest_digest,day,
+      schema_version,pricing_method,registry_sha256,record_count,values_digest,values_json)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(value_key) DO UPDATE SET
+      record_count=excluded.record_count,values_digest=excluded.values_digest,values_json=excluded.values_json`)
+    .bind(identity.value_key, identity.source_id, identity.source_layout, identity.source_namespace, identity.owner_digest,
+      identity.device_id, identity.manifest_id, identity.manifest_digest, identity.day, identity.schema_version,
+      identity.pricing_method, identity.registry_sha256, recordCount, valuesDigest, valuesJson);
 }
 
 async function discard(target: D1Database, change: StorageChange,
@@ -182,14 +229,23 @@ export async function advanceV11DailyProjection(options: {
     ]);
     return { state: "applied", sequence: change.sequence, recordsRead: 0 };
   }
-  const page = await sourcePage(source, input, work, layout);
+  const day = await sourceDay(source, input, work);
+  const identity = await reuseIdentity(input, layout, day, work.next_day);
+  // Validate the saved method/counters even when a concurrent generation has
+  // since completed this same immutable day. Reuse cannot hide corrupt work.
+  const priorValues = foldV11DailyProjectionValues(JSON.parse(work.values_json) as Values, []);
+  const cached = await reusableValue(target, identity, day.expected_records);
+  const rows = cached ? [] : await sourcePage(source, input, work, layout, day);
   options.signal?.throwIfAborted();
-  const values = foldV11DailyProjectionValues(JSON.parse(work.values_json) as Values,
-    page.rows.map(row => JSON.parse(row.record_json) as TelemetryV11Record));
-  const recordCount = work.day_records + page.rows.length;
+  const pageValues = cached ? null : foldV11DailyProjectionValues(createV11DailyProjectionValues(work.next_day),
+    rows.map(row => JSON.parse(row.record_json) as TelemetryV11Record));
+  const pageJson = pageValues ? canonicalJson(pageValues) : null;
+  const pageDigest = pageJson === null ? null : await sha256Hex(pageJson);
+  const values = cached ?? mergeV11DailyProjectionValues(priorValues, pageValues!);
+  const recordCount = cached ? day.expected_records : work.day_records + rows.length;
   int(recordCount);
-  const completeDay = page.rows.length < PAGE_SIZE;
-  if (recordCount > page.day.expected_records || (completeDay && recordCount !== page.day.expected_records)) {
+  const completeDay = cached !== null || rows.length < PAGE_SIZE;
+  if (recordCount > day.expected_records || (completeDay && recordCount !== day.expected_records)) {
     throw new Error("V11_PROJECTION_SOURCE_INCOMPLETE");
   }
   // Do not save more calculated content after a withdrawal was observed during
@@ -198,21 +254,35 @@ export async function advanceV11DailyProjection(options: {
   const current = await lookupV11StorageSource(source, change);
   if (current.disposition === "discard") {
     await discard(target, change, current);
-    return { state: "discarded", sequence: change.sequence, recordsRead: page.rows.length };
+    return { state: "discarded", sequence: change.sequence, recordsRead: rows.length };
   }
   validateWork(work, current, layout);
   const ready = completeDay && work.next_day === work.through_day;
-  const last = page.rows.at(-1);
+  const last = rows.at(-1);
   const afterStream = completeDay ? "" : last!.stream;
   const afterOccurrence = completeDay ? "" : last!.occurrence_id;
   const next = completeDay ? nextDay(work.next_day) : work.next_day;
-  const nextValues = completeDay && !ready ? createV11DailyProjectionValues(next) : values;
+  const nextValues = completeDay ? createV11DailyProjectionValues(next) : values;
   const stepDigest = await sha256Hex(canonicalJson({ eventDigest: change.eventDigest, revision: work.revision + 1,
-    day: work.next_day, afterStream, afterOccurrence, recordCount, completeDay, values }));
+    day: work.next_day, afterStream, afterOccurrence, recordCount, completeDay, valueKey: identity.value_key, pageDigest, values }));
   const statements = [target.prepare(`INSERT INTO analytics_v11_projection_steps(source_id,event_digest,revision,step_digest)
     VALUES(?,?,?,?)`).bind(sourceId, change.eventDigest, work.revision + 1, stepDigest)];
-  if (completeDay) statements.push(target.prepare(`INSERT INTO analytics_v11_day_values(source_id,event_digest,day,record_count,values_json)
-    VALUES(?,?,?,?,?)`).bind(sourceId, change.eventDigest, work.next_day, recordCount, canonicalJson(values)));
+  if (!cached && rows.length > 0) {
+    statements.push(target.prepare(`INSERT INTO analytics_v11_value_pages
+      (value_key,page_index,source_id,owner_digest,producer_event,day,record_count,page_digest,values_json)
+      VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(value_key,page_index) DO UPDATE SET
+        record_count=excluded.record_count,page_digest=excluded.page_digest,values_json=excluded.values_json`)
+      .bind(identity.value_key,work.day_records/PAGE_SIZE,sourceId,change.ownerDigest,change.eventDigest,
+        work.next_day,rows.length,pageDigest,pageJson));
+  }
+  if (completeDay) {
+    if (!cached) {
+      const valuesJson = canonicalJson(values);
+      statements.push(reusableValueInsert(target, identity, recordCount, valuesJson, await sha256Hex(valuesJson)));
+    }
+    statements.push(target.prepare(`INSERT INTO analytics_v11_day_references(source_id,event_digest,day,value_key)
+      VALUES(?,?,?,?)`).bind(sourceId, change.eventDigest, work.next_day, identity.value_key));
+  }
   statements.push(target.prepare(`UPDATE analytics_v11_projection_work SET
     next_day=?,after_stream=?,after_occurrence=?,day_records=?,values_json=?,revision=revision+1,phase=?
     WHERE source_id=? AND event_digest=? AND revision=?`)
@@ -228,10 +298,10 @@ export async function advanceV11DailyProjection(options: {
       // generation. Its exact final receipt is still durable; the old page must
       // not be written after that cleanup.
       await applyAnalyticsChange(target, change, async () => { throw new Error("V11_PROJECTION_STEP_UNACKNOWLEDGED"); });
-      return { state: "applied", sequence: change.sequence, recordsRead: page.rows.length };
+      return { state: "applied", sequence: change.sequence, recordsRead: rows.length };
     }
   }
-  return { state: "building", sequence, recordsRead: page.rows.length,
+  return { state: "building", sequence, recordsRead: rows.length,
     ...(completeDay ? { completedDay: work.next_day } : {}) };
 }
 
@@ -249,8 +319,12 @@ export async function retireV11DailyProjectionPage(target: D1Database, sourceId:
     .first<{ event_digest: string; owner_digest: string }>();
   if (!work) return { state: "idle" };
   await target.batch([
-    target.prepare(`DELETE FROM analytics_v11_day_values WHERE source_id=? AND event_digest=? AND day IN (
-      SELECT v.day FROM analytics_v11_day_values v JOIN analytics_v11_projection_work w
+    target.prepare(`DELETE FROM analytics_v11_day_references WHERE source_id=? AND event_digest=? AND day IN (
+      SELECT r.day FROM analytics_v11_day_references r
+      WHERE r.source_id=? AND r.event_digest=? ORDER BY r.day LIMIT 4)`)
+      .bind(sourceId, work.event_digest, sourceId, work.event_digest),
+    target.prepare(`DELETE FROM analytics_v11_legacy_day_values WHERE source_id=? AND event_digest=? AND day IN (
+      SELECT v.day FROM analytics_v11_legacy_day_values v JOIN analytics_v11_projection_work w
       ON w.source_id=v.source_id AND w.event_digest=v.event_digest AND w.phase='retiring'
       WHERE v.source_id=? AND v.event_digest=? ORDER BY v.day LIMIT 4)`)
       .bind(sourceId, work.event_digest, sourceId, work.event_digest),
@@ -259,17 +333,39 @@ export async function retireV11DailyProjectionPage(target: D1Database, sourceId:
       ON w.source_id=s.source_id AND w.event_digest=s.event_digest AND w.phase='retiring'
       WHERE s.source_id=? AND s.event_digest=? ORDER BY s.revision LIMIT 200)`)
       .bind(sourceId, work.event_digest, sourceId, work.event_digest),
+    target.prepare(`DELETE FROM analytics_v11_value_pages WHERE (value_key,page_index) IN (
+      SELECT p.value_key,p.page_index FROM analytics_v11_value_pages p
+      WHERE p.source_id=? AND p.owner_digest=?
+        AND NOT EXISTS(SELECT 1 FROM analytics_v11_day_references r WHERE r.value_key=p.value_key)
+        AND NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w WHERE w.source_id=p.source_id
+          AND w.event_digest=p.producer_event AND w.phase!='retiring')
+      ORDER BY p.value_key,p.page_index LIMIT 4)`).bind(sourceId,work.owner_digest),
+    target.prepare(`DELETE FROM analytics_v11_reusable_values WHERE value_key IN (
+      SELECT v.value_key FROM analytics_v11_reusable_values v
+      WHERE v.source_id=? AND v.owner_digest=?
+        AND NOT EXISTS(SELECT 1 FROM analytics_v11_value_pages p WHERE p.value_key=v.value_key)
+        AND NOT EXISTS(SELECT 1 FROM analytics_v11_day_references r WHERE r.value_key=v.value_key)
+      ORDER BY v.value_key LIMIT 4)`).bind(sourceId, work.owner_digest),
     target.prepare(`INSERT INTO analytics_v11_retirement_receipts(source_id,event_digest,owner_digest)
       SELECT source_id,event_digest,owner_digest FROM analytics_v11_projection_work w
       WHERE source_id=? AND event_digest=? AND phase='retiring'
-        AND NOT EXISTS(SELECT 1 FROM analytics_v11_day_values v WHERE v.source_id=w.source_id AND v.event_digest=w.event_digest)
+        AND NOT EXISTS(SELECT 1 FROM analytics_v11_day_references v WHERE v.source_id=w.source_id AND v.event_digest=w.event_digest)
+        AND NOT EXISTS(SELECT 1 FROM analytics_v11_legacy_day_values v WHERE v.source_id=w.source_id AND v.event_digest=w.event_digest)
         AND NOT EXISTS(SELECT 1 FROM analytics_v11_projection_steps s WHERE s.source_id=w.source_id AND s.event_digest=w.event_digest)
         AND NOT EXISTS(SELECT 1 FROM analytics_v11_owner_heads h WHERE h.source_id=w.source_id AND h.event_digest=w.event_digest)
+        AND NOT EXISTS(SELECT 1 FROM analytics_v11_value_pages p WHERE p.source_id=w.source_id AND p.owner_digest=w.owner_digest
+          AND NOT EXISTS(SELECT 1 FROM analytics_v11_day_references r WHERE r.value_key=p.value_key)
+          AND NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work live WHERE live.source_id=p.source_id
+            AND live.event_digest=p.producer_event AND live.phase!='retiring'))
+        AND NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values v WHERE v.source_id=w.source_id AND v.owner_digest=w.owner_digest
+          AND NOT EXISTS(SELECT 1 FROM analytics_v11_day_references r WHERE r.value_key=v.value_key))
       ON CONFLICT(source_id,event_digest) DO NOTHING`).bind(sourceId, work.event_digest),
     target.prepare(`DELETE FROM analytics_v11_projection_work WHERE source_id=? AND event_digest=? AND phase='retiring'
       AND EXISTS(SELECT 1 FROM analytics_v11_retirement_receipts r WHERE r.source_id=analytics_v11_projection_work.source_id
         AND r.event_digest=analytics_v11_projection_work.event_digest)
-      AND NOT EXISTS(SELECT 1 FROM analytics_v11_day_values v WHERE v.source_id=analytics_v11_projection_work.source_id
+      AND NOT EXISTS(SELECT 1 FROM analytics_v11_day_references v WHERE v.source_id=analytics_v11_projection_work.source_id
+        AND v.event_digest=analytics_v11_projection_work.event_digest)
+      AND NOT EXISTS(SELECT 1 FROM analytics_v11_legacy_day_values v WHERE v.source_id=analytics_v11_projection_work.source_id
         AND v.event_digest=analytics_v11_projection_work.event_digest)
       AND NOT EXISTS(SELECT 1 FROM analytics_v11_projection_steps s WHERE s.source_id=analytics_v11_projection_work.source_id
         AND s.event_digest=analytics_v11_projection_work.event_digest)`)
@@ -295,13 +391,24 @@ export async function readV11ProjectedOwnerDays(options: {
   }
   if (!Number.isInteger(days) || days < 1 || days > 31) throw new Error("V11_PROJECTION_RANGE_INVALID");
   if (!/^[0-9a-f]{64}$/.test(ownerDigest)) throw new Error("STORAGE_DIGEST_INVALID");
-  const rows = (await target.prepare(`SELECT c.authority_epoch,v.values_json
+  // Bound both branches before expanding JSON. Joining the unqualified UNION
+  // compatibility view here would materialize every owner's historical values.
+  const rows = (await target.prepare(`WITH authority AS MATERIALIZED (
+    SELECT c.authority_epoch,c.source_id,e.event_digest
     FROM analytics_source_cursors c
-    LEFT JOIN analytics_v11_owner_heads h ON h.source_id=c.source_id AND h.owner_digest=?
+    LEFT JOIN analytics_v11_owner_heads h ON h.source_id=c.source_id AND h.owner_digest=?2
     LEFT JOIN analytics_owner_state o ON o.source_id=h.source_id AND o.owner_digest=h.owner_digest AND o.state='active'
     LEFT JOIN analytics_applied_events e ON e.source_id=h.source_id AND e.sequence=h.sequence AND e.revision=o.revision
-    LEFT JOIN analytics_v11_day_values v ON v.source_id=h.source_id AND v.event_digest=e.event_digest AND v.day BETWEEN ? AND ?
-    WHERE c.source_id=? ORDER BY v.day LIMIT 32`).bind(ownerDigest, fromDay, throughDay, sourceId)
+    WHERE c.source_id=?1
+  ), selected_days AS MATERIALIZED (
+    SELECT r.day,v.values_json FROM analytics_v11_day_references r
+    JOIN analytics_v11_reusable_values v ON v.value_key=r.value_key
+    WHERE r.source_id=?1 AND r.event_digest=(SELECT event_digest FROM authority) AND r.day BETWEEN ?3 AND ?4
+    UNION ALL
+    SELECT l.day,l.values_json FROM analytics_v11_legacy_day_values l
+    WHERE l.source_id=?1 AND l.event_digest=(SELECT event_digest FROM authority) AND l.day BETWEEN ?3 AND ?4
+  ) SELECT a.authority_epoch,d.values_json FROM authority a LEFT JOIN selected_days d ON 1=1 ORDER BY d.day LIMIT 32`)
+    .bind(sourceId, ownerDigest, fromDay, throughDay)
     .all<{ authority_epoch: number; values_json: string | null }>()).results;
   const epoch = rows[0]?.authority_epoch;
   if (epoch === undefined || rows.length > 31 || rows.some(row => row.authority_epoch !== epoch)

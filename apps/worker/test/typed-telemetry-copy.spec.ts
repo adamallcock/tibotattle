@@ -68,6 +68,17 @@ function databaseWithBatch(batch: D1Database["batch"]): D1Database {
 }
 
 describe("populated legacy-to-typed raw copy", () => {
+  it("preserves a long codec-valid namespace independently from the operation token", async () => {
+    await seedV1(1);
+    const spec = { ...run("v1"), sourceNamespace: "original.namespace." + "x".repeat(130) };
+    await beginRawTelemetryCopy(target(), spec);
+    expect((await copyLegacyTelemetryPage(source(), target(), spec)).copied).toBe(1);
+    expect((await readTypedTelemetryPage(target(), { sourceNamespace: spec.sourceNamespace, format: "v1" })).records[0]?.sourceNamespace).toBe(spec.sourceNamespace);
+    await expect(verifyLegacyTelemetryCopyPage(source(), target(), spec, 0)).resolves.toMatchObject({verified:1});
+    await expect(beginRawTelemetryCopy(target(), { ...spec, runId: spec.sourceNamespace })).rejects.toThrow("RAW_COPY_EVIDENCE_MISMATCH");
+    await expect(beginRawTelemetryCopy(target(), { ...spec, sourceNamespace: "unadmitted space" })).rejects.toThrow();
+  });
+
   it("resumes v1 pages with original row IDs and exact current bytes", async () => {
     await seedV1(35); const spec = run("v1"); await beginRawTelemetryCopy(target(), spec);
     expect(await copyLegacyTelemetryPage(source(), target(), spec)).toMatchObject({ copied: 32, afterSourceRowId: 32, reachedEnd: false });

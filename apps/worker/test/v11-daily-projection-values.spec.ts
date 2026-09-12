@@ -73,6 +73,38 @@ describe('bounded pure v11 daily projection values',()=>{
     while(state.counts.usage<3_000_000)state=merge(state,state);
     expect(()=>merge(state,state)).toThrow('V11_DAILY_PROJECTION_VALUES_INVALID');
   });
+  it('keeps a bounded associative summary and exact omitted unknown/price subtotals across model pages',()=>{
+    const pages=Array.from({length:4},(_,p)=>fold(initial(day),Array.from({length:200},(_,i)=>usage(p*200+i,
+      {modelId:`model-${String((799-(p*200+i))%401).padStart(4,'0')}`,
+        components:{...zeroComponents,inputUncachedTokens:p*200+i,inputCacheReadTokens:i%2?null:0}}))));
+    const forward=pages.reduce(merge,initial(day)),backward=[...pages].reverse().reduce(merge,initial(day));
+    expect(forward).toEqual(backward);expect(merge(merge(pages[0]!,pages[1]!),merge(pages[2]!,pages[3]!))).toEqual(forward);
+    expect(forward.cells).toHaveLength(200);expect(forward.cells[0]!.modelId).toBe('model-0000');
+    expect(forward.cells.at(-1)!.modelId).toBe('model-0199');expect(forward.counts.usage).toBe(800);
+    expect(forward.tokens.inputUncachedTokens.knownSum).toBe('319600');
+    expect(forward.tokens.inputCacheReadTokens.unavailable).toBe(400);
+    expect(forward.pricing.unpriced).toBe(799);expect(forward.pricing.fullyPriced).toBe(1);expect(forward.omitted.usageEvents).toBeGreaterThan(0);
+    validate(JSON.parse(JSON.stringify(forward)));
+    const corrupt=structuredClone(forward);corrupt.omitted.tokens.inputCacheReadTokens.unavailable++;
+    expect(()=>validate(corrupt)).toThrow();
+  });
+  it('keeps priced, partially priced and unavailable portions exact even when their model is outside the display prefix',()=>{
+    const prefix=fold(initial(day),Array.from({length:200},(_,i)=>usage(i,{modelId:`.model-${String(i).padStart(3,'0')}`})));
+    const extra=[usage(200,{modelId:'gpt-5.4'}),usage(201,{modelId:'gpt-5.4',
+      components:{...zeroComponents,inputUncachedTokens:10,inputCacheReadTokens:null}}),usage(202,{modelId:'unknown'})];
+    const page=fold(initial(day),extra),state=merge(prefix,page);
+    expect(state.cells.map(c=>c.modelId)).toEqual(prefix.cells.map(c=>c.modelId));
+    expect(state.omitted).toEqual({usageEvents:3,tokens:page.tokens,pricing:page.pricing});
+    expect(state.omitted.pricing).toMatchObject({fullyPriced:1,partiallyPriced:1,unpriced:1});
+    expect(state.omitted.tokens.inputCacheReadTokens.unavailable).toBe(1);
+  });
+  it('normalizes only the exact complete legacy schema and refuses legacy-shaped omitted evidence',()=>{
+    const state=fold(initial(day),[usage(1)]);
+    const {omitted,...rest}=state;
+    const legacy={...rest,schemaVersion:'v11-daily-projection-values-v1'};
+    expect(fold(legacy as typeof state,[])).toEqual(state);
+    expect(()=>fold({...legacy,omitted} as typeof state,[])).toThrow();
+  });
   it('rejects wrong days, duplicate page identities, malformed state and mismatched pricing pins',()=>{
     expect(()=>initial('2026-02-31')).toThrow();expect(()=>fold(initial(day),[usage(1,{eventTime:'2026-09-10T00:00:00.000Z'})])).toThrow();
     expect(()=>fold(initial(day),[usage(1),usage(1)])).toThrow();
@@ -82,6 +114,9 @@ describe('bounded pure v11 daily projection values',()=>{
       {...state,counts:{...state.counts,usage:2}},{...state,cells:[...state.cells,...state.cells]},
       {...state,pricing:{...state.pricing,knownNanousd:'01'}}])expect(()=>validate(corrupt)).toThrow();
     expect(()=>fold(initial(day),Array.from({length:MAX_V11_DAILY_FOLD_RECORDS+1},(_,i)=>usage(i)))).toThrow();
-    expect(()=>fold(initial(day),Array.from({length:101},(_,i)=>usage(i,{modelId:`unknown-${i}`})))).toThrow();
+    const full=fold(initial(day),Array.from({length:200},(_,i)=>usage(i,{modelId:`unknown-${i}`})));
+    expect(full.cells).toHaveLength(200);
+    const over=fold(full,[usage(201,{modelId:'unknown-extra'})]);
+    expect(over.cells).toHaveLength(200);expect(over.omitted.usageEvents).toBe(1);expect(over.counts.usage).toBe(201);
   });
 });

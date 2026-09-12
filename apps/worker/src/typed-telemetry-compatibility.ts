@@ -315,3 +315,20 @@ export async function readTypedTelemetryRowsByStorageIds(db: D1Database, options
     throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
   }
 }
+
+/** Internal usage-only analytical page. SQL has already bounded and pinned its
+ * physical rows. Unlike generic/session reads, this performs no additional SQL.
+ * The legacy analytical protocol is at most5000 rows; retain all identity and
+ * canonical digest checks rather than reconstructing numeric JSON in SQLite. */
+export const MAX_TYPED_V1_USAGE_ANALYSIS_BYTES=32*1024*1024;
+export async function decodeTypedTelemetryUsageAnalysisRows(db:D1Database,rows:Record<string,unknown>[],options:{sourceNamespace:string;participantId:string;format?:'v1'|'v11'}):Promise<TypedTelemetryCompatibilityRecord[]> {
+ const format=options.format??'v1';
+ if(!['v1','v11'].includes(format)||!Array.isArray(rows)||rows.length>5000||rows.some(row=>row.stream!=='usage'||row.format!==format))fail();
+ let bytes=0;const encoder=new TextEncoder();
+ for(const row of rows)for(const value of Object.values(row)){
+  bytes+=typeof value==='string'?encoder.encode(value).byteLength:value instanceof ArrayBuffer?value.byteLength:
+   Array.isArray(value)?value.length:value instanceof Uint8Array?value.byteLength:8;
+  if(bytes>MAX_TYPED_V1_USAGE_ANALYSIS_BYTES)throw new TypedTelemetryError('TYPED_TELEMETRY_LIMIT');
+ }
+ return decodeRows(db,rows,{...options,stream:'usage'});
+}

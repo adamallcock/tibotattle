@@ -1,5 +1,5 @@
 import { canonicalTelemetryV11Json } from "@app-usagemonitor/telemetry-contract";
-import { encodeTypedTelemetryRecord, typedTelemetryCanonicalRecords,
+import { encodeTypedTelemetryId, encodeTypedTelemetryRecord, typedTelemetryCanonicalRecords,
   type TypedTelemetryFormat } from "./typed-telemetry-codec";
 import { prepareTypedTelemetryInsert, readTypedTelemetryPage,
   type TypedTelemetrySourceRecord } from "./typed-telemetry-repository";
@@ -20,7 +20,7 @@ function id(value: string) {
   if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/.test(value)) fail();
 }
 function validate(run: RawCopyRun) {
-  id(run.runId); id(run.sourceNamespace);
+  id(run.runId); encodeTypedTelemetryId(run.sourceNamespace);
   if (!/^[a-f0-9]{64}$/.test(run.sourceSnapshotDigest) || !["v1", "v11"].includes(run.format)) fail();
 }
 function text(row: Row, key: string): string { if (typeof row[key] !== "string") fail(); return row[key]; }
@@ -49,7 +49,7 @@ async function state(target: D1Database, run: RawCopyRun) {
 export async function readLegacyTelemetryCopyPage(source: D1Database, options: {
   sourceNamespace: string; format: TypedTelemetryFormat; afterSourceRowId: number; limit?: number;
 }): Promise<TypedTelemetrySourceRecord[]> {
-  id(options.sourceNamespace); integer(options.afterSourceRowId);
+  encodeTypedTelemetryId(options.sourceNamespace); integer(options.afterSourceRowId);
   const limit = options.limit ?? MAX_RAW_COPY_PAGE;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_RAW_COPY_PAGE) fail();
   if (!["v1", "v11"].includes(options.format)) fail();

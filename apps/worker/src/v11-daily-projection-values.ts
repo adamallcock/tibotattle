@@ -3,10 +3,10 @@ import { encodeTypedTelemetryRecord, typedTelemetryCanonicalRecords } from './ty
 import { priceChunkUsageRecord } from './quota-analysis-v1';
 import { COMMUNITY_DAILY_SPEND_PRICING_METHOD, COMMUNITY_DAILY_SPEND_REGISTRY_SHA256 } from './community-daily-spend';
 
-export const V11_DAILY_VALUES_SCHEMA = 'v11-daily-projection-values-v1';
+export const V11_DAILY_VALUES_SCHEMA = 'v11-daily-projection-values-v2';
 export const MAX_V11_DAILY_FOLD_RECORDS = 200;
 export const MAX_V11_DAILY_VALUES_RECORDS = 6_000_000;
-export const MAX_V11_DAILY_MODEL_CELLS = 100;
+export const MAX_V11_DAILY_MODEL_CELLS = 200;
 const COMPONENTS = ['inputUncachedTokens','inputCacheReadTokens','inputCacheWriteTokens',
   'outputTextTokens','outputReasoningTokens','outputCombinedTokens'] as const;
 const TOKEN_KEYS = [...COMPONENTS,'effectiveOutput','nonOverlappingTotal'] as const;
@@ -24,6 +24,8 @@ export interface V11DailyProjectionValues {
   pricingMethodVersion: string; registrySha256: string;
   counts: { usage: number; quota: number; session: number };
   tokens: Tokens; pricing: Pricing; cells: V11DailyModelCell[];
+  /** Exact subtotal outside the retained lexical cells; never a unique-model count. */
+  omitted: { usageEvents: number; tokens: Tokens; pricing: Pricing };
 }
 function fail(): never { throw new Error('V11_DAILY_PROJECTION_VALUES_INVALID'); }
 function closed(value: unknown, keys: readonly string[]): asserts value is Record<string, unknown> {
@@ -78,7 +80,7 @@ const compare=(a: V11DailyModelCell,b: V11DailyModelCell)=> a.provider<b.provide
 /** Closed persisted-state validation. This is an arithmetic checkpoint, not a
  * receipt proving source identity, disjoint pages, completion or eligibility. */
 export function validateV11DailyProjectionValues(value: unknown): asserts value is V11DailyProjectionValues {
-  closed(value,['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells']);
+  closed(value,['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells','omitted']);
   if(value.schemaVersion!==V11_DAILY_VALUES_SCHEMA || value.pricingMethodVersion!==COMMUNITY_DAILY_SPEND_PRICING_METHOD
     ||value.registrySha256!==COMMUNITY_DAILY_SPEND_REGISTRY_SHA256)fail();
   validDay(value.day); closed(value.counts,['usage','quota','session']);
@@ -86,7 +88,10 @@ export function validateV11DailyProjectionValues(value: unknown): asserts value 
   count(value.counts.usage+value.counts.quota+value.counts.session);
   validateTokens(value.tokens,value.counts.usage);validatePricing(value.pricing,value.counts.usage);
   if(!Array.isArray(value.cells)||value.cells.length>MAX_V11_DAILY_MODEL_CELLS)fail();
-  let total=0, sums=zeroTokens(), prices=zeroPricing(), previous: V11DailyModelCell|undefined;
+  closed(value.omitted,['usageEvents','tokens','pricing']);count(value.omitted.usageEvents);
+  validateTokens(value.omitted.tokens,value.omitted.usageEvents);validatePricing(value.omitted.pricing,value.omitted.usageEvents);
+  if(value.omitted.usageEvents>0&&value.cells.length!==MAX_V11_DAILY_MODEL_CELLS)fail();
+  let total=value.omitted.usageEvents, sums=addTokens(zeroTokens(),value.omitted.tokens), prices=addPricing(zeroPricing(),value.omitted.pricing), previous: V11DailyModelCell|undefined;
   for(const entry of value.cells) {
     closed(entry,['provider','modelId','usageEvents','tokens','pricing']);token(entry.provider);token(entry.modelId);
     count(entry.usageEvents);if(entry.usageEvents===0)fail();
@@ -98,15 +103,26 @@ export function validateV11DailyProjectionValues(value: unknown): asserts value 
   if(total!==value.counts.usage || canonicalTelemetryV11Json(sums)!==canonicalTelemetryV11Json(value.tokens)
     ||canonicalTelemetryV11Json(prices)!==canonicalTelemetryV11Json(value.pricing))fail();
 }
+/** Old bounded values contained every cell. Normalize only their exact closed
+ * shape; new summaries can never masquerade as an older complete breakdown. */
+export function normalizeV11DailyProjectionValues(value: unknown): V11DailyProjectionValues {
+  if(value&&typeof value==='object'&&!Array.isArray(value)&&'schemaVersion' in value
+      &&value.schemaVersion==='v11-daily-projection-values-v1') {
+    closed(value,['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells']);
+    value={...value,schemaVersion:V11_DAILY_VALUES_SCHEMA,
+      omitted:{usageEvents:0,tokens:zeroTokens(),pricing:zeroPricing()}};
+  }
+  validateV11DailyProjectionValues(value);return value;
+}
 export function createV11DailyProjectionValues(day: string): V11DailyProjectionValues {
   validDay(day);
   return {schemaVersion:V11_DAILY_VALUES_SCHEMA,day,pricingMethodVersion:COMMUNITY_DAILY_SPEND_PRICING_METHOD,
-    registrySha256:COMMUNITY_DAILY_SPEND_REGISTRY_SHA256,counts:{usage:0,quota:0,session:0},tokens:zeroTokens(),pricing:zeroPricing(),cells:[]};
+    registrySha256:COMMUNITY_DAILY_SPEND_REGISTRY_SHA256,counts:{usage:0,quota:0,session:0},tokens:zeroTokens(),pricing:zeroPricing(),cells:[],omitted:{usageEvents:0,tokens:zeroTokens(),pricing:zeroPricing()}};
 }
 /** Merge only source-proven disjoint pages from the SAME immutable generation.
  * Bounded state intentionally does not retain a day-sized occurrence-ID set. */
 export function mergeV11DailyProjectionValues(a: V11DailyProjectionValues,b: V11DailyProjectionValues): V11DailyProjectionValues {
-  validateV11DailyProjectionValues(a);validateV11DailyProjectionValues(b);if(a.day!==b.day)fail();
+  a=normalizeV11DailyProjectionValues(a);b=normalizeV11DailyProjectionValues(b);if(a.day!==b.day)fail();
   const result=createV11DailyProjectionValues(a.day);
   result.counts={usage:a.counts.usage+b.counts.usage,quota:a.counts.quota+b.counts.quota,session:a.counts.session+b.counts.session};
   result.tokens=addTokens(a.tokens,b.tokens);result.pricing=addPricing(a.pricing,b.pricing);
@@ -116,19 +132,29 @@ export function mergeV11DailyProjectionValues(a: V11DailyProjectionValues,b: V11
     cells.set(key,old?{...cell,usageEvents:old.usageEvents+cell.usageEvents,tokens:addTokens(old.tokens,cell.tokens),pricing:addPricing(old.pricing,cell.pricing)}
       :{...cell,tokens:addTokens(zeroTokens(),cell.tokens),pricing:addPricing(zeroPricing(),cell.pricing)});
   }
-  result.cells=[...cells.values()].sort(compare);validateV11DailyProjectionValues(result);return result;
+  const sorted=[...cells.values()].sort(compare);
+  result.omitted={usageEvents:a.omitted.usageEvents+b.omitted.usageEvents,
+    tokens:addTokens(a.omitted.tokens,b.omitted.tokens),pricing:addPricing(a.omitted.pricing,b.omitted.pricing)};
+  // A cell excluded from either input's first K can never enter the union's
+  // first K. This keeps exact displayed-cell sums associative across pages.
+  for(const cell of sorted.slice(MAX_V11_DAILY_MODEL_CELLS)) {
+    result.omitted.usageEvents+=cell.usageEvents;
+    result.omitted.tokens=addTokens(result.omitted.tokens,cell.tokens);
+    result.omitted.pricing=addPricing(result.omitted.pricing,cell.pricing);
+  }
+  result.cells=sorted.slice(0,MAX_V11_DAILY_MODEL_CELLS);validateV11DailyProjectionValues(result);return result;
 }
 function sumKnown(values: readonly (number|null)[]): ExactTokenSum {
   return {knownSum:values.reduce<bigint>((sum,value)=>sum+BigInt(value??0),0n).toString(),unavailable:values.some(v=>v===null)?1:0};
 }
 /** All three streams are validated; only usage contributes tokens and spend.
  * No DB/network writes, raw persistence, quota fit or source selection occurs. */
-export function foldV11DailyProjectionValues(state: V11DailyProjectionValues, records: readonly unknown[]): V11DailyProjectionValues {
-  validateV11DailyProjectionValues(state);
+function foldDailyProjectionValues(format:'v1'|'v11',state: V11DailyProjectionValues, records: readonly unknown[]): V11DailyProjectionValues {
+  state=normalizeV11DailyProjectionValues(state);
   if(!Array.isArray(records)||records.length>MAX_V11_DAILY_FOLD_RECORDS)fail();
   const page=createV11DailyProjectionValues(state.day), cells=new Map<string,V11DailyModelCell>();const identities=new Set<string>();
   for(const value of records) {
-    const fields=encodeTypedTelemetryRecord('v11',value),canonical=typedTelemetryCanonicalRecords(fields);
+    const fields=encodeTypedTelemetryRecord(format,value),canonical=typedTelemetryCanonicalRecords(fields);
     if(new Date(fields.observedAtMs).toISOString().slice(0,10)!==state.day)fail();
     const identity=`${fields.stream}:${Array.from(fields.occurrenceId).join(',')}`;
     if(identities.has(identity))fail();identities.add(identity);
@@ -165,4 +191,12 @@ export function finalizeV11DailyProjectionValues(state: V11DailyProjectionValues
   return {...copy,coverage:state.counts.usage===0||state.pricing.fullyPriced===state.counts.usage?'complete' as const
     :priced===0?'unavailable' as const:'partial' as const,
     knownCostNanousd:state.counts.usage===0||priced>0?state.pricing.knownNanousd:null};
+}
+
+/** Format-specific validation shares exact arithmetic without translating wire records. */
+export function foldV11DailyProjectionValues(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
+ return foldDailyProjectionValues('v11',state,records);
+}
+export function foldV1DailyProjectionValues(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
+ return foldDailyProjectionValues('v1',state,records);
 }

@@ -3,6 +3,10 @@
  * This module supplies no authorization: admission owns that check and includes
  * its accepted source writes and prepareIngestionChange() in the same D1 batch.
  */
+/** Explicit source/derived-store binding; no runtime or scheduler dependency. */
+export interface StorageAnalyticsBindings {
+ source:D1Database; target:D1Database; sourceId:string; sourceNamespace:string;
+}
 export const STORAGE_OPERATING_BUDGET_BYTES = 9_000_000_000;
 export const MAX_DELIVERY_PAGE = 100;
 export const MAX_PROJECTION_STATEMENTS = 800;

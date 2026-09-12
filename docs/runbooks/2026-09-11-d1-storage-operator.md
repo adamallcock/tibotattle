@@ -36,8 +36,8 @@ owner-move write fences. The fresh-target composition also exercises accountless
 HTTP enrollment/ownership, upload claims, typed staging and exact domain closure,
 isolated analytics outage/recovery, opt-out and owner erasure. This composition
 uses the optional `ingestion-bridge-migrations` and
-`typed-v11-admission-migrations` after the baseline and typed layouts; it is not
-the final role-specific schema accepted by the remote operator. Tests do not
+`typed-v11-admission-migrations` after the baseline and typed layouts; the authority restore rehearsal additionally builds the complete role-specific
+reference and verifies the generated fresh restore-base SQL before packaging. Tests do not
 qualify production HTTP admission, distributed erasure, or a full restored
 analytical publication.
 
@@ -69,16 +69,17 @@ Role directories are:
 
 | Role | SQL directory | Runtime purpose |
 |---|---|---|
-| ingestion | `typed-ingestion-migrations` | Typed evidence and ingestion-local journal; authority integration remains required |
-| analytics | `analytics-migrations` | Independent delivery state; analytical projection integration remains required |
+| ingestion | `.release-build/ingestion-role-migrations` | Qualified fresh restore base; complete authority/control/typed/admission/bridge/isolation reference is separately hash-bound |
+| analytics | `analytics-migrations` | All ordered delivery, projection, publication, history and retirement migrations; qualification must include the complete current inventory |
 | control | `routing-migrations` | Owner placement and move catalog; never an authorization substitute |
 
 Each directory must have source-bound `qualification.json` and
 `qualification-evidence.json` generated after the reviewed source is frozen.
 Qualification pins every ordered SQL file, before/after schema fingerprints and
 evidence hash. These receipts must describe completed qualification; do not write
-`qualified` merely because empty tables can be created. They are deliberately
-absent while runtime integration is incomplete.
+`qualified` merely because empty tables can be created. Ingestion qualification has the explicit scope `restore-base-schema-only` and
+`runtimeReady: false`; it does not authorize cutover. Other role qualifications
+remain absent until their actual complete runtime gate passes.
 
 ## Authorized execution and uncertain outcomes
 
@@ -121,3 +122,178 @@ after complete preservation, public withdrawal fences, retry/erasure tests and
 the live canary are proven. Later ingestion shards need stable owner placement
 and fenced whole-owner moves; filling a database does not authorize redirecting
 individual records to the next one.
+
+
+## Executable local restore preparation
+
+Use the Worker checkout and its pinned Node/dependencies. This default inspection
+reads local source and SQL only. An in-progress checkout requires the explicit
+local rehearsal flag; it cannot emit qualified metadata.
+
+```sh
+node scripts/d1-storage-restore.mjs --worker-root "$PWD" --allow-unfrozen
+node scripts/d1-storage-restore.mjs --worker-root "$PWD" \
+  --rehearse --allow-unfrozen --directory /absolute/new/private/rehearsal
+npm run storage:scripts:check
+```
+
+Supported restore input is the reviewed raw legacy schema copied into a fresh
+typed target. An already-typed or diverged source is not implicitly accepted;
+its journal/incarnation and retained erasure epochs need explicit reconciliation.
+No code resets or advances those epochs merely to fit the restore fixture.
+
+The directory must be new, canonical (use `/private/tmp`, not its `/tmp` alias
+on macOS), owner-private and unlinked. The rehearsal uses synthetic source data
+and real local D1 batches. It preserves the source, copies authority/receipts and
+typed evidence in bounded pages, adopts exact original IDs and digests, performs
+independent second-pass verification, installs the full final role, and completes
+bounded retained-owner discovery. It separately executes the emitted restore-base
+SQL in a fresh D1 database and checks its exact schema.
+
+A mandatory subsequent rehearsal uses restored credentials and accepted chunk
+receipts, accepts a new upload, drains a separate analytics database, checks exact
+daily values, opts out and physically erases the synthetic target owner. An
+independent deletion ledger also suppresses a previously tombstoned restored owner;
+the original source remains unchanged. `restored-runtime-evidence.json` records
+this gate separately and its hash is bound by `qualification-evidence.json`.
+Public graph qualification, real-source reconciliation and runtime cutover remain
+separate gates. Accountless tombstone replay revokes enrollment before claiming
+the digest-bound `restore-replay:` deletion fence; other operation fences are
+refused, exact interrupted replay can resume, and social replay retains its NULL
+fence. Original owner-shape and deletion guards remain authoritative.
+
+After the reviewed application and operator source is committed and clean, run:
+
+```sh
+node scripts/d1-storage-restore.mjs --worker-root "$PWD" \
+  --rehearse --qualify --directory "$PWD/.release-build/ingestion-role-migrations"
+```
+
+This creates `qualification.json`, `qualification-evidence.json`,
+`0001_restore_base.sql`, the exact `final-role-schema.json`, and `role-inputs.json`.
+The six ordered input directories are baseline migrations, typed ingestion,
+ingestion bridge, typed v1.1 admission, typed v1 admission, and ingestion isolation.
+The target contract additionally binds the exact `d1_storage_migrations` table
+and its ordered row digest. This small operator receipt ledger is preserved and
+rechecked at finalization; it is not treated as telemetry or ignored as arbitrary
+nonempty target state. The final role reference is retained as `final-role-reference.sql.txt`; it is not
+an extra remotely executable migration. Never deploy the full reference before
+restore: fresh-enrollment guards must not reinterpret historical expired/revoked
+authority as a new enrollment. Never use typed-core tables alone as the role.
+
+## Temporary migration Worker
+
+`d1-storage-migration-package.mjs` packages the same reviewed APIs with one exact
+contract embedded in the bundle. Prepare an actual operation contract only after
+source snapshot/write-pause and fresh target/base identities have been qualified;
+the synthetic rehearsal contract is never an actual source-copy approval.
+
+```sh
+node scripts/d1-storage-migration-package.mjs --worker-root "$PWD" \
+  --contract /absolute/private/restore-contract.json \
+  --contract-sha256 <reviewed-canonical-contract-digest> \
+  --expires-at <reviewed-ISO-UTC-deadline-within-24-hours> \
+  --directory /absolute/new/private/migration-worker
+node node_modules/wrangler/bin/wrangler.js deploy --dry-run \
+  --config /absolute/private/migration-worker/wrangler.jsonc \
+  --outdir /absolute/new/private/migration-worker-dry
+```
+
+`--allow-unfrozen` permits a local-only package check; that bundle refuses enabled
+execution even if its environment variable is changed. The generated config has
+placeholder database IDs, no cron, no public route, and disabled mode. Actual
+binding changes, deployment and schedule activation require the exact reviewed
+operator approval. Its `fetch` always returns 404. Enabled scheduling enqueues a
+fixed contract/stage/step wakeup. One Queue message performs one bounded native D1
+page and sends the next wakeup only after committed progress; cron recovers lost
+wakeups. No source records enter messages. Configure maximum batch size 1,
+concurrency 1 and retries 0, following the [Queue batching and retry contract](https://developers.cloudflare.com/queues/configuration/batching-retries/).
+Each API retains its atomic `batch`; prepared statements are never interpolated
+into Wrangler SQL.
+The `_authority_operator_progress` target table retains contract, stage, count and
+intent; concurrent invocations cannot claim the same page. A lost response leaves
+intent set and subsequent Queue messages and schedules refuse work. Inspect the exact restore/copy
+receipts and reconcile explicitly; do not clear intent or retry a write blindly.
+
+The temporary Worker does **not** reconcile the independent deletion ledger or
+switch production routing. A source write fence is not proof against privileged
+DDL or out-of-band writers: the external snapshot/write-pause protocol remains
+mandatory. Keep ordinary target traffic unbound through authority/typed/bootstrap
+verification, deletion-ledger reconciliation, independent analytics catch-up and
+actual HTTP/privacy/erasure/public-response qualification.
+
+## Separate analytics Worker
+
+`wrangler.analytics.example.jsonc` points at the maintained separate scheduler.
+It contains only placeholder IDs, `STORAGE_ANALYTICS_MODE: disabled`, no routes
+and no cron. Check its bundle locally without provisioning anything:
+
+```sh
+node node_modules/wrangler/bin/wrangler.js deploy --dry-run \
+  --config wrangler.analytics.example.jsonc \
+  --outdir /absolute/new/private/analytics-worker-dry
+```
+
+Enabled scheduling also requires the exact `DELETION_LEDGER` binding for automatic
+erasure-job cleanup. Its forward ledger migrations and analytics cleanup receipt
+migrations must be separately qualified; an ingestion-only deletion claim is
+insufficient. The template provides a third placeholder ID, never a real ledger.
+
+The actual analytics role qualification must pin **every** current ordered SQL
+file, including reusable day values, paged model values, graph publication,
+retirement and history checkpoints. It cannot reuse a foundation-only receipt.
+Source namespaces, source IDs and real bindings belong to the reviewed operation.
+The restore contract pins `sourceId` independently from the lossless typed
+`sourceNamespace`; the latter is validated by the existing typed codec, not
+shortened, normalized, or reused as the journal identifier.
+
+Legacy v0.2 remains an allowance-fit input, not a new daily-activity cohort.
+For an already-active owner, distinct-dataset header insertion and recognized
+header accounting/count completion emit `source-updated`; exact input revisions
+still invalidate future computations. Overlapping occurrence membership hard-
+invalidates the public graph in the same batch. Same-dataset, identity, policy or
+unknown metadata changes retain the hard authority transition; raw repairs and
+deletions retain the hard graph fence. Initial owner activation stays
+`owner-active`. No per-record outbox or fabricated daily values are introduced.
+
+
+## Disabled staging preparation
+
+Generate a reviewable package without creating resources or enabling collection:
+
+```sh
+node scripts/d1-storage-staging-preparation.mjs --worker-root "$PWD" \
+  --directory /absolute/new/private/staging-preparation
+```
+
+During local development only, add `--allow-unfrozen`. The package deliberately
+leaves approval, source snapshot, resource IDs and qualified receipt pins unfilled.
+It describes two fresh databases (ingestion and analytics), the existing independent
+deletion ledger, retained R2 reachability and one temporary migration Queue. No
+routing/control database is required for this first staging path. App and analytics
+config fragments remain disabled with no routes or schedules. The source pause,
+ledger reconciliation and resource plan templates must be bound to exact reviewed
+resources before any separately authorized provider action; an empty replacement
+ledger is forbidden. Synthetic canary approval is a separate operation boundary.
+
+## Whole-role measurement
+
+A bounded synthetic v1.1 usage workload can measure the actual complete role:
+
+```sh
+node scripts/d1-storage-restore.mjs --worker-root "$PWD" \
+  --rehearse --allow-unfrozen --records 10000 \
+  --directory /absolute/new/private/whole-role-measurement
+```
+
+The hard workload limit is 10,000 records. The receipt records actual D1
+`meta.size_after` for empty/populated baseline, empty full reference role, and
+populated final target. Target allocation includes retained authority, manifests,
+receipts, typed data, admissions/proofs, indexes and restore journals. It excludes
+the separate analytics database. Allocation is captured before the synthetic
+runtime canary mutates the target; `restoreElapsedMs`, `runtimeElapsedMs` and
+`elapsedMs` distinguish the two stages. The fixture has one data owner and one
+empty tombstoned authority owner. These usage-only results must not be
+presented as mixed-stream, fleet or production capacity; actual preserved-row and
+bootstrap checks must pass before the result is reported as measured. A changed
+source or interrupted operation yields no passing qualification receipt.

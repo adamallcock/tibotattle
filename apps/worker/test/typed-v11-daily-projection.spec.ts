@@ -13,11 +13,15 @@ import { revokeAccountlessEnrollment } from "../src/accountless-enrollment";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
 import { readTypedV11ManifestPage, TYPED_V11_MANIFEST_PAGE_SQL } from "../src/typed-v11-record-reader";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
+import { initializeTypedV1Admission } from "../src/typed-v1-admission";
+import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
+import { runStorageAnalyticsSchedule } from "../src/storage-analytics-worker";
 
 interface Bindings extends Env { STORAGE_ANALYTICS_DB: D1Database; TEST_MIGRATIONS: D1Migration[];
   TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[]; TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[];
   TEST_ANALYTICS_MIGRATIONS: D1Migration[]; TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[];
-  TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[] }
+  TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];
+  TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[] }
 const b = env as Bindings, source = () => b.USAGE_MONITOR_DB, target = () => b.STORAGE_ANALYTICS_DB;
 const sourceId = "synthetic-typed-source", namespace = "synthetic-original-typed-source";
 const sourceLayout = { kind: "typed-v11" as const, sourceNamespace: namespace };
@@ -89,6 +93,56 @@ async function fixture(count = 1) {
 }
 
 describe("typed accountless upload to isolated projection", () => {
+  it("refuses trigger separation on a target containing old analytical payloads",async()=>{
+    await source().prepare("INSERT INTO community_model_composition_days(day,payload_json,computed_at) VALUES('2026-09-01','{}','2026-09-01T00:00:00.000Z')").run();
+    await expect(applyD1Migrations(source(),b.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(m=>/^(0001|0002)_/.test(m.name)))).rejects.toThrow();
+    expect(await source().prepare("SELECT count(*) n FROM community_model_composition_days").first("n")).toBe(1);
+    const trigger=await source().prepare("SELECT sql FROM sqlite_schema WHERE name='telemetry_v11_head_insert_publish'").first<string>("sql");
+    expect(trigger).toContain("INSERT INTO community_daily_aggregate_rebuilds");
+  });
+  it("removes synchronous analytical work while retaining admission, head CAS and opt-out",async()=>{
+    await applyD1Migrations(source(),b.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(m=>/^(0001|0002)_/.test(m.name)));
+    const value=await fixture(203);
+    expect(await source().prepare("SELECT revision FROM community_analytical_input_versions WHERE participant_id=?")
+      .bind(value.participantId).first<number>("revision")).toBeGreaterThan(0);
+    expect(await source().prepare("SELECT COUNT(*) n FROM community_current_analysis_queue").first("n")).toBe(0);
+    expect(await source().prepare("SELECT COUNT(*) n FROM community_daily_aggregate_rebuilds").first("n")).toBe(0);
+    expect(await source().prepare("SELECT COUNT(*) n FROM storage_ingestion_changes").first("n")).toBe(1);
+    await source().prepare("UPDATE community_snapshot_policy SET maturity_days=maturity_days+1 WHERE singleton_id=1").run();
+    expect(await source().prepare("SELECT policy_revision FROM ingestion_analytics_separation").first("policy_revision")).toBe(2);
+    expect(await source().prepare("SELECT COUNT(*) n FROM storage_ingestion_changes").first("n")).toBe(1);
+    await expect(source().prepare("INSERT INTO community_model_composition_days(day,payload_json,computed_at) VALUES('2026-09-01','{}','2026-09-01T00:00:00.000Z')")
+      .run()).rejects.toThrow("analytics_write_requires_separate_database");
+    await drain();expect((await read(value.event.ownerDigest)).values[0]!.counts.usage).toBe(203);
+    await revokeAccountlessEnrollment(source(),value.deviceId,"user_opt_out",Date.now());
+    expect((await read(value.event.ownerDigest)).state).toBe("authority-unavailable");
+    await drain();expect((await read(value.event.ownerDigest)).values).toEqual([]);
+    expect(await source().prepare("SELECT COUNT(*) n FROM community_daily_aggregate_rebuilds").first("n")).toBe(0);
+  });
+  it("runs the independently metered scheduler and preserves a committed cursor across failure",async()=>{
+    await applyD1Migrations(source(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(source(),namespace);
+    const value=await fixture(203);
+    const options={source:source(),target:target(),sourceId,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(options);
+    await expect(initializeStorageAnalyticsRuntime({...options,sourceNamespace:"wrong-original"})).rejects.toThrow();
+    expect(await runStorageAnalyticsPass({...options,maxQueries:20})).toMatchObject({state:"deferred",reason:"query_budget",steps:0,recordsRead:0});
+    expect(await runStorageAnalyticsPass({...options,deadlineMs:0})).toMatchObject({state:"deferred",reason:"deadline",queriesUsed:0});
+    const first=await runStorageAnalyticsPass({...options,maxSteps:1});
+    expect(first).toMatchObject({state:"progress",recordsRead:200,steps:1});expect(first.queriesUsed).toBeLessThan(100);
+    const unavailable={prepare(){throw new Error("synthetic analytics offline");}} as unknown as D1Database;
+    await expect(runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:"enabled",STORAGE_SOURCE_ID:sourceId,
+      TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:unavailable,DELETION_LEDGER:b.DELETION_LEDGER}))
+      .rejects.toThrow("STORAGE_ANALYTICS_UNAVAILABLE");
+    expect(await source().prepare("SELECT COUNT(*) n FROM typed_v11_record_admissions").first("n")).toBe(203);
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({state:"idle",recordsRead:3});
+    expect((await read(value.event.ownerDigest)).values[0]!.counts.usage).toBe(203);
+    await revokeAccountlessEnrollment(source(),value.deviceId,"user_opt_out",Date.now());
+    expect((await read(value.event.ownerDigest)).state).toBe("authority-unavailable");
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({state:"idle"});
+    expect((await read(value.event.ownerDigest)).values).toEqual([]);
+    await expect(runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:"disabled"})).resolves.toBeUndefined();
+  });
   it("accepts typed-only records without analytics, resumes bounded pages, and withdraws before the consumer catches up", async () => {
     const value = await fixture(203);
     expect(await source().prepare("SELECT COUNT(*) n FROM telemetry_v11_records").first("n")).toBe(0);
@@ -126,8 +180,8 @@ describe("typed accountless upload to isolated projection", () => {
     }
     const plan = (await source().prepare(`EXPLAIN QUERY PLAN ${TYPED_V11_MANIFEST_PAGE_SQL}`)
       .bind(options.manifestId, "", "", 200).all<{ detail: string }>()).results.map(row => row.detail).join("\n");
-    expect(plan).toMatch(/SEARCH typed_v11_record_admissions USING COVERING INDEX .*manifest_id=\? AND \(stream,occurrence_id\)>/);
-    expect(plan).not.toMatch(/SCAN typed_v11_record_admissions|TEMP B-TREE/);
+    expect(plan).toMatch(/SEARCH p USING INDEX typed_v11_proof_manifest \(manifest_key=\? AND \(stream,occurrence_id\)>/);
+    expect(plan).not.toMatch(/SCAN p\b|SCAN m\b|TEMP B-TREE/);
   });
 
   it("validates empty-day identity and rejects a bad initial namespace without pinning unusable work", async () => {

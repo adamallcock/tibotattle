@@ -25,8 +25,7 @@ export interface TelemetryV11ClientOptions {
   clock?: () => number;
   requestTimeoutMs?: number;
 }
-export interface TelemetryV11SyncOptions extends TelemetryV11ClientOptions {
-  consent: TelemetryV11Consent;
+export interface TelemetryV11SyncBaseOptions extends TelemetryV11ClientOptions {
   days: string[];
   readDay: (day: string, context: {binding: Readonly<{destinationOrigin: string; enrollmentNamespace: string}>})
     => unknown | Promise<unknown>;
@@ -35,6 +34,15 @@ export interface TelemetryV11SyncOptions extends TelemetryV11ClientOptions {
   maxDurationMs?: number;
   maxDays?: number;
 }
+export type TelemetryV11SyncOptions = TelemetryV11SyncBaseOptions & (
+  | { consent: TelemetryV11Consent; authorization?: never }
+  | { consent?: never; authorization: Readonly<{
+      schemaVersion: "accountless-upload-owner-v0.1";
+      policyVersion: "accountless-opt-out-v1";
+      authorizationBasis: "accountless-policy-v1";
+      telemetrySchemaVersion: "telemetry-contribution-v1.1";
+    }>; laboratory?: boolean; rehearsal?: boolean; production?: boolean }
+);
 export interface TelemetryV11SyncRun {
   readonly schemaVersion: "incremental-contribution-sync-run-v1.0";
   readonly status: "complete" | "partial" | "failed";
