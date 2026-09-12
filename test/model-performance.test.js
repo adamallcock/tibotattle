@@ -11,16 +11,36 @@ const NOW = Date.parse('2026-09-09T12:00:00Z'), DAY = 86400000;
 const row = (patch = {}) => ({ at: NOW, model: 'gpt-5.6-sol', sample_method: 'receipt',
   sample_tokens: 100, sample_duration: 1000, sample_responses: 1, sample_total_responses: 2,
   ttft: 5000, ...patch });
-test('period coverage is independent and separates receipt/legacy distributions', () => {
+test('period coverage is independent and combines compatible speed evidence', () => {
   const rows = [row(), row({ sample_method: 'legacy', sample_tokens: 200 }),
     row({ sample_duration: null }), row({ ttft: null }), row({ at: NOW - 8 * DAY }),
     row({ model: 'unknown-private-model' }), row({ at: NOW + 1 })];
   const result = modelPerformanceProjection(rows, { period: '7', now: NOW });
   const m = result.models[0];
   assert.equal(m.turns, 4); assert.equal(m.speedTurns, 3); assert.equal(m.ttftTurns, 3);
-  assert.equal(m.timedResponses, 3); assert.equal(m.speed[0].points[0].median, 100);
-  assert.equal(m.speed[1].points[0].median, 200); assert.equal(m.ttft[0].median, 5);
+  assert.equal(m.timedResponses, 3); assert.equal(m.speed.length, 1);
+  assert.equal(m.speed[0].method, 'speed'); assert.equal(m.speed[0].points[0].median, 100);
+  assert.equal(m.speed[0].points[0].n, 3); assert.equal(m.ttft[0].median, 5);
   assert.equal(modelPerformanceProjection(rows, { period: 'all', now: NOW }).models[0].turns, 5);
+});
+test('all compatible speed observations form one percentile distribution', () => {
+  const rows = [100, 200, 300, 400, 500].map((speed, index) => row({
+    sample_method: index % 2 ? 'legacy' : 'receipt',
+    sample_tokens: speed,
+  }));
+  const result = modelPerformanceProjection(rows, { period: '7', now: NOW });
+  const speed = result.models[0].speed;
+  assert.equal(speed.length, 1);
+  assert.equal(speed[0].method, 'speed');
+  assert.deepEqual(speed[0].points[0], {
+    at: Math.floor(NOW / DAY) * DAY,
+    n: 5,
+    p10: 140,
+    p25: 200,
+    median: 300,
+    p75: 400,
+    p90: 460,
+  });
 });
 test('five percentile summary resists extremes without manufacturing missing bins or sparse bands', () => {
   const rows = [1,2,3,4,100000].map(n => row({ ttft: n * 1000 }));

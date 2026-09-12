@@ -4,7 +4,7 @@ import { formatModelName } from "./ui-format.js";
 // Presentation-only: the companion owns reconstruction, eligibility and bins.
 const DAY = 86_400_000;
 const PERIODS = ["7", "30", "all"];
-const METHODS = ["receipt", "legacy"];
+const SPEED_METHOD = "speed";
 const MODEL_NAMES = Object.freeze({
   "gpt-5.6-luna": "Luna", "gpt-5.6-terra": "Terra", "gpt-5.6-sol": "Sol",
   "gpt-6-astra": "Astra", "gpt-5.5": "GPT-5.5", "gpt-5.4": "GPT-5.4",
@@ -49,14 +49,12 @@ export function normalizeModelPerformance(value) {
         || !Object.hasOwn(MODEL_NAMES, model.id) || model.label !== MODEL_NAMES[model.id] || seen.has(model.id)
         || ![model.turns, model.speedTurns, model.ttftTurns, model.timedResponses].every(count)
         || model.speedTurns > model.turns || model.ttftTurns > model.turns
-        || !Array.isArray(model.speed) || model.speed.length > 2 || !validPoints(model.ttft, model.ttftTurns)) return null;
+        || !Array.isArray(model.speed) || model.speed.length > 1 || !validPoints(model.ttft, model.ttftTurns)) return null;
     seen.add(model.id);
-    const methods = new Set();
     let speedCount = 0;
     for (const series of model.speed) {
-      if (!exact(series, ["method", "points"]) || !METHODS.includes(series.method) || methods.has(series.method)
+      if (!exact(series, ["method", "points"]) || series.method !== SPEED_METHOD
           || !validPoints(series.points, model.speedTurns)) return null;
-      methods.add(series.method);
       speedCount += series.points.reduce((sum, point) => sum + point.n, 0);
     }
     if (speedCount > model.speedTurns) return null;
@@ -64,7 +62,7 @@ export function normalizeModelPerformance(value) {
   return value;
 }
 
-/** Connect observed medians within one method; missing bins use an honest dashed bridge. */
+/** Connect observed medians; missing bins use an honest dashed bridge. */
 export function performanceSegments(points, interval) {
   const step = interval === "week" ? 7 * DAY : DAY;
   return points.slice(1).flatMap((point, index) => {
@@ -249,8 +247,8 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
         // Pointer targets are independent of visible marker size; the whole plot
         // also accepts a horizontal sweep, including dates without evidence.
         marker.append(svgElement("circle", { cx, cy, r: 14, fill: "transparent", class: "performance-hit-target" }));
-        marker.append(svgElement(item.method === "legacy" ? "polygon" : "circle", {
-          ...(item.method === "legacy" ? { points: `${cx},${cy - 5} ${cx - 5},${cy + 4.5} ${cx + 5},${cy + 4.5}` } : { cx, cy, r: 4 }),
+        marker.append(svgElement("circle", {
+          cx, cy, r: 4,
           fill: point.n < 5 ? "var(--white)" : color, stroke: color, "stroke-width": 1.8,
         }));
         if (point.p10 !== null) svg.append(svgElement("line", { x1: cx, x2: cx, y1: y(point.p10), y2: y(point.p90), stroke: color, class: "performance-percentile-range" }),
@@ -271,11 +269,8 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     }
     markers.sort((a, b) => a.at - b.at);
     markers[0]?.node.setAttribute("tabindex", "0");
-    const endpointSeries = series.map(item => ({ item, latest: [...item.points].reverse().find(point => point.p10 !== null) }))
-      .filter(entry => entry.latest)
-      .sort((a, b) => b.latest.at - a.latest.at || (a.item.method === "receipt" ? -1 : b.item.method === "receipt" ? 1 : 0))[0];
-    if (endpointSeries) {
-      const { latest } = endpointSeries;
+    const latest = [...(series[0]?.points ?? [])].reverse().find(point => point.p10 !== null);
+    if (latest) {
       const unit = translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit");
       const labels = [["p90", "P90"], ["p75", "P75"], ["median", "P50"], ["p25", "P25"], ["p10", "P10"]]
         .map(([key, label]) => ({ key, label, actualY: y(latest[key]), labelY: y(latest[key]) }))
@@ -312,7 +307,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       for (const { point, method } of matches) {
         const row = element("div", "performance-tooltip-row");
         const unit = translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit");
-        row.append(element("span", "performance-tooltip-method", method === "ttft" ? translate("latency") : `${method === "legacy" ? "△" : "○"} ${translate("medianP50")}`),
+        row.append(element("span", "performance-tooltip-method", method === "ttft" ? translate("latency") : translate("medianP50")),
           element("strong", "performance-tooltip-value", `${metricNumber(point.median, metric)} ${unit}`));
         const distribution = element("div", "performance-tooltip-percentiles");
         if (point.p10 === null) distribution.append(element("span", "performance-tooltip-detail", translate("percentilesUnavailable")));

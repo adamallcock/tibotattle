@@ -10,9 +10,9 @@ const point = (at = 2 * DAY, n = 5) => ({ at, n,
 function payload() {
   return { schemaVersion: 1, method: 3, status: 'ready', collecting: false, stale: false, updatedAt: '2026-09-09T12:00:00.000Z', period: 'all', interval: 'day', start: DAY, end: 9 * DAY,
     models: [{ id: 'gpt-5.6-sol', label: 'Sol', turns: 20, speedTurns: 10, ttftTurns: 15, timedResponses: 45,
-      speed: [{ method: 'receipt', points: [point()] }, { method: 'legacy', points: [point(3 * DAY)] }], ttft: [point(), point(3 * DAY), point(4 * DAY)] }] };
+      speed: [{ method: 'speed', points: [point(), point(3 * DAY)] }], ttft: [point(), point(3 * DAY), point(4 * DAY)] }] };
 }
-test('bounded contract preserves independent populations and separate reconstruction methods', () => {
+test('bounded contract preserves independent populations and one combined speed series', () => {
   const data = payload();
   assert.equal(normalizeModelPerformance(data), data);
   assert.equal(data.models[0].speedTurns, 10);
@@ -78,8 +78,7 @@ test('every supported locale preserves coverage and measurement meaning', () => 
 
 test('all-time axes share the selected model earliest measured bin without borrowing another model history', () => {
   const data = payload(), selected = data.models[0];
-  selected.speed[0].points = [point(6 * DAY)];
-  selected.speed[1].points = [point(7 * DAY)];
+  selected.speed[0].points = [point(6 * DAY), point(7 * DAY)];
   selected.ttft = [point(3 * DAY), point(8 * DAY)];
   assert.deepEqual(performanceDomain(data, selected), { start: 3 * DAY, end: data.end });
   selected.ttft = [];
@@ -209,6 +208,7 @@ test('plot-area sweep works away from points, clears on exit, and keyboard order
   assert.ok(svgs[1].all().some(node => node.className === 'performance-percentile-band performance-percentile-band-inner'));
   assert.ok(svgs[1].all().some(node => node.className === 'performance-percentile-line performance-percentile-line-p10'));
   assert.ok(svgs[1].all().some(node => node.className === 'performance-median-line'));
+  assert.equal(svgs.some(svg => svg.all().some(node => node.tagName === 'polygon')), false);
   assert.equal(svgs[1].all().filter(node => node.className?.startsWith('performance-endpoint-label')).length, 5);
   assert.ok(dom.root.all().some(node => node.textContent === 'GPT-5.6 Sol'));
   assert.ok(dom.root.all().some(node => node.className === 'allowance-model-icon performance-model-icon allowance-model-sol'));
@@ -225,6 +225,7 @@ test('plot-area sweep works away from points, clears on exit, and keyboard order
   const tooltipPercentiles = dom.root.all().filter(node => node.className === 'performance-tooltip-percentiles');
   assert.equal(tooltipPercentiles.length, 2);
   assert.deepEqual(tooltipPercentiles[0].children.filter(node => node.tagName === 'span').map(node => node.textContent), ['P90', 'P75', 'P25', 'P10']);
+  assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-tooltip-method').map(node => node.textContent), ['Median (P50)', 'First-token latency']);
   assert.ok(dom.root.all().filter(node => node.className?.startsWith('performance-tooltip ')).every(node => node.className.includes('performance-tooltip-after')));
   svgs[0].listeners.pointermove({ clientX: 52, clientY: 200 });
   assert.ok(readouts().every(node => node.textContent.includes('Median 50')), 'vertical position never changes selected date');
@@ -259,9 +260,8 @@ test('output-speed labels round to whole tokens per second while latency retains
   controller.destroy();
 });
 
-test('coincident speed methods draw one readable set of endpoint percentile labels', async () => {
+test('combined speed evidence draws one readable set of endpoint percentile labels', async () => {
   const dom = focusHarness(), data = payload();
-  data.models[0].speed[1].points[0].at = data.models[0].speed[0].points[0].at;
   const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
     t: (key, values) => translate(key, values, 'en-US') });
   dom.show(); await controller.refresh();

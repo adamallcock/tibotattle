@@ -98,14 +98,13 @@ replace point-only hover text. Keyboard users enter each chart once, move throug
 observed dates with arrows/Home/End, and dismiss inspection with Escape.
 
 
-Newer-log and older-log TPS estimates remain separate series within each model:
-circles versus triangles. The visible legend describes the P10–P90 and P25–P75
-bands plus the P50 median. Logging-format and timestamp-reconstruction details are
-internal implementation provenance: do not expose them in table headings, row
-labels, tooltips, accessible descriptions, or the user-facing explanation.
-Separate median values may still appear when both internal series occur on the
-same day; never pool those underlying populations merely to simplify the UI.
-Do not imply a logging-format transition is necessarily a model-speed change.
+Combine every compatible TPS observation into one distribution per model and
+time bin. Logging-format and timestamp-reconstruction details remain internal
+implementation provenance: do not encode them as different shapes or expose them
+in headings, labels, tooltips, accessible descriptions, or explanations. Use
+circles throughout; a filled circle has enough observations for percentile bands,
+while a hollow circle is a sparse median-only bin.
+Do not imply that a logging-format transition is a model-speed change.
 Do not describe newer logs as inherently more accurate. Both TPS methods are
 estimates. Method distinctions apply only to TPS, not recorded TTFT.
 
