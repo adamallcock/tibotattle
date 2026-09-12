@@ -184,12 +184,26 @@ export async function priceCommunityDailySpend(
     }
     if ([...remaining.values()].some(count => count !== 0)) return { state: "conflicted" };
   }
+  return {state:"priced",spend:finalizeCommunityDailySpend({usageEvents,knownNanousd,
+    fullyPricedUsageEvents,partiallyPricedUsageEvents,unpricedUsageEvents})};
+}
+
+/** Shared exact integer fold boundary; never rounds individual owners/events. */
+export function finalizeCommunityDailySpend(input: {
+  usageEvents: number; knownNanousd: bigint; fullyPricedUsageEvents: number;
+  partiallyPricedUsageEvents: number; unpricedUsageEvents: number;
+}): CommunityDailySpend {
+  const {usageEvents,knownNanousd,fullyPricedUsageEvents,partiallyPricedUsageEvents,unpricedUsageEvents}=input;
+  if (![usageEvents,fullyPricedUsageEvents,partiallyPricedUsageEvents,unpricedUsageEvents]
+      .every(value=>Number.isSafeInteger(value)&&value>=0) || knownNanousd<0n
+      || fullyPricedUsageEvents+partiallyPricedUsageEvents+unpricedUsageEvents!==usageEvents)
+    throw new Error("community daily spend counts invalid");
   const hasKnownCost = usageEvents === 0 || fullyPricedUsageEvents + partiallyPricedUsageEvents > 0;
   // Match the public dollar series' four-decimal boundary, without rounding
   // individual events/components or losing integer precision during the fold.
   const units = (knownNanousd + 50_000n) / 100_000n;
   if (units > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("community daily spend total exceeds range");
-  return { state: "priced", spend: {
+  return {
     basis: COMMUNITY_DAILY_SPEND_BASIS, currency: "USD",
     knownCostUsd: hasKnownCost ? Number(units) / 10_000 : null,
     coverage: !hasKnownCost ? "unavailable"
@@ -197,5 +211,5 @@ export async function priceCommunityDailySpend(
     usageEvents, fullyPricedUsageEvents, partiallyPricedUsageEvents, unpricedUsageEvents,
     pricingMethodVersion: COMMUNITY_DAILY_SPEND_PRICING_METHOD,
     registrySha256: COMMUNITY_DAILY_SPEND_REGISTRY_SHA256,
-  } };
+  };
 }

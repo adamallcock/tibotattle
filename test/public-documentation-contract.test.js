@@ -89,10 +89,12 @@ test("owner erasure runbook preserves the exact request, retry, and audit contra
   }
   assert.match(runbook, /without\s+`participantErasure` performs ordinary maintenance only/u);
   assert.match(runbook, /stale attempt cannot complete after takeover/u);
-  assert.match(runbook, /Restore replay owns `state: 'deleting'` with `deletion_session_id: null`/u);
+  assert.match(runbook, /Social restore replay owns `state: 'deleting'` with `deletion_session_id: null`/u);
   assert.match(runbook, /Cron\s+must not resume non-null owner or legacy deletion fences/u);
-  assert.match(runbook, /restore replay atomically claims only active\s+rows or interrupted restores/u);
-  assert.match(runbook, /Final removal\s+must match the null restore fence or the owner operation UUID/u);
+  assert.match(runbook, /restore replay atomically claims only active\s+rows or interrupted restores with the exact same fence/u);
+  assert.match(runbook, /Social owners retain\s+the NULL restore fence; accountless owners use the deterministic\s+`restore-replay:<participantDeletionDigest>` fence after revoking their\s+enrollment, before changing participant state/u);
+  assert.match(runbook, /Accountless replay resumes only\s+that exact reserved fence and refuses other reserved or owner UUID fences/u);
+  assert.match(runbook, /Final removal must match the exact claimed fence: the social NULL restore\s+fence, the accountless reserved restore fence, or the owner operation UUID/u);
   assert.match(runbook, /not a claim that production has changed/u);
 });
 

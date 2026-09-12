@@ -61,6 +61,7 @@ async function fixture(rows: Usage[], switchPlan = false) {
     async first() {
       queries += 1;
       if (this.sql.includes("FROM telemetry_v11_domain_heads")) return null;
+      if (this.sql.includes("sqlite_schema") && this.sql.includes("typed_v1_admission_state")) return null;
       throw new Error("unexpected synthetic first query");
     }
     async all() {
@@ -258,7 +259,7 @@ describe("shared acquired v1 finish", () => {
 
   it("preserves usage-limit priority independently of a pre-usage model refusal", async () => {
     const f = await fixture([usage(1, 1)], true);
-    const result = await finishAccountScopedAnalysesV1(f.db, PARTICIPANT, f.evidence, budget(7),
+    const result = await finishAccountScopedAnalysesV1(f.db, PARTICIPANT, f.evidence, budget(v1QuotaFinishQueryReserve(0)),
       { ...f.options, maxWindowedUsageRows: 0 });
     expect(result).toMatchObject({ status: "complete",
       quotaAnalysis: { status: "not_testable", reason: "windowed_usage_limit_exceeded" },

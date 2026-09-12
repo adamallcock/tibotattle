@@ -1,4 +1,7 @@
-import { sha256Hex } from "./crypto";
+import {prepareStorageParticipantErasure,requireStorageParticipantErasureComplete,advanceStorageErasureJobs,type StorageErasureBindings} from './storage-erasure';
+import { participantDeletionDigest } from "./participant-deletion-digest";
+export { participantDeletionDigest } from "./participant-deletion-digest";
+import { revokeAccountlessEnrollment } from "./accountless-enrollment";
 import { ApiError } from "./errors";
 import { finishParticipantDeletion } from "./repository";
 import { telemetryV1ChunkR2KeyPage } from "./telemetry-v1-repository";
@@ -21,7 +24,6 @@ const DELETION_TOMBSTONE_DELETE_BATCH_SIZE = 100;
 const IDENTITY_REENROLLMENT_COOLDOWN_DELETE_BATCH_SIZE = 100;
 const MAX_RESTORE_SUPPRESSIONS_PER_PASS = 100;
 const MAX_LIFECYCLE_ROWS = 100_000;
-const DELETION_DIGEST_DOMAIN = "app-usagemonitor/deletion-tombstone/v1\0";
 const IDENTITY_REENROLLMENT_COOLDOWN_DOMAIN =
   "app-usagemonitor/identity-reenrollment-cooldown/v1\0";
 
@@ -110,11 +112,7 @@ function identityLinkSecret(value: unknown): string {
   return value;
 }
 
-export async function participantDeletionDigest(
-  participantId: string,
-): Promise<string> {
-  return sha256Hex(`${DELETION_DIGEST_DOMAIN}${participantId}`);
-}
+
 
 /**
  * Derives the short-lived anti-reissue marker from the already pseudonymous
@@ -171,12 +169,15 @@ export async function hasDeletionTombstone(
 ): Promise<boolean> {
   const participantDigest = await participantDeletionDigest(participantId);
   const row = await ledger.prepare(
-    `SELECT 1 AS present
-       FROM deletion_tombstones
-      WHERE participant_digest = ?
-        AND retain_until > ?`,
-  ).bind(participantDigest, canonicalInstant(nowEpoch)).first<{ present: number }>();
-  return row?.present === 1;
+    `SELECT 1 AS present,retain_until FROM deletion_tombstones WHERE participant_digest=?`,
+  ).bind(participantDigest).first<{present:number;retain_until:string}>();
+  if(!row)return false;
+  if(row.retain_until>canonicalInstant(nowEpoch))return true;
+  // Pending cross-store cleanup retains the original deletion authority even
+  // after its usual retention date; it cannot permit a restored enrollment.
+  if(!await ledger.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='storage_erasure_jobs'").first())return false;
+  return !!await ledger.prepare("SELECT 1 FROM storage_erasure_jobs WHERE participant_digest=? AND state='pending' LIMIT 1")
+    .bind(participantDigest).first();
 }
 
 export async function recordIdentityReenrollmentCooldown(
@@ -308,10 +309,12 @@ async function purgeExpiredLedgerRows(
   batchSize: number,
 ): Promise<ExpiredLedgerPurgeResult> {
   const now = canonicalInstant(nowEpoch);
+  const storageJobs=table==='deletion_tombstones'&&!!await ledger.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='storage_erasure_jobs'").first();
+  const pendingGuard=storageJobs?" AND NOT EXISTS(SELECT 1 FROM storage_erasure_jobs j WHERE j.participant_digest=deletion_tombstones.participant_digest AND j.state='pending')":"";
   const due = await ledger.prepare(
     `SELECT ${digestColumn}
        FROM ${table}
-      WHERE retain_until <= ?
+      WHERE retain_until <= ?${pendingGuard}
       ORDER BY retain_until, ${digestColumn}
       LIMIT ?`,
   ).bind(now, batchSize + 1).all<Record<typeof digestColumn, string>>();
@@ -321,12 +324,13 @@ async function purgeExpiredLedgerRows(
       WHERE ${digestColumn} IN (
         SELECT ${digestColumn}
           FROM ${table}
-         WHERE retain_until <= ?
+         WHERE retain_until <= ?${pendingGuard}
          ORDER BY retain_until, ${digestColumn}
          LIMIT ?
-      )`,
-  ).bind(now, batchSize).run();
-  const purged = deletion.meta.changes;
+      ) RETURNING ${digestColumn}`,
+  ).bind(now, batchSize).all<Record<typeof digestColumn,string>>();
+  // Count tombstones, not FK-cascaded completed retry recipes.
+  const purged = deletion.results.length;
   if (purged < 0 || purged > batchSize) {
     throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
   }
@@ -383,13 +387,15 @@ async function deletionDigests(
   nowEpoch: number,
 ): Promise<Set<string>> {
   const digests = new Set<string>();
+  const jobs=!!await ledger.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='storage_erasure_jobs'").first();
+  const pending=jobs?" OR EXISTS(SELECT 1 FROM storage_erasure_jobs j WHERE j.participant_digest=deletion_tombstones.participant_digest AND j.state='pending')":"";
   let cursor = "";
   while (digests.size <= MAX_LIFECYCLE_ROWS) {
     const page = await ledger.prepare(
       `SELECT participant_digest
          FROM deletion_tombstones
         WHERE participant_digest > ?
-          AND retain_until > ?
+          AND (retain_until > ?${pending})
         ORDER BY participant_digest
         LIMIT ?`,
     ).bind(cursor, canonicalInstant(nowEpoch), SCAN_PAGE_SIZE).all<TombstoneRow>();
@@ -429,21 +435,36 @@ async function suppressRestoredParticipant(
   participantId: string,
   rawIdentityLinkSecret?: unknown,
   allowMissingIdentityLinkSecret = false,
+  storage?: StorageErasureBindings,
 ): Promise<boolean> {
-  // NULL is the restore-replay fence. Never take over a non-NULL participant
-  // erasure fence: its tombstone is written before cleanup finishes, so a
-  // tombstone alone does not make an in-flight owner erasure a restored row.
-  // Retrying a failed restore (already deleting with NULL) remains supported.
+  // Social restore replay retains its historical NULL fence. Accountless
+  // owner shape requires a non-NULL deleting fence; reserve a deterministic,
+  // digest-only namespace distinct from every UUID owner-erasure operation.
+  // The caller already matched this exact owner against the independent ledger.
+  const participantState=await db.prepare('SELECT owner_kind,state,deletion_session_id FROM participants WHERE id=?')
+    .bind(participantId).first<{owner_kind:string;state:string;deletion_session_id:string|null}>();
+  if(!participantState)return false;
+  const restoreFence=participantState.owner_kind==='accountless'
+    ? `restore-replay:${await participantDeletionDigest(participantId)}` : null;
+  if(participantState.state!=='active'
+    && !(participantState.state==='deleting'&&participantState.deletion_session_id===restoreFence))return false;
+  // Revocation is idempotent and must precede the accountless state transition.
+  // An existing different restore/owner fence was refused before any revocation.
+  if(participantState.owner_kind==='accountless'){
+    const owner=await db.prepare("SELECT enrollment_device_id FROM accountless_upload_owners WHERE participant_id=? AND state='active'")
+      .bind(participantId).first<{enrollment_device_id:string}>();
+    if(owner)await revokeAccountlessEnrollment(db,owner.enrollment_device_id,"security_reset");
+  }
   const claimed = await db.prepare(
     `UPDATE participants
-        SET state = 'deleting',
-            deletion_session_id = NULL
+        SET state = 'deleting', deletion_session_id = ?
       WHERE id = ?
         AND (state = 'active'
-          OR (state = 'deleting' AND deletion_session_id IS NULL))
+          OR (state = 'deleting' AND deletion_session_id IS ?))
       RETURNING id`,
-  ).bind(participantId).first<{ id: string }>();
+  ).bind(restoreFence,participantId,restoreFence).first<{ id: string }>();
   if (claimed === null) return false;
+  if(storage)await prepareStorageParticipantErasure(storage,participantId);
   const keys = await participantQuarantineKeys(db, participantId);
   if (keys.length > 0) await quarantine.delete(keys);
   // v1.0 chunk journals can far exceed the bounded v0.1 key scan above, so
@@ -490,7 +511,8 @@ async function suppressRestoredParticipant(
       await recordIdentityReenrollmentCooldownFromDigest(ledger, cooldownDigest);
     }
   }
-  await finishParticipantDeletion(db, participantId, null);
+  await finishParticipantDeletion(db, participantId, restoreFence);
+  await requireStorageParticipantErasureComplete(ledger,participantId,storage??null);
   return true;
 }
 
@@ -504,6 +526,7 @@ export async function replayDeletionTombstones(
   // synthetic-development run. The Worker maintenance integration passes an
   // explicit production fail-closed value below.
   allowMissingIdentityLinkSecret = true,
+  storage?: StorageErasureBindings,
 ): Promise<{
   suppressed: number;
   complete: boolean;
@@ -542,6 +565,7 @@ export async function replayDeletionTombstones(
         participant.id,
         rawIdentityLinkSecret,
         allowMissingIdentityLinkSecret,
+        storage,
       );
       if (removed) suppressed += 1;
     }
@@ -623,6 +647,7 @@ export async function runBackendLifecycle(
   beforeDestructivePhase?: LifecyclePhaseGuard,
   rawIdentityLinkSecret?: unknown,
   allowMissingIdentityLinkSecret = true,
+  storage?: StorageErasureBindings,
 ): Promise<LifecyclePassResult> {
   let ownershipLost = false;
   const assertOwnership = async (): Promise<void> => {
@@ -653,7 +678,10 @@ export async function runBackendLifecycle(
       nowEpoch,
       rawIdentityLinkSecret,
       allowMissingIdentityLinkSecret,
+      storage,
     );
+    if(storage){const pending=await advanceStorageErasureJobs(storage,{maxJobs:1});
+      if(pending.pending)restoreReplay.complete=false;}
     // R2 quarantine removal is a distinct destructive phase. An owner that
     // lost its outer maintenance lease must not enter it. With retention
     // disabled the phase is skipped outright: nothing is due, so the pass

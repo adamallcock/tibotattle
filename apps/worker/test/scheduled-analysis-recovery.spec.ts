@@ -503,11 +503,15 @@ describe("actual scheduled resumable analysis recovery", () => {
       entry.sql.includes("FROM community_public_source_bootstrap b JOIN community_snapshot_mutation_control"))).toHaveLength(1);
     // Reserving graph capacity defers weekly publication in the 350-query first
     // pass; its first build now adds eight statements to this recovery pass.
-    expect(setupReceipt).toEqual({ fixedSetupQueries: 68, primary: 65, ledger: 3 });
-    // Worst legal 1024-part head:384 reads,3 final pin/head checks,407 finish
+    // Purge and replay each discover the optional pending-erasure table. These
+    // bounded ledger checks prevent expiry from discarding an unfinished erasure.
+    expect(second.queries.slice(0, fixedSetupQueries).filter(entry => entry.binding === "ledger"
+      && entry.sql.includes("name='storage_erasure_jobs'"))).toHaveLength(2);
+    expect(setupReceipt).toEqual({ fixedSetupQueries: 70, primary: 65, ledger: 5 });
+    // Worst legal 1024-part head:384 reads,3 final pin/head checks,409 finish
     // reserve,24 combined warmer/scheduler headroom. Heavy sustained required
-    // housekeeping can exceed the remaining 14 queries and safely defer finish.
-    expect(fixedSetupQueries + 384 + 3 + 407 + 24).toBeLessThanOrEqual(900);
+    // housekeeping can exceed the remaining 10 queries and safely defer finish.
+    expect(fixedSetupQueries + 384 + 3 + 409 + 24).toBeLessThanOrEqual(900);
     expect(await db().prepare("SELECT fixed_now,run_id,phase FROM community_analysis_work WHERE participant_id=?").bind(PARTICIPANT).first())
       .toMatchObject({ fixed_now: before!.fixed_now, run_id: before!.run_id, phase: "complete" });
     for (const table of ["community_allowance_fit_cache", "community_model_composition_cache"])

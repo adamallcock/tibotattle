@@ -291,9 +291,10 @@ describe("reusable elected source-day preparation", () => {
     expect(measured.stats.queries).toBe(3); expect(raw.stats.queries).toBe(18);
     expect(prepared.usageBins.fragmentCount).toBeLessThan(200);
     expect(preparedMeter.queriesUsed-beforePreparedFinish).toBe(6); // Five fences plus one fragment page.
-    // Raw: five fences + two initial seeks + one full equal-time tie page +
-    // two final seeks. The short final page ends the scan without an EOF read.
-    expect(rawMeter.queriesUsed).toBe(10);
+    // Raw: five fences + one typed-layout discovery + two initial seeks +
+    // one full equal-time tie page + two final seeks. The short final page ends
+    // the scan without an EOF read; prepared evidence needs no layout discovery.
+    expect(rawMeter.queriesUsed).toBe(11);
     expect(await prepare(await pin("2026-09-06"))).toMatchObject({status:"complete",pagesRun:0,queriesUsed:1});
     console.log(JSON.stringify({benchmark:"synthetic-prepared-history-18061",rawElapsedMs,preparedElapsedMs,
       rawAcquisition:raw.stats,preparedAcquisition:measured.stats,rawFinishQueries:rawMeter.queriesUsed,
