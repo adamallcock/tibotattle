@@ -40,7 +40,9 @@ async function run() {
     const rows = readTimingRows(store), now = Date.now();
     lastPublished = now; lastCollecting = collecting;
     parentPort.postMessage({ type: 'snapshots', values: ['7', '30', 'all'].map(period => ({
-      ...context.project(rows, { period, now }), collecting, stale: degraded,
+      ...context.project(rows, { period, now, historyProgress: files === null ? null : {
+        checked: Math.min(cursor, files.length), total: files.length,
+      } }), collecting, stale: degraded,
     })) });
   }
   try {
@@ -67,15 +69,16 @@ async function run() {
           await yieldTurn();
         }
         if (files && cursor >= files.length) degraded = passFailed;
-        if (!stopped && (bytes > 0 || lastCollecting !== (cursor < files.length) || Date.now() - lastPublished >= 60_000))
-          publish(cursor < files.length);
+        const collecting = cursor < files.length;
+        if (!stopped && (lastCollecting !== collecting || Date.now() - lastPublished >= 5_000))
+          publish(collecting);
       } catch {
         degraded = true; passFailed = true;
         if (!stopped) { try { publish(false); } catch { parentPort.postMessage({ type: 'unavailable' }); } }
       }
       if (!stopped) await new Promise(resolve => {
         const done = () => { clearTimeout(timer); abort.signal.removeEventListener('abort', done); resolve(); };
-        timer = setTimeout(done, 5000);
+        timer = setTimeout(done, files && cursor < files.length ? 250 : 5000);
         abort.signal.addEventListener('abort', done, { once: true });
       });
     }

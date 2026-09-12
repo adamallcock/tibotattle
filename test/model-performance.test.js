@@ -61,6 +61,16 @@ test('all history uses bounded weekly bins and excludes missing or invalid sampl
   assert.throws(() => modelPerformanceProjection([], { period: '90', now: NOW }));
   assert.throws(() => modelPerformanceProjection(new Array(100001), { now: NOW }));
 });
+test('history scan progress is explicit and fails closed', () => {
+  const historyProgress = { checked: 629, total: 9026 };
+  const result = modelPerformanceProjection([], { now: NOW, historyProgress });
+  assert.equal(result.schemaVersion, 2);
+  assert.equal(result.historyProgress, historyProgress);
+  for (const invalid of [
+    { checked: 2, total: 1 }, { checked: -1, total: 1 }, { checked: 0.5, total: 1 },
+    { checked: 0, total: 1, privatePath: '/synthetic/private' }, {}, [],
+  ]) assert.throws(() => modelPerformanceProjection([], { now: NOW, historyProgress: invalid }));
+});
 test('controller is lazy, coalesces reads, retains good snapshots on failure, and cancels', async () => {
   class FakeWorker extends EventEmitter {
     unref() {} postMessage(message) { assert.equal(message.type, 'stop'); queueMicrotask(() => this.emit('exit', 0)); }
@@ -79,6 +89,32 @@ test('controller is lazy, coalesces reads, retains good snapshots on failure, an
   await c.close(); assert.equal((await c.read('all')).status, 'unavailable');
   await assert.rejects(c.read('90'));
 });
+test('an explicitly requested initial history pass finishes after the reader lease expires', async () => {
+  class FakeWorker extends EventEmitter {
+    unref() {}
+    postMessage(message) {
+      assert.equal(message.type, 'stop'); stops++;
+      queueMicrotask(() => this.emit('exit', 0));
+    }
+  }
+  let worker, stops = 0;
+  const controller = createModelPerformanceController({
+    directory: 'unused', codexHome: 'unused', platform: 'darwin', idleMs: 10,
+    workerFactory: () => worker = new FakeWorker(),
+  });
+  await controller.read('all');
+  const progress = modelPerformanceProjection([row()], {
+    now: NOW, historyProgress: { checked: 1, total: 2 },
+  });
+  worker.emit('message', { type: 'snapshots', values: [{ ...progress, collecting: true }] });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(stops, 0, 'unfinished history survives an expired page lease');
+  worker.emit('message', { type: 'snapshots', values: [{ ...progress,
+    collecting: false, historyProgress: { checked: 2, total: 2 } }] });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(stops, 1, 'completed worker observes the ordinary idle stop');
+  await controller.close();
+});
 test('Windows returns the closed unavailable DTO immediately without a timing worker', async () => {
   let workers = 0;
   const controller = createModelPerformanceController({
@@ -90,7 +126,7 @@ test('Windows returns the closed unavailable DTO immediately without a timing wo
       const result = await controller.read(period);
       assert.deepEqual(Object.keys(result).sort(), [
         'schemaVersion', 'method', 'status', 'collecting', 'stale', 'updatedAt',
-        'period', 'interval', 'start', 'end', 'models',
+        'period', 'interval', 'start', 'end', 'historyProgress', 'models',
       ].sort());
       assert.equal(result.status, 'unavailable');
       assert.equal(result.collecting, false);
@@ -135,6 +171,8 @@ test('actual worker reconstructs synthetic logs off-main, persists, and shuts do
   let controller = createModelPerformanceController(options);
   try {
     let result = await readReady(controller);
+    assert.equal(result.schemaVersion, 2);
+    assert.deepEqual(result.historyProgress, { checked: 1, total: 1 });
     assert.equal(result.models[0].speed[0].points[0].median, 100);
     assert.equal(result.models[0].ttft[0].median, .2);
     assert.equal(result.models[0].turns, 1);

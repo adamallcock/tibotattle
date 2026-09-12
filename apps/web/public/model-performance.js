@@ -18,12 +18,15 @@ const exact = (value, keys) => value !== null && typeof value === "object" && !A
 
 /** A closed, bounded display contract: never pass arbitrary source text to DOM. */
 export function normalizeModelPerformance(value) {
-  if (!exact(value, ["schemaVersion", "method", "status", "collecting", "stale", "updatedAt", "period", "interval", "start", "end", "models"])
-      || value.schemaVersion !== 1 || value.method !== 3 || !["ready", "loading", "unavailable"].includes(value.status)
+  if (!exact(value, ["schemaVersion", "method", "status", "collecting", "stale", "updatedAt", "period", "interval", "start", "end", "historyProgress", "models"])
+      || value.schemaVersion !== 2 || value.method !== 3 || !["ready", "loading", "unavailable"].includes(value.status)
       || typeof value.collecting !== "boolean" || typeof value.stale !== "boolean" || !PERIODS.includes(value.period)
       || !["day", "week"].includes(value.interval) || !timestamp(value.end)
       || !(value.start === null || timestamp(value.start) && value.start <= value.end)
       || !(value.updatedAt === null || typeof value.updatedAt === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/u.test(value.updatedAt) && Number.isFinite(Date.parse(value.updatedAt)))
+      || !(value.historyProgress === null || exact(value.historyProgress, ["checked", "total"])
+        && count(value.historyProgress.checked) && count(value.historyProgress.total)
+        && value.historyProgress.checked <= value.historyProgress.total)
       || !Array.isArray(value.models) || value.models.length > 16) return null;
   const step = value.interval === "week" ? 7 * DAY : DAY;
   const seen = new Set();
@@ -249,7 +252,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
         marker.append(svgElement("circle", { cx, cy, r: 14, fill: "transparent", class: "performance-hit-target" }));
         marker.append(svgElement("circle", {
           cx, cy, r: 4,
-          fill: point.n < 5 ? "var(--white)" : color, stroke: color, "stroke-width": 1.8,
+          fill: point.n < 5 ? "var(--surface-raised)" : color, stroke: color, "stroke-width": 1.8,
         }));
         if (point.p10 !== null) svg.append(svgElement("line", { x1: cx, x2: cx, y1: y(point.p10), y2: y(point.p90), stroke: color, class: "performance-percentile-range" }),
           svgElement("line", { x1: cx, x2: cx, y1: y(point.p25), y2: y(point.p75), stroke: color, class: "performance-quartile-range" }));
@@ -364,7 +367,11 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     }
     heading.append(title, periods); root.append(heading);
     const status = element("p", "performance-status"); status.setAttribute("role", "status");
-    status.textContent = failed ? translate("failed") : loading && !payload ? translate("loading") : payload?.collecting || payload?.status === "loading" ? translate("updating") : payload?.status === "unavailable" ? translate("unavailable") : payload?.updatedAt ? translate("updated", { date: new Intl.DateTimeFormat(locale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(payload.updatedAt)) }) : "";
+    const progress = payload?.historyProgress;
+    const collectingLabel = progress?.total
+      ? translate("buildingHistory", { checked: number(progress.checked), total: number(progress.total) })
+      : translate("updating");
+    status.textContent = failed ? translate("failed") : loading && !payload ? translate("loading") : payload?.collecting || payload?.status === "loading" ? collectingLabel : payload?.status === "unavailable" ? translate("unavailable") : payload?.updatedAt ? translate("updated", { date: new Intl.DateTimeFormat(locale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(payload.updatedAt)) }) : "";
     root.append(status);
     if (payload?.stale) root.append(element("p", "performance-status", translate("stale")));
     if (failed || payload?.status === "unavailable") {

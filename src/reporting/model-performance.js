@@ -9,6 +9,10 @@ const LABELS = new Map([
 ]);
 const count = n => Number.isSafeInteger(n) && n >= 0;
 const positive = n => count(n) && n > 0;
+const progress = value => value === null || value !== null && typeof value === 'object'
+  && !Array.isArray(value) && Object.keys(value).length === 2
+  && Object.hasOwn(value, 'checked') && Object.hasOwn(value, 'total')
+  && count(value.checked) && count(value.total) && value.checked <= value.total;
 function quantile(sorted, p) {
   const i = (sorted.length - 1) * p, lo = Math.floor(i), hi = Math.ceil(i);
   return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
@@ -29,8 +33,9 @@ function add(bins, at, value) {
   if (!bins.has(at)) bins.set(at, []);
   bins.get(at).push(value);
 }
-export function modelPerformanceProjection(rows, { period = 'all', now = Date.now() } = {}) {
-  if (!['7', '30', 'all'].includes(period) || !count(now) || !Array.isArray(rows) || rows.length > 100000)
+export function modelPerformanceProjection(rows, { period = 'all', now = Date.now(), historyProgress = null } = {}) {
+  if (!['7', '30', 'all'].includes(period) || !count(now) || !Array.isArray(rows) || rows.length > 100000
+      || !progress(historyProgress))
     throw new Error('invalid_timing_projection');
   const known = rows.filter(r => LABELS.has(r.model) && count(r.at) && r.at <= now);
   const end = now;
@@ -56,8 +61,8 @@ export function modelPerformanceProjection(rows, { period = 'all', now = Date.no
     }
     if (count(r.ttft)) { m.ttftTurns++; add(m.latency, at, r.ttft / 1000); }
   }
-  return { schemaVersion: 1, method: 3, status: 'ready', collecting: false, stale: false,
-    updatedAt: new Date(now).toISOString(), period, interval, start, end,
+  return { schemaVersion: 2, method: 3, status: 'ready', collecting: false, stale: false,
+    updatedAt: new Date(now).toISOString(), period, interval, start, end, historyProgress,
     models: [...LABELS.keys()].filter(id => groups.has(id)).map(id => {
       const { speed, latency, ...m } = groups.get(id);
       return { ...m, speed: [{ method: 'speed', points: points(speed) }],

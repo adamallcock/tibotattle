@@ -11,9 +11,9 @@ Add **Model performance** beside Trends and Usage and costs in the app navigatio
 The page answers: how quickly do my models generate output, how long do I wait
 for the first token, and how much evidence supports that picture?
 
-This page is implemented locally on the timing branch, building on experiment
-`7416b912`. It includes a separate, lazily started timing worker. The installed
-app and published releases have not changed.
+This page is implemented locally on `main`, building on experiment `7416b912`.
+It includes a separate, lazily started timing worker. Published releases have
+not changed.
 Initial provider scope is Codex. Other providers should appear only when their
 measurements have a defined, supported contract.
 
@@ -83,10 +83,10 @@ Use daily bins through 366 days and weekly bins for longer All-time spans.
 Label the interval and apply it consistently across models. Both All-time axes
 begin at the selected model's earliest measured bin; 7/30-day axes retain their
 whole selected calendar window. All boundaries are UTC. Require five observations per
-method/model/bin for percentile bands. Sparse medians use hollow markers. Solid
+model/bin for percentile bands. Sparse medians use hollow markers. Solid
 segments connect adjacent measured bins; dashed, lower-emphasis median segments
 connect later observed bins across missing dates so a sparse series remains
-traceable. Percentile bands stop at missing dates. Never bridge between methods.
+traceable. Percentile bands stop at missing dates.
 
 Y axes begin at zero and use rounded 1/2/5 increments, with enough decimal
 precision for subsecond data. X ticks follow UTC days, Monday weeks, first/15th
@@ -105,8 +105,8 @@ in headings, labels, tooltips, accessible descriptions, or explanations. Use
 circles throughout; a filled circle has enough observations for percentile bands,
 while a hollow circle is a sparse median-only bin.
 Do not imply that a logging-format transition is a model-speed change.
-Do not describe newer logs as inherently more accurate. Both TPS methods are
-estimates. Method distinctions apply only to TPS, not recorded TTFT.
+Do not describe newer logs as inherently more accurate. All compatible TPS
+estimates belong to the same distribution.
 
 The hover/focus readout shows the date interval, model, metric, P10, P25, P50,
 P75, P90 and eligible turns. Do not fabricate per-bin counts. For example, use
@@ -141,34 +141,45 @@ the comparative chart. Counts reflect the same filters as the plotted values.
 
 ## Loading, sparse data and accessibility
 
-- Load saved aggregates immediately. A quiet “Updating…” status can accompany
-  background indexing while the existing chart remains visible.
+- Load saved aggregates immediately. During the initial earlier-history scan,
+  show the number of local session files checked out of the uncapped discovered
+  total while the partial chart remains visible. This is scan progress, not a
+  count of qualifying model measurements. After that pass, a quiet “Updating…”
+  status can accompany background indexing.
 - If timing is unavailable, keep the page accessible and explain the state;
   failure must not block allowance or cost accounting.
 - If TTFT is available but TPS is not, render TTFT and explain the missing starts
   in the speed panel. Avoid a page-wide empty state.
 - If no timing is collected yet, explain what future compatible sessions can
   provide; offer the existing local-analysis action if appropriate.
-- Use percentile labels, marker shapes and text alongside color, visible focus,
+- Use percentile labels, marker fill and text alongside color, visible focus,
   sufficiently large targets, reduced-motion behavior and accessible point descriptions.
 - Model tabs and the selected-model heading reuse the shared readable names,
   palette and decorative model icons used by the usage tables and other model surfaces.
-- In narrow windows, stack the comparison information and charts; keep units,
-  method distinctions and coverage visible without horizontal page scrolling.
+- In narrow windows, stack the comparison information and charts; keep units
+  and coverage visible without horizontal page scrolling.
 
 ## Visual direction and implementation boundary
 
 Reuse the [existing design tokens](../../apps/web/public/styles.css): cream paper,
 warm raised surfaces, dark ink, green controls, native system type and restrained
-separators. Use established chart accent tokens with tested contrast. Let spacing
-and typography establish hierarchy; keep technical explanations below the charts.
+separators. Cards, selected tabs, sparse-marker centers and tooltips use the shared
+raised-surface token so they follow the app's light and dark themes. Dark charts
+also reuse the restrained grid opacity used by the other graphs. Use established
+chart accent tokens with tested contrast. Let spacing and typography establish
+hierarchy; keep technical explanations below the charts.
 
 Initial delivery needs one page, the standard period filter, a model selector, two linked charts
 and coverage details. Defer rankings, speed alerts, benchmark claims, project
 filters and raw-turn drilldowns until their semantics and underlying data exist.
 
-The view reads compact local aggregates from a fixed loopback route. Filter changes query cached timing
-state; they do not parse rollouts or make external network requests. Keep ingestion,
+The view reads compact local aggregates from a fixed loopback route. Filter changes
+query cached timing state; they do not parse rollouts or make external network
+requests. Earlier-history ingestion runs in the bounded off-main timing worker;
+its scan covers every discovered session file rather than imposing a result cap.
+Once the user requests Model performance, that initial pass finishes even if the
+page becomes hidden; later workers still use the ordinary idle lease.
+Keep ingestion,
 sidecar compatibility and accounting-isolation qualification as separate gates
 from approving this page design. The experimental historical backfill is not a
 startup requirement for the product.

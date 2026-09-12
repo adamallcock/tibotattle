@@ -8,7 +8,7 @@ const point = (at = 2 * DAY, n = 5) => ({ at, n,
   p10: n < 5 ? null : 30, p25: n < 5 ? null : 40, median: 50,
   p75: n < 5 ? null : 60, p90: n < 5 ? null : 70 });
 function payload() {
-  return { schemaVersion: 1, method: 3, status: 'ready', collecting: false, stale: false, updatedAt: '2026-09-09T12:00:00.000Z', period: 'all', interval: 'day', start: DAY, end: 9 * DAY,
+  return { schemaVersion: 2, method: 3, status: 'ready', collecting: false, stale: false, updatedAt: '2026-09-09T12:00:00.000Z', period: 'all', interval: 'day', start: DAY, end: 9 * DAY, historyProgress: null,
     models: [{ id: 'gpt-5.6-sol', label: 'Sol', turns: 20, speedTurns: 10, ttftTurns: 15, timedResponses: 45,
       speed: [{ method: 'speed', points: [point(), point(3 * DAY)] }], ttft: [point(), point(3 * DAY), point(4 * DAY)] }] };
 }
@@ -25,6 +25,9 @@ test('malformed, private, unknown, duplicate and excessive evidence fails closed
   for (const mutate of [
     x => { x.privatePath = '/synthetic/private'; },
     x => { x.schemaVersion = 7; }, x => { x.method = 1; },
+    x => { x.historyProgress = { checked: 2, total: 1 }; },
+    x => { x.historyProgress = { checked: -1, total: 1 }; },
+    x => { x.historyProgress = { checked: 0, total: 1, privatePath: '/synthetic/private' }; },
     x => { x.period = '365'; }, x => { x.models[0].label = '<img>'; },
     x => { x.models[0].id = 'private-thread'; },
     x => { x.models.push(x.models[0]); },
@@ -66,7 +69,7 @@ test('client requests only an enum period, is abortable, and reports endpoint fa
 });
 test('every supported locale preserves coverage and measurement meaning', () => {
   for (const locale of SUPPORTED_LOCALES) {
-    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'unavailable', 'stale']) {
+    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'buildingHistory', 'unavailable', 'stale']) {
       const value = translate(`performance.${key}`, {}, locale);
       assert.notEqual(value, `performance.${key}`);
     }
@@ -139,6 +142,18 @@ function focusHarness() {
     navigate: (shown) => { inactive = !shown; visibilityObserver?.(); },
     find: key => root.all().find(node => node.dataset.performanceFocus === key) };
 }
+
+test('background history scan reports honest bounded progress while keeping charts visible', async () => {
+  const dom = focusHarness();
+  const data = { ...payload(), collecting: true, historyProgress: { checked: 629, total: 9026 } };
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  assert.equal(dom.root.all().find(node => node.className === 'performance-status').textContent,
+    'Building earlier history · 629 of 9,026 sessions checked');
+  assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
+  controller.destroy();
+});
 
 test('loading and background renders retain heading and About keyboard focus without a duplicate table', async () => {
   const dom = focusHarness();
