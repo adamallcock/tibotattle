@@ -51,10 +51,11 @@ type Cursor = Cell[];
 type EncodedRow = { cells: Cell[]; cursor: Cursor };
 interface TableState { name: string; descriptor:string; copy_cursor: string; verify_cursor: string; copied: number; verified: number; copy_done: number; verify_done: number; }
 
-export async function authoritySchemaInventory(db: D1Database): Promise<AuthoritySchemaObject[]> {
-  const rows = (await db.prepare(`SELECT s.type,s.name,s.tbl_name,s.sql FROM sqlite_master s WHERE s.sql IS NOT NULL
+const AUTHORITY_SCHEMA_QUERY = `SELECT s.type,s.name,s.tbl_name,s.sql FROM sqlite_master s WHERE s.sql IS NOT NULL
     AND s.name NOT GLOB 'sqlite_*' AND s.name NOT GLOB '_authority_*'
-    AND NOT (${D1_PROVIDER_SCHEMA_PREDICATE}) ORDER BY s.type,s.name LIMIT 1025`).all<AuthoritySchemaObject>()).results;
+    AND NOT (${D1_PROVIDER_SCHEMA_PREDICATE}) ORDER BY s.type,s.name LIMIT 1025`;
+export async function authoritySchemaInventory(db: D1Database): Promise<AuthoritySchemaObject[]> {
+  const rows = (await db.prepare(AUTHORITY_SCHEMA_QUERY).all<AuthoritySchemaObject>()).results;
   if (rows.length > 1024) fail();
   return rows;
 }
@@ -118,12 +119,29 @@ export async function freezeAuthorityRestoreSource(source: D1Database, contract:
   await assertFrozen(source,contract,expectedDigest);
 }
 async function assertFrozen(source: D1Database, contract: AuthorityRestoreContract, pin: string) {
-  const state = await source.prepare('SELECT contract_digest,namespace,snapshot_digest FROM _authority_snapshot WHERE id=1').first<{contract_digest:string;namespace:string;snapshot_digest:string}>();
-  if (!state || state.contract_digest!==pin || state.namespace!==contract.sourceNamespace || state.snapshot_digest!==contract.sourceSnapshotDigest || await hash(await authoritySchemaInventory(source))!==contract.sourceSchemaDigest) fail();
-  const rows = (await source.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name GLOB '_authority_freeze_*' ORDER BY name LIMIT 400").all<{name:string;sql:string}>()).results;
+  // These reads depend only on the pinned contract, not one another. Keep a
+  // fresh batch at every existing boundary; no proof survives a page operation.
+  const statements = [
+    source.prepare('SELECT contract_digest,namespace,snapshot_digest FROM _authority_snapshot WHERE id=1'),
+    source.prepare(AUTHORITY_SCHEMA_QUERY),
+    source.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name GLOB '_authority_freeze_*' ORDER BY name LIMIT 400"),
+    ...contract.authoritySequences.map(entry => source.prepare('SELECT seq FROM sqlite_sequence WHERE name=?').bind(entry.name)),
+  ];
+  const results = await source.batch<Record<string, unknown>>(statements);
+  if (!Array.isArray(results) || results.length !== statements.length
+      || results.some(result => result?.success !== true || !Array.isArray(result.results))) fail();
+  const states = results[0]!.results;
+  const schema = results[1]!.results;
+  const rows = results[2]!.results;
+  if (states.length !== 1 || schema.length > 1024) fail();
+  const state = states[0]!;
+  if (state.contract_digest!==pin || state.namespace!==contract.sourceNamespace || state.snapshot_digest!==contract.sourceSnapshotDigest || await hash(schema)!==contract.sourceSchemaDigest) fail();
   const expected = [...contract.tables.map(x=>x.name),'_authority_snapshot'].flatMap(name=>['INSERT','UPDATE','DELETE'].map(verb=>frozenTrigger(verb,name))).sort((a,b)=>a.name<b.name?-1:1);
   if (canonicalJson(rows)!==canonicalJson(expected)) fail();
-  for(const entry of contract.authoritySequences){const seq=await source.prepare('SELECT seq FROM sqlite_sequence WHERE name=?').bind(entry.name).first<number>('seq');if((seq??0)!==entry.sequence)fail();}
+  for (const [index,entry] of contract.authoritySequences.entries()) {
+    const sequences = results[index+3]!.results;
+    if (sequences.length > 1 || (sequences[0]?.seq??0)!==entry.sequence) fail();
+  }
 }
 async function descriptors(source: D1Database, contract: AuthorityRestoreContract): Promise<Descriptor[]> {
   const names = new Set(contract.tables.filter(x=>x.disposition==='authority').map(x=>x.name));
