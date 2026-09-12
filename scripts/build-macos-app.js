@@ -379,6 +379,7 @@ export const MACOS_QUOTA_ANALYSIS_RUNTIME_FILES = Object.freeze([
   "src/quota-rolling.js",
   "src/quota-tracks.js",
   "src/quota-windows.js",
+  "src/reset-events.js",
 ]);
 const IDENTITY_CORE_PACKAGE_NAME = "@app-usagemonitor/identity-core";
 const IDENTITY_CORE_PACKAGE_ROOT = join(

@@ -630,13 +630,34 @@ receive one retry with omitted parameters; subsequent reads on that client stay
 parameter-free. Authentication, transport, timeout, and other server failures
 are not retried by this compatibility path. `supportsLunaReserve` is never sent.
 
+When reset-credit details are present, the provider sanitizer converts their
+IDs to account-keyed HMAC fingerprints and attaches the authoritative count
+and bounded fingerprint/detail rows to the sanitized snapshot under a
+process-private symbol. The collector transactionally retains one bounded
+continuity checkpoint with its existing cursor so a short ordinary restart can
+compare two direct reads. It persists closed derived events such as
+`scheduled_reset`, `unknown_reset`, `banked_reset_used`,
+`reset_credit_granted`, or `reset_credit_expired` in its existing owner-only
+SQLite record store. Those events remain available to the all-history dashboard
+projection; provider credit IDs never enter local state, and the bounded
+checkpoint never enters collector records, dashboard JSON, diagnostics,
+exports, or contributions. Failed reads, account changes, malformed/capped
+detail evidence, and credit-observation gaps longer than 36 hours clear the
+comparison baseline without deleting previously classified events. Retained
+quota schedules independently support conservative reconstruction for
+observations recorded before the prospective classifier.
+The upstream [app-server documentation](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#7-rate-limits-chatgpt)
+and [generated v2 schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/json/v2/GetAccountRateLimitsResponse.json)
+define `availableCount` as authoritative, allow capped or absent detail rows,
+and define `grantedAt` and `expiresAt` as Unix timestamps in seconds.
+
 `ordinaryUsageAllowed` is an optional backend permission observation, normalized
 to boolean or `null`. A missing local account scope or disagreeing bracketed
 account/plan reads clears it to `null`. Local collector snapshots retain it with
 `observedAt`; sparse notifications cannot supply it or carry a previous value
 forward. Historical permission is not current authorization, and percentages or
 reset schedules never supply a replacement. This integration adds no permission
-badge, resume action, reset-credit persistence, or contribution field.
+badge, resume action, provider-ID persistence, or contribution field.
 The upstream contract is [Codex PR #42358](https://github.com/openai/codex/pull/42358).
 
 This is a local Codex subprocess contract, **not** a call to the OpenAI API.
@@ -733,12 +754,14 @@ undifferentiated names.
 - Speed accounting: `CODEX_SPEED_MODE_DECLARATION`, `CODEX_SPEED_MODE_OBSERVABILITY`, `DEFAULT_UNRESOLVED_SPEED_SCENARIO`, `FAST_MODE_ASSUMED_MULTIPLIER`, `FAST_MODE_ASSUMED_MULTIPLIER_SOURCE`, `FAST_MODE_MODEL_FAMILY_KEYS`, `FAST_MODE_MULTIPLIER_SOURCE`, `FAST_MODE_QUOTA_MULTIPLIERS`, `OBSERVED_SPEED_MODE_KEYS`, `QUOTA_WEIGHTED_API_PRICE_METRIC`, `SPEED_MODE_PROVENANCE_VALUES`, `deriveFastModePriorityRatiosFromRegistry`, `emptySpeedWeightingCrossing`, `fastModeModelFamilyKey`, `fastModeQuotaMultiplier`, `inferFastModeFromCalibrationWindows`, `quotaWeightedApiPriceEquivalent`, `resolveEffectiveSpeedMode`, `summarizeQuotaWeightedAccounting`.
 - Local pricing: `aggregateLocalApiPriceResults`, `apiPriceResolutionSummary`, `costWarningCodes`, `priceClaudeUsageRecord`, `priceCodexProviderToolUnits`, `priceCodexUsageEvent`.
 
-#### `@app-usagemonitor/quota-analysis` — 33 public symbols
+#### `@app-usagemonitor/quota-analysis` — 50 public symbols
 
 - Tracks: `buildResetEvidence`, `continuityKey`, `resetKey`.
 - Calibration: `QUOTA_CALIBRATION_POLICY`, `analyzeQuotaCalibration`, `fitResetCapacity`.
 - Rolling and pace: `buildRollingQuotaComparisons`, `analyzeQuotaPace`.
 - Composition: `MODEL_COMPOSITION_POLICY`, `blendedCompositionCapacityUsd`, `buildCompositionObservations`, `buildCompositionObservationsFromOrderedUsage`, `calibrateCompositionCapacities`, `compositionExpectedPp`.
+- Plan attribution: `PLAN_ATTRIBUTION_POLICY`, `buildPlanAttributionIndex`, `classifyUsageAttribution`, `planAttributionContextKey`, `planAttributionObservationFromSnapshot`, `planEraForInterval`.
+- Reset classification: `QUOTA_RESET_CLASSIFICATION_POLICY`, `QUOTA_RESET_EVENT_KINDS`, `QUOTA_RESET_EVENT_PRECISIONS`, `QUOTA_RESET_EVENT_REASONS`, `QUOTA_RESET_EVENT_SCHEMA_VERSION`, `RESET_EVENT_CONTINUITY_SCHEMA_VERSION`, `classifyQuotaResetTimeline`, `createResetEventClassifier`, `mergeQuotaResetEvents`, `normalizeQuotaResetEvent`, `normalizeResetEventContinuity`.
 - Windows and provider pools: `CODEX_PRIMARY_LIMIT_ID`, `CODEX_SPARK_LIMIT_ID`, `CODEX_SPARK_LIMIT_IDS`, `CODEX_SPARK_RESERVED_LIMIT_ID`, `FIVE_HOUR_WINDOW_MINUTES`, `formatQuotaWindowDuration`, `MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH`, `MAX_QUOTA_WINDOW_DURATION_MINUTES`, `QUOTA_LIMIT_DISPLAY_ALIASES`, `QUOTA_WINDOW_KINDS`, `classifyQuotaWindowKind`, `isSparkQuotaLimitId`, `isSupportedQuotaWindowDuration`, `isValidQuotaWindowDuration`, `quotaLimitDisplayAlias`, `quotaWindowLabel`, `sanitizeQuotaLimitDisplayName`, `sanitizeQuotaLimitId`, `SEVEN_DAY_WINDOW_MINUTES`.
 
 The ordered composition builder accepts a one-pass usage iterable with

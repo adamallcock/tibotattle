@@ -31,6 +31,7 @@ const EXPECTED_PUBLIC_EXPORTS = [
   "sanitizeCodexAccountSnapshotWithSecretLoader",
   "sanitizePlanType",
   "sanitizeRateLimit",
+  "volatileResetCreditInventory",
 ];
 
 test("Codex account facade exposes only reviewed exports with exact identities", () => {

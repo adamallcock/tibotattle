@@ -4385,6 +4385,69 @@ function completeUsageTimelineTotal(points, key) {
   return total;
 }
 
+const RESET_EVENT_ANNOTATION_PRESENTATION = Object.freeze({
+  scheduled_reset: Object.freeze({
+    className: "chart-reset-scheduled",
+    labelKey: "chart.resetEvent.scheduledReset",
+  }),
+  banked_reset_used: Object.freeze({
+    className: "chart-reset-banked",
+    labelKey: "chart.resetEvent.bankedResetUsed",
+  }),
+  unknown_reset: Object.freeze({
+    className: "chart-reset-unknown",
+    labelKey: "chart.resetEvent.unknownReset",
+  }),
+  reset_credit_granted: Object.freeze({
+    className: "chart-reset-granted",
+    labelKey: "chart.resetEvent.creditGranted",
+  }),
+  reset_credit_expired: Object.freeze({
+    className: "chart-reset-expired",
+    labelKey: "chart.resetEvent.creditExpired",
+  }),
+});
+
+function usageResetEventAnnotations(data, viewport) {
+  const selectedPlan = data?.allowancePlanSelection?.planType
+    ?? data?.weekly?.planType
+    ?? null;
+  return (Array.isArray(data?.timeline?.resetEvents)
+    ? data.timeline.resetEvents
+    : []).flatMap((event) => {
+    const presentation = RESET_EVENT_ANNOTATION_PRESENTATION[event?.kind];
+    const atMs = Date.parse(event?.occurredAt ?? "");
+    const lifecycle = event?.kind === "reset_credit_granted"
+      || event?.kind === "reset_credit_expired";
+    if (presentation === undefined || !Number.isFinite(atMs)
+        || atMs < viewport.startMs || atMs > viewport.endMs
+        || (!lifecycle && (
+          event.limitId !== CODEX_PRIMARY_LIMIT_ID
+          || event.windowDurationMins !== CODEX_WEEKLY_ALLOWANCE_MINUTES
+          || (selectedPlan !== null && selectedPlan !== "unknown"
+            && event.planType !== selectedPlan)
+        ))) return [];
+    const detail = event.precision === "observation_interval"
+      ? {
+        key: "chart.resetEvent.observedBetween",
+        values: {
+          start: formatChartTimestamp(event.intervalStartedAt),
+          end: formatChartTimestamp(event.observedAt),
+        },
+      }
+      : {
+        key: "chart.resetEvent.providerTime",
+        values: { time: formatChartTimestamp(event.occurredAt) },
+      };
+    return [{
+      atMs,
+      className: presentation.className,
+      label: { key: presentation.labelKey },
+      detail,
+    }];
+  });
+}
+
 function renderUsageTimeline(data) {
   syncUsageGroupingControls();
   const points = selectedUsagePoints(data);
@@ -4399,6 +4462,7 @@ function renderUsageTimeline(data) {
   const quotaComparable = timelineCalibrationCapacity(data) !== null;
   const axisLabels = usageChartAxisLabels(activeUsageGrouping, quotaComparable);
   const unavailable = accountingIsUnavailable(data);
+  const resetAnnotations = usageResetEventAnnotations(data, viewport);
   setLocalizedText(
     $("#usage-cost-legend-label"),
     quotaComparable
@@ -4406,6 +4470,11 @@ function renderUsageTimeline(data) {
       : "chart.series.standardApiUsage",
   );
   $("#usage-allowance-legend").hidden = !quotaComparable;
+  $("#usage-reset-event-legend").hidden = resetAnnotations.length === 0;
+  setLocalizedText(
+    $("#usage-reset-event-legend-label"),
+    "chart.resetEvents.legend",
+  );
   setLocalizedText(
     $("#usage-timeline-title"),
     quotaComparable ? "chart.usage.heading" : "chart.usage.standardHeading",
@@ -4469,6 +4538,7 @@ function renderUsageTimeline(data) {
       includeZero: true,
       height: TIMELINE_CHART_HEIGHT,
       xDomain: viewport,
+      annotations: resetAnnotations,
     }));
     bindUsageTimelineInteractions(shell, points, viewport);
   }
@@ -6041,6 +6111,7 @@ function lineChart({
   yDomain = null,
   yTickFormat = null,
   statusIntervals = [],
+  annotations = [],
   secondarySeries = [],
   secondaryYLabel = null,
   // The drawing height, in viewBox units. It pairs with an `aspect-ratio` in
@@ -6110,6 +6181,20 @@ function lineChart({
   const safeDomainEndMs = domainEndMs > domainStartMs
     ? domainEndMs
     : domainStartMs + 1;
+  const chartAnnotations = timed && Array.isArray(annotations)
+    ? annotations.flatMap((item) => {
+      const atMs = finite(item?.atMs);
+      if (atMs === null || atMs < domainStartMs || atMs > safeDomainEndMs
+          || typeof item.className !== "string"
+          || !/^chart-reset-[a-z]+$/u.test(item.className)) return [];
+      return [{
+        atMs,
+        className: item.className,
+        heading: chartText(item.label, "annotation label"),
+        detail: chartText(item.detail, "annotation detail"),
+      }];
+    })
+    : [];
   // `timestamps` was already computed above, once per point, so the x-scale
   // reads that array instead of re-parsing the same ISO string on every call.
   const plotWidth = width - margin.left - margin.right;
@@ -6542,6 +6627,38 @@ function lineChart({
     tick.setAttribute("height", String(STATUS_TICK_HEIGHT));
     tick.setAttribute("class", `chart-status-tick chart-status-${band}`);
     shade(tick);
+  }
+
+  for (const annotation of chartAnnotations) {
+    const xPosition = margin.left + (annotation.atMs - domainStartMs)
+      / (safeDomainEndMs - domainStartMs) * plotWidth;
+    const markerY = margin.top + 8;
+    const group = document.createElementNS(svg.namespaceURI, "g");
+    group.setAttribute("class", `chart-reset-event ${annotation.className}`);
+    const line = svgLine(
+      xPosition,
+      margin.top,
+      xPosition,
+      height - margin.bottom,
+      "chart-reset-event-line",
+    );
+    const marker = document.createElementNS(svg.namespaceURI, "polygon");
+    marker.setAttribute("points", [
+      `${xPosition},${markerY - 5}`,
+      `${xPosition + 5},${markerY}`,
+      `${xPosition},${markerY + 5}`,
+      `${xPosition - 5},${markerY}`,
+    ].join(" "));
+    marker.setAttribute("class", "chart-reset-event-marker");
+    group.append(line, marker);
+    bindChartInteraction({
+      element: group,
+      heading: annotation.heading,
+      detail: annotation.detail,
+      xPosition,
+      yPosition: markerY,
+    });
+    svg.append(group);
   }
 
   for (const item of chartSeries) {

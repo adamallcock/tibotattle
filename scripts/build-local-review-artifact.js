@@ -109,7 +109,7 @@ const PINNED_RUNTIME_PACKAGES = Object.freeze({
     license: "MIT",
   }),
   "fast-uri": Object.freeze({
-    version: "3.1.5",
+    version: "3.1.6",
     license: "BSD-3-Clause",
   }),
   "json-schema-traverse": Object.freeze({
@@ -137,6 +137,7 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
     "src/quota-calibration.js",
     "src/quota-pace-forecast.js",
     "src/quota-rolling.js",
+    "src/reset-events.js",
     "src/quota-tracks.js",
     "src/quota-windows.js",
   ]),

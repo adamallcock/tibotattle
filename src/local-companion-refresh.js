@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
+  createResetEventClassifier,
   isValidQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
 import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
@@ -981,6 +982,10 @@ export function createLocalCollectorRefreshRunner({
   // 2026-08-19 livelock ran for hours behind a bare unavailable estimate).
   let accountingRebuildDeferredStreak = 0;
   let hasReadQuota = false;
+  // Raw provider credit IDs never enter the collector store. The classifier's
+  // bounded keyed-fingerprint checkpoint is committed with the existing
+  // collector state so an ordinary companion restart preserves continuity.
+  const resetEventClassifier = createResetEventClassifier();
   return async function refreshLocalCollector({
     signal = null,
     onProgress = null,
@@ -1087,6 +1092,7 @@ export function createLocalCollectorRefreshRunner({
       maximumRecordBatchSize: 500,
       maximumRecentEventKeys: 5_000,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      resetEventClassifier,
       ...(readAccountAttributionBinding === null ? {} : { readAccountAttributionBinding }),
     };
     // The headline pass uses the collector's ordinary atomic SQLite state

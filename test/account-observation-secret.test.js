@@ -590,10 +590,12 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
     assert.equal(capturedScope.status, "available");
 
     let collectorLoader;
+    let collectorResetEventClassifier;
     await run(["collect-once", "--state-file", join(root, "collector.sqlite")], {
       ...dependencies,
       async runCollectorOnceCommand(options) {
         collectorLoader = options.loadAccountObservationSecret;
+        collectorResetEventClassifier = options.resetEventClassifier;
         return {
           rolloutRecordsWritten: 0,
           refresh: { attempted: false, errorCode: null, recordWritten: false },
@@ -602,6 +604,8 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
       },
     });
     assert.deepEqual(await collectorLoader(), secret);
+    assert.equal(typeof collectorResetEventClassifier.observe, "function");
+    assert.equal(typeof collectorResetEventClassifier.snapshot, "function");
     assert.equal(selections, 3);
     assert.ok(credentialLoads >= 3);
   } finally {

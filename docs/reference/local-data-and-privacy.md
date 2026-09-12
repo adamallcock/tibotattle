@@ -30,7 +30,7 @@ projected is refused or shown as unavailable.
 | Codex rollout metadata | Selected Codex home, normally `~/.codex/sessions` and `~/.codex/archived_sessions` | Bounded record headers and allowlisted metadata from `turn_context`, `token_count`, `thread_settings_applied`, quota/accounting, tool-outcome, lineage, and compaction-boundary records. | Typed usage/quota/tool facts, timestamps, model/speed/reasoning/outcome enums, local HMAC join keys, source cursors, coverage and diagnostic codes. | Local filesystem only. | App **Erase local data** removes TiboTattle's projection, not Codex source files. |
 | Codex configuration | `~/.codex/config.toml` | Only the top-level `service_tier` baseline used when a rollout has not yet recorded an observed speed. | Timestamped declared speed-baseline windows. An observed rollout value always wins. | Local filesystem only. | Local erase removes the derived baseline ledger; it never edits Codex config. |
 | Codex selected-rollout store | `~/.codex/state_5.sqlite` | Read-only `threads.id` and `threads.rollout_path`, after owner/file/path validation, to select the physical head of a logical thread. | Only the validated selected rollout filename mapping needed during ingest. | Local filesystem only. | Local erase removes derived selection state; it never edits Codex SQLite. |
-| Codex account/quota service | Local `codex app-server` subprocess using `account/read`, `account/rateLimits/read`, `account/usage/read`, and bounded update notifications | Current plan/account scope, quota windows, resets, credits-presence flags, ordinary included-usage permission, and provider usage projection. | Sanitized quota/account observations, timestamped boolean-or-unknown included-usage permission, and Keychain-HMAC account scope. Reset-credit counts and details are discarded. No Codex authentication token is copied. | TiboTattle talks to a local subprocess. If Codex itself cannot refresh its account evidence offline, TiboTattle records the source as unavailable/stale rather than inventing continuity. | Local erase removes observations; identity reset separately rotates the Keychain pseudonym. |
+| Codex account/quota service | Local `codex app-server` subprocess using `account/read`, `account/rateLimits/read`, `account/usage/read`, and bounded update notifications | Current plan/account scope, quota windows, reset schedules, reset-credit availability/details, ordinary included-usage permission, and provider usage projection. | Sanitized quota/account observations, timestamped boolean-or-unknown included-usage permission, Keychain-HMAC account scope, closed derived reset/lifecycle event labels, and one bounded reset-continuity checkpoint. Provider reset-credit IDs are replaced with account-keyed fingerprints before storage; the checkpoint retains only the current count, fingerprints, grant/expiry timestamps, and last three quota observations. None enter browser responses, exports, contributions, diagnostics, or logs. No Codex authentication token is copied. | TiboTattle talks to a local subprocess. If Codex itself cannot refresh its account evidence offline, TiboTattle records the source as unavailable/stale and clears reset-credit continuity rather than inventing a banked-reset use. | Local erase removes observations, derived events, and the continuity checkpoint; identity reset rotates the Keychain pseudonym so old credit fingerprints cannot be linked to new ones. |
 The normal installed refresh does **not** read Claude Desktop quota history,
 Claude prompt transcripts, Claude project files, or Gemini artifacts. Claude
 prototype and benchmark readers remain in the source tree for development
@@ -74,6 +74,20 @@ The standalone CLI/developer default uses the platform-specific
 `app-usagemonitor` state directory. The installed app supplies the stable
 `Usage Monitor` state root. Documentation and support instructions must not
 conflate those locations.
+
+The collector stores each closed derived reset event in its existing owner-only
+SQLite record store, and the dashboard's all-history projection retains those
+events beyond the 31-day detailed chart cache. It classifies a scheduled reset
+only when retained observations bracket the provider-reported schedule and the
+schedule advances. A material unscheduled quota drop needs confirming evidence
+and remains `unknown` unless a continuous comparison also proves that an
+unexpired banked reset disappeared. A short ordinary app restart preserves
+that comparison through the bounded keyed-fingerprint checkpoint; a failed
+read, account change, malformed checkpoint, or credit-observation gap longer
+than 36 hours clears it. Grant and expiry labels are lifecycle markers, not
+quota-period boundaries. Historical observations that predate the classifier
+can recover scheduled or unknown boundaries, but cannot recover past
+banked-reset uses after their credit detail evidence has been discarded.
 
 ## Keychain and credential state
 

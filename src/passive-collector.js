@@ -9,7 +9,13 @@ import {
   sanitizeBracketedCodexAccountSnapshotWithSecretLoader,
   sanitizeRateLimit,
   sanitizeAccountScope,
+  volatileResetCreditInventory,
 } from "./providers/codex/account.js";
+import {
+  createResetEventClassifier,
+  normalizeQuotaResetEvent,
+  normalizeResetEventContinuity,
+} from "@app-usagemonitor/quota-analysis";
 import {
   canonicalComponentAvailability,
   canonicalComponents,
@@ -204,6 +210,7 @@ function emptyCheckpoint(nowIso, backfill, backfillSinceAt = null) {
     recentEventKeys: [],
     lastQuotaObservedAt: null,
     accountScopeMarker: null,
+    resetEventContinuity: null,
     diagnostics: {
       filesDiscovered: 0,
       filesInitializedAtEnd: 0,
@@ -1516,7 +1523,65 @@ async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObs
     observationBinding: matchingCapturedBinding(bindingBefore, bindingAfter) };
 }
 
-async function appendAppRecord({ payload, source, checkpoint, clock, commitRecord }) {
+function derivedResetEventsForAppRecord(payload, record, classifier) {
+  if (record.source !== "app_server_read" || classifier === null) return [];
+  try {
+    const values = classifier.observe({
+      observedAt: record.observedAt,
+      accountScopeId: record.accountScope?.status === "available"
+        ? record.accountScope.scopeId
+        : null,
+      windows: record.windows,
+      resetCredits: volatileResetCreditInventory(payload),
+    });
+    if (!Array.isArray(values)) {
+      classifier.reset();
+      return [];
+    }
+    return values.map(normalizeQuotaResetEvent).filter(Boolean);
+  } catch {
+    classifier.reset();
+    return [];
+  }
+}
+
+function classifierContinuity(classifier) {
+  if (classifier === null) return null;
+  try {
+    const value = normalizeResetEventContinuity(classifier.snapshot());
+    return value?.timeline.length > 0 ? value : null;
+  } catch {
+    classifier.reset();
+    return null;
+  }
+}
+
+function restoreClassifierContinuity(checkpoint, classifier) {
+  if (classifier === null) return;
+  const value = normalizeResetEventContinuity(
+    checkpoint.resetEventContinuity,
+  );
+  try {
+    if (value === null || classifier.restore(value) !== true) {
+      classifier.reset();
+      checkpoint.resetEventContinuity = null;
+      return;
+    }
+    checkpoint.resetEventContinuity = value;
+  } catch {
+    classifier.reset();
+    checkpoint.resetEventContinuity = null;
+  }
+}
+
+async function appendAppRecord({
+  payload,
+  source,
+  checkpoint,
+  clock,
+  commitRecord,
+  resetEventClassifier = null,
+}) {
   if (typeof commitRecord !== "function") {
     throw new TypeError("commitRecord must be a function");
   }
@@ -1556,6 +1621,17 @@ async function appendAppRecord({ payload, source, checkpoint, clock, commitRecor
     checkpoint.diagnostics.duplicateEventsSkipped += 1;
     return null;
   }
+  const resetEvents = derivedResetEventsForAppRecord(
+    payload,
+    record,
+    resetEventClassifier,
+  );
+  if (resetEvents.length > 0) record.resetEvents = resetEvents;
+  if (resetEventClassifier !== null) {
+    checkpoint.resetEventContinuity = classifierContinuity(
+      resetEventClassifier,
+    );
+  }
   addRecentKey(checkpoint, record.eventKey, recentSet);
   trimRecentKeys(checkpoint, recentSet, MAX_RECENT_EVENT_KEYS);
   checkpoint.lastQuotaObservedAt = record.observedAt;
@@ -1579,6 +1655,7 @@ function safeErrorCode(error) {
 
 function recordAppServerError(checkpoint, error) {
   checkpoint.accountScopeMarker = null;
+  checkpoint.resetEventContinuity = null;
   checkpoint.diagnostics.appServerErrorCounts ??= {};
   const code = safeErrorCode(error);
   checkpoint.diagnostics.appServerErrorCounts[code] = (checkpoint.diagnostics.appServerErrorCounts[code] ?? 0) + 1;
@@ -1645,6 +1722,7 @@ export async function runCollectorOnce({
   appServerFactory = () => new CodexAppServerClient(),
   loadAccountObservationSecret = null,
   readAccountAttributionBinding = null,
+  resetEventClassifier = null,
   commitState = commitLocalCollectorState,
   saveState = saveLocalCollectorCheckpoint,
 } = {}) {
@@ -1658,6 +1736,16 @@ export async function runCollectorOnce({
   }
   if (typeof skipRolloutIngestion !== "boolean") {
     throw new TypeError("skipRolloutIngestion must be boolean");
+  }
+  if (resetEventClassifier !== null
+      && (typeof resetEventClassifier !== "object"
+        || typeof resetEventClassifier.observe !== "function"
+        || typeof resetEventClassifier.reset !== "function"
+        || typeof resetEventClassifier.snapshot !== "function"
+        || typeof resetEventClassifier.restore !== "function")) {
+    throw new TypeError(
+      "resetEventClassifier must expose observe, reset, snapshot, and restore",
+    );
   }
   if (typeof stateFile !== "string" || stateFile.length < 1) {
     throw new TypeError("stateFile must be a non-empty string");
@@ -1694,6 +1782,7 @@ export async function runCollectorOnce({
       : null;
     const checkpoint = existing
       ?? emptyCheckpoint(nowIso, backfill, requestedBackfillStart);
+    restoreClassifierContinuity(checkpoint, resetEventClassifier);
     const indexing = ensureCheckpointIndexing(checkpoint, {
       created: existing === null,
       backfill,
@@ -1745,6 +1834,7 @@ export async function runCollectorOnce({
             checkpoint,
             clock,
             commitRecord: commitRecords,
+            resetEventClassifier,
           });
           refresh.recordWritten = record !== null;
           if (record !== null) {
@@ -1754,6 +1844,7 @@ export async function runCollectorOnce({
             }
           }
         } catch (error) {
+          resetEventClassifier?.reset();
           await rewindCheckpointAfterAppRecordFailure({
             stateFile,
             checkpoint,
@@ -1961,6 +2052,7 @@ export async function runCollectorOnce({
           checkpoint,
           clock,
           commitRecord: commitRecords,
+          resetEventClassifier,
         });
         refresh.recordWritten = record !== null;
         if (record !== null) {
@@ -1970,6 +2062,7 @@ export async function runCollectorOnce({
           }
         }
       } catch (error) {
+        resetEventClassifier?.reset();
         await rewindCheckpointAfterAppRecordFailure({
           stateFile,
           checkpoint,
@@ -2062,6 +2155,7 @@ export async function runCollectorForeground({
   watchRoot = watch,
   loadAccountObservationSecret = null,
   readAccountAttributionBinding = null,
+  resetEventClassifier = createResetEventClassifier(),
   ingestUpdates = ingestRolloutUpdates,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
@@ -2072,6 +2166,16 @@ export async function runCollectorForeground({
   saveState = saveLocalCollectorCheckpoint,
 } = {}) {
   if (typeof watchRoot !== "function") throw new TypeError("watchRoot must be a function");
+  if (resetEventClassifier !== null
+      && (typeof resetEventClassifier !== "object"
+        || typeof resetEventClassifier.observe !== "function"
+        || typeof resetEventClassifier.reset !== "function"
+        || typeof resetEventClassifier.snapshot !== "function"
+        || typeof resetEventClassifier.restore !== "function")) {
+    throw new TypeError(
+      "resetEventClassifier must expose observe, reset, snapshot, and restore",
+    );
+  }
   if (typeof stateFile !== "string" || stateFile.length < 1) {
     throw new TypeError("stateFile must be a non-empty string");
   }
@@ -2079,6 +2183,7 @@ export async function runCollectorForeground({
   const release = await acquireLocalCollectorStateLock(stateFile, { clock });
   const existing = await readLocalCollectorCheckpoint({ stateFile });
   const checkpoint = existing ?? emptyCheckpoint(new Date(clock()).toISOString(), false);
+  restoreClassifierContinuity(checkpoint, resetEventClassifier);
   let client = null;
   let reconnectAttempts = 0;
   let totalReconnectAttempts = 0;
@@ -2131,6 +2236,7 @@ export async function runCollectorForeground({
     checkpoint.accountScopeMarker = null;
     checkpoint.diagnostics.ingestionErrorCounts ??= {};
     checkpoint.diagnostics.watcherErrorCounts ??= {};
+    restoreClassifierContinuity(checkpoint, resetEventClassifier);
   }
 
   async function appendForegroundAppRecord(payload, source) {
@@ -2140,6 +2246,7 @@ export async function runCollectorForeground({
         source,
         checkpoint,
         clock,
+        resetEventClassifier,
         commitRecord: async (records) => {
           await commitState({ stateFile, records, checkpoint, clock });
           checkpointWrites += 1;
@@ -2368,6 +2475,8 @@ export async function runCollectorForeground({
       if (connectedClient !== client) return;
       accountObservationEpoch += 1;
       checkpoint.accountScopeMarker = null;
+      checkpoint.resetEventContinuity = null;
+      resetEventClassifier?.reset();
       accountInvalidationDirty = true;
       if (accountInvalidationQueued) return;
       accountInvalidationQueued = true;
@@ -2420,6 +2529,7 @@ export async function runCollectorForeground({
     try {
       await connect();
     } catch (error) {
+      resetEventClassifier?.reset();
       recordAppServerError(checkpoint, error);
       client = null;
       reconnectAttempts = 1;
@@ -2454,6 +2564,7 @@ export async function runCollectorForeground({
         try {
           await connect({ afterReconnect: true });
         } catch (error) {
+          resetEventClassifier?.reset();
           recordAppServerError(checkpoint, error);
           reconnectAttempts += 1;
           totalReconnectAttempts += 1;

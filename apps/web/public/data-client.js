@@ -4196,8 +4196,90 @@ function normalizeLocalTimeline(value = {}) {
     allowanceCapacity,
     planScoped,
     quota,
+    resetEvents: normalizeLocalResetEvents(value.resetEvents),
     history: normalizeTimelineHistory(value.history)
   };
+}
+
+const LOCAL_RESET_EVENT_CONTRACT = Object.freeze({
+  scheduled_reset: Object.freeze({
+    precision: "provider_schedule",
+    reasons: Object.freeze(["scheduled_boundary"]),
+    lifecycle: false
+  }),
+  banked_reset_used: Object.freeze({
+    precision: "observation_interval",
+    reasons: Object.freeze(["credit_count_decreased_before_expiry"]),
+    lifecycle: false
+  }),
+  unknown_reset: Object.freeze({
+    precision: null,
+    reasons: Object.freeze([
+      "confirmed_unscheduled_quota_drop",
+      "overlapping_scheduled_and_credit_evidence"
+    ]),
+    lifecycle: false
+  }),
+  reset_credit_granted: Object.freeze({
+    precision: "provider_timestamp",
+    reasons: Object.freeze(["reset_credit_id_added"]),
+    lifecycle: true
+  }),
+  reset_credit_expired: Object.freeze({
+    precision: "provider_timestamp",
+    reasons: Object.freeze(["reset_credit_expiry_elapsed"]),
+    lifecycle: true
+  })
+});
+
+function normalizeLocalResetEvents(value, maximumRows = 100_000) {
+  return array(value).slice(-maximumRows).flatMap((row) => {
+    const contract = LOCAL_RESET_EVENT_CONTRACT[row?.kind];
+    const occurredAt = canonicalInstant(row?.occurredAt);
+    const observedAt = canonicalInstant(row?.observedAt);
+    const intervalStartedAt = canonicalInstant(row?.intervalStartedAt);
+    if (row?.schemaVersion !== "quota-reset-event-v0.1"
+        || contract === undefined
+        || occurredAt === null || observedAt === null
+        || intervalStartedAt === null
+        || Date.parse(intervalStartedAt) >= Date.parse(observedAt)
+        || Date.parse(occurredAt) < Date.parse(intervalStartedAt)
+        || Date.parse(occurredAt) > Date.parse(observedAt)
+        || row.provider !== "openai_codex"
+        || !contract.reasons.includes(row.reason)
+        || !["provider_schedule", "observation_interval", "provider_timestamp"]
+          .includes(row.precision)
+        || (contract.precision !== null && row.precision !== contract.precision)) {
+      return [];
+    }
+    const planType = row.planType === null ? null : normalizePlanType(row.planType);
+    const limitId = row.limitId === null ? null : normalizeQuotaLimitId(row.limitId);
+    const windowDurationMins = row.windowDurationMins;
+    if (contract.lifecycle
+      ? planType !== null || limitId !== null || windowDurationMins !== null
+      : planType === null || row.planType !== planType
+        || limitId === null || row.limitId !== limitId
+        || !isValidQuotaWindowDuration(windowDurationMins)) return [];
+    if (row.kind === "unknown_reset"
+        && row.reason === "overlapping_scheduled_and_credit_evidence"
+        && row.precision !== "provider_schedule") return [];
+    if (row.kind === "unknown_reset"
+        && row.reason === "confirmed_unscheduled_quota_drop"
+        && row.precision !== "observation_interval") return [];
+    return [{
+      schemaVersion: "quota-reset-event-v0.1",
+      kind: row.kind,
+      occurredAt,
+      observedAt,
+      intervalStartedAt,
+      precision: row.precision,
+      reason: row.reason,
+      provider: "openai_codex",
+      planType,
+      limitId,
+      windowDurationMins
+    }];
+  });
 }
 
 function normalizeLocalQuotaTimeline(value, maximumRows = 10_000) {
@@ -7019,6 +7101,47 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       bucketMinutes: 60,
       coveredAt: { startAt: iso(nowMs - 7 * DAY), endAt: nowIso },
       usage: timelineUsage,
+      resetEvents: [
+        {
+          schemaVersion: "quota-reset-event-v0.1",
+          kind: "scheduled_reset",
+          occurredAt: iso(lastResetMs),
+          observedAt: iso(lastResetMs + HOUR),
+          intervalStartedAt: iso(lastResetMs - HOUR),
+          precision: "provider_schedule",
+          reason: "scheduled_boundary",
+          provider: "openai_codex",
+          planType: "pro",
+          limitId: "codex",
+          windowDurationMins: CODEX_WEEKLY_ALLOWANCE_MINUTES
+        },
+        {
+          schemaVersion: "quota-reset-event-v0.1",
+          kind: "banked_reset_used",
+          occurredAt: iso(nowMs - DAY),
+          observedAt: iso(nowMs - DAY),
+          intervalStartedAt: iso(nowMs - DAY - HOUR),
+          precision: "observation_interval",
+          reason: "credit_count_decreased_before_expiry",
+          provider: "openai_codex",
+          planType: "pro",
+          limitId: "codex",
+          windowDurationMins: CODEX_WEEKLY_ALLOWANCE_MINUTES
+        },
+        {
+          schemaVersion: "quota-reset-event-v0.1",
+          kind: "reset_credit_granted",
+          occurredAt: iso(nowMs - 5 * DAY),
+          observedAt: iso(nowMs - 5 * DAY + HOUR),
+          intervalStartedAt: iso(nowMs - 5 * DAY - HOUR),
+          precision: "provider_timestamp",
+          reason: "reset_credit_id_added",
+          provider: "openai_codex",
+          planType: null,
+          limitId: null,
+          windowDurationMins: null
+        }
+      ],
       allowanceCapacity: {
         status: "available",
         reason: null,

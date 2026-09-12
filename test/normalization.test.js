@@ -8,6 +8,7 @@ import {
   sanitizeBracketedCodexAccountSnapshotWithSecretLoader,
   sanitizeCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,
+  volatileResetCreditInventory,
 } from "../src/providers/codex/account.js";
 import { summarizeCcusage } from "../src/ccusage.js";
 import {
@@ -49,7 +50,7 @@ test("fork snapshot lineage shares ancestors instead of copying their keys", () 
   assert.equal(chain.reduce((sum, node) => sum + node.localSize(), 0), 1_000);
 });
 
-test("Codex snapshot sanitizer drops balances and all reset-credit data", () => {
+test("Codex snapshot sanitizer keeps reset-credit inventory volatile and non-serializable", () => {
   const result = sanitizeCodexAccountSnapshot({
     account: { account: { email: "private.owner@example.test", planType: "pro" } },
     rateLimits: {
@@ -62,7 +63,12 @@ test("Codex snapshot sanitizer drops balances and all reset-credit data", () => 
       },
       rateLimitResetCredits: {
         availableCount: 1,
-        credits: [{ id: "private-credit-id" }],
+        credits: [{
+          id: "private-credit-id",
+          status: "available",
+          grantedAt: Date.parse("2026-08-09T00:00:00.000Z") / 1_000,
+          expiresAt: Date.parse("2026-09-08T00:00:00.000Z") / 1_000,
+        }],
       },
     },
     accountUsage: {
@@ -76,10 +82,86 @@ test("Codex snapshot sanitizer drops balances and all reset-credit data", () => 
   assert.equal(result.canonical.credits.hasCredits, true);
   assert.equal(result.accountScope.status, "available");
   assert.equal(result.officialUsageSummary.lifetimeTokens, 100);
+  const resetCredits = volatileResetCreditInventory(result);
+  assert.equal(resetCredits.availableCount, 1);
+  assert.equal(resetCredits.detailsStatus, "complete");
+  assert.equal(resetCredits.credits.length, 1);
+  assert.match(resetCredits.credits[0].id, /^reset-credit:v1:[A-Za-z0-9_-]{43}$/u);
+  assert.notEqual(resetCredits.credits[0].id, "private-credit-id");
+  assert.equal(resetCredits.credits[0].grantedAt, "2026-08-09T00:00:00.000Z");
+  assert.equal(resetCredits.credits[0].expiresAt, "2026-09-08T00:00:00.000Z");
   assert.equal(serialized.includes("private"), false);
   assert.equal(serialized.includes("example.test"), false);
   assert.equal(serialized.includes("credit-id"), false);
   assert.equal(serialized.includes("availableCount"), false);
+});
+
+test("reset-credit detail completeness is explicit and count-only reads stay bounded", () => {
+  const snapshot = (rateLimitResetCredits, accountHmacKey = "test-account-hmac-key") => sanitizeCodexAccountSnapshot({
+    account: { account: { email: "private.owner@example.test", planType: "pro" } },
+    rateLimits: {
+      rateLimits: {
+        limitId: "codex",
+        primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+        secondary: null,
+        planType: "pro",
+      },
+      rateLimitResetCredits,
+    },
+    accountUsage: null,
+  }, "2026-07-23T00:00:00.000Z", { accountHmacKey });
+
+  const partial = volatileResetCreditInventory(snapshot({
+    availableCount: 2,
+    credits: [{
+      id: "RateLimitResetCredit_one",
+      status: "available",
+      grantedAt: Date.parse("2026-08-09T00:00:00.000Z") / 1_000,
+      expiresAt: Date.parse("2026-09-08T00:00:00.000Z") / 1_000,
+    }],
+  }));
+  assert.equal(partial.availableCount, 2);
+  assert.equal(partial.detailsStatus, "partial");
+  assert.equal(partial.credits.length, 1);
+  assert.match(partial.credits[0].id, /^reset-credit:v1:[A-Za-z0-9_-]{43}$/u);
+  assert.notEqual(partial.credits[0].id, "RateLimitResetCredit_one");
+  assert.equal(partial.credits[0].grantedAt, "2026-08-09T00:00:00.000Z");
+  assert.equal(partial.credits[0].expiresAt, "2026-09-08T00:00:00.000Z");
+  const otherAccount = volatileResetCreditInventory(snapshot({
+    availableCount: 1,
+    credits: [{
+      id: "RateLimitResetCredit_one",
+      status: "available",
+      grantedAt: null,
+      expiresAt: null,
+    }],
+  }, "another-account-hmac-key"));
+  assert.notEqual(otherAccount.credits[0].id, partial.credits[0].id);
+  assert.deepEqual(volatileResetCreditInventory(snapshot({
+    availableCount: 1,
+    credits: [{
+      id: "RateLimitResetCredit_one",
+      status: "available",
+      grantedAt: null,
+      expiresAt: null,
+    }],
+  }, null)), {
+    availableCount: 1,
+    detailsStatus: "unavailable",
+    credits: [],
+  }, "detail IDs are discarded when no fingerprint key is available");
+  assert.deepEqual(volatileResetCreditInventory(snapshot({
+    availableCount: 2,
+    credits: null,
+  })), {
+    availableCount: 2,
+    detailsStatus: "unavailable",
+    credits: [],
+  });
+  assert.equal(volatileResetCreditInventory(snapshot({
+    availableCount: -1,
+    credits: [],
+  })), null);
 });
 
 test("Codex app-server child environment never inherits the account HMAC key", () => {

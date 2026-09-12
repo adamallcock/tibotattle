@@ -4485,12 +4485,14 @@ test("Claude usage shadow failure is contained and abort releases a non-cooperat
 
 test("quick polling omits reset details only after a successful startup read; detailed refreshes retain them", async () => {
   const optionsSeen = [];
+  const classifiersSeen = [];
   let succeeds = false;
   const makeRunner = () => createLocalCollectorRefreshRunner({
     accountingSourceMode: "unified",
     selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
     runCollector: async (options) => {
       optionsSeen.push(options.excludeResetCreditDetails);
+      classifiersSeen.push(options.resetEventClassifier);
       return { refresh: { attempted: true, recordWritten: succeeds, errorCode: succeeds ? null : "app_server_unavailable" } };
     },
     readAccountingCache: async () => null,
@@ -4503,4 +4505,10 @@ test("quick polling omits reset details only after a successful startup read; de
   await runner({ mode: "detailed" });
   await makeRunner()({ mode: "quick" });
   assert.deepEqual(optionsSeen, [false, false, true, false, false]);
+  assert.equal(classifiersSeen.slice(0, 4).every(
+    (classifier) => classifier === classifiersSeen[0],
+  ), true, "one volatile baseline is reused across a companion runner's polls");
+  assert.notEqual(classifiersSeen[4], classifiersSeen[0]);
+  assert.equal(typeof classifiersSeen[0].observe, "function");
+  assert.equal(typeof classifiersSeen[0].reset, "function");
 });
