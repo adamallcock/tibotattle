@@ -8,6 +8,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prepareElectronStablePublication, verifyElectronStableReadback, readElectronStablePublicObject } from './prepare-electron-stable-publication.mjs';
 import { hashPublicationFile } from './reconcile-release-publication.mjs';
+import { checkReleaseNotes } from './check-release-notes.mjs';
 import { identityDigest, openOperation } from './lib/release-operation.mjs';
 import { DEPLOYMENT_ENDPOINTS } from '../config/deployment-endpoints.js';
 import distribution from '../config/electron-production-distribution.cjs';
@@ -73,11 +74,15 @@ export function createElectronStableR2Transport({ temporaryDirectory, spawn = sp
 /** The exact prepared journal must already exist. There is no automatic retry,
  * lock acquisition/stealing, or release after uncertain remote work. */
 export async function publishElectronStableFeed({ artifactRoot, proposal, operationDirectory, approvedPlanSha256,
-  coordinationOwner, phase = 'publish', coordination, transport, readPublicObject = readElectronStablePublicObject } = {}) {
+  coordinationOwner, phase = 'publish', coordination, transport, readPublicObject = readElectronStablePublicObject, repositoryRoot = ROOT } = {}) {
   if (!['publish', 'rollback'].includes(phase) || !SHA.test(approvedPlanSha256 ?? '')
       || !/^[a-f0-9]{40}$/u.test(coordinationOwner ?? '') || typeof coordination?.assertOwned !== 'function') fail('APPROVAL_INVALID');
   const plan = await prepareElectronStablePublication({ artifactRoot, proposal });
   if (identityDigest(plan) !== approvedPlanSha256) fail('APPROVED_PLAN_CHANGED');
+  if (phase === 'publish') {
+    const documentation = await checkReleaseNotes({ rootDirectory: repositoryRoot });
+    if (!documentation.ok || !documentation.stableTagVersions.includes(plan.version)) fail('RELEASE_DOCUMENTATION_INVALID');
+  }
   const root = await realpath(resolve(artifactRoot));
   const operation = await openOperation({ directory: operationDirectory, kind: 'publication', resume: true,
     binding: { schema: plan.schemaVersion, proposal: plan.proposalSha256 } });
