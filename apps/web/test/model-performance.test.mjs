@@ -66,7 +66,7 @@ test('client requests only an enum period, is abortable, and reports endpoint fa
 });
 test('every supported locale preserves coverage and measurement meaning', () => {
   for (const locale of SUPPORTED_LOCALES) {
-    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'unavailable', 'stale']) {
+    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'unavailable', 'stale']) {
       const value = translate(`performance.${key}`, {}, locale);
       assert.notEqual(value, `performance.${key}`);
     }
@@ -210,6 +210,13 @@ test('plot-area sweep works away from points, clears on exit, and keyboard order
   assert.ok(svgs[1].all().some(node => node.className === 'performance-percentile-line performance-percentile-line-p10'));
   assert.ok(svgs[1].all().some(node => node.className === 'performance-median-line'));
   assert.equal(svgs[1].all().filter(node => node.className?.startsWith('performance-endpoint-label')).length, 5);
+  assert.ok(dom.root.all().some(node => node.textContent === 'GPT-5.6 Sol'));
+  assert.ok(dom.root.all().some(node => node.className === 'allowance-model-icon performance-model-icon allowance-model-sol'));
+  assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-unit').map(node => node.textContent), [
+    'tokens/s · Higher is faster · 10 of 20 turns measured',
+    'seconds · Lower is faster · 15 of 20 turns measured · 45 timed responses',
+  ]);
+  assert.equal(dom.root.all().some(node => node.className === 'performance-coverage'), false);
   const readouts = () => dom.root.all().filter(node => node.className === 'sr-only performance-readout');
   // Jan3 = first measured day. Pointer near the top, far from its actual point.
   svgs[0].listeners.pointermove({ clientX: 52, clientY: 30 });
@@ -218,10 +225,13 @@ test('plot-area sweep works away from points, clears on exit, and keyboard order
   const tooltipPercentiles = dom.root.all().filter(node => node.className === 'performance-tooltip-percentiles');
   assert.equal(tooltipPercentiles.length, 2);
   assert.deepEqual(tooltipPercentiles[0].children.filter(node => node.tagName === 'span').map(node => node.textContent), ['P90', 'P75', 'P25', 'P10']);
+  assert.ok(dom.root.all().filter(node => node.className?.startsWith('performance-tooltip ')).every(node => node.className.includes('performance-tooltip-after')));
   svgs[0].listeners.pointermove({ clientX: 52, clientY: 200 });
   assert.ok(readouts().every(node => node.textContent.includes('Median 50')), 'vertical position never changes selected date');
   svgs[0].listeners.pointermove({ clientX: 52 + 656 * 4/7, clientY: 100 });
   assert.ok(readouts().every(node => node.textContent.includes('No measurements')), 'missing day never borrows a nearby observation');
+  svgs[0].listeners.pointermove({ clientX: 700, clientY: 100 });
+  assert.ok(dom.root.all().filter(node => node.className?.startsWith('performance-tooltip ')).every(node => node.className.includes('performance-tooltip-before')));
   svgs[0].listeners.pointerleave();
   assert.ok(readouts().every(node => node.textContent === ''));
   const targets = svgs[0].all().filter(node => node.className === 'performance-point');
@@ -231,6 +241,21 @@ test('plot-area sweep works away from points, clears on exit, and keyboard order
   assert.ok(readouts().every(node => node.textContent.includes('Jan 4')));
   targets[1].listeners.keydown({ key: 'Escape' });
   assert.ok(readouts().every(node => node.textContent === ''));
+  controller.destroy();
+});
+
+test('output-speed labels round to whole tokens per second while latency retains tenths', async () => {
+  const dom = focusHarness(), data = payload();
+  Object.assign(data.models[0].speed[0].points[0], { p10: 30.4, p25: 40.4, median: 50.4, p75: 60.4, p90: 70.4 });
+  Object.assign(data.models[0].ttft[0], { p10: 3.04, p25: 4.04, median: 5.04, p75: 6.04, p90: 7.04 });
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  const plots = dom.root.all().filter(node => node.tagName === 'svg' && node.listeners.pointermove);
+  plots[0].listeners.pointermove({ clientX: 52, clientY: 30 });
+  const readouts = dom.root.all().filter(node => node.className === 'sr-only performance-readout');
+  assert.match(readouts[0].textContent, /Median 50 · P10 30 · P25 40 · P75 60 · P90 70/u);
+  assert.match(readouts[1].textContent, /Median 5 · P10 3 · P25 4 · P75 6 · P90 7/u);
   controller.destroy();
 });
 

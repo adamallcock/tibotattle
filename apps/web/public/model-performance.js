@@ -1,3 +1,6 @@
+import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { formatModelName } from "./ui-format.js";
+
 // Presentation-only: the companion owns reconstruction, eligibility and bins.
 const DAY = 86_400_000;
 const PERIODS = ["7", "30", "all"];
@@ -8,7 +11,6 @@ const MODEL_NAMES = Object.freeze({
   "gpt-5.4-mini": "GPT-5.4 mini", "gpt-5.3-codex-spark": "Spark",
   "gpt-5.3-codex": "GPT-5.3 Codex", "gpt-5.2-codex": "GPT-5.2 Codex", "gpt-5.2": "GPT-5.2",
 });
-const COLORS = { "gpt-5.6-luna": "#326a92", "gpt-5.6-terra": "#a47823", "gpt-6-astra": "#aa533b", "gpt-5.6-sol": "#737d35" };
 const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000;
 const timestamp = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 8_640_000_000_000_000;
 const exact = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value)
@@ -147,17 +149,19 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
   let selectedInterval = null;
   const showInterval = (at) => { if (at === selectedInterval) return; selectedInterval = at; for (const update of chartCursors) update(at); };
   const translate = (key, values) => t(`performance.${key}`, values);
-  let formatterLocale, numberFormat, dateFormat, fullDateFormat;
+  let formatterLocale, numberFormat, integerFormat, dateFormat, fullDateFormat;
   function formatters() {
     const selectedLocale = locale();
     if (formatterLocale !== selectedLocale) {
       formatterLocale = selectedLocale;
       numberFormat = new Intl.NumberFormat(selectedLocale, { maximumFractionDigits: 1 });
+      integerFormat = new Intl.NumberFormat(selectedLocale, { maximumFractionDigits: 0 });
       dateFormat = new Intl.DateTimeFormat(selectedLocale, { month: "short", day: "numeric", timeZone: "UTC" });
       fullDateFormat = new Intl.DateTimeFormat(selectedLocale, { dateStyle: "medium", timeZone: "UTC" });
     }
   }
   const number = (value) => { formatters(); return numberFormat.format(value); };
+  const metricNumber = (value, metric) => { formatters(); return (metric === "speed" ? integerFormat : numberFormat).format(value); };
   const date = (value) => { formatters(); return dateFormat.format(value); };
   const visible = () => !root.classList.contains("dashboard-page-inactive") && !documentRef.hidden;
   const remember = () => { try { windowRef.localStorage.setItem(storageKey, JSON.stringify({ period, model: modelId })); } catch { /* Nonessential preference. */ } };
@@ -181,7 +185,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     formatters();
     const { start, end } = domain;
     const scale = performanceYScale(points.map(point => point.p90 ?? point.median));
-    const axisNumber = new Intl.NumberFormat(locale(), { maximumFractionDigits: Math.min(20, scale.digits) });
+    const axisNumber = new Intl.NumberFormat(locale(), { maximumFractionDigits: metric === "speed" ? 0 : Math.min(20, scale.digits) });
     const plotLeft = 52, plotRight = 708, plotWidth = plotRight - plotLeft;
     const x = value => plotLeft + Math.max(0, Math.min(1, (value - start) / Math.max(1, end - start))) * plotWidth;
     const y = value => 214 - value / scale.maximum * 190;
@@ -209,9 +213,9 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     const tooltip = element("div", "performance-tooltip"); tooltip.hidden = true;
     tooltip.setAttribute("aria-hidden", "true");
     const percentileValues = point => point.p10 === null ? translate("percentilesUnavailable") : translate("percentileValues", {
-      p10: number(point.p10), p25: number(point.p25), p75: number(point.p75), p90: number(point.p90),
+      p10: metricNumber(point.p10, metric), p25: metricNumber(point.p25, metric), p75: metricNumber(point.p75, metric), p90: metricNumber(point.p90, metric),
     });
-    const formatPoint = (point, method) => translate("point", { date: fullDateFormat.format(point.at), method: method === "ttft" ? translate("latency") : translate("speed"), median: number(point.median), percentiles: percentileValues(point), count: number(point.n) });
+    const formatPoint = (point, method) => translate("point", { date: fullDateFormat.format(point.at), method: method === "ttft" ? translate("latency") : translate("speed"), median: metricNumber(point.median, metric), percentiles: percentileValues(point), count: number(point.n) });
     const cursor = svgElement("line", { x1: 0, x2: 0, y1: 24, y2: 214, class: "performance-cursor", visibility: "hidden" });
     const markers = [];
     for (const item of series) {
@@ -284,7 +288,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       for (const label of labels) {
         svg.append(svgElement("line", { x1: x(latest.at) + 3, y1: label.actualY, x2: 717, y2: label.labelY, stroke: color, class: "performance-endpoint-leader", "aria-hidden": "true" }),
           svgElement("circle", { cx: x(latest.at), cy: label.actualY, r: label.key === "median" ? 3.2 : 2.4, fill: color, class: "performance-endpoint-dot", "aria-hidden": "true" }),
-          svgElement("text", { x: 721, y: label.labelY + 4, fill: color, class: `performance-endpoint-label${label.key === "median" ? " performance-endpoint-label-median" : ""}`, "aria-hidden": "true" }, `${label.label} ${number(latest[label.key])} ${unit}`));
+          svgElement("text", { x: 721, y: label.labelY + 4, fill: color, class: `performance-endpoint-label${label.key === "median" ? " performance-endpoint-label-median" : ""}`, "aria-hidden": "true" }, `${label.label} ${metricNumber(latest[label.key], metric)} ${unit}`));
       }
     }
     const highlights = series.map(() => svgElement("circle", { r: 8, fill: "none", stroke: color, "stroke-width": 2.5, visibility: "hidden", class: "performance-highlight" }));
@@ -309,16 +313,25 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
         const row = element("div", "performance-tooltip-row");
         const unit = translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit");
         row.append(element("span", "performance-tooltip-method", method === "ttft" ? translate("latency") : `${method === "legacy" ? "△" : "○"} ${translate("medianP50")}`),
-          element("strong", "performance-tooltip-value", `${number(point.median)} ${unit}`));
+          element("strong", "performance-tooltip-value", `${metricNumber(point.median, metric)} ${unit}`));
         const distribution = element("div", "performance-tooltip-percentiles");
         if (point.p10 === null) distribution.append(element("span", "performance-tooltip-detail", translate("percentilesUnavailable")));
         else for (const [label, value] of [["P90", point.p90], ["P75", point.p75], ["P25", point.p25], ["P10", point.p10]]) {
-          distribution.append(element("span", "", label), element("strong", "", `${number(value)} ${unit}`));
+          distribution.append(element("span", "", label), element("strong", "", `${metricNumber(value, metric)} ${unit}`));
         }
         row.append(distribution, element("span", "performance-tooltip-detail", `${translate("turns")}: ${number(point.n)}`));
         tooltip.append(row);
       }
-      tooltip.style.setProperty("left", `clamp(0px, ${x(at) / 8 + 2}%, max(0px, 100% - 280px))`);
+      const anchorY = matches.length ? y(matches[0].point.median) : 24;
+      const bounds = svg.getBoundingClientRect();
+      const anchorXCss = x(at) / 800 * bounds.width;
+      const anchorYCss = anchorY / 256 * bounds.height;
+      const tooltipHeight = tooltip.offsetHeight || 180;
+      const vertical = bounds.top + anchorYCss >= tooltipHeight + 12 ? "above" : "below";
+      const horizontal = anchorXCss >= bounds.width / 2 ? "before" : "after";
+      tooltip.className = `performance-tooltip performance-tooltip-${horizontal} performance-tooltip-${vertical}`;
+      tooltip.style.setProperty("--performance-tooltip-x", `${anchorXCss}px`);
+      tooltip.style.setProperty("--performance-tooltip-y", `${anchorYCss}px`);
     });
     const sweep = event => {
       const bounds = svg.getBoundingClientRect();
@@ -368,11 +381,15 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       restoreFocus();
       return;
     }
-    if (!models.some((model) => model.id === modelId)) modelId = [...models].reverse().find((model) => Object.hasOwn(COLORS, model.id))?.id ?? models[0].id;
+    if (!models.some((model) => model.id === modelId)) modelId = models[0].id;
     const tabs = element("div", "performance-models"); tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", translate("models"));
     for (const model of models) {
-      const button = element("button", "performance-model", model.label); button.type = "button";
-      button.style.setProperty("--model-color", COLORS[model.id] ?? "var(--green)");
+      const presentation = modelUsagePresentation(model.id), displayName = formatModelName(model.id);
+      const button = element("button", `performance-model ${presentation.className}`); button.type = "button";
+      const icon = modelThemeIcon(documentRef, presentation.theme);
+      if (icon) { icon.setAttribute("class", `allowance-model-icon performance-model-icon ${presentation.className}`); button.append(icon); }
+      button.append(element("span", "", displayName));
+      button.setAttribute("aria-label", displayName);
       button.setAttribute("role", "tab"); button.setAttribute("aria-selected", String(model.id === modelId)); button.setAttribute("aria-controls", "performance-model-panel"); button.tabIndex = model.id === modelId ? 0 : -1;
       button.id = `performance-tab-${model.id}`; button.dataset.performanceFocus = `model-${model.id}`;
       button.addEventListener("click", () => { modelId = model.id; remember(); render(); });
@@ -385,18 +402,26 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     }
     root.append(tabs);
     const selected = models.find((model) => model.id === modelId);
+    const selectedPresentation = modelUsagePresentation(selected.id), selectedName = formatModelName(selected.id);
     const domain = performanceDomain(payload, selected);
-    const panel = element("div", "performance-model-panel"); panel.id = "performance-model-panel"; panel.setAttribute("role", "tabpanel"); panel.setAttribute("aria-labelledby", `performance-tab-${modelId}`);
-    const subheading = element("div", "performance-model-heading"); subheading.append(element("h3", "", selected.label), element("span", "", translate(payload.interval))); panel.append(subheading);
+    const panel = element("div", `performance-model-panel ${selectedPresentation.className}`); panel.id = "performance-model-panel"; panel.setAttribute("role", "tabpanel"); panel.setAttribute("aria-labelledby", `performance-tab-${modelId}`);
+    const subheading = element("div", "performance-model-heading"), identity = element("h3", "performance-model-identity");
+    const selectedIcon = modelThemeIcon(documentRef, selectedPresentation.theme);
+    if (selectedIcon) { selectedIcon.setAttribute("class", `allowance-model-icon performance-model-icon ${selectedPresentation.className}`); identity.append(selectedIcon); }
+    identity.append(element("span", "", selectedName));
+    subheading.append(identity, element("span", "", translate(payload.interval))); panel.append(subheading);
     for (const metric of ["speed", "latency"]) {
       const card = element("article", "performance-card");
       const cardHeading = element("div", "performance-card-heading"), cardTitle = element("div");
-      cardTitle.append(element("h4", "", translate(metric)), element("p", "performance-unit", translate(`${metric}Unit`)));
+      const summary = metric === "speed"
+        ? translate("speedSummary", { measured: number(selected.speedTurns), total: number(selected.turns) })
+        : translate("latencySummary", { measured: number(selected.ttftTurns), total: number(selected.turns), responses: number(selected.timedResponses) });
+      cardTitle.append(element("h4", "", translate(metric)), element("p", "performance-unit", summary));
       const legend = element("div", "performance-legend");
       for (const method of ["outerBand", "innerBand", "medianP50"]) {
         const entry = element("span", "performance-legend-item");
         const swatch = svgElement("svg", { width: method === "medianP50" ? 24 : 22, height: 16, viewBox: "0 0 24 16", "aria-hidden": "true" });
-        const color = COLORS[modelId] ?? "var(--green)";
+        const color = "var(--allowance-color)";
         swatch.append(svgElement(method === "medianP50" ? "line" : "rect", {
           ...(method === "medianP50" ? { x1: 1, y1: 8, x2: 23, y2: 8 } : { x: 1, y: method === "outerBand" ? 3 : 5, width: 22, height: method === "outerBand" ? 10 : 6, rx: 3 }),
           fill: color, stroke: color, opacity: method === "outerBand" ? .1 : method === "innerBand" ? .22 : 1,
@@ -405,11 +430,9 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
         entry.append(swatch, element("span", "", translate(method))); legend.append(entry);
       }
       cardHeading.append(cardTitle, legend); card.append(cardHeading,
-        plot(metric === "speed" ? selected.speed : [{ method: "ttft", points: selected.ttft }], metric, COLORS[modelId] ?? "var(--green)", domain));
+        plot(metric === "speed" ? selected.speed : [{ method: "ttft", points: selected.ttft }], metric, "var(--allowance-color)", domain));
       panel.append(card);
     }
-    const coverage = element("div", "performance-coverage");
-    coverage.append(element("span", "", translate("coverageSpeed", { measured: number(selected.speedTurns), total: number(selected.turns) })), element("span", "", translate("coverageTtft", { measured: number(selected.ttftTurns), total: number(selected.turns) })), element("span", "", translate("responses", { count: number(selected.timedResponses) }))); panel.append(coverage);
     const aboutSummary = element("summary", "", translate("about")); aboutSummary.dataset.performanceFocus = "about";
     const about = element("details", "performance-details"); about.open = aboutOpen; about.append(aboutSummary, element("p", "", translate("methodology")), element("p", "", translate("variance"))); about.addEventListener("toggle", () => { aboutOpen = about.open; }); panel.append(about);
     root.append(panel);

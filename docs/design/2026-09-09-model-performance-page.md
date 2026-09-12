@@ -69,6 +69,9 @@ panels. Show a subtle P10–P90 outer band, a stronger P25–P75 inner band and 
 dark P50 median curve. These are empirical percentiles of eligible turns, not a
 confidence interval or full probability density. The legend explicitly names
 both percentile spans and the median, and moves below the title on narrow views.
+Each chart subtitle carries its own coverage: output-speed turns on the speed
+card, and first-token turns plus timed responses on the latency card. Do not
+repeat those figures in a separate coverage strip.
 
 Keep extreme observations in the calculations. The five-percentile view reduces
 the visual influence of extremes without deleting data or classifying it as a
@@ -107,22 +110,25 @@ Do not describe newer logs as inherently more accurate. Both TPS methods are
 estimates. Method distinctions apply only to TPS, not recorded TTFT.
 
 The hover/focus readout shows the date interval, model, metric, P10, P25, P50,
-P75, P90 and
-eligible turns. Covered responses are shown in the selected-model coverage strip,
-not fabricated as per-bin counts. For example, use “23 measured turns,” not
-“n = 23.” TTFT gets its own eligible-turn count; the cursor must not imply paired
-observations when populations differ. The charts support keyboard focus and expose
-each plotted point through an accessible description; do not duplicate the same
-aggregates in a measurement table.
+P75, P90 and eligible turns. Do not fabricate per-bin counts. For example, use
+“23 measured turns,” not “n = 23.” TTFT gets its own eligible-turn count; the
+cursor must not imply paired observations when populations differ. The tooltip
+anchors to the selected point, prefers the space above it and flips to the
+opposite horizontal side of the cursor. It flips below only when the viewport
+cannot fit it above, so it does not obscure the values it explains. Output-speed
+display values use whole tokens per second; latency retains the precision needed
+for subsecond data. The charts support keyboard focus and expose each plotted
+point through an accessible description; do not duplicate the same aggregates
+in a measurement table.
 
 ## Coverage is part of the measurement
 
-Always show compact coverage beneath the charts, not only inside a tooltip. For the
-current Sol all-history snapshot, a compact example is:
+Always show compact coverage in the chart subtitles, not only inside a tooltip.
+For the current GPT-5.6 Sol all-history snapshot, compact examples are:
 
-> Speed: 284 of 2,078 turns · 12,463 timed responses
+> tokens/s · Higher is faster · 284 of 2,078 turns measured
 >
-> First token: 1,724 of 2,078 turns
+> seconds · Lower is faster · 1,724 of 2,078 turns measured · 12,463 timed responses
 
 The explanation defines output speed and first-token latency, identifies medians,
 variation and missing timing, and states that these are personal observations
@@ -146,6 +152,8 @@ the comparative chart. Counts reflect the same filters as the plotted values.
   provide; offer the existing local-analysis action if appropriate.
 - Use percentile labels, marker shapes and text alongside color, visible focus,
   sufficiently large targets, reduced-motion behavior and accessible point descriptions.
+- Model tabs and the selected-model heading reuse the shared readable names,
+  palette and decorative model icons used by the usage tables and other model surfaces.
 - In narrow windows, stack the comparison information and charts; keep units,
   method distinctions and coverage visible without horizontal page scrolling.
 
