@@ -7262,6 +7262,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     assert.equal(MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES.includes(relativeFile), true, relativeFile);
   }
   assert.equal(MACOS_QUOTA_ANALYSIS_RUNTIME_FILES.includes("src/plan-attribution.js"), true);
+  assert.equal(MACOS_QUOTA_ANALYSIS_RUNTIME_FILES.includes("src/reset-events.js"), true);
   assert.equal(
     MACOS_RUNTIME_STATIC_ASSETS.includes("apps/macos/reset-local-keychain.js"),
     true,

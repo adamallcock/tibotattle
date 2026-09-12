@@ -81,7 +81,7 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     }
 
     const workspace = await readFile(join(output, "pnpm-workspace.yaml"), "utf8");
-    assert.match(workspace, /^  fast-uri: 3\.1\.5$/m);
+    assert.match(workspace, /^  fast-uri: 3\.1\.6$/m);
 
     const osvWorkflow = await readFile(
       join(output, GENERATED_OSV_WORKFLOW_PATH),

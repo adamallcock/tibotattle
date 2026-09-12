@@ -31,6 +31,7 @@ const EXPECTED_PUBLIC_EXPORTS = [
   "sanitizeCodexAccountSnapshotWithSecretLoader",
   "sanitizePlanType",
   "sanitizeRateLimit",
+  "volatileResetCreditInventory",
 ];
 
 test("Codex account facade exposes only reviewed exports with exact identities", () => {
@@ -215,5 +216,91 @@ test("provider quota metadata validation stays in parity with canonical analysis
       sanitizeQuotaLimitDisplayName(value),
       String(value),
     );
+  }
+});
+
+async function withRateLimitServer(respond, run) {
+  const requests = [];
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new Writable({
+    write(chunk, _encoding, done) {
+      const request = JSON.parse(chunk.toString("utf8"));
+      if (request.id !== undefined) {
+        const response = request.method === "initialize" ? { result: {} } : respond(request, requests.length);
+        if (request.method !== "initialize") requests.push(request);
+        queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: request.id, ...response })}\n`));
+      }
+      done();
+    },
+  });
+  child.kill = () => true;
+  const client = new accountFacade.CodexAppServerClient({ spawnProcess: () => child });
+  try {
+    await client.start();
+    await run(client, requests);
+  } finally {
+    client.close();
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
+  }
+}
+
+test("rate-limit reads use lightweight capabilities only when explicitly requested and never opt into Reserve", async () => {
+  await withRateLimitServer(() => ({ result: { ordinaryUsageAllowed: false } }), async (client, requests) => {
+    assert.deepEqual(await client.readRateLimits(), { ordinaryUsageAllowed: false });
+    await client.readRateLimits({ excludeResetCreditDetails: true, supportsLunaReserve: true });
+    await client.readRateLimits({ excludeResetCreditDetails: false });
+    await client.readRateLimits({ excludeResetCreditDetails: "true" });
+    assert.deepEqual(requests.map(({ params }) => params), [undefined, { excludeResetCreditDetails: true }, undefined, undefined]);
+    assert.equal(requests.every((request) => request.method === "account/rateLimits/read"), true);
+    assert.equal(JSON.stringify(requests).includes("supportsLunaReserve"), false);
+    assert.equal(Object.hasOwn(requests[0], "params"), false);
+  });
+});
+
+test("older servers get one parameter-free retry and subsequent polls stay compatible", async () => {
+  for (const code of [-32600, -32602]) {
+    await withRateLimitServer((request) => Object.hasOwn(request, "params")
+      ? { error: { code, message: "Unsupported params" } }
+      : { result: { ordinaryUsageAllowed: null } }, async (client, requests) => {
+      assert.deepEqual(await client.readRateLimits({ excludeResetCreditDetails: true }), { ordinaryUsageAllowed: null });
+      await client.readRateLimits({ excludeResetCreditDetails: true });
+      assert.deepEqual(requests.map(({ params }) => params), [{ excludeResetCreditDetails: true }, undefined, undefined]);
+    });
+  }
+});
+
+test("rate-limit fallback never retries unrelated errors or loops after a legacy rejection", async () => {
+  for (const code of [-32000, -32603, "-32602", undefined]) {
+    await withRateLimitServer(() => ({ error: { code, message: "Synthetic failure" } }), async (client, requests) => {
+      await assert.rejects(client.readRateLimits({ excludeResetCreditDetails: true }), { code: "request_failed" });
+      assert.equal(requests.length, 1);
+    });
+  }
+  await withRateLimitServer(() => ({ error: { code: -32602, message: "Unsupported params" } }), async (client, requests) => {
+    await assert.rejects(client.readRateLimits({ excludeResetCreditDetails: true }), { code: "request_failed" });
+    assert.equal(requests.length, 2);
+  });
+});
+
+test("ordinary usage permission stays tri-state, account-scoped and independent of percentages", () => {
+  for (const value of [true, false, null, undefined, 0, 1, "true", {}, []]) {
+    for (const usedPercent of [0, 100]) {
+      const snapshot = {
+        account: { account: { email: "permission.fixture@example.test", planType: "pro" } },
+        rateLimits: { ordinaryUsageAllowed: value, rateLimits: {
+          limitId: "codex", planType: "pro", primary: { usedPercent, windowDurationMins: 300, resetsAt: 123 },
+        } },
+      };
+      const result = accountFacade.sanitizeCodexAccountSnapshot(snapshot, "2026-09-10T12:00:00.000Z", { accountHmacKey: "synthetic-key" });
+      assert.equal(result.ordinaryUsageAllowed, typeof value === "boolean" ? value : null);
+      assert.equal(result.capturedAt, "2026-09-10T12:00:00.000Z");
+      assert.equal(accountFacade.sanitizeCodexAccountSnapshot(snapshot, result.capturedAt).ordinaryUsageAllowed, null);
+      snapshot.account = null;
+      assert.equal(accountFacade.sanitizeCodexAccountSnapshot(snapshot, result.capturedAt, { accountHmacKey: "synthetic-key" }).ordinaryUsageAllowed, null);
+    }
   }
 });

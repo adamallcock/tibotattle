@@ -37,6 +37,19 @@ const PLAN_ATTRIBUTION_EXPORTS = Object.freeze([
   "planAttributionObservationFromSnapshot",
   "planEraForInterval",
 ]);
+const RESET_EVENT_EXPORTS = Object.freeze([
+  "classifyQuotaResetTimeline",
+  "createResetEventClassifier",
+  "mergeQuotaResetEvents",
+  "normalizeResetEventContinuity",
+  "normalizeQuotaResetEvent",
+  "RESET_EVENT_CONTINUITY_SCHEMA_VERSION",
+  "QUOTA_RESET_CLASSIFICATION_POLICY",
+  "QUOTA_RESET_EVENT_KINDS",
+  "QUOTA_RESET_EVENT_PRECISIONS",
+  "QUOTA_RESET_EVENT_REASONS",
+  "QUOTA_RESET_EVENT_SCHEMA_VERSION",
+]);
 const WINDOW_EXPORTS = Object.freeze([
   "classifyQuotaWindowKind",
   "CODEX_PRIMARY_LIMIT_ID",
@@ -134,6 +147,7 @@ test("quota analysis exposes one exact runtime-neutral package root", async () =
       ...PACE_EXPORTS,
       ...COMPOSITION_EXPORTS,
       ...PLAN_ATTRIBUTION_EXPORTS,
+      ...RESET_EVENT_EXPORTS,
       ...WINDOW_EXPORTS,
     ].sort(),
   );

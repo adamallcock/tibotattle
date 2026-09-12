@@ -1661,6 +1661,54 @@ test("local dashboard normalizer accepts artifact rows and keeps stale state exp
   assert.equal(result.gradient.rollingHistory.length, 1);
 });
 
+test("local dashboard normalizer admits only closed derived reset events", () => {
+  const base = {
+    schemaVersion: "quota-reset-event-v0.1",
+    kind: "banked_reset_used",
+    occurredAt: "2026-09-10T01:00:00.000Z",
+    observedAt: "2026-09-10T01:00:00.000Z",
+    intervalStartedAt: "2026-09-10T00:00:00.000Z",
+    precision: "observation_interval",
+    reason: "credit_count_decreased_before_expiry",
+    provider: "openai_codex",
+    planType: "pro",
+    limitId: "codex",
+    windowDurationMins: 10_080,
+  };
+  const result = normalizeDashboardPayload({
+    timeline: {
+      resetEvents: [
+        { ...base, privateCreditId: "RateLimitResetCredit_private" },
+        { ...base, kind: "used", reason: "private_reason" },
+        {
+          ...base,
+          kind: "reset_credit_granted",
+          occurredAt: "2026-09-10T00:30:00.000Z",
+          precision: "provider_timestamp",
+          reason: "reset_credit_id_added",
+          planType: null,
+          limitId: null,
+          windowDurationMins: null,
+        },
+      ],
+    },
+  });
+  assert.deepEqual(
+    result.timeline.resetEvents.map((event) => event.kind),
+    ["banked_reset_used", "reset_credit_granted"],
+  );
+  assert.equal(JSON.stringify(result).includes("RateLimitResetCredit_private"), false);
+  assert.equal(Object.hasOwn(result.timeline.resetEvents[0], "privateCreditId"), false);
+  const unknownPlan = normalizeDashboardPayload({
+    timeline: { resetEvents: [{ ...base, planType: "unknown" }] },
+  });
+  assert.equal(unknownPlan.timeline.resetEvents.length, 1);
+  const invalidPlan = normalizeDashboardPayload({
+    timeline: { resetEvents: [{ ...base, planType: "private-plan" }] },
+  });
+  assert.deepEqual(invalidPlan.timeline.resetEvents, []);
+});
+
 test("history coverage only becomes complete from coherent archive evidence", () => {
   const complete = {
     status: "complete",
@@ -6567,6 +6615,64 @@ test("lineChart DOM interactions cover default points, median, band, and narrow 
   // a tick now reads "Jul 15" or "2:04 PM", so the -24° transform and its 66px
   // gutter only made short labels harder to read. Compact tick shapes are
   // covered by `chart tick labels stay compact…` below.
+});
+
+test("lineChart reset annotations are bounded, localized, and keyboard reachable", async () => {
+  const documentRef = new FakeSvgDocument(900);
+  const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(documentRef);
+  const points = [0, 1, 2].map((index) => ({
+    timestamp: new Date(Date.UTC(2026, 8, 10, index)).toISOString(),
+    value: index + 1,
+  }));
+  const draw = (annotations) => lineChart({
+    points,
+    series: [{
+      key: "value",
+      className: "chart-line-value",
+      label: { key: "series.usage" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+    }],
+    annotations,
+    title: { key: "chart.title" },
+    description: { key: "chart.description" },
+    yLabel: { key: "chart.yLabel" },
+  });
+  const svg = draw([
+    {
+      atMs: Date.parse("2026-09-10T01:00:00.000Z"),
+      className: "chart-reset-banked",
+      label: { key: "chart.resetEvent.bankedResetUsed" },
+      detail: {
+        key: "chart.resetEvent.observedBetween",
+        values: { start: "midnight", end: "one" },
+      },
+    },
+    {
+      atMs: Date.parse("2026-09-11T01:00:00.000Z"),
+      className: "chart-reset-unknown",
+      label: { key: "chart.resetEvent.unknownReset" },
+      detail: { key: "chart.resetEvent.providerTime", values: { time: "later" } },
+    },
+  ]);
+  const markers = svg.querySelectorAll("g.chart-reset-event");
+  assert.equal(markers.length, 1, "an event outside the chart domain is not drawn");
+  assert.match(markers[0].getAttribute("class"), /chart-reset-banked/u);
+  assert.equal(markers[0].getAttribute("tabindex"), "0");
+  assert.equal(markers[0].getAttribute("role"), "img");
+  assert.match(markers[0].getAttribute("aria-label"), /bankedResetUsed/u);
+  assert.match(markers[0].getAttribute("aria-label"), /observedBetween/u);
+  markers[0].focus();
+  assert.equal(
+    svg.querySelector(".chart-hover-tooltip").getAttribute("visibility"),
+    "visible",
+  );
+  markers[0].blur();
+  assert.throws(() => draw([{
+    atMs: Date.parse("2026-09-10T01:00:00.000Z"),
+    className: "chart-reset-banked",
+    label: "Banked reset used",
+    detail: { key: "chart.resetEvent.providerTime", values: { time: "now" } },
+  }]), /localization descriptor/u);
 });
 
 test("accounting controls hide unavailable history and enable it when indexed evidence exists", async () => {

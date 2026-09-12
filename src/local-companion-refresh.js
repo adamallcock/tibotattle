@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
+  createResetEventClassifier,
   isValidQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
 import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
@@ -980,6 +981,11 @@ export function createLocalCollectorRefreshRunner({
   // distinguish one soft miss from a rebuild that is never landing (the
   // 2026-08-19 livelock ran for hours behind a bare unavailable estimate).
   let accountingRebuildDeferredStreak = 0;
+  let hasReadQuota = false;
+  // Raw provider credit IDs never enter the collector store. The classifier's
+  // bounded keyed-fingerprint checkpoint is committed with the existing
+  // collector state so an ordinary companion restart preserves continuity.
+  const resetEventClassifier = createResetEventClassifier();
   return async function refreshLocalCollector({
     signal = null,
     onProgress = null,
@@ -1064,6 +1070,9 @@ export function createLocalCollectorRefreshRunner({
       ...(stateFile === null ? {} : { stateFile }),
       staleAfterMs: 0,
       refreshStale: true,
+      // First read after companion startup and explicit detailed refreshes
+      // retain reset details; subsequent automatic quick polls need only usage.
+      excludeResetCreditDetails: !detailed && hasReadQuota,
       // Quick refresh reads only provider quota/headline evidence regardless
       // of storage authority. Unified detailed refresh also leaves usage facts
       // to its index; only detailed legacy collection may backfill rollouts.
@@ -1083,6 +1092,7 @@ export function createLocalCollectorRefreshRunner({
       maximumRecordBatchSize: 500,
       maximumRecentEventKeys: 5_000,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      resetEventClassifier,
       ...(readAccountAttributionBinding === null ? {} : { readAccountAttributionBinding }),
     };
     // The headline pass uses the collector's ordinary atomic SQLite state
@@ -1096,6 +1106,9 @@ export function createLocalCollectorRefreshRunner({
       maximumRecentPreludeBytes: EARLY_HEADLINE_RECENT_PRELUDE_BYTES,
       maximumBufferedLineBytes: EARLY_HEADLINE_BUFFERED_LINE_BYTES,
     });
+    if (result?.refresh?.recordWritten === true && !result.refresh.errorCode) {
+      hasReadQuota = true;
+    }
     let headlinePublished = false;
     let collectorResourceLimitDeferred = false;
     const publishHeadline = async (indexing) => {

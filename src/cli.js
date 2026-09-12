@@ -82,6 +82,7 @@ import {
   runCollectorForeground,
   runCollectorOnce,
 } from "./passive-collector.js";
+import { createResetEventClassifier } from "@app-usagemonitor/quota-analysis";
 import {
   forEachLocalCollectorRecord,
   inspectLocalCollectorStateStorage,
@@ -1406,6 +1407,7 @@ export async function run(
       refreshStale: args.refreshStale,
       backfill: args.backfill,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      resetEventClassifier: createResetEventClassifier(),
     });
     console.log(`Collector run-once: ${result.rolloutRecordsWritten} rollout record(s); refresh ${result.refresh.attempted ? (result.refresh.errorCode ?? (result.refresh.recordWritten ? "recorded" : "deduplicated")) : "not needed"}.`);
     console.log(`State: ${result.stateFile}`);
@@ -1425,6 +1427,7 @@ export async function run(
         reconciliationMs: args.reconciliationMs,
         signal: controller.signal,
         loadAccountObservationSecret: selection.loadAccountObservationSecret,
+        resetEventClassifier: createResetEventClassifier(),
       });
       console.log(`Collector foreground exited cleanly: ${result.rolloutRecordsWritten} rollout record(s), ${result.appServerRecordsWritten} app-server record(s), ${result.reconnectAttempts} reconnect attempt(s).`);
     } finally {

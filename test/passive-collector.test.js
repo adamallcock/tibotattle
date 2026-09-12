@@ -35,6 +35,7 @@ import {
   readLocalCollectorRecords,
   readLocalCollectorState,
 } from "../src/local-collector-state.js";
+import { createResetEventClassifier } from "@app-usagemonitor/quota-analysis";
 
 const virtualCollectorStatePaths = new Map();
 
@@ -2813,6 +2814,138 @@ test("a truncated fork file re-arms the replay boundary on rescan", async () => 
       .find((state) => state.isInlineFork === true);
     assert.ok(forkState);
     assert.equal(forkState.ownTurnContextSeen, false);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("permission is retained only on scoped direct observations, without credit details or notification carry-forward", async () => {
+  for (const skipRolloutIngestion of [false, true]) {
+    const fixture = await collectorFixture();
+    const optionsSeen = [];
+    let permission = false;
+    class PermissionClient {
+      async start() {}
+      async readAccount() { return { account: { email: "permission.fixture@example.test", planType: "pro" } }; }
+      async readRateLimits(options) {
+        optionsSeen.push(options);
+        return { ...appPayload(0), ordinaryUsageAllowed: permission,
+          rateLimitResetCredits: { availableCount: 2, credits: [{ id: "DO-NOT-RETAIN" }] } };
+      }
+      close() {}
+    }
+    let now = Date.parse("2026-07-23T00:01:00.000Z");
+    const options = { ...fixture, skipRolloutIngestion, staleAfterMs: 0,
+      clock: () => now, appServerFactory: () => new PermissionClient(),
+      loadAccountObservationSecret: async () => Buffer.alloc(32, 71) };
+    try {
+      await runCollectorOnce(options);
+      now += 1000;
+      permission = undefined;
+      await runCollectorOnce({ ...options, excludeResetCreditDetails: true });
+      assert.deepEqual(optionsSeen, [{ excludeResetCreditDetails: false }, { excludeResetCreditDetails: true }]);
+      const records = (await readLines(fixture.dataFile)).filter((row) => row.kind === "codex_quota_snapshot");
+      assert.deepEqual(records.map((row) => row.ordinaryUsageAllowed), [false, null]);
+      assert.equal(records[1].observedAt, new Date(now).toISOString());
+      assert.equal(JSON.stringify(records).includes("DO-NOT-RETAIN"), false);
+      assert.equal(JSON.stringify(records).includes("rateLimitResetCredits"), false);
+      const payload = { accountScope: records[0].accountScope, canonical: appPayload().rateLimits,
+        byLimitId: { codex: appPayload().rateLimits }, ordinaryUsageAllowed: true };
+      for (const [source, accountScope, expected] of [
+        ["app_server_read", payload.accountScope, true],
+        ["app_server_notification", payload.accountScope, null],
+        ["app_server_read", { status: "unavailable" }, null],
+        ["app_server_read", { status: "available", scopeId: "malformed" }, null],
+      ]) {
+        assert.equal(appServerSnapshotRecord({ ...payload, accountScope }, { source, receivedAt: new Date(now).toISOString() }).ordinaryUsageAllowed, expected);
+      }
+    } finally { await rm(fixture.root, { recursive: true }); }
+  }
+});
+
+test("collector persists only a derived banked-reset event from volatile credit details", async () => {
+  const fixture = await collectorFixture();
+  let now = Date.parse("2026-07-23T00:01:00.000Z");
+  let usedPercent = 88;
+  let resetsAt = Date.parse("2026-07-24T01:00:00.000Z") / 1_000;
+  let resetCredits = {
+    availableCount: 1,
+    credits: [{
+      id: "RateLimitResetCredit_DO-NOT-RETAIN",
+      status: "available",
+      grantedAt: Date.parse("2026-07-01T00:00:00.000Z") / 1_000,
+      expiresAt: Date.parse("2026-08-01T00:00:00.000Z") / 1_000,
+    }],
+  };
+  class ResetClient {
+    async start() {}
+    async readAccount() {
+      return { account: { email: "reset.fixture@example.test", planType: "pro" } };
+    }
+    async readRateLimits() {
+      const payload = appPayload(usedPercent);
+      payload.rateLimits.primary.resetsAt = resetsAt;
+      return { ...payload, rateLimitResetCredits: resetCredits };
+    }
+    async readAccountUsage() { return null; }
+    close() {}
+  }
+  const options = {
+    ...fixture,
+    skipRolloutIngestion: true,
+    staleAfterMs: 0,
+    clock: () => now,
+    appServerFactory: () => new ResetClient(),
+    loadAccountObservationSecret: async () => Buffer.alloc(32, 72),
+  };
+  try {
+    await runCollectorOnce({
+      ...options,
+      resetEventClassifier: createResetEventClassifier(),
+    });
+    const firstCheckpointText = await readFile(fixture.checkpointFile, "utf8");
+    const firstCheckpoint = JSON.parse(firstCheckpointText);
+    assert.equal(
+      firstCheckpoint.resetEventContinuity.schemaVersion,
+      "reset-event-continuity-v0.1",
+    );
+    assert.match(
+      firstCheckpoint.resetEventContinuity.creditBaseline
+        .resetCredits.credits[0].id,
+      /^reset-credit:v1:[A-Za-z0-9_-]{43}$/u,
+    );
+    assert.equal(firstCheckpointText.includes("DO-NOT-RETAIN"), false);
+    now += 60 * 60_000;
+    usedPercent = 4;
+    resetCredits = { availableCount: 0, credits: null };
+    await runCollectorOnce({
+      ...options,
+      excludeResetCreditDetails: true,
+      resetEventClassifier: createResetEventClassifier(),
+    });
+    now = Date.parse("2026-07-24T01:01:00.000Z");
+    usedPercent = 2;
+    resetsAt = Date.parse("2026-07-31T01:00:00.000Z") / 1_000;
+    await runCollectorOnce({
+      ...options,
+      excludeResetCreditDetails: true,
+      resetEventClassifier: createResetEventClassifier(),
+    });
+
+    const records = (await readLines(fixture.dataFile))
+      .filter((record) => record.kind === "codex_quota_snapshot");
+    assert.equal(records.length, 3);
+    assert.equal(records[0].resetEvents, undefined);
+    assert.deepEqual(records[1].resetEvents.map((event) => event.kind), [
+      "banked_reset_used",
+    ]);
+    assert.deepEqual(records[2].resetEvents.map((event) => event.kind), [
+      "scheduled_reset",
+    ]);
+    const serialized = JSON.stringify(records);
+    assert.equal(serialized.includes("DO-NOT-RETAIN"), false);
+    assert.equal(serialized.includes("availableCount"), false);
+    assert.equal(serialized.includes("resetCredits"), false);
   } finally {
     await rm(fixture.root, { recursive: true });
   }

@@ -1,5 +1,6 @@
 import { access } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
@@ -18,6 +19,14 @@ const BINARY_VERSION_MAXIMUM_BYTES = 4_096;
 const CODEX_BINARY_DIAGNOSTIC_SCHEMA_VERSION = "codex-binary-diagnostic-v0.1";
 const execFileAsync = promisify(execFile);
 const ACCOUNT_HMAC_ENV = "APP_USAGEMONITOR_ACCOUNT_HMAC_KEY";
+const VOLATILE_RESET_CREDIT_INVENTORY = Symbol(
+  "tibotattle.volatileResetCreditInventory",
+);
+const MAX_RESET_CREDIT_DETAILS = 1_024;
+const MAX_RESET_CREDIT_COUNT = 1_000_000;
+const SAFE_RESET_CREDIT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const RESET_CREDIT_FINGERPRINT_DOMAIN =
+  "app-usagemonitor/reset-credit-fingerprint/v1\u0000";
 // The app's Keychain broker announcement names a descriptor in *this*
 // process, and this child's descriptor 0 is a different file entirely. No
 // secret leaks — the child cannot reach the socketpair — but an announcement
@@ -154,6 +163,7 @@ export class CodexAppServerClient extends EventEmitter {
     this.stderr = "";
     this.closed = false;
     this.malformedMessages = 0;
+    this.rateLimitParamsSupported = true;
   }
 
   async start() {
@@ -204,8 +214,11 @@ export class CodexAppServerClient extends EventEmitter {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error) pending.reject(new CodexAppServerError("request_failed", message.error.message ?? "Codex app-server request failed"));
-      else pending.resolve(message.result);
+      if (message.error) {
+        const error = new CodexAppServerError("request_failed", message.error.message ?? "Codex app-server request failed");
+        error.rpcCode = Number.isInteger(message.error.code) ? message.error.code : null;
+        pending.reject(error);
+      } else pending.resolve(message.result);
       return;
     }
     if (message.method === "account/rateLimits/updated") {
@@ -229,7 +242,7 @@ export class CodexAppServerClient extends EventEmitter {
     this.emit("disconnect", { code });
   }
 
-  request(method, params = {}, { requestId = null } = {}) {
+  request(method, params, { requestId = null } = {}) {
     if (!this.child?.stdin?.writable) {
       return Promise.reject(new CodexAppServerError("temporary_disconnect", "Codex app-server is not writable"));
     }
@@ -250,8 +263,21 @@ export class CodexAppServerClient extends EventEmitter {
     return true;
   }
 
-  readRateLimits() {
-    return this.request("account/rateLimits/read", {});
+  async readRateLimits({ excludeResetCreditDetails = false } = {}) {
+    // Passive readers must never advertise automatic Luna Reserve fallback.
+    const params = excludeResetCreditDetails === true && this.rateLimitParamsSupported
+      ? { excludeResetCreditDetails: true }
+      : undefined;
+    try {
+      return await this.request("account/rateLimits/read", params);
+    } catch (error) {
+      // Older servers can reject object params. Retry that protocol failure
+      // once, without params; auth, timeout and transport failures propagate.
+      if (params === undefined || error.code !== "request_failed"
+          || ![-32600, -32602].includes(error.rpcCode)) throw error;
+      this.rateLimitParamsSupported = false;
+      return this.request("account/rateLimits/read");
+    }
   }
 
   readAccount() {
@@ -325,6 +351,95 @@ function sanitizeUsageSummary(summary) {
   return result;
 }
 
+function resetCreditInstant(value) {
+  if (value === null) return null;
+  if (!Number.isSafeInteger(value) || value <= 0) return undefined;
+  const milliseconds = value * 1_000;
+  if (!Number.isSafeInteger(milliseconds)) return undefined;
+  try {
+    return new Date(milliseconds).toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
+function resetCreditFingerprint(id, accountHmacKey) {
+  if (accountHmacKey === null || accountHmacKey === undefined) return null;
+  try {
+    return `reset-credit:v1:${createHmac("sha256", accountHmacKey)
+      .update(RESET_CREDIT_FINGERPRINT_DOMAIN, "utf8")
+      .update(id, "utf8")
+      .digest("base64url")}`;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeResetCreditDetail(value, accountHmacKey) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || typeof value.id !== "string"
+      || !SAFE_RESET_CREDIT_ID.test(value.id)
+      || (value.status !== undefined && value.status !== "available")) {
+    return null;
+  }
+  const grantedAt = resetCreditInstant(value.grantedAt ?? null);
+  const expiresAt = resetCreditInstant(value.expiresAt ?? null);
+  const id = resetCreditFingerprint(value.id, accountHmacKey);
+  if (grantedAt === undefined || expiresAt === undefined || id === null) return null;
+  return Object.freeze({ id, grantedAt, expiresAt });
+}
+
+function sanitizeResetCreditInventory(value, accountHmacKey) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || !Number.isSafeInteger(value.availableCount)
+      || value.availableCount < 0
+      || value.availableCount > MAX_RESET_CREDIT_COUNT) return null;
+  if (!Array.isArray(value.credits)) {
+    return Object.freeze({
+      availableCount: value.availableCount,
+      detailsStatus: "unavailable",
+      credits: Object.freeze([]),
+    });
+  }
+  if (value.credits.length > MAX_RESET_CREDIT_DETAILS
+      || value.credits.length > value.availableCount) {
+    return Object.freeze({
+      availableCount: value.availableCount,
+      detailsStatus: "unavailable",
+      credits: Object.freeze([]),
+    });
+  }
+  const credits = value.credits.map((credit) => (
+    sanitizeResetCreditDetail(credit, accountHmacKey)
+  ));
+  const ids = new Set(credits.filter(Boolean).map((credit) => credit.id));
+  if (credits.includes(null) || ids.size !== credits.length) {
+    return Object.freeze({
+      availableCount: value.availableCount,
+      detailsStatus: "unavailable",
+      credits: Object.freeze([]),
+    });
+  }
+  return Object.freeze({
+    availableCount: value.availableCount,
+    detailsStatus: credits.length === value.availableCount
+      ? "complete"
+      : "partial",
+    credits: Object.freeze(credits),
+  });
+}
+
+/**
+ * Read the local-only reset-credit inventory attached by the sanitizer. Its
+ * IDs are already account-keyed fingerprints. The symbol key survives
+ * internal object spread but is invisible to ordinary JSON, stable quota
+ * records, diagnostics, and the browser contract; only the bounded collector
+ * continuity checkpoint may deliberately retain the fingerprint projection.
+ */
+export function volatileResetCreditInventory(snapshot) {
+  return snapshot?.[VOLATILE_RESET_CREDIT_INVENTORY] ?? null;
+}
+
 export function sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
   accountHmacKey = null,
   accountCredentialUnavailableReason = null,
@@ -362,14 +477,26 @@ export function sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
     unavailableSecretReason: accountCredentialUnavailableReason,
   }));
 
-  return {
+  const result = {
     capturedAt,
     accountScope,
+    ordinaryUsageAllowed: accountScope.status === "available"
+      && typeof raw.ordinaryUsageAllowed === "boolean" ? raw.ordinaryUsageAllowed : null,
     canonical,
     byLimitId,
     officialDailyTokens: dailyUsageBuckets,
     officialUsageSummary: sanitizeUsageSummary(usage?.summary),
   };
+  Object.defineProperty(result, VOLATILE_RESET_CREDIT_INVENTORY, {
+    value: sanitizeResetCreditInventory(
+      raw.rateLimitResetCredits,
+      accountHmacKey,
+    ),
+    enumerable: true,
+    configurable: false,
+    writable: false,
+  });
+  return result;
 }
 
 async function loadAccountObservationSecretSafely(loadAccountObservationSecret) {
@@ -455,6 +582,7 @@ export async function sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snap
     const after = result.accountScope;
     if (before.status !== "available" || after.status !== "available") {
       result.accountScope = after.status === "unavailable" ? after : before;
+      result.ordinaryUsageAllowed = null;
       return result;
     }
     const knownPlans = new Set([
@@ -465,6 +593,7 @@ export async function sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snap
     ].filter((plan) => plan !== null && plan !== "unknown"));
     if (before.scopeId !== after.scopeId || knownPlans.size > 1) {
       result.accountScope = sanitizeAccountScope(null);
+      result.ordinaryUsageAllowed = null;
     }
     return result;
   } finally {

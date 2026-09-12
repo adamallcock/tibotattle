@@ -3,6 +3,8 @@ import {
   ExportResourceLimitError,
 } from "../../export/index.js";
 import {
+  QUOTA_RESET_CLASSIFICATION_POLICY,
+  normalizeQuotaResetEvent,
   sanitizeQuotaLimitDisplayName,
   sanitizeQuotaLimitId,
 } from "@app-usagemonitor/quota-analysis";
@@ -56,6 +58,12 @@ const RECORD_KEYS = Object.freeze([
   "controlledState",
   "eventKey",
 ]);
+const RECORD_KEYS_WITH_RESET_EVENTS = Object.freeze([
+  ...RECORD_KEYS,
+  "resetEvents",
+]);
+const MAXIMUM_RESET_EVENTS_PER_RECORD =
+  QUOTA_RESET_CLASSIFICATION_POLICY.maximumEventsPerObservation;
 const WINDOW_KEYS = Object.freeze([
   "provider", "planType", "limitId", "slot", "usedPercent", "windowDurationMins", "resetsAt",
 ]);
@@ -495,7 +503,15 @@ function classifyRecord(record, bounds, diagnostics) {
     diagnostics.unsupportedSchemaRecords += 1;
     return null;
   }
-  if (!exactKeys(record, RECORD_KEYS) || record.provider !== "openai_codex"
+  const hasResetEvents = exactKeys(record, RECORD_KEYS_WITH_RESET_EVENTS);
+  if ((!hasResetEvents && !exactKeys(record, RECORD_KEYS))
+      || (hasResetEvents && (
+        !Array.isArray(record.resetEvents)
+        || record.resetEvents.length < 1
+        || record.resetEvents.length > MAXIMUM_RESET_EVENTS_PER_RECORD
+        || record.resetEvents.some((event) => normalizeQuotaResetEvent(event) === null)
+      ))
+      || record.provider !== "openai_codex"
       || record.providerSurface !== "account_shared_unallocated"
       || record.controlledState !== "unknown"
       || !SHA256_PATTERN.test(record.eventKey ?? "")

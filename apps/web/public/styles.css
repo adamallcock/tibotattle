@@ -1498,6 +1498,13 @@ h2 {
 /* Colour only — the dashed fill itself is defined with `.legend-dot.dashed`
    above and draws in `currentColor`, so the swatch tracks the series stroke. */
 .legend-dot.allowance { color: var(--green); }
+.legend-reset-marker {
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--blue);
+  background: var(--surface);
+  transform: rotate(45deg);
+}
 .compact-legend { justify-content: flex-end; margin-top: var(--space-2); }
 .chart-area-confidence { fill: rgba(49, 95, 132, .14); }
 /* Five exclusion bands, five distinct hues, so a shaded region on the chart
@@ -1543,6 +1550,24 @@ h2 {
 .chart-status-tick.chart-status-weighting { fill: rgba(20, 120, 104, .62); }
 .chart-status-tick.chart-status-ambiguous { fill: rgba(124, 92, 173, .66); }
 .chart-status-tick.chart-status-saturated { fill: rgba(176, 101, 43, .64); }
+
+.chart-reset-event { color: var(--blue); }
+.chart-reset-event-line {
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-dasharray: 3 4;
+  opacity: .55;
+}
+.chart-reset-event-marker {
+  fill: var(--surface);
+  stroke: currentColor;
+  stroke-width: 2.5;
+}
+.chart-reset-banked { color: var(--rust); }
+.chart-reset-unknown { color: #7655a8; }
+.chart-reset-granted { color: var(--green-2); }
+.chart-reset-expired { color: var(--amber); }
+.chart-reset-event:focus-visible .chart-reset-event-marker { stroke-width: 4; }
 
 .legend-dot.chart-status-missing { background: rgba(99, 99, 104, .58); }
 .legend-dot.chart-status-reset { background: rgba(31, 111, 168, .62); }

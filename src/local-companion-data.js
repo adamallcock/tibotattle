@@ -89,6 +89,10 @@ import {
   unavailableHistoricalSideChatGapProbe,
   unavailableSideChatEstimates,
 } from "./side-chat-estimates.js";
+import {
+  createResetEventClassifier,
+  mergeQuotaResetEvents,
+} from "@app-usagemonitor/quota-analysis";
 
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
@@ -1567,6 +1571,7 @@ async function readCollectorProjection(
         quota: [],
         sparkUsage: [],
         sparkQuota: [],
+        resetEvents: [],
       },
       recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
       paceForecast,
@@ -1603,6 +1608,9 @@ async function readCollectorProjection(
   const timelineBuckets = new Map();
   const sparkTimelineBuckets = new Map();
   const quotaTimeline = [];
+  const historicalResetClassifier = createResetEventClassifier();
+  const reconstructedResetEvents = [];
+  const prospectiveResetEvents = [];
   const weeklyPaceSnapshots = [];
   let toolTotal = 0;
   let recordCount = indexedSummary?.recordCount ?? 0;
@@ -1669,6 +1677,21 @@ async function readCollectorProjection(
               0,
               weeklyPaceSnapshots.length - MAX_WEEKLY_PACE_OBSERVATIONS,
             );
+          }
+        }
+        if (observedMs <= nowMs + 5 * 60_000) {
+          if (value.source === "app_server_read"
+              && value.accountScope?.status === "available"
+              && typeof value.accountScope.scopeId === "string") {
+            reconstructedResetEvents.push(...historicalResetClassifier.observe({
+              observedAt: new Date(observedMs).toISOString(),
+              accountScopeId: value.accountScope.scopeId,
+              windows: Array.isArray(value.windows) ? value.windows : [],
+              resetCredits: null,
+            }));
+          }
+          if (Array.isArray(value.resetEvents)) {
+            prospectiveResetEvents.push(...value.resetEvents);
           }
         }
         if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
@@ -1784,6 +1807,10 @@ async function readCollectorProjection(
         // `codex-spark` is the reserved marketing token. Match both so the
         // series cannot be permanently empty against real captures.
         quotaTimeline.filter((row) => SPARK_QUOTA_LIMIT_IDS.includes(row.limitId)),
+      ),
+      resetEvents: mergeQuotaResetEvents(
+        reconstructedResetEvents,
+        prospectiveResetEvents,
       ),
     },
     recordCounts,
