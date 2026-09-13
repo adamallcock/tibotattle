@@ -48,7 +48,13 @@ states are meaningful; TiboTattle does not replace missing evidence with zero.
 
 ## Reading the dashboard
 
-Overview shows one equally sized fuel tank for each observed allowance. The fill
+Overview shows one equally sized glass fuel tank for each observed allowance.
+Liquid motion is illustrative: the level stays at the observed percentage. Only
+a matching fresh forecast drives the outlet; greater pace produces more flow,
+with amber or red overflow for excessive pace. Overflow is a pace cue, not wasted
+quota. Pause motion stops animation, and the system reduced-motion preference is
+respected. Offscreen tanks stop animating. Unavailable capacity retains its text
+state and stale observations have no animated flow. The fill
 and percentage both represent remaining capacity. A single current Codex weekly
 forecast appears beneath the tanks when usable pacing evidence exists; choosing
 a historical plan on the Allowance page does not change that current forecast.

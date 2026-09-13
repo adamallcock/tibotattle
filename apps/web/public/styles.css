@@ -5064,3 +5064,37 @@ html[data-theme="dark"] .noscript {
   .weekly-pace-track-scale { grid-template-columns: auto 1fr; gap: 12px; }
   .weekly-pace-track-gap { text-align: end; }
 }
+
+/* Local glass renderer: text remains the accessible source of truth. */
+.quota-tank {
+  --tank-bg: var(--paper); --tank-panel: var(--surface-raised);
+  --tank-ink: var(--ink); --tank-muted: var(--muted);
+  --tank-edge: #93b5a4; --tank-metal: #d0dbcf; --tank-bright: #ffffff;
+  --tank-shadow: #526f63; --tank-fluid: #147c5b; --tank-glow: #87df94; --tank-deep: #125440;
+}
+.quota-tank[data-flow="over"] { --tank-fluid: #d78112; --tank-glow: #ffe697; --tank-deep: #94510c; }
+.quota-tank[data-flow="critical"] { --tank-fluid: #df3c25; --tank-glow: #ffb65b; --tank-deep: #9e182c; }
+.quota-tank.stale { --tank-fluid: #929b91; --tank-glow: #d4d9cc; --tank-deep: #5a665b; }
+.quota-grid > .quota-tank.has-liquid-tank { padding: 18px 12px; gap: 8px; background: var(--surface-raised); }
+.quota-tank.has-liquid-tank .quota-tank-fuel { display: none; }
+.quota-tank.has-liquid-tank .quota-tank-header { align-items: center; text-align: center; min-height: 60px; }
+.quota-tank-canvas { display: block; width: 100%; height: 418px; touch-action: pan-y; }
+.quota-tank.has-liquid-tank .quota-tank-bottom { justify-content: center; }
+.quota-tank.has-liquid-tank .quota-tank-bottom > div:first-child {
+  position: absolute; top: 160px; inset-inline: 50% auto; transform: translateX(-50%);
+  text-align: center; background: color-mix(in srgb, var(--surface-raised) 90%, transparent);
+  border-radius: 12px; padding: 6px 12px; pointer-events: none;
+}
+.quota-tank.has-liquid-tank .quota-tank-reset { align-items: center; text-align: center; }
+.quota-tank.has-liquid-tank > .allowance-timestamp { align-self: center; }
+.allowance-motion-controls { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin: -4px 0 18px; color: var(--muted); font-size: .75rem; }
+.allowance-motion-controls > span { flex: 1 1 320px; }
+.allowance-motion-controls button { min-height: 36px; font: inherit; color: var(--ink); }
+.weekly-pace-forecast.is-over-pace.is-critical { --pace-accent: #d9432c; --pace-accent-text: #a72c1e; --pace-accent-soft: #fce8df; --pace-accent-wash: #fbe0d7; }
+html[data-theme="dark"] .weekly-pace-forecast.is-over-pace.is-critical { --pace-accent: #ff654b; --pace-accent-text: #ffac98; --pace-accent-soft: #532d28; --pace-accent-wash: #422821; }
+html[data-theme="dark"] .quota-tank { --tank-edge: #567568; --tank-metal: #334e42; --tank-bright: #bcebd1; --tank-shadow: #000b07; --tank-fluid: #28c89d; --tank-glow: #a3ffce; --tank-deep: #12664e; }
+html[data-theme="dark"] .quota-tank[data-flow="over"] { --tank-fluid: #ffb73f; --tank-glow: #ffe6a8; --tank-deep: #b06816; }
+html[data-theme="dark"] .quota-tank[data-flow="critical"] { --tank-fluid: #ff654b; --tank-glow: #ffd28c; --tank-deep: #ad2538; }
+html[data-theme="dark"] .quota-tank.stale { --tank-fluid: #8c9a8d; --tank-glow: #becbbf; --tank-deep: #435547; }
+
+@media (pointer: coarse) { .allowance-motion-controls button { min-height: 44px; } }

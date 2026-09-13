@@ -1,3 +1,4 @@
+import { mountAllowanceTanks } from "./allowance-tanks.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
 import { mountModelPerformance } from "./model-performance.js";
@@ -1574,8 +1575,10 @@ function renderDashboard(data) {
     hideConnectionNotice();
   }
 
+  allowanceTankView?.dispose();
   renderQuotaCards(data);
   renderWeeklyPaceForecast(data);
+  allowanceTankView = mountAllowanceTanks($("#quota-cards"), $("#weekly-pace-forecast"), { t });
   renderEvidenceWarnings(data);
   renderPricing(data);
   renderComparison(data);
@@ -1590,6 +1593,8 @@ function renderDashboard(data) {
   // accounting render. Only the first-column cells are updated when it lands.
   void loadCacheDropThreadLinks(data);
 }
+
+let allowanceTankView = null;
 
 function renderQuotaCards(data) {
   closeInformationPopover();
@@ -1668,6 +1673,10 @@ function renderQuotaCards(data) {
       remaining === null ? "insufficient" : "",
     ].filter(Boolean).join(" "));
     card.setAttribute("aria-label", localizedQuotaWindowLabel(window));
+    card.dataset.remaining = remaining === null ? "" : String(remaining);
+    card.dataset.forecastPool = String(isPrimaryCodexWeeklyQuotaWindow(window));
+    card.dataset.resetAt = String(forecastTimestamp(window.resetAt) ?? "");
+    card.dataset.stale = String(window.status === "stale");
     if (remaining !== null) {
       const fuel = node("div", "quota-tank-fuel");
       fuel.style.blockSize = `${remaining}%`;
@@ -7783,6 +7792,9 @@ function renderWeeklyPaceForecast(data) {
   if (!card) return;
   card.hidden = true;
   card.className = "weekly-pace-forecast";
+  delete card.dataset.tankRatio;
+  delete card.dataset.tankReset;
+  delete card.dataset.tankRemaining;
   card.removeAttribute("aria-labelledby");
   clear(card);
 
@@ -7882,6 +7894,11 @@ function renderWeeklyPaceForecast(data) {
       hoursToReset,
       pacePpPerHour: headlinePace,
     });
+  if (standing) {
+    card.dataset.tankRatio = String(standing.ratio);
+    card.dataset.tankReset = String(resetAt);
+    card.dataset.tankRemaining = String(remaining);
+  }
   const paceState = standing?.state
     ?? (collectingEvidence ? null : reachesResetFirst ? "under" : null);
   const projectedEtaAt = standing !== null && standing.state === "over"

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { translate } from "../public/localization.js";
 import {
-  isPrimaryCodexQuotaWindow, selectPrimaryCodexQuotaWindow,
+  isPrimaryCodexQuotaWindow, isPrimaryCodexWeeklyQuotaWindow, selectPrimaryCodexQuotaWindow,
   isSparkQuotaLimitId, isValidQuotaWindowDuration,
 } from "../public/data-client.js";
 
@@ -45,7 +45,7 @@ function harness(locale = "en-US") {
     .map(name => source.match(new RegExp(`\\nconst ${name} = [^;]+;`, "u"))[0]).join("\n");
   const functions = ["formatAllowanceDuration", "allowanceTimestamp", "formatForecastDuration", "forecastTimestamp", "firstFiniteForecastNumber", "weeklyPaceRates", "weeklyPaceStanding", "formatPaceRatio", "weeklyPaceTrack", "renderWeeklyPaceForecast", "renderQuotaCards", "providerReportedPlanEvidence"]
     .map(declaration).join("\n");
-  const factory = new Function("node", "document", "$", "t", "setLocalizedText", "isPrimaryCodexQuotaWindow", "selectPrimaryCodexQuotaWindow", "isSparkQuotaLimitId", "isValidQuotaWindowDuration", "card", `
+  const factory = new Function("node", "document", "$", "t", "setLocalizedText", "isPrimaryCodexQuotaWindow", "isPrimaryCodexWeeklyQuotaWindow", "selectPrimaryCodexQuotaWindow", "isSparkQuotaLimitId", "isValidQuotaWindowDuration", "card", `
     const finite = value => typeof value === "number" && Number.isFinite(value) ? value : null;
     const clear = element => element.replaceChildren();
     const formatDecimal = (value, digits = 0) => value.toFixed(digits);
@@ -67,7 +67,7 @@ function harness(locale = "en-US") {
   const api = factory(node, document, selector => ({ "#quota-cards": quota, "#allowance-context": context })[selector],
     (key, values = {}) => translate(key, values, locale),
     (element, key) => { element.textContent = translate(key, {}, locale); },
-    isPrimaryCodexQuotaWindow, selectPrimaryCodexQuotaWindow, isSparkQuotaLimitId, isValidQuotaWindowDuration, card);
+    isPrimaryCodexQuotaWindow, isPrimaryCodexWeeklyQuotaWindow, selectPrimaryCodexQuotaWindow, isSparkQuotaLimitId, isValidQuotaWindowDuration, card);
   return { ...api, quota, card, context, document };
 }
 const now = Date.now();
