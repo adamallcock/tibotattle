@@ -11,8 +11,6 @@ import {
   REPORTING_PERIODS,
   REPORTING_DURATION_MS,
   normalizeReportingWindow,
-  reportingPeriodLabel,
-  reportingWindowRange,
   appendEvidenceRow,
   createEvidenceList,
 } from "./dashboard-ui.js";
@@ -290,7 +288,9 @@ export function mountWorkUsageView(options = {}) {
   heading.append(headingText);
   if (!sharedReporting) heading.append(period);
   const toolbar = el("div", "work-usage-toolbar");
-  const views = el("div", "work-usage-period");
+  const views = el("div", "work-usage-period segmented-control");
+  views.setAttribute("role", "group");
+  views.setAttribute("aria-label", tr("title"));
   for (const id of ["project", "thread"]) {
     const viewButton = button(
       tr(id === "project" ? "projects" : "threads"),
@@ -351,13 +351,6 @@ export function mountWorkUsageView(options = {}) {
   });
   scope.wrapper.hidden = true;
   const refreshButton = button(tr("refresh"), refresh);
-  toolbar.append(
-    views,
-    sort.wrapper,
-    model.wrapper,
-    scope.wrapper,
-    refreshButton,
-  );
   const form = el("form", "work-usage-find");
   const input = el("input");
   input.type = "text";
@@ -365,6 +358,14 @@ export function mountWorkUsageView(options = {}) {
   input.placeholder = tr("findHint");
   input.setAttribute("aria-label", tr("findHint"));
   form.append(input);
+  toolbar.append(
+    views,
+    form,
+    sort.wrapper,
+    model.wrapper,
+    scope.wrapper,
+    refreshButton,
+  );
   function clearSearchTimer() {
     clearLeaseTimer(searchTimer);
     searchTimer = null;
@@ -464,13 +465,13 @@ export function mountWorkUsageView(options = {}) {
   cancel.hidden = true;
   const body = el("div");
   const eyebrow = el("p", "annotation", tr("local"));
+  const actions = el("div", "dashboard-actions work-usage-actions");
+  actions.append(message, cancel);
   root.replaceChildren(
     heading,
     eyebrow,
     toolbar,
-    form,
-    message,
-    cancel,
+    actions,
     body,
   );
   function resetPage() {
@@ -531,18 +532,7 @@ export function mountWorkUsageView(options = {}) {
       throw new Error("unavailable");
   };
   function appendUsageEvidence() {
-    const evidence = createEvidenceList(documentRef);
-    if (sharedReporting && reportingWindow) {
-      const periodLabel = reportingPeriodLabel(reportingWindow.period, (key) => reportTranslate(key));
-      appendEvidenceRow(documentRef, evidence, {
-        kind: "period",
-        label: reportTranslate("period"),
-        value: `${periodLabel} · ${reportingWindowRange(reportingWindow, {
-          translate: (key, values) => reportTranslate(key, values),
-          formatDate: reportDate,
-        })}`,
-      });
-    }
+    const evidence = createEvidenceList(documentRef, "work-usage-evidence");
     if (response?.metadata?.observedAt !== undefined) {
       appendEvidenceRow(documentRef, evidence, {
         kind: "freshness",
@@ -704,6 +694,16 @@ export function mountWorkUsageView(options = {}) {
       detailTitle.tabIndex = -1;
       body.append(detailTitle);
       if (pendingFocus === "heading") focusTarget = detailTitle;
+    }
+    if (!response.rowCount) {
+      body.dataset.state = "empty";
+      const empty = el("p", "work-usage-empty", tr(query.search || query.findThread ? "searchEmpty" : "empty"));
+      empty.dataset.state = "empty";
+      body.append(empty);
+      appendMethodology();
+      focusTarget?.focus();
+      pendingFocus = null;
+      return;
     }
     const summaries = el("div", "work-usage-summary");
     for (const [label, n] of [
@@ -1097,16 +1097,7 @@ export function mountWorkUsageView(options = {}) {
     panel.append(wrap);
     body.append(panel);
     body.append(el("p", "annotation", tr("shareNote")));
-    body.dataset.state = response.rowCount ? "ready" : "empty";
-    if (!response.rowCount) {
-      const empty = el(
-        "p",
-        "work-usage-empty",
-        sharedReporting ? reportTranslate("unavailable") : tr(query.search ? "searchEmpty" : "empty"),
-      );
-      empty.dataset.state = "empty";
-      body.append(empty);
-    }
+    body.dataset.state = "ready";
     const pagination = el("div", "table-pagination");
     const previous = quietButton(tr("previous"), () => {
       pendingFocus = "first-row";
@@ -1137,17 +1128,6 @@ export function mountWorkUsageView(options = {}) {
       next,
     );
     body.append(pagination);
-    body.append(
-      el(
-        "p",
-        "work-usage-caption",
-        tr("observed", {
-          date: formatLocal(
-            new Date(response.metadata.observedAt).toISOString(),
-          ),
-        }),
-      ),
-    );
     appendMethodology();
     focusTarget?.focus();
     pendingFocus = null;

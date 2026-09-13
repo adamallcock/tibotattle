@@ -115,3 +115,12 @@ actions share one wrapping row. A progress/error status keeps a secondary
 result timestamp; a ready status already contains that timestamp. Stale result
 warnings remain explicit. Each chart's subtitle owns its measured/total count
 and partial-coverage styling, without duplicate coverage cards above the tabs.
+
+## Projects and threads controls and states
+
+Grouping and search share a responsive toolbar with sort/model/scope and refresh.
+Progress and cancellation use one action row. Observation and coverage stay in
+inline metadata; the shared period is not repeated. Available empty reports
+show an empty/search-empty state without a blank table or summary metrics.
+Clearing search restores the report. Unavailable/expired reports retain their
+separate recovery behavior and incomplete coverage remains explicit.

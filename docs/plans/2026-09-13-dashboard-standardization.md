@@ -237,3 +237,12 @@ chart coverage summaries, and no horizontal overflow. Private evidence:
 `.release-build/evidence-layout.json` and the matching performance screenshots.
 This visual qualification does not resolve the existing full accounting-parity
 gate.
+
+## Projects and threads context follow-up
+
+Use one responsive toolbar for grouping, search, sort/model/scope and refresh.
+Place progress/cancel together; omit the duplicate global reporting row and
+repeat observation caption. Preserve observation and coverage in quiet inline
+metadata. Available reports with no rows show a true empty/search-empty state
+without empty result tables or summary cards; unavailable reports retain their
+own status. Validate query interactions and packaged controls at two widths.

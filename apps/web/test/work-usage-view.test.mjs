@@ -1529,7 +1529,37 @@ test("shared reporting waits for its bound, hides local period controls, and sen
   assert.equal(calls.length, 1);
   assert.equal(calls[0].period, "24h");
   assert.equal(calls[0].endAt, window.endAt);
-  assert.ok(findMounted(root, node => node.dataset?.evidence === "period").length);
+  assert.equal(findMounted(root, node => node.dataset?.evidence === "period").length, 0, "shared header owns the period");
+  assert.equal(findMounted(root, node => node.dataset?.evidence === "freshness").length, 1, "the observation remains available");
   assert.doesNotMatch(root.textContent, /Current allowance and sharing preferences are not affected/u);
   view.destroy();
+});
+
+
+test("an available shared-period search with no rows is empty rather than unavailable", async () => {
+  const { root, windowRef } = mountedRoot();
+  const empty = structuredClone(PROJECT_ROWS_RESPONSE);
+  empty.rows = []; empty.rowCount = 0; empty.display = {}; empty.nextCursor = null;
+  const window = { period: "24h", startAt: new Date(NOW - 86_400_000).toISOString(), endAt: new Date(NOW).toISOString() };
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator, sharedReporting: true, reportingWindow: window,
+    fetchRef: async (_url, init) => httpResponse(JSON.parse(init.body).search ? empty : PROJECT_ROWS_RESPONSE) });
+  try {
+    await settleMountedView();
+    const input = findMounted(root, node => node.tagName === "INPUT")[0];
+    const form = findMounted(root, node => node.tagName === "FORM")[0];
+    input.value = "no matching synthetic project";
+    form.dispatchEvent({ type: "submit" });
+    await settleMountedView();
+    const state = findMounted(root, node => node.classList.contains("work-usage-empty"))[0];
+    assert.ok(state);
+    assert.equal(state.textContent, mountedTranslator("workUsage.searchEmpty"));
+    assert.equal(state.dataset.state, "empty");
+    assert.equal(findMounted(root, node => node.tagName === "TABLE").length, 0);
+    assert.equal(findMounted(root, node => node.classList.contains("work-usage-summary")).length, 0);
+    assert.equal(findMounted(root, node => node.dataset?.evidence === "freshness").length, 1);
+    input.value = ""; form.dispatchEvent({ type: "submit" });
+    await settleMountedView();
+    assert.ok(findMounted(root, node => node.tagName === "TABLE").length);
+    assert.equal(findMounted(root, node => node.classList.contains("work-usage-empty")).length, 0);
+  } finally { view.destroy(); }
 });
