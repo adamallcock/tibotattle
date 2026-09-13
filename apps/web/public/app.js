@@ -11945,6 +11945,8 @@ async function loadLocalDashboard() {
 
 function renderDashboardSkeleton() {
   closeInformationPopover();
+  allowanceTankView?.dispose();
+  allowanceTankView = null;
   const forecast = $("#weekly-pace-forecast");
   if (forecast) { forecast.hidden = true; clear(forecast); }
   if ($("#allowance-context")) $("#allowance-context").hidden = true;
