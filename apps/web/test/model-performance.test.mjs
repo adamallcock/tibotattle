@@ -152,6 +152,9 @@ test('background history scan reports honest bounded progress while keeping char
   assert.equal(dom.root.all().find(node => node.className === 'performance-status').textContent,
     'Building earlier history · 629 of 9,026 sessions checked');
   assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
+  assert.equal(dom.root.all().filter(node => node.dataset.evidence === 'freshness').length, 1, 'progress retains the timestamp of the displayed results');
+  assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-unit').map(node => node.dataset.state), ['partial', 'partial']);
+  assert.equal(dom.root.all().some(node => node.dataset.evidence === 'speed-coverage'), false, 'counts are not repeated above the charts');
   controller.destroy();
 });
 
@@ -369,6 +372,33 @@ test('shared reporting waits for its bound, maps 24h to the rolling backend peri
   assert.equal(calls[0].period, '1');
   assert.equal(calls[0].options.endAt, window.endAt);
   assert.equal(dom.root.all().some(node => node.dataset.performanceFocus?.startsWith('period-')), false);
-  assert.ok(dom.root.all().some(node => node.dataset.evidence === 'period'));
+  assert.equal(dom.root.all().some(node => node.dataset.evidence === 'period'), false, 'the shared header owns the reporting range');
+  assert.equal(dom.root.all().filter(node => node.className === 'performance-unit').length, 2, 'coverage remains beside each chart');
+  controller.destroy();
+});
+
+
+test('failed refresh retains chart coverage and timestamp beside the retry action', async () => {
+  const dom = focusHarness();
+  let fail = false;
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => {
+    if (fail) throw new Error('Synthetic request failure');
+    return payload();
+  } }, t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  assert.equal(dom.root.all().some(node => node.dataset.evidence === 'freshness'), false, 'ready status already carries its timestamp');
+  assert.equal(dom.root.all().some(node => node.dataset.evidence === 'period'), true, 'standalone mode still identifies its own period');
+  fail = true; await controller.refresh();
+  const actions = dom.root.all().find(node => node.className === 'dashboard-actions performance-actions');
+  assert.ok(actions.children.some(node => node.dataset.state === 'error'));
+  assert.ok(actions.children.some(node => node.dataset.performanceFocus === 'retry'));
+  assert.equal(dom.root.all().filter(node => node.dataset.evidence === 'freshness').length, 1);
+  assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-unit').map(node => node.textContent), [
+    'tokens/s · Higher is faster · 10 of 20 turns measured',
+    'seconds · Lower is faster · 15 of 20 turns measured · 45 timed responses',
+  ]);
+  fail = false; await dom.find('retry').listeners.click();
+  assert.equal(dom.find('retry'), undefined);
+  assert.equal(dom.root.all().some(node => node.dataset.evidence === 'freshness'), false);
   controller.destroy();
 });

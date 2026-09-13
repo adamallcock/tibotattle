@@ -106,3 +106,12 @@ with a shared subgrid. Source chips sit below titles. Reset and observed times
 share a bordered footer. Spark remains a separate blue limit and retains its
 ordering. Stale cards include an Out of date label; unavailable percentages
 have no progress bar. The percentage scale is consistent across pools.
+
+## Compact model-performance context
+
+Model performance uses the app header's reporting period in shared mode and
+retains a local range only in standalone mode. Its status and cancel/retry
+actions share one wrapping row. A progress/error status keeps a secondary
+result timestamp; a ready status already contains that timestamp. Stale result
+warnings remain explicit. Each chart's subtitle owns its measured/total count
+and partial-coverage styling, without duplicate coverage cards above the tabs.

@@ -214,3 +214,12 @@ Final unsigned candidate source:
 Rendered Allowance, Trends and Model performance are reviewed at 1180px and
 960px; `.release-build/charts-layout.json` records card alignment and overflow
 checks. Full accounting-parity qualification remains an independent gate.
+
+## Compact performance evidence follow-up
+
+Remove duplicate page-local reporting context when the app header owns it.
+Keep update/progress and retry/cancel actions together. Coverage counts remain
+visible beside their chart, with partial coverage in amber. A secondary update
+timestamp remains available while progress or errors occupy the status line.
+Standalone reporting retains its own range. Validate retained-data progress,
+empty/error controls and a real packaged performance view before handoff.

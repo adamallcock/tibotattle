@@ -238,23 +238,18 @@ export function mountModelPerformance(options = {}) {
     return reportTranslate("range", { start: fullDateFormat.format(new Date(startAt)), end });
   };
   const appendReportingEvidence = (container, selected = null) => {
-    if (sharedReporting && reportingWindow) {
-      container.append(evidenceRow("period", reportTranslate("period"), `${reportingPeriodLabel(reportingWindow.period, (key) => reportTranslate(key))} · ${reportingRange(reportingWindow)}`));
-    } else if (selected) {
+    if (!sharedReporting && selected) {
       const fallback = { period: selected.period === "1" ? "24h" : selected.period === "7" ? "7d" : selected.period === "30" ? "30d" : "all", start: selected.start, end: selected.end };
       container.append(evidenceRow("period", reportTranslate("period"), `${reportingPeriodLabel(fallback.period, (key) => reportTranslate(key))} · ${reportingRange(null, fallback)}`));
     }
   };
-  const appendPerformanceEvidence = (container, selected) => {
+  const appendPerformanceEvidence = (container, statusState) => {
     appendReportingEvidence(container, payload);
-    if (payload?.updatedAt) {
+    if (payload?.updatedAt && statusState !== "ready") {
       formatters();
       const updated = fullDateFormat.format(new Date(payload.updatedAt));
       container.append(evidenceRow("freshness", translate("updated", { date: "" }).trim(), updated, payload.stale ? "stale" : "fresh"));
     }
-    if (!selected) return;
-    container.append(evidenceRow("speed-coverage", translate("speed"), translate("coverageSpeed", { measured: number(selected.speedTurns), total: number(selected.turns) }), selected.speedTurns < selected.turns ? "partial" : "complete"));
-    container.append(evidenceRow("latency-coverage", translate("latency"), translate("coverageTtft", { measured: number(selected.ttftTurns), total: number(selected.turns) }), selected.ttftTurns < selected.turns ? "partial" : "complete"));
   };
   const svgElement = (name, attributes = {}, text) => {
     const node = documentRef.createElementNS("http://www.w3.org/2000/svg", name);
@@ -460,27 +455,23 @@ export function mountModelPerformance(options = {}) {
     const statusState = cancelled ? "cancelled" : failed ? "error" : loading && !payload ? "loading" : payload?.collecting || payload?.status === "loading" ? "updating" : payload?.status === "unavailable" ? "unavailable" : payload?.updatedAt ? "ready" : sharedReporting && !reportingWindow ? "waiting" : "";
     status.dataset.state = statusState;
     status.textContent = cancelled ? translate("cancelled") : failed ? translate("failed") : loading && !payload ? translate("loading") : payload?.collecting || payload?.status === "loading" ? collectingLabel : payload?.status === "unavailable" ? translate("unavailable") : payload?.updatedAt ? translate("updated", { date: new Intl.DateTimeFormat(locale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(payload.updatedAt)) }) : sharedReporting && !reportingWindow ? reportTranslate("waiting") : "";
-    root.append(status);
+    const actions = element("div", "dashboard-actions performance-actions");
+    actions.append(status);
+    root.append(actions);
     if (payload?.stale) {
       const stale = element("p", "performance-status", translate("stale"));
       stale.dataset.state = "stale";
-      root.append(stale);
+      actions.append(stale);
     }
     if (loading) {
-      const cancel = element("button", "button button-secondary compact", translate("cancel")); cancel.type = "button"; cancel.dataset.performanceFocus = "cancel"; cancel.addEventListener("click", cancelRefresh); root.append(cancel);
+      const cancel = element("button", "button button-secondary compact", translate("cancel")); cancel.type = "button"; cancel.dataset.performanceFocus = "cancel"; cancel.addEventListener("click", cancelRefresh); actions.append(cancel);
     } else if (failed || payload?.status === "unavailable") {
-      const retry = element("button", "button button-secondary compact", translate("retry")); retry.type = "button"; retry.dataset.performanceFocus = "retry"; retry.addEventListener("click", refresh); root.append(retry);
+      const retry = element("button", "button button-secondary compact", translate("retry")); retry.type = "button"; retry.dataset.performanceFocus = "retry"; retry.addEventListener("click", refresh); actions.append(retry);
     }
     if (payload) {
       const evidence = element("dl", "performance-evidence");
-      const selectedForEvidence = payload.models.find((model) => model.id === modelId)
-        ?? payload.models[0] ?? null;
-      appendPerformanceEvidence(evidence, selectedForEvidence);
-      root.append(evidence);
-    } else if (sharedReporting && reportingWindow) {
-      const evidence = element("dl", "performance-evidence");
-      appendReportingEvidence(evidence);
-      root.append(evidence);
+      appendPerformanceEvidence(evidence, statusState);
+      if (evidence.children.length) root.append(evidence);
     }
     const models = payload?.models ?? [];
     if (!models.length) {
@@ -529,7 +520,10 @@ export function mountModelPerformance(options = {}) {
       const summary = metric === "speed"
         ? translate("speedSummary", { measured: number(selected.speedTurns), total: number(selected.turns) })
         : translate("latencySummary", { measured: number(selected.ttftTurns), total: number(selected.turns), responses: number(selected.timedResponses) });
-      cardTitle.append(element("h4", "chart-card-title", translate(metric)), element("p", "performance-unit", summary));
+      const coverage = element("p", "performance-unit", summary);
+      const measured = metric === "speed" ? selected.speedTurns : selected.ttftTurns;
+      coverage.dataset.state = measured < selected.turns ? "partial" : "complete";
+      cardTitle.append(element("h4", "chart-card-title", translate(metric)), coverage);
       const legend = element("div", "performance-legend chart-card-legend");
       for (const method of ["outerBand", "innerBand", "medianP50"]) {
         const entry = element("span", "performance-legend-item");
