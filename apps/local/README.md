@@ -36,6 +36,14 @@ USAGE_MONITOR_PORT=8791 node ./apps/local/server.js
 
 Then open `http://127.0.0.1:8791/`.
 
+The packaged Electron companion also owns the closed, read-only agent protocol
+used by the Codex plugin. `--agent-protocol 1` selects exactly `status`,
+`explain-usage-plans`, `explain-usage`, or `explain-usage-evidence` and writes
+one content-free JSON result instead of binding a server. It accepts no generic
+path, command, SQL, refresh, settings, or upload input. Normal companion startup
+is unchanged when the selector is absent. See the maintained
+[Codex plugin reference](../../docs/reference/codex-plugin.md).
+
 Startup defers the full-history projection so the first local dashboard does
 not wait for it. A validated last-authoritative snapshot may supply retained
 figures, labelled with their original provenance and the current projection's
