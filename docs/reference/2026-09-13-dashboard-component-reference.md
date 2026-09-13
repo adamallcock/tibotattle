@@ -19,7 +19,8 @@ Its `.segmented-control` (`#reporting-period-controls`) shows compact labels
 `24hr`, `7d`, `30d`, and `All`, with full localized accessible names. The
 selected choice uses `aria-pressed="true"`. The adjacent native disclosure
 exposes `#reporting-period-range` through a click or keyboard activation;
-its title also provides the exact dates on hover. At narrow widths the selector
+its title also provides the exact dates on hover. Outside pointer interaction
+and Escape dismiss it; Escape restores focus when focus was inside. At narrow widths the selector
 wraps onto a second header row. Community hides the reporting control.
 
 Page-local filters use the same `.segmented-control` and selected state. A

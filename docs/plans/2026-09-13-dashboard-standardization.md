@@ -158,3 +158,13 @@ keyboard focus when appropriate. The Electron dashboard minimum width is 960px,
 capped to the display work area so smaller displays remain usable. Settings and
 tray window constraints remain independent. Removed the previously rejected
 scope sentence from the remaining Model performance and Projects evidence rows.
+
+747 web tests and 79 Electron shell tests passed, including default 960px and
+small-display 800px window constraints. Packaged source
+`31aea2226af765c1c5fedf1521e8dd27fbe18576` verified with ASAR digest
+`cd350566712c400e330ba7fdf131e46bb8b54c1ce2fcaca582d267b6ffc9cd45`.
+Real packaged pointer and keyboard input confirmed open-to-closed transitions
+for both outside-click and Escape (`.release-build/popup-min-layout.json`).
+The debugging endpoint did not support the native-window resize command;
+minimum-width enforcement has constructor tests, not a live resize receipt.
+The existing full accounting-parity gate remains separate.
