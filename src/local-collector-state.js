@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import {
+import fsPromises, {
   chmod,
   lstat,
   mkdir,
@@ -56,6 +56,10 @@ const MANAGED_LEGACY_BASENAMES = new Set([
   "local-replay-safe-accounting-v0.2.json",
 ]);
 
+function lstatExact(path) {
+  return fsPromises.lstat(path, { bigint: true });
+}
+
 function fixedError(code) {
   const error = new Error(code);
   error.code = code;
@@ -70,18 +74,57 @@ function throwIfAccountingCachePublicationAborted(signal) {
 }
 
 function ownerOnlyRegularFile(metadata) {
-  return metadata?.isFile?.()
-    && !metadata.isSymbolicLink()
-    && metadata.nlink === 1
-    && (typeof process.getuid !== "function" || metadata.uid === process.getuid())
-    && (process.platform === "win32" || (metadata.mode & 0o077) === 0);
+  if (!metadata?.isFile?.() || metadata.isSymbolicLink()) return false;
+  const ownerUid = typeof process.getuid === "function"
+    ? process.getuid()
+    : null;
+  const ownerMatches = ownerUid === null
+    || metadata.uid === ownerUid
+    || (typeof metadata.uid === "bigint" && metadata.uid === BigInt(ownerUid));
+  const modeIsPrivate = process.platform === "win32"
+    || (typeof metadata.mode === "bigint"
+      ? (metadata.mode & 0o077n) === 0n
+      : (metadata.mode & 0o077) === 0);
+  return (metadata.nlink === 1 || metadata.nlink === 1n)
+    && ownerMatches
+    && modeIsPrivate;
+}
+
+function metadataSizeExceeds(size, maximum) {
+  return typeof size === "bigint"
+    ? size > BigInt(maximum)
+    : size > maximum;
+}
+
+function metadataSizeNumber(size) {
+  if (typeof size === "bigint") {
+    const number = Number(size);
+    return Number.isSafeInteger(number) ? number : null;
+  }
+  return Number.isSafeInteger(size) ? size : null;
+}
+
+function normalizeIdentityPart(value) {
+  if (typeof value === "bigint") return value >= 0n ? value : null;
+  return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+}
+
+function normalizedIdentityFields(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const dev = normalizeIdentityPart(value.dev);
+  const ino = normalizeIdentityPart(value.ino);
+  return dev === null || ino === null ? null : { dev, ino };
 }
 
 function sameFileIdentity(left, right) {
-  return left !== null
-    && right !== null
-    && left.dev === right.dev
-    && left.ino === right.ino;
+  const leftIdentity = normalizedIdentityFields(left);
+  const rightIdentity = normalizedIdentityFields(right);
+  return leftIdentity !== null
+    && rightIdentity !== null
+    && leftIdentity.dev === rightIdentity.dev
+    && leftIdentity.ino === rightIdentity.ino;
 }
 
 function validStateFileIdentity(value) {
@@ -89,18 +132,12 @@ function validStateFileIdentity(value) {
     && typeof value === "object"
     && !Array.isArray(value)
     && Object.keys(value).sort().join("\0") === "dev\0ino"
-    && Number.isSafeInteger(value.dev)
-    && value.dev >= 0
-    && Number.isSafeInteger(value.ino)
-    && value.ino >= 0;
+    && normalizedIdentityFields(value) !== null;
 }
 
 function stateFileIdentity(metadata) {
-  const identity = {
-    dev: metadata?.dev,
-    ino: metadata?.ino,
-  };
-  if (!validStateFileIdentity(identity)) {
+  const identity = normalizedIdentityFields(metadata);
+  if (identity === null) {
     throw fixedError("local_collector_state_unavailable");
   }
   return Object.freeze(identity);
@@ -249,20 +286,21 @@ function validateDatabase(database) {
   }
 }
 
-async function assertSafeStateFile(path, { allowMissing = false } = {}) {
+async function assertSafeStateFile(
+  path,
+  { allowMissing = false, exactIdentity = false } = {},
+) {
   let metadata;
   try {
-    metadata = await lstat(path);
+    metadata = exactIdentity
+      ? await lstatExact(path)
+      : await lstat(path);
   } catch (error) {
     if (allowMissing && error?.code === "ENOENT") return null;
     if (error?.code === "ENOENT") throw fixedError("local_collector_state_missing");
     throw fixedError("local_collector_state_unavailable");
   }
-  if (!metadata.isFile()
-      || metadata.isSymbolicLink()
-      || metadata.nlink !== 1
-      || (typeof process.getuid === "function" && metadata.uid !== process.getuid())
-      || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+  if (!ownerOnlyRegularFile(metadata)) {
     throw fixedError("local_collector_state_unavailable");
   }
   return metadata;
@@ -271,7 +309,7 @@ async function assertSafeStateFile(path, { allowMissing = false } = {}) {
 async function assertExpectedStateFileIdentity(stateFile, expectedIdentity) {
   let metadata;
   try {
-    metadata = await assertSafeStateFile(stateFile);
+    metadata = await assertSafeStateFile(stateFile, { exactIdentity: true });
   } catch (error) {
     // A session that just committed state cannot treat a vanished or replaced
     // path as a successful integrity proof. Keep this boundary content-free
@@ -300,13 +338,13 @@ function localCollectorMigrationLeasePath(stateFile) {
 async function lstatMigrationLease(path, { allowMissing = false } = {}) {
   let metadata;
   try {
-    metadata = await lstat(path);
+    metadata = await lstatExact(path);
   } catch (error) {
     if (allowMissing && error?.code === "ENOENT") return null;
     throw fixedError("local_collector_state_migration_lease_unavailable");
   }
   if (!ownerOnlyRegularFile(metadata)
-      || metadata.size > MAX_MIGRATION_LEASE_BYTES) {
+      || metadataSizeExceeds(metadata.size, MAX_MIGRATION_LEASE_BYTES)) {
     throw fixedError("local_collector_state_migration_lease_unavailable");
   }
   return metadata;
@@ -321,16 +359,20 @@ async function readMigrationLease(path) {
       path,
       constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
     );
-    const opened = await handle.stat();
+    const opened = await handle.stat({ bigint: true });
     if (!ownerOnlyRegularFile(opened)
-        || opened.size > MAX_MIGRATION_LEASE_BYTES
+        || metadataSizeExceeds(opened.size, MAX_MIGRATION_LEASE_BYTES)
         || !sameFileIdentity(initial, opened)) {
       throw fixedError("local_collector_state_migration_lease_unavailable");
     }
-    const buffer = Buffer.alloc(opened.size + 1);
+    const size = metadataSizeNumber(opened.size);
+    if (size === null) {
+      throw fixedError("local_collector_state_migration_lease_unavailable");
+    }
+    const buffer = Buffer.alloc(size + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    const completed = await handle.stat();
-    if (bytesRead > opened.size
+    const completed = await handle.stat({ bigint: true });
+    if (bytesRead > size
         || !sameFileIdentity(opened, completed)
         || completed.size !== opened.size) {
       throw fixedError("local_collector_state_migration_lease_unavailable");
@@ -388,9 +430,9 @@ async function createMigrationLease(path, clock) {
       startedAt: new Date(clock()).toISOString(),
     }), "utf8");
     await handle.sync();
-    const metadata = await handle.stat();
+    const metadata = await handle.stat({ bigint: true });
     if (!ownerOnlyRegularFile(metadata)
-        || metadata.size > MAX_MIGRATION_LEASE_BYTES) {
+        || metadataSizeExceeds(metadata.size, MAX_MIGRATION_LEASE_BYTES)) {
       throw fixedError("local_collector_state_migration_lease_unavailable");
     }
     await syncDirectory(dirname(path));
@@ -1368,19 +1410,27 @@ export async function openLocalCollectorStateSession({
   }
   await ensureDatabase(stateFile);
   const expectedIntegrityIdentity = stateFileIdentity(
-    await assertSafeStateFile(stateFile),
+    await assertSafeStateFile(stateFile, { exactIdentity: true }),
   );
   let database;
+  let insert;
   try {
     database = openDatabase(stateFile, { readOnly: false });
     // Preserve the selected identity so a later worker scan can detect a
     // changed path rather than treating a same-name replacement as verified.
     await assertExpectedStateFileIdentity(stateFile, expectedIntegrityIdentity);
+    // Prepare the statement while the setup cleanup scope is still active.
+    // A database error here must not leave an open descriptor behind before
+    // the caller can release its collector lock.
+    insert = recordInsertStatement(database);
   } catch (error) {
-    database?.close();
+    try {
+      database?.close();
+    } catch (cleanupError) {
+      error.cleanupError ??= cleanupError;
+    }
     throw error;
   }
-  const insert = recordInsertStatement(database);
   let batches = 0;
   let inserted = 0;
   let verified = false;
@@ -1546,20 +1596,16 @@ async function streamOwnedLegacyRecords(path, onRecord) {
   }
   let metadata;
   try {
-    metadata = await lstat(path);
+    metadata = await lstatExact(path);
   } catch (error) {
     if (error?.code === "ENOENT") {
       return { recordCount: 0, malformedLines: 0, recordsDigest: sha256("") };
     }
     throw fixedError("local_collector_state_legacy_unavailable");
   }
-  if (!metadata.isFile()
-      || metadata.isSymbolicLink()
-      || metadata.nlink !== 1
-      || metadata.size > MAX_LEGACY_COLLECTOR_BYTES
-      || (typeof process.getuid === "function" && metadata.uid !== process.getuid())
-      || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
-    throw fixedError(metadata.size > MAX_LEGACY_COLLECTOR_BYTES
+  if (!ownerOnlyRegularFile(metadata)
+      || metadataSizeExceeds(metadata.size, MAX_LEGACY_COLLECTOR_BYTES)) {
+    throw fixedError(metadataSizeExceeds(metadata.size, MAX_LEGACY_COLLECTOR_BYTES)
       ? "local_collector_state_legacy_records_too_large"
       : "local_collector_state_legacy_unavailable");
   }
@@ -1571,16 +1617,20 @@ async function streamOwnedLegacyRecords(path, onRecord) {
       path,
       constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
     );
-    const opened = await handle.stat();
+    const opened = await handle.stat({ bigint: true });
     if (!ownerOnlyRegularFile(opened)
-        || opened.size > MAX_LEGACY_COLLECTOR_BYTES
+        || metadataSizeExceeds(opened.size, MAX_LEGACY_COLLECTOR_BYTES)
         || !sameFileIdentity(metadata, opened)
         || opened.size !== metadata.size) {
       throw fixedError("local_collector_state_legacy_unavailable");
     }
+    const size = metadataSizeNumber(opened.size);
+    if (size === null) {
+      throw fixedError("local_collector_state_legacy_unavailable");
+    }
     for await (const entry of readBoundedUtf8LineEntries(handle, {
       maximumLineBytes: MAX_LEGACY_RECORD_BYTES,
-      maximumTotalBytes: opened.size,
+      maximumTotalBytes: size,
       highWaterMark: 64 * 1024,
       createLimitError: (limit) => fixedError(
         limit === "line_bytes"
@@ -1603,7 +1653,7 @@ async function streamOwnedLegacyRecords(path, onRecord) {
       await onRecord(value);
       recordCount += 1;
     }
-    const completed = await handle.stat();
+    const completed = await handle.stat({ bigint: true });
     if (!sameFileIdentity(opened, completed)
         || completed.size !== opened.size) {
       throw fixedError("local_collector_state_legacy_changed");
@@ -2038,6 +2088,8 @@ export async function prepareLocalCollectorState({
   });
 }
 
+let lastCollectorLockAcquiredAtMs = Number.NEGATIVE_INFINITY;
+
 export async function acquireLocalCollectorStateLock(
   stateFile = defaultLocalCollectorStatePath(),
   {
@@ -2050,15 +2102,73 @@ export async function acquireLocalCollectorStateLock(
         return false;
       }
     },
+    // These hooks keep the failure boundaries deterministic in tests without
+    // changing the on-disk lock schema or production dependencies.
+    openDatabaseForLock = openDatabase,
+    syncStateFileForLock = syncStateFile,
   } = {},
 ) {
-  if (typeof clock !== "function" || typeof processExists !== "function") {
+  if (typeof clock !== "function"
+      || typeof processExists !== "function"
+      || typeof openDatabaseForLock !== "function"
+      || typeof syncStateFileForLock !== "function") {
     throw new TypeError("Local collector lock options are invalid");
   }
   await ensureDatabase(stateFile);
+
+  // `instance_locks` predates a separate lease-token column. Keep the
+  // existing acquired_at contract as an ISO timestamp, but make timestamps
+  // unique for repeated acquisitions by this process when a test or a frozen
+  // system clock returns the same millisecond. Release matches both fields so
+  // a stale same-PID callback cannot delete a later acquisition (ABA).
+  const requestedAcquiredAt = new Date(clock()).toISOString();
+  const requestedAcquiredAtMs = Date.parse(requestedAcquiredAt);
+  const acquiredAtMs = requestedAcquiredAtMs <= lastCollectorLockAcquiredAtMs
+    ? lastCollectorLockAcquiredAtMs + 1
+    : requestedAcquiredAtMs;
+  const acquiredAt = new Date(acquiredAtMs).toISOString();
+  lastCollectorLockAcquiredAtMs = acquiredAtMs;
+
+  async function releaseOwnedAcquisition() {
+    let releaseDatabase;
+    let changed = false;
+    let firstError = null;
+    try {
+      await assertSafeStateFile(stateFile);
+      releaseDatabase = openDatabaseForLock(stateFile, { readOnly: false });
+      changed = transaction(releaseDatabase, () => {
+        const result = releaseDatabase.prepare(`
+          DELETE FROM instance_locks
+           WHERE name = 'collector' AND pid = ? AND acquired_at = ?
+        `).run(process.pid, acquiredAt);
+        return Number(result.changes ?? 0) > 0;
+      });
+    } catch (error) {
+      firstError = error;
+    } finally {
+      const openedDatabase = releaseDatabase;
+      releaseDatabase = null;
+      try {
+        openedDatabase?.close();
+      } catch (error) {
+        if (firstError === null) firstError = error;
+      }
+    }
+    if (changed || firstError === null) {
+      try {
+        await syncStateFileForLock(stateFile);
+      } catch (error) {
+        if (firstError === null) firstError = error;
+      }
+    }
+    return firstError;
+  }
+
   let database;
+  let acquired = false;
+  let acquisitionError = null;
   try {
-    database = openDatabase(stateFile, { readOnly: false });
+    database = openDatabaseForLock(stateFile, { readOnly: false });
     transaction(database, () => {
       const existing = database.prepare(`
         SELECT pid FROM instance_locks WHERE name = 'collector'
@@ -2071,25 +2181,54 @@ export async function acquireLocalCollectorStateLock(
       ).run();
       database.prepare(`
         INSERT INTO instance_locks(name, pid, acquired_at) VALUES (?, ?, ?)
-      `).run("collector", process.pid, new Date(clock()).toISOString());
+      `).run("collector", process.pid, acquiredAt);
     });
+    acquired = true;
+  } catch (error) {
+    acquisitionError = error;
   } finally {
-    database?.close();
-  }
-  await syncStateFile(stateFile);
-  return async () => {
-    let releaseDatabase;
+    const openedDatabase = database;
+    database = null;
     try {
-      await assertSafeStateFile(stateFile);
-      releaseDatabase = openDatabase(stateFile, { readOnly: false });
-      transaction(releaseDatabase, () => {
-        releaseDatabase.prepare(`
-          DELETE FROM instance_locks WHERE name = 'collector' AND pid = ?
-        `).run(process.pid);
-      });
-    } finally {
-      releaseDatabase?.close();
+      openedDatabase?.close();
+    } catch (error) {
+      if (acquisitionError === null) acquisitionError = error;
     }
-    await syncStateFile(stateFile);
+  }
+
+  if (acquisitionError !== null) {
+    if (acquired) {
+      // Preserve the original acquisition error if best-effort row cleanup
+      // encounters a second failure.
+      await releaseOwnedAcquisition();
+    }
+    throw acquisitionError;
+  }
+
+  try {
+    await syncStateFileForLock(stateFile);
+  } catch (error) {
+    // Preserve the original sync error if best-effort row cleanup encounters
+    // a second failure.
+    await releaseOwnedAcquisition();
+    throw error;
+  }
+
+  let releasePromise = null;
+  return async () => {
+    if (releasePromise === null) {
+      releasePromise = (async () => {
+        try {
+          const releaseError = await releaseOwnedAcquisition();
+          if (releaseError === null) return;
+          releasePromise = null;
+          throw releaseError;
+        } catch (error) {
+          releasePromise = null;
+          throw error;
+        }
+      })();
+    }
+    return releasePromise;
   };
 }
