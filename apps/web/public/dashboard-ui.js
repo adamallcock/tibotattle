@@ -108,3 +108,14 @@ export function createEvidenceList(documentRef, className = "performance-evidenc
   list.className = className;
   return list;
 }
+
+/** Observation recency is independent of a running job or stale cost cache. */
+export function observationFreshness(data) {
+  if (data?.mode === "demo") return "demo";
+  const freshness = data?.freshness;
+  if (!freshness?.latestObservedAt || !Number.isFinite(Date.parse(freshness.latestObservedAt))) return "unknown";
+  const age = freshness.ageSeconds;
+  const threshold = freshness.staleAfterSeconds;
+  if (!Number.isFinite(age) || age < 0 || !Number.isFinite(threshold) || threshold < 0) return "unknown";
+  return age <= threshold ? "current" : "stale";
+}

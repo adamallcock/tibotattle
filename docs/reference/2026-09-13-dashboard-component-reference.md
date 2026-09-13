@@ -87,3 +87,17 @@ contrast in light and dark themes, and usable wrapping or horizontal scrolling
 on narrow screens. These classes describe presentation and interaction; they
 do not change the source, account scope, freshness, coverage, or uncertainty of
 the underlying evidence.
+
+## Observation freshness and allowance metrics
+
+The Overview observation colour derives from its timestamp, age and freshness
+threshold, independently of accounting readiness or a running refresh. Unknown
+recency remains neutral. The header gives running work precedence while the
+observation retains its own recency. Routine stale notices use a compact inline
+warning; accounting qualifications remain explicit.
+
+Allowance cards align their title/source, value, progress and metadata rows
+with a shared subgrid. Source chips sit below titles. Reset and observed times
+share a bordered footer. Spark remains a separate blue limit and retains its
+ordering. Stale cards include an Out of date label; unavailable percentages
+have no progress bar. The percentage scale is consistent across pools.

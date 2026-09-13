@@ -1,3 +1,4 @@
+import { observationFreshness } from "./dashboard-ui.js";
 import { createReportingPeriod, reportingDays, reportingSelection, mountReportingPeriodDismissal } from "./reporting-period.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
@@ -850,10 +851,11 @@ function renderGlobalState() {
   };
   const pill = $("#global-state");
   if (!pill) return;
-  pill.className = `state-pill state-${globalState.state}`;
+  const state = localRefreshInProgress ? "updating" : globalState.state;
+  pill.className = `state-pill state-${state}`;
   pill.replaceChildren(
     node("span", "state-dot"),
-    document.createTextNode(t(keys[globalState.state] ?? "status.unknown")),
+    document.createTextNode(t(keys[state] ?? "status.unknown")),
   );
 }
 
@@ -1488,6 +1490,7 @@ function renderDashboard(data) {
     companionReachable: data.mode !== "demo"
   });
   renderHistoryIndexBadge(data);
+  $(".freshness-card").dataset.freshness = observationFreshness(data);
   $("#latest-observation").textContent = data.freshness.latestObservedAt
     ? formatAge(data.freshness.ageSeconds ?? (Date.now() - Date.parse(data.freshness.latestObservedAt)) / 1000)
     : "No timestamp";
@@ -1511,9 +1514,7 @@ function renderDashboard(data) {
     // the observation is old in that case is simply untrue, and it is the
     // reason a refresh appears to change nothing: the observation was never
     // what was stale.
-    const observationIsCurrent = finite(data.freshness.ageSeconds) !== null
-      && finite(data.freshness.staleAfterSeconds) !== null
-      && data.freshness.ageSeconds <= data.freshness.staleAfterSeconds;
+    const observationIsCurrent = observationFreshness(data) === "current";
     if (observationIsCurrent && data.freshness.accountingStatus === "stale") {
       showConnectionNotice({
         copyKey: "dashboard.stale.accountingCopy",
@@ -1522,8 +1523,8 @@ function renderDashboard(data) {
       });
     } else {
       showConnectionNotice({
-        title: "The local evidence is stale",
-        copy: "The dashboard is showing real local artifacts, but the latest collector observation is older than its freshness threshold.",
+        titleKey: "dashboard.stale.observationTitle",
+        copyKey: "dashboard.stale.observationCopy",
         kind: "warning"
       });
     }
@@ -1537,6 +1538,8 @@ function renderDashboard(data) {
   } else {
     hideConnectionNotice();
   }
+
+  $("#connection-notice").classList.toggle("notice-compact", data.state === "stale");
 
   renderQuotaCards(data);
   renderEvidenceWarnings(data);
@@ -1631,10 +1634,12 @@ function renderQuotaCards(data) {
     } else {
       setLocalizedText(plan, "dashboard.quota.observed");
     }
-    header.append(
-      name,
-      plan,
-    );
+    header.append(name, plan);
+    if (window.status === "stale") {
+      const status = node("span", "metric-card-status");
+      setLocalizedText(status, "dashboard.quota.stale");
+      header.append(status);
+    }
     const value = node("strong", "metric-value");
     setLocalizedText(value, "dashboard.quota.remaining", {
       value: remaining === null
@@ -1644,13 +1649,15 @@ function renderQuotaCards(data) {
     const progress = node("div", "mini-progress");
     const fill = node("i");
     fill.style.width = `${Math.max(0, Math.min(100, remaining ?? 0))}%`;
+    progress.hidden = remaining === null;
+    progress.setAttribute("aria-hidden", "true");
     progress.append(fill);
     const meta = node("div", "metric-meta");
     meta.append(
       node(
         "span",
         "",
-        window.usedPercent === null
+        finite(window.usedPercent) === null
           ? t("dashboard.quota.usedUnknown")
           : t("dashboard.quota.used", {
             value: formatPercent(window.usedPercent),
@@ -1664,10 +1671,12 @@ function renderQuotaCards(data) {
           : t("dashboard.quota.resetUnknown"),
       ),
     );
-    card.append(header, value, progress, meta);
-    if (window.resetAt) card.append(node("p", "", formatTimeRemaining(window.resetAt)));
+    const footer = node("div", "metric-card-footer");
+    footer.append(meta);
+    if (window.resetAt) footer.append(node("p", "", formatTimeRemaining(window.resetAt)));
+    card.append(header, value, progress, footer);
     if (window.observedAt) {
-      card.append(node("p", "", t("dashboard.quota.observedAtPlain", {
+      footer.append(node("p", "", t("dashboard.quota.observedAtPlain", {
         time: formatLocal(window.observedAt),
       })));
     }

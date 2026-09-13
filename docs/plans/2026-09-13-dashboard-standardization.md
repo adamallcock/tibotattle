@@ -168,3 +168,13 @@ for both outside-click and Escape (`.release-build/popup-min-layout.json`).
 The debugging endpoint did not support the native-window resize command;
 minimum-width enforcement has constructor tests, not a live resize receipt.
 The existing full accounting-parity gate remains separate.
+
+## Freshness and allowance card follow-up
+
+Acceptance: observation recency remains independent of accounting readiness and
+running jobs; stale cards carry a text qualifier; missing percentages never
+produce an apparent zero progress bar. Allowance cards share title, source,
+value, progress and footer alignment while retaining separate Spark limits and
+existing ordering. Validate freshness edge cases, the web suite and a fresh
+unsigned package at representative widths. Full accounting parity remains an
+independent gate.
