@@ -47,7 +47,7 @@ test("setup disclosure preserves manual expansion but opens when readiness needs
   assert.equal(h.card.open, true, "an unwritable state must expose recovery guidance");
   h.context.dashboard.collector.indexing = { status: "recent_7d_indexing" };
   h.update();
-  assert.equal(h.card.open, true, "ongoing collection keeps setup visible");
+  assert.equal(h.card.open, false, "ready setup stays compact while collection runs in the header");
   h.update({ state: "unavailable" });
   assert.equal(h.card.hidden, true, "unavailable onboarding is not a ready status");
 });

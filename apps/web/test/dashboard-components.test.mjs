@@ -8,8 +8,6 @@ const reference = await readFile(new URL("../../../docs/reference/2026-09-13-das
 
 test("dashboard component styles keep shared visual rules scoped", () => {
   for (const selector of [
-    ".reporting-period-toolbar",
-    ".reporting-period-selection",
     ".dashboard-tabs",
     ".chart-card",
     ".dashboard-state",
@@ -18,6 +16,9 @@ test("dashboard component styles keep shared visual rules scoped", () => {
   ]) {
     assert.match(styles, new RegExp(`\\.dashboard-shell[^{]*${selector.replaceAll(".", "\\.")}`), selector);
   }
+  const header = styles.slice(styles.indexOf("/* Report context belongs"), styles.indexOf(".dashboard-shell :is(.dashboard-control-group"));
+  assert.match(header, /body:not\(\.community-site\) > \.topbar/u);
+  assert.match(header, /\.reporting-period-toolbar/u);
   assert.match(styles, /prefers-reduced-motion:\s*reduce[\s\S]*dashboard-state-indicator/u);
   assert.match(styles, /aria-pressed="true"/u);
   assert.match(styles, /aria-selected="true"/u);

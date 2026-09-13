@@ -1364,6 +1364,8 @@ function renderReportingPeriod(data = dashboard) {
       ? t("reporting.range", { start: formatLocal(reportingWindow.startAt), end: formatLocal(reportingWindow.endAt) })
       : t("reporting.allThrough", { end: formatLocal(reportingWindow.endAt) })
     : t("reporting.waiting");
+  const rangeToggle = document.querySelector(".reporting-period-details > summary");
+  if (rangeToggle && range) rangeToggle.title = range.textContent;
   workUsageView.setReportingWindow(reportingWindow);
   modelPerformance.setReportingWindow(reportingWindow);
 }
@@ -1411,8 +1413,7 @@ function renderLocalOnboarding(value) {
   card.removeAttribute("aria-hidden");
   card.classList.toggle("needs-attention", !ready);
   // Preserve a manual disclosure choice while readiness stays unchanged.
-  const compactSetup = ready && !boundedPause && Boolean(dashboard)
-    && (!indexing || indexing.status === "recent_7d_complete");
+  const compactSetup = ready && !boundedPause && Boolean(dashboard);
   const setupMode = compactSetup ? "ready" : "attention";
   if (card.dataset.setupMode !== setupMode) card.open = !compactSetup;
   card.dataset.setupMode = setupMode;

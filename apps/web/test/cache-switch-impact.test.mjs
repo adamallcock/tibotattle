@@ -1367,7 +1367,7 @@ test("cache chart readout shows valid bucket subtotals despite a global gap and 
 test("the history selector reads the analyzer's all-indexed period", async () => {
   const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = source.indexOf("function accountingPeriod(data) {");
-  const end = source.indexOf("\nfunction syncAccountingPeriodControls", start);
+  const end = source.indexOf("\nfunction renderAccountingDimension", start);
   assert.ok(start >= 0 && end > start, "accounting period selector is available");
   const select = Function(
     `${source.slice(start, end)}\nlet activeAccountingPeriod = "history";`

@@ -95,9 +95,10 @@ diagnostics, or community contributions.
 
 ## Shared reporting period in development source
 
-The dashboard's **Reporting period** control offers **24 hours**, **7 days**,
-**30 days**, and **All available history**. Your selection persists across pages
-and restarts. The displayed start and end dates come from the selected accounting
+The app header's **Reporting period** control offers **24hr**, **7d**,
+**30d**, and **All**. Your selection persists across pages and restarts.
+Hover over or open the adjacent information control to see the exact dates.
+The start and end dates come from the selected accounting
 snapshot and apply to historical charts, usage totals, model performance, and
 Projects & threads. If matching accounting evidence is unavailable, the page says
 so instead of choosing a different period. All available history describes the

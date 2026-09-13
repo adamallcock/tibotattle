@@ -5032,7 +5032,7 @@ test("native dashboard readiness follows both first-render outcomes", async () =
   const marker = appSource.slice(markerStart, markerEnd);
   const loader = appSource.slice(loadStart, loadEnd);
   const bootSurface = html.match(
-    /<section[\s\S]*?id="dashboard-boot-state"[\s\S]*?<\/section>/u,
+    /<section[^>]*id="dashboard-boot-state"[^>]*>[\s\S]*?<\/section>/u,
   )?.[0] ?? "";
   assert.ok(bootSurface, "the native dashboard has a static boot surface");
   assert.match(bootSurface, /role="status"/u);

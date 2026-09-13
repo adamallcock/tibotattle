@@ -5042,9 +5042,10 @@ html[data-theme="dark"] .noscript {
 }
 .dashboard-shell #community .panel-heading h2 { font-size: 24px; }
 .setup-card { display: block; padding: 16px 24px; margin-bottom: 24px; }
-.setup-card > summary { cursor: pointer; color: var(--muted); }
+.setup-card > summary { cursor: pointer; color: var(--green); }
+.setup-card.needs-attention > summary { color: var(--amber); }
 .setup-card > summary h2 { display: inline; margin: 0; font-family: var(--sans); font-size: 15px; letter-spacing: 0; }
-.setup-details-body { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, .8fr); gap: 24px; padding-top: 20px; }
+.setup-details-body { align-items: start; display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, .8fr); gap: 24px; padding-top: 20px; }
 @media (max-width: 900px) {
   .dashboard-page-header { grid-template-columns: minmax(0, 1fr); gap: 16px; }
   .dashboard-page-header > :last-child { justify-self: start; }
@@ -5070,69 +5071,42 @@ html[data-theme="dark"] .noscript {
   --dashboard-focus-ring: rgba(49, 95, 132, .42);
 }
 
-/* A period is a report-wide context. Its label and control stay together at
-   the top of each report, before the page-specific heading. */
-.dashboard-shell .reporting-period-toolbar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--space-3) var(--space-5);
-  margin: 0 0 var(--space-5);
-  padding: var(--space-3) var(--space-4);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-  box-shadow: var(--shadow-card);
+/* Report context belongs to the persistent app header. */
+body:not(.community-site) > .topbar {
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 20px;
+  padding-inline: 24px;
 }
-.dashboard-shell .reporting-period-selection {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2) var(--space-3);
-  min-width: 0;
+.reporting-period-toolbar { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.reporting-period-toolbar[hidden] { display: none; }
+.reporting-period-toolbar .segmented-control { display: inline-flex; flex-wrap: nowrap; }
+.reporting-period-toolbar .segmented-control > button { min-width: 42px; padding: 8px 10px; white-space: nowrap; }
+.reporting-period-details { position: relative; }
+.reporting-period-details > summary {
+  display: grid; place-items: center; width: 32px; height: 36px;
+  cursor: pointer; color: var(--muted); list-style: none;
 }
-.dashboard-shell .reporting-period-selection > :is(span, label) {
-  color: var(--ink);
-  font-size: .76rem;
-  font-weight: var(--weight-semibold);
-  line-height: 1.35;
+.reporting-period-details > summary::-webkit-details-marker { display: none; }
+.reporting-period-details > p {
+  position: absolute; inset: calc(100% + 8px) 0 auto auto;
+  box-sizing: border-box; width: 220px; max-width: calc(100vw - 28px); margin: 0;
+  padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--ink); box-shadow: var(--shadow-card);
+  font-size: .76rem; line-height: 1.5;
 }
-.dashboard-shell .reporting-period-toolbar > :is(.reporting-period-toolbar-label, .reporting-period-toolbar__label, .reporting-period-label) {
-  display: grid;
-  gap: 1px;
-  min-width: 0;
-  color: var(--ink);
-  font-size: .76rem;
-  font-weight: var(--weight-semibold);
-  line-height: 1.35;
+/* The date explanation is also available by keyboard or click/tap. */
+.reporting-period-details:not([open]) > p { display: none; }
+
+body:not(.community-site) > .topbar #refresh-button.refresh-progress { width: min(28vw, 320px); min-width: 180px; }
+body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { grid-template-columns: auto minmax(0, 1fr); }
+@media (max-width: 1200px) {
+  body:not(.community-site) > .topbar { grid-template-columns: auto minmax(0, 1fr); gap: 8px 16px; padding-block: 10px; }
+  .reporting-period-toolbar { grid-row: 2; grid-column: 1 / -1; }
+  body:not(.community-site) > .topbar .top-actions { grid-column: 2; grid-row: 1; }
 }
-.dashboard-shell .reporting-period-toolbar > :is(.reporting-period-toolbar-label, .reporting-period-toolbar__label, .reporting-period-label) :is(small, .annotation) {
-  color: var(--muted);
-  font-size: .67rem;
-  font-weight: var(--weight-regular);
-}
-.dashboard-shell .reporting-period-toolbar > :is(.reporting-period-control, .reporting-period-toolbar__control, [data-reporting-period-controls], .segmented-control) {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 100%;
-}
-.dashboard-shell .reporting-period-selection > .segmented-control,
-.dashboard-shell .reporting-period-selection > [data-reporting-period-controls] { flex: 0 1 auto; }
-.dashboard-shell .reporting-period-toolbar > :is(#reporting-period-range, .reporting-period-range) {
-  min-width: 0;
-  margin: 0;
-  color: var(--muted);
-  font-size: .7rem;
-  line-height: 1.4;
-  text-align: end;
-}
-.dashboard-shell .reporting-period-toolbar > :is([data-i18n="reporting.scope"], .reporting-period-scope) {
-  grid-column: 1 / -1;
-  min-width: 0;
-  margin: 0;
-  color: var(--muted);
-  font-size: .68rem;
-  line-height: 1.4;
+@media (max-width: 760px) {
+  body:not(.community-site) > .topbar { padding-inline: 14px; }
+  body:not(.community-site) > .topbar #refresh-button.refresh-progress { display: none; }
 }
 
 .dashboard-shell :is(.dashboard-control-group, .dashboard-filter-group) {
@@ -5507,34 +5481,10 @@ html[data-theme="dark"] .noscript {
 }
 
 @media (max-width: 760px) {
-  .dashboard-shell .reporting-period-toolbar {
-    grid-template-columns: minmax(0, 1fr);
-    align-items: stretch;
-  }
-  .dashboard-shell .reporting-period-selection { align-items: stretch; }
-  .dashboard-shell .reporting-period-selection > :is(span, label) { align-self: center; }
-  .dashboard-shell .reporting-period-toolbar > :is(.reporting-period-control, .reporting-period-toolbar__control, [data-reporting-period-controls], .segmented-control) {
-    width: 100%;
-  }
-  .dashboard-shell .reporting-period-toolbar > :is(#reporting-period-range, .reporting-period-range) { text-align: start; }
-  .dashboard-shell .reporting-period-selection > .segmented-control,
-  .dashboard-shell .reporting-period-selection > [data-reporting-period-controls] { width: 100%; }
-  .dashboard-shell .reporting-period-toolbar .segmented-control > button { flex: 1 1 0; }
   .dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) { justify-content: flex-start; }
   .dashboard-shell :is(.chart-card-header, .chart-heading) { gap: var(--space-3); }
 }
 @media (max-width: 520px) {
-  .dashboard-shell .reporting-period-toolbar .segmented-control {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 3px;
-    overflow: visible;
-  }
-  .dashboard-shell .reporting-period-toolbar .segmented-control > button {
-    min-width: 0;
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
   .dashboard-shell :is(.dashboard-tabs, .performance-models) {
     flex-wrap: nowrap;
     overflow-x: auto;

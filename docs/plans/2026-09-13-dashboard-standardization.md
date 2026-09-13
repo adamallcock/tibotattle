@@ -88,3 +88,17 @@ Three Luna max agents completed the formatter, surface and presentation work.
   subprocess check (`null` exit status). This is separate from the passing
   focused Electron contracts and does not qualify native rendering.
 - No signing, publishing, updater qualification, or system installation occurred.
+
+## Compact header follow-up
+
+User review requested fixed left brand alignment, a compact header reporting
+control, dates available on demand, removal of the scope sentence, and compact
+successful setup. Implemented these with full accessible period labels and a
+keyboard-operable date disclosure. Header controls wrap at narrow widths; setup
+errors and bounded continuation remain expanded. Ready setup no longer expands
+solely because collection is running. Expanded setup checks align at the top.
+
+The 745 browser tests pass. Corrected two stale source-extraction tests to target
+their owning function/section after the reporting control moved. Documentation
+and i18n mirror checks pass. Browser inspection covered compact controls and
+keyboard date disclosure at narrow width. Fresh packaged verification follows.

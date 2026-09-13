@@ -79,6 +79,19 @@
         <img class="brand-icon" src="./tibotattle-icon.png" alt="">
         <span>TiboTattle</span>
       </a>
+      <section class="reporting-period-toolbar" id="reporting-period-toolbar" aria-labelledby="reporting-period-label">
+        <span class="sr-only" id="reporting-period-label" data-i18n="reporting.period">Reporting period</span>
+        <div class="segmented-control" id="reporting-period-controls" role="group" aria-labelledby="reporting-period-label">
+          <button type="button" data-period="24h" aria-pressed="false" data-i18n="reporting.compact.24h" data-i18n-aria-label="reporting.24h">24hr</button>
+          <button type="button" data-period="7d" aria-pressed="true" class="active" data-i18n="reporting.compact.7d" data-i18n-aria-label="reporting.7d">7d</button>
+          <button type="button" data-period="30d" aria-pressed="false" data-i18n="reporting.compact.30d" data-i18n-aria-label="reporting.30d">30d</button>
+          <button type="button" data-period="all" aria-pressed="false" data-i18n="reporting.compact.all" data-i18n-aria-label="reporting.all">All</button>
+        </div>
+        <details class="reporting-period-details">
+          <summary aria-label="Reporting period" data-i18n-aria-label="reporting.period"><span aria-hidden="true">ⓘ</span></summary>
+          <p id="reporting-period-range" role="status"></p>
+        </details>
+      </section>
       <div class="top-actions">
         <label class="language-picker">
           <span class="sr-only" data-i18n="language.label">Language</span>
@@ -130,19 +143,7 @@
       </aside>
       <div class="dashboard-content">
     <main id="main">
-      <section class="reporting-period-toolbar" id="reporting-period-toolbar" aria-labelledby="reporting-period-label">
-        <div class="reporting-period-selection">
-          <span id="reporting-period-label" data-i18n="reporting.period">Reporting period</span>
-          <div class="segmented-control" id="reporting-period-controls" role="group" aria-labelledby="reporting-period-label">
-            <button type="button" data-period="24h" aria-pressed="false" data-i18n="reporting.24h">24 hours</button>
-            <button type="button" data-period="7d" aria-pressed="true" class="active" data-i18n="reporting.7d">7 days</button>
-            <button type="button" data-period="30d" aria-pressed="false" data-i18n="reporting.30d">30 days</button>
-            <button type="button" data-period="all" aria-pressed="false" data-i18n="reporting.all">All available history</button>
-          </div>
-        </div>
-        <p class="small muted" id="reporting-period-range" role="status"></p>
-        <p class="small muted" data-i18n="reporting.scope">Current allowance and sharing preferences are not affected.</p>
-      </section>
+
       <section
         class="dashboard-boot-state"
         id="dashboard-boot-state"

@@ -8,21 +8,19 @@ status: proposed
 # TiboTattle dashboard component reference
 
 This reference names the shared visual contract for the local dashboard. The
-contract is scoped by `.dashboard-shell`, so the public site can keep its own
+page contract is scoped by `.dashboard-shell`, with the report toolbar scoped to the app header, so the public site can keep its own
 page styling. Existing names remain supported as aliases while new markup can
 use the clearer names below.
 
 ## Report context and controls
 
-Place one `.reporting-period-toolbar` before the page header. Its
-`.reporting-period-selection` groups the label and the shared
-`.segmented-control` (the current control is `#reporting-period-controls`). A
-`.reporting-period-toolbar-label` (or `reporting-period-toolbar__label`) and a
-`.reporting-period-control` (or `reporting-period-toolbar__control`) are valid
-names for future wrappers. The toolbar may include
-`#reporting-period-range` and a `.reporting-period-scope` status line. The
-period choices are `24h`, `7d`, `30d`, and `all`; the selected choice uses
-`aria-pressed="true"`.
+Place one `.reporting-period-toolbar` in the app header beside the brand.
+Its `.segmented-control` (`#reporting-period-controls`) shows compact labels
+`24hr`, `7d`, `30d`, and `All`, with full localized accessible names. The
+selected choice uses `aria-pressed="true"`. The adjacent native disclosure
+exposes `#reporting-period-range` through a click or keyboard activation;
+its title also provides the exact dates on hover. At narrow widths the selector
+wraps onto a second header row. Community hides the reporting control.
 
 Page-local filters use the same `.segmented-control` and selected state. A
 `.dashboard-filter-group` may pair a `.dashboard-filter-label` with a filter.
