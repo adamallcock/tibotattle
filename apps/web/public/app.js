@@ -1491,6 +1491,8 @@ function renderDashboard(data) {
   });
   renderHistoryIndexBadge(data);
   $(".freshness-card").dataset.freshness = observationFreshness(data);
+  setLocalizedText($(".freshness-card > span"), observationFreshness(data) === "stale"
+    ? "dashboard.freshness.stale" : "dashboard.freshness.observation");
   $("#latest-observation").textContent = data.freshness.latestObservedAt
     ? formatAge(data.freshness.ageSeconds ?? (Date.now() - Date.parse(data.freshness.latestObservedAt)) / 1000)
     : "No timestamp";
@@ -1521,6 +1523,10 @@ function renderDashboard(data) {
         kind: "warning",
         titleKey: "dashboard.stale.accountingTitle",
       });
+    } else if (observationFreshness(data) === "stale") {
+      // Timestamp and card qualifiers already identify old observations. Keep
+      // published coverage warnings, without repeating a generic banner.
+      hideConnectionNotice();
     } else {
       showConnectionNotice({
         titleKey: "dashboard.stale.observationTitle",
