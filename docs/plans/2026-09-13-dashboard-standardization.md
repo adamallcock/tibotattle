@@ -417,3 +417,48 @@ Projects page in the packaged app. Both share-header help buttons have distinct
 accessible labels. Enter opens the popover, Escape closes it and restores
 focus, and an outside click dismisses it. The popover fits at 960px. Evidence:
 `.release-build/usability-share-help.json` and its matching screenshot.
+
+
+## Integration with current main
+
+[PR #136](https://github.com/adamallcock/tibotattle/pull/136) integrates this
+work with main `1b086c13aa48db33cd19b3768d1db3c05cb28872`. The integration
+preserves the animated allowance tanks and background report preloading.
+Both reports retain exact shared window bounds, bounded caches, cancellation,
+and invalidation across visibility and source changes. The canonical asset
+manifest includes the shared dashboard modules for each client surface.
+
+Rendered review found obsolete metric-card subgrid rules overriding the tank
+layout. Those rules were removed. The unavailable dashboard path now disposes
+the tank manager before removing its observed DOM, with regression coverage.
+The localization, native bundle inventory, reporting export inventory, and
+release-tool caller assertions were reconciled with the reviewed source.
+
+Final executable source: `8f5dc1b9cba13ad04e263605744a6b69690d2dcc`.
+Unsigned development package ASAR:
+`3fca9e56bce3369002827ddcb2132ab8d1eeb12e70ee14551c2caf41d550837a`.
+The packaged real-history snapshot gate passes, including four advancing
+clock samples, responsive control endpoints, cancellation, retry, and clean
+quit. All seven pages were inspected at 1180px and 960px with no document
+overflow. Labeled synthetic states verify long model names, loading and
+cancellation, error recovery, empty search, pagination, and both share-column
+help buttons. Enter opens help, Escape returns focus, and outside click closes
+it. Evidence is retained under `.release-build/merged-dashboard-*`.
+
+The retained R7 release-evidence tests fail because their workload source digest
+and file count are stale. The same failures were reproduced against an
+unmodified archive of main `1b086c13aa48db33cd19b3768d1db3c05cb28872`.
+Protected private-history receipt regeneration was not performed. These
+receipts do not qualify the integrated source for release. The snapshot check
+also does not evaluate full-refresh completion or relaunch persistence, and
+no system installation, signing/notarization, release, updater publication,
+or hosted deployment is included.
+
+Final validation: `pnpm test` executed 5,379 tests: 5,329 passed, 48 were
+platform-gated skips, and only the two baseline R7 receipt tests failed. The
+54 Projects tests also pass after preserving main's mapping-caption removal.
+The final 816-test web suite and separate 359-test local companion suite,
+preflight, architecture, locale
+generation checks, release-trust policy, and asset/export checks pass.
+Existing platform gates were retained; no tests were disabled and no
+assertions were weakened to obtain these results.
