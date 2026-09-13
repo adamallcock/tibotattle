@@ -308,6 +308,7 @@ export const MACOS_RUNTIME_STATIC_ASSETS = Object.freeze([
   "apps/web/public/icon-settings.svg",
   "apps/web/public/codex-color.svg",
   "apps/web/public/model-performance.css",
+  "apps/web/public/cache-reuse-matrix.css",
   "apps/web/public/tibotattle-icon.png",
 ]);
 export const MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES =

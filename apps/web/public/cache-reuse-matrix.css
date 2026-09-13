@@ -1,0 +1,208 @@
+/* Count-scaled cache evidence. Motion emphasizes inspection, never fabricates
+   changing cache evidence or a provider retention deadline. */
+.cache-matrix {
+  --matrix-stage: #102b24;
+  --matrix-light: #ecf6ea;
+  --matrix-dim: #b0c7b6;
+  --matrix-good: #77e6b9;
+  --matrix-poor: #ffad89;
+  min-width: 0;
+}
+.cache-matrix *, .cache-matrix *::before, .cache-matrix *::after { box-sizing: border-box; }
+.cache-matrix [hidden] { display: none !important; }
+.cache-matrix-stage {
+  position: relative;
+  isolation: isolate;
+  border-radius: 18px;
+  overflow: hidden;
+  background: var(--matrix-stage);
+  color: var(--matrix-light);
+  box-shadow: inset 0 1px 0 rgb(236 246 234 / 18%);
+}
+.cache-matrix-stage::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: radial-gradient(ellipse at 25% 10%, rgb(119 230 185 / 9%), transparent 65%);
+  pointer-events: none;
+}
+.cache-matrix-instrument-head {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 18px 20px 14px;
+  font-size: .76rem;
+  color: var(--matrix-dim);
+}
+.cache-matrix-unit { display: flex; align-items: center; gap: 8px; }
+.cache-matrix-unit::before, .cache-matrix-legend > span::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 1px;
+  background: var(--matrix-good);
+  box-shadow: 0 0 7px rgb(119 230 185 / 40%);
+}
+.cache-matrix-model-field { display: flex; align-items: center; gap: 9px; margin-inline-start: auto; max-width: 100%; }
+.cache-matrix-model-note { flex-basis: 100%; margin-top: -6px; text-align: end; color: var(--matrix-dim); font-size: .75rem; }
+.cache-matrix-model-picker:disabled { opacity: .7; cursor: default; }
+.cache-matrix-model-picker {
+  width: 232px;
+  max-width: 100%;
+  min-height: 42px;
+  padding: 8px 12px;
+  border: 1px solid rgb(176 199 182 / 30%);
+  border-radius: 10px;
+  background: #203a31;
+  color: var(--matrix-light);
+  color-scheme: dark;
+  font: inherit;
+  font-size: .85rem;
+  cursor: pointer;
+}
+.cache-matrix-model-picker .allowance-model-icon {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 6px;
+  border-radius: 8px;
+  fill: none;
+  stroke: var(--matrix-model-color, var(--matrix-dim));
+  stroke-width: 1.65;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  background: color-mix(in srgb, var(--matrix-model-color, var(--matrix-dim)) 12%, transparent);
+}
+.cache-matrix-model-picker .allowance-model-astra { --matrix-model-color: #94c8d6; }
+.cache-matrix-model-picker .allowance-model-sol { --matrix-model-color: #f4c778; }
+.cache-matrix-model-picker .allowance-model-terra { --matrix-model-color: #c5d49a; }
+.cache-matrix-model-picker .allowance-model-luna { --matrix-model-color: #c5c6ef; }
+.cache-matrix-model-picker .allowance-model-review { --matrix-model-color: #abd5c1; }
+.cache-matrix-model-picker .allowance-model-spark { --matrix-model-color: #efc18c; }
+@supports (appearance: base-select) {
+  .cache-matrix-model-picker, .cache-matrix-model-picker::picker(select) { appearance: base-select; }
+  .cache-matrix-model-picker { padding: 5px 11px 5px 6px; }
+  .cache-matrix-model-picker::picker(select) {
+    width: 290px;
+    max-width: calc(100vw - 28px);
+    max-height: min(430px, 70vh);
+    overflow-y: auto;
+    border: 1px solid rgb(176 199 182 / 30%);
+    border-radius: 14px;
+    padding: 6px;
+    margin-top: 6px;
+    background: var(--matrix-stage);
+    color: var(--matrix-light);
+    box-shadow: 0 16px 38px rgb(5 24 17 / 55%);
+  }
+  .cache-matrix-model-picker option {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    min-height: 46px;
+    padding: 6px 9px;
+    border-radius: 8px;
+    font-size: .85rem;
+    white-space: normal;
+  }
+  .cache-matrix-model-picker option:hover { background: rgb(236 246 234 / 7%); }
+  .cache-matrix-model-picker option:checked, .cache-matrix-model-picker option:checked:hover { background: rgb(119 230 185 / 13%); }
+  .cache-matrix-model-picker option:focus-visible { outline-color: var(--matrix-light); }
+  .cache-matrix-model-picker option::checkmark { order: 2; margin-inline-start: auto; color: var(--matrix-good); }
+  .cache-matrix-model-picker::picker-icon { color: var(--matrix-dim); font-size: .75rem; }
+  .cache-matrix-model-picker selectedcontent { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .cache-matrix-model-picker selectedcontent > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cache-matrix-model-picker selectedcontent .allowance-model-icon { width: 28px; height: 28px; padding: 5px; }
+}
+.cache-matrix-view { position: relative; width: 100%; }
+.cache-matrix-plot { display: block; width: 100%; overflow: visible; }
+.cache-matrix-plot text { font-family: inherit; font-size: 11px; fill: var(--matrix-light); }
+.cache-matrix-plot .cache-matrix-muted { fill: var(--matrix-dim); font-variant-numeric: tabular-nums; }
+.cache-matrix-plot .cache-matrix-rate { font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.cache-matrix-gap { font-weight: 600; }
+.cache-matrix-baseline { stroke: rgb(176 199 182 / 25%); }
+.cache-matrix-gridline { stroke: rgb(176 199 182 / 8%); }
+.cache-matrix-cells { filter: drop-shadow(0 0 2.4px rgb(119 230 185 / 24%)); }
+.cache-matrix-cell-more { fill: var(--matrix-good); }
+.cache-matrix-cell-less { fill: var(--matrix-poor); }
+.cache-matrix-selection {
+  fill: rgb(236 246 234 / 4%);
+  stroke: rgb(236 246 234 / 34%);
+  stroke-width: 1;
+  pointer-events: none;
+  transition: transform 220ms cubic-bezier(.2,.8,.2,1), opacity 160ms ease;
+}
+.cache-matrix-hit-layer { position: absolute; inset: 0; pointer-events: none; }
+.cache-matrix-hit {
+  position: absolute;
+  pointer-events: auto;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  border-radius: 7px;
+  padding: 0;
+  min-width: 0;
+  cursor: pointer;
+  touch-action: pan-y;
+}
+.cache-matrix-hit:hover { background: transparent; }
+.cache-matrix-hit:focus-visible, .cache-matrix-model-picker:focus-visible { outline: 2px solid var(--matrix-light); outline-offset: -2px; }
+.cache-matrix-empty {
+  position: absolute;
+  inset: 55px 20px auto;
+  margin: 0;
+  padding: 20px;
+  text-align: center;
+  color: var(--matrix-dim);
+  font-size: .9rem;
+  pointer-events: none;
+}
+.cache-matrix-detail {
+  position: relative;
+  border-top: 1px solid rgb(176 199 182 / 17%);
+  padding: 17px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px 22px;
+  min-height: 122px;
+}
+.cache-matrix-detail-identity strong { display: block; font-size: .86rem; font-weight: 600; }
+.cache-matrix-detail small { display: block; color: var(--matrix-dim); font-size: .75rem; line-height: 1.5; }
+.cache-matrix-detail-identity small { margin-top: 4px; }
+.cache-matrix-outcomes { display: flex; flex-wrap: wrap; gap: 16px 26px; }
+.cache-matrix-detail-value { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px; font-variant-numeric: tabular-nums; }
+.cache-matrix-detail-value > span { font-size: 1.15rem; }
+.cache-matrix-detail-value > small { font-size: .74rem; }
+.cache-matrix-more .cache-matrix-detail-value > span { color: var(--matrix-good); }
+.cache-matrix-less .cache-matrix-detail-value > span { color: var(--matrix-poor); }
+.cache-matrix-metrics { width: 100%; display: flex; flex-wrap: wrap; gap: 4px 20px; }
+.cache-matrix-legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 13px; color: var(--muted, #57625c); font-size: .75rem; }
+.cache-matrix-legend > span { display: flex; align-items: center; gap: 7px; }
+.cache-matrix-legend > .cache-matrix-more::before { background: #237b5c; box-shadow: none; }
+.cache-matrix-legend > .cache-matrix-less::before { background: #b06544; box-shadow: none; }
+.cache-matrix-note { margin: 10px 0 0; font-size: .75rem; color: var(--muted, #57625c); }
+.cache-matrix-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@media (max-width: 540px) {
+  .cache-matrix-instrument-head { padding: 14px 14px 8px; gap: 12px; }
+  .cache-matrix-model-field { width: 100%; margin-inline-start: 0; }
+  .cache-matrix-model-picker { flex: 1; width: 100%; min-height: 44px; }
+  .cache-matrix-detail { padding: 16px 14px; }
+  .cache-matrix-outcomes { gap: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cache-matrix-selection { transition: none; }
+}
+@media (forced-colors: active) {
+  .cache-matrix-stage { border: 1px solid CanvasText; }
+  .cache-matrix-cell-more { fill: LinkText; }
+  .cache-matrix-cell-less { fill: Mark; }
+  .cache-matrix-plot text { fill: CanvasText; }
+  .cache-matrix-selection { stroke: Highlight; }
+}

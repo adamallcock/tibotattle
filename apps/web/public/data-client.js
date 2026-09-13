@@ -2171,6 +2171,7 @@ const CACHE_SWITCH_RECENT_LIMIT = 20;
 const CACHE_SWITCH_PROXIMITY_CEILING_SECONDS = 300;
 const CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO = 0.5;
 const CACHE_CONTINUITY_MINIMUM_GAP_SECONDS = 0;
+const MAX_CACHE_CONTINUITY_MODELS = 128;
 const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS = 7 * 24 * 60 * 60;
 const CACHE_CONTINUITY_GAP_BANDS = Object.freeze({
   under_one_minute: [0, 60],
@@ -3113,7 +3114,59 @@ function normalizeCacheContinuityRecent(rows, maximumRows) {
     .slice(0, Math.min(CACHE_SWITCH_RECENT_LIMIT, maximumRows));
 }
 
-function normalizeCacheContinuitySummary(value) {
+function cacheContinuityCohortsMatch(total, cohorts) {
+  if (CACHE_CONTINUITY_BREAKDOWN_FIELDS.some((field) => cohorts.reduce(
+    (sum, cohort) => sum + cohort[field], 0
+  ) !== total[field])) return false;
+  if (!cacheCoveredSubtotalsMatch(total, cohorts)) return false;
+  if (total.estimatedPremiumUsd !== null && (cohorts.some(
+    (cohort) => cohort.estimatedPremiumUsd === null
+  ) || Math.abs(cohorts.reduce((sum, cohort) => sum + cohort.estimatedPremiumUsd, 0)
+    - total.estimatedPremiumUsd) > 1e-9)) return false;
+  return true;
+}
+
+function normalizeCacheContinuityModels(value, total) {
+  // Missing older snapshots remain useful for All models; they do not
+  // masquerade as a completed model breakdown with zero evidence.
+  if (!Array.isArray(value?.byModel)
+      || value.byModel.length > MAX_CACHE_CONTINUITY_MODELS) return null;
+  const models = new Set();
+  const cohorts = [];
+  for (const candidate of value.byModel) {
+    const model = candidate?.model;
+    if (model === "unknown" || !LOCAL_MODELS.has(model) || models.has(model)) return null;
+    const summary = normalizeCacheContinuitySummary(candidate, false);
+    if (summary === null || summary.sameConfigurationReturns === 0
+        || summary.orderingCoverageGaps !== total.orderingCoverageGaps
+        || summary.recent.some((row) => row.configuration.model !== model)) return null;
+    models.add(model);
+    cohorts.push({
+      model,
+      ...summary,
+      allowanceImpact: value.periodId === "7d"
+        ? summary.allowanceImpact
+        : unavailableAllowanceImpact("period_denominator_mismatch")
+    });
+  }
+  if (!cacheContinuityCohortsMatch(total, cohorts)) return null;
+  // Compaction-only models are not picker options, so these counts may be a
+  // subset of the all-model total, but they must never exceed it.
+  if (["postCompactionRequests", "postCompactionCacheReadDrops"].some(
+    (field) => cohorts.reduce((sum, cohort) => sum + cohort[field], 0) > total[field]
+  )) return null;
+  for (const [field, keys] of [
+    ["byGapBand", CACHE_CONTINUITY_GAP_BAND_IDS],
+    ["byOutcomeBucket", CACHE_CONTINUITY_OUTCOME_BUCKET_IDS]
+  ]) {
+    if (keys.some((key) => !cacheContinuityCohortsMatch(
+      total[field][key], cohorts.map((cohort) => cohort[field][key])
+    ))) return null;
+  }
+  return cohorts;
+}
+
+function normalizeCacheContinuitySummary(value, includeModels = true) {
   const totals = normalizeCacheContinuityBreakdown(value, true);
   if (totals === null) return null;
   const allowanceWeighting = normalizeCachePremiumWeighting(
@@ -3181,7 +3234,7 @@ function normalizeCacheContinuitySummary(value) {
   if (postCompactionRequests === null
       || postCompactionCacheReadDrops === null
       || postCompactionCacheReadDrops > postCompactionRequests) return null;
-  return {
+  const summary = {
     ...totals,
     standardApiPremiumUsd: totals.estimatedPremiumUsd,
     allowanceWeighting,
@@ -3193,6 +3246,10 @@ function normalizeCacheContinuitySummary(value) {
     allowanceImpact: totals.estimatedPremiumUsd === null
       ? unavailableAllowanceImpact("weighting_evidence_incomplete")
       : normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
+  };
+  return {
+    ...summary,
+    ...(includeModels ? { byModel: normalizeCacheContinuityModels(value, summary) } : {})
   };
 }
 
@@ -3228,6 +3285,7 @@ function unavailableCacheContinuityImpact(errorCode = null) {
     postCompactionCacheReadDrops: 0,
     byGapBand: {},
     byOutcomeBucket: {},
+    byModel: null,
     recent: [],
     allowanceImpact: unavailableAllowanceImpact(),
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,

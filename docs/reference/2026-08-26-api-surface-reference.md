@@ -221,6 +221,15 @@ claim. Clients must identify the subtotal's scope and must not substitute it
 into `allowanceImpact` or hide excluded sessions. No priced observations means
 `coveredSubtotal: null`, not a zero-valued placeholder.
 
+Cache continuity also carries an optional `byModel` array on the selected
+impact and each reporting period. Each reviewed model ID has the same aggregate
+counts, gap/outcome buckets, pricing, coverage and bounded recent-detail shape.
+Cohorts partition the complete comparable evidence, never the recent-detail
+sample. Unattributable ordering gaps conservatively qualify every model total.
+The breakdown is bounded to 128 models; missing, unsupported or inconsistent
+breakdowns normalize to `null` while All models remains available. An empty
+array means no eligible same-configuration models were found.
+
 When contribution preparation encounters a preserved legacy export identity
 whose bounded silent migration has not completed, it returns the fixed
 `identity_migration_required` code. The dashboard directs the user to native

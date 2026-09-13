@@ -110,6 +110,17 @@ and disclosed; that subtotal is not the whole-period total or a percentage of
 your allowance. A subtotal with no priceable comparisons stays unavailable,
 not a zero-valued placeholder.
 
+The **Did the cache carry over?** memory matrix compares follow-up turns with
+unchanged model and settings across nine time gaps, ending at **24h+**. The
+percentage above each column is the share that reused more than half of the
+previous cached input; **n** is the number of checked follow-ups. Light counts
+use one shared count scale, with partly filled lights for remainders. Hover,
+tap, or use the arrow keys to inspect percentages, counts, lost reuse and
+Standard API-equivalent estimates. The model picker filters complete comparison
+aggregates and retains your choice when the reporting period changes. Missing
+model breakdowns and periods without eligible follow-ups remain explicit;
+zero eligible follow-ups does not mean a 0% cache reuse rate.
+
 The **Thread name** column in both recent cache-drop tables opens the associated
 Codex thread. A worker row shows a parent-name link and a separate bracketed
 subworker link. Hover a link for the local event time; keyboard users receive

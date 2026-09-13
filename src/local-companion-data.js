@@ -1424,6 +1424,23 @@ export function projectTrayCacheSummary(impact) {
   };
 }
 
+function projectCacheContinuityCohort(cohort, periodId, allowanceCapacity) {
+  const { byModel: _byModel, ...summary } = cohort;
+  const projected = {
+    ...summary,
+    allowanceWeighting: projectCachePremiumWeighting(cohort.allowanceWeighting),
+    coveredSubtotal: projectCacheCoveredSubtotal(cohort.coveredSubtotal, cohort.pricedDrops),
+    byGapBand: projectCacheImpactBreakdown(cohort.byGapBand),
+    byOutcomeBucket: projectCacheImpactBreakdown(cohort.byOutcomeBucket),
+  };
+  return {
+    ...projected,
+    allowanceImpact: cacheSwitchAllowanceImpact(
+      { ...projected, periodId }, allowanceCapacity,
+    ),
+  };
+}
+
 function cacheContinuityImpactProjection(
   impact,
   selectedPeriodId,
@@ -1446,26 +1463,18 @@ function cacheContinuityImpactProjection(
       allowanceImpact: unavailableCacheSwitchAllowance(
         "cache_continuity_impact_unavailable",
       ),
+      byModel: null,
       periods: [],
     };
   }
   const periods = impact.periods.map((period) => {
-    const allowanceWeighting = projectCachePremiumWeighting(
-      period.allowanceWeighting,
-    );
-    const projected = {
-      ...period,
-      allowanceWeighting,
-      coveredSubtotal: projectCacheCoveredSubtotal(period.coveredSubtotal, period.pricedDrops),
-      byGapBand: projectCacheImpactBreakdown(period.byGapBand),
-      byOutcomeBucket: projectCacheImpactBreakdown(period.byOutcomeBucket),
-    };
     return {
-      ...projected,
-      allowanceImpact: cacheSwitchAllowanceImpact(
-        projected,
-        allowanceCapacity,
-      ),
+      ...projectCacheContinuityCohort(period, period.periodId, allowanceCapacity),
+      byModel: Array.isArray(period.byModel) && period.byModel.length <= 128
+        ? period.byModel.map((cohort) => projectCacheContinuityCohort(
+          cohort, period.periodId, allowanceCapacity,
+        ))
+        : null,
     };
   });
   const selected = periods.find((period) => period.periodId === selectedPeriodId)
@@ -1481,6 +1490,7 @@ function cacheContinuityImpactProjection(
       allowanceImpact: unavailableCacheSwitchAllowance(
         "cache_continuity_impact_unavailable",
       ),
+      byModel: null,
       periods: [],
     };
   }
@@ -1516,6 +1526,7 @@ function cacheContinuityImpactProjection(
     postCompactionCacheReadDrops: selected.postCompactionCacheReadDrops,
     byGapBand: selected.byGapBand,
     byOutcomeBucket: selected.byOutcomeBucket,
+    byModel: selected.byModel,
     recent: selected.recent,
     allowanceImpact: selected.allowanceImpact,
     periods,
