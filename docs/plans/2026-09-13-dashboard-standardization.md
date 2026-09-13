@@ -62,8 +62,29 @@ Three Luna max agents completed the formatter, surface and presentation work.
   unqualified at `usage_parity_invalid`: the synthetic accounting projection was
   still unavailable. No assertion was relaxed; the complete receipt is
   `.release-build/standard-smoke.json`.
-- Automatic approval review rejected a real-history QA launch because private
-  Codex session-history access requires specific authorization. No real-history
-  QA process ran. Current rendering evidence is synthetic; real-data validation
-  remains pending that authorization.
+- After explicit user authorization, ran the same packaged app against real
+  local history in a separate persistent QA profile. Refresh succeeded and
+  loopback health/status probes stayed responsive. Inspected the rendered
+  dashboard and checked all four selections across six navigation destinations:
+  selected periods and displayed bounds stayed consistent; Community hid the
+  toolbar. Content-free evidence is in
+  `.release-build/standard-real-filter-evidence.json`.
+- Corrected the QA timer reader to inspect the dedicated `m:ss` slot, retaining
+  the four-advancing-samples requirement and rejection of invalid/stalled clocks.
+  All 73 focused Electron smoke/real-history contract tests passed.
+- Full real-history qualification remains unpassed at `usage_invalid`. A
+  separate content-free diagnostic confirmed a visible accounting page, four
+  populated token and cost rows, five populated model rows and explicit states
+  for all three advanced modules. The failed condition was the visibility of
+  `accounting-price-coverage`: the existing renderer hides this optional warning
+  when no unpriced events are reported, while the QA gate requires it visible.
+  Neither the product warning nor the parity assertion was changed. Receipts:
+  `.release-build/standard-real-history-retry.json` and
+  `.release-build/standard-real-usage-diagnostic.json`. Failure receipts reset
+  some earlier-stage fields; they do not independently preserve all successful
+  refresh observations. The isolated profile is retained; installed app state
+  was not used as the QA destination.
+- The broader macOS smoke lane additionally failed its native launcher layout
+  subprocess check (`null` exit status). This is separate from the passing
+  focused Electron contracts and does not qualify native rendering.
 - No signing, publishing, updater qualification, or system installation occurred.

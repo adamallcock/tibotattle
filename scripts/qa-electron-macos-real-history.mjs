@@ -2007,6 +2007,7 @@ async function uiSnapshot(session) {
     return {
       ready: document.documentElement?.dataset?.localDashboardReady === "true",
       refreshText: refresh?.textContent?.replace(/\\s+/gu, " ").trim() ?? "",
+      refreshTimerText: refresh?.querySelector('.refresh-progress-time')?.textContent?.trim() ?? null,
       refreshDisabled: Boolean(refresh?.disabled),
       cancelHidden: Boolean(cancel?.hidden),
       cancelDisabled: Boolean(cancel?.disabled),
@@ -2030,7 +2031,12 @@ export async function sampleAdvancingTimer(session, {
     // The first cancel closes this generation synchronously. A CDP read that
     // completes afterward cannot add cancellation or retry/reset evidence.
     if (signal?.aborted === true || now() >= deadline) break;
-    const elapsed = elapsedSeconds(snapshot?.refreshText);
+    // Read the dedicated clock slot: adjacent count/phase spans have no text
+    // separators, and must never be mistaken for elapsed-time evidence.
+    const clock = /^(\d+):([0-5]\d)$/u.exec(snapshot?.refreshTimerText ?? "");
+    const elapsed = snapshot?.refreshTimerText != null
+      ? clock ? Number(clock[1]) * 60 + Number(clock[2]) : null
+      : elapsedSeconds(snapshot?.refreshText);
     if (elapsed !== null) {
       const previous = values.at(-1);
       if (previous !== undefined && elapsed < previous) break;

@@ -1232,6 +1232,30 @@ test("timer proof refuses stalled and decreasing elapsed counters", async () => 
   }
 });
 
+test("timer proof reads the dedicated clock across a minute boundary", async () => {
+  let reads = 0;
+  let clock = 0;
+  const values = ["0:58", "0:59", "1:00", "1:01"];
+  const result = await sampleAdvancingTimer(null, {
+    readSnapshot: async () => ({ refreshTimerText: values[reads++], refreshText: "Analyzing…99/1001:01" }),
+    pause: async (ms) => { clock += ms; },
+    now: () => clock,
+  });
+  assert.deepEqual(result, { sampleCount: 4, uniqueCount: 4, advanced: true });
+});
+
+test("timer proof cannot substitute other text for an invalid dedicated clock", async () => {
+  for (const value of ["", "1:60", "1:2", "2/100:04", "0:03"]) {
+    let reads = 0;
+    let clock = 0;
+    await assert.rejects(sampleAdvancingTimer(null, {
+      readSnapshot: async () => ({ refreshTimerText: value, refreshText: `Analyzing… ${reads++}s` }),
+      pause: async (ms) => { clock += ms; },
+      now: () => clock,
+    }), (error) => error.qaReason === "timer_stalled");
+  }
+});
+
 test("cancel closes timer evidence before an in-flight retry snapshot resolves", async () => {
   const generation = new AbortController();
   let reads = 0;
