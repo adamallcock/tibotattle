@@ -55,6 +55,7 @@ import {
   revokeDeviceAuthorizationRoute,
   storageForAccountlessEnrollment,
   storageForDeviceAuthorization,
+  storageForParticipantOwner,
   storageForUploadAuthorization,
   type OwnerStorageContext,
 } from "./storage-routing-runtime";
@@ -3124,7 +3125,12 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
 async function handleExport(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
   const session = await personalSession(request, env);
-  const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
+  // Session authority remains in the global browser-auth ledger. Only after
+  // that authority and the global erasure tombstone have been checked may the
+  // participant digest select the one current storage route. The locator is
+  // not authentication and there is no shard scan or singleton read fallback.
+  const ownerStorage = await storageForParticipantOwner(env, session.participantId);
+  const contributions = await listContributions(ownerStorage.database, session.participantId);
   const generatedAt = new Date().toISOString();
   const encoder = new TextEncoder();
   const chunks = (async function* participantExportChunks() {
@@ -3152,7 +3158,7 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
     let cursor: { createdAt: string; contributionId: string } | null = null;
     do {
       const page = await telemetryContributionPage(
-        env.USAGE_MONITOR_DB,
+        ownerStorage.database,
         session.participantId,
         cursor,
       );
@@ -3169,7 +3175,7 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
     } while (cursor);
     yield encoder.encode('],"attributionTransport":[');
     let wroteAttributionEntry = false;
-    for await (const entry of telemetryV11ExportEntries(env.USAGE_MONITOR_DB, session.participantId, generatedAt)) {
+    for await (const entry of telemetryV11ExportEntries(ownerStorage.database, session.participantId, generatedAt)) {
       yield encoder.encode((wroteAttributionEntry ? "," : "") + JSON.stringify(entry));
       wroteAttributionEntry = true;
     }

@@ -31,12 +31,26 @@ import {
   STORAGE_NEW_OWNER_CUTOFF_BYTES,
 } from "../src/storage-routing";
 import { initializeStorageSource } from "../src/analytics-delivery";
-import { initializeTypedV11Admission } from "../src/typed-v11-admission";
-import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
+import {
+  initializeTypedV11Admission,
+  persistTypedV11StagedChunk,
+} from "../src/typed-v11-admission";
+import {
+  createV11DeviceFixture,
+  makeV11Day,
+  v11UsageRecord,
+} from "./helpers/telemetry-v11";
+import {
+  authenticateDevice,
+  claimDeviceUploadAuthorization,
+  createDeviceUploadAuthorization,
+} from "../src/device-auth";
+import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository";
 import { participantDeletionDigest } from "../src/participant-deletion-digest";
 import { recordCatalogDeletionReplayPending } from "../src/retention";
 import {
   participantStorageLocatorDigest,
+  registerParticipantOwnerRoute,
   storageForParticipantOwner,
 } from "../src/storage-routing-runtime";
 
@@ -938,6 +952,128 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
       .first("source_namespace")).toBe(NAMESPACE);
     expect(await shardB().prepare("SELECT source_namespace FROM typed_v11_admission_state WHERE id=1")
       .first("source_namespace")).toBe(NAMESPACE_B);
+  });
+
+  it("exports an authenticated participant from its exact routed shard without relabeling original provenance", async () => {
+    const participantId = `participant:${crypto.randomUUID()}`;
+    const route = await createCatalogStorageRouter({
+      catalog: catalog(),
+      bindings: {
+        STORAGE_INGESTION_A: shardA(),
+        STORAGE_INGESTION_B: shardB(),
+        STORAGE_INGESTION_C: shardC(),
+      },
+      clock: Date.now,
+    }).ensureOwner(`accountless:${crypto.randomUUID()}`, "b", 16_777_216);
+
+    // The physical database is B while the immutable record provenance is
+    // the original A namespace. Export must follow owner routing and let the
+    // qualified typed reader resolve that original namespace.
+    await prepareTyped(shardB(), NAMESPACE, "synthetic-retained-source-a-on-b");
+    const fixture = await createV11DeviceFixture(shardB(), {
+      participantId,
+      grant: true,
+    });
+    await registerParticipantOwnerRoute(runtime(), participantId, route);
+    const day = new Date().toISOString().slice(0, 10);
+    const eventId = `event:v2:${"7".repeat(64)}`;
+    const prepared = await makeV11Day(day, {
+      usage: [v11UsageRecord(day, "7", { eventId })],
+    });
+    const manifest = await registerTelemetryV11DayManifest(
+      shardB(), fixture, prepared.manifest,
+    );
+    const chunk = prepared.chunks[0]!;
+    const envelopeDigest = await sha256Hex(`synthetic-export-${crypto.randomUUID()}`);
+    const principal = await authenticateDevice(shardB(), fixture.authorization);
+    const upload = await createDeviceUploadAuthorization(
+      shardB(), principal, envelopeDigest, 200,
+    );
+    const claimed = await claimDeviceUploadAuthorization(
+      shardB(), `Upload ${upload.uploadAuthorization}`,
+      { envelopeDigest, bodyBytes: 200, contentType: "application/json" },
+    );
+    await persistTypedV11StagedChunk(shardB(), fixture, chunk, {
+      sourceNamespace: NAMESPACE,
+      chunkRowId: `chunk:${crypto.randomUUID()}`,
+      r2Key: `synthetic/export-${crypto.randomUUID()}`,
+      envelopeDigest,
+      deviceUploadAuthorizationId: claimed.authorizationId,
+    });
+    expect(await shardB().prepare(`SELECT origin.source_namespace
+      FROM typed_v11_record_proofs proof
+      JOIN typed_telemetry_records record ON record.id=proof.typed_record_id
+      JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=record.namespace_id
+      JOIN typed_v11_owner_memberships owner
+        ON owner.namespace_id=record.namespace_id AND owner.typed_owner_id=record.owner_id
+      WHERE owner.participant_id=? LIMIT 1`)
+      .bind(participantId).first("source_namespace")).toBe(NAMESPACE);
+
+    // Browser authority remains global. Its participant identity selects the
+    // immutable catalog locator only after the cookie has authenticated.
+    const authority = await createV11DeviceFixture(
+      bindings().USAGE_MONITOR_DB,
+      { participantId },
+    );
+    const authorityOnly = new Proxy(bindings().USAGE_MONITOR_DB, {
+      get(database, key) {
+        if (key === "prepare") return (sql: string) => {
+          if (/FROM (?:contributions|telemetry_contributions|telemetry_v11_)/u.test(sql)) {
+            throw new Error("singleton export read attempted");
+          }
+          return database.prepare(sql);
+        };
+        const value = Reflect.get(database, key);
+        return typeof value === "function" ? value.bind(database) : value;
+      },
+    });
+    const response = await api("/api/v1/me/export", {
+      method: "GET",
+      headers: { cookie: authority.cookie },
+    }, runtime({ USAGE_MONITOR_DB: authorityOnly }));
+    expect(response.status, await response.clone().text()).toBe(200);
+    const exported = await response.json<{
+      participant: { participantId: string };
+      attributionTransport: Array<{ kind: string; manifestId?: string; records?: unknown[] }>;
+    }>();
+    expect(exported.participant.participantId).toBe(participantId);
+    expect(exported.attributionTransport).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "day_manifest", manifestId: manifest.manifestId }),
+      expect.objectContaining({
+        kind: "chunk",
+        records: [expect.objectContaining({ eventId })],
+      }),
+    ]));
+  });
+
+  it("fails private export closed without a participant route and authenticates before catalog lookup", async () => {
+    const authority = await createV11DeviceFixture(bindings().USAGE_MONITOR_DB);
+    const missing = await api("/api/v1/me/export", {
+      headers: { cookie: authority.cookie },
+    });
+    expect(missing.status).toBe(503);
+    expect(await missing.json()).toMatchObject({
+      error: { code: "BACKEND_STORAGE_UNAVAILABLE" },
+    });
+
+    const unavailableCatalog = new Proxy(catalog(), {
+      get(database, key) {
+        if (key === "prepare") return () => {
+          throw new Error("catalog accessed before session authentication");
+        };
+        const value = Reflect.get(database, key);
+        return typeof value === "function" ? value.bind(database) : value;
+      },
+    });
+    const malformedCookie = authority.cookie
+      .replace(/=.*/u, "=invalid");
+    const unauthenticated = await api("/api/v1/me/export", {
+      headers: { cookie: malformedCookie },
+    }, runtime({ STORAGE_ROUTING_DB: unavailableCatalog }));
+    expect(unauthenticated.status).toBe(401);
+    expect(await unauthenticated.json()).toMatchObject({
+      error: { code: "AUTH_INVALID" },
+    });
   });
 
   it("rejects the complete typed batch when the route fences during preparation", async () => {

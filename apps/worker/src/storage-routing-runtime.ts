@@ -339,7 +339,8 @@ export async function assertParticipantOwnerRouteRegistered(
   }
 }
 
-/** Trusted admin locator. The caller retains Access-owner/CSRF authority. */
+/** Trusted participant locator. The caller must first establish independent
+ * session or Access-owner/CSRF authority; this digest never authenticates. */
 export async function storageForParticipantOwner(
   env: Env,
   participantId: string,
