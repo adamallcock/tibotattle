@@ -1831,3 +1831,38 @@ test("preload resumes a preparing report after document hiding cancels its respo
   assert.equal(root.children.at(-1).inert, false);
   assert.equal(calls.at(-1).snapshotId, selected.snapshotId);
 });
+
+test("cold startup polls back off while retaining a fixed request budget", async (t) => {
+  for (const becomesReady of [true, false]) {
+    await t.test(becomesReady ? "late readiness warms every period" : "never-ready work stops", async (t) => {
+      const harness = mountedLeaseRoot();
+      harness.root.inert = true;
+      const calls = [];
+      const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+        fetchRef: async (_url, init) => {
+          const query = JSON.parse(init.body);
+          calls.push(query);
+          if (becomesReady && calls.length >= 10)
+            return httpResponse(warmReport(`ready-${query.period}`, "Ready report"));
+          return httpResponse({ schemaVersion: WORK_USAGE_SCHEMA, status: "preparing", snapshotId: "cold" });
+        },
+      });
+      t.after(() => view.destroy());
+      const preloading = view.preload();
+      await settleMountedView();
+      const delays = [750, 1500, 3000, 6000, ...Array(16).fill(10_000)];
+      for (const delay of delays.slice(0, becomesReady ? 9 : 20)) {
+        assert.ok([...harness.timers.values()].some(timer => timer.delay === delay));
+        harness.runTimer(delay);
+        await settleMountedView();
+      }
+      assert.equal(await preloading, becomesReady);
+      assert.equal(calls.length, becomesReady ? 13 : 21);
+      assert.equal(harness.timers.size, 0, "inactive startup has no endless poll");
+      if (becomesReady) {
+        assert.deepEqual(calls.slice(-3).map(query => query.period), ["24h", "30d", "all"]);
+        assert.match(harness.root.textContent, /Ready report/);
+      }
+    });
+  }
+});

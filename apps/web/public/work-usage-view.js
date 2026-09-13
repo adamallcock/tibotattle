@@ -16,6 +16,9 @@ const PERIOD_IDS = ["24h", "7d", "30d", "all"];
 const PERIOD_PRELOAD_DELAY_MS = 250;
 const PREPARING_POLL_DELAY_MS = 750;
 const MAX_PREPARING_POLLS = 20;
+// Cold accounting can take minutes. Spread the same bounded request budget
+// over that work instead of exhausting it in the first fifteen seconds.
+const preloadPollDelay = attempt => Math.min(10_000, PREPARING_POLL_DELAY_MS * 2 ** attempt);
 const PRELOAD_REQUEST_TIMEOUT_MS = 10_000;
 const COMPONENTS = [
   "input_uncached_tokens",
@@ -378,7 +381,7 @@ export function mountWorkUsageView({
           return { result, invalidated: false };
         }
         if (attempt === MAX_PREPARING_POLLS) return { result: null, invalidated: false };
-        await delayPeriodPreload(PREPARING_POLL_DELAY_MS, signal);
+        await delayPeriodPreload(preloadPollDelay(attempt), signal);
         bodyQuery = {
           ...baseQuery,
           period: periodId,
@@ -1485,7 +1488,7 @@ export function mountWorkUsageView({
       if (result.status === "preparing") {
         if (background) {
           if (preparingAttempt >= MAX_PREPARING_POLLS) return;
-          await delayPeriodPreload(PREPARING_POLL_DELAY_MS, loadController.signal);
+          await delayPeriodPreload(preloadPollDelay(preparingAttempt), loadController.signal);
           return performLoad(recoverExpired, {
             background,
             preparingAttempt: preparingAttempt + 1,

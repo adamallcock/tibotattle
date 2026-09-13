@@ -67,9 +67,11 @@ requests, caches and server projections.
 
 Startup preparation validation:
 
-- UI suite: 762 tests passed, including first-visit preparation, primary-render
+- UI suite: 765 tests passed, including first-visit preparation, primary-render
   ordering, bounded cold-report polling, hidden-document cancellation during
   response parsing, visible resume, and foreground snapshot validation.
+  Cold Projects and threads polls back off from 750 ms to 10 seconds, retaining
+  the same twenty-retry budget across almost three minutes of preparation.
 - Local companion suite: 352 tests passed, including the startup module's
   static asset route and measurement/shared-accounting checks. Architecture,
   preflight and whitespace checks passed.
