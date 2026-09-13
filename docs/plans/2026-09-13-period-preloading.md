@@ -70,7 +70,8 @@ Startup preparation validation:
 - UI suite: 762 tests passed, including first-visit preparation, primary-render
   ordering, bounded cold-report polling, hidden-document cancellation during
   response parsing, visible resume, and foreground snapshot validation.
-- Focused measurement/shared-accounting backend tests: 13 passed. Architecture,
+- Local companion suite: 352 tests passed, including the startup module's
+  static asset route and measurement/shared-accounting checks. Architecture,
   preflight and whitespace checks passed.
 - Browser integration: while Overview remained selected, all three Performance
   periods and all four Projects and threads periods completed preparation. Both
