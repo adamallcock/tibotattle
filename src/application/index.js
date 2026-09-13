@@ -56,4 +56,10 @@ export {
   createLocalMetadataExportContext,
 } from "./local-metadata-export.js";
 export { createWorkUsageService, validateWorkUsageQuery } from "./work-usage.js";
+export {
+  createUsageExplainerService,
+  fitUsageExplanationEnvelope,
+  USAGE_EXPLAINER_SCHEMA_VERSION,
+  usageExplanationCatalog,
+} from "./usage-explainer.js";
 export { createModelPerformanceContext } from './model-performance.js';

@@ -2,7 +2,7 @@ import { setImmediate as cooperativeYield } from "node:timers/promises";
 import { codexCacheReasoningConfiguration } from "@app-usagemonitor/telemetry-contract";
 import {
   openLocalUnifiedIndex,
-  readUnifiedIndexGenerationDescriptor,
+  withReadOnlyUnifiedIndex,
   reasoningEffortOrdinal,
   REASONING_EFFORTS,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
@@ -316,28 +316,25 @@ export async function buildLocalCacheDropThreadLinks({
       || !count(nowMs) || typeof indexFile !== "string" || indexFile.length === 0) {
     return unavailable();
   }
-  let database;
   let matches;
   try {
-    database = openIndex(indexFile, { readOnly: true });
-    database.exec("BEGIN");
-    const descriptor = readUnifiedIndexGenerationDescriptor(database);
-    if (descriptor?.id !== generation
-        || !(descriptor.status === "complete" || (descriptor.status === "partial"
-          && ["tool_provenance_incomplete", "codex_rollout_sources_quarantined"]
-            .includes(descriptor.blockReason)))
-        || !descriptor.discoveryComplete || !descriptor.diagnosticsComplete
-        || source.generationFingerprint !== descriptor.fingerprint) {
-      return unavailable();
-    }
-    matches = await readSelectedMatches(
-      database, selectedReferences(overview), nowMs + FUTURE_EVIDENCE_TOLERANCE_MS,
-    );
+    matches = await withReadOnlyUnifiedIndex(indexFile, async ({ database, generation: descriptor }) => {
+      if (descriptor?.id !== generation
+          || !(descriptor.status === "complete" || (descriptor.status === "partial"
+            && ["tool_provenance_incomplete", "codex_rollout_sources_quarantined"]
+              .includes(descriptor.blockReason)))
+          || !descriptor.discoveryComplete || !descriptor.diagnosticsComplete
+          || source.generationFingerprint !== descriptor.fingerprint) {
+        return null;
+      }
+      return readSelectedMatches(
+        database, selectedReferences(overview), nowMs + FUTURE_EVIDENCE_TOLERANCE_MS,
+      );
+    }, { openIndex });
   } catch {
     return unavailable();
-  } finally {
-    if (database?.isOpen) database.close();
   }
+  if (matches === null) return unavailable();
   let metadata = null;
   try {
     metadata = await readThreadMetadata(codexHome, [...new Set(matches.map((row) => row.id))]);

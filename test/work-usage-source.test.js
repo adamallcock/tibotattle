@@ -21,6 +21,7 @@ import {
   readUnifiedIndexGenerationDescriptor,
 } from "../src/local-unified-index.js";
 import { readLocalWorkUsageSnapshot } from "../src/local-work-usage-source.js";
+import { readLocalAllowanceMovement } from "../src/local-usage-explainer.js";
 import { extractRolloutWorkContexts } from "../src/local-unified-index-extract.js";
 import { queryWorkUsageSnapshot } from "../src/reporting/index.js";
 
@@ -80,27 +81,32 @@ function tokenCount(timestamp, total, last) {
   };
 }
 
-function quotaRateLimits(usedPercent = 12) {
+function quotaRateLimits(usedPercent = 12, resetsAt = 1_785_433_600) {
   return {
     limit_id: "codex",
     plan_type: "pro",
     primary: {
       used_percent: usedPercent,
       window_minutes: 300,
-      resets_at: 1_785_433_600,
+      resets_at: resetsAt,
     },
     secondary: {
       used_percent: usedPercent,
       window_minutes: 10_080,
-      resets_at: 1_785_433_600,
+      resets_at: resetsAt,
     },
   };
 }
 
-function quotaTokenCount(timestamp, infoMode = "null") {
+function quotaTokenCount(
+  timestamp,
+  infoMode = "null",
+  usedPercent = 12,
+  resetsAt = 1_785_433_600,
+) {
   const payload = {
     type: "token_count",
-    rate_limits: quotaRateLimits(),
+    rate_limits: quotaRateLimits(usedPercent, resetsAt),
   };
   if (infoMode === "null") payload.info = null;
   if (infoMode === "object") {
@@ -195,7 +201,12 @@ async function makeFixture({ events, useCustomSecret = false }) {
       lines.push(turnContext(item.timestamp, cwd, index + 1));
     }
     if (item.kind === "quota-only") {
-      lines.push(quotaTokenCount(item.timestamp, item.infoMode ?? "null"));
+      lines.push(quotaTokenCount(
+        item.timestamp,
+        item.infoMode ?? "null",
+        item.usedPercent ?? 12,
+        item.resetsAt ?? 1_785_433_600,
+      ));
     } else if (item.kind === "all-null-info-quota") {
       lines.push(quotaTokenCount(item.timestamp, "object"));
     } else if (item.kind === "quota-repeat") {
@@ -262,6 +273,21 @@ function query(result, grouping) {
     pageSize: 100,
   });
 }
+
+test("a missing unified index remains explicitly missing through the read-only adapter", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-usage-missing-index-"));
+  try {
+    const result = await readLocalWorkUsageSnapshot({
+      indexFile: join(root, "missing.sqlite"),
+      codexHome: root,
+      fromMs: 0,
+      toMs: 1,
+    });
+    assert.deepEqual(result, { status: "missing" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function markToolingOnlyPartial(indexFile) {
   const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
@@ -687,6 +713,124 @@ test("tooling-only partial generation retains complete known usage", async () =>
     assert.equal(projects.totals.events, 1);
     assert.equal(projects.rows[0].incompleteEvents, 0);
     assert.equal(projects.rows[0].unknownEvents, 0);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("usage explainer reads compatible allowance movement from committed occurrences", async () => {
+  const fixture = await makeFixture({
+    events: [
+      {
+        timestamp: "2026-08-24T00:00:01.000Z",
+        kind: "quota-only",
+        usedPercent: 12,
+      },
+      {
+        timestamp: "2026-08-24T00:00:03.000Z",
+        kind: "quota-only",
+        usedPercent: 18,
+      },
+    ],
+  });
+  try {
+    const result = readLocalAllowanceMovement({
+      indexFile: fixture.indexFile,
+      codexHome: fixture.codexHome,
+      ...interval("2026-08-24T00:00:00.000Z", "2026-08-24T00:00:05.000Z"),
+      limit: 1,
+    });
+    assert.equal(result.status, "available");
+    assert.equal(result.windows.length, 1);
+    assert.equal(result.rowCount, 2);
+    assert.equal(result.observedMovementCount, 2);
+    assert.equal(result.resetIdentityMissingCount, 0);
+    assert.equal(result.singleObservationCount, 0);
+    assert.equal(result.nonMonotonicCount, 0);
+    assert.equal(result.nextOffset, 1);
+    const second = readLocalAllowanceMovement({
+      indexFile: fixture.indexFile,
+      ...interval("2026-08-24T00:00:00.000Z", "2026-08-24T00:00:05.000Z"),
+      offset: result.nextOffset,
+      limit: 1,
+    });
+    assert.equal(second.windows.length, 1);
+    assert.equal(second.rowCount, 2);
+    assert.equal(second.nextOffset, null);
+    assert.notEqual(second.windows[0].durationMins, result.windows[0].durationMins);
+    const weekly = [...result.windows, ...second.windows]
+      .find((row) => row.durationMins === 10_080);
+    assert.ok(weekly);
+    assert.equal(weekly.firstUsedPercent, 12);
+    assert.equal(weekly.lastUsedPercent, 18);
+    assert.equal(weekly.movementPercentagePoints, 6);
+    assert.equal(weekly.observationCount, 2);
+    assert.equal(weekly.movementStatus, "observed");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("allowance pages prioritize compatible movement and count unresolved classes", async () => {
+  const fixture = await makeFixture({
+    events: [
+      {
+        timestamp: "2026-08-24T00:00:01.000Z",
+        kind: "quota-only",
+        usedPercent: 12,
+      },
+      {
+        timestamp: "2026-08-24T00:00:03.000Z",
+        kind: "quota-only",
+        usedPercent: 18,
+      },
+      {
+        timestamp: "2026-08-24T00:00:04.000Z",
+        kind: "quota-only",
+        usedPercent: 4,
+        resetsAt: 1_786_038_400,
+      },
+      {
+        timestamp: "2026-08-24T00:00:04.100Z",
+        kind: "quota-only",
+        usedPercent: 4,
+        resetsAt: 1_786_038_400,
+      },
+      {
+        timestamp: "2026-08-24T00:00:04.200Z",
+        kind: "quota-only",
+        usedPercent: 2,
+        resetsAt: 1_786_643_200,
+      },
+    ],
+  });
+  try {
+    const result = readLocalAllowanceMovement({
+      indexFile: fixture.indexFile,
+      ...interval("2026-08-24T00:00:00.000Z", "2026-08-24T00:00:05.000Z"),
+      limit: 6,
+    });
+    assert.equal(result.status, "available");
+    assert.equal(result.rowCount, 6);
+    assert.equal(result.observedMovementCount, 4);
+    assert.equal(result.singleObservationCount, 2);
+    assert.equal(result.resetIdentityMissingCount, 0);
+    assert.equal(result.nonMonotonicCount, 0);
+    assert.deepEqual(
+      result.windows.map((row) => row.movementStatus),
+      [
+        "observed",
+        "observed",
+        "observed",
+        "observed",
+        "single_observation",
+        "single_observation",
+      ],
+    );
+    assert.deepEqual(
+      result.windows.map((row) => row.movementPercentagePoints),
+      [6, 6, 0, 0, null, null],
+    );
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

@@ -168,6 +168,11 @@ import {
   RELEASE_VERSION_PLACEHOLDER,
 } from "../../config/release-manifest.js";
 import {
+  installedAgentErrorResult,
+  isInstalledAgentInvocation,
+  runInstalledAgentCli,
+} from "./agent-cli.js";
+import {
   validateTelemetryContribution,
 } from "@app-usagemonitor/telemetry-contract";
 import {
@@ -5639,35 +5644,44 @@ export async function startLocalCompanionServer({
 
 if (process.argv[1]
     && resolve(process.argv[1]) === LOCAL_COMPANION_MODULE_FILE) {
-  const requestedPort = Number(process.env.USAGE_MONITOR_PORT ?? 8787);
-  const app = await startLocalCompanionServer({
-    port: requestedPort,
-    terminateProcessOnParentDeath: true,
-  });
-  process.stdout.write(`USAGE_MONITOR_READY http://${app.host}:${app.port}/\n`);
-  let closing = false;
-  const close = () => {
-    if (closing) process.exit(0);
-    closing = true;
-    app.server.closeAllConnections?.();
-    void app.close().then(
-      () => process.exit(0),
-      () => process.exit(1),
-    );
-  };
-  // A snapshot that cannot be built leaves nothing for the read routes to
-  // project, so the process still exits and the host still sees a failed
-  // companion - the same outcome as before the port moved ahead of the build,
-  // reported once the port is open rather than in place of opening it.
-  app.snapshotReady.catch(() => {
-    if (closing) return;
-    closing = true;
-    app.server.closeAllConnections?.();
-    void app.close().then(
-      () => process.exit(1),
-      () => process.exit(1),
-    );
-  });
-  process.once("SIGINT", close);
-  process.once("SIGTERM", close);
+  if (isInstalledAgentInvocation(process.argv.slice(2))) {
+    try {
+      await runInstalledAgentCli(process.argv.slice(2));
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify(installedAgentErrorResult(error))}\n`);
+      process.exitCode = 1;
+    }
+  } else {
+    const requestedPort = Number(process.env.USAGE_MONITOR_PORT ?? 8787);
+    const app = await startLocalCompanionServer({
+      port: requestedPort,
+      terminateProcessOnParentDeath: true,
+    });
+    process.stdout.write(`USAGE_MONITOR_READY http://${app.host}:${app.port}/\n`);
+    let closing = false;
+    const close = () => {
+      if (closing) process.exit(0);
+      closing = true;
+      app.server.closeAllConnections?.();
+      void app.close().then(
+        () => process.exit(0),
+        () => process.exit(1),
+      );
+    };
+    // A snapshot that cannot be built leaves nothing for the read routes to
+    // project, so the process still exits and the host still sees a failed
+    // companion - the same outcome as before the port moved ahead of the build,
+    // reported once the port is open rather than in place of opening it.
+    app.snapshotReady.catch(() => {
+      if (closing) return;
+      closing = true;
+      app.server.closeAllConnections?.();
+      void app.close().then(
+        () => process.exit(1),
+        () => process.exit(1),
+      );
+    });
+    process.once("SIGINT", close);
+    process.once("SIGTERM", close);
+  }
 }

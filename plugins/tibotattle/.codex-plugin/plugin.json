@@ -1,0 +1,30 @@
+{
+  "name": "tibotattle",
+  "version": "0.1.0",
+  "description": "Private, local-first TiboTattle usage evidence and coaching for Codex.",
+  "author": {
+    "name": "Adam Allcock",
+    "url": "https://github.com/adamallcock"
+  },
+  "homepage": "https://github.com/adamallcock/tibotattle",
+  "repository": "https://github.com/adamallcock/tibotattle",
+  "license": "MIT",
+  "keywords": ["codex", "usage", "analytics", "coaching", "local-first"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "TiboTattle",
+    "shortDescription": "Understand and improve your Codex usage.",
+    "longDescription": "Reads TiboTattle's content-free local evidence, explains usage patterns, and proposes measurable behavior experiments. It can also prepare and confirm an app install when a compatible release exists.",
+    "developerName": "Adam Allcock",
+    "category": "Productivity",
+    "capabilities": ["Local usage analysis", "Evidence lookup", "Optional app installation"],
+    "websiteURL": "https://tibotattle.com",
+    "defaultPrompt": [
+      "How can I improve my Codex usage?",
+      "What drove my usage this week?",
+      "Check whether my TiboTattle data is current."
+    ],
+    "brandColor": "#155B4D"
+  }
+}

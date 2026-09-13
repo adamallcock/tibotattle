@@ -1,3 +1,4 @@
+import { mountAllowanceTanks } from "./allowance-tanks.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
 import { mountModelPerformance } from "./model-performance.js";
@@ -69,7 +70,7 @@ import {
   formatLocal,
   formatModelName,
   formatNumber,
-  formatReportingTime,
+  dateTimeFormatter,
   formatTimeZoneLabel,
   getFormattingLocale,
   localCalendarParts,
@@ -869,20 +870,6 @@ function componentLabel(value) {
   return COMPONENT_LABELS[value] ?? humanize(value);
 }
 
-function formatTimeRemaining(value) {
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return t("format.timeUnavailable");
-  const remainingMs = timestamp - Date.now();
-  if (remainingMs <= 0) return t("format.resetDue");
-  const totalMinutes = Math.ceil(remainingMs / 60_000);
-  const days = Math.floor(totalMinutes / 1_440);
-  const hours = Math.floor((totalMinutes % 1_440) / 60);
-  const minutes = totalMinutes % 60;
-  if (days > 0) return t("format.remainingDays", { days, hours });
-  if (hours > 0) return t("format.remainingHours", { hours, minutes });
-  return t("format.remainingMinutes", { minutes });
-}
-
 function formatSpanLength(spanMs) {
   const minutes = Math.max(1, Math.round(spanMs / 60_000));
   if (minutes < 90) return tPlural("format.durationMinute", minutes);
@@ -1589,7 +1576,10 @@ function renderDashboard(data) {
     hideConnectionNotice();
   }
 
+  allowanceTankView?.dispose();
   renderQuotaCards(data);
+  renderWeeklyPaceForecast(data);
+  allowanceTankView = mountAllowanceTanks($("#quota-cards"), $("#weekly-pace-forecast"), { t });
   renderEvidenceWarnings(data);
   renderPricing(data);
   renderComparison(data);
@@ -1605,9 +1595,13 @@ function renderDashboard(data) {
   void loadCacheDropThreadLinks(data);
 }
 
+let allowanceTankView = null;
+
 function renderQuotaCards(data) {
+  closeInformationPopover();
   const container = $("#quota-cards");
   clear(container);
+  if ($("#allowance-context")) $("#allowance-context").hidden = true;
   const normalWindows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
   const sparkWindows = data.quotaWindows.filter((window) => (
     isSparkQuotaLimitId(window?.limitId)
@@ -1624,12 +1618,9 @@ function renderQuotaCards(data) {
     : [primaryWindow, ...normalWindows.filter((window) => window !== primaryWindow)];
   // Spark is a separate provider limit. Keep it out of the normal allowance
   // selection so it cannot be mistaken for the five-hour or seven-day track.
-  // Owner-directed 2026-08-20 card order: the Spark cards lead, shortest
-  // window first, and the normal-Codex allowance follows. Ordering on the
-  // duration rather than trusting the provider's slot assignment holds that
-  // order even if Spark's slots move again, as they did when the five-hour
-  // window returned on 2026-08-19. The filter above already required a valid
-  // duration on every window here, so the comparison never sees a null.
+  // The forecast's primary pool leads the tanks. Within Spark, order by
+  // duration rather than the provider's slot assignment. Future pools follow
+  // both reviewed groups and never enter primary selection or calibration.
   const sparkOrderedWindows = [...sparkWindows].sort((left, right) => (
     finite(left.durationMinutes) - finite(right.durationMinutes)
   ));
@@ -1642,8 +1633,8 @@ function renderQuotaCards(data) {
       || String(left.slot).localeCompare(String(right.slot))
   ));
   const windows = [
-    ...sparkOrderedWindows,
     ...normalOrderedWindows,
+    ...sparkOrderedWindows,
     ...otherOrderedWindows,
   ];
   if (!windows.length) {
@@ -1661,66 +1652,81 @@ function renderQuotaCards(data) {
     container.append(card);
     return;
   }
+  const context = $("#allowance-context");
+  if (context) {
+    context.textContent = data.mode === "demo" ? t("dashboard.quota.demo") : "";
+    context.hidden = !context.textContent;
+  }
   for (const window of windows) {
-    const remaining = finite(window.remainingPercent);
+    const reportedRemaining = finite(window.remainingPercent);
+    const remaining = reportedRemaining !== null
+      && reportedRemaining >= 0 && reportedRemaining <= 100
+      ? reportedRemaining : null;
     const spark = isSparkQuotaLimitId(window.limitId);
     const card = node("article", [
-      "metric-card",
-      window.status === "stale" ? "stale" : "",
+      "metric-card quota-tank",
       spark ? "quota-card-spark" : "",
+      window.status === "stale" ? "stale" : "",
+      remaining === null ? "insufficient" : "",
     ].filter(Boolean).join(" "));
-    const header = node("div", "metric-card-header");
-    const name = node("span", "metric-name", localizedQuotaWindowLabel(window));
-    const plan = node("span", "evidence-chip");
-    const reportedPlan = providerReportedPlanEvidence(window.planType);
-    if (spark) {
-      setLocalizedText(plan, "dashboard.quota.spark");
-    } else if (data.mode === "demo") {
-      setLocalizedText(plan, "dashboard.quota.demo");
-    } else if (reportedPlan) {
-      plan.textContent = reportedPlan;
-    } else {
-      setLocalizedText(plan, "dashboard.quota.observed");
+    card.setAttribute("aria-label", spark
+      ? `GPT-5.3 Codex Spark · ${localizedQuotaWindowDuration(window.durationMinutes)}`
+      : localizedQuotaWindowLabel(window));
+    card.dataset.shortWindow = String(window.durationMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES);
+    card.dataset.remaining = remaining === null ? "" : String(remaining);
+    card.dataset.forecastPool = String(isPrimaryCodexWeeklyQuotaWindow(window));
+    card.dataset.resetAt = String(forecastTimestamp(window.resetAt) ?? "");
+    card.dataset.stale = String(window.status === "stale");
+    if (remaining !== null) {
+      const fuel = node("div", "quota-tank-fuel");
+      fuel.style.blockSize = `${remaining}%`;
+      fuel.setAttribute("aria-hidden", "true");
+      card.append(fuel);
     }
-    header.append(
-      name,
-      plan,
-    );
-    const value = node("strong", "metric-value");
-    setLocalizedText(value, "dashboard.quota.remaining", {
-      value: remaining === null
-        ? "—"
-        : formatPercent(remaining, window.precision ?? 0),
-    });
-    const progress = node("div", "mini-progress");
-    const fill = node("i");
-    fill.style.width = `${Math.max(0, Math.min(100, remaining ?? 0))}%`;
-    progress.append(fill);
-    const meta = node("div", "metric-meta");
-    meta.append(
-      node(
-        "span",
-        "",
-        window.usedPercent === null
-          ? t("dashboard.quota.usedUnknown")
-          : t("dashboard.quota.used", {
-            value: formatPercent(window.usedPercent),
-          }),
-      ),
-      node(
-        "span",
-        "",
-        window.resetAt
-          ? t("dashboard.quota.resets", { time: formatLocal(window.resetAt) })
-          : t("dashboard.quota.resetUnknown"),
-      ),
-    );
-    card.append(header, value, progress, meta);
-    if (window.resetAt) card.append(node("p", "", formatTimeRemaining(window.resetAt)));
-    if (window.observedAt) {
-      card.append(node("p", "", t("dashboard.quota.observedAtPlain", {
-        time: formatLocal(window.observedAt),
-      })));
+    const header = node("div", "quota-tank-header");
+    const family = node("span", "quota-tank-family");
+    if (spark) {
+      family.className += " allowance-model-spark";
+      family.append(modelThemeIcon(document, "spark"), node("span", "", "GPT-5.3 Codex Spark"));
+    } else if (isPrimaryCodexQuotaWindow(window)) {
+      const logo = node("img", "quota-codex-icon");
+      logo.setAttribute("src", "./codex-color.svg");
+      logo.setAttribute("alt", "");
+      logo.setAttribute("aria-hidden", "true");
+      family.append(logo, node("span", "", "Codex"));
+    } else {
+      family.textContent = window.limitName || t("dashboard.quota.windowOther");
+    }
+    header.append(family);
+    header.append(node("span", "quota-tank-period",
+      localizedQuotaWindowDuration(window.durationMinutes)));
+    if (window.status === "stale") {
+      header.append(node("span", "evidence-chip", t("allowance.stale")));
+    }
+    const bottom = node("div", "quota-tank-bottom");
+    const amount = node("div");
+    amount.append(node("strong", "quota-tank-value", remaining === null
+      ? "—" : formatPercent(remaining, window.precision ?? 0)));
+    amount.append(node("span", "quota-tank-caption", t(remaining === null
+      ? "allowance.unknown" : "allowance.remaining")));
+    const reset = node("div", "quota-tank-reset");
+    const resetAt = forecastTimestamp(window.resetAt);
+    const hoursLeft = resetAt === null ? null : (resetAt - Date.now()) / 3_600_000;
+    reset.append(node("span", "", t(hoursLeft !== null && hoursLeft > 0
+      ? "allowance.resetsIn" : resetAt !== null ? "allowance.resets" : "dashboard.quota.resetUnknown")));
+    if (hoursLeft !== null && hoursLeft > 0) {
+      reset.append(allowanceTimestamp(formatAllowanceDuration(hoursLeft), resetAt));
+    } else if (resetAt !== null) {
+      reset.append(allowanceTimestamp(t("allowance.resetPassed"), resetAt));
+    }
+    bottom.append(amount, reset);
+    card.append(header, bottom);
+    // Keep differing observation times explicit without repeating the shared
+    // freshness timestamp on every current card.
+    if (window.observedAt && (window.status === "stale"
+        || forecastTimestamp(window.observedAt) !== forecastTimestamp(data.freshness?.latestObservedAt))) {
+      card.append(allowanceTimestamp(t("allowance.observation"),
+        forecastTimestamp(window.observedAt)));
     }
     container.append(card);
   }
@@ -7543,6 +7549,44 @@ function forecastTimestamp(...values) {
   return null;
 }
 
+function formatAllowanceDuration(hours) {
+  const value = finite(hours);
+  if (value === null || value < 0) return null;
+  if (value < 1) return t("allowance.lessThanHour");
+  const wholeHours = Math.floor(value + 1e-8);
+  const days = Math.floor(wholeHours / 24);
+  return days > 0
+    ? t("allowance.daysHours", { days: formatDecimal(days), hours: formatDecimal(wholeHours % 24) })
+    : t("allowance.hours", { hours: formatDecimal(wholeHours) });
+}
+
+function allowanceTimestamp(label, timestamp) {
+  if (timestamp === null) return node("span", "", label);
+  const button = node("button", "allowance-timestamp", label);
+  button.type = "button";
+  const exact = dateTimeFormatter({
+    timeZone: USER_TIME_ZONE, year: "numeric", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit", timeZoneName: "short",
+  }).format(new Date(timestamp));
+  button.dataset.informationExplanation = exact;
+  button.setAttribute("aria-label", `${label} · ${exact}`);
+  button.setAttribute("aria-expanded", "false");
+  const show = () => {
+    if (activeInformationPopover?.button !== button) openInformationPopover(button);
+  };
+  const hide = () => {
+    if (activeInformationPopover?.button === button) closeInformationPopover();
+  };
+  button.addEventListener("mouseenter", show);
+  button.addEventListener("mouseleave", () => {
+    if (document.activeElement !== button) hide();
+  });
+  button.addEventListener("focus", show);
+  button.addEventListener("blur", hide);
+  button.addEventListener("click", (event) => { event.stopPropagation(); show(); });
+  return button;
+}
+
 function formatForecastDuration(hours) {
   const value = finite(hours);
   if (value === null || value <= 0) return null;
@@ -7555,8 +7599,10 @@ function formatForecastDuration(hours) {
   return `${minutes}m`;
 }
 
+let weeklyPaceDetailsOpen = false;
+
 function ensureWeeklyPaceForecastCard() {
-  const hero = $(".weekly-hero");
+  const hero = $("#quota-cards");
   if (!hero?.parentNode) return null;
   let card = $("#weekly-pace-forecast");
   if (!card) {
@@ -7590,9 +7636,9 @@ const PACE_CRITICAL_RATIO = 2;
 // engine's active-interval pace and the card keeps saying it is early.
 const PACE_AVERAGE_MINIMUM_HOURS = 1;
 const PACE_STATE_LABELS = Object.freeze({
-  over: "Over pace",
-  on: "On pace",
-  under: "Under pace",
+  over: "allowance.over",
+  on: "allowance.on",
+  under: "allowance.under",
 });
 
 /**
@@ -7609,8 +7655,8 @@ const PACE_STATE_LABELS = Object.freeze({
  * `pace.overallPercentagePointsPerHour` is the same window's rate with idle
  * time included, and since quota-pace-forecast-v0.2 it is what the engine's
  * own `etaAt` and `status` are built from. That is the honest headline; the
- * active rate stays on the card as the without-pausing edge, drawn as a
- * separate mark on the track.
+ * active rate remains in the evidence disclosure as the without-pausing edge.
+ * Only the headline run-out is marked on the track.
  *
  * The `movementPp / elapsedHours` fallback covers a payload that predates the
  * named rates. It carries a minimum-span guard the engine field does not need,
@@ -7702,64 +7748,52 @@ function formatPaceRatio(ratio) {
  * heading and this track's own label all state the standing in words, so
  * colour is never the only carrier.
  */
-function weeklyPaceTrack(standing, hoursToReset, activePace, remainingPercent) {
+function weeklyPaceTrack(standing, hoursToReset, resetAt) {
   const hoursLeft = finite(hoursToReset);
   if (!standing || hoursLeft === null || hoursLeft <= 0) return null;
   const coveredShare = Math.max(0, Math.min(1, standing.coveredHours / hoursLeft));
   const track = node("div", "weekly-pace-track");
+  track.style.setProperty("--pace-covered", `${(coveredShare * 100).toFixed(2)}%`);
+  // Near either edge, stack callouts and retain the exact marker position.
+  // This avoids overlapping labels without falsifying the time geometry.
+  track.classList.toggle("is-edge", coveredShare < .22 || coveredShare > .78);
+  const labels = node("div", "weekly-pace-track-labels");
+  const dry = standing.dryHours > 0;
+  if (dry) {
+    const runout = node("div", "weekly-pace-track-runout");
+    runout.append(node("span", "", t("allowance.runout")),
+      allowanceTimestamp(t("allowance.inDuration", {
+        duration: formatAllowanceDuration(standing.coveredHours),
+      }), resetAt - standing.dryHours * 3_600_000));
+    labels.append(runout);
+  }
+  const reset = node("div", "weekly-pace-track-reset");
+  reset.append(node("span", "", t("allowance.resets")),
+    allowanceTimestamp(t("allowance.inDuration", {
+      duration: formatAllowanceDuration(hoursLeft),
+    }), resetAt));
+  labels.append(reset);
   const bar = node("div", "weekly-pace-track-bar");
   const covered = node("div", "weekly-pace-track-covered");
   covered.style.inlineSize = `${(coveredShare * 100).toFixed(2)}%`;
   bar.append(covered);
-
-  // The engine's active-interval pace, drawn only where it would run the
-  // allowance out sooner than the headline rate does. It is the edge of the
-  // estimate, not the estimate: it answers "and if I do not stop?".
-  const remaining = finite(remainingPercent);
-  const active = finite(activePace);
-  const flatOutHours = active !== null && active > 0 && remaining !== null
-    ? remaining / active
-    : null;
-  let flatOutLabel = null;
-  if (flatOutHours !== null && flatOutHours < standing.coveredHours * .95) {
-    const flatOutShare = Math.max(0, Math.min(1, flatOutHours / hoursLeft));
+  if (dry) {
     const mark = node("div", "weekly-pace-track-mark");
-    mark.style.insetInlineStart = `${(flatOutShare * 100).toFixed(2)}%`;
+    mark.style.insetInlineStart = `${(coveredShare * 100).toFixed(2)}%`;
     bar.append(mark);
-    flatOutLabel = formatForecastDuration(flatOutHours);
   }
-
-  const resetDuration = formatForecastDuration(hoursLeft);
-  const coveredDuration = formatForecastDuration(standing.coveredHours);
-  const dryDuration = formatForecastDuration(standing.dryHours);
   bar.setAttribute("role", "img");
-  bar.setAttribute(
-    "aria-label",
-    // Whether a gap exists is arithmetic, not a state name: the on-pace band
-    // straddles the point where the allowance lands exactly on the reset, so
-    // an on-pace card can still end with a short dry stretch.
-    dryDuration
-      ? `Of the ${resetDuration ?? "time"} left before the reset, the remaining allowance covers about ${coveredDuration ?? "none of it"}, leaving about ${dryDuration} with none left.`
-      : `The remaining allowance covers all ${resetDuration ?? "of the time"} left before the reset.`,
-  );
-
+  bar.setAttribute("aria-label", t(dry ? "allowance.trackDry" : "allowance.trackCovered", {
+    reset: formatAllowanceDuration(hoursLeft),
+    covered: formatAllowanceDuration(standing.coveredHours),
+    dry: formatAllowanceDuration(standing.dryHours),
+  }));
   const scale = node("div", "weekly-pace-track-scale");
-  scale.append(
-    node("span", "", "Now"),
-    node(
-      "span",
-      "weekly-pace-track-scale-end",
-      resetDuration ? `Reset in ${resetDuration}` : "Reset",
-    ),
-  );
-  track.append(bar, scale);
-  if (flatOutLabel) {
-    track.append(node(
-      "p",
-      "weekly-pace-track-note",
-      `The mark is where the allowance ends if the recent active pace continues without a pause: about ${flatOutLabel} from now.`,
-    ));
-  }
+  scale.append(node("span", "", t("allowance.now")));
+  scale.append(node("span", "weekly-pace-track-gap", dry
+    ? t("allowance.dryDuration", { duration: formatAllowanceDuration(standing.dryHours) })
+    : t("allowance.untilReset")));
+  track.append(labels, bar, scale);
   return track;
 }
 
@@ -7768,6 +7802,9 @@ function renderWeeklyPaceForecast(data) {
   if (!card) return;
   card.hidden = true;
   card.className = "weekly-pace-forecast";
+  delete card.dataset.tankRatio;
+  delete card.dataset.tankReset;
+  delete card.dataset.tankRemaining;
   card.removeAttribute("aria-labelledby");
   clear(card);
 
@@ -7867,6 +7904,11 @@ function renderWeeklyPaceForecast(data) {
       hoursToReset,
       pacePpPerHour: headlinePace,
     });
+  if (standing) {
+    card.dataset.tankRatio = String(standing.ratio);
+    card.dataset.tankReset = String(resetAt);
+    card.dataset.tankRemaining = String(remaining);
+  }
   const paceState = standing?.state
     ?? (collectingEvidence ? null : reachesResetFirst ? "under" : null);
   const projectedEtaAt = standing !== null && standing.state === "over"
@@ -7877,29 +7919,39 @@ function renderWeeklyPaceForecast(data) {
   const cardId = "weekly-pace-forecast-title";
   title.id = cardId;
   title.textContent = collectingEvidence
-    ? "Pace estimate ready after one more refresh"
+    ? t("allowance.collectingTitle")
     : paceState === "over"
       ? projectedEtaAt === null
-        ? "At this pace the weekly allowance runs out before the reset"
-        : `At this pace the weekly allowance runs out ${formatReportingTime(projectedEtaAt)}`
+        ? t("allowance.beforeReset")
+        : t("allowance.headline", { duration: formatAllowanceDuration(standing.coveredHours) })
       : paceState === "on"
-        ? "At this pace the weekly allowance runs close to the reset"
-        : "At this pace the weekly allowance lasts to the reset with room to spare";
+        ? t("allowance.nearReset")
+        : t("allowance.spareTitle");
+  if (projectedEtaAt !== null) {
+    const [before, after] = t("allowance.headline", { duration: "{duration}" }).split("{duration}");
+    title.replaceChildren(document.createTextNode(before),
+      allowanceTimestamp(formatAllowanceDuration(standing.coveredHours), projectedEtaAt),
+      document.createTextNode(after ?? ""));
+  }
   card.setAttribute("aria-labelledby", cardId);
 
   const heading = node("div", "weekly-pace-forecast-heading");
-  heading.append(
-    node(
-      "p",
-      "panel-kicker",
-      collectingEvidence ? "Collecting forecast evidence" : "Forecast from recent pace",
-    ),
-  );
+  const kicker = node("p", "panel-kicker");
+  if (collectingEvidence) {
+    kicker.textContent = t("allowance.collecting");
+  } else {
+    const logo = node("img", "quota-codex-icon");
+    logo.setAttribute("src", "./codex-color.svg");
+    logo.setAttribute("alt", "");
+    logo.setAttribute("aria-hidden", "true");
+    kicker.append(logo, node("span", "", t("allowance.forecast")));
+  }
+  heading.append(kicker);
   if (collectingEvidence) {
     heading.append(node(
       "span",
       "evidence-chip weekly-pace-forecast-collecting-chip",
-      "One more refresh",
+      t("allowance.oneMore"),
     ));
   } else if (paceState) {
     // The standing is named in words on the chip as well as carried in the
@@ -7908,33 +7960,33 @@ function renderWeeklyPaceForecast(data) {
     heading.append(node(
       "span",
       "evidence-chip weekly-pace-forecast-state-chip",
-      PACE_STATE_LABELS[paceState],
+      t(standing?.critical ? "allowance.wayOver" : PACE_STATE_LABELS[paceState]),
     ));
   }
   if (earlyEstimate) {
     heading.append(node(
       "span",
       "evidence-chip weekly-pace-forecast-early-chip",
-      "Early estimate",
+      t("allowance.early"),
     ));
   }
 
   const ratioLabel = standing === null ? null : formatPaceRatio(standing.ratio);
   const dryDuration = standing === null
     ? null
-    : formatForecastDuration(standing.dryHours);
+    : standing.dryHours > 0 ? formatAllowanceDuration(standing.dryHours) : null;
   const copy = node("p", "weekly-pace-forecast-copy");
   copy.textContent = collectingEvidence
-    ? "One clean weekly allowance observation is saved. The next fresh observation for this account and reset will establish its pace."
+    ? t("allowance.collectingCopy")
     : standing === null
-      ? "Recent allowance movement is not fast enough to exhaust this window before its reset."
+      ? t("allowance.slowCopy")
       : standing.state === "over"
-        ? `Recent use is running about ${ratioLabel} the pace this window can still sustain${dryDuration ? `, which leaves roughly ${dryDuration} with none left before the reset` : ""}.`
+        ? t("allowance.overCopy", { ratio: ratioLabel, gap: dryDuration ? t("allowance.gapCopy", { duration: dryDuration }) : "" })
         : standing.state === "on"
-          ? `Recent use is close to the pace this window can still sustain, so the allowance should land near the reset with little to spare.`
-          : `Recent use is running about ${ratioLabel} the pace this window can still sustain, so some of the allowance should still be unused at the reset.`;
+          ? t("allowance.onCopy")
+          : t("allowance.underCopy", { ratio: ratioLabel });
   if (earlyEstimate) {
-    copy.textContent += " This is an early estimate from a small amount of recent evidence; it will settle as more observations arrive.";
+    copy.textContent += ` ${t("allowance.earlyCopy")}`;
   }
 
   const metrics = node("div", "weekly-pace-forecast-metrics");
@@ -7943,25 +7995,25 @@ function renderWeeklyPaceForecast(data) {
     item.append(node("span", "", label), node("strong", "", value));
     metrics.append(item);
   };
-  if (remaining !== null) addMetric("Allowance left", formatPercent(remaining));
-  const resetDuration = formatForecastDuration(hoursToReset);
-  if (resetDuration) addMetric("Reset", `in ${resetDuration}`);
+  if (remaining !== null) addMetric(t("allowance.left"), formatPercent(remaining));
+  const resetDuration = formatAllowanceDuration(hoursToReset);
+  if (resetDuration) addMetric(t("allowance.resetsIn"), resetDuration);
   if (collectingEvidence) {
-    addMetric("Evidence", "1 saved");
+    addMetric(t("allowance.evidence"), t("allowance.oneSaved"));
   } else if (dryDuration) {
     // A dry stretch and spare allowance are mutually exclusive, and the tile
     // reports whichever one the reading actually produced rather than pinning
     // itself to the state name.
-    addMetric("Nothing left for", dryDuration);
+    addMetric(t("allowance.dry"), dryDuration);
   } else if (standing !== null) {
-    addMetric("Spare at reset", formatPercent(standing.sparePercent));
+    addMetric(t("allowance.spare"), formatPercent(standing.sparePercent));
   } else if (headlinePace !== null && headlinePace > 0) {
-    addMetric("Recent pace", `${formatDecimal(headlinePace, 1)} pp/hour`);
+    addMetric(t("allowance.recentPace"), t("allowance.rate", { rate: formatDecimal(headlinePace, 1) }));
   }
 
   const track = collectingEvidence
     ? null
-    : weeklyPaceTrack(standing, hoursToReset, rates.active, remaining);
+    : weeklyPaceTrack(standing, hoursToReset, resetAt);
 
   // The evidence line names both rates. A reader who wondered why the old
   // card's forecast kept arriving early can see the difference between the
@@ -7970,18 +8022,18 @@ function renderWeeklyPaceForecast(data) {
   const observationDuration = formatForecastDuration(paceElapsedHours);
   const rateSentences = [];
   if (rates.average !== null) {
-    rateSentences.push(`${formatDecimal(rates.average, 1)} pp/hour overall`);
+    rateSentences.push(t("allowance.overallRate", { rate: formatDecimal(rates.average, 1) }));
   }
   if (rates.active !== null) {
-    rateSentences.push(`${formatDecimal(rates.active, 1)} pp/hour while active`);
+    rateSentences.push(t("allowance.activeRate", { rate: formatDecimal(rates.active, 1) }));
   }
   const evidence = observations !== null && observations >= 1
     ? node(
       "p",
       "weekly-pace-forecast-evidence",
       collectingEvidence
-        ? "One fresh allowance observation is saved for this weekly reset."
-        : `Based on ${formatDecimal(Math.round(observations), 0)} recent allowance observation${Math.round(observations) === 1 ? "" : "s"}${observationDuration ? ` over ${observationDuration}` : ""}${rateSentences.length > 0 ? `: ${rateSentences.join(", ")}` : ""}.`,
+        ? t("allowance.oneObservation")
+        : t("allowance.observations", { count: formatDecimal(Math.round(observations), 0), duration: observationDuration ? t("allowance.overDuration", { duration: observationDuration }) : "", rates: rateSentences.length > 0 ? `: ${rateSentences.join(", ")}` : "" }),
     )
     : null;
   card.className = [
@@ -7998,9 +8050,19 @@ function renderWeeklyPaceForecast(data) {
     reachesResetFirst ? "is-reset-first" : "",
     available ? "is-available" : "",
   ].filter(Boolean).join(" ");
-  card.append(heading, title, copy, metrics);
+  card.append(heading, title, copy);
   if (track) card.append(track);
-  if (evidence) card.append(evidence);
+  const details = node("details", "weekly-pace-details");
+  details.open = weeklyPaceDetailsOpen;
+  details.addEventListener("toggle", () => { weeklyPaceDetailsOpen = details.open; });
+  details.append(node("summary", "", t("allowance.basis")), metrics);
+  if (evidence) details.append(evidence);
+  if (rates.active !== null && remaining !== null && rates.active > 0) {
+    details.append(node("p", "weekly-pace-track-note", t("allowance.active", {
+      duration: formatAllowanceDuration(remaining / rates.active),
+    })));
+  }
+  card.append(details);
   card.hidden = false;
 }
 
@@ -8042,7 +8104,6 @@ function renderWeeklyPlanControl(data) {
 function renderWeekly(data) {
   data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   renderWeeklyPlanControl(data);
-  renderWeeklyPaceForecast(data);
   // A weekly estimate carried over from the previous app version while the
   // recalculation runs announces itself here, quietly.
   renderStaleServeNote(
@@ -11989,6 +12050,10 @@ async function loadLocalDashboard() {
 // identity_migration_required sentence on the approve card.
 
 function renderDashboardSkeleton() {
+  closeInformationPopover();
+  const forecast = $("#weekly-pace-forecast");
+  if (forecast) { forecast.hidden = true; clear(forecast); }
+  if ($("#allowance-context")) $("#allowance-context").hidden = true;
   const container = $("#quota-cards");
   clear(container);
   const card = node("article", "metric-card insufficient");

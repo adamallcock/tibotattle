@@ -21,6 +21,7 @@ const APPLICATION_PUBLIC_EXPORTS = [
   ...QUOTA_SENSITIVITY_EXPORTS,
   "ClaudeCallbackCapabilityError",
   "CONTRIBUTION_PREFERENCE_SCHEMA_VERSION",
+  "USAGE_EXPLAINER_SCHEMA_VERSION",
   "accountlessTransportOrigin",
   "createAccountlessContributionScheduler",
   "createClaudeCallbackCapabilityContext",
@@ -43,10 +44,13 @@ const APPLICATION_PUBLIC_EXPORTS = [
   "createLocalMetadataExportContext",
   "createLocalMetadataBundleVerificationContext",
   "createModelPerformanceContext",
+  "createUsageExplainerService",
   "createWorkUsageService",
   "validateWorkUsageQuery",
+  "fitUsageExplanationEnvelope",
   "selectProductionParticipantIdentity",
   "selectProductionClaudeCallbackBackend",
+  "usageExplanationCatalog",
 ].sort();
 const PRODUCTION_EXTENSIONS = new Set([
   ".js",
