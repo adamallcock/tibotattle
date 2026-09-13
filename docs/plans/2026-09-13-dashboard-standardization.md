@@ -2,7 +2,7 @@
 title: Shared reporting periods and dashboard components
 date: 2026-09-13
 type: plan
-status: in-progress
+status: implemented
 ---
 
 ## Accepted scope
@@ -50,4 +50,20 @@ Three Luna max agents completed the formatter, surface and presentation work.
 - Browser review covered period persistence/navigation, missing-period clearing,
   labeled demo accounting, and narrow Spanish control wrapping. Regional date
   formatting remains independent of the selected translation language.
-- Packaged Electron rendering is the remaining validation gate at this point.
+- Fresh unsigned Electron package verified from source
+  `70a5a412066f0290b0130a2698bedda1c484c921`, ASAR SHA-256
+  `8f4e7191c88faf8b2875c5dba36b93a7d8642747a11bc1b0be8e03c0902dca0c`.
+  Inspected all seven packaged pages using the disposable synthetic smoke profile.
+  Six reporting pages share the same header coordinates; Community omits the
+  inapplicable reporting toolbar. All seven use the same 36px serif title style.
+  Captures and content-free bounds are under `.release-build/standard-*.png`
+  and `.release-build/standard-layout-evidence.json`.
+- Desktop startup refresh, chrome and data-flow checks passed. Full smoke remains
+  unqualified at `usage_parity_invalid`: the synthetic accounting projection was
+  still unavailable. No assertion was relaxed; the complete receipt is
+  `.release-build/standard-smoke.json`.
+- Automatic approval review rejected a real-history QA launch because private
+  Codex session-history access requires specific authorization. No real-history
+  QA process ran. Current rendering evidence is synthetic; real-data validation
+  remains pending that authorization.
+- No signing, publishing, updater qualification, or system installation occurred.
