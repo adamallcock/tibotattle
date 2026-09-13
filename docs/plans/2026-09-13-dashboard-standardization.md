@@ -140,3 +140,13 @@ widths compact the brand and redundant state pill. Progress count and timer
 use intrinsic non-clipping tracks; only the phase label can truncate. Quota
 headline type scales with card width to avoid premature word wrapping.
 Validation includes active refresh counters and responsive packaged screenshots.
+
+Packaged source `28fb656f127effe3a1cdf993528bf6cf2fe68c60` verified with ASAR
+SHA-256 `9f063cfd4550c58765e11896fa87d57910de758df8e807f1d6b558b1ddfbba64`.
+Authorized active real-history screenshots at 1240, 1024, 900, 800, 640 and 390px
+showed correct navigation widths and no page overflow. The captured early
+refresh counter was 0/0; a separate explicitly synthetic rendered stress check
+used 99999/99999 and 123:45, proving both fields visible and untruncated at all
+six widths. Evidence is `.release-build/narrow-active-*` and
+`.release-build/narrow-counter-stress.json`. These visual checks do not replace
+the pre-existing full accounting-parity qualification gate.
