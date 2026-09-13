@@ -95,6 +95,9 @@ describe("real activated source to isolated daily projection", () => {
   it("discards unfinished old work when withdrawal precedes its delivery", async () => {
     const { fixture, event } = await active(203);
     await step();
+    expect(await target().prepare(`SELECT phase,day_records,day_source_namespace,day_origin_set_digest
+      FROM analytics_v11_projection_work`).first()).toMatchObject({phase:"building",day_records:200,
+        day_source_namespace:"",day_origin_set_digest:expect.stringMatching(/^[a-f0-9]{64}$/u)});
     await source().prepare("UPDATE participants SET state='deleting' WHERE id=?").bind(fixture.participantId).run();
     expect(await step()).toMatchObject({ state: "discarded", sequence: 1 });
     expect(await target().prepare("SELECT phase FROM analytics_v11_projection_work").first("phase")).toBe("retiring");

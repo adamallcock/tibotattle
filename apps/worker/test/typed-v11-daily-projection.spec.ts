@@ -167,6 +167,18 @@ describe("typed accountless upload to isolated projection", () => {
     await expect(advanceV11DailyProjection({ source: source(), target: target(), sourceId,
       sourceLayout: { kind: "typed-v11", sourceNamespace: "other:synthetic" } })).rejects.toThrow("V11_PROJECTION_SOURCE_LAYOUT_CONFLICT");
     expect(await target().prepare("SELECT sequence FROM analytics_source_cursors").first()).toBeNull();
+    const pin=await target().prepare(`SELECT day_source_namespace,day_origin_set_digest FROM analytics_v11_projection_work`)
+      .first<{day_source_namespace:string;day_origin_set_digest:string}>();
+    const guard=(await target().prepare(`SELECT sql FROM sqlite_schema WHERE type='trigger'
+      AND name='analytics_v11_day_origin_pin_valid'`).first<string>('sql'))!;
+    await target().exec('DROP TRIGGER analytics_v11_day_origin_pin_valid');
+    await target().prepare(`UPDATE analytics_v11_projection_work SET day_source_namespace=NULL,day_origin_set_digest=NULL`).run();
+    await target().prepare(guard).run();
+    await expect(step()).rejects.toThrow('V11_PROJECTION_SOURCE_ORIGIN_CONFLICT');
+    await target().exec('DROP TRIGGER analytics_v11_day_origin_pin_valid');
+    await target().prepare(`UPDATE analytics_v11_projection_work SET day_source_namespace=?,day_origin_set_digest=?`)
+      .bind(pin!.day_source_namespace,pin!.day_origin_set_digest).run();
+    await target().prepare(guard).run();
     await drain();
   });
 

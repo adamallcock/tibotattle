@@ -12,12 +12,16 @@ export const V1_QUOTA_ACQUISITION_VERSION = "v1-quota-acquisition-1";
 export const V1_QUOTA_ACQUISITION_PAGE_SIZE = 1_024;
 export const V1_PLAN_ANCHOR_LIMIT = 120_000;
 export const V1_QUOTA_ENDPOINT_LIMIT = 60_000;
+export const V1_ORIGIN_CURSOR_VERSION = "source-namespace-1";
 const SAFE_TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
 const SOURCE_TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
 const PLAN_TYPES = new Set<string>(TELEMETRY_PLAN_TYPES);
 
 export interface V1PlanSourceRow {
   id: number;
+  /** Present only for the qualified multi-origin typed reader. This is the
+   * original immutable namespace, while id remains the original source row. */
+  source_namespace?: string;
   observed_at: string;
   observed_day: string;
   device_id: string;
@@ -53,8 +57,13 @@ export interface V1AcquiredQuotaRow {
   plan_era_key: string;
 }
 
-export interface V1TimeCursor { observedAt: string; id: number }
-export interface V1ResetCursor extends V1TimeCursor { resetsAt: string }
+export type V1TimeCursor = { observedAt: string; id: number } | {
+  cursorVersion: typeof V1_ORIGIN_CURSOR_VERSION;
+  observedAt: string;
+  sourceNamespace: string;
+  id: number;
+};
+export type V1ResetCursor = V1TimeCursor & { resetsAt: string };
 
 /** Each callback performs ONE bounded query, BEFORE residual winner filtering.
  * Plan order is (observed_at,id); fit order is (resets_at,observed_at,id).
@@ -64,6 +73,9 @@ export interface V1QuotaPageReader {
   /** A distinct, persisted prepared-reader policy uses smaller bounded fanout
    * pages. Absence is the immutable legacy 1024-row physical protocol. */
   readonly pageSize?: 128;
+  /** A reader with this marker orders equal-time rows by their immutable
+   * source namespace before the original source row ID. */
+  readonly cursorVersion?: typeof V1_ORIGIN_CURSOR_VERSION;
   readPlanPage(cursor: V1TimeCursor, limit: number): Promise<V1PlanSourceRow[]>;
   readFitPage(cursor: V1ResetCursor, limit: number): Promise<V1FitSourceRow[]>;
 }
@@ -99,8 +111,8 @@ export interface V1PlanAnchor {
 type PlanAnchor = V1PlanAnchor;
 interface PlanRun { first: PlanAnchor; last: PlanAnchor }
 interface FragmentStats { values: number[]; minimum: number; maximum: number }
-interface Endpoint { id: number; row: V1AcquiredQuotaRow }
-interface EndpointRun { firstId: number; last: Endpoint }
+interface Endpoint { id: number; sourceNamespace?: string; row: V1AcquiredQuotaRow }
+interface EndpointRun { firstId: number; firstSourceNamespace?: string; last: Endpoint }
 type EndpointRunEntry = [eraKey: string, slot: string, run: EndpointRun];
 
 /** Persist only under the matching participant revision/fingerprint fence.
@@ -175,8 +187,10 @@ function planOrder(left: PlanAnchor, right: PlanAnchor): number {
 function sameAnchor(left: PlanAnchor, right: PlanAnchor): boolean {
   return planOrder(left, right) === 0;
 }
-function initialCursor(identity: V1QuotaAcquisitionIdentity): V1ResetCursor {
-  return { resetsAt: identity.resetsAtCutoff, observedAt: "", id: 0 };
+function initialCursor(identity: V1QuotaAcquisitionIdentity, originAware = false): V1ResetCursor {
+  return originAware
+    ? { cursorVersion: V1_ORIGIN_CURSOR_VERSION, sourceNamespace: "", resetsAt: identity.resetsAtCutoff, observedAt: "", id: 0 }
+    : { resetsAt: identity.resetsAtCutoff, observedAt: "", id: 0 };
 }
 function fail(reason: "plan_attribution_limit_exceeded" | "downsampled_quota_limit_exceeded"): V1QuotaAcquisitionStep {
   return { status: "not_testable", reason };
@@ -196,6 +210,21 @@ function percent(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100;
 }
 function positiveId(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) > 0; }
+function sourceNamespace(value: unknown, empty = false): value is string {
+  return typeof value === "string" && value.length <= 256 && (empty || value.length > 0);
+}
+function originCursor(value: unknown): value is V1ResetCursor & { cursorVersion: typeof V1_ORIGIN_CURSOR_VERSION; sourceNamespace: string } {
+  return closed(value, ["cursorVersion", "sourceNamespace", "resetsAt", "observedAt", "id"])
+    && value.cursorVersion === V1_ORIGIN_CURSOR_VERSION && sourceNamespace(value.sourceNamespace, true)
+    && instant(value.resetsAt) && (value.observedAt === "" || instant(value.observedAt))
+    && Number.isSafeInteger(value.id) && (value.id as number) >= 0;
+}
+function legacyCursor(value: unknown): value is V1ResetCursor {
+  return closed(value, ["resetsAt", "observedAt", "id"]) && instant(value.resetsAt)
+    && (value.observedAt === "" || instant(value.observedAt))
+    && Number.isSafeInteger(value.id) && (value.id as number) >= 0;
+}
+function validCursor(value: unknown): value is V1ResetCursor { return legacyCursor(value) || originCursor(value); }
 function validAnchor(value: unknown): value is PlanAnchor {
   if (!closed(value, ["sourceContext", "contextKey", "observedAtMs", "planType", "planVariant", "accountScopeId"])) return false;
   const context = canonicalTuple(value.sourceContext, 2);
@@ -222,7 +251,9 @@ function validEraKey(value: unknown): value is string {
     && Number.isSafeInteger(fields[4]) && Math.abs(fields[4] as number) <= 8_640_000_000_000_000;
 }
 function validEndpoint(value: unknown): value is Endpoint {
-  if (!closed(value, ["id", "row"]) || !positiveId(value.id)) return false;
+  if (!(closed(value, ["id", "row"]) || closed(value, ["id", "sourceNamespace", "row"]))
+      || !positiveId(value.id)
+      || (Object.hasOwn(value, "sourceNamespace") && !sourceNamespace(value.sourceNamespace))) return false;
   return validQuotaRow(value.row);
 }
 function validQuotaRow(row: unknown): row is V1AcquiredQuotaRow {
@@ -272,8 +303,11 @@ export function validateV1QuotaWorkPart(component: V1QuotaWorkComponent, value: 
       return fields !== null && instant(fields[0]) && validEraKey(fields[1]);
     });
     case "endpoint-runs": return value.every((entry: unknown) => Array.isArray(entry) && entry.length === 3
-      && validEraKey(entry[0]) && token(entry[1]) && closed(entry[2], ["firstId", "last"])
-      && positiveId(entry[2].firstId) && validEndpoint(entry[2].last)
+      && validEraKey(entry[0]) && token(entry[1])
+      && (closed(entry[2], ["firstId", "last"]) || closed(entry[2], ["firstId", "firstSourceNamespace", "last"]))
+      && positiveId(entry[2].firstId)
+      && (!Object.hasOwn(entry[2], "firstSourceNamespace") || sourceNamespace(entry[2].firstSourceNamespace))
+      && validEndpoint(entry[2].last)
       && entry[0] === entry[2].last.row.plan_era_key && entry[1] === entry[2].last.row.slot);
     case "endpoints": return value.every(validEndpoint);
     default: return false;
@@ -283,18 +317,14 @@ export function validateV1QuotaWorkPart(component: V1QuotaWorkComponent, value: 
 export function validateV1QuotaWorkControl(value: unknown): value is V1QuotaWorkControl {
   return closed(value, ["version", "phase", "cursor", "planTime", "reset"])
     && value.version === V1_QUOTA_ACQUISITION_VERSION && ["plan", "fitability", "endpoints"].includes(value.phase as string)
-    && closed(value.cursor, ["resetsAt", "observedAt", "id"]) && instant(value.cursor.resetsAt)
-    && (value.cursor.observedAt === "" || instant(value.cursor.observedAt))
-    && Number.isSafeInteger(value.cursor.id) && (value.cursor.id as number) >= 0
+    && validCursor(value.cursor)
     && (value.planTime === null || instant(value.planTime)) && (value.reset === null || instant(value.reset));
 }
 
 export function validateV1QuotaPageReplay(value: unknown): value is V1QuotaPageReplay {
   const point = (candidate: unknown, complete: boolean): boolean => closed(candidate, ["phase", "cursor"])
     && (complete && candidate.phase === "complete" || ["plan", "fitability", "endpoints"].includes(candidate.phase as string))
-    && closed(candidate.cursor, ["resetsAt", "observedAt", "id"]) && instant(candidate.cursor.resetsAt)
-    && (candidate.cursor.observedAt === "" || instant(candidate.cursor.observedAt))
-    && Number.isSafeInteger(candidate.cursor.id) && (candidate.cursor.id as number) >= 0;
+    && validCursor(candidate.cursor);
   return (closed(value, ["version", "from", "through", "sourceQueryCount", "resolution"])
       && value.version === "v1-quota-page-replay-1"
     || closed(value, ["version", "from", "through", "sourceQueryCount", "resolution", "readerPolicy", "pageSize"])
@@ -310,7 +340,7 @@ export function validateV1QuotaPageReplay(value: unknown): value is V1QuotaPageR
  */
 export function createV1QuotaWorkInterner() {
   const strings = new Map<string, string>();
-  const endpoints = new Map<number, Endpoint>();
+  const endpoints = new Map<string, Endpoint>();
   const internText = (value: string): string => {
     const prior = strings.get(value);
     if (prior !== undefined) return prior;
@@ -324,7 +354,8 @@ export function createV1QuotaWorkInterner() {
     value.planVariant = internText(value.planVariant);
   };
   const endpoint = (value: Endpoint): Endpoint => {
-    const prior = endpoints.get(value.id);
+    const key = JSON.stringify([value.sourceNamespace ?? null, value.id]);
+    const prior = endpoints.get(key);
     if (prior) {
       if ((Object.keys(prior.row) as Array<keyof V1AcquiredQuotaRow>).some((key) => prior.row[key] !== value.row[key])) invalid();
       return prior;
@@ -333,7 +364,7 @@ export function createV1QuotaWorkInterner() {
     value.row.plan_type = internText(value.row.plan_type);
     value.row.plan_variant = internText(value.row.plan_variant);
     value.row.plan_era_key = internText(value.row.plan_era_key);
-    endpoints.set(value.id, value);
+    endpoints.set(key, value);
     return value;
   };
   return {
@@ -396,7 +427,8 @@ export function decodeV1QuotaWorkCheckpoint(identity: V1QuotaAcquisitionIdentity
     slots.add(slot);
   }
   if (new Set(state.eligible).size !== state.eligible.length
-      || new Set(state.endpoints.map((row) => row.id)).size !== state.endpoints.length
+      || new Set(state.endpoints.map((row) => JSON.stringify([row.sourceNamespace ?? null, row.id]))).size
+        !== state.endpoints.length
       || state.plan.equalTime.some((row) => row.observedAtMs !== Date.parse(state.plan.time ?? ""))
       || new Set(state.plan.equalTime.map((row) => JSON.stringify([row.sourceContext, row.planType, row.planVariant])))
         .size !== state.plan.equalTime.length) invalid();
@@ -439,8 +471,7 @@ function validateCheckpoint(state: V1QuotaAcquisitionCheckpoint, identity: V1Quo
       || (Object.keys(identity) as Array<keyof V1QuotaAcquisitionIdentity>)
         .some((key) => state.identity[key] !== identity[key])
       || !["plan", "fitability", "endpoints"].includes(state.phase)
-      || !Number.isSafeInteger(state.cursor.id) || state.cursor.id < 0
-      || typeof state.cursor.observedAt !== "string" || typeof state.cursor.resetsAt !== "string"
+      || !validCursor(state.cursor)
       || state.plan.anchors.length > V1_PLAN_ANCHOR_LIMIT
       || state.plan.runs.length > V1_PLAN_ANCHOR_LIMIT
       || state.plan.equalTime.length > V1_PLAN_ANCHOR_LIMIT
@@ -448,6 +479,10 @@ function validateCheckpoint(state: V1QuotaAcquisitionCheckpoint, identity: V1Quo
       || state.stats.length > PLAN_ATTRIBUTION_POLICY.maxEras
       || state.eligible.length > identity.maxQuotaRows
       || state.runs.length > identity.maxQuotaRows || state.endpoints.length > identity.maxQuotaRows) invalid();
+  const originAware=originCursor(state.cursor);
+  if(state.endpoints.some(endpoint=>Object.hasOwn(endpoint,"sourceNamespace")!==originAware)
+      ||state.runs.some(([, ,run])=>Object.hasOwn(run,"firstSourceNamespace")!==originAware
+        ||Object.hasOwn(run.last,"sourceNamespace")!==originAware))invalid();
 }
 
 function attributionIndex(anchors: PlanAnchor[]): PlanAttributionIndex {
@@ -471,6 +506,19 @@ export async function advanceV1QuotaAcquisition(
   const pageSize = reader.pageSize ?? V1_QUOTA_ACQUISITION_PAGE_SIZE;
   if (pageSize !== 128 && pageSize !== V1_QUOTA_ACQUISITION_PAGE_SIZE) throw new Error("v1 quota reader page policy invalid");
   validateCheckpoint(state, identity);
+  const originAware = reader.cursorVersion === V1_ORIGIN_CURSOR_VERSION;
+  if (originAware && !originCursor(state.cursor)) {
+    // A legacy checkpoint has no namespace tie-breaker. It can move forward
+    // only before its first physical row; any partially consumed cursor is
+    // ambiguous and must be rebuilt under the versioned origin protocol.
+    const pristine = state.phase === "plan" && state.cursor.observedAt === identity.observedAtCutoff
+      && state.cursor.resetsAt === identity.resetsAtCutoff && state.cursor.id === 0
+      && state.plan.time === null && state.plan.equalTime.length === 0 && state.plan.runs.length === 0
+      && state.plan.anchors.length === 0 && state.reset === null && state.stats.length === 0
+      && state.eligible.length === 0 && state.runs.length === 0 && state.endpoints.length === 0;
+    if (!pristine) invalid();
+    state.cursor = initialCursor(identity, true);
+  } else if (!originAware && originCursor(state.cursor)) invalid();
   if (!Number.isSafeInteger(budget.remainingQueries) || budget.remainingQueries < 0
       || !Number.isFinite(budget.deadlineMs)) throw new Error("v1 quota acquisition budget invalid");
   if (options.maxPages !== undefined && (!Number.isSafeInteger(options.maxPages) || options.maxPages < 1)) {
@@ -546,7 +594,7 @@ export async function advanceV1QuotaAcquisition(
   };
   const finishRuns = (): boolean => {
     for (const slots of endpointRuns.values()) for (const run of slots.values()) {
-      if (run.last.id !== run.firstId) state.endpoints.push(run.last);
+      if (run.last.id !== run.firstId || run.last.sourceNamespace !== run.firstSourceNamespace) state.endpoints.push(run.last);
       if (state.endpoints.length > identity.maxQuotaRows) return false;
     }
     endpointRuns.clear();
@@ -571,12 +619,19 @@ export async function advanceV1QuotaAcquisition(
       if (rows.length > pageSize) throw new Error("v1 quota acquisition page overflow");
       let previous: V1TimeCursor = state.cursor;
       for (const row of rows) {
+        const rowNamespace = originAware ? row.source_namespace : undefined;
+        const previousNamespace = originAware && "sourceNamespace" in previous ? previous.sourceNamespace : "";
         if (!Number.isSafeInteger(row.id) || row.id <= 0
+            || (originAware && !sourceNamespace(rowNamespace))
             || textOrder(row.observed_at, previous.observedAt) < 0
-            || (row.observed_at === previous.observedAt && row.id <= previous.id)) {
+            || (row.observed_at === previous.observedAt
+              && (textOrder(rowNamespace ?? "", previousNamespace) < 0
+                || (rowNamespace === previousNamespace && row.id <= previous.id)))) {
           throw new Error("v1 quota acquisition page order invalid");
         }
-        previous = { observedAt: row.observed_at, id: row.id };
+        previous = originAware
+          ? { cursorVersion: V1_ORIGIN_CURSOR_VERSION, sourceNamespace: rowNamespace!, observedAt: row.observed_at, id: row.id }
+          : { observedAt: row.observed_at, id: row.id };
         if (row.limit_id !== "codex" || winningDayDevices.get(row.observed_day) !== row.device_id) continue;
         if (state.plan.time !== null && state.plan.time !== row.observed_at && !flushPlanTime()) {
           return fail("plan_attribution_limit_exceeded");
@@ -607,7 +662,7 @@ export async function advanceV1QuotaAcquisition(
       index = attributionIndex(state.plan.anchors);
       if (index.status !== "ready") return fail("plan_attribution_limit_exceeded");
       state.phase = "fitability";
-      state.cursor = initialCursor(identity);
+      state.cursor = initialCursor(identity, originAware);
       continue;
     }
 
@@ -615,12 +670,17 @@ export async function advanceV1QuotaAcquisition(
     if (rows.length > pageSize) throw new Error("v1 quota acquisition page overflow");
     let previous: V1ResetCursor = state.cursor;
     for (const row of rows) {
+      const rowNamespace = originAware ? row.source_namespace : undefined;
+      const previousNamespace = originAware && "sourceNamespace" in previous ? previous.sourceNamespace : "";
       const order = textOrder(row.resets_at, previous.resetsAt) || textOrder(row.observed_at, previous.observedAt)
-        || row.id - previous.id;
-      if (!Number.isSafeInteger(row.id) || row.id <= 0 || order <= 0) {
+        || (originAware ? textOrder(rowNamespace ?? "", previousNamespace) : 0) || row.id - previous.id;
+      if (!Number.isSafeInteger(row.id) || row.id <= 0 || (originAware && !sourceNamespace(rowNamespace)) || order <= 0) {
         throw new Error("v1 quota acquisition page order invalid");
       }
-      previous = { resetsAt: row.resets_at, observedAt: row.observed_at, id: row.id };
+      previous = originAware
+        ? { cursorVersion: V1_ORIGIN_CURSOR_VERSION, sourceNamespace: rowNamespace!, resetsAt: row.resets_at,
+          observedAt: row.observed_at, id: row.id }
+        : { resetsAt: row.resets_at, observedAt: row.observed_at, id: row.id };
       if (row.observed_at < identity.observedAtCutoff
           || row.resets_at < identity.resetsAtCutoff || row.limit_id !== "codex"
           || row.window_duration_minutes !== identity.windowMinutes
@@ -650,17 +710,17 @@ export async function advanceV1QuotaAcquisition(
       if (!eligible.has(JSON.stringify([row.resets_at, eraKey]))) continue;
       let slots = endpointRuns.get(eraKey);
       if (!slots) { slots = new Map(); endpointRuns.set(eraKey, slots); }
-      const endpoint: Endpoint = { id: row.id, row: { occurrence_id: row.occurrence_id, observed_at: row.observed_at,
+      const endpoint: Endpoint = { id: row.id, ...(originAware ? { sourceNamespace: rowNamespace } : {}), row: { occurrence_id: row.occurrence_id, observed_at: row.observed_at,
         provider: interner.internText(row.provider), plan_type: row.plan_type, plan_variant: interner.internText(row.plan_variant),
         limit_id: row.limit_id, slot: row.slot, used_percent: row.used_percent,
         window_duration_minutes: row.window_duration_minutes, resets_at: row.resets_at, plan_era_key: eraKey } };
       const run = slots.get(row.slot);
       if (run && run.last.row.used_percent === row.used_percent) run.last = endpoint;
       else {
-        if (run && run.last.id !== run.firstId) state.endpoints.push(run.last);
+        if (run && (run.last.id !== run.firstId || run.last.sourceNamespace !== run.firstSourceNamespace)) state.endpoints.push(run.last);
         state.endpoints.push(endpoint);
         if (state.endpoints.length > identity.maxQuotaRows) return fail("downsampled_quota_limit_exceeded");
-        slots.set(row.slot, { firstId: row.id, last: endpoint });
+        slots.set(row.slot, { firstId: row.id, ...(originAware ? { firstSourceNamespace: rowNamespace } : {}), last: endpoint });
       }
     }
     state.cursor = previous;
@@ -669,11 +729,12 @@ export async function advanceV1QuotaAcquisition(
       if (!finishStats()) return fail("downsampled_quota_limit_exceeded");
       state.phase = "endpoints";
       state.reset = null;
-      state.cursor = initialCursor(identity);
+      state.cursor = initialCursor(identity, originAware);
       continue;
     }
     if (!finishRuns()) return fail("downsampled_quota_limit_exceeded");
-    state.endpoints.sort((left, right) => textOrder(left.row.observed_at, right.row.observed_at) || left.id - right.id);
+    state.endpoints.sort((left, right) => textOrder(left.row.observed_at, right.row.observed_at)
+      || textOrder(left.sourceNamespace ?? "", right.sourceNamespace ?? "") || left.id - right.id);
     return { status: "complete", attributionIndex: index!, planAnchors: state.plan.anchors,
       quotaRows: state.endpoints.map(({ row }) => row) };
   }

@@ -32,8 +32,8 @@ import { sha256Hex } from "./crypto";
 import { parseStoredRecordJson } from "./stored-record";
 import { assertV11SourcePinCurrent, loadV11SourcePin } from "./telemetry-v11-domain";
 import type { V11SourcePin } from "./telemetry-v11-domain";
-import { typedTelemetryReadNamespace } from "./typed-telemetry-read-layout";
-import { readTypedV11UsageAnalysisPage, TYPED_V11_ANALYSIS_PAGE_SIZE } from "./typed-v11-analysis-reader";
+import { loadTypedV11AnalysisScope, readTypedV11UsageAnalysisPage, TYPED_V11_ANALYSIS_PAGE_SIZE,
+  type TypedV11AnalysisScope } from "./typed-v11-analysis-reader";
 
 export const V11_PLAN_ATTRIBUTION_ADAPTER_VERSION =
   PLAN_ATTRIBUTION_POLICY.methodVersion + ":v11-account-era-buckets-1";
@@ -54,8 +54,9 @@ export interface V11AnalysisOptions {
   sourcePin?: V11SourcePin;
   maxDownsampledQuotaRows?: number;
   maxWindowedUsageRows?: number;
-  /** Resolved from the database contract at the public entrypoint. */
-  typedSourceNamespace?: string | null;
+  /** Bounded qualified provenance scope. Presence selects typed reads even
+   * when this owner's valid history is empty. */
+  typedAnalysisScope?: TypedV11AnalysisScope | null;
 }
 
 interface PlanRow {
@@ -238,7 +239,7 @@ async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11Analy
   // a predecessor query would scan the entire historical domain. Keep this
   // bounded horizon explicit and conditional until an indexed predecessor
   // lane exists; never assert a verified pre-window plan or quantity interval.
-  const inputSql = options.typedSourceNamespace ? TYPED_QUOTA_INPUT : QUOTA_INPUT;
+  const inputSql = options.typedAnalysisScope ? TYPED_QUOTA_INPUT : QUOTA_INPUT;
   const evidence = await db.prepare(PLAN_SQL.replace(QUOTA_INPUT, inputSql)).bind(...bindings, MAX_PLAN_ATTRIBUTION_ROWS + 1).all<PlanRow>();
   if (evidence.results.length > MAX_PLAN_ATTRIBUTION_ROWS) return refused("plan_attribution_limit_exceeded");
   const index = buildPlanAttributionIndex(evidence.results.filter((row) => TOKEN.test(row.provider)).map((row) => ({
@@ -339,11 +340,14 @@ async function visitUsage(
   for (const day of days.results) {
     let cursorTime = day.observed_day + "T00:00:00.000Z";
     let cursorId = "";
+    let cursorSourceNamespace = "";
     for (;;) {
-      const pageSize = options.typedSourceNamespace ? TYPED_V11_ANALYSIS_PAGE_SIZE : PAGE_SIZE;
-      const result = options.typedSourceNamespace ? { results: await readTypedV11UsageAnalysisPage(db, {
-        sourceNamespace: options.typedSourceNamespace, pin: context.pin, day: day.observed_day,
-        from: context.start, to: context.end, afterTime: cursorTime, afterOccurrence: cursorId,
+      const typed = options.typedAnalysisScope;
+      const pageSize = typed ? TYPED_V11_ANALYSIS_PAGE_SIZE : PAGE_SIZE;
+      const result = typed ? { results: await readTypedV11UsageAnalysisPage(db, {
+        scope: options.typedAnalysisScope!,
+        pin: context.pin, day: day.observed_day, from: context.start, to: context.end,
+        afterTime: cursorTime, afterOccurrence: cursorId, afterSourceNamespace: cursorSourceNamespace,
       }) } : await db.prepare(V11_USAGE_PAGE_SQL).bind(
         context.pin.participantId, context.pin.generationId, day.observed_day, context.start, context.end,
         cursorTime, cursorId, PAGE_SIZE,
@@ -387,6 +391,7 @@ async function visitUsage(
       const last = result.results[result.results.length - 1]!;
       cursorTime = last.observed_at;
       cursorId = last.occurrence_id;
+      cursorSourceNamespace = "source_namespace" in last ? String(last.source_namespace) : "";
     }
   }
   return null;
@@ -550,7 +555,7 @@ async function scalarAnalysis(db: D1Database, context: Context, options: V11Anal
 export async function accountScopedQuotaAnalysisV11(
   db: D1Database, participantId: string, options: V11AnalysisOptions = {},
 ): Promise<object> {
-  options = { ...options, typedSourceNamespace: await typedTelemetryReadNamespace(db) };
+  options = { ...options, typedAnalysisScope: await loadTypedV11AnalysisScope(db,participantId) };
   const pin = await sourcePin(db, participantId, options.sourcePin);
   if (!pin) return refused("activated_attribution_domain_unavailable");
   const context = await quotaContext(db, pin, options);
@@ -628,7 +633,7 @@ async function compositionAnalysis(
 export async function accountScopedModelCompositionV11(
   db: D1Database, participantId: string, options: V11AnalysisOptions = {},
 ): Promise<V1ModelCompositionResult> {
-  options = { ...options, typedSourceNamespace: await typedTelemetryReadNamespace(db) };
+  options = { ...options, typedAnalysisScope: await loadTypedV11AnalysisScope(db,participantId) };
   const pin = await sourcePin(db, participantId, options.sourcePin);
   if (!pin) return refused("activated_attribution_domain_unavailable");
   const context = await quotaContext(db, pin, options);

@@ -476,7 +476,10 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
     if (advance === 1) return true;
     const before = replay.from.cursor, after = replay.through.cursor;
     if (replay.from.phase !== "plan" && before.resetsAt !== after.resetsAt) return before.resetsAt < after.resetsAt;
-    return before.observedAt < after.observedAt || (before.observedAt === after.observedAt && before.id < after.id);
+    if (before.observedAt !== after.observedAt) return before.observedAt < after.observedAt;
+    const beforeNamespace = "sourceNamespace" in before ? before.sourceNamespace : "";
+    const afterNamespace = "sourceNamespace" in after ? after.sourceNamespace : "";
+    return beforeNamespace < afterNamespace || (beforeNamespace === afterNamespace && before.id < after.id);
   }
   async function stageHash(head: CommunityAnalysisWorkHead, stage: CommunityAnalysisWorkStage): Promise<string> {
     return sha256Hex(canonicalJson({ identity: head.identity, runId: head.runId, stage }));

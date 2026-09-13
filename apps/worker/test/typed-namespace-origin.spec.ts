@@ -15,7 +15,7 @@ import { sha256Hex } from "../src/crypto";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-repository";
 import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository";
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
-import { readTypedV11ManifestPage } from "../src/typed-v11-record-reader";
+import { readTypedV11ManifestPage,resolveTypedV11ManifestOrigin } from "../src/typed-v11-record-reader";
 import { readTypedV11ChunkRecords } from "../src/typed-v11-analysis-reader";
 
 const b = env as Env & { TEST_MIGRATIONS: D1Migration[]; TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[];
@@ -90,7 +90,8 @@ describe("qualified typed telemetry origins", () => {
       { namespaceId: retained.namespaceId, sourceNamespace: retainedNamespace, typedOwnerId: retained.ownerId, accessMode: "retained-read" },
       expect.objectContaining({ sourceNamespace: currentNamespace, accessMode: "current-write" }),
     ]);
-    await expect(loadTypedV1AnalysisScope(db(), fixture.participantId)).rejects.toThrow("TYPED_V1_ANALYSIS_NOT_READY");
+    expect((await loadTypedV1AnalysisScope(db(), fixture.participantId))?.origins.map(origin=>origin.sourceNamespace))
+      .toEqual([retainedNamespace,currentNamespace]);
     expect(await insertTypedTelemetryV1Chunk(db(), insert, currentNamespace)).toMatchObject({ replay: true, acceptedRecords: 1 });
     await expect(insertTypedTelemetryV1Chunk(db(), insert, retainedNamespace)).rejects.toMatchObject({ code: "TYPED_TELEMETRY_CONFLICT" });
     expect(await count("typed_telemetry_records")).toBe(1);
@@ -169,6 +170,10 @@ describe("qualified typed telemetry origins", () => {
 
     expect((await readQualifiedTypedTelemetryOwnerOrigins(db(), fixture.participantId, "v11"))
       .map(origin => origin.sourceNamespace)).toEqual([retainedNamespace, currentNamespace]);
+    expect(await resolveTypedV11ManifestOrigin(db(),{participantId:fixture.participantId,deviceId:fixture.deviceId,
+      manifestId:manifest.manifestId})).toBe(currentNamespace);
+    expect(await readTypedV11ManifestPage(db(), {participantId: fixture.participantId, deviceId: fixture.deviceId,
+      manifestId: manifest.manifestId,afterStream: "", afterOccurrence: "", limit: 2 })).toHaveLength(1);
     expect(await readTypedV11ManifestPage(db(), { sourceNamespace: currentNamespace,
       participantId: fixture.participantId, deviceId: fixture.deviceId, manifestId: manifest.manifestId,
       afterStream: "", afterOccurrence: "", limit: 2 })).toHaveLength(1);
