@@ -12,14 +12,32 @@ import {initializeTypedV11Admission,persistTypedV11StagedChunk} from '../src/typ
 import {registerTelemetryV11DayManifest} from '../src/telemetry-v11-repository';
 import {activateTelemetryV11Domain,createTelemetryV11DomainPredecessor} from '../src/telemetry-v11-domain';
 import {authenticateDevice,createDeviceUploadAuthorization,claimDeviceUploadAuthorization} from '../src/device-auth';
-import {sha256Hex} from '../src/crypto';
+import {encodeBase64Url,sha256,sha256Hex} from '../src/crypto';
 import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics} from '../src/storage-analytics-runtime';
 import {eraseParticipantAsOwner} from '../src/participant-erasure';
 import {advanceStorageErasureJobs,prepareStorageParticipantErasure,requireStorageParticipantErasureComplete} from '../src/storage-erasure';
+import {advanceMultiSourceStorageErasureJobs,prepareMultiSourceParticipantErasure,
+ requireMultiSourceParticipantErasureComplete} from '../src/storage-multi-source-erasure';
 import {recordDeletionTombstone,purgeExpiredDeletionTombstones,hasDeletionTombstone,participantDeletionDigest,replayDeletionTombstones} from '../src/retention';
-const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];
+import {ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+ ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,enrollAccountlessDevice} from '../src/accountless-enrollment';
+import {ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+ ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+ createAccountlessUploadOwner} from '../src/accountless-ownership';
+import {createCatalogStorageRouter,createOwnerMoveCoordinator} from '../src/storage-routing';
+import {configureStorageShardAllocation,recordStorageCapacityObservation} from '../src/storage-capacity';
+import {registerParticipantOwnerRoute} from '../src/storage-routing-runtime';
+import {publishMultiSourceCommunityDaily,readMultiSourcePublication} from '../src/storage-multi-source-publication';
+import {createV11DailyProjectionValues} from '../src/v11-daily-projection-values';
+import {STORAGE_COMMUNITY_DAILY_METHOD} from '../src/storage-community-daily';
+import {canonicalJson} from '../src/canonical-json';
+const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;STORAGE_PUBLICATION_DB:D1Database;
+ TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];
  TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];TEST_TYPED_V11_ADMISSION_MIGRATIONS:D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];
- TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[];TEST_ANALYTICS_MIGRATIONS:D1Migration[];TEST_DELETION_LEDGER_MIGRATIONS:D1Migration[]};
+ TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[];TEST_ANALYTICS_MIGRATIONS:D1Migration[];TEST_DELETION_LEDGER_MIGRATIONS:D1Migration[];
+ TEST_ROUTING_MIGRATIONS:D1Migration[];TEST_INGESTION_ROUTING_MIGRATIONS:D1Migration[];STORAGE_ROUTING_DB:D1Database;
+ STORAGE_INGESTION_A:D1Database;STORAGE_INGESTION_B:D1Database;STORAGE_INGESTION_C:D1Database;
+ STORAGE_ANALYTICS_A:D1Database;STORAGE_ANALYTICS_B:D1Database};
 const source=()=>b.USAGE_MONITOR_DB,target=()=>b.STORAGE_ANALYTICS_DB,sourceId='synthetic-erasure',sourceNamespace='synthetic-erasure-original';
 const bindings=()=>({source:source(),target:target(),ledger:b.DELETION_LEDGER,sourceId,sourceNamespace});
 const runtime=(t=target())=>{const configured={...b,ENVIRONMENT:'synthetic-development'} as Env;
@@ -27,7 +45,9 @@ const runtime=(t=target())=>{const configured={...b,ENVIRONMENT:'synthetic-devel
 const today=()=>new Date().toISOString().slice(0,10);
 beforeEach(async()=>{
  await reset();for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,b.TEST_TYPED_V11_ADMISSION_MIGRATIONS,b.TEST_TYPED_V1_ADMISSION_MIGRATIONS])await applyD1Migrations(source(),migrations);
- await applyD1Migrations(target(),b.TEST_ANALYTICS_MIGRATIONS);await applyD1Migrations(b.DELETION_LEDGER,b.TEST_DELETION_LEDGER_MIGRATIONS);
+ await applyD1Migrations(target(),b.TEST_ANALYTICS_MIGRATIONS);
+ await applyD1Migrations(b.STORAGE_PUBLICATION_DB,b.TEST_ANALYTICS_MIGRATIONS);
+ await applyD1Migrations(b.DELETION_LEDGER,b.TEST_DELETION_LEDGER_MIGRATIONS);
  await initializeStorageSource(source(),sourceId);await initializeTypedV11Admission(source(),sourceNamespace);await initializeTypedV1Admission(source(),sourceNamespace);
  await applyD1Migrations(source(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);await initializeStorageAnalyticsRuntime(bindings());
 });
@@ -52,7 +72,43 @@ async function fixture(days=1){
 async function deliver(){for(let i=0;i<30;i++)if((await advanceStorageAnalytics(bindings())).state==='idle')return;throw new Error('synthetic delivery bound');}
 const count=(table:string)=>target().prepare(`SELECT COUNT(*) n FROM ${table}`).first<number>('n');
 async function drain(){for(let n=0;n<20;n++)if(!(await advanceStorageErasureJobs(bindings())).pending)return;throw new Error('synthetic erasure bound');}
+
+async function copyRows(table:string,from:D1Database,to:D1Database):Promise<void>{
+ const columns=(await from.prepare(`PRAGMA table_info(${table})`).all<{name:string}>()).results.map(row=>row.name);
+ const rows=(await from.prepare(`SELECT * FROM ${table}`).all<Record<string,unknown>>()).results;
+ for(const row of rows)await to.prepare(`INSERT INTO ${table}(${columns.join(',')}) VALUES(${columns.map(()=>'?').join(',')})`)
+  .bind(...columns.map(column=>row[column])).run();
+}
+
+async function initializeCatalogErasureStore(source:D1Database,target:D1Database,sourceIdValue:string){
+ for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,
+  b.TEST_TYPED_V11_ADMISSION_MIGRATIONS,b.TEST_TYPED_V1_ADMISSION_MIGRATIONS])await applyD1Migrations(source,migrations);
+ await initializeStorageSource(source,sourceIdValue);await initializeTypedV11Admission(source,sourceNamespace);
+ await initializeTypedV1Admission(source,sourceNamespace);
+ await applyD1Migrations(source,b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+ await applyD1Migrations(source,b.TEST_INGESTION_ROUTING_MIGRATIONS);
+ await applyD1Migrations(target,b.TEST_ANALYTICS_MIGRATIONS);
+ await initializeStorageAnalyticsRuntime({source,target,sourceId:sourceIdValue,sourceNamespace});
+}
 describe('cross-store physical erasure completion',()=>{
+ it('retains a durable per-target completion gate until the declared analytics target is clean',async()=>{
+  const f=await fixture(5);await deliver();await recordDeletionTombstone(b.DELETION_LEDGER,f.participantId);
+  const targetBinding={...bindings(),targetId:'ANALYTICS_DB'};
+  expect(await prepareMultiSourceParticipantErasure([targetBinding],f.participantId,
+   {target:target(),routingGeneration:0,erasureGeneration:1})).toBe(1);
+  expect(await target().prepare('SELECT erasure_generation FROM analytics_multi_source_control WHERE singleton=1')
+   .first('erasure_generation')).toBe(1);
+  expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_targets').first('state')).toBe('pending');
+  expect((await purgeExpiredDeletionTombstones(b.DELETION_LEDGER,Date.now()+401*86400000)).purged).toBe(0);
+  try{await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId);}catch{/* Bounded cleanup resumes below. */}
+  for(let n=0;n<20;n++){
+   const result=await advanceMultiSourceStorageErasureJobs({targets:[targetBinding]});
+   if(result.pendingTargets===0)break;
+  }
+  await requireMultiSourceParticipantErasureComplete(b.DELETION_LEDGER,f.participantId,[targetBinding]);
+  expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_targets').first('state')).toBe('complete');
+  expect(await count('analytics_v11_value_pages')).toBe(0);
+ });
  it('fails closed when analytics is offline, then resumes from independent mapping after source deletion',async()=>{
   const f=await fixture(5);await deliver();expect(await count('analytics_v11_value_pages')).toBe(5);
   const offline=new Proxy(target(),{get(db,key){if(key==='prepare')return()=>{throw new Error('synthetic analytics offline');};const v=Reflect.get(db,key);return typeof v==='function'?v.bind(db):v;}});
@@ -150,5 +206,130 @@ describe('cross-store physical erasure completion',()=>{
   expect(await b.DELETION_LEDGER.prepare('SELECT participant_digest FROM storage_erasure_jobs').first('participant_digest')).toBe(await participantDeletionDigest(f.participantId));
   await drain();await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,f.participantId,bindings());
   expect(await count('analytics_v11_value_pages')).toBe(0);
+ });
+ it('removes a retained routed copy and resumes an unavailable derived target from durable receipts',async()=>{
+  await applyD1Migrations(b.STORAGE_ROUTING_DB,b.TEST_ROUTING_MIGRATIONS);
+  await initializeCatalogErasureStore(b.STORAGE_INGESTION_A,b.STORAGE_ANALYTICS_A,'routed-source-a');
+  await initializeCatalogErasureStore(b.STORAGE_INGESTION_B,b.STORAGE_ANALYTICS_B,'routed-source-b');
+  await applyD1Migrations(b.STORAGE_INGESTION_C,b.TEST_INGESTION_ROUTING_MIGRATIONS);
+  await b.STORAGE_ROUTING_DB.batch(['a','b','c'].map(shard=>b.STORAGE_ROUTING_DB.prepare(
+    'INSERT INTO storage_shards(shard_id,binding_name,state) VALUES(?,?,\'active\')')
+    .bind(shard,`STORAGE_INGESTION_${shard.toUpperCase()}`)));
+  for(const shardId of ['a','b','c']){
+    await recordStorageCapacityObservation(b.STORAGE_ROUTING_DB,{shardId,observedBytes:0,observedAt:1000,
+      validUntil:2000,pressureState:'normal'});
+    await configureStorageShardAllocation(b.STORAGE_ROUTING_DB,{shardId,allocationTier:'active',
+      allocationEnabled:true,updatedAt:1000});
+  }
+  const shardBindings={STORAGE_INGESTION_A:b.STORAGE_INGESTION_A,
+    STORAGE_INGESTION_B:b.STORAGE_INGESTION_B,STORAGE_INGESTION_C:b.STORAGE_INGESTION_C};
+  const router=createCatalogStorageRouter({catalog:b.STORAGE_ROUTING_DB,bindings:shardBindings,clock:()=>1500});
+  const ownerId='accountless:retained-erasure-owner';
+  const sourceRoute=await router.ensureOwner(ownerId,'a',1);
+  const deviceId=crypto.randomUUID(),secret=crypto.getRandomValues(new Uint8Array(32));
+  const prefix=new TextEncoder().encode(`app-usagemonitor/device/v1\0${deviceId}\0`);
+  const hashInput=new Uint8Array(prefix.length+secret.length);hashInput.set(prefix);hashInput.set(secret,prefix.length);
+  const enrollment={schemaVersion:ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,deviceId,
+    deviceSecretHash:await sha256(hashInput),policyVersion:ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+    authorizationBasis:ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS} as const;
+  hashInput.fill(0);
+  const authorization=`Device um_device_${deviceId}.${encodeBase64Url(secret)}`;secret.fill(0);
+  const ownerNow=Date.now();
+  await enrollAccountlessDevice(b.STORAGE_INGESTION_A,enrollment,ownerNow,sourceRoute);
+  expect(await b.STORAGE_INGESTION_A.prepare('SELECT state FROM storage_owner_fences WHERE owner_id=?')
+    .bind(ownerId).first('state')).toBe('active');
+  expect(await b.STORAGE_INGESTION_A.prepare('SELECT installation_principal_id FROM accountless_enrollment_ledger WHERE device_id=?')
+    .bind(deviceId).first('installation_principal_id')).toBe(ownerId);
+  const owner=await createAccountlessUploadOwner(b.STORAGE_INGESTION_A,authorization,{
+    schemaVersion:ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,policyVersion:ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis:ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion:ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION},ownerNow,sourceRoute);
+  const participantId=owner.participantId,ownerDigest='7'.repeat(64),objectDigest='8'.repeat(64),contentDigest='9'.repeat(64);
+  await b.STORAGE_INGESTION_A.batch([
+    b.STORAGE_INGESTION_A.prepare(`INSERT INTO storage_v11_owner_links
+      (participant_id,owner_digest,state,object_digest,manifest_digest) VALUES(?,?,'active',?,?)`)
+      .bind(participantId,ownerDigest,objectDigest,contentDigest),
+    b.STORAGE_INGESTION_A.prepare(`INSERT INTO storage_ingestion_changes
+      (event_digest,owner_digest,revision,kind,object_digest,content_digest,authority_epoch,public_authority_epoch,recorded_ms)
+      VALUES(?,?,1,'owner-active',?,?,1,1,1500)`).bind(objectDigest,ownerDigest,objectDigest,contentDigest),
+  ]);
+  const mover=createOwnerMoveCoordinator({catalog:b.STORAGE_ROUTING_DB,bindings:shardBindings,clock:()=>1500,
+    verifyDestinationCopy:async()=> 'a'.repeat(64)});
+  await mover.begin('retained-erasure-move',sourceRoute,'b');await mover.fenceSource('retained-erasure-move');
+  await mover.verifyCopied('retained-erasure-move');await mover.commit('retained-erasure-move');
+  const currentRoute=await mover.activateDestination('retained-erasure-move');
+  await enrollAccountlessDevice(b.STORAGE_INGESTION_B,enrollment,ownerNow,currentRoute);
+  for(const table of ['participants','device_credentials','accountless_upload_owners','accountless_v11_device_authorizations']){
+    await copyRows(table,b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B);
+  }
+  await b.STORAGE_INGESTION_B.batch([
+    b.STORAGE_INGESTION_B.prepare(`INSERT INTO storage_v11_owner_links
+      (participant_id,owner_digest,state,object_digest,manifest_digest) VALUES(?,?,'active',?,?)`)
+      .bind(participantId,ownerDigest,objectDigest,contentDigest),
+    b.STORAGE_INGESTION_B.prepare(`INSERT INTO storage_ingestion_changes
+      (event_digest,owner_digest,revision,kind,object_digest,content_digest,authority_epoch,public_authority_epoch,recorded_ms)
+      VALUES(?,?,1,'owner-active',?,?,1,1,1500)`).bind(objectDigest,ownerDigest,objectDigest,contentDigest),
+  ]);
+  const publicationSources=[
+    {source:b.STORAGE_INGESTION_A,target:b.STORAGE_ANALYTICS_A,sourceId:'routed-source-a',
+      sourceNamespace,targetId:'analytics-a'},
+    {source:b.STORAGE_INGESTION_B,target:b.STORAGE_ANALYTICS_B,sourceId:'routed-source-b',
+      sourceNamespace,targetId:'analytics-b'},
+  ];
+  for(const binding of publicationSources){
+    const authority=await captureStorageCommunityAuthority(binding.source,binding);
+    await binding.target.prepare(`INSERT INTO analytics_source_cursors(source_id,sequence,authority_epoch)
+      VALUES(?,?,?)`).bind(binding.sourceId,authority.sequence,authority.publicAuthorityEpoch).run();
+  }
+  await b.STORAGE_ANALYTICS_B.batch([
+    b.STORAGE_ANALYTICS_B.prepare(`INSERT INTO analytics_owner_state
+      (source_id,owner_digest,revision,authority_epoch,state) VALUES(?,?,1,1,'active')`)
+      .bind('routed-source-b',ownerDigest),
+    b.STORAGE_ANALYTICS_B.prepare(`INSERT INTO analytics_community_daily_owners
+      (source_id,day,owner_digest,input_revision,owner_revision,source_format,method,progress_revision,
+       next_index,fingerprint,complete,values_json) VALUES(?,?,?,1,1,'v11',?,1,0,NULL,1,?)`)
+      .bind('routed-source-b',today(),ownerDigest,STORAGE_COMMUNITY_DAILY_METHOD,
+        canonicalJson(createV11DailyProjectionValues(today()))),
+  ]);
+  const publicationSet={sources:publicationSources,publicationTarget:b.STORAGE_PUBLICATION_DB,
+    members:[{sourceId:'routed-source-b',ownerDigest,inputRevision:1,ownerRevision:1,
+      routeGeneration:currentRoute.generation}],routingGeneration:currentRoute.generation,erasureGeneration:0};
+  expect(await publishMultiSourceCommunityDaily(publicationSet,{day:today(),nowMs:ownerNow}))
+    .toMatchObject({state:'published'});
+  expect(await readMultiSourcePublication(b.STORAGE_PUBLICATION_DB,'daily',today())).not.toBeNull();
+  const catalogRuntime={...b,ENVIRONMENT:'synthetic-development',STORAGE_ROUTING_MODE:'catalog',
+    STORAGE_ROUTING_DB:b.STORAGE_ROUTING_DB,...shardBindings,STORAGE_ANALYTICS_A:b.STORAGE_ANALYTICS_A,
+    STORAGE_ANALYTICS_B:b.STORAGE_ANALYTICS_B,STORAGE_PUBLICATION_DB:b.STORAGE_PUBLICATION_DB,
+    STORAGE_ANALYTICS_DB:undefined} as unknown as Env;
+  await registerParticipantOwnerRoute(catalogRuntime,participantId,currentRoute);
+  const unavailableSource=new Proxy(b.STORAGE_INGESTION_A,{get(db,key){if(key==='prepare')return()=>{
+    throw new Error('synthetic retained source unavailable');};const value=Reflect.get(db,key);
+    return typeof value==='function'?value.bind(db):value;}});
+  await expect(eraseParticipantAsOwner({...catalogRuntime,STORAGE_INGESTION_A:unavailableSource} as Env,
+    'synthetic-admin',participantId)).rejects.toThrow();
+  expect(await b.STORAGE_PUBLICATION_DB.prepare('SELECT erasure_generation FROM analytics_multi_source_control WHERE singleton=1')
+    .first('erasure_generation')).toBe(1);
+  expect(await readMultiSourcePublication(b.STORAGE_PUBLICATION_DB,'daily',today())).toBeNull();
+  expect(await hasDeletionTombstone(b.DELETION_LEDGER,participantId)).toBe(true);
+  for(const sourceDb of [b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B]){
+    expect(await sourceDb.prepare('SELECT 1 FROM participants WHERE id=?').bind(participantId).first()).not.toBeNull();
+  }
+  const unavailable=new Proxy(b.STORAGE_ANALYTICS_B,{get(db,key){if(key==='prepare')return()=>{throw new Error('synthetic target unavailable');};
+    const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});
+  await expect(eraseParticipantAsOwner({...catalogRuntime,STORAGE_ANALYTICS_B:unavailable} as Env,
+    'synthetic-admin',participantId)).rejects.toThrow();
+  expect(await b.STORAGE_PUBLICATION_DB.prepare('SELECT erasure_generation FROM analytics_multi_source_control WHERE singleton=1')
+    .first<number>('erasure_generation')).toBeGreaterThan(0);
+  for(const sourceDb of [b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B]){
+    expect(await sourceDb.prepare('SELECT 1 FROM participants WHERE id=?').bind(participantId).first()).toBeNull();
+    expect(await sourceDb.prepare('SELECT 1 FROM storage_v11_owner_links WHERE participant_id=?').bind(participantId).first()).toBeNull();
+  }
+  expect(await b.DELETION_LEDGER.prepare("SELECT count(*) n FROM storage_erasure_targets WHERE state='complete'").first('n')).toBe(1);
+  expect(await b.DELETION_LEDGER.prepare("SELECT count(*) n FROM storage_erasure_targets WHERE state='pending'").first('n')).toBe(1);
+  await expect(eraseParticipantAsOwner(catalogRuntime,'synthetic-admin',participantId)).resolves
+    .toMatchObject({deleted:true,alreadyDeleted:true,contributionsDeleted:null});
+  expect(await b.DELETION_LEDGER.prepare("SELECT count(*) n FROM storage_erasure_targets WHERE state='complete'").first('n')).toBe(2);
+  expect(await b.STORAGE_ANALYTICS_A.prepare('SELECT count(*) n FROM analytics_storage_erasure_receipts').first('n')).toBe(1);
+  expect(await b.STORAGE_ANALYTICS_B.prepare('SELECT count(*) n FROM analytics_storage_erasure_receipts').first('n')).toBe(1);
  });
 });

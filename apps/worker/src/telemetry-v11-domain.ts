@@ -13,6 +13,8 @@ import {
   type TelemetryTransportPrincipal,
 } from "./telemetry-transport-policy";
 import { MAX_V1_SOURCE_CHUNKS, selectV1WinningDevices, type V1SourceChunk } from "./telemetry-v1-source-selection";
+import { ownerWriteFenceStatement } from "./storage-routing-fence";
+import type { OwnerStorageRoute } from "./storage-routing";
 
 export const V11_DOMAIN_METHOD_VERSION = "v11-complete-domain-1";
 const DAY_MS = 86_400_000;
@@ -99,6 +101,7 @@ export interface TelemetryV11DomainPredecessor {
  */
 export async function createTelemetryV11DomainPredecessor(
   db: D1Database, principal: TelemetryTransportPrincipal, nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<TelemetryV11DomainPredecessor> {
   await assertTelemetryTransportWriteAllowed(db, principal, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION);
   const result = await db.batch<SourceState | V1SourceChunk | LegacyRange>([
@@ -140,7 +143,11 @@ export async function createTelemetryV11DomainPredecessor(
   const now = new Date(nowEpoch).toISOString();
   const expiresAt = new Date(nowEpoch + PREDECESSOR_TTL_MS).toISOString();
   const winnersJson = JSON.stringify(winners.map((winner) => [winner.participant_id, winner.observed_day, winner.device_id]));
+  const guardCount = ownerRoute?.mode === "catalog" ? 1 : 0;
   const rows = await db.batch([
+    ...(guardCount === 1
+      ? [ownerWriteFenceStatement(db, ownerRoute!)]
+      : []),
     db.prepare(`DELETE FROM telemetry_v11_domain_predecessors
       WHERE participant_id = ? AND device_id = ? AND consumed_at IS NULL
         AND (expires_at <= ? OR token_hash IN (SELECT x.token_hash FROM telemetry_v11_domain_predecessors x
@@ -163,7 +170,7 @@ export async function createTelemetryV11DomainPredecessor(
       winnersJson, now, expiresAt, principal.participantId, state.input_revision,
       principal.participantId, state.generation_id, principal.participantId, principal.deviceId, now),
   ]);
-  if (rows[1]?.results.length !== 1) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+  if (rows[guardCount + 1]?.results.length !== 1) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   return {schemaVersion: "telemetry-domain-predecessor-v1.1", token,
     previousGenerationId: state.generation_id, legacyFingerprint, fromDay, throughDay, expiresAt};
 }
@@ -218,6 +225,7 @@ async function activeDomainByDigest(
  */
 export async function activateTelemetryV11Domain(
   db: D1Database, principal: TelemetryTransportPrincipal, value: unknown, nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<TelemetryV11DomainActivation> {
   let manifest: ReturnType<typeof parseTelemetryV11DomainManifest>;
   try {
@@ -262,7 +270,11 @@ export async function activateTelemetryV11Domain(
   const generationId = crypto.randomUUID();
   const now = new Date(nowEpoch).toISOString();
   try {
+    const guardCount = ownerRoute?.mode === "catalog" ? 1 : 0;
     const result = await db.batch<{generation_id?: string}>([
+      ...(guardCount === 1
+        ? [ownerWriteFenceStatement(db, ownerRoute!)]
+        : []),
       db.prepare(`INSERT INTO telemetry_v11_domains (
         id, participant_id, device_id, predecessor_token_hash, previous_generation_id,
         manifest_digest, legacy_fingerprint, input_revision, from_day, through_day, days_json, created_at
@@ -281,8 +293,9 @@ export async function activateTelemetryV11Domain(
         RETURNING generation_id`).bind(principal.participantId, generationId, now),
     ]);
     // Trigger writes inflate meta.changes. Prove this exact target instead.
-    if (result[2]?.results.length !== 1
-        || result[2].results[0]?.generation_id !== generationId) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+    const head = result[guardCount + 2];
+    if (head?.results.length !== 1
+        || head.results[0]?.generation_id !== generationId) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   } catch (error) {
     // An uncertain network response or concurrent identical retry is safe.
     const replay = await activeDomainByDigest(db, principal, manifest.manifestDigest);

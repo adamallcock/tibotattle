@@ -6,6 +6,8 @@ import { timingSafeEqual } from "./crypto";
 import { deviceHash, parseDeviceAuthorization } from "./device-auth";
 import { ApiError } from "./errors";
 import { parseStrictJson } from "./strict-json";
+import { ownerWriteFenceStatement } from "./storage-routing-fence";
+import type { OwnerStorageRoute } from "./storage-routing";
 
 /**
  * This policy authorization is intentionally distinct from the historical
@@ -50,6 +52,8 @@ export interface AccountlessOwnershipResponse {
 
 export interface AccountlessOwnershipResult {
   readonly status: 200 | 201;
+  /** Internal catalog publication key; never included in the HTTP response. */
+  readonly participantId: string;
   readonly response: AccountlessOwnershipResponse;
 }
 
@@ -255,6 +259,7 @@ export async function createAccountlessUploadOwner(
   authorizationHeader: string | null,
   request: AccountlessOwnershipRequest,
   nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<AccountlessOwnershipResult> {
   if (!db || typeof db.prepare !== "function") {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
@@ -276,6 +281,7 @@ export async function createAccountlessUploadOwner(
     }
     return {
       status: 200,
+      participantId: existing.participant_id,
       response: accountlessOwnershipResponse(
         ledger.device_id,
         ledger.expires_at,
@@ -289,6 +295,9 @@ export async function createAccountlessUploadOwner(
   const required = telemetryV11RequiredConsent();
   try {
     const results = await db.batch([
+      ...(ownerRoute?.mode === "catalog"
+        ? [ownerWriteFenceStatement(db, ownerRoute)]
+        : []),
       db.prepare(`
         INSERT INTO participants (
           id, owner_kind, access_token_id, access_token_hash,
@@ -394,6 +403,7 @@ export async function createAccountlessUploadOwner(
     if (owner !== null && validOwner(owner, ledger, nowEpoch)) {
       return {
         status: 201,
+        participantId,
         response: accountlessOwnershipResponse(
           ledger.device_id,
           ledger.expires_at,
@@ -409,6 +419,7 @@ export async function createAccountlessUploadOwner(
   if (raced !== null && validOwner(raced, ledger, nowEpoch)) {
     return {
       status: 200,
+      participantId: raced.participant_id,
       response: accountlessOwnershipResponse(
         ledger.device_id,
         ledger.expires_at,

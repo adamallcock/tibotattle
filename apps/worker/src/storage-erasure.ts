@@ -11,6 +11,7 @@ import {retireStorageCommunityDailyPage} from './storage-community-daily';
 import {retireStorageCommunityGraphPublications} from './storage-community-graph-publication';
 import type {StorageAnalyticsBindings} from './analytics-delivery';
 export type StorageErasureBindings=StorageAnalyticsBindings&{ledger:D1Database};
+export interface StorageErasureSourceIdentity {sourceId:string;sourceNamespace:string;}
 interface Job {participant_digest:string;source_id:string;owner_digest:string;source_namespace:string;
  state:'pending'|'complete';terminal_json:string|null;}
 const unavailable=()=>new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
@@ -25,11 +26,16 @@ export async function storageErasureBindings(env:Env):Promise<StorageErasureBind
  if(!sourceId)throw unavailable();
  return {source:env.USAGE_MONITOR_DB,target:target as D1Database,ledger:env.DELETION_LEDGER,sourceId,sourceNamespace:mode.sourceNamespace};
 }
-async function scope(b:StorageErasureBindings):Promise<void>{
- const row=await b.source.prepare(`SELECT s.source_id,a.source_namespace AS v1,b.source_namespace AS v11
+export async function readStorageErasureSourceIdentity(source:D1Database):Promise<StorageErasureSourceIdentity>{
+ const row=await source.prepare(`SELECT s.source_id,a.source_namespace AS v1,b.source_namespace AS v11
  FROM storage_source_state s JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
  JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 WHERE s.singleton=1`).first<{source_id:string;v1:string;v11:string}>();
- if(!row||row.source_id!==b.sourceId||row.v1!==b.sourceNamespace||row.v11!==b.sourceNamespace||b.source===b.target)throw unavailable();
+ if(!row||row.v1!==row.v11)throw unavailable();
+ return {sourceId:row.source_id,sourceNamespace:row.v1};
+}
+async function scope(b:StorageErasureBindings):Promise<void>{
+ const identity=await readStorageErasureSourceIdentity(b.source);
+ if(identity.sourceId!==b.sourceId||identity.sourceNamespace!==b.sourceNamespace||b.source===b.target)throw unavailable();
 }
 /** Called after the independent tombstone is durable but BEFORE deleting the
  * last participant->opaque-owner mapping. Existing completed jobs reopen on
@@ -148,6 +154,23 @@ export async function advanceStorageErasureJobs(b:StorageErasureBindings,options
  }
  return {completed,pending:!!await b.ledger.prepare("SELECT 1 FROM storage_erasure_jobs WHERE source_id=? AND state='pending' LIMIT 1").bind(b.sourceId).first()};
 }
+
+/** Complete only the declared derived-target receipts whose underlying source
+ * jobs have durable terminal proof. The multi-source scheduler calls this in
+ * the same metered pass that advances those jobs. */
+export async function reconcileStorageErasureTargetReceipts(ledger:D1Database,sourceId:string,targetId:string):Promise<number>{
+ if(!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/.test(sourceId)
+  ||!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/.test(targetId))throw unavailable();
+ const result=await ledger.prepare(`UPDATE storage_erasure_targets SET state='complete',completed_at=?1
+  WHERE (participant_digest,source_id,owner_digest,target_id) IN (
+   SELECT t.participant_digest,t.source_id,t.owner_digest,t.target_id FROM storage_erasure_targets t
+   JOIN storage_erasure_jobs j ON j.participant_digest=t.participant_digest AND j.source_id=t.source_id
+    AND j.owner_digest=t.owner_digest AND j.state='complete'
+   WHERE t.source_id=?2 AND t.target_id=?3 AND t.state='pending'
+   ORDER BY t.participant_digest,t.owner_digest LIMIT 4)`)
+  .bind(new Date().toISOString(),sourceId,targetId).run();
+ return result.meta.changes;
+}
 /** Both first response and missing-participant retry require durable completion.
  * Schema absence is tolerated only for a legacy JSON deployment with no jobs. */
 export async function requireStorageParticipantErasureComplete(ledger:D1Database,participantId:string,b:StorageErasureBindings|null):Promise<void>{
@@ -157,7 +180,23 @@ export async function requireStorageParticipantErasureComplete(ledger:D1Database
   .bind(digest).all<Job>()).results;
  if(jobs.length>200)throw unavailable();
  if(jobs.length===0)return;
- if(!b)throw unavailable();await scope(b);
+ if(!b)throw unavailable();await requireJobs(ledger,jobs,b);
+}
+
+/** Multi-source completion reuses the same restore/replay proof, scoped to one
+ * declared source so another source's pending job cannot be misclassified as a
+ * namespace mismatch. The caller must still require every declared source. */
+export async function requireStorageParticipantErasureSourceComplete(ledger:D1Database,participantId:string,
+ b:StorageErasureBindings):Promise<void>{
+ const digest=await participantDeletionDigest(participantId);
+ const jobs=(await ledger.prepare(`SELECT * FROM storage_erasure_jobs WHERE participant_digest=? AND source_id=?
+  ORDER BY owner_digest LIMIT 9`).bind(digest,b.sourceId).all<Job>()).results;
+ if(jobs.length>8)throw unavailable();
+ await requireJobs(ledger,jobs,b);
+}
+
+async function requireJobs(ledger:D1Database,jobs:Job[],b:StorageErasureBindings):Promise<void>{
+ await scope(b);
  const ready=await b.target.prepare('SELECT source_namespace FROM analytics_runtime_sources WHERE source_id=? AND contract_version=1')
   .bind(b.sourceId).first<string>('source_namespace');if(ready!==b.sourceNamespace)throw unavailable();
  let advanced=false;

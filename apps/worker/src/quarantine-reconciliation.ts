@@ -2,6 +2,8 @@ import {
   QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS,
 } from "./constants";
 import { ApiError } from "./errors";
+import { ownerWriteFenceStatement } from "./storage-routing-fence";
+import type { OwnerStorageRoute } from "./storage-routing";
 
 const QUARANTINE_RECONCILIATION_BATCH_SIZE = 100;
 const QUARANTINE_RECONCILIATION_LEASE_MILLISECONDS = 15 * 60 * 1000;
@@ -87,9 +89,10 @@ function assertRegistration(
 export async function registerPendingQuarantineObject(
   db: D1Database,
   registration: PendingQuarantineRegistration,
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<void> {
   assertRegistration(registration);
-  const result = await db.prepare(
+  const statement = db.prepare(
     `INSERT INTO pending_quarantine_objects (
       r2_key, contribution_id, object_kind, registered_at
     ) VALUES (?, ?, ?, ?)`,
@@ -98,7 +101,11 @@ export async function registerPendingQuarantineObject(
     registration.contributionId,
     registration.objectKind,
     registration.registeredAt,
-  ).run();
+  );
+  const result = ownerRoute?.mode === "catalog"
+    ? (await db.batch([ownerWriteFenceStatement(db, ownerRoute), statement]))[1]
+    : await statement.run();
+  if (!result) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   if (result.meta.changes !== 1) {
     throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
   }
@@ -110,8 +117,9 @@ export async function putTrackedQuarantineObject(
   registration: PendingQuarantineRegistration,
   value: string,
   options?: R2PutOptions,
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<void> {
-  await registerPendingQuarantineObject(db, registration);
+  await registerPendingQuarantineObject(db, registration, ownerRoute);
   await quarantine.put(registration.r2Key, value, options);
 }
 
@@ -121,11 +129,17 @@ export async function clearPendingQuarantineObject(
     PendingQuarantineRegistration,
     "contributionId" | "r2Key"
   >,
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<void> {
-  await db.prepare(
+  const statement = db.prepare(
     `DELETE FROM pending_quarantine_objects
       WHERE r2_key = ? AND contribution_id = ?`,
-  ).bind(registration.r2Key, registration.contributionId).run();
+  ).bind(registration.r2Key, registration.contributionId);
+  if (ownerRoute?.mode === "catalog") {
+    await db.batch([ownerWriteFenceStatement(db, ownerRoute), statement]);
+  } else {
+    await statement.run();
+  }
 }
 
 export async function readQuarantineReconciliationStatus(

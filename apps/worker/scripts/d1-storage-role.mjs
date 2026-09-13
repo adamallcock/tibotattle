@@ -5,7 +5,8 @@ import { storageError,storageSha256 } from './d1-storage-plan.mjs';
 import { identityDigest } from '../../../scripts/lib/release-operation.mjs';
 
 export const INGESTION_ROLE_INPUT_DIRECTORIES=Object.freeze(['migrations','typed-ingestion-migrations',
- 'ingestion-bridge-migrations','typed-v11-admission-migrations','typed-v1-admission-migrations','ingestion-isolation-migrations']);
+ 'ingestion-bridge-migrations','typed-v11-admission-migrations','typed-v1-admission-migrations','ingestion-isolation-migrations',
+ 'ingestion-routing-migrations']);
 export async function readIngestionRoleInputs(workerRoot,{allowUnfrozen=false}={}){
  workerRoot=resolve(workerRoot);
  const git=(args)=>{const r=spawnSync('git',args,{cwd:workerRoot,encoding:'utf8',maxBuffer:1024*1024});

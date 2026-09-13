@@ -1,0 +1,83 @@
+---
+title: D1 shard continuity implementation
+date: 2026-09-13
+type: plan
+status: in-progress
+---
+
+# D1 shard continuity implementation
+
+The user approved implementation on September 13. Work starts from `ceeeca32e63923ba308e02c296d1d2aaf48c861d` in an isolated branch, preserving the pinned production recovery. This plan extends the [typed-storage isolation plan](2026-09-11-d1-typed-storage-isolation.md); it does not establish production deployment or change an active migration.
+
+## Accepted outcome
+
+Capacity expansion must not require a service-wide upload freeze. Assign each authenticated contribution owner to a stable ingestion shard, stop new assignments at **6,000,000,000 bytes**, and preserve the **9,000,000,000-byte operating budget per database**. Keep prepared spare capacity. Move growing owners before capacity becomes urgent. Credentials, opt-outs, telemetry provenance, replay and owner-only erasure survive routing changes.
+
+Analytics processes new records independently per source into separate storage. Combine owner-level evidence with existing accounting/statistical semantics; no averaging shard medians or double-counting moved owners. Publish only a complete declared set of source checkpoints and routing/erasure generations. A stalled analytics shard must leave uploads and the prior complete public result available.
+
+## Ownership and sequence
+
+Sol High agents lead implementation; they may delegate bounded work to Luna Max agents. Root owns integration, operations, shared configuration, documentation and final validation. All cloud and credential operations remain with root.
+
+| Stage | Scope and acceptance | State |
+|---|---|---|
+| 1. Routing and capacity | Actual enrollment, ownership, credential lifecycle and upload paths across two ingestion shards and a spare; concurrent enrollment converges; cutoff, stale capacity, replay and route fences tested | In progress |
+| 2. Analytics and erasure | Independent source progress, complete combined publication, no moved-owner duplication; owner-only erasure covers current/prior sources and derived targets with completion receipts | In progress |
+| 3. Owner movement | Background copy plus catch-up, brief owner-specific final fence, exact verification and routing switch; restart/reconcile every phase | Queued |
+| 4. Operations | Wrangler-managed qualified spare capacity, size/growth alerts, safe allocation and movement controls; per-writer headroom reservations | Queued |
+| 5. Qualification | Integrated local HTTP journeys, real isolated cloud rollover and failure rehearsal, measured final pause, then reviewed production activation | Queued |
+
+Each stage must integrate its runtime callers. Uncalled interfaces, isolated mock tests or a configuration flag alone do not close a stage.
+
+## Contracts
+
+- The server's authenticated owner is the routing boundary. Client installation IDs and credential-hash locators do not grant authority. Legacy account/device ownership remains intact.
+- Existing single-database mode remains the default until the new mode is explicitly configured and its required schemas and bindings are qualified. Inventory legacy, admin, queue, cron and repair pathways before claiming catalog-mode coverage.
+- Global controls, abuse admission and sign-in handoffs must not silently become per-owner state through an environment/database substitution.
+- New assignments refuse a shard at or above 6 GB. Missing, stale or incompatible capacity observations refuse new allocation. Existing owners continue subject to write admission; stop-new-allocation alone does not prevent their growth.
+- Reserve concurrent physical growth, including indexes, journals and authority. Once-per-owner reservations or the existing 16 MiB observed-size guard are not a proof of a strict physical cap.
+- Route checks must share each mutation's shard-local atomic batch. Catalog updates and writes to different D1 databases are not one transaction. Record intent and reconcile ambiguous outcomes.
+- Source namespaces and event identities are evidence provenance, not current routing locations. Changing the shard cannot recreate old contributions under new identities.
+- Background owner copying must account for every mutable authority/consent/erasure transition as well as telemetry. The existing analytics journal is not presumed to capture all owner mutations.
+- Qualify a final hosted-write pause under one minute for the largest representative synthetic owner. This is a target, not an existing guarantee. Verify immutable ranges during copying so final fencing does not require another full historical scan.
+- Source bytes remain until verified, separately authorized retirement. Switching a route does not reclaim storage. Measure actual reusable capacity before releasing its reservation. Never use a stale source as fallback after destination writes.
+- Independent analytics use bounded jobs and per-source cursors. Missing sources remain explicit; public requests read published results. Erasure generations may invalidate previously published results and must never be bypassed merely to serve stale data.
+- A single owner approaching one shard's capacity, unavailable catalog, exhausted spare pool and incomplete erasure each need explicit bounded behavior. No silent data loss, unverified fallback or cross-database exactly-once claim.
+
+## Validation and release boundary
+
+Use synthetic local Miniflare/D1 tests first, including pre-migration refusal and post-migration behavior. Exercise concurrent enrollment, cutoff, renewal/revocation, retries after uncertain acknowledgement, stale routes, move interruption, duplicate delivery, shard outage and owner-only erasure. Test source and analytics storage independently, and inject small capacity thresholds instead of filling databases to 9 GB.
+
+Run focused tests while iterating, then the owning Worker gate and applicable architecture/docs checks on the integrated source. Isolated cloud qualification must bind its exact code, schemas, resources and observed results. Production activation remains separate from source completion and must not alter the running recovery's source or journal.
+
+Cloudflare's supported model is horizontal scale across smaller databases; each D1 has a fixed 10 GB maximum and each Worker invocation has bounded connection concurrency. Use bindings and bounded per-shard jobs. [D1 limits](https://developers.cloudflare.com/d1/platform/limits/) [D1 batch semantics](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch)
+
+## Progress evidence
+
+- September 13: isolated implementation branch created from the qualified parent-upsert fix. Runtime routing lead assigned; remaining evidence will be recorded here as integrated tests complete.
+- Capacity monitor and its private scheduled entrypoint: nine local D1 tests passed, covering real size readback, failed measurements, over-budget pressure, preserved reservations/readiness, and default-disabled behavior. These are local source tests, not deployed monitoring.
+- Movement prerequisite found during source review: typed v1/v1.1 admission state and active views currently assume one source namespace per physical database. Mixed-origin owner movement requires a forward schema/read-path change; copied history must never be relabelled to avoid that work. Distinct unmoved shards can be qualified first.
+
+## September 13 implementation checkpoint
+
+The local slice has separate synthetic Wrangler entrypoints for capacity and analytics, both disabled with no public route or credentials. The initial pool has ingestion A/B plus spare C and separate matching analytics targets, a routing catalog and a publication database. This is a bounded starting pool, not a claim that all configured databases are already provisioned or ready.
+
+Implemented in the first local checkpoint:
+
+- Accountless enrollment and ownership use a stable server-issued route. Encrypted typed v1.1 HTTP admission, replay, renewal/revocation and same-batch route fences have targeted local coverage.
+- Actual size observations control new-owner placement. Missing or expired measurements close allocation; readiness and reserved bytes are preserved. Crossing 6 GB stops new assignments, while 9 GB remains the operating ceiling rather than a provider limit change.
+- Independent source processing, complete cohort capture, retained-copy exclusion, exact combination of owner evidence and generation-bound publication are wired locally. A failed publisher preserves source-processing progress.
+- Access-owner erasure resolves a retained participant locator, invalidates central publication, prepares all recorded physical/derived targets and resumes after partial failure. It requires no participant credential.
+- The canonical ingestion role includes shard-local fences. The role/operator script suite, documentation governance and architecture checks passed. One native rollover fixture used an expired fixed timestamp; its clock now follows the D1 wall clock while retaining the expiry refusal assertions. The running recovery source was not changed.
+
+Required before enabling catalog mode:
+
+1. Complete the owning Worker gate on committed source and reconcile every unsupported legacy/admin/repair/public-read pathway.
+2. Qualify the complete spare tuple: schema, analytics binding, replay, erasure, measured capacity and allocation policy. The synthetic 16 MiB enrollment reservation is not a production sizing decision.
+3. Add namespace-aware admission/read paths and a resumable owner copier with exact verification, a short final fence and retained-source cleanup receipts.
+4. Add per-write physical growth reservations and reconcile actual reusable capacity. Stopping new owners at 6 GB cannot constrain growth by existing owners.
+5. Finish catalog-aware tombstone replay, existing-participant locator backfill and central public-reader integration; prove these against isolated cloud resources before production activation. Preserve the global enrollment issuance ceilings with a replay-safe catalog reservation: moving the existing issuance counters into each shard would otherwise multiply the daily/lifetime budget.
+
+The existing production restore remains on its pinned source. Its continuation deadline, deployment journal, source preservation and final activation/canaries remain a separate workstream.
+
+Integrated checkpoint validation: Worker typecheck and seven focused D1/HTTP suites passed (73 tests) on the frozen source. The earlier broad diagnostic run overlapped active edits and failed seven cases; their corrected paths pass the fresh focused run. The complete Worker gate remains required on the committed checkpoint. No catalog-mode cloud resource or deployment is claimed by these local results.

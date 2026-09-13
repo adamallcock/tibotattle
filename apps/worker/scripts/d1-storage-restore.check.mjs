@@ -83,7 +83,8 @@ test('ingestion qualification binds tested restore base and complete ordered rol
   migrations.push({directory:name,name:'0001_synthetic.sql',sha256:storageSha256(sql),bytes:Buffer.byteLength(sql)});}
  const objects=['participants','device_credentials','upload_authorizations','accountless_enrollment_ledger','telemetry_contributions','telemetry_records',
   'telemetry_contribution_occurrences','typed_telemetry_records','typed_v1_admission_state','typed_v11_record_proofs','typed_v11_manifest_memberships','telemetry_v11_domain_heads',
-  'storage_v11_owner_links','storage_legacy_event_sources','ingestion_analytics_separation','storage_v11_append_transitions']
+  'storage_v11_owner_links','storage_legacy_event_sources','ingestion_analytics_separation','storage_v11_append_transitions',
+  'storage_owner_fences','storage_route_write_checks']
   .map(name=>({type:'table',name,tbl_name:name,sql:`CREATE TABLE ${name}(id INTEGER PRIMARY KEY)`}));
  objects.push({type:'view',name:'typed_v11_record_admissions',tbl_name:'typed_v11_record_admissions',sql:'CREATE VIEW typed_v11_record_admissions AS SELECT * FROM typed_v11_record_proofs'});
  const inputs={schema:'d1-ingestion-role-inputs-v1',sourceCommit,frozen:true,migrations,inputSha256:identityDigest(migrations)};
@@ -101,6 +102,16 @@ test('ingestion qualification binds tested restore base and complete ordered rol
  const save=async()=>{const evidence=JSON.stringify(proof);await writeFile(join(directory,'qualification-evidence.json'),evidence);manifest.evidenceSha256=storageSha256(evidence);
   const bytes=JSON.stringify(manifest);await writeFile(join(directory,'qualification.json'),bytes);return {workerRoot:root,plan:{sourceCommit},target:{role:'ingestion',qualificationSha256:storageSha256(bytes)}};};
  assert.equal((await loadStorageQualification(await save())).migrations.length,1);
+ for(const missing of ['storage_owner_fences','storage_route_write_checks']){
+  const incomplete=objects.filter(object=>object.name!==missing),bytes=JSON.stringify(incomplete);
+  await writeFile(join(directory,'final-role-schema.json'),bytes);
+  proof.finalRoleSchemaSha256=manifest.finalRoleSchemaSha256=storageSha256(bytes);
+  proof.finalSchemaSha256=storageSchemaDigest(incomplete);
+  await assert.rejects(loadStorageQualification(await save()),/ROLE_QUALIFICATION_INCOMPLETE/);
+ }
+ await writeFile(join(directory,'final-role-schema.json'),finalRole);
+ proof.finalRoleSchemaSha256=manifest.finalRoleSchemaSha256=storageSha256(finalRole);
+ proof.finalSchemaSha256=storageSchemaDigest(objects);
  proof.baseSqlSha256='f'.repeat(64);await assert.rejects(loadStorageQualification(await save()),/ROLE_QUALIFICATION_INVALID/);proof.baseSqlSha256=storageSha256(base);
  proof.frozenSource=false;await assert.rejects(loadStorageQualification(await save()),/ROLE_QUALIFICATION_INVALID/);proof.frozenSource=true;
  manifest.runtimeReady=true;await assert.rejects(loadStorageQualification(await save()),/ROLE_QUALIFICATION_INVALID/);manifest.runtimeReady=false;

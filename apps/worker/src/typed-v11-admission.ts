@@ -12,6 +12,8 @@ import { telemetryV11LegacyProjection } from "./telemetry-v11-compatibility";
 import { existingTelemetryV11StagedChunk, validateTelemetryV11StagedChunk,
   type TelemetryV11StagedChunkRow } from "./telemetry-v11-repository";
 import { assertTelemetryTransportWriteAllowed, type TelemetryTransportPrincipal } from "./telemetry-transport-policy";
+import { ownerWriteFenceStatement } from "./storage-routing-fence";
+import type { OwnerStorageRoute } from "./storage-routing";
 
 export interface TypedV11ChunkMetadata {
   /** Stable original source namespace, never a destination shard or request ID. */
@@ -115,7 +117,8 @@ async function replayResult(db: D1Database, row: TelemetryV11StagedChunkRow, chu
  * no analytics database access, queue requirement or automatic domain activation.
  */
 export async function persistTypedV11StagedChunk(db: D1Database, principalValue: TelemetryTransportPrincipal,
-  value: unknown, metadataValue: TypedV11ChunkMetadata, nowEpoch = Date.now()): Promise<TypedV11StagedChunkResult> {
+  value: unknown, metadataValue: TypedV11ChunkMetadata, nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute): Promise<TypedV11StagedChunkResult> {
   const metadata = snapshotMetadata(metadataValue);
   const principal = { participantId: principalValue.participantId, deviceId: principalValue.deviceId };
   encoded(principal.participantId); encoded(principal.deviceId);
@@ -150,7 +153,10 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
     if (values.length > 100 || transactionBytes > MAX_TYPED_TELEMETRY_BATCH_BYTES) throw new TypedTelemetryError("TYPED_TELEMETRY_LIMIT");
     return db.prepare(sql).bind(...values);
   } });
-  const statements: D1PreparedStatement[] = [prepare(`INSERT INTO telemetry_v11_chunks (
+  const statements: D1PreparedStatement[] = ownerRoute?.mode === "catalog"
+    ? [ownerWriteFenceStatement(db, ownerRoute)]
+    : [];
+  statements.push(prepare(`INSERT INTO telemetry_v11_chunks (
     id,manifest_id,participant_id,device_id,stream,chunk_day,chunk_seq,chunk_id,chunk_digest,envelope_digest,
     parser_version,record_count,r2_key,device_upload_authorization_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .bind(metadata.chunkRowId, manifest.id, principal.participantId, principal.deviceId, stream, day, seq, chunk.chunkId,
@@ -158,7 +164,7 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
       metadata.deviceUploadAuthorizationId, now),
     prepare(`INSERT INTO typed_v11_chunk_allocations(chunk_id,namespace_id,chunk_original,first_source_row_id,record_count)
       VALUES (?,?,?,?,?)`).bind(metadata.chunkRowId, state.namespace_id, encoded(metadata.chunkRowId), state.next_source_row_id, chunk.records.length),
-  ];
+  );
   // Keep the copy owner's per-page 800-statement contract. The final admitted
   // chunk is still indivisible, and the complete combined batch is capped below.
   for (let offset = 0; offset < rows.length; offset += 100) {

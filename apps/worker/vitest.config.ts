@@ -15,6 +15,7 @@ const ingestionBridgeMigrations = await readD1Migrations("./ingestion-bridge-mig
 const typedV11AdmissionMigrations = await readD1Migrations("./typed-v11-admission-migrations");
 const typedV1AdmissionMigrations = await readD1Migrations("./typed-v1-admission-migrations");
 const ingestionIsolationMigrations = await readD1Migrations("./ingestion-isolation-migrations");
+const ingestionRoutingMigrations = await readD1Migrations("./ingestion-routing-migrations");
 
 export default defineConfig({
   plugins: [
@@ -22,7 +23,8 @@ export default defineConfig({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
         d1Databases: ["USAGE_MONITOR_DB", "DELETION_LEDGER", "STORAGE_ROUTING_DB",
-          "STORAGE_INGESTION_A", "STORAGE_INGESTION_B", "STORAGE_ANALYTICS_DB"],
+          "STORAGE_INGESTION_A", "STORAGE_INGESTION_B", "STORAGE_INGESTION_C",
+          "STORAGE_ANALYTICS_DB", "STORAGE_ANALYTICS_A", "STORAGE_ANALYTICS_B", "STORAGE_ANALYTICS_C", "STORAGE_PUBLICATION_DB"],
         bindings: {
           ENVELOPE_PRIVATE_JWK: "",
           ENVELOPE_PUBLIC_JWK: "",
@@ -35,6 +37,7 @@ export default defineConfig({
           TEST_TYPED_V11_ADMISSION_MIGRATIONS: typedV11AdmissionMigrations,
           TEST_TYPED_V1_ADMISSION_MIGRATIONS: typedV1AdmissionMigrations,
           TEST_INGESTION_ISOLATION_MIGRATIONS: ingestionIsolationMigrations,
+          TEST_INGESTION_ROUTING_MIGRATIONS: ingestionRoutingMigrations,
         },
       },
     }),

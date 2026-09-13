@@ -9,9 +9,14 @@ import { existingTelemetryV11StagedChunk, persistTelemetryV11StagedChunk,
 import { insertTelemetryV1Chunk, type TelemetryV1ChunkInsert, type TelemetryV1ChunkRow } from "./telemetry-v1-repository";
 import { insertTypedTelemetryV1Chunk, validateTypedTelemetryV1Receipt } from "./typed-v1-admission";
 import type { TelemetryTransportPrincipal } from "./telemetry-transport-policy";
+import type { OwnerStorageRoute } from "./storage-routing";
 
 export type TelemetryStorageMode = Readonly<{ kind: "json" } | { kind: "typed"; sourceNamespace: string }>;
-interface StorageModeSettings { TELEMETRY_STORAGE_MODE?: unknown; TELEMETRY_STORAGE_NAMESPACE?: unknown }
+interface StorageModeSettings {
+  TELEMETRY_STORAGE_MODE?: unknown; TELEMETRY_STORAGE_NAMESPACE?: unknown;
+  STORAGE_SOURCE_NAMESPACE_A?: unknown; STORAGE_SOURCE_NAMESPACE_B?: unknown;
+  STORAGE_SOURCE_NAMESPACE_C?: unknown;
+}
 const unavailable = () => new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
 
 /** Deployment selection, never automatic schema detection or a fallback. */
@@ -21,6 +26,22 @@ export function parseTelemetryStorageMode(settings: StorageModeSettings): Teleme
   const sourceNamespace = settings.TELEMETRY_STORAGE_NAMESPACE;
   try { encodeTypedTelemetryId(sourceNamespace); } catch { throw unavailable(); }
   return { kind: "typed", sourceNamespace };
+}
+
+/** Catalog bindings have independent immutable provenance namespaces. The
+ * route selects an explicit configured namespace; shard schema cannot infer or
+ * relabel it. Single-database mode retains the original global setting. */
+export function telemetryStorageSettingsForRoute(
+  settings: StorageModeSettings, route: OwnerStorageRoute,
+): StorageModeSettings {
+  if (route.mode === "single") return settings;
+  const key = route.bindingName === "STORAGE_INGESTION_A" ? "STORAGE_SOURCE_NAMESPACE_A"
+    : route.bindingName === "STORAGE_INGESTION_B" ? "STORAGE_SOURCE_NAMESPACE_B"
+      : route.bindingName === "STORAGE_INGESTION_C" ? "STORAGE_SOURCE_NAMESPACE_C" : null;
+  const namespace = key === null ? undefined : settings[key];
+  if (settings.TELEMETRY_STORAGE_MODE !== "typed"
+      || typeof namespace !== "string" || namespace.length === 0) throw unavailable();
+  return { TELEMETRY_STORAGE_MODE: "typed", TELEMETRY_STORAGE_NAMESPACE: namespace };
 }
 
 /** Initialization checks the complete local migration contract transactionally;
@@ -69,9 +90,11 @@ export async function readTelemetryV11StorageReplay(db: D1Database, mode: Teleme
 }
 
 export async function persistTelemetryV11StorageChunk(db: D1Database, mode: TelemetryStorageMode,
-  principal: TelemetryTransportPrincipal, chunk: TelemetryV11Chunk, metadata: Omit<TypedV11ChunkMetadata, "sourceNamespace">) {
+  principal: TelemetryTransportPrincipal, chunk: TelemetryV11Chunk,
+  metadata: Omit<TypedV11ChunkMetadata, "sourceNamespace">, ownerRoute?: OwnerStorageRoute) {
+  if (ownerRoute?.mode === "catalog" && mode.kind !== "typed") throw unavailable();
   return mode.kind === "typed"
-    ? persistTypedV11StagedChunk(db, principal, chunk, { ...metadata, sourceNamespace: mode.sourceNamespace })
+    ? persistTypedV11StagedChunk(db, principal, chunk, { ...metadata, sourceNamespace: mode.sourceNamespace }, Date.now(), ownerRoute)
     : persistTelemetryV11StagedChunk(db, principal, chunk, metadata);
 }
 
@@ -91,9 +114,11 @@ export async function readTelemetryV1StorageReceipt(db: D1Database, mode: Teleme
 }
 
 export async function persistTelemetryV1StorageChunk(db: D1Database, mode: TelemetryStorageMode,
-  insert: TelemetryV1ChunkInsert & { authorizationEnvelopeDigest: string }): Promise<{ acceptedRecords: number; replay: boolean }> {
+  insert: TelemetryV1ChunkInsert & { authorizationEnvelopeDigest: string },
+  ownerRoute?: OwnerStorageRoute): Promise<{ acceptedRecords: number; replay: boolean }> {
+  if (ownerRoute?.mode === "catalog" && mode.kind !== "typed") throw unavailable();
   if (mode.kind === "typed") {
-    try { return await insertTypedTelemetryV1Chunk(db, insert, mode.sourceNamespace); }
+    try { return await insertTypedTelemetryV1Chunk(db, insert, mode.sourceNamespace, ownerRoute); }
     catch (error) { if (error instanceof ApiError) throw error; throw unavailable(); }
   }
   return { ...await insertTelemetryV1Chunk(db, insert), replay: false };

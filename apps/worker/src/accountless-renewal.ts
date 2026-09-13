@@ -11,6 +11,8 @@ import { timingSafeEqual } from "./crypto";
 import { deviceHash, parseDeviceAuthorization } from "./device-auth";
 import { ApiError } from "./errors";
 import { parseStrictJson } from "./strict-json";
+import { ownerWriteFenceStatement } from "./storage-routing-fence";
+import type { OwnerStorageRoute } from "./storage-routing";
 
 /**
  * Renewal is deliberately a separate, bearer-authenticated operation.  An
@@ -342,6 +344,7 @@ export async function renewAccountlessUploadOwner(
   authorizationHeader: string | null,
   request: AccountlessRenewalRequest,
   nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<AccountlessRenewalResponse> {
   if (!db || typeof db.prepare !== "function") {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
@@ -369,7 +372,12 @@ export async function renewAccountlessUploadOwner(
   ).toISOString();
   const nextGeneration = ledger.renewal_generation + 1;
   try {
+    const guardedRoute = ownerRoute?.mode === "catalog" ? ownerRoute : null;
+    const guardCount = guardedRoute === null ? 0 : 1;
     const results = await db.batch([
+      ...(guardCount === 1
+        ? [ownerWriteFenceStatement(db, guardedRoute!)]
+        : []),
       db.prepare(`
         UPDATE accountless_enrollment_ledger
            SET expires_at = ?, renewed_at = ?, renewal_generation = ?
@@ -513,8 +521,9 @@ export async function renewAccountlessUploadOwner(
     // readback remains the authority for issuing its renewal receipt. A
     // contender that lost the compare-and-swap falls through to a stable
     // existing receipt below.
-    const transitioned = results[0]?.results[0];
-    if (results[0]?.results.length === 1
+    const transitionResult = results[guardCount];
+    const transitioned = transitionResult?.results[0];
+    if (transitionResult?.results.length === 1
         && typeof transitioned === "object" && transitioned !== null
         && Reflect.get(transitioned, "device_id") === ledger.device_id
         && Reflect.get(transitioned, "renewal_generation") === nextGeneration

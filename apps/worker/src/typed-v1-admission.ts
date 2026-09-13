@@ -9,6 +9,8 @@ import { MAX_STORAGE_TRANSACTION_STATEMENTS } from './storage-routing-batch-budg
 import { prepareTelemetryV1ChunkWrite, existingTelemetryV1ChunkByEnvelopeDigest, type TelemetryV1ChunkInsert, type TelemetryV1ChunkRow } from './telemetry-v1-repository';
 import { parseTelemetryV1Chunk, assertTelemetryV1ConsentCurrent } from './telemetry-v1';
 import { readIngestionChanges, type StorageChange } from './analytics-delivery';
+import { ownerWriteFenceStatement } from './storage-routing-fence';
+import type { OwnerStorageRoute } from './storage-routing';
 
 const encoded = (value: string): ArrayBuffer => Uint8Array.from(encodeTypedTelemetryId(value)).buffer;
 const conflict = () => new TypedTelemetryError('TYPED_TELEMETRY_CONFLICT');
@@ -71,7 +73,7 @@ async function replay(db: D1Database, insert: TelemetryV1ChunkInsert, namespace:
  * derived-data work separately. No analytics database is called by this adapter.
  */
 export async function insertTypedTelemetryV1Chunk(db: D1Database, value: TelemetryV1ChunkInsert & {authorizationEnvelopeDigest?:string},
- sourceNamespace: string): Promise<{acceptedRecords:number;replay:boolean}> {
+ sourceNamespace: string, ownerRoute?: OwnerStorageRoute): Promise<{acceptedRecords:number;replay:boolean}> {
  const insert=JSON.parse(JSON.stringify(value)) as TelemetryV1ChunkInsert & {authorizationEnvelopeDigest?:string};
  const authorizationEnvelopeDigest=insert.authorizationEnvelopeDigest??insert.envelopeDigest;
  if(!/^[a-f0-9]{64}$/.test(authorizationEnvelopeDigest))throw conflict();
@@ -121,11 +123,13 @@ export async function insertTypedTelemetryV1Chunk(db: D1Database, value: Telemet
  const {statements,chunkStatementIndex}=prepareTelemetryV1ChunkWrite(db,insert,{insertStatements:typed,deleteSupersededStatements:deletes,authorizationEnvelopeDigest});
  statements.unshift(db.prepare(`INSERT INTO typed_v1_authority_requests(chunk_id,participant_id,device_id,authorization_id,authorization_digest,envelope_digest)
  VALUES(?,?,?,?,?,?)`).bind(insert.chunkRowId,insert.participantId,insert.deviceId,insert.deviceUploadAuthorizationId,authorizationEnvelopeDigest,insert.envelopeDigest));
+ const routeGuardCount=ownerRoute?.mode==='catalog'?1:0;
+ if(routeGuardCount)statements.unshift(ownerWriteFenceStatement(db,ownerRoute!));
  statements.push(db.prepare('DELETE FROM typed_v1_authority_requests WHERE chunk_id=?').bind(insert.chunkRowId));
  if(statements.length>MAX_STORAGE_TRANSACTION_STATEMENTS) throw new TypedTelemetryError('TYPED_TELEMETRY_LIMIT');
  try {
   const results=await db.batch(statements);
-  if(results.some(r=>!r.success) || results[chunkStatementIndex+1]?.results.length!==1) throw conflict();
+  if(results.some(r=>!r.success) || results[chunkStatementIndex+1+routeGuardCount]?.results.length!==1) throw conflict();
  } catch(error) {
   if(await replay(db,insert,sourceNamespace)) return {acceptedRecords:rows.length,replay:true};
   const message=String(error);

@@ -1,4 +1,8 @@
-import {storageErasureBindings,prepareStorageParticipantErasure,requireStorageParticipantErasureComplete} from './storage-erasure';
+import {requireStorageParticipantErasureComplete} from './storage-erasure';
+import {invalidatePublicationsForOwnerErasure,prepareMultiSourceParticipantErasure,
+  requireMultiSourceParticipantErasureComplete,storageErasurePlanForOwnerRoute,
+} from './storage-multi-source-erasure';
+import {storageForParticipantOwner} from './storage-routing-runtime';
 import { beginAdminOperation, finishAdminOperation } from "./admin-operations";
 import { revokeAccountlessEnrollment } from "./accountless-enrollment";
 import { MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT } from "./constants";
@@ -59,6 +63,94 @@ export function parseParticipantErasureRequest(value: unknown): string {
   return participantId;
 }
 
+interface ParticipantDeletionSnapshot {
+  contributions:number;
+  telemetry:number;
+  telemetryV1:number;
+  telemetryV11:number;
+}
+
+async function routedParticipantOwner(db:D1Database,participantId:string):Promise<string|null>{
+  return db.prepare(`SELECT ledger.installation_principal_id FROM participants participant
+    JOIN accountless_upload_owners owner ON owner.participant_id=participant.id
+    JOIN accountless_enrollment_ledger ledger ON ledger.device_id=owner.enrollment_device_id
+    WHERE participant.id=? AND participant.owner_kind='accountless' LIMIT 1`)
+    .bind(participantId).first<string>('installation_principal_id');
+}
+
+async function beginParticipantSourceDeletion(options:{global:D1Database;source:D1Database;participantId:string;
+  operationId:string;expectedRouteOwnerId?:string}):Promise<ParticipantDeletionSnapshot|null>{
+  const {global,source,participantId,operationId,expectedRouteOwnerId}=options;
+  let participant=await source.prepare(`SELECT participant.state,participant.deletion_session_id,
+    participant.owner_kind,owner.enrollment_device_id FROM participants participant
+    LEFT JOIN accountless_upload_owners owner ON owner.participant_id=participant.id AND owner.state='active'
+    WHERE participant.id=?`).bind(participantId).first<{state:string;deletion_session_id:string|null;
+      owner_kind:"social"|"accountless";enrollment_device_id:string|null}>();
+  if(!participant)return null;
+  if(expectedRouteOwnerId!==undefined&&await routedParticipantOwner(source,participantId)!==expectedRouteOwnerId){
+    throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+  }
+  if(participant.state!=='active'&&participant.state!=='deleting')throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+  if(participant.owner_kind==='accountless'&&typeof participant.enrollment_device_id==='string'){
+    await revokeAccountlessEnrollment(source,participant.enrollment_device_id,'security_reset');
+  }
+  if(participant.state==='active'){
+    await markParticipantDeleting(source,participantId,operationId);
+  }else if(participant.deletion_session_id!==operationId){
+    const previous=participant.deletion_session_id;
+    if(typeof previous!=='string'||!UUID_PATTERN.test(previous))throw new ApiError(409,'PARTICIPANT_DELETING');
+    const active=await global.prepare(`SELECT 1 AS active FROM admin_action_audit
+      WHERE operation_id=? AND outcome='started' AND created_at>? LIMIT 1`)
+      .bind(previous,new Date(Date.now()-ERASURE_ATTEMPT_LEASE_MILLISECONDS).toISOString()).first();
+    if(active)throw new ApiError(409,'PARTICIPANT_DELETING');
+    const claimed=await source.prepare(`UPDATE participants SET deletion_session_id=?
+      WHERE id=? AND state='deleting' AND deletion_session_id=?`).bind(operationId,participantId,previous).run();
+    if(claimed.meta.changes!==1)throw new ApiError(409,'PARTICIPANT_DELETING');
+  }
+  await assertDeletionOwner(source,participantId,operationId);
+  await source.prepare(`UPDATE web_sessions SET state='revoked',revoked_at=? WHERE participant_id=? AND state='active'
+    AND EXISTS(SELECT 1 FROM participants WHERE id=? AND state='deleting' AND deletion_session_id=?)`)
+    .bind(new Date().toISOString(),participantId,participantId,operationId).run();
+  const [contributions,telemetry,telemetryV1,telemetryV11]=await Promise.all([
+    listContributions(source,participantId),telemetryContributionCount(source,participantId),
+    telemetryV1ChunkCount(source,participantId),telemetryV11ChunkCount(source,participantId),
+  ]);
+  if(contributions.length>MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT)throw new ApiError(500,'INTERNAL_ERROR');
+  participant=await source.prepare(`SELECT state,deletion_session_id,owner_kind,NULL AS enrollment_device_id
+    FROM participants WHERE id=?`).bind(participantId).first<typeof participant>();
+  if(!participant||participant.state!=='deleting'||participant.deletion_session_id!==operationId){
+    throw new ApiError(409,'PARTICIPANT_DELETING');
+  }
+  return {contributions:contributions.length,telemetry,telemetryV1,telemetryV11};
+}
+
+async function finishParticipantSourceDeletion(env:Env,source:D1Database,participantId:string,operationId:string,
+  expected:ParticipantDeletionSnapshot):Promise<void>{
+  const contributions=await listContributions(source,participantId);
+  if(contributions.length>0){
+    await assertDeletionOwner(source,participantId,operationId);
+    await env.QUARANTINE.delete(contributions.map(row=>row.r2_key));
+  }
+  let cursor:{createdAt:string;contributionId:string}|null=null;
+  do{const page=await telemetryContributionR2KeyPage(source,participantId,cursor);
+    if(page.rows.length>0){await assertDeletionOwner(source,participantId,operationId);
+      await env.QUARANTINE.delete(page.rows.map(row=>row.r2Key));}cursor=page.nextCursor;}while(cursor);
+  let chunkCursor:{createdAt:string;chunkRowId:string}|null=null;
+  do{const page=await telemetryV1ChunkR2KeyPage(source,participantId,chunkCursor);
+    if(page.rows.length>0){await assertDeletionOwner(source,participantId,operationId);
+      await env.QUARANTINE.delete(page.rows.map(row=>row.r2Key));}chunkCursor=page.nextCursor;}while(chunkCursor);
+  let stagedCursor:{createdAt:string;chunkRowId:string}|null=null;
+  do{const page=await telemetryV11ChunkR2KeyPage(source,participantId,stagedCursor);
+    if(page.rows.length>0){await assertDeletionOwner(source,participantId,operationId);
+      await env.QUARANTINE.delete(page.rows.map(row=>row.r2Key));}stagedCursor=page.nextCursor;}while(stagedCursor);
+  const current=await Promise.all([telemetryContributionCount(source,participantId),
+    telemetryV1ChunkCount(source,participantId),telemetryV11ChunkCount(source,participantId)]);
+  if(current[0]!==expected.telemetry||current[1]!==expected.telemetryV1||current[2]!==expected.telemetryV11){
+    throw new ApiError(409,'UPLOAD_IN_PROGRESS');
+  }
+  await finishParticipantDeletion(source,participantId,operationId);
+}
+
 /**
  * Internal erasure machinery, called only after owner authorization and CSRF.
  * The audit operation is also the deletion fence for a newly erased account.
@@ -70,8 +162,12 @@ async function eraseParticipantData(
   participantId: string,
   operationId: string,
 ): Promise<ErasureResult> {
-  const storage=await storageErasureBindings(env);
-  const participant = await env.USAGE_MONITOR_DB.prepare(
+  const ownerStorage=await storageForParticipantOwner(env,participantId);
+  await invalidatePublicationsForOwnerErasure(env,ownerStorage.route);
+  const catalogErasure=ownerStorage.route.mode==='catalog';
+  if(catalogErasure)await recordDeletionTombstone(env.DELETION_LEDGER,participantId);
+  const plan=await storageErasurePlanForOwnerRoute(env,ownerStorage.route);
+  const participant = await ownerStorage.database.prepare(
     `SELECT participant.state,
             participant.deletion_session_id,
             participant.owner_kind,
@@ -90,25 +186,8 @@ async function eraseParticipantData(
     if (!await hasDeletionTombstone(env.DELETION_LEDGER, participantId)) {
       throw new ApiError(404, "NOT_FOUND");
     }
-    await requireStorageParticipantErasureComplete(env.DELETION_LEDGER,participantId,storage);
-    // A lost response can be retried, but the removed rows cannot provide a
-    // historical contribution count. Unknown is not zero.
-    return { deleted: true, alreadyDeleted: true, contributionsDeleted: null };
-  }
-  if (participant.state !== "active" && participant.state !== "deleting") {
+  } else if (participant.state !== "active" && participant.state !== "deleting") {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-  }
-  // An accountless owner has no social session or consent to revoke. Its
-  // enrollment ledger is the authority root, so revoke it before entering the
-  // deletion state; that batched cascade revokes the owner, direct v1.1 grant,
-  // device credential, and any pending device-upload authorizations.
-  if (participant.owner_kind === "accountless"
-      && typeof participant.enrollment_device_id === "string") {
-    await revokeAccountlessEnrollment(
-      env.USAGE_MONITOR_DB,
-      participant.enrollment_device_id,
-      "security_reset",
-    );
   }
   if (identityRequired(env)) {
     await assertPinnedIdentityLinkSecretConfiguration(
@@ -117,114 +196,56 @@ async function eraseParticipantData(
       Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
     );
   }
-  let deletionFence = participant.deletion_session_id;
-  if (participant.state === "active") {
-    deletionFence = operationId;
-    await markParticipantDeleting(env.USAGE_MONITOR_DB, participantId, deletionFence);
-  } else {
-    // Restore replay owns the NULL fence, including an interrupted replay.
-    // Let its existing maintenance retry finish rather than taking it over.
-    if (deletionFence === null) throw new ApiError(409, "PARTICIPANT_DELETING");
-    if (typeof deletionFence !== "string" || !UUID_PATTERN.test(deletionFence)) {
-      throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  const ordered=[...(plan?.routeTargets??[])].sort((left,right)=>Number(left.current)-Number(right.current));
+  const snapshots=new Map<D1Database,ParticipantDeletionSnapshot>();
+  // Preserve the single-database fence ordering: an unavailable independent
+  // ledger must still leave the source participant deleting and block uploads.
+  // Catalog mode durably records its tombstone before touching any source.
+  if(!catalogErasure){
+    const snapshot=await beginParticipantSourceDeletion({global:env.USAGE_MONITOR_DB,
+      source:ownerStorage.database,participantId,operationId});
+    if(snapshot)snapshots.set(ownerStorage.database,snapshot);
+  }
+  if(!catalogErasure)await recordDeletionTombstone(env.DELETION_LEDGER, participantId);
+  if(plan)await prepareMultiSourceParticipantErasure(plan.targets,participantId);
+
+  // Mark every retained catalog source before deleting any of them. A target
+  // outage leaves all owner links available for the next bounded retry.
+  if(catalogErasure){
+    for(const target of ordered){
+      const snapshot=await beginParticipantSourceDeletion({global:env.USAGE_MONITOR_DB,source:target.database,
+        participantId,operationId,expectedRouteOwnerId:target.ownerId});
+      if(snapshot)snapshots.set(target.database,snapshot);
     }
-    const claimed = await env.USAGE_MONITOR_DB.prepare(
-      `UPDATE participants SET deletion_session_id = ?
-        WHERE id = ? AND state = 'deleting' AND deletion_session_id = ?
-          AND NOT EXISTS (
-            SELECT 1 FROM admin_action_audit
-             WHERE operation_id = ? AND outcome = 'started' AND created_at > ?
-          )`,
-    ).bind(
-      operationId,
-      participantId,
-      deletionFence,
-      deletionFence,
-      new Date(Date.now() - ERASURE_ATTEMPT_LEASE_MILLISECONDS).toISOString(),
-    ).run();
-    if (claimed.meta.changes !== 1) throw new ApiError(409, "PARTICIPANT_DELETING");
-    deletionFence = operationId;
   }
-  if (typeof deletionFence !== "string" || !UUID_PATTERN.test(deletionFence)) {
-    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-  }
-  await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-  // A legacy deleting participant may still have its old deletion-only web
-  // session. The owner procedure no longer needs to preserve that capability.
-  await env.USAGE_MONITOR_DB.prepare(
-    `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
-      WHERE participant_id = ? AND state = 'active'
-        AND EXISTS (
-          SELECT 1 FROM participants
-           WHERE id = ? AND state = 'deleting' AND deletion_session_id = ?
-        )`,
-  ).bind(new Date().toISOString(), participantId, participantId, deletionFence).run();
-  await recordDeletionTombstone(env.DELETION_LEDGER, participantId);
-  if(storage)await prepareStorageParticipantErasure(storage,participantId);
-  const identityLinkKey = await participantIdentityLinkKeyForDeletion(
-    env.USAGE_MONITOR_DB, participantId, deletionFence,
-  );
-  if (identityLinkKey !== null) {
+  const currentSnapshot=snapshots.get(ownerStorage.database);
+  if(participant!==null&&!currentSnapshot)throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+  const identityLinkKey=currentSnapshot?await participantIdentityLinkKeyForDeletion(
+    ownerStorage.database,participantId,operationId):null;
+  if(identityLinkKey!==null){
     const secret: unknown = Reflect.get(env, "IDENTITY_LINK_SECRET");
     if (typeof secret !== "string" || secret.length < 32) {
       if (identityRequired(env)) throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
     } else {
       const digest = await identityReenrollmentCooldownDigest(secret, identityLinkKey);
-      await recordPrimaryIdentityReenrollmentCooldown(env.USAGE_MONITOR_DB, digest);
+      await recordPrimaryIdentityReenrollmentCooldown(ownerStorage.database, digest);
       await recordIdentityReenrollmentCooldownFromDigest(env.DELETION_LEDGER, digest);
     }
   }
-  const contributions = await listContributions(env.USAGE_MONITOR_DB, participantId);
-  if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT) {
-    throw new ApiError(500, "INTERNAL_ERROR");
+  for(const target of ordered){
+    const snapshot=snapshots.get(target.database);
+    if(snapshot)await finishParticipantSourceDeletion(env,target.database,participantId,operationId,snapshot);
   }
-  const telemetryTotal = await telemetryContributionCount(env.USAGE_MONITOR_DB, participantId);
-  const telemetryV1Total = await telemetryV1ChunkCount(env.USAGE_MONITOR_DB, participantId);
-  const telemetryV11Total = await telemetryV11ChunkCount(env.USAGE_MONITOR_DB, participantId);
-  if (contributions.length > 0) {
-    await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-    await env.QUARANTINE.delete(contributions.map((row) => row.r2_key));
-  }
-  let cursor: { createdAt: string; contributionId: string } | null = null;
-  do {
-    const page = await telemetryContributionR2KeyPage(env.USAGE_MONITOR_DB, participantId, cursor);
-    if (page.rows.length > 0) {
-      await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
-    }
-    cursor = page.nextCursor;
-  } while (cursor);
-  let chunkCursor: { createdAt: string; chunkRowId: string } | null = null;
-  do {
-    const page = await telemetryV1ChunkR2KeyPage(env.USAGE_MONITOR_DB, participantId, chunkCursor);
-    if (page.rows.length > 0) {
-      await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
-    }
-    chunkCursor = page.nextCursor;
-  } while (chunkCursor);
-  let stagedCursor: { createdAt: string; chunkRowId: string } | null = null;
-  do {
-    const page = await telemetryV11ChunkR2KeyPage(env.USAGE_MONITOR_DB, participantId, stagedCursor);
-    if (page.rows.length > 0) {
-      await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
-    }
-    stagedCursor = page.nextCursor;
-  } while (stagedCursor);
-  const currentTelemetryTotal = await telemetryContributionCount(env.USAGE_MONITOR_DB, participantId);
-  const currentTelemetryV1Total = await telemetryV1ChunkCount(env.USAGE_MONITOR_DB, participantId);
-  const currentTelemetryV11Total = await telemetryV11ChunkCount(env.USAGE_MONITOR_DB, participantId);
-  if (currentTelemetryTotal !== telemetryTotal || currentTelemetryV1Total !== telemetryV1Total
-      || currentTelemetryV11Total !== telemetryV11Total) {
-    throw new ApiError(409, "UPLOAD_IN_PROGRESS");
-  }
-  await finishParticipantDeletion(env.USAGE_MONITOR_DB, participantId, deletionFence);
-  await requireStorageParticipantErasureComplete(env.DELETION_LEDGER,participantId,storage);
+  if(!plan&&currentSnapshot)await finishParticipantSourceDeletion(env,ownerStorage.database,participantId,operationId,currentSnapshot);
+  if(plan){
+    await requireMultiSourceParticipantErasureComplete(env.DELETION_LEDGER,participantId,plan.targets);
+  }else await requireStorageParticipantErasureComplete(env.DELETION_LEDGER,participantId,null);
+  if(participant===null)return {deleted:true,alreadyDeleted:true,contributionsDeleted:null};
   return {
     deleted: true,
     alreadyDeleted: false,
-    contributionsDeleted: contributions.length + telemetryTotal + telemetryV1Total + telemetryV11Total,
+    contributionsDeleted:(currentSnapshot?.contributions??0)+(currentSnapshot?.telemetry??0)
+      +(currentSnapshot?.telemetryV1??0)+(currentSnapshot?.telemetryV11??0),
   };
 }
 

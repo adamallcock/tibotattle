@@ -1,6 +1,8 @@
 import { timingSafeEqual } from "./crypto";
 import { ApiError } from "./errors";
 import { parseStrictJson } from "./strict-json";
+import { ownerWriteFenceStatement } from "./storage-routing-fence";
+import type { OwnerStorageRoute } from "./storage-routing";
 
 export const ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION =
   "accountless-enrollment-v0.1";
@@ -264,19 +266,27 @@ export async function enrollAccountlessDevice(
   db: D1Database,
   request: AccountlessEnrollmentRequest,
   nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<AccountlessEnrollmentResult> {
   validNow(nowEpoch);
   if (!db || typeof db.prepare !== "function") {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }
   const existing = await readEnrollment(db, request.deviceId);
-  if (existing !== null) return assertReplayable(existing, request, nowEpoch);
+  if (existing !== null) {
+    if (ownerRoute?.mode === "catalog"
+        && existing.installation_principal_id !== ownerRoute.ownerId) {
+      throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+    }
+    return assertReplayable(existing, request, nowEpoch);
+  }
 
   const issuedAt = new Date(nowEpoch).toISOString();
   const expiresAt = new Date(
     nowEpoch + ACCOUNTLESS_ENROLLMENT_LEASE_MILLISECONDS,
   ).toISOString();
-  const installationPrincipalId = `accountless:${crypto.randomUUID()}`;
+  const installationPrincipalId = ownerRoute?.ownerId
+    ?? `accountless:${crypto.randomUUID()}`;
   const day = utcDay(nowEpoch);
   const updateBudget = db.prepare(`
     UPDATE accountless_enrollment_issuance
@@ -328,10 +338,16 @@ export async function enrollAccountlessDevice(
   );
 
   try {
-    const [budgetResult, insertResult] = await db.batch([
+    const guarded = ownerRoute?.mode === "catalog"
+      ? [ownerWriteFenceStatement(db, ownerRoute)]
+      : [];
+    const results = await db.batch([
+      ...guarded,
       updateBudget,
       insertLedger,
     ]);
+    const budgetResult = results[guarded.length];
+    const insertResult = results[guarded.length + 1];
     if (!budgetResult || !insertResult
         || budgetResult.meta.changes !== 1
         || insertResult.meta.changes !== 1) {
@@ -381,6 +397,7 @@ export async function revokeAccountlessEnrollment(
   deviceId: string,
   reason: AccountlessRevocationReason,
   nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<boolean> {
   validNow(nowEpoch);
   if (!UUID_V4_PATTERN.test(deviceId) || !REVOCATION_REASON_PATTERN.test(reason)) {
@@ -388,7 +405,11 @@ export async function revokeAccountlessEnrollment(
   }
   try {
     const now = new Date(nowEpoch).toISOString();
+    const guarded = ownerRoute?.mode === "catalog"
+      ? [ownerWriteFenceStatement(db, ownerRoute)]
+      : [];
     const results = await db.batch<{ device_id: string }>([
+      ...guarded,
       db.prepare(`
         UPDATE accountless_enrollment_ledger
            SET state = 'revoked', revoked_at = ?, revocation_reason = ?
@@ -435,7 +456,9 @@ export async function revokeAccountlessEnrollment(
     ]);
     // Authority-withdrawal triggers may change many rows in this transaction.
     // Acknowledge the exact enrollment transition, not that aggregate count.
-    return results[0]?.results.length === 1 && results[0].results[0]?.device_id === deviceId;
+    const enrollmentResult = results[guarded.length];
+    return enrollmentResult?.results.length === 1
+      && enrollmentResult.results[0]?.device_id === deviceId;
   } catch {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }
