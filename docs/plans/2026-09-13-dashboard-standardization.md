@@ -378,3 +378,42 @@ qualification is not established by this visual check.
   empty/stale/loading/error states and keyboard interactions. Fix defects found.
 - Resolve the root-layout and accounting-parity validation blockers based on
   their actual contracts, run affected gates, and verify a fresh unsigned app.
+
+Implemented in `f71f717d596cc5874239a2718ac914f295e17986`. Single-page
+reports and nested thread lists show localized counts without inactive page
+buttons; multi-page navigation retains its cursor behavior. Share-column help
+uses the existing information popover with distinct accessible labels. Active
+refresh controls survive nested reloads, and terminal refreshes restore the
+last stable dashboard status. Long model names wrap in the open picker and
+truncate within the closed control.
+
+The obsolete root `design-qa.md` scratch note was removed. The real-history
+pricing gate now checks aggregate event counts and requires the warning when
+unpriced events exist; it accepts a hidden warning only when those counts
+justify it. Missing evidence and inconsistent counts still fail validation.
+
+Validation: 758 web tests, 35 real-history QA contract tests, 12 root locale
+tests, generated locale verification, architecture checks, and preflight pass.
+Unsigned macOS arm64 package ASAR
+`680c17d1658b6ddab286f78294a4cdf1a255cba9dbbcd8dcb2f1dfb448aa547b`
+was launched with the isolated real-history profile. All seven pages were
+visually reviewed at 1180px and the 960px minimum; none had document overflow.
+The review included real stale observations and loading reports. A labeled
+synthetic report verified long model names, empty-search recovery and focus,
+loading cancellation, error display, and recovery without overflow.
+
+The packaged real-history snapshot gate passes: populated Usage parity,
+community transport-unavailable presentation, advancing refresh timer,
+responsive control endpoints, cancellation, retry, and clean quit. Evidence:
+`.release-build/usability-qa.json`, `.release-build/usability-pages.json`,
+`.release-build/usability-report-layout.json`,
+`.release-build/usability-state-checks.json`, and matching screenshots.
+Snapshot mode does not evaluate full-refresh completion or relaunch persistence.
+This evidence does not qualify the separate native smoke, installation,
+signing, release, updater, or hosted deployment gates.
+
+A separate interaction pass supplied a labeled synthetic report to the actual
+Projects page in the packaged app. Both share-header help buttons have distinct
+accessible labels. Enter opens the popover, Escape closes it and restores
+focus, and an outside click dismisses it. The popover fits at 960px. Evidence:
+`.release-build/usability-share-help.json` and its matching screenshot.
