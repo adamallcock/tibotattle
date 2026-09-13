@@ -110,22 +110,21 @@
           Cancel
         </button>
         <button
-          class="button button-quiet compact electron-only-control"
+          class="button button-quiet compact icon-button electron-only-control"
           id="electron-share-button"
           type="button"
-          data-i18n="electron.shell.share"
           aria-label="Share"
           data-i18n-aria-label="electron.shell.share"
           title="Share"
           data-i18n-title="electron.shell.share"
-        >Share</button>
+        ><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15V3m-4 4 4-4 4 4M7 10H5v11h14V10h-2"/></svg></button>
         <button
-          class="button button-quiet compact electron-only-control electron-settings-control"
+          class="button button-quiet compact icon-button electron-only-control electron-settings-control"
           id="electron-settings-button"
           type="button"
-          aria-label="Settings"
-          title="Settings"
-        >Settings</button>
+          aria-label="Settings" data-i18n-aria-label="electron.settings.heading"
+          title="Settings" data-i18n-title="electron.settings.heading"
+        ><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9.5 3-.6 2.3-2 .9-2.1-.7-2.5 4.3L4 11.4v2.2l-1.7 1.6 2.5 4.3 2.1-.7 2 .9.6 2.3h5l.6-2.3 2-.9 2.1.7 2.5-4.3-1.7-1.6v-2.2l1.7-1.6-2.5-4.3-2.1.7-2-.9L14.5 3z"/><circle cx="12" cy="12.5" r="3.2"/></svg></button>
       </div>
     </header>
 
@@ -279,7 +278,7 @@
       </section>
 
       <details class="setup-card" open id="setup-card" aria-labelledby="setup-title" data-dashboard-page="overview" hidden>
-        <summary><h2 id="setup-title">Check this Mac before analyzing</h2></summary>
+        <summary><h2 id="setup-title">Check this Mac before analyzing</h2><span id="setup-ready-label" class="setup-ready-label" hidden data-i18n="setup.ready">Ready</span></summary>
         <div class="setup-details-body">
           <div class="setup-copy">
             <p id="setup-summary">
@@ -289,6 +288,13 @@
             </p>
           </div>
           <ol class="setup-checks" id="setup-checks" aria-live="polite"></ol>
+          <p id="setup-note">
+              A useful headline often appears in seconds. The first deep pass can
+              take a few minutes; later updates are normally faster. Work stops or
+              checkpoints at a fixed bound, so a large Codex history may continue
+              in another pass. You may close the browser tab; keep the Usage
+              Monitor app open while analysis runs.
+          </p>
           <div class="setup-actions">
             <button class="button button-primary" id="setup-refresh" type="button">
               Analyze local usage
@@ -296,13 +302,6 @@
             <button class="button button-quiet" id="setup-check-again" type="button">
               Check again
             </button>
-            <p id="setup-note">
-              A useful headline often appears in seconds. The first deep pass can
-              take a few minutes; later updates are normally faster. Work stops or
-              checkpoints at a fixed bound, so a large Codex history may continue
-              in another pass. You may close the browser tab; keep the Usage
-              Monitor app open while analysis runs.
-            </p>
           </div>
         </div>
       </details>

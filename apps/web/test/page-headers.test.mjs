@@ -22,7 +22,7 @@ function onboardingHarness() {
     setJourneyState() {}, updateLocalActionButtons() {}, setGlobalState() {},
     onboardingSourceGuidance: () => ({ title: "Source needs attention", summary: "Check source", check: "Unavailable" }),
     localAnalysisAllowed: (value) => value.sourceStatus === "ready" && value.stateWritable,
-    clear() {}, node: () => ({}), compact: String,
+    clear() {}, node: () => ({}), compact: String, t: (key) => translate(key, {}, "en"),
   });
   vm.runInContext(render, context);
   const ready = { state: "ready", sourceStatus: "ready", stateWritable: true, rolloutFilesPresent: true, rolloutFilesObserved: 3 };

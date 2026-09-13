@@ -1420,10 +1420,11 @@ function renderLocalOnboarding(value) {
   $("#setup-title").textContent = boundedPause
     ? "Continue your local analysis"
     : ready
-      ? "This Mac is ready"
+      ? t("setup.title")
       : value.stateStatus === "unwritable" && sourceReady
         ? "Local app state needs attention"
         : sourceGuidance.title;
+  $("#setup-ready-label").hidden = !ready || boundedPause;
   $("#setup-summary").textContent = boundedPause
     ? `A bounded pass completed safely: ${compact(indexing.filesProcessed)} of ${compact(indexing.filesSelected)} recent rollout files are analyzed. Continue when convenient; existing results remain usable.`
     : ready

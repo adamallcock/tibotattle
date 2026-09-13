@@ -113,3 +113,13 @@ still failed `usage_parity_invalid`. Automatic approval review rejected a new
 real-history screenshot capture for lack of capture-specific authorization; no
 real-history capture ran for this revision. The synthetic fallback was approved.
 No system installation or publication occurred.
+
+## Header density and setup layout refinement
+
+The user authorized real-history screenshots for this follow-up. Reduced the
+header wrapping breakpoint to 1000px and made refresh progress shrink with the
+window. Share and Settings use 36px icon buttons with accessible localized names
+and tooltips. Setup now has a neutral Local setup heading and a separate Ready
+label; its summary/checks use two columns and the note/actions span both columns.
+All 745 browser tests passed. A new development build and authorized packaged
+real-history screenshots are the remaining visual validation.
