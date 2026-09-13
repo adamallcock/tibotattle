@@ -1047,7 +1047,7 @@ function applyElectronAccountlessContributionMode() {
   if (community) {
     community.setAttribute(
       "aria-labelledby",
-      electronMode ? "electron-accountless-community-title" : "contribution-cta-title",
+      "community-page-title",
     );
   }
   const legacySurfaces = [
@@ -1469,6 +1469,12 @@ function renderLocalOnboarding(value) {
   card.hidden = false;
   card.removeAttribute("aria-hidden");
   card.classList.toggle("needs-attention", !ready);
+  // Preserve a manual disclosure choice while readiness stays unchanged.
+  const compactSetup = ready && !boundedPause && Boolean(dashboard)
+    && (!indexing || indexing.status === "recent_7d_complete");
+  const setupMode = compactSetup ? "ready" : "attention";
+  if (card.dataset.setupMode !== setupMode) card.open = !compactSetup;
+  card.dataset.setupMode = setupMode;
   $("#setup-title").textContent = boundedPause
     ? "Continue your local analysis"
     : ready

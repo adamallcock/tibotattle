@@ -249,12 +249,12 @@ export function mountWorkUsageView({
     b.addEventListener("click", action);
     return b;
   };
-  const heading = el("div", "work-usage-heading");
+  const heading = el("div", "dashboard-page-header");
   const headingText = el("div");
   const title = el("h2", null, tr("title"));
   title.id = "work-usage-title";
-  headingText.append(title, el("p", "section-description", tr("subtitle")));
-  const period = el("div", "work-usage-period");
+  headingText.append(title, el("p", "page-description", tr("subtitle")));
+  const period = el("div", "segmented-control");
   period.setAttribute("role", "group");
   period.setAttribute("aria-label", tr("period"));
   for (const id of ["24h", "7d", "30d", "all"]) {
@@ -440,7 +440,7 @@ export function mountWorkUsageView({
   });
   cancel.hidden = true;
   const body = el("div");
-  const eyebrow = el("p", "eyebrow", tr("local"));
+  const eyebrow = el("p", "annotation", tr("local"));
   root.replaceChildren(
     heading,
     eyebrow,

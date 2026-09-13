@@ -6810,8 +6810,8 @@ test("the weekly allowance chart leads the dashboard", async () => {
     html.indexOf('data-nav="weekly"') < html.indexOf('data-nav="trends"'),
     "primary navigation follows the same order as the sections",
   );
-  assert.match(html, /<p class="eyebrow">02 · Weekly allowance<\/p>/u);
-  assert.match(html, /<p class="eyebrow">03 · Timeline<\/p>/u);
+  assert.match(html, /<h2 id="weekly-title" data-i18n="page.weekly.title">Allowance<\/h2>/u);
+  assert.match(html, /<h2 id="timeline-title" data-i18n="page.timeline.title">Trends<\/h2>/u);
   assert.match(html, /class="dashboard-section lead-section(?: dashboard-page-inactive)?" id="weekly"/u);
   assert.match(html, /class="panel weekly-history-panel lead-chart-panel"/u);
   // The lead chart must use the available page width instead of introducing a

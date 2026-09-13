@@ -354,18 +354,18 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     };
     chartCursors = []; selectedInterval = null;
     root.replaceChildren();
-    const heading = element("div", "performance-heading");
+    const heading = element("div", "dashboard-page-header");
     const title = element("div");
     const h2 = element("h2", "", translate("title")); h2.id = "performance-title";
     h2.tabIndex = -1; h2.dataset.performanceFocus = "heading";
-    title.append(h2, element("p", "performance-subtitle", translate("subtitle")), element("p", "performance-provider", translate("provider")));
+    title.append(h2, element("p", "page-description", translate("subtitle")));
     const periods = element("div", "segmented-control performance-periods"); periods.setAttribute("aria-label", translate("period")); periods.setAttribute("role", "group");
     for (const value of PERIODS) {
       const button = element("button", value === period ? "active" : "", translate(value === "all" ? "all" : `days${value}`));
       button.type = "button"; button.setAttribute("aria-pressed", String(period === value)); button.dataset.performanceFocus = `period-${value}`;
       button.addEventListener("click", () => { if (period === value) return; period = value; payload = readyPeriods.get(value) ?? null; remember(); render(); refresh(); }); periods.append(button);
     }
-    heading.append(title, periods); root.append(heading);
+    heading.append(title, periods); root.append(heading, element("p", "performance-provider", translate("provider")));
     const status = element("p", "performance-status"); status.setAttribute("role", "status");
     const progress = payload?.historyProgress;
     const collectingLabel = progress?.total

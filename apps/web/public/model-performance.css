@@ -1,7 +1,4 @@
 .model-performance { min-width: 0; }
-.performance-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
-.performance-heading h2 { font-family: var(--sans); margin: 0; font-size: clamp(24px, 3vw, 34px); letter-spacing: -.035em; }
-.performance-subtitle { margin: 8px 0 13px; color: var(--muted); }
 .performance-provider { display: inline-block; margin: 0; color: var(--green); font-size: 12px; font-weight: 650; }
 .performance-periods { flex-shrink: 0; }
 .performance-periods button { min-height: 36px; white-space: nowrap; }
@@ -65,7 +62,6 @@
 .performance-details p { max-width: 80ch; line-height: 1.65; margin: 0 0 16px; }
 .performance-model:focus-visible, .performance-point:focus-visible, .performance-details summary:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
 @media (max-width: 720px) {
-  .performance-heading { flex-direction: column; gap: 14px; }
   .performance-periods { align-self: flex-start; }
   .performance-card { padding: 16px 12px 12px; }
   .performance-card-heading { flex-direction: column; gap: 8px; }

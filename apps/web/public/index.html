@@ -150,14 +150,10 @@
         </div>
       </section>
 
-      <div class="page-heading" data-dashboard-page="overview">
+      <div class="dashboard-page-header" data-dashboard-page="overview">
         <div>
-          <p class="eyebrow">Local evidence dashboard</p>
-          <h1>Your Codex allowance, made measurable.</h1>
-          <p class="lede">
-            Compare content-free token metadata with observed quota movement, see
-            what the model can and cannot explain, and improve the estimate over time.
-          </p>
+          <h1 data-i18n="page.overview.title">Overview</h1>
+          <p class="page-description" data-i18n="page.overview.description">Your current allowance and recent usage at a glance.</p>
         </div>
         <div class="freshness-card" aria-live="polite">
           <span>Latest observation</span>
@@ -268,38 +264,38 @@
         </div>
       </section>
 
-      <section class="setup-card" id="setup-card" aria-labelledby="setup-title" data-dashboard-page="overview" hidden>
-        <div class="setup-copy">
-          <p class="eyebrow">Local setup</p>
-          <h2 id="setup-title">Check this Mac before analyzing</h2>
-          <p id="setup-summary">
-            TiboTattle checks only whether the expected Codex folders and its
-            private state directory are available. It does not send or display
-            prompts, responses, commands, paths, or account identifiers.
-          </p>
+      <details class="setup-card" open id="setup-card" aria-labelledby="setup-title" data-dashboard-page="overview" hidden>
+        <summary><h2 id="setup-title">Check this Mac before analyzing</h2></summary>
+        <div class="setup-details-body">
+          <div class="setup-copy">
+            <p id="setup-summary">
+              TiboTattle checks only whether the expected Codex folders and its
+              private state directory are available. It does not send or display
+              prompts, responses, commands, paths, or account identifiers.
+            </p>
+          </div>
+          <ol class="setup-checks" id="setup-checks" aria-live="polite"></ol>
+          <div class="setup-actions">
+            <button class="button button-primary" id="setup-refresh" type="button">
+              Analyze local usage
+            </button>
+            <button class="button button-quiet" id="setup-check-again" type="button">
+              Check again
+            </button>
+            <p id="setup-note">
+              A useful headline often appears in seconds. The first deep pass can
+              take a few minutes; later updates are normally faster. Work stops or
+              checkpoints at a fixed bound, so a large Codex history may continue
+              in another pass. You may close the browser tab; keep the Usage
+              Monitor app open while analysis runs.
+            </p>
+          </div>
         </div>
-        <ol class="setup-checks" id="setup-checks" aria-live="polite"></ol>
-        <div class="setup-actions">
-          <button class="button button-primary" id="setup-refresh" type="button">
-            Analyze local usage
-          </button>
-          <button class="button button-quiet" id="setup-check-again" type="button">
-            Check again
-          </button>
-          <p id="setup-note">
-            A useful headline often appears in seconds. The first deep pass can
-            take a few minutes; later updates are normally faster. Work stops or
-            checkpoints at a fixed bound, so a large Codex history may continue
-            in another pass. You may close the browser tab; keep the Usage
-            Monitor app open while analysis runs.
-          </p>
-        </div>
-      </section>
+      </details>
 
       <section class="dashboard-section" id="overview" aria-labelledby="overview-title" data-dashboard-page="overview" data-requires-evidence>
-        <div class="section-heading">
+        <div class="sr-only">
           <div>
-            <p class="eyebrow">01 · Overview</p>
             <h2 id="overview-title">Where your allowance stands</h2>
           </div>
         </div>
@@ -438,10 +434,10 @@
       </section>
 
       <section class="dashboard-section lead-section dashboard-page-inactive" id="weekly" aria-labelledby="weekly-title" data-dashboard-page="weekly" data-requires-evidence aria-hidden="true" inert>
-        <div class="section-heading">
+        <div class="dashboard-page-header">
           <div>
-            <p class="eyebrow">02 · Weekly allowance</p>
-            <h2 id="weekly-title">Our best estimate of the seven-day limit</h2>
+            <h2 id="weekly-title" data-i18n="page.weekly.title">Allowance</h2>
+            <p class="page-description" data-i18n="page.weekly.description">Estimated capacity and how it changes over time.</p>
           </div>
           <label class="language-picker" id="weekly-plan-control" for="weekly-plan-select" hidden>
             <span data-i18n="weekly.plan.label">Plan</span>
@@ -589,10 +585,10 @@
       </section>
 
       <section class="dashboard-section dashboard-page-inactive" id="timeline" aria-labelledby="timeline-title" data-dashboard-page="trends" data-requires-evidence aria-hidden="true" inert>
-        <div class="section-heading">
+        <div class="dashboard-page-header">
           <div>
-            <p class="eyebrow">03 · Timeline</p>
-            <h2 id="timeline-title">Usage and allowance over time</h2>
+            <h2 id="timeline-title" data-i18n="page.timeline.title">Trends</h2>
+            <p class="page-description" data-i18n="page.timeline.description">Compare recorded usage with observed allowance changes.</p>
           </div>
         </div>
 
@@ -780,10 +776,10 @@
       <section class="dashboard-section dashboard-page-inactive model-performance" id="performance" aria-labelledby="performance-title" data-dashboard-page="performance" aria-hidden="true" inert data-i18n-skip></section>
 
       <section class="dashboard-section dashboard-page-inactive" id="accounting" aria-labelledby="accounting-title" data-dashboard-page="method" data-requires-evidence aria-hidden="true" inert>
-        <div class="section-heading split">
+        <div class="dashboard-page-header">
           <div>
-            <p class="eyebrow">04 · Cost accounting</p>
-            <h2 id="accounting-title">How the estimate was calculated</h2>
+            <h2 id="accounting-title" data-i18n="page.accounting.title">Usage and costs</h2>
+            <p class="page-description" data-i18n="page.accounting.description">Recorded tokens and their API-equivalent cost.</p>
           </div>
           <div class="segmented-control" id="accounting-period-controls" aria-label="Accounting period" data-i18n-aria-label="aria.accountingPeriod">
             <button type="button" data-period="24h">24h</button>
@@ -1033,18 +1029,23 @@
       </section>
 
       <section
-        class="contribution-cta dashboard-page-inactive"
+        class="contribution-cta dashboard-section dashboard-page-inactive"
         id="community"
-        aria-labelledby="contribution-cta-title"
+        aria-labelledby="community-page-title"
         data-dashboard-page="community"
         data-requires-evidence
         aria-hidden="true"
         inert
       >
+        <div class="dashboard-page-header">
+          <div>
+            <h2 id="community-page-title" data-i18n="page.community.title">Community</h2>
+            <p class="page-description" data-i18n="page.community.description">Manage sharing and explore community measurements.</p>
+          </div>
+        </div>
         <section class="panel electron-accountless-community" id="electron-accountless-community" aria-labelledby="electron-accountless-community-title" hidden>
           <div class="panel-heading">
             <div>
-              <p class="panel-kicker" data-i18n="electron.sharing.community.eyebrow">Community sharing</p>
               <h2 id="electron-accountless-community-title" data-i18n="electron.sharing.community.title">Share usage measurements</h2>
             </div>
           </div>
