@@ -269,3 +269,18 @@ rows retain a quiet context cue; unavailable monetary cells remain text, with
 muted treatment distinct from a real zero. Keep existing row/expansion and
 pricing semantics. Validate interaction tests and real packaged model-table
 layout at two desktop widths.
+
+752 web tests and documentation governance pass. Unsigned source
+`cbb48a603b514368224762b91857f6d3203aab06` has ASAR
+`951d0e240a9fa5e8c3fd9fbe33360df86903875f918025d57c7c67adbc81bd97`.
+The packaged Model usage table was visually reviewed with real aggregate data
+at 1180px and 960px: six scoped column headings, right-aligned numeric cells,
+a focusable overflow region, and four visible components in an expanded row.
+Neither width has document overflow; at 960px the table retains intentional
+horizontal scrolling inside its card. Keyboard focus was verified; arrow-key
+scrolling was not separately exercised. Private evidence:
+`.release-build/tables-layout.json`, `.release-build/model-table-1180.png`,
+and `.release-build/model-table-960.png`. Projects/threads share the source
+styles and test coverage; this pass visually qualified only Model usage.
+The full real-history runner still reports `parity / usage_invalid`; this
+visual qualification does not close that independent gate.
