@@ -48,6 +48,20 @@ states are meaningful; TiboTattle does not replace missing evidence with zero.
 
 ## Reading the dashboard
 
+Overview shows one equally sized fuel tank for each observed allowance. The fill
+and percentage both represent remaining capacity. A single current Codex weekly
+forecast appears beneath the tanks when usable pacing evidence exists; choosing
+a historical plan on the Allowance page does not change that current forecast.
+
+The forecast names its pace assessment, estimated run-out, reset countdown and
+any time without allowance. Its timeline represents time until reset, not quota
+percentage. Countdown labels use days and hours (less than an hour stays explicit).
+Hover, focus or tap an underlined time for the exact timestamp and time zone.
+Expand **Forecast basis and assumptions** for observation coverage, overall and
+active rates, and the uninterrupted-use estimate. Unknown amounts have no fill;
+stale or earlier observations retain their evidence qualifiers.
+
+
 - **Overview and trends** summarize locally derived activity and quota evidence.
 - **Usage and costs** use the repository’s accounting/pricing contracts. A cost
   estimate is not a provider bill.

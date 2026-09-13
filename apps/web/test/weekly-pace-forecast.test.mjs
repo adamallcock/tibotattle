@@ -186,10 +186,10 @@ test("weekly pace forecast is an optional, allowance-scoped dashboard surface", 
     paceSource,
     /status === "insufficient_observations"[\s\S]*?observations === 1/u,
   );
-  assert.match(paceSource, /At this pace the weekly allowance runs out/u);
-  assert.match(paceSource, /lasts to the reset with room to spare/u);
-  assert.match(paceSource, /Pace estimate ready after one more refresh/u);
-  assert.match(paceSource, /Early estimate/u);
+  assert.match(paceSource, /allowance\.headline/u);
+  assert.match(paceSource, /allowance\.spareTitle/u);
+  assert.match(paceSource, /allowance\.collectingTitle/u);
+  assert.match(paceSource, /allowance\.early/u);
   assert.match(
     paceSource,
     /if \(!available && !reachesResetFirst && !collectingEvidence\) return/u,
@@ -210,9 +210,9 @@ test("the standing drives the card's class and is also stated in words", () => {
   assert.match(paceSource, /is-under-pace/u);
   assert.match(paceSource, /is-critical/u);
   assert.match(paceSource, /weekly-pace-forecast-state-chip/u);
-  assert.match(appSource, /over: "Over pace"/u);
-  assert.match(appSource, /on: "On pace"/u);
-  assert.match(appSource, /under: "Under pace"/u);
+  assert.match(appSource, /over: "allowance\.over"/u);
+  assert.match(appSource, /on: "allowance\.on"/u);
+  assert.match(appSource, /under: "allowance\.under"/u);
   // The engine's own split is no longer what colours the card, but it stays
   // readable from the DOM.
   assert.match(paceSource, /reachesResetFirst \? "is-reset-first" : ""/u);

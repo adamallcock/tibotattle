@@ -1151,18 +1151,6 @@ h2 {
 }
 .metric-card.stale::before { background: var(--amber); }
 .metric-card.insufficient::before { background: var(--rust); }
-.metric-card.quota-card-spark {
-  border-color: rgba(49, 95, 132, .24);
-  background: linear-gradient(145deg, rgba(224, 234, 241, .72), rgba(255, 254, 249, .9));
-}
-.metric-card.quota-card-spark::before { background: var(--blue); }
-/* Spark is metered against its own small allowance and is never the number a
-   reader came to the dashboard for. It keeps the anatomy of the primary
-   allowance cards so it is obviously the same kind of thing, at a reduced
-   scale so it stops competing with the five-hour and weekly tracks. */
-.metric-card.quota-card-spark .metric-value { margin: 12px 0 6px; font-size: 1.9rem; }
-.metric-card.quota-card-spark .mini-progress { margin: 12px 0 8px; }
-
 .metric-card-header { display: flex; justify-content: space-between; gap: 1rem; }
 .metric-card .metric-name { color: var(--muted); font-size: .73rem; font-weight: var(--weight-semibold); text-transform: uppercase; letter-spacing: .05em; }
 .metric-card .metric-value { display: block; margin: 22px 0 8px; font-family: var(--serif); font-size: 3.2rem; font-weight: var(--weight-regular); line-height: .9; }
@@ -5000,3 +4988,79 @@ html[data-theme="dark"] .noscript {
 .work-usage-mix-count { grid-column:2 / -1; color:var(--muted); font-variant-numeric:tabular-nums; }
 .work-usage-mix-legend strong { font-variant-numeric:tabular-nums; }
 .work-usage-search-note { padding-inline-start:var(--space-3); border-inline-start:3px solid var(--green-2); }
+
+/* Equal allowance tanks: content and observed capacity share one surface. */
+.allowance-context { margin: 0 0 12px; color: var(--muted); font-size: .75rem; }
+.metric-grid.quota-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.quota-grid > .quota-tank {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 22px;
+  isolation: isolate;
+  min-width: 0;
+  min-height: 230px;
+  padding: 22px;
+  border: 0;
+  background: var(--surface-raised);
+}
+.quota-grid > .quota-tank:only-child { min-height: 185px; }
+.quota-tank::before { content: none; }
+.quota-tank-fuel {
+  position: absolute;
+  inset-inline: 0;
+  inset-block-end: 0;
+  z-index: -1;
+  background: color-mix(in srgb, var(--green-2) 24%, var(--surface-raised));
+}
+.quota-tank.stale .quota-tank-fuel { background: color-mix(in srgb, var(--amber) 18%, var(--surface-raised)); }
+.quota-tank-header { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.quota-tank-family { color: var(--muted); font-size: .7rem; letter-spacing: .06em; }
+.quota-tank-period { font-family: var(--serif); font-size: 1.4rem; }
+.quota-tank-bottom { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
+.quota-tank-value { display: block; font-family: var(--serif); font-size: clamp(2.6rem, 4vw, 3.5rem); font-weight: var(--weight-regular); line-height: 1.15; font-variant-numeric: tabular-nums; }
+.quota-tank-caption, .quota-tank-reset { display: flex; flex-direction: column; font-size: .75rem; }
+.quota-tank-reset { align-items: flex-end; text-align: end; }
+.allowance-timestamp { display: inline; width: fit-content; max-width: 100%; padding: 0; border: 0; border-bottom: 1px dotted currentColor; border-radius: 0; color: inherit; background: transparent; font: inherit; text-align: inherit; cursor: help; }
+.allowance-timestamp:hover { color: var(--green-text); }
+.quota-tank > .allowance-timestamp { font-size: .7rem; }
+.weekly-pace-forecast { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.weekly-pace-forecast-title { max-width: 48ch; font-family: var(--serif); font-size: clamp(1.3rem, 2.4vw, 1.7rem); font-weight: var(--weight-regular); line-height: 1.25; }
+.weekly-pace-forecast-copy { max-width: 80ch; font-size: .85rem; line-height: 1.6; }
+.weekly-pace-track { gap: 0; margin-top: 12px; }
+.weekly-pace-track-bar { border: 0; }
+.weekly-pace-track-labels { display: grid; grid-template-columns: var(--pace-covered) minmax(0, 1fr); align-items: end; font-size: .75rem; }
+.weekly-pace-track-runout, .weekly-pace-track-reset { display: flex; flex-direction: column; align-items: flex-end; position: relative; text-align: end; padding: 0 8px 12px 0; }
+.weekly-pace-track-runout { color: var(--pace-accent-text); }
+.weekly-pace-track-reset { grid-column: 2; padding-inline: 8px 0; }
+.weekly-pace-track-labels .allowance-timestamp { font-weight: var(--weight-semibold); }
+.weekly-pace-track-runout::after, .weekly-pace-track-reset::after { content: ''; position: absolute; inset-inline-end: 0; inset-block-end: 0; height: 9px; width: 1px; background: currentColor; }
+.weekly-pace-track-scale { display: grid; grid-template-columns: var(--pace-covered) minmax(0, 1fr); margin-top: 9px; text-transform: none; letter-spacing: 0; font-size: .75rem; }
+.weekly-pace-track-gap { text-align: center; color: var(--pace-accent-text); }
+.weekly-pace-track.is-edge .weekly-pace-track-labels { grid-template-columns: 1fr 1fr; gap: 12px; }
+.weekly-pace-track.is-edge .weekly-pace-track-runout { align-items: flex-start; text-align: start; }
+.weekly-pace-track.is-edge .weekly-pace-track-runout::after { content: none; }
+.weekly-pace-track.is-edge .weekly-pace-track-scale { grid-template-columns: auto 1fr; gap: 12px; }
+.weekly-pace-track.is-edge .weekly-pace-track-gap { text-align: end; }
+.weekly-pace-details { border-top: 1px solid var(--pace-accent-edge); margin-top: 8px; padding-top: 12px; color: var(--muted); font-size: .75rem; }
+.weekly-pace-details > summary { cursor: pointer; }
+.weekly-pace-details .weekly-pace-forecast-metrics { grid-column: auto; grid-row: auto; margin: 12px 0; }
+.weekly-pace-details .weekly-pace-forecast-metric { background: transparent; padding: 0; border: 0; }
+.weekly-pace-details .weekly-pace-track-note { margin-top: 8px; }
+@media (max-width: 1050px) {
+  .metric-grid.quota-grid > :last-child:nth-child(odd) { grid-column: auto; }
+}
+@media (max-width: 500px) {
+  .metric-grid.quota-grid { grid-template-columns: 1fr; }
+  .quota-grid > .quota-tank { min-height: 185px; padding: 18px; }
+  .weekly-pace-forecast { padding: 18px; gap: 12px; }
+  .weekly-pace-track-labels { grid-template-columns: 1fr 1fr; gap: 12px; }
+  .weekly-pace-track-runout { align-items: flex-start; text-align: start; }
+  .weekly-pace-track-runout::after { content: none; }
+  .weekly-pace-track-scale { grid-template-columns: auto 1fr; gap: 12px; }
+  .weekly-pace-track-gap { text-align: end; }
+}
