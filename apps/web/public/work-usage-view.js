@@ -843,7 +843,6 @@ export function mountWorkUsageView(options = {}) {
   const resultCount = (count, grouping) => tr(
     `${grouping}Count${count === 1 ? "One" : "Other"}`, { count: quantity(count) },
   );
-  const reportDate = (value) => formatLocal(value);
   const expectedReportingBounds = (window) => {
     if (!window) return null;
     const endMs = Date.parse(window.endAt);
@@ -862,14 +861,6 @@ export function mountWorkUsageView(options = {}) {
   };
   function appendUsageEvidence() {
     const evidence = createEvidenceList(documentRef, "work-usage-evidence");
-    if (response?.metadata?.observedAt !== undefined) {
-      appendEvidenceRow(documentRef, evidence, {
-        kind: "freshness",
-        label: tr("observed", { date: "" }).trim(),
-        value: reportDate(response.metadata.observedAt),
-        state: "observed",
-      });
-    }
     const totalEvents = response?.totals?.events;
     const incompleteEvents = response?.totals?.incompleteEvents;
     if (count(totalEvents) && count(incompleteEvents) && incompleteEvents <= totalEvents) {
