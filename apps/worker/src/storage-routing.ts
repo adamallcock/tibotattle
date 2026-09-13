@@ -1,5 +1,6 @@
 import { ownerWriteFenceStatement } from './storage-routing-fence';
 import { MAX_STORAGE_APPLICATION_STATEMENTS } from './storage-routing-batch-budget';
+import { sha256Hex } from './crypto';
 
 export const STORAGE_SHARD_OPERATING_CAP_BYTES = 9_000_000_000;
 export const STORAGE_NEW_OWNER_CUTOFF_BYTES = 6_000_000_000;
@@ -72,6 +73,12 @@ interface AccountlessIssuanceRow {
   reservation_key: string; owner_id: string; device_digest: string;
   budget_day: string; reserved_at: number;
 }
+interface HistoricalIssuanceStateRow {
+  import_state: 'importing' | 'ready'; imported_count: number; import_revision: number;
+  roster_digest: string | null; baseline_budget_day: string | null;
+  baseline_daily_reserved: number | null; baseline_lifetime_reserved: number | null;
+  baseline_digest: string | null; baseline_initialized_at: number | null;
+}
 export type StorageShardBindings = Readonly<Record<string, D1Database>>;
 export type OwnerStorageStatementBuilder = (database: D1Database) =>
   D1PreparedStatement[] | Promise<D1PreparedStatement[]>;
@@ -140,10 +147,34 @@ async function assertAccountlessIssuanceSchema(catalog: D1Database): Promise<voi
       'storage_accountless_issuance_requires_baseline',
       'storage_accountless_issuance_device_conflict',
       'storage_accountless_issuance_reservation_immutable',
-      'storage_accountless_issuance_reservation_no_delete')
+      'storage_accountless_issuance_reservation_no_delete',
+      'storage_accountless_issuance_historical_conflict',
+      'storage_accountless_historical_issuance_state',
+      'storage_accountless_historical_issuance_reservations',
+      'storage_accountless_historical_issuance_import_gate',
+      'storage_accountless_historical_issuance_conflict',
+      'storage_accountless_historical_issuance_current_conflict',
+      'storage_accountless_historical_issuance_count',
+      'storage_accountless_historical_issuance_state_transition',
+      'storage_accountless_historical_issuance_state_no_delete',
+      'storage_accountless_historical_issuance_finalize',
+      'storage_accountless_historical_issuance_immutable',
+      'storage_accountless_historical_issuance_no_delete')
     ORDER BY name`).all<{name: string}>());
   if (rows.results.map((row) => row.name).join(',') !== [
+    'storage_accountless_historical_issuance_conflict',
+    'storage_accountless_historical_issuance_count',
+    'storage_accountless_historical_issuance_current_conflict',
+    'storage_accountless_historical_issuance_finalize',
+    'storage_accountless_historical_issuance_immutable',
+    'storage_accountless_historical_issuance_import_gate',
+    'storage_accountless_historical_issuance_no_delete',
+    'storage_accountless_historical_issuance_reservations',
+    'storage_accountless_historical_issuance_state',
+    'storage_accountless_historical_issuance_state_no_delete',
+    'storage_accountless_historical_issuance_state_transition',
     'storage_accountless_issuance_device_conflict',
+    'storage_accountless_issuance_historical_conflict',
     'storage_accountless_issuance_requires_baseline',
     'storage_accountless_issuance_reservation_immutable',
     'storage_accountless_issuance_reservation_no_delete',
@@ -159,16 +190,12 @@ export interface AccountlessIssuanceBaseline {
   readonly baselineDigest: string;
   readonly initializedAt: number;
 }
-interface AccountlessIssuanceBaselineRow {
-  budget_day: string; initialization_state: string; daily_reserved: number;
-  lifetime_reserved: number; baseline_digest: string | null; initialized_at: number | null;
+export interface HistoricalAccountlessIssuanceReservation extends AccountlessIssuanceReservation {}
+export interface HistoricalAccountlessIssuanceBaseline extends AccountlessIssuanceBaseline {
+  readonly historicalRosterCount: number;
+  readonly historicalRosterDigest: string;
 }
-/** Trusted, one-way activation seam. The caller must derive these counts from
- * the existing global enrollment issuance authority before catalog enablement. */
-export async function initializeAccountlessIssuanceBaseline(
-  catalog: D1Database,
-  baseline: AccountlessIssuanceBaseline,
-): Promise<void> {
+function validateIssuanceBaseline(baseline: AccountlessIssuanceBaseline): void {
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(baseline.budgetDay)
       || !Number.isSafeInteger(baseline.dailyReserved)
       || baseline.dailyReserved < 0 || baseline.dailyReserved > 1_000
@@ -179,25 +206,214 @@ export async function initializeAccountlessIssuanceBaseline(
       || !Number.isSafeInteger(baseline.initializedAt) || baseline.initializedAt < 0) {
     fail('INVALID_ROUTING_INPUT');
   }
+}
+function validateHistoricalReservation(input: HistoricalAccountlessIssuanceReservation): void {
+  digest(input.reservationKey); identifier(input.ownerId); digest(input.deviceDigest);
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(input.budgetDay)
+      || !Number.isSafeInteger(input.reservedAt) || input.reservedAt < 0) {
+    fail('INVALID_ROUTING_INPUT');
+  }
+}
+/** Canonical content-free roster commitment for a trusted, bounded import manifest. */
+export async function historicalAccountlessIssuanceRosterDigest(
+  reservations: readonly HistoricalAccountlessIssuanceReservation[],
+): Promise<string> {
+  if (!Array.isArray(reservations) || reservations.length > 10_000) fail('INVALID_ROUTING_INPUT');
+  const seenKeys = new Set<string>(); const seenOwners = new Set<string>(); const seenDevices = new Set<string>();
+  const ordered = reservations.map((row) => {
+    validateHistoricalReservation(row);
+    if (seenKeys.has(row.reservationKey) || seenOwners.has(row.ownerId)
+        || seenDevices.has(row.deviceDigest)) fail('INVALID_ROUTING_INPUT');
+    seenKeys.add(row.reservationKey); seenOwners.add(row.ownerId); seenDevices.add(row.deviceDigest);
+    return [row.reservationKey, row.ownerId, row.deviceDigest, row.budgetDay, row.reservedAt] as const;
+  }).sort((left, right) => left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0);
+  return sha256Hex(`app-usagemonitor/storage-accountless-historical-issuance-roster/v1\0${JSON.stringify(ordered)}`);
+}
+function historicalRow(row: AccountlessIssuanceRow | null | undefined): HistoricalAccountlessIssuanceReservation {
+  if (!row) fail('STORAGE_UNAVAILABLE');
+  const value = Object.freeze({ reservationKey: row.reservation_key, ownerId: row.owner_id,
+    deviceDigest: row.device_digest, budgetDay: row.budget_day, reservedAt: row.reserved_at });
+  validateHistoricalReservation(value);
+  return value;
+}
+function sameHistoricalReservation(
+  row: AccountlessIssuanceRow | null | undefined,
+  input: HistoricalAccountlessIssuanceReservation,
+): boolean {
+  return row?.reservation_key === input.reservationKey && row.owner_id === input.ownerId
+    && row.device_digest === input.deviceDigest && row.budget_day === input.budgetDay
+    && row.reserved_at === input.reservedAt;
+}
+/** Trusted private import seam. It creates the exact locator and immutable
+ * historical reservation together, and never advances issuance counters. */
+export async function importHistoricalAccountlessIssuanceReservation(
+  catalog: D1Database,
+  input: HistoricalAccountlessIssuanceReservation,
+): Promise<HistoricalAccountlessIssuanceReservation> {
+  validateHistoricalReservation(input);
   await assertAccountlessIssuanceSchema(catalog);
-  await storage(() => catalog.prepare(`UPDATE storage_accountless_issuance_state
-    SET budget_day=?,initialization_state='ready',daily_reserved=?,lifetime_reserved=?,
-        last_reservation_key='',baseline_digest=?,initialized_at=?,updated_at=?
-    WHERE singleton_id=1 AND initialization_state='uninitialized'`)
-    .bind(baseline.budgetDay, baseline.dailyReserved, baseline.lifetimeReserved,
-      baseline.baselineDigest, baseline.initializedAt, baseline.initializedAt).run());
-  const row = await storage(() => catalog.prepare(`SELECT budget_day,initialization_state,
-    daily_reserved,lifetime_reserved,baseline_digest,initialized_at
-    FROM storage_accountless_issuance_state WHERE singleton_id=1`)
-    .first<AccountlessIssuanceBaselineRow>());
-  if (!row || row.initialization_state !== 'ready'
-      || row.budget_day !== baseline.budgetDay
-      || row.daily_reserved !== baseline.dailyReserved
-      || row.lifetime_reserved !== baseline.lifetimeReserved
-      || row.baseline_digest !== baseline.baselineDigest
-      || row.initialized_at !== baseline.initializedAt) {
+  const collisions = await storage(() => catalog.batch<AccountlessIssuanceRow>([
+    catalog.prepare(`SELECT reservation_key,owner_id,device_digest,budget_day,reserved_at
+      FROM storage_accountless_historical_issuance_reservations
+      WHERE reservation_key=? OR owner_id=? OR device_digest=? LIMIT 2`)
+      .bind(input.reservationKey, input.ownerId, input.deviceDigest),
+    catalog.prepare(`SELECT reservation_key,owner_id,device_digest,budget_day,reserved_at
+      FROM storage_accountless_issuance_reservations
+      WHERE reservation_key=? OR owner_id=? OR device_digest=? LIMIT 1`)
+      .bind(input.reservationKey, input.ownerId, input.deviceDigest),
+  ]));
+  const historical = collisions[0]?.results ?? [];
+  if (historical.length === 1 && sameHistoricalReservation(historical[0], input)
+      && (collisions[1]?.results.length ?? 0) === 0) {
+    const locator = await storage(() => catalog.prepare(`SELECT owner_id FROM storage_capability_locators
+      WHERE capability_hash=? LIMIT 1`).bind(input.reservationKey).first<{owner_id: string}>());
+    if (locator?.owner_id !== input.ownerId) fail('STORAGE_UNAVAILABLE');
+    return historicalRow(historical[0]);
+  }
+  if (historical.length > 0 || (collisions[1]?.results.length ?? 0) > 0) fail('ENROLLMENT_CONFLICT');
+  await storage(() => catalog.batch([
+    catalog.prepare(`INSERT INTO storage_capability_locators (capability_hash,owner_id,state)
+      SELECT ?,?,'active' WHERE NOT EXISTS (SELECT 1 FROM storage_capability_locators
+        WHERE capability_hash=? AND owner_id<>?)
+      ON CONFLICT(capability_hash) DO NOTHING`)
+      .bind(input.reservationKey, input.ownerId, input.reservationKey, input.ownerId),
+    catalog.prepare(`INSERT INTO storage_accountless_historical_issuance_reservations
+      (reservation_key,owner_id,device_digest,budget_day,reserved_at)
+      SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM storage_capability_locators
+        WHERE capability_hash=? AND owner_id=?)
+      ON CONFLICT(reservation_key) DO NOTHING`)
+      .bind(input.reservationKey, input.ownerId, input.deviceDigest, input.budgetDay,
+        input.reservedAt, input.reservationKey, input.ownerId),
+  ]));
+  const results = await storage(() => catalog.batch<AccountlessIssuanceRow>([
+    catalog.prepare(`SELECT reservation_key,owner_id,device_digest,budget_day,reserved_at
+      FROM storage_accountless_historical_issuance_reservations
+      WHERE reservation_key=? OR owner_id=? OR device_digest=? LIMIT 2`)
+      .bind(input.reservationKey, input.ownerId, input.deviceDigest),
+    catalog.prepare(`SELECT reservation_key,owner_id,device_digest,budget_day,reserved_at
+      FROM storage_accountless_issuance_reservations
+      WHERE reservation_key=? OR owner_id=? OR device_digest=? LIMIT 1`)
+      .bind(input.reservationKey, input.ownerId, input.deviceDigest),
+  ]));
+  const admitted = results[0]?.results ?? [];
+  if (admitted.length !== 1 || !sameHistoricalReservation(admitted[0], input)
+      || (results[1]?.results.length ?? 0) !== 0) fail('ENROLLMENT_CONFLICT');
+  const locator = await storage(() => catalog.prepare(`SELECT owner_id FROM storage_capability_locators
+    WHERE capability_hash=? LIMIT 1`).bind(input.reservationKey).first<{owner_id: string}>());
+  if (locator?.owner_id !== input.ownerId) fail('STORAGE_UNAVAILABLE');
+  return historicalRow(admitted[0]);
+}
+
+function sameHistoricalBaseline(row: HistoricalIssuanceStateRow,
+  baseline: HistoricalAccountlessIssuanceBaseline): boolean {
+  return row.import_state === 'ready'
+    && row.imported_count === baseline.historicalRosterCount
+    && row.import_revision === baseline.historicalRosterCount
+    && row.roster_digest === baseline.historicalRosterDigest
+    && row.baseline_budget_day === baseline.budgetDay
+    && row.baseline_daily_reserved === baseline.dailyReserved
+    && row.baseline_lifetime_reserved === baseline.lifetimeReserved
+    && row.baseline_digest === baseline.baselineDigest
+    && row.baseline_initialized_at === baseline.initializedAt;
+}
+async function readHistoricalState(catalog: D1Database): Promise<HistoricalIssuanceStateRow> {
+  const row = await storage(() => catalog.prepare(`SELECT import_state,imported_count,import_revision,
+    roster_digest,baseline_budget_day,baseline_daily_reserved,baseline_lifetime_reserved,
+    baseline_digest,baseline_initialized_at FROM storage_accountless_historical_issuance_state
+    WHERE singleton_id=1`).first<HistoricalIssuanceStateRow>());
+  if (!row) fail('STORAGE_UNAVAILABLE');
+  return row;
+}
+/** Trusted one-way activation seam. Aggregate counters and the retained roster
+ * are independent manifest facts; neither is inferred from the other. */
+export async function finalizeAccountlessIssuanceBaseline(
+  catalog: D1Database,
+  baseline: HistoricalAccountlessIssuanceBaseline,
+): Promise<void> {
+  validateIssuanceBaseline(baseline);
+  integer(baseline.historicalRosterCount, 0, 10_000);
+  digest(baseline.historicalRosterDigest);
+  await assertAccountlessIssuanceSchema(catalog);
+  const initial = await readHistoricalState(catalog);
+  if (initial.import_state === 'ready') {
+    if (!sameHistoricalBaseline(initial, baseline)) fail('STORAGE_UNAVAILABLE');
+    return;
+  }
+  if (initial.imported_count !== baseline.historicalRosterCount
+      || initial.import_revision !== baseline.historicalRosterCount) fail('STORAGE_UNAVAILABLE');
+  const roster: HistoricalAccountlessIssuanceReservation[] = [];
+  let cursor = '';
+  for (let page = 0; page < 41; page += 1) {
+    const result = await storage(() => catalog.prepare(`SELECT reservation_key,owner_id,device_digest,
+      budget_day,reserved_at FROM storage_accountless_historical_issuance_reservations
+      WHERE reservation_key>? ORDER BY reservation_key LIMIT 250`).bind(cursor).all<AccountlessIssuanceRow>());
+    for (const row of result.results) roster.push(historicalRow(row));
+    if (result.results.length < 250) break;
+    cursor = result.results.at(-1)!.reservation_key;
+    if (page === 40) fail('STORAGE_UNAVAILABLE');
+  }
+  const stable = await readHistoricalState(catalog);
+  if (stable.import_state !== 'importing' || stable.imported_count !== initial.imported_count
+      || stable.import_revision !== initial.import_revision || roster.length !== initial.imported_count
+      || await historicalAccountlessIssuanceRosterDigest(roster) !== baseline.historicalRosterDigest) {
     fail('STORAGE_UNAVAILABLE');
   }
+  const retained = await storage(() => catalog.prepare(`SELECT COUNT(*) AS total_reserved,
+    COALESCE(SUM(CASE WHEN budget_day=? THEN 1 ELSE 0 END),0) AS day_reserved FROM (
+      SELECT budget_day FROM storage_accountless_historical_issuance_reservations
+      UNION ALL SELECT budget_day FROM storage_accountless_issuance_reservations
+    )`).bind(baseline.budgetDay).first<{total_reserved: number; day_reserved: number}>());
+  if (!retained || !Number.isSafeInteger(retained.total_reserved)
+      || !Number.isSafeInteger(retained.day_reserved)
+      || retained.total_reserved < 0 || retained.day_reserved < 0
+      || baseline.lifetimeReserved < retained.total_reserved
+      || baseline.dailyReserved < retained.day_reserved) fail('STORAGE_UNAVAILABLE');
+  const updated = await storage(() => catalog.prepare(`UPDATE storage_accountless_historical_issuance_state
+    SET import_state='ready',roster_digest=?,baseline_budget_day=?,baseline_daily_reserved=?,
+      baseline_lifetime_reserved=?,baseline_digest=?,baseline_initialized_at=?,updated_at=?
+    WHERE singleton_id=1 AND import_state='importing' AND imported_count=? AND import_revision=?
+    RETURNING import_state,imported_count,import_revision,roster_digest,baseline_budget_day,
+      baseline_daily_reserved,baseline_lifetime_reserved,baseline_digest,baseline_initialized_at`)
+    .bind(baseline.historicalRosterDigest, baseline.budgetDay, baseline.dailyReserved,
+      baseline.lifetimeReserved, baseline.baselineDigest, baseline.initializedAt,
+      baseline.initializedAt, initial.imported_count, initial.import_revision)
+    .first<HistoricalIssuanceStateRow>());
+  if (!updated || !sameHistoricalBaseline(updated, baseline)) fail('STORAGE_UNAVAILABLE');
+}
+
+/** Compatibility helper for fresh synthetic catalogs with an empty historical roster. */
+export async function initializeAccountlessIssuanceBaseline(
+  catalog: D1Database,
+  baseline: AccountlessIssuanceBaseline,
+): Promise<void> {
+  await finalizeAccountlessIssuanceBaseline(catalog, {
+    ...baseline,
+    historicalRosterCount: 0,
+    historicalRosterDigest: await historicalAccountlessIssuanceRosterDigest([]),
+  });
+}
+
+async function assertAccountlessIssuanceReady(catalog: D1Database): Promise<void> {
+  const row = await storage(() => catalog.prepare(`SELECT 1 AS ready
+    FROM storage_accountless_issuance_state issuance
+    JOIN storage_accountless_historical_issuance_state history
+      ON history.singleton_id=issuance.singleton_id
+    WHERE issuance.singleton_id=1 AND issuance.initialization_state='ready'
+      AND history.import_state='ready'`).first<{ready: number}>());
+  if (row?.ready !== 1) fail('ISSUANCE_UNINITIALIZED');
+}
+async function readIssuanceReservations(catalog: D1Database,
+  reservationKey: string, deviceDigest: string): Promise<AccountlessIssuanceRow[]> {
+  const result = await storage(() => catalog.prepare(`SELECT reservation_key,owner_id,device_digest,
+    budget_day,reserved_at FROM storage_accountless_issuance_reservations
+    WHERE reservation_key=? OR device_digest=?
+    UNION ALL
+    SELECT reservation_key,owner_id,device_digest,budget_day,reserved_at
+      FROM storage_accountless_historical_issuance_reservations
+      WHERE reservation_key=? OR device_digest=? LIMIT 3`)
+    .bind(reservationKey, deviceDigest, reservationKey, deviceDigest).all<AccountlessIssuanceRow>());
+  if (result.results.length > 1) fail('ENROLLMENT_CONFLICT');
+  return result.results;
 }
 function utcDay(epoch: number): string {
   return new Date(epoch).toISOString().slice(0, 10);
@@ -310,12 +526,28 @@ export function createCatalogStorageRouter({ catalog, bindings, clock }: {
       digest(capabilityHash); digest(deviceDigest); identifier(proposedOwnerId);
       integer(reservationBytes, 1, STORAGE_SHARD_OPERATING_CAP_BYTES);
       await assertAccountlessIssuanceSchema(catalog);
+      await assertAccountlessIssuanceReady(catalog);
+      const existingReservations = await readIssuanceReservations(
+        catalog, capabilityHash, deviceDigest,
+      );
+      let existingReservation = existingReservations[0] ?? null;
+      if (existingReservation && (existingReservation.reservation_key !== capabilityHash
+          || existingReservation.device_digest !== deviceDigest)) fail('ENROLLMENT_CONFLICT');
       const located = await storage(() => catalog.prepare(`SELECT owner_id, state
         FROM storage_capability_locators WHERE capability_hash = ? LIMIT 1`)
         .bind(capabilityHash).first<{owner_id: string; state: 'active' | 'revoked'}>());
-      let ownerId = located?.owner_id ?? proposedOwnerId;
+      if (located && !existingReservation) {
+        const racedReservations = await readIssuanceReservations(catalog, capabilityHash, deviceDigest);
+        existingReservation = racedReservations[0] ?? null;
+        if (existingReservation && (existingReservation.reservation_key !== capabilityHash
+            || existingReservation.device_digest !== deviceDigest)) fail('ENROLLMENT_CONFLICT');
+      }
+      if (existingReservation && (!located || located.owner_id !== existingReservation.owner_id)) {
+        fail('STORAGE_UNAVAILABLE');
+      }
+      let ownerId = existingReservation?.owner_id ?? located?.owner_id ?? proposedOwnerId;
       if (located?.state === 'revoked') fail('ROUTE_NOT_FOUND');
-      if (!located) {
+      if (!located && !existingReservation) {
         try {
           const stamp = now(clock);
           const candidate = await storage(() => catalog.prepare(`SELECT shard.shard_id,shard.binding_name
@@ -376,19 +608,20 @@ export function createCatalogStorageRouter({ catalog, bindings, clock }: {
           ownerId = winner.owner_id;
         }
       }
-      const reservationStamp = now(clock);
-      await storage(() => catalog.prepare(`INSERT INTO storage_accountless_issuance_reservations
-        (reservation_key,owner_id,device_digest,budget_day,reserved_at)
-        SELECT ?,?,?,?,? WHERE EXISTS (
-          SELECT 1 FROM storage_capability_locators
-           WHERE capability_hash=? AND owner_id=? AND state='active'
-        ) ON CONFLICT(reservation_key) DO NOTHING`)
-        .bind(capabilityHash, ownerId, deviceDigest,
-          utcDay(reservationStamp), reservationStamp,
-          capabilityHash, ownerId).run());
-      const admitted = await storage(() => catalog.prepare(`SELECT reservation_key,owner_id,device_digest,
-        budget_day,reserved_at FROM storage_accountless_issuance_reservations
-        WHERE reservation_key=? LIMIT 1`).bind(capabilityHash).first<AccountlessIssuanceRow>());
+      if (!existingReservation) {
+        const reservationStamp = now(clock);
+        await storage(() => catalog.prepare(`INSERT INTO storage_accountless_issuance_reservations
+          (reservation_key,owner_id,device_digest,budget_day,reserved_at)
+          SELECT ?,?,?,?,? WHERE EXISTS (
+            SELECT 1 FROM storage_capability_locators
+             WHERE capability_hash=? AND owner_id=? AND state='active'
+          ) ON CONFLICT(reservation_key) DO NOTHING`)
+          .bind(capabilityHash, ownerId, deviceDigest,
+            utcDay(reservationStamp), reservationStamp,
+            capabilityHash, ownerId).run());
+      }
+      const admittedRows = await readIssuanceReservations(catalog, capabilityHash, deviceDigest);
+      const admitted = admittedRows[0] ?? null;
       const row = await readRoute(catalog, ownerId);
       if (!row) fail('STORAGE_UNAVAILABLE');
       const route = await this.ensureOwner(ownerId, row.shard_id, row.reservation_bytes);
