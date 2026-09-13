@@ -1388,6 +1388,7 @@ async function assertDashboardShell(cdp) {
       topbar: visible(document.querySelector(".topbar")),
       sidebar: visible(document.querySelector(".dashboard-sidebar")),
       navCount: navLinks.length,
+      navKeys: navLinks.map((link) => link.dataset.nav).join(","),
       activeLinkCount: navLinks.filter((link) => link.classList.contains("active")
         && link.getAttribute("aria-current") === "page").length,
       activePageCount: document.querySelectorAll(
@@ -1402,7 +1403,8 @@ async function assertDashboardShell(cdp) {
   })()`);
   if (snapshot?.topbar !== true
       || snapshot?.sidebar !== true
-      || snapshot?.navCount !== 5
+      || snapshot?.navCount !== 7
+      || snapshot?.navKeys !== "overview,weekly,trends,performance,method,projects,community"
       || snapshot?.activeLinkCount !== 1
       || snapshot?.activePageCount !== 1
       || snapshot?.refresh !== true
