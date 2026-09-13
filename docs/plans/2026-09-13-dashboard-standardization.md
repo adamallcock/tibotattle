@@ -131,3 +131,12 @@ at 900px, and no horizontal overflow. Setup was checked collapsed and expanded.
 Captures and content-free layout measurements are `.release-build/refined-header-*`.
 The real-history snapshot QA retains the existing accounting-parity gate; these
 screenshots qualify this visual refinement, not full release readiness.
+
+## Narrow navigation and progress counters
+
+Corrected horizontal navigation links inheriting sidebar width: 100%, delayed
+sidebar collapse to 900px, and delayed header wrapping to 760px. Intermediate
+widths compact the brand and redundant state pill. Progress count and timer
+use intrinsic non-clipping tracks; only the phase label can truncate. Quota
+headline type scales with card width to avoid premature word wrapping.
+Validation includes active refresh counters and responsive packaged screenshots.

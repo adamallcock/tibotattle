@@ -2745,6 +2745,17 @@ footer p { margin: 0; }
 @media (max-width: 1050px) {
   .topbar { grid-template-columns: auto 1fr; padding-inline: 24px; }
   .top-actions { justify-self: end; }
+  .metric-grid { grid-template-columns: 1fr 1fr; }
+  /* Only stretch a trailing card that would otherwise sit half-width alone on
+     its own row. `:last-child` on its own also stretched the second of two
+     cards, which is why the Spark allowance rendered double the width of the
+     primary allowance beside it at this breakpoint. In a two-column grid the
+     last child is alone exactly when its position is odd. The accounting grid
+     also contains a full-width disclosure, so child parity is not card parity. */
+  .metric-grid:not(.accounting-summary) > :last-child:nth-child(odd) { grid-column: 1 / -1; }
+}
+
+@media (max-width: 900px) {
   .dashboard-shell { display: block; min-height: 0; }
   .dashboard-sidebar {
     position: static;
@@ -2759,15 +2770,7 @@ footer p { margin: 0; }
     overflow-x: auto;
     scrollbar-width: thin;
   }
-  .primary-nav a { flex: 0 0 auto; }
-  .metric-grid { grid-template-columns: 1fr 1fr; }
-  /* Only stretch a trailing card that would otherwise sit half-width alone on
-     its own row. `:last-child` on its own also stretched the second of two
-     cards, which is why the Spark allowance rendered double the width of the
-     primary allowance beside it at this breakpoint. In a two-column grid the
-     last child is alone exactly when its position is odd. The accounting grid
-     also contains a full-width disclosure, so child parity is not card parity. */
-  .metric-grid:not(.accounting-summary) > :last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .primary-nav a { flex: 0 0 auto; width: auto; white-space: nowrap; }
 }
 
 @media (max-width: 760px) {
@@ -5098,9 +5101,9 @@ body:not(.community-site) > .topbar {
 /* The date explanation is also available by keyboard or click/tap. */
 .reporting-period-details:not([open]) > p { display: none; }
 
-body:not(.community-site) > .topbar #refresh-button.refresh-progress { width: clamp(180px, calc(100vw - 850px), 320px); min-width: 180px; grid-template-columns: minmax(0, 1fr) 8ch 5ch; }
+body:not(.community-site) > .topbar #refresh-button.refresh-progress { width: clamp(250px, calc(100vw - 750px), 360px); min-width: 250px; grid-template-columns: minmax(0, 1fr) max-content max-content; }
 body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { grid-template-columns: auto minmax(0, 1fr); }
-@media (max-width: 1000px) {
+@media (max-width: 760px) {
   body:not(.community-site) > .topbar { grid-template-columns: auto minmax(0, 1fr); gap: 8px 16px; padding-block: 10px; }
   .reporting-period-toolbar { grid-row: 2; grid-column: 1 / -1; }
   body:not(.community-site) > .topbar .top-actions { grid-column: 2; grid-row: 1; }
@@ -5510,3 +5513,15 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
 @media (max-width: 760px) {
   .topbar .button.icon-button { display: inline-flex; }
 }
+
+/* Counters are evidence: only the descriptive phase may truncate. */
+.refresh-progress-count, .refresh-progress-time { overflow: visible; text-overflow: clip; white-space: nowrap; }
+@media (min-width: 761px) and (max-width: 1100px) {
+  body:not(.community-site) > .topbar .brand > span { display: none; }
+}
+@media (min-width: 761px) and (max-width: 950px) {
+  body:not(.community-site) > .topbar #global-state { display: none; }
+}
+#quota-cards > .metric-card { container-type: inline-size; }
+#quota-cards .metric-value { font-size: clamp(1.5rem, 10cqi, 2.7rem); line-height: 1.1; }
+#quota-cards .quota-card-spark .metric-value { font-size: clamp(1.4rem, 9cqi, 1.9rem); }
