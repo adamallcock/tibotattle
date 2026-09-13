@@ -106,10 +106,11 @@ test('bounded periods preserve the complete requested domain and empty all-time 
 // A small DOM harness models the important browser behavior here: replacing a
 // focused descendant drops focus, so rendering must focus its new equivalent.
 function focusHarness() {
-  let inactive = true, visibilityObserver = null, nextTimer = 0;
+  let inactive = true, visibilityObserver = null, documentVisibilityObserver = null, nextTimer = 0;
   const timers = new Map();
   const documentRef = { activeElement: null, hidden: false,
-    addEventListener() {}, removeEventListener() {} };
+    addEventListener: (type, listener) => { if (type === 'visibilitychange') documentVisibilityObserver = listener; },
+    removeEventListener: (type, listener) => { if (type === 'visibilitychange' && documentVisibilityObserver === listener) documentVisibilityObserver = null; } };
   class Node {
     constructor(tagName) {
       this.tagName = tagName; this.ownerDocument = documentRef; this.children = [];
@@ -143,7 +144,8 @@ function focusHarness() {
   return { root, documentRef, windowRef, show: () => { inactive = false; },
     navigate: (shown) => { inactive = !shown; visibilityObserver?.(); },
     find: key => root.all().find(node => node.dataset.performanceFocus === key),
-    timerIds: () => [...timers.keys()], runTimer: id => timers.get(id)?.() };
+    timerIds: () => [...timers.keys()], runTimer: id => timers.get(id)?.(),
+    setDocumentHidden: hidden => { documentRef.hidden = hidden; documentVisibilityObserver?.(); } };
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const periodPayload = (period, overrides = {}) => ({ ...payload(), ...overrides, period });
@@ -335,6 +337,71 @@ test('first visible load prioritizes the selected period and warms the other two
   controller.destroy();
 });
 
+test('page preload warms all periods before first visit and remains idempotent', async () => {
+  const dom = focusHarness();
+  const { calls, client } = performanceClient(period => periodPayload(period));
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  const first = controller.preload();
+  assert.equal(controller.preload(), first, 'a concurrent preload joins the existing operation');
+  await first; await settle();
+  assert.deepEqual(calls.map(call => call.period), ['all', '7', '30']);
+  assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'), 'selected data is ready before navigation');
+  await controller.preload();
+  assert.deepEqual(calls.map(call => call.period), ['all', '7', '30'], 'fresh periods are not fetched again');
+  controller.destroy();
+});
+
+test('page preload retries a cold loading response with a bounded retry', async () => {
+  const dom = focusHarness();
+  let attempts = 0;
+  const { calls, client } = performanceClient(period => period === 'all' && attempts++ === 0
+    ? periodPayload('all', { status: 'loading', models: [] }) : periodPayload(period));
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  const operation = controller.preload();
+  await settle();
+  assert.deepEqual(calls.map(call => call.period), ['all']);
+  const retry = dom.timerIds()[0];
+  assert.ok(retry, 'loading response schedules a retry');
+  dom.runTimer(retry);
+  await operation; await settle();
+  assert.deepEqual(calls.map(call => call.period), ['all', 'all', '7', '30']);
+  controller.destroy();
+});
+
+test('active navigation joins an in-flight page preload without duplicating the request', async () => {
+  const dom = focusHarness(), all = Promise.withResolvers();
+  const { calls, client } = performanceClient(period => period === 'all' ? all.promise : periodPayload(period));
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  const preparation = controller.preload(); await settle();
+  dom.navigate(true);
+  const navigation = controller.refresh(); await settle();
+  assert.equal(calls.filter(call => call.period === 'all').length, 1, 'foreground refresh joins speculative work');
+  all.resolve(periodPayload('all'));
+  await Promise.all([preparation, navigation]); await settle();
+  assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
+  controller.destroy();
+});
+
+test('document hiding fences preload and allows a later visible retry', async () => {
+  const dom = focusHarness(), first = Promise.withResolvers();
+  let attempts = 0;
+  const { calls, client } = performanceClient(period => period === 'all' && attempts++ === 0
+    ? first.promise : periodPayload(period));
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  const canceled = controller.preload(); await settle();
+  assert.equal(calls.length, 1);
+  dom.setDocumentHidden(true);
+  assert.equal(calls[0].options.signal.aborted, true, 'document hiding aborts speculative work');
+  await controller.preload();
+  assert.equal(calls.length, 1, 'a hidden document does not start speculative work');
+  first.resolve(periodPayload('all')); await canceled; await settle();
+  assert.equal(dom.root.all().some(node => node.id === 'performance-model-panel'), false, 'late hidden data is fenced');
+  dom.setDocumentHidden(false);
+  await controller.preload(); await settle();
+  assert.deepEqual(calls.map(call => call.period), ['all', 'all', '7', '30']);
+  controller.destroy();
+});
+
 test('a warmed period switches synchronously while its replacement revalidates in the background', async () => {
   const dom = focusHarness(), replacement = Promise.withResolvers();
   let blockReplacement = false;
@@ -456,6 +523,28 @@ test('scope unavailability invalidates every period cache', async () => {
     await settle();
   } finally { Date.now = originalNow; }
   assert.ok(calls.some(call => call.period === '7'));
+  controller.destroy();
+});
+
+test('scope unavailability withdraws the selected chart while the page is inactive', async () => {
+  const dom = focusHarness();
+  let unavailable = false;
+  const { client } = performanceClient(period => period === '7' && unavailable
+    ? periodPayload('7', { status: 'unavailable', models: [] })
+    : periodPayload(period));
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh(); await settle(); await settle();
+  assert.ok(dom.root.all().some(node => node.id === 'performance-model-panel'));
+  dom.navigate(false);
+  const originalNow = Date.now, expiredAt = originalNow() + 61_000;
+  Date.now = () => expiredAt;
+  try {
+    unavailable = true;
+    await controller.preload();
+    await settle();
+    assert.equal(dom.root.all().some(node => node.id === 'performance-model-panel'), false,
+      'an unavailable sibling cannot leave a stale chart for the first visit');
+  } finally { Date.now = originalNow; }
   controller.destroy();
 });
 

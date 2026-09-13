@@ -1,6 +1,7 @@
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
 import { mountModelPerformance } from "./model-performance.js";
+import { createDashboardReportPreloader } from "./dashboard-report-preload.js";
 import {
   CommunityClient,
   isPrimaryCodexQuotaWindow,
@@ -11949,6 +11950,7 @@ async function loadLocalDashboard() {
     renderLocalOnboarding(localOnboarding);
     markLocalDashboardReady();
     primaryAvailable = true;
+    dashboardReportPreloader.schedule();
   } catch {
     if (!isCurrent()) return;
     dashboard = null;
@@ -12011,6 +12013,7 @@ async function loadQuickResultDashboard() {
     if (!isCurrent()) return;
     renderDashboard(data);
     renderLocalOnboarding(localOnboarding);
+    dashboardReportPreloader.schedule();
   } finally {
     // This generation replaces any pending startup reads too. Keep optional
     // recovery alive without making native evidence reloads wait for it.
@@ -15919,12 +15922,13 @@ document.addEventListener("scroll", () => {
   if (current) positionInformationPopover(current.popover, current.button);
 }, true);
 
-mountWorkUsageView({ root: document.querySelector("#projects"), t });
+const workUsage = mountWorkUsageView({ root: document.querySelector("#projects"), t });
 const modelPerformance = mountModelPerformance({
   root: document.querySelector("#performance"), client: localClient,
   t, locale: () => localization.formatLocale(),
 });
 window.addEventListener("tibotattle:locale-change", () => modelPerformance.render());
+const dashboardReportPreloader = createDashboardReportPreloader({ reports: [workUsage, modelPerformance] });
 
 mountDashboardNavigation({
   documentRef: document,

@@ -216,9 +216,18 @@ export function mountWorkUsageView({
   let periodPreloadTimer = null;
   let periodPreloadController = null;
   let periodPreloadSerial = 0;
+  let periodPreloadInFlight = null;
+  let periodPreloadAllowInactive = false;
+  let loadInFlight = null;
+  let loadInFlightKey = null;
+  let loadInFlightBackground = false;
+  let foregroundLoadQueued = false;
+  let preloadInFlight = null;
+  let needsLeaseValidation = false;
   const scheduleLease = windowRef.setTimeout?.bind(windowRef) ?? setTimeout;
   const clearLeaseTimer = windowRef.clearTimeout?.bind(windowRef) ?? clearTimeout;
   const visible = () => !destroyed && !root.inert && documentRef.visibilityState !== "hidden";
+  const documentVisible = () => !destroyed && documentRef.visibilityState !== "hidden";
 
   function generationKey(value) {
     const generation = value?.generation;
@@ -278,6 +287,8 @@ export function mountWorkUsageView({
     periodPreloadSerial += 1;
     periodPreloadController?.abort();
     periodPreloadController = null;
+    periodPreloadInFlight = null;
+    periodPreloadAllowInactive = false;
   }
 
   function delayPeriodPreload(milliseconds, signal) {
@@ -381,9 +392,10 @@ export function mountWorkUsageView({
     return { result: null, invalidated: false };
   }
 
-  async function preloadPeriods() {
-    if (!visible() || statusKey !== "snapshot" || !liveAnchor || !stableAnchor(liveAnchor)
-        || !response || query.cursor) return;
+  async function runPeriodPreload({ allowInactive = false } = {}) {
+    const canRun = allowInactive ? documentVisible() : visible();
+    if (!canRun || statusKey !== "snapshot" || !liveAnchor || !stableAnchor(liveAnchor)
+        || !response || query.cursor) return false;
     const token = ++periodPreloadSerial;
     const anchor = { ...liveAnchor };
     const familyKey = queryFamilyKey();
@@ -396,7 +408,8 @@ export function mountWorkUsageView({
     periodPreloadController = controllerRef;
     try {
       for (const periodId of PERIOD_IDS) {
-        if (token !== periodPreloadSerial || !visible() || !liveAnchor
+        const stillVisible = allowInactive ? documentVisible() : visible();
+        if (token !== periodPreloadSerial || !stillVisible || !liveAnchor
             || liveAnchor.snapshotId !== anchor.snapshotId
             || queryFamilyKey() !== familyKey) return;
         if (periodCache.has(periodId)) continue;
@@ -427,6 +440,22 @@ export function mountWorkUsageView({
     } finally {
       if (periodPreloadController === controllerRef) periodPreloadController = null;
     }
+    return true;
+  }
+
+  function preloadPeriods(options = {}) {
+    const allowInactive = options.allowInactive === true;
+    if (periodPreloadInFlight) {
+      if (!allowInactive || periodPreloadAllowInactive) return periodPreloadInFlight;
+      stopPeriodPreload();
+    }
+    const promise = runPeriodPreload(options);
+    const tracked = promise.finally(() => {
+      if (periodPreloadInFlight === tracked) periodPreloadInFlight = null;
+    });
+    periodPreloadInFlight = tracked;
+    periodPreloadAllowInactive = allowInactive;
+    return tracked;
   }
 
   function schedulePeriodPreload() {
@@ -727,7 +756,7 @@ export function mountWorkUsageView({
     delete query.sourceSnapshotId;
     if (typeof sourceSnapshotId === "string") query.sourceSnapshotId = sourceSnapshotId;
     resetPage();
-    load();
+    load(true, { force: true });
   }
   function descend(row, grouping = null) {
     ancestors.push({
@@ -1308,7 +1337,50 @@ export function mountWorkUsageView({
     focusTarget?.focus();
     pendingFocus = null;
   }
-  async function load(recoverExpired = true) {
+  function load(recoverExpired = true, options = {}) {
+    const background = options.background === true;
+    const force = options.force === true;
+    if (force) foregroundLoadQueued = false;
+    if (loadInFlight && !force) {
+      if (loadInFlightKey === queryKey() && !background && loadInFlightBackground) {
+        foregroundLoadQueued = true;
+        const current = loadInFlight;
+        return current.then(() => {
+          if (!foregroundLoadQueued || destroyed) return undefined;
+          foregroundLoadQueued = false;
+          return load(recoverExpired);
+        });
+      }
+      if (loadInFlightKey === queryKey()) return loadInFlight;
+      serial++;
+      controller?.abort();
+      clearTimeout(timer);
+      timer = null;
+      loadInFlight = null;
+      loadInFlightKey = null;
+      loadInFlightBackground = false;
+      foregroundLoadQueued = false;
+    }
+    const promise = performLoad(recoverExpired, { background, preparingAttempt: 0 });
+    const key = queryKey();
+    let tracked;
+    tracked = promise.finally(() => {
+      if (loadInFlight === tracked) {
+        loadInFlight = null;
+        loadInFlightKey = null;
+        loadInFlightBackground = false;
+      }
+    });
+    loadInFlight = tracked;
+    loadInFlightKey = key;
+    loadInFlightBackground = background;
+    return tracked;
+  }
+
+  async function performLoad(
+    recoverExpired = true,
+    { background = false, preparingAttempt = 0 } = {},
+  ) {
     if (destroyed || composing) return;
     clearSearchTimer();
     if (searchPending) {
@@ -1333,6 +1405,7 @@ export function mountWorkUsageView({
     controller?.abort();
     clearTimeout(timer);
     controller = new AbortController();
+    const loadController = controller;
     setStatus("preparing");
     body.inert = true;
     // Keep the exact query's previous report visible during revalidation, but
@@ -1352,19 +1425,39 @@ export function mountWorkUsageView({
       b.setAttribute("aria-pressed", String(b.dataset.period === query.period));
     sort.control.value = query.sort;
     try {
-      const http = await fetchRef("/api/local/work-usage/query", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-usage-monitor-local": "1",
-        },
-        cache: "no-store",
-        body: JSON.stringify(query),
-        signal: controller.signal,
-      });
+      const requestController = background ? new AbortController() : loadController;
+      const requestSignal = requestController.signal;
+      const forwardAbort = background ? () => requestController.abort() : null;
+      const requestTimer = background
+        ? scheduleLease(() => requestController.abort(), PRELOAD_REQUEST_TIMEOUT_MS)
+        : null;
+      requestTimer?.unref?.();
+      if (forwardAbort) loadController.signal.addEventListener("abort", forwardAbort, { once: true });
+      let http;
+      let payload = null;
+      try {
+        http = await fetchRef("/api/local/work-usage/query", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-usage-monitor-local": "1",
+          },
+          cache: "no-store",
+          body: JSON.stringify(query),
+          signal: requestSignal,
+        });
+        if (requestSignal.aborted)
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        if (http.status === 409 || http.ok) payload = await http.json();
+        if (requestSignal.aborted)
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      } finally {
+        clearLeaseTimer(requestTimer);
+        if (forwardAbort) loadController.signal.removeEventListener("abort", forwardAbort);
+      }
       if (token !== serial) return;
       if (!http.ok && http.status === 409 && recoverExpired) {
-        const error = await http.json();
+        const error = payload;
         if (token !== serial) return;
         if (error.error?.code === "work_usage_snapshot_expired") {
           liveAnchor = null;
@@ -1372,7 +1465,7 @@ export function mountWorkUsageView({
           delete query.snapshotId;
           delete query.sourceSnapshotId;
           resetPage();
-          return load(false);
+          return performLoad(false, { background, preparingAttempt: 0 });
         }
       }
       if (!http.ok) {
@@ -1385,12 +1478,23 @@ export function mountWorkUsageView({
         }
         throw new Error(http.status === 409 ? "expired" : "unavailable");
       }
-      const result = validateWorkUsageResponse(await http.json());
+      const result = validateWorkUsageResponse(payload);
       if (token !== serial) return;
       query.snapshotId = result.snapshotId;
       delete query.sourceSnapshotId;
       if (result.status === "preparing") {
-        timer = setTimeout(() => load(recoverExpired), PREPARING_POLL_DELAY_MS);
+        if (background) {
+          if (preparingAttempt >= MAX_PREPARING_POLLS) return;
+          await delayPeriodPreload(PREPARING_POLL_DELAY_MS, loadController.signal);
+          return performLoad(recoverExpired, {
+            background,
+            preparingAttempt: preparingAttempt + 1,
+          });
+        }
+        timer = setTimeout(
+          () => load(recoverExpired, { background }),
+          PREPARING_POLL_DELAY_MS,
+        );
         return;
       }
       if (result.status !== "available") {
@@ -1436,10 +1540,18 @@ export function mountWorkUsageView({
       scope.control.value = result.scope;
       scope.wrapper.hidden = result.scopes.length < 2;
       body.hidden = false;
-      body.inert = false;
+      const retainForInactive = !visible() && (background || needsLeaseValidation);
+      if (retainForInactive) needsLeaseValidation = true;
+      else needsLeaseValidation = false;
+      body.inert = retainForInactive;
       render();
-      queueLease();
-      schedulePeriodPreload();
+      if (retainForInactive) {
+        stopLease();
+        stopPeriodPreload();
+      } else {
+        queueLease();
+        schedulePeriodPreload();
+      }
     } catch (error) {
       if (token !== serial || error.name === "AbortError") return;
       setStatus(error.message === "expired" ? "expired" : "unavailable");
@@ -1453,13 +1565,55 @@ export function mountWorkUsageView({
       }
     }
   }
+
+  function preload() {
+    if (preloadInFlight) return preloadInFlight;
+    if (!documentVisible()) return Promise.resolve(false);
+    if (!visible()) {
+      needsLeaseValidation = true;
+      body.inert = true;
+    }
+    const operation = (async () => {
+      if (statusKey !== "snapshot" || !response || !liveAnchor)
+        await load(true, { background: true });
+      if (!documentVisible() || !response || statusKey !== "snapshot" || !liveAnchor)
+        return false;
+      if (!visible()) {
+        needsLeaseValidation = true;
+        body.inert = true;
+      } else if (needsLeaseValidation) {
+        await load();
+        if (!documentVisible() || statusKey !== "snapshot" || !response || !liveAnchor)
+          return false;
+      }
+      await preloadPeriods({ allowInactive: true });
+      return PERIOD_IDS.every((periodId) => periodCache.has(periodId));
+    })();
+    const tracked = operation.finally(() => {
+      if (preloadInFlight === tracked) preloadInFlight = null;
+    });
+    preloadInFlight = tracked;
+    return tracked;
+  }
+
   function visibilityChanged() {
     stopLease();
-    if (!visible()) {
+    if (!documentVisible()) {
       stopPeriodPreload();
+      foregroundLoadQueued = false;
+      if (loadInFlightBackground) {
+        serial++;
+        controller?.abort();
+        clearTimeout(timer);
+        timer = null;
+      }
       return;
     }
-    if (!started) load();
+    if (!visible()) {
+      if (!periodPreloadAllowInactive) stopPeriodPreload();
+      return;
+    }
+    if (!started || !response || responseQueryKey !== queryKey() || needsLeaseValidation) load();
     else {
       keepReportAlive();
       schedulePeriodPreload();
@@ -1511,6 +1665,7 @@ export function mountWorkUsageView({
   windowRef.addEventListener("tibotattle:locale-change", relocalize);
   return {
     refresh,
+    preload,
     destroy() {
       destroyed = true;
       clearSearchTimer();

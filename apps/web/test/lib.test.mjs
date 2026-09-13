@@ -5203,6 +5203,9 @@ async function createDashboardStartupHarness({
     document: { documentElement: { dataset: {} } },
     cacheDropThreadLinks: { loadToken: 0 },
     activeLocalDashboardLoad: null,
+    dashboardReportPreloader: {
+      schedule() { state.events.push(["preload-reports"]); },
+    },
     localActionBusy: initialBusy,
     localRefreshInProgress: false,
     electronStartupRefreshDeferred: false,
@@ -5319,6 +5322,10 @@ test("primary startup renders and releases busy state while optional reads remai
         await settleDashboardStartupTasks();
         assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
         assert.equal(harness.context.dashboard.marker, "primary");
+        assert.deepEqual(harness.state.events.filter(([kind]) =>
+          kind === "primary" || kind === "preload-reports"),
+        [["primary", "primary"], ["preload-reports"]],
+        "report preparation is scheduled only after the primary render");
         assert.equal(harness.state.journey, "local-ready",
           "real evidence must not remain hidden by first-run while onboarding waits");
         assert.equal(completed, true, "only the primary result owns the dashboard load promise");
@@ -5346,6 +5353,7 @@ test("primary startup failure renders unavailable without waiting on optional re
     assert.equal(harness.state.primaryReads, 2, "the existing single retry is retained");
     assert.equal(harness.context.dashboard, null);
     assert.equal(harness.state.events.filter(([kind]) => kind === "primary").length, 0);
+    assert.equal(harness.state.events.filter(([kind]) => kind === "preload-reports").length, 0);
     assert.deepEqual(harness.state.events.filter(([kind]) => kind === "unavailable"), [
       ["unavailable", "companion-unavailable"],
     ]);

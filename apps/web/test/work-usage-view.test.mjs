@@ -1683,3 +1683,151 @@ test("unknown generation evidence prevents speculative period requests", async (
   assert.equal(calls, 1);
   assert.equal([...harness.timers.values()].some(timer => timer.delay === 250), false);
 });
+
+test("preload prepares an inactive page and validates its selected lease on first visit", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root } = harness;
+  root.inert = true;
+  const selected = warmReport("selected", "Selected report");
+  const warmed = {
+    "24h": warmReport("warm-24h", "24 hour report"),
+    "30d": warmReport("warm-30d", "30 day report"),
+    all: warmReport("warm-all", "All time report"),
+  };
+  const calls = [];
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      if (query.sourceSnapshotId) return httpResponse(warmed[query.period]);
+      return httpResponse(selected);
+    },
+  });
+  t.after(() => view.destroy());
+
+  const preload = view.preload();
+  assert.strictEqual(view.preload(), preload, "concurrent startup calls share one promise");
+  assert.equal(await preload, true);
+  assert.deepEqual(calls.map((query) => query.period), ["7d", "24h", "30d", "all"]);
+  assert.equal(calls[0].snapshotId, undefined);
+  assert.ok(calls.slice(1).every((query) => query.sourceSnapshotId === selected.snapshotId));
+  assert.equal(root.children.at(-1).inert, true);
+  assert.match(root.textContent, /Selected report/u);
+
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.equal(calls.length, 5);
+  assert.equal(calls.at(-1).snapshotId, selected.snapshotId);
+  assert.equal(calls.at(-1).sourceSnapshotId, undefined);
+  assert.equal(root.children.at(-1).inert, false);
+});
+
+test("a cold preload retries after a hidden-start failure when the page becomes active", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root } = harness;
+  root.inert = true;
+  let attempts = 0;
+  const calls = [];
+  const selected = warmReport("selected", "Recovered selected report");
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      if (attempts++ === 0) throw new Error("temporary startup failure");
+      if (query.sourceSnapshotId) return httpResponse(warmReport(`warm-${query.period}`, query.period));
+      return httpResponse(selected);
+    },
+  });
+  t.after(() => view.destroy());
+
+  assert.equal(await view.preload(), false);
+  assert.equal(calls.length, 1);
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.ok(calls.length >= 2);
+  assert.equal(calls[1].snapshotId, undefined);
+  assert.match(root.textContent, /Recovered selected report/u);
+  assert.equal(root.children.at(-1).inert, false);
+});
+
+test("preload resumes a preparing report after document hiding cancels its response body", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, documentRef } = harness;
+  root.inert = true;
+  const preparing = {
+    schemaVersion: WORK_USAGE_SCHEMA,
+    status: "preparing",
+    snapshotId: "selected-preparing",
+  };
+  const selected = warmReport("selected", "Selected after retry");
+  const warmed = {
+    "24h": warmReport("warm-24h", "24 hour report"),
+    "30d": warmReport("warm-30d", "30 day report"),
+    all: warmReport("warm-all", "All time report"),
+  };
+  const calls = [];
+  const selectedBody = deferred();
+  let selectedPollSignal = null;
+  let phase = "initial";
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body);
+      calls.push(query);
+      if (query.sourceSnapshotId) return httpResponse(warmed[query.period]);
+      if (query.snapshotId === "selected-preparing") {
+        if (phase === "poll") {
+          phase = "poll-body";
+          selectedPollSignal = init.signal;
+          return { ok: true, status: 200, json: () => selectedBody.promise };
+        }
+        return httpResponse(selected);
+      }
+      if (!query.snapshotId) {
+        if (phase === "initial") {
+          phase = "poll";
+          return httpResponse(preparing);
+        }
+        return httpResponse(selected);
+      }
+      if (query.snapshotId === selected.snapshotId) return httpResponse(selected);
+      throw new Error(`unexpected preload query: ${JSON.stringify(query)}`);
+    },
+  });
+  t.after(() => view.destroy());
+
+  const first = view.preload();
+  await settleMountedView();
+  assert.deepEqual(calls.map((query) => query.period), ["7d"]);
+  assert.equal(calls[0].snapshotId, undefined);
+  assert.ok([...harness.timers.values()].some((timer) => timer.delay === 750));
+
+  harness.runTimer(750);
+  await settleMountedView();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].snapshotId, preparing.snapshotId);
+  assert.ok(selectedPollSignal);
+
+  documentRef.visibilityState = "hidden";
+  harness.dispatch(documentRef, "visibilitychange");
+  assert.equal(selectedPollSignal.aborted, true);
+  selectedBody.resolve(httpResponse(selected));
+  assert.equal(await first, false);
+  await settleMountedView();
+  assert.equal(calls.length, 2, "cancellation stops fan-out to speculative periods");
+
+  phase = "resume";
+  documentRef.visibilityState = "visible";
+  harness.dispatch(documentRef, "visibilitychange");
+  assert.equal(await view.preload(), true);
+  assert.deepEqual(calls.map((query) => query.period), [
+    "7d", "7d", "7d", "24h", "30d", "all",
+  ]);
+  assert.equal(root.children.at(-1).inert, true);
+  assert.match(root.textContent, /Selected after retry/u);
+
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.equal(root.children.at(-1).inert, false);
+  assert.equal(calls.at(-1).snapshotId, selected.snapshotId);
+});
