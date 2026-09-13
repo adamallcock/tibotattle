@@ -1,62 +1,8 @@
 import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
+import { addUsdStrings } from "@app-usagemonitor/accounting";
 
 const SCHEMA_VERSION = "weekly-calibration-v0.2";
 const WEEKLY_WINDOW_MINS = SEVEN_DAY_WINDOW_MINUTES;
-
-// Reporting owns this small runtime-neutral decimal helper so its projections
-// do not cross into the accounting owner just to aggregate provenance totals.
-function normalizeDecimal(value, label) {
-  if (typeof value === "number" && !Number.isFinite(value)) {
-    throw new TypeError(`${label} must be finite`);
-  }
-  const input = String(value ?? "").trim();
-  if (!input) throw new TypeError(`${label} must be a non-negative decimal`);
-  const match = input.match(/^\+?(\d+)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/u);
-  if (!match) throw new TypeError(`${label} must be a non-negative decimal`);
-  const exponent = Number(match[3] ?? 0);
-  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 1_000) {
-    throw new TypeError(`${label} exponent is too large`);
-  }
-  let digits = `${match[1]}${match[2] ?? ""}`;
-  let scale = (match[2] ?? "").length - exponent;
-  if (!Number.isSafeInteger(scale) || Math.abs(scale) > 1_000) {
-    throw new TypeError(`${label} precision is too large`);
-  }
-  digits = digits.replace(/^0+(?=\d)/u, "");
-  if (scale < 0) {
-    digits += "0".repeat(-scale);
-    scale = 0;
-  }
-  while (scale > 0 && digits.endsWith("0")) {
-    digits = digits.slice(0, -1);
-    scale -= 1;
-  }
-  if (!digits || /^0+$/u.test(digits)) return "0";
-  if (scale === 0) return digits;
-  if (digits.length <= scale) return `0.${"0".repeat(scale - digits.length)}${digits}`;
-  return `${digits.slice(0, -scale)}.${digits.slice(-scale)}`;
-}
-
-function decimalParts(value) {
-  const normalized = normalizeDecimal(value, "decimal");
-  const [whole, fraction = ""] = normalized.split(".");
-  return { value: BigInt(`${whole}${fraction}`), scale: fraction.length };
-}
-
-function addUsdStrings(...values) {
-  return values.reduce((total, value) => {
-    const left = decimalParts(total);
-    const right = decimalParts(value);
-    const scale = Math.max(left.scale, right.scale);
-    const sum = left.value * (10n ** BigInt(scale - left.scale))
-      + right.value * (10n ** BigInt(scale - right.scale));
-    const digits = sum.toString().padStart(scale + 1, "0");
-    return normalizeDecimal(
-      scale === 0 ? digits : `${digits.slice(0, -scale)}.${digits.slice(-scale)}`,
-      "sum",
-    );
-  }, "0");
-}
 
 const FROZEN_BASELINE = {
   id: "weekly-calibration-2026-07-24-v0.1",

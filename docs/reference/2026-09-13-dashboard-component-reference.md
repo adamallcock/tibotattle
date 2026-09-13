@@ -101,11 +101,13 @@ observation retains its own recency. Known old observations use a timestamp
 label and card qualifiers without a repeated generic banner. Other stale
 notices use a compact inline warning; accounting qualifications remain explicit.
 
-Allowance cards align their title/source, value, progress and metadata rows
-with a shared subgrid. Source chips sit below titles. Reset and observed times
-share a bordered footer. Spark remains a separate blue limit and retains its
-ordering. Stale cards include an Out of date label; unavailable percentages
-have no progress bar. The percentage scale is consistent across pools.
+Allowance cards retain the separately integrated tank design: pool identity
+and period above the level, remaining percentage and reset below. Codex leads;
+Spark retains its own name and icon, with its five-hour pool before seven-day.
+Stale observations remain labelled, and unknown percentages have no liquid fill.
+Observation timestamps appear when stale or different from the shared timestamp.
+The percentage scale is consistent across pools. Motion follows the system
+preference and the local pause control; the text remains accessible without it.
 
 ## Compact model-performance context
 
@@ -119,8 +121,8 @@ and partial-coverage styling, without duplicate coverage cards above the tabs.
 ## Projects and threads controls and states
 
 Grouping and search share a responsive toolbar with sort/model/scope and refresh.
-Progress and cancellation use one action row. Observation and coverage stay in
-inline metadata; the shared period is not repeated. Available empty reports
+Progress and cancellation use one action row. Coverage stays in inline metadata;
+the mapping-observation caption is omitted. The shared period is not repeated. Available empty reports
 show an empty/search-empty state without a blank table or summary metrics.
 Clearing search restores the report. Unavailable/expired reports retain their
 separate recovery behavior and incomplete coverage remains explicit.

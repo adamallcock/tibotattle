@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import {
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
+  WINDOWS_SOURCE_READ_CONTRACT, WINDOWS_SOURCE_READ_METHODS, WINDOWS_SOURCE_READ_APPROVED,
 } from "../src/platform/windows-filesystem.js";
 
 const require = createRequire(import.meta.url);
@@ -90,7 +91,15 @@ export function createWindowsFilesystemBindingManifest({ bytes, binding }) {
   if (native.productionSafe !== false || native.pathWalkRaceSafe !== false) {
     throw failure("WINDOWS_FILESYSTEM_MANIFEST_NATIVE_CLAIM_UNREVIEWED");
   }
+  const hasSourceRead = native.sourceReadContractVersion !== undefined;
+  if (hasSourceRead && (native.sourceReadContractVersion !== WINDOWS_SOURCE_READ_CONTRACT
+      || !WINDOWS_SOURCE_READ_METHODS.every(name => typeof native[name] === 'function'))) {
+    throw failure('WINDOWS_FILESYSTEM_MANIFEST_INVALID_SOURCE_READ');
+  }
   return Object.freeze({
+    ...(hasSourceRead ? { sourceRead: {
+      contractVersion: WINDOWS_SOURCE_READ_CONTRACT, approved: WINDOWS_SOURCE_READ_APPROVED,
+    } } : {}),
     schemaVersion: WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
     bindingFile: BINDING_FILE,
     platform: "win32",

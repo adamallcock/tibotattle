@@ -1055,6 +1055,68 @@ test("period switches reuse the available report anchor, polling drops it, and r
 });
 
 
+test("available period reports warm from one live anchor and switch through cached DTOs", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const anchoredResponse = (snapshotId, totalTokens) => {
+    const response = structuredClone(PROJECT_ROWS_RESPONSE);
+    response.snapshotId = snapshotId;
+    response.generation = { fingerprint: "generation-mounted" };
+    response.totals.tokens = totalTokens;
+    return response;
+  };
+  const initial = anchoredResponse("snapshot-mounted", 100);
+  const warmed = {
+    "24h": anchoredResponse("warm-24h", 200),
+    "30d": anchoredResponse("warm-30d", 300),
+    all: anchoredResponse("warm-all", 400),
+  };
+  const freshAll = anchoredResponse("fresh-all", 500);
+  const requests = [];
+  let freshAllNext = false;
+  const view = mountWorkUsageView({
+    root,
+    windowRef,
+    t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      if (body.action === "touch") return httpResponse({ status: "available" });
+      if (freshAllNext && body.period === "all") {
+        freshAllNext = false;
+        return httpResponse(freshAll);
+      }
+      if (!body.snapshotId && !body.sourceSnapshotId) return httpResponse(initial);
+      if (body.sourceSnapshotId === initial.snapshotId && warmed[body.period])
+        return httpResponse(warmed[body.period]);
+      throw new Error(`unexpected work-usage request for ${body.period}`);
+    },
+  });
+  t.after(() => view.destroy());
+
+  await settleMountedView();
+  assert.match(root.textContent, /100/u);
+  await harness.runTimer(250);
+  await settleMountedView();
+  const warmRequests = requests.filter((request) => request.sourceSnapshotId === initial.snapshotId);
+  assert.deepEqual(warmRequests.map((request) => request.period), ["24h", "30d", "all"]);
+  assert.ok(warmRequests.every((request) => request.snapshotId === undefined));
+
+  freshAllNext = true;
+  const body = root.children.at(-1);
+  findMounted(root, (node) => node.dataset?.period === "all")[0].click();
+  assert.equal(body.hidden, false, "the cached period remains readable while it revalidates");
+  assert.equal(body.inert, true, "cached controls stay disabled until the fresh report is ready");
+  assert.match(body.textContent, /400/u);
+  await settleMountedView();
+  assert.equal(requests.at(-1).period, "all");
+  assert.equal(requests.at(-1).sourceSnapshotId, initial.snapshotId);
+  assert.equal(requests.at(-1).snapshotId, undefined);
+  assert.match(body.textContent, /500/u);
+  assert.equal(body.inert, false);
+});
+
+
 test("assumptions stay distinct from missing data and the non-project bucket is localized", async () => {
   const response = structuredClone(PROJECT_ROWS_RESPONSE);
   response.rows[0].id = "non-project";
@@ -1649,4 +1711,311 @@ test("multi-page reports retain navigation and restore the first page", async ()
     assert.equal(calls.at(-1).cursor, undefined);
     assert.ok(pager().textContent.includes("1–25 of 27"));
   } finally { view.destroy(); }
+});
+
+function warmReport(id, name, generation = "stable-generation") {
+  const value = structuredClone(PROJECT_ROWS_RESPONSE);
+  value.snapshotId = id;
+  value.generation = { fingerprint: generation };
+  for (const display of Object.values(value.display)) display.name = name;
+  return value;
+}
+
+test("period warm-up defers hidden mounts and fences response bodies after cancellation or timeout", async (t) => {
+  for (const stop of ["hidden", "destroyed", "timeout", "filter"]) await t.test(stop, async () => {
+    const harness = mountedLeaseRoot();
+    const { root, documentRef } = harness;
+    documentRef.visibilityState = "hidden";
+    const held = deferred();
+    const calls = [];
+    let warmSignal;
+    const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+      fetchRef: async (_url, init) => {
+        const query = JSON.parse(init.body); calls.push(query);
+        if (query.sourceSnapshotId) {
+          warmSignal = init.signal;
+          return { ok: true, status: 200, json: () => held.promise };
+        }
+        return httpResponse(warmReport("selected", "Selected report"));
+      },
+    });
+    try {
+      assert.equal(calls.length, 0);
+      documentRef.visibilityState = "visible";
+      harness.dispatch(documentRef, "visibilitychange");
+      await settleMountedView();
+      harness.runTimer(250); await settleMountedView();
+      assert.equal(calls.length, 2);
+      if (stop === "hidden") { root.inert = true; harness.changed(); }
+      else if (stop === "destroyed") view.destroy();
+      else if (stop === "timeout") harness.runTimer(10_000);
+      else findMounted(root, n => n.dataset?.grouping === "thread")[0].click();
+      assert.equal(warmSignal.aborted, true);
+      const before = calls.length;
+      held.resolve(warmReport("late", "Late obsolete period"));
+      await settleMountedView();
+      assert.equal(calls.length, before, "an aborted warm-up cannot fan out to more periods");
+      assert.doesNotMatch(root.textContent, /Late obsolete period/);
+      if (stop === "destroyed") assert.equal(harness.timers.size, 0);
+    } finally { view.destroy(); }
+  });
+});
+
+test("background scope invalidation clears warmed periods and recovers through the foreground path", async (t) => {
+  for (const failure of ["denied", "expired", "generation"]) await t.test(failure, async () => {
+    const harness = mountedLeaseRoot();
+    const { root } = harness;
+    const recovery = deferred();
+    const calls = [];
+    let invalidated = false;
+    const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+      fetchRef: async (_url, init) => {
+        const query = JSON.parse(init.body); calls.push(query);
+        if (!query.sourceSnapshotId) return invalidated ? recovery.promise : httpResponse(warmReport("selected", "Selected report"));
+        if (query.period === "24h") return httpResponse(warmReport("warm-day", "Warmed day"));
+        invalidated = true;
+        if (failure === "denied") return { ok: false, status: 403, json: async () => ({}) };
+        if (failure === "expired") return { ok: false, status: 409, json: async () => ({ error: { code: "work_usage_snapshot_expired" } }) };
+        return httpResponse(warmReport("other-generation", "Other generation", "changed-generation"));
+      },
+    });
+    try {
+      await settleMountedView(); harness.runTimer(250); await settleMountedView();
+      assert.equal(calls.length, 4, "selected, two siblings, then one foreground recovery");
+      assert.equal(calls.at(-1).sourceSnapshotId, undefined);
+      assert.equal(calls.at(-1).snapshotId, undefined);
+      assert.equal(root.children.at(-1).inert, true);
+      findMounted(root, n => n.dataset?.period === "24h")[0].click();
+      assert.equal(root.children.at(-1).hidden, true, "invalidated warm data cannot be displayed on a switch");
+      assert.equal(calls.at(-1).sourceSnapshotId, undefined, "an invalidated display DTO cannot revive its old server handle");
+      recovery.resolve(httpResponse(warmReport("recovered", "Recovered report", "new-generation")));
+      await settleMountedView();
+      assert.match(root.textContent, /Recovered report/);
+      assert.equal(root.children.at(-1).inert, false);
+    } finally { view.destroy(); }
+  });
+});
+
+test("pagination never replaces a cached period's first page", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root } = harness;
+  const first = warmReport("selected", "First page projects");
+  first.nextCursor = "synthetic-next-page";
+  first.rowCount = 4;
+  const second = warmReport("selected", "Second page projects");
+  second.offset = 2;
+  second.rowCount = 4;
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body);
+      return httpResponse(query.cursor ? second : query.period === "7d" ? first : warmReport(`warm-${query.period}`, `Other ${query.period}`));
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView(); harness.runTimer(250); await settleMountedView();
+  findMounted(root, n => n.tagName === "BUTTON" && n.textContent === "Next").at(-1).click();
+  await settleMountedView();
+  assert.match(root.textContent, /Second page projects/);
+  findMounted(root, n => n.dataset?.period === "all")[0].click();
+  await settleMountedView();
+  findMounted(root, n => n.dataset?.period === "7d")[0].click();
+  const body = root.children.at(-1);
+  assert.equal(body.hidden, false);
+  assert.equal(body.inert, true);
+  assert.match(body.textContent, /First page projects/);
+  assert.doesNotMatch(body.textContent, /Second page projects/);
+});
+
+test("unknown generation evidence prevents speculative period requests", async (t) => {
+  const harness = mountedLeaseRoot(); let calls = 0;
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async () => { calls++; return httpResponse(PROJECT_ROWS_RESPONSE); },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  assert.equal(calls, 1);
+  assert.equal([...harness.timers.values()].some(timer => timer.delay === 250), false);
+});
+
+test("preload prepares an inactive page and validates its selected lease on first visit", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root } = harness;
+  root.inert = true;
+  const selected = warmReport("selected", "Selected report");
+  const warmed = {
+    "24h": warmReport("warm-24h", "24 hour report"),
+    "30d": warmReport("warm-30d", "30 day report"),
+    all: warmReport("warm-all", "All time report"),
+  };
+  const calls = [];
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      if (query.sourceSnapshotId) return httpResponse(warmed[query.period]);
+      return httpResponse(selected);
+    },
+  });
+  t.after(() => view.destroy());
+
+  const preload = view.preload();
+  assert.strictEqual(view.preload(), preload, "concurrent startup calls share one promise");
+  assert.equal(await preload, true);
+  assert.deepEqual(calls.map((query) => query.period), ["7d", "24h", "30d", "all"]);
+  assert.equal(calls[0].snapshotId, undefined);
+  assert.ok(calls.slice(1).every((query) => query.sourceSnapshotId === selected.snapshotId));
+  assert.equal(root.children.at(-1).inert, true);
+  assert.match(root.textContent, /Selected report/u);
+
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.equal(calls.length, 5);
+  assert.equal(calls.at(-1).snapshotId, selected.snapshotId);
+  assert.equal(calls.at(-1).sourceSnapshotId, undefined);
+  assert.equal(root.children.at(-1).inert, false);
+});
+
+test("a cold preload retries after a hidden-start failure when the page becomes active", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root } = harness;
+  root.inert = true;
+  let attempts = 0;
+  const calls = [];
+  const selected = warmReport("selected", "Recovered selected report");
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      if (attempts++ === 0) throw new Error("temporary startup failure");
+      if (query.sourceSnapshotId) return httpResponse(warmReport(`warm-${query.period}`, query.period));
+      return httpResponse(selected);
+    },
+  });
+  t.after(() => view.destroy());
+
+  assert.equal(await view.preload(), false);
+  assert.equal(calls.length, 1);
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.ok(calls.length >= 2);
+  assert.equal(calls[1].snapshotId, undefined);
+  assert.match(root.textContent, /Recovered selected report/u);
+  assert.equal(root.children.at(-1).inert, false);
+});
+
+test("preload resumes a preparing report after document hiding cancels its response body", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, documentRef } = harness;
+  root.inert = true;
+  const preparing = {
+    schemaVersion: WORK_USAGE_SCHEMA,
+    status: "preparing",
+    snapshotId: "selected-preparing",
+  };
+  const selected = warmReport("selected", "Selected after retry");
+  const warmed = {
+    "24h": warmReport("warm-24h", "24 hour report"),
+    "30d": warmReport("warm-30d", "30 day report"),
+    all: warmReport("warm-all", "All time report"),
+  };
+  const calls = [];
+  const selectedBody = deferred();
+  let selectedPollSignal = null;
+  let phase = "initial";
+  const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body);
+      calls.push(query);
+      if (query.sourceSnapshotId) return httpResponse(warmed[query.period]);
+      if (query.snapshotId === "selected-preparing") {
+        if (phase === "poll") {
+          phase = "poll-body";
+          selectedPollSignal = init.signal;
+          return { ok: true, status: 200, json: () => selectedBody.promise };
+        }
+        return httpResponse(selected);
+      }
+      if (!query.snapshotId) {
+        if (phase === "initial") {
+          phase = "poll";
+          return httpResponse(preparing);
+        }
+        return httpResponse(selected);
+      }
+      if (query.snapshotId === selected.snapshotId) return httpResponse(selected);
+      throw new Error(`unexpected preload query: ${JSON.stringify(query)}`);
+    },
+  });
+  t.after(() => view.destroy());
+
+  const first = view.preload();
+  await settleMountedView();
+  assert.deepEqual(calls.map((query) => query.period), ["7d"]);
+  assert.equal(calls[0].snapshotId, undefined);
+  assert.ok([...harness.timers.values()].some((timer) => timer.delay === 750));
+
+  harness.runTimer(750);
+  await settleMountedView();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].snapshotId, preparing.snapshotId);
+  assert.ok(selectedPollSignal);
+
+  documentRef.visibilityState = "hidden";
+  harness.dispatch(documentRef, "visibilitychange");
+  assert.equal(selectedPollSignal.aborted, true);
+  selectedBody.resolve(httpResponse(selected));
+  assert.equal(await first, false);
+  await settleMountedView();
+  assert.equal(calls.length, 2, "cancellation stops fan-out to speculative periods");
+
+  phase = "resume";
+  documentRef.visibilityState = "visible";
+  harness.dispatch(documentRef, "visibilitychange");
+  assert.equal(await view.preload(), true);
+  assert.deepEqual(calls.map((query) => query.period), [
+    "7d", "7d", "7d", "24h", "30d", "all",
+  ]);
+  assert.equal(root.children.at(-1).inert, true);
+  assert.match(root.textContent, /Selected after retry/u);
+
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.equal(root.children.at(-1).inert, false);
+  assert.equal(calls.at(-1).snapshotId, selected.snapshotId);
+});
+
+test("cold startup polls back off while retaining a fixed request budget", async (t) => {
+  for (const becomesReady of [true, false]) {
+    await t.test(becomesReady ? "late readiness warms every period" : "never-ready work stops", async (t) => {
+      const harness = mountedLeaseRoot();
+      harness.root.inert = true;
+      const calls = [];
+      const view = mountWorkUsageView({ ...harness, t: mountedTranslator,
+        fetchRef: async (_url, init) => {
+          const query = JSON.parse(init.body);
+          calls.push(query);
+          if (becomesReady && calls.length >= 10)
+            return httpResponse(warmReport(`ready-${query.period}`, "Ready report"));
+          return httpResponse({ schemaVersion: WORK_USAGE_SCHEMA, status: "preparing", snapshotId: "cold" });
+        },
+      });
+      t.after(() => view.destroy());
+      const preloading = view.preload();
+      await settleMountedView();
+      const delays = [750, 1500, 3000, 6000, ...Array(16).fill(10_000)];
+      for (const delay of delays.slice(0, becomesReady ? 9 : 20)) {
+        assert.ok([...harness.timers.values()].some(timer => timer.delay === delay));
+        harness.runTimer(delay);
+        await settleMountedView();
+      }
+      assert.equal(await preloading, becomesReady);
+      assert.equal(calls.length, becomesReady ? 13 : 21);
+      assert.equal(harness.timers.size, 0, "inactive startup has no endless poll");
+      if (becomesReady) {
+        assert.deepEqual(calls.slice(-3).map(query => query.period), ["24h", "30d", "all"]);
+        assert.match(harness.root.textContent, /Ready report/);
+      }
+    });
+  }
 });

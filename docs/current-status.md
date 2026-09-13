@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-13
 type: status
 status: current
-source_commit: 95d85557411b9f6acc470a78f7a8fea5d53d0c3e
+source_commit: 53abbbe19ac905abcab161b9afd9d368676697fe
 observation_date: 2026-09-13
 ---
 
@@ -17,7 +17,7 @@ new operational decision.
 
 ## Source boundary and reconciliation status
 
-This status records application source revision `95d85557` on 2026-09-13. The
+This status records application source revision `53abbbe1` on 2026-09-13. The
 published 0.1.22 artifacts are instead bound to immutable source
 `16a0d4dffad4b1213b28adaae139fc9ee6705837`. Current source includes the secure
 startup diagnostics and the not-yet-released Codex plugin/agent interface; it

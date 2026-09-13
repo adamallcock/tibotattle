@@ -77,7 +77,7 @@ export async function forEachRolloutLine(path, {
   if (end <= start) return empty;
 
   const callerOwnedHandle = path && typeof path === "object"
-    && Number.isInteger(path.fd) && typeof path.read === "function";
+    && typeof path.stat === "function" && typeof path.read === "function";
   const compressed = isCompressedRolloutSource(path);
   const input = callerOwnedHandle || compressed
     ? null

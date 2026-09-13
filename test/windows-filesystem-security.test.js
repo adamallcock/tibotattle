@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   link,
   mkdtemp,
   rename,
   rm,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +19,10 @@ import {
 } from "../src/platform/windows-filesystem.js";
 import { createWindowsCredentialAuditFileGuardContext } from "../src/platform/windows-credential-audit-file-guard.js";
 import { createWindowsCredentialOperationAuditStore } from "../src/platform/windows-credential-operation-audit.js";
+
+import { createTimingFilesystem } from '../src/platform/inference-timing-filesystem.js';
+import { openTimingStore, ingestTimingFile, readTimingRows } from '../src/platform/inference-timing-store.js';
+import { createParser, digest, METHOD, MAX_STATE_BYTES } from '../src/providers/codex/logs.js';
 
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
 const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
@@ -310,4 +316,89 @@ test("native audit guard rejects hard-linked and reparse-point database files", 
     }
     throw error;
   }
+}));
+
+
+test("native source handle holds its name, bounds reads and rejects links and foreign leases", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(async ({ adapter, root }) => {
+  adapter.ensureDirectory(root);
+  const native = loadWindowsFilesystemBinding();
+  const source = join(root, "source Ω.jsonl");
+  // Codex's normal inherited ACL is accepted; derived state still requires
+  // the stricter owner-only protected DACL.
+  await writeFile(source, "synthetic\n");
+  const protectedFile = join(root, "protected.sqlite");
+  adapter.createFile(protectedFile, Buffer.alloc(0));
+  const protectedLease = native.acquireCredentialAuditFileGuard(protectedFile);
+  try {
+    assert.throws(() => native.closeSourceFile(protectedLease.guard));
+    assert.throws(() => native.readSourceFile(protectedLease.guard, 0, 1));
+  } finally { native.releaseCredentialAuditFileGuard(protectedLease.guard); }
+  const lease = native.openSourceFile(source);
+  try {
+    assert.equal(native.statSourceFile(lease).size, 10);
+    assert.equal(native.readSourceFile(lease, 0, 65536).toString(), "synthetic\n");
+    assert.throws(() => native.readSourceFile(lease, 0, 65537));
+    assert.throws(() => native.readSourceFile(lease, -1, 1));
+    assert.throws(() => native.statSourceFile({}));
+    await assert.rejects(rename(source, join(root, "moved.jsonl")));
+    await assert.rejects(rename(root, `${root}-moved`));
+  } finally { native.closeSourceFile(lease); }
+  assert.throws(() => native.statSourceFile(lease));
+  await rename(source, join(root, "moved.jsonl"));
+  const linked = join(root, "hardlink.jsonl");
+  await link(join(root, "moved.jsonl"), linked);
+  assert.throws(() => native.openSourceFile(linked));
+  const junction = `${root}-junction`;
+  try {
+    await symlink(root, junction, "junction");
+    assert.throws(() => native.openSourceFile(join(junction, "moved.jsonl")));
+  } finally { await rm(junction, { force: true }); }
+}));
+
+test("native timing SQLite retains guarded journal, reconstructs TTFT and reopens without duplication", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(async ({ adapter, root }) => {
+  adapter.ensureDirectory(root);
+  const native = loadWindowsFilesystemBinding();
+  // Explicit qualification injection does not change production policy.
+  const filesystem = createTimingFilesystem({ platform: "win32", loadWindowsBinding: () => native });
+  const options = { createParser, digest, METHOD, MAX_STATE_BYTES, filesystem };
+  const source = join(root, "synthetic.jsonl"), dir = join(root, "timing");
+  const at = 1789200000000;
+  const records = [
+    { type: "session_meta", payload: { id: "synthetic-session" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "synthetic-turn" } },
+    { type: "turn_context", payload: { turn_id: "synthetic-turn", model: "gpt-5.6-sol" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "synthetic-turn", time_to_first_token_ms: 200 } },
+  ];
+  await writeFile(source, records.map((r, i) => JSON.stringify({ ...r, timestamp: new Date(at + i * 1000).toISOString() })).join("\n") + "\n");
+  let store = await openTimingStore(dir, options);
+  try {
+    await ingestTimingFile(store, source);
+    assert.equal(readTimingRows(store)[0].ttft, 200);
+    assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "persist");
+    await assert.rejects(rename(store.file, `${store.file}.moved`));
+    await assert.rejects(rename(`${store.file}-journal`, `${store.file}-journal.moved`));
+    store.close();
+    store = await openTimingStore(dir, options);
+    assert.equal((await ingestTimingFile(store, source)).unchanged, true);
+    assert.equal(readTimingRows(store).length, 1);
+    store.close();
+    const crash = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { createTimingFilesystem } from './src/platform/inference-timing-filesystem.js';
+      import { loadWindowsFilesystemBinding } from './src/platform/windows-filesystem.js';
+      import { openTimingStore } from './src/platform/inference-timing-store.js';
+      import { createParser, digest, METHOD, MAX_STATE_BYTES } from './src/providers/codex/logs.js';
+      const filesystem = createTimingFilesystem({ platform: 'win32', loadWindowsBinding: loadWindowsFilesystemBinding });
+      const store = await openTimingStore(process.argv[1], { createParser, digest, METHOD, MAX_STATE_BYTES, filesystem });
+      store.db.exec('PRAGMA cache_size=1; BEGIN IMMEDIATE; CREATE TABLE uncommitted(x BLOB); INSERT INTO uncommitted VALUES(zeroblob(1048576));');
+      process.exit(0);
+    `, dir], { encoding: 'utf8', timeout: 10000, windowsHide: true });
+    assert.equal(crash.status, 0, 'synthetic crash writer completed');
+    store = await openTimingStore(dir, options);
+    assert.equal(readTimingRows(store).length, 1, 'hot journal recovery preserves committed timing');
+    assert.equal(store.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='uncommitted'").get().n, 0);
+  } finally { store.close(); }
 }));

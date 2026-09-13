@@ -48,6 +48,31 @@ states are meaningful; TiboTattle does not replace missing evidence with zero.
 
 ## Reading the dashboard
 
+Overview shows one glass fuel tank for each observed allowance. Five-hour vessels
+are visually narrower (40% of standard width); this styling is not a measured
+capacity ratio. GPT-5.3 Codex Spark uses its shared model name and icon.
+Liquid motion is illustrative: the level stays at the observed percentage. Only
+a matching fresh forecast drives the outlet; greater pace produces more flow,
+with amber or red overflow for excessive pace. Overflow is a pace cue, not wasted
+quota. A discreet pause icon in the forecast header stops both tank and forecast-bar
+motion (it sits in the tank header when no forecast is available). The system
+reduced-motion preference is respected silently and hides the motion control.
+The forecast bar has a subtle moving sheen; its extent and time markers do not
+move with the animation. Offscreen tanks stop animating. Unavailable capacity retains its text
+state and stale observations have no animated flow. The fill
+and percentage both represent remaining capacity. A single current Codex weekly
+forecast appears beneath the tanks when usable pacing evidence exists; choosing
+a historical plan on the Allowance page does not change that current forecast.
+
+The forecast names its pace assessment, estimated run-out, reset countdown and
+any time without allowance. Its timeline represents time until reset, not quota
+percentage. Countdown labels use days and hours (less than an hour stays explicit).
+Hover, focus or tap an underlined time for the exact timestamp and time zone.
+Expand **Forecast basis and assumptions** for observation coverage, overall and
+active rates, and the uninterrupted-use estimate. Unknown amounts have no fill;
+stale or earlier observations retain their evidence qualifiers.
+
+
 - **Overview and trends** summarize locally derived activity and quota evidence.
 - **Usage and costs** use the repository’s accounting/pricing contracts. A cost
   estimate is not a provider bill.
@@ -117,6 +142,12 @@ Open **Model performance** from the dashboard sidebar, then choose a model
 and use the shared **Reporting period** above the page. The web and native navigation
 include this page in development source; an installed release must contain
 these changes before the page is available there.
+
+After the initial dashboard loads, the app prepares this page and its standard
+periods in the background before you visit. Once ready, opening the page or
+changing period displays its cached chart immediately while checking for
+updates. These results stay in memory only; restarting the app starts a fresh
+page cache. Speculative report requests pause while the app document is hidden.
 
 **Output speed** estimates tokens per second from covered response windows.
 **First-token latency** uses independently available turn timing, so its sample
@@ -224,6 +255,14 @@ cached report without recalculating usage. Reports may be released after five
 minutes away from the page; returning automatically rebuilds an expired report.
 A fresh refresh can still require accounting work when the underlying cache
 is no longer valid.
+
+The app prepares this page and its standard periods after the initial dashboard
+loads, using the same accounting snapshot. A warmed report displays immediately
+on the first visit or a period switch; drill-down controls wait for
+its report to be validated. Changing filters or refreshing the report discards
+incompatible warmed results. Preloading does not collect logs or repeat the
+underlying accounting calculation.
+
 This feature is qualified in a local development build and has not been released.
 
 ## Refresh, progress, and recovery

@@ -1,6 +1,6 @@
 {
   "schemaVersion": "tool-inventory-v0.1",
-  "reviewedAt": "2026-08-27",
+  "reviewedAt": "2026-09-13",
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
@@ -245,14 +245,11 @@
       ],
       "callers": [
         "apps/local/README.md",
-        "apps/local/electron-static-assets.test.mjs",
         "apps/macos/README.md",
         "apps/worker/scripts/check-deployment-endpoints.mjs",
         "package.json#scripts.product:macos:build",
         "package.json#scripts.product:macos:preview:build",
         "package.json#scripts.product:macos:preview:validate",
-        "scripts/build-electron-runtime.mjs",
-        "scripts/build-public-release-site.js",
         "scripts/install-macos-preview-app.js",
         "scripts/macos-release-core.js",
         "scripts/package-macos-dmg.js",
@@ -260,13 +257,11 @@
         "scripts/validate-macos-install.js",
         "scripts/validate-macos-login-item-release.js",
         "scripts/verify-macos-preview-remote.js",
-        "test/browser-module-serving-parity.test.js",
         "test/macos-app-bundle.test.js",
         "test/macos-keychain-migration-artifact.test.js",
         "test/macos-localization.test.js",
         "test/macos-test-build.test.mjs",
-        "test/public-release-site.test.js",
-        "test/weekly-pace-macos-runtime.test.js"
+        "test/surface-manifest.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -568,6 +563,7 @@
       "callers": [
         "apps/local/electron-static-assets.test.mjs",
         "test/export-tibotattle.test.js",
+        "test/surface-manifest.test.js",
         "test/weekly-pace-macos-runtime.test.js"
       ],
       "decision": "retain_until_client_repository_cutover",
@@ -593,6 +589,25 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
       "provenanceReason": "Generated browser mirror has a canonical package source and parity test, but no separate dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "telemetry_contract",
+      "canonicalPath": "scripts/generate-i18n-electron-copy.js",
+      "stableAlias": "i18n:electron:generate",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "i18n:electron:check"
+      ],
+      "callers": [
+        "apps/electron/test/i18n-copy.test.mjs",
+        "package.json#scripts.i18n:electron:check",
+        "package.json#scripts.i18n:electron:generate"
+      ],
+      "decision": "retain_as_generated_localization_support",
+      "provenance": "docs/decisions/2026-09-13-engineering-simplification-evaluation.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {
@@ -748,11 +763,52 @@
       "callers": [
         "scripts/build-local-review-artifact.js",
         "scripts/build-macos-app.js",
+        "scripts/lib/runtime-closure.mjs",
         "test/captured-utf8-source.test.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": null,
       "provenanceReason": "The helper binds captured workspace-package bytes into local-review and macOS release provenance.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/lib/runtime-closure.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Shared runtime closure and byte-capture policy is imported by surface builders and tests, not invoked as a command.",
+      "additionalAliases": [],
+      "callers": [
+        "apps/local/electron-static-assets.test.mjs",
+        "scripts/build-electron-runtime.mjs",
+        "scripts/build-macos-app.js",
+        "scripts/build-public-release-site.js",
+        "test/browser-module-serving-parity.test.js",
+        "test/public-release-site.test.js",
+        "test/surface-manifest.test.js",
+        "test/weekly-pace-macos-runtime.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/decisions/2026-09-13-engineering-simplification-evaluation.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/lib/surface-manifest.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Exact surface-manifest projections are imported by builders and tests, not invoked as a command.",
+      "additionalAliases": [],
+      "callers": [
+        "apps/local/electron-static-assets.test.mjs",
+        "scripts/build-electron-runtime.mjs",
+        "scripts/export-tibotattle.mjs",
+        "test/surface-manifest.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/decisions/2026-09-13-engineering-simplification-evaluation.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {
@@ -769,6 +825,7 @@
         "scripts/build-macos-app.js",
         "scripts/check-architecture-boundaries.mjs",
         "scripts/export-tibotattle.mjs",
+        "scripts/lib/runtime-closure.mjs",
         "test/application-quota-sensitivity.test.js",
         "test/architecture-boundaries.test.js",
         "test/codex-local-usage-analysis-boundary.test.js",

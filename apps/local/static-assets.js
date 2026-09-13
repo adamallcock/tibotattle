@@ -1,4 +1,7 @@
 export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
+  "/allowance-tanks.js": Object.freeze({ file: "allowance-tanks.js", type: "text/javascript; charset=utf-8" }),
+  "/allowance-tank-renderer.js": Object.freeze({ file: "allowance-tank-renderer.js", type: "text/javascript; charset=utf-8" }),
+  "/codex-color.svg": Object.freeze({ file: "codex-color.svg", type: "image/svg+xml" }),
   "/": Object.freeze({
     file: "index.html",
     type: "text/html; charset=utf-8",
@@ -10,6 +13,10 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
   "/reporting-period.js": Object.freeze({ file: "reporting-period.js", type: "text/javascript; charset=utf-8" }),
   "/dashboard-ui.js": Object.freeze({ file: "dashboard-ui.js", type: "text/javascript; charset=utf-8" }),
   "/work-usage-view.js": Object.freeze({ file: "work-usage-view.js", type: "text/javascript; charset=utf-8" }),
+  "/dashboard-report-preload.js": Object.freeze({
+    file: "dashboard-report-preload.js",
+    type: "text/javascript; charset=utf-8",
+  }),
   "/app.js": Object.freeze({
     file: "app.js",
     type: "text/javascript; charset=utf-8",

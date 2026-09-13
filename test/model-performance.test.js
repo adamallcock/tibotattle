@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { modelPerformanceProjection } from '../src/reporting/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
+import { loadWindowsSourceReadBinding } from '../src/platform/windows-filesystem.js';
 
 const NOW = Date.parse('2026-09-09T12:00:00Z'), DAY = 86400000;
 const row = (patch = {}) => ({ at: NOW, model: 'gpt-5.6-sol', sample_method: 'receipt',
@@ -115,11 +116,11 @@ test('an explicitly requested initial history pass finishes after the reader lea
   assert.equal(stops, 1, 'completed worker observes the ordinary idle stop');
   await controller.close();
 });
-test('Windows returns the closed unavailable DTO immediately without a timing worker', async () => {
+test('missing timing capability returns unavailable with bounded worker retry', async () => {
   let workers = 0;
   const controller = createModelPerformanceController({
-    directory: 'unused', codexHome: 'unused', platform: 'win32',
-    workerFactory: () => { workers++; throw new Error('must not start'); },
+    directory: 'unused', codexHome: 'unused',
+    workerFactory: () => { workers++; throw new Error('native capability unavailable'); },
   });
   try {
     for (const period of ['7', '30', 'all', 'all']) {
@@ -136,10 +137,10 @@ test('Windows returns the closed unavailable DTO immediately without a timing wo
       assert.deepEqual(result.models, []);
     }
     await assert.rejects(controller.read('90'), /invalid_timing_period/u);
-    assert.equal(workers, 0);
+    assert.equal(workers, 1, 'missing capability is attempted once during the backoff');
   } finally { await controller.close(); }
   assert.equal((await controller.read('all')).status, 'unavailable');
-  assert.equal(workers, 0);
+  assert.equal(workers, 1, 'missing capability is attempted once during the backoff');
 });
 
 test('actual worker reconstructs synthetic logs off-main, persists, and shuts down', async t => {
@@ -170,6 +171,23 @@ test('actual worker reconstructs synthetic logs off-main, persists, and shuts do
   }
   let controller = createModelPerformanceController(options);
   try {
+    if (process.platform === 'win32') {
+      let unavailable = false;
+      try { loadWindowsSourceReadBinding(); } catch { unavailable = true; }
+      if (unavailable) {
+        const deadline = Date.now() + 10000;
+        let result;
+        do {
+          result = await controller.read('all');
+          if (result.status === 'unavailable') break;
+          await new Promise(resolve => setTimeout(resolve, 20));
+        } while (Date.now() < deadline);
+        assert.equal(result.status, 'unavailable');
+        assert.deepEqual(result.models, []);
+        assert.equal(result.historyProgress, null, 'unsupported worker never scans sources');
+        return;
+      }
+    }
     let result = await readReady(controller);
     assert.equal(result.schemaVersion, 2);
     assert.deepEqual(result.historyProgress, { checked: 1, total: 1 });

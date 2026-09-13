@@ -4,7 +4,7 @@ import './model-performance-worker.js';
 
 const PERIODS = ['1', '7', '30', 'all'];
 const MAX_WINDOWS = 8;
-export function createModelPerformanceController({ directory, codexHome, platform = process.platform,
+export function createModelPerformanceController({ directory, codexHome,
   idleMs = 60_000, workerFactory = options => new Worker(new URL('./model-performance-worker.js', import.meta.url), options) }) {
   const cache = new Map();
   const windows = new Map();
@@ -19,8 +19,8 @@ export function createModelPerformanceController({ directory, codexHome, platfor
     clearTimeout(idle);
     idle = setTimeout(() => {
       idle = null;
-      // Once explicitly requested, finish the discovered history pass even if
-      // its page becomes hidden. This remains lazy and off-main; completed
+      // Once requested by the dashboard, finish the discovered history pass
+      // even if its page is inactive. This remains off-main; completed
       // workers still stop after the ordinary idle lease.
       if ([...cache.values()].some(value => value.collecting)) scheduleIdleStop();
       else void stop();
@@ -75,9 +75,8 @@ export function createModelPerformanceController({ directory, codexHome, platfor
           || end < 0 || end > Date.now() || new Date(end).toISOString() !== endAt)) throw new Error('invalid_timing_window');
       const key = end === null ? period : `${period}:${end}`;
       const fallback = status => ({ ...empty(period, status), ...(end === null ? {} : { end, start: period === 'all' ? null : Math.max(0, end - Number(period) * 86400000) }) });
-      // The timing sidecar currently requires POSIX owner protection. Report
-      // this fixed platform boundary without starting a worker or retry timer.
-      if (closed || platform === 'win32') return fallback('unavailable');
+      // Platform capability is checked inside the worker before source discovery.
+      if (closed) return fallback('unavailable');
       if (end !== null && !windows.has(key)) {
         windows.set(key, { period, end, requestKey: key });
         while (windows.size > MAX_WINDOWS) { const oldest = windows.keys().next().value; windows.delete(oldest); cache.delete(oldest); }

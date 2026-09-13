@@ -2662,7 +2662,8 @@ test("quota presentation keeps Spark separate and weekly surfaces exact", async 
   assert.match(appSource, /dashboard\.quota\.windowSparkSevenDay/u);
   assert.match(appSource, /dashboard\.quota\.windowOtherDuration/u);
   assert.match(appSource, /dashboard\.quota\.windowNamedObserved/u);
-  assert.match(appSource, /dashboard\.quota\.spark/u);
+  assert.match(appSource, /GPT-5\.3 Codex Spark/u);
+  assert.match(appSource, /modelThemeIcon\(document, "spark"\)/u);
   assert.match(appSource, /const normalWindows = data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u);
   assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);
   assert.match(appSource, /title: \{ key: "weekly\.chart\.title" \}/u);
@@ -5187,6 +5188,9 @@ async function createDashboardStartupHarness({
     document: { documentElement: { dataset: {} } },
     cacheDropThreadLinks: { loadToken: 0 },
     activeLocalDashboardLoad: null,
+    dashboardReportPreloader: {
+      schedule() { state.events.push(["preload-reports"]); },
+    },
     localActionBusy: initialBusy,
     localRefreshInProgress: false,
     electronStartupRefreshDeferred: false,
@@ -5303,6 +5307,10 @@ test("primary startup renders and releases busy state while optional reads remai
         await settleDashboardStartupTasks();
         assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
         assert.equal(harness.context.dashboard.marker, "primary");
+        assert.deepEqual(harness.state.events.filter(([kind]) =>
+          kind === "primary" || kind === "preload-reports"),
+        [["primary", "primary"], ["preload-reports"]],
+        "report preparation is scheduled only after the primary render");
         assert.equal(harness.state.journey, "local-ready",
           "real evidence must not remain hidden by first-run while onboarding waits");
         assert.equal(completed, true, "only the primary result owns the dashboard load promise");
@@ -5330,6 +5338,7 @@ test("primary startup failure renders unavailable without waiting on optional re
     assert.equal(harness.state.primaryReads, 2, "the existing single retry is retained");
     assert.equal(harness.context.dashboard, null);
     assert.equal(harness.state.events.filter(([kind]) => kind === "primary").length, 0);
+    assert.equal(harness.state.events.filter(([kind]) => kind === "preload-reports").length, 0);
     assert.deepEqual(harness.state.events.filter(([kind]) => kind === "unavailable"), [
       ["unavailable", "companion-unavailable"],
     ]);
@@ -6097,7 +6106,7 @@ test("the weekly headline is a stable all-data median and says so on screen", as
   }
 });
 
-test("the rendered allowance headline, history, pace and shared history use one selected plan", async () => {
+test("the historical allowance headline and shared history use one selected plan without changing current pace", async () => {
   const populations = [["pro", 2_400], ["plus", 85]].map(([planType, value]) => ({
     planType,
     status: "available",
@@ -6141,15 +6150,15 @@ test("the rendered allowance headline, history, pace and shared history use one 
     [plus, "plus", 85, 2], [pro, "pro", 2_400, 1], [proInSpanish, "pro", 2_400, 2],
   ]) {
     assert.equal(view.shared.data.weekly.planType, planType);
-    assert.strictEqual(view.shared.data, view.paceData,
-      "pace and the share card receive the same selected population as the headline");
+    assert.equal(view.paceData, null,
+      "historical plan changes cannot overwrite the current Overview forecast");
     assert.equal(view.shared.history.points.length, shown);
     assert.ok(view.shared.history.points.every((row) => row.value === value),
       "the share card gets the exact selected-plan and filtered history, never a pooled graph");
     assert.strictEqual(view.shared.data.accounting, data.accounting,
       "plan-specific estimates do not discard the complete activity ledger");
   }
-  assert.equal(pro.paceData.weekly.paceForecast, null);
+  assert.equal(pro.shared.data.weekly.paceForecast, null);
   assert.deepEqual(pro.shared.data.quotaWindows, []);
 });
 
@@ -6891,12 +6900,11 @@ test("live timeline couples speed-priced usage to the matching allowance capacit
     quotaCardsMatch[1],
     /data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u,
   );
-  // Owner-directed 2026-08-20: the Spark cards lead the row and the
-  // normal-Codex allowance follows. Future pools remain visible only after
-  // both reviewed groups, never promoted into either one.
+  // The approved tank design leads with the current Codex pool. Spark and
+  // future pools remain distinct and cannot become the forecast's subject.
   assert.match(
     quotaCardsMatch[1],
-    /const windows = \[[\s\S]*?\.\.\.sparkOrderedWindows,[\s\S]*?\.\.\.normalOrderedWindows,[\s\S]*?\.\.\.otherOrderedWindows,[\s\S]*?\];/u,
+    /const windows = \[[\s\S]*?\.\.\.normalOrderedWindows,[\s\S]*?\.\.\.sparkOrderedWindows,[\s\S]*?\.\.\.otherOrderedWindows,[\s\S]*?\];/u,
   );
   // Within the Spark pair the order comes from the window duration, not from
   // the provider's slot assignment, so five-hour precedes seven-day even if

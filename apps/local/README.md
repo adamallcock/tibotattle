@@ -30,6 +30,18 @@ the source databases. Missing metadata does not fail an accounting refresh. See 
 
 ## Run
 
+Standard dashboard periods are supplied by the shared dashboard projection.
+After the initial dashboard paints, the separate Performance and Projects &
+threads views prepare their selected and other fixed periods before the first
+visit. Their browser caches are bounded and memory-only; speculative browser
+requests pause when the app document is hidden. A measurement history pass that
+has already started can finish independently. Performance reuses the
+worker's existing three-period snapshots. Projects & threads uses related
+period queries anchored to the selected report, preserving generation checks
+and the two-report server capacity; cached display values do not authorize
+drill-down through an expired report. No additional log scan is required to
+change a warmed period.
+
 ```bash
 USAGE_MONITOR_PORT=8791 node ./apps/local/server.js
 ```

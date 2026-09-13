@@ -6,8 +6,9 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../../src/platform/index.js';
 import { createModelPerformanceContext } from '../../src/application/index.js';
 
-// Separate from accounting: no startup work, no accounting DB, and only while
-// a recent page reader holds the controller's lease. Fixed, bounded errors only.
+// Separate from accounting: no accounting DB, and starts only when a dashboard
+// reader requests it (including background preparation after first paint).
+// Fixed, bounded errors only.
 async function run() {
   const context = createModelPerformanceContext({ openStore: openTimingStore });
   const abort = new AbortController();
@@ -59,9 +60,6 @@ async function run() {
     })) });
   }
   try {
-    // The existing sidecar permission contract is POSIX. Unsupported platforms
-    // stay unavailable until their protected-state adapter has been qualified.
-    if (typeof process.getuid !== 'function') throw new Error('unsupported_platform');
     store = await context.open(workerData.directory);
     publish(true);
     while (!stopped) {

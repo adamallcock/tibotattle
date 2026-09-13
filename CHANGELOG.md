@@ -41,6 +41,7 @@ No changes yet.
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.22) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.22) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/16a0d4dffad4b1213b28adaae139fc9ee6705837) ·
 [changes since v0.1.21](https://github.com/adamallcock/tibotattle/compare/v0.1.21...v0.1.22)
 
 Add Projects & threads and local model-performance views, with scoped cached
@@ -53,6 +54,7 @@ See the [release notes](./release-notes/0.1.22.md).
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.21) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.21) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/a651ea130dd1460e4443a037c4434f57b911fec4) ·
 [changes since v0.1.20](https://github.com/adamallcock/tibotattle/compare/v0.1.20...v0.1.21)
 
 Complete native 0.1.18's update path to Electron, preserving local history,
@@ -95,7 +97,7 @@ compact website download controls with GitHub asset links. See the
 
 This release's native Mac handover requires preserving the old app and does not
 provide an ordinary replacement upgrade. Native Sparkle updates remain separate.
-The 0.1.20 candidate above addresses that limitation; the checked-in 0.1.19 notes
+The 0.1.20 release above addresses that limitation; the checked-in 0.1.19 notes
 preserve the published release wording.
 
 ## [0.1.18](./release-notes/0.1.18.md) - 2026-09-05

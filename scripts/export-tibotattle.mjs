@@ -23,6 +23,7 @@ import {
 import { fileURLToPath } from "node:url";
 
 import { extractEsmImports } from "./lib/esm-imports.mjs";
+import { surfaceFiles } from "./lib/surface-manifest.mjs";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -255,6 +256,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/platform/export-identity-keychain.js",
   "src/platform/export-set-verification-storage.js",
   "src/platform/index.js",
+  "src/platform/inference-timing-filesystem.js",
   "src/platform/inference-timing-store.js",
   "src/platform/keychain-capabilities.js",
   "src/platform/local-codex-log-ports.js",
@@ -276,10 +278,12 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/platform/participant-identity.js",
   "src/platform/telemetry-envelope.js",
   "src/platform/rollout-line-reader.js",
+  "src/platform/source-file-access.js",
   "src/platform/telemetry-v1-envelope.js",
   "src/platform/telemetry-v11-envelope.js",
   "src/platform/windows-production-readiness.js",
   "src/platform/windows-filesystem.js",
+  "src/platform/windows-protected-sqlite.js",
   "src/platform/windows-protected-state-store.js",
   "src/platform/windows-qualification-mode.js",
   "src/platform/work-usage-projects.js",
@@ -316,44 +320,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/weekly-pace-projection.js",
 ]);
 
-export const CLIENT_WEB_FILES = Object.freeze([
-  "apps/web/public/app.js",
-  "apps/web/public/community-data.js",
-  "apps/web/public/community-refresh.js",
-  "apps/web/public/community-view.js",
-  "apps/web/public/model-visuals.js",
-  "apps/web/public/community.html",
-  "apps/web/public/community.js",
-  "apps/web/public/data-client.js",
-  "apps/web/public/desktop-shell.js",
-  "apps/web/public/electron-tray-popup.css",
-  "apps/web/public/electron-tray-popup.html",
-  "apps/web/public/electron-tray-popup.js",
-  "apps/web/public/electron-settings.css",
-  "apps/web/public/electron-settings.html",
-  "apps/web/public/electron-settings.js",
-  "apps/web/public/electron-tray-settings.js",
-  "apps/web/public/electron-tray-preferences.js",
-  "apps/web/public/icon-panel-left.svg",
-  "apps/web/public/icon-refresh-cw.svg",
-  "apps/web/public/icon-settings.svg",
-  "apps/web/public/index.html",
-  "apps/web/public/i18n.generated.js",
-  "apps/web/public/install-cta.js",
-  "apps/web/public/lib.js",
-  "apps/web/public/localization.js",
-  "apps/web/public/model-catalog.generated.js",
-  "apps/web/public/model-performance.css",
-  "apps/web/public/model-performance.js",
-  "apps/web/public/navigation.js",
-  "apps/web/public/reporting-period.js",
-  "apps/web/public/dashboard-ui.js",
-  "apps/web/public/styles.css",
-  "apps/web/public/telemetry-envelope.js",
-  "apps/web/public/telemetry-shared.generated.js",
-  "apps/web/public/ui-format.js",
-  "apps/web/public/work-usage-view.js",
-]);
+export const CLIENT_WEB_FILES = surfaceFiles("history-free-export");
 
 export const CLIENT_MACOS_FILES = Object.freeze([
   "apps/macos/Assets/AppIcon.icns",
@@ -435,6 +402,7 @@ export const CLIENT_SCRIPT_FILES = Object.freeze([
   "scripts/generate-telemetry-contract.js",
   "scripts/lib/captured-utf8-source.mjs",
   "scripts/lib/esm-imports.mjs",
+  "scripts/lib/runtime-closure.mjs",
   "scripts/lib/release-operation.mjs",
   "scripts/macos-bundle-version.js",
   "scripts/macos-release-core.js",

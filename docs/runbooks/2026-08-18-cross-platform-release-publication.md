@@ -772,6 +772,17 @@ lock's exact owner commit, checks ownership before/after I/O, and never acquires
 steals, expires or releases it. The lock coordinates compliant release tooling;
 R2 itself still supplies no conditional write through this CLI path.
 
+The writer runs the existing release-documentation validator before opening a
+publication journal or contacting R2. The publishing checkout must contain the
+complete release-note and changelog history for its stable tags, including the
+exact version being published. Fetch the existing tags and incorporate any
+missing reviewed documentation into the publishing branch before freezing it;
+do not recreate or move a published tag. Run `node scripts/check-release-notes.mjs`
+there before requesting publication. A passing check on main does not qualify
+an older release worktree, and a green packaging workflow does not run this
+publication check. Explicit rollback retains its existing ownership and journal
+checks without depending on subsequently changed documentation.
+
 Compute the approved digest with the maintained `identityDigest(plan)` helper,
 where `plan` is the result of `prepareElectronStablePublication` for the exact
 inputs above. Preserve the already-created private preparation operation.

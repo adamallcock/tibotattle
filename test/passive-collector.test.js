@@ -551,6 +551,71 @@ test("cancellation during a normal pooled close is surfaced as a bounded pause",
   }
 });
 
+test("a client close failure still releases the run-once collector lock", async () => {
+  const fixture = await collectorFixture();
+  class FailingCloseClient {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return null; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {
+      const error = new Error("injected client close failure");
+      error.code = "injected_client_close_failure";
+      throw error;
+    }
+  }
+  try {
+    await assert.rejects(
+      runCollectorOnce({
+        ...fixture,
+        skipRolloutIngestion: true,
+        staleAfterMs: 0,
+        appServerFactory: () => new FailingCloseClient(),
+        clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+      }),
+      { code: "injected_client_close_failure" },
+    );
+    const retried = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+    assert.equal(retried.status, "complete");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a pooled session settle failure still releases the run-once collector lock", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const integrityFailure = new Error("injected session settle failure");
+  integrityFailure.code = "injected_session_settle_failure";
+  try {
+    await assert.rejects(
+      runCollectorOnce({
+        ...fixture,
+        backfill: true,
+        refreshStale: false,
+        clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+        integrityVerifier: async () => {
+          throw integrityFailure;
+        },
+      }),
+      { code: "injected_session_settle_failure" },
+    );
+    const retried = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+    assert.equal(retried.status, "complete");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("fresh recent backfill selects only overlapping archives and reports content-free progress", async () => {
   const fixture = await collectorFixture([
     tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
