@@ -811,14 +811,14 @@ export const WEB_MESSAGES = Object.freeze({
     "Mezcla del intervalo (todo el período seleccionado, no solo esta ventana): sobre todo {model}, velocidad {speed}.",
   ],
   "divergence.breakdown.show": [
-    "Show this window's cost mix",
-    "显示此窗口的成本构成",
-    "Mostrar la mezcla de costes de esta ventana",
+    "Models & speeds",
+    "模型与速度",
+    "Modelos y velocidades",
   ],
   "divergence.breakdown.hide": [
-    "Hide this window's cost mix",
-    "隐藏此窗口的成本构成",
-    "Ocultar la mezcla de costes de esta ventana",
+    "Hide breakdown",
+    "隐藏明细",
+    "Ocultar desglose",
   ],
   "divergence.breakdown.loading": [
     "Repricing this window…",
@@ -861,14 +861,14 @@ export const WEB_MESSAGES = Object.freeze({
     "No hay eventos de uso con precio en esta ventana.",
   ],
   "divergence.breakdown.unavailable": [
-    "Per-window cost mix is unavailable from this companion — range mix instead: mostly {model}, {speed} speed.",
-    "此伴随程序无法提供逐窗口成本构成——改用范围构成：以 {model} 为主，{speed} 速度。",
-    "La mezcla de costes por ventana no está disponible en este acompañante; en su lugar, la mezcla del intervalo: sobre todo {model}, velocidad {speed}.",
+    "This period’s breakdown could not be loaded. For context, the whole selected range is mostly {model}, {speed} speed; that does not describe this period.",
+    "无法加载此时段明细。作为背景，整个所选范围以 {model}、{speed} 速度为主，但这不代表此时段。",
+    "No se pudo cargar el desglose del período. Como contexto, todo el intervalo seleccionado usa principalmente {model}, velocidad {speed}; esto no describe este período.",
   ],
   "divergence.breakdown.unavailablePlain": [
-    "Per-window cost mix is unavailable from this companion.",
-    "此伴随程序无法提供逐窗口成本构成。",
-    "La mezcla de costes por ventana no está disponible en este acompañante.",
+    "This period’s breakdown could not be loaded.",
+    "无法加载此时段明细。",
+    "No se pudo cargar el desglose del período.",
   ],
   "divergence.empty": [
     "No sustained divergence in this range — observed and priced usage track within the noise band.",

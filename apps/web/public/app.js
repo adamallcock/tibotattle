@@ -5827,6 +5827,28 @@ function renderResiduals(data, points, viewport = null) {
   renderResidualInspectionTable();
 }
 
+// Explain the existing classification; do not promote absent quality metadata
+// or an absent estimate into a comparable window.
+function residualEvidence(row) {
+  const status = row.status;
+  if (status === "matched") {
+    if (finite(row.observed) === null) return ["trends.evidenceMissing", "trends.evidenceMissingWhy"];
+    if (finite(row.expected) === null) return ["trends.evidenceEstimate", "trends.evidenceEstimateWhy"];
+    return ["trends.evidenceComparable", "trends.evidenceComparableWhy"];
+  }
+  const keys = {
+    missing_quota_bracket: ["trends.evidenceMissing", "trends.evidenceMissingWhy"],
+    reset_or_track_change: ["trends.evidenceReset", "trends.evidenceResetWhy"],
+    backward_or_ambiguous: ["trends.evidenceBackward", "trends.evidenceBackwardWhy"],
+    pool_saturated: ["trends.evidenceExhausted", "trends.evidenceExhaustedWhy"],
+    quota_weighting_unavailable: ["trends.evidencePricing", "trends.evidencePricingWhy"],
+    unpriced_local_activity: ["trends.evidenceUnpriced", "trends.evidenceUnpricedWhy"],
+    unexplained_without_local_activity: ["trends.evidenceUnrecorded", "trends.evidenceUnrecordedWhy"],
+    inactive: ["trends.evidenceQuiet", "trends.evidenceQuietWhy"],
+  };
+  return Object.hasOwn(keys, status) ? keys[status] : ["trends.evidenceUnknown", "trends.evidenceUnknownWhy"];
+}
+
 /**
  * One page of the exact-windows inspection table, plus the pager beneath it.
  * Rendered from the module-held row set so Prev/Next can redraw the table
@@ -5855,12 +5877,19 @@ function renderResidualInspectionTable() {
     const residual = item.observed === null || item.expected === null
       ? null
       : item.residual;
+    const [labelKey, detailKey] = residualEvidence(item);
+    const evidence = node("td", "residual-evidence");
+    evidence.append(node("strong", "residual-evidence-label", t(labelKey)),
+      node("span", "residual-evidence-detail", t(detailKey)));
+    const time = node("td", "residual-window-time", formatChartTimestamp(item.timestamp));
+    if (finite(item.measuredSpanMs) > 0) time.append(node("small", "residual-window-span",
+      t("trends.measuredSpan", { duration: formatSpanLength(item.measuredSpanMs) })));
     row.append(
-      node("td", "", formatChartTimestamp(item.timestamp)),
+      time,
       node("td", "", formatPp(item.observed)),
       node("td", "", formatPp(item.expected)),
       node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? t("residual.table.notComparable") : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
-      node("td", "", timelineStatusLabel(item.status ?? "matched")),
+      evidence,
     );
     table.append(row);
   }
@@ -6090,6 +6119,16 @@ function divergencePeriodItem(period, rangeContext, state) {
       ));
     }
     panel.append(magnitude, mix);
+    if (state.failed && !state.pending && state.local) {
+      if (state.breakdown) panel.append(localizedNode("p", "divergence-breakdown-status", "trends.mixRetained"));
+      const retry = localizedNode("button", "button button-quiet compact divergence-retry", "trends.mixRetry");
+      retry.type = "button";
+      retry.addEventListener("click", () => {
+        state.toggle.focus({ preventScroll: true });
+        state.load();
+      });
+      panel.append(retry);
+    }
   };
   state.render = renderBreakdown;
   const loadBreakdown = async () => {
@@ -6097,6 +6136,7 @@ function divergencePeriodItem(period, rangeContext, state) {
         || state.loadedRevision === state.revision) return;
     const revision = state.revision;
     state.pending = true;
+    state.failed = false;
     renderBreakdown();
     let breakdown = null;
     try {
@@ -6110,6 +6150,7 @@ function divergencePeriodItem(period, rangeContext, state) {
       if (state.expanded) state.load();
       return;
     }
+    state.failed = breakdown?.status !== "available";
     if (breakdown?.status === "available") {
       state.breakdown = breakdown;
       state.loadedRevision = revision;
@@ -6153,6 +6194,7 @@ function divergenceModelLabel(model) {
 
 function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
   clear(panel);
+  panel.append(localizedNode("p", "divergence-breakdown-purpose", "trends.mixPurpose"));
   if (!breakdown || breakdown.status !== "available") {
     panel.append(rangeContext !== null
       ? localizedNode(
@@ -6198,7 +6240,8 @@ function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
   }
   panel.append(modelList);
 
-  const speedEntries = Object.values(breakdown.bySpeed)
+  const speedEntries = Object.entries(breakdown.bySpeed)
+    .map(([speed, row]) => ({ ...row, speed }))
     .filter((row) => row.events > 0)
     .sort((left, right) => right.costUsd - left.costUsd);
   if (speedEntries.length) {

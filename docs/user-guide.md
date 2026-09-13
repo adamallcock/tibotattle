@@ -331,10 +331,20 @@ share a numbered marker with every event listed. A confirmed drop can have a
 later confirming observation. Scheduled versus banked reset types are not present
 in this payload and are not inferred. Plan-incompatible boundaries stay excluded.
 
-**When usage and allowance disagree** ranks sustained divergence periods by their
-largest signed percentage-point gap. The gap accumulates from the cycle comparison
+**When usage and allowance disagree** lists sustained divergence periods as compact
+rows ranked by their largest signed percentage-point gap. The gap accumulates from the cycle comparison
 anchor, not just within the listed period. **View on charts** focuses all views
-on that period; its cost mix and detailed measurements remain expandable.
+on that period. **Models & speeds** shows the recorded activity behind the period;
+it helps investigate a mismatch but cannot establish its cause. Failed lookups
+have a **Retry breakdown** action, and a failed update preserves and labels the
+previous successful result.
+
+The exact-window table names the measured span and explains each comparison.
+**Comparable** means measured and estimated values cover the same allowance cycle,
+not that the values agree. Missing or stale readings, reset or allowance changes,
+unavailable pricing, backwards readings and exhausted allowance each have a
+specific explanation. Unknown quality stays unknown. Differences are percentage
+points of allowance: falling from 60% to 50% remaining is 10 pp used.
 
 Trends compares the selected plan's compatible usage and quota history. Earlier
 history on another plan does not disable a usable current-plan fit, and it is

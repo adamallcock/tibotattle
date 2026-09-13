@@ -109,6 +109,40 @@ test("expanded details and keyboard focus survive unchanged snapshots without an
   assert.equal(h.requests.length, 1);
 });
 
+test("period breakdowns use the keyed speed contract and explain their purpose", async () => {
+  const h = harness(); h.render(snapshot(), [period()]); h.toggle().click();
+  h.requests[0].resolve({ ...result(), bySpeed: {
+    standard: { costUsd: 1, events: 2 }, fast: { costUsd: .8, events: 1 }, unknown: { costUsd: .2, events: 1 },
+  } });
+  await settle();
+  assert.match(h.panel().textContent, /trends.mixPurpose/);
+  assert.match(h.panel().textContent, /divergence.speed.standard/);
+  assert.match(h.panel().textContent, /divergence.speed.fast/);
+  assert.equal(h.panel().textContent.match(/divergence.speed.unknown/g).length, 1);
+  assert.equal(h.panel().children.some(child => child.className.includes("divergence-retry")), false);
+});
+
+test("failed initial and retained breakdowns offer a bounded retry without closing the panel", async () => {
+  const h = harness(); h.render(snapshot(), [period()]); h.toggle().click();
+  h.requests[0].resolve(null); await settle();
+  let retry = h.panel().children.find(child => child.className.includes("divergence-retry"));
+  assert.ok(retry);
+  retry.click(); retry.click();
+  assert.equal(h.requests.length, 2, "pending retries cannot duplicate a request");
+  assert.equal(h.document.activeElement, h.toggle(), "loading must not discard keyboard focus with the retry button");
+  assert.equal(h.panel().hidden, false);
+  h.requests[1].resolve(result()); await settle();
+  assert.match(h.panel().textContent, /gpt-6-astra/);
+  h.render(snapshot("2"), [period()]);
+  h.requests[2].resolve(null); await settle();
+  assert.match(h.panel().textContent, /gpt-6-astra/);
+  assert.match(h.panel().textContent, /trends.mixRetained/);
+  retry = h.panel().children.find(child => child.className.includes("divergence-retry"));
+  retry.click(); h.requests[3].resolve(result("updated")); await settle();
+  assert.match(h.panel().textContent, /updated/);
+  assert.doesNotMatch(h.panel().textContent, /trends.mixRetained/);
+});
+
 test("new revisions refresh behind retained details and failed refreshes can retry", async () => {
   const h = harness(); h.render(snapshot(), [period()]); h.toggle().click();
   h.requests[0].resolve(result()); await settle();

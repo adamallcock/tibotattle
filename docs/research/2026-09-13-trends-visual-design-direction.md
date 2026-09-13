@@ -138,9 +138,14 @@ confirmation times. Existing evidence bands still identify excluded windows.
 
 The selected-time header converts the existing rolling speed-priced total to an
 hourly rate using its measured duration. Unknown pricing and stale samples stay
-unavailable. The divergence cards lead with the signed peak gap, describe its
-direction in plain language, and focus the shared chart viewport on selection.
-Detailed cost mix and signed-area measurements remain behind disclosure.
+unavailable. Compact divergence rows lead with the signed peak gap, describe its direction
+in plain language, and focus the shared chart viewport on selection. The
+Models & speeds disclosure states its investigative purpose and provides an
+explicit retry after failure. Speed names come from the keyed breakdown contract.
+The exact-window table explains comparison quality in each row, states measured
+spans, and distinguishes a valid comparison from agreement between the values.
+Unknown quality is never labelled as matched. Detailed cost mix and signed-area
+measurements remain behind disclosure.
 
 The shared cursor, range, zoom and exact sample readouts use real prepared
 series. Installation, signing, release and publication remain separate operations.

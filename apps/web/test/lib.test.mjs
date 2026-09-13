@@ -10112,7 +10112,7 @@ test("a session-rejected repair clears the dead session and renders one sign-in 
 
 async function loadResidualInspectionTable({ rows, page = 0 }) {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = appSource.indexOf("function renderResidualInspectionTable()");
+  const start = appSource.indexOf("function residualEvidence(row)");
   const end = appSource.indexOf("\n/**\n * Whether a series draws its data points", start);
   assert.ok(start >= 0 && end > start, "the inspection-table renderer is available");
   const section = appSource.slice(start, end);
@@ -10134,7 +10134,7 @@ async function loadResidualInspectionTable({ rows, page = 0 }) {
   const state = { page };
   Function(
     "$", "clear", "node", "t", "setLocalizedText",
-    "formatNumber", "formatChartTimestamp", "formatPp", "timelineStatusLabel",
+    "formatNumber", "formatChartTimestamp", "formatPp", "finite", "formatSpanLength",
     "residualInspectionRows", "state",
     `const RESIDUAL_TABLE_PAGE_SIZE = 10;
 let residualTablePage = state.page;
@@ -10158,7 +10158,8 @@ state.page = residualTablePage;`,
     (value) => String(value),
     (value) => String(value),
     (value) => value === null ? "—" : `${value} pp`,
-    (status) => `status:${status}`,
+    finite,
+    String,
     rows,
     state,
   );
@@ -10210,6 +10211,38 @@ test("the exact-windows table pages ten rows at a time and states the shown rang
   assert.equal(empty.pagination.hidden, true);
   assert.equal(empty.table.children.length, 1);
   assert.equal(empty.table.children[0].children[0].textContent, "[residual.table.empty]");
+});
+
+test("exact comparisons explain quality without mistaking agreement, missing estimates, or unknown states", async () => {
+  const row = { timestamp: "2026-09-09T23:00:00Z", observed: 30, expected: 10, residual: 20, measuredSpanMs: 3_600_000 };
+  const checks = [
+    ["matched", "Comparable", {}],
+    ["matched", "Estimate", { expected: null, residual: null }],
+    ["matched", "Missing", { observed: null, residual: null }],
+    ["missing_quota_bracket", "Missing", {}],
+    ["reset_or_track_change", "Reset", {}],
+    ["backward_or_ambiguous", "Backward", {}],
+    ["pool_saturated", "Exhausted", {}],
+    ["quota_weighting_unavailable", "Pricing", {}],
+    ["unpriced_local_activity", "Unpriced", {}],
+    ["unexplained_without_local_activity", "Unrecorded", {}],
+    ["inactive", "Quiet", {}],
+    [undefined, "Unknown", {}],
+    ["future_state", "Unknown", {}],
+  ];
+  for (const [status, expectedKey, overrides] of checks) {
+    const h = await loadResidualInspectionTable({ rows: [{ ...row, status, ...overrides }] });
+    const cells = h.table.children[0].children;
+    assert.equal(cells[4].children[0].textContent, `[trends.evidence${expectedKey}]`);
+    assert.equal(cells[4].children[1].textContent, `[trends.evidence${expectedKey}Why]`);
+    assert.equal(cells[0].children[0].textContent, "[trends.measuredSpan]");
+    if (status === "matched" && expectedKey === "Comparable") assert.equal(cells[3].textContent, "+20 pp");
+    for (const locale of SUPPORTED_LOCALES) {
+      for (const key of [`trends.evidence${expectedKey}`, `trends.evidence${expectedKey}Why`]) {
+        assert.notEqual(translate(key, {}, locale), key);
+      }
+    }
+  }
 });
 
 test("the inspection list keeps every row and restarts paging when the selection changes", async () => {

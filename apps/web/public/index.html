@@ -737,19 +737,21 @@
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Inspect exact periods</p>
-                <h3>Exact windows and evidence state</h3>
+                <h3 data-i18n="trends.evidenceTitle">What each comparison tells us</h3>
               </div>
             </div>
+            <p class="annotation" data-i18n="trends.evidenceIntro">Each sample compares a rolling window, normally 3 hours. Observed is allowance used; estimated is the amount predicted from recorded activity. Difference = observed − estimated, in percentage points (pp).</p>
+            <p class="annotation" data-i18n="trends.evidenceHelp">For example, falling from 60% to 50% remaining uses 10 pp. Comparable means the two values can be compared, not that they agree. A dash means a value could not be established.</p>
             <div class="table-wrap">
-              <table>
+              <table class="residual-inspection-table">
                 <caption class="sr-only">Largest unexplained quota movement periods</caption>
                 <thead>
                   <tr>
                   <th scope="col" id="residual-time-heading">Local time</th>
                   <th scope="col">Observed</th>
-                  <th scope="col">Expected</th>
+                  <th scope="col" data-i18n="trends.estimated">Estimated</th>
                   <th scope="col">Difference</th>
-                  <th scope="col">Evidence state</th>
+                  <th scope="col" data-i18n="trends.evidenceColumn">How to read this row</th>
                   </tr>
                 </thead>
                 <tbody id="residual-table">
