@@ -116,3 +116,27 @@ test('Windows source reads reject excessive sizes before calling native code', a
   } finally { await handle.close(); }
   await assert.rejects(handle.stat(), /timing_source_closed/);
 });
+
+test('read and batch limits retain measurements after an 8 MiB record across resumptions', async t => {
+  const f = await fixture(t), path = join(f.root, 'synthetic-large.jsonl');
+  const later = lines().split('\n').slice(1).join('\n')
+    .replaceAll('synthetic-turn', 'synthetic-later-turn')
+    .replaceAll('synthetic-response', 'synthetic-later-response');
+  const content = lines() + JSON.stringify({ type: 'synthetic_ignored', padding: 'x'.repeat(8 * 1024 * 1024) }) + '\n' + later;
+  await writeFile(path, content);
+  const store = await openTimingStore(join(f.root, 'timing'), f.options);
+  try {
+    let result, passes = 0;
+    do {
+      result = await ingestTimingFile(store, path, { maxBytes: 4 * 1024 * 1024 });
+      assert.ok(++passes < 10, 'bounded batches make forward progress');
+    } while (result.remaining > 0);
+    assert.ok(passes >= 3, 'the source crosses several ingestion batches');
+    assert.equal(result.cursor, Buffer.byteLength(content), 'cursor reaches the entire file');
+    const rows = readTimingRows(store);
+    assert.equal(rows.length, 2, 'turns before and after the large record survive');
+    assert.ok(rows.every(row => row.sample_tokens === 100 && row.ttft === 200));
+    assert.ok(f.reads.every(bytes => bytes <= 65536), 'native reads stay bounded');
+    assert.equal(f.sources.size, 0);
+  } finally { store.close(); }
+});
