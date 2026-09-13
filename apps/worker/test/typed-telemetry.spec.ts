@@ -114,6 +114,97 @@ describe("lossless typed telemetry codec", () => {
 });
 
 describe("typed target D1", () => {
+  it("keeps identical parent replay reads bounded as existing typed records grow", async () => {
+    const metadata = new WeakMap<D1PreparedStatement, string>();
+    const measured = new Proxy(db(), { get(target, key) {
+      if (key === "prepare") return (sql: string) => {
+        const capture = (statement: D1PreparedStatement): D1PreparedStatement => {
+          const wrapped = new Proxy(statement, { get(inner, member) {
+            if (member === "bind") return (...values: unknown[]) => capture(inner.bind(...values));
+            const value = Reflect.get(inner, member);
+            return typeof value === "function" ? value.bind(inner) : value;
+          } });
+          metadata.set(wrapped, sql);
+          return wrapped;
+        };
+        return capture(target.prepare(sql));
+      };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const probes: TypedTelemetrySourceRecord[] = [];
+    for (const format of ["v1", "v11"] as const) {
+      for (let page = 0; page < 3; page++) {
+        const rows = Array.from({ length: 200 }, (_, index) => source(format, page * 200 + index + 1,
+          usage(format, `event:v2:${(page * 200 + index).toString(16).padStart(64, "0")}`),
+          { chunkRowId: `chunk:${format}:page-${page}` }));
+        await persistTypedTelemetryBatch(db(), rows);
+        if (page === 0) probes.push(rows[0]!);
+      }
+    }
+    const prepared = await prepareTypedTelemetryInsert(measured, probes);
+    const parents = prepared.statements.filter(statement =>
+      /^INSERT INTO typed_telemetry_(devices|manifests|chunks) /.test(metadata.get(statement) ?? ""));
+    expect(parents.length).toBe(4); // One shared device, one manifest, two chunks.
+    for (const statement of parents) {
+      const result = await statement.run();
+      expect(result.meta.changes).toBe(0);
+      expect(result.meta.rows_written).toBe(0);
+      // Native D1 metadata, not EXPLAIN's potentially misleading SEARCH label:
+      // the old same-value UPSERT scanned namespace/owner children for its FK.
+      expect(result.meta.rows_read).toBeLessThanOrEqual(32);
+    }
+    expect(await count("typed_telemetry_records")).toBe(1200);
+    expect((await db().prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
+  });
+  it("replays mixed existing parents after concurrent delivery and lost commit response", async () => {
+    const rows = (["v1", "v11"] as const).flatMap(format => [source(format, 1, usage(format)),
+      source(format, 2, quota(format)), source(format, 3, session(format))]);
+    await assertRoundtrip(rows);
+    const original = await prepareTypedTelemetryInsert(db(), rows);
+    await Promise.all([persistTypedTelemetryBatch(db(), rows), persistTypedTelemetryBatch(db(), rows)]);
+    const lost = new Proxy(db(), { get(target, key) {
+      if (key === "batch") return async (statements: D1PreparedStatement[]) => {
+        await target.batch(statements);
+        throw new Error("Synthetic committed response loss");
+      };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    await expect(persistTypedTelemetryBatch(lost, rows)).rejects.toMatchObject({ code: "TYPED_TELEMETRY_UNAVAILABLE" });
+    const replay = await persistTypedTelemetryBatch(db(), rows);
+    expect(replay.batchDigest).toBe(original.batchDigest);
+    expect(await count("typed_telemetry_records")).toBe(6);
+    await assertRoundtrip([...rows, source("v11", 4, usage("v11", "event:after-replay"))]);
+  });
+  it("keeps mismatched parent membership aborts atomic, including NULL manifest and chunk fields", async () => {
+    const v1 = source("v1", 1, usage("v1"));
+    const v11 = source("v11", 1, usage("v11"));
+    await persistTypedTelemetryBatch(db(), [v1, v11]);
+    const conflicting = [
+      { ...v11, participantId: "participant:other" },
+      { ...v11, deviceId: "device:other" },
+      { ...v11, chunkDay: "2026-08-25" },
+      { ...v11, manifestId: "manifest:other" },
+      { ...v11, manifestId: "manifest:other", chunkDay: "2026-08-25" },
+      { ...v11, record: quota("v11") },
+      { ...v1, deviceId: "device:other" },
+      { ...v1, chunkDay: "2026-08-25" },
+      { ...v1, record: quota("v1") },
+    ];
+    for (const row of conflicting) {
+      const prepared = await prepareTypedTelemetryInsert(db(), [row]);
+      const before = db().prepare("INSERT INTO typed_telemetry_namespaces(original_id) VALUES(?)")
+        .bind(encodeTypedTelemetryId("must-rollback").buffer);
+      await expect(db().batch([before, ...prepared.statements])).rejects.toThrow(/typed_telemetry_(?:identity|membership)_conflict/);
+      expect(await count("typed_telemetry_namespaces")).toBe(1);
+      expect(await count("typed_telemetry_records")).toBe(2);
+    }
+    // Exact NULL manifests on v1 replay remain accepted; no comparison treats
+    // NULL as unknown and suppresses a mismatch in another immutable field.
+    await assertRoundtrip([v1, v11]);
+    expect((await db().prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
+  });
   it("reconstructs all fields, NULL/zero/unknown and exact legacy counterparts from persisted typed rows", async () => {
     const unavailable = { accountBasis: "unavailable", accountTrackId: null, planBasis: "conflicted", planType: "unknown", planEraId: null };
     const rows = [source("v1", 1, usage("v1")), source("v1", 2, quota("v1")), source("v1", 3, session("v1")),
