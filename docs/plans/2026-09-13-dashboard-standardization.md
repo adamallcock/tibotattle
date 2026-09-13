@@ -355,3 +355,13 @@ The independent accounting-parity gate remains outside this visual proof.
 Owner requested removal of How this report is built from Projects & threads.
 Remove the disclosure from both populated and empty shared reports. The report
 now ends after its results/pagination; filter and evidence behavior is unchanged.
+
+753 web tests and documentation checks pass. Unsigned source
+`1b94953bd056539c6b7be05e607aa6f5615be772`, ASAR
+`024ffa059f0064c08b58ec29f20910c55d603ebd2abc92487367140b130b2d05`,
+was checked in the packaged renderer with a synthetic shared-period report.
+The populated result has one table and zero methodology panels; its screenshot
+ends with pagination. Empty-state recovery also passes at 1180px and 960px.
+Evidence: `.release-build/report-clean-layout.json` and
+`.release-build/report-footer-clean.png`. The independent full accounting-parity
+qualification is not established by this visual check.
