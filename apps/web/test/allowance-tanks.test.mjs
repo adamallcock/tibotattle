@@ -96,7 +96,8 @@ test("tanks retain one, two and many pools, with the current Codex pool first", 
     assert.equal(h.quota.children[0].attributes["aria-label"], "codex 10080");
     assert.equal(find(h.quota, "quota-tank-fuel").length, count);
     assert.equal(h.quota.textContent.includes("Observation time"), false);
-    assert.match(h.context.textContent, /pro/u);
+    assert.equal(h.context.textContent, "");
+    assert.equal(h.context.hidden, true);
   }
 });
 test("unknown capacity has no fill; zero is a real empty tank; stale evidence stays explicit", () => {
@@ -224,4 +225,24 @@ test("five-hour tanks are narrow and Spark uses its shared model identity", () =
   const family = find(spark, "quota-tank-family")[0];
   assert.equal(family.children[0].attributes.class, "allowance-model-icon");
   assert.equal(family.children[0].attributes["aria-hidden"], "true");
+});
+
+
+test("Codex tanks use the bundled logo and demo evidence remains labelled", () => {
+  const h = harness();
+  h.renderQuotaCards({ ...payload([window()]), mode: "demo" });
+  const family = find(h.quota, "quota-tank-family")[0];
+  assert.equal(family.children[0].attributes.src, "./codex-color.svg");
+  assert.equal(family.children[0].attributes.alt, "");
+  assert.equal(family.textContent, "Codex");
+  assert.equal(h.context.hidden, false);
+  assert.notEqual(h.context.textContent, "");
+});
+
+test("animated forecast coverage retains absolute positioning and a non-collapsing fill", async () => {
+  const css = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const rules = [...css.matchAll(/\.weekly-pace-track-covered\s*\{([^}]+)\}/gu)];
+  const positions = rules.flatMap(rule => [...rule[1].matchAll(/position:\s*([^;]+);/gu)].map(value => value[1]));
+  assert.equal(positions.at(-1), "absolute");
+  assert.ok(rules.some(rule => /inset-block:\s*0;/.test(rule[1])));
 });

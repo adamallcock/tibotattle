@@ -28,6 +28,7 @@ const SHARED_WEB_FILES = Object.freeze([
   "apps/web/public/icon-panel-left.svg",
   "apps/web/public/icon-refresh-cw.svg",
   "apps/web/public/icon-settings.svg",
+  "apps/web/public/codex-color.svg",
   "apps/web/public/index.html",
   "apps/web/public/install-cta.js",
   "apps/web/public/lib.js",

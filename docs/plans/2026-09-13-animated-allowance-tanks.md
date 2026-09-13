@@ -56,3 +56,10 @@ Follow-up validation: 740 web tests passed. Browser checks confirmed the 40%
 vessel geometry, full Spark labels with the shared icon colour, hidden controls
 and no explanatory copy under reduced motion, and a changing forecast sheen
 with an unchanged coverage width. The discreet pause control stopped both.
+
+Final polish: bundle the owner-supplied Codex logo for tank and forecast headers,
+hide the provider plan line while retaining the demo qualifier, and place the
+motion control inside the forecast header (tank header when absent). Corrected
+a CSS positioning regression that collapsed the coverage fill to zero height.
+The moving highlight now sits inside an absolutely positioned, full-height fill;
+a regression test guards the positioning contract.

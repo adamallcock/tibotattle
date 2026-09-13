@@ -54,7 +54,8 @@ capacity ratio. GPT-5.3 Codex Spark uses its shared model name and icon.
 Liquid motion is illustrative: the level stays at the observed percentage. Only
 a matching fresh forecast drives the outlet; greater pace produces more flow,
 with amber or red overflow for excessive pace. Overflow is a pace cue, not wasted
-quota. A discreet pause icon stops both tank and forecast-bar motion. The system
+quota. A discreet pause icon in the forecast header stops both tank and forecast-bar
+motion (it sits in the tank header when no forecast is available). The system
 reduced-motion preference is respected silently and hides the motion control.
 The forecast bar has a subtle moving sheen; its extent and time markers do not
 move with the animation. Offscreen tanks stop animating. Unavailable capacity retains its text

@@ -5096,7 +5096,7 @@ html[data-theme="dark"] .quota-tank.stale { --tank-fluid: #8c9a8d; --tank-glow: 
 
 
 /* Quiet motion control; the system preference needs no status message. */
-.allowance-motion-controls { display: flex; justify-content: flex-end; margin: -10px 0 6px; min-height: 24px; }
+.allowance-motion-controls { display: flex; margin-inline-start: auto; min-height: 24px; }
 .allowance-motion-controls[hidden] { display: none; }
 .allowance-motion-controls button { display: grid; place-items: center; width: 28px; min-height: 28px; padding: 6px; border: 0; border-radius: 50%; background: transparent; color: var(--muted); }
 .allowance-motion-controls button:hover { background: var(--surface-raised); color: var(--ink); }
@@ -5106,9 +5106,15 @@ html[data-theme="dark"] .quota-tank.stale { --tank-fluid: #8c9a8d; --tank-glow: 
 .quota-tank-family .allowance-model-icon { flex: 0 0 15px; width: 15px; height: 15px; }
 .quota-tank[data-short-window="true"] .quota-tank-value { font-size: 2rem; }
 .quota-tank[data-short-window="true"].has-liquid-tank .quota-tank-bottom > div:first-child { padding: 6px 8px; }
-.weekly-pace-track-covered { position: relative; overflow: hidden; }
-.weekly-pace-track-covered::after { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(105deg, transparent 0 45px, color-mix(in srgb, var(--surface-raised) 24%, transparent) 58px, transparent 80px); background-size: 80px 100%; animation: allowance-forecast-flow var(--forecast-flow-duration, 5s) linear infinite; animation-play-state: paused; }
+.weekly-pace-track-covered { position: absolute; overflow: hidden; }
+.weekly-pace-track-covered::after { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(105deg, transparent 0 45px, color-mix(in srgb, var(--surface-raised) 42%, transparent) 58px, transparent 80px); background-size: 80px 100%; animation: allowance-forecast-flow var(--forecast-flow-duration, 5s) linear infinite; animation-play-state: paused; }
 .weekly-pace-forecast[data-motion="running"] .weekly-pace-track-covered::after { animation-play-state: running; }
 @keyframes allowance-forecast-flow { to { background-position: 80px 0; } }
 @media (prefers-reduced-motion: reduce) { .weekly-pace-track-covered::after { display: none; } }
 @media (pointer: coarse) { .allowance-motion-controls button { width: 44px; min-height: 44px; } }
+
+.quota-codex-icon { width: 18px; height: 18px; flex: 0 0 18px; }
+.quota-tank-header { position: relative; }
+.quota-tank-header > .allowance-motion-controls { position: absolute; top: 0; right: 0; }
+
+.weekly-pace-forecast-heading .panel-kicker { display: inline-flex; align-items: center; gap: 6px; }

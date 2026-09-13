@@ -1653,11 +1653,7 @@ function renderQuotaCards(data) {
   }
   const context = $("#allowance-context");
   if (context) {
-    const plans = [...new Set(normalWindows.map((window) => (
-      providerReportedPlanEvidence(window.planType)
-    )).filter(Boolean))];
-    context.textContent = data.mode === "demo"
-      ? t("dashboard.quota.demo") : plans.join(" · ");
+    context.textContent = data.mode === "demo" ? t("dashboard.quota.demo") : "";
     context.hidden = !context.textContent;
   }
   for (const window of windows) {
@@ -1691,9 +1687,14 @@ function renderQuotaCards(data) {
     if (spark) {
       family.className += " allowance-model-spark";
       family.append(modelThemeIcon(document, "spark"), node("span", "", "GPT-5.3 Codex Spark"));
+    } else if (isPrimaryCodexQuotaWindow(window)) {
+      const logo = node("img", "quota-codex-icon");
+      logo.setAttribute("src", "./codex-color.svg");
+      logo.setAttribute("alt", "");
+      logo.setAttribute("aria-hidden", "true");
+      family.append(logo, node("span", "", "Codex"));
     } else {
-      family.textContent = isPrimaryCodexQuotaWindow(window) ? "Codex"
-        : window.limitName || t("dashboard.quota.windowOther");
+      family.textContent = window.limitName || t("dashboard.quota.windowOther");
     }
     header.append(family);
     header.append(node("span", "quota-tank-period",
@@ -7934,13 +7935,17 @@ function renderWeeklyPaceForecast(data) {
   card.setAttribute("aria-labelledby", cardId);
 
   const heading = node("div", "weekly-pace-forecast-heading");
-  heading.append(
-    node(
-      "p",
-      "panel-kicker",
-      collectingEvidence ? t("allowance.collecting") : t("allowance.forecast"),
-    ),
-  );
+  const kicker = node("p", "panel-kicker");
+  if (collectingEvidence) {
+    kicker.textContent = t("allowance.collecting");
+  } else {
+    const logo = node("img", "quota-codex-icon");
+    logo.setAttribute("src", "./codex-color.svg");
+    logo.setAttribute("alt", "");
+    logo.setAttribute("aria-hidden", "true");
+    kicker.append(logo, node("span", "", t("allowance.forecast")));
+  }
+  heading.append(kicker);
   if (collectingEvidence) {
     heading.append(node(
       "span",

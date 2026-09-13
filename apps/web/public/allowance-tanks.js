@@ -172,7 +172,9 @@ export function mountAllowanceTanks(container, forecast, { t }) {
     entries.push(entry);
   }
   if (!entries.length) return { dispose() {} };
-  container.after(controls);
+  const controlHost = forecast?.querySelector(".weekly-pace-forecast-heading")
+    ?? container.querySelector(".quota-tank-header");
+  controlHost?.append(controls);
   const motion = createTankMotion({
     request: (callback) => view.requestAnimationFrame(callback),
     cancel: (frame) => view.cancelAnimationFrame(frame),
