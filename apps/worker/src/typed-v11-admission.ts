@@ -14,6 +14,8 @@ import { existingTelemetryV11StagedChunk, validateTelemetryV11StagedChunk,
 import { assertTelemetryTransportWriteAllowed, type TelemetryTransportPrincipal } from "./telemetry-transport-policy";
 import { ownerWriteFenceStatement } from "./storage-routing-fence";
 import type { OwnerStorageRoute } from "./storage-routing";
+import { assertCurrentTypedTelemetryOrigin, typedTelemetryOriginQualificationStatements,
+  TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST } from "./typed-telemetry-origins";
 
 export interface TypedV11ChunkMetadata {
   /** Stable original source namespace, never a destination shard or request ID. */
@@ -55,7 +57,9 @@ export async function initializeTypedV11Admission(db: D1Database, sourceNamespac
         .bind(sourceNamespace, source),
       db.prepare(`UPDATE typed_v11_admission_state SET runtime_contract_version=1
         WHERE id=1 AND source_namespace=? AND runtime_contract_version=0`).bind(sourceNamespace),
+      ...typedTelemetryOriginQualificationStatements(db, sourceNamespace, "v11"),
     ]);
+    await assertCurrentTypedTelemetryOrigin(db, sourceNamespace, "v11");
   } catch (error) {
     if (String(error).includes("typed_v11_unqualified_history") || String(error).includes("typed_v11_namespace_or_allocator_conflict")
         || String(error).includes("typed_v11_runtime_contract_unqualified")) {
@@ -127,8 +131,12 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
   const chunk = await validateTelemetryV11StagedChunk(value);
   const { stream, day, seq } = parseTelemetryV11ChunkId(chunk.chunkId);
   await assertTelemetryTransportWriteAllowed(db, principal, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION);
-  const state = await db.prepare("SELECT source_namespace,namespace_id,next_source_row_id FROM typed_v11_admission_state WHERE id=1")
-    .first<AdmissionState>();
+  const state = await db.prepare(`SELECT s.source_namespace,s.namespace_id,s.next_source_row_id
+    FROM typed_v11_admission_state s
+    JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=s.namespace_id
+      AND origin.source_namespace=s.source_namespace AND origin.access_mode='current-write'
+      AND origin.v11_read_contract_version=2 AND origin.source_schema_digest=?
+    WHERE s.id=1`).bind(TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST).first<AdmissionState>();
   if (!state || state.source_namespace !== metadata.sourceNamespace || !Number.isSafeInteger(state.next_source_row_id)
       || state.next_source_row_id < 1 || !Number.isSafeInteger(state.next_source_row_id + chunk.records.length)) {
     throw new TypedTelemetryError("TYPED_TELEMETRY_CONFLICT");
@@ -173,12 +181,12 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
     if (transactionBytes > MAX_TYPED_TELEMETRY_BATCH_BYTES) throw new TypedTelemetryError("TYPED_TELEMETRY_LIMIT");
     statements.push(...page.statements);
   }
-  statements.push(prepare(`INSERT INTO typed_v11_owner_memberships(participant_id,typed_owner_id)
-    SELECT ?,owner_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
-    ON CONFLICT(participant_id) DO UPDATE SET typed_owner_id=excluded.typed_owner_id`)
+  statements.push(prepare(`INSERT INTO typed_v11_owner_memberships(participant_id,namespace_id,typed_owner_id)
+    SELECT ?,namespace_id,owner_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
+    ON CONFLICT(participant_id,namespace_id) DO UPDATE SET typed_owner_id=excluded.typed_owner_id`)
     .bind(principal.participantId, state.namespace_id, state.next_source_row_id));
-  statements.push(prepare(`INSERT INTO typed_v11_manifest_memberships(manifest_id,typed_manifest_id)
-    SELECT ?,manifest_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
+  statements.push(prepare(`INSERT INTO typed_v11_manifest_memberships(manifest_id,namespace_id,typed_manifest_id)
+    SELECT ?,namespace_id,manifest_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
     ON CONFLICT DO NOTHING`).bind(manifest.id,state.namespace_id,state.next_source_row_id));
   const proofs = await Promise.all(chunk.records.map(async (record, index) => {
     const anchor = telemetryV11RecordAnchor(stream, record);

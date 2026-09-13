@@ -10,6 +10,7 @@ import { insertTelemetryV1Chunk, type TelemetryV1ChunkInsert, type TelemetryV1Ch
 import { insertTypedTelemetryV1Chunk, validateTypedTelemetryV1Receipt } from "./typed-v1-admission";
 import type { TelemetryTransportPrincipal } from "./telemetry-transport-policy";
 import type { OwnerStorageRoute } from "./storage-routing";
+import { TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST } from "./typed-telemetry-origins";
 
 export type TelemetryStorageMode = Readonly<{ kind: "json" } | { kind: "typed"; sourceNamespace: string }>;
 interface StorageModeSettings {
@@ -56,9 +57,15 @@ export async function resolveTelemetryStorageMode(db: D1Database, settings: Stor
   try {
     const ready = await db.prepare(`SELECT 1 AS ready FROM ${stateTable} s
       JOIN typed_telemetry_namespaces n ON n.id=s.namespace_id
+      JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=s.namespace_id
+        AND origin.namespace_original=n.original_id AND origin.source_namespace=s.source_namespace
+        AND origin.access_mode='current-write' AND origin.registered_move_id IS NULL
+        AND origin.source_schema_digest=?
+        AND origin.${format === "v1" ? "v1_read_contract_version" : "v11_read_contract_version"}=2
       JOIN typed_telemetry_schema v ON v.id=1 AND v.version=1
       WHERE s.id=1 AND s.source_namespace=? AND n.original_id=? AND s.runtime_contract_version=1`)
-      .bind(mode.sourceNamespace, Uint8Array.from(encodeTypedTelemetryId(mode.sourceNamespace)).buffer).first();
+      .bind(TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST, mode.sourceNamespace,
+        Uint8Array.from(encodeTypedTelemetryId(mode.sourceNamespace)).buffer).first();
     if (!ready) throw unavailable();
   } catch { throw unavailable(); }
   return mode;

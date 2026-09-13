@@ -5,7 +5,11 @@
 export async function typedTelemetryReadNamespace(db: D1Database): Promise<string | null> {
   const present = await db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='typed_v11_admission_state'").first();
   if (!present) return null;
-  const state = await db.prepare("SELECT source_namespace,runtime_contract_version FROM typed_v11_admission_state WHERE id=1")
+  const state = await db.prepare(`SELECT s.source_namespace,s.runtime_contract_version
+    FROM typed_v11_admission_state s JOIN typed_telemetry_origin_contracts origin
+      ON origin.namespace_id=s.namespace_id AND origin.source_namespace=s.source_namespace
+     AND origin.access_mode='current-write' AND origin.v11_read_contract_version=2
+    WHERE s.id=1`)
     .first<{ source_namespace: string; runtime_contract_version: number }>();
   if (!state) return null;
   if (state.runtime_contract_version !== 1 || typeof state.source_namespace !== "string"

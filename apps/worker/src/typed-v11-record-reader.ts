@@ -1,5 +1,8 @@
 import { readTypedTelemetryRowsByStorageIds } from "./typed-telemetry-compatibility";
 import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
+import { TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST } from "./typed-telemetry-origins";
+
+const binary = (value: string): ArrayBuffer => Uint8Array.from(encodeTypedTelemetryId(value)).buffer;
 
 export const TYPED_V11_MANIFEST_PAGE_SQL = `SELECT typed_record_id AS record_id,stream,occurrence_id
   FROM typed_v11_record_admissions
@@ -22,10 +25,25 @@ export async function readTypedV11ManifestPage(db: D1Database, options: {
       || (options.afterStream === "") !== (options.afterOccurrence === "")) {
     throw new Error("TYPED_V11_READER_INVALID");
   }
-  const manifest = await db.prepare(`SELECT 1 AS present FROM typed_v11_admission_state s
-    CROSS JOIN telemetry_v11_day_manifests m
-    WHERE s.id=1 AND s.source_namespace=? AND m.id=? AND m.participant_id=? AND m.device_id=? AND m.state='ready'`)
-    .bind(options.sourceNamespace, options.manifestId, options.participantId, options.deviceId).first();
+  const manifest = await db.prepare(`SELECT 1 AS present FROM telemetry_v11_day_manifests m
+    JOIN typed_v11_manifest_memberships membership ON membership.manifest_id=m.id
+    JOIN typed_telemetry_manifests typed_manifest ON typed_manifest.id=membership.typed_manifest_id
+      AND typed_manifest.namespace_id=membership.namespace_id AND typed_manifest.original_id=?
+    JOIN typed_telemetry_owners owner ON owner.id=typed_manifest.owner_id
+      AND owner.namespace_id=membership.namespace_id AND owner.original_id=?
+    JOIN typed_telemetry_devices device ON device.id=typed_manifest.device_id
+      AND device.namespace_id=membership.namespace_id AND device.owner_id=typed_manifest.owner_id
+      AND device.original_id=?
+    JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=membership.namespace_id
+      AND origin.namespace_original=? AND origin.source_namespace=?
+      AND origin.v11_read_contract_version=2 AND origin.source_schema_digest=?
+    JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=m.participant_id
+      AND owner_membership.namespace_id=membership.namespace_id
+      AND owner_membership.typed_owner_id=typed_manifest.owner_id
+    WHERE m.id=? AND m.participant_id=? AND m.device_id=? AND m.state='ready'`)
+    .bind(binary(options.manifestId), binary(options.participantId), binary(options.deviceId),
+      binary(options.sourceNamespace), options.sourceNamespace, TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST,
+      options.manifestId, options.participantId, options.deviceId).first();
   if (!manifest) throw new Error("TYPED_V11_READER_MEMBERSHIP_CONFLICT");
   const rows = (await db.prepare(TYPED_V11_MANIFEST_PAGE_SQL)
     .bind(options.manifestId, options.afterStream, options.afterOccurrence, options.limit)

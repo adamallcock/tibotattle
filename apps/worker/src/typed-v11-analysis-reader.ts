@@ -1,5 +1,9 @@
 import { decodeTypedTelemetryUsageAnalysisRows, readTypedTelemetryRowsByStorageIds } from "./typed-telemetry-compatibility";
 import type { V11SourcePin } from "./telemetry-v11-domain";
+import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
+import { TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST } from "./typed-telemetry-origins";
+
+const binary = (value: string): ArrayBuffer => Uint8Array.from(encodeTypedTelemetryId(value)).buffer;
 
 export const TYPED_V11_ANALYSIS_PAGE_SIZE = 5_000;
 export const TYPED_V11_USAGE_PAGE_SQL = `WITH page AS MATERIALIZED (
@@ -53,6 +57,19 @@ export async function readTypedV11ChunkRecords(db: D1Database, options: {
   if (!Number.isSafeInteger(expectedCount) || expectedCount < 1 || expectedCount > 200) {
     throw new Error("TYPED_V11_EXPORT_MEMBERSHIP_CONFLICT");
   }
+  const qualified = await db.prepare(`SELECT 1 AS present FROM telemetry_v11_chunks c
+    JOIN typed_v11_chunk_allocations allocation ON allocation.chunk_id=c.id
+    JOIN typed_telemetry_chunks typed_chunk ON typed_chunk.namespace_id=allocation.namespace_id
+      AND typed_chunk.format=11 AND typed_chunk.original_id=allocation.chunk_original
+    JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=allocation.namespace_id
+      AND origin.namespace_original=? AND origin.source_namespace=?
+      AND origin.v11_read_contract_version=2 AND origin.source_schema_digest=?
+    JOIN typed_v11_owner_memberships membership ON membership.participant_id=c.participant_id
+      AND membership.namespace_id=allocation.namespace_id AND membership.typed_owner_id=typed_chunk.owner_id
+    WHERE c.id=? AND c.participant_id=? AND typed_chunk.original_id=?`)
+    .bind(binary(sourceNamespace), sourceNamespace, TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST,
+      chunkId, participantId, binary(chunkId)).first();
+  if (!qualified) throw new Error("TYPED_V11_EXPORT_MEMBERSHIP_CONFLICT");
   const rows = (await db.prepare(`SELECT p.typed_record_id FROM typed_v11_record_admissions p
     JOIN telemetry_v11_chunks c ON c.id=p.chunk_id
     WHERE p.chunk_id=? AND c.participant_id=? ORDER BY p.occurrence_id LIMIT 201`)

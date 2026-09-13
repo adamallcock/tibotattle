@@ -2,6 +2,7 @@ import { encodeTypedTelemetryId } from './typed-telemetry-codec';
 import { decodeTypedTelemetryUsageAnalysisRows } from './typed-telemetry-compatibility';
 import type { V1QuotaPageReader,V1PlanSourceRow,V1FitSourceRow } from './quota-analysis-v1-reader';
 import { V1_WINNER_FILTER_SQL } from './telemetry-v1-source-selection';
+import { readQualifiedTypedTelemetryOwnerOrigins } from './typed-telemetry-origins';
 
 export interface TypedV1AnalysisScope {sourceNamespace:string;participantId:string;ownerId:number}
 const fail=()=>new Error('TYPED_V1_ANALYSIS_NOT_READY');
@@ -24,10 +25,16 @@ export async function loadTypedV1AnalysisScope(db:D1Database,participantId:strin
   (SELECT id FROM typed_telemetry_owners WHERE namespace_id=s.namespace_id AND original_id=?) owner_id,
   EXISTS(SELECT 1 FROM participants WHERE id=? AND state='active') active,
   EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='typed_v1_analytical_schema') ready
-  FROM typed_v1_admission_state s WHERE s.id=1`).bind(blob(participantId),participantId)
+  FROM typed_v1_admission_state s JOIN typed_telemetry_origin_contracts origin
+   ON origin.namespace_id=s.namespace_id AND origin.source_namespace=s.source_namespace
+    AND origin.access_mode='current-write' AND origin.v1_read_contract_version=2
+  WHERE s.id=1`).bind(blob(participantId),participantId)
   .first<{source_namespace:string;runtime_contract_version:number;owner_id:number|null;active:number;ready:number}>();
  if(!state)return null;
  if(state.runtime_contract_version!==1||state.ready!==1||state.active!==1)throw fail();
+ const origins=await readQualifiedTypedTelemetryOwnerOrigins(db,participantId,'v1');
+ if(origins.length>1 || (origins.length===1 && (origins[0]!.sourceNamespace!==state.source_namespace
+   || origins[0]!.typedOwnerId!==(state.owner_id??-1) || origins[0]!.accessMode!=='current-write')))throw fail();
  return {sourceNamespace:state.source_namespace,participantId,ownerId:state.owner_id??-1};
 }
 

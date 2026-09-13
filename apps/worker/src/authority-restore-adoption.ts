@@ -3,6 +3,7 @@ import { sha256 } from './crypto';
 import { encodeTypedTelemetryId, typedTelemetryCanonicalRecords, encodeTypedTelemetryRecord } from './typed-telemetry-codec';
 import { MAX_TYPED_TELEMETRY_BATCH_BYTES, readTypedTelemetryPage } from './typed-telemetry-repository';
 import { MAX_STORAGE_TRANSACTION_STATEMENTS } from './storage-routing-batch-budget';
+import { assertCurrentTypedTelemetryOrigin, typedTelemetryOriginQualificationStatements } from './typed-telemetry-origins';
 
 /** Only the isolated restore coordinator calls this adapter. Original source
  * rows are copied and independently verified elsewhere; this reconstructs the
@@ -14,7 +15,7 @@ const binary=(value:Uint8Array)=>Uint8Array.from(value).buffer;
 const fail=()=>new Error('AUTHORITY_RESTORE_ADOPTION_MISMATCH');
 const prefix=(format:'v1'|'v11')=>format==='v1'?'typed_v1':'typed_v11';
 const code=(format:'v1'|'v11')=>format==='v1'?10:11;
-interface Stored {id:number;owner_id:number;chunk_id:number;manifest_id:number|null;stream:number;occurrence_id:number[];observed_at_ms:number;canonical_digest:number[]}
+interface Stored {id:number;namespace_id:number;namespace_original:number[];owner_id:number;owner_namespace_id:number;owner_namespace_original:number[];chunk_id:number;manifest_id:number|null;manifest_namespace_id:number|null;manifest_namespace_original:number[]|null;stream:number;occurrence_id:number[];observed_at_ms:number;canonical_digest:number[]}
 interface Range {first_id:number;last_id:number;count:number}
 function exactRead<T>(result:D1Result<T>|undefined):T {
  if(result?.success!==true||!Array.isArray(result.results)||result.results.length!==1)throw fail();
@@ -71,9 +72,8 @@ export async function restoreTypedAdmissionPage(db:D1Database,options:{format:'v
  if(verify?checkpoint.verify_done:checkpoint.done)return {done:true,records:0};
  const after=verify?checkpoint.verify_after:checkpoint.after_id;
  const page=await readTypedTelemetryPage(db,{sourceNamespace,format,afterSourceRowId:after,limit});
- if(!verify)await db.prepare('INSERT INTO typed_telemetry_namespaces(original_id) VALUES(?) ON CONFLICT DO NOTHING').bind(binary(encodeTypedTelemetryId(sourceNamespace))).run();
  const namespace=await db.prepare('SELECT id FROM typed_telemetry_namespaces WHERE original_id=?').bind(binary(encodeTypedTelemetryId(sourceNamespace))).first<number>('id');
- if(!namespace){if(page.records.length)throw fail();}
+ if(!namespace)throw fail();
  const statements:D1PreparedStatement[]=[];
  // Fetch the same indexed rows in <=100-bind sets. Explicit keyed cardinality
  // checks retain per-record identity even if the provider reorders result rows.
@@ -85,15 +85,34 @@ export async function restoreTypedAdmissionPage(db:D1Database,options:{format:'v
  const storedQueries:Query[]=[];
  for(let offset=0;offset<page.records.length;offset+=98){
   const ids=page.records.slice(offset,offset+98).map(record=>record.sourceRowId);
-  storedQueries.push({sql:`SELECT source_row_id,id,owner_id,chunk_id,manifest_id,stream,occurrence_id,observed_at_ms,canonical_digest FROM typed_telemetry_records WHERE namespace_id=? AND format=? AND source_row_id IN (${ids.map(()=>'?').join(',')}) LIMIT ${ids.length+1}`,
+  storedQueries.push({sql:`SELECT r.source_row_id,r.id,r.namespace_id,record_namespace.original_id namespace_original,
+    r.owner_id,owner.namespace_id owner_namespace_id,owner_namespace.original_id owner_namespace_original,
+    r.chunk_id,r.manifest_id,manifest.namespace_id manifest_namespace_id,manifest_namespace.original_id manifest_namespace_original,
+    r.stream,r.occurrence_id,r.observed_at_ms,r.canonical_digest
+    FROM typed_telemetry_records r
+    JOIN typed_telemetry_namespaces record_namespace ON record_namespace.id=r.namespace_id
+    JOIN typed_telemetry_owners owner ON owner.id=r.owner_id
+    JOIN typed_telemetry_namespaces owner_namespace ON owner_namespace.id=owner.namespace_id
+    LEFT JOIN typed_telemetry_manifests manifest ON manifest.id=r.manifest_id
+    LEFT JOIN typed_telemetry_namespaces manifest_namespace ON manifest_namespace.id=manifest.namespace_id
+    WHERE r.namespace_id=? AND r.format=? AND r.source_row_id IN (${ids.map(()=>'?').join(',')}) LIMIT ${ids.length+1}`,
    args:[namespace,code(format),...ids]});
  }
  const storedResults=storedQueries.length?await db.batch<Stored&Record<string,unknown>>(storedQueries.map(query=>statement(db,query))):[];
  if(storedResults.length!==storedQueries.length)throw fail();
  const storedRows=storedResults.flatMap((result,index)=>keyedRows(result,'source_row_id',storedQueries[index]!.args.slice(2)));
+ const expectedNamespace=Array.from(encodeTypedTelemetryId(sourceNamespace));
  for(const row of storedRows){
-  if([row.id,row.owner_id,row.chunk_id].some(value=>!Number.isSafeInteger(value)||value<1)
+  if([row.id,row.namespace_id,row.owner_id,row.owner_namespace_id,row.chunk_id].some(value=>!Number.isSafeInteger(value)||value<1)
    ||(row.manifest_id!==null&&(!Number.isSafeInteger(row.manifest_id)||row.manifest_id<1))
+   ||(row.manifest_namespace_id!==null&&(!Number.isSafeInteger(row.manifest_namespace_id)||row.manifest_namespace_id<1))
+   ||row.namespace_id!==namespace||row.owner_namespace_id!==namespace
+   ||(format==='v11'?(row.manifest_id===null||row.manifest_namespace_id!==namespace):(row.manifest_id!==null||row.manifest_namespace_id!==null))
+   ||canonicalTelemetryV11Json(row.namespace_original)!==canonicalTelemetryV11Json(expectedNamespace)
+   ||canonicalTelemetryV11Json(row.owner_namespace_original)!==canonicalTelemetryV11Json(expectedNamespace)
+   ||(format==='v11'
+    ?canonicalTelemetryV11Json(row.manifest_namespace_original)!==canonicalTelemetryV11Json(expectedNamespace)
+    :row.manifest_namespace_original!==null)
    ||![1,2,3].includes(row.stream)||!Number.isSafeInteger(row.observed_at_ms)
    ||!Array.isArray(row.canonical_digest)||row.canonical_digest.length!==32
    ||!Array.isArray(row.occurrence_id)||!row.occurrence_id.length
@@ -154,7 +173,7 @@ export async function restoreTypedAdmissionPage(db:D1Database,options:{format:'v
   const expectedDigest=binary(await sha256(parsed.canonicalRecord));
   if(canonicalTelemetryV11Json(Array.from(new Uint8Array(expectedDigest)))!==canonicalTelemetryV11Json(stored.canonical_digest))throw fail();
   const allocation={chunk_id:record.chunkRowId,namespace_id:namespace,chunk_original:Array.from(encodeTypedTelemetryId(record.chunkRowId)),first_source_row_id:range.first_id,record_count:range.count};
-  const membership={participant_id:record.participantId,typed_owner_id:stored.owner_id};
+  const membership={participant_id:record.participantId,namespace_id:stored.owner_namespace_id,typed_owner_id:stored.owner_id};
   let proof:Record<string,unknown>={typed_record_id:stored.id,chunk_id:record.chunkRowId};
   if(format==='v11'){
    const base={...parsed.record} as Record<string,unknown>;delete base.accountPlanAttribution;
@@ -167,7 +186,7 @@ export async function restoreTypedAdmissionPage(db:D1Database,options:{format:'v
    stream_code:stored.stream,occurrence_blob:stored.occurrence_id,base_digest:proof.base_digest,
    legacy_occurrence_blob:parsed.legacy?Array.from(encodeTypedTelemetryId(parsed.legacy.occurrenceId)):null,
    legacy_digest:proof.legacy_digest,observed_at_ms:stored.observed_at_ms}:proof;
-  const manifestMembership={manifest_id:record.manifestId,typed_manifest_id:stored.manifest_id};
+  const manifestMembership={manifest_id:record.manifestId,namespace_id:stored.manifest_namespace_id,typed_manifest_id:stored.manifest_id};
   prepared.push({record,stored,expectedDigest,allocation,membership,proof,physicalProof,manifestMembership});
  }
  let writes:Query[]=[],reads:ReturnType<typeof proofQueries>=[];
@@ -186,10 +205,10 @@ export async function restoreTypedAdmissionPage(db:D1Database,options:{format:'v
      proofRead('typed_v11_record_proofs',physicalProof,'typed_record_id',stored.id,false,Object.keys(physicalProof).join(','));
      proofRead('typed_v11_manifest_memberships',manifestMembership,'manifest_id',record.manifestId,true);
     }
-    for(const [table,expected,key,value] of [[`${p}_chunk_allocations`,allocation,'chunk_id',record.chunkRowId],[`${p}_owner_memberships`,membership,'participant_id',record.participantId],[`${p}_record_admissions`,proof,'typed_record_id',stored.id]] as const)
+    for(const [table,expected,key,value] of [[`${p}_chunk_allocations`,allocation,'chunk_id',record.chunkRowId],[`${p}_owner_memberships`,membership,'typed_owner_id',stored.owner_id],[`${p}_record_admissions`,proof,'typed_record_id',stored.id]] as const)
      proofRead(table,expected,key,value,key!=='typed_record_id');
    }else{
-    for(const [table,expected,key,value] of [[`${p}_chunk_allocations`,allocation,'chunk_id',record.chunkRowId],[`${p}_owner_memberships`,membership,'participant_id',record.participantId],
+    for(const [table,expected,key,value] of [[`${p}_chunk_allocations`,allocation,'chunk_id',record.chunkRowId],[`${p}_owner_memberships`,membership,'typed_owner_id',stored.owner_id],
      ...(format==='v11'?[['typed_v11_manifest_memberships',manifestMembership,'manifest_id',record.manifestId] as const]:[]),
      [format==='v11'?'typed_v11_record_proofs':`${p}_record_admissions`,physicalProof,'typed_record_id',stored.id]] as const){
      if(key!=='typed_record_id'){
@@ -217,6 +236,7 @@ export async function restoreTypedAdmissionPage(db:D1Database,options:{format:'v
    for(const [at,row] of actual.entries())if(canonicalTelemetryV11Json(row)!==canonicalTelemetryV11Json(read.expected[at]))throw fail();
   }
  }
+ if(!verify)statements.push(...typedTelemetryOriginQualificationStatements(db,sourceNamespace,format));
  statements.push(...writes.map(query=>statement(db,query)));
  const through=page.records[count-1]?.sourceRowId??after, done=page.records.length===0;
  if(done){
@@ -224,13 +244,16 @@ export async function restoreTypedAdmissionPage(db:D1Database,options:{format:'v
   const next=Math.max(expected?.maximum??0,checkpoint.high_water)+1;
   if(!expected||!Number.isSafeInteger(next)||(verify?checkpoint.verified:checkpoint.copied)!==expected.count)throw fail();
   if(verify){
+   await assertCurrentTypedTelemetryOrigin(db,sourceNamespace,format);
    const state=await db.prepare(`SELECT source_namespace,namespace_id,next_source_row_id,runtime_contract_version FROM ${p}_admission_state WHERE id=1`).first();
    if(canonicalTelemetryV11Json(state)!==canonicalTelemetryV11Json({source_namespace:sourceNamespace,namespace_id:namespace,next_source_row_id:next,runtime_contract_version:1}))throw fail();
-   for(const [table,key,typedKey] of [[`${p}_chunk_allocations`,'chunk_id','chunk_id'],[`${p}_owner_memberships`,'participant_id','owner_id']] as const){const actual=await db.prepare(`SELECT count(*) n FROM ${table}`).first<number>('n');const expectedCount=await db.prepare(`SELECT count(DISTINCT ${typedKey}) n FROM typed_telemetry_records WHERE namespace_id=? AND format=?`).bind(namespace,code(format)).first<number>('n');if(actual!==expectedCount)throw fail();}
-   const count=await db.prepare(`SELECT count(*) n FROM ${p}_record_admissions`).first<number>('n');if(count!==expected.count)throw fail();
+   for(const [table,typedKey] of [[`${p}_chunk_allocations`,'chunk_id'],[`${p}_owner_memberships`,'owner_id']] as const){const actual=await db.prepare(`SELECT count(*) n FROM ${table} WHERE namespace_id=?`).bind(namespace).first<number>('n');const expectedCount=await db.prepare(`SELECT count(DISTINCT ${typedKey}) n FROM typed_telemetry_records WHERE namespace_id=? AND format=?`).bind(namespace,code(format)).first<number>('n');if(actual!==expectedCount)throw fail();}
+   const count=await db.prepare(`SELECT count(*) n FROM ${p}_record_admissions admission
+    JOIN typed_telemetry_records raw ON raw.id=admission.typed_record_id
+    WHERE raw.namespace_id=? AND raw.format=?`).bind(namespace,code(format)).first<number>('n');if(count!==expected.count)throw fail();
    if(format==='v11'){
-    if(await db.prepare('SELECT count(*) n FROM typed_v11_record_proofs').first<number>('n')!==expected.count)throw fail();
-    const maps=await db.prepare('SELECT count(*) n FROM typed_v11_manifest_memberships').first<number>('n');
+    if(await db.prepare('SELECT count(*) n FROM typed_v11_record_proofs proof JOIN typed_telemetry_records raw ON raw.id=proof.typed_record_id WHERE raw.namespace_id=?').bind(namespace).first<number>('n')!==expected.count)throw fail();
+    const maps=await db.prepare('SELECT count(*) n FROM typed_v11_manifest_memberships WHERE namespace_id=?').bind(namespace).first<number>('n');
     if(maps!==await db.prepare('SELECT count(DISTINCT manifest_id) n FROM typed_telemetry_records WHERE namespace_id=? AND format=11').bind(namespace).first<number>('n'))throw fail();
    }
   }else{
