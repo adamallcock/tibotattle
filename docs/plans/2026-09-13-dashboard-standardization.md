@@ -293,3 +293,19 @@ and chart availability decisions. Announce placeholder text as status. Add a
 localized Clear search action to a no-match Projects/threads result, using the
 existing search lifecycle and restoring focus to its input. Validate recovery
 with synthetic data, then inspect the fresh packaged renderer.
+
+752 web tests pass, including clicking Clear search to restore populated
+results. Documentation governance passes. Preflight remains blocked by the
+pre-existing tracked root `design-qa.md` allowlist issue.
+Unsigned source `b04cde12f287899147c291b6965f8561f5b806c2`, ASAR
+`011089d0b2fdcbe586e5a6cca81952725691b347a85608ce7fda8075193c35bb`,
+was launched with the isolated real-history profile. The loaded Usage page
+has all five shared status placeholders; unavailable appearance was not
+triggered by that real dataset. A clearly labeled synthetic search-empty view
+inside the packaged renderer was visually inspected at 1180px and 960px.
+Both widths show the recovery action without horizontal overflow. Clicking it
+clears the input, restores focus, and removes the now-inapplicable action.
+Evidence: `.release-build/states-real-layout.json`,
+`.release-build/states-layout.json`, and matching `search-empty` screenshots.
+This does not qualify a real private report or the separate accounting-parity
+gate.
