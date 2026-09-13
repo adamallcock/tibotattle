@@ -25,6 +25,9 @@ keep them out of commits, issues, logs, and documentation.
 | `doctor` | Inspect local source/tool readiness without exposing content. | None. |
 | `capture` | Capture one bounded account observation. | Appends to the selected local observation file. |
 | `report` | Summarize captured observations and corrections. | None unless output is redirected by the caller. |
+| `explain-usage-plans` | Describe the usage-explainer plans and request contract as JSON. | Read-only; does not open or refresh the unified index. |
+| `explain-usage` | Run one named, bounded usage-evidence plan against the committed unified index. | Read-only; emits compact content-free JSON and never refreshes the index. |
+| `explain-usage-evidence` | Resolve one generation-bound opaque selector returned by `explain-usage`. | Read-only; stale or unresolvable selectors fail closed without exposing local identities. |
 | `transitions` | Mine bounded Codex quota transitions. | Writes only explicitly selected output/audit paths. |
 | `infer` | Infer capacity from a transition artifact. | Writes selected JSON/Markdown outputs. |
 | `history` | Build weekly-limit history from an input artifact. | Writes selected JSON/Markdown outputs. |
@@ -34,6 +37,41 @@ keep them out of commits, issues, logs, and documentation.
 | `contamination` | Analyze experiment/observation contamination. | Writes selected JSON/Markdown outputs. |
 | `tools` | Analyze bounded tool-mechanism observations. | Writes selected JSON/Markdown outputs. |
 | `migrate-corrections` | Plan and materialize additive correction state. | Writes selected correction/report outputs; does not rewrite source evidence. |
+
+Usage explanation initially supports `data_health`, `current_usage`,
+`top_work`, `period_drivers`, `model_effort_mix`, `pricing_coverage`,
+`parent_subworker_usage`, and `allowance_movement`. The output separates exact
+facts, deterministic calculations, configured estimates, coverage,
+limitations, and prohibited claims. Task/project names, paths, commands, raw
+session identifiers, and source coordinates are excluded. Responses are capped
+at 16 KiB with at most 25 rows per page. `explain-usage-plans` exposes the
+current plan catalog, supported periods, limits, evidence availability, and
+pagination fields without opening the index. `period_drivers` compares equal
+adjacent windows and therefore does not accept `all`.
+
+Default discovery uses a closed production-first order: Electron companion
+state, retained native macOS state where applicable, then legacy CLI state.
+`coverage.sourceKind` reports which class was selected without exposing a local
+path. `USAGE_MONITOR_STATE_ROOT` overrides discovery and `--index-file` is an
+explicit development/recovery override; the corresponding device-salt file
+must be beside it for plans that return evidence selectors. `--codex-home`
+changes only the local metadata-discovery root. Neither command advances the
+index.
+
+Every result compares the committed generation time with its fixed query
+window. A recent window not reached by that generation returns
+`usage_explainer_window_uncovered` instead of a misleading zero; stale
+historical results are marked partial. A selector is valid only for the
+committed generation and exact window that produced it. When `nextCursor` is
+non-null, pass it back with the same plan, period, and limit using `--cursor`.
+The cursor preserves the original window across CLI invocations and fails
+closed if the index generation or bound query changes. `nextCursor: null` ends
+the pageable result. Allowance pages order compatible observed movement before
+non-monotonic, missing-reset, and single-observation groups, while aggregate
+facts count every unresolved class without combining reset identities. A true
+`truncated` with no continuation means a stated source bound remains, not that
+another page is available. The maintained agent workflow is the
+[usage explainer agent protocol](./usage-explainer-agent-protocol.md).
 
 ## Local activity and export
 
@@ -116,6 +154,9 @@ authorizes wiping Application Support or deleting the unified index.
 usage-monitor doctor
 usage-monitor capture [--label TEXT] [--controlled] [--offline] [--data-file PATH]
 usage-monitor report [--json] [--data-file PATH] [--corrections PATH]
+usage-monitor explain-usage-plans
+usage-monitor explain-usage --plan data_health|current_usage|top_work|period_drivers|model_effort_mix|pricing_coverage|parent_subworker_usage|allowance_movement [--period 24h|7d|30d|all] [--limit N] [--cursor CURSOR] [--index-file PATH] [--codex-home PATH]
+usage-monitor explain-usage-evidence --selector SELECTOR [--index-file PATH] [--codex-home PATH]
 usage-monitor transitions --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--offline] [--compact] [--window-minutes N] [--output PATH] [--audit-file PATH]
 usage-monitor infer [--input PATH] [--output PATH] [--report-file PATH]
 usage-monitor history [--input PATH] [--output PATH] [--report-file PATH]
