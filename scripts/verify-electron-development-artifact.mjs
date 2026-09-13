@@ -43,6 +43,8 @@ import {
 import {
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
+  WINDOWS_SOURCE_READ_APPROVED,
+  WINDOWS_SOURCE_READ_CONTRACT,
 } from "../src/platform/windows-filesystem.js";
 import {
   LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH as LINUX_BINDING_PATH,
@@ -197,6 +199,10 @@ const WINDOWS_NATIVE_MANIFEST_KEYS = Object.freeze([
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
+]);
+const WINDOWS_SOURCE_READ_MANIFEST_KEYS = Object.freeze([
+  "approved",
+  "contractVersion",
 ]);
 const WINDOWS_UNQUALIFIED_BINDING_PROVENANCE = Object.freeze({
   contractVersion: "windows-binding-provenance-v1",
@@ -640,7 +646,14 @@ function validateNativeManifestShape(value) {
   const exactBooleanShape = (candidate, keys) =>
     exactObjectKeys(candidate, keys)
       && keys.every((key) => typeof candidate[key] === "boolean");
-  if (!exactObjectKeys(value, WINDOWS_NATIVE_MANIFEST_KEYS)
+  const hasSourceRead = Object.hasOwn(value, "sourceRead");
+  const manifestKeys = hasSourceRead
+    ? [...WINDOWS_NATIVE_MANIFEST_KEYS, "sourceRead"]
+    : WINDOWS_NATIVE_MANIFEST_KEYS;
+  if (!exactObjectKeys(value, manifestKeys)
+      || (hasSourceRead && (!exactObjectKeys(value.sourceRead, WINDOWS_SOURCE_READ_MANIFEST_KEYS)
+        || value.sourceRead.contractVersion !== WINDOWS_SOURCE_READ_CONTRACT
+        || value.sourceRead.approved !== WINDOWS_SOURCE_READ_APPROVED))
       || value.schemaVersion !== WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION
       || value.bindingFile !== "windows_filesystem.node"
       || value.platform !== "win32"

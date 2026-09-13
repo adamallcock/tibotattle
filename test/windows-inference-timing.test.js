@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile, readFile, realpath } from 'node:fs/promises';
 import { mkdirSync, writeFileSync, openSync, readSync, fstatSync, closeSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { createTimingFilesystem } from '../src/platform/inference-timing-filesystem.js';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../src/platform/inference-timing-store.js';
 import { createParser, digest, METHOD, MAX_STATE_BYTES } from '../src/providers/codex/logs.js';
@@ -41,6 +42,18 @@ async function fixture(t) {
   const filesystem = createTimingFilesystem({ platform: 'win32', loadWindowsBinding: () => state.native });
   return { root, ...state, filesystem,
     options: { createParser, digest, METHOD, MAX_STATE_BYTES, filesystem } };
+}
+
+function wrappedDatabaseFactory({ close }) {
+  return (file, options) => {
+    const database = new DatabaseSync(file, options);
+    return {
+      get isOpen() { return database.isOpen; },
+      exec: database.exec.bind(database),
+      prepare: database.prepare.bind(database),
+      close: () => close(database),
+    };
+  };
 }
 function lines() {
   const at = 1789200000000;
@@ -119,6 +132,86 @@ test('source reads reject invalid buffer ranges before calling native code', asy
     assert.equal(f.reads.length, 0);
   } finally { await handle.close(); }
   await assert.rejects(handle.stat(), /source_file_closed/);
+});
+
+test('database close failure keeps the native lease until a retry can close SQLite', async t => {
+  const f = await fixture(t), directory = join(f.root, 'timing');
+  let failClose = true;
+  const databaseFactory = wrappedDatabaseFactory({
+    close(database) {
+      if (failClose) throw new Error('synthetic database close failure');
+      return database.close();
+    },
+  });
+  const store = await openTimingStore(directory, { ...f.options, databaseFactory });
+  try {
+    assert.throws(() => store.close(), /database close failure/);
+    assert.equal(f.guards.size, 2, 'an open database retains both native guards');
+    failClose = false;
+    store.close();
+    assert.equal(f.guards.size, 0);
+    store.close();
+  } finally {
+    failClose = false;
+    try { store.close(); } catch { /* Preserve the test failure. */ }
+  }
+});
+
+test('database close failure after SQLite closes still releases the native lease', async t => {
+  const f = await fixture(t), directory = join(f.root, 'timing');
+  const databaseFactory = wrappedDatabaseFactory({
+    close(database) {
+      database.close();
+      throw new Error('synthetic post-close failure');
+    },
+  });
+  const store = await openTimingStore(directory, { ...f.options, databaseFactory });
+  assert.throws(() => store.close(), /post-close failure/);
+  assert.equal(f.guards.size, 0, 'a closed database no longer needs native guards');
+  store.close();
+});
+
+test('store initialization preserves the schema failure when lease cleanup fails', async t => {
+  const f = await fixture(t), directory = join(f.root, 'timing');
+  let store = await openTimingStore(directory, f.options);
+  store.db.exec('PRAGMA user_version=999');
+  store.close(); store = null;
+  const originalRelease = f.native.releaseCredentialAuditFileGuard;
+  f.native.releaseCredentialAuditFileGuard = guard => {
+    originalRelease(guard);
+    throw new Error('synthetic lease release failure');
+  };
+  await assert.rejects(
+    openTimingStore(directory, f.options),
+    /incompatible_database/,
+  );
+  assert.equal(f.guards.size, 0);
+});
+
+test('ingestion preserves its primary failure when source-handle cleanup fails', async t => {
+  const f = await fixture(t), path = join(f.root, 'synthetic.jsonl');
+  await writeFile(path, lines());
+  const store = await openTimingStore(join(f.root, 'timing'), f.options);
+  const originalRead = f.native.readSourceFile;
+  const originalClose = f.native.closeSourceFile;
+  f.native.readSourceFile = () => { throw new Error('synthetic read failure'); };
+  f.native.closeSourceFile = lease => {
+    originalClose(lease);
+    throw new Error('synthetic handle close failure');
+  };
+  try {
+    await assert.rejects(ingestTimingFile(store, path), error => {
+      assert.match(error.message, /read failure/);
+      assert.ok(error.attemptedBytes > 0);
+      return true;
+    });
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM source').get().n, 0);
+    assert.equal(f.sources.size, 0);
+  } finally {
+    f.native.readSourceFile = originalRead;
+    f.native.closeSourceFile = originalClose;
+    store.close();
+  }
 });
 
 test('read and batch limits retain measurements after an 8 MiB record across resumptions', async t => {

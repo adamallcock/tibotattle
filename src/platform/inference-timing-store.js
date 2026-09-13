@@ -9,13 +9,64 @@ import { forEachRolloutLine } from './rollout-line-reader.js';
 const APPLICATION = 0x54425450;
 const CHUNK = 16 * 1024 * 1024;
 const safe = (ok, code) => { if (!ok) throw new Error(code); };
+
+function databaseIsClosed(database) {
+  if (database === undefined || database === null) return true;
+  try { return database.isOpen === false; } catch { return false; }
+}
+
+function setAttemptedBytes(error, attemptedBytes) {
+  try {
+    if (error !== null && (typeof error === 'object' || typeof error === 'function')) {
+      Object.defineProperty(error, 'attemptedBytes', {
+        configurable: true, enumerable: false, value: attemptedBytes, writable: true,
+      });
+    }
+  } catch { /* Preserve arbitrary thrown values and frozen errors. */ }
+}
+
 export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES,
-  filesystem = createTimingFilesystem() }) {
+  filesystem = createTimingFilesystem(),
+  databaseFactory = (file, options) => new DatabaseSync(file, options) }) {
   const lease = await filesystem.prepare(directory);
   const { file, created } = lease;
   let db;
+  let dbClosed = false;
+  let leaseReleaseAttempted = false;
+  let leaseReleaseError = null;
+
+  // SQLite must be closed before its native file guards are released. If a
+  // close failure leaves the database open, retain the lease and let a caller
+  // retry close rather than allowing another owner to reach the file.
+  function closeOwnedResources(primaryError = null) {
+    let firstError = primaryError;
+    if (!dbClosed && db !== undefined) {
+      try {
+        db.close();
+        dbClosed = databaseIsClosed(db);
+        if (!dbClosed && firstError === null) firstError = new Error('database_close_incomplete');
+      } catch (error) {
+        if (firstError === null) firstError = error;
+        dbClosed = databaseIsClosed(db);
+      }
+    } else if (db === undefined) {
+      dbClosed = true;
+    }
+    if (dbClosed && !leaseReleaseAttempted) {
+      leaseReleaseAttempted = true;
+      try {
+        lease.release();
+      } catch (error) {
+        leaseReleaseError = error;
+        if (firstError === null) firstError = error;
+      }
+    }
+    if (firstError === null && leaseReleaseError !== null) firstError = leaseReleaseError;
+    return firstError;
+  }
+
   try {
-    db = new DatabaseSync(file, { timeout: 100 });
+    db = databaseFactory(file, { timeout: 100 });
     if (lease.persistentJournal) configureGuardedSqliteConnection(db);
     const version = db.prepare('PRAGMA user_version').get().user_version;
     const application = db.prepare('PRAGMA application_id').get().application_id;
@@ -40,13 +91,12 @@ export async function openTimingStore(directory, { createParser, digest, METHOD,
     }
     const key = Buffer.from(db.prepare('SELECT key FROM metadata').get().key);
     safe(key.length === 32, 'invalid_metadata');
-    let closed = false;
     return { db, key, file, createParser, digest, filesystem, method: METHOD, close: () => {
-      if (closed) return;
-      db.close(); closed = true; lease.release();
+      const error = closeOwnedResources();
+      if (error !== null) throw error;
     } };
   } catch (e) {
-    db?.close(); lease.release();
+    closeOwnedResources(e);
     throw e;
   }
 }
@@ -69,6 +119,7 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
   const { db, key, createParser, digest } = store;
   const handle = await store.filesystem.openSource(path);
   let attemptedBytes = 0;
+  let primaryError = null;
   try {
     const stat = await handle.stat();
     const before = snapshot(stat);
@@ -136,9 +187,26 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
       db.exec('COMMIT');
       return { bytes: end - cursor, unchanged: false, cursor: nextOffset,
         remaining: before.size - nextOffset, partial: receipt.partialDeferred };
-    } catch (e) { db.exec('ROLLBACK'); throw e; }
-  } catch (e) { e.attemptedBytes = attemptedBytes; throw e; }
-  finally { await handle.close(); }
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* Preserve the operation failure. */ }
+      throw e;
+    }
+  } catch (e) {
+    primaryError = e;
+    setAttemptedBytes(e, attemptedBytes);
+    throw e;
+  } finally {
+    try {
+      await handle.close();
+    } catch (e) {
+      if (primaryError === null) {
+        setAttemptedBytes(e, attemptedBytes);
+        throw e;
+      }
+      // A cleanup failure must not replace the parser, read, or transaction
+      // error that the caller uses to account for attempted bytes.
+    }
+  }
 }
 
 export function readTimingRows(store) {
