@@ -12,10 +12,14 @@ Codex usage, quota, tool, lineage, source, and generation provenance. It is a
 content-free SQLite database: its schema deliberately has no column for prompt,
 response, reasoning, command, repository, filename, or arbitrary free text.
 
-The installed macOS path is
+The current Electron macOS installation stores the index at
+`~/Library/Application Support/TiboTattle/companion-state/local-unified-index-v1.sqlite`.
+The retained native macOS surface uses
 `~/Library/Application Support/Usage Monitor/local-unified-index-v1.sqlite`.
-The `v1` filename is a stable machine identifier and is **not** the current
-SQLite schema version.
+Readers that discover installed state prefer the Electron location, then the
+native location, before legacy CLI state; explicit configuration remains
+authoritative. The `v1` filename is a stable machine identifier and is **not**
+the current SQLite schema version.
 
 ## Version identifiers
 
