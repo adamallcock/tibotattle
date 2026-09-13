@@ -18,6 +18,7 @@ import { inspectNativeElectronHandoverCompletion } from '../apps/electron/deskto
 import { macOSCredentialApplicationVerificationArguments } from '../apps/electron/desktop-macos-keychain.js';
 import { validateProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 import distributionPolicy from '../config/electron-production-distribution.cjs';
+import { collectMacOSTransitionUIDiagnostics } from './lib/macos-transition-ui-diagnostics.mjs';
 
 export const NATIVE_SPARKLE_TRANSITION_SCHEMA = 'tibotattle-signed-macos-sparkle-transition-v1';
 export const NATIVE_018_DMG_SHA256 = '2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae';
@@ -46,8 +47,8 @@ export function validateSparkleTransitionIntake(value) {
     || value.schemaVersion !== 'tibotattle-native-sparkle-test-intake-v1'
     || !['darwin-arm64', 'darwin-x64'].includes(value.target)
     || !['isolated_test_feed', 'production_feed'].includes(value.feedScope)
-    || typeof value.sourceRevision !== 'string' || !SOURCE.test(value.sourceRevision) || value.version !== '0.1.21'
-    || value.bundleVersion !== '1028' || typeof value.buildNumber !== 'string' || !/^[1-9][0-9]{0,9}$/u.test(value.buildNumber)
+    || typeof value.sourceRevision !== 'string' || !SOURCE.test(value.sourceRevision) || value.version !== '0.1.22'
+    || value.bundleVersion !== '1029' || typeof value.buildNumber !== 'string' || !/^[1-9][0-9]{0,9}$/u.test(value.buildNumber)
     || ![value.dmgSha256, value.asarSha256, value.feedSha256].every((v) => typeof v === 'string' && SHA.test(v))
     || value.nativeDmgSha256 !== (value.target === 'darwin-arm64' ? NATIVE_018_DMG_SHA256 : NATIVE_018_INTEL_DMG_SHA256)
     || !isAbsolute(value.directory ?? '')) fail('intake');
@@ -126,11 +127,29 @@ function processes() {
     return { pid: +m[1], parent: +m[2], group: +m[3], command: m[4] };
   });
 }
-function appProcess(executable) {
-  const found = processes().filter((row) => row.command === executable);
-  if (found.length > 1) fail('multiple_owned_apps');
-  return found[0] ?? null;
+export function selectMacTransitionApplicationProcess(rows, executable) {
+  const inventory = new Map(rows.map(row => [row.pid, row]));
+  if (inventory.size !== rows.length) fail('process_inventory');
+  const matches = rows.filter(row => row.command === executable);
+  // The signed Electron companion uses the same executable in Node mode.
+  // It is an owned descendant, not a second independently launched app.
+  const roots = matches.filter(row => {
+    const visited = new Set([row.pid]);
+    let parent = row.parent;
+    while (inventory.has(parent)) {
+      if (visited.has(parent)) fail('process_inventory');
+      visited.add(parent);
+      const ancestor = inventory.get(parent);
+      if (ancestor.command === executable) return false;
+      parent = ancestor.parent;
+    }
+    return true;
+  });
+  if (roots.length > 1 || (matches.length && roots.length === 0)) fail('multiple_owned_apps');
+  return roots[0] ?? null;
 }
+export const findMacTransitionApplicationProcess = executable => selectMacTransitionApplicationProcess(processes(), executable);
+const appProcess = findMacTransitionApplicationProcess;
 async function until(check, timeout, stage) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) { const result = await check(); if (result) return result; await sleep(500); }
@@ -138,29 +157,50 @@ async function until(check, timeout, stage) {
 }
 
 // Targets only the already identity-checked synthetic process. No global keystrokes or prompt approval.
+function nativeWindowElements(windows) {
+  const queue = windows.map(element => ({ element, depth: 0 })), elements = [];
+  const started = Date.now();
+  const limited = () => { throw Object.assign(new Error('Native UI tree limit'), { uiTreeLimit: true }); };
+  if (queue.length > 8) limited();
+  for (let index = 0; index < queue.length; index++) {
+    if (index >= 512 || Date.now() - started > 6000) limited();
+    const { element, depth } = queue[index], role = String(element.role());
+    // Sparkle and About controls are native. The dashboard and release notes
+    // are web content; enumerating their entire DOM can stall System Events.
+    if (role === 'AXWebArea') continue;
+    if (role === 'AXButton' || role === 'AXStaticText') { elements.push(element); continue; }
+    const children = element.uiElements();
+    if (children.length && (depth >= 8 || queue.length + children.length > 512)) limited();
+    queue.push(...children.map(child => ({ element: child, depth: depth + 1 })));
+  }
+  return elements;
+}
 export function sparkleTransitionUiScript(pid, action) {
   if (!Number.isSafeInteger(pid) || pid < 2 || !['activate', 'openmenu', 'about', 'check', 'install', 'relaunch', 'quit', 'inspect'].includes(action)) fail('ui_arguments');
   return [
     'function run() {',
+    nativeWindowElements.toString(),
+    'let actionAttempted = false;',
+    'try {',
     'const matches = Application("System Events").applicationProcesses.whose({unixId:' + pid + '})();',
     'if (matches.length !== 1) return "process_absent";',
     'const p = matches[0];',
     'const action = ' + JSON.stringify(action) + ';',
     'function label(e) { try { return String(e.name()); } catch (_) { try { return String(e.title()); } catch (_) { return ""; } } }',
-    'function press(e) { e.click(); return "clicked"; }',
-    'if (action === "activate") { p.frontmost = true; return p.frontmost() ? "activated" : "target_absent"; }',
+    'function press(e) { actionAttempted = true; e.click(); return "clicked"; }',
+    'if (action === "activate") { actionAttempted = true; p.frontmost = true; return p.frontmost() ? "activated" : "target_absent"; }',
     'if (action === "openmenu" || action === "about" || action === "quit") {',
     '  const bars = p.menuBars(); if (bars.length < 1) return "menu_absent";',
     '  const items = bars.flatMap(b => b.menuBarItems()).filter(e => label(e) === "TiboTattle");',
     '  if (items.length !== 1) return "menu_absent";',
     '  if (action === "openmenu") return press(items[0]);',
-    '  if (action === "quit") { p.frontmost = true; items[0].click(); }',
+    '  if (action === "quit") { actionAttempted = true; p.frontmost = true; items[0].click(); }',
     '  const menus = items[0].menus(); if (menus.length !== 1) return "menu_absent";',
     '  const names = action === "about" ? ["About TiboTattle","Acerca de TiboTattle"] : ["Quit TiboTattle","Salir de TiboTattle"];',
     '  const targets = menus[0].menuItems().filter(e => names.includes(label(e)));',
     '  return targets.length === 1 ? press(targets[0]) : "target_absent";',
     '}',
-    'let elements = []; for (const w of p.windows()) elements = elements.concat(w.entireContents());',
+    'const elements = nativeWindowElements(p.windows());',
     'const labels = {check:["Check for Updates…","Buscar actualizaciones…"],',
     '  install:["Install Update","Instalar actualización"], relaunch:["Install and Relaunch","Instalar y volver a abrir"]};',
     'if (action !== "inspect") {',
@@ -173,17 +213,20 @@ export function sparkleTransitionUiScript(pid, action) {
     'if (/up.to.date|versión más reciente/i.test(text)) return "no_update";',
     'if (/Keychain|keychain|llavero/.test(text)) return "keychain_dialog";',
     'return "target_absent";',
+    '} catch (error) { return actionAttempted ? "action_unconfirmed" : error.uiTreeLimit ? "ui_tree_limit" : "snapshot_unavailable"; }',
     '}',
   ].join('\n');
 }
 function ui(executable, pid, action) {
   const current = appProcess(executable);
   if (!current || current.pid !== pid) return 'process_absent';
-  const result = command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', sparkleTransitionUiScript(pid, action)], 10000);
+  let result;
+  try { result = command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', sparkleTransitionUiScript(pid, action)], 10000); }
+  catch (error) { fail(error.code === 'ETIMEDOUT' ? 'ui_command_timeout' : 'ui_command_failed'); }
   const allowed = ['clicked', 'activated', 'process_absent', 'menu_absent', 'target_absent', 'ambiguous_target',
-    'signature_error', 'no_update', 'keychain_dialog'];
+    'signature_error', 'no_update', 'keychain_dialog', 'snapshot_unavailable', 'action_unconfirmed', 'ui_tree_limit'];
   if (!allowed.includes(result)) fail('ui_result');
-  if (['ambiguous_target', 'signature_error', 'no_update', 'keychain_dialog'].includes(result)) fail(result);
+  if (['ambiguous_target', 'signature_error', 'no_update', 'keychain_dialog', 'action_unconfirmed', 'ui_tree_limit'].includes(result)) fail(result);
   return result;
 }
 
@@ -191,6 +234,7 @@ export function sparkleTransitionDiagnosticScript(pid) {
   if (!Number.isSafeInteger(pid) || pid < 2) fail('ui_arguments');
   return [
     'function run() {',
+    nativeWindowElements.toString(),
     'const matches = Application("System Events").applicationProcesses.whose({unixId:' + pid + '})();',
     'if (matches.length !== 1) return JSON.stringify({processPresent:false});',
     'const p=matches[0], bars=p.menuBars(), windows=p.windows();',
@@ -199,7 +243,7 @@ export function sparkleTransitionDiagnosticScript(pid) {
     'const known={"About TiboTattle":"about","Acerca de TiboTattle":"about","Check for Updates…":"check","Buscar actualizaciones…":"check","Install Update":"install","Instalar actualización":"install","Install and Relaunch":"relaunch","Instalar y volver a abrir":"relaunch","Get Started":"first_run"};',
     'let elements=[];',
     'for(const b of bars.slice(0,8)){for(const i of b.menuBarItems()){if(label(i)==="TiboTattle"){result.appMenus++;for(const m of i.menus())elements=elements.concat(m.menuItems());}}}',
-    'for(const w of windows.slice(0,8))elements=elements.concat(w.entireContents());',
+    'elements=elements.concat(nativeWindowElements(windows));',
     'let text="";',
     'for(const e of elements.slice(0,2000)){const name=label(e),id=known[name];if(id){const c=result.controls[id]??{count:0,enabled:0};c.count++;try{if(e.enabled())c.enabled++;}catch(_){}result.controls[id]=c;}else if(name)result.unknownLabelCount++;try{text+=" "+String(e.value());}catch(_){}}',
     'result.keychainDialog=/Keychain|keychain|llavero/.test(text);',
@@ -321,6 +365,8 @@ export async function verifySparkleTransitionCandidate(input, appPath) {
   distributionPolicy.assertProductionElectronMacOSBundleMetadata({ target: input.target,
     version: input.version, buildNumber: input.buildNumber, bundleVersion: value.CFBundleVersion,
     bundleShortVersion: value.CFBundleShortVersionString });
+  distributionPolicy.assertProductionElectronMacOSIncomingUpgradeMetadata({ target: input.target,
+    publicEDKey: value.SUPublicEDKey });
   if (value.CFBundleIdentifier !== 'com.usagemonitor.local' || value.LSMinimumSystemVersion !== '14.0'
     || verified.distribution.buildNumber !== input.buildNumber) fail('candidate_identity');
   return verified;
@@ -437,7 +483,7 @@ export async function runSparkleTransition(options) {
       captureMacTransitionProcesses(installedApp, original.pid, knownProcesses);
       const current = appProcess(installedExecutable);
       if (current && current.pid !== original.pid) return current;
-      if (current) ui(installedExecutable, original.pid, 'relaunch');
+      if (current) interact('relaunch');
       return null;
     }, 180000, 'sparkle_relaunch');
     const relaunched = appProcess(installedExecutable);
@@ -482,6 +528,13 @@ export async function runSparkleTransition(options) {
     proof.productionFeedVerified = input.feedScope === 'production_feed'; proof.status = 'passed';
   } catch (error) {
     proof.failureStage = error?.transitionStage ?? stage;
+    if (ownedPid) {
+      proof.uiState = collectMacOSTransitionUIDiagnostics({ pid: ownedPid, verifyOwnedProcess: pid => {
+        const expected = knownProcesses.get(pid);
+        const row = processes().find(p => p.pid === pid && p.command === installedExecutable);
+        return typeof expected === 'string' && Boolean(row) && processFingerprint(row) === expected;
+      } });
+    }
     try {
       if (installedExecutable && ownedPid && appProcess(installedExecutable)?.pid === ownedPid) {
         proof.uiDiagnostic = JSON.parse(command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', sparkleTransitionDiagnosticScript(ownedPid)], 10000));

@@ -231,7 +231,23 @@ export function normalizeSource({ value, release, label }) {
   return normalized;
 }
 
-export function validateAssurances(value, platform, channel, label) {
+/** Missing native execution stays explicit; an owner decision is never a passed smoke. */
+export function normalizeCleanInstallAcceptance(value, { platform, channel, architecture, source, assurances }) {
+  if (value === undefined) return undefined;
+  const label = "cleanInstallAcceptance";
+  assertPlainObject(value, "RELEASE_EVIDENCE_ACCEPTANCE_INVALID", label);
+  assertAllowedKeys(value, ["status", "reason", "sourceCommit"], label, "RELEASE_EVIDENCE_ACCEPTANCE_INVALID");
+  assert(channel === "direct" && ((platform === "macos" && ["arm64", "x64"].includes(architecture))
+    || (["windows", "linux"].includes(platform) && architecture === "x64")),
+  "RELEASE_EVIDENCE_ACCEPTANCE_INVALID", "acceptance requires a supported direct target");
+  assert(["owner_accepted", "pending"].includes(value.status), "RELEASE_EVIDENCE_ACCEPTANCE_INVALID", "acceptance status is invalid");
+  assertSafeText(value.reason, "RELEASE_EVIDENCE_ACCEPTANCE_INVALID", "acceptance reason", { maximumBytes: 512 });
+  assert(value.sourceCommit === source.commit, "RELEASE_EVIDENCE_SOURCE_MISMATCH", "acceptance must identify the artifact source");
+  assert(assurances?.cleanInstallSmokePassed === false, "RELEASE_EVIDENCE_ACCEPTANCE_INVALID", "unobserved execution must not claim a passed smoke");
+  return { status: value.status, reason: value.reason, sourceCommit: value.sourceCommit };
+}
+
+export function validateAssurances(value, platform, channel, label, acceptance = undefined) {
   const assurances = assertPlainObject(value,
     "RELEASE_EVIDENCE_ASSURANCES_INVALID", label);
   assertAllowedKeys(assurances,
@@ -242,6 +258,7 @@ export function validateAssurances(value, platform, channel, label) {
       `${label}.${key} must be boolean`);
   }
   for (const key of RELEASE_EVIDENCE_PLATFORM_ASSURANCES[platform][channel]) {
+    if (key === "cleanInstallSmokePassed" && acceptance !== undefined) continue;
     assert(assurances[key] === true, "RELEASE_EVIDENCE_ASSURANCES_INCOMPLETE",
       `${label}.${key} must be true for ${platform}/${channel}`);
   }
@@ -496,13 +513,23 @@ export function normalizeNativeTrust({ value, platform, channel, store, label })
   };
 }
 
-export function normalizeBuild(value, channel, label) {
+export function normalizeBuild(value, channel, label, finalArtifactSha256 = undefined, electronTarget = undefined) {
   if (channel === "store") {
     assert(value === null, "RELEASE_EVIDENCE_BUILD_INVALID",
       `${label} must be null for a Store-delivered subject`);
     return null;
   }
   const build = assertPlainObject(value, "RELEASE_EVIDENCE_BUILD_INVALID", label);
+  if (Object.hasOwn(build, "finalArtifactSha256")) {
+    assert(channel === "direct" && electronTarget?.updater?.enabled === true && electronTarget.updater.mechanism === "electron-updater"
+      && ((electronTarget.platform === "macos" && ["arm64", "x64"].includes(electronTarget.architecture))
+        || (["windows", "linux"].includes(electronTarget.platform) && electronTarget.architecture === "x64")),
+    "RELEASE_EVIDENCE_BUILD_INVALID", "final build evidence requires a supported direct Electron updater target");
+    assertAllowedKeys(build, ["sourceManifestSha256", "finalArtifactSha256"], label, "RELEASE_EVIDENCE_BUILD_INVALID");
+    assert(build.finalArtifactSha256 === finalArtifactSha256, "RELEASE_EVIDENCE_BUILD_INVALID", "final build evidence must bind the exact final artifact");
+    return { sourceManifestSha256: assertSha256(build.sourceManifestSha256, `${label}.sourceManifestSha256`),
+      finalArtifactSha256: assertSha256(build.finalArtifactSha256, `${label}.finalArtifactSha256`) };
+  }
   assertAllowedKeys(build, ["sourceManifestSha256", "unsignedPayloadSha256"], label,
     "RELEASE_EVIDENCE_BUILD_INVALID");
   return {
@@ -856,7 +883,7 @@ export function validateCanonicalArtifact(artifact, release, index) {
   assertAllowedKeys(artifact, [
     "platform", "channel", "architecture", "format", "version", "distribution",
     "downloadUrl", "fileName", "bytes", "sha256", "source", "nativeTrust", "build",
-    "sbom", "provenance", "assurances", "store", "updater",
+    "sbom", "provenance", "assurances", "store", "updater", "cleanInstallAcceptance",
   ], label, "RELEASE_EVIDENCE_ARTIFACT_INVALID");
   assert(Object.prototype.hasOwnProperty.call(artifact, "store"),
     "RELEASE_EVIDENCE_ARTIFACT_INVALID",
@@ -907,13 +934,14 @@ export function validateCanonicalArtifact(artifact, release, index) {
   validateCanonicalAttestation(artifact.provenance, {
     label: `${label}.provenance`, release, artifactDigest: artifact.sha256,
   });
-  validateAssurances(artifact.assurances, platform, channel, `${label}.assurances`);
+  const acceptance = normalizeCleanInstallAcceptance(artifact.cleanInstallAcceptance, { platform, channel, architecture: artifact.architecture, source, assurances: artifact.assurances });
+  validateAssurances(artifact.assurances, platform, channel, `${label}.assurances`, acceptance);
   const store = normalizeStore(artifact.store, platform, channel, `${label}.store`, {
     artifactDigest: artifact.sha256,
   });
   normalizeNativeTrust({ value: artifact.nativeTrust, platform, channel, store,
     label: `${label}.nativeTrust` });
-  normalizeBuild(artifact.build, channel, `${label}.build`);
+  normalizeBuild(artifact.build, channel, `${label}.build`, artifact.sha256, artifact);
   validateDistribution({ value: artifact.distribution, channel, platform, store,
     source: release, fileName: artifact.fileName, downloadUrl, label: `${label}.distribution` });
   const updater = assertPlainObject(artifact.updater,

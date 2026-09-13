@@ -1,0 +1,141 @@
+name: Signed Mac empty-profile clean install
+on:
+  push:
+    branches: [codex/electron-sparkle-transition-021]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Plan only or launch the pinned signed app on a disposable Mac
+        type: choice
+        options: [plan, execute]
+        default: plan
+        required: true
+      target:
+        description: Pinned signed application architecture
+        type: choice
+        options: [darwin-arm64, darwin-x64]
+        default: darwin-arm64
+        required: true
+      intake:
+        description: Closed JSON with target and exact runnerRevision only; app source and hashes are pinned in the runner
+        type: string
+        required: true
+      confirmation:
+        description: Execute requires RUN_DISPOSABLE_EMPTY_PROFILE
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: signed-mac-empty-profile-${{ inputs.target }}
+  cancel-in-progress: false
+jobs:
+  registration:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Register without installing an application
+        run: echo "Only an explicit reviewed workflow dispatch executes the hosted clean install."
+  clean_arm64:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-arm64'
+    runs-on: macos-26
+    timeout-minutes: 15
+    env:
+      EMPTY_PROFILE_INTAKE: ${{ inputs.intake }}
+      SELECTED_TARGET: ${{ inputs.target }}
+      SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Check out exact qualification source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: arm64
+          package-manager-cache: false
+      - name: Install locked verification dependencies
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify intake and exercise clean install
+        shell: bash
+        run: |
+          umask 077
+          mkdir -m 700 empty-profile-receipts
+          node --input-type=module - <<'JS'
+          import { validateEmptyProfileIntake } from './scripts/smoke-electron-macos-empty-profile.mjs';
+          const input = validateEmptyProfileIntake(JSON.parse(process.env.EMPTY_PROFILE_INTAKE));
+          if (input.target !== process.env.SELECTED_TARGET || input.runnerRevision !== process.env.GITHUB_SHA) throw new Error('Intake mismatch');
+          if (!['plan', 'execute'].includes(process.env.SELECTED_MODE)) throw new Error('Mode mismatch');
+          if (process.env.SELECTED_CONFIRMATION !== (process.env.SELECTED_MODE === 'execute' ? 'RUN_DISPOSABLE_EMPTY_PROFILE' : '')) throw new Error('Confirmation mismatch');
+          JS
+          args=(--plan)
+          if [[ "$SELECTED_MODE" == execute ]]; then
+            args=(--execute --confirm "$SELECTED_CONFIRMATION")
+          fi
+          node scripts/smoke-electron-macos-empty-profile.mjs "${args[@]}" > empty-profile-receipts/execution.json
+      - name: Retain separate content-free clean-install evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-mac-empty-profile-darwin-arm64-${{ github.run_id }}
+          path: empty-profile-receipts/*.json
+          if-no-files-found: error
+          retention-days: 14
+  clean_x64:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-x64'
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    env:
+      EMPTY_PROFILE_INTAKE: ${{ inputs.intake }}
+      SELECTED_TARGET: ${{ inputs.target }}
+      SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Check out exact qualification source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          package-manager-cache: false
+      - name: Install locked verification dependencies
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify intake and exercise clean install
+        shell: bash
+        run: |
+          umask 077
+          mkdir -m 700 empty-profile-receipts
+          node --input-type=module - <<'JS'
+          import { validateEmptyProfileIntake } from './scripts/smoke-electron-macos-empty-profile.mjs';
+          const input = validateEmptyProfileIntake(JSON.parse(process.env.EMPTY_PROFILE_INTAKE));
+          if (input.target !== process.env.SELECTED_TARGET || input.runnerRevision !== process.env.GITHUB_SHA) throw new Error('Intake mismatch');
+          if (!['plan', 'execute'].includes(process.env.SELECTED_MODE)) throw new Error('Mode mismatch');
+          if (process.env.SELECTED_CONFIRMATION !== (process.env.SELECTED_MODE === 'execute' ? 'RUN_DISPOSABLE_EMPTY_PROFILE' : '')) throw new Error('Confirmation mismatch');
+          JS
+          args=(--plan)
+          if [[ "$SELECTED_MODE" == execute ]]; then
+            args=(--execute --confirm "$SELECTED_CONFIRMATION")
+          fi
+          node scripts/smoke-electron-macos-empty-profile.mjs "${args[@]}" > empty-profile-receipts/execution.json
+      - name: Retain separate content-free clean-install evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-mac-empty-profile-darwin-x64-${{ github.run_id }}
+          path: empty-profile-receipts/*.json
+          if-no-files-found: error
+          retention-days: 14

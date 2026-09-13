@@ -187,10 +187,12 @@
     },
     "build": {
       "type": "object", "additionalProperties": false,
-      "required": ["sourceManifestSha256", "unsignedPayloadSha256"],
+      "required": ["sourceManifestSha256"],
+      "oneOf": [{ "required": ["unsignedPayloadSha256"] }, { "required": ["finalArtifactSha256"] }],
       "properties": {
         "sourceManifestSha256": { "$ref": "#/$defs/sha256" },
-        "unsignedPayloadSha256": { "$ref": "#/$defs/sha256" }
+        "unsignedPayloadSha256": { "$ref": "#/$defs/sha256" },
+        "finalArtifactSha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "store": {
@@ -306,10 +308,40 @@
           ]
         },
         "assurances": { "$ref": "#/$defs/assurances" },
+        "cleanInstallAcceptance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "reason", "sourceCommit"],
+          "properties": {
+            "status": { "enum": ["owner_accepted", "pending"] },
+            "reason": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "sourceCommit": { "$ref": "#/$defs/commit" }
+          }
+        },
         "store": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/store" }] },
         "updater": { "$ref": "#/$defs/updater" }
       },
       "allOf": [
+        {
+          "if": { "properties": { "build": { "type": "object", "required": ["finalArtifactSha256"] } }, "required": ["build"] },
+          "then": {
+            "properties": { "channel": { "const": "direct" }, "updater": { "properties": { "enabled": { "const": true }, "mechanism": { "const": "electron-updater" } } } },
+            "oneOf": [
+              { "properties": { "platform": { "const": "macos" }, "architecture": { "enum": ["arm64", "x64"] } } },
+              { "properties": { "platform": { "enum": ["windows", "linux"] }, "architecture": { "const": "x64" } } }
+            ]
+          }
+        },
+        {
+          "if": { "required": ["cleanInstallAcceptance"] },
+          "then": {
+            "properties": { "channel": { "const": "direct" }, "assurances": { "properties": { "cleanInstallSmokePassed": { "const": false } } } },
+            "oneOf": [
+              { "properties": { "platform": { "const": "macos" }, "architecture": { "enum": ["arm64", "x64"] } } },
+              { "properties": { "platform": { "enum": ["windows", "linux"] }, "architecture": { "const": "x64" } } }
+            ]
+          },
+          "else": { "properties": { "assurances": { "properties": { "cleanInstallSmokePassed": { "const": true } } } } }
+        },
         {
           "if": { "properties": { "platform": { "const": "macos" }, "channel": { "const": "direct" } }, "required": ["platform", "channel"] },
           "then": {
@@ -318,8 +350,8 @@
               "build": { "$ref": "#/$defs/build" },
               "store": { "type": "null" },
               "distribution": { "not": { "enum": ["mac-app-store", "microsoft-store", "flathub", "snap", "apt", "rpm"] } },
-              "assurances": { "required": ["cleanInstallSmokePassed", "developerIdSigned", "hardenedRuntime", "notarizationAccepted", "ticketStapled", "gatekeeperAssessmentPassed"], "properties": { "cleanInstallSmokePassed": { "const": true }, "developerIdSigned": { "const": true }, "hardenedRuntime": { "const": true }, "notarizationAccepted": { "const": true }, "ticketStapled": { "const": true }, "gatekeeperAssessmentPassed": { "const": true } } },
-              "updater": { "properties": { "mechanism": { "enum": ["sparkle", "none"] } } }
+              "assurances": { "required": ["cleanInstallSmokePassed", "developerIdSigned", "hardenedRuntime", "notarizationAccepted", "ticketStapled", "gatekeeperAssessmentPassed"], "properties": { "cleanInstallSmokePassed": { "type": "boolean" }, "developerIdSigned": { "const": true }, "hardenedRuntime": { "const": true }, "notarizationAccepted": { "const": true }, "ticketStapled": { "const": true }, "gatekeeperAssessmentPassed": { "const": true } } },
+              "updater": { "properties": { "mechanism": { "enum": ["sparkle", "electron-updater", "none"] } } }
             }
           }
         },
@@ -331,7 +363,7 @@
               "build": { "$ref": "#/$defs/build" },
               "store": { "type": "null" },
               "distribution": { "not": { "enum": ["mac-app-store", "microsoft-store", "flathub", "snap", "apt", "rpm"] } },
-              "assurances": { "required": ["cleanInstallSmokePassed", "authenticodeSigned", "timestamped"], "properties": { "cleanInstallSmokePassed": { "const": true }, "authenticodeSigned": { "const": true }, "timestamped": { "const": true } } },
+              "assurances": { "required": ["cleanInstallSmokePassed", "authenticodeSigned", "timestamped"], "properties": { "cleanInstallSmokePassed": { "type": "boolean" }, "authenticodeSigned": { "const": true }, "timestamped": { "const": true } } },
               "updater": { "properties": { "mechanism": { "enum": ["electron-updater", "none"] } } }
             }
           }
@@ -344,8 +376,8 @@
               "build": { "$ref": "#/$defs/build" },
               "store": { "type": "null" },
               "distribution": { "not": { "enum": ["mac-app-store", "microsoft-store", "flathub", "snap", "apt", "rpm"] } },
-              "assurances": { "required": ["cleanInstallSmokePassed", "artifactIntegrityVerified"], "properties": { "cleanInstallSmokePassed": { "const": true }, "artifactIntegrityVerified": { "const": true } } },
-              "updater": { "properties": { "mechanism": { "enum": ["none"] } } }
+              "assurances": { "required": ["cleanInstallSmokePassed", "artifactIntegrityVerified"], "properties": { "cleanInstallSmokePassed": { "type": "boolean" }, "artifactIntegrityVerified": { "const": true } } },
+              "updater": { "properties": { "mechanism": { "enum": ["electron-updater", "none"] } } }
             }
           }
         },

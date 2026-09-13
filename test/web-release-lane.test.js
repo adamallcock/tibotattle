@@ -26,6 +26,7 @@ import {
 } from "../scripts/deploy-web-release.js";
 import {
   inspectWebReleaseScope,
+  assertElectronSiteCatalogScope,
   isAllowedWebReleasePath,
   verifyWebReleaseReceipt,
   WEB_RELEASE_OUTPUT_DIRECTORY,
@@ -318,4 +319,44 @@ test("web-only preparation refuses a receipt path redirected through a symlink",
     /receipt path is not a safe regular file/u,
   );
   assert.equal(await readFile(redirectedPath, "utf8"), "do not replace\n");
+});
+
+
+test("web-only Electron catalog admission permits copy only and refuses runtime or unrelated catalog changes", () => {
+  const before = 'export const CATALOG = Object.freeze({\n  "old.key": "old",\n});\nexport const runtime = 1;';
+  const edited = before.replace('  "old.key"', '  "electron.site.download.linux": "Download Linux",\n  "old.key"');
+  const check = after => assertElectronSiteCatalogScope({ repositoryRoot: "/fixture", baseCommit: "before", sourceCommit: "after",
+    git: (_root, args) => args[1].startsWith("before:") ? before : after });
+  assert.doesNotThrow(() => check(edited));
+  assert.throws(() => check(edited.replace('runtime = 1', 'runtime = 2')), /outside Electron site copy/u);
+  assert.throws(() => check(edited.replace('"old"', '"changed"')), /outside Electron site copy/u);
+  assert.throws(() => check(edited.replace('"Download Linux"', 'runCode()')), /outside Electron site copy/u);
+  for (const path of ['scripts/lib/electron-public-site.mjs', 'test/electron-public-site.test.js', 'packages/i18n/index.js']) assert.equal(isAllowedWebReleasePath(path), true);
+  for (const path of ['packages/i18n/other.js', 'apps/worker/src/index.ts', 'config/electron-production-distribution.cjs']) assert.equal(isAllowedWebReleasePath(path), false);
+});
+
+test("web-only release receipt refuses an explicitly local Electron preview", async (t) => {
+  const value = await candidateFixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  await assert.rejects(prepareWebRelease({
+    repositoryRoot: value.root, baseCommit: value.baseCommit,
+    rawBuildArgs: { output: value.output, replace: true, source: value.publicSource },
+    build: async () => {
+      const manifestPath = await writeBoundManifest(value);
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+      manifest.electronRelease = { publishedInstallersVerified: false };
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      return { fileCount: 1, output: value.output, manifestPath };
+    },
+  }), /not bound/u);
+});
+
+
+test("web-only release admits exact public evidence controls, never general config or product runtime", () => {
+  for (const path of ['config/release-evidence.js', 'schemas/release-evidence-v1/manifest.schema.json',
+    'scripts/release-evidence-descriptor.js', 'scripts/release-evidence-policy.js',
+    'scripts/release-evidence-output.js', 'test/release-evidence.test.js']) assert.equal(isAllowedWebReleasePath(path), true);
+  for (const path of ['config/deployment-endpoints.js', 'config/release-manifest.js',
+    'apps/worker/src/index.ts', 'apps/worker/wrangler.jsonc', 'apps/electron/main.js',
+    'schemas/unrelated.json']) assert.equal(isAllowedWebReleasePath(path), false);
 });
