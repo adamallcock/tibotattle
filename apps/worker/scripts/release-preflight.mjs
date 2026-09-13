@@ -88,6 +88,10 @@ export const REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS = Object.freeze([
   ["table", "identity_reenrollment_cooldowns"],
   ["index", "deletion_tombstones_retention"],
   ["index", "identity_reenrollment_cooldowns_retention"],
+  ["table", "storage_erasure_jobs"],
+  ["index", "storage_erasure_pending"],
+  ["trigger", "storage_erasure_job_scope"],
+  ["trigger", "storage_erasure_tombstone_retained"],
 ]);
 
 export const REQUIRED_COLUMNS = Object.freeze({
@@ -180,6 +184,10 @@ export const REQUIRED_COLUMNS = Object.freeze({
 });
 
 export const REQUIRED_DELETION_LEDGER_COLUMNS = Object.freeze({
+  storage_erasure_jobs: Object.freeze([
+    "participant_digest", "source_id", "owner_digest", "source_namespace",
+    "state", "terminal_json", "completed_at", "attempted_ms",
+  ]),
   deletion_tombstones: Object.freeze([
     "participant_digest",
     "schema_version",

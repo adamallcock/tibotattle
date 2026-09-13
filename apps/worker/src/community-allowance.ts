@@ -978,9 +978,11 @@ const SCALAR_CACHE_REFUSALS: Record<"v0.2" | "v1" | "v1.1", ReadonlySet<string>>
     "usage_cost_limit_exceeded", "reduced_usage_limit_exceeded"]),
 };
 
-function validCompleteScalarAnalysis(value: unknown, source: "v0.2" | "v1" | "v1.1", fingerprint: string): boolean {
+export function validCompleteScalarAnalysis(value: unknown, source: "v0.2" | "v1" | "v1.1", fingerprint: string,
+  sourceOnly = false): boolean {
   if (!cacheObject(value)) return false;
-  const method = source === "v1.1" ? V11_PLAN_ATTRIBUTION_ADAPTER_VERSION : V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION;
+  const method = source === "v1.1" ? V11_PLAN_ATTRIBUTION_ADAPTER_VERSION
+    : sourceOnly ? V1_PLAN_ATTRIBUTION_ADAPTER_VERSION : V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION;
   if (Object.hasOwn(value, "attributionMethod") && value.attributionMethod !== method
       || Object.hasOwn(value, "inputFingerprint") && value.inputFingerprint !== fingerprint) return false;
   if (value.status === "not_testable") {

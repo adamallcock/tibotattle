@@ -78,6 +78,10 @@ import {
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
 import { readAdminReconstructionProgress } from "./admin-reconstruction-progress";
 import { readAdminGraphRefreshProgress } from "./admin-graph-refresh-progress";
+import { readStorageCommunityProgress } from "./storage-community-progress";
+import { readPublishedStorageCommunityAdminPreview } from "./storage-community-graph-publication";
+import type { StorageAnalyticsBindings } from "./analytics-delivery";
+import { storageErasureBindings } from "./storage-erasure";
 import { retireV1PreparedEvidence, V1PreparedEvidenceUnavailableError } from "./prepared-v1-evidence";
 import { readDistributionAnalytics } from "./distribution-analytics";
 import {
@@ -177,8 +181,6 @@ import {
   telemetryTransportSchemaVersion,
 } from "./telemetry-transport-policy";
 import {
-  existingTelemetryV11StagedChunk,
-  persistTelemetryV11StagedChunk,
   readTelemetryV11DayCandidates,
   readTelemetryV11DayChunkVector,
   registerTelemetryV11DayManifest,
@@ -186,6 +188,8 @@ import {
   validateTelemetryV11StagedChunk,
 } from "./telemetry-v11-repository";
 import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "./telemetry-v11-domain";
+import { parseTelemetryStorageMode, resolveTelemetryStorageMode, readTelemetryV11StorageReplay, persistTelemetryV11StorageChunk,
+  readTelemetryV1StorageReceipt, persistTelemetryV1StorageChunk } from "./telemetry-storage-mode";
 import {
   claimPendingAppleSignInHandoff,
   completeAppleSignInHandoff,
@@ -330,7 +334,6 @@ import {
   MAX_SYNC_MANIFEST_RANGE_DAYS,
   currentTelemetryV1Chunk,
   existingTelemetryV1ChunkByEnvelopeDigest,
-  insertTelemetryV1Chunk,
   telemetryV1AcknowledgedThroughDay,
   telemetryV1ChunkAdmission,
   telemetryV1ChunkAdmissionError,
@@ -349,6 +352,8 @@ import {
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
 import { isCurrentCommunityDailySpend } from "./community-daily-spend";
+import { captureStorageCommunityAuthority } from "./storage-community-authority";
+import { readPublishedStorageCommunityDaily } from "./storage-community-daily";
 import { projectPublicAllowanceGraph } from "./public-allowance-breakdowns";
 import {
   COMMUNITY_ALLOWANCE_BASIS,
@@ -2474,13 +2479,14 @@ async function handleTelemetryV11Contribution(
     envelope, env.ENVELOPE_PUBLIC_JWK, env.ENVELOPE_PRIVATE_JWK,
   );
   const chunk = await validateTelemetryV11StagedChunk(plaintext);
+  const storageMode = await resolveTelemetryStorageMode(env.USAGE_MONITOR_DB, env, "v11");
   const receipt = (contributionId: string, manifestId: string, replayed: boolean) => jsonResponse({
     schemaVersion: "telemetry-chunk-receipt-v1.1",
     contributionId, manifestId, chunkId: chunk.chunkId, chunkRevision: 1,
     status: "staged", replayed,
     recordCounts: { declared: chunk.records.length, accepted: chunk.records.length },
   }, 202, replayed ? { "idempotency-replayed": "true" } : undefined);
-  const prior = await existingTelemetryV11StagedChunk(env.USAGE_MONITOR_DB, principal, chunk);
+  const prior = await readTelemetryV11StorageReplay(env.USAGE_MONITOR_DB, storageMode, principal, chunk);
   if (prior) {
     if (prior.chunk_digest !== chunk.chunkDigest || prior.record_count !== chunk.records.length) {
       throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
@@ -2502,18 +2508,19 @@ async function handleTelemetryV11Contribution(
       plaintextSchemaVersion: chunk.schemaVersion, synthetic: "false" },
   });
   try {
-    const result = await persistTelemetryV11StagedChunk(env.USAGE_MONITOR_DB, principal, chunk, {
+    const result = await persistTelemetryV11StorageChunk(env.USAGE_MONITOR_DB, storageMode, principal, chunk, {
       chunkRowId, r2Key, envelopeDigest, deviceUploadAuthorizationId: authorizationId,
     });
-    if (result.replay) {
+    if (result.replay && result.contributionId !== chunkRowId) {
       // A content replay won after our first lookup. Only our unreferenced
-      // object is removable; the retained winner is never touched.
+      // object is removable; the retained winner is never touched. A lost
+      // response from OUR committed transaction keeps its own retained object.
       await env.QUARANTINE.delete(r2Key);
       await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
     }
     return receipt(result.contributionId, result.manifestId, result.replay);
   } catch (error) {
-    const retained = await existingTelemetryV11StagedChunk(env.USAGE_MONITOR_DB, principal, chunk);
+    const retained = await readTelemetryV11StorageReplay(env.USAGE_MONITOR_DB, storageMode, principal, chunk);
     if (retained && retained.chunk_digest === chunk.chunkDigest) {
       return receipt(retained.id, retained.manifest_id, true);
     }
@@ -2556,13 +2563,15 @@ async function handleTelemetryV1Contribution(
     uploadAuthorization.authorizationId,
   );
   if (deviceId === null) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  const storageMode = await resolveTelemetryStorageMode(env.USAGE_MONITOR_DB, env, "v1");
   const envelopeReplay = await existingTelemetryV1ChunkByEnvelopeDigest(
     env.USAGE_MONITOR_DB,
     participant.id,
     envelopeDigestValue,
   );
   if (envelopeReplay) {
-    return telemetryV1ChunkReceipt(env, envelopeReplay, deviceId);
+    return telemetryV1ChunkReceipt(env, await readTelemetryV1StorageReceipt(
+      env.USAGE_MONITOR_DB, storageMode, envelopeReplay, deviceId), deviceId);
   }
 
   const plaintext = await decryptSyntheticEnvelope(
@@ -2605,7 +2614,8 @@ async function handleTelemetryV1Contribution(
   // (device, stream, day, seq) chunk with an equal digest is a replay. An
   // equal digest anywhere else is a coincidence and proceeds as an insert.
   if (current && current.chunk_digest === chunk.chunkDigest) {
-    return telemetryV1ChunkReceipt(env, current, deviceId);
+    return telemetryV1ChunkReceipt(env, await readTelemetryV1StorageReceipt(
+      env.USAGE_MONITOR_DB, storageMode, current, deviceId), deviceId);
   }
   // Same-digest replay answered above, so a declared revision must extend
   // the current one by exactly one; anything else means the client's cursor
@@ -2648,17 +2658,31 @@ async function handleTelemetryV1Contribution(
     },
   );
   try {
-    const result = await insertTelemetryV1Chunk(env.USAGE_MONITOR_DB, {
+    const result = await persistTelemetryV1StorageChunk(env.USAGE_MONITOR_DB, storageMode, {
       participantId: participant.id,
       deviceId,
       deviceUploadAuthorizationId: uploadAuthorization.authorizationId,
       chunkRowId,
       r2Key,
       envelopeDigest: envelopeDigestValue,
+      authorizationEnvelopeDigest: await sha256Hex(body.raw),
       chunk,
       supersedes: current,
       createdAt,
     });
+    if (result.replay) {
+      // A recovered batch response must acknowledge its committed ID, never
+      // this request's proposed ID when another request won the same content.
+      const row = await existingTelemetryV1ChunkByEnvelopeDigest(
+        env.USAGE_MONITOR_DB, participant.id, envelopeDigestValue);
+      if (!row) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+      const retained = await readTelemetryV1StorageReceipt(env.USAGE_MONITOR_DB, storageMode, row, deviceId);
+      if (retained.id !== chunkRowId) {
+        await env.QUARANTINE.delete(r2Key);
+        await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
+      }
+      return telemetryV1ChunkReceipt(env, retained, deviceId);
+    }
     const [acknowledgedThroughDay, settledAdmission] = await Promise.all([
       telemetryV1AcknowledgedThroughDay(
         env.USAGE_MONITOR_DB,
@@ -2683,10 +2707,12 @@ async function handleTelemetryV1Contribution(
     }, 202);
   } catch (error) {
     // The journal batch can have committed before this response was built.
-    // A found current row with this exact identity and digest makes this an
-    // indeterminate, committed outcome; only a proven-absent row permits
-    // removing the orphaned quarantine object.
-    const replay = await currentTelemetryV1Chunk(
+    // The exact envelope can already have been superseded by a newer chunk;
+    // its retained receipt still owns its ciphertext. Only a completed lookup
+    // and validation can distinguish our committed object from an orphan.
+    const envelopeResult = await existingTelemetryV1ChunkByEnvelopeDigest(
+      env.USAGE_MONITOR_DB, participant.id, envelopeDigestValue);
+    const replay = envelopeResult ?? await currentTelemetryV1Chunk(
       env.USAGE_MONITOR_DB,
       participant.id,
       deviceId,
@@ -2695,7 +2721,14 @@ async function handleTelemetryV1Contribution(
       chunk.chunkSeq,
     );
     if (replay && replay.chunk_digest === chunk.chunkDigest) {
-      return telemetryV1ChunkReceipt(env, replay, deviceId);
+      const retained = await readTelemetryV1StorageReceipt(env.USAGE_MONITOR_DB, storageMode, replay, deviceId);
+      if (retained.id !== chunkRowId) {
+        try {
+          await env.QUARANTINE.delete(r2Key);
+          await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
+        } catch { /* durable pending registration retains the cleanup obligation */ }
+      }
+      return telemetryV1ChunkReceipt(env, retained, deviceId);
     }
     try {
       await env.QUARANTINE.delete(r2Key);
@@ -3140,10 +3173,11 @@ async function handleAdminCommunityAllowancePreview(
     }
     await adminSession(request, env);
   }
-  const preview = await readCachedAdminCommunityAllowancePreview(
-    env.USAGE_MONITOR_DB,
-    Date.now(),
-  );
+  const storage=await optionalStorageAnalyticsBindings(env);
+  const preview = storage
+    ? await readPublishedStorageCommunityAdminPreview(storage,Date.now())
+    : await readCachedAdminCommunityAllowancePreview(env.USAGE_MONITOR_DB,Date.now());
+  if(preview===null)throw new ApiError(503,"ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE");
   return jsonResponse(preview, 200, {
     "cache-control": "no-store",
     vary: "Cookie",
@@ -3163,9 +3197,19 @@ async function handleAdminReconstructionProgress(
   const params = [...new URL(request.url).searchParams];
   const includePreparation = params.length === 1 && params[0]?.[0] === "detail" && params[0]?.[1] === "preparation";
   if (params.length !== 0 && !includePreparation) throw new ApiError(400, "BODY_INVALID");
-  const progress = await readAdminGraphRefreshProgress(env.USAGE_MONITOR_DB, Date.now(), allowanceReconstructionMode(env),
-    { includePreparation });
+  const storage=await optionalStorageAnalyticsBindings(env);
+  const progress = storage?await readStorageCommunityProgress(storage,Date.now(),{includePreparation})
+    :await readAdminGraphRefreshProgress(env.USAGE_MONITOR_DB, Date.now(), allowanceReconstructionMode(env),{ includePreparation });
   return jsonResponse(progress, 200, { "cache-control": "no-store", vary: "Cookie" });
+}
+
+async function optionalStorageAnalyticsBindings(env:Env):Promise<StorageAnalyticsBindings|null> {
+ const mode=parseTelemetryStorageMode(env);if(mode.kind==='json')return null;
+ const target:unknown=Reflect.get(env,'ANALYTICS_DB');
+ if(!target||typeof target!=='object'||typeof Reflect.get(target,'prepare')!=='function'
+  ||typeof Reflect.get(target,'batch')!=='function')throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+ const authority=await captureStorageCommunityAuthority(env.USAGE_MONITOR_DB,{sourceNamespace:mode.sourceNamespace});
+ return {source:env.USAGE_MONITOR_DB,target:target as D1Database,sourceId:authority.sourceId,sourceNamespace:mode.sourceNamespace};
 }
 
 async function handleAdminOverview(
@@ -3203,8 +3247,10 @@ async function handleAdminOverview(
       ? readGithubDistributionSnapshot(env.USAGE_MONITOR_DB, nowEpoch)
         .catch(() => githubUnavailable("unavailable", "GITHUB_SNAPSHOT_UNAVAILABLE"))
       : Promise.resolve(undefined),
-    readAdminReconstructionProgress(env.USAGE_MONITOR_DB, nowEpoch,
-      allowanceReconstructionMode(env)),
+    parseTelemetryStorageMode(env).kind==='typed'
+      ? Promise.resolve({schemaVersion:'admin-reconstruction-progress-v0.1',observedAt:new Date(nowEpoch).toISOString(),
+        mode:'resumable' as const,status:'unavailable' as const})
+      :readAdminReconstructionProgress(env.USAGE_MONITOR_DB, nowEpoch,allowanceReconstructionMode(env)),
   ]);
   const distribution = await readDistributionAnalytics({
     enabled: distributionEnabled,
@@ -3462,15 +3508,24 @@ async function handleCommunityDaily(
   if (rangeDays < 1 || rangeDays > COMMUNITY_DAILY_MAX_RANGE_DAYS) {
     throw new ApiError(400, "BODY_INVALID");
   }
-  // Two SELECTs in one snapshot read this precomputed range/readiness plus one
-  // bounded published cache. Interactive requests never analyze history,
+  // Read the precomputed range and one bounded, authority-fenced graph cache.
+  // Interactive requests never analyze history,
   // duplicate the preview JSON across daily rows, or write readiness state.
   const nowMs = Date.now();
-  const read = await readPublishedCommunityDailyAggregatesWithAllowanceState(
-    env.USAGE_MONITOR_DB,
-    from,
-    to,
-  );
+  const storageMode = parseTelemetryStorageMode(env);
+  const read = storageMode.kind === "json"
+    ? await readPublishedCommunityDailyAggregatesWithAllowanceState(env.USAGE_MONITOR_DB,from,to)
+    : await (async () => {
+      try {
+        const target: unknown = Reflect.get(env,"ANALYTICS_DB");
+        if (!target || typeof target !== "object" || typeof Reflect.get(target,"prepare") !== "function"
+            || typeof Reflect.get(target,"batch") !== "function") throw new Error("analytics binding unavailable");
+        const authority = await captureStorageCommunityAuthority(env.USAGE_MONITOR_DB,
+          {sourceNamespace:storageMode.sourceNamespace});
+        return await readPublishedStorageCommunityDaily({source:env.USAGE_MONITOR_DB,target:target as D1Database,
+          sourceId:authority.sourceId,sourceNamespace:storageMode.sourceNamespace,fromDay:from,throughDay:to});
+      } catch { throw new ApiError(503,"BACKEND_STORAGE_UNAVAILABLE"); }
+    })();
   const today = new Date(nowMs).toISOString().slice(0, 10);
   const todayStartMs = Date.parse(`${today}T00:00:00.000Z`);
   const mergedHistoryFrom = new Date(
@@ -3626,9 +3681,15 @@ async function handleReady(
   const reconciliation = await readQuarantineReconciliationStatus(
     env.USAGE_MONITOR_DB,
   );
-  const rebuildComplete = await aggregateRebuildComplete(
-    env.USAGE_MONITOR_DB,
-  );
+  const delegated = parseTelemetryStorageMode(env).kind === "typed";
+  if (delegated) {
+    await resolveTelemetryStorageMode(env.USAGE_MONITOR_DB,env,"v1");
+    await resolveTelemetryStorageMode(env.USAGE_MONITOR_DB,env,"v11");
+  }
+  // This endpoint qualifies ingestion. The separate analytics progress route
+  // qualifies publication; an offline analytics database cannot make uploads
+  // unavailable. False remains unconfirmed, never a claim that backfill passed.
+  const rebuildComplete = !delegated && await aggregateRebuildComplete(env.USAGE_MONITOR_DB);
   const maintenanceCycleMatched =
     retention.maintenance_run_at !== null
     && reconciliation.maintenanceRunAt === retention.maintenance_run_at;
@@ -3636,7 +3697,7 @@ async function handleReady(
     && reconciliation.reconciliationComplete
     && maintenanceCycleMatched;
   const ready = lifecycle.state === "ready"
-    && rebuildComplete
+    && (delegated || rebuildComplete)
     && reconciliationComplete;
   return jsonResponse({
     status: ready ? "ready" : "not_ready",
@@ -3647,6 +3708,7 @@ async function handleReady(
         retention.quarantine_retention_complete === 1,
       restoreReplayComplete: retention.restore_replay_complete === 1,
       aggregateRebuildComplete: rebuildComplete,
+      ...(delegated ? { aggregateRebuildDelegated: true } : {}),
       maintenanceCycleMatched,
       quarantineReconciliation: reconciliation.state,
       quarantineReconciliationComplete: reconciliationComplete,
@@ -4085,6 +4147,7 @@ interface ScheduledMaintenanceLog {
   expiredDeviceCredentialRotationsPurged: number;
   expiredDevicePairingEventsPurged: number;
   aggregateRebuildComplete: boolean;
+  aggregateRebuildDelegated?: boolean;
   publicationEnabled: boolean | null;
 }
 
@@ -4206,12 +4269,21 @@ export async function runScheduledMaintenance(
     return log;
   }
   const reconstructionMode = allowanceReconstructionMode(env);
+  // Typed ingestion is serviced by the independent analytics scheduler. Never
+  // run the old raw-JSON backfill against empty compatibility tables or create
+  // another copy of analytical preparation in the upload database.
+  const localAnalytics = parseTelemetryStorageMode(env).kind === "json";
   const queryMeter = createD1InvocationBudget();
   queryMeter.reserveQueries = 1;
   const originalEnv = env;
   env = new Proxy(originalEnv, { get(target, property) {
     if (property === "USAGE_MONITOR_DB") return queryMeter.wrap(target.USAGE_MONITOR_DB);
     if (property === "DELETION_LEDGER") return queryMeter.wrap(target.DELETION_LEDGER);
+    if (property === "ANALYTICS_DB") {
+      const database:unknown=Reflect.get(target,property);
+      return database&&typeof database==='object'&&typeof Reflect.get(database,'prepare')==='function'
+        ?queryMeter.wrap(database as D1Database):database;
+    }
     return Reflect.get(target, property);
   } });
   const maintenanceStartedMs = Date.now();
@@ -4227,6 +4299,7 @@ export async function runScheduledMaintenance(
   };
   const attemptedMetricCaches = new Set<string>();
   const warmOwnerMetricCaches = async (phase: "before_analysis" | "after_analysis") => {
+    if (!localAnalytics) return;
     // These scheduled-only helpers retain their 55-minute self-throttle. A
     // browser never rebuilds them; at most one attempt per cache per invocation.
     for (const task of [
@@ -4376,6 +4449,7 @@ export async function runScheduledMaintenance(
       ),
       Reflect.get(env, "IDENTITY_LINK_SECRET"),
       !identityRequired(env),
+      await storageErasureBindings(env)??undefined,
     );
     quarantineRetentionComplete =
       lifecycle.quarantineRetentionComplete;
@@ -4426,7 +4500,7 @@ export async function runScheduledMaintenance(
     // control; `quarantineReconciliationComplete` still flows into the overall
     // `complete`/`code` below so maintenance honestly reports housekeeping lag.
     let weeklyRebuildComplete = false;
-    if (lifecycleComplete && publicationEnabled === true) {
+    if (localAnalytics && lifecycleComplete && publicationEnabled === true) {
       preGraphPhase = "weekly_publication";
       const weeklyStartedMs = Date.now(), weeklyStartedQueries = queryMeter.queriesUsed;
       const weeklyDeadlineMs = weeklyStartedMs + 40_000;
@@ -4480,12 +4554,12 @@ export async function runScheduledMaintenance(
     const optionalStartedMs = Date.now();
     optionalDeadlineMs = optionalStartedMs + 40_000;
     console.log(JSON.stringify({level:"info",event:"scheduled_graph_admission",
-      outcome:lifecycleComplete && publicationEnabled && reconstructionMode !== "paused" ? "ready" : "skipped",
-      code:lifecycleComplete && publicationEnabled && reconstructionMode !== "paused" ? "GRAPH_BUDGET_STARTED" : "GRAPH_WORK_GATED",
+      outcome:localAnalytics && lifecycleComplete && publicationEnabled && reconstructionMode !== "paused" ? "ready" : "skipped",
+      code:localAnalytics && lifecycleComplete && publicationEnabled && reconstructionMode !== "paused" ? "GRAPH_BUDGET_STARTED" : "GRAPH_WORK_GATED",
       lifecycleComplete,publicationEnabled,reconstructionMode,
       preGraphElapsedMs:Math.max(0,optionalStartedMs-maintenanceStartedMs),
       ...preGraphTiming,...phaseTiming()}));
-    if (lifecycleComplete && publicationEnabled === true) {
+    if (localAnalytics && lifecycleComplete && publicationEnabled === true) {
       if (reconstructionMode !== "paused") {
         queryMeter.reserveQueries = 12;
         try {
@@ -4621,7 +4695,7 @@ export async function runScheduledMaintenance(
           code:"ALLOWANCE_RECONSTRUCTION_PAUSED"}));
       }
     } else {
-      rebuildComplete = reconstructionMode !== "paused" && await aggregateRebuildComplete(
+      rebuildComplete = localAnalytics && reconstructionMode !== "paused" && await aggregateRebuildComplete(
         env.USAGE_MONITOR_DB,
       );
     }
@@ -4645,7 +4719,7 @@ export async function runScheduledMaintenance(
       && primaryIdentityReenrollmentCooldownPurgeComplete
       && identityReenrollmentCooldownPurgeComplete
       && signInAdmissionPurgeComplete
-      && rebuildComplete;
+      && (!localAnalytics || rebuildComplete);
     const log: ScheduledMaintenanceLog = {
       level: "info",
       event: "scheduled_backend_maintenance",
@@ -4671,6 +4745,7 @@ export async function runScheduledMaintenance(
       expiredDeviceCredentialRotationsPurged,
       expiredDevicePairingEventsPurged,
       aggregateRebuildComplete: rebuildComplete,
+      ...(!localAnalytics ? { aggregateRebuildDelegated: true } : {}),
       publicationEnabled,
     };
     console.log(JSON.stringify(log));

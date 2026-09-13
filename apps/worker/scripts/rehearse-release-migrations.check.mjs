@@ -341,6 +341,8 @@ test("fixed scale admission rejects unknown profiles, override dimensions and wr
   assert.equal(historical.migrations.USAGE_MONITOR_DB.pending.at(-1).name, LOCAL_SCALE_PROFILE.throughMigration);
   const current = await inspectMigrationPrefix({ prefix: p });
   assert.equal(current.migrations.USAGE_MONITOR_DB.pending.at(-1).name, "0060_public_contribution_sources.sql");
+  assert.deepEqual(historical.migrations.DELETION_LEDGER.pending, []);
+  assert.deepEqual(current.migrations.DELETION_LEDGER.pending.map(row => row.name), ["0003_storage_erasure_jobs.sql"]);
   await assert.rejects(inspectMigrationPrefix({ prefix: p, throughMigration: "0058_accountless_upload_ownership.sql" }), /REHEARSAL_TARGET_INVALID/);
   for (const options of [{ profile: "unknown" }, { profile: LOCAL_SCALE_PROFILE.name, accounts: 2 },
     { profile: LOCAL_SCALE_PROFILE.name, timeoutMs: 1 }, { profile: LOCAL_SCALE_PROFILE.name, maxDatabaseBytes: 3 * 2 ** 30 }]) {

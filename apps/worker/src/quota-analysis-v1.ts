@@ -1,3 +1,4 @@
+import { loadTypedV1AnalysisScope, readTypedV1UsageAnalysisPage, type TypedV1AnalysisScope } from './typed-v1-analysis-reader';
 import {
   MODEL_COMPOSITION_POLICY,
   PLAN_ATTRIBUTION_POLICY,
@@ -316,7 +317,8 @@ export interface V1AcquiredQuotaEvidence {
 /** The whole non-resumable usage/fit phase must fit the SAME invocation budget.
  * This is a conservative reservation, not a report of queries actually used.
  * With a supplied pin: 1 successor check + 2 initial source checks + at most
- * 2 queries per 5,000-row usage page (including EOF/overflow) + 2 final checks.
+ * 2 queries per 5,000-row usage page (including EOF/overflow) + 2 final checks
+ * + at most2 layout/namespace qualification queries.
  * Caller separately reserves checkpoint/cache promotion and maintenance costs.
  * CPU and combined retained-memory qualification remain required before wiring
  * this entry point into production; a query reservation alone proves neither.
@@ -325,7 +327,7 @@ export function v1QuotaFinishQueryReserve(maxUsageRows = MAX_WINDOWED_USAGE_ROWS
   if (!Number.isSafeInteger(maxUsageRows) || maxUsageRows < 0 || maxUsageRows > MAX_WINDOWED_USAGE_ROWS) {
     throw new TypeError("v1 finish usage bound invalid");
   }
-  return 5 + 2 * (Math.floor(maxUsageRows / USAGE_PAGE_SIZE) + 1);
+  return 7 + 2 * (Math.floor(maxUsageRows / USAGE_PAGE_SIZE) + 1);
 }
 
 /** Exact bounded read allowance for the selected prepared finishing path.
@@ -445,7 +447,7 @@ export async function finishHistoricalModelCompositionV1(
 }
 
 /** One acquired corpus, one admitted usage scan and one server-pricing pass.
- * The existing 407-query default reserve covers BOTH results; the caller owns
+ * The 409-query default reserve covers BOTH results; the caller owns
  * checkpoint/cache promotion and the invocation-wide database statement meter.
  * Evidence is borrowed, never mutated. Release acquisition indexes/checkpoints
  * before calling: completed normalized evidence is the sole retained input.
@@ -695,10 +697,13 @@ function planObservation(row: PlanEvidenceRow): PlanAttributionObservation | nul
 }
 
 async function loadPlanAttributionIndex(
-  db: D1Database, participantId: string, winnersJson: string, observedAtCutoff: string,
+  db: D1Database, participantId: string, winnersJson: string, observedAtCutoff: string, observedAtBefore?:string,
 ): Promise<PlanAttributionIndex | null> {
-  const result = await db.prepare(PLAN_EVIDENCE_SQL)
-    .bind(winnersJson, participantId, observedAtCutoff, MAX_PLAN_ATTRIBUTION_ROWS + 1)
+  const typed=await loadTypedV1AnalysisScope(db,participantId);
+  let sql=typed?PLAN_EVIDENCE_SQL.replaceAll('telemetry_v1_records','typed_v1_current_records'):PLAN_EVIDENCE_SQL;
+  if(observedAtBefore)sql=sql.replace('r.observed_at >= ?', 'r.observed_at >= ? AND r.observed_at < ?');
+  const result = await db.prepare(sql)
+    .bind(winnersJson, participantId, observedAtCutoff, ...(observedAtBefore?[observedAtBefore]:[]), MAX_PLAN_ATTRIBUTION_ROWS + 1)
     .all<PlanEvidenceRow>();
   if (result.results.length > MAX_PLAN_ATTRIBUTION_ROWS) return null;
   const index = buildPlanAttributionIndex(result.results.map(planObservation));
@@ -883,12 +888,31 @@ export const V1_HISTORY_USAGE_PAGE_AFTER_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
      AND r.observed_at > ? AND r.observed_at < ?
    ORDER BY r.observed_at, r.id LIMIT ?`;
 
+async function v1QuotaAnalysisSql(db:D1Database,participantId:string,sql:string):Promise<string>{
+  if(!await loadTypedV1AnalysisScope(db,participantId))return sql;
+  // Materialize the narrow owner/window once before the shared multi-stage
+  // reduction. Flattening the full compatibility view through every window
+  // expression makes SQLite exhaust its query-planner memory on a tiny corpus.
+  // Explicit positions preserve the existing call's parameter order.
+  let parameter=0;
+  const positioned=sql.replace(/\?/g,()=>`?${++parameter}`);
+  const upper=sql.includes('r.observed_at >= ? AND r.observed_at < ?');
+  return positioned.replace('WITH era_markers',`WITH typed_quota_input AS MATERIALIZED (
+    SELECT occurrence_id,observed_at,provider,plan_type,plan_variant,limit_id,slot,
+      used_percent,window_duration_minutes,resets_at,id,participant_id,device_id,observed_day,stream
+    FROM typed_v1_current_records WHERE participant_id=?3 AND stream='quota' AND observed_at>=?4
+      ${upper?'AND observed_at<?5':''}
+  ), era_markers`).replaceAll('telemetry_v1_records','typed_quota_input');
+}
 /** Shared page/cursor contract for both scalar and model-composition readers. */
 export async function readV1UsagePage(
   db: D1Database, winnersJson: string, participantId: string,
   cursorObservedAt: string, cursorId: number, pageSize: number,
   observedAtBefore?: string,
+  selectedLayout?:TypedV1AnalysisScope|null,
 ): Promise<WindowedUsageRow[]> {
+  const typed=selectedLayout===undefined?await loadTypedV1AnalysisScope(db,participantId):selectedLayout;
+  if(typed)return readTypedV1UsageAnalysisPage(db,typed,winnersJson,cursorObservedAt,cursorId,pageSize,observedAtBefore);
   if (observedAtBefore !== undefined) {
     const sameTime = await db.prepare(V1_HISTORY_USAGE_PAGE_AT_TIME_SQL)
       .bind(winnersJson, participantId, cursorObservedAt, cursorId, observedAtBefore, pageSize).all<WindowedUsageRow>();
@@ -1107,6 +1131,7 @@ async function readAndBucketUsage(
   // matchedUsage lower bound is inclusive, so a grid-exact event that equals a
   // reset's firstObserved is in-window while interior events of the same bucket
   // are not — the singleton-split preserves that distinction).
+  const selectedLayout=preparedUsage?null:await loadTypedV1AnalysisScope(db,participantId);
   const buckets = new Map<string, Map<number, BucketAccumulator>>();
   const singletons = new Map<string, Map<number, BucketAccumulator>>();
   const bucketScopes = new Map<string, { provider: string; planEraKey: string | null }>();
@@ -1175,7 +1200,7 @@ async function readAndBucketUsage(
   for (;;) {
     const rows = preparedUsage
       ? await preparedUsage.readPage(cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore)
-      : await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore);
+      : await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore,selectedLayout);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) {
@@ -1522,7 +1547,7 @@ async function analyzeAccountScopedQuotaV1(
   if (attributionIndex === null) return notTestable("plan_attribution_limit_exceeded");
   if (attributionIndex.status === "limit_exceeded") return notTestable("plan_attribution_limit_exceeded");
 
-  const quotaResult = prepared ?? await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+  const quotaResult = prepared ?? await db.prepare(await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL)).bind(
     eraMarkersJson(attributionIndex),
     sourcePin.winnersJson,
     participantId,
@@ -1603,7 +1628,7 @@ export async function downsampleQuotaForTest(
   if (sourcePin.winners.length === 0) return [];
   const attributionIndex = await loadPlanAttributionIndex(db, participantId, sourcePin.winnersJson, observedAtCutoff);
   if (!attributionIndex) return [];
-  const result = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+  const result = await db.prepare(await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL)).bind(
     eraMarkersJson(attributionIndex),
     sourcePin.winnersJson,
     participantId,
@@ -2037,9 +2062,20 @@ export async function accountScopedModelCompositionV1(
   return analyzeAccountScopedModelCompositionV1(db, participantId, options);
 }
 
+/** Direct closed-window endpoint reduction, with the same existing composition
+ * kernel. No checkpoints or source mutations. A caller may select the resumable
+ * page driver after a bounded database/time failure; neither path changes math. */
+export async function accountScopedHistoricalModelCompositionV1(db:D1Database,participantId:string,day:string,
+ options:Omit<V1AnalysisOptions,'nowMs'>&{sourcePin:V1SourcePin}):Promise<V1ModelCompositionResult>{
+ const history=modelHistoryWindow(day),sourcePin=structuredClone(options.sourcePin);
+ const result=await analyzeAccountScopedModelCompositionV1(db,participantId,{...options,sourcePin,nowMs:Date.parse(history.fixedNow)},undefined,history);
+ // Include conservative early refusals in the final source fence.
+ await assertV1SourcePinCurrent(db,sourcePin);return result;
+}
+
 async function analyzeAccountScopedModelCompositionV1(
   db: D1Database, participantId: string, options: V1AnalysisOptions,
-  acquired?: V1AcquiredQuotaEvidence,
+  acquired?: V1AcquiredQuotaEvidence, history?:ModelHistoryWindow,
 ): Promise<V1ModelCompositionResult> {
   const nowMs = options.nowMs ?? Date.now();
   const maxDownsampledQuotaRows =
@@ -2051,15 +2087,15 @@ async function analyzeAccountScopedModelCompositionV1(
   const cutoffMs = Date.parse(observedAtCutoff);
   const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
 
-  const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin);
+  const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin,history);
   const prepared = acquired ? await validateAcquiredQuotaEvidence(db, participantId, acquired,
-    sourcePin, observedAtCutoff, resetsAtCutoff, maxDownsampledQuotaRows) : null;
+    sourcePin, observedAtCutoff, resetsAtCutoff, maxDownsampledQuotaRows,history) : null;
   if (sourcePin.winners.length === 0) {
     return { status: "not_testable", reason: "supported_quota_track_unavailable" };
   }
   const winnersJsonArg = sourcePin.winnersJson;
   const attributionIndex = prepared?.attributionIndex
-    ?? await loadPlanAttributionIndex(db, participantId, winnersJsonArg, observedAtCutoff);
+    ?? await loadPlanAttributionIndex(db, participantId, winnersJsonArg, observedAtCutoff,history?.observedAtBefore);
   if (attributionIndex === null) return { status: "not_testable", reason: "plan_attribution_limit_exceeded" };
   if (attributionIndex.status === "limit_exceeded") return { status: "not_testable", reason: "plan_attribution_limit_exceeded" };
   // The single-plan composition contract is intentional at this gate. Inspect
@@ -2073,11 +2109,14 @@ async function analyzeAccountScopedModelCompositionV1(
     return { status: "not_testable", reason: "multi_provider_window_unsupported" };
   }
 
-  const quotaResult = prepared ?? await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+  let quotaSql=history?QUOTA_DOWNSAMPLE_SQL.replace('r.observed_at >= ?', 'r.observed_at >= ? AND r.observed_at < ?'):QUOTA_DOWNSAMPLE_SQL;
+  quotaSql=await v1QuotaAnalysisSql(db,participantId,quotaSql);
+  const quotaResult = prepared ?? await db.prepare(quotaSql).bind(
     eraMarkersJson(attributionIndex),
     winnersJsonArg,
     participantId,
     observedAtCutoff,
+    ...(history?[history.observedAtBefore]:[]),
     resetsAtCutoff,
     SEVEN_DAY_WINDOW_MINUTES,
     MINIMUM_BOUNDARIES,
@@ -2142,9 +2181,10 @@ async function analyzeAccountScopedModelCompositionV1(
   // Only providers that carry the retained quota series contribute — cost from
   // an unrelated provider cannot have debited this pool.
   const accumulator = createCompositionUsageAccumulator(quotaProviders, compositionQuotaBins(quotaRows.map(row => row.observedAtMs)));
+  const selectedLayout=await loadTypedV1AnalysisScope(db,participantId);
   let total = 0, cursorObs = observedAtCutoff, cursorId = 0;
   for (;;) {
-    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE);
+    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE,history?.observedAtBefore,selectedLayout);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) return { status: "not_testable", reason: "windowed_usage_limit_exceeded" };
@@ -2177,7 +2217,7 @@ async function analyzeAccountScopedModelCompositionV1(
     poisonedBinCount,
     latestQuotaObservedAt: new Date(latestQuotaObservedAtMs).toISOString(),
     attributionStatus: "legacy_conditional",
-    attributionMethod: acquired ? V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION : V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+    attributionMethod: history?MODEL_HISTORY_METHOD_VERSION:acquired ? V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION : V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
     inputFingerprint: sourcePin.fingerprint,
   };
 }

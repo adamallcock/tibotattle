@@ -1,3 +1,4 @@
+import {loadTypedV1AnalysisScope,createTypedV1QuotaPageReader} from './typed-v1-analysis-reader';
 import type {
   V1FitSourceRow,
   V1PlanSourceRow,
@@ -14,6 +15,7 @@ interface BackfillState {
   through_record_id: number;
   last_record_id: number;
   is_complete: number;
+  typed_present?:number;
 }
 
 export class V1QuotaFitProjectionUnavailableError extends Error {
@@ -29,7 +31,8 @@ function validState(value: BackfillState | null): value is BackfillState {
     && (value.is_complete === 0 || value.last_record_id === value.through_record_id);
 }
 
-const STATE_SQL = `SELECT through_record_id, last_record_id, is_complete
+const STATE_SQL = `SELECT through_record_id, last_record_id, is_complete,
+ EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='typed_v1_admission_state') typed_present
   FROM telemetry_v1_quota_fit_backfill WHERE singleton_id = 1`;
 
 // LIMIT applies to canonical rowids BEFORE eligibility filtering. A page of
@@ -91,6 +94,13 @@ export async function backfillV1QuotaFitProjection(
     throw new TypeError("v1 quota projection backfill bound invalid");
   }
   let state = await db.prepare(STATE_SQL).first<BackfillState>();
+  if(state?.typed_present===1){
+    const typed=await db.prepare(`SELECT s.runtime_contract_version,s.next_source_row_id,
+      EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='typed_v1_analytical_schema') ready
+      FROM typed_v1_admission_state s WHERE s.id=1`).first<{runtime_contract_version:number;next_source_row_id:number;ready:number}>();
+    if(typed){if(typed.runtime_contract_version!==1||typed.ready!==1)throw new V1QuotaFitProjectionUnavailableError();
+      return {status:'complete',pagesRun:0,queriesUsed:2,lastRecordId:typed.next_source_row_id-1,throughRecordId:typed.next_source_row_id-1};}
+  }
   if (!validState(state)) throw new V1QuotaFitProjectionUnavailableError();
   let pagesRun = 0;
   while (state.is_complete === 0 && pagesRun < maxPages) {
@@ -175,9 +185,12 @@ export async function createV1QuotaPageReader(db: D1Database, participantId: str
   if (typeof participantId !== "string" || participantId.length === 0) throw new TypeError("participant required");
   if (observedAtBefore !== undefined && (!Number.isFinite(Date.parse(observedAtBefore))
     || new Date(observedAtBefore).toISOString() !== observedAtBefore)) throw new TypeError("quota upper bound invalid");
-  const ready = await db.prepare(`SELECT s.through_record_id, s.last_record_id, s.is_complete
+  const ready = await db.prepare(`SELECT s.through_record_id, s.last_record_id, s.is_complete,
+      EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='typed_v1_admission_state') typed_present
     FROM telemetry_v1_quota_fit_backfill s JOIN participants p ON p.id = ? AND p.state = 'active'
     WHERE s.singleton_id = 1`).bind(participantId).first<BackfillState>();
+  if(ready?.typed_present===1){const scope=await loadTypedV1AnalysisScope(db,participantId,true);
+    if(scope)return createTypedV1QuotaPageReader(db,scope,observedAtBefore);}
   if (!validState(ready) || ready.is_complete !== 1) throw new V1QuotaFitProjectionUnavailableError();
   return {
     async readPlanPage(cursor, limit) {

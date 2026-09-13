@@ -152,6 +152,39 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
   );
 });
 
+test("JSON staging accepts only exact reviewed legacy or additive deletion ledgers", () => {
+  const config = provisionedConfig();
+  for (const [names, current] of [
+    [EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER, true],
+    [EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER.slice(0, 2), true],
+    [EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER.slice(0, 1), false],
+    [[...EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER, "0004_unreviewed.sql"], false],
+    [["0001_deletion_tombstones.sql", "0002_unreviewed.sql"], false],
+  ]) {
+    const calls = [], baseSpawn = successSpawn(config, calls);
+    const result = probeStagingLive({config, wrangler: "/fake/wrangler", workerDirectory,
+      spawn(command, args, options) {
+        if (args[2] === "DELETION_LEDGER" && args.some(arg => arg.includes("FROM d1_migrations"))) {
+          calls.push(args);
+          return {status: 0, stdout: JSON.stringify([{results: names.map(name => ({name}))}]), stderr: ""};
+        }
+        return baseSpawn(command, args, options);
+      },
+    });
+    assert.equal(result.checks.migrationsCurrent, current, names.join(","));
+    assert.equal(result.checks.deletionLedgerSchemaCurrent, current);
+    assert.equal(result.collectionAuthorized, false);
+    assert.equal(calls.some(args => args.includes("apply") || args.includes("deploy")), false);
+  }
+  for (const vars of [
+    {TELEMETRY_STORAGE_MODE: "typed", TELEMETRY_STORAGE_NAMESPACE: "synthetic"},
+    {TELEMETRY_STORAGE_MODE: "json", TELEMETRY_STORAGE_NAMESPACE: "unexpected"},
+  ]) {
+    const altered = structuredClone(config); Object.assign(altered.env.staging.vars, vars);
+    assert.equal(assessStagingConfiguration(altered).state, "unsafe_configuration");
+  }
+});
+
 test("reconciled migration lineage pins historical SQL and reviewed unapplied repairs", () => {
   // Historical 0041 is the deployed 4519b349 migration. The other digests pin
   // the unchanged SQL from the pre-reconciliation release source a9220795,

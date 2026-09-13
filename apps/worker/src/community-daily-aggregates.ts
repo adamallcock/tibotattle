@@ -83,7 +83,7 @@ interface DailyRebuildRow {
   requested_at: string;
 }
 
-interface DailyTotalsRow {
+export interface DailyTotalsRow {
   contributing_participants: number;
   contributing_devices: number;
   usage_events: number;
@@ -97,7 +97,7 @@ interface DailyTotalsRow {
   output_combined_tokens: number;
 }
 
-interface DailyCellRow {
+export interface DailyCellRow {
   provider: string;
   model_id: string;
   usage_events: number;
@@ -328,6 +328,61 @@ async function readCommunitySpendDriftDays(
   return drifted;
 }
 
+/** Shared public DTO: both storage layouts retain the same totals, cell cap,
+ * suppression decision and optional allowance semantics. */
+export function buildCommunityDailyPayload(options: {
+  day: string; revision: number; releasedAt: string; totals: DailyTotalsRow | null;
+  cells: DailyCellRow[]; cellsTruncated?: boolean; spend: import("./community-daily-spend").CommunityDailySpend;
+  allowance?: ReturnType<typeof summarizeCommunityAllowanceDay>;
+}) {
+  const { day, revision, releasedAt, totals, cells, spend, allowance } = options;
+  const aggregateId = `community-daily:${day}:r${revision}`;
+  const cellRows = cells.slice(0, MAX_DAILY_AGGREGATE_CELLS);
+  return {
+    schemaVersion: DAILY_AGGREGATE_SCHEMA_VERSION,
+    aggregateId,
+    day,
+    revision,
+    releasedAt,
+    // Revisions replace sealing: this row never mutates, and late or revised
+    // source data produces the next revision instead of being rejected.
+    immutableRevision: true,
+    recomputesOnLateData: true,
+    policyVersion: COMMUNITY_DAILY_POLICY_VERSION,
+    suppression: "none_daily_grain_by_owner_decision",
+    // Aggregate dollar-equivalent estimates and participant counts are
+    // explicitly owner-approved for publication; no per-account identifier
+    // exists anywhere in this block.
+    ...(allowance === undefined ? {} : { allowance }),
+    apiEquivalentSpend: spend,
+    totals: {
+      contributingParticipants: Number(totals?.contributing_participants ?? 0),
+      contributingDevices: Number(totals?.contributing_devices ?? 0),
+      usageEvents: Number(totals?.usage_events ?? 0),
+      quotaObservations: Number(totals?.quota_observations ?? 0),
+      sessionDimensions: Number(totals?.session_dimensions ?? 0),
+      inputUncachedTokens: Number(totals?.input_uncached_tokens ?? 0),
+      inputCacheReadTokens: Number(totals?.input_cache_read_tokens ?? 0),
+      inputCacheWriteTokens: Number(totals?.input_cache_write_tokens ?? 0),
+      outputTextTokens: Number(totals?.output_text_tokens ?? 0),
+      outputReasoningTokens: Number(totals?.output_reasoning_tokens ?? 0),
+      outputCombinedTokens: Number(totals?.output_combined_tokens ?? 0),
+    },
+    cellsTruncated: options.cellsTruncated ?? cells.length > MAX_DAILY_AGGREGATE_CELLS,
+    cells: cellRows.map((cell) => ({
+      provider: cell.provider,
+      modelId: cell.model_id,
+      usageEvents: Number(cell.usage_events),
+      inputUncachedTokens: Number(cell.input_uncached_tokens),
+      inputCacheReadTokens: Number(cell.input_cache_read_tokens),
+      inputCacheWriteTokens: Number(cell.input_cache_write_tokens),
+      outputTextTokens: Number(cell.output_text_tokens),
+      outputReasoningTokens: Number(cell.output_reasoning_tokens),
+      outputCombinedTokens: Number(cell.output_combined_tokens),
+    })),
+  };
+}
+
 async function buildCommunityDailyAggregate(
   db: D1Database,
   rebuild: DailyRebuildRow | { day: string },
@@ -446,50 +501,8 @@ async function buildCommunityDailyAggregate(
     if (previous.allowance !== undefined) allowance = previous.allowance;
   }
   const releasedAt = new Date(scheduledTime).toISOString();
-  const cellRows = cells.results.slice(0, MAX_DAILY_AGGREGATE_CELLS);
-  const payload = {
-    schemaVersion: DAILY_AGGREGATE_SCHEMA_VERSION,
-    aggregateId,
-    day,
-    revision,
-    releasedAt,
-    // Revisions replace sealing: this row never mutates, and late or revised
-    // source data produces the next revision instead of being rejected.
-    immutableRevision: true,
-    recomputesOnLateData: true,
-    policyVersion: COMMUNITY_DAILY_POLICY_VERSION,
-    suppression: "none_daily_grain_by_owner_decision",
-    // Aggregate dollar-equivalent estimates and participant counts are
-    // explicitly owner-approved for publication; no per-account identifier
-    // exists anywhere in this block.
-    ...(allowance === undefined ? {} : { allowance }),
-    apiEquivalentSpend: spendResult.spend,
-    totals: {
-      contributingParticipants: Number(totals?.contributing_participants ?? 0),
-      contributingDevices: Number(totals?.contributing_devices ?? 0),
-      usageEvents: Number(totals?.usage_events ?? 0),
-      quotaObservations: Number(totals?.quota_observations ?? 0),
-      sessionDimensions: Number(totals?.session_dimensions ?? 0),
-      inputUncachedTokens: Number(totals?.input_uncached_tokens ?? 0),
-      inputCacheReadTokens: Number(totals?.input_cache_read_tokens ?? 0),
-      inputCacheWriteTokens: Number(totals?.input_cache_write_tokens ?? 0),
-      outputTextTokens: Number(totals?.output_text_tokens ?? 0),
-      outputReasoningTokens: Number(totals?.output_reasoning_tokens ?? 0),
-      outputCombinedTokens: Number(totals?.output_combined_tokens ?? 0),
-    },
-    cellsTruncated: cells.results.length > MAX_DAILY_AGGREGATE_CELLS,
-    cells: cellRows.map((cell) => ({
-      provider: cell.provider,
-      modelId: cell.model_id,
-      usageEvents: Number(cell.usage_events),
-      inputUncachedTokens: Number(cell.input_uncached_tokens),
-      inputCacheReadTokens: Number(cell.input_cache_read_tokens),
-      inputCacheWriteTokens: Number(cell.input_cache_write_tokens),
-      outputTextTokens: Number(cell.output_text_tokens),
-      outputReasoningTokens: Number(cell.output_reasoning_tokens),
-      outputCombinedTokens: Number(cell.output_combined_tokens),
-    })),
-  };
+  const payload = buildCommunityDailyPayload({day,revision,releasedAt,totals,cells:cells.results,
+    spend:spendResult.spend,...(allowance === undefined ? {} : {allowance})});
   const payloadJson = canonicalJson(payload);
   const payloadHash = await sha256Hex(payloadJson);
   if ((await loadV1SourcePin(db, sourceScope)).fingerprint !== sourcePin.fingerprint) {

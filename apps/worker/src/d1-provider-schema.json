@@ -1,0 +1,14 @@
+[
+  {
+    "type": "table",
+    "name": "_cf_KV",
+    "tbl_name": "_cf_KV",
+    "sql": "CREATE TABLE _cf_KV (\n        key TEXT PRIMARY KEY,\n        value BLOB\n      ) WITHOUT ROWID"
+  },
+  {
+    "type": "table",
+    "name": "_cf_METADATA",
+    "tbl_name": "_cf_METADATA",
+    "sql": "CREATE TABLE _cf_METADATA (\n        key INTEGER PRIMARY KEY,\n        value BLOB\n      )"
+  }
+]
