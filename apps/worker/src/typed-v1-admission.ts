@@ -1,4 +1,6 @@
-import { assertTypedStorageAdmissionCapacity } from './typed-storage-capacity';
+import { assertTypedStorageAdmissionCapacity, isTypedStorageCapacityRefusal,
+ prepareTypedStorageAdmissionReservation, reconcileTypedStorageAdmissionReservation,
+ type TypedStorageAdmissionReservation } from './typed-storage-capacity';
 import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
 import { ApiError } from './errors';
@@ -104,7 +106,6 @@ export async function insertTypedTelemetryV1Chunk(db: D1Database, value: Telemet
  if(!state || state.runtime_contract_version!==1 || state.source_namespace!==sourceNamespace || !Number.isSafeInteger(state.next_source_row_id)
   || state.next_source_row_id<1 || !Number.isSafeInteger(state.next_source_row_id+chunk.records.length)) throw conflict();
  if(await replay(db,insert,sourceNamespace)) return {acceptedRecords:chunk.records.length,replay:true};
- await assertTypedStorageAdmissionCapacity(db);
  const start=state.next_source_row_id;
  const typed:D1PreparedStatement[]=[db.prepare(`INSERT INTO typed_v1_chunk_allocations(chunk_id,namespace_id,chunk_original,first_source_row_id,record_count)
  VALUES(?,?,?,?,?)`).bind(insert.chunkRowId,state.namespace_id,encoded(insert.chunkRowId),start,chunk.records.length)];
@@ -136,16 +137,24 @@ export async function insertTypedTelemetryV1Chunk(db: D1Database, value: Telemet
  const {statements,chunkStatementIndex}=prepareTelemetryV1ChunkWrite(db,insert,{insertStatements:typed,deleteSupersededStatements:deletes,authorizationEnvelopeDigest});
  statements.unshift(db.prepare(`INSERT INTO typed_v1_authority_requests(chunk_id,participant_id,device_id,authorization_id,authorization_digest,envelope_digest)
  VALUES(?,?,?,?,?,?)`).bind(insert.chunkRowId,insert.participantId,insert.deviceId,insert.deviceUploadAuthorizationId,authorizationEnvelopeDigest,insert.envelopeDigest));
- const routeGuardCount=ownerRoute?.mode==='catalog'?1:0;
- if(routeGuardCount)statements.unshift(ownerWriteFenceStatement(db,ownerRoute!));
+ let reservation:TypedStorageAdmissionReservation|undefined;
+ let admissionPrefixCount=0;
+ if(ownerRoute?.mode==='catalog') {
+  reservation=await prepareTypedStorageAdmissionReservation(db,ownerRoute,{transactionBytes,recordCount:rows.length});
+  statements.unshift(ownerWriteFenceStatement(db,ownerRoute),reservation.statement);
+  admissionPrefixCount=2;
+ } else await assertTypedStorageAdmissionCapacity(db);
  statements.push(db.prepare('DELETE FROM typed_v1_authority_requests WHERE chunk_id=?').bind(insert.chunkRowId));
  if(statements.length>MAX_STORAGE_TRANSACTION_STATEMENTS) throw new TypedTelemetryError('TYPED_TELEMETRY_LIMIT');
  try {
   const results=await db.batch(statements);
-  if(results.some(r=>!r.success) || results[chunkStatementIndex+1+routeGuardCount]?.results.length!==1) throw conflict();
+  if(results.some(r=>!r.success) || results[chunkStatementIndex+1+admissionPrefixCount]?.results.length!==1
+   || (reservation&&results[1]?.results.length!==1)) throw conflict();
+  if(reservation) await reconcileTypedStorageAdmissionReservation(db,reservation,results[1],results.at(-1));
  } catch(error) {
   if(await replay(db,insert,sourceNamespace)) return {acceptedRecords:rows.length,replay:true};
   const message=String(error);
+  if(isTypedStorageCapacityRefusal(error)) throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
   if(message.includes('typed_v1_allocator_conflict')) throw new ApiError(409,'UPLOAD_IN_PROGRESS');
   if(message.includes('typed_telemetry_records.device_id')) throw new ApiError(409,'RECORD_OWNED_BY_OTHER_CHUNK');
   if(message.includes('upload unavailable')) throw new ApiError(401,'UPLOAD_AUTH_INVALID');

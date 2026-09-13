@@ -1,4 +1,5 @@
-import { assertTypedStorageAdmissionCapacity } from './typed-storage-capacity';
+import { assertTypedStorageAdmissionCapacity, prepareTypedStorageAdmissionReservation,
+  reconcileTypedStorageAdmissionReservation, type TypedStorageAdmissionReservation } from './typed-storage-capacity';
 import {
   canonicalTelemetryV11Json, parseTelemetryV11ChunkId, telemetryV11RecordAnchor,
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, type TelemetryV11Chunk,
@@ -147,7 +148,6 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
   if (!manifest) throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
   const existing = await existingTelemetryV11StagedChunk(db, principal, chunk);
   if (existing) return replayResult(db, existing, chunk, state.namespace_id);
-  await assertTypedStorageAdmissionCapacity(db);
   const rows: TypedTelemetrySourceRecord[] = chunk.records.map((record, index) => ({
     sourceNamespace: metadata.sourceNamespace, format: "v11", sourceRowId: state.next_source_row_id + index,
     participantId: principal.participantId, deviceId: principal.deviceId, chunkRowId: metadata.chunkRowId,
@@ -161,9 +161,7 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
     if (values.length > 100 || transactionBytes > MAX_TYPED_TELEMETRY_BATCH_BYTES) throw new TypedTelemetryError("TYPED_TELEMETRY_LIMIT");
     return db.prepare(sql).bind(...values);
   } });
-  const statements: D1PreparedStatement[] = ownerRoute?.mode === "catalog"
-    ? [ownerWriteFenceStatement(db, ownerRoute)]
-    : [];
+  const statements: D1PreparedStatement[] = [];
   statements.push(prepare(`INSERT INTO telemetry_v11_chunks (
     id,manifest_id,participant_id,device_id,stream,chunk_day,chunk_seq,chunk_id,chunk_digest,envelope_digest,
     parser_version,record_count,r2_key,device_upload_authorization_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
@@ -211,10 +209,16 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
       AND NOT EXISTS (SELECT 1 FROM telemetry_v11_chunks c WHERE c.manifest_id=?
         AND c.record_count!=(SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id=c.id))`)
     .bind(now, manifest.id, manifest.id, manifest.id));
+  let reservation:TypedStorageAdmissionReservation|undefined;
+  if(ownerRoute?.mode==='catalog') {
+    reservation=await prepareTypedStorageAdmissionReservation(db,ownerRoute,{transactionBytes,recordCount:rows.length});
+    statements.unshift(ownerWriteFenceStatement(db,ownerRoute),reservation.statement);
+  } else await assertTypedStorageAdmissionCapacity(db);
   if (statements.length > MAX_STORAGE_TRANSACTION_STATEMENTS) throw new TypedTelemetryError("TYPED_TELEMETRY_LIMIT");
   try {
     const results = await db.batch(statements);
-    if (results.some(result => !result.success)) throw unavailable();
+    if (results.some(result => !result.success) || (reservation&&results[1]?.results.length!==1)) throw unavailable();
+    if(reservation) await reconcileTypedStorageAdmissionReservation(db,reservation,results[1],results.at(-1));
   } catch (error) {
     // A response can be lost after commit. Reconcile only this authenticated,
     // exact chunk and its complete typed membership; never blindly resend it.
