@@ -5525,3 +5525,12 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
 #quota-cards > .metric-card { container-type: inline-size; }
 #quota-cards .metric-value { font-size: clamp(1.5rem, 10cqi, 2.7rem); line-height: 1.1; }
 #quota-cards .quota-card-spark .metric-value { font-size: clamp(1.4rem, 9cqi, 1.9rem); }
+
+@media (max-width: 760px) {
+  body:not(.community-site) > .topbar .top-actions { flex-wrap: wrap; min-width: 0; }
+  body:not(.community-site) > .topbar #refresh-button.refresh-progress {
+    display: grid; width: max-content; min-width: 0;
+    grid-template-columns: max-content max-content;
+  }
+  .topbar .refresh-progress-phase { display: none; }
+}
