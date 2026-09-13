@@ -338,3 +338,14 @@ picker. Increase menu width and row spacing, move the selection checkmark to
 the right, and preserve a distinct selected background and keyboard focus.
 Build the icon-bearing options during initial loading as well as after reports
 and locale changes; localization must not replace an option with plain text.
+
+753 web tests and documentation checks pass. The model-filter regression also
+verifies that locale refresh preserves icon-bearing options and selection.
+Unsigned source `d7e50c31cc9d6e7b08fb4b96b20e1e8bfd310c76`, ASAR
+`1e42e9305f2090ffb937abc715fde458a7bd8c86f2edc70c6fd9bcf6b10e738d`,
+was reviewed in the packaged renderer at 1180px and 960px with the labeled
+synthetic model list. All nine options have icons, including All models; the
+selected Astra icon, keyboard selection, Escape, and outside dismissal pass.
+Evidence: `.release-build/picker-polished-layout.json`, the corresponding
+`model-picker-polished` captures, and `.release-build/model-picker-detail.png`.
+The independent accounting-parity gate remains outside this visual proof.
