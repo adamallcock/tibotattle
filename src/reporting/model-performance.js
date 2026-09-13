@@ -33,13 +33,14 @@ function add(bins, at, value) {
   if (!bins.has(at)) bins.set(at, []);
   bins.get(at).push(value);
 }
-export function modelPerformanceProjection(rows, { period = 'all', now = Date.now(), historyProgress = null } = {}) {
-  if (!['7', '30', 'all'].includes(period) || !count(now) || !Array.isArray(rows) || rows.length > 100000
-      || !progress(historyProgress))
+export function modelPerformanceProjection(rows, { period = 'all', now = Date.now(), historyProgress = null, rolling = false } = {}) {
+  if (!['1', '7', '30', 'all'].includes(period) || !count(now) || !Array.isArray(rows) || rows.length > 100000
+      || !progress(historyProgress) || typeof rolling !== 'boolean')
     throw new Error('invalid_timing_projection');
   const known = rows.filter(r => LABELS.has(r.model) && count(r.at) && r.at <= now);
   const end = now;
   const start = period === 'all' ? (known.length ? known.reduce((min, r) => Math.min(min, r.at), now) : null)
+    : rolling || period === '1' ? Math.max(0, now - Number(period) * DAY)
     : Math.floor(now / DAY) * DAY - (Number(period) - 1) * DAY;
   const interval = period === 'all' && start !== null && end - start > 366 * DAY ? 'week' : 'day';
   const size = interval === 'week' ? 7 * DAY : DAY;

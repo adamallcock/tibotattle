@@ -5054,3 +5054,499 @@ html[data-theme="dark"] .noscript {
   .dashboard-shell main { width: calc(100% - 32px); padding-top: 24px; }
   .dashboard-shell .dashboard-page-header :is(h1, h2) { font-size: 30px; }
 }
+
+/*
+ * Shared dashboard components.
+ *
+ * The public pages use some of the same names (for example `.panel` and
+ * `.button`), so the component contract lives under `.dashboard-shell`. This
+ * keeps the companion report consistent while leaving the public site free to
+ * keep its own spacing and interaction treatment. Existing dashboard names
+ * remain aliases beside the names intended for new markup.
+ */
+.dashboard-shell {
+  --dashboard-control-height: 36px;
+  --dashboard-card-gap: var(--space-5);
+  --dashboard-focus-ring: rgba(49, 95, 132, .42);
+}
+
+/* A period is a report-wide context. Its label and control stay together at
+   the top of each report, before the page-specific heading. */
+.dashboard-shell .reporting-period-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3) var(--space-5);
+  margin: 0 0 var(--space-5);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+.dashboard-shell .reporting-period-selection {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  min-width: 0;
+}
+.dashboard-shell .reporting-period-selection > :is(span, label) {
+  color: var(--ink);
+  font-size: .76rem;
+  font-weight: var(--weight-semibold);
+  line-height: 1.35;
+}
+.dashboard-shell .reporting-period-toolbar > :is(.reporting-period-toolbar-label, .reporting-period-toolbar__label, .reporting-period-label) {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  color: var(--ink);
+  font-size: .76rem;
+  font-weight: var(--weight-semibold);
+  line-height: 1.35;
+}
+.dashboard-shell .reporting-period-toolbar > :is(.reporting-period-toolbar-label, .reporting-period-toolbar__label, .reporting-period-label) :is(small, .annotation) {
+  color: var(--muted);
+  font-size: .67rem;
+  font-weight: var(--weight-regular);
+}
+.dashboard-shell .reporting-period-toolbar > :is(.reporting-period-control, .reporting-period-toolbar__control, [data-reporting-period-controls], .segmented-control) {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+.dashboard-shell .reporting-period-selection > .segmented-control,
+.dashboard-shell .reporting-period-selection > [data-reporting-period-controls] { flex: 0 1 auto; }
+.dashboard-shell .reporting-period-toolbar > :is(#reporting-period-range, .reporting-period-range) {
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: .7rem;
+  line-height: 1.4;
+  text-align: end;
+}
+.dashboard-shell .reporting-period-toolbar > :is([data-i18n="reporting.scope"], .reporting-period-scope) {
+  grid-column: 1 / -1;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: .68rem;
+  line-height: 1.4;
+}
+
+.dashboard-shell :is(.dashboard-control-group, .dashboard-filter-group) {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.dashboard-shell :is(.dashboard-control-label, .dashboard-filter-label, .control-label) {
+  color: var(--muted);
+  font-size: .64rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+
+/* Segmented controls are filters or period choices: the selected value is a
+   filled pill. A tab uses the underlined treatment below, so the two patterns
+   remain visually and semantically distinct. */
+.dashboard-shell .segmented-control {
+  display: inline-flex;
+  align-items: stretch;
+  max-width: 100%;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+.dashboard-shell .segmented-control > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--hit-target);
+  min-height: var(--dashboard-control-height);
+  padding: .4rem .72rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-size: .7rem;
+  font-weight: var(--weight-semibold);
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background-color .12s ease, border-color .12s ease, color .12s ease;
+}
+.dashboard-shell .segmented-control > button:hover:not(:disabled):not(.active):not([aria-pressed="true"]):not([aria-selected="true"]) {
+  color: var(--ink);
+  background: var(--surface-quiet);
+}
+.dashboard-shell .segmented-control > button:is(.active, [aria-pressed="true"], [aria-selected="true"]) {
+  color: var(--action-ink);
+  border-color: transparent;
+  background: var(--action-bg);
+}
+.dashboard-shell .segmented-control > button:disabled { cursor: not-allowed; }
+.dashboard-shell .segmented-control > button:focus-visible,
+.dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"]:focus-visible {
+  outline: 3px solid var(--dashboard-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Actions share the same wrapping and status rhythm wherever a panel can
+   refresh, retry, cancel, or continue. */
+.dashboard-shell :is(.dashboard-actions, .dashboard-action-group, .action-group) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.dashboard-shell :is(.dashboard-action-status, .participant-action-status, .work-usage-status) {
+  min-height: 1.5em;
+  margin: var(--space-3) 0 0;
+  color: var(--muted);
+  font-size: .75rem;
+  line-height: 1.45;
+}
+.dashboard-shell :is(.dashboard-action-status, .participant-action-status, .work-usage-status):is(.error, [data-state="error"]) {
+  color: var(--rust);
+}
+.dashboard-shell .work-usage-status:is([data-state="preparing"], [data-state="loading"], [data-state="updating"]) { color: var(--blue); }
+.dashboard-shell .work-usage-status:is([data-state="missing"], [data-state="unavailable"], [data-state="waiting"]) { color: var(--muted); }
+.dashboard-shell :is(.button, button)[aria-busy="true"],
+.dashboard-shell :is(.button, button)[data-loading="true"] { cursor: progress; }
+
+/* Tabs have a baseline and an underline rather than the filled filter pill.
+   `.performance-models` is an existing tablist and remains an alias. */
+.dashboard-shell :is(.dashboard-tabs, .performance-models) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-5);
+  padding: 0;
+  border-bottom: 1px solid var(--line);
+}
+.dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"],
+.dashboard-shell .performance-model {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-width: var(--hit-target);
+  min-height: 40px;
+  margin: 0;
+  padding: .5rem .72rem;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--radius-xs) var(--radius-xs) 0 0;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-size: .76rem;
+  font-weight: var(--weight-semibold);
+  text-align: start;
+  cursor: pointer;
+  transition: background-color .12s ease, border-color .12s ease, color .12s ease;
+}
+.dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"]:hover:not(:disabled),
+.dashboard-shell .performance-model:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--surface-quiet);
+}
+.dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"]:is(.active, [aria-selected="true"]),
+.dashboard-shell .performance-model[aria-selected="true"] {
+  color: var(--ink);
+  border-bottom-color: var(--green);
+  background: var(--green-soft);
+}
+
+/* Chart cards use one predictable order: title and description, controls,
+   legend, then the chart body. `.chart-panel`, `.chart-heading`,
+   `.chart-control-stack`, and `.legend` continue to work for existing pages. */
+.dashboard-shell :is(.chart-card, .chart-panel) {
+  min-width: 0;
+  padding: var(--pad-card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+.dashboard-shell :is(.chart-card-header, .chart-heading) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-5);
+  margin: 0 0 var(--space-4);
+}
+.dashboard-shell :is(.chart-card-title, .chart-heading h3) {
+  min-width: 0;
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1.45rem;
+  font-weight: var(--weight-display);
+  letter-spacing: -.025em;
+  line-height: 1.15;
+}
+.dashboard-shell :is(.chart-card-description, .chart-heading p) {
+  max-width: 70ch;
+  margin: var(--space-1) 0 0;
+  color: var(--muted);
+  font-size: .76rem;
+  line-height: 1.5;
+}
+.dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2) var(--space-3);
+  min-width: 0;
+}
+.dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) > :is(.segmented-control, .dashboard-filter-group, .dashboard-filter) { order: 1; }
+.dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) > :is(.chart-navigation, .dashboard-chart-navigation) { order: 2; }
+.dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) > :is(.legend, .chart-card-legend) {
+  order: 3;
+  flex-basis: 100%;
+  justify-content: flex-start;
+}
+.dashboard-shell :is(.chart-card-legend, .legend) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  color: var(--muted);
+  font-size: .68rem;
+  line-height: 1.4;
+}
+.dashboard-shell :is(.chart-card-legend, .legend) :is(span, li) { display: inline-flex; align-items: center; gap: var(--space-2); }
+.dashboard-shell :is(.chart-card-body, .chart-shell) { min-width: 0; }
+
+/* A state is a bounded, readable replacement for a chart/table body. The
+   state modifier preserves the difference between loading, missing evidence,
+   stale/partial evidence, and a genuine error. */
+.dashboard-shell :is(.dashboard-state, .chart-empty, .work-usage-empty) {
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: var(--space-2);
+  min-height: clamp(220px, 28vw, 340px);
+  margin: 0;
+  padding: var(--space-7) var(--space-5);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: var(--surface-quiet);
+  font-size: .78rem;
+  line-height: 1.5;
+  text-align: center;
+}
+.dashboard-shell :is(.dashboard-state, .chart-empty, .work-usage-empty).small,
+.dashboard-shell .dashboard-state-compact { min-height: 220px; }
+.dashboard-shell .chart-empty.small { min-height: 280px; font-size: .8rem; }
+.dashboard-shell :is(.dashboard-state, .chart-empty, .work-usage-empty) > :is(strong, h3) {
+  margin: 0;
+  color: var(--ink);
+  font-size: .84rem;
+  font-weight: var(--weight-semibold);
+}
+.dashboard-shell :is(.dashboard-state, .chart-empty, .work-usage-empty) > p,
+.dashboard-shell .dashboard-state-copy { max-width: 48ch; margin: 0; }
+.dashboard-shell .dashboard-state-icon { color: var(--muted); font-size: 1.25rem; line-height: 1; }
+.dashboard-shell .dashboard-state-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--space-2); margin-top: var(--space-2); }
+.dashboard-shell :is(.dashboard-state-loading, .dashboard-state[data-state="loading"], .dashboard-state[data-state="updating"]) {
+  border-style: solid;
+  border-color: rgba(44, 88, 120, .3);
+  background: var(--blue-soft);
+}
+.dashboard-shell .dashboard-state-indicator {
+  width: 2.25rem;
+  height: .25rem;
+  border-radius: var(--radius-pill);
+  background: var(--blue);
+  animation: dashboard-state-pulse 1.25s ease-in-out infinite;
+}
+.dashboard-shell :is(.dashboard-state-error, .dashboard-state[data-state="error"]) {
+  border-style: solid;
+  border-color: rgba(151, 64, 42, .32);
+  color: var(--rust);
+  background: var(--rust-soft);
+}
+.dashboard-shell :is(.dashboard-state-empty, .dashboard-state[data-state="empty"]) { border-style: dashed; }
+.dashboard-shell :is(.dashboard-state-partial, .dashboard-state-stale, .dashboard-state[data-state="partial"], .dashboard-state[data-state="stale"]) {
+  border-style: solid;
+  border-color: rgba(129, 87, 24, .3);
+  background: var(--amber-soft);
+}
+.dashboard-shell :is(.dashboard-state-unavailable, .dashboard-state[data-state="unavailable"], .dashboard-state[data-state="unknown"]) {
+  border-style: solid;
+  color: var(--muted);
+  background: var(--surface-sunken);
+}
+@keyframes dashboard-state-pulse {
+  0%, 100% { opacity: .45; transform: scaleX(.72); }
+  50% { opacity: 1; transform: scaleX(1); }
+}
+
+/* Evidence metadata is intentionally quieter than a result card, while its
+   accent and state make freshness, coverage, and availability scannable. */
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) var(--pad-tile);
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid var(--blue);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: var(--surface-quiet);
+  font-size: .74rem;
+  line-height: 1.5;
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence) :is(dt, .evidence-label, .freshness-label, .coverage-label) {
+  color: var(--muted);
+  font-size: .64rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence) :is(dd, .evidence-value, .freshness-value, .coverage-value) {
+  margin: 0;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence):is(.is-current, .is-fresh, [data-state="current"], [data-state="fresh"]) {
+  border-inline-start-color: var(--green-2);
+  background: var(--green-soft);
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence):is(.is-stale, .is-partial, [data-state="stale"], [data-state="partial"]) {
+  border-inline-start-color: var(--amber);
+  background: var(--amber-soft);
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence):is(.is-error, [data-state="error"]) {
+  border-inline-start-color: var(--rust);
+  background: var(--rust-soft);
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence):is(.is-unavailable, .is-unknown, [data-state="unavailable"], [data-state="unknown"]) {
+  border-inline-start-color: var(--line-strong);
+  background: var(--surface-sunken);
+}
+.dashboard-shell :is(.series-coverage, .timeline-confidence) {
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) var(--pad-tile);
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid var(--blue);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: var(--blue-soft);
+  font-size: .75rem;
+  line-height: 1.5;
+}
+.dashboard-shell :is(.series-coverage, .timeline-confidence).low,
+.dashboard-shell .series-coverage {
+  border-inline-start-color: var(--rust);
+  color: var(--rust);
+  background: var(--rust-soft);
+}
+
+/* Longer explanations are disclosures, so they get a card boundary and a
+   predictable open/closed affordance. Older evidence disclosures retain their
+   text-only appearance and use the same minimum target below. */
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) {
+  margin-top: var(--dashboard-card-gap);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  min-height: var(--hit-target);
+  padding: var(--space-4) var(--pad-card);
+  color: var(--ink);
+  font-size: .78rem;
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+  list-style: none;
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > summary::-webkit-details-marker { display: none; }
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > summary::after {
+  flex: 0 0 auto;
+  color: var(--green);
+  content: "+";
+  font-size: 1.15rem;
+  font-weight: var(--weight-regular);
+  line-height: 1;
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure)[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure)[open] > summary::after { content: "−"; }
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > :is(.technical-disclosure-body, .dashboard-disclosure-body) {
+  padding: var(--space-4) var(--pad-card) var(--pad-card);
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > summary:focus-visible {
+  outline: 3px solid var(--dashboard-focus-ring);
+  outline-offset: -3px;
+}
+.dashboard-shell :is(.advanced-calibration, .advanced-diagnostics, .manual-contribution, .evidence-disclosure) > summary {
+  min-height: var(--hit-target);
+  padding-block: var(--space-2);
+  border-radius: var(--radius-xs);
+}
+
+@media (max-width: 760px) {
+  .dashboard-shell .reporting-period-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+  .dashboard-shell .reporting-period-selection { align-items: stretch; }
+  .dashboard-shell .reporting-period-selection > :is(span, label) { align-self: center; }
+  .dashboard-shell .reporting-period-toolbar > :is(.reporting-period-control, .reporting-period-toolbar__control, [data-reporting-period-controls], .segmented-control) {
+    width: 100%;
+  }
+  .dashboard-shell .reporting-period-toolbar > :is(#reporting-period-range, .reporting-period-range) { text-align: start; }
+  .dashboard-shell .reporting-period-selection > .segmented-control,
+  .dashboard-shell .reporting-period-selection > [data-reporting-period-controls] { width: 100%; }
+  .dashboard-shell .reporting-period-toolbar .segmented-control > button { flex: 1 1 0; }
+  .dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) { justify-content: flex-start; }
+  .dashboard-shell :is(.chart-card-header, .chart-heading) { gap: var(--space-3); }
+}
+@media (max-width: 520px) {
+  .dashboard-shell .reporting-period-toolbar .segmented-control {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 3px;
+    overflow: visible;
+  }
+  .dashboard-shell .reporting-period-toolbar .segmented-control > button {
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .dashboard-shell :is(.dashboard-tabs, .performance-models) {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"],
+  .dashboard-shell .performance-model {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-shell .dashboard-state-indicator { animation: none; }
+  .dashboard-shell :is(.segmented-control > button, .dashboard-tabs > [role="tab"], .performance-model) { transition: none; }
+}

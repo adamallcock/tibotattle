@@ -183,3 +183,37 @@ test('actual worker reconstructs synthetic logs off-main, persists, and shuts do
     assert.ok(!JSON.stringify(result).includes(thread));
   } finally { await controller.close(); }
 });
+
+test('explicit reporting windows include exactly the rolling duration and no later samples', () => {
+  for (const period of ['1', '7', '30']) {
+    const start = NOW - Number(period) * DAY;
+    const result = modelPerformanceProjection([row({ at: start - 1 }), row({ at: start }), row(), row({ at: NOW + 1 })], { period, now: NOW, rolling: true });
+    assert.equal(result.start, start);
+    assert.equal(result.end, NOW);
+    assert.equal(result.models[0].turns, 2);
+  }
+});
+
+test('controller caches each exact reporting window independently and rejects malformed anchors', async () => {
+  const messages = [];
+  class FakeWorker extends EventEmitter {
+    unref() {}
+    postMessage(message) { messages.push(message); if (message.type === 'stop') queueMicrotask(() => this.emit('exit', 0)); }
+  }
+  const worker = new FakeWorker();
+  const controller = createModelPerformanceController({ directory: 'unused', codexHome: 'unused', workerFactory: () => worker });
+  try {
+    const endAt = new Date(NOW).toISOString();
+    const prior = new Date(NOW - DAY).toISOString();
+    const loading = await controller.read('1', { endAt });
+    assert.equal(loading.end, NOW);
+    assert.equal(loading.start, NOW - DAY);
+    const request = messages.find(message => message.type === 'window');
+    worker.emit('message', { type: 'snapshots', values: [{ ...modelPerformanceProjection([row()], { period: '1', now: NOW }), requestKey: request.requestKey }] });
+    assert.equal((await controller.read('1', { endAt })).models[0].turns, 1);
+    assert.equal((await controller.read('1', { endAt: prior })).status, 'loading');
+    assert.equal((await controller.read('1')).status, 'loading');
+    await assert.rejects(controller.read('1', { endAt: '2026-09-10' }), /invalid_timing_window/);
+    await assert.rejects(controller.read('1', { endAt: new Date(Date.now() + DAY).toISOString() }), /invalid_timing_window/);
+  } finally { await controller.close(); }
+});

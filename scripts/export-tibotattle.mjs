@@ -346,6 +346,8 @@ export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/model-performance.css",
   "apps/web/public/model-performance.js",
   "apps/web/public/navigation.js",
+  "apps/web/public/reporting-period.js",
+  "apps/web/public/dashboard-ui.js",
   "apps/web/public/styles.css",
   "apps/web/public/telemetry-envelope.js",
   "apps/web/public/telemetry-shared.generated.js",

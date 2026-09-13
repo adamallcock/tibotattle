@@ -93,10 +93,27 @@ uses a shortened thread ID. If attribution cannot be proven, it stays unlinked.
 Names are looked up locally and are not included in reports, share cards,
 diagnostics, or community contributions.
 
+## Shared reporting period in development source
+
+The dashboard's **Reporting period** control offers **24 hours**, **7 days**,
+**30 days**, and **All available history**. Your selection persists across pages
+and restarts. The displayed start and end dates come from the selected accounting
+snapshot and apply to historical charts, usage totals, model performance, and
+Projects & threads. If matching accounting evidence is unavailable, the page says
+so instead of choosing a different period. All available history describes the
+evidence retained locally; coverage and indexing notices still qualify it.
+
+Current allowance readings and Community sharing preferences are unaffected.
+The Allowance headline remains the median of its full qualifying plan population;
+the reporting period filters its history chart. Plan, allowance-window, model,
+grouping, chart zoom, and minimum-span controls remain beside the data they affect.
+Updating local usage can advance the displayed reporting dates when a new
+accounting snapshot becomes available.
+
 ## Model performance in development source
 
 Open **Model performance** from the dashboard sidebar, then choose a model
-and **7 days**, **30 days**, or **All time**. The web and native navigation
+and use the shared **Reporting period** above the page. The web and native navigation
 include this page in development source; an installed release must contain
 these changes before the page is available there.
 
@@ -198,8 +215,9 @@ input counters support it; **Includes assumed counts** distinguishes them from
 observed values. Other missing counts remain labelled partial.
 
 **Refresh report** updates this view from the existing local index. Use the app's
-main **Refresh** to collect new usage first. Each report displays its own as-of
-time; opening another section does not rewrite an existing report's snapshot.
+main **Refresh** to collect new usage first. Each report displays its as-of time and the shared reporting bounds. Opening
+another section preserves the selection; changing the reporting period or its
+accounting snapshot rebuilds a report for those exact dates.
 While Projects & threads is visible, a lightweight keep-alive preserves its
 cached report without recalculating usage. Reports may be released after five
 minutes away from the page; returning automatically rebuilds an expired report.

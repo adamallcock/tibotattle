@@ -2557,7 +2557,7 @@ async function assertUsage(session) {
     return {
       route: location.hash,
       pageVisible: visible(page) && page?.inert !== true,
-      periodCount: document.querySelectorAll('#accounting-period-controls [data-period]').length,
+      periodCount: document.querySelectorAll('#reporting-period-controls [data-period]').length,
       summaryCardCount: document.querySelectorAll('#accounting-summary .metric-card').length,
       tokenCountRows: tokenRows.length,
       costContributionRows: costRows.length,

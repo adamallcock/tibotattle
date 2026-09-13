@@ -335,3 +335,40 @@ test('period revisits reuse only their own ready data and late responses cannot 
   assert.ok(panel(), 'transient errors leave the current period visible');
   controller.destroy();
 });
+
+test('shared reporting waits for its bound, maps 24h to the rolling backend period, and hides local period controls', async () => {
+  const dom = focusHarness();
+  const end = 9 * DAY;
+  const window = {
+    period: '24h',
+    startAt: new Date(end - DAY).toISOString(),
+    endAt: new Date(end).toISOString(),
+  };
+  const exact = structuredClone(payload());
+  exact.period = '1'; exact.start = end - DAY; exact.end = end;
+  exact.models[0].speed[0].points = [point(end - DAY), point(end)];
+  exact.models[0].ttft = [point(end - DAY), point(end)];
+  const calls = [];
+  const controller = mountModelPerformance({
+    ...dom,
+    sharedReporting: true,
+    reportingWindow: null,
+    client: { modelPerformance: async (period, options) => {
+      calls.push({ period, options });
+      return exact;
+    } },
+    t: (key, values) => translate(key, values, 'en-US'),
+  });
+  assert.equal(calls.length, 0);
+  assert.equal(dom.root.all().some(node => node.dataset.performanceFocus?.startsWith('period-')), false);
+  assert.match(dom.root.all().find(node => node.className === 'performance-status').textContent, /unavailable until local evidence loads/u);
+  dom.show();
+  assert.equal(controller.setReportingWindow(window), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].period, '1');
+  assert.equal(calls[0].options.endAt, window.endAt);
+  assert.equal(dom.root.all().some(node => node.dataset.performanceFocus?.startsWith('period-')), false);
+  assert.ok(dom.root.all().some(node => node.dataset.evidence === 'period'));
+  controller.destroy();
+});

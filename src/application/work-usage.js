@@ -19,6 +19,7 @@ const KEYS = new Set([
   "snapshotId",
   "sourceSnapshotId",
   "period",
+  "endAt",
   "scope",
   "grouping",
   "project",
@@ -57,6 +58,10 @@ export function validateWorkUsageQuery(value) {
     q.pageSize < 1 ||
     q.pageSize > 100
   )
+    throw workUsageError("work_usage_query_invalid");
+  if (q.endAt !== undefined && (typeof q.endAt !== "string"
+      || !Number.isSafeInteger(Date.parse(q.endAt)) || Date.parse(q.endAt) < 0
+      || new Date(q.endAt).toISOString() !== q.endAt))
     throw workUsageError("work_usage_query_invalid");
   for (const key of [
     "snapshotId",
@@ -164,7 +169,10 @@ export function createWorkUsageService({
       if (source && source.status !== "available") throw workUsageError("work_usage_snapshot_changed");
       // Capture before capacity eviction: related periods share the displayed
       // accounting instant, even when the original build took a long time.
-      const anchorToMs = source?.toMs ?? null;
+      const requestedEnd = q.endAt === undefined ? null : Date.parse(q.endAt);
+      if (requestedEnd !== null && (requestedEnd > clock()
+          || (source && source.toMs !== requestedEnd))) throw workUsageError("work_usage_query_invalid");
+      const anchorToMs = requestedEnd ?? source?.toMs ?? null;
       const expectedGeneration = source?.result?.generation?.fingerprint ?? source?.result?.generation;
       let entry = q.snapshotId ? snapshots.get(q.snapshotId) : null;
       if (q.snapshotId && !entry)
@@ -176,6 +184,7 @@ export function createWorkUsageService({
       if (
         entry && q.action !== "touch" &&
         (entry.period !== q.period ||
+          (requestedEnd !== null && entry.toMs !== requestedEnd) ||
           (q.scope !== undefined && entry.requestedScope !== q.scope))
       )
         throw workUsageError("work_usage_snapshot_changed");
@@ -185,6 +194,7 @@ export function createWorkUsageService({
           active.period === q.period &&
           active.requestedScope === q.scope &&
           active.anchorToMs === anchorToMs &&
+          active.exactWindow === (requestedEnd !== null) &&
           active.expectedGeneration === expectedGeneration
         )
           entry = active;
@@ -205,7 +215,8 @@ export function createWorkUsageService({
             expectedGeneration,
             fromMs: duration === null ? 0 : Math.max(0, now - duration),
             toMs: now,
-            touched: now,
+            touched: clock(),
+            exactWindow: requestedEnd !== null,
             controller: new AbortController(),
             status: "preparing",
             cursors: new Map(),
@@ -218,6 +229,7 @@ export function createWorkUsageService({
               build(
                 {
                   period: selected.period,
+                  exactWindow: selected.exactWindow,
                   fromMs: selected.fromMs,
                   toMs: selected.toMs,
                   scope: selected.requestedScope,
@@ -231,9 +243,10 @@ export function createWorkUsageService({
                   selected.expectedGeneration !== (result.generation?.fingerprint ?? result.generation)) {
                 throw workUsageError("work_usage_snapshot_changed");
               }
-              if (result.status === "available" && result.toMs !== undefined) {
+              if (result.status === "available" && (selected.exactWindow || result.toMs !== undefined)) {
                 const duration = PERIODS[selected.period];
                 if (!Number.isSafeInteger(result.toMs) || result.toMs > selected.toMs
+                    || (selected.exactWindow && result.toMs !== selected.toMs)
                     || !Number.isSafeInteger(result.fromMs)
                     || result.fromMs !== (duration === null ? 0 : Math.max(0, result.toMs - duration))) {
                   throw workUsageError("work_usage_snapshot_changed");

@@ -149,7 +149,7 @@ function createDisconnectHarness({
     "maybeRepairIncrementalAuthorization", "resumeContributionCeremonyAfterSignIn",
   ].map(productionFunction).join("\n\n"), context);
   const eventHandlers = appSource.match(
-    /^\$\("#disconnect-device"\)\.addEventListener[\s\S]*?(?=^\$\("#range-controls"\))/mu,
+    /^\$\("#disconnect-device"\)\.addEventListener[\s\S]*?(?=^\$\("#usage-zoom-in"\))/mu,
   );
   assert.ok(eventHandlers, "disconnect event wiring is tested from production source");
   runInContext(eventHandlers[0], context);

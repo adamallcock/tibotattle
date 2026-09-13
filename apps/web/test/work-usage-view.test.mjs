@@ -1497,3 +1497,39 @@ test("cancelling revalidation preserves read-only values and fences its late res
   assert.equal(body.textContent, previous);
   assert.match(root.textContent, /cancelled/i);
 });
+
+test("shared reporting waits for its bound, hides local period controls, and sends the exact window", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const window = {
+    period: "24h",
+    startAt: new Date(NOW - 86_400_000).toISOString(),
+    endAt: new Date(NOW).toISOString(),
+  };
+  const response = structuredClone(PROJECT_ROWS_RESPONSE);
+  response.fromMs = NOW - 86_400_000;
+  response.toMs = NOW;
+  const view = mountWorkUsageView({
+    root,
+    windowRef,
+    t: mountedTranslator,
+    sharedReporting: true,
+    reportingWindow: null,
+    fetchRef: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      return httpResponse(response);
+    },
+  });
+  await settleMountedView();
+  assert.equal(calls.length, 0);
+  assert.equal(findMounted(root, node => node.dataset?.period).length, 0);
+  assert.match(root.textContent, /unavailable until local evidence loads/u);
+  assert.equal(view.setReportingWindow(window), true);
+  await settleMountedView();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].period, "24h");
+  assert.equal(calls[0].endAt, window.endAt);
+  assert.ok(findMounted(root, node => node.dataset?.evidence === "period").length);
+  assert.match(root.textContent, /Current allowance and sharing preferences are not affected/u);
+  view.destroy();
+});

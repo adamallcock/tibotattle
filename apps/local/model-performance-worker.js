@@ -12,8 +12,18 @@ async function run() {
   const context = createModelPerformanceContext({ openStore: openTimingStore });
   const abort = new AbortController();
   let timer, store, files = null, cursor = 0, discoveryAt = 0, stopped = false, degraded = false, passFailed = false;
+  const windows = new Map();
+  let windowsChanged = false;
   const stop = () => { stopped = true; clearTimeout(timer); abort.abort(); };
-  parentPort.on('message', message => { if (message?.type === 'stop') stop(); });
+  parentPort.on('message', message => {
+    if (message?.type === 'stop') stop();
+    else if (message?.type === 'window' && ['1','7','30','all'].includes(message.period)
+      && Number.isSafeInteger(message.end) && message.end >= 0 && message.end <= Date.now()
+      && message.requestKey === `${message.period}:${message.end}`) {
+      windows.set(message.requestKey, message); windowsChanged = true;
+      while (windows.size > 8) windows.delete(windows.keys().next().value);
+    }
+  });
   async function discover() {
     const result = []; let entries = 0;
     async function walk(path, depth) {
@@ -38,11 +48,14 @@ async function run() {
   let lastPublished = 0, lastCollecting = null;
   function publish(collecting) {
     const rows = readTimingRows(store), now = Date.now();
-    lastPublished = now; lastCollecting = collecting;
-    parentPort.postMessage({ type: 'snapshots', values: ['7', '30', 'all'].map(period => ({
-      ...context.project(rows, { period, now, historyProgress: files === null ? null : {
+    lastPublished = now; lastCollecting = collecting; windowsChanged = false;
+    parentPort.postMessage({ type: 'snapshots', values: [
+      ...['1', '7', '30', 'all'].map(period => ({ period, end: now })), ...windows.values(),
+    ].map(({period, end, requestKey}) => ({
+      ...(requestKey ? { requestKey } : {}),
+      ...context.project(rows, { period, now: end, rolling: Boolean(requestKey), historyProgress: files === null ? null : {
         checked: Math.min(cursor, files.length), total: files.length,
-      } }), collecting, stale: degraded,
+      } }), updatedAt: new Date(now).toISOString(), collecting, stale: degraded,
     })) });
   }
   try {
@@ -70,7 +83,7 @@ async function run() {
         }
         if (files && cursor >= files.length) degraded = passFailed;
         const collecting = cursor < files.length;
-        if (!stopped && (lastCollecting !== collecting || Date.now() - lastPublished >= 5_000))
+        if (!stopped && (windowsChanged || lastCollecting !== collecting || Date.now() - lastPublished >= 5_000))
           publish(collecting);
       } catch {
         degraded = true; passFailed = true;

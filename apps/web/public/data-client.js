@@ -5328,6 +5328,15 @@ function normalizeLocalAccounting(value = {}, {
       && /^\d{4}-\d{2}-\d{2}$/u.test(value.evidenceStartDate)
       ? value.evidenceStartDate
       : null,
+    reportingWindow: (() => {
+      const endAt = canonicalInstant(value.reportingWindow?.endAt);
+      const startAt = canonicalInstant(value.reportingWindow?.startAt);
+      const days = { "24h": 1, "7d": 7, "30d": 30 }[value.periodId];
+      if (!endAt || (days && (!startAt
+          || Date.parse(startAt) !== Math.max(0, Date.parse(endAt) - days * 86_400_000)))) return null;
+      if (!days && value.reportingWindow?.startAt !== null) return null;
+      return { startAt: days ? startAt : null, endAt };
+    })(),
     generatedAt: text(value.generatedAt, ""),
     coveredAt: {
       startAt: text(value?.coveredAt?.startAt, ""),
@@ -6316,9 +6325,16 @@ export class LocalCompanionClient {
     return normalizeDashboardPayload({}, fragments);
   }
 
-  modelPerformance(period = "all", { signal } = {}) {
-    if (!["7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
-    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/model-performance?period=${period}`, {
+  modelPerformance(period = "all", { signal, endAt } = {}) {
+    if (!["1", "7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
+    const query = new URLSearchParams({ period });
+    if (endAt !== undefined) {
+      const end = Date.parse(endAt);
+      if (typeof endAt !== "string" || !Number.isSafeInteger(end) || end < 0
+          || new Date(end).toISOString() !== endAt) throw new RangeError("Unsupported display window");
+      query.set("endAt", endAt);
+    }
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/model-performance?${query}`, {
       cache: "no-store", signal, headers: { "X-Usage-Monitor-Local": "1" },
     });
   }
@@ -7150,6 +7166,10 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
         unattributedForkReplayEventsExcluded: Math.round(2_150 * factor),
         duplicateSnapshotsExcluded: Math.round(11_800 * factor),
         missingLineageParents: Math.round(37 * factor)
+      },
+      reportingWindow: {
+        startAt: id === "all" ? null : iso(nowMs - ({ "24h": 1, "7d": 7, "30d": 30 }[id]) * DAY),
+        endAt: nowIso,
       },
       generatedAt: nowIso,
       coveredAt: { startAt: iso(nowMs - 7 * DAY), endAt: nowIso },

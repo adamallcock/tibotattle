@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { normalizeDashboardPayload } from "../public/data-client.js";
 import { historyIndexContinuationDecision } from "../public/lib.js";
-import { finite, formatNumber, numberFormatter } from "../public/ui-format.js";
+import {
+  finite,
+  formatNumber,
+  formatPercent,
+  numberFormatter,
+} from "../public/ui-format.js";
 import { SUPPORTED_LOCALES, translate, translatePlural } from "../public/localization.js";
 
 function completedScan(overrides = {}) {
@@ -35,7 +40,7 @@ function dashboardFor(historyCoverage) {
 
 async function renderHistory(data, active = false, locale = "en-US") {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const functions = ["formatPercent", "renderHistoryIndexBadge", "renderHistoryProgress"]
+  const functions = ["renderHistoryIndexBadge", "renderHistoryProgress"]
     .map((name) => {
       const source = appSource.match(new RegExp(`^function ${name}\\([^]*?^\\}`, "mu"))?.[0];
       assert.ok(source, `production ${name} function is present`);
@@ -64,14 +69,14 @@ async function renderHistory(data, active = false, locale = "en-US") {
   const t = (key, values) => translate(key, values, locale);
   const tPlural = (key, count, values) => translatePlural(key, count, values, locale);
   const render = Function(
-    "$", "finite", "formatNumber", "numberFormatter", "compact", "t", "tPlural",
+    "$", "finite", "formatNumber", "numberFormatter", "compact", "formatPercent", "t", "tPlural",
     "setRawText", "setLocalizedText", "archiveHistoryScanActive",
     `${appSource.slice(unitsStart, bytesEnd)}\n${functions.join("\n")}\nreturn (data) => {
       renderHistoryProgress(data);
       renderHistoryIndexBadge(data);
     };`,
   )(
-    select, finite, formatNumber, numberFormatter, (n) => formatNumber(n), t, tPlural,
+    select, finite, formatNumber, numberFormatter, (n) => formatNumber(n), formatPercent, t, tPlural,
     (element, text) => { element.textContent = String(text); },
     (element, key, values) => { element.textContent = t(key, values); }, active,
   );

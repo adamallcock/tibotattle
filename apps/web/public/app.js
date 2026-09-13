@@ -1,3 +1,4 @@
+import { createReportingPeriod, reportingDays, reportingSelection } from "./reporting-period.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
 import { mountModelPerformance } from "./model-performance.js";
@@ -65,18 +66,25 @@ import {
   finite,
   formatAge,
   formatChartTimestamp,
+  formatChartTimeLabel,
+  formatCount,
+  formatDecimal,
+  formatMoney,
+  formatPercent,
+  formatPp,
   formatLocal,
   formatModelName,
   formatNumber,
   formatReportingTime,
+  formatSignedPp,
+  formatSignedPpHours,
+  formatSpanLength,
+  formatTimeRemaining,
   formatTimeZoneLabel,
   getFormattingLocale,
   localCalendarParts,
-  numberFormatter,
-  selectAvailableAccountingPeriod,
   setFormattingLocale,
   setMessageLocale,
-  REPORTING_TIME_ZONE,
   USER_TIME_ZONE,
 } from "./ui-format.js";
 
@@ -713,79 +721,6 @@ function setCommunitySession(value) {
   }
 }
 
-function formatMoney(value, digits = 0) {
-  const number = finite(value);
-  return number === null
-    ? "—"
-    : formatNumber(number, {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: digits,
-      maximumFractionDigits: digits,
-    });
-}
-
-/**
- * A percentage near an end of the scale must not be printed as if it were at
- * that end. `Intl` rounds 99.96 to "100%" and 0.04 to "0%", and on this
- * dashboard both ends are load-bearing claims rather than cosmetics:
- *
- *   100% price coverage means every usage change carries a reviewed price,
- *        which is why the rounded "100%" sat next to a note saying coverage
- *        was partial - the note was right and the number was rounded.
- *     0% remaining means the allowance is gone, which is a different fact
- *        from "a sliver is left".
- *
- * So only an exact 0 or 100 may print as 0% or 100%. Anything strictly
- * between prints as a bounded "<" or ">" reading, the same idiom
- * `formatApiMoney` already uses for amounts under a cent.
- */
-function formatPercent(value, digits = 0) {
-  const number = finite(value);
-  if (number === null) return "—";
-  const places = Number.isInteger(number) ? 0 : digits;
-  const percentFormatter = numberFormatter({
-    maximumFractionDigits: places,
-    minimumFractionDigits: 0,
-    style: "percent",
-  });
-  const format = (amount) => percentFormatter.format(amount / 100);
-  // The test is whether this value *renders* as an endpoint, not whether it
-  // is near one: at whole-number precision 99.2 renders as "99%", which is
-  // honest and needs no bound, while 99.5 renders as "100%", which is not.
-  // Comparing rendered strings also keeps this agreeing with whatever
-  // rounding mode the locale's formatter uses.
-  const step = 10 ** -places;
-  const rendered = format(number);
-  if (number > 0 && rendered === format(0)) return `<${format(step)}`;
-  if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
-  return rendered;
-}
-
-/**
- * One whole-number formatter for tabular counts.
- *
- * `compact` is right for a headline chip, where a single number stands alone.
- * It is wrong for a column: it renders "154.9K" next to "74" and silently
- * changes precision partway down the table, so nothing can be compared or
- * added up by eye. Grouped exact integers stay comparable at every magnitude.
- */
-function formatCount(value) {
-  const number = finite(value);
-  if (number === null || number < 0) return t("accounting.model.notReported");
-  return formatNumber(Math.trunc(number), { maximumFractionDigits: 0 });
-}
-
-function formatDecimal(value, digits = 0) {
-  const number = finite(value);
-  return number === null
-    ? "—"
-    : numberFormatter({
-      maximumFractionDigits: digits,
-      minimumFractionDigits: digits,
-    }).format(number);
-}
-
 let activeInformationPopover = null;
 let nextInformationPopoverId = 1;
 
@@ -850,11 +785,6 @@ function informationLabel(label, explanation) {
   return fragment;
 }
 
-function formatPp(value, digits = 1) {
-  const number = finite(value);
-  return number === null ? "—" : `${formatDecimal(number, digits)} pp`;
-}
-
 const COMPONENT_LABELS = Object.freeze({
   input_uncached_tokens: "Uncached input",
   input_cache_read_tokens: "Cached input",
@@ -866,34 +796,6 @@ const COMPONENT_LABELS = Object.freeze({
 
 function componentLabel(value) {
   return COMPONENT_LABELS[value] ?? humanize(value);
-}
-
-function formatTimeRemaining(value) {
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return t("format.timeUnavailable");
-  const remainingMs = timestamp - Date.now();
-  if (remainingMs <= 0) return t("format.resetDue");
-  const totalMinutes = Math.ceil(remainingMs / 60_000);
-  const days = Math.floor(totalMinutes / 1_440);
-  const hours = Math.floor((totalMinutes % 1_440) / 60);
-  const minutes = totalMinutes % 60;
-  if (days > 0) return t("format.remainingDays", { days, hours });
-  if (hours > 0) return t("format.remainingHours", { hours, minutes });
-  return t("format.remainingMinutes", { minutes });
-}
-
-function formatSpanLength(spanMs) {
-  const minutes = Math.max(1, Math.round(spanMs / 60_000));
-  if (minutes < 90) return tPlural("format.durationMinute", minutes);
-  const hours = minutes / 60;
-  if (hours < 48) {
-    const value = Number(hours.toFixed(hours < 10 ? 1 : 0));
-    return tPlural("format.durationHour", value, {
-      count: formatDecimal(value, hours < 10 ? 1 : 0),
-    });
-  }
-  const value = Number((hours / 24).toFixed(1));
-  return tPlural("format.durationDay", value, { count: formatDecimal(value, 1) });
 }
 
 function setGlobalState(state, { companionReachable = false } = {}) {
@@ -1427,6 +1329,45 @@ function onboardingSourceGuidance(value) {
   };
 }
 
+let reportingWindow = null;
+let reportingAccountingPeriod = null;
+const reportingPeriod = createReportingPeriod({
+  onChange: () => {
+    resetTimelineViewport();
+    resetUsageTimelineViewport();
+    timelineSeriesMemo = null;
+    if (dashboard) renderDashboard(dashboard);
+    else renderReportingPeriod();
+  },
+});
+
+function renderReportingPeriod(data = dashboard) {
+  const selection = reportingSelection(data, reportingPeriod.period);
+  reportingWindow = selection.window;
+  reportingAccountingPeriod = selection.accountingPeriod;
+  activeAccountingPeriod = reportingAccountingPeriod;
+  activeUsageRangeDays = reportingDays(selection.period);
+  activeCalibrationRangeDays = activeUsageRangeDays;
+  activeWeeklyRangeDays = activeUsageRangeDays;
+  if (data) {
+    data.reportingWindow = reportingWindow;
+    data.reportingAccountingPeriod = reportingAccountingPeriod;
+  }
+  for (const control of document.querySelectorAll("#reporting-period-controls button")) {
+    const selected = control.dataset.period === selection.period;
+    control.classList.toggle("active", selected);
+    control.setAttribute("aria-pressed", String(selected));
+  }
+  const range = document.querySelector("#reporting-period-range");
+  if (range) range.textContent = reportingWindow
+    ? reportingWindow.startAt
+      ? t("reporting.range", { start: formatLocal(reportingWindow.startAt), end: formatLocal(reportingWindow.endAt) })
+      : t("reporting.allThrough", { end: formatLocal(reportingWindow.endAt) })
+    : t("reporting.waiting");
+  workUsageView.setReportingWindow(reportingWindow);
+  modelPerformance.setReportingWindow(reportingWindow);
+}
+
 function renderLocalOnboarding(value) {
   localOnboarding = value;
   const card = $("#setup-card");
@@ -1527,6 +1468,7 @@ function renderLocalOnboarding(value) {
 }
 
 function renderDashboard(data) {
+  renderReportingPeriod(data);
   dashboardUnavailableState = null;
   dashboard = data;
   if (!isCacheDropThreadDashboard(data) || !data?.accounting?.cacheDiagnosticsSource
@@ -1817,10 +1759,26 @@ function projectionUnavailableCopyKey(data) {
 }
 
 function renderPricing(data) {
-  const pricing = data.pricing;
+  const selected = data.reportingWindow ? accountingPeriod(data) : null;
+  if (data.reportingWindow && selected === null) {
+    setRawText($("#cost-period"), t("reporting.unavailable"));
+    $("#cost-total").textContent = "—";
+    clear($("#cost-components"));
+    $("#cost-components").append(node("p", "empty-inline", t("reporting.unavailable")));
+    renderHistoryProgress(data);
+    return;
+  }
+  const pricing = selected ? {
+    ...data.pricing,
+    periodLabel: t(`reporting.${data.reportingWindow.period}`),
+    totalCostUsd: selected.apiPriceEquivalentUsd,
+    quotaWeightedTotalCostUsd: selected.quotaWeightedApiPriceEquivalentUsd,
+    fastMode: selected.fastMode,
+    components: Object.entries(selected.componentCosts).map(([name, row]) => ({ name, ...row })),
+  } : data.pricing;
   const projection = dashboardAccountingProjection(data);
   const retainedPeriod = projection.status === "retained"
-    ? staleAccountingServePeriod(data) ?? data.accounting
+    ? data.reportingWindow ? selected : staleAccountingServePeriod(data) ?? data.accounting
     : null;
   const retainedEvidence = retainedPeriod !== null
     && finite(retainedPeriod.apiPriceEquivalentUsd, 0) > 0;
@@ -3652,8 +3610,13 @@ const SHARE_CARD_RANGE_PERIODS = Object.freeze({
 function shareCardActivitySelection(data, rangeDays) {
   const projection = dashboardAccountingProjection(data);
   if (projection.status === "unavailable") return null;
-  const selected = SHARE_CARD_RANGE_PERIODS[rangeDays]
-    ?? { id: "all", labelKey: "share.period.allRecorded" };
+  const selected = { ...(SHARE_CARD_RANGE_PERIODS[rangeDays]
+    ?? { id: "all", labelKey: "share.period.allRecorded" }) };
+  if (data.reportingWindow) {
+    const matched = data.accounting.periods.find(row => row.periodId === data.reportingAccountingPeriod);
+    if (!matched) return null;
+    selected.id = matched.periodId;
+  }
   const period = (Array.isArray(data?.accounting?.periods)
     ? data.accounting.periods
     : []).find((row) => row?.periodId === selected.id) ?? null;
@@ -3889,7 +3852,9 @@ function latestTimelineObservationMs(data) {
 }
 
 function timelineCutoffMs(data, rangeDays) {
-  const latestMs = latestTimelineObservationMs(data);
+  const selectedEnd = Date.parse(data.reportingWindow?.endAt ?? "");
+  const latestMs = Number.isFinite(selectedEnd) ? selectedEnd : latestTimelineObservationMs(data);
+  if (data.reportingWindow?.startAt === null) return Number.NEGATIVE_INFINITY;
   return latestMs === null
     ? Number.NEGATIVE_INFINITY
     : latestMs - rangeDays * 24 * 60 * 60 * 1_000;
@@ -4388,7 +4353,7 @@ function liveTimelinePoints(
       rollingEvents -= usage[startIndex].usageEvents;
       startIndex += 1;
     }
-    if (endMs < cutoff) continue;
+    if (endMs < cutoff || endMs > Date.parse(data.reportingWindow?.endAt ?? "9999-12-31")) continue;
     const startMs = endMs - windowMs;
     const afterMatch = quotaLookup.atOrBefore(endMs);
     const maximumBracketGapMs = Math.max(30 * 60 * 1_000, windowMs);
@@ -4623,7 +4588,8 @@ function groupedUsageTimeline(data) {
   const groups = new Map();
   for (const row of allowanceTimelineUsage(data)) {
     const timestamp = Date.parse(row.startAt);
-    if (!Number.isFinite(timestamp) || timestamp < cutoff) continue;
+    if (!Number.isFinite(timestamp) || timestamp < cutoff
+        || Date.parse(row.endAt) > Date.parse(data.reportingWindow?.endAt ?? "9999-12-31")) continue;
     let key;
     let sortMs;
     if (activeUsageGrouping === "hour") {
@@ -5449,25 +5415,6 @@ function signedResidualAucPpHours(matched) {
   return area;
 }
 
-// A signed pp·hours figure keeps its sign visible: "+" is printed explicitly
-// because the sign IS the finding — which side of the cost-implied line the
-// observed movement accumulated on.
-function formatSignedPpHours(value) {
-  const number = finite(value);
-  if (number === null) return "—";
-  return t("format.ppHours", {
-    value: `${number < 0 ? "" : "+"}${formatDecimal(number, 1)}`,
-  });
-}
-
-// A signed percentage-point figure, same convention as the pp·hours reading:
-// the "+" or "−" is which side of the cost-implied line the drift sits on.
-function formatSignedPp(value) {
-  const number = finite(value);
-  if (number === null) return "—";
-  return `${number < 0 ? "" : "+"}${formatPp(number)}`;
-}
-
 function renderTimelineSummary(
   data,
   points,
@@ -6229,84 +6176,6 @@ function renderDivergencePeriods(data, points) {
     const state = divergenceDetails.get(key);
     list.append(divergencePeriodItem(period, rangeContext, state));
     if (key === focusedKey) state.toggle.focus({ preventScroll: true });
-  }
-}
-
-// A tick label's resolution follows the span the axis actually covers, so
-// every tick on one axis has the same compact shape instead of each one
-// carrying a full date and time.
-const CHART_TICK_TIME_ONLY_SPAN_MS = 36 * 60 * 60 * 1_000;
-const CHART_TICK_MONTH_ONLY_SPAN_MS = 365 * 24 * 60 * 60 * 1_000;
-
-// The three tick shapes, hoisted so each one is a stable object rather than a
-// literal rebuilt per call, and one live formatter per (locale, shape).
-// `formatChartTimeLabel` runs once per tick and per rendered frame; building an
-// `Intl.DateTimeFormat` for each half of each label was a measurable share of
-// the pan and zoom cost, and nothing about the formatter depends on the instant
-// being formatted. Keying on the live formatting locale means a language change
-// needs no invalidation — it simply misses the cache once per shape.
-const CHART_TICK_SHAPES = Object.freeze({
-  day: Object.freeze({ month: "short", day: "numeric" }),
-  clock: Object.freeze({ hour: "numeric", minute: "2-digit" }),
-  month: Object.freeze({ month: "short", year: "numeric" }),
-});
-
-const chartTickFormatters = new Map();
-
-function chartTickFormatter(shape) {
-  const locale = getFormattingLocale();
-  const key = `${locale} ${shape}`;
-  const cached = chartTickFormatters.get(key);
-  if (cached !== undefined) return cached;
-  const formatter = new Intl.DateTimeFormat(locale, {
-    timeZone: USER_TIME_ZONE,
-    ...CHART_TICK_SHAPES[shape],
-  });
-  chartTickFormatters.set(key, formatter);
-  return formatter;
-}
-
-/**
- * The one axis-tick label formatter.
- *
- * Two properties are deliberate and both were reported as defects:
- *
- * 1. No tick carries a time-zone name. A chart states its zone exactly once,
- *    in its caption, through `formatTimeZoneLabel()` — which reads
- *    `Intl.DateTimeFormat().resolvedOptions().timeZone`, so it is correct for
- *    whatever zone the reader's Mac is in and is never assumed. Repeating a
- *    short name ("EDT") on ticks while the caption said a long generic name
- *    ("Eastern Time") stated the same fact two different ways.
- *
- * 2. The date and time halves are formatted independently and joined with a
- *    separator chosen here. Asking one `Intl.DateTimeFormat` for both halves
- *    delegates the join to ICU, and WebKit's ICU supplies a localized
- *    connective — "Jan 5 at 3:04 PM" — that Node's ICU does not, so no Node
- *    test can see it. Composing the halves removes that glue by construction
- *    rather than by rewriting a string after the fact.
- */
-function formatChartTimeLabel(value, { dateOnly = false, spanMs = null } = {}) {
-  const timestamp = value instanceof Date
-    ? value.valueOf()
-    : typeof value === "number"
-      ? value
-      : Date.parse(value);
-  if (!Number.isFinite(timestamp)) return t("format.unknown");
-  const span = finite(spanMs);
-  const resolution = dateOnly ? "date"
-    : span === null ? "dateAndTime"
-      : span <= CHART_TICK_TIME_ONLY_SPAN_MS ? "time"
-        : span <= CHART_TICK_MONTH_ONLY_SPAN_MS ? "date"
-          : "month";
-  try {
-    const instant = new Date(timestamp);
-    const part = (shape) => chartTickFormatter(shape).format(instant);
-    if (resolution === "time") return part("clock");
-    if (resolution === "month") return part("month");
-    if (resolution === "date") return part("day");
-    return `${part("day")} · ${part("clock")}`;
-  } catch {
-    return formatChartTimestamp(new Date(timestamp).toISOString(), { dateOnly });
   }
 }
 
@@ -7269,13 +7138,14 @@ function allowanceHistoryChartModel(data, {
     })
     .filter((point) => point !== null)
     .sort((left, right) => left.at - right.at);
-  const latestObservedAt = allPoints.at(-1)?.at ?? null;
+  const selectedEnd = Date.parse(data.reportingWindow?.endAt ?? "");
+  const latestObservedAt = Number.isFinite(selectedEnd) ? selectedEnd : allPoints.at(-1)?.at ?? null;
   const validRangeDays = Number.isFinite(rangeDays) && rangeDays > 0 ? rangeDays : null;
   const boundedRangeDays = validRangeDays !== null
     && validRangeDays < ALL_HISTORY_RANGE_DAYS
     ? validRangeDays
     : null;
-  const cutoffAt = latestObservedAt === null || validRangeDays === null
+  const cutoffAt = latestObservedAt === null || boundedRangeDays === null
     ? Number.NEGATIVE_INFINITY
     : latestObservedAt - validRangeDays * 24 * 60 * 60 * 1_000;
   // A 7-day window over a roughly weekly per-reset series holds one or two
@@ -7289,7 +7159,8 @@ function allowanceHistoryChartModel(data, {
   const spanFloorPp = boundedRangeDays !== null && boundedRangeDays <= 7
     ? 0
     : activeWeeklyMinimumObservedSpanPp;
-  const inRange = allPoints.filter((point) => point.at >= cutoffAt);
+  const inRange = allPoints.filter((point) => point.at >= cutoffAt
+    && (latestObservedAt === null || point.at <= latestObservedAt));
   const points = inRange.filter((point) => (
     spanFloorPp === 0
       || (point.observedSpanPp !== null
@@ -8343,35 +8214,6 @@ function accountingPeriod(data) {
     replayExclusionDiagnostics: data.accounting.replayExclusionDiagnostics,
     accountingSource: data.accounting.accountingSource,
   };
-}
-
-function syncAccountingPeriodControls(data) {
-  const controls = $("#accounting-period-controls");
-  if (!controls) return;
-  const periods = Array.isArray(data?.accounting?.periods)
-    ? data.accounting.periods
-    : [];
-  const available = new Set(
-    periods
-      .map((period) => period?.periodId)
-      .filter((periodId) => typeof periodId === "string" && periodId !== ""),
-  );
-  if (!available.has(activeAccountingPeriod)) {
-    activeAccountingPeriod = selectAvailableAccountingPeriod(periods, activeAccountingPeriod);
-  }
-  for (const control of controls.querySelectorAll("button")) {
-    const periodId = control.dataset.period;
-    const present = available.has(periodId);
-    // The indexed-history option is a capability, not a promise made by the
-    // static page. If the payload does not carry it, keep the control out of
-    // the UI rather than making the 31-day cache look like full history.
-    control.hidden = periodId === "history" && !present;
-    control.disabled = !present;
-    control.setAttribute("aria-disabled", String(!present));
-    const active = present && periodId === activeAccountingPeriod;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
 }
 
 function renderAccountingDimension(containerSelector, dimension, {
@@ -10586,14 +10428,13 @@ function accountingPriceHeadline(accounting) {
 }
 
 function renderAccounting(data) {
-  syncAccountingPeriodControls(data);
   const projection = dashboardAccountingProjection(data);
   // The prior-version figures stand in only while the current channels are
   // genuinely empty: no current cache AND no events from any live source for
   // the selected period. The moment a current source serves (unified index or
   // a fresh cache), it wins and the stale label leaves this section.
   const livePeriod = accountingPeriod(data);
-  const staleRow = projection.status !== "available"
+  const staleRow = !data.reportingWindow && projection.status !== "available"
       && data?.accounting?.accountingCacheStatus === "unavailable"
       && (livePeriod === null || finite(livePeriod.events, 0) === 0)
     ? staleAccountingServePeriod(data)
@@ -10617,14 +10458,16 @@ function renderAccounting(data) {
   });
   const accounting = livePeriod;
   if (accounting === null || (projection.status !== "available" && !retainedEvidence)) {
+    const unavailableCopy = accounting === null && data.reportingWindow
+      ? t("reporting.unavailable") : t(projectionUnavailableCopyKey(data));
     const summary = $("#accounting-summary");
     clear(summary);
     for (const [label, explanation] of [
       [
         t("accounting.projection.metricUnavailable"),
-        t(projectionUnavailableCopyKey(data)),
+        unavailableCopy,
       ],
-      ["Tokens", t(projectionUnavailableCopyKey(data))],
+      ["Tokens", unavailableCopy],
     ]) {
       const card = node("article", "metric-card compact-metric");
       const metricLabel = node("span", "metric-name");
@@ -10632,7 +10475,7 @@ function renderAccounting(data) {
       card.append(
         metricLabel,
         node("strong", "metric-value", "—"),
-        node("p", "", t(projectionUnavailableCopyKey(data))),
+        node("p", "", unavailableCopy),
       );
       summary.append(card);
     }
@@ -11048,11 +10891,11 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
   clear(models);
   const coverage = $("#accounting-price-coverage");
   if (coverage) {
-    const note = pricingCoverageNote(accounting);
+    const note = unavailable ? null : pricingCoverageNote(accounting);
     setRawText(coverage, note ?? "");
     coverage.hidden = note === null;
   }
-  const modelRows = modelUsageRows(accounting);
+  const modelRows = unavailable ? [] : modelUsageRows(accounting);
   const page = paginateCacheImpactRows(
     modelRows,
     accountingModelsTablePagination,
@@ -11127,8 +10970,16 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
     const separate = modelRowIsSeparateAllowance(model);
     row.append(
       identity,
-      rawNode("td", "numeric-cell", formatCount(model.events)),
-      rawNode("td", "numeric-cell", formatCount(model.totalTokens)),
+      rawNode(
+        "td",
+        "numeric-cell",
+        formatCount(model.events, { missing: t("accounting.model.notReported") }),
+      ),
+      rawNode(
+        "td",
+        "numeric-cell",
+        formatCount(model.totalTokens, { missing: t("accounting.model.notReported") }),
+      ),
       separate
         ? localizedNode("td", "numeric-cell model-share", "accounting.model.shareWithheld")
         : modelShareCell(model.totalTokens, totals.tokens),
@@ -15653,28 +15504,7 @@ $("#disconnect-device-dialog").addEventListener("keydown", (event) => {
 $("#disconnect-device-confirm").addEventListener("click", () => {
   void disconnectCommunityDevice();
 });
-$("#range-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-days]");
-  if (!button || !dashboard) return;
-  activeUsageRangeDays = Number(button.dataset.days);
-  for (const control of $("#range-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  // Choosing a date range restates what the chart should cover, so a zoom left
-  // over from the previous range cannot survive it. This is the same rule the
-  // calibration range control follows.
-  resetUsageTimelineViewport();
-  renderUsageTimeline(dashboard);
-  renderComparison(dashboard);
-  // The share card's activity figure follows this same selection
-  // (owner-directed, 2026-08-10). The chart renderer owns the card
-  // re-render, so this goes through renderWeekly — the same rule the weekly
-  // range and span handlers follow — rather than a direct card call a new
-  // path could forget.
-  renderWeekly(dashboard);
-});
+
 $("#usage-zoom-in").addEventListener("click", () => {
   if (!dashboard) return;
   zoomUsageTimeline(selectedUsagePoints(dashboard), 1 / TIMELINE_BUTTON_ZOOM_STEP);
@@ -15695,18 +15525,7 @@ $("#usage-reset-zoom").addEventListener("click", () => {
   resetUsageTimelineViewport();
   if (dashboard) renderUsageTimeline(dashboard);
 });
-$("#calibration-range-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-days]");
-  if (!button || !dashboard) return;
-  activeCalibrationRangeDays = Number(button.dataset.days);
-  for (const control of $("#calibration-range-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  resetTimelineViewport();
-  renderTimeline(dashboard);
-});
+
 $("#timeline-zoom-in").addEventListener("click", () => {
   if (!dashboard) return;
   zoomTimeline(selectedTimelinePoints(dashboard).points, 1 / TIMELINE_BUTTON_ZOOM_STEP);
@@ -15835,14 +15654,7 @@ $("#side-chat-historical-gap-focus").addEventListener("click", () => {
   if (probe?.status !== "available"
       || !Number.isFinite(startMs) || !Number.isFinite(endMs)
       || endMs <= startMs) return;
-  activeCalibrationRangeDays = ALL_HISTORY_RANGE_DAYS;
-  for (const control of $("#calibration-range-controls").querySelectorAll(
-    "button",
-  )) {
-    const active = Number(control.dataset.days) === ALL_HISTORY_RANGE_DAYS;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
+  reportingPeriod.select("all");
   timelineViewport = { startMs, endMs };
   timelineSeriesMemo = null;
   window.location.hash = "#timeline";
@@ -15860,20 +15672,7 @@ $("#usage-group-controls").addEventListener("click", (event) => {
   resetUsageTimelineViewport();
   renderUsageTimeline(dashboard);
 });
-$("#weekly-range-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-days]");
-  if (!button || !dashboard) return;
-  activeWeeklyRangeDays = Number(button.dataset.days);
-  for (const control of $("#weekly-range-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  // renderWeekly itself re-renders the share card from the same model
-  // (owner-verified regression, 2026-08-08), so a control cannot redraw the
-  // chart while leaving the card on the previous filters.
-  renderWeekly(dashboard);
-});
+
 $("#weekly-plan-select")?.addEventListener("change", (event) => {
   if (!dashboard || !dashboard.weekly.planPopulations.some(
     (population) => population.planType === event.target.value,
@@ -15889,20 +15688,7 @@ $("#weekly-span-control").addEventListener("input", (event) => {
   activeWeeklyMinimumObservedSpanPp = Math.min(99, Math.max(0, Number(event.target.value)));
   renderWeekly(dashboard);
 });
-$("#accounting-period-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-period]");
-  if (!button || !dashboard) return;
-  const available = new Set(
-    (Array.isArray(dashboard.accounting?.periods) ? dashboard.accounting.periods : [])
-      .map((period) => period?.periodId),
-  );
-  if (!available.has(button.dataset.period) || button.disabled) {
-    syncAccountingPeriodControls(dashboard);
-    return;
-  }
-  activeAccountingPeriod = button.dataset.period;
-  renderAccounting(dashboard);
-});
+
 $("#share-card-download").addEventListener("click", downloadShareCard);
 $("#share-card-copy").addEventListener("click", copyShareCardImage);
 document.addEventListener("click", (event) => {
@@ -15925,12 +15711,20 @@ document.addEventListener("scroll", () => {
   if (current) positionInformationPopover(current.popover, current.button);
 }, true);
 
-mountWorkUsageView({ root: document.querySelector("#projects"), t });
+const workUsageView = mountWorkUsageView({ root: document.querySelector("#projects"), t, sharedReporting: true, reportingWindow: null });
 const modelPerformance = mountModelPerformance({
   root: document.querySelector("#performance"), client: localClient,
-  t, locale: () => localization.formatLocale(),
+  t, locale: () => localization.formatLocale(), sharedReporting: true, reportingWindow: null,
 });
-window.addEventListener("tibotattle:locale-change", () => modelPerformance.render());
+window.addEventListener("tibotattle:locale-change", () => {
+  modelPerformance.render();
+  renderReportingPeriod();
+});
+document.querySelector("#reporting-period-controls").addEventListener("click", event => {
+  const button = event.target.closest("button[data-period]");
+  if (button) reportingPeriod.select(button.dataset.period);
+});
+renderReportingPeriod();
 
 mountDashboardNavigation({
   documentRef: document,

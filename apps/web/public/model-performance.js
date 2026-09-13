@@ -1,9 +1,18 @@
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { formatModelName } from "./ui-format.js";
+import {
+  REPORTING_PERIODS,
+  normalizeReportingWindow,
+  reportingRequestPeriod,
+  reportingPeriodLabel,
+} from "./dashboard-ui.js";
+export { normalizeReportingWindow } from "./dashboard-ui.js";
 
 // Presentation-only: the companion owns reconstruction, eligibility and bins.
 const DAY = 86_400_000;
-const PERIODS = ["7", "30", "all"];
+const PERIODS = ["1", "7", "30", "all"];
+const STANDALONE_PERIODS = ["7", "30", "all"];
+const MAX_READY_PERIODS = 8;
 const SPEED_METHOD = "speed";
 const MODEL_NAMES = Object.freeze({
   "gpt-5.6-luna": "Luna", "gpt-5.6-terra": "Terra", "gpt-5.6-sol": "Sol",
@@ -15,6 +24,8 @@ const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1
 const timestamp = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 8_640_000_000_000_000;
 const exact = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value)
   && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+
+export { reportingRequestPeriod } from "./dashboard-ui.js";
 
 /** A closed, bounded display contract: never pass arbitrary source text to DOM. */
 export function normalizeModelPerformance(value) {
@@ -134,22 +145,45 @@ export function performanceHoverBin(fraction, { start, end }, interval) {
   return Math.max(first, Math.min(last, Math.round((at - anchor) / step))) * step + anchor;
 }
 
-export function mountModelPerformance({ root, client, t, locale = () => "en-US", windowRef = globalThis.window }) {
-  if (!root) return { render() {}, refresh() {} };
+export function mountModelPerformance(options = {}) {
+  const { root, client, t, locale = () => "en-US", windowRef = globalThis.window } = options;
+  if (!root) return {
+    render() {},
+    refresh() {},
+    setReportingWindow() { return false; },
+    cancel() {},
+  };
   const documentRef = root.ownerDocument;
+  let sharedReporting = options.sharedReporting === true || Object.hasOwn(options, "reportingWindow");
   const storageKey = "tibotattle.performance.v1";
   let saved = {};
   try { saved = JSON.parse(windowRef.localStorage.getItem(storageKey)) ?? {}; } catch { /* Storage can be disabled. */ }
-  let period = PERIODS.includes(saved.period) ? saved.period : "all";
+  let period = STANDALONE_PERIODS.includes(saved.period) ? saved.period : "all";
+  let reportingWindow = sharedReporting ? normalizeReportingWindow(options.reportingWindow) : null;
   let modelId = Object.hasOwn(MODEL_NAMES, saved.model) ? saved.model : null;
-  let payload = null, loading = false, failed = false, request = 0, abort = null, timer = null;
-  // At most the three fixed periods, retained only for this mounted local view.
+  let payload = null, loading = false, failed = false, cancelled = false, request = 0, abort = null, timer = null;
+  // Retain only a bounded set of exact reporting windows for this mounted
+  // local view. Shared end bounds can change as accounting snapshots advance.
   // No measurements or identity-bearing data enter browser storage.
   const readyPeriods = new Map();
+  const rememberReady = (key, value) => {
+    readyPeriods.delete(key);
+    readyPeriods.set(key, value);
+    while (readyPeriods.size > MAX_READY_PERIODS)
+      readyPeriods.delete(readyPeriods.keys().next().value);
+  };
   let aboutOpen = false, chartCursors = [];
   let selectedInterval = null;
   const showInterval = (at) => { if (at === selectedInterval) return; selectedInterval = at; for (const update of chartCursors) update(at); };
   const translate = (key, values) => t(`performance.${key}`, values);
+  const reportTranslate = (key, values) => t(`reporting.${key}`, values);
+  const reportingKey = () => sharedReporting
+    ? `${reportingWindow?.period ?? "waiting"}:${reportingWindow?.startAt ?? ""}:${reportingWindow?.endAt ?? ""}`
+    : period;
+  const requestPeriod = () => sharedReporting
+    ? reportingRequestPeriod(reportingWindow?.period)
+    : period;
+  const requestEndAt = () => sharedReporting ? reportingWindow?.endAt ?? null : null;
   let formatterLocale, numberFormat, integerFormat, dateFormat, fullDateFormat;
   function formatters() {
     const selectedLocale = locale();
@@ -165,12 +199,63 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
   const metricNumber = (value, metric) => { formatters(); return (metric === "speed" ? integerFormat : numberFormat).format(value); };
   const date = (value) => { formatters(); return dateFormat.format(value); };
   const visible = () => !root.classList.contains("dashboard-page-inactive") && !documentRef.hidden;
-  const remember = () => { try { windowRef.localStorage.setItem(storageKey, JSON.stringify({ period, model: modelId })); } catch { /* Nonessential preference. */ } };
+  const remember = () => {
+    try {
+      const preference = sharedReporting ? { model: modelId } : { period, model: modelId };
+      windowRef.localStorage.setItem(storageKey, JSON.stringify(preference));
+    } catch { /* Nonessential preference. */ }
+  };
   const element = (name, className, text) => {
     const node = documentRef.createElement(name);
     if (className) node.className = className;
     if (text !== undefined) node.textContent = text;
     return node;
+  };
+  const evidenceRow = (kind, label, value, state = null) => {
+    const row = element("div", "performance-evidence-row");
+    row.dataset.evidence = kind;
+    if (state) row.dataset.state = state;
+    row.append(element("dt", "performance-evidence-label", label), element("dd", "performance-evidence-value", value));
+    return row;
+  };
+  const derivedReportingStart = (window) => {
+    if (!window?.endAt || window.period === "all") return null;
+    const duration = window.period === "24h" ? DAY : window.period === "7d" ? 7 * DAY : 30 * DAY;
+    return new Date(Date.parse(window.endAt) - duration).toISOString();
+  };
+  const reportingRange = (window, fallback = null) => {
+    formatters();
+    const selected = window ?? fallback;
+    if (!selected) return null;
+    const period = selected.period;
+    const endAt = selected.endAt ?? (Number.isFinite(selected.end) ? new Date(selected.end).toISOString() : null);
+    if (!endAt) return null;
+    const end = fullDateFormat.format(new Date(endAt));
+    if (period === "all") return reportTranslate("allThrough", { end });
+    const startAt = selected.startAt ?? derivedReportingStart(selected)
+      ?? (Number.isFinite(selected.start) ? new Date(selected.start).toISOString() : null);
+    if (!startAt) return end;
+    return reportTranslate("range", { start: fullDateFormat.format(new Date(startAt)), end });
+  };
+  const appendReportingEvidence = (container, selected = null) => {
+    if (sharedReporting && reportingWindow) {
+      container.append(evidenceRow("period", reportTranslate("period"), `${reportingPeriodLabel(reportingWindow.period, (key) => reportTranslate(key))} · ${reportingRange(reportingWindow)}`));
+      container.append(element("div", "annotation reporting-scope", reportTranslate("scope")));
+    } else if (selected) {
+      const fallback = { period: selected.period === "1" ? "24h" : selected.period === "7" ? "7d" : selected.period === "30" ? "30d" : "all", start: selected.start, end: selected.end };
+      container.append(evidenceRow("period", reportTranslate("period"), `${reportingPeriodLabel(fallback.period, (key) => reportTranslate(key))} · ${reportingRange(null, fallback)}`));
+    }
+  };
+  const appendPerformanceEvidence = (container, selected) => {
+    appendReportingEvidence(container, payload);
+    if (payload?.updatedAt) {
+      formatters();
+      const updated = fullDateFormat.format(new Date(payload.updatedAt));
+      container.append(evidenceRow("freshness", translate("updated", { date: "" }).trim(), updated, payload.stale ? "stale" : "fresh"));
+    }
+    if (!selected) return;
+    container.append(evidenceRow("speed-coverage", translate("speed"), translate("coverageSpeed", { measured: number(selected.speedTurns), total: number(selected.turns) }), selected.speedTurns < selected.turns ? "partial" : "complete"));
+    container.append(evidenceRow("latency-coverage", translate("latency"), translate("coverageTtft", { measured: number(selected.ttftTurns), total: number(selected.turns) }), selected.ttftTurns < selected.turns ? "partial" : "complete"));
   };
   const svgElement = (name, attributes = {}, text) => {
     const node = documentRef.createElementNS("http://www.w3.org/2000/svg", name);
@@ -360,26 +445,53 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     h2.tabIndex = -1; h2.dataset.performanceFocus = "heading";
     title.append(h2, element("p", "page-description", translate("subtitle")));
     const periods = element("div", "segmented-control performance-periods"); periods.setAttribute("aria-label", translate("period")); periods.setAttribute("role", "group");
-    for (const value of PERIODS) {
+    for (const value of STANDALONE_PERIODS) {
       const button = element("button", value === period ? "active" : "", translate(value === "all" ? "all" : `days${value}`));
       button.type = "button"; button.setAttribute("aria-pressed", String(period === value)); button.dataset.performanceFocus = `period-${value}`;
       button.addEventListener("click", () => { if (period === value) return; period = value; payload = readyPeriods.get(value) ?? null; remember(); render(); refresh(); }); periods.append(button);
     }
-    heading.append(title, periods); root.append(heading, element("p", "performance-provider", translate("provider")));
+    heading.append(title);
+    if (!sharedReporting) heading.append(periods);
+    root.append(heading, element("p", "performance-provider", translate("provider")));
     const status = element("p", "performance-status"); status.setAttribute("role", "status");
     const progress = payload?.historyProgress;
     const collectingLabel = progress?.total
       ? translate("buildingHistory", { checked: number(progress.checked), total: number(progress.total) })
       : translate("updating");
-    status.textContent = failed ? translate("failed") : loading && !payload ? translate("loading") : payload?.collecting || payload?.status === "loading" ? collectingLabel : payload?.status === "unavailable" ? translate("unavailable") : payload?.updatedAt ? translate("updated", { date: new Intl.DateTimeFormat(locale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(payload.updatedAt)) }) : "";
+    const statusState = cancelled ? "cancelled" : failed ? "error" : loading && !payload ? "loading" : payload?.collecting || payload?.status === "loading" ? "updating" : payload?.status === "unavailable" ? "unavailable" : payload?.updatedAt ? "ready" : sharedReporting && !reportingWindow ? "waiting" : "";
+    status.dataset.state = statusState;
+    status.textContent = cancelled ? translate("cancelled") : failed ? translate("failed") : loading && !payload ? translate("loading") : payload?.collecting || payload?.status === "loading" ? collectingLabel : payload?.status === "unavailable" ? translate("unavailable") : payload?.updatedAt ? translate("updated", { date: new Intl.DateTimeFormat(locale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(payload.updatedAt)) }) : sharedReporting && !reportingWindow ? reportTranslate("waiting") : "";
     root.append(status);
-    if (payload?.stale) root.append(element("p", "performance-status", translate("stale")));
-    if (failed || payload?.status === "unavailable") {
+    if (payload?.stale) {
+      const stale = element("p", "performance-status", translate("stale"));
+      stale.dataset.state = "stale";
+      root.append(stale);
+    }
+    if (loading) {
+      const cancel = element("button", "button button-secondary compact", translate("cancel")); cancel.type = "button"; cancel.dataset.performanceFocus = "cancel"; cancel.addEventListener("click", cancelRefresh); root.append(cancel);
+    } else if (failed || payload?.status === "unavailable") {
       const retry = element("button", "button button-secondary compact", translate("retry")); retry.type = "button"; retry.dataset.performanceFocus = "retry"; retry.addEventListener("click", refresh); root.append(retry);
+    }
+    if (payload) {
+      const evidence = element("dl", "performance-evidence");
+      const selectedForEvidence = payload.models.find((model) => model.id === modelId)
+        ?? payload.models[0] ?? null;
+      appendPerformanceEvidence(evidence, selectedForEvidence);
+      root.append(evidence);
+    } else if (sharedReporting && reportingWindow) {
+      const evidence = element("dl", "performance-evidence");
+      appendReportingEvidence(evidence);
+      root.append(evidence);
     }
     const models = payload?.models ?? [];
     if (!models.length) {
-      if (payload?.status === "ready") root.append(element("p", "performance-empty", translate("empty")));
+      if (payload?.status === "ready") {
+        const empty = element("p", "performance-empty", sharedReporting
+          ? reportTranslate("unavailable")
+          : translate("empty"));
+        empty.dataset.state = "empty";
+        root.append(empty);
+      }
       restoreFocus();
       return;
     }
@@ -440,22 +552,52 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     root.append(panel);
     restoreFocus();
   }
+  function cancelRefresh() {
+    if (!loading) return;
+    request++;
+    abort?.abort();
+    abort = null;
+    windowRef.clearTimeout(timer);
+    timer = null;
+    loading = false;
+    failed = false;
+    cancelled = true;
+    render();
+  }
   async function refresh() {
     if (!visible()) return;
+    if (sharedReporting && !reportingWindow) {
+      abort?.abort();
+      abort = null;
+      loading = false;
+      failed = false;
+      cancelled = false;
+      payload = null;
+      render();
+      return;
+    }
     const current = ++request; abort?.abort(); abort = new AbortController();
     const controller = abort;
     const deadline = windowRef.setTimeout(() => controller.abort(), 15_000);
     const hadFailure = failed;
-    loading = true; failed = false; windowRef.clearTimeout(timer);
+    loading = true; failed = false; cancelled = false; windowRef.clearTimeout(timer);
     if (!payload || hadFailure) render();
     let changed = false;
     try {
-      const result = normalizeModelPerformance(await client.modelPerformance(period, { signal: abort.signal }));
+      const requestedPeriod = requestPeriod();
+      const result = normalizeModelPerformance(await client.modelPerformance(requestedPeriod, {
+        signal: abort.signal,
+        ...(requestEndAt() ? { endAt: requestEndAt() } : {}),
+      }));
       if (request !== current) return;
-      if (!result || result.period !== period) throw new Error("Invalid timing contract");
-      if (result.status === "unavailable") readyPeriods.clear();
-      else if (result.status === "ready") readyPeriods.set(period, result);
-      const retained = result.status === "loading" ? readyPeriods.get(period) : null;
+      if (!result || result.period !== requestedPeriod
+          || (requestEndAt() && result.end !== Date.parse(requestEndAt()))
+          || (requestEndAt() && reportingWindow?.startAt !== null
+            && result.start !== Date.parse(reportingWindow.startAt))) throw new Error("Invalid timing contract");
+      const cacheKey = reportingKey();
+      if (result.status === "unavailable") readyPeriods.delete(cacheKey);
+      else if (result.status === "ready") rememberReady(cacheKey, result);
+      const retained = result.status === "loading" ? readyPeriods.get(cacheKey) : null;
       const next = retained ? { ...retained, collecting: true, stale: true } : result;
       changed = JSON.stringify({ ...next, updatedAt: null }) !== JSON.stringify(payload ? { ...payload, updatedAt: null } : null);
       payload = next;
@@ -472,9 +614,38 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     if (visible()) { if (!loading) refresh(); }
     else { windowRef.clearTimeout(timer); abort?.abort(); request++; loading = false; }
   };
+  function setReportingWindow(value) {
+    const next = normalizeReportingWindow(value);
+    const previousKey = reportingKey();
+    sharedReporting = true;
+    reportingWindow = next;
+    const nextKey = reportingKey();
+    if (previousKey === nextKey) return next !== null;
+    abort?.abort();
+    abort = null;
+    request++;
+    windowRef.clearTimeout(timer);
+    timer = null;
+    loading = false;
+    failed = false;
+    cancelled = false;
+    payload = next === null ? null : readyPeriods.get(nextKey) ?? null;
+    render();
+    if (next !== null && visible()) refresh();
+    return next !== null;
+  }
   const observer = new windowRef.MutationObserver(visibilityChanged);
   observer.observe(root, { attributes: true, attributeFilter: ["class"] });
   documentRef.addEventListener("visibilitychange", visibilityChanged);
   render(); if (visible()) refresh();
-  return { render, refresh, destroy() { readyPeriods.clear(); payload = null; observer.disconnect(); abort?.abort(); request++; windowRef.clearTimeout(timer); documentRef.removeEventListener("visibilitychange", visibilityChanged); } };
+  return {
+    render,
+    refresh,
+    setReportingWindow,
+    cancel: cancelRefresh,
+    destroy() {
+      readyPeriods.clear(); payload = null; observer.disconnect(); abort?.abort(); request++; windowRef.clearTimeout(timer);
+      documentRef.removeEventListener("visibilitychange", visibilityChanged);
+    },
+  };
 }

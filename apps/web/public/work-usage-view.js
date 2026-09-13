@@ -7,6 +7,16 @@ import {
   formatApiMoney,
   formatSharePercent,
 } from "./ui-format.js";
+import {
+  REPORTING_PERIODS,
+  REPORTING_DURATION_MS,
+  normalizeReportingWindow,
+  reportingPeriodLabel,
+  reportingWindowRange,
+  appendEvidenceRow,
+  createEvidenceList,
+} from "./dashboard-ui.js";
+export { normalizeReportingWindow } from "./dashboard-ui.js";
 const SCHEMA = "local-work-usage-v1";
 const COMPONENTS = [
   "input_uncached_tokens",
@@ -148,14 +158,18 @@ export function validateWorkUsageResponse(value) {
   }
   return value;
 }
-export function mountWorkUsageView({
-  root,
-  t,
-  windowRef = window,
-  fetchRef = (input, init) => windowRef.fetch(input, init),
-}) {
+export function mountWorkUsageView(options = {}) {
+  const {
+    root,
+    t,
+    windowRef = window,
+    fetchRef = (input, init) => windowRef.fetch(input, init),
+  } = options;
   const documentRef = root.ownerDocument;
+  let sharedReporting = options.sharedReporting === true || Object.hasOwn(options, "reportingWindow");
+  let reportingWindow = sharedReporting ? normalizeReportingWindow(options.reportingWindow) : null;
   const tr = (key, values) => t(`workUsage.${key}`, values);
+  const reportTranslate = (key, values) => t(`reporting.${key}`, values);
   const el = (tag, className, text) => {
     const node = documentRef.createElement(tag);
     if (className) node.className = className;
@@ -164,11 +178,12 @@ export function mountWorkUsageView({
   };
   let query = {
     schemaVersion: SCHEMA,
-    period: "7d",
+    period: sharedReporting ? reportingWindow?.period ?? null : "7d",
     grouping: "project",
     sort: "tokens",
     pageSize: 25,
   };
+  if (sharedReporting && reportingWindow) query.endAt = reportingWindow.endAt;
   let response = null;
   let responseQueryKey = null;
   const queryKey = () => JSON.stringify(Object.entries(query)
@@ -241,7 +256,13 @@ export function mountWorkUsageView({
   const setStatus = (key, values) => {
     statusKey = key;
     statusValues = values;
-    message.textContent = tr(key, values);
+    const messageKey = key === "error" ? "error" : key;
+    message.textContent = key === "waiting"
+      ? reportTranslate("waiting")
+      : sharedReporting && key === "missing"
+        ? reportTranslate("unavailable")
+        : tr(messageKey, values);
+    message.dataset.state = key === "snapshot" ? "ready" : key === "preparing" ? "loading" : key;
   };
   const button = (label, action, className = "button button-secondary") => {
     const b = el("button", className, label);
@@ -266,7 +287,8 @@ export function mountWorkUsageView({
     b.dataset.period = id;
     period.append(b);
   }
-  heading.append(headingText, period);
+  heading.append(headingText);
+  if (!sharedReporting) heading.append(period);
   const toolbar = el("div", "work-usage-toolbar");
   const views = el("div", "work-usage-period");
   for (const id of ["project", "thread"]) {
@@ -436,6 +458,7 @@ export function mountWorkUsageView({
     // Retained values stay readable, but their cancelled/expired report must
     // not regain active drill-down controls until a fresh query succeeds.
     body.inert = response !== null;
+    body.dataset.state = "cancelled";
     setStatus("cancelled");
   });
   cancel.hidden = true;
@@ -490,6 +513,86 @@ export function mountWorkUsageView({
           `${tr(row.kind === "project" ? "projects" : row.kind === "worktree" ? "worktrees" : "threads")} · ${display?.shortId ?? row.id.slice(-10)}`);
   }
   const quantity = (n) => (n === null ? "—" : formatNumber(n));
+  const reportDate = (value) => formatLocal(value);
+  const expectedReportingBounds = (window) => {
+    if (!window) return null;
+    const endMs = Date.parse(window.endAt);
+    if (!Number.isSafeInteger(endMs) || endMs < 0) return null;
+    const fromMs = window.period === "all"
+      ? (window.startAt === null ? null : Date.parse(window.startAt))
+      : Math.max(0, endMs - REPORTING_DURATION_MS[window.period]);
+    return { fromMs, toMs: endMs };
+  };
+  const assertExactReportingBounds = (result) => {
+    if (!sharedReporting || !reportingWindow || result.status !== "available") return;
+    const expected = expectedReportingBounds(reportingWindow);
+    if (!expected || result.toMs !== expected.toMs
+        || expected.fromMs !== null && result.fromMs !== expected.fromMs)
+      throw new Error("unavailable");
+  };
+  function appendUsageEvidence() {
+    const evidence = createEvidenceList(documentRef);
+    if (sharedReporting && reportingWindow) {
+      const periodLabel = reportingPeriodLabel(reportingWindow.period, (key) => reportTranslate(key));
+      appendEvidenceRow(documentRef, evidence, {
+        kind: "period",
+        label: reportTranslate("period"),
+        value: `${periodLabel} · ${reportingWindowRange(reportingWindow, {
+          translate: (key, values) => reportTranslate(key, values),
+          formatDate: reportDate,
+        })}`,
+      });
+    }
+    if (response?.metadata?.observedAt !== undefined) {
+      appendEvidenceRow(documentRef, evidence, {
+        kind: "freshness",
+        label: tr("observed", { date: "" }).trim(),
+        value: reportDate(response.metadata.observedAt),
+        state: "observed",
+      });
+    }
+    const totalEvents = response?.totals?.events;
+    const incompleteEvents = response?.totals?.incompleteEvents;
+    if (count(totalEvents) && count(incompleteEvents) && incompleteEvents <= totalEvents) {
+      const complete = totalEvents - incompleteEvents;
+      appendEvidenceRow(documentRef, evidence, {
+        kind: "token-coverage",
+        label: tr("coverage", { known: quantity(complete), total: quantity(totalEvents) }),
+        value: complete === totalEvents ? tr("complete") : tr("partial"),
+        state: complete === totalEvents ? "complete" : "partial",
+      });
+    }
+    const unpricedEvents = response?.totals?.unpricedEvents;
+    const priced = count(totalEvents) && count(unpricedEvents) && unpricedEvents <= totalEvents
+      ? totalEvents - unpricedEvents
+      : response?.totals?.priceStatus === "complete" && count(totalEvents)
+        ? totalEvents
+        : null;
+    if (priced !== null) {
+      appendEvidenceRow(documentRef, evidence, {
+        kind: "price-coverage",
+        label: tr("priceCoverage", { priced: quantity(priced), total: quantity(totalEvents) }),
+        value: priced === totalEvents ? tr("complete") : tr("partial"),
+        state: priced === totalEvents ? "complete" : "partial",
+      });
+    }
+    if (sharedReporting && reportingWindow)
+      evidence.append(el("div", "annotation reporting-scope", reportTranslate("scope")));
+    return evidence.children.length ? evidence : null;
+  }
+  function appendMethodology() {
+    if (!sharedReporting) return;
+    const disclosure = el("details", "technical-disclosure dashboard-disclosure work-usage-methodology");
+    disclosure.append(el("summary", null, tr("methodology")));
+    const notes = el("div", "work-usage-notes");
+    notes.append(
+      el("p", null, tr("mapping")),
+      el("p", null, tr("transient")),
+      el("p", null, tr("priceNote")),
+    );
+    disclosure.append(notes);
+    body.append(disclosure);
+  }
   function appendModelIcon(target, id) {
     const presentation = modelUsagePresentation(id);
     const icon = modelThemeIcon(documentRef, presentation.theme);
@@ -584,6 +687,8 @@ export function mountWorkUsageView({
   }
   function render() {
     body.replaceChildren();
+    const evidence = appendUsageEvidence();
+    if (evidence) body.append(evidence);
     let focusTarget;
     if (ancestors.length)
       body.append(
@@ -994,8 +1099,16 @@ export function mountWorkUsageView({
     panel.append(wrap);
     body.append(panel);
     body.append(el("p", "annotation", tr("shareNote")));
-    if (!response.rowCount)
-      body.append(el("p", "work-usage-empty", tr(query.search ? "searchEmpty" : "empty")));
+    body.dataset.state = response.rowCount ? "ready" : "empty";
+    if (!response.rowCount) {
+      const empty = el(
+        "p",
+        "work-usage-empty",
+        sharedReporting ? reportTranslate("unavailable") : tr(query.search ? "searchEmpty" : "empty"),
+      );
+      empty.dataset.state = "empty";
+      body.append(empty);
+    }
     const pagination = el("div", "table-pagination");
     const previous = quietButton(tr("previous"), () => {
       pendingFocus = "first-row";
@@ -1037,6 +1150,7 @@ export function mountWorkUsageView({
         }),
       ),
     );
+    appendMethodology();
     focusTarget?.focus();
     pendingFocus = null;
   }
@@ -1055,6 +1169,24 @@ export function mountWorkUsageView({
         return;
       }
     }
+    if (sharedReporting && !reportingWindow) {
+      started = false;
+      stopLease();
+      serial++;
+      controller?.abort();
+      controller = null;
+      clearTimeout(timer);
+      timer = null;
+      clearNested();
+      body.replaceChildren();
+      body.hidden = true;
+      body.inert = true;
+      body.dataset.state = "waiting";
+      cancel.hidden = true;
+      root.removeAttribute("aria-busy");
+      setStatus("waiting");
+      return;
+    }
     stopLease();
     started = true;
     clearNested();
@@ -1063,6 +1195,7 @@ export function mountWorkUsageView({
     clearTimeout(timer);
     controller = new AbortController();
     setStatus("preparing");
+    body.dataset.state = "loading";
     body.inert = true;
     // Keep the exact query's previous report visible during revalidation, but
     // disable old snapshot controls until the replacement is authoritative.
@@ -1108,11 +1241,13 @@ export function mountWorkUsageView({
           response = null;
           responseQueryKey = null;
           body.hidden = true;
+          body.dataset.state = http.status === 409 ? "expired" : "unavailable";
         }
         throw new Error(http.status === 409 ? "expired" : "unavailable");
       }
       const result = validateWorkUsageResponse(await http.json());
       if (token !== serial) return;
+      assertExactReportingBounds(result);
       query.snapshotId = result.snapshotId;
       delete query.sourceSnapshotId;
       if (result.status === "preparing") {
@@ -1123,6 +1258,7 @@ export function mountWorkUsageView({
         response = null;
         responseQueryKey = null;
         body.hidden = true;
+        body.dataset.state = result.status === "missing" ? "missing" : "unavailable";
         setStatus(result.status === "missing" ? "missing" : "unavailable");
         return;
       }
@@ -1163,7 +1299,8 @@ export function mountWorkUsageView({
       queueLease();
     } catch (error) {
       if (token !== serial || error.name === "AbortError") return;
-      setStatus(error.message === "expired" ? "expired" : "unavailable");
+      setStatus(error.message === "expired" ? "expired" : "error");
+      body.dataset.state = error.message === "expired" ? "expired" : "error";
     } finally {
       if (token === serial) {
         cancel.hidden =
@@ -1173,6 +1310,49 @@ export function mountWorkUsageView({
         if (cancel.hidden) root.removeAttribute("aria-busy");
       }
     }
+  }
+  function setReportingWindow(value) {
+    const next = normalizeReportingWindow(value);
+    const previousKey = queryKey();
+    sharedReporting = true;
+    reportingWindow = next;
+    query = { ...query, period: next?.period ?? null };
+    if (next) query.endAt = next.endAt;
+    else delete query.endAt;
+    const nextKey = queryKey();
+    if (previousKey === nextKey) {
+      if (next === null) setStatus("waiting");
+      return next !== null;
+    }
+    stopLease();
+    serial++;
+    controller?.abort();
+    controller = null;
+    clearTimeout(timer);
+    timer = null;
+    clearSearchTimer();
+    searchPending = false;
+    clearNested();
+    delete query.snapshotId;
+    delete query.sourceSnapshotId;
+    resetPage();
+    ancestors = [];
+    selectedTitle = null;
+    response = null;
+    responseQueryKey = null;
+    started = false;
+    cancel.hidden = true;
+    root.removeAttribute("aria-busy");
+    body.replaceChildren();
+    body.hidden = true;
+    body.inert = true;
+    body.dataset.state = next === null ? "waiting" : "loading";
+    if (next === null) {
+      setStatus("waiting");
+      return false;
+    }
+    if (visible()) load();
+    return true;
   }
   function visibilityChanged() {
     stopLease();
@@ -1185,7 +1365,10 @@ export function mountWorkUsageView({
     attributes: true,
     attributeFilter: ["aria-hidden"],
   });
-  if (!root.inert) load();
+  if (!root.inert) {
+    if (sharedReporting && !reportingWindow) setStatus("waiting");
+    else load();
+  }
   documentRef.addEventListener?.("visibilitychange", visibilityChanged);
   windowRef.addEventListener("pageshow", visibilityChanged);
   function relocalize() {
@@ -1193,7 +1376,7 @@ export function mountWorkUsageView({
     title.textContent = tr("title");
     headingText.lastChild.textContent = tr("subtitle");
     period.setAttribute("aria-label", tr("period"));
-    period.lastChild.textContent = tr("all");
+    if (period.lastChild) period.lastChild.textContent = tr("all");
     for (const b of views.children)
       b.textContent = tr(
         b.dataset.grouping === "project" ? "projects" : "threads",
@@ -1226,6 +1409,7 @@ export function mountWorkUsageView({
   windowRef.addEventListener("tibotattle:locale-change", relocalize);
   return {
     refresh,
+    setReportingWindow,
     destroy() {
       destroyed = true;
       clearSearchTimer();
