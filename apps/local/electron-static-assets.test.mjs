@@ -11,7 +11,7 @@ import {
 } from "../../scripts/lib/runtime-closure.mjs";
 import { surfaceFiles } from "../../scripts/lib/surface-manifest.mjs";
 
-const ASSETS = ["desktop-shell.js", "electron-tray-popup.html", "electron-tray-popup.js",
+const ASSETS = ["allowance-tanks.js", "allowance-tank-renderer.js", "codex-color.svg", "desktop-shell.js", "electron-tray-popup.html", "electron-tray-popup.js",
   "electron-tray-popup.css", "electron-settings.html", "electron-settings.js",
   "electron-tray-settings.js", "electron-tray-preferences.js", "electron-settings.css", "icon-panel-left.svg", "icon-refresh-cw.svg", "icon-settings.svg"];
 

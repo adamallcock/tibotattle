@@ -11,6 +11,8 @@ export const SURFACE_MANIFEST_SCHEMA = "tibotattle-surface-manifest-v0.1";
 
 const SHARED_WEB_FILES = Object.freeze([
   "apps/web/public/app.js",
+  "apps/web/public/allowance-tanks.js",
+  "apps/web/public/allowance-tank-renderer.js",
   "apps/web/public/community-data.js",
   "apps/web/public/data-client.js",
   "apps/web/public/desktop-shell.js",
@@ -26,6 +28,7 @@ const SHARED_WEB_FILES = Object.freeze([
   "apps/web/public/icon-panel-left.svg",
   "apps/web/public/icon-refresh-cw.svg",
   "apps/web/public/icon-settings.svg",
+  "apps/web/public/codex-color.svg",
   "apps/web/public/index.html",
   "apps/web/public/install-cta.js",
   "apps/web/public/lib.js",
