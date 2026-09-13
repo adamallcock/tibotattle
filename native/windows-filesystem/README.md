@@ -176,3 +176,30 @@ disabled production flags, native Windows x64 physical and adversarial
 qualification, cross-session decision, protected-state and audit lifecycle,
 and authenticated installer/binding provenance remain separate production
 gates.
+
+
+## Model-performance timing source (pending native qualification)
+
+The `windows-timing-source-v1` extension supplies `openTimingSource(path)`,
+`statTimingSource(lease)` and `readTimingSource(lease, offset, length)`.
+It accepts ordinary inherited source ACLs only when the current user owns the
+regular, single-link file. It does not change Codex source permissions. All
+components are traversed relative to held handles with reparse rejection;
+ancestors and the source remain open without delete sharing until release.
+Each read is capped at 64 KiB before allocation. Source leases share the bounded
+64-slot guard registry and use `releaseCredentialAuditFileGuard` for cleanup.
+
+The timing SQLite adapter separately creates protected owner-only database and
+journal files and holds the existing audit guards throughout database use.
+`journal_mode=PERSIST` prevents SQLite deleting the guarded journal. WAL/SHM
+residue and non-rollback database headers are refused, not repaired or deleted.
+SQLite closes before guards release. No timing schema migration is introduced.
+
+The production loader requires manifest-approved filesystem/path-walk and audit
+protection plus the new source contract. Existing approval values remain false;
+this implementation does not enable model performance in released Windows builds.
+The native security suite includes source handle and SQLite integration tests.
+Run that suite against a rebuilt exact binary and manifest on Windows x64, then
+complete policy review and packaged-worker smoke before enabling the feature.
+The loader's closed manifest validator and generator must be updated as part of
+that reviewed approval; changing a sidecar boolean by itself is rejected.

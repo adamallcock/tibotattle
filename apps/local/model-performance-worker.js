@@ -46,9 +46,6 @@ async function run() {
     })) });
   }
   try {
-    // The existing sidecar permission contract is POSIX. Unsupported platforms
-    // stay unavailable until their protected-state adapter has been qualified.
-    if (typeof process.getuid !== 'function') throw new Error('unsupported_platform');
     store = await context.open(workerData.directory);
     publish(true);
     while (!stopped) {

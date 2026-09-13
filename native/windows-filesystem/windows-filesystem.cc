@@ -15,6 +15,7 @@
 #include <atomic>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -2321,6 +2322,7 @@ napi_value ReplaceProtectedChildCallback(napi_env env, napi_callback_info info) 
 struct CredentialAuditFileGuard {
   std::vector<HANDLE> handles;
   bool active = false;
+  bool timingSource = false;
 };
 
 std::array<CredentialAuditFileGuard*, 64> gCredentialAuditFileGuards{};
@@ -2499,6 +2501,127 @@ napi_value ReleaseCredentialAuditFileGuardCallback(
   napi_value undefined;
   napi_get_undefined(env, &undefined);
   return undefined;
+}
+
+// Source logs belong to Codex: authenticate the owner without changing their
+// inherited ACLs. Keep every ancestor and the file open without delete sharing
+// for the entire chunk. Reads use this handle, never a path-based reopen.
+napi_value OpenTimingSourceCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  std::wstring path;
+  if (!GetArguments(env, info, &arguments, 1) || !GetString(env, arguments[0], &path))
+    return ThrowFailure(env, InvalidConfiguration());
+  ParsedPath parsed;
+  Failure failure = OperationFailed();
+  if (!ParseAndValidatePath(path, false, &parsed, &failure)) return ThrowFailure(env, failure);
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  options.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  options.protectedAncestorDepth = (std::numeric_limits<std::size_t>::max)();
+  options.protectedAncestorShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  RelativeHandles opened;
+  bool missing = false;
+  if (!OpenRelativePath(parsed, options, &opened, &missing, &failure) || missing)
+    return ThrowFailure(env, failure);
+  HandleIdentity identity;
+  SecuritySnapshot security;
+  if (!GetIdentity(opened.final, &identity) || !ReadSecurity(opened.final, &security)
+      || !ResolveFinalPath(opened.final, &parsed)) return ThrowFailure(env, OperationFailed());
+  if (identity.directory || identity.linkCount != 1 || !security.ownerMatches)
+    return ThrowFailure(env, SecurityPolicy("timing_source_security"));
+  auto* guard = new (std::nothrow) CredentialAuditFileGuard;
+  if (guard == nullptr) return ThrowFailure(env, OperationFailed());
+  guard->handles = std::move(opened.parents);
+  guard->handles.push_back(opened.releaseFinal());
+  guard->active = true;
+  guard->timingSource = true;
+  {
+    const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
+    if (!RegisterCredentialAuditFileGuard(guard)) {
+      for (HANDLE handle : guard->handles) CloseHandle(handle);
+      delete guard;
+      return ThrowFailure(env, OperationFailed());
+    }
+  }
+  napi_value external;
+  if (napi_create_external(env, guard, FinalizeCredentialAuditFileGuard, nullptr, &external) != napi_ok) {
+    FinalizeCredentialAuditFileGuard(env, guard, nullptr);
+    return ThrowFailure(env, OperationFailed());
+  }
+  return external;
+}
+
+// Callers hold gCredentialAuditFileGuardsMutex while using the returned handle.
+CredentialAuditFileGuard* TimingSourceGuard(napi_env env, napi_value value) {
+  void* data = nullptr;
+  if (napi_get_value_external(env, value, &data) != napi_ok || data == nullptr) return nullptr;
+  auto* guard = static_cast<CredentialAuditFileGuard*>(data);
+  if (!IsIssuedCredentialAuditFileGuard(guard) || !guard->active
+      || !guard->timingSource || guard->handles.empty()) return nullptr;
+  return guard;
+}
+
+napi_value StatTimingSourceCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) return ThrowFailure(env, InvalidConfiguration());
+  const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
+  auto* guard = TimingSourceGuard(env, arguments[0]);
+  if (guard == nullptr) return ThrowFailure(env, CredentialAuditGuardForeign());
+  HANDLE handle = guard->handles.back();
+  FILE_BASIC_INFO basic{};
+  FILE_STANDARD_INFO standard{};
+  HandleIdentity identity;
+  SecuritySnapshot security;
+  if (!GetIdentity(handle, &identity) || !ReadSecurity(handle, &security)
+      || !GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic))
+      || !GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standard)))
+    return ThrowFailure(env, OperationFailed());
+  if (!security.ownerMatches || identity.directory || identity.linkCount != 1
+      || standard.EndOfFile.QuadPart < 0 || standard.EndOfFile.QuadPart > 9007199254740991LL)
+    return ThrowFailure(env, SecurityPolicy("timing_source_security"));
+  napi_value result, value, id = IdentityValue(env, identity);
+  napi_create_object(env, &result);
+  napi_get_named_property(env, id, "volumeSerialNumber", &value);
+  napi_set_named_property(env, result, "dev", value);
+  napi_get_named_property(env, id, "fileId", &value);
+  napi_set_named_property(env, result, "ino", value);
+  const auto number = [&](const char* name, double n) {
+    napi_value v; napi_create_double(env, n, &v); napi_set_named_property(env, result, name, v);
+  };
+  const auto millis = [](LARGE_INTEGER t) { return static_cast<double>(t.QuadPart / 10000) - 11644473600000.0; };
+  number("size", static_cast<double>(standard.EndOfFile.QuadPart));
+  number("birthtimeMs", millis(basic.CreationTime));
+  number("mtimeMs", millis(basic.LastWriteTime));
+  number("ctimeMs", millis(basic.ChangeTime));
+  return result;
+}
+
+napi_value ReadTimingSourceCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  double position = -1, length = -1;
+  if (!GetArguments(env, info, &arguments, 3)
+      || napi_get_value_double(env, arguments[1], &position) != napi_ok
+      || napi_get_value_double(env, arguments[2], &length) != napi_ok
+      || !std::isfinite(position) || position < 0 || position > 9007199254740991.0
+      || std::floor(position) != position || !std::isfinite(length)
+      || length < 0 || length > 65536 || std::floor(length) != length)
+    return ThrowFailure(env, InvalidConfiguration());
+  const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
+  auto* guard = TimingSourceGuard(env, arguments[0]);
+  if (guard == nullptr) return ThrowFailure(env, CredentialAuditGuardForeign());
+  LARGE_INTEGER offset; offset.QuadPart = static_cast<LONGLONG>(position);
+  HANDLE handle = guard->handles.back();
+  if (!SetFilePointerEx(handle, offset, nullptr, FILE_BEGIN)) return ThrowFailure(env, OperationFailed());
+  std::array<BYTE, 65536> bytes{};
+  DWORD count = 0;
+  if (length > 0 && !ReadFile(handle, bytes.data(), static_cast<DWORD>(length), &count, nullptr))
+    return ThrowFailure(env, OperationFailed());
+  napi_value result;
+  if (napi_create_buffer_copy(env, count, bytes.data(), nullptr, &result) != napi_ok)
+    return ThrowFailure(env, OperationFailed());
+  return result;
 }
 
 enum class CredentialMutexLeaseKind {
@@ -2916,6 +3039,12 @@ NAPI_MODULE_INIT() {
       exports,
       "releaseAccountlessInstallationCredentialMutex",
       ReleaseAccountlessInstallationCredentialMutexCallback);
+  DefineMethod(env, exports, "openTimingSource", OpenTimingSourceCallback);
+  DefineMethod(env, exports, "statTimingSource", StatTimingSourceCallback);
+  DefineMethod(env, exports, "readTimingSource", ReadTimingSourceCallback);
+  napi_value timingVersion;
+  napi_create_string_utf8(env, "windows-timing-source-v1", NAPI_AUTO_LENGTH, &timingVersion);
+  napi_set_named_property(env, exports, "timingSourceContractVersion", timingVersion);
   napi_value version;
   napi_create_string_utf8(env, "windows-filesystem-v1", NAPI_AUTO_LENGTH, &version);
   napi_set_named_property(env, exports, "contractVersion", version);

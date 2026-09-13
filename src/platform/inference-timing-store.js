@@ -1,6 +1,5 @@
-import { constants } from 'node:fs';
-import { lstat, open, mkdir, realpath } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
+import { createTimingFilesystem } from './inference-timing-filesystem.js';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { forEachRolloutLine } from './rollout-line-reader.js';
@@ -9,29 +8,21 @@ import { forEachRolloutLine } from './rollout-line-reader.js';
 const APPLICATION = 0x54425450;
 const CHUNK = 16 * 1024 * 1024;
 const safe = (ok, code) => { if (!ok) throw new Error(code); };
-function ownerFile(s) {
-  return s.isFile() && s.nlink === 1 && s.uid === process.getuid() && !(s.mode & 0o077);
-}
-export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES }) {
-  const dir = resolve(directory);
-  // Parent must exist and every resolved component must be the requested path.
-  const parent = resolve(dir, '..');
-  safe(await realpath(parent) === parent, 'unsafe_directory');
-  await mkdir(dir, { mode: 0o700 }).catch(e => { if (e.code !== 'EEXIST') throw e; });
-  const d = await lstat(dir);
-  safe(d.isDirectory() && !d.isSymbolicLink() && d.uid === process.getuid() && !(d.mode & 0o077), 'unsafe_directory');
-  const file = join(dir, 'timing-experiment.sqlite');
-  let created = false;
+export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES,
+  filesystem = createTimingFilesystem() }) {
+  const lease = await filesystem.prepare(directory);
+  const { file, created } = lease;
+  let db;
   try {
-    const h = await open(file, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-    await h.close(); created = true;
-  } catch (e) { if (e.code !== 'EEXIST') throw e; }
-  safe(ownerFile(await lstat(file)), 'unsafe_database');
-  const db = new DatabaseSync(file);
-  try {
+    db = new DatabaseSync(file);
     const version = db.prepare('PRAGMA user_version').get().user_version;
     const application = db.prepare('PRAGMA application_id').get().application_id;
     safe(created || (version === METHOD && application === APPLICATION), 'incompatible_database');
+    if (lease.persistentJournal) {
+      const mode = db.prepare('PRAGMA journal_mode=PERSIST').get().journal_mode;
+      safe(mode === 'persist', 'unsafe_journal_mode');
+      db.exec('PRAGMA temp_store=MEMORY');
+    }
     db.exec('PRAGMA busy_timeout=100; PRAGMA cache_size=-2048; PRAGMA synchronous=FULL; PRAGMA max_page_count=65536;');
     if (created) {
       db.exec(`BEGIN IMMEDIATE;
@@ -52,8 +43,13 @@ export async function openTimingStore(directory, { createParser, digest, METHOD,
     }
     const key = Buffer.from(db.prepare('SELECT key FROM metadata').get().key);
     safe(key.length === 32, 'invalid_metadata');
-    return { db, key, file, createParser, digest, method: METHOD, close: () => db.close() };
-  } catch (e) { db.close(); throw e; }
+    return { db, key, file, createParser, digest, filesystem, method: METHOD, close: () => {
+      db.close(); lease.release();
+    } };
+  } catch (e) {
+    db?.close(); lease.release();
+    throw e;
+  }
 }
 
 const snapshot = s => ({ dev: s.dev, ino: s.ino, birth: s.birthtimeMs,
@@ -72,11 +68,10 @@ async function fingerprint(handle, cursor, key, digest) {
 export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, onReadLine } = {}) {
   safe(Number.isSafeInteger(maxBytes) && maxBytes > 0 && maxBytes <= CHUNK, 'invalid_budget');
   const { db, key, createParser, digest } = store;
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const handle = await store.filesystem.openSource(path);
   let attemptedBytes = 0;
   try {
     const stat = await handle.stat();
-    safe(stat.isFile() && stat.uid === process.getuid(), 'unsafe_source');
     const before = snapshot(stat);
     const sourceKey = Buffer.from(digest(key, 'source-path', resolve(path)), 'hex');
     const old = db.prepare('SELECT * FROM source WHERE digest=?').get(sourceKey);
@@ -114,6 +109,7 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
       });
       attemptedBytes = end - cursor;
       const receipt = await forEachRolloutLine(handle, { start: cursor, end, signal,
+        highWaterMark: store.filesystem.readSize ?? 256 * 1024,
         onLine: (line, offset, partial) => {
           if (discardLine) discardLine = false;
           else parser.line(line, offset, partial);
@@ -121,7 +117,7 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
         } });
       if (receipt.aborted || signal?.aborted) throw new Error('cancelled');
       const after = snapshot(await handle.stat());
-      const named = snapshot(await lstat(path));
+      const named = snapshot(await store.filesystem.namedStat(path, handle));
       safe(sameFile(before, after) && sameFile(before, named)
         && before.size === after.size && before.mtime === after.mtime
         && before.ctime === after.ctime, 'source_changed');

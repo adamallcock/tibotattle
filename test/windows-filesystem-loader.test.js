@@ -22,6 +22,7 @@ import {
   isWindowsFilesystemAlreadyExists,
   isWindowsFilesystemNotFound,
   loadWindowsFilesystemBinding,
+  loadWindowsTimingBinding,
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../src/platform/windows-filesystem.js";
@@ -715,4 +716,21 @@ test("production integration guard rejects the unproven native path walk", () =>
   );
   const safe = { productionSafe: true, pathWalkRaceSafe: true };
   assert.equal(assertWindowsFilesystemProductionSafe(safe), safe);
+});
+
+
+test("timing loader refuses unqualified policy even when new native methods exist", () => {
+  const options = {
+    platform: "win32", architecture: "x64",
+    bindingPath: "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node",
+    readManifest: () => JSON.stringify(manifest()),
+    readBindingBytes: () => BINDING_BYTES,
+    requireBinding: () => binding({ timingSourceContractVersion: "windows-timing-source-v1",
+      openTimingSource() {}, statTimingSource() {}, readTimingSource() {} }),
+  };
+  assert.throws(() => loadWindowsTimingBinding(options), { code: "WINDOWS_FILESYSTEM_TIMING_UNQUALIFIED" });
+  assert.throws(() => loadWindowsTimingBinding({ ...options, readBindingBytes: () => Buffer.from("tampered") }),
+    { code: "WINDOWS_FILESYSTEM_BINDING_INTEGRITY_MISMATCH" });
+  assert.throws(() => loadWindowsTimingBinding({ ...options, architecture: "arm64" }),
+    { code: "WINDOWS_FILESYSTEM_UNSUPPORTED_ARCHITECTURE" });
 });

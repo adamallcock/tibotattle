@@ -319,6 +319,20 @@ export function loadWindowsFilesystemBinding(options = {}) {
   return loadVerifiedWindowsFilesystemBinding(options).binding;
 }
 
+// Timing needs both protected SQLite guards and native bounded source handles.
+// Existing binaries and unapproved manifests cannot enable this feature.
+export function loadWindowsTimingBinding(options = {}) {
+  const { binding, manifest } = loadVerifiedWindowsFilesystemBinding(options);
+  if (manifest.approvedPolicy.productionSafe !== true
+      || manifest.approvedPolicy.pathWalkRaceSafe !== true
+      || manifest.approvedPolicy.credentialAuditFileGuardSafe !== true
+      || binding.productionSafe !== true || binding.pathWalkRaceSafe !== true
+      || binding.timingSourceContractVersion !== 'windows-timing-source-v1'
+      || !['openTimingSource', 'statTimingSource', 'readTimingSource'].every(
+        name => typeof binding[name] === 'function')) throw failure('TIMING_UNQUALIFIED');
+  return binding;
+}
+
 function fixedOperationError(code) {
   const error = new Error("Windows filesystem operation failed");
   error.code = code;
