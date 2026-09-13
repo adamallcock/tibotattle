@@ -41,6 +41,8 @@ export function mountDashboardNavigation({ documentRef, windowRef }) {
       return false;
     }
     activePage = page;
+    const reportingToolbar = documentRef.querySelector("#reporting-period-toolbar");
+    if (reportingToolbar) reportingToolbar.hidden = page === "community";
     for (const element of pages) {
       const inactive = element.dataset.dashboardPage !== page;
       element.classList.toggle("dashboard-page-inactive", inactive);

@@ -1,4 +1,4 @@
-import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { compareModelPresentation, modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import {
   formatNumber,
   formatLocal,
@@ -7,8 +7,16 @@ import {
   formatApiMoney,
   formatSharePercent,
 } from "./ui-format.js";
+import {
+  REPORTING_PERIODS,
+  REPORTING_DURATION_MS,
+  normalizeReportingWindow,
+  appendEvidenceRow,
+  createEvidenceList,
+} from "./dashboard-ui.js";
+export { normalizeReportingWindow } from "./dashboard-ui.js";
 const SCHEMA = "local-work-usage-v1";
-const PERIOD_IDS = ["24h", "7d", "30d", "all"];
+const PERIOD_IDS = REPORTING_PERIODS;
 // Give the selected report a chance to paint before the bounded background
 // warm-up starts. The warm-up is deliberately sequential: the local service
 // already shares one all-period projection, while each report still occupies
@@ -160,14 +168,18 @@ export function validateWorkUsageResponse(value) {
   }
   return value;
 }
-export function mountWorkUsageView({
-  root,
-  t,
-  windowRef = window,
-  fetchRef = (input, init) => windowRef.fetch(input, init),
-}) {
+export function mountWorkUsageView(options = {}) {
+  const {
+    root,
+    t,
+    windowRef = window,
+    fetchRef = (input, init) => windowRef.fetch(input, init),
+  } = options;
   const documentRef = root.ownerDocument;
+  let sharedReporting = options.sharedReporting === true || Object.hasOwn(options, "reportingWindow");
+  let reportingWindow = sharedReporting ? normalizeReportingWindow(options.reportingWindow) : null;
   const tr = (key, values) => t(`workUsage.${key}`, values);
+  const reportTranslate = (key, values) => t(`reporting.${key}`, values);
   const el = (tag, className, text) => {
     const node = documentRef.createElement(tag);
     if (className) node.className = className;
@@ -176,11 +188,12 @@ export function mountWorkUsageView({
   };
   let query = {
     schemaVersion: SCHEMA,
-    period: "7d",
+    period: sharedReporting ? reportingWindow?.period ?? null : "7d",
     grouping: "project",
     sort: "tokens",
     pageSize: 25,
   };
+  if (sharedReporting && reportingWindow) query.endAt = reportingWindow.endAt;
   let response = null;
   let responseQueryKey = null;
   // Work Usage responses are immutable, bounded page DTOs. Their snapshot
@@ -525,7 +538,13 @@ export function mountWorkUsageView({
   const setStatus = (key, values) => {
     statusKey = key;
     statusValues = values;
-    message.textContent = tr(key, values);
+    const messageKey = key === "error" ? "error" : key;
+    message.textContent = key === "waiting"
+      ? reportTranslate("waiting")
+      : sharedReporting && key === "missing"
+        ? reportTranslate("unavailable")
+        : tr(messageKey, values);
+    message.dataset.state = key === "snapshot" ? "ready" : key === "preparing" ? "loading" : key;
   };
   const button = (label, action, className = "button button-secondary") => {
     const b = el("button", className, label);
@@ -533,15 +552,15 @@ export function mountWorkUsageView({
     b.addEventListener("click", action);
     return b;
   };
-  const heading = el("div", "work-usage-heading");
+  const heading = el("div", "dashboard-page-header");
   const headingText = el("div");
   const title = el("h2", null, tr("title"));
   title.id = "work-usage-title";
-  headingText.append(title, el("p", "section-description", tr("subtitle")));
-  const period = el("div", "work-usage-period");
+  headingText.append(title, el("p", "page-description", tr("subtitle")));
+  const period = el("div", "segmented-control");
   period.setAttribute("role", "group");
   period.setAttribute("aria-label", tr("period"));
-  for (const id of ["24h", "7d", "30d", "all"]) {
+  for (const id of PERIOD_IDS) {
     const b = button(id === "all" ? tr("all") : id, () => {
       query = { ...query, period: id };
       delete query.scope;
@@ -560,9 +579,12 @@ export function mountWorkUsageView({
     b.dataset.period = id;
     period.append(b);
   }
-  heading.append(headingText, period);
+  heading.append(headingText);
+  if (!sharedReporting) heading.append(period);
   const toolbar = el("div", "work-usage-toolbar");
-  const views = el("div", "work-usage-period");
+  const views = el("div", "work-usage-period segmented-control");
+  views.setAttribute("role", "group");
+  views.setAttribute("aria-label", tr("title"));
   for (const id of ["project", "thread"]) {
     const viewButton = button(
       tr(id === "project" ? "projects" : "threads"),
@@ -617,19 +639,43 @@ export function mountWorkUsageView({
     resetPage();
     load();
   });
+  model.control.classList.add("model-picker");
+  function renderModelOptions(ids) {
+    model.control.replaceChildren(
+      ...[
+        ["", tr("allModels")],
+        ...[...ids].sort(compareModelPresentation).map((id) => [id, formatModelName(id)]),
+      ].map(([value, text]) => {
+        const option = el("option", null, text);
+        option.value = value;
+        option.title = value || text;
+        const presentation = value ? modelUsagePresentation(value)
+          : { theme: "layers", className: "allowance-model-classic" };
+        const icon = modelThemeIcon(documentRef, presentation.theme);
+        if (icon) {
+          icon.classList.add(presentation.className);
+          option.replaceChildren(icon, el("span", null, text));
+        }
+        return option;
+      }),
+    );
+    // Customizable native selects retain platform keyboard/dismiss behavior
+    // while allowing the same SVG identity in the list and selected value.
+    if (windowRef.CSS?.supports("appearance", "base-select")) {
+      const selected = el("button");
+      selected.type = "button";
+      selected.append(el("selectedcontent"));
+      model.control.prepend(selected);
+    }
+    model.control.value = query.model ?? "";
+  }
+  renderModelOptions([]);
   const scope = select(tr("scope"), [], (value) => {
     query.scope = value;
     refresh(liveAnchor?.snapshotId ?? null);
   });
   scope.wrapper.hidden = true;
   const refreshButton = button(tr("refresh"), refresh);
-  toolbar.append(
-    views,
-    sort.wrapper,
-    model.wrapper,
-    scope.wrapper,
-    refreshButton,
-  );
   const form = el("form", "work-usage-find");
   const input = el("input");
   input.type = "text";
@@ -637,6 +683,9 @@ export function mountWorkUsageView({
   input.placeholder = tr("findHint");
   input.setAttribute("aria-label", tr("findHint"));
   form.append(input);
+  const filters = el("div", "work-usage-filter-controls");
+  filters.append(sort.wrapper, model.wrapper, scope.wrapper, refreshButton);
+  toolbar.append(views, form, filters);
   function clearSearchTimer() {
     clearLeaseTimer(searchTimer);
     searchTimer = null;
@@ -734,18 +783,19 @@ export function mountWorkUsageView({
     // Retained values stay readable, but their cancelled/expired report must
     // not regain active drill-down controls until a fresh query succeeds.
     body.inert = response !== null;
+    body.dataset.state = "cancelled";
     setStatus("cancelled");
   });
   cancel.hidden = true;
   const body = el("div");
-  const eyebrow = el("p", "eyebrow", tr("local"));
+  const eyebrow = el("p", "annotation", tr("local"));
+  const actions = el("div", "dashboard-actions work-usage-actions");
+  actions.append(message, cancel);
   root.replaceChildren(
     heading,
     eyebrow,
     toolbar,
-    form,
-    message,
-    cancel,
+    actions,
     body,
   );
   function resetPage() {
@@ -790,6 +840,54 @@ export function mountWorkUsageView({
           `${tr(row.kind === "project" ? "projects" : row.kind === "worktree" ? "worktrees" : "threads")} · ${display?.shortId ?? row.id.slice(-10)}`);
   }
   const quantity = (n) => (n === null ? "—" : formatNumber(n));
+  const resultCount = (count, grouping) => tr(
+    `${grouping}Count${count === 1 ? "One" : "Other"}`, { count: quantity(count) },
+  );
+  const expectedReportingBounds = (window) => {
+    if (!window) return null;
+    const endMs = Date.parse(window.endAt);
+    if (!Number.isSafeInteger(endMs) || endMs < 0) return null;
+    const fromMs = window.period === "all"
+      ? (window.startAt === null ? null : Date.parse(window.startAt))
+      : Math.max(0, endMs - REPORTING_DURATION_MS[window.period]);
+    return { fromMs, toMs: endMs };
+  };
+  const assertExactReportingBounds = (result) => {
+    if (!sharedReporting || !reportingWindow || result.status !== "available") return;
+    const expected = expectedReportingBounds(reportingWindow);
+    if (!expected || result.toMs !== expected.toMs
+        || expected.fromMs !== null && result.fromMs !== expected.fromMs)
+      throw new Error("unavailable");
+  };
+  function appendUsageEvidence() {
+    const evidence = createEvidenceList(documentRef, "work-usage-evidence");
+    const totalEvents = response?.totals?.events;
+    const incompleteEvents = response?.totals?.incompleteEvents;
+    if (count(totalEvents) && count(incompleteEvents) && incompleteEvents <= totalEvents) {
+      const complete = totalEvents - incompleteEvents;
+      appendEvidenceRow(documentRef, evidence, {
+        kind: "token-coverage",
+        label: tr("coverage", { known: quantity(complete), total: quantity(totalEvents) }),
+        value: complete === totalEvents ? tr("complete") : tr("partial"),
+        state: complete === totalEvents ? "complete" : "partial",
+      });
+    }
+    const unpricedEvents = response?.totals?.unpricedEvents;
+    const priced = count(totalEvents) && count(unpricedEvents) && unpricedEvents <= totalEvents
+      ? totalEvents - unpricedEvents
+      : response?.totals?.priceStatus === "complete" && count(totalEvents)
+        ? totalEvents
+        : null;
+    if (priced !== null) {
+      appendEvidenceRow(documentRef, evidence, {
+        kind: "price-coverage",
+        label: tr("priceCoverage", { priced: quantity(priced), total: quantity(totalEvents) }),
+        value: priced === totalEvents ? tr("complete") : tr("partial"),
+        state: priced === totalEvents ? "complete" : "partial",
+      });
+    }
+    return evidence.children.length ? evidence : null;
+  }
   function appendModelIcon(target, id) {
     const presentation = modelUsagePresentation(id);
     const icon = modelThemeIcon(documentRef, presentation.theme);
@@ -884,6 +982,8 @@ export function mountWorkUsageView({
   }
   function render() {
     body.replaceChildren();
+    const evidence = appendUsageEvidence();
+    if (evidence) body.append(evidence);
     let focusTarget;
     if (ancestors.length)
       body.append(
@@ -901,6 +1001,29 @@ export function mountWorkUsageView({
       detailTitle.tabIndex = -1;
       body.append(detailTitle);
       if (pendingFocus === "heading") focusTarget = detailTitle;
+    }
+    if (!response.rowCount) {
+      body.dataset.state = "empty";
+      const searching = Boolean(query.search || query.findThread);
+      const empty = el("div", "work-usage-empty dashboard-state");
+      empty.dataset.state = "empty";
+      const copy = el("p", null, tr(searching ? "searchEmpty" : "empty"));
+      copy.setAttribute("role", "status");
+      empty.append(copy);
+      if (searching) {
+        const recovery = el("div", "dashboard-state-actions");
+        recovery.append(button(tr("clearSearch"), () => {
+          input.value = "";
+          searchPending = true;
+          input.focus();
+          load();
+        }));
+        empty.append(recovery);
+      }
+      body.append(empty);
+      focusTarget?.focus();
+      pendingFocus = null;
+      return;
     }
     const summaries = el("div", "work-usage-summary");
     for (const [label, n] of [
@@ -979,8 +1102,11 @@ export function mountWorkUsageView({
       }
     }
     const panel = el("div", "accounting-models-panel work-usage-table-panel");
-    const wrap = el("div", "table-wrap");
-    const table = el("table", "work-usage-table");
+    const wrap = el("div", "table-wrap dashboard-table-scroll");
+    wrap.tabIndex = 0;
+    wrap.setAttribute("role", "region");
+    wrap.setAttribute("aria-label", tr("title"));
+    const table = el("table", "work-usage-table dashboard-data-table");
     table.setAttribute("aria-label", tr("title"));
     const head = el("thead");
     const header = el("tr");
@@ -996,12 +1122,18 @@ export function mountWorkUsageView({
       const isShare = index === 3 || index === 5;
       const th = el(
         "th",
-        isShare ? "model-share-head" : null,
+        index === 0 ? null : isShare ? "numeric-cell model-share-head" : "numeric-cell",
         isShare ? tr("shareColumn") : name,
       );
       if (isShare) th.setAttribute("aria-label", name);
       th.scope = "col";
-      if (index === 3 || index === 5) th.title = tr("shareNote");
+      if (isShare) {
+        if (options.renderInformationLabel) {
+          th.replaceChildren(options.renderInformationLabel(tr("shareColumn"), tr("shareNote"), name));
+        } else {
+          th.title = tr("shareNote");
+        }
+      }
       header.append(th);
     });
     head.append(header);
@@ -1261,12 +1393,16 @@ export function mountWorkUsageView({
         next.disabled = !entry.response.nextCursor;
         for (const button of [previous, next])
           button.setAttribute("aria-controls", entry.regionId);
+        const singlePage = entry.response.offset === 0 && !entry.pages.length
+          && !entry.response.nextCursor && entry.response.rowCount <= entry.response.rows.length;
+        previous.hidden = singlePage;
+        next.hidden = singlePage;
         page.append(
           previous,
           el(
             "span",
             "table-pagination-status",
-            tr("rows", {
+            singlePage ? resultCount(entry.response.rowCount, "thread") : tr("rows", {
               from: entry.response.rowCount ? entry.response.offset + 1 : 0,
               to: Math.min(
                 entry.response.offset + query.pageSize,
@@ -1293,9 +1429,7 @@ export function mountWorkUsageView({
     wrap.append(table);
     panel.append(wrap);
     body.append(panel);
-    body.append(el("p", "annotation", tr("shareNote")));
-    if (!response.rowCount)
-      body.append(el("p", "work-usage-empty", tr(query.search ? "searchEmpty" : "empty")));
+    body.dataset.state = "ready";
     const pagination = el("div", "table-pagination");
     const previous = quietButton(tr("previous"), () => {
       pendingFocus = "first-row";
@@ -1312,12 +1446,16 @@ export function mountWorkUsageView({
       load();
     });
     next.disabled = !response.nextCursor;
+    const singlePage = response.offset === 0 && !pages.length
+      && !response.nextCursor && response.rowCount <= response.rows.length;
+    previous.hidden = singlePage;
+    next.hidden = singlePage;
     pagination.append(
       previous,
       el(
         "span",
         "table-pagination-status",
-        tr("rows", {
+        singlePage ? resultCount(response.rowCount, query.grouping) : tr("rows", {
           from: response.rowCount ? response.offset + 1 : 0,
           to: Math.min(response.offset + query.pageSize, response.rowCount),
           total: response.rowCount,
@@ -1387,6 +1525,24 @@ export function mountWorkUsageView({
         return;
       }
     }
+    if (sharedReporting && !reportingWindow) {
+      started = false;
+      stopLease();
+      serial++;
+      controller?.abort();
+      controller = null;
+      clearTimeout(timer);
+      timer = null;
+      clearNested();
+      body.replaceChildren();
+      body.hidden = true;
+      body.inert = true;
+      body.dataset.state = "waiting";
+      cancel.hidden = true;
+      root.removeAttribute("aria-busy");
+      setStatus("waiting");
+      return;
+    }
     stopLease();
     stopPeriodPreload();
     const familyKey = queryFamilyKey();
@@ -1399,6 +1555,7 @@ export function mountWorkUsageView({
     controller = new AbortController();
     const loadController = controller;
     setStatus("preparing");
+    body.dataset.state = "loading";
     body.inert = true;
     // Keep the exact query's previous report visible during revalidation, but
     // disable old snapshot controls until the replacement is authoritative.
@@ -1467,11 +1624,13 @@ export function mountWorkUsageView({
           response = null;
           responseQueryKey = null;
           body.hidden = true;
+          body.dataset.state = http.status === 409 ? "expired" : "unavailable";
         }
         throw new Error(http.status === 409 ? "expired" : "unavailable");
       }
       const result = validateWorkUsageResponse(payload);
       if (token !== serial) return;
+      assertExactReportingBounds(result);
       query.snapshotId = result.snapshotId;
       delete query.sourceSnapshotId;
       if (result.status === "preparing") {
@@ -1495,6 +1654,7 @@ export function mountWorkUsageView({
         response = null;
         responseQueryKey = null;
         body.hidden = true;
+        body.dataset.state = result.status === "missing" ? "missing" : "unavailable";
         setStatus(result.status === "missing" ? "missing" : "unavailable");
         return;
       }
@@ -1505,17 +1665,7 @@ export function mountWorkUsageView({
       setStatus("snapshot", {
         date: formatLocal(new Date(result.toMs).toISOString()),
       });
-      model.control.replaceChildren(
-        ...[
-          ["", tr("allModels")],
-          ...result.models.map((id) => [id, formatModelName(id)]),
-        ].map(([value, text]) => {
-          const option = el("option", null, text);
-          option.value = value;
-          return option;
-        }),
-      );
-      model.control.value = query.model ?? "";
+      renderModelOptions(result.models);
       scope.control.replaceChildren(
         ...result.scopes.map((s, i) => {
           const option = el(
@@ -1546,7 +1696,8 @@ export function mountWorkUsageView({
       }
     } catch (error) {
       if (token !== serial || error.name === "AbortError") return;
-      setStatus(error.message === "expired" ? "expired" : "unavailable");
+      setStatus(error.message === "expired" ? "expired" : "error");
+      body.dataset.state = error.message === "expired" ? "expired" : "error";
     } finally {
       if (token === serial) {
         cancel.hidden =
@@ -1556,6 +1707,57 @@ export function mountWorkUsageView({
         if (cancel.hidden) root.removeAttribute("aria-busy");
       }
     }
+  }
+  function setReportingWindow(value) {
+    const next = normalizeReportingWindow(value);
+    const previousKey = queryKey();
+    sharedReporting = true;
+    reportingWindow = next;
+    query = { ...query, period: next?.period ?? null };
+    if (next) query.endAt = next.endAt;
+    else delete query.endAt;
+    const nextKey = queryKey();
+    if (previousKey === nextKey) {
+      if (next === null) setStatus("waiting");
+      return next !== null;
+    }
+    stopLease();
+    stopPeriodPreload();
+    preloadInFlight = null;
+    liveAnchor = null;
+    needsLeaseValidation = false;
+    clearPeriodCache();
+    // A reporting-window change is a new exact evidence scope. Fence every
+    // old request before replacing the query so a late response cannot revive
+    // a snapshot or period cache from the previous window.
+    serial++;
+    controller?.abort();
+    controller = null;
+    clearTimeout(timer);
+    timer = null;
+    clearSearchTimer();
+    searchPending = false;
+    clearNested();
+    delete query.snapshotId;
+    delete query.sourceSnapshotId;
+    resetPage();
+    ancestors = [];
+    selectedTitle = null;
+    response = null;
+    responseQueryKey = null;
+    started = false;
+    cancel.hidden = true;
+    root.removeAttribute("aria-busy");
+    body.replaceChildren();
+    body.hidden = true;
+    body.inert = true;
+    body.dataset.state = next === null ? "waiting" : "loading";
+    if (next === null) {
+      setStatus("waiting");
+      return false;
+    }
+    if (visible()) load();
+    return true;
   }
 
   function preload() {
@@ -1617,6 +1819,7 @@ export function mountWorkUsageView({
     attributeFilter: ["aria-hidden"],
   });
   if (visible()) load();
+  else if (sharedReporting && !reportingWindow) setStatus("waiting");
   documentRef.addEventListener?.("visibilitychange", visibilityChanged);
   windowRef.addEventListener("pageshow", visibilityChanged);
   function relocalize() {
@@ -1624,7 +1827,7 @@ export function mountWorkUsageView({
     title.textContent = tr("title");
     headingText.lastChild.textContent = tr("subtitle");
     period.setAttribute("aria-label", tr("period"));
-    period.lastChild.textContent = tr("all");
+    if (period.lastChild) period.lastChild.textContent = tr("all");
     for (const b of views.children)
       b.textContent = tr(
         b.dataset.grouping === "project" ? "projects" : "threads",
@@ -1635,8 +1838,7 @@ export function mountWorkUsageView({
     });
     model.wrapper.firstChild.textContent = tr("model");
     scope.wrapper.firstChild.textContent = tr("scope");
-    if (model.control.options[0])
-      model.control.options[0].textContent = tr("allModels");
+    renderModelOptions([...model.control.options].map(option => option.value).filter(Boolean));
     [...scope.control.options].forEach((option, i) => {
       option.textContent =
         response?.scopes[i]?.status === "unavailable"
@@ -1657,6 +1859,7 @@ export function mountWorkUsageView({
   windowRef.addEventListener("tibotattle:locale-change", relocalize);
   return {
     refresh,
+    setReportingWindow,
     preload,
     destroy() {
       destroyed = true;

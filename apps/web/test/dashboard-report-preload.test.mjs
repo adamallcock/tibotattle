@@ -87,5 +87,5 @@ test("both real dashboard success paths schedule mounted reports after rendering
     const body = source.slice(offset, offset + start.length + next);
     assert.match(body, /renderDashboard\(data\);[\s\S]*?dashboardReportPreloader\.schedule\(\);/);
   }
-  assert.match(source, /reports: \[workUsage, modelPerformance\]/);
+  assert.match(source, /reports: \[workUsageView, modelPerformance\]/);
 });

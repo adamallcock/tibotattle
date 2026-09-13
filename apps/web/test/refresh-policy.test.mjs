@@ -56,6 +56,7 @@ function refreshHarness({
   const buttons = new Map();
   const pendingRefreshStates = [...refreshStates];
   const progressFrames = [];
+  const globalStates = [];
   const document = {
     createElement: refreshElement,
     createTextNode: (textContent) => ({ textContent }),
@@ -83,6 +84,7 @@ function refreshHarness({
     electronStartupRefreshTriggered: false,
     electronStartupRefreshDeferred: false,
     activeLocalDashboardLoad: null,
+    globalState: { state: "stale", companionReachable: true },
     ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS: 1_000,
     tibotattleDesktop: bridge,
     document,
@@ -126,7 +128,10 @@ function refreshHarness({
     runsInsideElectronDashboard: () => electron,
     refreshAccountingStatus,
     refreshQuickResultStatus,
-    setGlobalState() {},
+    setGlobalState(state, options = {}) {
+      globalStates.push({ state, ...options });
+      context.globalState = { state, ...options };
+    },
     setTimeout: (resolve) => resolve(),
     clearTimeout() {},
     window: { setTimeout: (callback) => timers.push(callback) },
@@ -143,7 +148,7 @@ function refreshHarness({
   runInContext(productionFunction("signalElectronRefreshLifecycle"), context);
   runInContext(productionFunction("requestRefresh"), context);
   runInContext(productionFunction("scheduleReturningUserRefresh"), context);
-  return { context, calls, routes, notices, timers, buttons, priorDashboard, progressFrames };
+  return { context, calls, routes, notices, timers, buttons, priorDashboard, progressFrames, globalStates };
 }
 
 test("refresh progress reserves distinct count and timer slots and clears them when idle", () => {
@@ -178,6 +183,50 @@ test("refresh progress reserves distinct count and timer slots and clears them w
   assert.equal(button.getAttribute("title"), null);
   assert.equal(button.textContent, "Update local usage");
   assert.equal(harness.context.$("#cancel-refresh").hidden, true);
+});
+
+test("an active refresh keeps its progress affordance and cancellation action after a load lock is released", () => {
+  const harness = refreshHarness();
+  const button = harness.context.$("#refresh-button");
+  button.textContent = "Update local usage";
+  harness.context.localActionBusy = false;
+  harness.context.localRefreshInProgress = true;
+
+  harness.context.updateLocalActionButtons();
+
+  assert.equal(button.disabled, true, "the refresh action remains locked while active");
+  assert.equal(button.classList.contains("refresh-progress"), true);
+  assert.equal(button.textContent, "Update running…");
+  const cancel = harness.context.$("#cancel-refresh");
+  assert.equal(cancel.hidden, false, "Cancel remains available for the active refresh");
+  assert.equal(cancel.disabled, false);
+  assert.equal(cancel.textContent, "Cancel");
+});
+
+test("a terminal refresh restores the last dashboard status after showing Running", async () => {
+  const harness = refreshHarness();
+
+  await harness.context.requestRefresh({ detailed: true });
+
+  assert.deepEqual(harness.globalStates, [
+    { state: "updating" },
+    { state: "stale", companionReachable: true },
+  ]);
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.context.localRefreshInProgress, false);
+  assert.equal(harness.context.$("#refresh-button").textContent, "Update local usage");
+});
+
+test("a terminal refresh recovers the prior stable state when the dashboard still says updating", async () => {
+  const harness = refreshHarness();
+  harness.context.dashboard = { ...harness.priorDashboard, state: "updating" };
+
+  await harness.context.requestRefresh();
+
+  assert.deepEqual(harness.globalStates.at(-1), {
+    state: "stale",
+    companionReachable: true,
+  });
 });
 
 test("refresh polling preserves counted indexing and count-free accounting phases", async () => {

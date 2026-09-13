@@ -1632,3 +1632,13 @@ test("tray smoke fixture reader returns only the validated preference and reject
     await assert.rejects(readMacSyntheticFixtureTray(fixture.settingsPath), TypeError);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
+
+test("the packaged dashboard navigation gate matches every shipped page in order", async () => {
+  const source = await readFile("scripts/smoke-electron-macos.mjs", "utf8");
+  const html = await readFile("apps/web/public/index.html", "utf8");
+  const pageKeys = [...html.matchAll(/data-nav="([^"]+)"/gu)].map((match) => match[1]);
+  const requiredKeys = source.match(/snapshot\?\.navKeys !== "([^"]+)"/u)?.[1].split(",");
+  const requiredCount = Number(source.match(/snapshot\?\.navCount !== (\d+)/u)?.[1]);
+  assert.deepEqual(requiredKeys, pageKeys);
+  assert.equal(requiredCount, pageKeys.length);
+});

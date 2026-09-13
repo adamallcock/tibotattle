@@ -238,6 +238,23 @@ test("closing the shared reader aborts work and prevents builds after asynchrono
   assert.equal(closes, 1);
 });
 
+test("exact reporting windows reuse only identical anchors even within a cache membership lease", async () => {
+  let reads = 0;
+  const reader = createCachedLocalUnifiedProjectionReader({
+    reader: async o => { reads++; return combined(o.nowMs, reads); },
+    readGeneration: async () => generation,
+    validUntil: async o => o.nowMs + 1000,
+  });
+  const read = async end => selectSharedWorkUsageSnapshot(await reader({ ...options(end), exactWindow: true }), { period: 'all', scope: 'account-a' });
+  assert.equal((await read(100)).toMs, 100);
+  assert.equal((await read(100)).toMs, 100);
+  assert.equal(reads, 1);
+  assert.equal((await read(101)).toMs, 101);
+  assert.equal(reads, 2);
+  assert.equal((await read(100)).toMs, 100);
+  assert.equal(reads, 3);
+});
+
 test("warming every period preserves the selected report and shares one accounting projection within two snapshots", async () => {
   let reads = 0;
   const now = 40 * 86400000;

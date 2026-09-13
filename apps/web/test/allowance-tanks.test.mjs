@@ -44,7 +44,7 @@ function harness(locale = "en-US") {
   const document = { createElementNS: (_namespace, tag) => node(tag), createTextNode: text => node("text", "", text), activeElement: null };
   const constants = ["PACE_ON_TRACK_LOWER_RATIO", "PACE_ON_TRACK_UPPER_RATIO", "PACE_CRITICAL_RATIO", "PACE_AVERAGE_MINIMUM_HOURS", "PACE_STATE_LABELS"]
     .map(name => source.match(new RegExp(`\\nconst ${name} = [^;]+;`, "u"))[0]).join("\n");
-  const functions = ["formatAllowanceDuration", "allowanceTimestamp", "formatForecastDuration", "forecastTimestamp", "firstFiniteForecastNumber", "weeklyPaceRates", "weeklyPaceStanding", "formatPaceRatio", "weeklyPaceTrack", "renderWeeklyPaceForecast", "renderQuotaCards", "providerReportedPlanEvidence"]
+  const functions = ["formatAllowanceDuration", "allowanceTimestamp", "formatForecastDuration", "forecastTimestamp", "firstFiniteForecastNumber", "weeklyPaceRates", "weeklyPaceStanding", "formatPaceRatio", "weeklyPaceTrack", "renderWeeklyPaceForecast", "renderQuotaCards", "providerReportedPlanEvidence", "renderDashboardSkeleton"]
     .map(declaration).join("\n");
   const factory = new Function("node", "document", "modelThemeIcon", "$", "t", "setLocalizedText", "isPrimaryCodexQuotaWindow", "isPrimaryCodexWeeklyQuotaWindow", "selectPrimaryCodexQuotaWindow", "isSparkQuotaLimitId", "isValidQuotaWindowDuration", "card", `
     const finite = value => typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -58,15 +58,17 @@ function harness(locale = "en-US") {
     const localizedQuotaWindowDuration = value => value + " minutes";
     let activeInformationPopover = null;
     let weeklyPaceDetailsOpen = false;
+    let allowanceTankView = null;
     const closeInformationPopover = () => { activeInformationPopover = null; };
     const openInformationPopover = button => { activeInformationPopover = { button }; };
     const ensureWeeklyPaceForecastCard = () => card;
     ${constants}
     ${functions}
     return { renderQuotaCards, renderWeeklyPaceForecast, weeklyPaceTrack, formatAllowanceDuration,
-      allowanceTimestamp, popover: () => activeInformationPopover };
+      allowanceTimestamp, renderDashboardSkeleton, setTankView: view => { allowanceTankView = view; },
+      popover: () => activeInformationPopover };
   `);
-  const api = factory(node, document, modelThemeIcon, selector => ({ "#quota-cards": quota, "#allowance-context": context })[selector],
+  const api = factory(node, document, modelThemeIcon, selector => ({ "#quota-cards": quota, "#allowance-context": context, "#weekly-pace-forecast": card })[selector],
     (key, values = {}) => translate(key, values, locale),
     (element, key) => { element.textContent = translate(key, {}, locale); },
     isPrimaryCodexQuotaWindow, isPrimaryCodexWeeklyQuotaWindow, selectPrimaryCodexQuotaWindow, isSparkQuotaLimitId, isValidQuotaWindowDuration, card);
@@ -245,4 +247,23 @@ test("animated forecast coverage retains absolute positioning and a non-collapsi
   const positions = rules.flatMap(rule => [...rule[1].matchAll(/position:\s*([^;]+);/gu)].map(value => value[1]));
   assert.equal(positions.at(-1), "absolute");
   assert.ok(rules.some(rule => /inset-block:\s*0;/.test(rule[1])));
+});
+
+
+test("unavailable dashboard disposes tank observers before removing their DOM", () => {
+  const h = harness();
+  h.renderQuotaCards(payload([window()]));
+  h.card.append(new Element());
+  let disposals = 0;
+  h.setTankView({ dispose() {
+    assert.equal(find(h.quota, "quota-tank").length, 1, "dispose while the observed card still exists");
+    disposals++;
+  } });
+  h.renderDashboardSkeleton();
+  assert.equal(disposals, 1);
+  assert.equal(find(h.quota, "quota-tank").length, 0);
+  assert.equal(h.card.hidden, true);
+  assert.equal(h.card.children.length, 0);
+  h.renderDashboardSkeleton();
+  assert.equal(disposals, 1, "repeated unavailable renders do not retain or dispose an old manager");
 });

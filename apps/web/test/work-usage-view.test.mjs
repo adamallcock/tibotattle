@@ -7,7 +7,7 @@ import {
   createWorkUsageAccumulator,
 } from "../../../src/reporting/index.js";
 import { createWorkUsageService } from "../../../src/application/index.js";
-import { formatApiMoney, formatSharePercent } from "../public/ui-format.js";
+import { formatApiMoney, formatSharePercent, formatLocal } from "../public/ui-format.js";
 import { translate } from "../public/localization.js";
 import {
   mountWorkUsageView,
@@ -708,6 +708,9 @@ test("mounted project expansion pins the snapshot/model and renders linked child
     node.classList.contains("work-usage-thread-row"),
   );
   assert.equal(childRows.length, 2);
+  const childPager = findMounted(childGroup, node => node.classList.contains("table-pagination"))[0];
+  assert.equal(childPager.textContent.includes("2 threads"), true);
+  assert.ok(findMounted(childPager, node => node.tagName === "BUTTON").every(node => node.hidden));
   assert.deepEqual(
     childRows.map((row) => row.children.length),
     [6, 6],
@@ -1558,6 +1561,159 @@ test("cancelling revalidation preserves read-only values and fences its late res
   await settleMountedView();
   assert.equal(body.textContent, previous);
   assert.match(root.textContent, /cancelled/i);
+});
+
+test("shared reporting waits for its bound, hides local period controls, and sends the exact window", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const window = {
+    period: "24h",
+    startAt: new Date(NOW - 86_400_000).toISOString(),
+    endAt: new Date(NOW).toISOString(),
+  };
+  const response = structuredClone(PROJECT_ROWS_RESPONSE);
+  response.fromMs = NOW - 86_400_000;
+  response.toMs = NOW;
+  const view = mountWorkUsageView({
+    root,
+    windowRef,
+    t: mountedTranslator,
+    sharedReporting: true,
+    reportingWindow: null,
+    fetchRef: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      return httpResponse(response);
+    },
+  });
+  await settleMountedView();
+  assert.equal(calls.length, 0);
+  assert.equal(findMounted(root, node => node.dataset?.period).length, 0);
+  assert.match(root.textContent, /unavailable until local evidence loads/u);
+  assert.equal(view.setReportingWindow(window), true);
+  await settleMountedView();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].period, "24h");
+  assert.equal(calls[0].endAt, window.endAt);
+  assert.equal(findMounted(root, node => node.dataset?.evidence === "period").length, 0, "shared header owns the period");
+  assert.ok(root.textContent.includes(mountedTranslator("workUsage.snapshot", { date: formatLocal(NOW) })), "the report timestamp remains available");
+  assert.doesNotMatch(root.textContent, /Mapping observed/u);
+  assert.doesNotMatch(root.textContent, /Current allowance and sharing preferences are not affected/u);
+  view.destroy();
+});
+
+
+test("an available shared-period search with no rows is empty rather than unavailable", async () => {
+  const { root, windowRef } = mountedRoot();
+  const empty = structuredClone(PROJECT_ROWS_RESPONSE);
+  empty.rows = []; empty.rowCount = 0; empty.display = {}; empty.nextCursor = null;
+  const window = { period: "24h", startAt: new Date(NOW - 86_400_000).toISOString(), endAt: new Date(NOW).toISOString() };
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator, sharedReporting: true, reportingWindow: window,
+    fetchRef: async (_url, init) => httpResponse(JSON.parse(init.body).search ? empty : PROJECT_ROWS_RESPONSE) });
+  try {
+    await settleMountedView();
+    const input = findMounted(root, node => node.tagName === "INPUT")[0];
+    const form = findMounted(root, node => node.tagName === "FORM")[0];
+    input.value = "no matching synthetic project";
+    form.dispatchEvent({ type: "submit" });
+    await settleMountedView();
+    const state = findMounted(root, node => node.classList.contains("work-usage-empty"))[0];
+    assert.ok(state);
+    assert.equal(state.children[0].textContent, mountedTranslator("workUsage.searchEmpty"));
+    assert.equal(state.children[0].getAttribute("role"), "status");
+    assert.equal(state.dataset.state, "empty");
+    assert.equal(findMounted(root, node => node.tagName === "TABLE").length, 0);
+    assert.equal(findMounted(root, node => node.classList.contains("work-usage-summary")).length, 0);
+    assert.ok(root.textContent.includes(mountedTranslator("workUsage.snapshot", { date: formatLocal(NOW) })));
+    assert.equal(findMounted(root, node => node.dataset?.evidence === "token-coverage").length, 1);
+    assert.doesNotMatch(root.textContent, /Mapping observed/u);
+    const clearSearch = findMounted(state, node => node.tagName === "BUTTON")[0];
+    assert.equal(clearSearch.textContent, mountedTranslator("workUsage.clearSearch"));
+    clearSearch.dispatchEvent({ type: "click" });
+    assert.equal(input.value, "");
+    await settleMountedView();
+    assert.ok(findMounted(root, node => node.tagName === "TABLE").length);
+    assert.equal(findMounted(root, node => node.classList.contains("work-usage-empty")).length, 0);
+  } finally { view.destroy(); }
+});
+
+test("model filter uses shared identity order and sends the exact selected ID", async () => {
+  const { root, windowRef } = mountedRoot();
+  const requests = [];
+  const models = ["gpt-5.5", "gpt-5.6-luna", "gpt-6-astra", "gpt-5.6-terra", "gpt-5.6-sol-wm", "gpt-5.4-mini", "gpt-5.4", "unreviewed-model"];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      requests.push(JSON.parse(init.body));
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, models });
+    } });
+  try {
+    await settleMountedView();
+    const picker = findMounted(root, node => node.classList.contains("model-picker"))[0];
+    assert.deepEqual(picker.options.map(option => option.value),
+      ["", "gpt-6-astra", "gpt-5.6-sol-wm", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "unreviewed-model"]);
+    const astra = picker.options[1];
+    assert.equal(astra.textContent, "GPT-6 Astra");
+    assert.equal(astra.children[0].getAttribute("aria-hidden"), "true");
+    assert.equal(astra.title, "gpt-6-astra");
+    picker.value = "gpt-5.6-sol-wm";
+    picker.dispatchEvent({ type: "change" });
+    await settleMountedView();
+    assert.equal(requests.at(-1).model, "gpt-5.6-sol-wm");
+    assert.equal(picker.value, "gpt-5.6-sol-wm");
+    for (const listener of windowRef.listeners.get("tibotattle:locale-change") ?? []) listener();
+    assert.equal(picker.value, "gpt-5.6-sol-wm");
+    assert.equal(picker.options[0].textContent, mountedTranslator("workUsage.allModels"));
+    assert.equal(picker.options[0].children[0].getAttribute("aria-hidden"), "true");
+    assert.equal(picker.options[1].children[0].getAttribute("aria-hidden"), "true");
+  } finally { view.destroy(); }
+});
+
+test("single-page reports show a result count and keep the share explanation at the headers", async () => {
+  const { root, windowRef } = mountedRoot();
+  const labels = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    renderInformationLabel: (label, explanation, accessibleLabel) => {
+      labels.push({ label, explanation, accessibleLabel });
+      const node = root.ownerDocument.createElement("button");
+      node.textContent = label;
+      node.setAttribute("aria-label", accessibleLabel);
+      return node;
+    },
+    fetchRef: async () => httpResponse(PROJECT_ROWS_RESPONSE) });
+  try {
+    await settleMountedView();
+    const pagination = findMounted(root, node => node.classList.contains("table-pagination"))[0];
+    assert.equal(pagination.textContent.includes("2 projects"), true);
+    assert.ok(findMounted(pagination, node => node.tagName === "BUTTON").every(node => node.hidden));
+    assert.deepEqual(labels.map(item => item.accessibleLabel), ["Token share", "Value share"]);
+    assert.ok(labels.every(item => item.explanation === mountedTranslator("workUsage.shareNote")));
+    assert.equal(findMounted(root, node => node.tagName === "P" && node.textContent === mountedTranslator("workUsage.shareNote")).length, 0);
+  } finally { view.destroy(); }
+});
+
+test("multi-page reports retain navigation and restore the first page", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, rowCount: 27,
+        offset: query.cursor ? 25 : 0, nextCursor: query.cursor ? null : "page-two" });
+    } });
+  const pager = () => findMounted(root, node => node.classList.contains("table-pagination"))[0];
+  const buttons = () => findMounted(pager(), node => node.tagName === "BUTTON");
+  try {
+    await settleMountedView();
+    assert.ok(buttons().every(node => !node.hidden));
+    assert.equal(buttons()[0].disabled, true);
+    buttons()[1].click(); await settleMountedView();
+    assert.equal(calls.at(-1).cursor, "page-two");
+    assert.ok(pager().textContent.includes("26–27 of 27"));
+    assert.ok(buttons().every(node => !node.hidden));
+    assert.equal(buttons()[1].disabled, true);
+    buttons()[0].click(); await settleMountedView();
+    assert.equal(calls.at(-1).cursor, undefined);
+    assert.ok(pager().textContent.includes("1–25 of 27"));
+  } finally { view.destroy(); }
 });
 
 function warmReport(id, name, generation = "stable-generation") {

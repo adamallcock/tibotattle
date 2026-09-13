@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const start = source.indexOf("let nextDivergenceBreakdownId = 0;");
-const end = source.indexOf("// A tick label's resolution", start);
+const end = source.indexOf("\n/**\n * Whether a series draws its data points", start);
 assert.ok(start >= 0 && end > start);
 
 function deferred() {

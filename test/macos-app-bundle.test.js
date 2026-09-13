@@ -7301,8 +7301,12 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   // dependencies. The Electron bridge is inert without its preload; the
   // community entry stays website-only.
   assert.deepEqual(webModules.relativeFiles, [
+    "apps/web/public/allowance-tank-renderer.js",
+    "apps/web/public/allowance-tanks.js",
     "apps/web/public/app.js",
     "apps/web/public/community-data.js",
+    "apps/web/public/dashboard-report-preload.js",
+    "apps/web/public/dashboard-ui.js",
     "apps/web/public/data-client.js",
     "apps/web/public/desktop-shell.js",
     "apps/web/public/electron-settings.js",
@@ -7317,6 +7321,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/model-performance.js",
     "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
+    "apps/web/public/reporting-period.js",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
     "apps/web/public/ui-format.js",
@@ -7350,8 +7355,13 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   ]);
   assert.deepEqual(runtimeAssets, [
     "apps/macos/reset-local-keychain.js",
+    "apps/web/public/allowance-tank-renderer.js",
+    "apps/web/public/allowance-tanks.js",
     "apps/web/public/app.js",
+    "apps/web/public/codex-color.svg",
     "apps/web/public/community-data.js",
+    "apps/web/public/dashboard-report-preload.js",
+    "apps/web/public/dashboard-ui.js",
     "apps/web/public/data-client.js",
     "apps/web/public/desktop-shell.js",
     "apps/web/public/electron-settings.css",
@@ -7375,6 +7385,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/model-performance.js",
     "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
+    "apps/web/public/reporting-period.js",
     "apps/web/public/styles.css",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",

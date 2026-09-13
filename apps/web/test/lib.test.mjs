@@ -97,12 +97,19 @@ import {
 } from "../public/data-client.js";
 import {
   adaptiveChartTickCount,
+  CHART_CLOCK_OPTIONS,
+  CHART_DAY_OPTIONS,
+  CHART_MONTH_OPTIONS,
   classifyTimelineEvidence,
+  dateTimeFormatter,
   finite,
+  formatChartTimeLabel,
   formatChartTimestamp,
+  formatCount,
   formatLocal,
   formatNumber,
   formatReportingTime,
+  formatSignedPpHours,
   formatTimeZoneLabel,
   formatUtcCalendarDay,
   numberFormatter,
@@ -434,29 +441,6 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
   };
 }
 
-async function loadAccountingPeriodSync(periodIds) {
-  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = appSource.indexOf("function accountingPeriod(data)");
-  const end = appSource.indexOf("\nfunction renderAccountingDimension", start);
-  assert.ok(start >= 0 && end > start, "accounting period guard is available");
-  const controls = new FakePeriodControls(periodIds);
-  const section = appSource.slice(start, end);
-  return Function(
-    "$",
-    "selectAvailableAccountingPeriod",
-    "controls",
-    `let activeAccountingPeriod = "history";\n${section}\nreturn {
-      syncAccountingPeriodControls,
-      getActive: () => activeAccountingPeriod,
-      setActive: (value) => { activeAccountingPeriod = value; },
-      controls,
-    };`,
-  )(
-    () => controls,
-    selectAvailableAccountingPeriod,
-    controls,
-  );
-}
 
 async function loadTimelineInteractions() {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
@@ -5049,7 +5033,7 @@ test("native dashboard readiness follows both first-render outcomes", async () =
   const marker = appSource.slice(markerStart, markerEnd);
   const loader = appSource.slice(loadStart, loadEnd);
   const bootSurface = html.match(
-    /<section[\s\S]*?id="dashboard-boot-state"[\s\S]*?<\/section>/u,
+    /<section[^>]*id="dashboard-boot-state"[^>]*>[\s\S]*?<\/section>/u,
   )?.[0] ?? "";
   assert.ok(bootSurface, "the native dashboard has a static boot surface");
   assert.match(bootSurface, /role="status"/u);
@@ -5818,12 +5802,8 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /safeDomainEndMs - domainStartMs/);
   assert.match(appSource, /adaptiveChartTickCount\(width, \{/u);
   assert.match(appSource, /tick\.alignment \?\? "middle"/u);
-  assert.match(appSource, /function formatChartTimeLabel\(value/);
-  assert.match(appSource, /new Intl\.DateTimeFormat\(getFormattingLocale\(\), \{[\s\S]*?timeZone: USER_TIME_ZONE/u);
-  assert.doesNotMatch(
-    appSource.match(/function formatChartTimeLabel\(value[\s\S]*?\n\}/u)?.[0] ?? "",
-    /timeZoneName/u,
-  );
+  assert.match(appSource, /formatChartTimeLabel,/u);
+  assert.doesNotMatch(appSource, /function formatChartTimeLabel\(value/u);
   assert.match(appSource, /formatChartTimeLabel\(at/);
   assert.doesNotMatch(appSource, /function formatUtc/);
   assert.match(adminSource, /formatReportingTime/);
@@ -5844,8 +5824,8 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /chart\.status\.resetOrTrackChange/u);
   assert.match(appSource, /chart\.status\.backwardOrAmbiguous/u);
   assert.match(appSource, /Calculating usage and allowance/);
-  assert.match(html, /id="calibration-range-controls"/);
-  assert.match(html, /id="weekly-range-controls"/);
+  assert.match(html, /id="reporting-period-controls"/);
+  assert.match(html, /id="reporting-period-controls"/);
   assert.match(html, /id="weekly-partial-legend"/);
   // Re-pinned 2026-08-08 (owner-directed): the contribution lookback picker
   // and prepare button are removed with the legacy prepare flow.
@@ -5858,7 +5838,7 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   // hierarchy was deliberately reversed, so this pins the new order rather
   // than being deleted - the ordering is still a decision, not an accident.
   assert.ok(
-    html.indexOf("advanced-calibration") < html.indexOf('id="range-controls"'),
+    html.indexOf('id="timeline-chart"') < html.indexOf('id="usage-timeline-chart"'),
     "calibration chart leads Trends ahead of the usage chart",
   );
   assert.match(html, /<details class="advanced-calibration" open>/u);
@@ -6002,27 +5982,29 @@ test("the weekly evidence slider is bounded below 100 and cannot create an accid
 
 test("chart tick labels stay compact and take their resolution from the axis span", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = appSource.indexOf("const CHART_TICK_TIME_ONLY_SPAN_MS");
-  const end = appSource.indexOf("\n/**\n * Whether a series draws its data points", start);
-  assert.ok(start >= 0 && end > start, "the tick label formatter is available");
-  const formatChartTimeLabel = Function(
-    "t", "finite", "getFormattingLocale", "USER_TIME_ZONE", "formatChartTimestamp",
-    `${appSource.slice(start, end)}\nreturn formatChartTimeLabel;`,
-  )(
-    () => "Unknown",
-    (value, fallback = null) => typeof value === "number" && Number.isFinite(value) ? value : fallback,
-    () => "en-US",
-    "America/New_York",
-    () => "fallback",
-  );
+  assert.match(appSource, /formatChartTimeLabel,/u);
+  assert.doesNotMatch(appSource, /function formatChartTimeLabel\(value/u);
 
   const at = Date.parse("2026-07-15T18:04:00.000Z");
   const hour = 3_600_000;
-  assert.equal(formatChartTimeLabel(at, { spanMs: 24 * hour }), "2:04 PM");
-  assert.equal(formatChartTimeLabel(at, { spanMs: 7 * 24 * hour }), "Jul 15");
-  assert.equal(formatChartTimeLabel(at, { spanMs: 31 * 24 * hour }), "Jul 15");
-  assert.equal(formatChartTimeLabel(at, { spanMs: 3 * 365 * 24 * hour }), "Jul 2026");
-  assert.equal(formatChartTimeLabel("not a timestamp"), "Unknown");
+  const date = new Date(at);
+  assert.equal(
+    formatChartTimeLabel(at, { spanMs: 24 * hour }),
+    dateTimeFormatter(CHART_CLOCK_OPTIONS).format(date),
+  );
+  assert.equal(
+    formatChartTimeLabel(at, { spanMs: 7 * 24 * hour }),
+    dateTimeFormatter(CHART_DAY_OPTIONS).format(date),
+  );
+  assert.equal(
+    formatChartTimeLabel(at, { spanMs: 31 * 24 * hour }),
+    dateTimeFormatter(CHART_DAY_OPTIONS).format(date),
+  );
+  assert.equal(
+    formatChartTimeLabel(at, { spanMs: 3 * 365 * 24 * hour }),
+    dateTimeFormatter(CHART_MONTH_OPTIONS).format(date),
+  );
+  assert.equal(formatChartTimeLabel("not a timestamp"), translate("format.unknown"));
   for (const spanMs of [24 * hour, 7 * 24 * hour, 31 * 24 * hour, 3 * 365 * 24 * hour, null]) {
     const label = formatChartTimeLabel(at, { spanMs });
     assert.doesNotMatch(label, / at /u, "no ICU date/time connective on a tick");
@@ -6086,7 +6068,7 @@ test("the weekly headline is a stable all-data median and says so on screen", as
     // The range is anchored at the newest fit, and the sentence says so
     // (estimator audit, 2026-08-08): "7d" is seven days back from that fit,
     // not from today.
-    assert.match(view.explanation, /anchored at the newest fit \(2026-07-29\)/u);
+    assert.match(view.explanation, /selected reporting range through 2026-07-29/u);
   }
   // Re-pinned 2026-08-08 (estimator audit): a 7-day window over a per-reset
   // series holds one or two fits, so the short range relaxes the span floor
@@ -6636,45 +6618,14 @@ test("lineChart DOM interactions cover default points, median, band, and narrow 
   // covered by `chart tick labels stay compact…` below.
 });
 
-test("accounting controls hide unavailable history and enable it when indexed evidence exists", async () => {
-  const withoutHistory = await loadAccountingPeriodSync(["24h", "7d", "30d", "all", "history"]);
-  withoutHistory.syncAccountingPeriodControls({
-    accounting: {
-      periods: [{ periodId: "7d" }, { periodId: "all" }],
-    },
-  });
-  assert.equal(withoutHistory.getActive(), "7d");
-  const unavailableHistory = withoutHistory.controls.buttons.find(
-    (button) => button.dataset.period === "history",
-  );
-  assert.equal(unavailableHistory.hidden, true);
-  assert.equal(unavailableHistory.disabled, true);
-  assert.equal(
-    withoutHistory.controls.buttons.find((button) => button.dataset.period === "all").disabled,
-    false,
-  );
-
-  const withHistory = await loadAccountingPeriodSync(["7d", "history", "all"]);
-  withHistory.syncAccountingPeriodControls({
-    accounting: {
-      periods: [{ periodId: "7d" }, { periodId: "history" }, { periodId: "all" }],
-    },
-  });
-  const historyButton = withHistory.controls.buttons.find(
-    (button) => button.dataset.period === "history",
-  );
-  assert.equal(withHistory.getActive(), "history");
-  assert.equal(historyButton.hidden, false);
-  assert.equal(historyButton.disabled, false);
-
-  const cacheOnly = await loadAccountingPeriodSync(["all", "history"]);
-  cacheOnly.syncAccountingPeriodControls({
-    accounting: {
-      periods: [{ periodId: "all" }],
-    },
-  });
-  assert.equal(cacheOnly.getActive(), null, "cache-only payloads do not impersonate indexed history");
-  assert.equal(cacheOnly.controls.buttons.find((button) => button.dataset.period === "all").disabled, false);
+test("accounting cannot silently change the shared period when evidence is absent", async () => {
+  const { reportingSelection } = await import("../public/reporting-period.js");
+  const selection = reportingSelection({
+    generatedAt: "2026-09-13T00:00:00.000Z",
+    accounting: { periods: [{ periodId: "all" }] },
+  }, "7d");
+  assert.equal(selection.period, "7d");
+  assert.equal(selection.accountingPeriod, null, "no alternate period is substituted");
 });
 
 test("timeline drag suppresses selection only during the chart gesture", async () => {
@@ -6819,10 +6770,10 @@ test("the weekly allowance chart leads the dashboard", async () => {
     html.indexOf('data-nav="weekly"') < html.indexOf('data-nav="trends"'),
     "primary navigation follows the same order as the sections",
   );
-  assert.match(html, /<p class="eyebrow">02 · Weekly allowance<\/p>/u);
-  assert.match(html, /<p class="eyebrow">03 · Timeline<\/p>/u);
+  assert.match(html, /<h2 id="weekly-title" data-i18n="page.weekly.title">Allowance<\/h2>/u);
+  assert.match(html, /<h2 id="timeline-title" data-i18n="page.timeline.title">Trends<\/h2>/u);
   assert.match(html, /class="dashboard-section lead-section(?: dashboard-page-inactive)?" id="weekly"/u);
-  assert.match(html, /class="panel weekly-history-panel lead-chart-panel"/u);
+  assert.match(html, /class="panel weekly-history-panel lead-chart-panel chart-card"/u);
   // The lead chart must use the available page width instead of introducing a
   // second horizontal scrollbar for a handful of reset estimates.
   assert.match(styles, /\.weekly-history-chart \{ overflow: visible; \}/u);
@@ -8652,9 +8603,8 @@ test("the model table separates allowance tracks and never conflates zero with u
   const start = appSource.indexOf("function modelUsageRows(accounting) {");
   const end = appSource.indexOf("function renderAccountingModels(", start);
   assert.ok(start >= 0 && end > start, "the model-table helpers are available");
-  const countStart = appSource.indexOf("function formatCount(value) {");
-  const countEnd = appSource.indexOf("function formatDecimal(", countStart);
-  assert.ok(countStart >= 0 && countEnd > countStart, "the count formatter is available");
+  assert.match(appSource, /formatCount\(model\.events, \{ missing: t\("accounting\.model\.notReported"\) \}\)/u);
+  assert.doesNotMatch(appSource, /function formatCount\(value\)/u);
 
   const table = Function(
     "node",
@@ -8664,8 +8614,8 @@ test("the model table separates allowance tracks and never conflates zero with u
     "finite",
     "formatNumber",
     "formatApiMoney",
-    `${appSource.slice(start, end)}\n${appSource.slice(countStart, countEnd)}`
-      + "\nreturn { modelUsageRows, modelApiEquivalentCell, formatCount };",
+    "formatCount",
+    `${appSource.slice(start, end)}\nreturn { modelUsageRows, modelApiEquivalentCell };`,
   )(
     () => ({ title: "", textContent: "" }),
     (element, key) => { element.textContent = key; },
@@ -8680,6 +8630,7 @@ test("the model table separates allowance tracks and never conflates zero with u
       minimumFractionDigits: 2,
       maximumFractionDigits: 2,
     }).format(value),
+    formatCount,
   );
 
   const row = (model, extra) => ({
@@ -8730,9 +8681,12 @@ test("the model table separates allowance tracks and never conflates zero with u
 
   // One formatter for the count columns: "154,900" beside "74", never
   // "154.9K" beside "74".
-  assert.equal(table.formatCount(154_900), "154,900");
-  assert.equal(table.formatCount(74), "74");
-  assert.equal(table.formatCount(null), "accounting.model.notReported");
+  assert.equal(formatCount(154_900), "154,900");
+  assert.equal(formatCount(74), "74");
+  assert.equal(
+    formatCount(null, { missing: "accounting.model.notReported" }),
+    "accounting.model.notReported",
+  );
 });
 
 test("failure copy is chosen from fixed maps and never echoes a server string", async () => {
@@ -9179,6 +9133,8 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     [
       "data.accounting",
       "data.allowancePlanSelection",
+      "data.reportingAccountingPeriod",
+      "data.reportingWindow",
       "data?.accounting?.periods",
       "data?.freshness?.latestObservedAt",
       "data?.mode",
@@ -10147,7 +10103,7 @@ test("a session-rejected repair clears the dead session and renders one sign-in 
 async function loadResidualInspectionTable({ rows, page = 0 }) {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = appSource.indexOf("function renderResidualInspectionTable()");
-  const end = appSource.indexOf("\n// A tick label's resolution", start);
+  const end = appSource.indexOf("\n/**\n * Whether a series draws its data points", start);
   assert.ok(start >= 0 && end > start, "the inspection-table renderer is available");
   const section = appSource.slice(start, end);
 
@@ -10856,7 +10812,7 @@ test("the signed AUC stat integrates observed-minus-expected trapezoids over hou
     "pointTimestampMs",
     "t",
     "formatDecimal",
-    `${appSource.slice(start, end)}\nreturn { signedResidualAucPpHours, formatSignedPpHours };`,
+    `${appSource.slice(start, end)}\nreturn { signedResidualAucPpHours };`,
   )(
     finite,
     (point) => point.timestampMs,
@@ -10889,9 +10845,9 @@ test("the signed AUC stat integrates observed-minus-expected trapezoids over hou
     0,
   );
   assert.equal(scope.signedResidualAucPpHours([point(0, 2, 1)]), null);
-  assert.equal(scope.formatSignedPpHours(null), "—");
-  assert.equal(scope.formatSignedPpHours(4), "[format.ppHours] +4.0");
-  assert.equal(scope.formatSignedPpHours(-2.5), "[format.ppHours] -2.5");
+  assert.equal(formatSignedPpHours(null), "—");
+  assert.equal(formatSignedPpHours(4), translate("format.ppHours", { value: "+4.0" }));
+  assert.equal(formatSignedPpHours(-2.5), translate("format.ppHours", { value: "-2.5" }));
 });
 
 // ---------------------------------------------------------------------------

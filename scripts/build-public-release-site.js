@@ -91,6 +91,8 @@ const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
   "allowance-tanks.js",
   "allowance-tank-renderer.js",
   "work-usage-view.js",
+  "reporting-period.js",
+  "dashboard-ui.js",
   "data-client.js",
   "index.html",
   "lib.js",

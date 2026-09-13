@@ -2690,6 +2690,7 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
     candidate.options.webPreferences.preload === "/private/preload.cjs"
   ));
   const firstDashboard = dashboard();
+  assert.equal(firstDashboard.options.minWidth, 960);
   assert.equal(trays.length, 1);
   assert.equal(trays[0].menu.template.some((item) => item.label === "Retry"), false);
   assert.equal(firstDashboard.options.webPreferences.nodeIntegration, false);
@@ -5146,4 +5147,24 @@ test("preload marks both document roots as electron-dashboard across DOM readine
   assert.equal(document.body.classList.contains("electron-dashboard"), true);
   assert.equal(documentElement.classList.contains("native-dashboard"), false);
   assert.equal(document.body.classList.contains("native-dashboard"), false);
+});
+
+test("dashboard minimum width fits smaller display work areas", async () => {
+  const windows = [];
+  const lifecycle = createDesktopLifecycle({
+    app: new FakeApp(),
+    BrowserWindow: class extends FakeWindow {
+      constructor(options) { super(options); windows.push(this); }
+    },
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: template => ({ template }) },
+    icon: "empty-icon", preloadPath: "/private/preload.cjs",
+    screen: { getPrimaryDisplay: () => ({ workAreaSize: { width: 800, height: 600 } }) },
+    supervisor: { async start() { return { origin: "http://127.0.0.1:4999" }; }, async stop() {} },
+  });
+  await lifecycle.start();
+  const dashboard = windows.find(window => window.options.webPreferences.preload === "/private/preload.cjs");
+  assert.equal(dashboard.options.minWidth, 800);
+  assert.equal(dashboard.options.width, 800);
+  await lifecycle.requestQuit();
 });

@@ -18,7 +18,7 @@ export {
   validateSyntheticFixture,
 } from "./telemetry-envelope.js";
 
-import { formatNumber } from "./ui-format.js";
+import { compact } from "./ui-format.js";
 
 const JSON_WHITESPACE = new Set([" ", "\t", "\n", "\r"]);
 const JSON_SIMPLE_ESCAPES = Object.freeze({
@@ -505,11 +505,26 @@ export function historyIndexContinuationDecision({
 }
 
 export function formatTokenTotal(usage) {
-  const total = usage.inputUncachedTokens
-    + usage.inputCachedTokens
-    + usage.outputTextTokens
-    + usage.outputReasoningTokens;
-  return formatNumber(total, { notation: "compact", maximumFractionDigits: 1 });
+  if (usage === null || typeof usage !== "object" || Array.isArray(usage)) {
+    return compact(null);
+  }
+  let total = 0;
+  // This legacy projection has one combined cached-input field and split text /
+  // reasoning output. Every component must be present: an omitted component is
+  // unknown evidence, not a zero contribution. Combined output is intentionally
+  // not added a second time when split components are available.
+  for (const key of [
+    "inputUncachedTokens",
+    "inputCachedTokens",
+    "outputTextTokens",
+    "outputReasoningTokens",
+  ]) {
+    const value = usage[key];
+    if (!Number.isSafeInteger(value) || value < 0) return compact(null);
+    total += value;
+    if (!Number.isSafeInteger(total)) return compact(null);
+  }
+  return compact(total);
 }
 
 export function safeFilename(participantId) {

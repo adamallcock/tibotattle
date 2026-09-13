@@ -540,27 +540,11 @@ h1 {
   font-size: 1.3rem;
   font-weight: var(--weight-display);
 }
-:root:has(#global-state.state-live) .freshness-card,
-:root:has(#global-state.state-local) .freshness-card {
-  --freshness-accent: var(--green);
-  --freshness-surface: var(--green-soft);
-}
-:root:has(#global-state.state-updating) .freshness-card,
-:root:has(#global-state.state-setup) .freshness-card {
-  --freshness-accent: var(--amber);
-  --freshness-surface: var(--amber-soft);
-}
-:root:has(#global-state.state-demo) .freshness-card {
-  --freshness-accent: var(--blue);
-  --freshness-surface: var(--blue-soft);
-}
-:root:has(#global-state.state-stale) .freshness-card,
-:root:has(#global-state.state-offline) .freshness-card,
-:root:has(#global-state.state-insufficient) .freshness-card,
-:root:has(#global-state.state-connecting) .freshness-card {
-  --freshness-accent: var(--muted);
-  --freshness-surface: var(--surface-quiet);
-}
+/* Observation colour follows its own timestamp, never accounting or job state. */
+.freshness-card[data-freshness="current"] { --freshness-accent: var(--green); }
+.freshness-card[data-freshness="stale"] { --freshness-accent: var(--amber); }
+.freshness-card[data-freshness="demo"] { --freshness-accent: var(--blue); }
+.freshness-card[data-freshness="unknown"] { --freshness-accent: var(--muted); }
 
 .notice {
   display: flex;
@@ -2733,6 +2717,17 @@ footer p { margin: 0; }
 @media (max-width: 1050px) {
   .topbar { grid-template-columns: auto 1fr; padding-inline: 24px; }
   .top-actions { justify-self: end; }
+  .metric-grid { grid-template-columns: 1fr 1fr; }
+  /* Only stretch a trailing card that would otherwise sit half-width alone on
+     its own row. `:last-child` on its own also stretched the second of two
+     cards, which is why the Spark allowance rendered double the width of the
+     primary allowance beside it at this breakpoint. In a two-column grid the
+     last child is alone exactly when its position is odd. The accounting grid
+     also contains a full-width disclosure, so child parity is not card parity. */
+  .metric-grid:not(.accounting-summary) > :last-child:nth-child(odd) { grid-column: 1 / -1; }
+}
+
+@media (max-width: 900px) {
   .dashboard-shell { display: block; min-height: 0; }
   .dashboard-sidebar {
     position: static;
@@ -2747,15 +2742,7 @@ footer p { margin: 0; }
     overflow-x: auto;
     scrollbar-width: thin;
   }
-  .primary-nav a { flex: 0 0 auto; }
-  .metric-grid { grid-template-columns: 1fr 1fr; }
-  /* Only stretch a trailing card that would otherwise sit half-width alone on
-     its own row. `:last-child` on its own also stretched the second of two
-     cards, which is why the Spark allowance rendered double the width of the
-     primary allowance beside it at this breakpoint. In a two-column grid the
-     last child is alone exactly when its position is odd. The accounting grid
-     also contains a full-width disclosure, so child parity is not card parity. */
-  .metric-grid:not(.accounting-summary) > :last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .primary-nav a { flex: 0 0 auto; width: auto; white-space: nowrap; }
 }
 
 @media (max-width: 760px) {
@@ -4899,9 +4886,7 @@ html[data-theme="dark"] .noscript {
 .model-identity .model-usage-icon { width: 1.25rem; height: 1.25rem; display: inline-block; vertical-align: middle; margin-inline-end: .45rem; }
 .allowance-model-spark { --allowance-color: #996315; }
 /* Local Projects & threads: shared paper surfaces, typography and controls. */
-.work-usage-heading, .work-usage-toolbar, .work-usage-pagination { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
-.work-usage-heading h2 { margin:0 0 8px; }
-.work-usage-heading { margin-bottom:20px; }
+.work-usage-toolbar, .work-usage-pagination { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
 .work-usage-period { display:flex; gap:6px; flex-wrap:wrap; }
 .work-usage-period .button[aria-pressed="true"] { background:var(--action-bg); color:var(--action-ink); }
 .work-usage-toolbar { justify-content:flex-start; margin:24px 0 16px; }
@@ -4989,6 +4974,615 @@ html[data-theme="dark"] .noscript {
 .work-usage-mix-legend strong { font-variant-numeric:tabular-nums; }
 .work-usage-search-note { padding-inline-start:var(--space-3); border-inline-start:3px solid var(--green-2); }
 
+/* Shared dashboard page chrome. Keep chart headings and public-site heroes separate. */
+.dashboard-shell main { width: calc(100% - 64px); padding-top: 32px; }
+.dashboard-shell .dashboard-section,
+.dashboard-shell .dashboard-section.lead-section { padding-top: 0; }
+.dashboard-shell #overview { border-top: 0; padding-top: 0; }
+.dashboard-page-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 24px;
+  margin: 0 0 24px;
+}
+.dashboard-page-header > div { min-width: 0; }
+.dashboard-shell .dashboard-page-header :is(h1, h2) {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 36px;
+  font-weight: var(--weight-regular);
+  letter-spacing: -.035em;
+  line-height: 1.15;
+}
+.dashboard-shell .dashboard-page-header .page-description {
+  max-width: 70ch;
+  margin: 8px 0 0;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.dashboard-page-header .segmented-control { flex-wrap: wrap; }
+.dashboard-page-header .segmented-control button { min-height: 36px; }
+.dashboard-page-header .segmented-control button[aria-pressed="true"] {
+  background: var(--action-bg); color: var(--action-ink);
+}
+.dashboard-page-header .freshness-card {
+  min-width: 0; padding: 0; border: 0; background: none; box-shadow: none;
+}
+.dashboard-page-header .freshness-card strong { font-family: var(--sans); font-size: 15px; }
+.dashboard-shell #community {
+  display: block; margin-top: 0; padding: 0 0 var(--space-8);
+  border: 0; border-radius: 0; background: none; box-shadow: none;
+}
+.dashboard-shell #community .panel-heading h2 { font-size: 24px; }
+.setup-card { display: block; padding: 16px 24px; margin-bottom: 24px; }
+.setup-card > summary { cursor: pointer; color: var(--ink); }
+.setup-ready-label { margin-inline-start: 12px; color: var(--green); font-size: 12px; font-weight: var(--weight-semibold); }
+.setup-card.needs-attention > summary { color: var(--amber); }
+.setup-card > summary h2 { display: inline; margin: 0; font-family: var(--sans); font-size: 14px; font-weight: var(--weight-semibold); letter-spacing: 0; }
+.setup-details-body { align-items: start; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px 32px; padding-top: 20px; }
+@media (max-width: 900px) {
+  .dashboard-page-header { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .dashboard-page-header > :last-child { justify-self: start; }
+  .setup-details-body { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 600px) {
+  .dashboard-shell main { width: calc(100% - 32px); padding-top: 24px; }
+  .dashboard-shell .dashboard-page-header :is(h1, h2) { font-size: 30px; }
+}
+
+/*
+ * Shared dashboard components.
+ *
+ * The public pages use some of the same names (for example `.panel` and
+ * `.button`), so the component contract lives under `.dashboard-shell`. This
+ * keeps the companion report consistent while leaving the public site free to
+ * keep its own spacing and interaction treatment. Existing dashboard names
+ * remain aliases beside the names intended for new markup.
+ */
+.dashboard-shell {
+  --dashboard-control-height: 36px;
+  --dashboard-card-gap: var(--space-5);
+  --dashboard-focus-ring: rgba(49, 95, 132, .42);
+}
+
+/* Report context belongs to the persistent app header. */
+body:not(.community-site) > .topbar {
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 14px;
+  padding-inline: 24px;
+}
+.reporting-period-toolbar { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.reporting-period-toolbar[hidden] { display: none; }
+.reporting-period-toolbar .segmented-control { display: inline-flex; flex-wrap: nowrap; }
+.reporting-period-toolbar .segmented-control > button { min-width: 42px; padding: 8px 10px; white-space: nowrap; }
+.reporting-period-details { position: relative; }
+.reporting-period-details > summary {
+  display: grid; place-items: center; width: 32px; height: 36px;
+  cursor: pointer; color: var(--muted); list-style: none;
+}
+.reporting-period-details > summary::-webkit-details-marker { display: none; }
+.reporting-period-details > p {
+  position: absolute; inset: calc(100% + 8px) 0 auto auto;
+  box-sizing: border-box; width: 220px; max-width: calc(100vw - 28px); margin: 0;
+  padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--ink); box-shadow: var(--shadow-card);
+  font-size: .76rem; line-height: 1.5;
+}
+/* The date explanation is also available by keyboard or click/tap. */
+.reporting-period-details:not([open]) > p { display: none; }
+
+body:not(.community-site) > .topbar #refresh-button.refresh-progress { width: clamp(250px, calc(100vw - 750px), 360px); min-width: 250px; grid-template-columns: minmax(0, 1fr) max-content max-content; }
+body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { grid-template-columns: auto minmax(0, 1fr); }
+@media (max-width: 760px) {
+  body:not(.community-site) > .topbar { grid-template-columns: auto minmax(0, 1fr); gap: 8px 16px; padding-block: 10px; }
+  .reporting-period-toolbar { grid-row: 2; grid-column: 1 / -1; }
+  body:not(.community-site) > .topbar .top-actions { grid-column: 2; grid-row: 1; }
+}
+@media (max-width: 760px) {
+  body:not(.community-site) > .topbar { padding-inline: 14px; }
+  body:not(.community-site) > .topbar #refresh-button.refresh-progress { display: none; }
+}
+
+.dashboard-shell :is(.dashboard-control-group, .dashboard-filter-group) {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.dashboard-shell :is(.dashboard-control-label, .dashboard-filter-label, .control-label) {
+  color: var(--muted);
+  font-size: .64rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+
+/* Segmented controls are filters or period choices: the selected value is a
+   filled pill. A tab uses the underlined treatment below, so the two patterns
+   remain visually and semantically distinct. */
+.dashboard-shell .segmented-control {
+  display: inline-flex;
+  align-items: stretch;
+  max-width: 100%;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+.dashboard-shell .segmented-control > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--hit-target);
+  min-height: var(--dashboard-control-height);
+  padding: .4rem .72rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-size: .7rem;
+  font-weight: var(--weight-semibold);
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background-color .12s ease, border-color .12s ease, color .12s ease;
+}
+.dashboard-shell .segmented-control > button:hover:not(:disabled):not(.active):not([aria-pressed="true"]):not([aria-selected="true"]) {
+  color: var(--ink);
+  background: var(--surface-quiet);
+}
+.dashboard-shell .segmented-control > button:is(.active, [aria-pressed="true"], [aria-selected="true"]) {
+  color: var(--action-ink);
+  border-color: transparent;
+  background: var(--action-bg);
+}
+.dashboard-shell .segmented-control > button:disabled { cursor: not-allowed; }
+.dashboard-shell .segmented-control > button:focus-visible,
+.dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"]:focus-visible {
+  outline: 3px solid var(--dashboard-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Actions share the same wrapping and status rhythm wherever a panel can
+   refresh, retry, cancel, or continue. */
+.dashboard-shell :is(.dashboard-actions, .dashboard-action-group, .action-group) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.dashboard-shell :is(.dashboard-action-status, .participant-action-status, .work-usage-status) {
+  min-height: 1.5em;
+  margin: var(--space-3) 0 0;
+  color: var(--muted);
+  font-size: .75rem;
+  line-height: 1.45;
+}
+.dashboard-shell :is(.dashboard-action-status, .participant-action-status, .work-usage-status):is(.error, [data-state="error"]) {
+  color: var(--rust);
+}
+.dashboard-shell .work-usage-status:is([data-state="preparing"], [data-state="loading"], [data-state="updating"]) { color: var(--blue); }
+.dashboard-shell .work-usage-status:is([data-state="missing"], [data-state="unavailable"], [data-state="waiting"]) { color: var(--muted); }
+.dashboard-shell :is(.button, button)[aria-busy="true"],
+.dashboard-shell :is(.button, button)[data-loading="true"] { cursor: progress; }
+
+/* Tabs have a baseline and an underline rather than the filled filter pill.
+   `.performance-models` is an existing tablist and remains an alias. */
+.dashboard-shell :is(.dashboard-tabs, .performance-models) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-5);
+  padding: 0;
+  border-bottom: 1px solid var(--line);
+}
+.dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"],
+.dashboard-shell .performance-model {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-width: var(--hit-target);
+  min-height: 40px;
+  margin: 0;
+  padding: .5rem .72rem;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--radius-xs) var(--radius-xs) 0 0;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-size: .76rem;
+  font-weight: var(--weight-semibold);
+  text-align: start;
+  cursor: pointer;
+  transition: background-color .12s ease, border-color .12s ease, color .12s ease;
+}
+.dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"]:hover:not(:disabled),
+.dashboard-shell .performance-model:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--surface-quiet);
+}
+.dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"]:is(.active, [aria-selected="true"]),
+.dashboard-shell .performance-model[aria-selected="true"] {
+  color: var(--ink);
+  border-bottom-color: var(--green);
+  background: var(--green-soft);
+}
+
+/* Chart cards use one predictable order: title and description, controls,
+   legend, then the chart body. `.chart-panel`, `.chart-heading`,
+   `.chart-control-stack`, and `.legend` continue to work for existing pages. */
+.dashboard-shell :is(.chart-card, .chart-panel) {
+  min-width: 0;
+  padding: var(--pad-card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+.dashboard-shell :is(.chart-card-header, .chart-heading) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-5);
+  margin: 0 0 var(--space-4);
+}
+.dashboard-shell :is(.chart-card-title, .chart-heading h3) {
+  min-width: 0;
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1.45rem;
+  font-weight: var(--weight-display);
+  letter-spacing: -.025em;
+  line-height: 1.15;
+}
+.dashboard-shell :is(.chart-card-description, .chart-heading p) {
+  max-width: 70ch;
+  margin: var(--space-1) 0 0;
+  color: var(--muted);
+  font-size: .76rem;
+  line-height: 1.5;
+}
+.dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2) var(--space-3);
+  min-width: 0;
+}
+.dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) > :is(.segmented-control, .dashboard-filter-group, .dashboard-filter) { order: 1; }
+.dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) > :is(.chart-navigation, .dashboard-chart-navigation) { order: 2; }
+.dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) > :is(.legend, .chart-card-legend) {
+  order: 3;
+  flex-basis: 100%;
+  justify-content: flex-start;
+}
+.dashboard-shell :is(.chart-card-legend, .legend) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  color: var(--muted);
+  font-size: .68rem;
+  line-height: 1.4;
+}
+.dashboard-shell :is(.chart-card-legend, .legend) :is(span, li) { display: inline-flex; align-items: center; gap: var(--space-2); }
+.dashboard-shell :is(.chart-card-body, .chart-shell) { min-width: 0; }
+
+/* A state is a bounded, readable replacement for a chart/table body. The
+   state modifier preserves the difference between loading, missing evidence,
+   stale/partial evidence, and a genuine error. */
+.dashboard-shell :is(.dashboard-state, .chart-empty, .work-usage-empty) {
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: var(--space-2);
+  min-height: clamp(220px, 28vw, 340px);
+  margin: 0;
+  padding: var(--space-7) var(--space-5);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: var(--surface-quiet);
+  font-size: .78rem;
+  line-height: 1.5;
+  text-align: center;
+}
+.dashboard-shell :is(.dashboard-state, .chart-empty, .work-usage-empty).small,
+.dashboard-shell .dashboard-state-compact { min-height: 220px; }
+.dashboard-shell .chart-empty.small { min-height: 280px; font-size: .8rem; }
+.dashboard-shell :is(.dashboard-state, .chart-empty, .work-usage-empty) > :is(strong, h3) {
+  margin: 0;
+  color: var(--ink);
+  font-size: .84rem;
+  font-weight: var(--weight-semibold);
+}
+.dashboard-shell :is(.dashboard-state, .chart-empty, .work-usage-empty) > p,
+.dashboard-shell .dashboard-state-copy { max-width: 48ch; margin: 0; }
+.dashboard-shell .dashboard-state-icon { color: var(--muted); font-size: 1.25rem; line-height: 1; }
+.dashboard-shell .dashboard-state-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--space-2); margin-top: var(--space-2); }
+.dashboard-shell :is(.dashboard-state-loading, .dashboard-state[data-state="loading"], .dashboard-state[data-state="updating"]) {
+  border-style: solid;
+  border-color: rgba(44, 88, 120, .3);
+  background: var(--blue-soft);
+}
+.dashboard-shell .dashboard-state-indicator {
+  width: 2.25rem;
+  height: .25rem;
+  border-radius: var(--radius-pill);
+  background: var(--blue);
+  animation: dashboard-state-pulse 1.25s ease-in-out infinite;
+}
+.dashboard-shell :is(.dashboard-state-error, .dashboard-state[data-state="error"]) {
+  border-style: solid;
+  border-color: rgba(151, 64, 42, .32);
+  color: var(--rust);
+  background: var(--rust-soft);
+}
+.dashboard-shell :is(.dashboard-state-empty, .dashboard-state[data-state="empty"]) { border-style: dashed; }
+.dashboard-shell :is(.dashboard-state-partial, .dashboard-state-stale, .dashboard-state[data-state="partial"], .dashboard-state[data-state="stale"]) {
+  border-style: solid;
+  border-color: rgba(129, 87, 24, .3);
+  background: var(--amber-soft);
+}
+.dashboard-shell :is(.dashboard-state-unavailable, .dashboard-state[data-state="unavailable"], .dashboard-state[data-state="unknown"]) {
+  border-style: solid;
+  color: var(--muted);
+  background: var(--surface-sunken);
+}
+@keyframes dashboard-state-pulse {
+  0%, 100% { opacity: .45; transform: scaleX(.72); }
+  50% { opacity: 1; transform: scaleX(1); }
+}
+
+/* Evidence metadata is intentionally quieter than a result card, while its
+   accent and state make freshness, coverage, and availability scannable. */
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) var(--pad-tile);
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid var(--blue);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: var(--surface-quiet);
+  font-size: .74rem;
+  line-height: 1.5;
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence) :is(dt, .evidence-label, .freshness-label, .coverage-label) {
+  color: var(--muted);
+  font-size: .64rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence) :is(dd, .evidence-value, .freshness-value, .coverage-value) {
+  margin: 0;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence):is(.is-current, .is-fresh, [data-state="current"], [data-state="fresh"]) {
+  border-inline-start-color: var(--green-2);
+  background: var(--green-soft);
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence):is(.is-stale, .is-partial, [data-state="stale"], [data-state="partial"]) {
+  border-inline-start-color: var(--amber);
+  background: var(--amber-soft);
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence):is(.is-error, [data-state="error"]) {
+  border-inline-start-color: var(--rust);
+  background: var(--rust-soft);
+}
+.dashboard-shell :is(.evidence-meta, .freshness-meta, .coverage-note, .dashboard-freshness, .dashboard-coverage, .performance-evidence):is(.is-unavailable, .is-unknown, [data-state="unavailable"], [data-state="unknown"]) {
+  border-inline-start-color: var(--line-strong);
+  background: var(--surface-sunken);
+}
+.dashboard-shell :is(.series-coverage, .timeline-confidence) {
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) var(--pad-tile);
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid var(--blue);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: var(--blue-soft);
+  font-size: .75rem;
+  line-height: 1.5;
+}
+.dashboard-shell :is(.series-coverage, .timeline-confidence).low,
+.dashboard-shell .series-coverage {
+  border-inline-start-color: var(--amber);
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+/* Longer explanations are disclosures, so they get a card boundary and a
+   predictable open/closed affordance. Older evidence disclosures retain their
+   text-only appearance and use the same minimum target below. */
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) {
+  margin-top: var(--dashboard-card-gap);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  min-height: var(--hit-target);
+  padding: var(--space-4) var(--pad-card);
+  color: var(--ink);
+  font-size: .78rem;
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+  list-style: none;
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > summary::-webkit-details-marker { display: none; }
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > summary::after {
+  flex: 0 0 auto;
+  color: var(--green);
+  content: "+";
+  font-size: 1.15rem;
+  font-weight: var(--weight-regular);
+  line-height: 1;
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure)[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure)[open] > summary::after { content: "−"; }
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > :is(.technical-disclosure-body, .dashboard-disclosure-body) {
+  padding: var(--space-4) var(--pad-card) var(--pad-card);
+}
+.dashboard-shell :is(.technical-disclosure, .dashboard-disclosure) > summary:focus-visible {
+  outline: 3px solid var(--dashboard-focus-ring);
+  outline-offset: -3px;
+}
+.dashboard-shell :is(.advanced-calibration, .advanced-diagnostics, .manual-contribution, .evidence-disclosure) > summary {
+  min-height: var(--hit-target);
+  padding-block: var(--space-2);
+  border-radius: var(--radius-xs);
+}
+
+@media (max-width: 760px) {
+  .dashboard-shell :is(.chart-card-controls, .chart-control-stack, .weekly-chart-controls) { justify-content: flex-start; }
+  .dashboard-shell :is(.chart-card-header, .chart-heading) { gap: var(--space-3); }
+}
+@media (max-width: 520px) {
+  .dashboard-shell :is(.dashboard-tabs, .performance-models) {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .dashboard-shell :is(.dashboard-tabs, .performance-models) > [role="tab"],
+  .dashboard-shell .performance-model {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-shell .dashboard-state-indicator { animation: none; }
+  .dashboard-shell :is(.segmented-control > button, .dashboard-tabs > [role="tab"], .performance-model) { transition: none; }
+}
+
+/* Compact desktop actions remain recognisable and keyboard accessible. */
+.topbar .icon-button { width: 36px; min-width: 36px; height: 36px; padding: 7px; justify-content: center; flex: 0 0 36px; }
+.topbar .icon-button svg { display: block; flex: none; }
+.setup-details-body > #setup-note { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: .76rem; max-width: 90ch; }
+.setup-details-body > .setup-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+@media (max-width: 760px) {
+  .topbar .button.icon-button { display: inline-flex; }
+}
+
+/* Counters are evidence: only the descriptive phase may truncate. */
+.refresh-progress-count, .refresh-progress-time { overflow: visible; text-overflow: clip; white-space: nowrap; }
+@media (min-width: 761px) and (max-width: 1100px) {
+  body:not(.community-site) > .topbar .brand > span { display: none; }
+}
+@media (min-width: 761px) and (max-width: 950px) {
+  body:not(.community-site) > .topbar #global-state { display: none; }
+}
+
+@media (max-width: 760px) {
+  body:not(.community-site) > .topbar .top-actions { flex-wrap: wrap; min-width: 0; }
+  body:not(.community-site) > .topbar #refresh-button.refresh-progress {
+    display: grid; width: max-content; min-width: 0;
+    grid-template-columns: max-content max-content;
+  }
+  .topbar .refresh-progress-phase { display: none; }
+}
+
+.metric-card-status { color: var(--amber); font-size: .75rem; font-weight: var(--weight-semibold); }
+#connection-notice.notice-compact { padding: 12px 16px; border-width: 0 0 0 3px; border-radius: 6px; box-shadow: none; }
+#connection-notice.notice-compact p { margin: 4px 0 0; }
+
+/* Legends occupy their own row, leaving titles and controls room to wrap. */
+.dashboard-shell .chart-card > :is(.chart-card-header, .chart-heading) > :first-child { flex: 1 1 22rem; min-width: 0; }
+.dashboard-shell .chart-card > :is(.chart-card-legend, .legend) { justify-content: flex-start; margin: 0 0 var(--space-4); }
+.dashboard-shell .chart-card-note { margin: var(--space-3) 0 0; color: var(--muted); font-size: .75rem; line-height: 1.5; }
+.dashboard-shell .chart-card-note + .chart-card-note { margin-top: var(--space-2); }
+.dashboard-shell .chart-card .chart-card-header .panel-kicker { margin-top: 0; }
+
+@media (max-width: 760px) {
+  .dashboard-shell :is(.chart-card, .chart-panel) { padding: var(--space-4); }
+}
+
+/* Project controls form one responsive toolbar; reporting lives in the header. */
+.dashboard-shell .work-usage-toolbar { align-items: flex-end; gap: 12px; margin: 16px 0; }
+.dashboard-shell .work-usage-toolbar .work-usage-find { flex: 1 1 240px; margin: 0; min-width: 180px; }
+.dashboard-shell .work-usage-toolbar .work-usage-find input { width: 100%; max-width: none; height: 44px; min-height: 44px; box-sizing: border-box; font-size: .8rem; }
+.dashboard-shell .work-usage-select { min-width: 120px; }
+.dashboard-shell .work-usage-select select { height: 44px; min-height: 44px; box-sizing: border-box; }
+.dashboard-shell .work-usage-filter-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
+.dashboard-shell .work-usage-actions { gap: 8px 12px; margin: 12px 0; }
+.dashboard-shell .work-usage-actions .work-usage-status { margin: 0; }
+.dashboard-shell .work-usage-evidence { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 12px 0; margin: 0; border-bottom: 1px solid var(--line); color: var(--muted); font-size: .75rem; }
+.dashboard-shell .work-usage-evidence > div { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.dashboard-shell .work-usage-evidence :is(dt,dd) { margin: 0; font-size: inherit; font-variant-numeric: tabular-nums; }
+.dashboard-shell .work-usage-evidence [data-state="partial"] { color: var(--amber); }
+@media (max-width: 600px) {
+  .dashboard-shell .work-usage-toolbar .work-usage-find { flex-basis: 100%; }
+}
+
+/* Shared data tables preserve native columns, with supporting values quieter. */
+.dashboard-shell .dashboard-data-table { font-size: .8rem; line-height: 1.45; }
+.dashboard-shell .dashboard-data-table th { padding-block: 12px; font-size: .72rem; font-weight: var(--weight-semibold); letter-spacing: 0; text-transform: none; background: var(--surface-quiet); }
+.dashboard-shell .dashboard-data-table td { padding-block: 12px; vertical-align: top; }
+.dashboard-shell .dashboard-data-table :is(.numeric-cell, .model-api-equivalent) { text-align: end; font-variant-numeric: tabular-nums; }
+.dashboard-shell .dashboard-data-table :is(.model-share, .data-value-unavailable) { color: var(--muted); }
+.dashboard-shell .dashboard-data-table .model-share { font-size: .9em; }
+.dashboard-shell .dashboard-data-table tbody tr:focus-within > td { background: var(--surface-quiet); }
+.dashboard-shell .dashboard-data-table .model-row-expandable[aria-expanded="true"] > td { background: var(--surface-quiet); }
+.dashboard-shell .dashboard-data-table .model-row-expandable[aria-expanded="true"] > td:first-child { box-shadow: inset 3px 0 var(--green-2); }
+.dashboard-shell .dashboard-table-scroll:focus-visible { outline: 3px solid var(--dashboard-focus-ring); outline-offset: 3px; }
+.dashboard-shell .table-pagination { flex-wrap: wrap; }
+.dashboard-shell .table-pagination-status { flex: 1 1 12rem; text-align: center; line-height: 1.5; }
+
+/* Native model picker keeps shared identities prominent in both states. */
+@supports (appearance: base-select) {
+  .model-picker, .model-picker::picker(select) { appearance: base-select; }
+  .model-picker::picker(select) {
+    width: 288px; min-width: 272px; max-width: calc(100vw - 32px);
+    border: 1px solid var(--line); border-radius: 14px;
+    background: var(--surface-raised); color: var(--ink); padding: 6px;
+    box-shadow: 0 12px 32px rgba(25, 42, 35, .16), 0 2px 6px rgba(25, 42, 35, .06);
+    max-height: min(65vh, 520px); overflow-y: auto;
+  }
+  .model-picker option {
+    display: flex; align-items: center; gap: 12px;
+    min-height: 46px; padding: 6px 10px; border-radius: 9px;
+    font-size: .84rem; line-height: 1.3; white-space: normal;
+  }
+  .model-picker option > span { min-width: 0; overflow-wrap: anywhere; }
+  .model-picker option::checkmark { order: 2; margin-inline-start: auto; color: var(--green); }
+  .model-picker option:checked { background: var(--green-soft); font-weight: var(--weight-semibold); }
+  .model-picker option:hover { background: var(--surface-quiet); }
+  .model-picker option:checked:hover { background: var(--green-soft); }
+  .model-picker option:focus-visible { outline: 2px solid var(--dashboard-focus-ring); outline-offset: -2px; }
+  .model-picker selectedcontent { display: flex; align-items: center; gap: 9px; min-width: 0; overflow: hidden; }
+  .model-picker selectedcontent > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .model-picker .allowance-model-icon {
+    width: 32px; height: 32px; padding: 6px; box-sizing: border-box;
+    flex-shrink: 0; border-radius: 9px;
+    background: color-mix(in srgb, var(--allowance-color) 10%, transparent);
+  }
+  .model-picker selectedcontent .allowance-model-icon { width: 28px; height: 28px; padding: 5px; border-radius: 7px; }
+  .dashboard-shell .work-usage-select:has(.model-picker) { min-width: 0; max-width: 100%; }
+  .dashboard-shell .work-usage-select .model-picker { width: 240px; min-width: 210px; max-width: 100%; padding: 6px 12px 6px 7px; background: var(--surface-raised); }
+  .model-picker::picker-icon { color: var(--muted); font-size: .7rem; }
+}
 /* Equal allowance tanks: content and observed capacity share one surface. */
 .allowance-context { margin: 0 0 12px; color: var(--muted); font-size: .75rem; }
 .metric-grid.quota-grid {

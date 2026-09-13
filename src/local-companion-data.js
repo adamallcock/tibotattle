@@ -3153,6 +3153,21 @@ export async function buildLocalCompanionSnapshot({
         periods: usage.map((period) => ({
           periodId: period.id,
           periodLabel: period.label,
+          reportingWindow: (() => {
+            const endAt = period.id === "history"
+              ? historyAccounting.generatedAt
+              : period.id === "all" && unifiedAvailable
+                ? unified.generatedAt
+                : replaySafeCache?.generatedAt
+                  ?? (unifiedAvailable ? unified.generatedAt : null);
+            const endMs = Date.parse(endAt ?? "");
+            if (!Number.isFinite(endMs)) return null;
+            const days = { "24h": 1, "7d": 7, "30d": 30 }[period.id];
+            return {
+              startAt: days ? new Date(Math.max(0, endMs - days * 86_400_000)).toISOString() : null,
+              endAt: new Date(endMs).toISOString(),
+            };
+          })(),
           events: period.events,
           totalTokens: period.totalTokens,
           apiPriceEquivalentUsd: period.apiPriceEquivalentUsd,

@@ -692,6 +692,7 @@ test("raw rollout history reaches the companion through the archive projection w
       .find((period) => period.periodId === "history");
     assert.ok(history);
     assert.equal(history.periodLabel, "Indexed history");
+    assert.deepEqual(history.reportingWindow, { startAt: null, endAt: "2026-08-01T12:00:00.000Z" });
     assert.equal(history.events, 3);
     assert.equal(history.totalTokens, 3_000_000);
     assert.equal(history.apiPriceEquivalentUsd, 7);

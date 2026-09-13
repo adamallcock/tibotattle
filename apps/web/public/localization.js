@@ -117,6 +117,9 @@ export const WEB_MESSAGES = Object.freeze({
   ...Object.fromEntries(Object.keys(CATALOGS[DEFAULT_LOCALE])
     .filter((key) => key.startsWith("allowance.")
       || key.startsWith("contribution.")
+      || key.startsWith("page.")
+      || key.startsWith("reporting.")
+      || key.startsWith("setup.")
       || key.startsWith("workUsage.")
       || key.startsWith("performance.")
       || key.startsWith("appearance.")
@@ -184,6 +187,11 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.quota.providerPlan": ["Provider-reported plan: {plan}", "提供方报告的方案：{plan}", "Plan informado por el proveedor: {plan}"],
   "dashboard.quota.providerPlanUnavailable": ["Provider-reported plan unavailable", "提供方报告的方案不可用", "Plan informado por el proveedor no disponible"],
   "shareCard.showInFinder": ["Show in Finder", "在访达中显示", "Mostrar en Finder"],
+  "dashboard.quota.stale": ["Out of date", "已过期", "Desactualizado"],
+  "dashboard.freshness.observation": ["Latest observation", "最新观测", "Última observación"],
+  "dashboard.freshness.stale": ["Observation out of date", "观测数据已过期", "Observación desactualizada"],
+  "dashboard.stale.observationTitle": ["Results need an update", "结果需要更新", "Los resultados necesitan actualizarse"],
+  "dashboard.stale.observationCopy": ["Showing the last available results. Update local usage to check for newer measurements.", "显示最近可用的结果。更新本地使用量以检查更新的测量数据。", "Se muestran los últimos resultados disponibles. Actualiza el uso local para comprobar si hay mediciones más recientes."],
   "dashboard.quota.remaining": ["{value} remaining", "剩余 {value}", "{value} restante"],
   "dashboard.quota.used": ["{value} used", "已使用 {value}", "{value} usado"],
   "dashboard.quota.usedUnknown": ["Used unknown", "已用量未知", "Uso desconocido"],
@@ -660,10 +668,10 @@ export const WEB_MESSAGES = Object.freeze({
   "chart.series.sevenDayAllowanceRemaining": ["Seven-day allowance remaining", "七天额度剩余", "Asignación de siete días restante"],
   "chart.usage.title": ["Real local speed-priced API-equivalent usage over time", "真实本地按速度档定价 API 等价使用量随时间变化", "Uso local real equivalente de API con precio según velocidad a lo largo del tiempo"],
   "chart.usage.description": ["Local speed-priced API-equivalent usage per {unit}, using recorded or selected Codex speed and published Fast (Priority) price ratios, with the provider-observed seven-day allowance remaining on the right axis. Times are shown in {timeZone}.", "按{unit}显示的本地按速度档定价 API 等价使用量，使用已记录或所选的 Codex 速度及经审核的 Fast 倍数；右轴为提供方观测到的七天额度剩余。时间显示为 {timeZone}。", "Uso local equivalente de API con precio según velocidad por {unit}, con la velocidad de Codex registrada o seleccionada y multiplicadores de precio Fast (Priority) publicados; la cuota restante de siete días observada por el proveedor aparece en el eje derecho. Las horas se muestran en {timeZone}."],
-  "chart.usage.heading": ["Speed-priced API-equivalent usage by {unit} · latest {range}", "按{unit}的按速度档定价 API 等价使用量 · 最近 {range}", "Uso equivalente de API con precio según velocidad por {unit} · periodo reciente: {range}"],
+  "chart.usage.heading": ["Speed-priced API-equivalent usage by {unit}", "按{unit}的按速度档定价 API 等价使用量", "Uso equivalente de API con precio según velocidad por {unit}"],
   "chart.usage.standardTitle": ["Standard-rate API-equivalent usage over time", "Standard 费率 API 等价使用量随时间变化", "Uso equivalente de API con tarifa Standard a lo largo del tiempo"],
   "chart.usage.standardDescription": ["Local Standard-rate API-equivalent usage per {unit}. The allowance series is omitted because no matching speed-priced capacity is available. Times are shown in {timeZone}.", "按{unit}显示的本地 Standard 费率 API 等价使用量。由于没有匹配的按速度档定价容量，因此不显示额度序列。时间显示为 {timeZone}。", "Uso local equivalente de API con tarifa Standard por {unit}. Se omite la serie de cuota porque no hay una capacidad ponderada coincidente. Las horas se muestran en {timeZone}."],
-  "chart.usage.standardHeading": ["Standard-rate API-equivalent usage by {unit} · latest {range}", "按{unit}的 Standard 费率 API 等价使用量 · 最近 {range}", "Uso equivalente de API con tarifa Standard por {unit} · periodo reciente: {range}"],
+  "chart.usage.standardHeading": ["Standard-rate API-equivalent usage by {unit}", "按{unit}的 Standard 费率 API 等价使用量", "Uso equivalente de API con tarifa Standard por {unit}"],
   "chart.usage.emptyTitle": ["No real usage timeline loaded", "未加载真实使用情况时间线", "No se cargó ninguna cronología de uso real"],
   "chart.usage.emptyCopy": ["Analyze local usage to build recent content-free usage buckets.", "分析本地使用情况以构建近期不含内容的使用分桶。", "Analiza el uso local para crear intervalos recientes de uso sin contenido."],
   "chart.usage.newerBuildTitle": ["A newer build is required to read this usage history", "需要较新版本才能读取此使用历史记录", "Se necesita una versión más reciente para leer este historial de uso"],
@@ -712,7 +720,7 @@ export const WEB_MESSAGES = Object.freeze({
   "weekly.headline.insufficient": ["Insufficient evidence", "证据不足", "Evidencia insuficiente"],
   "weekly.headline.range": ["80% across-reset range, all data: {lower}–{upper}", "全部数据的 80% 跨重置区间：{lower}–{upper}", "Intervalo del 80 % entre restablecimientos, todos los datos: {lower}–{upper}"],
   "weekly.headline.rangeUnavailable": ["No evidence interval available", "没有可用的证据区间", "No hay intervalo de evidencia disponible"],
-  "weekly.headline.relationship": ["The headline is the median of all {qualifying} qualifying reset estimates and never moves with the controls below. The chart is currently drawing {shown} of {total} estimates: the selected range, anchored at the newest fit ({anchor}), with observed quota spans of {span}.", "标题为全部 {qualifying} 个合格重置估计的中位数，不会随下方控件变化。图表当前绘制 {total} 个估计中的 {shown} 个：所选范围以最新拟合（{anchor}）为锚点，且观测额度跨度为{span}。", "El titular es la mediana de las {qualifying} estimaciones de restablecimiento válidas y nunca cambia con los controles de abajo. El gráfico dibuja actualmente {shown} de {total} estimaciones: el intervalo seleccionado, anclado en el ajuste más reciente ({anchor}), con intervalos de cuota observada de {span}."],
+  "weekly.headline.relationship": ["The headline is the median of all {qualifying} qualifying reset estimates and never moves with the controls below. The chart is currently drawing {shown} of {total} estimates: the selected reporting range through {anchor}, with observed quota spans of {span}.", "标题为全部 {qualifying} 个合格重置估计的中位数，不会随下方控件变化。图表当前绘制 {total} 个估计中的 {shown} 个：所选报告范围截至 {anchor}，且观测额度跨度为{span}。", "El titular es la mediana de las {qualifying} estimaciones de restablecimiento válidas y nunca cambia con los controles de abajo. El gráfico dibuja actualmente {shown} de {total} estimaciones: el rango de informe seleccionado hasta {anchor}, con intervalos de cuota observada de {span}."],
   "weekly.headline.pending": ["The estimate will appear when enough quota transitions can be matched to priced usage. The headline will then summarize all data, while the controls below filter only the chart.", "当有足够的额度变化可以与已定价的使用量匹配时，估计值就会出现。届时标题将汇总全部数据，而下方控件只会筛选图表。", "La estimación aparecerá cuando haya suficientes transiciones de cuota que puedan asociarse a uso con precio. Entonces el titular resumirá todos los datos, mientras que los controles de abajo solo filtran el gráfico."],
   "weekly.span.all": ["All spans", "全部跨度", "Todos los intervalos"],
   // The slider's own readout says "All spans"; a sentence has to say the same
