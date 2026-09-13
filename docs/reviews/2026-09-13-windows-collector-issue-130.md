@@ -8,8 +8,8 @@ status: implemented-locally
 The reported large file identity and a collector lock cleanup defect form a
 credible, independently reproduced explanation for issue 130. This is source
 and synthetic runtime evidence, not qualification of an installed Windows binary.
-The collector repair is committed locally as `6c8e68c0`; coordinated integration
-and validation evidence are recorded below.
+The collector repair was first committed locally as `6c8e68c0`; coordinated
+integration and publication-branch validation evidence are recorded below.
 
 ## Evidence boundary
 
@@ -224,3 +224,29 @@ The full-suite command therefore remains non-green; focused reruns must not be
 represented as a fresh complete green run. Windows native binding/build, kernel
 security, packaged large-ID startup and repeated refresh, signing, updater and
 publication remain separate gates. No private state was reset or replaced.
+
+## Publication branch
+
+The user authorized commit, push, PR and merge on 2026-09-13. To keep the PR
+scoped, the five Windows integration commits were cherry-picked onto current
+GitHub main `6f7473453dad3ddcf60f2ae5d7c3ba166241baca`, retaining its model
+performance tab-ordering fix. The publication branch is
+`codex/issue-130-windows-publication`; the original integration branch is
+preserved. Unrelated usage-explainer and plugin commits from the initial local
+base are excluded. The publication branch's reporting-owner-boundary test
+passes; the inherited mismatch described above applies only to the original
+integration tree.
+
+Fresh publication-branch verification produced:
+
+- Passive collector, timing store and model-performance runtime: 86 passed.
+- Reporting boundary, source exporter, Windows test manifest and development
+  artifact verifier: 31 passed, two platform skips.
+- Portable lane: 1,406 passed, 20 platform skips, one inherited root-layout
+  failure. The obsolete, unreferenced `design-qa.md` was then removed using its
+  existing isolated cleanup commit. The failing root-hygiene suite and complete
+  preflight both passed on rerun; the complete portable lane was not rerun.
+- Architecture: passed, 528 production files and 2,101 imports, no approved debt.
+
+Retained R7 receipt regeneration and native Windows qualification remain open;
+this validation does not establish a fresh full-suite or release qualification.
