@@ -63,3 +63,7 @@ motion control inside the forecast header (tank header when absent). Corrected
 a CSS positioning regression that collapsed the coverage fill to zero height.
 The moving highlight now sits inside an absolutely positioned, full-height fill;
 a regression test guards the positioning contract.
+
+PR integration onto main d8e5aec2 preserves the shared surface manifest and
+runtime-neutral module graph introduced upstream. The new modules and logo have
+explicit companion routes, covered by the real synthetic loopback asset test.
