@@ -147,3 +147,8 @@ The Projects model filter reuses `model-visuals.js` ordering/icons and
 separate exact query values. Electron's customizable native select renders SVG
 identities in options and the selected value. Other browsers retain a native
 text select if customizable selects are unsupported.
+
+Single-page Projects/threads lists show a localized result count and hide both
+page navigation buttons; multi-page lists keep their range and controls.
+Share explanations live in the two Share header info popovers, with distinct
+accessible labels for token share and value share, rather than below the table.

@@ -540,6 +540,9 @@ export function mountWorkUsageView(options = {}) {
           `${tr(row.kind === "project" ? "projects" : row.kind === "worktree" ? "worktrees" : "threads")} · ${display?.shortId ?? row.id.slice(-10)}`);
   }
   const quantity = (n) => (n === null ? "—" : formatNumber(n));
+  const resultCount = (count, grouping) => tr(
+    `${grouping}Count${count === 1 ? "One" : "Other"}`, { count: quantity(count) },
+  );
   const reportDate = (value) => formatLocal(value);
   const expectedReportingBounds = (window) => {
     if (!window) return null;
@@ -833,7 +836,13 @@ export function mountWorkUsageView(options = {}) {
       );
       if (isShare) th.setAttribute("aria-label", name);
       th.scope = "col";
-      if (index === 3 || index === 5) th.title = tr("shareNote");
+      if (isShare) {
+        if (options.renderInformationLabel) {
+          th.replaceChildren(options.renderInformationLabel(tr("shareColumn"), tr("shareNote"), name));
+        } else {
+          th.title = tr("shareNote");
+        }
+      }
       header.append(th);
     });
     head.append(header);
@@ -1093,12 +1102,16 @@ export function mountWorkUsageView(options = {}) {
         next.disabled = !entry.response.nextCursor;
         for (const button of [previous, next])
           button.setAttribute("aria-controls", entry.regionId);
+        const singlePage = entry.response.offset === 0 && !entry.pages.length
+          && !entry.response.nextCursor && entry.response.rowCount <= entry.response.rows.length;
+        previous.hidden = singlePage;
+        next.hidden = singlePage;
         page.append(
           previous,
           el(
             "span",
             "table-pagination-status",
-            tr("rows", {
+            singlePage ? resultCount(entry.response.rowCount, "thread") : tr("rows", {
               from: entry.response.rowCount ? entry.response.offset + 1 : 0,
               to: Math.min(
                 entry.response.offset + query.pageSize,
@@ -1125,7 +1138,6 @@ export function mountWorkUsageView(options = {}) {
     wrap.append(table);
     panel.append(wrap);
     body.append(panel);
-    body.append(el("p", "annotation", tr("shareNote")));
     body.dataset.state = "ready";
     const pagination = el("div", "table-pagination");
     const previous = quietButton(tr("previous"), () => {
@@ -1143,12 +1155,16 @@ export function mountWorkUsageView(options = {}) {
       load();
     });
     next.disabled = !response.nextCursor;
+    const singlePage = response.offset === 0 && !pages.length
+      && !response.nextCursor && response.rowCount <= response.rows.length;
+    previous.hidden = singlePage;
+    next.hidden = singlePage;
     pagination.append(
       previous,
       el(
         "span",
         "table-pagination-status",
-        tr("rows", {
+        singlePage ? resultCount(response.rowCount, query.grouping) : tr("rows", {
           from: response.rowCount ? response.offset + 1 : 0,
           to: Math.min(response.offset + query.pageSize, response.rowCount),
           total: response.rowCount,

@@ -365,3 +365,16 @@ ends with pagination. Empty-state recovery also passes at 1180px and 960px.
 Evidence: `.release-build/report-clean-layout.json` and
 `.release-build/report-footer-clean.png`. The independent full accounting-parity
 qualification is not established by this visual check.
+
+## Final dashboard usability and validation pass
+
+- Hide single-page navigation controls and show a localized result count in
+  Projects/threads and nested thread lists; preserve multi-page navigation.
+- Move the share explanation beside its column headers with keyboard-accessible
+  disclosure; retain coverage warnings and exact value semantics.
+- Make the header's busy state, progress, and cancellation consistent through
+  refresh, reload, startup, and terminal transitions.
+- Review all dashboard pages at the minimum width, including long model names,
+  empty/stale/loading/error states and keyboard interactions. Fix defects found.
+- Resolve the root-layout and accounting-parity validation blockers based on
+  their actual contracts, run affected gates, and verify a fresh unsigned app.

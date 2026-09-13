@@ -708,6 +708,9 @@ test("mounted project expansion pins the snapshot/model and renders linked child
     node.classList.contains("work-usage-thread-row"),
   );
   assert.equal(childRows.length, 2);
+  const childPager = findMounted(childGroup, node => node.classList.contains("table-pagination"))[0];
+  assert.equal(childPager.textContent.includes("2 threads"), true);
+  assert.ok(findMounted(childPager, node => node.tagName === "BUTTON").every(node => node.hidden));
   assert.deepEqual(
     childRows.map((row) => row.children.length),
     [6, 6],
@@ -1596,5 +1599,54 @@ test("model filter uses shared identity order and sends the exact selected ID", 
     assert.equal(picker.options[0].textContent, mountedTranslator("workUsage.allModels"));
     assert.equal(picker.options[0].children[0].getAttribute("aria-hidden"), "true");
     assert.equal(picker.options[1].children[0].getAttribute("aria-hidden"), "true");
+  } finally { view.destroy(); }
+});
+
+test("single-page reports show a result count and keep the share explanation at the headers", async () => {
+  const { root, windowRef } = mountedRoot();
+  const labels = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    renderInformationLabel: (label, explanation, accessibleLabel) => {
+      labels.push({ label, explanation, accessibleLabel });
+      const node = root.ownerDocument.createElement("button");
+      node.textContent = label;
+      node.setAttribute("aria-label", accessibleLabel);
+      return node;
+    },
+    fetchRef: async () => httpResponse(PROJECT_ROWS_RESPONSE) });
+  try {
+    await settleMountedView();
+    const pagination = findMounted(root, node => node.classList.contains("table-pagination"))[0];
+    assert.equal(pagination.textContent.includes("2 projects"), true);
+    assert.ok(findMounted(pagination, node => node.tagName === "BUTTON").every(node => node.hidden));
+    assert.deepEqual(labels.map(item => item.accessibleLabel), ["Token share", "Value share"]);
+    assert.ok(labels.every(item => item.explanation === mountedTranslator("workUsage.shareNote")));
+    assert.equal(findMounted(root, node => node.tagName === "P" && node.textContent === mountedTranslator("workUsage.shareNote")).length, 0);
+  } finally { view.destroy(); }
+});
+
+test("multi-page reports retain navigation and restore the first page", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); calls.push(query);
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, rowCount: 27,
+        offset: query.cursor ? 25 : 0, nextCursor: query.cursor ? null : "page-two" });
+    } });
+  const pager = () => findMounted(root, node => node.classList.contains("table-pagination"))[0];
+  const buttons = () => findMounted(pager(), node => node.tagName === "BUTTON");
+  try {
+    await settleMountedView();
+    assert.ok(buttons().every(node => !node.hidden));
+    assert.equal(buttons()[0].disabled, true);
+    buttons()[1].click(); await settleMountedView();
+    assert.equal(calls.at(-1).cursor, "page-two");
+    assert.ok(pager().textContent.includes("26–27 of 27"));
+    assert.ok(buttons().every(node => !node.hidden));
+    assert.equal(buttons()[1].disabled, true);
+    buttons()[0].click(); await settleMountedView();
+    assert.equal(calls.at(-1).cursor, undefined);
+    assert.ok(pager().textContent.includes("1–25 of 27"));
   } finally { view.destroy(); }
 });

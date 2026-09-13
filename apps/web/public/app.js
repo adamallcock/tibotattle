@@ -687,10 +687,20 @@ function renderRefreshProgress(button, phase, { processed = null, selected = nul
 function updateLocalActionButtons() {
   const allowed = localAnalysisAllowed();
   const label = localAnalysisLabel();
+  const refreshActive = localRefreshInProgress;
   for (const selector of ["#refresh-button", "#setup-refresh"]) {
     const button = $(selector);
-    button.disabled = localActionBusy || !allowed;
-    if (!localActionBusy) {
+    // A refresh owns both visible controls for its whole lifetime. The
+    // progress renderer and cancel action are deliberately independent of the
+    // primary load lock, because a terminal dashboard reload can release that
+    // lock before the refresh's finalizer clears its own lifecycle state.
+    button.disabled = localActionBusy || refreshActive || !allowed;
+    if (refreshActive && !button.classList.contains("refresh-progress")) {
+      // Recover a progress affordance if a nested dashboard render released
+      // the primary load lock after the refresh began.
+      renderRefreshProgress(button, "Update running…");
+    }
+    if (!localActionBusy && !refreshActive) {
       button.textContent = label;
       button.classList.remove("refresh-progress");
       button.removeAttribute("aria-label");
@@ -770,13 +780,15 @@ function openInformationPopover(button) {
   positionInformationPopover(popover, button);
 }
 
-function informationLabel(label, explanation) {
+function informationLabel(label, explanation, accessibleLabel = label) {
   const fragment = document.createDocumentFragment();
   fragment.append(document.createTextNode(label));
   const button = node("button", "info-button", "i");
   button.type = "button";
   button.dataset.informationExplanation = explanation;
-  button.setAttribute("aria-label", t("aria.moreInformation", { label }));
+  button.setAttribute("aria-label", t("aria.moreInformation", {
+    label: accessibleLabel,
+  }));
   button.setAttribute("aria-expanded", "false");
   button.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -12025,6 +12037,7 @@ function signalElectronRefreshLifecycle(action, args = [], options = {}) {
 
 async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   if (localActionBusy) return;
+  const previousGlobalState = globalState;
   // Fence continuation against the exact coverage visible before this pass.
   // If the terminal reload presents the same generation/count/byte receipt,
   // scheduleReindexAutoContinuation stops immediately instead of spending the
@@ -12345,6 +12358,21 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     localRefreshInProgress = false;
     localRefreshCancelRequested = false;
     updateLocalActionButtons();
+    // The updating pill is derived from the renderer-owned lifecycle flag.
+    // Restore the dashboard's last verified status after the refresh reaches a
+    // terminal state so it cannot remain stuck on "Running" beside the idle
+    // action button.
+    const stableState = [dashboard?.state, globalState?.state, previousGlobalState?.state]
+      .find((state) => state && state !== "updating");
+    const candidateState = stableState ?? "insufficient";
+    setGlobalState(
+      candidateState,
+      {
+        companionReachable: dashboard
+          ? dashboard.mode !== "demo"
+          : previousGlobalState?.companionReachable ?? false,
+      },
+    );
   }
 }
 
@@ -15728,7 +15756,7 @@ document.addEventListener("scroll", () => {
   if (current) positionInformationPopover(current.popover, current.button);
 }, true);
 
-const workUsageView = mountWorkUsageView({ root: document.querySelector("#projects"), t, sharedReporting: true, reportingWindow: null });
+const workUsageView = mountWorkUsageView({ root: document.querySelector("#projects"), t, renderInformationLabel: informationLabel, sharedReporting: true, reportingWindow: null });
 const modelPerformance = mountModelPerformance({
   root: document.querySelector("#performance"), client: localClient,
   t, locale: () => localization.formatLocale(), sharedReporting: true, reportingWindow: null,

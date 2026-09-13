@@ -28,6 +28,7 @@ import {
   fetchJsonMeasured,
   localQaCommunityParitySnapshotValid,
   parseRealHistoryArguments,
+  pricingCoverageSnapshotValid,
   realHistoryDashboardReadySnapshotValid,
   realHistoryCancelPreQuickBoundaryReady,
   releaseRealHistoryRefreshGate,
@@ -1597,6 +1598,15 @@ test("real-history parity helpers reject blank model metrics, hidden advanced mo
     meaningfulCostRows: 1,
     meaningfulModelRows: 1,
     meaningfulModelMetricCells: 2,
+    pricingCoverage: {
+      events: 2,
+      fullyPricedEvents: 1,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 1,
+    },
+    priceCoverageElementPresent: true,
+    priceCoverageVisible: true,
+    priceCoverageTextPresent: true,
     priceCoverage: true,
     advancedModuleShellCount: 3,
     advancedModulesExplicit: true,
@@ -1605,6 +1615,36 @@ test("real-history parity helpers reject blank model metrics, hidden advanced mo
   assert.equal(usageParitySnapshotValid(usage), true);
   assert.equal(usageParitySnapshotValid({ ...usage, meaningfulModelMetricCells: 1 }), false);
   assert.equal(usageParitySnapshotValid({ ...usage, advancedModulesExplicit: false }), false);
+
+  const fullyPriced = {
+    ...usage,
+    pricingCoverage: {
+      events: 2,
+      fullyPricedEvents: 2,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 0,
+    },
+    priceCoverageVisible: false,
+    priceCoverageTextPresent: false,
+    priceCoverage: false,
+  };
+  assert.equal(pricingCoverageSnapshotValid(fullyPriced), true);
+  assert.equal(usageParitySnapshotValid(fullyPriced), true);
+  assert.equal(
+    pricingCoverageSnapshotValid({ ...fullyPriced, priceCoverageVisible: true }),
+    false,
+  );
+  assert.equal(
+    pricingCoverageSnapshotValid({ ...usage, priceCoverageVisible: false, priceCoverage: false }),
+    false,
+  );
+  assert.equal(
+    pricingCoverageSnapshotValid({
+      ...usage,
+      pricingCoverage: { ...usage.pricingCoverage, events: 3 },
+    }),
+    false,
+  );
 
   const health = {
     capabilities: {
@@ -1716,6 +1756,15 @@ test("real-history Usage parity polls from an incomplete view to the strict term
     meaningfulCostRows: 1,
     meaningfulModelRows: 1,
     meaningfulModelMetricCells: 2,
+    pricingCoverage: {
+      events: 2,
+      fullyPricedEvents: 1,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 1,
+    },
+    priceCoverageElementPresent: true,
+    priceCoverageVisible: true,
+    priceCoverageTextPresent: true,
     priceCoverage: true,
     advancedModuleShellCount: 3,
     advancedModulesExplicit: true,
