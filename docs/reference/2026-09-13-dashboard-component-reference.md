@@ -124,3 +124,14 @@ inline metadata; the shared period is not repeated. Available empty reports
 show an empty/search-empty state without a blank table or summary metrics.
 Clearing search restores the report. Unavailable/expired reports retain their
 separate recovery behavior and incomplete coverage remains explicit.
+
+## Shared data tables
+
+Model usage and project reports use `.dashboard-data-table` inside a labelled,
+keyboard-focusable `.dashboard-table-scroll` region. Preserve native table-cell
+layout and horizontal scrolling for wide data. Headers use sentence case;
+numeric columns align right with tabular digits. Share figures and unavailable
+money labels remain quieter than primary amounts, without changing their text.
+Expanded/focused rows retain a background cue, and pagination may wrap without
+truncating its status. Model share columns have distinct token/value labels for
+assistive technology.

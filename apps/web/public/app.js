@@ -10751,7 +10751,7 @@ function modelHasComparableCost(row) {
 }
 
 function modelApiEquivalentCell(row) {
-  const cell = node("td", "model-api-equivalent");
+  const cell = node("td", "model-api-equivalent data-value-unavailable");
   if (modelRowIsSeparateAllowance(row)) {
     setLocalizedText(cell, "accounting.model.separateAllowance");
     cell.title = t("accounting.model.separateAllowanceTitle");
@@ -10778,6 +10778,7 @@ function modelApiEquivalentCell(row) {
     cell.title = t("accounting.model.notReportedTitle");
     return cell;
   }
+  cell.className = "model-api-equivalent";
   setRawText(cell, formatApiMoney(amount));
   if (amount === 0) cell.title = t("accounting.model.zeroTitle");
   return cell;

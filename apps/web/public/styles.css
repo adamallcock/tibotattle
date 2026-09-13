@@ -5562,3 +5562,17 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
 @media (max-width: 600px) {
   .dashboard-shell .work-usage-toolbar .work-usage-find { flex-basis: 100%; }
 }
+
+/* Shared data tables preserve native columns, with supporting values quieter. */
+.dashboard-shell .dashboard-data-table { font-size: .8rem; line-height: 1.45; }
+.dashboard-shell .dashboard-data-table th { padding-block: 12px; font-size: .72rem; font-weight: var(--weight-semibold); letter-spacing: 0; text-transform: none; background: var(--surface-quiet); }
+.dashboard-shell .dashboard-data-table td { padding-block: 12px; vertical-align: top; }
+.dashboard-shell .dashboard-data-table :is(.numeric-cell, .model-api-equivalent) { text-align: end; font-variant-numeric: tabular-nums; }
+.dashboard-shell .dashboard-data-table :is(.model-share, .data-value-unavailable) { color: var(--muted); }
+.dashboard-shell .dashboard-data-table .model-share { font-size: .9em; }
+.dashboard-shell .dashboard-data-table tbody tr:focus-within > td { background: var(--surface-quiet); }
+.dashboard-shell .dashboard-data-table .model-row-expandable[aria-expanded="true"] > td { background: var(--surface-quiet); }
+.dashboard-shell .dashboard-data-table .model-row-expandable[aria-expanded="true"] > td:first-child { box-shadow: inset 3px 0 var(--green-2); }
+.dashboard-shell .dashboard-table-scroll:focus-visible { outline: 3px solid var(--dashboard-focus-ring); outline-offset: 3px; }
+.dashboard-shell .table-pagination { flex-wrap: wrap; }
+.dashboard-shell .table-pagination-status { flex: 1 1 12rem; text-align: center; line-height: 1.5; }

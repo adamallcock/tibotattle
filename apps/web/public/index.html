@@ -825,20 +825,20 @@
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">Models</p>
-              <h3>Model usage</h3>
+              <h3 id="accounting-models-title">Model usage</h3>
             </div>
           </div>
-            <div class="table-wrap">
-              <table>
+            <div class="table-wrap dashboard-table-scroll" tabindex="0" role="region" aria-labelledby="accounting-models-title">
+              <table class="dashboard-data-table">
                 <caption class="sr-only">Replay-safe usage grouped by model, across every allowance. Each model expands into its token components as rows of the same table.</caption>
                 <thead>
                   <tr>
-                    <th>Model</th>
-                    <th>Usage changes</th>
-                    <th>Tokens</th>
-                    <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
-                    <th data-i18n-title="accounting.apiEquivalent.standardRateBasis" title="Calculated at Standard API rates.">API equivalent</th>
-                    <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
+                    <th scope="col">Model</th>
+                    <th scope="col" class="numeric-cell">Usage changes</th>
+                    <th scope="col" class="numeric-cell">Tokens</th>
+                    <th scope="col" class="numeric-cell model-share-head" data-i18n="accounting.model.shareHeading" data-i18n-aria-label="workUsage.tokenShare" aria-label="Token share">Share</th>
+                    <th scope="col" class="numeric-cell" data-i18n-title="accounting.apiEquivalent.standardRateBasis" title="Calculated at Standard API rates.">API equivalent</th>
+                    <th scope="col" class="numeric-cell model-share-head" data-i18n="accounting.model.shareHeading" data-i18n-aria-label="workUsage.valueShare" aria-label="Value share">Share</th>
                   </tr>
                 </thead>
                 <tbody id="accounting-models"></tbody>

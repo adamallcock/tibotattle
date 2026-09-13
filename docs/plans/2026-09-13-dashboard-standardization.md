@@ -259,3 +259,13 @@ report rows. Evidence: `.release-build/projects-layout.json` and matching
 control screenshots. Empty/restore behavior is tested with synthetic data;
 this check does not qualify the populated real report or resolve the existing
 full accounting-parity gate.
+
+## Data-table presentation follow-up
+
+Apply shared data-table typography and numeric alignment to Model usage and
+Projects/threads. Make overflow regions keyboard focusable and label model
+columns explicitly, including the two different share columns. Expanded/focused
+rows retain a quiet context cue; unavailable monetary cells remain text, with
+muted treatment distinct from a real zero. Keep existing row/expansion and
+pricing semantics. Validate interaction tests and real packaged model-table
+layout at two desktop widths.

@@ -777,8 +777,11 @@ export function mountWorkUsageView(options = {}) {
       }
     }
     const panel = el("div", "accounting-models-panel work-usage-table-panel");
-    const wrap = el("div", "table-wrap");
-    const table = el("table", "work-usage-table");
+    const wrap = el("div", "table-wrap dashboard-table-scroll");
+    wrap.tabIndex = 0;
+    wrap.setAttribute("role", "region");
+    wrap.setAttribute("aria-label", tr("title"));
+    const table = el("table", "work-usage-table dashboard-data-table");
     table.setAttribute("aria-label", tr("title"));
     const head = el("thead");
     const header = el("tr");
@@ -794,7 +797,7 @@ export function mountWorkUsageView(options = {}) {
       const isShare = index === 3 || index === 5;
       const th = el(
         "th",
-        isShare ? "model-share-head" : null,
+        index === 0 ? null : isShare ? "numeric-cell model-share-head" : "numeric-cell",
         isShare ? tr("shareColumn") : name,
       );
       if (isShare) th.setAttribute("aria-label", name);
