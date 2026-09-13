@@ -6,11 +6,12 @@ const DAY = 86_400_000;
 const PERIODS = ["7", "30", "all"];
 const SPEED_METHOD = "speed";
 const MODEL_NAMES = Object.freeze({
-  "gpt-5.6-luna": "Luna", "gpt-5.6-terra": "Terra", "gpt-5.6-sol": "Sol",
-  "gpt-6-astra": "Astra", "gpt-5.5": "GPT-5.5", "gpt-5.4": "GPT-5.4",
+  "gpt-6-astra": "Astra", "gpt-5.6-sol": "Sol", "gpt-5.6-terra": "Terra",
+  "gpt-5.6-luna": "Luna", "gpt-5.5": "GPT-5.5", "gpt-5.4": "GPT-5.4",
   "gpt-5.4-mini": "GPT-5.4 mini", "gpt-5.3-codex-spark": "Spark",
   "gpt-5.3-codex": "GPT-5.3 Codex", "gpt-5.2-codex": "GPT-5.2 Codex", "gpt-5.2": "GPT-5.2",
 });
+const MODEL_ORDER = Object.freeze(Object.keys(MODEL_NAMES));
 const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000;
 const timestamp = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 8_640_000_000_000_000;
 const exact = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value)
@@ -377,7 +378,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     if (failed || payload?.status === "unavailable") {
       const retry = element("button", "button button-secondary compact", translate("retry")); retry.type = "button"; retry.dataset.performanceFocus = "retry"; retry.addEventListener("click", refresh); root.append(retry);
     }
-    const models = payload?.models ?? [];
+    const models = [...(payload?.models ?? [])].sort((a, b) => MODEL_ORDER.indexOf(a.id) - MODEL_ORDER.indexOf(b.id));
     if (!models.length) {
       if (payload?.status === "ready") root.append(element("p", "performance-empty", translate("empty")));
       restoreFocus();
