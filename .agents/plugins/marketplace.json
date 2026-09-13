@@ -1,0 +1,20 @@
+{
+  "name": "tibotattle-local",
+  "interface": {
+    "displayName": "TiboTattle local"
+  },
+  "plugins": [
+    {
+      "name": "tibotattle",
+      "source": {
+        "source": "local",
+        "path": "./plugins/tibotattle"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

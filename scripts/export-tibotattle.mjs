@@ -41,6 +41,7 @@ export const CLIENT_MANIFEST_FILE = "client-export-manifest.json";
  */
 export const CLIENT_RUNTIME_FILES = Object.freeze([
   "apps/local/accountless-contribution.js",
+  "apps/local/agent-cli.js",
   "apps/local/model-performance-controller.js",
   "apps/local/model-performance-worker.js",
   "apps/local/server.js",
@@ -125,6 +126,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/application/local-prepared-contribution.js",
   "src/application/production-participant-identity.js",
   "src/application/subscription-speed-sensitivity.js",
+  "src/application/usage-explainer.js",
   "src/application/work-usage.js",
   "src/automatic-contribution-retirement.js",
   "src/bounded-jsonl.js",
@@ -242,6 +244,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/local-unified-index-off-main.js",
   "src/local-unified-index-worker.js",
   "src/local-unified-index.js",
+  "src/local-usage-explainer.js",
   "src/local-work-usage-source.js",
   "src/passive-collector.js",
   "src/platform/bounded-directory-reader.js",
@@ -304,6 +307,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/reporting/index.js",
   "src/reporting/model-performance.js",
   "src/reporting/monitoring-quality.js",
+  "src/reporting/usage-explainer.js",
   "src/reporting/weekly-calibration.js",
   "src/reporting/work-usage.js",
   "src/rollout-line-reader.js",
@@ -414,6 +418,7 @@ export const CLIENT_SCRIPT_FILES = Object.freeze([
 ]);
 
 export const CLIENT_TEST_FILES = Object.freeze([
+  "apps/local/agent-cli.test.mjs",
   "apps/local/participant-relay-routes.test.mjs",
   "apps/local/participant-session-cookie-bridge.test.mjs",
   "apps/local/server.test.mjs",
@@ -456,6 +461,8 @@ export const CLIENT_TEST_FILES = Object.freeze([
   "test/telemetry-contract.test.js",
   "test/telemetry-envelope-adapter.test.js",
   "test/telemetry-schema-mirror.test.js",
+  "test/tibotattle-plugin.test.js",
+  "test/usage-explainer.test.js",
   "test/work-usage-source.test.js",
   "test/work-usage.test.js",
 ]);
@@ -466,7 +473,16 @@ export const CLIENT_TEST_FIXTURE_FILES = Object.freeze([
 ]);
 
 export const CLIENT_CONTRACT_FILES = Object.freeze([
+  ".agents/plugins/marketplace.json",
   "LICENSE",
+  "docs/reference/codex-plugin.md",
+  "docs/reference/usage-explainer-agent-protocol.md",
+  "plugins/tibotattle/.codex-plugin/plugin.json",
+  "plugins/tibotattle/.mcp.json",
+  "plugins/tibotattle/lib/installation.mjs",
+  "plugins/tibotattle/lib/installed-agent.mjs",
+  "plugins/tibotattle/mcp/server.mjs",
+  "plugins/tibotattle/skills/tibotattle-usage-coach/SKILL.md",
   "third_party_licenses/runcost-0.2.0.txt",
   "third_party_licenses/sparkle-2.9.3.txt",
 ]);
@@ -964,6 +980,10 @@ function generatedFiles({ osvWorkflow } = {}) {
       "`client-export-manifest.json`. Hosted service implementation, operator",
       "assets, deployment configuration, credentials, local observations, and",
       "private Git history are intentionally absent.",
+      "",
+      "The self-contained Codex plugin is under `plugins/tibotattle`; its",
+      "repository marketplace descriptor is `.agents/plugins/marketplace.json`.",
+      "The plugin and the TiboTattle desktop app are installed separately.",
       "",
       "## Next build/test boundary",
       "",

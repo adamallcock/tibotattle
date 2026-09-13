@@ -32,7 +32,7 @@ test("maintained CLI reference exactly mirrors every CLI invocation", async () =
     repositoryFile("package.json"),
   ]);
   const sourceUsage = usageLines(source);
-  assert.equal(sourceUsage.length, 44, "review unexpected CLI surface change");
+  assert.equal(sourceUsage.length, 47, "review unexpected CLI surface change");
   assert.deepEqual(documentedUsageLines(markdown), sourceUsage);
   assert.equal(
     Object.hasOwn(JSON.parse(packageSource).scripts, "register-account"),
