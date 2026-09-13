@@ -100,6 +100,11 @@ and **7 days**, **30 days**, or **All time**. The web and native navigation
 include this page in development source; an installed release must contain
 these changes before the page is available there.
 
+Opening the page loads the selected period first, then warms the other standard
+periods in the background. Once ready, changing period displays its cached chart
+immediately while checking for updates. These results stay in memory only;
+reloading the app starts a fresh page cache. Hidden pages stop preloading.
+
 **Output speed** estimates tokens per second from covered response windows.
 **First-token latency** uses independently available turn timing, so its sample
 count can be much larger. The plots show median trends and middle-50% bands
@@ -205,6 +210,13 @@ cached report without recalculating usage. Reports may be released after five
 minutes away from the page; returning automatically rebuilds an expired report.
 A fresh refresh can still require accounting work when the underlying cache
 is no longer valid.
+
+The page also warms its other standard periods from the same accounting
+snapshot. A warmed period displays immediately; drill-down controls wait for
+its report to be validated. Changing filters or refreshing the report discards
+incompatible warmed results. Preloading does not collect logs or repeat the
+underlying accounting calculation.
+
 This feature is qualified in a local development build and has not been released.
 
 ## Refresh, progress, and recovery
