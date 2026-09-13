@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { createMaintenanceTransport } from './production-maintenance-transport.mjs';
+import { matchesExactBootstrapQueueConsumer, queueConsumerWorkerName } from './cloudflare-queue-consumer.mjs';
 import { identityDigest, operationError } from '../../../scripts/lib/release-operation.mjs';
 
 const fail = code => { throw operationError(`PRODUCTION_MAINTENANCE_${code}`); };
@@ -106,13 +107,15 @@ export async function createMaintenanceProvider({plan,packageDirectory,operation
       if(q===isolatedQueues[0]){
         if(q.queue_id!==isolatedBootstrap.queueId||q.queue_name!==isolatedBootstrap.queueName)fail('ISOLATION_CHANGED');
         if(isolatedBootstrap.phase==='enabled'){
-          if(consumers.length!==1||consumers[0].script_name!==isolatedBootstrap.workerName
-            ||consumers[0].queue_name!==isolatedBootstrap.queueName||consumers[0].max_batch_size!==1
-            ||consumers[0].max_batch_timeout!==1||consumers[0].max_concurrency!==1||consumers[0].max_retries!==0)fail('ISOLATION_CHANGED');
+          if(consumers.length!==1||!matchesExactBootstrapQueueConsumer(consumers[0],{
+            workerName:isolatedBootstrap.workerName,queueName:isolatedBootstrap.queueName,queueId:isolatedBootstrap.queueId,
+          }))fail('ISOLATION_CHANGED');
         }else if(consumers.length)fail('ISOLATION_CHANGED');
         continue;
       }
-      snapshot.queues.push({queueId:q.queue_id,consumers:identityDigest(sorted(consumers))});if(consumers.some(c=>c.script_name===plan.workerName||c.script_name===isolatedBootstrap?.workerName))fail('OTHER_INGRESS');}
+      snapshot.queues.push({queueId:q.queue_id,consumers:identityDigest(sorted(consumers))});
+      for(const consumer of consumers){const name=queueConsumerWorkerName(consumer);if(name===null)fail('INVENTORY_INVALID');
+        if(name===plan.workerName||name===isolatedBootstrap?.workerName)fail('OTHER_INGRESS');}}
     await ingress();
     snapshot.workers=sorted(snapshot.workers);snapshot.queues=sorted(snapshot.queues);
     if(identityDigest(snapshot)!==(cutoverInventory?.digest??plan.predecessor.inventoryDigest))fail('WRITER_INVENTORY_CHANGED');

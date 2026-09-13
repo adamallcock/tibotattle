@@ -33,7 +33,8 @@ async function fixture(t) {
       : index === 1 ? 'release-site-manifest.json' : `asset-${index}.js`, bytes: 5, sha256: maintenanceHash('bytes') })) };
   const mainBindings = [{ type: 'assets', name: 'ASSETS' },
     { type: 'plain_text', name: 'MAINTENANCE_PLAN_DIGEST', text: identityDigest(plan) }];
-  const state = { phase: 'enabled', rogue: false, wrongBinding: false, extraBinding: false, extraConsumer: false, wrongTag: false };
+  const state = { phase: 'enabled', rogue: false, wrongBinding: false, extraBinding: false, extraConsumer: false,
+    wrongTag: false, consumerChange: null };
   const isolatedBindings = () => [{ type: 'd1', name: 'SOURCE', id: state.wrongBinding ? catalogId : sourceId },
     { type: 'd1', name: 'STORAGE_ROUTING_DB', id: catalogId },
     { type: 'plain_text', name: 'STORAGE_EXISTING_BOOTSTRAP_MODE', text: state.phase },
@@ -58,9 +59,12 @@ async function fixture(t) {
     else if (path.endsWith('/records')) result = isolated ? [] : ['synthetic.example', 'www.synthetic.example', 'admin.synthetic.example'].map(hostname => ({ hostname }));
     else if (path.endsWith('/namespaces')) result = [{ id: plan.predecessor.durableNamespaceId, class: 'UploadIngressBudget', script: main }];
     else if (path.endsWith('/queues')) result = state.phase === 'gone' ? [] : [{ queue_id: queueId, queue_name: bootstrap.queueName }];
-    else if (path.endsWith('/consumers')) result = state.phase === 'enabled' ? [{ script_name: bootstrap.workerName,
-      queue_name: bootstrap.queueName, max_batch_size: 1, max_batch_timeout: 1, max_concurrency: 1, max_retries: 0 },
-      ...(state.extraConsumer ? [{ script_name: 'rogue-worker' }] : [])] : [];
+    else if (path.endsWith('/consumers')) { const consumer = { script: bootstrap.workerName, type: 'worker',
+      queue_name: bootstrap.queueName, queue_id: queueId, consumer_id: '6'.repeat(32),
+      created_on: '2026-09-13T19:50:49.046911Z', settings: { batch_size: 1, max_retries: 0,
+        max_wait_time_ms: 1000, max_concurrency: 1, retry_delay: 0 } };
+      if(state.consumerChange)state.consumerChange(consumer);
+      result = state.phase === 'enabled' ? [consumer,...(state.extraConsumer ? [{ ...consumer,consumer_id:'7'.repeat(32),script:'rogue-worker' }] : [])] : []; }
     else if (path.endsWith('/schedules')) result = { schedules: [] };
     else throw Error(`unexpected ${path}`);
     return Response.json({ success: true, result });
@@ -81,6 +85,21 @@ test('wrong source binding, config tag, extra binding, consumer or unrelated Wor
     f.state[key] = true; await assert.rejects(f.verify('enabled'), { code: key === 'rogue'
       ? 'PRODUCTION_MAINTENANCE_WRITER_INVENTORY_CHANGED' : 'PRODUCTION_MAINTENANCE_ISOLATION_CHANGED' }); f.state[key] = false;
   }
+});
+
+test('actual nested Queue consumer shape is exact and contradictory, missing or broadened values refuse',async t=>{
+  const f=await fixture(t);
+  const changes=[
+    value=>{value.script='foreign-worker';},value=>{value.script_name=value.script;},value=>{delete value.script;},
+    value=>{value.type='http_pull';},value=>{value.queue_name='foreign-queue';},value=>{value.queue_id='8'.repeat(32);},
+    value=>{value.consumer_id='not-an-id';},value=>{value.created_on='not-an-instant';},
+    value=>{value.settings.batch_size=2;},value=>{value.settings.max_retries=1;},
+    value=>{value.settings.max_wait_time_ms=1001;},value=>{value.settings.max_concurrency=2;},
+    value=>{value.settings.retry_delay=1;},value=>{value.settings.unreviewed=true;},
+  ];
+  for(const change of changes){f.state.consumerChange=change;
+    await assert.rejects(f.verify('enabled'),{code:'PRODUCTION_MAINTENANCE_ISOLATION_CHANGED'});}
+  f.state.consumerChange=null;await f.verify('enabled');
 });
 
 test('ordinary containment is restored only after the isolated Worker and Queue are gone', async t => {

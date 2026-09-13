@@ -11,6 +11,7 @@ import { createMaintenanceProvider } from './production-maintenance-provider.mjs
 import { createProductionDeploymentLock } from './production-deployment-lock.mjs';
 import { readMaintenanceFile, validateMaintenancePlan, validateMaintenanceState } from './production-maintenance.mjs';
 import { FROZEN_ACCOUNTLESS_SOURCE_TABLES } from './storage-existing-owner-bootstrap-runtime.mjs';
+import { matchesExactBootstrapQueueConsumer } from './cloudflare-queue-consumer.mjs';
 
 const SHA = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
@@ -231,10 +232,12 @@ export function createExistingAccountlessBootstrapTransport({ plan, packageDirec
     if (mode === 'enabled') {
       if (!found) fail('QUEUE_MISSING');
       const consumers = await api('GET', `${account}/queues/${found.queue_id}/consumers`, undefined, false);
-      if (!Array.isArray(consumers) || consumers.length !== 1 || consumers[0].script_name !== plan.workerName) fail('QUEUE_CONSUMER_CHANGED');
+      if (!Array.isArray(consumers) || consumers.length !== 1 || !matchesExactBootstrapQueueConsumer(consumers[0],{
+        workerName:plan.workerName,queueName:plan.queueName,queueId:found.queue_id,
+      })) fail('QUEUE_CONSUMER_CHANGED');
     } else if (found) {
       const consumers = await api('GET', `${account}/queues/${found.queue_id}/consumers`, undefined, false);
-      if (!Array.isArray(consumers) || consumers.some(item => item.script_name === plan.workerName)) fail('QUEUE_CONSUMER_CHANGED');
+      if (!Array.isArray(consumers) || consumers.length) fail('QUEUE_CONSUMER_CHANGED');
     }
     return true;
   };

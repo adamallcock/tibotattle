@@ -176,6 +176,41 @@ test('concrete API transport binds exact D1 and queue identities and sends a JSO
   assert.equal(JSON.stringify(events).includes(token), false);
 });
 
+test('transport accepts the observed nested Queue consumer and refuses identity or delivery-policy drift',async t=>{
+  const f=await fixture(t),queueId='d'.repeat(32),consumerId='e'.repeat(32);
+  const preparation=JSON.parse(await readFile(join(f.candidate,'preparation.json')));
+  const bindings=[
+    {type:'d1',name:'SOURCE',id:plan.sourceDatabase.id},
+    {type:'d1',name:'STORAGE_ROUTING_DB',database_id:plan.catalogDatabase.id},
+    {type:'plain_text',name:'STORAGE_EXISTING_BOOTSTRAP_MODE',text:'enabled'},
+    {type:'plain_text',name:'STORAGE_EXISTING_BOOTSTRAP_OPERATION_DIGEST',text:identityDigest(plan)},
+    {type:'plain_text',name:'STORAGE_EXISTING_BOOTSTRAP_BUNDLE_SHA256',text:preparation.bundleSha256},
+  ];
+  let change=null;
+  const fetcher=async(url)=>{const parsed=new URL(url),path=parsed.pathname;let result;
+    if(path.endsWith(`/workers/scripts/${plan.workerName}/settings`))result={bindings};
+    else if(path.endsWith(`/workers/scripts/${plan.workerName}/subdomain`))result={enabled:false,previews_enabled:false};
+    else if(path.endsWith('/routes'))result=[];
+    else if(path.endsWith('/schedules'))result=[];
+    else if(path.endsWith('/queues'))result=[{queue_id:queueId,queue_name:plan.queueName}];
+    else if(path.endsWith(`/queues/${queueId}/consumers`)){const consumer={script:plan.workerName,type:'worker',
+      queue_name:plan.queueName,queue_id:queueId,consumer_id:consumerId,created_on:'2026-09-13T19:50:49.046911Z',
+      settings:{batch_size:1,max_retries:0,max_wait_time_ms:1000,max_concurrency:1,retry_delay:0}};
+      if(change)change(consumer);result=[consumer];}
+    else throw Error(`unexpected ${path}`);
+    return json(result);
+  };
+  const make=()=>createExistingAccountlessBootstrapTransport({plan,packageDirectory:f.candidate,cliPath:cli,
+    token:'synthetic-secret-token-value',fetcher,environment:{},receipt:async()=>{}});
+  await make().inspectWorker('enabled');
+  for(const mutate of [value=>{value.script_name='contradictory-worker';},value=>{delete value.script;},
+    value=>{value.queue_id='f'.repeat(32);},value=>{value.type='http_pull';},
+    value=>{value.settings.max_wait_time_ms=999;},value=>{value.settings.extra=true;}]){
+    change=mutate;await assert.rejects(make().inspectWorker('enabled'),
+      {code:'D1_STORAGE_EXISTING_BOOTSTRAP_QUEUE_CONSUMER_CHANGED'});
+  }
+});
+
 test('same database id with wrong name refuses before queue creation', async t => {
   const f = await fixture(t), calls = [];
   const transport = createExistingAccountlessBootstrapTransport({ plan, packageDirectory: f.candidate, cliPath: cli,
