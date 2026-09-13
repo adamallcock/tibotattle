@@ -2322,7 +2322,7 @@ napi_value ReplaceProtectedChildCallback(napi_env env, napi_callback_info info) 
 struct CredentialAuditFileGuard {
   std::vector<HANDLE> handles;
   bool active = false;
-  bool timingSource = false;
+  bool sourceFile = false;
 };
 
 std::array<CredentialAuditFileGuard*, 64> gCredentialAuditFileGuards{};
@@ -2505,8 +2505,8 @@ napi_value ReleaseCredentialAuditFileGuardCallback(
 
 // Source logs belong to Codex: authenticate the owner without changing their
 // inherited ACLs. Keep every ancestor and the file open without delete sharing
-// for the entire chunk. Reads use this handle, never a path-based reopen.
-napi_value OpenTimingSourceCallback(napi_env env, napi_callback_info info) {
+// until the lease closes. Reads use this handle, never a path-based reopen.
+napi_value OpenSourceFileCallback(napi_env env, napi_callback_info info) {
   std::vector<napi_value> arguments;
   std::wstring path;
   if (!GetArguments(env, info, &arguments, 1) || !GetString(env, arguments[0], &path))
@@ -2530,13 +2530,13 @@ napi_value OpenTimingSourceCallback(napi_env env, napi_callback_info info) {
   if (!GetIdentity(opened.final, &identity) || !ReadSecurity(opened.final, &security)
       || !ResolveFinalPath(opened.final, &parsed)) return ThrowFailure(env, OperationFailed());
   if (identity.directory || identity.linkCount != 1 || !security.ownerMatches)
-    return ThrowFailure(env, SecurityPolicy("timing_source_security"));
+    return ThrowFailure(env, SecurityPolicy("source_file_security"));
   auto* guard = new (std::nothrow) CredentialAuditFileGuard;
   if (guard == nullptr) return ThrowFailure(env, OperationFailed());
   guard->handles = std::move(opened.parents);
   guard->handles.push_back(opened.releaseFinal());
   guard->active = true;
-  guard->timingSource = true;
+  guard->sourceFile = true;
   {
     const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
     if (!RegisterCredentialAuditFileGuard(guard)) {
@@ -2554,20 +2554,20 @@ napi_value OpenTimingSourceCallback(napi_env env, napi_callback_info info) {
 }
 
 // Callers hold gCredentialAuditFileGuardsMutex while using the returned handle.
-CredentialAuditFileGuard* TimingSourceGuard(napi_env env, napi_value value) {
+CredentialAuditFileGuard* SourceFileGuard(napi_env env, napi_value value) {
   void* data = nullptr;
   if (napi_get_value_external(env, value, &data) != napi_ok || data == nullptr) return nullptr;
   auto* guard = static_cast<CredentialAuditFileGuard*>(data);
   if (!IsIssuedCredentialAuditFileGuard(guard) || !guard->active
-      || !guard->timingSource || guard->handles.empty()) return nullptr;
+      || !guard->sourceFile || guard->handles.empty()) return nullptr;
   return guard;
 }
 
-napi_value StatTimingSourceCallback(napi_env env, napi_callback_info info) {
+napi_value StatSourceFileCallback(napi_env env, napi_callback_info info) {
   std::vector<napi_value> arguments;
   if (!GetArguments(env, info, &arguments, 1)) return ThrowFailure(env, InvalidConfiguration());
   const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
-  auto* guard = TimingSourceGuard(env, arguments[0]);
+  auto* guard = SourceFileGuard(env, arguments[0]);
   if (guard == nullptr) return ThrowFailure(env, CredentialAuditGuardForeign());
   HANDLE handle = guard->handles.back();
   FILE_BASIC_INFO basic{};
@@ -2580,7 +2580,7 @@ napi_value StatTimingSourceCallback(napi_env env, napi_callback_info info) {
     return ThrowFailure(env, OperationFailed());
   if (!security.ownerMatches || identity.directory || identity.linkCount != 1
       || standard.EndOfFile.QuadPart < 0 || standard.EndOfFile.QuadPart > 9007199254740991LL)
-    return ThrowFailure(env, SecurityPolicy("timing_source_security"));
+    return ThrowFailure(env, SecurityPolicy("source_file_security"));
   napi_value result, value, id = IdentityValue(env, identity);
   napi_create_object(env, &result);
   napi_get_named_property(env, id, "volumeSerialNumber", &value);
@@ -2592,13 +2592,14 @@ napi_value StatTimingSourceCallback(napi_env env, napi_callback_info info) {
   };
   const auto millis = [](LARGE_INTEGER t) { return static_cast<double>(t.QuadPart / 10000) - 11644473600000.0; };
   number("size", static_cast<double>(standard.EndOfFile.QuadPart));
+  number("nlink", identity.linkCount);
   number("birthtimeMs", millis(basic.CreationTime));
   number("mtimeMs", millis(basic.LastWriteTime));
   number("ctimeMs", millis(basic.ChangeTime));
   return result;
 }
 
-napi_value ReadTimingSourceCallback(napi_env env, napi_callback_info info) {
+napi_value ReadSourceFileCallback(napi_env env, napi_callback_info info) {
   std::vector<napi_value> arguments;
   double position = -1, length = -1;
   if (!GetArguments(env, info, &arguments, 3)
@@ -2609,7 +2610,7 @@ napi_value ReadTimingSourceCallback(napi_env env, napi_callback_info info) {
       || length < 0 || length > 65536 || std::floor(length) != length)
     return ThrowFailure(env, InvalidConfiguration());
   const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
-  auto* guard = TimingSourceGuard(env, arguments[0]);
+  auto* guard = SourceFileGuard(env, arguments[0]);
   if (guard == nullptr) return ThrowFailure(env, CredentialAuditGuardForeign());
   LARGE_INTEGER offset; offset.QuadPart = static_cast<LONGLONG>(position);
   HANDLE handle = guard->handles.back();
@@ -2622,6 +2623,16 @@ napi_value ReadTimingSourceCallback(napi_env env, napi_callback_info info) {
   if (napi_create_buffer_copy(env, count, bytes.data(), nullptr, &result) != napi_ok)
     return ThrowFailure(env, OperationFailed());
   return result;
+}
+
+napi_value CloseSourceFileCallback(napi_env env, napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) return ThrowFailure(env, InvalidConfiguration());
+  {
+    const std::lock_guard<std::mutex> lock(gCredentialAuditFileGuardsMutex);
+    if (SourceFileGuard(env, arguments[0]) == nullptr) return ThrowFailure(env, CredentialAuditGuardForeign());
+  }
+  return ReleaseCredentialAuditFileGuardCallback(env, info);
 }
 
 enum class CredentialMutexLeaseKind {
@@ -3039,12 +3050,13 @@ NAPI_MODULE_INIT() {
       exports,
       "releaseAccountlessInstallationCredentialMutex",
       ReleaseAccountlessInstallationCredentialMutexCallback);
-  DefineMethod(env, exports, "openTimingSource", OpenTimingSourceCallback);
-  DefineMethod(env, exports, "statTimingSource", StatTimingSourceCallback);
-  DefineMethod(env, exports, "readTimingSource", ReadTimingSourceCallback);
-  napi_value timingVersion;
-  napi_create_string_utf8(env, "windows-timing-source-v1", NAPI_AUTO_LENGTH, &timingVersion);
-  napi_set_named_property(env, exports, "timingSourceContractVersion", timingVersion);
+  DefineMethod(env, exports, "openSourceFile", OpenSourceFileCallback);
+  DefineMethod(env, exports, "statSourceFile", StatSourceFileCallback);
+  DefineMethod(env, exports, "readSourceFile", ReadSourceFileCallback);
+  DefineMethod(env, exports, "closeSourceFile", CloseSourceFileCallback);
+  napi_value sourceVersion;
+  napi_create_string_utf8(env, "windows-source-read-v1", NAPI_AUTO_LENGTH, &sourceVersion);
+  napi_set_named_property(env, exports, "sourceReadContractVersion", sourceVersion);
   napi_value version;
   napi_create_string_utf8(env, "windows-filesystem-v1", NAPI_AUTO_LENGTH, &version);
   napi_set_named_property(env, exports, "contractVersion", version);

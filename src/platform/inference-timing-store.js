@@ -1,5 +1,6 @@
 import { resolve } from 'node:path';
 import { createTimingFilesystem } from './inference-timing-filesystem.js';
+import { configureGuardedSqliteConnection } from './windows-protected-sqlite.js';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { forEachRolloutLine } from './rollout-line-reader.js';
@@ -14,15 +15,11 @@ export async function openTimingStore(directory, { createParser, digest, METHOD,
   const { file, created } = lease;
   let db;
   try {
-    db = new DatabaseSync(file);
+    db = new DatabaseSync(file, { timeout: 100 });
+    if (lease.persistentJournal) configureGuardedSqliteConnection(db);
     const version = db.prepare('PRAGMA user_version').get().user_version;
     const application = db.prepare('PRAGMA application_id').get().application_id;
     safe(created || (version === METHOD && application === APPLICATION), 'incompatible_database');
-    if (lease.persistentJournal) {
-      const mode = db.prepare('PRAGMA journal_mode=PERSIST').get().journal_mode;
-      safe(mode === 'persist', 'unsafe_journal_mode');
-      db.exec('PRAGMA temp_store=MEMORY');
-    }
     db.exec('PRAGMA busy_timeout=100; PRAGMA cache_size=-2048; PRAGMA synchronous=FULL; PRAGMA max_page_count=65536;');
     if (created) {
       db.exec(`BEGIN IMMEDIATE;
@@ -43,8 +40,10 @@ export async function openTimingStore(directory, { createParser, digest, METHOD,
     }
     const key = Buffer.from(db.prepare('SELECT key FROM metadata').get().key);
     safe(key.length === 32, 'invalid_metadata');
+    let closed = false;
     return { db, key, file, createParser, digest, filesystem, method: METHOD, close: () => {
-      db.close(); lease.release();
+      if (closed) return;
+      db.close(); closed = true; lease.release();
     } };
   } catch (e) {
     db?.close(); lease.release();
@@ -109,7 +108,6 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
       });
       attemptedBytes = end - cursor;
       const receipt = await forEachRolloutLine(handle, { start: cursor, end, signal,
-        highWaterMark: store.filesystem.readSize ?? 256 * 1024,
         onLine: (line, offset, partial) => {
           if (discardLine) discardLine = false;
           else parser.line(line, offset, partial);

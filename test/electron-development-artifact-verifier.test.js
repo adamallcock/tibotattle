@@ -135,6 +135,7 @@ const SHELL_FILES = [
   "src/platform/windows-credential-mutex.js",
   "src/platform/windows-credential-operation-audit.js",
   "src/platform/windows-credential-audit-file-guard.js",
+  "src/platform/windows-protected-sqlite.js",
 ];
 const KEYTAR = Object.freeze({
   "darwin-arm64": "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",

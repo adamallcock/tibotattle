@@ -161,6 +161,7 @@ export const ELECTRON_SHELL_FILES = Object.freeze([
   "src/platform/windows-credential-mutex.js",
   "src/platform/windows-credential-operation-audit.js",
   "src/platform/windows-credential-audit-file-guard.js",
+  "src/platform/windows-protected-sqlite.js",
 ]);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const INVENTORY_KINDS = new Set([

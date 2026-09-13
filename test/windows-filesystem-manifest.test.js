@@ -108,6 +108,25 @@ test("manifest builder refuses an unreviewed native production claim", () => {
   );
 });
 
+test("manifest source-read extension is additive and cannot approve itself", () => {
+  const extension = {
+    sourceReadContractVersion: 'windows-source-read-v1',
+    openSourceFile() {}, statSourceFile() {}, readSourceFile() {}, closeSourceFile() {},
+  };
+  const result = createWindowsFilesystemBindingManifest({ bytes: BYTES, binding: binding(extension) });
+  assert.deepEqual(result.sourceRead, { contractVersion: 'windows-source-read-v1', approved: false });
+  assert.equal(result.approvedPolicy.productionSafe, false);
+  assert.equal(result.approvedPolicy.pathWalkRaceSafe, false);
+  for (const name of ['openSourceFile', 'statSourceFile', 'readSourceFile', 'closeSourceFile']) {
+    assert.throws(() => createWindowsFilesystemBindingManifest({
+      bytes: BYTES, binding: binding({ ...extension, [name]: undefined }),
+    }), { code: 'WINDOWS_FILESYSTEM_MANIFEST_INVALID_SOURCE_READ' });
+  }
+  assert.throws(() => createWindowsFilesystemBindingManifest({
+    bytes: BYTES, binding: binding({ ...extension, sourceReadContractVersion: 'future-contract' }),
+  }), { code: 'WINDOWS_FILESYSTEM_MANIFEST_INVALID_SOURCE_READ' });
+});
+
 test("manifest builder writes only the exact native digest and safe aggregate fields", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-manifest-"));
   try {

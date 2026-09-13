@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { modelPerformanceProjection } from '../src/reporting/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
-import { loadWindowsTimingBinding } from '../src/platform/windows-filesystem.js';
+import { loadWindowsSourceReadBinding } from '../src/platform/windows-filesystem.js';
 
 const NOW = Date.parse('2026-09-09T12:00:00Z'), DAY = 86400000;
 const row = (patch = {}) => ({ at: NOW, model: 'gpt-5.6-sol', sample_method: 'receipt',
@@ -173,7 +173,7 @@ test('actual worker reconstructs synthetic logs off-main, persists, and shuts do
   try {
     if (process.platform === 'win32') {
       let unavailable = false;
-      try { loadWindowsTimingBinding(); } catch { unavailable = true; }
+      try { loadWindowsSourceReadBinding(); } catch { unavailable = true; }
       if (unavailable) {
         const deadline = Date.now() + 10000;
         let result;

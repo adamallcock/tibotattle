@@ -22,7 +22,7 @@ import {
   isWindowsFilesystemAlreadyExists,
   isWindowsFilesystemNotFound,
   loadWindowsFilesystemBinding,
-  loadWindowsTimingBinding,
+  loadWindowsSourceReadBinding,
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../src/platform/windows-filesystem.js";
@@ -312,6 +312,7 @@ test("qualification authority refuses a self-consistent manifest missing any obs
       "src/platform/windows-credential-mutex.js",
       "src/platform/windows-credential-operation-audit.js",
       "src/platform/windows-credential-audit-file-guard.js",
+      "src/platform/windows-protected-sqlite.js",
     ]) {
       await writeFile(join(resourceRoot, "electron-runtime-manifest.json"), JSON.stringify(qualificationResourceManifest(omitted)));
       assert.throws(() => assertWindowsQualificationResourceAuthority({ resourceRoot }),
@@ -719,18 +720,47 @@ test("production integration guard rejects the unproven native path walk", () =>
 });
 
 
-test("timing loader refuses unqualified policy even when new native methods exist", () => {
+test("source-read loader refuses unqualified policy even when new native methods exist", () => {
   const options = {
     platform: "win32", architecture: "x64",
     bindingPath: "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node",
     readManifest: () => JSON.stringify(manifest()),
     readBindingBytes: () => BINDING_BYTES,
-    requireBinding: () => binding({ timingSourceContractVersion: "windows-timing-source-v1",
-      openTimingSource() {}, statTimingSource() {}, readTimingSource() {} }),
+    requireBinding: () => binding({ sourceReadContractVersion: "windows-source-read-v1",
+      openSourceFile() {}, statSourceFile() {}, readSourceFile() {}, closeSourceFile() {} }),
   };
-  assert.throws(() => loadWindowsTimingBinding(options), { code: "WINDOWS_FILESYSTEM_TIMING_UNQUALIFIED" });
-  assert.throws(() => loadWindowsTimingBinding({ ...options, readBindingBytes: () => Buffer.from("tampered") }),
+  assert.throws(() => loadWindowsSourceReadBinding(options), { code: "WINDOWS_FILESYSTEM_SOURCE_READ_UNQUALIFIED" });
+  assert.throws(() => loadWindowsSourceReadBinding({ ...options, readBindingBytes: () => Buffer.from("tampered") }),
     { code: "WINDOWS_FILESYSTEM_BINDING_INTEGRITY_MISMATCH" });
-  assert.throws(() => loadWindowsTimingBinding({ ...options, architecture: "arm64" }),
+  assert.throws(() => loadWindowsSourceReadBinding({ ...options, architecture: "arm64" }),
     { code: "WINDOWS_FILESYSTEM_UNSUPPORTED_ARCHITECTURE" });
+});
+
+test('source-read manifest verifies every method and rejects edited capability approval', () => {
+  const native = binding({ sourceReadContractVersion: 'windows-source-read-v1',
+    openSourceFile() {}, statSourceFile() {}, readSourceFile() {}, closeSourceFile() {} });
+  const sidecar = createWindowsFilesystemBindingManifest({ bytes: BINDING_BYTES, binding: native });
+  const options = {
+    platform: 'win32', architecture: 'x64',
+    bindingPath: 'C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node',
+    readManifest: () => JSON.stringify(sidecar), readBindingBytes: () => BINDING_BYTES,
+    requireBinding: () => native,
+  };
+  assert.equal(loadWindowsFilesystemBinding(options), native);
+  assert.throws(() => loadWindowsSourceReadBinding(options),
+    { code: 'WINDOWS_FILESYSTEM_SOURCE_READ_UNQUALIFIED' });
+  for (const name of ['openSourceFile', 'statSourceFile', 'readSourceFile', 'closeSourceFile']) {
+    assert.throws(() => loadWindowsFilesystemBinding({ ...options,
+      requireBinding: () => ({ ...native, [name]: undefined }),
+    }), { code: 'WINDOWS_FILESYSTEM_MANIFEST_BINDING_MISMATCH' });
+  }
+  for (const sourceRead of [
+    { ...sidecar.sourceRead, approved: true },
+    { ...sidecar.sourceRead, extra: true },
+    { ...sidecar.sourceRead, contractVersion: 'future-contract' },
+  ]) {
+    assert.throws(() => loadWindowsSourceReadBinding({ ...options,
+      readManifest: () => JSON.stringify({ ...sidecar, sourceRead }),
+    }), { code: 'WINDOWS_FILESYSTEM_INVALID_MANIFEST' });
+  }
 });

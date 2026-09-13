@@ -263,6 +263,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "src/platform/windows-credential-mutex.js",
   "src/platform/windows-credential-operation-audit.js",
   "src/platform/windows-credential-audit-file-guard.js",
+  "src/platform/windows-protected-sqlite.js",
 ]);
 // Existing outputs are authenticated against their own complete manifest and
 // payload before replacement. Keep this stable identity subset separate from

@@ -1,7 +1,10 @@
 import { constants } from 'node:fs';
 import { lstat, open, mkdir, realpath } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { loadWindowsTimingBinding } from './windows-filesystem.js';
+import * as pathApi from 'node:path';
+import { loadWindowsSourceReadBinding } from './windows-filesystem.js';
+import { createSourceFileAccess } from './source-file-access.js';
+import { acquireProtectedSqliteFiles } from './windows-protected-sqlite.js';
 
 const safe = (ok, code) => { if (!ok) throw new Error(code); };
 const ownerFile = s => s.isFile() && s.nlink === 1
@@ -10,8 +13,12 @@ const ownerFile = s => s.isFile() && s.nlink === 1
 // The injected loader is for portable/native qualification tests. Production
 // always uses the manifest-verified, approved Windows capability loader.
 export function createTimingFilesystem({ platform = process.platform,
-  loadWindowsBinding = loadWindowsTimingBinding } = {}) {
+  loadWindowsBinding = loadWindowsSourceReadBinding } = {}) {
+  const native = platform === 'win32' ? loadWindowsBinding() : null;
+  const sources = createSourceFileAccess({ platform, loadWindowsBinding: () => native });
+  const sourceMethods = { openSource: path => sources.open(path), namedStat: sources.namedStat };
   if (platform !== 'win32') return {
+    ...sourceMethods,
     async prepare(directory) {
       const dir = resolve(directory);
       safe(await realpath(dirname(dir)) === dirname(dir), 'unsafe_directory');
@@ -28,38 +35,16 @@ export function createTimingFilesystem({ platform = process.platform,
       safe(ownerFile(await lstat(file)), 'unsafe_database');
       return { file, created, persistentJournal: false, release() {} };
     },
-    async openSource(path) {
-      const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      try {
-        const stat = await handle.stat();
-        safe(stat.isFile() && stat.uid === process.getuid(), 'unsafe_source');
-        return handle;
-      } catch (e) { await handle.close(); throw e; }
-    },
-    namedStat: path => lstat(path),
+
   };
 
-  const native = loadWindowsBinding();
   return {
-    readSize: 64 * 1024,
+    ...sourceMethods,
     async prepare(directory) {
       const dir = resolve(directory), file = join(dir, 'timing-experiment.sqlite');
-      // Validate existing parents; never repair their ACLs. The native guard
-      // authenticates and holds the private directory and its parent.
-      native.ensureDirectory(dirname(dir));
-      native.ensureDirectory(dir);
-      const guards = [];
-      let created = false;
+      const lease = acquireProtectedSqliteFiles({ native, path: file, pathApi });
+      const { created } = lease;
       try {
-        for (const path of [file, `${file}-journal`]) {
-          try {
-            native.createFile(path, Buffer.alloc(0));
-            if (path === file) created = true;
-          } catch (e) {
-            if (e.code !== 'WINDOWS_FILESYSTEM_ALREADY_EXISTS' && e.code !== 'EEXIST') throw e;
-          }
-          guards.push(native.acquireCredentialAuditFileGuard(path).guard);
-        }
         for (const suffix of ['-wal', '-shm']) {
           let missing = false;
           try { native.inspectPath(`${file}${suffix}`); } catch (e) {
@@ -79,43 +64,10 @@ export function createTimingFilesystem({ platform = process.platform,
           } finally { await h.close(); }
         }
       } catch (e) {
-        for (const guard of guards.reverse()) {
-          try { native.releaseCredentialAuditFileGuard(guard); } catch { /* Preserve original failure. */ }
-        }
+        try { lease.release(); } catch { /* Keep the validation failure. */ }
         throw e;
       }
-      let released = false;
-      return { file, created, persistentJournal: true, release() {
-        if (released) return;
-        released = true;
-        let failed = false;
-        for (const guard of guards.reverse()) {
-          try { native.releaseCredentialAuditFileGuard(guard); } catch { failed = true; }
-        }
-        safe(!failed, 'timing_guard_release_failed');
-      } };
+      return { file, created, persistentJournal: true, release: lease.release };
     },
-    async openSource(path) {
-      const lease = native.openTimingSource(path);
-      let closed = false;
-      return {
-        async stat() { safe(!closed, 'timing_source_closed'); return native.statTimingSource(lease); },
-        async read(buffer, offset, length, position) {
-          safe(!closed, 'timing_source_closed');
-          safe(Buffer.isBuffer(buffer) && Number.isSafeInteger(offset) && offset >= 0
-            && Number.isSafeInteger(length) && length >= 0 && length <= 65536
-            && offset + length <= buffer.length && Number.isSafeInteger(position) && position >= 0,
-          'invalid_timing_read');
-          const data = native.readTimingSource(lease, position, length);
-          safe(Buffer.isBuffer(data) && data.length <= length, 'invalid_timing_read');
-          data.copy(buffer, offset);
-          return { bytesRead: data.length, buffer };
-        },
-        async close() { if (!closed) { closed = true; native.releaseCredentialAuditFileGuard(lease); } },
-      };
-    },
-    // The native lease holds every ancestor and the source without delete
-    // sharing, so the name cannot change until the chunk is committed.
-    namedStat: (_path, handle) => handle.stat(),
   };
 }

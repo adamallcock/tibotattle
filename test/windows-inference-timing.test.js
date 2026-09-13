@@ -11,18 +11,22 @@ import { createParser, digest, METHOD, MAX_STATE_BYTES } from '../src/providers/
 // Exercises Windows orchestration on real SQLite, not Windows ACL guarantees.
 function nativeFixture() {
   const guards = new Set(), sources = new Map(), reads = [];
+  const identity = { volumeSerialNumber: '0000000000000001', fileId: '00000000000000000000000000000002', linkCount: 1 };
   const native = {
+    credentialAuditFileGuardContractVersion: 'windows-credential-audit-file-guard-v1',
+    credentialAuditFileGuardSafe: true,
     ensureDirectory: path => mkdirSync(path, { recursive: true, mode: 0o700 }),
     createFile: (path, data) => writeFileSync(path, data, { flag: 'wx', mode: 0o600 }),
     inspectPath: path => lstatSync(path),
-    acquireCredentialAuditFileGuard(path) { const guard = { path }; guards.add(guard); return { guard }; },
+    acquireCredentialAuditFileGuard(path) { const guard = { path }; guards.add(guard); return { guard, identity }; },
     releaseCredentialAuditFileGuard(guard) {
       if (sources.has(guard)) { closeSync(sources.get(guard)); sources.delete(guard); }
       else assert.ok(guards.delete(guard), 'only live guards are released');
     },
-    openTimingSource(path) { const lease = {}; sources.set(lease, openSync(path, 'r')); return lease; },
-    statTimingSource(lease) { return fstatSync(sources.get(lease)); },
-    readTimingSource(lease, position, length) {
+    closeSourceFile(lease) { closeSync(sources.get(lease)); sources.delete(lease); },
+    openSourceFile(path) { const lease = {}; sources.set(lease, openSync(path, 'r')); return lease; },
+    statSourceFile(lease) { return fstatSync(sources.get(lease)); },
+    readSourceFile(lease, position, length) {
       assert.ok(length <= 65536); reads.push(length);
       const data = Buffer.alloc(length);
       return data.subarray(0, readSync(sources.get(lease), data, 0, length, position));
@@ -80,7 +84,7 @@ test('partial database-guard acquisition fails closed and releases acquired hand
     if (path.endsWith('-journal')) throw new Error('synthetic guard refusal');
     return original(path);
   };
-  await assert.rejects(openTimingStore(join(f.root, 'timing'), f.options), /guard refusal/);
+  await assert.rejects(openTimingStore(join(f.root, 'timing'), f.options), /Windows protected SQLite operation failed/);
   assert.equal(f.guards.size, 0);
 });
 test('incompatible database and WAL state are preserved and guards released', async t => {
@@ -99,22 +103,22 @@ test('source read failure rolls back checkpoints and closes its native handle', 
   const f = await fixture(t), path = join(f.root, 'synthetic.jsonl');
   await writeFile(path, lines());
   const store = await openTimingStore(join(f.root, 'timing'), f.options);
-  f.native.readTimingSource = () => { throw new Error('synthetic read failure'); };
+  f.native.readSourceFile = () => { throw new Error('synthetic read failure'); };
   try {
     await assert.rejects(ingestTimingFile(store, path), /read failure/);
     assert.equal(store.db.prepare('SELECT count(*) AS n FROM source').get().n, 0);
     assert.equal(f.sources.size, 0);
   } finally { store.close(); }
 });
-test('Windows source reads reject excessive sizes before calling native code', async t => {
+test('source reads reject invalid buffer ranges before calling native code', async t => {
   const f = await fixture(t), path = join(f.root, 'synthetic.jsonl');
   await writeFile(path, 'synthetic\n');
   const handle = await f.filesystem.openSource(path);
   try {
-    await assert.rejects(handle.read(Buffer.alloc(65537), 0, 65537, 0), /invalid_timing_read/);
+    await assert.rejects(handle.read(Buffer.alloc(8), 0, 9, 0), /invalid_source_read/);
     assert.equal(f.reads.length, 0);
   } finally { await handle.close(); }
-  await assert.rejects(handle.stat(), /timing_source_closed/);
+  await assert.rejects(handle.stat(), /source_file_closed/);
 });
 
 test('read and batch limits retain measurements after an 8 MiB record across resumptions', async t => {

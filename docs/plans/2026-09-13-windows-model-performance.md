@@ -2,94 +2,85 @@
 title: Windows model-performance storage and ingestion
 date: 2026-09-13
 type: plan
-status: needs-revision
+status: native-qualification-pending
 ---
 
-The c94e0c1f candidate needs architectural and recovery corrections before
-native qualification. It is not an approved Windows implementation.
+The local implementation on `codex/windows-model-performance` now uses shared
+filesystem and SQLite primitives. Windows model performance remains unavailable
+until native qualification; this is not release or installed-artifact evidence.
+The isolated branch starts at `9385bad2` and preserves the main checkout's
+uncommitted work. Accounting and timing schemas are unchanged.
 
-Implement Windows timing behind the existing native filesystem qualification
-boundary. This branch starts at 9385bad2 and preserves the main checkout's
-uncommitted changes. No accounting schema or timing schema migration is needed.
+## Implemented boundaries
 
-- Extract platform file operations from the timing store. Preserve the POSIX
-  owner checks, incremental checkpoints, parser, bounded reads and projections.
-- On Windows, use the verified native adapter to create owner-private state,
-  guard the database and persistent journal throughout SQLite's lifetime, and
-  open source logs through validated handles. Source logs may inherit normal
-  user ACLs; never rewrite their permissions. Reject other-owner files, links,
-  reparse paths and replacement races.
-- Bound source reads to 64 KiB per call. Keep filesystem work in the existing
-  worker and retain its memory, batch, retry and shutdown limits.
-- Replace the unconditional Windows controller refusal with capability-based
-  failure. Missing, mismatched or unqualified binaries stay unavailable; do not
-  change approved native policy or claim Windows release support.
-- Validate portable integration, cleanup, compatibility and refusal behavior;
-  add native Windows tests for the exact new handle operations. Native build,
-  security qualification and packaged Windows smoke remain required before
-  enabling the capability or changing the visible support claim.
+- `source-file-access.js` provides the common positional file-handle interface.
+  POSIX uses Node FileHandles; Windows uses the existing native handle-relative
+  path walker and a generic `windows-source-read-v1` extension. The timing store
+  consumes that interface through the existing rollout reader and parser.
+  The generic handles also work with the existing bounded JSONL and compressed
+  readers. This does not switch the accounting scanner to an unqualified adapter.
+- Native source opens authenticate the current owner of a regular, single-link
+  file, reject reparse paths, and hold the file and its ancestors without delete
+  sharing until close. Normal inherited source ACLs are accepted without changes.
+  `closeSourceFile` rejects database guards and foreign or closed leases.
+- The shared reader retains its 256 KiB buffer; the Windows adapter splits each
+  request into native reads of at most 64 KiB. There is no 64 KiB file-size limit.
+  Batch checkpoints, cancellation, replay protection and worker budgets remain.
+- `windows-protected-sqlite.js` shares database/journal creation, guard validation,
+  partial cleanup, release and recovery setup between timing and credential audit.
+  Callers retain their database names, schema rules and branded error contracts.
+  Both files remain guarded through SQLite close. WAL/SHM residue and incompatible
+  timing headers remain refused without deletion or repair.
+- SQLite startup enters exclusive locking before setting persistent journaling
+  and forcing recovery, then returns to normal locking and releases the temporary
+  exclusive lock with a read. This happens before schema queries. Temporary
+  storage remains in memory. Both consumers use the same sequence.
+- The existing manifest accepts an optional, closed `sourceRead` capability,
+  tied to the exact native contract and all four methods. Older manifests remain
+  compatible for their existing consumers. The source-read loader requires narrow
+  approval and existing audit-guard approval, without enabling unrelated native
+  write/path-walk policy. `WINDOWS_SOURCE_READ_APPROVED` remains false; edited
+  sidecar approval is rejected. Qualification must explicitly change that reviewed
+  policy and regenerate the binary-bound manifest.
+- Electron runtime, qualification authority and artifact verification include the
+  shared SQLite helper. Worker capability failure occurs before source discovery
+  and remains bounded, retryable and explicitly unavailable.
 
+## Recovery and completeness evidence
 
-## Local result
+The earlier candidate (`c94e0c1f`, reviewed in `96ce84c2`) queried schema before
+journal setup and duplicated guard lifecycle. A local child-process crash left
+a hot journal that SQLite deleted on its first schema query. Setting PERSIST
+alone also deleted it during recovery, conflicting with Windows delete denial.
+The corrected shared sequence preserves the journal inode through every startup
+statement and database close in a real SQLite test, rolls back uncommitted data,
+and lets a second connection read and write afterward. This is portable SQLite
+evidence; Windows kernel enforcement still needs the native run. See SQLite's
+[locking mode documentation](https://www.sqlite.org/pragma.html#pragma_locking_mode)
+and [hot-journal recovery](https://www.sqlite.org/lockingv3.html#dealing_with_hot_journals).
 
-Implemented on `codex/windows-model-performance`. The platform adapter uses the
-existing native SQLite guards and a new bounded source-handle contract. The
-worker now checks capability during store creation before source discovery.
-The published Windows availability copy remains accurate and unchanged.
+A synthetic file containing an 8 MiB record reaches exact EOF across multiple
+4 MiB ingestion batches and retains measurements before and after that record.
+Every native read stays at or below 64 KiB. The existing 64 KiB record-prefix
+limit is different: oversized individual records remain explicitly partial.
+Existing discovery and projection capacity ceilings remain separate concerns;
+this change does not remove resource limits or reinterpret them as retention.
 
-Validation on macOS with Node 26.2.0: 74 focused timing, reader, loader and
-manifest tests passed; 11 Windows-only cases were not run. The full local
-companion suite passed 356 tests. Architecture, documentation and preflight
-checks passed. Portable Windows orchestration tests use synthetic bindings and
-real SQLite; they do not validate Windows ACLs or kernel handles.
+## Validation and remaining gates
 
-Remaining release gates: rebuild native Windows x64 binary and manifest; run
-`test/windows-filesystem-security.test.js` including the new held-source,
-junction/hard-link, guarded-journal and hot-journal crash recovery cases;
-complete native policy review; then run the actual packaged timing worker
-against synthetic logs and verify TPS/TTFT, restart and graceful refusal.
-Existing manifest validation intentionally rejects production/path-walk approval;
-a reviewed loader/generator policy update is required after qualification.
-No native approval boolean, signed artifact or release was changed here.
+On macOS with Node 26.2.0, the focused shared SQLite, audit, loader, manifest,
+source/rollout/compressed-reader and timing suite passed 92 tests. Synthetic
+bindings test orchestration and real SQLite behavior, not Windows ACLs.
+The full local companion suite passed 356 tests. Electron staging/package tests
+passed 36 tests; artifact, loader and qualification checks passed 42 with 13
+platform-specific skips. Four API/facade contract tests passed. Architecture,
+documentation and preflight checks passed. These are local source and portable
+packaging checks, not an installed Windows artifact or native build receipt.
 
-
-## Correctness and reuse review, 2026-09-13
-
-The initial implementation claim was too strong. Keep the candidate disabled.
-
-1. **Crash recovery is a blocker.** The timing store queries schema metadata
-   before setting PERSIST. A local Node 26.2.0 / SQLite reproduction created an
-   uncommitted transaction in a child process and exited without closing it.
-   Its 9,728-byte hot journal was deleted on the first `PRAGMA user_version`.
-   Running `PRAGMA journal_mode=PERSIST` first also deleted that journal during
-   recovery. The Windows guard denies deletion for the journal's lifetime, so
-   this lifecycle conflicts with crash recovery. The deletion is reproduced on
-   macOS; the resulting Windows error still needs native verification. Merely
-   reordering pragmas is not a proven fix. SQLite documents the
-   [hot-journal recovery lifecycle](https://www.sqlite.org/lockingv3.html#dealing_with_hot_journals).
-2. **Share the database-guard lifecycle.** Directory/file creation, acquisition,
-   partial cleanup and release duplicate `windows-credential-audit-file-guard.js`.
-   Extract an internal shared primitive with narrow, fixed-purpose wrappers.
-   Resolve recovery once in that shared layer and test both consumers; do not
-   blindly copy the existing credential implementation or weaken its contract.
-3. **Make source handles generic.** Existing native whole-file reads enforce
-   protected-state ACLs and a 1 MiB allocation bound, so they are unsuitable for
-   ordinary large Codex logs. A native streaming primitive is justified, but it
-   should implement a common source-handle port rather than expose timing-named
-   methods. Integrate through platform source ports and the shared line reader;
-   avoid importing the legacy root source-snapshot owner into platform code.
-4. **The capability gate is currently unsatisfiable.** The manifest validator
-   accepts overall production/path-walk approval only as false, while the timing
-   loader requires true. Thus this is an implementation candidate, not a feature
-   that only needs a passing test run. Define and qualify the narrow capability
-   without accidentally enabling unrelated Windows filesystem consumers.
-
-Bounded streaming itself is correct: a new synthetic regression ingests a file
-containing an 8 MiB record across multiple 4 MiB batches, reaches its exact EOF,
-and retains both measured turns before and after that record. Every native read
-stays at or below 64 KiB. All six Windows-orchestration tests pass on macOS using
-an injected filesystem binding. This proves iteration, not Windows kernel safety.
-The 64 KiB read buffer is separate from the existing 64 KiB record-prefix limit;
-large individual records are flagged partial. Existing ceilings of 50,000
-entries per discovery and 100,000 projected turns are actual capacity limits,
-not read-buffer limits, and remain a separate capacity-review concern.
+Remaining native gates: build the exact Windows x64 binary and sidecar; run
+`test/windows-filesystem-security.test.js`, including held-source replacement,
+junction/hard-link refusal, foreign leases, guarded journaling and hot-journal
+crash recovery; complete native policy review; then run the packaged timing
+worker against synthetic logs and verify TPS/TTFT, restart and graceful refusal.
+Only after that evidence should narrow source-read approval or the visible
+Windows availability claim change. No signing, install, push or release occurred.

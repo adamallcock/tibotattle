@@ -319,7 +319,7 @@ test("native audit guard rejects hard-linked and reparse-point database files", 
 }));
 
 
-test("native timing source holds its name, bounds reads and rejects links and foreign leases", {
+test("native source handle holds its name, bounds reads and rejects links and foreign leases", {
   skip: NATIVE_SKIP,
 }, () => withSyntheticRoot(async ({ adapter, root }) => {
   adapter.ensureDirectory(root);
@@ -328,25 +328,32 @@ test("native timing source holds its name, bounds reads and rejects links and fo
   // Codex's normal inherited ACL is accepted; derived state still requires
   // the stricter owner-only protected DACL.
   await writeFile(source, "synthetic\n");
-  const lease = native.openTimingSource(source);
+  const protectedFile = join(root, "protected.sqlite");
+  adapter.createFile(protectedFile, Buffer.alloc(0));
+  const protectedLease = native.acquireCredentialAuditFileGuard(protectedFile);
   try {
-    assert.equal(native.statTimingSource(lease).size, 10);
-    assert.equal(native.readTimingSource(lease, 0, 65536).toString(), "synthetic\n");
-    assert.throws(() => native.readTimingSource(lease, 0, 65537));
-    assert.throws(() => native.readTimingSource(lease, -1, 1));
-    assert.throws(() => native.statTimingSource({}));
+    assert.throws(() => native.closeSourceFile(protectedLease.guard));
+    assert.throws(() => native.readSourceFile(protectedLease.guard, 0, 1));
+  } finally { native.releaseCredentialAuditFileGuard(protectedLease.guard); }
+  const lease = native.openSourceFile(source);
+  try {
+    assert.equal(native.statSourceFile(lease).size, 10);
+    assert.equal(native.readSourceFile(lease, 0, 65536).toString(), "synthetic\n");
+    assert.throws(() => native.readSourceFile(lease, 0, 65537));
+    assert.throws(() => native.readSourceFile(lease, -1, 1));
+    assert.throws(() => native.statSourceFile({}));
     await assert.rejects(rename(source, join(root, "moved.jsonl")));
     await assert.rejects(rename(root, `${root}-moved`));
-  } finally { native.releaseCredentialAuditFileGuard(lease); }
-  assert.throws(() => native.statTimingSource(lease));
+  } finally { native.closeSourceFile(lease); }
+  assert.throws(() => native.statSourceFile(lease));
   await rename(source, join(root, "moved.jsonl"));
   const linked = join(root, "hardlink.jsonl");
   await link(join(root, "moved.jsonl"), linked);
-  assert.throws(() => native.openTimingSource(linked));
+  assert.throws(() => native.openSourceFile(linked));
   const junction = `${root}-junction`;
   try {
     await symlink(root, junction, "junction");
-    assert.throws(() => native.openTimingSource(join(junction, "moved.jsonl")));
+    assert.throws(() => native.openSourceFile(join(junction, "moved.jsonl")));
   } finally { await rm(junction, { force: true }); }
 }));
 

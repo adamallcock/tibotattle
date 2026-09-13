@@ -178,28 +178,35 @@ and authenticated installer/binding provenance remain separate production
 gates.
 
 
-## Model-performance timing source (pending native qualification)
+## Shared source handles (pending native qualification)
 
-The `windows-timing-source-v1` extension supplies `openTimingSource(path)`,
-`statTimingSource(lease)` and `readTimingSource(lease, offset, length)`.
-It accepts ordinary inherited source ACLs only when the current user owns the
-regular, single-link file. It does not change Codex source permissions. All
-components are traversed relative to held handles with reparse rejection;
-ancestors and the source remain open without delete sharing until release.
-Each read is capped at 64 KiB before allocation. Source leases share the bounded
-64-slot guard registry and use `releaseCredentialAuditFileGuard` for cleanup.
+The `windows-source-read-v1` extension supplies `openSourceFile(path)`,
+`statSourceFile(lease)`, `readSourceFile(lease, offset, length)` and
+`closeSourceFile(lease)`. It accepts ordinary inherited source ACLs only when the
+current user owns the regular, single-link file. It does not change Codex source
+permissions. Components are traversed relative to held handles with reparse
+rejection; ancestors and source remain open without delete sharing until close.
+Each native read is capped at 64 KiB before allocation. Source leases share the
+bounded 64-slot guard registry, with source-only validation at their public close
+entrypoint. The common JavaScript source-file adapter splits larger buffer reads
+and exposes a FileHandle-like interface to the existing readers.
 
-The timing SQLite adapter separately creates protected owner-only database and
-journal files and holds the existing audit guards throughout database use.
-`journal_mode=PERSIST` prevents SQLite deleting the guarded journal. WAL/SHM
-residue and non-rollback database headers are refused, not repaired or deleted.
-SQLite closes before guards release. No timing schema migration is introduced.
+Timing and credential audit use `windows-protected-sqlite.js` for protected
+owner-only database/journal creation and the existing native guard lifecycle.
+Before any schema query, it enters EXCLUSIVE locking, selects PERSIST journaling,
+forces recovery, then returns to NORMAL locking and releases the temporary lock
+with a read. PERSIST alone does not prevent journal deletion during hot-journal
+recovery. The shared sequence has portable SQLite crash/reopen coverage; native
+Windows recovery remains a qualification gate. SQLite closes before guards
+release. Timing refuses WAL/SHM residue and non-rollback headers without deletion;
+no schema migration is introduced.
 
-The production loader requires manifest-approved filesystem/path-walk and audit
-protection plus the new source contract. Existing approval values remain false;
-this implementation does not enable model performance in released Windows builds.
-The native security suite includes source handle and SQLite integration tests.
-Run that suite against a rebuilt exact binary and manifest on Windows x64, then
-complete policy review and packaged-worker smoke before enabling the feature.
-The loader's closed manifest validator and generator must be updated as part of
-that reviewed approval; changing a sidecar boolean by itself is rejected.
+An optional closed `sourceRead` manifest capability binds the generic methods and
+contract to the native digest. Existing manifests remain compatible for their
+existing consumers. Source-read approval is separate from the still-disabled
+general production/path-walk policies and requires the approved audit guard.
+`WINDOWS_SOURCE_READ_APPROVED` remains false, and the loader refuses this feature.
+A sidecar-only approval edit is rejected. Run the native security suite against a
+rebuilt exact binary and manifest on Windows x64, complete policy review, then
+run the packaged worker before enabling the narrow policy. See the
+[implementation and qualification plan](../../docs/plans/2026-09-13-windows-model-performance.md).
