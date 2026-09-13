@@ -70,3 +70,11 @@ test("every static page header is available through the browser locale entrypoin
     }
   }
 });
+
+test("setup status labels resolve through the browser catalog", () => {
+  for (const locale of SUPPORTED_LOCALES) {
+    for (const key of ["setup.title", "setup.ready"]) {
+      assert.notEqual(translate(key, {}, locale), key);
+    }
+  }
+});
