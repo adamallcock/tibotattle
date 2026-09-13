@@ -121,5 +121,13 @@ header wrapping breakpoint to 1000px and made refresh progress shrink with the
 window. Share and Settings use 36px icon buttons with accessible localized names
 and tooltips. Setup now has a neutral Local setup heading and a separate Ready
 label; its summary/checks use two columns and the note/actions span both columns.
-All 745 browser tests passed. A new development build and authorized packaged
-real-history screenshots are the remaining visual validation.
+All 746 browser tests passed after correcting the browser locale catalog to
+expose the new setup labels. Final development source is
+`7efee1413fa9395e1053fdb8a1a4cd46c945771b`; verified ASAR digest is
+`5caf2abb4e03f218a35985aa060c128bc201c2aa761115623e6eda888e5f1718`.
+Authorized real-history screenshots at 1180px, 1050px and 900px confirmed correct
+setup labels, compact icon buttons, one header row at 1180px and 1050px, wrapping
+at 900px, and no horizontal overflow. Setup was checked collapsed and expanded.
+Captures and content-free layout measurements are `.release-build/refined-header-*`.
+The real-history snapshot QA retains the existing accounting-parity gate; these
+screenshots qualify this visual refinement, not full release readiness.
