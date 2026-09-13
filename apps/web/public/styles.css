@@ -5494,7 +5494,6 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
 @media (min-width: 761px) and (max-width: 950px) {
   body:not(.community-site) > .topbar #global-state { display: none; }
 }
-#quota-cards > .metric-card { container-type: inline-size; }
 
 @media (max-width: 760px) {
   body:not(.community-site) > .topbar .top-actions { flex-wrap: wrap; min-width: 0; }
@@ -5505,28 +5504,9 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
   .topbar .refresh-progress-phase { display: none; }
 }
 
-/* Allowance cards share row rhythm and footer placement at every width. */
-#quota-cards > .metric-card { display: flex; flex-direction: column; gap: 16px; min-height: 0; padding: 20px; }
-#quota-cards .metric-card-header { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
-#quota-cards .metric-name { line-height: 1.5; }
-#quota-cards .evidence-chip { max-width: 100%; border-radius: 6px; padding: 4px 8px; font-size: .65rem; line-height: 1.4; }
-#quota-cards .metric-value { margin: 0; min-height: 1.2em; font-size: clamp(1.4rem, 9cqi, 2.25rem); line-height: 1.2; font-variant-numeric: tabular-nums; }
-#quota-cards .quota-card-spark .metric-value { font-size: clamp(1.4rem, 9cqi, 2.25rem); }
-#quota-cards .mini-progress { margin: 0; flex: 0 0 6px; }
-#quota-cards .mini-progress[hidden] { display: none; }
-#quota-cards .metric-card-footer { margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line); display: grid; gap: 5px; }
-#quota-cards .metric-meta { display: grid; gap: 5px; font-size: .75rem; }
-#quota-cards .metric-card-footer p { margin: 0; line-height: 1.5; }
 .metric-card-status { color: var(--amber); font-size: .75rem; font-weight: var(--weight-semibold); }
-#quota-cards .metric-card.stale::before { background: var(--amber); }
 #connection-notice.notice-compact { padding: 12px 16px; border-width: 0 0 0 3px; border-radius: 6px; box-shadow: none; }
 #connection-notice.notice-compact p { margin: 4px 0 0; }
-
-#quota-cards > .metric-card:not(.insufficient) { display: grid; grid-template-rows: subgrid; grid-row: span 4; }
-#quota-cards .metric-card-header { grid-row: 1; }
-#quota-cards .metric-value { grid-row: 2; }
-#quota-cards .mini-progress { grid-row: 3; }
-#quota-cards .metric-card-footer { grid-row: 4; }
 
 /* Legends occupy their own row, leaving titles and controls room to wrap. */
 .dashboard-shell .chart-card > :is(.chart-card-header, .chart-heading) > :first-child { flex: 1 1 22rem; min-width: 0; }
