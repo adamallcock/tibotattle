@@ -349,3 +349,9 @@ selected Astra icon, keyboard selection, Escape, and outside dismissal pass.
 Evidence: `.release-build/picker-polished-layout.json`, the corresponding
 `model-picker-polished` captures, and `.release-build/model-picker-detail.png`.
 The independent accounting-parity gate remains outside this visual proof.
+
+## Remove report methodology panel
+
+Owner requested removal of How this report is built from Projects & threads.
+Remove the disclosure from both populated and empty shared reports. The report
+now ends after its results/pagination; filter and evidence behavior is unchanged.

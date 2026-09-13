@@ -594,19 +594,6 @@ export function mountWorkUsageView(options = {}) {
     }
     return evidence.children.length ? evidence : null;
   }
-  function appendMethodology() {
-    if (!sharedReporting) return;
-    const disclosure = el("details", "technical-disclosure dashboard-disclosure work-usage-methodology");
-    disclosure.append(el("summary", null, tr("methodology")));
-    const notes = el("div", "work-usage-notes");
-    notes.append(
-      el("p", null, tr("mapping")),
-      el("p", null, tr("transient")),
-      el("p", null, tr("priceNote")),
-    );
-    disclosure.append(notes);
-    body.append(disclosure);
-  }
   function appendModelIcon(target, id) {
     const presentation = modelUsagePresentation(id);
     const icon = modelThemeIcon(documentRef, presentation.theme);
@@ -740,7 +727,6 @@ export function mountWorkUsageView(options = {}) {
         empty.append(recovery);
       }
       body.append(empty);
-      appendMethodology();
       focusTarget?.focus();
       pendingFocus = null;
       return;
@@ -1171,7 +1157,6 @@ export function mountWorkUsageView(options = {}) {
       next,
     );
     body.append(pagination);
-    appendMethodology();
     focusTarget?.focus();
     pendingFocus = null;
   }
