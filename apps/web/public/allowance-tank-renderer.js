@@ -2,14 +2,28 @@
 // All drawing is local and bounded; no percentage is depleted by this renderer.
 export function drawAllowanceTank(
   canvas,
-  { remaining, pace, time = 0, tilt: slosh = 0, colors, width, dpr = 1 },
+  {
+    remaining,
+    pace,
+    time = 0,
+    tilt: slosh = 0,
+    colors,
+    width,
+    dpr = 1,
+    widthScale = 1,
+  },
 ) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return false;
   const height = 418;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const state = { pace: pace === null ? 0 : Math.max(0.1, Math.min(5, pace)) };
-  const vessel = { x: width / 2, y: 12, w: Math.min(228, width - 42), h: 220 };
+  const vessel = {
+    x: width / 2,
+    y: 12,
+    w: Math.min(228, width - 42) * widthScale,
+    h: 220,
+  };
   function rounded(x, y, w, h, r) {
     ctx.beginPath();
     ctx.roundRect(x, y, w, h, r);
@@ -177,7 +191,7 @@ export function drawAllowanceTank(
         rate = state.pace,
         excess = Math.max(0, rate - 1),
         basinY = bottom + 75,
-        half = 56;
+        half = Math.min(56, vessel.w * 0.3);
       if (flowing) {
         ctx.save();
         ctx.fillStyle = fuel;

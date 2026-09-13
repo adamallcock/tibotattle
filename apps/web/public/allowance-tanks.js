@@ -77,11 +77,13 @@ export function mountAllowanceTanks(container, forecast, { t }) {
     : null;
   const controls = doc.createElement("div");
   controls.className = "allowance-motion-controls";
-  const legend = doc.createElement("span");
-  legend.textContent = t("allowance.motionMeaning");
   const button = doc.createElement("button");
   button.type = "button";
-  controls.append(legend, button);
+  const icon = doc.createElement("span");
+  icon.setAttribute("aria-hidden", "true");
+  button.append(icon);
+  controls.append(button);
+  let forecastVisible = false;
   let disposed = false,
     lastTime = 0;
   const paletteKeys = [
@@ -118,6 +120,7 @@ export function mountAllowanceTanks(container, forecast, { t }) {
       colors: entry.colors,
       width: entry.width,
       dpr: entry.dpr,
+      widthScale: entry.card.dataset.shortWindow === "true" ? 0.4 : 1,
     });
   }
   for (const card of container.querySelectorAll(".quota-tank")) {
@@ -203,15 +206,30 @@ export function mountAllowanceTanks(container, forecast, { t }) {
     },
   });
   function sync() {
-    button.textContent = t(
-      reduced.matches
-        ? "allowance.motionReduced"
-        : userPaused
-          ? "allowance.resumeMotion"
-          : "allowance.pauseMotion",
+    const label = t(
+      userPaused ? "allowance.resumeMotion" : "allowance.pauseMotion",
     );
-    button.disabled = reduced.matches;
-    button.setAttribute("aria-pressed", String(userPaused || reduced.matches));
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    button.dataset.paused = String(userPaused);
+    controls.hidden = reduced.matches;
+    button.setAttribute("aria-pressed", String(userPaused));
+    if (forecast) {
+      const ratio = number(forecastState?.tankRatio);
+      const available = entries.some((entry) => entry.pace !== null);
+      forecast.dataset.motion =
+        !reduced.matches &&
+        !userPaused &&
+        !doc.hidden &&
+        forecastVisible &&
+        available
+          ? "running"
+          : "paused";
+      forecast.style.setProperty(
+        "--forecast-flow-duration",
+        `${Math.max(1.2, 5 / Math.max(0.3, Math.min(5, ratio ?? 1)))}s`,
+      );
+    }
     motion.sync();
   }
   button.addEventListener("click", () => {
@@ -231,11 +249,13 @@ export function mountAllowanceTanks(container, forecast, { t }) {
   });
   const intersection = new view.IntersectionObserver((changes) => {
     for (const change of changes) {
+      if (change.target === forecast) forecastVisible = change.isIntersecting;
       const entry = entries.find((item) => item.card === change.target);
       if (entry) entry.visible = change.isIntersecting;
     }
     sync();
   });
+  if (forecast) intersection.observe(forecast);
   for (const entry of entries) {
     resize.observe(entry.canvas);
     intersection.observe(entry.card);
@@ -272,6 +292,7 @@ export function mountAllowanceTanks(container, forecast, { t }) {
       appearance.removeEventListener("change", recolor);
       doc.removeEventListener("visibilitychange", sync);
       controls.remove();
+      if (forecast) delete forecast.dataset.motion;
       for (const entry of entries) {
         entry.canvas.removeEventListener("pointermove", entry.move);
         entry.canvas.removeEventListener("pointerleave", entry.leave);

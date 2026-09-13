@@ -1672,7 +1672,10 @@ function renderQuotaCards(data) {
       window.status === "stale" ? "stale" : "",
       remaining === null ? "insufficient" : "",
     ].filter(Boolean).join(" "));
-    card.setAttribute("aria-label", localizedQuotaWindowLabel(window));
+    card.setAttribute("aria-label", spark
+      ? `GPT-5.3 Codex Spark · ${localizedQuotaWindowDuration(window.durationMinutes)}`
+      : localizedQuotaWindowLabel(window));
+    card.dataset.shortWindow = String(window.durationMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES);
     card.dataset.remaining = remaining === null ? "" : String(remaining);
     card.dataset.forecastPool = String(isPrimaryCodexWeeklyQuotaWindow(window));
     card.dataset.resetAt = String(forecastTimestamp(window.resetAt) ?? "");
@@ -1684,10 +1687,15 @@ function renderQuotaCards(data) {
       card.append(fuel);
     }
     const header = node("div", "quota-tank-header");
-    header.append(node("span", "quota-tank-family", spark
-      ? t("dashboard.quota.spark")
-      : isPrimaryCodexQuotaWindow(window) ? "Codex"
-        : window.limitName || t("dashboard.quota.windowOther")));
+    const family = node("span", "quota-tank-family");
+    if (spark) {
+      family.className += " allowance-model-spark";
+      family.append(modelThemeIcon(document, "spark"), node("span", "", "GPT-5.3 Codex Spark"));
+    } else {
+      family.textContent = isPrimaryCodexQuotaWindow(window) ? "Codex"
+        : window.limitName || t("dashboard.quota.windowOther");
+    }
+    header.append(family);
     header.append(node("span", "quota-tank-period",
       localizedQuotaWindowDuration(window.durationMinutes)));
     if (window.status === "stale") {

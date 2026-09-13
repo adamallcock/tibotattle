@@ -39,8 +39,20 @@ Validation on 2026-09-13:
 - Read-only browser preview used real local allowance and forecast data. Verified
   crimson flow only for the matching Codex pool, idle separate pools, changing
   visible canvas pixels and identical paused pixels. Verified reduced-motion
-  disabled controls, dark palette, one control group after language changes, and
+  static rendering, dark palette, one control group after language changes, and
   Spanish at a 323 CSS-pixel viewport without horizontal overflow.
 - The preview refuses mutations and therefore displays an existing analysis-start
   notice; no refresh or private evidence mutation was performed. Installed app,
   signing, release, deployment and remote publication remain unqualified.
+
+Follow-up refinement: replace the labelled motion toolbar with an accessible
+pause icon and silently hide it for reduced motion. Remove the explanatory UI
+line, use the shared Spark icon and full model name, draw five-hour vessels at
+40% width, and animate a sheen inside the fixed forecast coverage bar. The same
+pause, reduced-motion and visibility policy governs the bar. Narrow width is a
+visual convention, not a capacity estimate.
+
+Follow-up validation: 740 web tests passed. Browser checks confirmed the 40%
+vessel geometry, full Spark labels with the shared icon colour, hidden controls
+and no explanatory copy under reduced motion, and a changing forecast sheen
+with an unchanged coverage width. The discreet pause control stopped both.

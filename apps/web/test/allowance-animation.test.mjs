@@ -139,3 +139,46 @@ test("renderer keeps observed capacity fixed, handles empty/full and bounded ext
     false,
   );
 });
+
+test("short windows use forty percent vessel width without changing height or observed capacity", () => {
+  const rectangles = [];
+  const context = new Proxy(
+    {},
+    {
+      get(_target, key) {
+        if (key === "roundRect") return (...args) => rectangles.push(args);
+        if (key.startsWith("create")) return () => ({ addColorStop() {} });
+        return () => {};
+      },
+      set() {
+        return true;
+      },
+    },
+  );
+  const colors = Object.fromEntries(
+    [
+      "bg",
+      "panel",
+      "ink",
+      "muted",
+      "edge",
+      "metal",
+      "bright",
+      "shadow",
+      "fluid",
+      "glow",
+      "deep",
+    ].map((key) => [key, "rgb(100, 150, 120)"]),
+  );
+  const options = { remaining: 67, pace: null, width: 300, colors };
+  drawAllowanceTank({ getContext: () => context }, options);
+  const standard = rectangles[0];
+  rectangles.length = 0;
+  drawAllowanceTank(
+    { getContext: () => context },
+    { ...options, widthScale: 0.4 },
+  );
+  assert.equal(rectangles[0][2], standard[2] * 0.4);
+  assert.equal(rectangles[0][3], standard[3]);
+  assert.equal(options.remaining, 67);
+});

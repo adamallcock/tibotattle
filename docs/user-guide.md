@@ -48,12 +48,16 @@ states are meaningful; TiboTattle does not replace missing evidence with zero.
 
 ## Reading the dashboard
 
-Overview shows one equally sized glass fuel tank for each observed allowance.
+Overview shows one glass fuel tank for each observed allowance. Five-hour vessels
+are visually narrower (40% of standard width); this styling is not a measured
+capacity ratio. GPT-5.3 Codex Spark uses its shared model name and icon.
 Liquid motion is illustrative: the level stays at the observed percentage. Only
 a matching fresh forecast drives the outlet; greater pace produces more flow,
 with amber or red overflow for excessive pace. Overflow is a pace cue, not wasted
-quota. Pause motion stops animation, and the system reduced-motion preference is
-respected. Offscreen tanks stop animating. Unavailable capacity retains its text
+quota. A discreet pause icon stops both tank and forecast-bar motion. The system
+reduced-motion preference is respected silently and hides the motion control.
+The forecast bar has a subtle moving sheen; its extent and time markers do not
+move with the animation. Offscreen tanks stop animating. Unavailable capacity retains its text
 state and stale observations have no animated flow. The fill
 and percentage both represent remaining capacity. A single current Codex weekly
 forecast appears beneath the tanks when usable pacing evidence exists; choosing

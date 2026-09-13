@@ -2678,7 +2678,8 @@ test("quota presentation keeps Spark separate and weekly surfaces exact", async 
   assert.match(appSource, /dashboard\.quota\.windowSparkSevenDay/u);
   assert.match(appSource, /dashboard\.quota\.windowOtherDuration/u);
   assert.match(appSource, /dashboard\.quota\.windowNamedObserved/u);
-  assert.match(appSource, /dashboard\.quota\.spark/u);
+  assert.match(appSource, /GPT-5\.3 Codex Spark/u);
+  assert.match(appSource, /modelThemeIcon\(document, "spark"\)/u);
   assert.match(appSource, /const normalWindows = data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u);
   assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);
   assert.match(appSource, /title: \{ key: "weekly\.chart\.title" \}/u);

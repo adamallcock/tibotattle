@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { modelThemeIcon } from "../public/model-visuals.js";
 import { translate } from "../public/localization.js";
 import {
   isPrimaryCodexQuotaWindow, isPrimaryCodexWeeklyQuotaWindow, selectPrimaryCodexQuotaWindow,
@@ -40,16 +41,17 @@ function find(element, className) {
 function harness(locale = "en-US") {
   const quota = new Element(); const card = new Element(); const context = new Element();
   const node = (...args) => new Element(...args);
-  const document = { createTextNode: text => node("text", "", text), activeElement: null };
+  const document = { createElementNS: (_namespace, tag) => node(tag), createTextNode: text => node("text", "", text), activeElement: null };
   const constants = ["PACE_ON_TRACK_LOWER_RATIO", "PACE_ON_TRACK_UPPER_RATIO", "PACE_CRITICAL_RATIO", "PACE_AVERAGE_MINIMUM_HOURS", "PACE_STATE_LABELS"]
     .map(name => source.match(new RegExp(`\\nconst ${name} = [^;]+;`, "u"))[0]).join("\n");
   const functions = ["formatAllowanceDuration", "allowanceTimestamp", "formatForecastDuration", "forecastTimestamp", "firstFiniteForecastNumber", "weeklyPaceRates", "weeklyPaceStanding", "formatPaceRatio", "weeklyPaceTrack", "renderWeeklyPaceForecast", "renderQuotaCards", "providerReportedPlanEvidence"]
     .map(declaration).join("\n");
-  const factory = new Function("node", "document", "$", "t", "setLocalizedText", "isPrimaryCodexQuotaWindow", "isPrimaryCodexWeeklyQuotaWindow", "selectPrimaryCodexQuotaWindow", "isSparkQuotaLimitId", "isValidQuotaWindowDuration", "card", `
+  const factory = new Function("node", "document", "modelThemeIcon", "$", "t", "setLocalizedText", "isPrimaryCodexQuotaWindow", "isPrimaryCodexWeeklyQuotaWindow", "selectPrimaryCodexQuotaWindow", "isSparkQuotaLimitId", "isValidQuotaWindowDuration", "card", `
     const finite = value => typeof value === "number" && Number.isFinite(value) ? value : null;
     const clear = element => element.replaceChildren();
     const formatDecimal = (value, digits = 0) => value.toFixed(digits);
     const formatPercent = value => value + "%";
+    const CODEX_FIVE_HOUR_ALLOWANCE_MINUTES = 300;
     const USER_TIME_ZONE = "UTC";
     const dateTimeFormatter = () => ({ format: value => value.toISOString() });
     const localizedQuotaWindowLabel = w => w.limitId + " " + w.durationMinutes;
@@ -64,7 +66,7 @@ function harness(locale = "en-US") {
     return { renderQuotaCards, renderWeeklyPaceForecast, weeklyPaceTrack, formatAllowanceDuration,
       allowanceTimestamp, popover: () => activeInformationPopover };
   `);
-  const api = factory(node, document, selector => ({ "#quota-cards": quota, "#allowance-context": context })[selector],
+  const api = factory(node, document, modelThemeIcon, selector => ({ "#quota-cards": quota, "#allowance-context": context })[selector],
     (key, values = {}) => translate(key, values, locale),
     (element, key) => { element.textContent = translate(key, {}, locale); },
     isPrimaryCodexQuotaWindow, isPrimaryCodexWeeklyQuotaWindow, selectPrimaryCodexQuotaWindow, isSparkQuotaLimitId, isValidQuotaWindowDuration, card);
@@ -207,4 +209,19 @@ test("all forecast states translate without changing their observed values", () 
     assert.equal(h.card.textContent.includes("allowance."), false);
     assert.equal(h.card.textContent.includes("{duration}"), false);
   }
+});
+
+test("five-hour tanks are narrow and Spark uses its shared model identity", () => {
+  const h = harness();
+  h.renderQuotaCards(payload([
+    window(),
+    window({ durationMinutes: 300 }),
+    window({ limitId: "codex_bengalfox", durationMinutes: 300 }),
+  ]));
+  assert.deepEqual(h.quota.children.map(card => card.dataset.shortWindow), ["false", "true", "true"]);
+  const spark = h.quota.children[2];
+  assert.match(spark.textContent, /GPT-5\.3 Codex Spark/);
+  const family = find(spark, "quota-tank-family")[0];
+  assert.equal(family.children[0].attributes.class, "allowance-model-icon");
+  assert.equal(family.children[0].attributes["aria-hidden"], "true");
 });
