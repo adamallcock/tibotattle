@@ -1,27 +1,26 @@
 ---
 title: Platform support and qualification
-date: 2026-09-11
+date: 2026-09-13
 type: reference
 status: maintained
 ---
 
 # Platform support and qualification
 
-The released Electron application is **0.1.21** across four distribution
-targets: macOS Apple silicon, macOS Intel, Windows x64 and Linux x64. Version
-0.1.22 is being qualified and is not yet a published successor. See
+The released Electron application is **0.1.22** across four distribution
+targets: macOS Apple silicon, macOS Intel, Windows x64 and Linux x64. See
 [current status](../current-status.md) for exact source, release and hosted
-boundaries, and the [public release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.21/release-manifest.json)
+boundaries, and the [public release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.22/release-manifest.json)
 for the final artifact assurances.
 
 ## Status matrix
 
 | Platform | Current distribution | Proven final-artifact boundary | Acceptance limits |
 |---|---|---|---|
-| macOS 14+ arm64 | Supported; 0.1.21 DMG | Developer ID signing, notarization/stapling, Gatekeeper and clean-install smoke; actual native 0.1.18 and Electron 0.1.20 upgrade journeys | A new release must bind checks to its own final bytes |
-| macOS 14+ x86_64 | Supported; separate 0.1.21 Intel DMG | Separate native trust, clean-install smoke and actual native/Electron upgrade journeys | Remaining physical/manual Intel observations explicitly accepted by the owner, not recorded as passed |
-| Windows x64 | Released; 0.1.21 signed installer | Authenticode signing, timestamp and clean-install smoke; signed normal installed journey | Remaining physical desktop/update/notification acceptance explicitly accepted by the owner; credential persistence and hosted enrollment were not requalified by that journey |
-| Linux x86_64 | Released; 0.1.21 AppImage | Exact artifact integrity; updater metadata bound to the AppImage | Owner accepted remaining physical desktop/lifecycle qualification; manifest clean-install assurance remains false and native trust scheme is none |
+| macOS 14+ arm64 | Supported; 0.1.22 DMG | Developer ID signing, notarization/stapling, Gatekeeper and clean-install smoke for the exact artifact | Retained native/Electron upgrade receipts apply to 0.1.21, not 0.1.22 |
+| macOS 14+ x86_64 | Supported; separate 0.1.22 Intel DMG | Separate native trust and clean-install smoke for the exact artifact | Remaining physical/manual Intel observations explicitly accepted by the owner, not recorded as passed |
+| Windows x64 | Released; 0.1.22 signed installer | Authenticode signing, timestamp and clean-install smoke for the exact artifact | Remaining physical desktop/update/notification acceptance explicitly accepted by the owner; credential persistence and hosted enrollment were not requalified by that journey |
+| Linux x86_64 | Released; 0.1.22 AppImage | Exact artifact integrity; updater metadata bound to the AppImage | Owner accepted remaining physical desktop/lifecycle qualification; manifest clean-install assurance remains false and native trust scheme is none |
 
 These owner decisions apply to the named Electron release workstream. They do
 not fabricate physical test results or declare other platforms supported.
@@ -52,8 +51,9 @@ binding, credential protection or update integrity.
 ## macOS
 
 Both published Mac installers require macOS 14 or later and use bundle version
-`1028`. Their signed clean-install and actual production-upgrade evidence is
-linked from [current status](../current-status.md#published-electron-release).
+`1029`. Their signed clean-install evidence is linked from
+[current status](../current-status.md#published-electron-release). Retained
+production-upgrade receipts qualify 0.1.21 and are not reused for 0.1.22.
 The incoming native Sparkle transition and the outgoing Electron updater are
 separate paths. Installing the current app transfers compatible retained local
 state; users should not need to preserve an old app bundle manually.
@@ -68,14 +68,14 @@ for subsequent versions.
 
 ## Windows
 
-The public 0.1.21 installer is signed and timestamped. Its signed-installed
+The public 0.1.22 installer is signed and timestamped. Its clean-install
 normal journey confirms installation, normal local processing, uninstall and
 owned cleanup. Earlier synthetic credential and portability tests remain
 useful within their recorded scope; they do not establish continuity of an
 existing user's credentials in a later installer. Physical update replacement
 and notification appearance remain accepted user-testing limits.
 
-The pending 0.1.22 **model-performance page is unavailable on Windows** until
+The 0.1.22 **model-performance page is unavailable on Windows** until
 its protected session-state reader is qualified there. That is a feature
 availability boundary, not a statement that the normal Windows application or
 local usage processing is unavailable.
@@ -94,5 +94,5 @@ this release on unavailable hardware tests.
 
 Update this declaration from exact release evidence and explicit acceptance.
 Do not infer current support from an open pull request, development build,
-screenshot or old receipt. Version 0.1.22 requires its own frozen source,
-artifacts and qualification; current 0.1.21 publication does not satisfy them.
+screenshot or old receipt. Every future release requires its own frozen source,
+artifacts and qualification; current 0.1.22 publication does not satisfy them.
