@@ -346,6 +346,36 @@ export function mountWorkUsageView(options = {}) {
     load();
   });
   model.control.classList.add("model-picker");
+  function renderModelOptions(ids) {
+    model.control.replaceChildren(
+      ...[
+        ["", tr("allModels")],
+        ...[...ids].sort(compareModelPresentation).map((id) => [id, formatModelName(id)]),
+      ].map(([value, text]) => {
+        const option = el("option", null, text);
+        option.value = value;
+        option.title = value || text;
+        const presentation = value ? modelUsagePresentation(value)
+          : { theme: "layers", className: "allowance-model-classic" };
+        const icon = modelThemeIcon(documentRef, presentation.theme);
+        if (icon) {
+          icon.classList.add(presentation.className);
+          option.replaceChildren(icon, el("span", null, text));
+        }
+        return option;
+      }),
+    );
+    // Customizable native selects retain platform keyboard/dismiss behavior
+    // while allowing the same SVG identity in the list and selected value.
+    if (windowRef.CSS?.supports("appearance", "base-select")) {
+      const selected = el("button");
+      selected.type = "button";
+      selected.append(el("selectedcontent"));
+      model.control.prepend(selected);
+    }
+    model.control.value = query.model ?? "";
+  }
+  renderModelOptions([]);
   const scope = select(tr("scope"), [], (value) => {
     query.scope = value;
     refresh(response?.snapshotId);
@@ -1258,34 +1288,7 @@ export function mountWorkUsageView(options = {}) {
       setStatus("snapshot", {
         date: formatLocal(new Date(result.toMs).toISOString()),
       });
-      model.control.replaceChildren(
-        ...[
-          ["", tr("allModels")],
-          ...[...result.models].sort(compareModelPresentation).map((id) => [id, formatModelName(id)]),
-        ].map(([value, text]) => {
-          const option = el("option", null, text);
-          option.value = value;
-          option.title = value || text;
-          if (value) {
-            const presentation = modelUsagePresentation(value);
-            const icon = modelThemeIcon(documentRef, presentation.theme);
-            if (icon) {
-              icon.classList.add(presentation.className);
-              option.replaceChildren(icon, el("span", null, text));
-            }
-          }
-          return option;
-        }),
-      );
-      // Customizable native selects retain platform keyboard/dismiss behavior
-      // while allowing the same SVG identity in the list and selected value.
-      if (windowRef.CSS?.supports("appearance", "base-select")) {
-        const selected = el("button");
-        selected.type = "button";
-        selected.append(el("selectedcontent"));
-        model.control.prepend(selected);
-      }
-      model.control.value = query.model ?? "";
+      renderModelOptions(result.models);
       scope.control.replaceChildren(
         ...result.scopes.map((s, i) => {
           const option = el(
@@ -1395,8 +1398,7 @@ export function mountWorkUsageView(options = {}) {
     });
     model.wrapper.firstChild.textContent = tr("model");
     scope.wrapper.firstChild.textContent = tr("scope");
-    if (model.control.options[0])
-      model.control.options[0].textContent = tr("allModels");
+    renderModelOptions([...model.control.options].map(option => option.value).filter(Boolean));
     [...scope.control.options].forEach((option, i) => {
       option.textContent =
         response?.scopes[i]?.status === "unavailable"

@@ -1591,5 +1591,10 @@ test("model filter uses shared identity order and sends the exact selected ID", 
     await settleMountedView();
     assert.equal(requests.at(-1).model, "gpt-5.6-sol-wm");
     assert.equal(picker.value, "gpt-5.6-sol-wm");
+    for (const listener of windowRef.listeners.get("tibotattle:locale-change") ?? []) listener();
+    assert.equal(picker.value, "gpt-5.6-sol-wm");
+    assert.equal(picker.options[0].textContent, mountedTranslator("workUsage.allModels"));
+    assert.equal(picker.options[0].children[0].getAttribute("aria-hidden"), "true");
+    assert.equal(picker.options[1].children[0].getAttribute("aria-hidden"), "true");
   } finally { view.destroy(); }
 });

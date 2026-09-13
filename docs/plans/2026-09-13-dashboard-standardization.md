@@ -330,3 +330,11 @@ Keyboard selection chooses Astra and renders its selected icon. Escape and an
 outside click close the menu. Evidence: `.release-build/picker-layout.json`
 and matching `model-picker` screenshots. The review does not qualify private
 report contents or close the separate accounting-parity gate.
+
+## Model picker visual refinement
+
+Give each shared model icon a tinted tile, including All models in the closed
+picker. Increase menu width and row spacing, move the selection checkmark to
+the right, and preserve a distinct selected background and keyboard focus.
+Build the icon-bearing options during initial loading as well as after reports
+and locale changes; localization must not replace an option with plain text.
