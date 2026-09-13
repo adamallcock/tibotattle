@@ -46,7 +46,7 @@ Those remain separate verification gates in the relevant runbooks.
 | Hosted Worker API | Internet/native collector → Cloudflare Worker | 39 API paths, 40 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
-| Process protocols | Native shell, companion, analysis owners ↔ child/worker | 9 explicit runtime protocol families |
+| Process protocols | Native shell, Codex plugin, companion, analysis owners ↔ child/worker | 11 explicit runtime protocol families |
 | Cloudflare service bindings | Worker → platform-managed resources | 3 D1 bindings, 3 production R2 bindings, 1 Durable Object, 8 rate limiters, 1 assets binding, 1 cron schedule |
 | Reviewed code APIs | App/source owners → reusable modules | 5 workspace packages and 24 reviewed source-owner entrypoints |
 | JSON/wire contracts | Collectors, exports, release tooling, hosted intake | Closed versioned families, including generated staged v1.1 and frozen code-defined telemetry v1.0; see schema lifecycle inventory |
@@ -702,6 +702,33 @@ accountless channel, never renderer IPC or HTTP. `productionSafe` remains
 `false` and runtime selection remains disabled pending native Windows x64 build,
 manifest, security, physical-runner, installed-lifecycle, signing, and release
 evidence.
+
+### Codex plugin MCP and installed-agent protocols
+
+**Sources of truth:**
+[`plugins/tibotattle/mcp/server.mjs`](../../plugins/tibotattle/mcp/server.mjs),
+[`plugins/tibotattle/lib/installed-agent.mjs`](../../plugins/tibotattle/lib/installed-agent.mjs),
+and [`apps/local/agent-cli.js`](../../apps/local/agent-cli.js).
+
+The Codex host starts the plugin's dependency-free local MCP server over stdio.
+It exposes six closed tools: status, plan discovery, one usage query, one
+evidence lookup, install planning, and confirmed installation. MCP input lines
+are bounded to 128 KiB. Analysis tools are read-only and offline; only install
+planning reads the public GitHub release manifest and Homebrew cask. The install
+tool is separately marked destructive and requires a single-use, expiring token
+bound to the exact release, source commit, artifact size and architecture SHA.
+
+For analysis, the plugin locates only reviewed TiboTattle application bundles,
+selects the highest semantic version when system and user installations coexist,
+starts that Electron executable with `ELECTRON_RUN_AS_NODE=1`, and selects
+packaged companion protocol v1. The subprocess accepts only `status`,
+`explain-usage-plans`, `explain-usage`, and `explain-usage-evidence`, with their
+closed plan/period/page/cursor/selector arguments. It returns exactly one JSON
+record with a 64 KiB parent-side ceiling and 30-second timeout. The child
+environment is allowlisted; unexpected errors are collapsed to fixed codes.
+Neither boundary accepts an arbitrary executable, path, shell command, SQL,
+refresh, settings mutation, or upload instruction. The
+[plugin reference](./codex-plugin.md) owns installation and release boundaries.
 
 ### Codex app-server subprocess protocol
 

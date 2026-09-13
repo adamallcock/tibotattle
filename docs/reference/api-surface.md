@@ -321,6 +321,8 @@ and bounded blob downloads. Provider sign-in opens in the system browser.
 
 | Boundary | Caller | Contract |
 | --- | --- | --- |
+| Codex plugin MCP | Codex host | Bounded newline-delimited JSON-RPC over local stdio exposes six closed tools. Analysis/status are read-only; install planning and confirmed installation are separate tools. |
+| Installed Electron agent protocol v1 | TiboTattle plugin | Runs the packaged companion through Electron's retained Node mode with four closed commands and one bounded JSON result. No arbitrary path, SQL, command, refresh, setting or upload input. |
 | Codex app-server | Local collector | Spawns the local `codex app-server` binary and uses bounded JSON-RPC for account, rate-limit, and usage evidence. No provider credential is copied into documentation or telemetry. |
 | Claude status line | Explicit standalone callback hook to local broker | Bounded JSON input through the managed callback/socket boundary; content-free status projection only. It is not an installed-app API. |
 | Model performance worker | Page-leased local controller | Independent, bounded Codex timing scan and aggregate snapshots; no accounting or contribution input. Stops after 60 seconds without a page reader. |
