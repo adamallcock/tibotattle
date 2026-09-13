@@ -67,6 +67,7 @@
     >
     <title>TiboTattle</title>
     <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./cache-reuse-matrix.css">
     <link rel="stylesheet" href="./model-performance.css">
     <script type="module" src="./app.js"></script>
     <script type="module" src="./desktop-shell.js"></script>
@@ -903,44 +904,8 @@
               <h3 id="cache-reuse-outcome-heading" data-i18n="accounting.cacheContinuity.outcome.heading">Did the cache carry over?</h3>
               <p data-i18n="accounting.cacheContinuity.outcome.subtitle">Follow-up turns with the same model and settings, grouped by time since the previous turn.</p>
             </header>
-            <div class="cache-reuse-metrics">
-              <div class="cache-reuse-metric-more">
-                <strong id="cache-reuse-more-percent">0%</strong>
-                <span data-i18n="accounting.cacheContinuity.outcome.moreLabel">reused more than half</span>
-                <small id="cache-reuse-more-count"></small>
-              </div>
-              <div class="cache-reuse-metric-less">
-                <strong id="cache-reuse-less-percent">0%</strong>
-                <span data-i18n="accounting.cacheContinuity.outcome.lessLabel">reused half or less</span>
-                <small id="cache-reuse-less-count"></small>
-              </div>
-              <div class="cache-reuse-metric-overhead">
-                <strong id="cache-reuse-overhead">—</strong>
-                <span data-i18n="accounting.cacheContinuity.outcome.overheadLabel">estimated overhead from cache drops</span>
-                <small data-i18n="accounting.cacheContinuity.outcome.overheadBasis">Standard API equivalent</small>
-              </div>
-              <p class="cache-reuse-explanation" id="cache-reuse-explanation"></p>
-            </div>
           </div>
-          <p class="cache-reuse-empty" id="cache-reuse-empty" data-i18n="accounting.cacheContinuity.outcome.noData" hidden>No eligible follow-up turns were found in this period.</p>
-          <p class="annotation" id="cache-reuse-coverage" hidden></p>
-          <div class="cache-reuse-raster" id="cache-reuse-raster">
-            <div class="cache-reuse-raster-scroll" id="cache-reuse-raster-scroll">
-              <div class="cache-reuse-raster-stage" id="cache-reuse-raster-stage">
-                <canvas id="cache-reuse-canvas" height="376" tabindex="0"></canvas>
-                <div class="cache-reuse-readout-rail" id="cache-reuse-readout-rail" hidden>
-                  <div class="cache-reuse-readout" id="cache-reuse-readout" aria-live="polite">
-                    <strong id="cache-reuse-readout-bucket"></strong>
-                    <span id="cache-reuse-readout-checked"></span>
-                    <span class="cache-reuse-readout-more" id="cache-reuse-readout-more"></span>
-                    <span class="cache-reuse-readout-less" id="cache-reuse-readout-less"></span>
-                    <small class="cache-reuse-readout-lost" id="cache-reuse-readout-lost"></small>
-                    <small class="cache-reuse-readout-api" id="cache-reuse-readout-api"></small>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
+          <div id="cache-reuse-matrix"></div>
         </section>
         <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details cache-continuity-details" id="cache-continuity-details" hidden>
           <summary data-i18n="accounting.cacheContinuity.detailsSummary">See recent large cache drops</summary>

@@ -125,7 +125,8 @@ export const WEB_MESSAGES = Object.freeze({
       || key.startsWith("appearance.")
       || key.startsWith("electron.")
       || key.startsWith("weekly.controls.")
-      || key.startsWith("accounting.cacheImpact.bullet"))
+      || key.startsWith("accounting.cacheImpact.bullet")
+      || key.startsWith("accounting.cacheContinuity.matrix."))
     .map((key) => [key, SUPPORTED_LOCALES.map((locale) => CATALOGS[locale][key])])),
   "dashboard.title": ["Usage overview", "使用概览", "Resumen de uso"],
   "usage.events": ["Usage events: {count}", "使用事件：{count}", "Eventos de uso: {count}"],
