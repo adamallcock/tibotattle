@@ -199,3 +199,18 @@ Use amber for incomplete coverage, reserving error styling for failed actions.
 Acceptance: consistent title scale/padding, readable controls and legends at
 1180px and 960px, preserved model tooltip and keyboard tests, and a fresh
 unsigned packaged visual inspection.
+
+The shared chart anatomy is implemented, including legends below the controls
+and consistent 24px padding / 23.2px heading scale in the reviewed desktop
+layouts. The usage heading no longer repeats the reporting period, preventing
+the internal All-range day sentinel from appearing as a duration.
+750 web tests pass, including existing chart tooltip and keyboard checks.
+Two exact-class checks were reconciled with the shared aliases without removing
+their original structural expectations.
+
+Final unsigned candidate source:
+`51508dbce6dc83885fe72cb4feeed4a34a74fb42`; ASAR:
+`4e4e1b2a5230b7c487191a27c9faad251f236922beb19ce956a7585ab406a33d`.
+Rendered Allowance, Trends and Model performance are reviewed at 1180px and
+960px; `.release-build/charts-layout.json` records card alignment and overflow
+checks. Full accounting-parity qualification remains an independent gate.
