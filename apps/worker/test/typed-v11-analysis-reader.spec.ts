@@ -330,6 +330,47 @@ describe("typed active-domain analytical reads",()=>{
     expect(await typedTelemetryReadNamespace(legacy())).toBeNull();
   });
 
+  it("exports current and retained staged chunks once without exposing origin metadata",async()=>{
+    const retainedNamespace="synthetic-export-retained";
+    const priorDay=new Date(Date.parse(day()+"T00:00:00.000Z")-86400000).toISOString().slice(0,10);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    const retainedRecord=v11UsageRecord(priorDay,"a"),currentRecord=v11UsageRecord(day(),"b");
+    const retained=await makeV11Day(priorDay,{usage:[retainedRecord]});
+    await stage(typed(),f,retained,true);
+    const manifestId=await retainStagedV11Origin(f,retained,retainedNamespace);
+    await stage(typed(),f,await makeV11Day(day(),{usage:[currentRecord]}),true);
+    const foreign=await createV11DeviceFixture(typed(),{participantId:"participant:synthetic-foreign-export",grant:true});
+    await stage(typed(),foreign,await makeV11Day(day(),{usage:[v11UsageRecord(day(),"c")]}),true);
+    const entries=[];
+    for await(const entry of telemetryV11ExportEntries(typed(),participantId,new Date().toISOString()))entries.push(entry);
+    const chunks=entries.filter(entry=>Reflect.get(entry,"kind")==="chunk");
+    expect(chunks).toHaveLength(2);
+    expect(chunks.flatMap(entry=>Reflect.get(entry,"records")).sort((a,b)=>a.eventId.localeCompare(b.eventId)))
+      .toEqual([retainedRecord,currentRecord].sort((a,b)=>a.eventId.localeCompare(b.eventId)));
+    expect(chunks.every(entry=>Reflect.get(entry,"activeWhenRead")===false)).toBe(true);
+    expect(JSON.stringify(entries)).not.toContain(retainedNamespace);
+    expect(JSON.stringify(entries)).not.toContain("sourceNamespace");
+    const chunkId=(await typed().prepare('SELECT id FROM telemetry_v11_chunks WHERE manifest_id=?')
+      .bind(manifestId).first<string>('id'))!;
+    const read={participantId,chunkId,expectedCount:1};
+    expect(await readTypedV11ChunkRecords(typed(),read)).toEqual([{record_json:canonicalTelemetryV11Json(retainedRecord)}]);
+    await expect(readTypedV11ChunkRecords(typed(),{...read,sourceNamespace:namespace}))
+      .rejects.toThrow("TYPED_V11_EXPORT_MEMBERSHIP_CONFLICT");
+    await expect(readTypedV11ChunkRecords(typed(),{...read,participantId:foreign.participantId}))
+      .rejects.toThrow("TYPED_V11_EXPORT_MEMBERSHIP_CONFLICT");
+    // Emulate an incomplete origin restore without changing the production
+    // retention guard or dropping any participant's stored records.
+    const retentionGuard=(await typed().prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='typed_telemetry_origin_retained'")
+      .first<string>('sql'))!;
+    await typed().exec('DROP TRIGGER typed_telemetry_origin_retained');
+    try {
+      await typed().prepare('DELETE FROM typed_telemetry_origin_contracts WHERE source_namespace=?')
+        .bind(retainedNamespace).run();
+    } finally { await typed().prepare(retentionGuard).run(); }
+    await expect(readTypedV11ChunkRecords(typed(),read)).rejects.toThrow("TYPED_V11_EXPORT_MEMBERSHIP_CONFLICT");
+    expect(await typed().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(0);
+  });
+
   it("calculates and reuses exact allowance fits in the separate database, then fences a policy change",async()=>{
     await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
     await initializeTypedV1Admission(typed(),namespace);

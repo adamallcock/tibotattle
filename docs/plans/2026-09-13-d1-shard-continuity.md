@@ -134,3 +134,7 @@ Independent review found and corrected two integration defects: withdrawing a pa
 
 
 Before cloud bootstrap, root compared the transport against retained responses from the completed isolated verification rehearsal. Cloudflare returns the Worker under `script` and delivery bounds under nested `settings`; the initial bootstrap fixtures used an older flat shape. Both runtime readback and containment now validate the observed representation, including exact queue identity, batch size, concurrency, timeout and retry settings. Synthetic refusal cases cover missing and contradictory fields. This closes the known response-shape mismatch; it does not replace the pending live bootstrap rehearsal.
+
+## Private export follow-up
+
+The v1.1 private export iterator now resolves each chunk through its exact qualified origin membership instead of imposing the current write namespace. Staged and active inventory semantics remain unchanged; original records retain their identities, and internal origin metadata is not exported. The focused two-suite check passes 31 tests, including current plus retained history, foreign-owner refusal, explicit wrong-origin refusal and missing-origin refusal without JSON fallback. TypeScript passes. This is a local follow-up to the qualified eighth checkpoint; its full owning gate, a moved-owner export journey and cloud activation remain pending.

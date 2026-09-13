@@ -356,7 +356,7 @@ export async function* telemetryV11ExportEntries(
       .first<ChunkRow>();
     if (!row) break;
     const stored = typedNamespace ? { results: await readTypedV11ChunkRecords(db, {
-      sourceNamespace: typedNamespace, participantId, chunkId: row.id, expectedCount: row.record_count,
+      participantId, chunkId: row.id, expectedCount: row.record_count,
     }) } : await db.prepare(
       "SELECT record_json FROM telemetry_v11_records WHERE chunk_id = ? ORDER BY observed_at, occurrence_id LIMIT 201",
     ).bind(row.id).all<{ record_json: string }>();

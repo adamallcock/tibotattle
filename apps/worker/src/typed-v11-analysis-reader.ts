@@ -93,25 +93,33 @@ export async function readTypedV11UsageAnalysisPage(db: D1Database, options: {
 /** Private exports include staging as well as active evidence, so they use the
  * authenticated chunk membership instead of the active-domain view. */
 export async function readTypedV11ChunkRecords(db: D1Database, options: {
-  sourceNamespace: string; participantId: string; chunkId: string; expectedCount: number;
+  sourceNamespace?: string; participantId: string; chunkId: string; expectedCount: number;
 }): Promise<Array<{ record_json: string }>> {
-  const { sourceNamespace, participantId, chunkId, expectedCount } = options;
+  const { participantId, chunkId, expectedCount } = options;
   if (!Number.isSafeInteger(expectedCount) || expectedCount < 1 || expectedCount > 200) {
     throw new Error("TYPED_V11_EXPORT_MEMBERSHIP_CONFLICT");
   }
-  const qualified = await db.prepare(`SELECT 1 AS present FROM telemetry_v11_chunks c
+  // An export may include accepted chunks from a retained origin. Resolve the
+  // chunk's exact membership; the current write namespace is not its identity.
+  const qualified = await db.prepare(`SELECT origin.source_namespace FROM telemetry_v11_chunks c
     JOIN typed_v11_chunk_allocations allocation ON allocation.chunk_id=c.id
     JOIN typed_telemetry_chunks typed_chunk ON typed_chunk.namespace_id=allocation.namespace_id
       AND typed_chunk.format=11 AND typed_chunk.original_id=allocation.chunk_original
     JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=allocation.namespace_id
-      AND origin.namespace_original=? AND origin.source_namespace=?
       AND origin.v11_read_contract_version=2 AND origin.source_schema_digest=?
     JOIN typed_v11_owner_memberships membership ON membership.participant_id=c.participant_id
       AND membership.namespace_id=allocation.namespace_id AND membership.typed_owner_id=typed_chunk.owner_id
-    WHERE c.id=? AND c.participant_id=? AND typed_chunk.original_id=?`)
-    .bind(binary(sourceNamespace), sourceNamespace, TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST,
-      chunkId, participantId, binary(chunkId)).first();
-  if (!qualified) throw new Error("TYPED_V11_EXPORT_MEMBERSHIP_CONFLICT");
+    WHERE c.id=? AND c.participant_id=? AND typed_chunk.original_id=? LIMIT 2`)
+    .bind(TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST, chunkId, participantId, binary(chunkId))
+    .all<{source_namespace:string}>();
+  if (qualified.success !== true || !Array.isArray(qualified.results) || qualified.results.length !== 1
+      || typeof qualified.results[0]?.source_namespace !== "string") {
+    throw new Error("TYPED_V11_EXPORT_MEMBERSHIP_CONFLICT");
+  }
+  const sourceNamespace = qualified.results[0].source_namespace;
+  if (options.sourceNamespace !== undefined && options.sourceNamespace !== sourceNamespace) {
+    throw new Error("TYPED_V11_EXPORT_MEMBERSHIP_CONFLICT");
+  }
   const rows = (await db.prepare(`SELECT p.typed_record_id FROM typed_v11_record_admissions p
     JOIN telemetry_v11_chunks c ON c.id=p.chunk_id
     WHERE p.chunk_id=? AND c.participant_id=? ORDER BY p.occurrence_id LIMIT 201`)
