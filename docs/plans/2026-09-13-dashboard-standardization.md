@@ -317,3 +317,16 @@ model filter, with All models first and exact observed IDs retained. Enhance
 the native select with customizable-select rendering in Electron; browsers
 without that capability retain their native text select. Verify selection,
 keyboard/dismiss behavior, and open-menu rendering in the packaged app.
+
+753 web tests pass, including shared model ordering, decorative SVG semantics,
+unknown IDs, and exact alias selection through a report refresh. Documentation
+checks pass. Final unsigned source
+`378d25c4d643856bbb9b53e38834fa7e46765f68` has ASAR
+`86946bc3bc8caeff4af1809f6c0a318c22dd6fbe1df23d86f1d4ed7c26664d2c`.
+The packaged renderer was reviewed at 1180px and 960px with a labeled synthetic
+model list in the isolated QA profile. All eight model icons and the intended
+order render; base models precede their variants, and unknown IDs sort last.
+Keyboard selection chooses Astra and renders its selected icon. Escape and an
+outside click close the menu. Evidence: `.release-build/picker-layout.json`
+and matching `model-picker` screenshots. The review does not qualify private
+report contents or close the separate accounting-parity gate.
