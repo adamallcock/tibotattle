@@ -842,10 +842,10 @@ topology and calibration policy.
 
 `deriveExportPseudonym`, `deriveExportPseudonymV2`.
 
-#### `@app-usagemonitor/i18n` — 17 public symbols
+#### `@app-usagemonitor/i18n` — 18 public symbols
 
 - Catalogs and policy: `DEFAULT_LOCALE`, `SYSTEM_LOCALE_PREFERENCE`, `SUPPORTED_LOCALES`, `LANGUAGE_OPTIONS`, `EN_US_CATALOG`, `ZH_HANS_CATALOG`, `ES_CATALOG`, `CATALOGS`.
-- Resolution and copy: `negotiateLocale`, `resolveLocalePreference`, `isLanguagePreference`, `getMessage`, `interpolateMessage`, `translate`.
+- Resolution and copy: `canonicalizeLocale`, `negotiateLocale`, `resolveLocalePreference`, `isLanguagePreference`, `getMessage`, `interpolateMessage`, `translate`.
 - Formatting: `formatNumber`, `formatPercent`, `formatDate`.
 
 The accounting and quota package roots were narrowed by 20 and 7 symbols

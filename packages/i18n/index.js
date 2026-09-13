@@ -1501,7 +1501,11 @@ export const CATALOGS = Object.freeze({
   es: ES_CATALOG,
 });
 
-function canonicalizeLocale(value) {
+/**
+ * Canonicalize a locale tag without selecting a catalog. Invalid and empty
+ * values return null so callers can preserve their own fallback policy.
+ */
+export function canonicalizeLocale(value) {
   if (typeof value !== "string" || value.trim().length === 0) return null;
   try {
     return Intl.getCanonicalLocales(value.trim())[0] ?? null;

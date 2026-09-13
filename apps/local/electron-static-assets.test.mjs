@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startLocalCompanionServer } from "./server.js";
 import { CLIENT_WEB_FILES } from "../../scripts/export-tibotattle.mjs";
-import { MACOS_WEB_MODULE_ENTRYPOINTS, MACOS_RUNTIME_STATIC_ASSETS } from "../../scripts/build-macos-app.js";
+import {
+  RUNTIME_WEB_MODULE_ENTRYPOINTS,
+} from "../../scripts/lib/runtime-closure.mjs";
+import { surfaceFiles } from "../../scripts/lib/surface-manifest.mjs";
 
 const ASSETS = ["desktop-shell.js", "electron-tray-popup.html", "electron-tray-popup.js",
   "electron-tray-popup.css", "electron-settings.html", "electron-settings.js",
@@ -35,7 +38,7 @@ test("Electron settings and bridge have a real loopback route and retained clien
       assert.equal(await response.text(), await readFile(join(staticRoot, file), "utf8"), file);
       assert.equal(response.headers.get("access-control-allow-origin"), null);
       assert.ok(CLIENT_WEB_FILES.includes(`apps/web/public/${file}`), `client export: ${file}`);
-      assert.ok([...MACOS_WEB_MODULE_ENTRYPOINTS, ...MACOS_RUNTIME_STATIC_ASSETS]
+      assert.ok([...RUNTIME_WEB_MODULE_ENTRYPOINTS, ...surfaceFiles("native-macos")]
         .includes(`apps/web/public/${file}`), `native closure: ${file}`);
     }
     const health = await (await fetch(`${origin}/api/local/health`)).json();

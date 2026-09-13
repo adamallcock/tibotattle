@@ -19,6 +19,8 @@ export const CATALOGS: Readonly<{
   es: MessageCatalog;
 }>;
 
+export function canonicalizeLocale(value: unknown): string | null;
+
 export function negotiateLocale(
   requestedLocales?: LocaleRequest,
   supportedLocales?: readonly string[],

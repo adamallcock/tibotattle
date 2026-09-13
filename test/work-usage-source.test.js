@@ -263,6 +263,21 @@ function query(result, grouping) {
   });
 }
 
+test("a missing unified index remains explicitly missing through the read-only adapter", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-usage-missing-index-"));
+  try {
+    const result = await readLocalWorkUsageSnapshot({
+      indexFile: join(root, "missing.sqlite"),
+      codexHome: root,
+      fromMs: 0,
+      toMs: 1,
+    });
+    assert.deepEqual(result, { status: "missing" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function markToolingOnlyPartial(indexFile) {
   const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
   try {

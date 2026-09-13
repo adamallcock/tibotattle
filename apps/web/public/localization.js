@@ -3,29 +3,39 @@
 // surfaces are shipped as ordinary static ES modules, and a locale choice must
 // work while the local companion is offline.
 
-import { CATALOGS } from "./i18n.generated.js";
+import {
+  CATALOGS,
+  canonicalizeLocale,
+  DEFAULT_LOCALE as CANONICAL_DEFAULT_LOCALE,
+  isLanguagePreference as canonicalIsLanguagePreference,
+  LANGUAGE_OPTIONS as CANONICAL_LANGUAGE_OPTIONS,
+  negotiateLocale as canonicalNegotiateLocale,
+  SUPPORTED_LOCALES as CANONICAL_SUPPORTED_LOCALES,
+  SYSTEM_LOCALE_PREFERENCE,
+} from "./i18n.generated.js";
 
 export const LOCALIZATION_SCHEMA_VERSION = "tibotattle-localization-v2";
-export const SYSTEM_LANGUAGE_PREFERENCE = "system";
-export const DEFAULT_LOCALE = "en-US";
-export const SUPPORTED_LOCALES = Object.freeze([
-  "en-US",
-  "zh-Hans",
-  "es",
-]);
+// Keep these browser names stable while the package owns the locale policy.
+// The generated mirror is static so this remains safe for the offline/public
+// browser boundary.
+export const SYSTEM_LANGUAGE_PREFERENCE = SYSTEM_LOCALE_PREFERENCE;
+export const DEFAULT_LOCALE = CANONICAL_DEFAULT_LOCALE;
+export const SUPPORTED_LOCALES = CANONICAL_SUPPORTED_LOCALES;
 export const LANGUAGE_PREFERENCE_STORAGE_KEY =
   "tibotattle.language-preference.v1";
 
-export const LANGUAGE_OPTIONS = Object.freeze([
+const BROWSER_LANGUAGE_LABELS = Object.freeze({
+  [SYSTEM_LANGUAGE_PREFERENCE]: "System",
+  "en-US": "English",
+  "zh-Hans": "Simplified Chinese",
+  es: "Spanish",
+});
+export const LANGUAGE_OPTIONS = Object.freeze(CANONICAL_LANGUAGE_OPTIONS.map((option) =>
   Object.freeze({
-    id: SYSTEM_LANGUAGE_PREFERENCE,
-    label: "System",
-    nativeLabel: "System",
-  }),
-  Object.freeze({ id: "en-US", label: "English", nativeLabel: "English" }),
-  Object.freeze({ id: "zh-Hans", label: "Simplified Chinese", nativeLabel: "简体中文" }),
-  Object.freeze({ id: "es", label: "Spanish", nativeLabel: "Español" }),
-]);
+    ...option,
+    label: BROWSER_LANGUAGE_LABELS[option.id],
+  })
+));
 
 // These mirror the minimum point/span gates in `fitReset` in the weekly
 // calibration contract. The browser catalog cannot import the Node-only
@@ -59,19 +69,7 @@ const RTL_LANGUAGES = new Set([
 ]);
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 
-export function canonicalLocale(value) {
-  if (typeof value !== "string" || value.trim() === "") return null;
-  try {
-    return Intl.getCanonicalLocales(value.trim())[0] ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function requestedValues(value) {
-  if (Array.isArray(value)) return value;
-  return value == null ? [] : [value];
-}
+export const canonicalLocale = canonicalizeLocale;
 
 function localeParts(value) {
   const canonical = canonicalLocale(value);
@@ -93,64 +91,14 @@ function localeParts(value) {
   };
 }
 
-function normalizedSupportedLocales(supportedLocales) {
-  if (!Array.isArray(supportedLocales) || supportedLocales.length === 0) {
-    throw new TypeError("At least one supported locale is required");
-  }
-  const result = [];
-  for (const value of supportedLocales) {
-    const canonical = canonicalLocale(value);
-    if (canonical === null) {
-      throw new RangeError("Supported locales must be valid BCP 47 tags");
-    }
-    if (!result.includes(canonical)) result.push(canonical);
-  }
-  return result;
-}
-
-/**
- * Resolve a requested locale without treating Traditional Chinese as a match
- * for a Simplified-Chinese translation. Generic `zh` is intentionally not
- * enough evidence to select `zh-Hans`: its script is ambiguous.
- */
-export function negotiateLocale(
-  requestedLocales,
-  supportedLocales = SUPPORTED_LOCALES,
-  fallbackLocale = DEFAULT_LOCALE,
-) {
-  const supported = normalizedSupportedLocales(supportedLocales);
-  const fallback = canonicalLocale(fallbackLocale);
-  const resolvedFallback = fallback && supported.includes(fallback)
-    ? fallback
-    : supported[0];
-
-  for (const requestedValue of requestedValues(requestedLocales)) {
-    const requested = localeParts(requestedValue);
-    if (requested === null) continue;
-    if (supported.includes(requested.canonical)) return requested.canonical;
-
-    if (requested.language === "zh") {
-      const isSimplified = requested.script === "Hans"
-        || ["CN", "SG"].includes(requested.region);
-      if (isSimplified && supported.includes("zh-Hans")) return "zh-Hans";
-      continue;
-    }
-
-    const languageMatch = supported.find((candidate) =>
-      localeParts(candidate)?.language === requested.language);
-    if (languageMatch) return languageMatch;
-  }
-  return resolvedFallback;
-}
+export const negotiateLocale = canonicalNegotiateLocale;
 
 export function directionForLocale(locale) {
   const language = localeParts(locale)?.language;
   return language && RTL_LANGUAGES.has(language) ? "rtl" : "ltr";
 }
 
-export function isLanguagePreference(value) {
-  return value === SYSTEM_LANGUAGE_PREFERENCE || SUPPORTED_LOCALES.includes(value);
-}
+export const isLanguagePreference = canonicalIsLanguagePreference;
 
 function interpolate(message, values = {}) {
   if (typeof message !== "string") return "";

@@ -1881,6 +1881,65 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
 }
 
 /**
+ * Run one asynchronous reader against one stable, read-only publication.
+ *
+ * The callback owns the connection until its promise settles. It must not
+ * commit or roll back the transaction; the helper rolls the transaction back
+ * on every exit and closes the connection afterwards. A caller may provide an
+ * open-failure handler when it has a more specific missing/unavailable
+ * envelope to preserve. That handler runs only when opening the connection
+ * fails; descriptor, callback, cancellation and cleanup failures are left to
+ * the caller.
+ */
+export async function withReadOnlyUnifiedIndex(
+  indexFile,
+  callback,
+  { openIndex = openLocalUnifiedIndex, onOpenFailure = null } = {},
+) {
+  if (typeof callback !== "function") {
+    throw new TypeError("read-only unified-index callback must be a function");
+  }
+  if (typeof openIndex !== "function") {
+    throw new TypeError("read-only unified-index opener must be a function");
+  }
+  if (onOpenFailure !== null && typeof onOpenFailure !== "function") {
+    throw new TypeError("read-only unified-index open-failure handler must be a function");
+  }
+
+  let database;
+  let primaryFailure = false;
+  try {
+    try {
+      database = openIndex(indexFile, { readOnly: true });
+    } catch (error) {
+      if (onOpenFailure !== null) return await onOpenFailure(error);
+      throw error;
+    }
+    database.exec("BEGIN");
+    const generation = readUnifiedIndexGenerationDescriptor(database);
+    return await callback({ database, generation });
+  } catch (error) {
+    primaryFailure = true;
+    throw error;
+  } finally {
+    let cleanupError = null;
+    if (database && database.isOpen !== false) {
+      try {
+        database.exec("ROLLBACK");
+      } catch (error) {
+        cleanupError = error;
+      }
+      try {
+        database.close();
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    }
+    if (!primaryFailure && cleanupError !== null) throw cleanupError;
+  }
+}
+
+/**
  * Return a deterministic digest over one generation's typed tool facts. The
  * digest is content-free: it commits only to local HMACs, offsets, ordinals,
  * timestamps and fixed classifications. Readers use it to detect a fact row

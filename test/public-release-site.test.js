@@ -28,8 +28,8 @@ import {
 } from "../scripts/macos-release-core.js";
 import { SPARKLE_VERSION } from "../scripts/macos-updater-core.js";
 import {
-  collectMacOSWebModuleGraph,
-} from "../scripts/build-macos-app.js";
+  collectWebModuleGraph,
+} from "../scripts/lib/runtime-closure.mjs";
 import {
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
   PUBLIC_RELEASE_SOURCE_PROVENANCE_SCHEMA,
@@ -1233,8 +1233,9 @@ test("checked-in public source satisfies the complete release contract", async (
   ]) {
     assert.ok(publishedNames.has(publicAsset), `Missing public asset ${publicAsset}`);
   }
-  const communityClosure = await collectMacOSWebModuleGraph({
+  const communityClosure = await collectWebModuleGraph({
     entrypoints: ["apps/web/public/community.js"],
+    surface: "public release",
   });
   for (const relativeFile of communityClosure.relativeFiles) {
     const name = relativeFile.slice("apps/web/public/".length);
