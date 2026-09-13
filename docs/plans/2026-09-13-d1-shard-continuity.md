@@ -9,6 +9,12 @@ status: in-progress
 
 The user approved implementation on September 13. Work starts from `ceeeca32e63923ba308e02c296d1d2aaf48c861d` in an isolated branch, preserving the pinned production recovery. This plan extends the [typed-storage isolation plan](2026-09-11-d1-typed-storage-isolation.md); it does not establish production deployment or change an active migration.
 
+## Current checkpoint
+
+The integrated source `ccffd651` passed the complete local Worker gate on September 13: **128 test files and 1,520 tests**, workspace/type/script checks, and capacity, analytics, main and staging dry builds. Existing-owner import, concurrent upload headroom reservations and multi-origin analytics are implemented and locally qualified. The isolated cloud bootstrap rehearsal is being prepared. Production catalog mode remains disabled.
+
+The remaining implementation is the owner copier and final routing switch, complete moved-owner export/lifecycle coverage, qualified spare operations and measured capacity calibration. Cloud rollover/failure qualification and production activation follow those gates. The historical checkpoints below record what was proven at each stage; this section states the current boundary.
+
 ## Accepted outcome
 
 Capacity expansion must not require a service-wide upload freeze. Assign each authenticated contribution owner to a stable ingestion shard, stop new assignments at **6,000,000,000 bytes**, and preserve the **9,000,000,000-byte operating budget per database**. Keep prepared spare capacity. Move growing owners before capacity becomes urgent. Credentials, opt-outs, telemetry provenance, replay and owner-only erasure survive routing changes.
@@ -23,9 +29,9 @@ Sol High agents lead implementation; they may delegate bounded work to Luna Max 
 |---|---|---|
 | 1. Routing and capacity | Actual enrollment, ownership, credential lifecycle and upload paths across two ingestion shards and a spare; concurrent enrollment converges; cutoff, stale capacity, replay and route fences tested | In progress |
 | 2. Analytics and erasure | Independent source progress, complete combined publication, no moved-owner duplication; owner-only erasure covers current/prior sources and derived targets with completion receipts | In progress |
-| 3. Owner movement | Background copy plus catch-up, brief owner-specific final fence, exact verification and routing switch; restart/reconcile every phase | Origin prerequisites under validation; copier pending |
-| 4. Operations | Wrangler-managed qualified spare capacity, size/growth alerts, safe allocation and movement controls; per-writer headroom reservations | Per-write admission in parallel development; spare qualification pending |
-| 5. Qualification | Integrated local HTTP journeys, real isolated cloud rollover and failure rehearsal, measured final pause, then reviewed production activation | Queued |
+| 3. Owner movement | Background copy plus catch-up, brief owner-specific final fence, exact verification and routing switch; restart/reconcile every phase | Origin prerequisites locally qualified; copier pending |
+| 4. Operations | Wrangler-managed qualified spare capacity, size/growth alerts, safe allocation and movement controls; per-writer headroom reservations | Upload reservations locally qualified; calibration and spare qualification pending |
+| 5. Qualification | Integrated local HTTP journeys, real isolated cloud rollover and failure rehearsal, measured final pause, then reviewed production activation | Local owning gate passed; cloud bootstrap preparation active |
 
 Each stage must integrate its runtime callers. Uncalled interfaces, isolated mock tests or a configuration flag alone do not close a stage.
 
@@ -72,10 +78,10 @@ Implemented in the first local checkpoint:
 
 Required before enabling catalog mode:
 
-1. Complete the owning Worker gate on committed source and reconcile every unsupported legacy/admin/repair/public-read pathway.
+1. Reconcile every unsupported legacy/admin/repair/public-read pathway; preserve the complete owning gate on each integrated source.
 2. Qualify the complete spare tuple: schema, analytics binding, replay, erasure, measured capacity and allocation policy. The synthetic 16 MiB enrollment reservation is not a production sizing decision.
-3. Add namespace-aware admission/read paths and a resumable owner copier with exact verification, a short final fence and retained-source cleanup receipts.
-4. Add per-write physical growth reservations and reconcile actual reusable capacity. Stopping new owners at 6 GB cannot constrain growth by existing owners.
+3. Complete a resumable owner copier with exact verification, a short final fence, moved-owner exports and retained-source cleanup receipts. Namespace-aware admission and analytics prerequisites are now locally qualified.
+4. Calibrate the implemented upload reservations against physical growth, cover other writers and reconcile actual reusable capacity. Stopping new owners at 6 GB cannot constrain growth by existing owners.
 5. Finish catalog-aware tombstone replay and existing-participant locator backfill; prove the integrated paths against isolated cloud resources before production activation. Carry the retained global issuance counts into a qualified catalog baseline before allocation. Never initialize that baseline from a guessed zero.
 
 The existing production restore remains on its pinned source. Its continuation deadline, deployment journal, source preservation and final activation/canaries remain a separate workstream.
@@ -119,12 +125,12 @@ The corrected integrated namespace/capacity source `222b7673` passed the complet
 
 The seventh local slice imports an existing accountless installation population into the routing catalog. It extracts an immutable, bounded owner and credential manifest from a closed source, preserves the original issuance counters, and resumes exact catalog import in pages of at most 32 owners. The integrated core passes 72 tests across five suites and TypeScript. Imports reserve only separately configured future headroom per owner; retained physical bytes remain in the measured shard size and are not charged again.
 
-The executable bootstrap operator prepares a disabled Worker with no HTTP or cron ingress, uses one private Queue consumer, freezes the exact authority tables, advances the import, and separately releases the source and cleans up its resources. Every mutation rechecks the existing containment lock. Temporary resource admission requires exact operation, database, bundle, configuration, version tag and consumer identities; after cleanup the ordinary inventory guard must pass. The journal pins the complete prepared package and refuses changed files or expired apply/release operations before remote calls. The 17-test integrated operator/provider selection passes, including real Miniflare import of three owners, real Wrangler dry builds, package tampering, stale capacity and threshold refusal, release authorization and isolation failures. Complete owning qualification and a cloud synthetic of the operator remain open; no production catalog or bootstrap was activated.
+The executable bootstrap operator prepares a disabled Worker with no HTTP or cron ingress, uses one private Queue consumer, freezes the exact authority tables, advances the import, and separately releases the source and cleans up its resources. Every mutation rechecks the existing containment lock. Temporary resource admission requires exact operation, database, bundle, configuration, version tag and consumer identities; after cleanup the ordinary inventory guard must pass. The journal pins the complete prepared package and refuses changed files or expired apply/release operations before remote calls. The 17-test integrated operator/provider selection passes, including real Miniflare import of three owners, real Wrangler dry builds, package tampering, stale capacity and threshold refusal, release authorization and isolation failures. The seventh-slice source `b46c0814` subsequently passed 128 test files and 1,516 tests in its complete owning gate. A cloud synthetic of the operator remains open; no production catalog or bootstrap was activated.
 
 
 The eighth local slice reads an owner's qualified retained origins during v1 and v1.1 analytics. Composite cursors retain the original source namespace and record identity; legacy partial cursors without that identity refuse continuation. Daily preparation pins the exact origin set and rejects drift before publishing. Analytics migration `0017_v11_multi_origin_day_values.sql` adds the daily pins and requires any pre-existing unpinned typed partial work to be reconciled before migration.
 
-Independent review found and corrected two integration defects: withdrawing a partial day must retain its provenance while retiring its rows, and pagination must limit the indexed read before collision checking. The corrected v1 paths use bounded indexed arms per origin; v1.1 avoids repeatedly materializing a whole day's records. The integrated seven-suite selection passes 66 tests and TypeScript. Complete owning qualification is still pending. This adds analytical prerequisites only: no owner copier, route switch, public export qualification for moved owners, or cloud activation is claimed.
+Independent review found and corrected two integration defects: withdrawing a partial day must retain its provenance while retiring its rows, and pagination must limit the indexed read before collision checking. The corrected v1 paths use bounded indexed arms per origin; v1.1 avoids repeatedly materializing a whole day's records. The integrated seven-suite selection passes 66 tests and TypeScript. The integrated `ccffd651` source subsequently passed 128 test files and 1,520 tests in its complete owning gate. This adds analytical prerequisites only: no owner copier, route switch, public export qualification for moved owners, or cloud activation is claimed.
 
 
 Before cloud bootstrap, root compared the transport against retained responses from the completed isolated verification rehearsal. Cloudflare returns the Worker under `script` and delivery bounds under nested `settings`; the initial bootstrap fixtures used an older flat shape. Both runtime readback and containment now validate the observed representation, including exact queue identity, batch size, concurrency, timeout and retry settings. Synthetic refusal cases cover missing and contradictory fields. This closes the known response-shape mismatch; it does not replace the pending live bootstrap rehearsal.
