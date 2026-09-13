@@ -457,25 +457,43 @@ export function createCatalogStorageRouter({ catalog, bindings, clock }: {
         .bind(capabilityHash).first<{owner_id: string; state: 'active' | 'revoked'}>());
       if (!locator || locator.owner_id !== route.ownerId || locator.state !== 'active') fail('ROUTE_STALE');
     },
-    async registerParticipantOwner(participantDigest: string, route: OwnerStorageRoute): Promise<void> {
-      digest(participantDigest);
+    async registerParticipantOwner(participantDigest: string, deletionDigest: string,
+      route: OwnerStorageRoute): Promise<void> {
+      digest(participantDigest); digest(deletionDigest);
       const row = await readRoute(catalog, route.ownerId);
       if (!row || !matches(route, row)) fail('ROUTE_STALE');
       const createdAt = now(clock);
-      await storage(() => catalog.prepare(`INSERT INTO storage_participant_owner_locators
-        (participant_digest,owner_id,created_at) VALUES (?,?,?)
-        ON CONFLICT(participant_digest) DO NOTHING`)
-        .bind(participantDigest, route.ownerId, createdAt).run());
-      const locator = await storage(() => catalog.prepare(`SELECT owner_id
-        FROM storage_participant_owner_locators
-        WHERE participant_digest=? LIMIT 1`).bind(participantDigest)
-        .first<{owner_id: string}>());
-      if (!locator || locator.owner_id !== route.ownerId) fail('ROUTE_STALE');
+      await storage(() => catalog.batch([
+        catalog.prepare(`INSERT INTO storage_participant_owner_locators
+          (participant_digest,owner_id,created_at) VALUES (?,?,?)
+          ON CONFLICT(participant_digest) DO NOTHING`)
+          .bind(participantDigest, route.ownerId, createdAt),
+        catalog.prepare(`INSERT INTO storage_participant_deletion_replay_locators
+          (participant_digest,owner_id,created_at) VALUES (?,?,?)
+          ON CONFLICT(participant_digest) DO NOTHING`)
+          .bind(deletionDigest, route.ownerId, createdAt),
+      ]));
+      const locators = await storage(() => catalog.batch<{owner_id:string}>([
+        catalog.prepare(`SELECT owner_id FROM storage_participant_owner_locators
+          WHERE participant_digest=? LIMIT 1`).bind(participantDigest),
+        catalog.prepare(`SELECT owner_id FROM storage_participant_deletion_replay_locators
+          WHERE participant_digest=? LIMIT 1`).bind(deletionDigest),
+      ]));
+      if (locators.length !== 2
+          || locators.some(result => result.results[0]?.owner_id !== route.ownerId)) fail('ROUTE_STALE');
     },
     async locateParticipantOwner(participantDigest: string): Promise<OwnerStorageRoute | null> {
       digest(participantDigest);
       const locator = await storage(() => catalog.prepare(`SELECT owner_id
         FROM storage_participant_owner_locators
+        WHERE participant_digest=? LIMIT 1`).bind(participantDigest)
+        .first<{owner_id: string}>());
+      return locator ? activeRoute(await readRoute(catalog, locator.owner_id), bindings) : null;
+    },
+    async locateParticipantDeletionOwner(participantDigest: string): Promise<OwnerStorageRoute | null> {
+      digest(participantDigest);
+      const locator = await storage(() => catalog.prepare(`SELECT owner_id
+        FROM storage_participant_deletion_replay_locators
         WHERE participant_digest=? LIMIT 1`).bind(participantDigest)
         .first<{owner_id: string}>());
       return locator ? activeRoute(await readRoute(catalog, locator.owner_id), bindings) : null;

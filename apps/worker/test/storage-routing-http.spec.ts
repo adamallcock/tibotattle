@@ -33,6 +33,7 @@ import {
 import { initializeStorageSource } from "../src/analytics-delivery";
 import { initializeTypedV11Admission } from "../src/typed-v11-admission";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
+import { participantDeletionDigest } from "../src/participant-deletion-digest";
 import {
   participantStorageLocatorDigest,
   storageForParticipantOwner,
@@ -278,7 +279,7 @@ function refuseParticipantLocator(database: D1Database): D1Database {
     get(target, key) {
       if (key === "prepare") return (sql: string) => {
         const statement = target.prepare(sql);
-        if (!/INSERT INTO storage_participant_owner_locators/u.test(sql)) {
+        if (!/INSERT INTO storage_participant_(?:owner|deletion_replay)_locators/u.test(sql)) {
           return statement;
         }
         return new Proxy(statement, {
@@ -301,6 +302,9 @@ function refuseParticipantLocator(database: D1Database): D1Database {
             return typeof property === "function" ? property.bind(value) : property;
           },
         });
+      };
+      if (key === "batch") return async () => {
+        throw new Error("synthetic catalog publication refusal");
       };
       const property = Reflect.get(target, key);
       return typeof property === "function" ? property.bind(target) : property;
@@ -498,6 +502,10 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
       FROM storage_participant_owner_locators
       WHERE participant_digest=? AND participant_digest<>?`)
       .bind(digest, participantId).first("n")).toBe(1);
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_participant_deletion_replay_locators
+      WHERE participant_digest=? AND participant_digest<>?`)
+      .bind(await participantDeletionDigest(participantId!), participantId).first("n")).toBe(1);
     expect((await storageForParticipantOwner(runtime(), participantId!)).route)
       .toMatchObject({ ownerId: expect.stringMatching(/^accountless:/u), shardId: "a" });
     expect(await catalog().prepare(`SELECT daily_reserved,lifetime_reserved
@@ -745,6 +753,8 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
       .toBe(1);
     expect(await catalog().prepare("SELECT count(*) AS n FROM storage_participant_owner_locators").first("n"))
       .toBe(0);
+    expect(await catalog().prepare("SELECT count(*) AS n FROM storage_participant_deletion_replay_locators").first("n"))
+      .toBe(0);
 
     const skippedRetryUpload = await api("/api/v1/device/upload-authorizations", {
       method: "POST", headers: { authorization: authorization(deviceId, secret),
@@ -765,6 +775,8 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
     const retry = await own(deviceId, secret);
     expect(retry.status, await retry.clone().text()).toBe(200);
     expect(await catalog().prepare("SELECT count(*) AS n FROM storage_participant_owner_locators").first("n"))
+      .toBe(1);
+    expect(await catalog().prepare("SELECT count(*) AS n FROM storage_participant_deletion_replay_locators").first("n"))
       .toBe(1);
     expect(await shardA().prepare("SELECT count(*) AS n FROM participants").first("n"))
       .toBe(1);

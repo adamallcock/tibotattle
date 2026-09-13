@@ -4569,7 +4569,8 @@ export async function runScheduledMaintenance(
       ),
       Reflect.get(env, "IDENTITY_LINK_SECRET"),
       !identityRequired(env),
-      await storageErasureBindings(env)??undefined,
+      catalogRoutingEnabled(env)?undefined:await storageErasureBindings(env)??undefined,
+      catalogRoutingEnabled(env)?env:undefined,
     );
     quarantineRetentionComplete =
       lifecycle.quarantineRetentionComplete;

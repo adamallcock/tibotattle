@@ -128,6 +128,7 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0002_identity_reenrollment_cooldown.sql",
     "0003_storage_erasure_jobs.sql",
     "0004_storage_erasure_targets.sql",
+    "0005_catalog_deletion_replay_cursor.sql",
   ]),
 });
 

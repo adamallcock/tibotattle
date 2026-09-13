@@ -6,6 +6,7 @@ import {
   uploadAuthorizationCapabilityHash,
 } from "./device-auth";
 import { sha256Hex } from "./crypto";
+import { participantDeletionDigest } from "./participant-deletion-digest";
 import { ApiError } from "./errors";
 import {
   assertStorageCatalogEpoch,
@@ -47,8 +48,10 @@ interface CatalogRouter {
   registerCapability(capabilityHash: string, route: OwnerStorageRoute): Promise<void>;
   revokeCapability(capabilityHash: string, route: OwnerStorageRoute): Promise<void>;
   ownerTargets(route: OwnerStorageRoute): Promise<OwnerStorageTarget[]>;
-  registerParticipantOwner(participantDigest: string, route: OwnerStorageRoute): Promise<void>;
+  registerParticipantOwner(participantDigest: string, deletionDigest: string,
+    route: OwnerStorageRoute): Promise<void>;
   locateParticipantOwner(participantDigest: string): Promise<OwnerStorageRoute | null>;
+  locateParticipantDeletionOwner(participantDigest: string): Promise<OwnerStorageRoute | null>;
 }
 
 interface RoutingRuntimeEnv {
@@ -271,8 +274,47 @@ export async function registerParticipantOwnerRoute(
   try {
     await catalogRouter(env).registerParticipantOwner(
       await participantStorageLocatorDigest(participantId),
+      await participantDeletionDigest(participantId),
       route,
     );
+  } catch (error) {
+    return routingFailure(error);
+  }
+}
+
+/** Background restore/replay lookup. The digest is already the retained
+ * tombstone key; this seam neither accepts nor recovers a raw participant id. */
+export async function storageForParticipantDeletionDigest(
+  env: Env,
+  participantDigest: string,
+): Promise<OwnerStorageContext> {
+  if (routingMode(env) !== "catalog" || !/^[a-f0-9]{64}$/u.test(participantDigest)) {
+    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+  try {
+    const router = catalogRouter(env);
+    const route = await router.locateParticipantDeletionOwner(participantDigest);
+    if (!route) throw new StorageRoutingError("ROUTE_NOT_FOUND");
+    return { route, database: await router.database(route) };
+  } catch (error) {
+    return routingFailure(error);
+  }
+}
+
+/** New catalog owners cannot be erased until the deletion-domain locator that
+ * scheduled restore replay depends on is durable. Legacy rows need backfill. */
+export async function assertParticipantDeletionRouteRegistered(
+  env: Env, participantId: string, expected: OwnerStorageRoute,
+): Promise<void> {
+  if (routingMode(env) === "single") return;
+  try {
+    const route = await catalogRouter(env).locateParticipantDeletionOwner(
+      await participantDeletionDigest(participantId),
+    );
+    if (!route || route.ownerId !== expected.ownerId || route.shardId !== expected.shardId
+        || route.bindingName !== expected.bindingName || route.generation !== expected.generation) {
+      throw new StorageRoutingError("ROUTE_STALE");
+    }
   } catch (error) {
     return routingFailure(error);
   }

@@ -36,6 +36,25 @@ function database(value:unknown):value is D1Database {
     &&typeof Reflect.get(value,'batch')==='function';
 }
 
+/** Bind one catalog-proven physical source to its explicitly configured
+ * analytics store. The caller may isolate failures per retained target. */
+export async function storageErasureTargetForRouteTarget(
+  env:Env,source:OwnerStorageTargetContext,
+):Promise<StorageErasureTarget>{
+  const runtime=env as Env&MultiSourceErasureEnv;
+  const configured:Readonly<Record<string,{binding:keyof MultiSourceErasureEnv;targetId:string}>>={
+    STORAGE_INGESTION_A:{binding:'STORAGE_ANALYTICS_A',targetId:'analytics-a'},
+    STORAGE_INGESTION_B:{binding:'STORAGE_ANALYTICS_B',targetId:'analytics-b'},
+    STORAGE_INGESTION_C:{binding:'STORAGE_ANALYTICS_C',targetId:'analytics-c'},
+  };
+  const pair=configured[source.bindingName];
+  const target=pair?runtime[pair.binding]:undefined;
+  if(!pair||!database(target))throw fail();
+  const identity=await readStorageErasureSourceIdentity(source.database);
+  return {source:source.database,target,ledger:env.DELETION_LEDGER,
+    sourceId:identity.sourceId,sourceNamespace:identity.sourceNamespace,targetId:pair.targetId};
+}
+
 /** Resolve only the physical sources proven by the authenticated route and its
  * immutable move history. Analytics pairings are explicit binding pairs; an
  * unbound spare refuses erasure rather than silently omitting derived data. */
@@ -47,19 +66,9 @@ export async function storageErasurePlanForOwnerRoute(env:Env,route:OwnerStorage
   }
   const runtime=env as Env&MultiSourceErasureEnv;
   if(!database(runtime.STORAGE_PUBLICATION_DB))throw fail();
-  const analyticsBindings:Readonly<Record<string,{binding:keyof MultiSourceErasureEnv;targetId:string}>>={
-    STORAGE_INGESTION_A:{binding:'STORAGE_ANALYTICS_A',targetId:'analytics-a'},
-    STORAGE_INGESTION_B:{binding:'STORAGE_ANALYTICS_B',targetId:'analytics-b'},
-    STORAGE_INGESTION_C:{binding:'STORAGE_ANALYTICS_C',targetId:'analytics-c'},
-  };
   const targets:StorageErasureTarget[]=[];
   for(const source of routeTargets){
-    const configured=analyticsBindings[source.bindingName];
-    const target=configured?runtime[configured.binding]:undefined;
-    if(!configured||!database(target))throw fail();
-    const identity=await readStorageErasureSourceIdentity(source.database);
-    targets.push({source:source.database,target,ledger:env.DELETION_LEDGER,
-      sourceId:identity.sourceId,sourceNamespace:identity.sourceNamespace,targetId:configured.targetId});
+    targets.push(await storageErasureTargetForRouteTarget(env,source));
   }
   validate(targets);
   return {routeTargets,targets,publicationTarget:runtime.STORAGE_PUBLICATION_DB};
@@ -123,7 +132,8 @@ export async function prepareMultiSourceParticipantErasure(targets:readonly Stor
 
 export async function advanceMultiSourceStorageErasureJobs(options:{
   targets:readonly StorageErasureTarget[];publicationTarget?:D1Database;
-  routingGeneration?:number;erasureGeneration?:number;maxJobsPerTarget?:number;participantId?:string;
+  routingGeneration?:number;erasureGeneration?:number;maxJobsPerTarget?:number;
+  participantId?:string;participantDigest?:string;
 }):Promise<{completedTargets:number;pendingTargets:number;unavailableTargets:string[]}>{
   validate(options.targets);
   if(options.publicationTarget){
@@ -140,7 +150,10 @@ export async function advanceMultiSourceStorageErasureJobs(options:{
     }catch{unavailableTargets.push(target.targetId);}
   }
   const ledger=options.targets[0]!.ledger;
-  const participantDigest=options.participantId===undefined?null:await participantDeletionDigest(options.participantId);
+  if(options.participantId!==undefined&&options.participantDigest!==undefined)throw fail();
+  const participantDigest=options.participantDigest??(options.participantId===undefined
+    ?null:await participantDeletionDigest(options.participantId));
+  if(participantDigest!==null&&!/^[a-f0-9]{64}$/.test(participantDigest))throw fail();
   const pendingTargets=participantDigest===null
     ?await ledger.prepare("SELECT COUNT(*) n FROM storage_erasure_targets WHERE state='pending'").first<number>('n')
     :await ledger.prepare("SELECT COUNT(*) n FROM storage_erasure_targets WHERE state='pending' AND participant_digest=?")

@@ -2,7 +2,7 @@ import {requireStorageParticipantErasureComplete} from './storage-erasure';
 import {invalidatePublicationsForOwnerErasure,prepareMultiSourceParticipantErasure,
   requireMultiSourceParticipantErasureComplete,storageErasurePlanForOwnerRoute,
 } from './storage-multi-source-erasure';
-import {storageForParticipantOwner} from './storage-routing-runtime';
+import {assertParticipantDeletionRouteRegistered,storageForParticipantOwner} from './storage-routing-runtime';
 import { beginAdminOperation, finishAdminOperation } from "./admin-operations";
 import { revokeAccountlessEnrollment } from "./accountless-enrollment";
 import { MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT } from "./constants";
@@ -163,6 +163,7 @@ async function eraseParticipantData(
   operationId: string,
 ): Promise<ErasureResult> {
   const ownerStorage=await storageForParticipantOwner(env,participantId);
+  await assertParticipantDeletionRouteRegistered(env,participantId,ownerStorage.route);
   await invalidatePublicationsForOwnerErasure(env,ownerStorage.route);
   const catalogErasure=ownerStorage.route.mode==='catalog';
   if(catalogErasure)await recordDeletionTombstone(env.DELETION_LEDGER,participantId);

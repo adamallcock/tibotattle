@@ -54,7 +54,7 @@ test("accountless hosted rehearsal plan fixes one origin and stays blocked befor
   ]);
   assert.deepEqual(freshBootstrap.expectedFinalMigrations, {
     USAGE_MONITOR_DB: "0060_public_contribution_sources.sql",
-    DELETION_LEDGER: "0004_storage_erasure_targets.sql",
+    DELETION_LEDGER: "0005_catalog_deletion_replay_cursor.sql",
   });
   const disabledDeployment = plan.requiredRemoteActions.find(
     (step) => step.kind === "deploy_checked_in_disabled_staging",

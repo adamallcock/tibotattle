@@ -18,7 +18,8 @@ import {eraseParticipantAsOwner} from '../src/participant-erasure';
 import {advanceStorageErasureJobs,prepareStorageParticipantErasure,requireStorageParticipantErasureComplete} from '../src/storage-erasure';
 import {advanceMultiSourceStorageErasureJobs,prepareMultiSourceParticipantErasure,
  requireMultiSourceParticipantErasureComplete} from '../src/storage-multi-source-erasure';
-import {recordDeletionTombstone,purgeExpiredDeletionTombstones,hasDeletionTombstone,participantDeletionDigest,replayDeletionTombstones} from '../src/retention';
+import {recordDeletionTombstone,purgeExpiredDeletionTombstones,hasDeletionTombstone,participantDeletionDigest,
+ replayDeletionTombstones,runBackendLifecycle,CATALOG_DELETION_REPLAY_PAGE_SIZE} from '../src/retention';
 import {ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
  ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,enrollAccountlessDevice} from '../src/accountless-enrollment';
 import {ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
@@ -32,6 +33,7 @@ import {publishMultiSourceCommunityDaily,readMultiSourcePublication} from '../sr
 import {createV11DailyProjectionValues} from '../src/v11-daily-projection-values';
 import {STORAGE_COMMUNITY_DAILY_METHOD} from '../src/storage-community-daily';
 import {canonicalJson} from '../src/canonical-json';
+import {runScheduledMaintenance} from '../src/index';
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;STORAGE_PUBLICATION_DB:D1Database;
  TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];
  TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];TEST_TYPED_V11_ADMISSION_MIGRATIONS:D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];
@@ -90,6 +92,107 @@ async function initializeCatalogErasureStore(source:D1Database,target:D1Database
  await applyD1Migrations(source,b.TEST_INGESTION_ROUTING_MIGRATIONS);
  await applyD1Migrations(target,b.TEST_ANALYTICS_MIGRATIONS);
  await initializeStorageAnalyticsRuntime({source,target,sourceId:sourceIdValue,sourceNamespace});
+}
+
+async function catalogReplayFixture(){
+ await applyD1Migrations(b.STORAGE_ROUTING_DB,b.TEST_ROUTING_MIGRATIONS);
+ await initializeAccountlessIssuanceBaseline(b.STORAGE_ROUTING_DB,{budgetDay:'1970-01-01',dailyReserved:0,
+  lifetimeReserved:0,baselineDigest:'f'.repeat(64),initializedAt:1000});
+ await initializeCatalogErasureStore(b.STORAGE_INGESTION_A,b.STORAGE_ANALYTICS_A,'replay-source-a');
+ await initializeCatalogErasureStore(b.STORAGE_INGESTION_B,b.STORAGE_ANALYTICS_B,'replay-source-b');
+ await applyD1Migrations(b.STORAGE_INGESTION_C,b.TEST_INGESTION_ROUTING_MIGRATIONS);
+ await b.STORAGE_ROUTING_DB.batch(['a','b','c'].map(shard=>b.STORAGE_ROUTING_DB.prepare(
+  "INSERT INTO storage_shards(shard_id,binding_name,state) VALUES(?,?,'active')")
+  .bind(shard,`STORAGE_INGESTION_${shard.toUpperCase()}`)));
+ for(const shardId of ['a','b','c']){
+  await recordStorageCapacityObservation(b.STORAGE_ROUTING_DB,{shardId,observedBytes:0,observedAt:1000,
+   validUntil:2000,pressureState:'normal'});
+  await configureStorageShardAllocation(b.STORAGE_ROUTING_DB,{shardId,allocationTier:'active',
+   allocationEnabled:true,updatedAt:1000});
+ }
+ const shardBindings={STORAGE_INGESTION_A:b.STORAGE_INGESTION_A,
+  STORAGE_INGESTION_B:b.STORAGE_INGESTION_B,STORAGE_INGESTION_C:b.STORAGE_INGESTION_C};
+ const router=createCatalogStorageRouter({catalog:b.STORAGE_ROUTING_DB,bindings:shardBindings,clock:()=>1500});
+ const ownerId='accountless:catalog-replay-owner';
+ let sourceRoute=await router.ensureOwner(ownerId,'a',1);
+ const deviceId=crypto.randomUUID(),secret=crypto.getRandomValues(new Uint8Array(32));
+ const prefix=new TextEncoder().encode(`app-usagemonitor/device/v1\0${deviceId}\0`);
+ const input=new Uint8Array(prefix.length+secret.length);input.set(prefix);input.set(secret,prefix.length);
+ const enrollment={schemaVersion:ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,deviceId,deviceSecretHash:await sha256(input),
+  policyVersion:ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+  authorizationBasis:ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS} as const;
+ input.fill(0);
+ const authorization=`Device um_device_${deviceId}.${encodeBase64Url(secret)}`;secret.fill(0);
+ const ownerNow=Date.now();
+ const capabilityHash=[...enrollment.deviceSecretHash].map(value=>value.toString(16).padStart(2,'0')).join('');
+ await b.STORAGE_ROUTING_DB.prepare(`INSERT INTO storage_capability_locators
+  (capability_hash,owner_id,state) VALUES (?,?,'active')`).bind(capabilityHash,ownerId).run();
+ const allocation=await router.ensureCapabilityOwner(capabilityHash,
+  await sha256Hex(`app-usagemonitor/storage-accountless-device/v1\0${deviceId}`),ownerId,1);
+ sourceRoute=allocation.route;
+ await enrollAccountlessDevice(b.STORAGE_INGESTION_A,enrollment,ownerNow,sourceRoute,allocation.issuanceReservation);
+ const owner=await createAccountlessUploadOwner(b.STORAGE_INGESTION_A,authorization,{
+  schemaVersion:ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,policyVersion:ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  authorizationBasis:ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  telemetrySchemaVersion:ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION},ownerNow,sourceRoute);
+ const ownerDigest='6'.repeat(64),objectDigest='7'.repeat(64),manifestDigest='8'.repeat(64);
+ await b.STORAGE_INGESTION_A.batch([
+  b.STORAGE_INGESTION_A.prepare(`INSERT INTO storage_v11_owner_links
+   (participant_id,owner_digest,state,object_digest,manifest_digest) VALUES(?,?,'active',?,?)`)
+   .bind(owner.participantId,ownerDigest,objectDigest,manifestDigest),
+  b.STORAGE_INGESTION_A.prepare(`INSERT INTO storage_ingestion_changes
+   (event_digest,owner_digest,revision,kind,object_digest,content_digest,authority_epoch,public_authority_epoch,recorded_ms)
+   VALUES(?,?,1,'owner-active',?,?,1,1,1500)`).bind(objectDigest,ownerDigest,objectDigest,manifestDigest),
+ ]);
+ const mover=createOwnerMoveCoordinator({catalog:b.STORAGE_ROUTING_DB,bindings:shardBindings,clock:()=>1500,
+  verifyDestinationCopy:async()=> 'a'.repeat(64)});
+ await mover.begin('catalog-replay-move',sourceRoute,'b');await mover.fenceSource('catalog-replay-move');
+ await mover.verifyCopied('catalog-replay-move');await mover.commit('catalog-replay-move');
+ const currentRoute=await mover.activateDestination('catalog-replay-move');
+ await enrollAccountlessDevice(b.STORAGE_INGESTION_B,enrollment,ownerNow,currentRoute,allocation.issuanceReservation);
+ for(const table of ['participants','device_credentials','accountless_upload_owners','accountless_v11_device_authorizations']){
+  await copyRows(table,b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B);
+ }
+ await b.STORAGE_INGESTION_B.batch([
+  b.STORAGE_INGESTION_B.prepare(`INSERT INTO storage_v11_owner_links
+   (participant_id,owner_digest,state,object_digest,manifest_digest) VALUES(?,?,'active',?,?)`)
+   .bind(owner.participantId,ownerDigest,objectDigest,manifestDigest),
+  b.STORAGE_INGESTION_B.prepare(`INSERT INTO storage_ingestion_changes
+   (event_digest,owner_digest,revision,kind,object_digest,content_digest,authority_epoch,public_authority_epoch,recorded_ms)
+   VALUES(?,?,1,'owner-active',?,?,1,1,1500)`).bind(objectDigest,ownerDigest,objectDigest,manifestDigest),
+ ]);
+ const runtime={...b,ENVIRONMENT:'synthetic-development',STORAGE_ROUTING_MODE:'catalog',
+  STORAGE_ROUTING_DB:b.STORAGE_ROUTING_DB,...shardBindings,STORAGE_ANALYTICS_A:b.STORAGE_ANALYTICS_A,
+  STORAGE_ANALYTICS_B:b.STORAGE_ANALYTICS_B,STORAGE_PUBLICATION_DB:b.STORAGE_PUBLICATION_DB,
+  TELEMETRY_STORAGE_MODE:'typed',TELEMETRY_STORAGE_NAMESPACE:sourceNamespace,
+  ALLOWANCE_RECONSTRUCTION_MODE:'paused'} as unknown as Env;
+ await registerParticipantOwnerRoute(runtime,owner.participantId,currentRoute);
+ await recordDeletionTombstone(b.DELETION_LEDGER,owner.participantId);
+ return {runtime,participantId:owner.participantId};
+}
+async function seedEarlierCatalogTombstones(participantId:string,count:number){
+ const participantDigest=await participantDeletionDigest(participantId);
+ const value=BigInt(`0x${participantDigest}`);
+ if(value<=BigInt(count))throw new Error('synthetic digest lacks predecessor range');
+ const retainUntil=new Date(Date.now()+86400000).toISOString();
+ const digests:string[]=[];
+  for(let index=0;index<count;index++){
+  const digest=(value-BigInt(count-index)).toString(16).padStart(64,'0');
+  digests.push(digest);
+  const ownerId=`accountless:replay-page-${index}`;
+  await b.STORAGE_ROUTING_DB.batch([
+   b.STORAGE_ROUTING_DB.prepare(`INSERT INTO storage_owner_routes
+    (owner_id,shard_id,route_generation,state,reservation_bytes,updated_at)
+    VALUES(?,?,1,'active',1,1500)`).bind(ownerId,index===0?'a':'b'),
+   b.STORAGE_ROUTING_DB.prepare(`INSERT INTO storage_participant_deletion_replay_locators
+    (participant_digest,owner_id,created_at) VALUES(?,?,1500)`).bind(digest,ownerId),
+  ]);
+  await b.DELETION_LEDGER.prepare(`INSERT INTO deletion_tombstones
+   (participant_digest,schema_version,deleted_at,retain_until)
+   VALUES(?,'participant-deletion-tombstone-v0.1',?,?)`)
+   .bind(digest,new Date(Date.now()).toISOString(),retainUntil).run();
+ }
+ return digests;
 }
 describe('cross-store physical erasure completion',()=>{
  it('retains a durable per-target completion gate until the declared analytics target is clean',async()=>{
@@ -343,5 +446,78 @@ describe('cross-store physical erasure completion',()=>{
   expect(await b.DELETION_LEDGER.prepare("SELECT count(*) n FROM storage_erasure_targets WHERE state='complete'").first('n')).toBe(2);
   expect(await b.STORAGE_ANALYTICS_A.prepare('SELECT count(*) n FROM analytics_storage_erasure_receipts').first('n')).toBe(1);
   expect(await b.STORAGE_ANALYTICS_B.prepare('SELECT count(*) n FROM analytics_storage_erasure_receipts').first('n')).toBe(1);
+ });
+ it('scheduled catalog replay removes current and retained restores and resumes an offline target',async()=>{
+  const f=await catalogReplayFixture();
+  const offlineSource=new Proxy(b.STORAGE_INGESTION_A,{get(database,key){
+   if(key==='prepare')return()=>{throw new Error('synthetic retained source offline');};
+   const value=Reflect.get(database,key);return typeof value==='function'?value.bind(database):value;
+  }});
+  const first=await runScheduledMaintenance({...f.runtime,STORAGE_INGESTION_A:offlineSource} as Env,Date.now());
+  expect(first).toMatchObject({outcome:'success',restoreReplayComplete:false});
+  expect(await b.STORAGE_INGESTION_A.prepare('SELECT state FROM participants WHERE id=?')
+   .bind(f.participantId).first('state')).toBe('active');
+  expect(await b.STORAGE_INGESTION_B.prepare('SELECT 1 FROM participants WHERE id=?')
+   .bind(f.participantId).first()).toBeNull();
+  const offlineAnalytics=new Proxy(b.STORAGE_ANALYTICS_A,{get(database,key){
+   if(key==='prepare')return()=>{throw new Error('synthetic analytics offline');};
+   const value=Reflect.get(database,key);return typeof value==='function'?value.bind(database):value;
+  }});
+  const second=await runScheduledMaintenance({...f.runtime,STORAGE_ANALYTICS_A:offlineAnalytics} as Env,Date.now()+1);
+  expect(second).toMatchObject({outcome:'success',restoreReplayComplete:false});
+  for(const database of [b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B]){
+   expect(await database.prepare('SELECT 1 FROM participants WHERE id=?').bind(f.participantId).first()).toBeNull();
+  }
+  expect(await b.DELETION_LEDGER.prepare("SELECT count(*) n FROM storage_erasure_targets WHERE state='pending'")
+   .first('n')).toBe(1);
+  const participantDigest=await participantDeletionDigest(f.participantId);
+  await b.DELETION_LEDGER.prepare('UPDATE deletion_tombstones SET retain_until=? WHERE participant_digest=?')
+   .bind(new Date(Date.now()-1).toISOString(),participantDigest).run();
+  expect(await purgeExpiredDeletionTombstones(b.DELETION_LEDGER,Date.now())).toMatchObject({purged:0});
+  expect(await b.DELETION_LEDGER.prepare('SELECT 1 FROM deletion_tombstones WHERE participant_digest=?')
+   .bind(participantDigest).first()).not.toBeNull();
+  const retry=await runScheduledMaintenance(f.runtime,Date.now()+2);
+  expect(retry).toMatchObject({outcome:'success',restoreReplayComplete:true});
+  expect(await b.DELETION_LEDGER.prepare("SELECT count(*) n FROM storage_erasure_targets WHERE state='complete'")
+   .first('n')).toBe(2);
+  const repeated=await runScheduledMaintenance(f.runtime,Date.now()+3);
+  expect(repeated).toMatchObject({outcome:'success',restoreReplayComplete:true});
+ });
+ it('fails closed for a legacy catalog owner whose deletion locator was not backfilled',async()=>{
+  const f=await catalogReplayFixture();
+  await b.STORAGE_ROUTING_DB.prepare('DROP TRIGGER storage_participant_deletion_replay_locator_no_delete').run();
+  await b.STORAGE_ROUTING_DB.prepare('DELETE FROM storage_participant_deletion_replay_locators').run();
+  await expect(runBackendLifecycle(b.USAGE_MONITOR_DB,b.DELETION_LEDGER,b.QUARANTINE,Date.now(),
+   undefined,undefined,true,undefined,f.runtime)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  for(const database of [b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B]){
+   expect(await database.prepare('SELECT state FROM participants WHERE id=?').bind(f.participantId).first('state'))
+    .toBe('active');
+  }
+ });
+ it('pages every digest and reaches a later restore after an early source outage',async()=>{
+  const f=await catalogReplayFixture();
+  const earlier=await seedEarlierCatalogTombstones(f.participantId,CATALOG_DELETION_REPLAY_PAGE_SIZE+2);
+  const offlineSource=new Proxy(b.STORAGE_INGESTION_A,{get(database,key){
+   if(key==='prepare')return()=>{throw new Error('synthetic first page source offline');};
+   const value=Reflect.get(database,key);return typeof value==='function'?value.bind(database):value;
+  }});
+  const first=await runScheduledMaintenance({...f.runtime,STORAGE_INGESTION_A:offlineSource} as Env,Date.now());
+  expect(first.restoreReplayComplete).toBe(false);
+  expect(await b.STORAGE_INGESTION_B.prepare('SELECT state FROM participants WHERE id=?')
+   .bind(f.participantId).first('state')).toBe('active');
+  const firstCursor=await b.DELETION_LEDGER.prepare(`SELECT after_participant_digest,cycle_incomplete
+   FROM storage_catalog_deletion_replay_state WHERE singleton_id=1`).first();
+  expect(firstCursor).toEqual({cycle_incomplete:1,
+   after_participant_digest:earlier[CATALOG_DELETION_REPLAY_PAGE_SIZE-1]});
+  const second=await runScheduledMaintenance(f.runtime,Date.now()+1);
+  expect(second.restoreReplayComplete).toBe(false);
+  for(const database of [b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B]){
+   expect(await database.prepare('SELECT 1 FROM participants WHERE id=?').bind(f.participantId).first()).toBeNull();
+  }
+  expect(await b.DELETION_LEDGER.prepare(`SELECT after_participant_digest,verification_required
+   FROM storage_catalog_deletion_replay_state WHERE singleton_id=1`).first())
+   .toEqual({after_participant_digest:'',verification_required:1});
+  expect((await runScheduledMaintenance(f.runtime,Date.now()+2)).restoreReplayComplete).toBe(false);
+  expect((await runScheduledMaintenance(f.runtime,Date.now()+3)).restoreReplayComplete).toBe(true);
  });
 });
