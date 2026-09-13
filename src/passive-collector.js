@@ -1581,6 +1581,39 @@ function recordAppServerError(checkpoint, error) {
   return code;
 }
 
+function rememberCleanupError(primary, cleanup) {
+  if (primary === null || primary === undefined || cleanup === null || cleanup === undefined
+      || primary === cleanup) return;
+  if (typeof primary !== "object" && typeof primary !== "function") return;
+  try {
+    if (primary.cleanupError === undefined) {
+      Object.defineProperty(primary, "cleanupError", {
+        value: cleanup,
+        configurable: true,
+        enumerable: false,
+        writable: true,
+      });
+    } else if (Array.isArray(primary.cleanupError)) {
+      primary.cleanupError.push(cleanup);
+    } else {
+      primary.cleanupError = [primary.cleanupError, cleanup];
+    }
+  } catch {
+    // Preserve the original error even when a provider supplies a frozen error
+    // object or a non-standard throw value.
+  }
+}
+
+async function closeResource(resource) {
+  try {
+    if (resource === null || resource === undefined || typeof resource.close !== "function") return null;
+    await resource.close();
+    return null;
+  } catch (error) {
+    return error;
+  }
+}
+
 // A failed app-server refresh leaves the in-memory checkpoint speculatively
 // mutated: the append records the dedupe key and observation stamp before its
 // atomic commit, so keeping either after a failed commit would make the next
@@ -1678,16 +1711,20 @@ export async function runCollectorOnce({
   // check even when the enclosing refresh is cancelled or fails. Deliberately
   // do not pass `signal` to the worker verifier: cancellation cannot shorten
   // that mandatory settle, and the lock remains held until it completes.
-  const pooled = commitState === commitLocalCollectorState
-    && saveState === saveLocalCollectorCheckpoint
-    ? await openLocalCollectorStateSession({
-      stateFile,
-      clock,
-      integrityVerifier,
-    })
-    : null;
+  let pooled = null;
   let sessionSettled = false;
+  let primaryError = null;
   try {
+    // Opening the pooled session is part of the lock's cleanup scope. A failed
+    // identity check or database open must still release the instance row.
+    pooled = commitState === commitLocalCollectorState
+      && saveState === saveLocalCollectorCheckpoint
+      ? await openLocalCollectorStateSession({
+        stateFile,
+        clock,
+        integrityVerifier,
+      })
+      : null;
     const nowIso = new Date(clock()).toISOString();
     const existing = await readLocalCollectorCheckpoint({ stateFile });
     const saveCheckpoint = async () => {
@@ -1732,7 +1769,7 @@ export async function runCollectorOnce({
         refresh.attempted = true;
         try {
           client = appServerFactory();
-          abortClient = () => client?.close();
+          abortClient = () => { void closeResource(client); };
           signal?.addEventListener("abort", abortClient, { once: true });
           await client.start();
           if (signal?.aborted) throw new Error("collector_aborted");
@@ -1769,7 +1806,6 @@ export async function runCollectorOnce({
         } finally {
           signal?.removeEventListener("abort", abortClient);
           abortClient = null;
-          client?.close();
         }
       }
       checkpoint.savedAt = new Date(clock()).toISOString();
@@ -1960,7 +1996,7 @@ export async function runCollectorOnce({
       refresh.attempted = true;
       try {
         client = appServerFactory();
-        abortClient = () => client?.close();
+        abortClient = () => { void closeResource(client); };
         signal?.addEventListener("abort", abortClient, { once: true });
         await client.start();
         if (signal?.aborted) throw new Error("collector_aborted");
@@ -1992,7 +2028,6 @@ export async function runCollectorOnce({
       } finally {
         signal?.removeEventListener("abort", abortClient);
         abortClient = null;
-        client?.close();
       }
     }
     if (indexingRun) {
@@ -2034,21 +2069,52 @@ export async function runCollectorOnce({
       result.pauseReason = result.resourceLimit?.code ?? "collector_aborted";
     }
     return resultStateProperties(result, { stateFile });
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    signal?.removeEventListener("abort", abortClient);
-    client?.close();
-    if (pooled !== null && !sessionSettled) {
-      sessionSettled = true;
-      // A run that is exiting through an error path still owes the store its
-      // settle: everything already committed stays committed, and the
-      // integrity check is not skipped just because the run did not finish.
+    let cleanupError = null;
+    try {
       try {
-        await pooled.close();
-      } catch {
-        await pooled.abort().catch(() => {});
+        signal?.removeEventListener("abort", abortClient);
+      } catch (error) {
+        cleanupError = error;
+      }
+      const clientCloseError = await closeResource(client);
+      if (clientCloseError !== null) {
+        if (cleanupError === null) cleanupError = clientCloseError;
+        else rememberCleanupError(cleanupError, clientCloseError);
+      }
+      if (pooled !== null && !sessionSettled) {
+        sessionSettled = true;
+        // A run that is exiting through an error path still owes the store its
+        // settle: everything already committed stays committed, and the
+        // integrity check is not skipped just because the run did not finish.
+        try {
+          await pooled.close();
+        } catch (error) {
+          if (cleanupError === null) cleanupError = error;
+          else rememberCleanupError(cleanupError, error);
+          try {
+            await pooled.abort();
+          } catch (abortError) {
+            if (cleanupError === null) cleanupError = abortError;
+            else rememberCleanupError(cleanupError, abortError);
+          }
+        }
+      }
+    } finally {
+      try {
+        await release();
+      } catch (error) {
+        if (cleanupError === null) cleanupError = error;
+        else rememberCleanupError(cleanupError, error);
       }
     }
-    await release();
+    if (cleanupError !== null) {
+      if (primaryError !== null) rememberCleanupError(primaryError, cleanupError);
+      else throw cleanupError;
+    }
   }
 }
 
@@ -2097,8 +2163,21 @@ export async function runCollectorForeground({
   }
   await prepareLocalCollectorState({ stateFile, clock });
   const release = await acquireLocalCollectorStateLock(stateFile, { clock });
-  const existing = await readLocalCollectorCheckpoint({ stateFile });
-  const checkpoint = existing ?? emptyCheckpoint(new Date(clock()).toISOString(), false);
+  let existing;
+  let checkpoint;
+  try {
+    existing = await readLocalCollectorCheckpoint({ stateFile });
+    checkpoint = existing ?? emptyCheckpoint(new Date(clock()).toISOString(), false);
+    checkpoint.diagnostics.ingestionErrorCounts ??= {};
+    checkpoint.diagnostics.watcherErrorCounts ??= {};
+  } catch (error) {
+    try {
+      await release();
+    } catch (cleanupError) {
+      rememberCleanupError(error, cleanupError);
+    }
+    throw error;
+  }
   let client = null;
   let reconnectAttempts = 0;
   let totalReconnectAttempts = 0;
@@ -2129,9 +2208,6 @@ export async function runCollectorForeground({
   let accountInvalidationQueued = false;
   let accountInvalidationDirty = false;
   const watchers = [];
-
-  checkpoint.diagnostics.ingestionErrorCounts ??= {};
-  checkpoint.diagnostics.watcherErrorCounts ??= {};
 
   async function save() {
     checkpoint.savedAt = new Date(clock()).toISOString();
@@ -2377,7 +2453,10 @@ export async function runCollectorForeground({
   }
 
   async function connect({ afterReconnect = false } = {}) {
-    client?.close();
+    const previousClient = client;
+    client = null;
+    const previousClientCloseError = await closeResource(previousClient);
+    if (previousClientCloseError !== null) throw previousClientCloseError;
     client = appServerFactory();
     const connectedClient = client;
     rateLimitNotificationsPaused = true;
@@ -2435,6 +2514,7 @@ export async function runCollectorForeground({
     }
   }
 
+  let primaryError = null;
   try {
     await queueIngestion();
     try {
@@ -2454,7 +2534,7 @@ export async function runCollectorForeground({
         watcher.on("error", (error) => {
           recordWatcherError(error);
           activateWatcherFallback();
-          watcher.close();
+          void closeResource(watcher);
         });
         watchers.push(watcher);
       } catch (error) {
@@ -2509,11 +2589,37 @@ export async function runCollectorForeground({
         maximumPendingRateLimitNotifications,
       },
     };
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    for (const watcher of watchers) watcher.close();
-    client?.close();
-    await drainOperations().catch(() => {});
-    if (!finalized) await save().catch(() => {});
-    await release();
+    let cleanupError = null;
+    try {
+      for (const watcher of watchers) {
+        const watcherCloseError = await closeResource(watcher);
+        if (watcherCloseError !== null) {
+          if (cleanupError === null) cleanupError = watcherCloseError;
+          else rememberCleanupError(cleanupError, watcherCloseError);
+        }
+      }
+      const clientCloseError = await closeResource(client);
+      if (clientCloseError !== null) {
+        if (cleanupError === null) cleanupError = clientCloseError;
+        else rememberCleanupError(cleanupError, clientCloseError);
+      }
+      await drainOperations().catch(() => {});
+      if (!finalized) await save().catch(() => {});
+    } finally {
+      try {
+        await release();
+      } catch (error) {
+        if (cleanupError === null) cleanupError = error;
+        else rememberCleanupError(cleanupError, error);
+      }
+    }
+    if (cleanupError !== null) {
+      if (primaryError !== null) rememberCleanupError(primaryError, cleanupError);
+      else throw cleanupError;
+    }
   }
 }

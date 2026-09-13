@@ -1,3 +1,4 @@
+export { createSourceFileAccess } from './source-file-access.js';
 export {
   attachAccountlessParentChannel,
   createAccountlessChildChannel,
