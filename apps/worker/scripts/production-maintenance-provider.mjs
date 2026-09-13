@@ -6,16 +6,32 @@ import { identityDigest, operationError } from '../../../scripts/lib/release-ope
 
 const fail = code => { throw operationError(`PRODUCTION_MAINTENANCE_${code}`); };
 const uuid = value => /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value ?? '');
+const sha = value => /^[a-f0-9]{64}$/.test(value ?? ''), qid=value=>/^[a-f0-9]{32}$/.test(value??'');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const sorted = values => [...values].sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
 export const maintenanceBindingDigest = bindings => identityDigest(sorted(bindings));
 export const MAINTENANCE_SCHEMA_QUERY = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name LIMIT 4097";
 const list = (value, key, max) => { const rows = Array.isArray(value) ? value : value?.[key]; if (!Array.isArray(rows)||rows.length>max) fail('INVENTORY_UNBOUNDED'); return rows; };
+function validateIsolatedBootstrap(value,plan){
+  if(value===null)return null;
+  const exact=(item,keys)=>item&&typeof item==='object'&&!Array.isArray(item)&&Object.keys(item).sort().join()===keys.sort().join();
+  if(!exact(value,['schema','phase','operationDigest','workerName','queueName','queueId','sourceDatabaseId','catalogDatabaseId',
+    'bundleSha256','disabledConfigSha256','enabledConfigSha256'])
+    ||value.schema!=='storage-existing-accountless-bootstrap-isolation-v1'
+    ||!['queue-only','disabled','enabled'].includes(value.phase)||!sha(value.operationDigest)||!sha(value.bundleSha256)
+    ||!sha(value.disabledConfigSha256)||!sha(value.enabledConfigSha256)||!uuid(value.sourceDatabaseId)
+    ||!uuid(value.catalogDatabaseId)||value.sourceDatabaseId!==plan.databaseId||value.catalogDatabaseId===value.sourceDatabaseId
+    ||!/^tibotattle-[a-z0-9-]{1,52}$/.test(value.workerName)||!/^tibotattle-[a-z0-9-]{1,52}$/.test(value.queueName)
+    ||value.workerName===plan.workerName||!qid(value.queueId))
+    fail('ISOLATION_INVALID');
+  return structuredClone(value);
+}
 
 /** Fixed-account provider. Only the five closed mutations below exist; schema
  * inspection is a fixed read, never a caller-supplied SQL execution escape. */
 export async function createMaintenanceProvider({plan,packageDirectory,operationDirectory,operationId,cliPath,
-  fetcher=fetch,spawn=spawnSync,environment=process.env,cutoverInventory=null}) {
+  fetcher=fetch,spawn=spawnSync,environment=process.env,cutoverInventory=null,isolatedBootstrap=null}) {
+  isolatedBootstrap=validateIsolatedBootstrap(isolatedBootstrap,plan);
   const {api,receipt,publicRead,run:command}=createMaintenanceTransport({plan,operationDirectory,cliPath,fetcher,spawn,environment});
   const account=`/accounts/${plan.accountId}`,script=`${account}/workers/scripts/${plan.workerName}`;
   const tag=`maintenance-${operationId}`;
@@ -45,10 +61,34 @@ export async function createMaintenanceProvider({plan,packageDirectory,operation
   if(cutoverInventory!==null&&(!/^[a-f0-9]{64}$/.test(cutoverInventory.digest??'')||!/^tibotattle-analytics-[a-z0-9-]{1,42}$/.test(cutoverInventory.analyticsWorker??'')||cutoverInventory.analyticsWorker===plan.workerName))fail('INVENTORY_INVALID');
   const writerInventory=async expectOwn=>{
     const workers=list(await api(`${account}/workers/scripts?per_page=100`),'scripts',30);let own=false;const snapshot={workers:[],queues:[]};
+    const isolatedWorker=workers.filter(worker=>worker.id===isolatedBootstrap?.workerName);
+    if(isolatedWorker.length>1||isolatedBootstrap?.phase==='queue-only'&&isolatedWorker.length!==0
+      ||isolatedBootstrap&&!['queue-only'].includes(isolatedBootstrap.phase)&&isolatedWorker.length!==1)fail('ISOLATION_CHANGED');
     for(const worker of workers){
       const name=worker.id;if(!/^[a-zA-Z0-9_-]{1,63}$/.test(name??''))fail('INVENTORY_INVALID');
       const id=await active(name);const v=await api(`${account}/workers/scripts/${name}/versions/${id}`);
       const settings=await api(`${account}/workers/scripts/${name}/settings`);
+      if(name===isolatedBootstrap?.workerName){
+        const mode=isolatedBootstrap.phase,configDigest=mode==='enabled'?isolatedBootstrap.enabledConfigSha256:isolatedBootstrap.disabledConfigSha256;
+        if(v.annotations?.['workers/tag']!==`existing-bootstrap-${mode}-${configDigest}`)fail('ISOLATION_CHANGED');
+        const expected=[
+          ['d1','SOURCE',isolatedBootstrap.sourceDatabaseId],['d1','STORAGE_ROUTING_DB',isolatedBootstrap.catalogDatabaseId],
+          ['plain_text','STORAGE_EXISTING_BOOTSTRAP_MODE',mode],
+          ['plain_text','STORAGE_EXISTING_BOOTSTRAP_OPERATION_DIGEST',isolatedBootstrap.operationDigest],
+          ['plain_text','STORAGE_EXISTING_BOOTSTRAP_BUNDLE_SHA256',isolatedBootstrap.bundleSha256],
+        ];
+        for(const bs of [v.resources?.bindings,settings.bindings]){
+          if(!Array.isArray(bs)||bs.length!==expected.length)fail('ISOLATION_CHANGED');
+          for(const [type,name,value]of expected){const matches=bs.filter(b=>b.type===type&&b.name===name
+            &&(type==='d1'?(b.id??b.database_id)===value:b.text===value));if(matches.length!==1)fail('ISOLATION_CHANGED');}
+        }
+        const subdomain=await api(`${account}/workers/scripts/${name}/subdomain`);
+        const isolatedRoutes=list(await api(`${account}/workers/services/${name}/environments/production/routes?show_zonename=true`),'routes',100);
+        const isolatedDomains=list(await api(`${account}/workers/domains/records?page=0&per_page=100&service=${name}&environment=production`),'records',99);
+        const isolatedCrons=list(await api(`${account}/workers/scripts/${name}/schedules`),'schedules',16);
+        if(subdomain.enabled!==false||subdomain.previews_enabled!==false||isolatedRoutes.length||isolatedDomains.length||isolatedCrons.length)fail('ISOLATION_CHANGED');
+        continue;
+      }
       if(name!==cutoverInventory?.analyticsWorker)snapshot.workers.push(name===plan.workerName?{name}:{name,versionId:id,bindings:maintenanceBindingDigest(v.resources?.bindings??[]),settings:maintenanceBindingDigest(settings.bindings??[])});
       for(const bs of [v.resources?.bindings,settings.bindings]){
         if(!Array.isArray(bs)||bs.length>100)fail('INVENTORY_INVALID');
@@ -60,7 +100,19 @@ export async function createMaintenanceProvider({plan,packageDirectory,operation
     }
     if(expectOwn&&!own||!workers.some(w=>w.id===plan.workerName))fail('WRITER_STATE_CHANGED');
     const queues=list(await api(`${account}/queues?page=1&per_page=100`),'queues',20);
-    for(const q of queues){if(!/^[a-f0-9]{32}$/.test(q.queue_id??''))fail('INVENTORY_INVALID');const consumers=list(await api(`${account}/queues/${q.queue_id}/consumers`),'consumers',20);snapshot.queues.push({queueId:q.queue_id,consumers:identityDigest(sorted(consumers))});if(consumers.some(c=>c.script_name===plan.workerName))fail('OTHER_INGRESS');}
+    const isolatedQueues=queues.filter(q=>q.queue_id===isolatedBootstrap?.queueId||q.queue_name===isolatedBootstrap?.queueName);
+    if(isolatedBootstrap&&isolatedQueues.length!==1)fail('ISOLATION_CHANGED');
+    for(const q of queues){if(!/^[a-f0-9]{32}$/.test(q.queue_id??''))fail('INVENTORY_INVALID');const consumers=list(await api(`${account}/queues/${q.queue_id}/consumers`),'consumers',20);
+      if(q===isolatedQueues[0]){
+        if(q.queue_id!==isolatedBootstrap.queueId||q.queue_name!==isolatedBootstrap.queueName)fail('ISOLATION_CHANGED');
+        if(isolatedBootstrap.phase==='enabled'){
+          if(consumers.length!==1||consumers[0].script_name!==isolatedBootstrap.workerName
+            ||consumers[0].queue_name!==isolatedBootstrap.queueName||consumers[0].max_batch_size!==1
+            ||consumers[0].max_batch_timeout!==1||consumers[0].max_concurrency!==1||consumers[0].max_retries!==0)fail('ISOLATION_CHANGED');
+        }else if(consumers.length)fail('ISOLATION_CHANGED');
+        continue;
+      }
+      snapshot.queues.push({queueId:q.queue_id,consumers:identityDigest(sorted(consumers))});if(consumers.some(c=>c.script_name===plan.workerName||c.script_name===isolatedBootstrap?.workerName))fail('OTHER_INGRESS');}
     await ingress();
     snapshot.workers=sorted(snapshot.workers);snapshot.queues=sorted(snapshot.queues);
     if(identityDigest(snapshot)!==(cutoverInventory?.digest??plan.predecessor.inventoryDigest))fail('WRITER_INVENTORY_CHANGED');
