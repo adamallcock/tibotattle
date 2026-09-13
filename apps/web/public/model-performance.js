@@ -4,6 +4,12 @@ import { formatModelName } from "./ui-format.js";
 // Presentation-only: the companion owns reconstruction, eligibility and bins.
 const DAY = 86_400_000;
 const PERIODS = ["7", "30", "all"];
+// Keep the in-memory period cache useful across quick switches while ensuring
+// each entry is eventually revalidated. The cache is deliberately bounded by
+// PERIODS; it never persists measurements in browser storage.
+const PERIOD_CACHE_TTL_MS = 60_000;
+const PRELOAD_MAX_ATTEMPTS = 3;
+const PRELOAD_RETRY_DELAY_MS = 5_000;
 const SPEED_METHOD = "speed";
 const MODEL_NAMES = Object.freeze({
   "gpt-6-astra": "Astra", "gpt-5.6-sol": "Sol", "gpt-5.6-terra": "Terra",
@@ -136,17 +142,21 @@ export function performanceHoverBin(fraction, { start, end }, interval) {
 }
 
 export function mountModelPerformance({ root, client, t, locale = () => "en-US", windowRef = globalThis.window }) {
-  if (!root) return { render() {}, refresh() {} };
+  if (!root) return { render() {}, refresh() {}, preload: () => Promise.resolve() };
   const documentRef = root.ownerDocument;
   const storageKey = "tibotattle.performance.v1";
   let saved = {};
   try { saved = JSON.parse(windowRef.localStorage.getItem(storageKey)) ?? {}; } catch { /* Storage can be disabled. */ }
   let period = PERIODS.includes(saved.period) ? saved.period : "all";
   let modelId = Object.hasOwn(MODEL_NAMES, saved.model) ? saved.model : null;
-  let payload = null, loading = false, failed = false, request = 0, abort = null, timer = null;
+  let payload = null, loading = false, failed = false, request = 0, timer = null;
   // At most the three fixed periods, retained only for this mounted local view.
   // No measurements or identity-bearing data enter browser storage.
   const readyPeriods = new Map();
+  const pendingPeriods = new Map();
+  let lifecycle = 0, scopeGeneration = 0, scopeUnavailable = false, destroyed = false;
+  let preloadPromise = null, preloadComplete = false;
+  const preloadWaiters = new Map();
   let aboutOpen = false, chartCursors = [];
   let selectedInterval = null;
   const showInterval = (at) => { if (at === selectedInterval) return; selectedInterval = at; for (const update of chartCursors) update(at); };
@@ -364,7 +374,12 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     for (const value of PERIODS) {
       const button = element("button", value === period ? "active" : "", translate(value === "all" ? "all" : `days${value}`));
       button.type = "button"; button.setAttribute("aria-pressed", String(period === value)); button.dataset.performanceFocus = `period-${value}`;
-      button.addEventListener("click", () => { if (period === value) return; period = value; payload = readyPeriods.get(value) ?? null; remember(); render(); refresh(); }); periods.append(button);
+      button.addEventListener("click", () => {
+        if (period === value) return;
+        period = value;
+        payload = readyPeriods.get(value)?.payload ?? null;
+        remember(); render(); refresh();
+      }); periods.append(button);
     }
     heading.append(title, periods); root.append(heading);
     const status = element("p", "performance-status"); status.setAttribute("role", "status");
@@ -441,41 +456,220 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     root.append(panel);
     restoreFocus();
   }
+  const cachedPayload = value => readyPeriods.get(value)?.payload ?? null;
+  const cacheFresh = entry => entry && Date.now() - entry.cachedAt < PERIOD_CACHE_TTL_MS;
+  const allPeriodsFresh = () => PERIODS.every(value => cacheFresh(readyPeriods.get(value)));
+  const documentVisible = () => !documentRef.hidden && !destroyed;
+  const canPreload = (runLifecycle, runScope) => documentVisible()
+    && lifecycle === runLifecycle && scopeGeneration === runScope;
+  const cancelPending = ({ includeSpeculative = true } = {}) => {
+    for (const [value, entry] of pendingPeriods) {
+      if (!includeSpeculative && entry.speculative) continue;
+      entry.controller.abort();
+      if (pendingPeriods.get(value) === entry) pendingPeriods.delete(value);
+    }
+  };
+  const cancelPreloadWaits = () => {
+    for (const finish of preloadWaiters.values()) finish(false);
+  };
+  const invalidateScope = (sourcePeriod, unavailable) => {
+    scopeGeneration++;
+    scopeUnavailable = true;
+    preloadComplete = false;
+    cancelPreloadWaits();
+    readyPeriods.clear();
+    // An unavailable response describes the complete local scope. Abort
+    // requests from the prior scope so they cannot spend work or repopulate
+    // the cache after the invalidation. Keep the response that established
+    // the invalidation alive for its caller.
+    for (const [value, entry] of pendingPeriods) if (value !== sourcePeriod) {
+      entry.controller.abort();
+      if (pendingPeriods.get(value) === entry) pendingPeriods.delete(value);
+    }
+    // A sibling period can discover that the whole scope is unavailable while
+    // the selected period is still displaying a previous ready value. Remove
+    // that value immediately, including on an inactive page, so first visit
+    // cannot resurrect stale evidence.
+    if (!destroyed && period !== sourcePeriod) {
+      payload = { ...unavailable, period };
+      failed = false;
+      render();
+    }
+  };
+  const presentResult = (value, result) => {
+    if (!result || value !== period) return false;
+    if (result.status === "unavailable") readyPeriods.clear();
+    const retained = result.status === "loading" ? cachedPayload(value) : null;
+    const next = retained ? { ...retained, collecting: true, stale: true } : result;
+    const changed = JSON.stringify({ ...next, updatedAt: null }) !== JSON.stringify(payload ? { ...payload, updatedAt: null } : null);
+    payload = next;
+    return changed;
+  };
+  function requestPeriod(value, { force = false, speculative = false } = {}) {
+    if (!PERIODS.includes(value)) return Promise.reject(new RangeError("Unsupported performance period"));
+    const existing = pendingPeriods.get(value);
+    if (existing) return existing.promise;
+    const entry = readyPeriods.get(value);
+    if (!force && cacheFresh(entry)) return Promise.resolve(entry.payload);
+    const controller = new AbortController();
+    const startedLifecycle = lifecycle;
+    const startedScope = scopeGeneration;
+    let timedOut = false;
+    const deadline = windowRef.setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
+    const record = { controller, promise: null, speculative };
+    const promise = (async () => {
+      try {
+        const result = normalizeModelPerformance(await client.modelPerformance(value, { signal: controller.signal }));
+        if (!result || result.period !== value) throw new Error("Invalid timing contract");
+        // Hidden/destroyed views and responses from an invalidated scope may
+        // finish, but they must not affect the visible state or cache.
+        if (destroyed || lifecycle !== startedLifecycle || scopeGeneration !== startedScope) return null;
+        // Some clients may ignore AbortSignal and resolve after the deadline.
+        // Treat that response as timed out so a late result cannot become a
+        // fresh cache entry or replace the current period.
+        if (controller.signal.aborted) {
+          if (timedOut) throw new Error("Performance request timed out");
+          return null;
+        }
+        if (result.status === "unavailable") invalidateScope(value, result);
+        else {
+          scopeUnavailable = false;
+          if (result.status === "ready") readyPeriods.set(value, { payload: result, cachedAt: Date.now() });
+        }
+        return result;
+      } finally {
+        windowRef.clearTimeout(deadline);
+        if (pendingPeriods.get(value) === record) pendingPeriods.delete(value);
+      }
+    })();
+    record.promise = promise;
+    pendingPeriods.set(value, record);
+    return promise;
+  }
+  function waitForPreload(delay, runLifecycle, runScope) {
+    return new Promise(resolve => {
+      let timeout;
+      const finish = value => {
+        if (!preloadWaiters.delete(timeout)) return;
+        windowRef.clearTimeout(timeout);
+        resolve(value && canPreload(runLifecycle, runScope));
+      };
+      timeout = windowRef.setTimeout(() => finish(true), delay);
+      preloadWaiters.set(timeout, finish);
+    });
+  }
+  async function preloadPeriod(value, runLifecycle, runScope) {
+    for (let attempt = 0; attempt < PRELOAD_MAX_ATTEMPTS; attempt++) {
+      if (!canPreload(runLifecycle, runScope)) return null;
+      let result = null;
+      try { result = await requestPeriod(value, { speculative: true }); }
+      catch { if (!canPreload(runLifecycle, runScope)) return null; }
+      if (result?.status === "unavailable") {
+        if (value === period && presentResult(value, result)) render();
+        return result;
+      }
+      if (!canPreload(runLifecycle, runScope)) return null;
+      if (result) {
+        if (presentResult(value, result)) render();
+        if (result.status === "ready") return result;
+      }
+      if (attempt + 1 < PRELOAD_MAX_ATTEMPTS
+          && !await waitForPreload(PRELOAD_RETRY_DELAY_MS, runLifecycle, runScope)) return null;
+    }
+    return null;
+  }
+  async function runPreload(runLifecycle, runScope, selectedPeriod) {
+    const selectedResult = await preloadPeriod(selectedPeriod, runLifecycle, runScope);
+    if (selectedResult?.status === "unavailable" || !canPreload(runLifecycle, runScope)) return;
+    for (const value of PERIODS) {
+      if (value === selectedPeriod) continue;
+      const result = await preloadPeriod(value, runLifecycle, runScope);
+      if (result?.status === "unavailable" || !canPreload(runLifecycle, runScope)) return;
+    }
+  }
+  function preload() {
+    if (destroyed || documentRef.hidden) return Promise.resolve();
+    if (preloadPromise) return preloadPromise;
+    if (preloadComplete && allPeriodsFresh()) return Promise.resolve();
+    preloadComplete = false;
+    const runLifecycle = lifecycle, runScope = scopeGeneration, selectedPeriod = period;
+    const operation = (async () => {
+      try { await runPreload(runLifecycle, runScope, selectedPeriod); }
+      catch { /* Speculative warming is best effort; the visible refresh remains authoritative. */ }
+    })();
+    preloadPromise = operation;
+    void operation.finally(() => {
+      if (preloadPromise !== operation) return;
+      preloadPromise = null;
+      preloadComplete = allPeriodsFresh();
+    });
+    return operation;
+  }
+  async function warmOtherPeriods() {
+    if (!visible() || destroyed || scopeUnavailable || payload?.status === "unavailable") return;
+    const selectedPeriod = period;
+    await Promise.all(PERIODS.filter(value => value !== selectedPeriod).map(async value => {
+      if (!visible() || destroyed) return;
+      const entry = readyPeriods.get(value);
+      if (cacheFresh(entry)) return;
+      try { await requestPeriod(value); } catch { /* Background warming is best effort. */ }
+    }));
+  }
   async function refresh() {
-    if (!visible()) return;
-    const current = ++request; abort?.abort(); abort = new AbortController();
-    const controller = abort;
-    const deadline = windowRef.setTimeout(() => controller.abort(), 15_000);
+    if (!visible() || destroyed) return;
+    const current = ++request;
+    const startedLifecycle = lifecycle;
+    const startedScope = scopeGeneration;
+    const targetPeriod = period;
     const hadFailure = failed;
+    scopeUnavailable = false;
     loading = true; failed = false; windowRef.clearTimeout(timer);
+    // A cached period remains visible while its replacement is fetched.
     if (!payload || hadFailure) render();
-    let changed = false;
+    let changed = false, shouldWarm = false;
     try {
-      const result = normalizeModelPerformance(await client.modelPerformance(period, { signal: abort.signal }));
-      if (request !== current) return;
-      if (!result || result.period !== period) throw new Error("Invalid timing contract");
-      if (result.status === "unavailable") readyPeriods.clear();
-      else if (result.status === "ready") readyPeriods.set(period, result);
-      const retained = result.status === "loading" ? readyPeriods.get(period) : null;
-      const next = retained ? { ...retained, collecting: true, stale: true } : result;
-      changed = JSON.stringify({ ...next, updatedAt: null }) !== JSON.stringify(payload ? { ...payload, updatedAt: null } : null);
-      payload = next;
-    } catch { if (request !== current) return; failed = true; }
-    finally {
-      windowRef.clearTimeout(deadline);
-      if (request === current) {
+      const result = await requestPeriod(targetPeriod, { force: true });
+      if (request !== current || lifecycle !== startedLifecycle || destroyed || !result) return;
+      shouldWarm = result.status !== "unavailable";
+      changed = presentResult(targetPeriod, result);
+    } catch {
+      if (request !== current || lifecycle !== startedLifecycle || destroyed) return;
+      // Keep a good period visible through transient foreground failures. A
+      // scope invalidation that aborted this request already rendered its
+      // unavailable state, so do not replace it with a generic failure.
+      failed = scopeGeneration === startedScope;
+    } finally {
+      if (request === current && lifecycle === startedLifecycle && !destroyed) {
         loading = false; if (changed || failed || !payload) render();
-        if (visible()) timer = windowRef.setTimeout(refresh, failed ? 30_000 : 10_000);
+        if (visible()) {
+          timer = windowRef.setTimeout(refresh, failed ? 30_000 : 10_000);
+          if (shouldWarm && !scopeUnavailable) void warmOtherPeriods();
+        }
       }
     }
   }
-  const visibilityChanged = () => {
+  const rootVisibilityChanged = () => {
     if (visible()) { if (!loading) refresh(); }
-    else { windowRef.clearTimeout(timer); abort?.abort(); request++; loading = false; }
+    else {
+      windowRef.clearTimeout(timer); request++; loading = false;
+      // A page transition should stop its foreground poll, while a
+      // document-visible speculative preload is allowed to finish for the
+      // first visit. Document hiding below cancels both kinds of work.
+      cancelPending({ includeSpeculative: false });
+    }
   };
-  const observer = new windowRef.MutationObserver(visibilityChanged);
+  const documentVisibilityChanged = () => {
+    if (documentRef.hidden) {
+      windowRef.clearTimeout(timer); lifecycle++; cancelPending(); cancelPreloadWaits();
+      if (preloadPromise && !preloadComplete) preloadPromise = null;
+      request++; loading = false;
+    } else if (visible() && !loading) refresh();
+  };
+  const observer = new windowRef.MutationObserver(rootVisibilityChanged);
   observer.observe(root, { attributes: true, attributeFilter: ["class"] });
-  documentRef.addEventListener("visibilitychange", visibilityChanged);
+  documentRef.addEventListener("visibilitychange", documentVisibilityChanged);
   render(); if (visible()) refresh();
-  return { render, refresh, destroy() { readyPeriods.clear(); payload = null; observer.disconnect(); abort?.abort(); request++; windowRef.clearTimeout(timer); documentRef.removeEventListener("visibilitychange", visibilityChanged); } };
+  return { render, refresh, preload, destroy() {
+    destroyed = true; lifecycle++; readyPeriods.clear(); payload = null; observer.disconnect(); cancelPending(); cancelPreloadWaits(); preloadPromise = null; preloadComplete = false; request++; windowRef.clearTimeout(timer); documentRef.removeEventListener("visibilitychange", documentVisibilityChanged);
+  } };
 }

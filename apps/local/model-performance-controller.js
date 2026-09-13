@@ -17,8 +17,8 @@ export function createModelPerformanceController({ directory, codexHome,
     clearTimeout(idle);
     idle = setTimeout(() => {
       idle = null;
-      // Once explicitly requested, finish the discovered history pass even if
-      // its page becomes hidden. This remains lazy and off-main; completed
+      // Once requested by the dashboard, finish the discovered history pass
+      // even if its page is inactive. This remains off-main; completed
       // workers still stop after the ordinary idle lease.
       if ([...cache.values()].some(value => value.collecting)) scheduleIdleStop();
       else void stop();
