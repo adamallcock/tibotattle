@@ -178,3 +178,14 @@ value, progress and footer alignment while retaining separate Spark limits and
 existing ordering. Validate freshness edge cases, the web suite and a fresh
 unsigned package at representative widths. Full accounting parity remains an
 independent gate.
+
+Implemented and visually inspected source
+`a0d9a097aaf94abc3011cfb0168326da4a2e9848`, unsigned development ASAR
+`4eb165ac739eca90d54f2c1f13882d28ed57f1fd17a4accc274dfbea1cd567ab`.
+750 web tests and documentation governance pass. Packaged real-data captures at
+1180px and 960px confirm aligned value, progress and footer rows within each
+card row, no card or document horizontal overflow, and the explicit stale
+observation label without a repeated generic banner. Evidence is retained in
+`.release-build/freshness-layout.json` and the matching private screenshots.
+The full runner still encounters its existing `usage_invalid` accounting-parity
+gate; this is visual qualification, not full accounting-parity qualification.
