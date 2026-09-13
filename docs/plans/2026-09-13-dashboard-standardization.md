@@ -246,3 +246,16 @@ repeat observation caption. Preserve observation and coverage in quiet inline
 metadata. Available reports with no rows show a true empty/search-empty state
 without empty result tables or summary cards; unavailable reports retain their
 own status. Validate query interactions and packaged controls at two widths.
+
+752 web tests pass, including no-match search and restoring results after
+clearing search, along with existing snapshot/filter/expansion interactions.
+Documentation governance passes. Final unsigned source
+`81dc10df91046779a83d4cc0289822058b83568c` has ASAR
+`1ccb8cde50f5a8685faf55c67f50dc641a319ae8376c25187d3f1badc86a7aac`.
+Packaged report controls were reviewed at 1180px and 960px while preparing a
+real report, with no toolbar/document overflow. Search and selects are 44px
+high; sort/model/refresh wrap together. Captures deliberately end above private
+report rows. Evidence: `.release-build/projects-layout.json` and matching
+control screenshots. Empty/restore behavior is tested with synthetic data;
+this check does not qualify the populated real report or resolve the existing
+full accounting-parity gate.
