@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createReportingPeriod, reportingSelection } from '../public/reporting-period.js';
+import { createReportingPeriod, reportingSelection, mountReportingPeriodDismissal } from '../public/reporting-period.js';
 const endAt = '2026-09-10T12:34:56.000Z';
 const startAt = '2026-09-03T12:34:56.000Z';
 
@@ -80,4 +80,30 @@ test('unavailable selected accounting clears previous model totals and coverage'
   assert.equal(coverage.textContent, '');
   assert.equal(table.children.length, 1);
   assert.equal(table.children[0].children[0].key, 'accounting.model.unavailable');
+});
+
+test('reporting date dismissal preserves inside clicks and handles outside and Escape', () => {
+  const inside = {};
+  const outside = {};
+  let focused = false;
+  let prevented = false;
+  const handlers = new Map();
+  const details = { open: true, contains: target => target === inside,
+    querySelector: () => ({ focus: () => { focused = true; } }) };
+  const doc = { activeElement: inside, querySelector: () => details,
+    addEventListener: (key, fn) => handlers.set(key, fn),
+    removeEventListener: key => handlers.delete(key) };
+  const teardown = mountReportingPeriodDismissal(doc);
+  handlers.get('pointerdown')({ target: inside });
+  assert.equal(details.open, true);
+  handlers.get('pointerdown')({ target: outside });
+  assert.equal(details.open, false);
+  assert.equal(focused, false);
+  details.open = true;
+  handlers.get('keydown')({ key: 'Escape', preventDefault: () => { prevented = true; } });
+  assert.equal(details.open, false);
+  assert.equal(focused, true);
+  assert.equal(prevented, true);
+  teardown();
+  assert.equal(handlers.size, 0);
 });

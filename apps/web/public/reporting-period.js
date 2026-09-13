@@ -47,3 +47,23 @@ export function createReportingPeriod({ storage = preferenceStorage(), onChange 
     },
   };
 }
+
+export function mountReportingPeriodDismissal(documentRef = document) {
+  const details = documentRef.querySelector('.reporting-period-details');
+  if (!details) return () => {};
+  const outside = (event) => {
+    if (details.open && !details.contains(event.target)) details.open = false;
+  };
+  const escape = (event) => {
+    if (event.key !== 'Escape' || !details.open) return;
+    details.open = false;
+    event.preventDefault();
+    if (details.contains(documentRef.activeElement)) details.querySelector('summary')?.focus();
+  };
+  documentRef.addEventListener('pointerdown', outside);
+  documentRef.addEventListener('keydown', escape);
+  return () => {
+    documentRef.removeEventListener('pointerdown', outside);
+    documentRef.removeEventListener('keydown', escape);
+  };
+}

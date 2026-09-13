@@ -576,8 +576,6 @@ export function mountWorkUsageView(options = {}) {
         state: priced === totalEvents ? "complete" : "partial",
       });
     }
-    if (sharedReporting && reportingWindow)
-      evidence.append(el("div", "annotation reporting-scope", reportTranslate("scope")));
     return evidence.children.length ? evidence : null;
   }
   function appendMethodology() {

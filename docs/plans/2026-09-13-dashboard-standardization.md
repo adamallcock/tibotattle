@@ -150,3 +150,11 @@ used 99999/99999 and 123:45, proving both fields visible and untruncated at all
 six widths. Evidence is `.release-build/narrow-active-*` and
 `.release-build/narrow-counter-stress.json`. These visual checks do not replace
 the pre-existing full accounting-parity qualification gate.
+
+## Date popup dismissal and window minimum
+
+Date details now dismiss on outside pointer interaction and Escape, returning
+keyboard focus when appropriate. The Electron dashboard minimum width is 960px,
+capped to the display work area so smaller displays remain usable. Settings and
+tray window constraints remain independent. Removed the previously rejected
+scope sentence from the remaining Model performance and Projects evidence rows.

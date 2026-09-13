@@ -240,7 +240,6 @@ export function mountModelPerformance(options = {}) {
   const appendReportingEvidence = (container, selected = null) => {
     if (sharedReporting && reportingWindow) {
       container.append(evidenceRow("period", reportTranslate("period"), `${reportingPeriodLabel(reportingWindow.period, (key) => reportTranslate(key))} · ${reportingRange(reportingWindow)}`));
-      container.append(element("div", "annotation reporting-scope", reportTranslate("scope")));
     } else if (selected) {
       const fallback = { period: selected.period === "1" ? "24h" : selected.period === "7" ? "7d" : selected.period === "30" ? "30d" : "all", start: selected.start, end: selected.end };
       container.append(evidenceRow("period", reportTranslate("period"), `${reportingPeriodLabel(fallback.period, (key) => reportTranslate(key))} · ${reportingRange(null, fallback)}`));

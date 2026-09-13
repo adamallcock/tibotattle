@@ -1,4 +1,4 @@
-import { createReportingPeriod, reportingDays, reportingSelection } from "./reporting-period.js";
+import { createReportingPeriod, reportingDays, reportingSelection, mountReportingPeriodDismissal } from "./reporting-period.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
 import { mountModelPerformance } from "./model-performance.js";
@@ -15722,6 +15722,7 @@ window.addEventListener("tibotattle:locale-change", () => {
   modelPerformance.render();
   renderReportingPeriod();
 });
+mountReportingPeriodDismissal(document);
 document.querySelector("#reporting-period-controls").addEventListener("click", event => {
   const button = event.target.closest("button[data-period]");
   if (button) reportingPeriod.select(button.dataset.period);

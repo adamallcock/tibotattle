@@ -1530,6 +1530,6 @@ test("shared reporting waits for its bound, hides local period controls, and sen
   assert.equal(calls[0].period, "24h");
   assert.equal(calls[0].endAt, window.endAt);
   assert.ok(findMounted(root, node => node.dataset?.evidence === "period").length);
-  assert.match(root.textContent, /Current allowance and sharing preferences are not affected/u);
+  assert.doesNotMatch(root.textContent, /Current allowance and sharing preferences are not affected/u);
   view.destroy();
 });
