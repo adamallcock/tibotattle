@@ -616,6 +616,10 @@
           <div class="trends-horizon">
             <div class="trends-sky" aria-hidden="true"><div class="trends-stars"></div><div class="trends-clouds"></div><div class="trends-sun"></div><div class="trends-moon"></div><div class="trends-ridge"></div></div>
             <div class="trends-clock-content"><span class="trends-clock-label" data-i18n="trends.localClock">Local clock · selected time</span><span id="trends-date" data-i18n-skip>—</span><strong id="trends-clock" data-i18n-skip>—</strong></div>
+            <div class="trends-live-metrics">
+              <div><span data-i18n="trends.headerAllowance">Allowance remaining</span><strong id="trends-allowance-value" data-i18n-skip>—</strong><small data-i18n="trends.headerObserved">Latest observation at this time</small></div>
+              <div><span data-i18n="trends.headerSpend">API equivalent / hour</span><strong id="trends-spend-value" data-i18n-skip>—</strong><small id="trends-spend-basis" data-i18n-skip>—</small></div>
+            </div>
           </div>
           <div class="trends-time-controls"><button id="trends-replay" class="button button-quiet compact" type="button" aria-pressed="false" disabled data-i18n="trends.play">Play history</button><input id="trends-time" type="range" aria-label="Explore history" data-i18n-aria-label="trends.explore" disabled><button id="trends-latest" class="button button-quiet compact" type="button" data-i18n="trends.latest">Latest</button></div>
           <div class="chart-heading">
@@ -649,7 +653,9 @@
           </div>
           <div class="trends-lane-heading" data-i18n="trends.allowance">Observed allowance remaining</div>
           <div class="chart-empty small" id="allowance-timeline-empty" hidden data-i18n="trends.allowanceUnavailable">No comparable allowance observations in this view.</div>
+          <div class="trends-reset-legend"><span id="trends-reset-count" data-i18n-skip></span><span data-i18n="trends.resetHint">Select a reset marker to inspect it.</span></div>
           <div class="chart-shell" id="allowance-timeline-chart" hidden></div>
+          <p id="trends-event-detail" class="trends-event-detail" data-i18n-skip hidden></p>
           <div class="trends-lane-heading" id="trends-activity-label" data-i18n="trends.activity">Recorded activity · API-price equivalent</div>
           <div class="chart-shell" id="usage-timeline-chart" hidden></div>
           <p class="series-coverage" id="usage-timeline-coverage" role="status" hidden></p>
@@ -717,15 +723,10 @@
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">Divergence periods</p>
-              <h3>Where observed and priced usage diverge</h3>
+              <h3 data-i18n="trends.divergenceTitle">When usage and allowance disagree</h3>
             </div>
           </div>
-          <p class="annotation">
-            Sustained stretches where provider-reported quota movement and the
-            movement implied by priced usage persistently disagree. A single
-            spike that cancels out is not listed. Expand a period to reprice just
-            that window and see its cost mix by model and speed.
-          </p>
+          <p class="annotation" data-i18n="trends.divergenceCopy">Periods when allowance fell more or less than recorded usage would explain. Each gap is measured in percentage points from the cycle’s comparison start. Select a period to inspect the charts.</p>
           <p class="timeline-confidence" id="divergence-summary" role="status" hidden></p>
           <p class="annotation" id="divergence-caveat" hidden></p>
           <div class="chart-empty small" id="divergence-empty" hidden></div>

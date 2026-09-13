@@ -10299,7 +10299,7 @@ async function loadLiveTimelinePoints() {
     "isPrimaryCodexWeeklyQuotaWindow",
     "CALIBRATION_WINDOW_HOURS",
     "activeCalibrationRangeDays",
-    `${appSource.slice(usageStart, usageEnd)}\n${section}\nreturn liveTimelinePoints;`,
+    `${appSource.slice(usageStart, usageEnd)}\n${section}\nreturn Object.assign(liveTimelinePoints, { resetBoundaries: timelineResetBoundaryEvents });`,
   )(
     finite,
     () => Number.NEGATIVE_INFINITY,
@@ -10312,7 +10312,7 @@ async function loadLiveTimelinePoints() {
   // Existing lifecycle tests predate the weighted DTO. Give those fixtures a
   // matching basis by default, while tests that exercise a mismatch provide
   // their own explicit weighting/capacity.
-  return (data, options) => {
+  const wrapped = (data, options) => {
     const legacyCapacity = finite(
       data?.weekly?.summary?.blended_capacity_usd
         ?? data?.weekly?.summary?.median_weekly_value_usd
@@ -10333,6 +10333,8 @@ async function loadLiveTimelinePoints() {
       },
     }, options);
   };
+  wrapped.resetBoundaries = liveTimelinePoints.resetBoundaries;
+  return wrapped;
 }
 
 test("selected-plan rolling windows and cumulative drift cannot bridge an omitted era or ambiguous bucket", async () => {
@@ -10415,6 +10417,26 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
   // three-hour window.
   assert.equal(points[2].measuredSpanMs, 2 * 60 * 60 * 1_000);
   assert.equal(points[2].allowanceWeightedUsd, 100);
+  assert.deepEqual(points.flatMap(point => point.resetEvent ?? []), [{
+    timestampMs: Date.parse(hour(4)), confirmedAtMs: Date.parse(hour(4)), kind: "observed_reset",
+  }]);
+});
+
+test("recorded reset boundaries remain visible without pricing, but not across unknown or incompatible history", async () => {
+  const { resetBoundaries } = await loadLiveTimelinePoints();
+  const row = (hour, resetAt) => ({ observedAt: `2026-08-05T0${hour}:00:00Z`, resetAt,
+    limitId: "codex", durationMinutes: 10_080 });
+  const first = "2026-08-10T00:00:00Z", next = "2026-08-17T00:00:00Z";
+  const quota = [row(1, first), row(2, "2026-08-10T00:00:22Z"), row(3, next)];
+  const data = { timeline: { quota } };
+  assert.deepEqual(resetBoundaries(data), [{ timestampMs: Date.parse(quota[2].observedAt),
+    confirmedAtMs: Date.parse(quota[2].observedAt), kind: "window_change" }]);
+  assert.deepEqual(resetBoundaries({ timeline: { quota: [quota[0], row(2, null), quota[2]] } }), []);
+  assert.deepEqual(resetBoundaries({ ...data, allowancePlanSelection: {}, timeline: {
+    quota, comparisonIntervals: [[Date.parse(quota[0].observedAt), Date.parse(quota[1].observedAt)]],
+  } }), []);
+  assert.deepEqual(resetBoundaries({ timeline: { quota: quota.map(item => ({ ...item, limitId: "spark" })) } }), []);
+  assert.deepEqual(resetBoundaries({ timeline: { quota: [row(1, null), row(2, next)] } }), []);
 });
 
 test("an unweightable bucket creates a red-line gap instead of falling back to Standard cost", async () => {
@@ -10503,6 +10525,7 @@ test("a single stale quota dip suspends one drift point instead of re-anchoring"
     [0],
   );
   assert.equal(points[4].cumulativeResidual, null);
+  assert.ok(points.every(point => point.resetEvent === null), "a stale dip must not gain a reset marker");
   // Drift resumes from the SAME anchor after the recovery — never a jump of
   // the dip's magnitude.
   for (const point of points) {
@@ -10556,6 +10579,10 @@ test("two consecutive confirming readings re-anchor the drift at a banked reset"
   assert.equal(points[3].driftReanchor, false);
   assert.equal(points[4].cumulativeResidual, 0);
   assert.equal(points[4].driftReanchor, true);
+  assert.deepEqual(points[4].resetEvent, {
+    timestampMs: Date.parse(hour(4)), confirmedAtMs: Date.parse(hour(5)), kind: "observed_reset",
+  });
+  assert.equal(points.filter(point => point.resetEvent).length, 1);
   // Post-reset drift measures from the new anchor, not the pre-reset level.
   for (const point of points.slice(5)) {
     assert.ok(point.cumulativeResidual === null

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { horizonAt, advanceHorizonTime, sampleAt, presentationSegments, differenceLobes } from "../public/trends-horizon.js";
+import { horizonAt, advanceHorizonTime, sampleAt, hourlySpend, resetMarkerGroups, mountTrendsHorizon, presentationSegments, differenceLobes } from "../public/trends-horizon.js";
 import { translate, SUPPORTED_LOCALES } from "../public/localization.js";
 
 test("the sun and moon cross midnight continuously, with an unmistakably brighter day", () => {
@@ -49,6 +49,75 @@ test("reservoir and cycle paths break at missing values, time gaps, and actual a
   assert.deepEqual(presentationSegments([p(0, 2), p(1, 3), p(2, 0, 1, true), p(3, -1)], ["value"], { breakBefore: "reanchor" }).map(r => r.length), [2, 2]);
 });
 
+test("hourly readouts normalize the measured window and preserve unknown versus actual zero", () => {
+  assert.equal(hourlySpend({ allowanceWeightedUsd: 180, measuredSpanMs: 3 * 3_600_000 }), 60);
+  assert.equal(hourlySpend({ allowanceWeightedUsd: 15, measuredSpanMs: 30 * 60_000 }), 30);
+  assert.equal(hourlySpend({ allowanceWeightedUsd: 0, measuredSpanMs: 3_600_000 }), 0);
+  for (const amount of [null, undefined, -1, NaN, Infinity]) {
+    assert.equal(hourlySpend({ allowanceWeightedUsd: amount, measuredSpanMs: 3_600_000 }), null);
+  }
+  for (const duration of [null, undefined, -1, 0, NaN, Infinity]) {
+    assert.equal(hourlySpend({ allowanceWeightedUsd: 30, measuredSpanMs: duration }), null);
+  }
+  assert.equal(hourlySpend(null), null);
+  assert.equal(hourlySpend({ allowanceWeightedUsd: Number.MAX_VALUE, measuredSpanMs: 1 }), null);
+});
+
+test("nearby reset markers group without dropping evidence or inventing a display timestamp", () => {
+  const events = [90, 10, 25, 30, 35].map(timestampMs => ({ timestampMs }));
+  const groups = resetMarkerGroups(events, event => event.timestampMs);
+  assert.deepEqual(groups.map(group => group.map(event => event.timestampMs)), [[10, 25, 30], [35], [90]]);
+  assert.deepEqual(groups.flat(), [...events].sort((a, b) => a.timestampMs - b.timestampMs));
+  assert.deepEqual(resetMarkerGroups(events, event => event.timestampMs * 10).map(group => group.length), [1, 1, 1, 1, 1]);
+  assert.deepEqual(resetMarkerGroups([], event => event.timestampMs), []);
+});
+
+test("header refresh uses exact observations, keeps missing evidence empty, and clears on an unavailable view", () => {
+  class Element {
+    constructor() { this.attributes = {}; this.children = []; this.style = {}; this.dataset = {}; this.isConnected = true; this.hidden = false; this.textContent = ""; }
+    setAttribute(key, value) { this.attributes[key] = String(value); }
+    append(...children) { this.children.push(...children); }
+    insertBefore(child) { this.children.unshift(child); }
+    addEventListener() {}
+    removeEventListener() {}
+    querySelector(selector) { return elements.get(selector) ?? null; }
+  }
+  const elements = new Map(["#trends-time", "#trends-replay", "#trends-latest", ".trends-sky", ".trends-sun", ".trends-moon", ".trends-stars", "#trends-date", "#trends-clock", "#trends-allowance-value", "#trends-spend-value", "#trends-spend-basis"].map(key => [key, new Element()]));
+  const win = { matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+    cancelAnimationFrame() {}, MutationObserver: class { observe() {} disconnect() {} } };
+  const document = { defaultView: win, createElement: () => new Element(), createElementNS: () => new Element(), addEventListener() {}, removeEventListener() {} };
+  const root = new Element(); root.ownerDocument = document;
+  const controller = mountTrendsHorizon(root, { t: key => key, locale: "en-US", timeZone: "UTC", formatMoney: String, formatPercent: String, formatDuration: String });
+  const hour = 3_600_000;
+  const shell = new Element(); shell.id = "timeline-chart";
+  controller.register(shell, { svg: new Element(), points: [
+    { timestampMs: 2 * hour, allowanceWeightedUsd: 120, measuredSpanMs: 3 * hour },
+    { timestampMs: 3 * hour, allowanceWeightedUsd: null, measuredSpanMs: 3 * hour },
+  ], series: [{ key: "observed", label: "Observed", format: String }], x: point => point.timestampMs / hour, y: value => value,
+  domain: { startMs: 0, endMs: 4 * hour }, margin: { top: 12, bottom: 30, left: 72, right: 24 }, width: 900, height: 270 });
+  controller.setAllowanceSamples([
+    { timestampMs: 3.5 * hour, allowanceRemaining: 20 },
+    { timestampMs: 2.5 * hour, allowanceRemaining: 90 },
+    { timestampMs: 3 * hour, allowanceRemaining: null },
+  ]);
+  controller.refresh();
+  const text = selector => elements.get(selector).textContent;
+  assert.equal(text("#trends-allowance-value"), "20", "the first refresh must populate data received after chart registration");
+  controller.select(2.75 * hour);
+  assert.equal(text("#trends-allowance-value"), "90", "a within-hour observation must not lag until the next chart bucket");
+  assert.equal(text("#trends-spend-value"), "40");
+  controller.select(3.25 * hour);
+  assert.equal(text("#trends-allowance-value"), "—");
+  assert.equal(text("#trends-spend-value"), "—");
+  controller.select(2 * hour);
+  assert.equal(text("#trends-allowance-value"), "—", "a future observation cannot be borrowed");
+  shell.hidden = true;
+  controller.refresh();
+  assert.equal(text("#trends-spend-value"), "—");
+  assert.equal(elements.get("#trends-time").disabled, true);
+  controller.dispose();
+});
+
 test("difference fills split sign at the crossing and leave missing windows empty", () => {
   const points = [{ timestampMs: 0, observed: 4, expected: 2 }, { timestampMs: 10, observed: 0, expected: 2 }];
   const x = p => p.timestampMs, y = v => v;
@@ -73,7 +142,7 @@ test("all three analyses are visible and time navigation has one visible range c
 
 test("Horizon messages are available in every shipped locale", () => {
   for (const locale of SUPPORTED_LOCALES) {
-    for (const key of ["trends.localClock", "trends.play", "trends.pause", "trends.allowance", "trends.driftCopy", "trends.noSample"]) {
+    for (const key of ["trends.localClock", "trends.play", "trends.pause", "trends.allowance", "trends.driftCopy", "trends.noSample", "trends.headerAllowance", "trends.headerSpend", "trends.rollingAverage", "trends.resetObserved", "trends.resetBoundary", "trends.resetConfirmed", "trends.gapExplanation", "trends.viewPeriod"]) {
       const text = translate(key, {}, locale);
       assert.ok(text && text !== key);
     }

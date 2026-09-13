@@ -4317,6 +4317,27 @@ function timelineComparisonInterval(data, startMs, endMs) {
   return interval && endMs <= interval[1] ? interval : false;
 }
 
+// A recorded boundary change remains useful even when pricing comparison is
+// unavailable. Keep it distinct from a confirmed drop and from a reset type.
+function timelineResetBoundaryEvents(data) {
+  const rows = mainWeeklyQuotaTrack(data.timeline.quota)
+    .map(row => ({ row, timestampMs: Date.parse(row.observedAt) }))
+    .filter(entry => Number.isFinite(entry.timestampMs))
+    .sort((a, b) => a.timestampMs - b.timestampMs);
+  const events = [];
+  let previous = null;
+  for (const current of rows) {
+    if (!Number.isFinite(Date.parse(current.row.resetAt))) { previous = null; continue; }
+    if (previous && current.timestampMs > previous.timestampMs
+        && timelineComparisonInterval(data, previous.timestampMs, current.timestampMs) !== false
+        && !sameResetBoundary(previous.row.resetAt, current.row.resetAt)) {
+      events.push({ timestampMs: current.timestampMs, confirmedAtMs: current.timestampMs, kind: "window_change" });
+    }
+    previous = current;
+  }
+  return events;
+}
+
 function liveTimelinePoints(
   data,
   {
@@ -4523,6 +4544,7 @@ function liveTimelinePoints(
     // that crosses a boundary is never read as one continuous period across the
     // reset. Stamped on the point so the flag survives viewport filtering.
     let driftReanchor = false;
+    let resetEvent = null;
     if (capacity !== null && capacity > 0
         && currentWeightedCost !== null
         && after !== null
@@ -4548,6 +4570,17 @@ function liveTimelinePoints(
         && after.usedPercent
           <= driftAnchor.pendingDrop.usedPercent + RESET_DECREASE_THRESHOLD_PP;
       if (boundaryChanged || confirmedReset) {
+        // Expose the existing anchor decision; do not classify scheduled/banked
+        // resets without provider evidence. Initial anchors and recovery after
+        // missing pricing or a plan transition are not reset events.
+        if (driftAnchor !== null) {
+          resetEvent = {
+            timestampMs: confirmedReset ? driftAnchor.pendingDrop.timestampMs : afterMatch.timestampMs,
+            confirmedAtMs: afterMatch.timestampMs,
+            kind: confirmedReset || after.usedPercent < driftAnchor.maxUsedPercent - RESET_DECREASE_THRESHOLD_PP
+              ? "observed_reset" : "window_change",
+          };
+        }
         // A boundary or track change re-anchors the accumulation: drift is
         // zero by definition at the first observation of a new reset.
         driftAnchor = {
@@ -4607,6 +4640,7 @@ function liveTimelinePoints(
       residual: evidence.residual,
       cumulativeResidual,
       driftReanchor,
+      resetEvent,
       // Kept under the legacy internal key for downstream chart diagnostics,
       // but this is now the selected speed-priced amount, never Standard
       // dollars paired with a Fast-adjusted capacity.
@@ -4722,7 +4756,7 @@ function usagePointsWithAllowance(data, points, includeAllowance) {
     return {
       ...point,
       allowanceSegment,
-      allowanceObservedAt: observationMatch?.row.timestamp ?? null,
+      allowanceObservedAt: observationMatch?.row.observedAt ?? null,
       allowanceRemaining: includeAllowance
           && point.quotaWeightedCostUsd !== null
           && observationAge <= maximumObservationAgeMs
@@ -5312,6 +5346,18 @@ function renderTimeline(data) {
   // zoomed viewport: it answers "across this range, where did observed and
   // priced usage persistently disagree", so pan and zoom must not reshape it.
   renderDivergencePeriods(data, points);
+  // The instrument reads observations, not the end-of-hour/day chart buckets.
+  // Incompatible intervals explicitly interrupt the sample stream.
+  trendsHorizonView?.setAllowanceSamples(mainWeeklyQuotaTrack(data.timeline.quota).map(row => {
+    const timestampMs = Date.parse(row.observedAt);
+    return { timestampMs, allowanceRemaining:
+      timelineComparisonInterval(data, timestampMs, timestampMs) !== false
+        ? finite(row.remainingPercent) : null };
+  }));
+  trendsHorizonView?.setEvents([
+    ...timelineResetBoundaryEvents(data),
+    ...points.flatMap(point => point.resetEvent ? [point.resetEvent] : []),
+  ]);
   trendsHorizonView?.refresh();
 }
 
@@ -5842,8 +5888,21 @@ function renderResidualInspectionTable() {
  * exact cost/token/unpriced mix from its buckets; this line adds the range's
  * dominant priced model and observed speed as clearly-marked context.
  */
-// One id per rendered divergence period, so each period's expandable breakdown
-// panel has a stable target for its toggle's `aria-controls`.
+function focusTrendsPeriod(period) {
+  if (!dashboard) return;
+  const padding = Math.max(30 * 60_000, period.durationMs * .12);
+  updateTimelineViewport(selectedUsagePoints(dashboard), () => ({
+    startMs: period.startMs - padding, endMs: period.endMs + padding,
+  }));
+  requestAnimationFrame(() => {
+    trendsHorizonView?.select(period.endMs, true);
+    $("#timeline").scrollIntoView({ block: "start", behavior: "instant" });
+    $("#trends-time").focus({ preventScroll: true });
+  });
+}
+
+// One id per rendered divergence period, so each expandable breakdown has a
+// stable target for its toggle's aria-controls.
 let nextDivergenceBreakdownId = 0;
 
 // Display-only state for the detector's bounded set of visible windows. Index
@@ -5962,8 +6021,8 @@ function divergencePeriodItem(period, rangeContext, state) {
     "p",
     "divergence-period-finding",
     period.direction === "under_costed"
-      ? "divergence.underCosted"
-      : "divergence.overCosted",
+      ? "trends.faster"
+      : "trends.slower",
     { pp: formatPp(period.absPeakDriftPp) },
   );
 
@@ -5984,7 +6043,14 @@ function divergencePeriodItem(period, rangeContext, state) {
     events: compact(contributors.usageEvents),
   });
 
-  item.append(header, finding, magnitude, mix);
+  const gap = node("div", "divergence-gap");
+  gap.append(rawNode("strong", "divergence-gap-value", formatSignedPp(period.peakDriftPp)),
+    localizedNode("span", "", "trends.maxGap"));
+  gap.setAttribute("title", t("trends.gapExplanation"));
+  const focus = localizedNode("button", "button button-quiet compact divergence-focus", "trends.viewPeriod");
+  focus.type = "button";
+  focus.addEventListener("click", () => focusTrendsPeriod(period));
+  item.append(header, gap, finding, focus);
 
   if (contributors.unpricedEventShare !== null
       && contributors.unpricedEvents > 0) {
@@ -6023,6 +6089,7 @@ function divergencePeriodItem(period, rangeContext, state) {
         "divergence.breakdown.loading",
       ));
     }
+    panel.append(magnitude, mix);
   };
   state.render = renderBreakdown;
   const loadBreakdown = async () => {
@@ -6219,7 +6286,7 @@ function renderDivergencePeriods(data, points) {
   // expected line ships, every listed period carries this caveat.
   if (caveat) {
     caveat.hidden = false;
-    setLocalizedText(caveat, "divergence.methodCaveat");
+    setLocalizedText(caveat, "trends.divergenceBasis");
   }
   if (result.truncated) {
     setLocalizedText(summary, "divergence.truncated", {
@@ -6327,7 +6394,8 @@ function drawChart(shell, chart) {
   }
   shell.replaceChildren(chart);
   if (shell.closest?.("#timeline") && chart.timelinePresentation) {
-    trendsHorizonView ??= mountTrendsHorizon($("#timeline"), { t, locale: getFormattingLocale(), timeZone: USER_TIME_ZONE });
+    trendsHorizonView ??= mountTrendsHorizon($("#timeline"), { t, locale: getFormattingLocale(), timeZone: USER_TIME_ZONE,
+      formatMoney: formatApiMoney, formatPercent, formatDuration: formatSpanLength });
     trendsHorizonView.refreshLocale(getFormattingLocale());
     trendsHorizonView.register(shell, chart.timelinePresentation);
   }

@@ -47,6 +47,27 @@ export function sampleAt(points, timestamp, maximumAge = 6 * 3_600_000) {
   return point && timestamp - point.timestampMs <= maximumAge ? point : null;
 }
 
+// Unit conversion of the existing rolling-window total. A partial recovered
+// window uses its measured duration, and unknown pricing never becomes $0.
+export function hourlySpend(point) {
+  if (!finite(point?.allowanceWeightedUsd) || point.allowanceWeightedUsd < 0
+      || !finite(point?.measuredSpanMs) || point.measuredSpanMs <= 0) return null;
+  const rate = point.allowanceWeightedUsd / point.measuredSpanMs * 3_600_000;
+  return finite(rate) ? rate : null;
+}
+
+// Neighboring markers share a badge at the latest event's actual time. Every
+// event remains in the inspection text; no timestamp is moved to avoid overlap.
+export function resetMarkerGroups(events, x, minimumSpacing = 24) {
+  const groups = [];
+  for (const event of [...events].sort((a, b) => a.timestampMs - b.timestampMs)) {
+    const last = groups.at(-1);
+    if (last && x(event) - x(last[0]) < minimumSpacing) last.push(event);
+    else groups.push([event]);
+  }
+  return groups;
+}
+
 export function presentationSegments(points, keys, { segmentKey, breakBefore, maxGapMs = Infinity } = {}) {
   const segments = [];
   let current = [];
@@ -92,11 +113,13 @@ function svgNode(document, tag, attrs) {
   return element;
 }
 
-export function mountTrendsHorizon(root, { t, locale, timeZone }) {
+export function mountTrendsHorizon(root, { t, locale, timeZone, formatMoney, formatPercent, formatDuration }) {
   const document = root.ownerDocument;
   const win = document.defaultView;
   const $ = selector => root.querySelector(selector);
   const charts = new Map();
+  let resetEvents = [];
+  let allowanceSamples = [];
   const input = $("#trends-time");
   const replay = $("#trends-replay");
   const sky = $(".trends-sky");
@@ -138,13 +161,23 @@ export function mountTrendsHorizon(root, { t, locale, timeZone }) {
     sky.style.background = `linear-gradient(125deg,${light.top},${light.bottom})`;
     for (const body of ["sun", "moon"]) {
       const element = sky.querySelector(`.trends-${body}`), position = light[body];
-      element.style.left = `${position.x}%`; element.style.top = `${position.y}%`; element.style.opacity = position.opacity;
+      // Keep the orbit in the open sky between the clock and the readouts.
+      element.style.left = `${45 + (position.x - 77) * .5}%`; element.style.top = `${position.y}%`; element.style.opacity = position.opacity;
     }
     sky.querySelector(".trends-stars").style.opacity = light.stars;
     setText("#trends-date", format(at, { weekday: "long", month: "short", day: "numeric", year: "numeric" }));
     setText("#trends-clock", format(at, { hour: "numeric", minute: "2-digit" }));
     const description = format(at, { dateStyle: "medium", timeStyle: "short" });
     input.setAttribute("aria-valuetext", description);
+    const movement = charts.get("timeline-chart");
+    const levelPoint = sampleAt(allowanceSamples, at, 3 * 3_600_000);
+    const spendPoint = movement && !movement.shell.hidden && movement.svg.isConnected
+      ? sampleAt(movement.points, at, 3_600_000) : null;
+    const rate = hourlySpend(spendPoint);
+    setText("#trends-allowance-value", finite(levelPoint?.allowanceRemaining) ? formatPercent(levelPoint.allowanceRemaining, 0) : "—");
+    setText("#trends-spend-value", rate === null ? "—" : formatMoney(rate));
+    setText("#trends-spend-basis", rate === null ? t("trends.rateUnavailable")
+      : t("trends.rollingAverage", { duration: formatDuration(spendPoint.measuredSpanMs) }));
     for (const chart of charts.values()) {
       if (chart.shell.hidden || !chart.svg.isConnected) continue;
       const inside = at >= chart.domain.startMs && at <= chart.domain.endMs;
@@ -190,6 +223,50 @@ export function mountTrendsHorizon(root, { t, locale, timeZone }) {
   const pageObserver = new win.MutationObserver(() => { if (root.inert) stop(); });
   pageObserver.observe(root, { attributes: true, attributeFilter: ["inert"] });
   motionChanged();
+
+  function renderEvents() {
+    const chart = charts.get("allowance-timeline-chart");
+    if (!chart || chart.shell.hidden || !chart.svg.isConnected) {
+      setText("#trends-reset-count", t("trends.allowanceUnavailable"));
+      return;
+    }
+    chart.svg.querySelector(".trends-reset-layer")?.remove();
+    const visible = resetEvents.filter(event => event.timestampMs >= chart.domain.startMs && event.timestampMs <= chart.domain.endMs);
+    setText("#trends-reset-count", visible.length ? t("trends.resetCount", { count: visible.length }) : t("trends.resetUnavailable"));
+    const layer = svgNode(document, "g", { class: "trends-reset-layer" });
+    for (const group of resetMarkerGroups(visible, chart.x)) {
+      const event = group.at(-1), x = chart.x(event);
+      const caption = group.map(item => {
+        const label = t(item.kind === "observed_reset" ? "trends.resetObserved" : "trends.resetBoundary");
+        const detail = t("trends.resetDetail", { event: label,
+          time: format(item.timestampMs, { dateStyle: "medium", timeStyle: "short" }) });
+        return item.confirmedAtMs > item.timestampMs ? detail + " " + t("trends.resetConfirmed", {
+          time: format(item.confirmedAtMs, { dateStyle: "medium", timeStyle: "short" }),
+        }) : detail;
+      }).join("\n");
+      const marker = svgNode(document, "g", { class: `trends-reset-marker ${event.kind}`, tabindex: 0, role: "button", "aria-label": caption });
+      const title = svgNode(document, "title", {}); title.textContent = caption;
+      const stem = svgNode(document, "line", { x1: x, x2: x, y1: 21, y2: chart.height - chart.margin.bottom });
+      const badge = svgNode(document, "rect", { x: x - 9, y: 1, width: 18, height: 18, rx: 6 });
+      const icon = svgNode(document, "text", { x, y: 14, "text-anchor": "middle", "aria-hidden": "true", "data-i18n-skip": "" });
+      icon.textContent = group.length > 1 ? String(group.length) : event.kind === "observed_reset" ? "↻" : "◇";
+      if (group.length > 1) icon.setAttribute("class", "trends-reset-group-count");
+      marker.append(title, stem, badge, icon);
+      const inspect = () => {
+        select(event.timestampMs, true);
+        setText("#trends-event-detail", caption);
+        $("#trends-event-detail").hidden = false;
+      };
+      marker.addEventListener("click", e => { e.stopPropagation(); inspect(); });
+      marker.addEventListener("focus", inspect);
+      marker.addEventListener("pointerenter", inspect);
+      marker.addEventListener("keydown", e => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); inspect(); }
+      });
+      layer.append(marker);
+    }
+    chart.svg.append(layer);
+  }
 
   function register(shell, model) {
     if (!model || disposed) return;
@@ -239,6 +316,7 @@ export function mountTrendsHorizon(root, { t, locale, timeZone }) {
     const readout = document.createElement("p");
     readout.className = "trends-readout"; readout.dataset.i18nSkip = ""; shell.append(readout);
     const choosePointer = event => {
+      if (event.target.closest?.(".trends-reset-marker")) return;
       if (event.buttons || event.pointerType === "touch" && event.type !== "click") return;
       const rect = svg.getBoundingClientRect();
       const ratio = clamp((event.clientX - rect.left) / rect.width * width - margin.left, 0, width - margin.left - margin.right) / (width - margin.left - margin.right);
@@ -257,15 +335,34 @@ export function mountTrendsHorizon(root, { t, locale, timeZone }) {
       input.min = limits.startMs; input.max = limits.endMs; input.step = Math.max(1, (limits.endMs - limits.startMs) / 4000);
       select(at === null ? limits.endMs : at);
     }
+    if (shell.id === "allowance-timeline-chart") renderEvents();
   }
   return {
     register,
+    select,
+    setAllowanceSamples(points) {
+      allowanceSamples = points.filter(point => finite(point.timestampMs)).sort((a, b) => a.timestampMs - b.timestampMs);
+    },
+    setEvents(events) {
+      const byTime = new Map();
+      for (const event of events) {
+        if (!finite(event.timestampMs) || !["observed_reset", "window_change"].includes(event.kind)) continue;
+        if (byTime.get(event.timestampMs)?.kind !== "observed_reset") byTime.set(event.timestampMs, event);
+      }
+      resetEvents = [...byTime.values()];
+      $("#trends-event-detail").hidden = true;
+      renderEvents();
+    },
     refresh() {
       for (const [id, chart] of charts) {
         if (!chart.svg.isConnected || chart.shell.hidden) { chart.cleanup(); charts.delete(id); }
       }
       input.disabled = replay.disabled = !domain();
-      if (!domain()) { stop(); at = null; setText("#trends-date", "—"); setText("#trends-clock", "—"); }
+      if (!domain()) {
+        stop(); at = null; setText("#trends-date", "—"); setText("#trends-clock", "—");
+        setText("#trends-allowance-value", "—"); setText("#trends-spend-value", "—");
+        setText("#trends-spend-basis", t("trends.rateUnavailable"));
+      } else select(at ?? domain().endMs);
     },
     refreshLocale(next) {
       if (formatLocale !== next) { formatLocale = next; formatters.clear(); charts.forEach(chart => { delete chart.lastPoint; }); }

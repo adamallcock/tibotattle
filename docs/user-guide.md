@@ -319,6 +319,23 @@ is hidden and is omitted when reduced motion is enabled. The slider and exact
 sample timestamps remain available. Range and zoom controls move the views
 together; detailed comparison assumptions and exact evidence remain expandable.
 
+The Horizon readouts show allowance remaining at the selected time and the
+existing rolling API-equivalent total converted to an hourly rate. The caption
+names the measured averaging window, including shorter windows after a data gap;
+unavailable or stale evidence displays a dash. These amounts are API equivalents,
+not subscription charges.
+
+Reset markers distinguish confirmed allowance drops from recorded changes to the
+reset boundary. Select a marker for its observation time; closely spaced events
+share a numbered marker with every event listed. A confirmed drop can have a
+later confirming observation. Scheduled versus banked reset types are not present
+in this payload and are not inferred. Plan-incompatible boundaries stay excluded.
+
+**When usage and allowance disagree** ranks sustained divergence periods by their
+largest signed percentage-point gap. The gap accumulates from the cycle comparison
+anchor, not just within the listed period. **View on charts** focuses all views
+on that period; its cost mix and detailed measurements remain expandable.
+
 Trends compares the selected plan's compatible usage and quota history. Earlier
 history on another plan does not disable a usable current-plan fit, and it is
 not borrowed into that fit. Ambiguous intervals and plan transitions remain

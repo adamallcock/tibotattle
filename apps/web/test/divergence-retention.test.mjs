@@ -50,6 +50,7 @@ function harness() {
   const elements = new Map(["list", "empty", "summary", "caveat"]
     .map((key) => [`#divergence-${key}`, new Element("div")]));
   const requests = [];
+  const focusedPeriods = [];
   const node = (...args) => new Element(...args);
   const translate = (key, values = {}) => `${key} ${Object.values(values).join(" ")}`;
   const dependencies = {
@@ -61,6 +62,7 @@ function harness() {
     $: (id) => elements.get(id), t: translate,
     detectDeviationPeriods: (periods) => ({ periods, totalFound: periods.length }),
     accountingPeriod: () => null,
+    focusTrendsPeriod: period => focusedPeriods.push(period),
     localClient: { windowBreakdown(from, to) {
       const request = { from, to, ...deferred() }; requests.push(request); return request.promise;
     } },
@@ -71,11 +73,27 @@ function harness() {
   const api = Function(...Object.keys(dependencies), `${source.slice(start, end)}
     return { render: renderDivergencePeriods, state: divergenceDetails };`
   )(...Object.values(dependencies));
-  return { ...api, requests, document,
+  return { ...api, requests, document, focusedPeriods,
+    card: () => elements.get("#divergence-list").children[0],
     toggle: () => elements.get("#divergence-list").children[0].children.at(-2),
     panel: () => elements.get("#divergence-list").children[0].children.at(-1),
   };
 }
+
+test("divergence cards lead with the signed peak gap and focus the exact period without fetching details", () => {
+  for (const direction of ["under_costed", "over_costed"]) {
+    const h = harness(), selected = { ...period(), direction, peakDriftPp: direction === "under_costed" ? 2 : -2 };
+    h.render(snapshot(), [selected]);
+    const card = h.card();
+    assert.equal(card.children[1].children[0].textContent, String(selected.peakDriftPp));
+    assert.match(card.children[1].getAttribute("title"), /trends.gapExplanation/);
+    assert.match(card.children[2].textContent, direction === "under_costed" ? /trends.faster/ : /trends.slower/);
+    card.children.find(child => child.className.includes("divergence-focus")).click();
+    assert.deepEqual(h.focusedPeriods, [selected]);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.panel().hidden, true);
+  }
+});
 
 test("expanded details and keyboard focus survive unchanged snapshots without another request", async () => {
   const h = harness();

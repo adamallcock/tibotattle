@@ -124,14 +124,23 @@ model/speed evidence. Reserve causal statements for evidence that supports them.
 The [dashboard](../../apps/web/public/app.js) retains `liveTimelinePoints`,
 `renderTimeline`, `residualRows` and `renderResiduals` as the calculation and
 evidence owners. [Horizon presentation](../../apps/web/public/trends-horizon.js)
-adds only sky, cursor, replay and geometry from those prepared values. No new
+adds sky, cursor, replay, hourly readouts and geometry from those prepared values. No new
 chart dependency or external request is required.
 
 The [composition-aware expected-line contract](../design/composition-aware-expected-line.md)
 remains authoritative for calibration and saturation semantics. Typed reset
 classification is absent from the current companion payload; the presentation
-must not fabricate scheduled or banked-reset labels. The existing evidence bands
-continue to identify window boundaries or track changes.
+must not fabricate scheduled or banked-reset labels. The allowance chart now
+shows existing confirmed-drop decisions and recorded reset-boundary changes,
+including boundary changes when pricing comparison is unavailable. Neighboring
+events share a selectable numbered badge; the details retain their observed and
+confirmation times. Existing evidence bands still identify excluded windows.
+
+The selected-time header converts the existing rolling speed-priced total to an
+hourly rate using its measured duration. Unknown pricing and stale samples stay
+unavailable. The divergence cards lead with the signed peak gap, describe its
+direction in plain language, and focus the shared chart viewport on selection.
+Detailed cost mix and signed-area measurements remain behind disclosure.
 
 The shared cursor, range, zoom and exact sample readouts use real prepared
 series. Installation, signing, release and publication remain separate operations.
