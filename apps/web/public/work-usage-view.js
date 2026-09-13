@@ -1326,17 +1326,6 @@ export function mountWorkUsageView({
       next,
     );
     body.append(pagination);
-    body.append(
-      el(
-        "p",
-        "work-usage-caption",
-        tr("observed", {
-          date: formatLocal(
-            new Date(response.metadata.observedAt).toISOString(),
-          ),
-        }),
-      ),
-    );
     focusTarget?.focus();
     pendingFocus = null;
   }
