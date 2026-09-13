@@ -454,10 +454,19 @@
             <h2 id="weekly-title" data-i18n="page.weekly.title">Allowance</h2>
             <p class="page-description" data-i18n="page.weekly.description">Estimated capacity and how it changes over time.</p>
           </div>
-          <label class="language-picker" id="weekly-plan-control" for="weekly-plan-select" hidden>
-            <span data-i18n="weekly.plan.label">Plan</span>
-            <select id="weekly-plan-select" aria-label="Allowance history plan" data-i18n-aria-label="weekly.plan.aria"></select>
-          </label>
+          <div class="allowance-header-controls">
+            <div class="allowance-window-control" id="allowance-window-control">
+              <span data-i18n="weekly.window.label">Allowance window</span>
+              <div class="segmented-control allowance-window-toggle" id="allowance-window-controls" role="group" aria-label="Allowance history window" data-i18n-aria-label="weekly.window.aria">
+                <button id="allowance-window-five-hour" type="button" data-window-minutes="300" aria-pressed="false">5-hour</button>
+                <button id="allowance-window-seven-day" type="button" data-window-minutes="10080" class="active" aria-pressed="true">7-day</button>
+              </div>
+            </div>
+            <label class="language-picker" id="weekly-plan-control" for="weekly-plan-select" hidden>
+              <span data-i18n="weekly.plan.label">Plan</span>
+              <select id="weekly-plan-select" aria-label="Allowance history plan" data-i18n-aria-label="weekly.plan.aria"></select>
+            </label>
+          </div>
         </div>
         <p class="annotation" id="weekly-plan-note" hidden></p>
 
@@ -470,6 +479,7 @@
           <p id="weekly-explanation">The estimate will appear when local usage can be matched to quota changes.</p>
           <p class="annotation stale-serve-note" id="weekly-stale-note" hidden></p>
         </div>
+        <p class="annotation allowance-window-note" id="allowance-window-note" hidden></p>
 
         <article class="panel weekly-history-panel lead-chart-panel chart-card">
           <div class="panel-heading chart-card-header">
@@ -565,7 +575,7 @@
           <summary>See individual usage changes</summary>
           <div class="table-wrap">
             <table>
-              <caption class="sr-only">Individual seven-day reset estimates</caption>
+              <caption class="sr-only" id="weekly-table-caption">Individual seven-day reset estimates</caption>
               <thead>
                 <tr>
                   <th scope="col">Observed</th>

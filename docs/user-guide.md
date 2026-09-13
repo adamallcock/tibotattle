@@ -94,6 +94,15 @@ selected population. The newest observed plan is selected even if it does not
 yet have enough usable evidence; older-plan estimates remain selectable rather
 than being presented as the current plan's allowance.
 
+The Allowance window control defaults to **7-day** whenever seven-day evidence
+is available. Choose **5-hour** to replace the headline, history graph and reset
+table with the selected plan's five-hour capacity history. Pace forecasts and
+share cards remain seven-day-only. A grey five-hour choice is an evidence state,
+not a timer: run **Update local usage** so the detailed refresh can rebuild the
+local accounting cache. The choice becomes available only when that retained
+history contains a plan-specific five-hour reset with enough observed quota
+movement to fit; missing evidence is never presented as zero.
+
 These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
 ambiguous boundary quantities are excluded narrowly; coherent older history is

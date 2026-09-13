@@ -240,6 +240,11 @@ let activeAccountingPeriod = "7d";
 // visible reason, which is the inconsistency this settles.
 let activeWeeklyRangeDays = 30;
 let activeWeeklyMinimumObservedSpanPp = 50;
+// The seven-day allowance stays the preferred initial view whenever it has
+// evidence. A user's explicit window choice survives redraws and refreshes;
+// if that duration disappears from a later payload, resolution falls back to
+// the best available window instead of leaving a stale selection on screen.
+let activeAllowanceWindowMinutes = null;
 // Null follows the latest observed plan, including an insufficient one. An
 // explicit choice stays in memory across refreshes, ranges and locale changes.
 let activeWeeklyPlanType = null;
@@ -7359,7 +7364,11 @@ function weeklyPointDetail(point) {
   };
 }
 
-function renderAllowanceHistoryChart(history) {
+function renderAllowanceHistoryChart(
+  history,
+  windowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES,
+) {
+  const fiveHour = windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
   return lineChart({
     points: history.points,
     series: [
@@ -7425,10 +7434,16 @@ function renderAllowanceHistoryChart(history) {
     xTicks: history.xTicks,
     yDomain: history.axis,
     yTickFormat: (value, digits) => formatMoney(value, digits),
-    yLabel: { key: "chart.axis.apiEquivalentPerSevenDays" },
-    title: { key: "weekly.chart.title" },
+    yLabel: { key: fiveHour
+      ? "weekly.chart.fiveHourAxis"
+      : "chart.axis.apiEquivalentPerSevenDays" },
+    title: { key: fiveHour
+      ? "weekly.chart.fiveHourTitle"
+      : "weekly.chart.title" },
     description: {
-      key: "weekly.chart.description",
+      key: fiveHour
+        ? "weekly.chart.fiveHourDescription"
+        : "weekly.chart.description",
       values: {
         span: spanFloorSentenceLabel(history.spanFloorPp),
         timeZone: formatTimeZoneLabel(),
@@ -8012,15 +8027,123 @@ function renderWeeklyPaceForecast(data) {
   card.hidden = false;
 }
 
+function allowanceHistoryForWindow(data, windowMinutes) {
+  if (windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) return data?.weekly ?? null;
+  if (windowMinutes !== CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return null;
+  return data?.allowanceHistoryByWindow?.[
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+  ] ?? null;
+}
+
+function allowanceHistoryHasEvidence(history) {
+  return history !== null && (
+    history?.status === "available"
+    || (Array.isArray(history?.weeklyValues) && history.weeklyValues.length > 0)
+  );
+}
+
+function resolvedAllowanceWindowMinutes(data) {
+  const fiveHour = allowanceHistoryForWindow(
+    data,
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  );
+  if (activeAllowanceWindowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+      && fiveHour !== null) return CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  if (activeAllowanceWindowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return allowanceHistoryHasEvidence(data?.weekly) || fiveHour === null
+      ? CODEX_WEEKLY_ALLOWANCE_MINUTES
+      : CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  }
+  if (allowanceHistoryHasEvidence(data?.weekly)) {
+    return CODEX_WEEKLY_ALLOWANCE_MINUTES;
+  }
+  return fiveHour !== null
+    ? CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+    : CODEX_WEEKLY_ALLOWANCE_MINUTES;
+}
+
+function allowanceWindowView(data) {
+  const windowMinutes = resolvedAllowanceWindowMinutes(data);
+  if (windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return {
+      ...selectAllowancePlanPopulation(data, activeWeeklyPlanType),
+      allowanceWindowDurationMinutes: windowMinutes,
+    };
+  }
+  const windowData = {
+    ...data,
+    weekly: allowanceHistoryForWindow(data, windowMinutes),
+    quotaWindows: (Array.isArray(data?.quotaWindows) ? data.quotaWindows : [])
+      .filter((window) => (
+        isPrimaryCodexQuotaWindow(window)
+        && finite(window?.durationMinutes) === windowMinutes
+      )),
+    allowanceWindowDurationMinutes: windowMinutes,
+  };
+  return selectAllowancePlanPopulation(windowData, activeWeeklyPlanType);
+}
+
+function renderAllowanceWindowChrome(data, windowMinutes) {
+  const fiveHourSelected = windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  const fiveHourAvailable = allowanceHistoryForWindow(
+    data,
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  ) !== null;
+  const controls = $("#allowance-window-controls");
+  const buttons = typeof controls?.querySelectorAll === "function"
+    ? controls.querySelectorAll("button[data-window-minutes]")
+    : [];
+  for (const button of buttons) {
+    const duration = Number(button.dataset.windowMinutes);
+    const active = duration === windowMinutes;
+    const unavailable = duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+      && !fiveHourAvailable;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = unavailable;
+    button.title = unavailable ? t("weekly.window.unavailable") : "";
+    setLocalizedText(button, duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+      ? "weekly.window.fiveHour"
+      : "weekly.window.sevenDay");
+  }
+  setLocalizedText($("#weekly-title"), "page.weekly.title");
+  const note = $("#allowance-window-note");
+  note.hidden = !fiveHourSelected && fiveHourAvailable;
+  if (!note.hidden) setLocalizedText(note, fiveHourSelected
+    ? "weekly.window.historyOnly"
+    : "weekly.window.unavailable");
+  $("#share-panel").hidden = fiveHourSelected;
+  setLocalizedText($("#weekly-table-caption"), fiveHourSelected
+    ? "weekly.table.fiveHourCaption"
+    : "weekly.table.sevenDayCaption");
+}
+
 function renderWeeklyPlanControl(data) {
   const control = $("#weekly-plan-control");
   const select = $("#weekly-plan-select");
   const note = $("#weekly-plan-note");
   if (!control || !select || !note) return;
   const selection = data.allowancePlanSelection;
-  control.hidden = !selection;
+  const previewPlan = data.mode === "demo"
+    ? shareCardPlanLabel(data?.weekly?.planType)
+    : "";
+  control.hidden = !selection && previewPlan === "";
   note.hidden = !selection;
-  if (!selection) return;
+  if (!selection) {
+    if (previewPlan !== "") {
+      const signature = `preview:${data.weekly.planType}:${localization.locale()}`;
+      if (select.dataset.populationSignature !== signature) {
+        const option = node("option");
+        option.value = data.weekly.planType;
+        option.textContent = t("weekly.plan.latestOption", { plan: previewPlan });
+        select.replaceChildren(option);
+        select.dataset.populationSignature = signature;
+      }
+      select.value = data.weekly.planType;
+      select.disabled = true;
+    }
+    return;
+  }
   const populations = data.weekly.planPopulations ?? [];
   const signature = JSON.stringify([
     populations.map((row) => row.planType),
@@ -8048,7 +8171,10 @@ function renderWeeklyPlanControl(data) {
 }
 
 function renderWeekly(data) {
-  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
+  const rootData = data;
+  data = allowanceWindowView(data);
+  const windowMinutes = data.allowanceWindowDurationMinutes;
+  renderAllowanceWindowChrome(rootData, windowMinutes);
   renderWeeklyPlanControl(data);
   // A weekly estimate carried over from the previous app version while the
   // recalculation runs announces itself here, quietly.
@@ -8125,7 +8251,9 @@ function renderWeekly(data) {
     // no fits fall in the selected range at all, or fits are in range and the
     // span floor filtered every one of them (estimator audit, 2026-08-08).
     if (values.length === 0) {
-      setLocalizedText(empty, "weekly.chart.empty");
+      setLocalizedText(empty, windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+        ? "weekly.chart.fiveHourEmpty"
+        : "weekly.chart.empty");
     } else if (history.inRangeCount === 0) {
       setLocalizedText(empty, "weekly.chart.emptyRange");
     } else {
@@ -8139,9 +8267,9 @@ function renderWeekly(data) {
   } else {
     empty.hidden = true;
     shell.hidden = false;
-    shell.replaceChildren(renderAllowanceHistoryChart(history));
+    shell.replaceChildren(renderAllowanceHistoryChart(history, windowMinutes));
   }
-  renderWeeklyTable(values);
+  renderWeeklyTable(values, windowMinutes);
   // The chart renderer owns the card re-render (owner-verified regression,
   // 2026-08-08). The old wiring re-rendered the card only where a caller
   // remembered to, so a path that redrew the chart without the extra call
@@ -8149,7 +8277,9 @@ function renderWeekly(data) {
   // the allowance history — the range buttons, the span slider, a dashboard
   // load, a locale change — now redraws the card from the SAME model
   // instance, so the two surfaces cannot disagree.
-  renderShareCard(data, { history });
+  if (windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    renderShareCard(data, { history });
+  }
 }
 
 // The Allowance page's reset-estimate table pages through its full row set
@@ -8161,8 +8291,9 @@ const WEEKLY_TABLE_PAGE_SIZE = 20;
 let weeklyTablePage = 0;
 let weeklyTableRows = [];
 let weeklyTableSignature = "";
+let weeklyTableWindowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES;
 
-function renderWeeklyTable(values) {
+function renderWeeklyTable(values, windowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES) {
   // Newest first over the FULL set: the old `.slice(-14)` silently dropped
   // every earlier reset estimate. A changed row set restarts at the first
   // page, exactly like the exact-windows inspection table: a page index only
@@ -8176,6 +8307,7 @@ function renderWeeklyTable(values) {
     weeklyTablePage = 0;
   }
   weeklyTableRows = rows;
+  weeklyTableWindowMinutes = windowMinutes;
   renderWeeklyTablePage();
 }
 
@@ -8188,7 +8320,11 @@ function renderWeeklyTablePage() {
   if (!rows.length) {
     if (pagination) pagination.hidden = true;
     const row = node("tr");
-    const cell = node("td", "empty-cell", t("weekly.table.empty"));
+    const cell = node("td", "empty-cell", t(
+      weeklyTableWindowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+        ? "weekly.table.fiveHourEmpty"
+        : "weekly.table.empty",
+    ));
     cell.colSpan = 5;
     row.append(cell);
     table.append(row);
@@ -15094,7 +15230,29 @@ $("#usage-group-controls").addEventListener("click", (event) => {
   resetUsageTimelineViewport();
   renderUsageTimeline(dashboard);
 });
-
+$("#allowance-window-controls")?.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-window-minutes]");
+  if (!button || !dashboard || button.disabled) return;
+  const windowMinutes = Number(button.dataset.windowMinutes);
+  if (![CODEX_FIVE_HOUR_ALLOWANCE_MINUTES, CODEX_WEEKLY_ALLOWANCE_MINUTES]
+      .includes(windowMinutes)) return;
+  activeAllowanceWindowMinutes = windowMinutes;
+  renderWeekly(dashboard);
+});
+$("#weekly-range-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-days]");
+  if (!button || !dashboard) return;
+  activeWeeklyRangeDays = Number(button.dataset.days);
+  for (const control of $("#weekly-range-controls").querySelectorAll("button")) {
+    const active = control === button;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  // renderWeekly itself re-renders the share card from the same model
+  // (owner-verified regression, 2026-08-08), so a control cannot redraw the
+  // chart while leaving the card on the previous filters.
+  renderWeekly(dashboard);
+});
 $("#weekly-plan-select")?.addEventListener("change", (event) => {
   if (!dashboard || !dashboard.weekly.planPopulations.some(
     (population) => population.planType === event.target.value,

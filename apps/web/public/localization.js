@@ -124,7 +124,7 @@ export const WEB_MESSAGES = Object.freeze({
       || key.startsWith("performance.")
       || key.startsWith("appearance.")
       || key.startsWith("electron.")
-      || key.startsWith("weekly.controls.")
+      || key.startsWith("weekly.")
       || key.startsWith("accounting.cacheImpact.bullet")
       || key.startsWith("accounting.cacheContinuity.matrix."))
     .map((key) => [key, SUPPORTED_LOCALES.map((locale) => CATALOGS[locale][key])])),

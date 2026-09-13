@@ -777,7 +777,19 @@ function fakeStore() {
       return { status: "available", datasets: { rolling: [{ quota_change_pp: 3 }] } };
     },
     getWeekly() {
-      return { status: "available", datasets: { summary: [{ median_weekly_value_usd: 100 }] } };
+      return {
+        status: "available",
+        datasets: { summary: [{ median_weekly_value_usd: 100 }] },
+        allowanceHistoryByWindow: {
+          300: {
+            status: "available",
+            datasets: {
+              summary: [{ median_weekly_value_usd: 10 }],
+              weekly_values: [{ sequence: 1, value_usd: 10 }],
+            },
+          },
+        },
+      };
     },
     getWeeklyPaceOutlook() {
       return structuredClone(paceOutlook);
@@ -1105,6 +1117,14 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     const overview = await fetch(`${base}/api/local/overview`);
     assert.equal(overview.status, 200);
     assert.equal((await overview.json()).mode, "real_local_evidence");
+
+    const weekly = await fetch(`${base}/api/local/weekly`);
+    assert.equal(weekly.status, 200);
+    assert.equal(
+      (await weekly.json()).weekly.allowanceHistoryByWindow[300]
+        .datasets.weekly_values.length,
+      1,
+    );
 
     const paceOutlook = await fetch(`${base}/api/local/weekly-pace-outlook`);
     assert.equal(paceOutlook.status, 200);

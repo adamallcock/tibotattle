@@ -345,10 +345,17 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const chartStart = appSource.indexOf("const CHART_POINT_STYLE = Object.freeze(");
   const chartEnd = appSource.indexOf("\nfunction firstFiniteForecastNumber", chartStart);
+  const allowanceWindowStart = appSource.indexOf("function allowanceHistoryForWindow");
+  const allowanceWindowEnd = appSource.indexOf("\nfunction renderWeeklyPlanControl", allowanceWindowStart);
   const weeklyStart = appSource.indexOf("function renderWeekly(data) {");
   const weeklyEnd = appSource.indexOf("\nfunction accountingPeriod(data)", weeklyStart);
-  assert.ok(chartStart >= 0 && weeklyStart > chartStart, "renderWeekly is available");
-  const section = `${appSource.slice(chartStart, chartEnd)}\n${appSource.slice(weeklyStart, weeklyEnd)}`;
+  assert.ok(
+    chartStart >= 0 && allowanceWindowStart > chartEnd && weeklyStart > allowanceWindowEnd,
+    "renderWeekly and its allowance-window selector are available",
+  );
+  const section = `${appSource.slice(chartStart, chartEnd)}\n`
+    + `${appSource.slice(allowanceWindowStart, allowanceWindowEnd)}\n`
+    + appSource.slice(weeklyStart, weeklyEnd);
 
   const elements = new Map();
   const element = (id) => {
@@ -387,6 +394,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
     "renderStaleServeNote",
     "activeWeeklyRangeDays", "activeWeeklyMinimumObservedSpanPp",
     "selectAllowancePlanPopulation", "activeWeeklyPlanType",
+    "activeAllowanceWindowMinutes", "CODEX_FIVE_HOUR_ALLOWANCE_MINUTES",
+    "CODEX_WEEKLY_ALLOWANCE_MINUTES", "isPrimaryCodexQuotaWindow",
     "renderWeeklyPlanControl", "shareCardPlanLabel",
     `${section}\nreturn renderWeekly;`,
   )(
@@ -423,6 +432,10 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
     span,
     selectAllowancePlanPopulation,
     planType,
+    null,
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+    CODEX_WEEKLY_ALLOWANCE_MINUTES,
+    () => true,
     () => {},
     shareCardPlanLabel,
   )(data);
@@ -2666,7 +2679,8 @@ test("quota presentation keeps Spark separate and weekly surfaces exact", async 
   assert.match(appSource, /modelThemeIcon\(document, "spark"\)/u);
   assert.match(appSource, /const normalWindows = data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u);
   assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);
-  assert.match(appSource, /title: \{ key: "weekly\.chart\.title" \}/u);
+  assert.match(appSource, /"weekly\.chart\.title"/u);
+  assert.match(appSource, /"weekly\.chart\.fiveHourTitle"/u);
   assert.doesNotMatch(appSource, /renderAccountScopedQuotaAnalysis/u);
 });
 
@@ -6493,7 +6507,7 @@ test("weekly points carry measured ranges with pointer and keyboard detail", asy
     /if \(errorBars\) values\.push\([\s\S]*?errorBars\.low[\s\S]*?errorBars\.high/u,
   );
   const weeklyChart = appSource.match(
-    /function renderAllowanceHistoryChart\(history\) \{([\s\S]*?)\n\}/u,
+    /function renderAllowanceHistoryChart\([\s\S]*?\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
   assert.match(weeklyChart, /tooltip: false,/u);
   assert.match(weeklyChart, /detail: weeklyPointDetail,/u);
@@ -6788,7 +6802,7 @@ test("weekly details keep reset evidence concise and do not present speed covera
   // Both halves of the paginated presentation (owner-directed 2026-08-10):
   // the row-set holder and the page renderer beneath it.
   const tableMatch = appSource.match(
-    /function renderWeeklyTable\(values\) \{([\s\S]*?)\nfunction accountingPeriod\(data\)/u,
+    /function renderWeeklyTable\(values, windowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES\) \{([\s\S]*?)\nfunction accountingPeriod\(data\)/u,
   );
   assert.ok(tableMatch, "renderWeeklyTable source is available for contract review");
   const tableSource = tableMatch[1];
@@ -9396,7 +9410,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   // of each carrying its own card call that a new path could forget.
   assert.match(
     appSource,
-    /renderWeeklyTable\(values\);\s*\n[\s\S]{0,640}?renderShareCard\(data, \{ history \}\);\s*\n\}/u,
+    /renderWeeklyTable\(values, windowMinutes\);\s*\n[\s\S]{0,900}?if \(windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES\) \{\s*\n\s*renderShareCard\(data, \{ history \}\);/u,
   );
   assert.doesNotMatch(appSource, /renderShareCard\(dashboard\);/u);
 });
@@ -9568,7 +9582,7 @@ test("the posted allowance graph uses the exact history model from the dashboard
     appSource,
     /function renderWeekly\(data\) \{[\s\S]*?const history = allowanceHistoryChartModel\(data\);/u,
   );
-  assert.match(appSource, /shell\.replaceChildren\(renderAllowanceHistoryChart\(history\)\);/u);
+  assert.match(appSource, /shell\.replaceChildren\(renderAllowanceHistoryChart\(history, windowMinutes\)\);/u);
   assert.match(
     section,
     // Re-pinned 2026-08-08 (owner-verified regression): the chart renderer
