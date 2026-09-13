@@ -358,14 +358,9 @@ export function mountWorkUsageView(options = {}) {
   input.placeholder = tr("findHint");
   input.setAttribute("aria-label", tr("findHint"));
   form.append(input);
-  toolbar.append(
-    views,
-    form,
-    sort.wrapper,
-    model.wrapper,
-    scope.wrapper,
-    refreshButton,
-  );
+  const filters = el("div", "work-usage-filter-controls");
+  filters.append(sort.wrapper, model.wrapper, scope.wrapper, refreshButton);
+  toolbar.append(views, form, filters);
   function clearSearchTimer() {
     clearLeaseTimer(searchTimer);
     searchTimer = null;

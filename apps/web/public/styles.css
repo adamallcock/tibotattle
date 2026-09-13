@@ -5549,9 +5549,10 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
 /* Project controls form one responsive toolbar; reporting lives in the header. */
 .dashboard-shell .work-usage-toolbar { align-items: flex-end; gap: 12px; margin: 16px 0; }
 .dashboard-shell .work-usage-toolbar .work-usage-find { flex: 1 1 240px; margin: 0; min-width: 180px; }
-.dashboard-shell .work-usage-toolbar .work-usage-find input { width: 100%; max-width: none; min-height: 38px; box-sizing: border-box; }
+.dashboard-shell .work-usage-toolbar .work-usage-find input { width: 100%; max-width: none; height: 44px; min-height: 44px; box-sizing: border-box; font-size: .8rem; }
 .dashboard-shell .work-usage-select { min-width: 120px; }
-.dashboard-shell .work-usage-select select { min-height: 38px; }
+.dashboard-shell .work-usage-select select { height: 44px; min-height: 44px; box-sizing: border-box; }
+.dashboard-shell .work-usage-filter-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
 .dashboard-shell .work-usage-actions { gap: 8px 12px; margin: 12px 0; }
 .dashboard-shell .work-usage-actions .work-usage-status { margin: 0; }
 .dashboard-shell .work-usage-evidence { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 12px 0; margin: 0; border-bottom: 1px solid var(--line); color: var(--muted); font-size: .75rem; }
