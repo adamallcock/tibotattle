@@ -141,3 +141,9 @@ Unavailable Usage/Trends data uses a solid, neutral treatment; a period without
 points keeps the dashed empty treatment and its existing explanation. Search
 results with no matches offer Clear search, retain other filters, and return
 focus to the search field while refreshing the result.
+
+The Projects model filter reuses `model-visuals.js` ordering/icons and
+`formatModelName`. All models precedes the observed model IDs; aliases remain
+separate exact query values. Electron's customizable native select renders SVG
+identities in options and the selected value. Other browsers retain a native
+text select if customizable selects are unsupported.

@@ -309,3 +309,11 @@ Evidence: `.release-build/states-real-layout.json`,
 `.release-build/states-layout.json`, and matching `search-empty` screenshots.
 This does not qualify a real private report or the separate accounting-parity
 gate.
+
+## Model filter identity
+
+Use shared display names, SVG icons, and presentation ordering in the Projects
+model filter, with All models first and exact observed IDs retained. Enhance
+the native select with customizable-select rendering in Electron; browsers
+without that capability retain their native text select. Verify selection,
+keyboard/dismiss behavior, and open-menu rendering in the packaged app.

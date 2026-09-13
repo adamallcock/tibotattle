@@ -5576,3 +5576,15 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
 .dashboard-shell .dashboard-table-scroll:focus-visible { outline: 3px solid var(--dashboard-focus-ring); outline-offset: 3px; }
 .dashboard-shell .table-pagination { flex-wrap: wrap; }
 .dashboard-shell .table-pagination-status { flex: 1 1 12rem; text-align: center; line-height: 1.5; }
+
+/* Native model picker uses the shared icons without a second menu controller. */
+@supports (appearance: base-select) {
+  .model-picker, .model-picker::picker(select) { appearance: base-select; }
+  .model-picker::picker(select) { border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--ink); padding: 4px; max-height: min(60vh, 420px); overflow-y: auto; }
+  .model-picker option { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-radius: 6px; font-size: .8rem; }
+  .model-picker option:checked { background: var(--green-soft); font-weight: var(--weight-semibold); }
+  .model-picker option:is(:hover, :focus) { background: var(--surface-quiet); }
+  .model-picker selectedcontent { display: flex; align-items: center; gap: 8px; }
+  .model-picker .allowance-model-icon { width: 18px; height: 18px; flex-shrink: 0; }
+  .model-picker { min-width: 170px; }
+}

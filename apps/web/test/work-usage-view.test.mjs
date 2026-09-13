@@ -1567,3 +1567,29 @@ test("an available shared-period search with no rows is empty rather than unavai
     assert.equal(findMounted(root, node => node.classList.contains("work-usage-empty")).length, 0);
   } finally { view.destroy(); }
 });
+
+test("model filter uses shared identity order and sends the exact selected ID", async () => {
+  const { root, windowRef } = mountedRoot();
+  const requests = [];
+  const models = ["gpt-5.5", "gpt-5.6-luna", "gpt-6-astra", "gpt-5.6-terra", "gpt-5.6-sol-wm", "unreviewed-model"];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      requests.push(JSON.parse(init.body));
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, models });
+    } });
+  try {
+    await settleMountedView();
+    const picker = findMounted(root, node => node.classList.contains("model-picker"))[0];
+    assert.deepEqual(picker.options.map(option => option.value),
+      ["", "gpt-6-astra", "gpt-5.6-sol-wm", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "unreviewed-model"]);
+    const astra = picker.options[1];
+    assert.equal(astra.textContent, "GPT-6 Astra");
+    assert.equal(astra.children[0].getAttribute("aria-hidden"), "true");
+    assert.equal(astra.title, "gpt-6-astra");
+    picker.value = "gpt-5.6-sol-wm";
+    picker.dispatchEvent({ type: "change" });
+    await settleMountedView();
+    assert.equal(requests.at(-1).model, "gpt-5.6-sol-wm");
+    assert.equal(picker.value, "gpt-5.6-sol-wm");
+  } finally { view.destroy(); }
+});

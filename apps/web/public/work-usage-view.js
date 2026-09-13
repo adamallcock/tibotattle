@@ -1,4 +1,4 @@
-import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { compareModelPresentation, modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import {
   formatNumber,
   formatLocal,
@@ -345,6 +345,7 @@ export function mountWorkUsageView(options = {}) {
     resetPage();
     load();
   });
+  model.control.classList.add("model-picker");
   const scope = select(tr("scope"), [], (value) => {
     query.scope = value;
     refresh(response?.snapshotId);
@@ -1260,13 +1261,30 @@ export function mountWorkUsageView(options = {}) {
       model.control.replaceChildren(
         ...[
           ["", tr("allModels")],
-          ...result.models.map((id) => [id, formatModelName(id)]),
+          ...[...result.models].sort(compareModelPresentation).map((id) => [id, formatModelName(id)]),
         ].map(([value, text]) => {
           const option = el("option", null, text);
           option.value = value;
+          option.title = value || text;
+          if (value) {
+            const presentation = modelUsagePresentation(value);
+            const icon = modelThemeIcon(documentRef, presentation.theme);
+            if (icon) {
+              icon.classList.add(presentation.className);
+              option.replaceChildren(icon, el("span", null, text));
+            }
+          }
           return option;
         }),
       );
+      // Customizable native selects retain platform keyboard/dismiss behavior
+      // while allowing the same SVG identity in the list and selected value.
+      if (windowRef.CSS?.supports("appearance", "base-select")) {
+        const selected = el("button");
+        selected.type = "button";
+        selected.append(el("selectedcontent"));
+        model.control.prepend(selected);
+      }
       model.control.value = query.model ?? "";
       scope.control.replaceChildren(
         ...result.scopes.map((s, i) => {
