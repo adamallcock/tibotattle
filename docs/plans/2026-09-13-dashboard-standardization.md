@@ -101,4 +101,15 @@ solely because collection is running. Expanded setup checks align at the top.
 The 745 browser tests pass. Corrected two stale source-extraction tests to target
 their owning function/section after the reporting control moved. Documentation
 and i18n mirror checks pass. Browser inspection covered compact controls and
-keyboard date disclosure at narrow width. Fresh packaged verification follows.
+keyboard date disclosure at narrow width (391 CSS pixels; the popup remained
+inside the viewport). Packaged development source
+`906eb385c0060ad693dd58e7fe4fb42f0c931594` passed artifact verification; ASAR digest
+`ffd1439436dd4907fe36ab92b0d3da11448760130f82a68cf0feeecb85671f38`.
+Synthetic packaged inspection confirmed 24px brand inset, header-owned reporting
+controls, collapsed ready setup and no horizontal overflow at 1180 CSS pixels.
+Seven-page captures and layout evidence are under
+`.release-build/compact-synthetic-*`. Startup chrome/data-flow passed; full smoke
+still failed `usage_parity_invalid`. Automatic approval review rejected a new
+real-history screenshot capture for lack of capture-specific authorization; no
+real-history capture ran for this revision. The synthetic fallback was approved.
+No system installation or publication occurred.
