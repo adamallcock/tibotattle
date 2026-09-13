@@ -136,9 +136,13 @@ including boundary changes when pricing comparison is unavailable. Neighboring
 events share a selectable numbered badge; the details retain their observed and
 confirmation times. Existing evidence bands still identify excluded windows.
 
-The selected-time header converts the existing rolling speed-priced total to an
-hourly rate using its measured duration. Unknown pricing and stale samples stay
-unavailable. Compact divergence rows lead with the signed peak gap, describe its direction
+The selected-time header averages the selected plan's already-priced usage
+buckets over three hours, ending at the latest completed fifteen-minute boundary.
+It is independent of quota-comparison availability and chart grouping. Coverage
+breaks shorten the averaging window; covered quiet time lowers the rate without
+filling unknown coverage or missing prices with zero. The header never borrows
+future activity or extends beyond the recorded usage history. Compact divergence
+rows lead with the signed peak gap, describe its direction
 in plain language, and focus the shared chart viewport on selection. The
 Models & speeds disclosure states its investigative purpose and provides an
 explicit retry after failure. Speed names come from the keyed breakdown contract.

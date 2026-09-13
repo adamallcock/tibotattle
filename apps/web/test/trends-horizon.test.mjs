@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { horizonAt, advanceHorizonTime, sampleAt, hourlySpend, resetMarkerGroups, mountTrendsHorizon, presentationSegments, differenceLobes } from "../public/trends-horizon.js";
+import { horizonAt, advanceHorizonTime, sampleAt, hourlySpend, createSpendRateLookup, resetMarkerGroups, mountTrendsHorizon, presentationSegments, differenceLobes } from "../public/trends-horizon.js";
 import { translate, SUPPORTED_LOCALES } from "../public/localization.js";
 
 test("the sun and moon cross midnight continuously, with an unmistakably brighter day", () => {
@@ -72,7 +72,45 @@ test("nearby reset markers group without dropping evidence or inventing a displa
   assert.deepEqual(resetMarkerGroups([], event => event.timestampMs), []);
 });
 
-test("header refresh uses exact observations, keeps missing evidence empty, and clears on an unavailable view", () => {
+test("spending averages survive quota gaps and decay through covered quiet time", () => {
+  const hour = 3_600_000, step = hour / 4;
+  const buckets = [{ startMs: 0, endMs: step, usd: 90 }, { startMs: 5 * hour, endMs: 5 * hour + step, usd: 30 }];
+  const at = createSpendRateLookup(buckets, { intervals: [[0, 6 * hour]] });
+  assert.equal(at(step - 1), null, "unfinished buckets cannot reveal future cost");
+  assert.equal(hourlySpend(at(step)), 360);
+  assert.equal(hourlySpend(at(2 * hour)), 45, "last usage being over an hour old does not erase spending in the rolling window");
+  assert.equal(hourlySpend(at(3 * hour)), 30);
+  assert.equal(hourlySpend(at(3 * hour + step)), 0, "fully covered quiet time is a real recorded zero");
+  assert.equal(hourlySpend(at(5 * hour + step)), 10);
+  assert.equal(at(6 * hour), null, "do not extend beyond the retained usage horizon");
+});
+
+test("spending windows shorten at plan-coverage breaks instead of hiding valid activity or treating gaps as zero", () => {
+  const step = 900_000;
+  const buckets = [0, 1, 4, 5].map(i => ({ startMs: i * step, endMs: (i + 1) * step, usd: 10 }));
+  const at = createSpendRateLookup(buckets, { intervals: [[0, 2 * step], [4 * step, 6 * step]] });
+  assert.equal(at(3 * step), null);
+  assert.equal(at(4 * step), null);
+  assert.deepEqual(at(5 * step), { timestampMs: 5 * step, allowanceWeightedUsd: 10, measuredSpanMs: step });
+  assert.equal(hourlySpend(at(5 * step)), 40);
+  assert.equal(hourlySpend(at(6 * step)), 40);
+  assert.equal(createSpendRateLookup(buckets)(3 * step), null, "legacy gaps have no implied coverage");
+  assert.equal(createSpendRateLookup(buckets, { intervals: [] })(step), null);
+});
+
+test("spending cannot borrow future pricing or silently fill unpriced buckets", () => {
+  const step = 900_000;
+  const buckets = Array.from({ length: 20 }, (_, i) => ({ startMs: i * step, endMs: (i + 1) * step, usd: i === 2 ? null : 10 }));
+  const at = createSpendRateLookup(buckets);
+  assert.equal(hourlySpend(at(2.5 * step)), 40, "only completed buckets contribute");
+  assert.equal(at(3 * step), null);
+  assert.equal(at(14 * step), null);
+  assert.equal(hourlySpend(at(15 * step)), 40, "the missing-price bucket has now left the three-hour window");
+  assert.equal(createSpendRateLookup([...buckets, buckets[0]])(step), null, "overlapping buckets cannot double count");
+  assert.equal(createSpendRateLookup([{ ...buckets[0], endMs: 2 * step }])(step), null);
+});
+
+test("header spending needs no quota-comparison chart, uses exact observations, and clears on an unavailable view", () => {
   class Element {
     constructor() { this.attributes = {}; this.children = []; this.style = {}; this.dataset = {}; this.isConnected = true; this.hidden = false; this.textContent = ""; }
     setAttribute(key, value) { this.attributes[key] = String(value); }
@@ -89,7 +127,7 @@ test("header refresh uses exact observations, keeps missing evidence empty, and 
   const root = new Element(); root.ownerDocument = document;
   const controller = mountTrendsHorizon(root, { t: key => key, locale: "en-US", timeZone: "UTC", formatMoney: String, formatPercent: String, formatDuration: String });
   const hour = 3_600_000;
-  const shell = new Element(); shell.id = "timeline-chart";
+  const shell = new Element(); shell.id = "usage-timeline-chart";
   controller.register(shell, { svg: new Element(), points: [
     { timestampMs: 2 * hour, allowanceWeightedUsd: 120, measuredSpanMs: 3 * hour },
     { timestampMs: 3 * hour, allowanceWeightedUsd: null, measuredSpanMs: 3 * hour },
@@ -100,6 +138,9 @@ test("header refresh uses exact observations, keeps missing evidence empty, and 
     { timestampMs: 2.5 * hour, allowanceRemaining: 90 },
     { timestampMs: 3 * hour, allowanceRemaining: null },
   ]);
+  controller.setSpendLookup(createSpendRateLookup(Array.from({ length: 20 }, (_, i) => ({
+    startMs: -hour + i * hour / 4, endMs: -hour + (i + 1) * hour / 4, usd: i === 16 ? null : 10,
+  }))));
   controller.refresh();
   const text = selector => elements.get(selector).textContent;
   assert.equal(text("#trends-allowance-value"), "20", "the first refresh must populate data received after chart registration");

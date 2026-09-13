@@ -2,7 +2,7 @@ import { observationFreshness } from "./dashboard-ui.js";
 import { createReportingPeriod, reportingDays, reportingSelection, mountReportingPeriodDismissal } from "./reporting-period.js";
 import { createCacheReuseMatrix } from "./cache-reuse-matrix.js";
 import { cacheReuseMetricLines, cacheReuseCoverageNote } from "./cache-reuse-metrics.js";
-import { mountTrendsHorizon } from "./trends-horizon.js";
+import { mountTrendsHorizon, createSpendRateLookup } from "./trends-horizon.js";
 import { mountAllowanceTanks } from "./allowance-tanks.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
@@ -5224,6 +5224,24 @@ function selectedTimelinePoints(data) {
   return selection;
 }
 
+let spendRateMemo = null;
+function selectedSpendRateLookup(data) {
+  if (spendRateMemo?.data === data) return spendRateMemo.lookup;
+  const capacity = timelineCalibrationCapacity(data);
+  const buckets = allowanceTimelineUsage(data).map(row => ({
+    startMs: Date.parse(row.startAt), endMs: Date.parse(row.endAt),
+    usd: timelineAllowanceWeightedCost(row, capacity),
+  }));
+  const lookup = createSpendRateLookup(buckets, {
+    intervals: data.allowancePlanSelection ? data.timeline.comparisonIntervals ?? [] : undefined,
+    // The plan-scoped contract publishes fixed fifteen-minute buckets even
+    // when the legacy all-plan timeline uses a different grouping.
+    bucketMs: data.allowancePlanSelection ? 900_000 : (data.timeline.bucketMinutes ?? 15) * 60_000,
+  });
+  spendRateMemo = { data, lookup };
+  return lookup;
+}
+
 function renderTimeline(data) {
   data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   const {
@@ -5346,6 +5364,7 @@ function renderTimeline(data) {
   // zoomed viewport: it answers "across this range, where did observed and
   // priced usage persistently disagree", so pan and zoom must not reshape it.
   renderDivergencePeriods(data, points);
+  trendsHorizonView?.setSpendLookup(selectedSpendRateLookup(data));
   // The instrument reads observations, not the end-of-hour/day chart buckets.
   // Incompatible intervals explicitly interrupt the sample stream.
   trendsHorizonView?.setAllowanceSamples(mainWeeklyQuotaTrack(data.timeline.quota).map(row => {

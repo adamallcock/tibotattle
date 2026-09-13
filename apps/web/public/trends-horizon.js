@@ -56,6 +56,58 @@ export function hourlySpend(point) {
   return finite(rate) ? rate : null;
 }
 
+// A presentation index over already-priced usage buckets. Quota readings and
+// comparison-chart visibility do not determine whether recorded spending exists.
+// Prefix sums keep replay queries logarithmic and leave unknown pricing explicit.
+export function createSpendRateLookup(buckets, { intervals, bucketMs = 900_000, windowMs = 3 * 3_600_000 } = {}) {
+  const unavailable = () => null;
+  if (!buckets.length || !finite(bucketMs) || bucketMs <= 0 || !finite(windowMs)
+      || windowMs < bucketMs || windowMs % bucketMs !== 0) return unavailable;
+  const rows = [...buckets].sort((a, b) => a.endMs - b.endMs);
+  const costs = [0], missing = [0], ends = [];
+  const contiguous = [];
+  for (const row of rows) {
+    if (!finite(row.startMs) || !finite(row.endMs) || row.endMs - row.startMs !== bucketMs
+        || row.startMs % bucketMs !== 0 || row.endMs % bucketMs !== 0
+        || (ends.length && row.startMs < ends.at(-1))) return unavailable;
+    const priced = finite(row.usd) && row.usd >= 0;
+    costs.push(costs.at(-1) + (priced ? row.usd : 0));
+    missing.push(missing.at(-1) + (priced ? 0 : 1));
+    ends.push(row.endMs);
+    const last = contiguous.at(-1);
+    if (last?.[1] === row.startMs) last[1] = row.endMs;
+    else contiguous.push([row.startMs, row.endMs]);
+  }
+  // Selected-plan coverage explicitly includes quiet time. Legacy buckets alone
+  // establish only their contiguous runs; an omitted run must not become $0.
+  const coverage = intervals ?? contiguous;
+  if (!coverage.length || coverage.some(([start, end], i) => !finite(start) || !finite(end)
+      || end <= start || start % bucketMs !== 0 || end % bucketMs !== 0
+      || (i > 0 && start < coverage[i - 1][1]))) return unavailable;
+  const upperBound = (values, at) => {
+    let lo = 0, hi = values.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (values[mid] <= at) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  };
+  const starts = coverage.map(([start]) => start);
+  return timestamp => {
+    if (!finite(timestamp) || timestamp < rows[0].startMs || timestamp > ends.at(-1)) return null;
+    // A bucket becomes knowable at its end. Never pull future activity into the
+    // selected time, or spread its cost fractionally across the unfinished bin.
+    const endMs = Math.floor(timestamp / bucketMs) * bucketMs;
+    const interval = coverage[upperBound(starts, endMs - 1) - 1];
+    if (!interval || endMs > interval[1]) return null;
+    const startMs = Math.max(rows[0].startMs, interval[0], endMs - windowMs);
+    if (startMs >= endMs) return null;
+    const from = upperBound(ends, startMs), to = upperBound(ends, endMs);
+    if (missing[to] !== missing[from]) return null;
+    return { timestampMs: endMs, allowanceWeightedUsd: Math.max(0, costs[to] - costs[from]), measuredSpanMs: endMs - startMs };
+  };
+}
+
 // Neighboring markers share a badge at the latest event's actual time. Every
 // event remains in the inspection text; no timestamp is moved to avoid overlap.
 export function resetMarkerGroups(events, x, minimumSpacing = 24) {
@@ -120,6 +172,7 @@ export function mountTrendsHorizon(root, { t, locale, timeZone, formatMoney, for
   const charts = new Map();
   let resetEvents = [];
   let allowanceSamples = [];
+  let spendAt = () => null;
   const input = $("#trends-time");
   const replay = $("#trends-replay");
   const sky = $(".trends-sky");
@@ -169,10 +222,8 @@ export function mountTrendsHorizon(root, { t, locale, timeZone, formatMoney, for
     setText("#trends-clock", format(at, { hour: "numeric", minute: "2-digit" }));
     const description = format(at, { dateStyle: "medium", timeStyle: "short" });
     input.setAttribute("aria-valuetext", description);
-    const movement = charts.get("timeline-chart");
     const levelPoint = sampleAt(allowanceSamples, at, 3 * 3_600_000);
-    const spendPoint = movement && !movement.shell.hidden && movement.svg.isConnected
-      ? sampleAt(movement.points, at, 3_600_000) : null;
+    const spendPoint = spendAt(at);
     const rate = hourlySpend(spendPoint);
     setText("#trends-allowance-value", finite(levelPoint?.allowanceRemaining) ? formatPercent(levelPoint.allowanceRemaining, 0) : "—");
     setText("#trends-spend-value", rate === null ? "—" : formatMoney(rate));
@@ -340,6 +391,7 @@ export function mountTrendsHorizon(root, { t, locale, timeZone, formatMoney, for
   return {
     register,
     select,
+    setSpendLookup(lookup) { spendAt = lookup; },
     setAllowanceSamples(points) {
       allowanceSamples = points.filter(point => finite(point.timestampMs)).sort((a, b) => a.timestampMs - b.timestampMs);
     },

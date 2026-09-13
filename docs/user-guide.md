@@ -319,10 +319,15 @@ is hidden and is omitted when reduced motion is enabled. The slider and exact
 sample timestamps remain available. Range and zoom controls move the views
 together; detailed comparison assumptions and exact evidence remain expandable.
 
-The Horizon readouts show allowance remaining at the selected time and the
-existing rolling API-equivalent total converted to an hourly rate. The caption
-names the measured averaging window, including shorter windows after a data gap;
-unavailable or stale evidence displays a dash. These amounts are API equivalents,
+The Horizon readouts show allowance remaining at the selected time and a
+three-hour moving average of recorded API-equivalent usage per hour. The spending
+rate uses completed usage buckets, independently of whether allowance observations
+can be compared. It updates at fifteen-minute boundaries for the selected plan.
+The caption names the actual averaging window, which shortens after a coverage
+break. Quiet time within known coverage lowers the average, reaching $0 after
+three hours without recorded activity. Missing pricing or coverage displays a
+dash; the rate does not extend beyond the recorded usage history. Allowance
+readings also become unavailable when stale. These amounts are API equivalents,
 not subscription charges.
 
 Reset markers distinguish confirmed allowance drops from recorded changes to the
