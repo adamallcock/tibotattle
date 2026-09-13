@@ -1,8 +1,8 @@
 import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
-import { buildCommunityDailyPayload } from './community-daily-aggregates';
+import { buildCommunityDailyPayload, type PublishedCommunityDailyRead } from './community-daily-aggregates';
 import { buildAdminCommunityAllowancePreview, PREVIEW_CACHE_JSON_LIMIT_BYTES,
-  validCachedAdminCommunityAllowancePreview } from './admin-community-allowance';
+  validCachedAdminCommunityAllowancePreview, type AdminCommunityAllowancePreview } from './admin-community-allowance';
 import { parsedCachedFits, type CommunityAllowanceFit } from './community-allowance';
 import { captureStorageCommunityAuthority, sameStorageCommunityAuthority,
   storageCommunityAuthorityIsCurrent, type StorageCommunityAuthority } from './storage-community-authority';
@@ -30,7 +30,8 @@ interface SourceCheckpoint {
 }
 interface CapturedSource {binding:StorageAnalyticsSource;authority:StorageCommunityAuthority;checkpoint:SourceCheckpoint;}
 type PublicationKind='daily'|'allowance';
-const MAX_SOURCES=4,MAX_MEMBERS=5_000,MAX_CAPTURE_BYTES=16*1024*1024,MAX_PUBLICATION_BYTES=2*1024*1024;
+const MAX_SOURCES=4,MAX_MEMBERS=5_000,MAX_CAPTURE_BYTES=16*1024*1024,MAX_PUBLICATION_BYTES=2*1024*1024,
+  MAX_PUBLIC_RANGE_BYTES=16*1024*1024,MAX_PUBLIC_RANGE_CHECKPOINT_BYTES=4*1024*1024,MAX_PUBLIC_RANGE_DAYS=366;
 const id=/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/,digest=/^[a-f0-9]{64}$/;
 const fail=()=>new Error('MULTI_SOURCE_PUBLICATION_UNAVAILABLE');
 const bytes=(value:string)=>new TextEncoder().encode(value).byteLength;
@@ -266,4 +267,79 @@ export async function readMultiSourcePublication(target:D1Database,kind:Publicat
     ||await sha256Hex(row.checkpoints_json)!==row.checkpoints_sha256)return null;
   return {payloadJson:row.payload_json,releasedAt:row.released_at,revision:row.revision,
     routingGeneration:row.routing_generation,erasureGeneration:row.erasure_generation};
+}
+
+export async function readMultiSourceAllowancePreview(target:D1Database,nowMs=Date.now())
+  :Promise<AdminCommunityAllowancePreview|null>{
+  integer(nowMs);
+  const receipt=await readMultiSourcePublication(target,'allowance','current');
+  if(!receipt)return null;
+  let parsed:unknown;
+  try{parsed=JSON.parse(receipt.payloadJson);}catch{return null;}
+  if(typeof parsed!=='object'||parsed===null||Array.isArray(parsed))return null;
+  const generatedAt=Reflect.get(parsed,'generatedAt');
+  return typeof generatedAt==='string'&&validCachedAdminCommunityAllowancePreview(parsed,generatedAt,nowMs)
+    ?parsed as AdminCommunityAllowancePreview:null;
+}
+
+interface MultiSourceDailyRangeRow {
+  publication_key:string|null;revision:number|null;payload_json:string|null;payload_sha256:string|null;
+  checkpoints_json:string|null;checkpoints_sha256:string|null;released_at:string|null;
+  head_count:number;invalid_erasure_count:number;invalid_routing_count:number;
+  payload_bytes:number;checkpoint_bytes:number;
+}
+
+/** One bounded central read supplies the existing public daily DTO. Any head
+ * from an obsolete erasure generation fails the requested range closed; a
+ * newer routing generation may retain the previous complete cohort. */
+export async function readMultiSourceCommunityDaily(target:D1Database,fromDay:string,throughDay:string,
+  nowMs=Date.now()):Promise<PublishedCommunityDailyRead|null>{
+  day(fromDay);day(throughDay);integer(nowMs);
+  const range=(Date.parse(throughDay)-Date.parse(fromDay))/86_400_000+1;
+  if(!Number.isSafeInteger(range)||range<1||range>MAX_PUBLIC_RANGE_DAYS)throw fail();
+  const result=await target.prepare(`WITH selected AS MATERIALIZED(
+    SELECT p.publication_key,p.revision,p.payload_json,p.payload_sha256,p.checkpoints_json,p.checkpoints_sha256,
+      p.released_at,p.routing_generation,p.erasure_generation,c.routing_generation required_routing_generation,
+      c.erasure_generation required_erasure_generation
+    FROM analytics_multi_source_heads h JOIN analytics_multi_source_publications p
+      ON p.kind=h.kind AND p.publication_key=h.publication_key AND p.revision=h.revision
+    JOIN analytics_multi_source_control c ON c.singleton=1
+    WHERE h.kind='daily' AND h.publication_key BETWEEN ? AND ? ORDER BY h.publication_key LIMIT 367),
+   stats AS(SELECT COUNT(*) head_count,
+      COALESCE(SUM(CASE WHEN erasure_generation!=required_erasure_generation THEN 1 ELSE 0 END),0) invalid_erasure_count,
+      COALESCE(SUM(CASE WHEN routing_generation>required_routing_generation THEN 1 ELSE 0 END),0) invalid_routing_count,
+      COALESCE(SUM(length(CAST(payload_json AS BLOB))),0) payload_bytes,
+      COALESCE(SUM(length(CAST(checkpoints_json AS BLOB))),0) checkpoint_bytes FROM selected)
+   SELECT selected.publication_key,selected.revision,
+     CASE WHEN stats.head_count<=? AND stats.payload_bytes<=? AND stats.checkpoint_bytes<=?
+       AND stats.invalid_erasure_count=0 AND stats.invalid_routing_count=0 THEN selected.payload_json ELSE NULL END payload_json,
+     selected.payload_sha256,
+     CASE WHEN stats.head_count<=? AND stats.payload_bytes<=? AND stats.checkpoint_bytes<=?
+       AND stats.invalid_erasure_count=0 AND stats.invalid_routing_count=0 THEN selected.checkpoints_json ELSE NULL END checkpoints_json,
+     selected.checkpoints_sha256,selected.released_at,stats.* FROM stats LEFT JOIN selected ON 1=1
+     ORDER BY selected.publication_key`)
+    .bind(fromDay,throughDay,MAX_PUBLIC_RANGE_DAYS,MAX_PUBLIC_RANGE_BYTES,MAX_PUBLIC_RANGE_CHECKPOINT_BYTES,
+      MAX_PUBLIC_RANGE_DAYS,MAX_PUBLIC_RANGE_BYTES,MAX_PUBLIC_RANGE_CHECKPOINT_BYTES)
+    .all<MultiSourceDailyRangeRow>();
+  const first=result.results[0];
+  if(!first||!Number.isSafeInteger(first.head_count)||first.head_count<0||first.head_count>MAX_PUBLIC_RANGE_DAYS
+    ||first.invalid_erasure_count!==0||first.invalid_routing_count!==0
+    ||first.payload_bytes>MAX_PUBLIC_RANGE_BYTES||first.checkpoint_bytes>MAX_PUBLIC_RANGE_CHECKPOINT_BYTES)return null;
+  const selected=result.results.filter((row):row is MultiSourceDailyRangeRow&{publication_key:string;revision:number;
+    payload_json:string;payload_sha256:string;checkpoints_json:string;checkpoints_sha256:string;released_at:string}=>
+      typeof row.publication_key==='string'&&typeof row.revision==='number'&&typeof row.payload_json==='string'
+      &&typeof row.payload_sha256==='string'&&typeof row.checkpoints_json==='string'
+      &&typeof row.checkpoints_sha256==='string'&&typeof row.released_at==='string');
+  if(selected.length!==first.head_count)return null;
+  const rows:PublishedCommunityDailyRead['rows']=[];
+  for(const row of selected){
+    if(row.publication_key<fromDay||row.publication_key>throughDay||!Number.isSafeInteger(row.revision)||row.revision<1
+      ||await sha256Hex(row.payload_json)!==row.payload_sha256
+      ||await sha256Hex(row.checkpoints_json)!==row.checkpoints_sha256)return null;
+    rows.push({day:row.publication_key,revision:row.revision,payload_json:row.payload_json,released_at:row.released_at});
+  }
+  const allowance=await readMultiSourceAllowancePreview(target,nowMs);
+  return {rows,allowancePublicationState:null,
+    allowanceBreakdownsCache:allowance?{generated_at:allowance.generatedAt,payload_json:canonicalJson(allowance)}:null,
+    allowanceReadState:allowance?'confirmed':'temporarily_unavailable'};
 }

@@ -18,10 +18,13 @@ import {canonicalJson} from '../src/canonical-json';
 import {sha256Hex} from '../src/crypto';
 import {recordDeletionTombstone,purgeExpiredDeletionTombstones} from '../src/retention';
 import {participantDeletionDigest} from '../src/participant-deletion-digest';
+import {handleRequest} from '../src/index';
+import {invalidateMultiSourcePublicationsForErasure} from '../src/storage-multi-source-erasure';
 
 interface Bindings extends Env {
  STORAGE_INGESTION_A:D1Database;STORAGE_INGESTION_B:D1Database;
  STORAGE_ANALYTICS_A:D1Database;STORAGE_ANALYTICS_B:D1Database;STORAGE_ANALYTICS_DB:D1Database;
+ STORAGE_PUBLICATION_DB:D1Database;
  TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];
  TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];TEST_TYPED_V11_ADMISSION_MIGRATIONS:D1Migration[];
  TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[];
@@ -36,11 +39,12 @@ const definitions=():[StorageAnalyticsSource,StorageAnalyticsSource]=>[
 
 beforeEach(async()=>{
  await reset();
+ await applyD1Migrations(b.USAGE_MONITOR_DB,b.TEST_MIGRATIONS);
  for(const source of [b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B]){
   for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,
    b.TEST_TYPED_V11_ADMISSION_MIGRATIONS,b.TEST_TYPED_V1_ADMISSION_MIGRATIONS])await applyD1Migrations(source,migrations);
  }
- for(const target of [b.STORAGE_ANALYTICS_A,b.STORAGE_ANALYTICS_B,b.STORAGE_ANALYTICS_DB])
+ for(const target of [b.STORAGE_ANALYTICS_A,b.STORAGE_ANALYTICS_B,b.STORAGE_ANALYTICS_DB,b.STORAGE_PUBLICATION_DB])
   await applyD1Migrations(target,b.TEST_ANALYTICS_MIGRATIONS);
  await applyD1Migrations(b.DELETION_LEDGER,b.TEST_DELETION_LEDGER_MIGRATIONS);
  for(const source of definitions()){
@@ -183,6 +187,49 @@ describe('multi-source analytics and complete publication',()=>{
   expect(preview).toMatchObject({generatedAt:new Date(now).toISOString()});
   expect(preview.days.find(row=>row.day===day())!.combined.centralUsd).toBe(25);
   expect(preview.days.find(row=>row.day===day())!.combined.centralUsd).not.toBe(60);
+ });
+
+ it('serves the complete central daily and allowance receipt over HTTP and refuses it after erasure',async()=>{
+  const now=Date.now(),observedDay=new Date(Date.parse(`${day()}T00:00:00.000Z`)-86_400_000).toISOString().slice(0,10);
+  const source=definitions()[0],owner='e'.repeat(64),members=[await member(source,owner,1,2,1)];
+  await source.target.prepare('UPDATE analytics_community_daily_owners SET day=? WHERE source_id=? AND owner_digest=?')
+    .bind(observedDay,source.sourceId,owner).run();
+  const authority=await captureStorageCommunityAuthority(source.source,source);
+  const fits=canonicalJson([{participantId:owner,planType:'pro',capacityNanousd:25_000_000_000,
+    lastObservedAt:`${observedDay}T12:00:00.000Z`}]);
+  await source.target.prepare(`INSERT INTO analytics_community_graph_results
+    (source_id,owner_digest,metric,day,method,dependency_digest,input_revision,payload_fingerprint,payload_json,
+     payload_sha256,authority_json,computed_ms,source_kind) VALUES(?,?,'fits',?,?,?,?,?,?,?,?,?,'v1.1')`)
+    .bind(source.sourceId,owner,day(),STORAGE_GRAPH_METHOD,'a'.repeat(64),1,'b'.repeat(64),fits,
+      await sha256Hex(fits),canonicalJson(authority),now).run();
+  const publicationSet={...set(members),publicationTarget:b.STORAGE_PUBLICATION_DB};
+  expect(await publishMultiSourceCommunityDaily(publicationSet,{day:observedDay,nowMs:now})).toMatchObject({state:'published'});
+  expect(await publishMultiSourceAllowancePreview(publicationSet,{nowMs:now})).toMatchObject({state:'published'});
+  const offlineSource=new Proxy(b.STORAGE_INGESTION_A,{get(db,key){
+    if(key==='prepare')return()=>{throw new Error('synthetic source offline');};
+    const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  const runtime={...b,ENVIRONMENT:'synthetic-development',STORAGE_ROUTING_MODE:'catalog',
+    TELEMETRY_STORAGE_MODE:'typed',TELEMETRY_STORAGE_NAMESPACE:namespace,
+    STORAGE_PUBLICATION_DB:b.STORAGE_PUBLICATION_DB,STORAGE_ANALYTICS_DB:undefined,
+    STORAGE_INGESTION_A:offlineSource} as unknown as Env;
+  const request=()=>new Request(`https://synthetic.example.test/api/v1/community/daily?from=${observedDay}&to=${observedDay}`);
+  const first=await handleRequest(request(),runtime);expect(first.status).toBe(200);
+  expect(first.headers.get('cache-control')).toBe('public, max-age=300');
+  const text=await first.text();const body=JSON.parse(text);
+  expect(body).toMatchObject({schemaVersion:'community-daily-read-v1.0',allowanceState:'ready',
+    allowanceReadState:'confirmed',days:[{revision:1,payload:{suppression:'none_daily_grain_by_owner_decision',
+      totals:{contributingParticipants:1,usageEvents:2}}}]});
+  expect(body.allowanceBreakdowns.days.find((row:{day:string})=>row.day===observedDay).combined.centralUsd).toBe(25);
+  expect(body.allowanceBreakdowns).not.toHaveProperty('coverage');
+  for(const privateValue of [owner,source.sourceId,source.sourceNamespace])expect(text).not.toContain(privateValue);
+
+  await advanceMultiSourcePublicationGenerations(b.STORAGE_PUBLICATION_DB,{routingGeneration:2,erasureGeneration:0});
+  expect((await handleRequest(request(),runtime)).status).toBe(200);
+  await invalidateMultiSourcePublicationsForErasure(b.STORAGE_PUBLICATION_DB);
+  const erased=await handleRequest(request(),runtime);expect(erased.status).toBe(503);
+  expect(erased.headers.get('cache-control')).toBe('no-store');
+  await expect(erased.json()).resolves.toMatchObject({error:{code:'BACKEND_STORAGE_UNAVAILABLE'}});
  });
 
  it('keeps a two-source erasure incomplete until every declared analytics target has a durable receipt',async()=>{

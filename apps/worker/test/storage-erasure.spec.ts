@@ -24,7 +24,8 @@ import {ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,ACCOUNTLESS_ENROLLMENT_POLICY
 import {ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
  createAccountlessUploadOwner} from '../src/accountless-ownership';
-import {createCatalogStorageRouter,createOwnerMoveCoordinator} from '../src/storage-routing';
+import {createCatalogStorageRouter,createOwnerMoveCoordinator,
+ initializeAccountlessIssuanceBaseline} from '../src/storage-routing';
 import {configureStorageShardAllocation,recordStorageCapacityObservation} from '../src/storage-capacity';
 import {registerParticipantOwnerRoute} from '../src/storage-routing-runtime';
 import {publishMultiSourceCommunityDaily,readMultiSourcePublication} from '../src/storage-multi-source-publication';
@@ -209,6 +210,8 @@ describe('cross-store physical erasure completion',()=>{
  });
  it('removes a retained routed copy and resumes an unavailable derived target from durable receipts',async()=>{
   await applyD1Migrations(b.STORAGE_ROUTING_DB,b.TEST_ROUTING_MIGRATIONS);
+  await initializeAccountlessIssuanceBaseline(b.STORAGE_ROUTING_DB,{budgetDay:'1970-01-01',
+   dailyReserved:0,lifetimeReserved:0,baselineDigest:'f'.repeat(64),initializedAt:1000});
   await initializeCatalogErasureStore(b.STORAGE_INGESTION_A,b.STORAGE_ANALYTICS_A,'routed-source-a');
   await initializeCatalogErasureStore(b.STORAGE_INGESTION_B,b.STORAGE_ANALYTICS_B,'routed-source-b');
   await applyD1Migrations(b.STORAGE_INGESTION_C,b.TEST_INGESTION_ROUTING_MIGRATIONS);
@@ -225,7 +228,7 @@ describe('cross-store physical erasure completion',()=>{
     STORAGE_INGESTION_B:b.STORAGE_INGESTION_B,STORAGE_INGESTION_C:b.STORAGE_INGESTION_C};
   const router=createCatalogStorageRouter({catalog:b.STORAGE_ROUTING_DB,bindings:shardBindings,clock:()=>1500});
   const ownerId='accountless:retained-erasure-owner';
-  const sourceRoute=await router.ensureOwner(ownerId,'a',1);
+  let sourceRoute=await router.ensureOwner(ownerId,'a',1);
   const deviceId=crypto.randomUUID(),secret=crypto.getRandomValues(new Uint8Array(32));
   const prefix=new TextEncoder().encode(`app-usagemonitor/device/v1\0${deviceId}\0`);
   const hashInput=new Uint8Array(prefix.length+secret.length);hashInput.set(prefix);hashInput.set(secret,prefix.length);
@@ -235,7 +238,15 @@ describe('cross-store physical erasure completion',()=>{
   hashInput.fill(0);
   const authorization=`Device um_device_${deviceId}.${encodeBase64Url(secret)}`;secret.fill(0);
   const ownerNow=Date.now();
-  await enrollAccountlessDevice(b.STORAGE_INGESTION_A,enrollment,ownerNow,sourceRoute);
+  const capabilityHash=[...enrollment.deviceSecretHash]
+   .map(value=>value.toString(16).padStart(2,'0')).join('');
+  await b.STORAGE_ROUTING_DB.prepare(`INSERT INTO storage_capability_locators
+   (capability_hash,owner_id,state) VALUES (?,?,'active')`).bind(capabilityHash,ownerId).run();
+  const allocation=await router.ensureCapabilityOwner(capabilityHash,
+   await sha256Hex(`app-usagemonitor/storage-accountless-device/v1\0${deviceId}`),ownerId,1);
+  sourceRoute=allocation.route;
+  await enrollAccountlessDevice(b.STORAGE_INGESTION_A,enrollment,ownerNow,sourceRoute,
+   allocation.issuanceReservation);
   expect(await b.STORAGE_INGESTION_A.prepare('SELECT state FROM storage_owner_fences WHERE owner_id=?')
     .bind(ownerId).first('state')).toBe('active');
   expect(await b.STORAGE_INGESTION_A.prepare('SELECT installation_principal_id FROM accountless_enrollment_ledger WHERE device_id=?')
@@ -258,7 +269,8 @@ describe('cross-store physical erasure completion',()=>{
   await mover.begin('retained-erasure-move',sourceRoute,'b');await mover.fenceSource('retained-erasure-move');
   await mover.verifyCopied('retained-erasure-move');await mover.commit('retained-erasure-move');
   const currentRoute=await mover.activateDestination('retained-erasure-move');
-  await enrollAccountlessDevice(b.STORAGE_INGESTION_B,enrollment,ownerNow,currentRoute);
+  await enrollAccountlessDevice(b.STORAGE_INGESTION_B,enrollment,ownerNow,currentRoute,
+   allocation.issuanceReservation);
   for(const table of ['participants','device_credentials','accountless_upload_owners','accountless_v11_device_authorizations']){
     await copyRows(table,b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B);
   }

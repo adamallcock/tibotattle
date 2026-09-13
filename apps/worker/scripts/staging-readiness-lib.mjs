@@ -127,6 +127,7 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0001_deletion_tombstones.sql",
     "0002_identity_reenrollment_cooldown.sql",
     "0003_storage_erasure_jobs.sql",
+    "0004_storage_erasure_targets.sql",
   ]),
 });
 

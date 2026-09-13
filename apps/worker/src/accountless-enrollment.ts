@@ -1,8 +1,9 @@
-import { timingSafeEqual } from "./crypto";
+import { sha256Hex, timingSafeEqual } from "./crypto";
 import { ApiError } from "./errors";
 import { parseStrictJson } from "./strict-json";
 import { ownerWriteFenceStatement } from "./storage-routing-fence";
 import type { OwnerStorageRoute } from "./storage-routing";
+import type { AccountlessIssuanceReservation } from "./storage-routing";
 
 export const ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION =
   "accountless-enrollment-v0.1";
@@ -256,19 +257,51 @@ function validNow(nowEpoch: number): void {
   }
 }
 
+function requestReservationKey(request: AccountlessEnrollmentRequest): string {
+  return [...request.deviceSecretHash]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function assertIssuanceReservation(
+  request: AccountlessEnrollmentRequest,
+  ownerRoute: OwnerStorageRoute | undefined,
+  reservation: AccountlessIssuanceReservation | undefined,
+): Promise<boolean> {
+  if (ownerRoute?.mode !== "catalog") {
+    if (reservation !== undefined) {
+      throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+    }
+    return false;
+  }
+  if (!reservation
+      || reservation.ownerId !== ownerRoute.ownerId
+      || reservation.deviceDigest !== await sha256Hex(
+        `app-usagemonitor/storage-accountless-device/v1\0${request.deviceId}`,
+      )
+      || reservation.reservationKey !== requestReservationKey(request)) {
+    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+  return true;
+}
+
 /**
- * Atomically issue one enrollment-only ledger row. The preflight replay read
- * is intentionally outside the issuance counter: retries and revocation
- * checks do not consume the candidate budget. A raced duplicate insert rolls
- * back the counter in D1, then is resolved by one bounded replay read.
+ * Atomically issue one enrollment-only ledger row. Single-database mode keeps
+ * its issuance counter in this same batch. Catalog mode requires the matching
+ * immutable global reservation first and never advances a shard-local counter.
+ * A raced duplicate is resolved by one bounded replay read in either mode.
  */
 export async function enrollAccountlessDevice(
   db: D1Database,
   request: AccountlessEnrollmentRequest,
   nowEpoch = Date.now(),
   ownerRoute?: OwnerStorageRoute,
+  issuanceReservation?: AccountlessIssuanceReservation,
 ): Promise<AccountlessEnrollmentResult> {
   validNow(nowEpoch);
+  const globallyReserved = await assertIssuanceReservation(
+    request, ownerRoute, issuanceReservation,
+  );
   if (!db || typeof db.prepare !== "function") {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }
@@ -288,7 +321,7 @@ export async function enrollAccountlessDevice(
   const installationPrincipalId = ownerRoute?.ownerId
     ?? `accountless:${crypto.randomUUID()}`;
   const day = utcDay(nowEpoch);
-  const updateBudget = db.prepare(`
+  const updateBudget = globallyReserved ? null : db.prepare(`
     UPDATE accountless_enrollment_issuance
        SET budget_day = ?,
            daily_issued = CASE WHEN budget_day = ? THEN daily_issued + 1 ELSE 1 END,
@@ -309,7 +342,28 @@ export async function enrollAccountlessDevice(
     day,
     ACCOUNTLESS_ENROLLMENT_DAILY_ISSUANCE_BUDGET,
   );
-  const insertLedger = db.prepare(`
+  const insertLedger = globallyReserved ? db.prepare(`
+    INSERT INTO accountless_enrollment_ledger (
+      device_id,
+      device_secret_hash,
+      installation_principal_id,
+      schema_version,
+      policy_version,
+      authorization_basis,
+      state,
+      issued_at,
+      expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+  `).bind(
+    request.deviceId,
+    request.deviceSecretHash,
+    installationPrincipalId,
+    request.schemaVersion,
+    request.policyVersion,
+    request.authorizationBasis,
+    issuedAt,
+    expiresAt,
+  ) : db.prepare(`
     INSERT INTO accountless_enrollment_ledger (
       device_id,
       device_secret_hash,
@@ -341,15 +395,16 @@ export async function enrollAccountlessDevice(
     const guarded = ownerRoute?.mode === "catalog"
       ? [ownerWriteFenceStatement(db, ownerRoute)]
       : [];
-    const results = await db.batch([
+    const statements = [
       ...guarded,
-      updateBudget,
+      ...(updateBudget ? [updateBudget] : []),
       insertLedger,
-    ]);
-    const budgetResult = results[guarded.length];
-    const insertResult = results[guarded.length + 1];
-    if (!budgetResult || !insertResult
-        || budgetResult.meta.changes !== 1
+    ];
+    const results = await db.batch(statements);
+    const budgetResult = updateBudget ? results[guarded.length] : null;
+    const insertResult = results[guarded.length + (updateBudget ? 1 : 0)];
+    if (!insertResult
+        || (budgetResult !== null && budgetResult?.meta.changes !== 1)
         || insertResult.meta.changes !== 1) {
       // A concurrent identical request can observe the final budget slot as
       // unavailable after the winner commits. Resolve that one replay before

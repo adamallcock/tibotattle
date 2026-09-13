@@ -20,7 +20,8 @@ import { encodeBase64Url, sha256, sha256Hex } from "../src/crypto";
 import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository";
 import { activateTelemetryV11Domain,
   createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
-import { createCatalogStorageRouter, type OwnerStorageRoute } from "../src/storage-routing";
+import { createCatalogStorageRouter, initializeAccountlessIssuanceBaseline,
+  type AccountlessIssuanceReservation, type OwnerStorageRoute } from "../src/storage-routing";
 import { configureStorageShardAllocation,
   recordStorageCapacityObservation } from "../src/storage-capacity";
 import { captureStorageMultiSourceCohort,
@@ -60,6 +61,11 @@ const cohortEnv = () => ({ STORAGE_ROUTING_DB: b.STORAGE_ROUTING_DB, ...routeBin
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(b.STORAGE_ROUTING_DB, b.TEST_ROUTING_MIGRATIONS);
+  await initializeAccountlessIssuanceBaseline(b.STORAGE_ROUTING_DB, {
+    budgetDay: new Date().toISOString().slice(0, 10), dailyReserved: 0,
+    lifetimeReserved: 0, baselineDigest: "f".repeat(64),
+    initializedAt: Date.now(),
+  });
   await applyD1Migrations(b.DELETION_LEDGER, b.TEST_DELETION_LEDGER_MIGRATIONS);
   await applyD1Migrations(b.STORAGE_PUBLICATION_DB, b.TEST_ANALYTICS_MIGRATIONS);
   for (const shard of ["a", "b", "c"] as const) {
@@ -93,14 +99,6 @@ beforeEach(async () => {
 async function seedOwner(shard: "a" | "b" | "c", ownerId: string,
   options: { catalog?: boolean; fill?: string } = {}) {
   const db = sources()[shard], now = Date.now();
-  let route: OwnerStorageRoute;
-  if (options.catalog !== false) route = await router().ensureOwner(ownerId, shard, 1);
-  else {
-    route = { mode: "catalog", ownerId, shardId: shard,
-      bindingName: `STORAGE_INGESTION_${shard.toUpperCase()}`, generation: 1 };
-    await db.prepare("INSERT INTO storage_owner_fences VALUES(?,?,1,'active',NULL,NULL)")
-      .bind(ownerId, shard).run();
-  }
   const deviceId = crypto.randomUUID();
   const secret = crypto.getRandomValues(new Uint8Array(32));
   const prefix = new TextEncoder().encode(`app-usagemonitor/device/v1\0${deviceId}\0`);
@@ -110,7 +108,28 @@ async function seedOwner(shard: "a" | "b" | "c", ownerId: string,
     authorizationBasis: ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS } as const;
   input.fill(0);
   const authorization = `Device um_device_${deviceId}.${encodeBase64Url(secret)}`; secret.fill(0);
-  await enrollAccountlessDevice(db, request, now, route);
+  let route: OwnerStorageRoute;
+  let issuanceReservation: AccountlessIssuanceReservation | undefined;
+  if (options.catalog !== false) {
+    route = await router().ensureOwner(ownerId, shard, 1);
+    const capabilityHash = [...request.deviceSecretHash]
+      .map(value => value.toString(16).padStart(2, "0")).join("");
+    await b.STORAGE_ROUTING_DB.prepare(`INSERT INTO storage_capability_locators
+      (capability_hash,owner_id,state) VALUES (?,?,'active')`)
+      .bind(capabilityHash, ownerId).run();
+    const allocation = await router().ensureCapabilityOwner(
+      capabilityHash,
+      await sha256Hex(`app-usagemonitor/storage-accountless-device/v1\0${deviceId}`),
+      ownerId,
+      1,
+    );
+    route = allocation.route;
+    issuanceReservation = allocation.issuanceReservation;
+  } else {
+    route = { mode: "single", ownerId, shardId: "primary",
+      bindingName: "USAGE_MONITOR_DB", generation: 0 };
+  }
+  await enrollAccountlessDevice(db, request, now, route, issuanceReservation);
   const owner = await createAccountlessUploadOwner(db, authorization, {
     schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
     policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,

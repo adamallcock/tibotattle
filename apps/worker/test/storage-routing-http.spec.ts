@@ -25,7 +25,11 @@ import {
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import { configureStorageShardAllocation, recordStorageCapacityObservation } from "../src/storage-capacity";
-import { STORAGE_NEW_OWNER_CUTOFF_BYTES } from "../src/storage-routing";
+import {
+  createCatalogStorageRouter,
+  initializeAccountlessIssuanceBaseline,
+  STORAGE_NEW_OWNER_CUTOFF_BYTES,
+} from "../src/storage-routing";
 import { initializeStorageSource } from "../src/analytics-delivery";
 import { initializeTypedV11Admission } from "../src/typed-v11-admission";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
@@ -304,6 +308,105 @@ function refuseParticipantLocator(database: D1Database): D1Database {
   });
 }
 
+function refuseAccountlessLedgerBatch(database: D1Database): D1Database {
+  const enrollmentStatements = new WeakSet<object>();
+  return new Proxy(database, {
+    get(target, key) {
+      if (key === "prepare") return (sql: string) => {
+        const statement = target.prepare(sql);
+        if (!/INSERT INTO accountless_enrollment_ledger/u.test(sql)) return statement;
+        return new Proxy(statement, {
+          get(value, member) {
+            if (member === "bind") return (...values: Parameters<D1PreparedStatement["bind"]>) => {
+              const bound = value.bind(...values);
+              enrollmentStatements.add(bound);
+              return bound;
+            };
+            const property = Reflect.get(value, member);
+            return typeof property === "function" ? property.bind(value) : property;
+          },
+        });
+      };
+      if (key === "batch") return async (statements: D1PreparedStatement[]) => {
+        if (statements.some((statement) => enrollmentStatements.has(statement))) {
+          throw new Error("synthetic shard enrollment refusal");
+        }
+        return target.batch(statements);
+      };
+      const property = Reflect.get(target, key);
+      return typeof property === "function" ? property.bind(target) : property;
+    },
+  });
+}
+
+function loseFirstCatalogBatchAcknowledgement(database: D1Database): D1Database {
+  let lost = false;
+  return new Proxy(database, {
+    get(target, key) {
+      if (key === "batch") return async (statements: D1PreparedStatement[]) => {
+        const result = await target.batch(statements);
+        if (!lost) {
+          lost = true;
+          throw new Error("synthetic committed catalog acknowledgement loss");
+        }
+        return result;
+      };
+      const property = Reflect.get(target, key);
+      return typeof property === "function" ? property.bind(target) : property;
+    },
+  });
+}
+
+function refuseCatalogIssuanceBatch(database: D1Database): D1Database {
+  const issuanceStatements = new WeakSet<object>();
+  return new Proxy(database, {
+    get(target, key) {
+      if (key === "prepare") return (sql: string) => {
+        const statement = target.prepare(sql);
+        if (!/INSERT INTO storage_accountless_issuance_reservations/u.test(sql)) {
+          return statement;
+        }
+        return new Proxy(statement, {
+          get(value, member) {
+            if (member === "bind") return (...values: Parameters<D1PreparedStatement["bind"]>) => {
+              const bound = value.bind(...values);
+              issuanceStatements.add(bound);
+              return bound;
+            };
+            const property = Reflect.get(value, member);
+            return typeof property === "function" ? property.bind(value) : property;
+          },
+        });
+      };
+      if (key === "batch") return async (statements: D1PreparedStatement[]) => {
+        if (statements.some((statement) => issuanceStatements.has(statement))) {
+          throw new Error("synthetic catalog issuance refusal");
+        }
+        return target.batch(statements);
+      };
+      const property = Reflect.get(target, key);
+      return typeof property === "function" ? property.bind(target) : property;
+    },
+  });
+}
+
+async function prepareEnrollmentRoute(deviceId: string, secret: Uint8Array,
+  ownerId: string, shardId: "a" | "b"): Promise<void> {
+  const route = await createCatalogStorageRouter({
+    catalog: catalog(),
+    bindings: {
+      STORAGE_INGESTION_A: shardA(),
+      STORAGE_INGESTION_B: shardB(),
+      STORAGE_INGESTION_C: shardC(),
+    },
+    clock: Date.now,
+  }).ensureOwner(ownerId, shardId, 16_777_216);
+  const capabilityHash = await deviceSecretHash(deviceId, secret);
+  await catalog().prepare(`INSERT INTO storage_capability_locators
+    (capability_hash,owner_id,state) VALUES (?,?,'active')`)
+    .bind(capabilityHash, route.ownerId).run();
+}
+
 async function observe(shardId: string, observedBytes: number,
   allocationTier: "active" | "spare" = "active"): Promise<void> {
   await recordStorageCapacityObservation(catalog(), {
@@ -321,6 +424,13 @@ beforeEach(async () => {
   await applyD1Migrations(bindings().DELETION_LEDGER,
     bindings().TEST_DELETION_LEDGER_MIGRATIONS);
   await applyD1Migrations(catalog(), bindings().TEST_ROUTING_MIGRATIONS);
+  await initializeAccountlessIssuanceBaseline(catalog(), {
+    budgetDay: new Date().toISOString().slice(0, 10),
+    dailyReserved: 0,
+    lifetimeReserved: 0,
+    baselineDigest: "f".repeat(64),
+    initializedAt: Date.now() - 2_000,
+  });
   for (const database of [shardA(), shardB(), shardC()]) {
     await applyD1Migrations(database, bindings().TEST_MIGRATIONS);
     await applyD1Migrations(database,
@@ -341,6 +451,25 @@ beforeEach(async () => {
 });
 
 describe("catalog-routed accountless HTTP lifecycle", () => {
+  it("refuses catalog enrollment until the historical issuance baseline is qualified", async () => {
+    await catalog().prepare(`UPDATE storage_accountless_issuance_state
+      SET budget_day='1970-01-01',initialization_state='uninitialized',
+          daily_reserved=0,lifetime_reserved=0,last_reservation_key='',
+          baseline_digest=NULL,initialized_at=NULL,updated_at=0
+      WHERE singleton_id=1`).run();
+    const deviceId = crypto.randomUUID();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const response = await enroll(deviceId, secret);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      error: { code: "ADMISSION_CONFIGURATION_INVALID" },
+    });
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_owner_routes`).first("n")).toBe(0);
+    expect(await shardA().prepare(`SELECT count(*) AS n
+      FROM accountless_enrollment_ledger`).first("n")).toBe(0);
+  });
+
   it("routes two synthetic owners to separate shards while preserving replay", async () => {
     const firstId = crypto.randomUUID();
     const firstSecret = crypto.getRandomValues(new Uint8Array(32));
@@ -371,6 +500,187 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
       .bind(digest, participantId).first("n")).toBe(1);
     expect((await storageForParticipantOwner(runtime(), participantId!)).route)
       .toMatchObject({ ownerId: expect.stringMatching(/^accountless:/u), shardId: "a" });
+    expect(await catalog().prepare(`SELECT daily_reserved,lifetime_reserved
+      FROM storage_accountless_issuance_state WHERE singleton_id=1`).first())
+      .toEqual({ daily_reserved: 2, lifetime_reserved: 2 });
+    expect(await shardA().prepare(`SELECT daily_issued FROM accountless_enrollment_issuance
+      WHERE singleton=1`).first("daily_issued")).toBe(0);
+    expect(await shardB().prepare(`SELECT daily_issued FROM accountless_enrollment_issuance
+      WHERE singleton=1`).first("daily_issued")).toBe(0);
+  });
+
+  it("enforces one global final issuance slot across different routed shards", async () => {
+    const firstId = crypto.randomUUID();
+    const secondId = crypto.randomUUID();
+    const firstSecret = crypto.getRandomValues(new Uint8Array(32));
+    const secondSecret = crypto.getRandomValues(new Uint8Array(32));
+    await prepareEnrollmentRoute(firstId, firstSecret, "accountless:global-a", "a");
+    await prepareEnrollmentRoute(secondId, secondSecret, "accountless:global-b", "b");
+    const day = new Date().toISOString().slice(0, 10);
+    await catalog().prepare(`UPDATE storage_accountless_issuance_state
+      SET budget_day=?,daily_reserved=999,lifetime_reserved=9999,
+          last_reservation_key='',updated_at=? WHERE singleton_id=1`)
+      .bind(day, Date.now()).run();
+
+    const [first, second] = await Promise.all([
+      enroll(firstId, firstSecret),
+      enroll(secondId, secondSecret),
+    ]);
+    expect([first.status, second.status].sort()).toEqual([201, 429]);
+    const winner = first.status === 201
+      ? { id: firstId, secret: firstSecret }
+      : { id: secondId, secret: secondSecret };
+    const loser = first.status === 429
+      ? { id: firstId, secret: firstSecret }
+      : { id: secondId, secret: secondSecret };
+    expect((await enroll(winner.id, winner.secret)).status).toBe(200);
+    expect((await enroll(loser.id, loser.secret)).status).toBe(429);
+    expect(await catalog().prepare(`SELECT daily_reserved,lifetime_reserved
+      FROM storage_accountless_issuance_state WHERE singleton_id=1`).first())
+      .toEqual({ daily_reserved: 1000, lifetime_reserved: 10000 });
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_accountless_issuance_reservations`).first("n")).toBe(1);
+    const localRows = Number(await shardA().prepare(`SELECT count(*) AS n
+      FROM accountless_enrollment_ledger`).first("n"))
+      + Number(await shardB().prepare(`SELECT count(*) AS n
+        FROM accountless_enrollment_ledger`).first("n"));
+    expect(localRows).toBe(1);
+  });
+
+  it("keeps a catalog reservation spent after a definite shard refusal and retries exactly", async () => {
+    const deviceId = crypto.randomUUID();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const refused = await api("/api/v1/accountless/enrollment", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schemaVersion: ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
+        deviceId,
+        deviceSecretHash: await deviceSecretHash(deviceId, secret),
+        policyVersion: ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+        authorizationBasis: ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
+      }),
+    }, runtime({ STORAGE_INGESTION_A: refuseAccountlessLedgerBatch(shardA()) }));
+    expect(refused.status).toBe(503);
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_accountless_issuance_reservations`).first("n")).toBe(1);
+    expect(await catalog().prepare(`SELECT lifetime_reserved
+      FROM storage_accountless_issuance_state WHERE singleton_id=1`)
+      .first("lifetime_reserved")).toBe(1);
+    expect(await shardA().prepare(`SELECT count(*) AS n
+      FROM accountless_enrollment_ledger`).first("n")).toBe(0);
+
+    expect((await enroll(deviceId, secret)).status).toBe(201);
+    expect(await catalog().prepare(`SELECT lifetime_reserved
+      FROM storage_accountless_issuance_state WHERE singleton_id=1`)
+      .first("lifetime_reserved")).toBe(1);
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_owner_routes`).first("n")).toBe(1);
+  });
+
+  it("creates no shard authority when the central reservation is not durable", async () => {
+    const deviceId = crypto.randomUUID();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const response = await api("/api/v1/accountless/enrollment", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schemaVersion: ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
+        deviceId,
+        deviceSecretHash: await deviceSecretHash(deviceId, secret),
+        policyVersion: ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+        authorizationBasis: ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
+      }),
+    }, runtime({ STORAGE_ROUTING_DB: refuseCatalogIssuanceBatch(catalog()) }));
+    expect(response.status).toBe(503);
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_accountless_issuance_reservations`).first("n")).toBe(0);
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_owner_routes`).first("n")).toBe(0);
+    expect(await shardA().prepare(`SELECT count(*) AS n
+      FROM accountless_enrollment_ledger`).first("n")).toBe(0);
+  });
+
+  it("keeps the original budget day when a failed shard write retries after midnight", async () => {
+    const deviceId = crypto.randomUUID();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const firstInstant = Date.parse("2026-09-13T23:59:59.000Z");
+    const retryInstant = Date.parse("2026-09-14T00:00:01.000Z");
+    await recordStorageCapacityObservation(catalog(), {
+      shardId: "a", observedBytes: 1_000, observedAt: firstInstant - 1_000,
+      validUntil: retryInstant + 60_000, pressureState: "normal",
+    });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(firstInstant);
+    try {
+      const body = JSON.stringify({
+        schemaVersion: ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
+        deviceId,
+        deviceSecretHash: await deviceSecretHash(deviceId, secret),
+        policyVersion: ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+        authorizationBasis: ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
+      });
+      const first = await api("/api/v1/accountless/enrollment", {
+        method: "POST", headers: { "content-type": "application/json" }, body,
+      }, runtime({ STORAGE_INGESTION_A: refuseAccountlessLedgerBatch(shardA()) }));
+      expect(first.status).toBe(503);
+      clock.mockReturnValue(retryInstant);
+      const retry = await api("/api/v1/accountless/enrollment", {
+        method: "POST", headers: { "content-type": "application/json" }, body,
+      });
+      expect(retry.status, await retry.clone().text()).toBe(201);
+      expect(await catalog().prepare(`SELECT budget_day,reserved_at
+        FROM storage_accountless_issuance_reservations`).first())
+        .toEqual({ budget_day: "2026-09-13", reserved_at: firstInstant });
+      expect(await catalog().prepare(`SELECT budget_day,daily_reserved,lifetime_reserved
+        FROM storage_accountless_issuance_state WHERE singleton_id=1`).first())
+        .toEqual({ budget_day: "2026-09-13", daily_reserved: 1, lifetime_reserved: 1 });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("converges after a committed catalog batch loses its acknowledgement", async () => {
+    const deviceId = crypto.randomUUID();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const response = await api("/api/v1/accountless/enrollment", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schemaVersion: ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
+        deviceId,
+        deviceSecretHash: await deviceSecretHash(deviceId, secret),
+        policyVersion: ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+        authorizationBasis: ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
+      }),
+    }, runtime({
+      STORAGE_ROUTING_DB: loseFirstCatalogBatchAcknowledgement(catalog()),
+    }));
+    expect(response.status, await response.clone().text()).toBe(201);
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_accountless_issuance_reservations`).first("n")).toBe(1);
+    expect(await catalog().prepare(`SELECT lifetime_reserved
+      FROM storage_accountless_issuance_state WHERE singleton_id=1`)
+      .first("lifetime_reserved")).toBe(1);
+    expect(await shardA().prepare(`SELECT count(*) AS n
+      FROM accountless_enrollment_ledger`).first("n")).toBe(1);
+  });
+
+  it("rejects one client device digest from splitting across two owners", async () => {
+    const deviceId = crypto.randomUUID();
+    const firstSecret = crypto.getRandomValues(new Uint8Array(32));
+    const secondSecret = crypto.getRandomValues(new Uint8Array(32));
+    expect((await enroll(deviceId, firstSecret)).status).toBe(201);
+    await observe("a", STORAGE_NEW_OWNER_CUTOFF_BYTES);
+    const conflict = await enroll(deviceId, secondSecret);
+    expect(conflict.status).toBe(409);
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_accountless_issuance_reservations`).first("n")).toBe(1);
+    expect(await shardA().prepare(`SELECT count(*) AS n
+      FROM accountless_enrollment_ledger`).first("n")).toBe(1);
+    expect(await shardB().prepare(`SELECT count(*) AS n
+      FROM accountless_enrollment_ledger`).first("n")).toBe(0);
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_owner_routes`).first("n")).toBe(1);
   });
 
   it("keeps credential lookup separate from shard authentication and fails closed", async () => {
@@ -458,6 +768,9 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
       .toBe(1);
     expect(await shardA().prepare("SELECT count(*) AS n FROM participants").first("n"))
       .toBe(1);
+    expect(await catalog().prepare(`SELECT lifetime_reserved
+      FROM storage_accountless_issuance_state WHERE singleton_id=1`)
+      .first("lifetime_reserved")).toBe(1);
   });
 
   it("routes upload registration and durable disconnect through the same owner shard", async () => {
@@ -536,6 +849,35 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
     });
     expect(await shardA().prepare("SELECT count(*) AS n FROM typed_v11_record_admissions").first("n"))
       .toBe(1);
+  });
+
+  it("keeps a healthy routed upload available when an unrelated shard is offline", async () => {
+    const prepared = await preparedV11Owner();
+    const unavailableB = new Proxy(shardB(), {
+      get(target, key) {
+        if (key === "prepare") return () => {
+          throw new Error("synthetic unrelated shard unavailable");
+        };
+        const property = Reflect.get(target, key);
+        return typeof property === "function" ? property.bind(target) : property;
+      },
+    });
+    const isolatedRuntime = runtime({ STORAGE_INGESTION_B: unavailableB });
+    const upload = await registerUpload(
+      prepared.deviceAuthorization, prepared.raw, isolatedRuntime,
+    );
+    const accepted = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${upload}`,
+        "content-type": "application/json",
+      },
+      body: prepared.raw,
+    }, isolatedRuntime);
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    expect(await shardA().prepare(
+      "SELECT count(*) AS n FROM typed_v11_record_admissions",
+    ).first("n")).toBe(1);
   });
 
   it("uses each routed shard's explicit immutable typed source namespace", async () => {

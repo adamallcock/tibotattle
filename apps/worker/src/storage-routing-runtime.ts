@@ -14,6 +14,8 @@ import {
   createSingleIngestionShardRouter,
   STORAGE_SHARD_OPERATING_CAP_BYTES,
   StorageRoutingError,
+  type AccountlessIssuanceReservation,
+  type AccountlessOwnerAllocation,
   type OwnerStorageRoute,
   type OwnerStorageTarget,
   type ActiveOwnerRouteSnapshot,
@@ -25,6 +27,9 @@ export interface OwnerStorageContext {
   readonly database: D1Database;
   readonly route: OwnerStorageRoute;
 }
+export interface AccountlessEnrollmentStorageContext extends OwnerStorageContext {
+  readonly issuanceReservation?: AccountlessIssuanceReservation;
+}
 export interface OwnerStorageTargetContext extends OwnerStorageTarget {
   readonly database: D1Database;
 }
@@ -34,9 +39,10 @@ interface CatalogRouter {
   database(route: OwnerStorageRoute): Promise<D1Database>;
   ensureCapabilityOwner(
     capabilityHash: string,
+    deviceDigest: string,
     proposedOwnerId: string,
     reservationBytes: number,
-  ): Promise<OwnerStorageRoute>;
+  ): Promise<AccountlessOwnerAllocation>;
   locateCapability(capabilityHash: string): Promise<OwnerStorageRoute | null>;
   registerCapability(capabilityHash: string, route: OwnerStorageRoute): Promise<void>;
   revokeCapability(capabilityHash: string, route: OwnerStorageRoute): Promise<void>;
@@ -111,6 +117,20 @@ function hex(bytes: Uint8Array): string {
 
 function routingFailure(error: unknown, unknownCapability = false): never {
   if (error instanceof ApiError) throw error;
+  if (error instanceof StorageRoutingError
+      && error.code === "ISSUANCE_LIMIT_REACHED") {
+    throw new ApiError(429, "ACCOUNTLESS_ENROLLMENT_LIMIT_REACHED", {
+      responseHeaders: { "retry-after": "86400" },
+    });
+  }
+  if (error instanceof StorageRoutingError
+      && error.code === "ENROLLMENT_CONFLICT") {
+    throw new ApiError(409, "ACCOUNTLESS_ENROLLMENT_CONFLICT");
+  }
+  if (error instanceof StorageRoutingError
+      && error.code === "ISSUANCE_UNINITIALIZED") {
+    throw new ApiError(503, "ADMISSION_CONFIGURATION_INVALID");
+  }
   if (unknownCapability && error instanceof StorageRoutingError
       && ["ROUTE_NOT_FOUND", "ROUTE_NOT_ACTIVE"].includes(error.code)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
@@ -126,7 +146,7 @@ function routingFailure(error: unknown, unknownCapability = false): never {
 export async function storageForAccountlessEnrollment(
   env: Env,
   request: AccountlessEnrollmentRequest,
-): Promise<OwnerStorageContext> {
+): Promise<AccountlessEnrollmentStorageContext> {
   if (routingMode(env) === "single") {
     const route = await createSingleIngestionShardRouter({
       database: env.USAGE_MONITOR_DB,
@@ -135,12 +155,17 @@ export async function storageForAccountlessEnrollment(
   }
   try {
     const router = catalogRouter(env);
-    const route = await router.ensureCapabilityOwner(
+    const allocation = await router.ensureCapabilityOwner(
       hex(request.deviceSecretHash),
+      await sha256Hex(`app-usagemonitor/storage-accountless-device/v1\0${request.deviceId}`),
       `accountless:${crypto.randomUUID()}`,
       reservationBytes(env),
     );
-    return { route, database: await router.database(route) };
+    return {
+      route: allocation.route,
+      database: await router.database(allocation.route),
+      issuanceReservation: allocation.issuanceReservation,
+    };
   } catch (error) {
     return routingFailure(error, true);
   }

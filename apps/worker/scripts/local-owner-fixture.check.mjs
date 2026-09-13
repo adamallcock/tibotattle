@@ -71,6 +71,10 @@ test("owner Worker config is local, one-owner-only and excludes hosted environme
     { ...baseConfig, name: "production" },
     { ...baseConfig, vars: { ENVIRONMENT: "production" } },
     { ...baseConfig, d1_databases: [{ ...baseConfig.d1_databases[0], database_id: "real-resource" }] },
+    { ...baseConfig, d1_databases: baseConfig.d1_databases.map(binding => binding.binding === "STORAGE_INGESTION_A"
+      ? { ...binding, database_id: "11111111-1111-4111-8111-111111111111" } : binding) },
+    { ...baseConfig, d1_databases: baseConfig.d1_databases.map(binding => binding.binding === "STORAGE_INGESTION_A"
+      ? { ...binding, binding: "STORAGE_INGESTION_B" } : binding) },
     { ...baseConfig, r2_buckets: [{ ...baseConfig.r2_buckets[0], remote: true }] },
     { ...baseConfig, services: [{ binding: "REMOTE" }] },
   ]) assert.throws(() => localOwnerWorkerConfig(config, { identityKey: key }));

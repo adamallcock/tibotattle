@@ -7,6 +7,7 @@ import {
   captureActiveOwnerRouteSnapshot,
   createCatalogStorageRouter,
   createOwnerMoveCoordinator,
+  initializeAccountlessIssuanceBaseline,
   STORAGE_NEW_OWNER_CUTOFF_BYTES,
 } from "../src/storage-routing";
 
@@ -53,6 +54,10 @@ async function observe(
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(catalog(), bindings().TEST_ROUTING_MIGRATIONS);
+  await initializeAccountlessIssuanceBaseline(catalog(), {
+    budgetDay: "1970-01-01", dailyReserved: 0, lifetimeReserved: 0,
+    baselineDigest: "f".repeat(64), initializedAt: 9_000,
+  });
   for (const database of Object.values(shards())) {
     await applyD1Migrations(database,
       bindings().TEST_INGESTION_ROUTING_MIGRATIONS);
@@ -65,16 +70,34 @@ beforeEach(async () => {
 });
 
 describe("owner shard allocation capacity", () => {
+  it("refuses owner allocation until historical issuance is qualified", async () => {
+    await observe("a", 1_000);
+    await catalog().prepare(`UPDATE storage_accountless_issuance_state
+      SET budget_day='1970-01-01',initialization_state='uninitialized',
+          daily_reserved=0,lifetime_reserved=0,last_reservation_key='',
+          baseline_digest=NULL,initialized_at=NULL,updated_at=0
+      WHERE singleton_id=1`).run();
+    await expect(router().ensureCapabilityOwner(
+      "9".repeat(64), "8".repeat(64), "accountless:unqualified", 1,
+    )).rejects.toMatchObject({ code: "ISSUANCE_UNINITIALIZED" });
+    expect(await catalog().prepare(`SELECT count(*) AS n
+      FROM storage_owner_routes`).first("n")).toBe(0);
+  });
+
   it("prefers measured active capacity and retains the qualified spare", async () => {
     await observe("a", 5_500_000_000);
     await observe("b", 1_000_000_000);
     await observe("c", 0, "spare");
     const route = await router().ensureCapabilityOwner(
       "a".repeat(64),
+      "0".repeat(64),
       "accountless:owner-one",
       16_777_216,
     );
-    expect(route).toMatchObject({ shardId: "b", generation: 1, mode: "catalog" });
+    expect(route.route).toMatchObject({ shardId: "b", generation: 1, mode: "catalog" });
+    expect(route.issuanceReservation).toMatchObject({
+      ownerId: "accountless:owner-one", reservationKey: "a".repeat(64),
+    });
     expect(await catalog().prepare("SELECT reserved_bytes FROM storage_shards WHERE shard_id='b'").first("reserved_bytes"))
       .toBe(16_777_216);
     expect(await catalog().prepare("SELECT reserved_bytes FROM storage_shards WHERE shard_id='c'").first("reserved_bytes"))
@@ -87,10 +110,11 @@ describe("owner shard allocation capacity", () => {
     await observe("c", 5_000_000_000, "spare");
     const route = await router().ensureCapabilityOwner(
       "b".repeat(64),
+      "1".repeat(64),
       "accountless:owner-two",
       100,
     );
-    expect(route.shardId).toBe("c");
+    expect(route.route.shardId).toBe("c");
   });
 
   it("refuses a direct new assignment on stale capacity but preserves an existing owner", async () => {
@@ -116,7 +140,7 @@ describe("owner shard allocation capacity", () => {
     let tick = 0;
     const racing = createCatalogStorageRouter({ catalog: catalog(), bindings: shards(),
       clock: () => tick++ === 0 ? 10_000 : 20_001 });
-    await expect(racing.ensureCapabilityOwner("e".repeat(64),
+    await expect(racing.ensureCapabilityOwner("e".repeat(64), "2".repeat(64),
       "accountless:raced-owner", 16_777_216))
       .rejects.toMatchObject({ code: "CAPACITY_UNAVAILABLE" });
     expect(await catalog().prepare("SELECT count(*) AS n FROM storage_owner_routes").first("n")).toBe(0);
@@ -166,7 +190,7 @@ describe("owner shard allocation capacity", () => {
     await observe("c", 5_999_999_999, "spare");
     await catalog().prepare("UPDATE storage_shards SET reserved_bytes=3000000001 WHERE shard_id='c'").run();
     await expect(router().ensureCapabilityOwner(
-      "c".repeat(64), "accountless:owner-three", 1,
+      "c".repeat(64), "3".repeat(64), "accountless:owner-three", 1,
     )).rejects.toMatchObject({ code: "CAPACITY_UNAVAILABLE" });
     expect(await catalog().prepare("SELECT count(*) AS n FROM storage_owner_routes").first("n")).toBe(0);
   });
@@ -177,13 +201,13 @@ describe("owner shard allocation capacity", () => {
     await observe("c", 0, "spare");
     const capability = "d".repeat(64);
     const [first, second] = await Promise.all([
-      router().ensureCapabilityOwner(capability, "accountless:proposal-one", 4096),
-      router().ensureCapabilityOwner(capability, "accountless:proposal-two", 4096),
+      router().ensureCapabilityOwner(capability, "4".repeat(64), "accountless:proposal-one", 4096),
+      router().ensureCapabilityOwner(capability, "4".repeat(64), "accountless:proposal-two", 4096),
     ]);
     expect(first).toEqual(second);
     expect(await catalog().prepare("SELECT count(*) AS n FROM storage_owner_routes").first("n")).toBe(1);
     expect(await catalog().prepare("SELECT sum(reserved_bytes) AS n FROM storage_shards").first("n")).toBe(4096);
-    expect(await router().locateCapability(capability)).toEqual(first);
+    expect(await router().locateCapability(capability)).toEqual(first.route);
   });
 
   it("preserves over-cap and equal-time pressure observations conservatively", async () => {

@@ -92,6 +92,8 @@ import { readAdminReconstructionProgress } from "./admin-reconstruction-progress
 import { readAdminGraphRefreshProgress } from "./admin-graph-refresh-progress";
 import { readStorageCommunityProgress } from "./storage-community-progress";
 import { readPublishedStorageCommunityAdminPreview } from "./storage-community-graph-publication";
+import { readMultiSourceAllowancePreview,
+  readMultiSourceCommunityDaily } from "./storage-multi-source-publication";
 import type { StorageAnalyticsBindings } from "./analytics-delivery";
 import { storageErasureBindings } from "./storage-erasure";
 import { retireV1PreparedEvidence, V1PreparedEvidenceUnavailableError } from "./prepared-v1-evidence";
@@ -652,6 +654,7 @@ async function handleAccountlessEnrollment(
     body,
     Date.now(),
     storage.route,
+    storage.issuanceReservation,
   );
   return jsonResponse(result.response, result.status);
 }
@@ -3271,15 +3274,26 @@ async function handleAdminCommunityAllowancePreview(
     }
     await adminSession(request, env);
   }
-  const storage=await optionalStorageAnalyticsBindings(env);
-  const preview = storage
-    ? await readPublishedStorageCommunityAdminPreview(storage,Date.now())
-    : await readCachedAdminCommunityAllowancePreview(env.USAGE_MONITOR_DB,Date.now());
+  const nowMs=Date.now();
+  const preview = catalogRoutingEnabled(env)
+    ? await readMultiSourceAllowancePreview(multiSourcePublicationDatabase(env),nowMs)
+    : await (async()=>{
+      const storage=await optionalStorageAnalyticsBindings(env);
+      return storage?readPublishedStorageCommunityAdminPreview(storage,nowMs)
+        :readCachedAdminCommunityAllowancePreview(env.USAGE_MONITOR_DB,nowMs);
+    })();
   if(preview===null)throw new ApiError(503,"ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE");
   return jsonResponse(preview, 200, {
     "cache-control": "no-store",
     vary: "Cookie",
   });
+}
+
+function multiSourcePublicationDatabase(env:Env):D1Database {
+  const target:unknown=Reflect.get(env,'STORAGE_PUBLICATION_DB');
+  if(!target||typeof target!=='object'||typeof Reflect.get(target,'prepare')!=='function'
+    ||typeof Reflect.get(target,'batch')!=='function')throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+  return target as D1Database;
 }
 
 async function handleAdminReconstructionProgress(
@@ -3611,9 +3625,17 @@ async function handleCommunityDaily(
   // duplicate the preview JSON across daily rows, or write readiness state.
   const nowMs = Date.now();
   const storageMode = parseTelemetryStorageMode(env);
-  const read = storageMode.kind === "json"
-    ? await readPublishedCommunityDailyAggregatesWithAllowanceState(env.USAGE_MONITOR_DB,from,to)
-    : await (async () => {
+  const read = catalogRoutingEnabled(env)
+    ? await (async()=>{
+      try{
+        const central=await readMultiSourceCommunityDaily(multiSourcePublicationDatabase(env),from,to,nowMs);
+        if(!central)throw new Error('central publication unavailable');
+        return central;
+      }catch{throw new ApiError(503,"BACKEND_STORAGE_UNAVAILABLE");}
+    })()
+    :storageMode.kind === "json"
+      ? await readPublishedCommunityDailyAggregatesWithAllowanceState(env.USAGE_MONITOR_DB,from,to)
+      : await (async () => {
       try {
         const target: unknown = Reflect.get(env,"ANALYTICS_DB");
         if (!target || typeof target !== "object" || typeof Reflect.get(target,"prepare") !== "function"
@@ -3623,7 +3645,7 @@ async function handleCommunityDaily(
         return await readPublishedStorageCommunityDaily({source:env.USAGE_MONITOR_DB,target:target as D1Database,
           sourceId:authority.sourceId,sourceNamespace:storageMode.sourceNamespace,fromDay:from,throughDay:to});
       } catch { throw new ApiError(503,"BACKEND_STORAGE_UNAVAILABLE"); }
-    })();
+      })();
   const today = new Date(nowMs).toISOString().slice(0, 10);
   const todayStartMs = Date.parse(`${today}T00:00:00.000Z`);
   const mergedHistoryFrom = new Date(

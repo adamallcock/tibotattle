@@ -64,11 +64,20 @@ SELECT COUNT(*) AS owner_fixture_sessions FROM web_sessions WHERE id = '${sessio
 }
 
 export function localOwnerWorkerConfig(base, { workerDirectory = workerRoot, identityKey } = {}) {
+  // The optional shard pool is synthetic too. Match names to exact placeholders
+  // so a real resource, alias, or unexpected binding cannot enter this fixture.
+  const syntheticBindings = ["USAGE_MONITOR_DB", "DELETION_LEDGER", "STORAGE_ROUTING_DB",
+    "STORAGE_INGESTION_A", "STORAGE_INGESTION_B", "STORAGE_INGESTION_C",
+    "STORAGE_ANALYTICS_A", "STORAGE_ANALYTICS_B", "STORAGE_PUBLICATION_DB", "STORAGE_ANALYTICS_C"];
+  const localBindings = Array.isArray(base?.d1_databases)
+    && base.d1_databases.length === syntheticBindings.length
+    && syntheticBindings.every((name, index) => base.d1_databases.filter(binding =>
+      binding.binding === name
+        && binding.database_id === `00000000-0000-0000-0000-00000000000${index}`).length === 1);
   if (!/^[0-9a-f]{64}$/u.test(identityKey)
       || base?.name !== "app-usagemonitor-synthetic"
       || base?.vars?.ENVIRONMENT !== "synthetic-development"
-      || base.d1_databases?.length !== 2
-      || base.d1_databases.some((binding) => !/^00000000-0000-0000-0000-00000000000[01]$/u.test(binding.database_id))
+      || !localBindings
       || base.r2_buckets?.length !== 1
       || base.r2_buckets[0].bucket_name !== "app-usagemonitor-synthetic-quarantine") {
     throw new Error("The owner fixture requires the repository's synthetic local Worker configuration.");
@@ -98,7 +107,8 @@ export function localOwnerWorkerConfig(base, { workerDirectory = workerRoot, ide
     assets: { ...config.assets, directory: resolve(workerDirectory, "..", "web", "public") },
     d1_databases: config.d1_databases.map((binding) => ({
       ...binding,
-      migrations_dir: resolve(workerDirectory, binding.migrations_dir),
+      ...(binding.migrations_dir === undefined ? {}
+        : { migrations_dir: resolve(workerDirectory, binding.migrations_dir) }),
     })),
   };
 }

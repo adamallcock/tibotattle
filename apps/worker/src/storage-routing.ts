@@ -9,7 +9,8 @@ const DIGEST = /^[a-f0-9]{64}$/;
 export class StorageRoutingError extends Error {
   constructor(readonly code: 'ROUTE_NOT_FOUND' | 'ROUTE_NOT_ACTIVE' | 'ROUTE_STALE' | 'UNKNOWN_BINDING'
     | 'INVALID_ROUTING_INPUT' | 'CAPACITY_UNAVAILABLE' | 'MOVE_CONFLICT' | 'MOVE_PHASE_INVALID'
-    | 'COPY_VERIFICATION_REQUIRED' | 'STORAGE_UNAVAILABLE') { super(code); this.name = 'StorageRoutingError'; }
+    | 'COPY_VERIFICATION_REQUIRED' | 'ISSUANCE_LIMIT_REACHED' | 'ENROLLMENT_CONFLICT'
+    | 'ISSUANCE_UNINITIALIZED' | 'STORAGE_UNAVAILABLE') { super(code); this.name = 'StorageRoutingError'; }
 }
 function fail(code: StorageRoutingError['code']): never { throw new StorageRoutingError(code); }
 function identifier(value: string) { if (typeof value !== 'string' || !ID.test(value)) fail('INVALID_ROUTING_INPUT'); }
@@ -25,6 +26,9 @@ async function storage<T>(operation: () => Promise<T>): Promise<T> {
     const message = error instanceof Error ? error.message : '';
     if (message.includes('STORAGE_CAPACITY_UNAVAILABLE')) fail('CAPACITY_UNAVAILABLE');
     if (message.includes('STORAGE_ROUTE_STALE')) fail('ROUTE_STALE');
+    if (message.includes('STORAGE_ACCOUNTLESS_ISSUANCE_LIMIT')) fail('ISSUANCE_LIMIT_REACHED');
+    if (message.includes('STORAGE_ACCOUNTLESS_ENROLLMENT_CONFLICT')) fail('ENROLLMENT_CONFLICT');
+    if (message.includes('STORAGE_ACCOUNTLESS_ISSUANCE_UNINITIALIZED')) fail('ISSUANCE_UNINITIALIZED');
     fail('STORAGE_UNAVAILABLE');
   }
 }
@@ -48,11 +52,26 @@ export interface ActiveOwnerRouteSnapshot {
   readonly bounded: boolean;
   readonly nextAfterOwnerId: string | null;
 }
+export interface AccountlessIssuanceReservation {
+  readonly reservationKey: string;
+  readonly ownerId: string;
+  readonly deviceDigest: string;
+  readonly budgetDay: string;
+  readonly reservedAt: number;
+}
+export interface AccountlessOwnerAllocation {
+  readonly route: OwnerStorageRoute;
+  readonly issuanceReservation: AccountlessIssuanceReservation;
+}
 interface RouteRow { owner_id: string; shard_id: string; route_generation: number;
   state: 'preparing' | 'active' | 'moving'; reservation_bytes: number; binding_name: string; shard_state: string; }
 interface ShardRow { shard_id: string; binding_name: string; state: string; }
 interface FenceRow { owner_id: string; shard_id: string; route_generation: number;
   state: 'active' | 'prepared' | 'fenced'; move_id: string | null; copy_digest: string | null; }
+interface AccountlessIssuanceRow {
+  reservation_key: string; owner_id: string; device_digest: string;
+  budget_day: string; reserved_at: number;
+}
 export type StorageShardBindings = Readonly<Record<string, D1Database>>;
 export type OwnerStorageStatementBuilder = (database: D1Database) =>
   D1PreparedStatement[] | Promise<D1PreparedStatement[]>;
@@ -112,6 +131,93 @@ async function assertShardRoutingSchema(database: D1Database): Promise<void> {
     'storage_route_write_checks',
     'storage_route_write_guard',
   ].join(',')) fail('STORAGE_UNAVAILABLE');
+}
+async function assertAccountlessIssuanceSchema(catalog: D1Database): Promise<void> {
+  const rows = await storage(() => catalog.prepare(`SELECT name FROM sqlite_schema
+    WHERE name IN ('storage_accountless_issuance_state',
+      'storage_accountless_issuance_reservations',
+      'storage_accountless_issuance_reserve',
+      'storage_accountless_issuance_requires_baseline',
+      'storage_accountless_issuance_device_conflict',
+      'storage_accountless_issuance_reservation_immutable',
+      'storage_accountless_issuance_reservation_no_delete')
+    ORDER BY name`).all<{name: string}>());
+  if (rows.results.map((row) => row.name).join(',') !== [
+    'storage_accountless_issuance_device_conflict',
+    'storage_accountless_issuance_requires_baseline',
+    'storage_accountless_issuance_reservation_immutable',
+    'storage_accountless_issuance_reservation_no_delete',
+    'storage_accountless_issuance_reservations',
+    'storage_accountless_issuance_reserve',
+    'storage_accountless_issuance_state',
+  ].join(',')) fail('STORAGE_UNAVAILABLE');
+}
+export interface AccountlessIssuanceBaseline {
+  readonly budgetDay: string;
+  readonly dailyReserved: number;
+  readonly lifetimeReserved: number;
+  readonly baselineDigest: string;
+  readonly initializedAt: number;
+}
+interface AccountlessIssuanceBaselineRow {
+  budget_day: string; initialization_state: string; daily_reserved: number;
+  lifetime_reserved: number; baseline_digest: string | null; initialized_at: number | null;
+}
+/** Trusted, one-way activation seam. The caller must derive these counts from
+ * the existing global enrollment issuance authority before catalog enablement. */
+export async function initializeAccountlessIssuanceBaseline(
+  catalog: D1Database,
+  baseline: AccountlessIssuanceBaseline,
+): Promise<void> {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(baseline.budgetDay)
+      || !Number.isSafeInteger(baseline.dailyReserved)
+      || baseline.dailyReserved < 0 || baseline.dailyReserved > 1_000
+      || !Number.isSafeInteger(baseline.lifetimeReserved)
+      || baseline.lifetimeReserved < 0 || baseline.lifetimeReserved > 10_000
+      || baseline.dailyReserved > baseline.lifetimeReserved
+      || !DIGEST.test(baseline.baselineDigest)
+      || !Number.isSafeInteger(baseline.initializedAt) || baseline.initializedAt < 0) {
+    fail('INVALID_ROUTING_INPUT');
+  }
+  await assertAccountlessIssuanceSchema(catalog);
+  await storage(() => catalog.prepare(`UPDATE storage_accountless_issuance_state
+    SET budget_day=?,initialization_state='ready',daily_reserved=?,lifetime_reserved=?,
+        last_reservation_key='',baseline_digest=?,initialized_at=?,updated_at=?
+    WHERE singleton_id=1 AND initialization_state='uninitialized'`)
+    .bind(baseline.budgetDay, baseline.dailyReserved, baseline.lifetimeReserved,
+      baseline.baselineDigest, baseline.initializedAt, baseline.initializedAt).run());
+  const row = await storage(() => catalog.prepare(`SELECT budget_day,initialization_state,
+    daily_reserved,lifetime_reserved,baseline_digest,initialized_at
+    FROM storage_accountless_issuance_state WHERE singleton_id=1`)
+    .first<AccountlessIssuanceBaselineRow>());
+  if (!row || row.initialization_state !== 'ready'
+      || row.budget_day !== baseline.budgetDay
+      || row.daily_reserved !== baseline.dailyReserved
+      || row.lifetime_reserved !== baseline.lifetimeReserved
+      || row.baseline_digest !== baseline.baselineDigest
+      || row.initialized_at !== baseline.initializedAt) {
+    fail('STORAGE_UNAVAILABLE');
+  }
+}
+function utcDay(epoch: number): string {
+  return new Date(epoch).toISOString().slice(0, 10);
+}
+function issuanceReservation(row: AccountlessIssuanceRow | null,
+  reservationKey: string, deviceDigest: string,
+  ownerId: string): AccountlessIssuanceReservation {
+  if (row && row.reservation_key === reservationKey && row.owner_id === ownerId
+      && row.device_digest !== deviceDigest) {
+    fail('ENROLLMENT_CONFLICT');
+  }
+  if (!row || row.reservation_key !== reservationKey || row.owner_id !== ownerId
+      || row.device_digest !== deviceDigest
+      || !/^\d{4}-\d{2}-\d{2}$/u.test(row.budget_day)
+      || !Number.isSafeInteger(row.reserved_at) || row.reserved_at < 0) {
+    fail('STORAGE_UNAVAILABLE');
+  }
+  return Object.freeze({ reservationKey: row.reservation_key, ownerId: row.owner_id,
+    deviceDigest: row.device_digest,
+    budgetDay: row.budget_day, reservedAt: row.reserved_at });
 }
 function matches(route: OwnerStorageRoute, row: RouteRow) {
   return route.mode === 'catalog' && row.state === 'active' && row.shard_state !== 'offline'
@@ -198,10 +304,12 @@ export function createCatalogStorageRouter({ catalog, bindings, clock }: {
      * locator. A raced duplicate rolls back the losing proposed owner rather
      * than leaving an unlocatable allocation behind.
      */
-    async ensureCapabilityOwner(capabilityHash: string, proposedOwnerId: string,
-      reservationBytes: number): Promise<OwnerStorageRoute> {
-      digest(capabilityHash); identifier(proposedOwnerId);
+    async ensureCapabilityOwner(capabilityHash: string, deviceDigest: string,
+      proposedOwnerId: string,
+      reservationBytes: number): Promise<AccountlessOwnerAllocation> {
+      digest(capabilityHash); digest(deviceDigest); identifier(proposedOwnerId);
       integer(reservationBytes, 1, STORAGE_SHARD_OPERATING_CAP_BYTES);
+      await assertAccountlessIssuanceSchema(catalog);
       const located = await storage(() => catalog.prepare(`SELECT owner_id, state
         FROM storage_capability_locators WHERE capability_hash = ? LIMIT 1`)
         .bind(capabilityHash).first<{owner_id: string; state: 'active' | 'revoked'}>());
@@ -229,13 +337,26 @@ export function createCatalogStorageRouter({ catalog, bindings, clock }: {
           const results = await storage(() => catalog.batch([
             catalog.prepare(`INSERT INTO storage_owner_routes
               (owner_id, shard_id, route_generation, state, reservation_bytes, updated_at)
-              SELECT ?, ?, 1, 'preparing', ?, ?`)
-              .bind(proposedOwnerId, candidate.shard_id, reservationBytes, reservationStamp),
+              SELECT ?, ?, 1, 'preparing', ?, ?
+               WHERE NOT EXISTS (SELECT 1 FROM storage_accountless_issuance_reservations
+                 WHERE reservation_key = ?)`)
+              .bind(proposedOwnerId, candidate.shard_id, reservationBytes, reservationStamp,
+                capabilityHash),
             catalog.prepare(`INSERT INTO storage_capability_locators
               (capability_hash, owner_id, state)
               SELECT ?, ?, 'active'
-               WHERE EXISTS (SELECT 1 FROM storage_owner_routes WHERE owner_id = ?)`)
+               WHERE EXISTS (SELECT 1 FROM storage_owner_routes WHERE owner_id = ?)
+              ON CONFLICT(capability_hash) DO NOTHING`)
               .bind(capabilityHash, proposedOwnerId, proposedOwnerId),
+            catalog.prepare(`INSERT INTO storage_accountless_issuance_reservations
+              (reservation_key,owner_id,device_digest,budget_day,reserved_at)
+              SELECT ?,?,?,?,?
+               WHERE EXISTS (SELECT 1 FROM storage_capability_locators
+                 WHERE capability_hash=? AND owner_id=? AND state='active')
+              ON CONFLICT(reservation_key) DO NOTHING`)
+              .bind(capabilityHash, proposedOwnerId, deviceDigest,
+                utcDay(reservationStamp), reservationStamp,
+                capabilityHash, proposedOwnerId),
           ]));
           void results;
           const created = await storage(() => catalog.prepare(`SELECT owner_id, state
@@ -255,9 +376,24 @@ export function createCatalogStorageRouter({ catalog, bindings, clock }: {
           ownerId = winner.owner_id;
         }
       }
+      const reservationStamp = now(clock);
+      await storage(() => catalog.prepare(`INSERT INTO storage_accountless_issuance_reservations
+        (reservation_key,owner_id,device_digest,budget_day,reserved_at)
+        SELECT ?,?,?,?,? WHERE EXISTS (
+          SELECT 1 FROM storage_capability_locators
+           WHERE capability_hash=? AND owner_id=? AND state='active'
+        ) ON CONFLICT(reservation_key) DO NOTHING`)
+        .bind(capabilityHash, ownerId, deviceDigest,
+          utcDay(reservationStamp), reservationStamp,
+          capabilityHash, ownerId).run());
+      const admitted = await storage(() => catalog.prepare(`SELECT reservation_key,owner_id,device_digest,
+        budget_day,reserved_at FROM storage_accountless_issuance_reservations
+        WHERE reservation_key=? LIMIT 1`).bind(capabilityHash).first<AccountlessIssuanceRow>());
       const row = await readRoute(catalog, ownerId);
       if (!row) fail('STORAGE_UNAVAILABLE');
-      return this.ensureOwner(ownerId, row.shard_id, row.reservation_bytes);
+      const route = await this.ensureOwner(ownerId, row.shard_id, row.reservation_bytes);
+      return Object.freeze({ route,
+        issuanceReservation: issuanceReservation(admitted, capabilityHash, deviceDigest, ownerId) });
     },
     /** Caller supplies an explicit admitted shard. Capacity failure never redirects elsewhere. */
     async ensureOwner(ownerId: string, shardId: string, reservationBytes: number) {
