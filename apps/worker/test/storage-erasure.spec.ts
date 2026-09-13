@@ -19,7 +19,8 @@ import {advanceStorageErasureJobs,prepareStorageParticipantErasure,requireStorag
 import {advanceMultiSourceStorageErasureJobs,prepareMultiSourceParticipantErasure,
  requireMultiSourceParticipantErasureComplete} from '../src/storage-multi-source-erasure';
 import {recordDeletionTombstone,purgeExpiredDeletionTombstones,hasDeletionTombstone,participantDeletionDigest,
- replayDeletionTombstones,runBackendLifecycle,CATALOG_DELETION_REPLAY_PAGE_SIZE} from '../src/retention';
+ replayDeletionTombstones,runBackendLifecycle,CATALOG_DELETION_REPLAY_PAGE_SIZE,
+ recordCatalogDeletionReplayPending,completeCatalogDeletionReplayPending} from '../src/retention';
 import {ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
  ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,enrollAccountlessDevice} from '../src/accountless-enrollment';
 import {ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
@@ -94,7 +95,7 @@ async function initializeCatalogErasureStore(source:D1Database,target:D1Database
  await initializeStorageAnalyticsRuntime({source,target,sourceId:sourceIdValue,sourceNamespace});
 }
 
-async function catalogReplayFixture(){
+async function catalogReplayFixture(withTombstone=true){
  await applyD1Migrations(b.STORAGE_ROUTING_DB,b.TEST_ROUTING_MIGRATIONS);
  await initializeAccountlessIssuanceBaseline(b.STORAGE_ROUTING_DB,{budgetDay:'1970-01-01',dailyReserved:0,
   lifetimeReserved:0,baselineDigest:'f'.repeat(64),initializedAt:1000});
@@ -167,7 +168,7 @@ async function catalogReplayFixture(){
   TELEMETRY_STORAGE_MODE:'typed',TELEMETRY_STORAGE_NAMESPACE:sourceNamespace,
   ALLOWANCE_RECONSTRUCTION_MODE:'paused'} as unknown as Env;
  await registerParticipantOwnerRoute(runtime,owner.participantId,currentRoute);
- await recordDeletionTombstone(b.DELETION_LEDGER,owner.participantId);
+ if(withTombstone)await recordDeletionTombstone(b.DELETION_LEDGER,owner.participantId);
  return {runtime,participantId:owner.participantId};
 }
 async function seedEarlierCatalogTombstones(participantId:string,count:number){
@@ -264,6 +265,61 @@ describe('cross-store physical erasure completion',()=>{
   await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId);
   expect((await purgeExpiredDeletionTombstones(b.DELETION_LEDGER,future)).purged).toBe(1);
   expect(await b.DELETION_LEDGER.prepare('SELECT COUNT(*) n FROM storage_erasure_jobs').first('n')).toBe(0);
+ });
+ it('keeps an expired deletion credential fence while only a target receipt is pending',async()=>{
+  const f=await fixture(),digest=await participantDeletionDigest(f.participantId),ownerDigest='5'.repeat(64);
+  await recordDeletionTombstone(b.DELETION_LEDGER,f.participantId);
+  await b.DELETION_LEDGER.batch([
+   b.DELETION_LEDGER.prepare(`INSERT INTO storage_erasure_jobs
+    (participant_digest,source_id,owner_digest,source_namespace,state,terminal_json,completed_at)
+    VALUES(?,?,?,?,'complete','{}',?)`).bind(digest,sourceId,ownerDigest,sourceNamespace,new Date().toISOString()),
+   b.DELETION_LEDGER.prepare(`INSERT INTO storage_erasure_targets
+    (participant_digest,source_id,owner_digest,target_id,source_namespace,state,completed_at)
+    VALUES(?,?,?,?,?,'pending',NULL)`).bind(digest,sourceId,ownerDigest,'analytics-only-pending',sourceNamespace),
+  ]);
+  const future=Date.now()+401*86400000;
+  expect(await hasDeletionTombstone(b.DELETION_LEDGER,f.participantId,future)).toBe(true);
+  expect(await purgeExpiredDeletionTombstones(b.DELETION_LEDGER,future)).toMatchObject({purged:0});
+ });
+ it('does not let an older replay receipt clear a concurrently refreshed marker',async()=>{
+  const f=await fixture();
+  const first=await recordCatalogDeletionReplayPending(b.DELETION_LEDGER,f.participantId,1000);
+  const refreshed=await recordCatalogDeletionReplayPending(b.DELETION_LEDGER,f.participantId,1001);
+  expect(refreshed.revision).toBe(first.revision+1);
+  expect(await completeCatalogDeletionReplayPending(b.DELETION_LEDGER,first)).toBe(false);
+  expect(await b.DELETION_LEDGER.prepare(`SELECT revision FROM storage_catalog_deletion_replay_pending
+   WHERE participant_digest=?`).bind(first.participant_digest).first('revision')).toBe(refreshed.revision);
+  expect(await completeCatalogDeletionReplayPending(b.DELETION_LEDGER,refreshed)).toBe(true);
+ });
+ it('returns the exact marker written by its batch despite an interleaved refresh',async()=>{
+  const f=await fixture();let concurrent:Awaited<ReturnType<typeof recordCatalogDeletionReplayPending>>|null=null;
+  const interleaved=new Proxy(b.DELETION_LEDGER,{get(db,key){
+   if(key==='batch')return async(statements:D1PreparedStatement[])=>{
+    const results=await db.batch(statements);
+    const digest=await participantDeletionDigest(f.participantId),token=crypto.randomUUID();
+    concurrent=await db.prepare(`UPDATE storage_catalog_deletion_replay_pending
+      SET attempted_ms=attempted_ms,revision=revision+1,attempt_token=? WHERE participant_digest=?
+      RETURNING participant_digest,attempted_ms,revision,attempt_token`).bind(token,digest)
+      .first<Awaited<ReturnType<typeof recordCatalogDeletionReplayPending>>>();
+    return results;
+   };
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  const recorded=await recordCatalogDeletionReplayPending(interleaved,f.participantId,1000);
+  expect(concurrent).not.toBeNull();
+  expect(recorded.attempt_token).not.toBe(concurrent!.attempt_token);
+  expect(recorded.revision+1).toBe(concurrent!.revision);
+  expect(await completeCatalogDeletionReplayPending(b.DELETION_LEDGER,recorded)).toBe(false);
+  expect(await completeCatalogDeletionReplayPending(b.DELETION_LEDGER,concurrent!)).toBe(true);
+ });
+ it('does not let a deleted marker receipt clear a same-epoch recreated row',async()=>{
+  const f=await fixture(),first=await recordCatalogDeletionReplayPending(b.DELETION_LEDGER,f.participantId,1000);
+  expect(await completeCatalogDeletionReplayPending(b.DELETION_LEDGER,first)).toBe(true);
+  const recreated=await recordCatalogDeletionReplayPending(b.DELETION_LEDGER,f.participantId,1000);
+  expect(recreated).toMatchObject({attempted_ms:first.attempted_ms,revision:first.revision});
+  expect(recreated.attempt_token).not.toBe(first.attempt_token);
+  expect(await completeCatalogDeletionReplayPending(b.DELETION_LEDGER,first)).toBe(false);
+  expect(await completeCatalogDeletionReplayPending(b.DELETION_LEDGER,recreated)).toBe(true);
  });
  it('does not let an interrupted source deletion starve another erased owner',async()=>{
   const a=await fixture(),z=await fixture();await recordDeletionTombstone(b.DELETION_LEDGER,a.participantId);
@@ -449,16 +505,24 @@ describe('cross-store physical erasure completion',()=>{
  });
  it('scheduled catalog replay removes current and retained restores and resumes an offline target',async()=>{
   const f=await catalogReplayFixture();
-  const offlineSource=new Proxy(b.STORAGE_INGESTION_A,{get(database,key){
+  const offlineSource=(sourceDatabase:D1Database)=>new Proxy(sourceDatabase,{get(database,key){
    if(key==='prepare')return()=>{throw new Error('synthetic retained source offline');};
    const value=Reflect.get(database,key);return typeof value==='function'?value.bind(database):value;
   }});
-  const first=await runScheduledMaintenance({...f.runtime,STORAGE_INGESTION_A:offlineSource} as Env,Date.now());
+  const first=await runScheduledMaintenance({...f.runtime,STORAGE_INGESTION_A:offlineSource(b.STORAGE_INGESTION_A),
+   STORAGE_INGESTION_B:offlineSource(b.STORAGE_INGESTION_B)} as Env,Date.now());
   expect(first).toMatchObject({outcome:'success',restoreReplayComplete:false});
-  expect(await b.STORAGE_INGESTION_A.prepare('SELECT state FROM participants WHERE id=?')
-   .bind(f.participantId).first('state')).toBe('active');
-  expect(await b.STORAGE_INGESTION_B.prepare('SELECT 1 FROM participants WHERE id=?')
-   .bind(f.participantId).first()).toBeNull();
+  for(const database of [b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B]){
+   expect(await database.prepare('SELECT state FROM participants WHERE id=?')
+    .bind(f.participantId).first('state')).toBe('active');
+  }
+  expect(await b.DELETION_LEDGER.prepare('SELECT count(*) n FROM storage_erasure_jobs').first('n')).toBe(0);
+  const participantDigest=await participantDeletionDigest(f.participantId);
+  await b.DELETION_LEDGER.prepare('UPDATE deletion_tombstones SET retain_until=? WHERE participant_digest=?')
+   .bind(new Date(Date.now()-1).toISOString(),participantDigest).run();
+  expect(await purgeExpiredDeletionTombstones(b.DELETION_LEDGER,Date.now())).toMatchObject({purged:0});
+  expect(await b.DELETION_LEDGER.prepare('SELECT participant_digest FROM storage_catalog_deletion_replay_pending')
+   .first('participant_digest')).toBe(participantDigest);
   const offlineAnalytics=new Proxy(b.STORAGE_ANALYTICS_A,{get(database,key){
    if(key==='prepare')return()=>{throw new Error('synthetic analytics offline');};
    const value=Reflect.get(database,key);return typeof value==='function'?value.bind(database):value;
@@ -470,9 +534,6 @@ describe('cross-store physical erasure completion',()=>{
   }
   expect(await b.DELETION_LEDGER.prepare("SELECT count(*) n FROM storage_erasure_targets WHERE state='pending'")
    .first('n')).toBe(1);
-  const participantDigest=await participantDeletionDigest(f.participantId);
-  await b.DELETION_LEDGER.prepare('UPDATE deletion_tombstones SET retain_until=? WHERE participant_digest=?')
-   .bind(new Date(Date.now()-1).toISOString(),participantDigest).run();
   expect(await purgeExpiredDeletionTombstones(b.DELETION_LEDGER,Date.now())).toMatchObject({purged:0});
   expect(await b.DELETION_LEDGER.prepare('SELECT 1 FROM deletion_tombstones WHERE participant_digest=?')
    .bind(participantDigest).first()).not.toBeNull();
@@ -519,5 +580,35 @@ describe('cross-store physical erasure completion',()=>{
    .toEqual({after_participant_digest:'',verification_required:1});
   expect((await runScheduledMaintenance(f.runtime,Date.now()+2)).restoreReplayComplete).toBe(false);
   expect((await runScheduledMaintenance(f.runtime,Date.now()+3)).restoreReplayComplete).toBe(true);
+ });
+ it('atomically refuses catalog erasure when replay-marker publication fails',async()=>{
+  const f=await catalogReplayFixture(false);
+  await b.DELETION_LEDGER.prepare('DROP TRIGGER storage_erasure_tombstone_retained').run();
+  await b.DELETION_LEDGER.prepare('DROP TABLE storage_catalog_deletion_replay_pending').run();
+  await expect(eraseParticipantAsOwner(f.runtime,'synthetic-admin',f.participantId))
+   .rejects.toMatchObject({code:'DELETION_LEDGER_UNAVAILABLE'});
+  expect(await b.DELETION_LEDGER.prepare('SELECT count(*) n FROM deletion_tombstones').first('n')).toBe(0);
+  expect(await b.STORAGE_PUBLICATION_DB.prepare(`SELECT erasure_generation
+   FROM analytics_multi_source_control WHERE singleton=1`).first('erasure_generation')).toBe(1);
+  for(const database of [b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B]){
+   expect(await database.prepare('SELECT state FROM participants WHERE id=?')
+    .bind(f.participantId).first('state')).toBe('active');
+  }
+ });
+ it('does not publish deletion authority or touch sources when central invalidation fails',async()=>{
+  const f=await catalogReplayFixture(false);
+  const unavailablePublication=new Proxy(b.STORAGE_PUBLICATION_DB,{get(db,key){
+   if(key==='prepare')return()=>{throw new Error('synthetic publication unavailable');};
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  await expect(eraseParticipantAsOwner({...f.runtime,STORAGE_PUBLICATION_DB:unavailablePublication} as Env,
+   'synthetic-admin',f.participantId)).rejects.toThrow('synthetic publication unavailable');
+  expect(await b.DELETION_LEDGER.prepare('SELECT count(*) n FROM deletion_tombstones').first('n')).toBe(0);
+  expect(await b.DELETION_LEDGER.prepare('SELECT count(*) n FROM storage_catalog_deletion_replay_pending')
+   .first('n')).toBe(0);
+  for(const database of [b.STORAGE_INGESTION_A,b.STORAGE_INGESTION_B]){
+   expect(await database.prepare('SELECT state FROM participants WHERE id=?')
+    .bind(f.participantId).first('state')).toBe('active');
+  }
  });
 });

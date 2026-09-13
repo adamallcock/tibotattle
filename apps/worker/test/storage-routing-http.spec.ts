@@ -34,6 +34,7 @@ import { initializeStorageSource } from "../src/analytics-delivery";
 import { initializeTypedV11Admission } from "../src/typed-v11-admission";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 import { participantDeletionDigest } from "../src/participant-deletion-digest";
+import { recordCatalogDeletionReplayPending } from "../src/retention";
 import {
   participantStorageLocatorDigest,
   storageForParticipantOwner,
@@ -783,6 +784,31 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
     expect(await catalog().prepare(`SELECT lifetime_reserved
       FROM storage_accountless_issuance_state WHERE singleton_id=1`)
       .first("lifetime_reserved")).toBe(1);
+  });
+
+  it("refuses real device credentials while an expired catalog replay marker is pending", async () => {
+    const deviceId = crypto.randomUUID();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    expect((await enroll(deviceId, secret)).status).toBe(201);
+    expect((await own(deviceId, secret)).status).toBe(201);
+    const participantId = await shardA().prepare(`SELECT participant_id
+      FROM accountless_upload_owners WHERE enrollment_device_id=?`)
+      .bind(deviceId).first<string>("participant_id");
+    expect(participantId).toBeTruthy();
+    const marker=await recordCatalogDeletionReplayPending(bindings().DELETION_LEDGER,participantId!);
+    await bindings().DELETION_LEDGER.prepare(`UPDATE deletion_tombstones
+      SET deleted_at=?,retain_until=? WHERE participant_digest=?`)
+      .bind(new Date(Date.now()-2).toISOString(),new Date(Date.now()-1).toISOString(),
+        marker.participant_digest).run();
+    const response=await api("/api/v1/device/upload-authorizations",{
+      method:"POST",headers:{authorization:authorization(deviceId,secret),"content-type":"application/json"},
+      body:JSON.stringify({envelopeDigest:"a".repeat(64),contentLengthBytes:200,
+        contentType:"application/json",telemetrySchemaVersion:"telemetry-contribution-v1.1"}),
+    });
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({error:{code:"DEVICE_AUTH_INVALID"}});
+    expect(await shardA().prepare("SELECT count(*) AS n FROM device_upload_authorizations").first("n"))
+      .toBe(0);
   });
 
   it("routes upload registration and durable disconnect through the same owner shard", async () => {

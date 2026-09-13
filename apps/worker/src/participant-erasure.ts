@@ -20,6 +20,8 @@ import {
 import {
   hasDeletionTombstone,
   identityReenrollmentCooldownDigest,
+  completeCatalogDeletionReplayPending,
+  recordCatalogDeletionReplayPending,
   recordDeletionTombstone,
   recordIdentityReenrollmentCooldownFromDigest,
   recordPrimaryIdentityReenrollmentCooldown,
@@ -164,9 +166,10 @@ async function eraseParticipantData(
 ): Promise<ErasureResult> {
   const ownerStorage=await storageForParticipantOwner(env,participantId);
   await assertParticipantDeletionRouteRegistered(env,participantId,ownerStorage.route);
-  await invalidatePublicationsForOwnerErasure(env,ownerStorage.route);
   const catalogErasure=ownerStorage.route.mode==='catalog';
-  if(catalogErasure)await recordDeletionTombstone(env.DELETION_LEDGER,participantId);
+  await invalidatePublicationsForOwnerErasure(env,ownerStorage.route);
+  const replayMarker=catalogErasure
+    ?await recordCatalogDeletionReplayPending(env.DELETION_LEDGER,participantId):null;
   const plan=await storageErasurePlanForOwnerRoute(env,ownerStorage.route);
   const participant = await ownerStorage.database.prepare(
     `SELECT participant.state,
@@ -241,6 +244,9 @@ async function eraseParticipantData(
   if(plan){
     await requireMultiSourceParticipantErasureComplete(env.DELETION_LEDGER,participantId,plan.targets);
   }else await requireStorageParticipantErasureComplete(env.DELETION_LEDGER,participantId,null);
+  if(replayMarker&&!await completeCatalogDeletionReplayPending(env.DELETION_LEDGER,replayMarker)){
+    throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+  }
   if(participant===null)return {deleted:true,alreadyDeleted:true,contributionsDeleted:null};
   return {
     deleted: true,
