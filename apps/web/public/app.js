@@ -4834,15 +4834,12 @@ function renderUsageTimeline(data) {
       : "chart.series.standardApiUsage",
   );
   $("#usage-allowance-legend").hidden = !quotaComparable;
+  // The shared header owns the reporting period; a numerical "All" sentinel
+  // must never become a user-visible duration in a chart heading.
   setLocalizedText(
     $("#usage-timeline-title"),
     quotaComparable ? "chart.usage.heading" : "chart.usage.standardHeading",
-    {
-    unit,
-    range: tPlural("format.durationDay", activeUsageRangeDays, {
-      count: formatDecimal(activeUsageRangeDays, 0),
-    }),
-    },
+    { unit },
   );
   if (!visiblePoints.length) {
     shell.hidden = true;
