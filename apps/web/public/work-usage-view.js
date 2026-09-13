@@ -692,8 +692,22 @@ export function mountWorkUsageView(options = {}) {
     }
     if (!response.rowCount) {
       body.dataset.state = "empty";
-      const empty = el("p", "work-usage-empty", tr(query.search || query.findThread ? "searchEmpty" : "empty"));
+      const searching = Boolean(query.search || query.findThread);
+      const empty = el("div", "work-usage-empty dashboard-state");
       empty.dataset.state = "empty";
+      const copy = el("p", null, tr(searching ? "searchEmpty" : "empty"));
+      copy.setAttribute("role", "status");
+      empty.append(copy);
+      if (searching) {
+        const recovery = el("div", "dashboard-state-actions");
+        recovery.append(button(tr("clearSearch"), () => {
+          input.value = "";
+          searchPending = true;
+          input.focus();
+          load();
+        }));
+        empty.append(recovery);
+      }
       body.append(empty);
       appendMethodology();
       focusTarget?.focus();

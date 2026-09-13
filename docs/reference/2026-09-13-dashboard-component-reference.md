@@ -135,3 +135,9 @@ money labels remain quieter than primary amounts, without changing their text.
 Expanded/focused rows retain a background cue, and pagination may wrap without
 truncating its status. Model share columns have distinct token/value labels for
 assistive technology.
+
+Chart placeholders use the shared state container and status semantics.
+Unavailable Usage/Trends data uses a solid, neutral treatment; a period without
+points keeps the dashed empty treatment and its existing explanation. Search
+results with no matches offer Clear search, retain other filters, and return
+focus to the search field while refreshing the result.

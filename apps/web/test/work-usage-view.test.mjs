@@ -1552,12 +1552,16 @@ test("an available shared-period search with no rows is empty rather than unavai
     await settleMountedView();
     const state = findMounted(root, node => node.classList.contains("work-usage-empty"))[0];
     assert.ok(state);
-    assert.equal(state.textContent, mountedTranslator("workUsage.searchEmpty"));
+    assert.equal(state.children[0].textContent, mountedTranslator("workUsage.searchEmpty"));
+    assert.equal(state.children[0].getAttribute("role"), "status");
     assert.equal(state.dataset.state, "empty");
     assert.equal(findMounted(root, node => node.tagName === "TABLE").length, 0);
     assert.equal(findMounted(root, node => node.classList.contains("work-usage-summary")).length, 0);
     assert.equal(findMounted(root, node => node.dataset?.evidence === "freshness").length, 1);
-    input.value = ""; form.dispatchEvent({ type: "submit" });
+    const clearSearch = findMounted(state, node => node.tagName === "BUTTON")[0];
+    assert.equal(clearSearch.textContent, mountedTranslator("workUsage.clearSearch"));
+    clearSearch.dispatchEvent({ type: "click" });
+    assert.equal(input.value, "");
     await settleMountedView();
     assert.ok(findMounted(root, node => node.tagName === "TABLE").length);
     assert.equal(findMounted(root, node => node.classList.contains("work-usage-empty")).length, 0);

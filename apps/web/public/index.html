@@ -490,7 +490,7 @@
             <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
             <span><i class="legend-dot weekly-error-bar"></i>Slope-agreement range</span>
           </div>
-          <div class="chart-empty small" id="weekly-empty">No weekly estimates loaded.</div>
+          <div class="dashboard-state chart-empty small" id="weekly-empty" role="status" data-state="empty">No weekly estimates loaded.</div>
           <div class="chart-shell weekly-history-chart" id="weekly-chart" hidden></div>
           <!--
             Honest naming for the per-reset bars: they are the 10th-to-90th
@@ -636,7 +636,7 @@
             <span><i class="legend-dot area chart-status-ambiguous"></i>Movement needs context</span>
             <span><i class="legend-dot area chart-status-saturated"></i>Allowance exhausted</span>
           </div>
-          <div class="chart-empty" id="timeline-empty">
+          <div class="dashboard-state chart-empty" id="timeline-empty" role="status" data-state="empty">
             <strong>No timeline loaded</strong>
             <p>Connect the local companion or choose the labeled demo.</p>
           </div>
@@ -670,7 +670,7 @@
               bucket’s observed-minus-expected movement, restarted at every
               window boundary or track change.
             </p>
-            <div class="chart-empty small" id="residual-empty">No residual evidence loaded.</div>
+            <div class="dashboard-state chart-empty small" id="residual-empty" role="status" data-state="empty">No residual evidence loaded.</div>
             <div class="chart-shell compact-chart" id="residual-chart" hidden></div>
             <p class="timeline-confidence" id="residual-coverage" role="status"></p>
           </article>
@@ -728,7 +728,7 @@
           </p>
           <p class="timeline-confidence" id="divergence-summary" role="status" hidden></p>
           <p class="annotation" id="divergence-caveat" hidden></p>
-          <div class="chart-empty small" id="divergence-empty" hidden></div>
+          <div class="dashboard-state chart-empty small" id="divergence-empty" role="status" data-state="empty" hidden></div>
           <ol class="divergence-list" id="divergence-list"></ol>
         </article>
         <article class="panel chart-panel chart-card">
@@ -757,7 +757,7 @@
             <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Speed-priced API-equivalent usage</span></span>
             <span id="usage-allowance-legend"><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
           </div>
-          <div class="chart-empty" id="usage-timeline-empty">
+          <div class="dashboard-state chart-empty" id="usage-timeline-empty" role="status" data-state="empty">
             <strong>No real usage timeline loaded</strong>
             <p>Analyze local usage to build recent content-free usage buckets.</p>
           </div>

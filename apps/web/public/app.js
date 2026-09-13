@@ -4844,6 +4844,7 @@ function renderUsageTimeline(data) {
   if (!visiblePoints.length) {
     shell.hidden = true;
     empty.hidden = false;
+    empty.dataset.state = unavailable ? "unavailable" : "empty";
     empty.querySelector("strong").textContent = unavailable
       ? t(accountingRequiresNewerBuild(data)
         ? "chart.usage.newerBuildTitle"
@@ -5183,6 +5184,7 @@ function renderTimeline(data) {
   if (!visiblePoints.length || (usingLive && matchedVisible.length === 0)) {
     shell.hidden = true;
     empty.hidden = false;
+    empty.dataset.state = unavailable ? "unavailable" : "empty";
     empty.querySelector("strong").textContent = unavailable
       ? t(accountingRequiresNewerBuild(data)
         ? "dashboard.timeline.newerBuildTitle"

@@ -284,3 +284,12 @@ and `.release-build/model-table-960.png`. Projects/threads share the source
 styles and test coverage; this pass visually qualified only Model usage.
 The full real-history runner still reports `parity / usage_invalid`; this
 visual qualification does not close that independent gate.
+
+## Empty-state recovery follow-up
+
+Reuse the shared state container for chart placeholders, with explicit empty
+versus unavailable styling on Usage and Trends. Preserve reason-specific copy
+and chart availability decisions. Announce placeholder text as status. Add a
+localized Clear search action to a no-match Projects/threads result, using the
+existing search lifecycle and restoring focus to its input. Validate recovery
+with synthetic data, then inspect the fresh packaged renderer.
