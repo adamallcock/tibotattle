@@ -191,6 +191,11 @@ export async function beginAuthorityRestore(source:D1Database,target:D1Database,
   for(const object of contract.targetBaseSchema.filter(x=>x.type==='table')){
     if(['typed_telemetry_schema','typed_v1_analytical_schema'].includes(object.name)){if(canonicalJson((await target.prepare(`SELECT * FROM ${q(object.name)} LIMIT 2`).all()).results)!==canonicalJson([{id:1,version:1}]))fail();}
     else if(object.name==='ingestion_analytics_separation'){if(canonicalJson((await target.prepare('SELECT * FROM ingestion_analytics_separation LIMIT 2').all()).results)!==canonicalJson([{id:1,phase:'prepared',policy_revision:1,empty_source_check:1}]))fail();}
+    else if(object.name==='storage_write_capacity_sample_clock'){
+      // A freshly migrated capacity clock is schema seed state, not imported data.
+      // Any observed or reserved state still makes this target nonempty.
+      if(canonicalJson((await target.prepare('SELECT * FROM storage_write_capacity_sample_clock LIMIT 2').all()).results)!==canonicalJson([{singleton_id:1,revision:0,reserved_total_bytes:0}]))throw new Error('AUTHORITY_RESTORE_TARGET_NOT_EMPTY');
+    }
     else if(object.name==='d1_storage_migrations'){await assertOperatorLedger(target,contract);}
     else if(object.name==='d1_migrations'){const rows=(await target.prepare('SELECT * FROM d1_migrations ORDER BY id LIMIT 129').all()).results;if(rows.length>128||await hash(rows)!==contract.targetMigrationLedgerDigest)fail();}
     else if(await target.prepare(`SELECT 1 FROM ${q(object.name)} LIMIT 1`).first())throw new Error('AUTHORITY_RESTORE_TARGET_NOT_EMPTY');

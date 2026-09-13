@@ -138,6 +138,17 @@ describe('isolated authority restore protocol',()=>{
   expect(await source().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(3);
   expect(await target().prepare('SELECT state FROM device_credentials').first('state')).toBe('revoked');
  });
+ it.each(['revision','reserved_total_bytes'] as const)('refuses a used capacity clock (%s) even when the target schema matches',async column=>{
+  const f=await rawFixture();await freezeAuthorityRestoreSource(source(),f.contract,f.pin);
+  await target().prepare(`UPDATE storage_write_capacity_sample_clock SET ${column}=1 WHERE singleton_id=1`).run();
+  await expect(beginAuthorityRestore(source(),target(),f.contract,f.pin)).rejects.toThrow('AUTHORITY_RESTORE_TARGET_NOT_EMPTY');
+  expect(await target().prepare("SELECT name FROM sqlite_master WHERE name='_authority_restore_run'").first()).toBeNull();
+ });
+ it('refuses a missing capacity seed row instead of resetting target state',async()=>{
+  const f=await rawFixture();await freezeAuthorityRestoreSource(source(),f.contract,f.pin);
+  await target().prepare('DELETE FROM storage_write_capacity_sample_clock').run();
+  await expect(beginAuthorityRestore(source(),target(),f.contract,f.pin)).rejects.toThrow('AUTHORITY_RESTORE_TARGET_NOT_EMPTY');
+ });
  it('refuses a nonempty typed target even when its schema matches',async()=>{
   const f=await rawFixture();await freezeAuthorityRestoreSource(source(),f.contract,f.pin);
   await target().prepare("INSERT INTO typed_telemetry_dictionary(value) VALUES('foreign')").run();
