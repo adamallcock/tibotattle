@@ -8068,10 +8068,14 @@ test("macOS Swift discovery rejects candidates in unknown top-level directories"
       join(sourceRoot, "FutureFeature", "Runtime", "Coordinator.swift"),
       "struct Coordinator {}\n",
     );
-    await assert.rejects(
-      collectMacOSSwiftSources(options),
-      /Unreviewed top-level macOS directory contains Swift source candidates/u,
-    );
+    await assert.rejects(collectMacOSSwiftSources(options), (error) => {
+      assert.equal(error.code, "MACOS_APP_BUILD_FAILED");
+      assert.match(
+        error.message,
+        /Unreviewed top-level macOS directory contains Swift source candidates/u,
+      );
+      return true;
+    });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
@@ -8293,6 +8297,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       "config/product-brand.js",
       "scripts/build-macos-app.js",
       "scripts/lib/captured-utf8-source.mjs",
+      "scripts/lib/runtime-closure.mjs",
       "apps/macos/Assets/AppIcon.icns",
       "apps/macos/Assets/AppIcon.provenance.txt",
       ...swiftSources.relativeFiles,

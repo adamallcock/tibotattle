@@ -23,6 +23,7 @@ const REPORTING_IMPLEMENTATIONS = Object.freeze({
   // reads it from that package's public entrypoint instead of restating
   // 10_080 and letting the two definitions drift apart.
   "src/reporting/weekly-calibration.js": Object.freeze([
+    "@app-usagemonitor/accounting",
     "@app-usagemonitor/quota-analysis",
   ]),
   "src/reporting/work-usage.js": Object.freeze([

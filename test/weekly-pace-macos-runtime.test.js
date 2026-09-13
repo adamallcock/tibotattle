@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
-} from "../scripts/build-macos-app.js";
+  RUNTIME_QUOTA_ANALYSIS_FILES,
+} from "../scripts/lib/runtime-closure.mjs";
 import {
   CLIENT_RUNTIME_FILES,
   CLIENT_PACKAGE_FILES,
@@ -11,7 +11,7 @@ import {
 
 test("pace analysis ships in both the macOS bundle and client export", () => {
   assert.equal(
-    MACOS_QUOTA_ANALYSIS_RUNTIME_FILES.includes("src/quota-pace-forecast.js"),
+    RUNTIME_QUOTA_ANALYSIS_FILES.includes("src/quota-pace-forecast.js"),
     true,
   );
   assert.equal(
