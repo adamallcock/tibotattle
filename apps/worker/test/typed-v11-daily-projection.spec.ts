@@ -194,6 +194,8 @@ describe("typed accountless upload to isolated projection", () => {
       manifestId: value.manifest.days[0]!.manifestId, afterStream: "", afterOccurrence: "", limit: 200 };
     expect(await readTypedV11ManifestPage(source(), options)).toEqual([]);
     await expect(readTypedV11ManifestPage(source(), { ...options, participantId: "other:synthetic" })).rejects.toThrow();
+    await expect(readTypedV11ManifestPage(source(), { ...options, deviceId: "other:device" })).rejects.toThrow();
+    await expect(readTypedV11ManifestPage(source(), { ...options, sourceNamespace: "other:namespace" })).rejects.toThrow();
     await drain();
     expect((await read(value.event.ownerDigest)).values[0]!.counts).toEqual({ usage: 0, quota: 0, session: 0 });
   });

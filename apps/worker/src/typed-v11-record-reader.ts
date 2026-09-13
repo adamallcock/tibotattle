@@ -40,9 +40,21 @@ export async function readTypedV11ManifestPage(db: D1Database, options: {
     JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=m.participant_id
       AND owner_membership.namespace_id=membership.namespace_id
       AND owner_membership.typed_owner_id=typed_manifest.owner_id
-    WHERE m.id=? AND m.participant_id=? AND m.device_id=? AND m.state='ready'`)
+    WHERE m.id=? AND m.participant_id=? AND m.device_id=? AND m.state='ready'
+    UNION ALL
+    SELECT 1 AS present FROM telemetry_v11_day_manifests m
+    JOIN typed_v11_admission_state s ON s.id=1 AND s.runtime_contract_version=1
+    JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=s.namespace_id
+      AND origin.source_namespace=s.source_namespace AND origin.source_namespace=?
+      AND origin.namespace_original=? AND origin.access_mode='current-write'
+      AND origin.v11_read_contract_version=2 AND origin.source_schema_digest=?
+    WHERE m.id=? AND m.participant_id=? AND m.device_id=? AND m.state='ready'
+      AND m.expected_chunk_count=0
+      AND NOT EXISTS(SELECT 1 FROM telemetry_v11_chunks c WHERE c.manifest_id=m.id)`)
     .bind(binary(options.manifestId), binary(options.participantId), binary(options.deviceId),
       binary(options.sourceNamespace), options.sourceNamespace, TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST,
+      options.manifestId, options.participantId, options.deviceId,
+      options.sourceNamespace, binary(options.sourceNamespace), TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST,
       options.manifestId, options.participantId, options.deviceId).first();
   if (!manifest) throw new Error("TYPED_V11_READER_MEMBERSHIP_CONFLICT");
   const rows = (await db.prepare(TYPED_V11_MANIFEST_PAGE_SQL)

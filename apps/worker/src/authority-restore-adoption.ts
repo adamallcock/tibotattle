@@ -72,7 +72,17 @@ export async function restoreTypedAdmissionPage(db:D1Database,options:{format:'v
  if(verify?checkpoint.verify_done:checkpoint.done)return {done:true,records:0};
  const after=verify?checkpoint.verify_after:checkpoint.after_id;
  const page=await readTypedTelemetryPage(db,{sourceNamespace,format,afterSourceRowId:after,limit});
- const namespace=await db.prepare('SELECT id FROM typed_telemetry_namespaces WHERE original_id=?').bind(binary(encodeTypedTelemetryId(sourceNamespace))).first<number>('id');
+ let namespace=await db.prepare('SELECT id FROM typed_telemetry_namespaces WHERE original_id=?').bind(binary(encodeTypedTelemetryId(sourceNamespace))).first<number>('id');
+ // An entirely empty first format has no copied row to create its namespace.
+ // Only the initial, empty adoption may establish that original identity;
+ // verification and populated histories must already have it.
+ if(!namespace&&!verify&&page.records.length===0&&checkpoint.high_water===0
+   &&checkpoint.after_id===0&&checkpoint.copied===0){
+  await db.prepare('INSERT INTO typed_telemetry_namespaces(original_id) VALUES(?) ON CONFLICT DO NOTHING')
+   .bind(binary(encodeTypedTelemetryId(sourceNamespace))).run();
+  namespace=await db.prepare('SELECT id FROM typed_telemetry_namespaces WHERE original_id=?')
+   .bind(binary(encodeTypedTelemetryId(sourceNamespace))).first<number>('id');
+ }
  if(!namespace)throw fail();
  const statements:D1PreparedStatement[]=[];
  // Fetch the same indexed rows in <=100-bind sets. Explicit keyed cardinality
