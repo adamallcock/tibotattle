@@ -223,3 +223,17 @@ visible beside their chart, with partial coverage in amber. A secondary update
 timestamp remains available while progress or errors occupy the status line.
 Standalone reporting retains its own range. Validate retained-data progress,
 empty/error controls and a real packaged performance view before handoff.
+
+Validated with 751 passing web tests and passing documentation governance.
+The retained-results failure/retry test verifies coverage, secondary timestamp,
+and recovery without duplicate ready timestamps. Shared mode omits its local
+period row while standalone mode retains it.
+
+Unsigned source `44aff8e6b861f227f0f71eca75243d4f77d13ac4`, ASAR
+`d8602d0d70b61f5d90de70bf541b1ab27dfacc239e9cb70b1c922e765abb9a97`,
+was visually reviewed with real aggregate data at 1180px and 960px. Both show
+one secondary timestamp during collection, zero duplicate period rows, two
+chart coverage summaries, and no horizontal overflow. Private evidence:
+`.release-build/evidence-layout.json` and the matching performance screenshots.
+This visual qualification does not resolve the existing full accounting-parity
+gate.
