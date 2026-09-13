@@ -189,3 +189,13 @@ observation label without a repeated generic banner. Evidence is retained in
 `.release-build/freshness-layout.json` and the matching private screenshots.
 The full runner still encounters its existing `usage_invalid` accounting-parity
 gate; this is visual qualification, not full accounting-parity qualification.
+
+## Chart anatomy follow-up
+
+Bring allowance and model-performance cards onto the shared chart anatomy.
+Legends should occupy a separate row below heading/controls, including the
+usage timeline. Keep plot interactions and uncertainty semantics unchanged.
+Use amber for incomplete coverage, reserving error styling for failed actions.
+Acceptance: consistent title scale/padding, readable controls and legends at
+1180px and 960px, preserved model tooltip and keyboard tests, and a fresh
+unsigned packaged visual inspection.

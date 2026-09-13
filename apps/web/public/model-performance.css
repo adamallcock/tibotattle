@@ -194,25 +194,9 @@ html[data-theme="dark"] .performance-axis-line { opacity: .42; }
   font-size: .72rem;
 }
 
-.model-performance .performance-card {
-  min-width: 0;
-  margin-bottom: var(--space-4, 16px);
-  padding: var(--pad-card, 24px) var(--pad-card, 24px) var(--space-3, 12px);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md, 14px);
-  background: var(--surface);
-  box-shadow: var(--shadow-card);
-}
-.model-performance .performance-card-heading { gap: var(--space-4, 16px); margin-bottom: var(--space-3, 12px); }
-.model-performance .performance-card h4 {
-  margin: 0;
-  font-family: var(--serif);
-  font-size: 1.2rem;
-  font-weight: var(--weight-display, 500);
-  line-height: 1.2;
-}
-.model-performance .performance-unit { margin: var(--space-1, 4px) 0 0; font-size: .75rem; line-height: 1.45; }
-.model-performance .performance-legend { gap: var(--space-2, 8px) var(--space-4, 16px); font-size: .7rem; line-height: 1.4; }
+.model-performance .performance-card { margin-bottom: var(--space-4, 16px); }
+.model-performance .performance-unit { margin: var(--space-1, 4px) 0 0; font-size: .76rem; line-height: 1.5; }
+.model-performance .performance-legend { justify-content: flex-start; padding: 0; margin-bottom: var(--space-4, 16px); gap: var(--space-2, 8px) var(--space-4, 16px); font-size: .68rem; line-height: 1.4; }
 .model-performance .performance-empty {
   display: grid;
   place-items: center;
@@ -251,7 +235,7 @@ html[data-theme="dark"] .performance-axis-line { opacity: .42; }
 .model-performance .performance-details p:first-of-type { padding-top: var(--space-4, 16px); }
 
 @media (max-width: 720px) {
-  .model-performance .performance-card { padding: var(--space-5, 20px) var(--space-3, 12px) var(--space-3, 12px); }
+  .model-performance .performance-card { padding: var(--space-4, 16px); }
   .model-performance .performance-evidence-row { flex-basis: 100%; }
 }
 @media (max-width: 480px) {

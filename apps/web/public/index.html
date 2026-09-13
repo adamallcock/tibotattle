@@ -469,13 +469,13 @@
           <p class="annotation stale-serve-note" id="weekly-stale-note" hidden></p>
         </div>
 
-        <article class="panel weekly-history-panel lead-chart-panel">
-          <div class="panel-heading">
+        <article class="panel weekly-history-panel lead-chart-panel chart-card">
+          <div class="panel-heading chart-card-header">
             <div>
               <p class="panel-kicker">History</p>
-              <h3>Allowance estimate history</h3>
+              <h3 class="chart-card-title">Allowance estimate history</h3>
             </div>
-            <div class="weekly-chart-controls">
+            <div class="weekly-chart-controls chart-card-controls">
               <label class="weekly-span-control" for="weekly-span-control">
                 <span id="weekly-span-label">Minimum observed quota span</span>
                 <input id="weekly-span-control" type="range" min="0" max="99" step="1" value="50">
@@ -484,7 +484,7 @@
             </div>
           </div>
           <p id="weekly-span-note" class="small muted" hidden></p>
-          <div class="legend weekly-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
+          <div class="legend weekly-legend chart-card-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
             <span><i class="legend-dot weekly-center"></i>All-data median</span>
             <span><i class="legend-dot weekly-mature"></i><span id="weekly-span-legend">Observed across 50+ points</span></span>
             <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
@@ -499,7 +499,7 @@
             calibration report states the same thing; calling it a measured or
             confidence range here overclaimed.
           -->
-          <p class="annotation">
+          <p class="annotation chart-card-note">
             Each reset estimate is drawn with its slope-agreement range: the
             spread of slopes from different pairs of observed quota boundaries
             within that reset. It is a within-reset disagreement diagnostic,
@@ -507,7 +507,7 @@
           </p>
           <!-- The zone is named once per chart, from the reader's own system
                zone, instead of being repeated on every tick and tooltip. -->
-          <p class="annotation" id="weekly-chart-timezone"></p>
+          <p class="annotation chart-card-note" id="weekly-chart-timezone"></p>
         </article>
 
         <!--
@@ -602,13 +602,13 @@
 
         <details class="advanced-calibration" open>
           <summary>Advanced calibration: measured quota change versus calculated change</summary>
-        <article class="panel chart-panel">
+        <article class="panel chart-panel chart-card">
           <div class="chart-heading">
             <div>
               <h3 id="timeline-chart-title">Observed quota change versus cost-implied change</h3>
               <p id="timeline-chart-copy">Chart and table use this Mac’s reporting time zone.</p>
             </div>
-            <div class="calibration-controls">
+            <div class="calibration-controls chart-card-controls">
               <!--
                 Owner decision 2026-08-06: the rolling comparison window is
                 fixed at three hours. The 15-minute and 1-hour widths the old
@@ -731,7 +731,7 @@
           <div class="chart-empty small" id="divergence-empty" hidden></div>
           <ol class="divergence-list" id="divergence-list"></ol>
         </article>
-        <article class="panel chart-panel">
+        <article class="panel chart-panel chart-card">
           <div class="chart-heading">
             <div>
               <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
@@ -751,11 +751,11 @@
                 <button class="button button-quiet compact" id="usage-pan-forward" type="button" title="Pan usage later" data-i18n-title="title.panUsageLater">Later →</button>
                 <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
               </div>
-              <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
-                <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Speed-priced API-equivalent usage</span></span>
-                <span id="usage-allowance-legend"><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
-              </div>
             </div>
+          </div>
+          <div class="legend compact-legend chart-card-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
+            <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Speed-priced API-equivalent usage</span></span>
+            <span id="usage-allowance-legend"><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
           </div>
           <div class="chart-empty" id="usage-timeline-empty">
             <strong>No real usage timeline loaded</strong>

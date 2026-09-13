@@ -5408,9 +5408,9 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
 }
 .dashboard-shell :is(.series-coverage, .timeline-confidence).low,
 .dashboard-shell .series-coverage {
-  border-inline-start-color: var(--rust);
-  color: var(--rust);
-  background: var(--rust-soft);
+  border-inline-start-color: var(--amber);
+  color: var(--amber);
+  background: var(--amber-soft);
 }
 
 /* Longer explanations are disclosures, so they get a card boundary and a
@@ -5534,3 +5534,14 @@ body:not(.community-site) > .topbar:has(#reporting-period-toolbar[hidden]) { gri
 #quota-cards .metric-value { grid-row: 2; }
 #quota-cards .mini-progress { grid-row: 3; }
 #quota-cards .metric-card-footer { grid-row: 4; }
+
+/* Legends occupy their own row, leaving titles and controls room to wrap. */
+.dashboard-shell .chart-card > :is(.chart-card-header, .chart-heading) > :first-child { flex: 1 1 22rem; min-width: 0; }
+.dashboard-shell .chart-card > :is(.chart-card-legend, .legend) { justify-content: flex-start; margin: 0 0 var(--space-4); }
+.dashboard-shell .chart-card-note { margin: var(--space-3) 0 0; color: var(--muted); font-size: .75rem; line-height: 1.5; }
+.dashboard-shell .chart-card-note + .chart-card-note { margin-top: var(--space-2); }
+.dashboard-shell .chart-card .chart-card-header .panel-kicker { margin-top: 0; }
+
+@media (max-width: 760px) {
+  .dashboard-shell :is(.chart-card, .chart-panel) { padding: var(--space-4); }
+}

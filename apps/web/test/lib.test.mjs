@@ -6764,7 +6764,7 @@ test("the weekly allowance chart leads the dashboard", async () => {
   assert.match(html, /<h2 id="weekly-title" data-i18n="page.weekly.title">Allowance<\/h2>/u);
   assert.match(html, /<h2 id="timeline-title" data-i18n="page.timeline.title">Trends<\/h2>/u);
   assert.match(html, /class="dashboard-section lead-section(?: dashboard-page-inactive)?" id="weekly"/u);
-  assert.match(html, /class="panel weekly-history-panel lead-chart-panel"/u);
+  assert.match(html, /class="panel weekly-history-panel lead-chart-panel chart-card"/u);
   // The lead chart must use the available page width instead of introducing a
   // second horizontal scrollbar for a handful of reset estimates.
   assert.match(styles, /\.weekly-history-chart \{ overflow: visible; \}/u);

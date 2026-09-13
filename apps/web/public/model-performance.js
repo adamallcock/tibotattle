@@ -524,13 +524,13 @@ export function mountModelPerformance(options = {}) {
     identity.append(element("span", "", selectedName));
     subheading.append(identity, element("span", "", translate(payload.interval))); panel.append(subheading);
     for (const metric of ["speed", "latency"]) {
-      const card = element("article", "performance-card");
-      const cardHeading = element("div", "performance-card-heading"), cardTitle = element("div");
+      const card = element("article", "performance-card chart-card");
+      const cardHeading = element("div", "performance-card-heading chart-card-header"), cardTitle = element("div");
       const summary = metric === "speed"
         ? translate("speedSummary", { measured: number(selected.speedTurns), total: number(selected.turns) })
         : translate("latencySummary", { measured: number(selected.ttftTurns), total: number(selected.turns), responses: number(selected.timedResponses) });
-      cardTitle.append(element("h4", "", translate(metric)), element("p", "performance-unit", summary));
-      const legend = element("div", "performance-legend");
+      cardTitle.append(element("h4", "chart-card-title", translate(metric)), element("p", "performance-unit", summary));
+      const legend = element("div", "performance-legend chart-card-legend");
       for (const method of ["outerBand", "innerBand", "medianP50"]) {
         const entry = element("span", "performance-legend-item");
         const swatch = svgElement("svg", { width: method === "medianP50" ? 24 : 22, height: 16, viewBox: "0 0 24 16", "aria-hidden": "true" });
@@ -542,7 +542,7 @@ export function mountModelPerformance(options = {}) {
         }));
         entry.append(swatch, element("span", "", translate(method))); legend.append(entry);
       }
-      cardHeading.append(cardTitle, legend); card.append(cardHeading,
+      cardHeading.append(cardTitle); card.append(cardHeading, legend,
         plot(metric === "speed" ? selected.speed : [{ method: "ttft", points: selected.ttft }], metric, "var(--allowance-color)", domain));
       panel.append(card);
     }

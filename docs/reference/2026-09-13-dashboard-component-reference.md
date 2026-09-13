@@ -46,7 +46,11 @@ card should keep this order:
 3. `.chart-card-body`, containing the chart or its state.
 
 Existing `.chart-heading`, `.chart-control-stack`, `.legend`, and `.chart-shell`
-map to the same roles. Controls wrap at narrow widths and chart bodies retain
+map to the same roles. Allowance history and model-performance cards use these
+shared classes. Legends are direct card children below the header, including
+the usage timeline; they never compete with controls for header width.
+Incomplete chart coverage uses amber and retains its full explanation.
+Controls wrap at narrow widths and chart bodies retain
 their overflow and pointer behavior.
 
 ## Loading, empty, and error states
