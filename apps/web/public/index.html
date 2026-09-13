@@ -133,7 +133,7 @@
       <aside class="dashboard-sidebar" aria-label="Dashboard navigation" data-i18n-aria-label="aria.dashboardNavigation">
         <nav class="primary-nav" aria-label="Dashboard sections" data-i18n-aria-label="aria.dashboardSections">
           <a href="#overview" data-nav="overview" data-requires-evidence>Overview</a>
-          <a href="#weekly" data-nav="weekly" data-requires-evidence>Allowance</a>
+          <a href="#weekly" data-nav="weekly" data-requires-evidence data-i18n="allowance.valueTab">Allowance Value</a>
           <a href="#timeline" data-nav="trends" data-requires-evidence>Trends</a>
           <a href="#performance" data-nav="performance" data-i18n="performance.title">Model performance</a>
           <a href="#accounting" data-nav="method" data-requires-evidence>Usage and costs</a>
@@ -451,7 +451,7 @@
       <section class="dashboard-section lead-section dashboard-page-inactive" id="weekly" aria-labelledby="weekly-title" data-dashboard-page="weekly" data-requires-evidence aria-hidden="true" inert>
         <div class="dashboard-page-header">
           <div>
-            <h2 id="weekly-title" data-i18n="page.weekly.title">Allowance</h2>
+            <h2 id="weekly-title" data-i18n="page.weekly.title">Allowance Value</h2>
             <p class="page-description" data-i18n="page.weekly.description">Estimated capacity and how it changes over time.</p>
           </div>
           <div class="allowance-header-controls">
@@ -612,15 +612,57 @@
           </div>
         </div>
 
-        <details class="advanced-calibration" open>
-          <summary>Advanced calibration: measured quota change versus calculated change</summary>
-        <article class="panel chart-panel chart-card">
+        <article class="panel chart-panel trends-capacity-panel">
+          <div class="trends-horizon">
+            <div class="trends-sky" aria-hidden="true"><div class="trends-stars"></div><div class="trends-clouds"></div><div class="trends-sun"></div><div class="trends-moon"></div><div class="trends-ridge"></div></div>
+            <div class="trends-clock-content"><span class="trends-clock-label" data-i18n="trends.localClock">Local clock · selected time</span><span id="trends-date" data-i18n-skip>—</span><strong id="trends-clock" data-i18n-skip>—</strong></div>
+          </div>
+          <div class="trends-time-controls"><button id="trends-replay" class="button button-quiet compact" type="button" aria-pressed="false" disabled data-i18n="trends.play">Play history</button><input id="trends-time" type="range" aria-label="Explore history" data-i18n-aria-label="trends.explore" disabled><button id="trends-latest" class="button button-quiet compact" type="button" data-i18n="trends.latest">Latest</button></div>
+          <div class="chart-heading">
+            <div>
+              <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
+              <p id="usage-timeline-copy">Local usage over time</p>
+            </div>
+            <div class="chart-control-stack">
+              <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping" data-i18n-aria-label="aria.usageGrouping">
+                <button type="button" data-group="hour" class="active" aria-pressed="true">Hour</button>
+                <button type="button" data-group="day">Day</button>
+                <button type="button" data-group="week">Week</button>
+              </div>
+              <div class="chart-navigation" aria-label="Usage zoom and pan" data-i18n-aria-label="aria.usageZoomPan">
+                <button class="button button-quiet compact" id="usage-pan-back" type="button" title="Pan usage earlier" data-i18n-title="title.panUsageEarlier">← Earlier</button>
+                <button class="button button-quiet compact" id="usage-zoom-out" type="button" title="Zoom out" data-i18n-title="title.zoomOut">−</button>
+                <button class="button button-quiet compact" id="usage-zoom-in" type="button" title="Zoom in" data-i18n-title="title.zoomIn">+</button>
+                <button class="button button-quiet compact" id="usage-reset-zoom" type="button">Reset view</button>
+                <button class="button button-quiet compact" id="usage-pan-forward" type="button" title="Pan usage later" data-i18n-title="title.panUsageLater">Later →</button>
+                <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
+              </div>
+              <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
+                <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Speed-priced API-equivalent usage</span></span>
+                <span id="usage-allowance-legend"><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
+              </div>
+            </div>
+          </div>
+          <div class="chart-empty" id="usage-timeline-empty">
+            <strong>No real usage timeline loaded</strong>
+            <p>Analyze local usage to build recent content-free usage buckets.</p>
+          </div>
+          <div class="trends-lane-heading" data-i18n="trends.allowance">Observed allowance remaining</div>
+          <div class="chart-empty small" id="allowance-timeline-empty" hidden data-i18n="trends.allowanceUnavailable">No comparable allowance observations in this view.</div>
+          <div class="chart-shell" id="allowance-timeline-chart" hidden></div>
+          <div class="trends-lane-heading" id="trends-activity-label" data-i18n="trends.activity">Recorded activity · API-price equivalent</div>
+          <div class="chart-shell" id="usage-timeline-chart" hidden></div>
+          <p class="series-coverage" id="usage-timeline-coverage" role="status" hidden></p>
+          <div class="chart-summary-grid" id="usage-timeline-summary"></div>
+        </article>
+
+        <article class="panel chart-panel trends-comparison-panel">
           <div class="chart-heading">
             <div>
               <h3 id="timeline-chart-title">Observed quota change versus cost-implied change</h3>
               <p id="timeline-chart-copy">Chart and table use this Mac’s reporting time zone.</p>
             </div>
-            <div class="calibration-controls chart-card-controls">
+            <div class="calibration-controls" hidden>
               <!--
                 Owner decision 2026-08-06: the rolling comparison window is
                 fixed at three hours. The 15-minute and 1-hour widths the old
@@ -654,39 +696,43 @@
           </div>
           <div class="chart-shell" id="timeline-chart" hidden></div>
           <p class="series-coverage" id="timeline-coverage" role="status" hidden></p>
+          <div class="trends-difference-heading"><span data-i18n="trends.difference">Observed minus calculated</span><span class="trends-sign-key"><i></i><span data-i18n="trends.above">Above estimate</span><i></i><span data-i18n="trends.below">Below estimate</span></span></div>
+          <div class="chart-shell trends-difference-chart" id="difference-timeline-chart" hidden></div>
+          <p class="timeline-confidence" id="residual-coverage" role="status"></p>
+          <details class="trends-evidence-details"><summary data-i18n="trends.method">Comparison quality and assumptions</summary>
+          <p class="annotation" data-i18n="trends.quiet">Quiet periods with no activity and no quota change are neutral, not errors.</p>
           <div class="chart-summary-grid" id="timeline-summary"></div>
           <p class="timeline-confidence" id="timeline-confidence" role="status"></p>
+          </details>
         </article>
 
-        <div class="two-column lower-charts">
-          <article class="panel">
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Residuals</p>
-                <h3>Observed versus calculated movement</h3>
-              </div>
-            </div>
-            <p class="annotation">
-              The difference between provider-reported quota movement and the
-              movement implied by local usage changes. Quiet periods with no
-              activity and no quota change are neutral, not errors.
-            </p>
-            <!--
-              The designed cumulative view (owner-directed, 2026-08-08). The
-              sentence names the semantics honestly: a per-bucket
-              non-overlapping running sum, restarted at every reset boundary
-              or track change, drawn only where live reset annotations exist.
-            -->
-            <p class="annotation">
-              The second line is cumulative drift: the running sum of each
-              bucket’s observed-minus-expected movement, restarted at every
-              window boundary or track change.
-            </p>
-            <div class="dashboard-state chart-empty small" id="residual-empty" role="status" data-state="empty">No residual evidence loaded.</div>
+        <article class="panel trends-drift-panel">
+          <div class="panel-heading"><div><p class="panel-kicker" data-i18n="trends.cycle">Within each allowance cycle</p><h3 data-i18n="trends.drift">Cumulative drift</h3></div></div>
+          <p class="annotation" data-i18n="trends.driftCopy">Observed minus calculated movement since the cycle anchor. Gaps and changes of cycle interrupt the line.</p>
+            <div class="chart-empty small" id="residual-empty">No residual evidence loaded.</div>
             <div class="chart-shell compact-chart" id="residual-chart" hidden></div>
-            <p class="timeline-confidence" id="residual-coverage" role="status"></p>
+            <p class="timeline-confidence" id="trends-drift-coverage" role="status"></p>
           </article>
-          <article class="panel">
+        <article class="panel divergence-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Divergence periods</p>
+              <h3>Where observed and priced usage diverge</h3>
+            </div>
+          </div>
+          <p class="annotation">
+            Sustained stretches where provider-reported quota movement and the
+            movement implied by priced usage persistently disagree. A single
+            spike that cancels out is not listed. Expand a period to reprice just
+            that window and see its cost mix by model and speed.
+          </p>
+          <p class="timeline-confidence" id="divergence-summary" role="status" hidden></p>
+          <p class="annotation" id="divergence-caveat" hidden></p>
+          <div class="chart-empty small" id="divergence-empty" hidden></div>
+          <ol class="divergence-list" id="divergence-list"></ol>
+        </article>
+          <details class="panel trends-evidence-details">
+            <summary data-i18n="trends.evidence">Exact windows and evidence</summary>
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Inspect exact periods</p>
@@ -722,61 +768,7 @@
               <span class="table-pagination-status" id="residual-page-status" role="status"></span>
               <button class="button button-quiet compact" id="residual-page-next" type="button" disabled>Next</button>
             </div>
-          </article>
-        </div>
-        </details>
-        <article class="panel divergence-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Divergence periods</p>
-              <h3>Where observed and priced usage diverge</h3>
-            </div>
-          </div>
-          <p class="annotation">
-            Sustained stretches where provider-reported quota movement and the
-            movement implied by priced usage persistently disagree. A single
-            spike that cancels out is not listed. Expand a period to reprice just
-            that window and see its cost mix by model and speed.
-          </p>
-          <p class="timeline-confidence" id="divergence-summary" role="status" hidden></p>
-          <p class="annotation" id="divergence-caveat" hidden></p>
-          <div class="dashboard-state chart-empty small" id="divergence-empty" role="status" data-state="empty" hidden></div>
-          <ol class="divergence-list" id="divergence-list"></ol>
-        </article>
-        <article class="panel chart-panel chart-card">
-          <div class="chart-heading">
-            <div>
-              <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
-              <p id="usage-timeline-copy">Local usage over time</p>
-            </div>
-            <div class="chart-control-stack">
-              <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping" data-i18n-aria-label="aria.usageGrouping">
-                <button type="button" data-group="hour" class="active" aria-pressed="true">Hour</button>
-                <button type="button" data-group="day">Day</button>
-                <button type="button" data-group="week">Week</button>
-              </div>
-              <div class="chart-navigation" aria-label="Usage zoom and pan" data-i18n-aria-label="aria.usageZoomPan">
-                <button class="button button-quiet compact" id="usage-pan-back" type="button" title="Pan usage earlier" data-i18n-title="title.panUsageEarlier">← Earlier</button>
-                <button class="button button-quiet compact" id="usage-zoom-out" type="button" title="Zoom out" data-i18n-title="title.zoomOut">−</button>
-                <button class="button button-quiet compact" id="usage-zoom-in" type="button" title="Zoom in" data-i18n-title="title.zoomIn">+</button>
-                <button class="button button-quiet compact" id="usage-reset-zoom" type="button">Reset view</button>
-                <button class="button button-quiet compact" id="usage-pan-forward" type="button" title="Pan usage later" data-i18n-title="title.panUsageLater">Later →</button>
-                <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
-              </div>
-            </div>
-          </div>
-          <div class="legend compact-legend chart-card-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
-            <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Speed-priced API-equivalent usage</span></span>
-            <span id="usage-allowance-legend"><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
-          </div>
-          <div class="dashboard-state chart-empty" id="usage-timeline-empty" role="status" data-state="empty">
-            <strong>No real usage timeline loaded</strong>
-            <p>Analyze local usage to build recent content-free usage buckets.</p>
-          </div>
-          <div class="chart-shell" id="usage-timeline-chart" hidden></div>
-          <p class="series-coverage" id="usage-timeline-coverage" role="status" hidden></p>
-          <div class="chart-summary-grid" id="usage-timeline-summary"></div>
-        </article>
+          </details>
 
       </section>
 

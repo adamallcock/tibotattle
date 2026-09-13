@@ -64,7 +64,7 @@ and percentage both represent remaining capacity. A single current Codex weekly
 forecast appears beneath the tanks when usable pacing evidence exists. Otherwise,
 a waiting panel explains that fresh or sufficient allowance evidence is needed;
 it does not display a guessed rate or run-out time. Choosing a historical plan
-on the Allowance page does not change that current forecast.
+on the Allowance Value page does not change that current forecast.
 
 The forecast names its pace assessment, estimated run-out, reset countdown and
 any time without allowance. Its timeline represents time until reset, not quota
@@ -303,6 +303,21 @@ open it may make one automatic detailed attempt after an hour. Failed,
 cancelled, and interrupted detailed attempts count toward that hour so they do
 not become a retry loop. After an already-running quick quota check finishes,
 you can choose Refresh again to request detailed work.
+
+Trends shows three linked views: **Allowance and activity**, the **three-hour
+observed versus calculated comparison**, and **Cumulative drift**. The first
+view keeps remaining percentage separate from API-price-equivalent activity.
+Warm and cool fills in the comparison show movement above and below the
+estimate; the signed difference has its own strip. Cycle drift uses the existing
+cycle anchor calculation, not a sum of overlapping three-hour windows.
+
+Hover or tap a chart, or use the history slider, to inspect a shared time across
+all views. **Play history** advances that cursor; **Latest** returns to the end
+of the displayed range. The bright daytime and moonlit nighttime Horizon follows
+local clock time, not astronomical sunrise or sunset. Replay stops when the page
+is hidden and is omitted when reduced motion is enabled. The slider and exact
+sample timestamps remain available. Range and zoom controls move the views
+together; detailed comparison assumptions and exact evidence remain expandable.
 
 Trends compares the selected plan's compatible usage and quota history. Earlier
 history on another plan does not disable a usable current-plan fit, and it is

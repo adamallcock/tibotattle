@@ -5845,17 +5845,11 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   // and prepare button are removed with the legacy prepare flow.
   assert.doesNotMatch(html, /id="contribution-lookback-controls"/);
   assert.doesNotMatch(html, /Prepare and review last 24 hours/);
-  // Owner decision 2026-08-06: the calibration chart leads Trends and its
-  // disclosure is open by default. The previous assertion pinned the opposite
-  // order, on the reviewed consumer hierarchy that a first-time reader should
-  // meet the headline usage chart before the technical evidence. That
-  // hierarchy was deliberately reversed, so this pins the new order rather
-  // than being deleted - the ordering is still a decision, not an accident.
-  assert.ok(
-    html.indexOf('id="timeline-chart"') < html.indexOf('id="usage-timeline-chart"'),
-    "calibration chart leads Trends ahead of the usage chart",
-  );
-  assert.match(html, /<details class="advanced-calibration" open>/u);
+  // Owner decision 2026-09-13: allowance leads, with all three analyses visible.
+  assert.ok(html.indexOf('id="usage-timeline-chart"') < html.indexOf('id="timeline-chart"'));
+  assert.ok(html.indexOf('id="timeline-chart"') < html.indexOf('id="residual-chart"'));
+  assert.doesNotMatch(html, /<details class="advanced-calibration"/u);
+  assert.match(html, /class="panel trends-evidence-details"/u);
   // Owner decision 2026-08-06: the calibration rolling comparison window is
   // fixed at three hours — the 15-minute and 1-hour widths proved inaccurate,
   // and a segmented control with one honest option is clutter. The previous
@@ -6760,7 +6754,7 @@ test("residuals span the calibration range and show uncomputable windows as gaps
   assert.match(appSource, /xDomain: domain,/u);
   assert.match(
     appSource,
-    /statusIntervals: domain === null\s*\?\s*\[\]\s*: timelineStatusIntervals\(residuals, domain\),/u,
+    /statusIntervals: usingLive && viewport !== null\s*\? timelineStatusIntervals\(points, viewport\)/u,
   );
   assert.match(
     appSource,
@@ -6769,6 +6763,8 @@ test("residuals span the calibration range and show uncomputable windows as gaps
   assert.match(appSource, /function residualGapReasons/u);
   assert.match(appSource, /"dashboard\.residual\.partial"/u);
   assert.match(html, /id="residual-coverage"/u);
+  assert.ok(html.indexOf('id="residual-coverage"') < html.indexOf('id="residual-chart"'));
+  assert.match(appSource, /"trends.driftCoverage"/u);
   assert.match(html, /Quiet periods with no\s+activity and no quota change are neutral, not errors/u);
 });
 
@@ -6784,7 +6780,7 @@ test("the weekly allowance chart leads the dashboard", async () => {
     html.indexOf('data-nav="weekly"') < html.indexOf('data-nav="trends"'),
     "primary navigation follows the same order as the sections",
   );
-  assert.match(html, /<h2 id="weekly-title" data-i18n="page.weekly.title">Allowance<\/h2>/u);
+  assert.match(html, /<h2 id="weekly-title" data-i18n="page.weekly.title">Allowance Value<\/h2>/u);
   assert.match(html, /<h2 id="timeline-title" data-i18n="page.timeline.title">Trends<\/h2>/u);
   assert.match(html, /class="dashboard-section lead-section(?: dashboard-page-inactive)?" id="weekly"/u);
   assert.match(html, /class="panel weekly-history-panel lead-chart-panel chart-card"/u);
@@ -10780,11 +10776,10 @@ test("the residual panel draws the cumulative line and states the signed-AUC dri
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
 
-  // The second series reads the model's cumulative key with its own honest
-  // label; the residual series keeps its own.
+  // Cycle drift now has its own chart; the short-term residual has its own lane.
   assert.match(
     appSource,
-    /key: "cumulativeResidual",\s*\n\s*className: "chart-line-expected",\s*\n\s*label: \{ key: "chart\.residual\.cumulativeSeries" \},/u,
+    /key: "cumulativeResidual", className: "chart-line-observed",\s*label: \{ key: "trends\.drift" \}/u,
   );
   // The stat sits beside MAE and peak, live view integrating the visible
   // residuals and the historical view reporting the artifact's own figure.
@@ -10796,7 +10791,7 @@ test("the residual panel draws the cumulative line and states the signed-AUC dri
   // the legacy inventory (checked by the static-copy test).
   assert.match(
     html,
-    /The second line is cumulative drift: the running sum of each\s*\n?\s*bucket’s observed-minus-expected movement, restarted at every\s*\n?\s*window boundary or track change\./u,
+    /Observed minus calculated movement since the cycle anchor\. Gaps and changes of cycle interrupt the line\./u,
   );
   for (const locale of SUPPORTED_LOCALES) {
     for (const key of [
@@ -13595,4 +13590,31 @@ test("Forest Ink dark appearance is explicit, balanced, and live-updateable", as
     appSource,
     /theme === "dark" \? "#141a17" : "#f5f1e8"/u,
   );
+});
+
+test("responsive charts keep tooltips in bounds and interrupt an anchored cycle", async () => {
+  const documentRef = new FakeSvgDocument(360);
+  const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(documentRef);
+  const svg = lineChart({
+    width: 360, height: 230,
+    points: [
+      { timestamp: '2026-09-01T00:00:00Z', value: 2 },
+      { timestamp: '2026-09-01T01:00:00Z', value: 3 },
+      { timestamp: '2026-09-01T02:00:00Z', value: 0, reanchor: true },
+      { timestamp: '2026-09-01T03:00:00Z', value: -1 },
+    ],
+    series: [{ key: 'value', className: 'chart-line-observed',
+      label: { key: 'trends.drift' }, pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+      breakBefore: 'reanchor' }],
+    title: { key: 'trends.drift' }, description: { key: 'trends.driftCopy' },
+    yLabel: { key: 'dashboard.timeline.percentagePoints' }, includeZero: true,
+  });
+  assert.equal(svg.getAttribute('viewBox'), '0 0 360 230');
+  assert.equal(svg.querySelectorAll('polyline.chart-line-observed').length, 2);
+  const tooltip = svg.querySelector('.chart-hover-tooltip');
+  assert.equal(Number(tooltip.querySelector('rect').getAttribute('width')), 264);
+  const markers = svg.querySelectorAll('circle.chart-point-hit-target');
+  markers.at(-1).dispatchEvent({ type: 'focus' });
+  const [left] = tooltip.getAttribute('transform').match(/[\d.]+/g).map(Number);
+  assert.ok(left + 264 <= 360);
 });

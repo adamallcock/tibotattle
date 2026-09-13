@@ -109,7 +109,7 @@ test("unknown capacity has no fill; zero is a real empty tank; stale evidence st
   assert.match(h.quota.children[0].textContent, /unknown/u);
   assert.equal(find(h.quota.children[1], "quota-tank-fuel")[0].style.blockSize, "0%");
   assert.match(h.quota.children[2].textContent, /Stale observation/u);
-  assert.match(h.quota.children[2].textContent, /Observation time/u);
+  assert.doesNotMatch(h.quota.textContent, /Observation time/u);
   h.renderQuotaCards(payload([]));
   assert.equal(h.context.hidden, true);
   assert.equal(h.quota.children.length, 1);

@@ -5596,3 +5596,71 @@ html[data-theme="dark"] .quota-tank.stale { --tank-fluid: #8c9a8d; --tank-glow: 
 .quota-tank-header > .allowance-motion-controls { position: absolute; top: 0; right: 0; }
 
 .weekly-pace-forecast-heading .panel-kicker { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Integrated Trends: time-of-day is a local-clock context, kept outside data axes. */
+#timeline { --trends-above: #b87039; --trends-below: #547caf; }
+#timeline .trends-capacity-panel { overflow: hidden; padding-top: 0; box-shadow: 0 12px 38px #173e3010; }
+.trends-horizon { position: relative; height: 174px; margin: 0 -24px; overflow: hidden; background: #287bb0; }
+.trends-sky { position: absolute; inset: 0; background: linear-gradient(125deg,#32a2e7,#caeffc); overflow: hidden; }
+.trends-sky::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg,#0b2438e8, #14354e9c 26%,transparent 67%); }
+.trends-clock-content { position: relative; z-index: 1; display: flex; flex-direction: column; padding: 22px 32px; color: #fff; text-shadow: 0 1px 5px #18344533; }
+.trends-clock-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1.6px; font-weight: 700; color: #e6f3ff; margin-bottom: 13px; }
+#trends-date { font-size: 12px; color: #edf7ff; }
+#trends-clock { font: 44px/1.15 var(--serif); font-variant-numeric: tabular-nums; letter-spacing: -1px; margin-top: 3px; }
+.trends-sun { position: absolute; width: 30px; height: 30px; border-radius: 50%; background: #fffde1; box-shadow: 0 0 16px 7px #ffffd788,0 0 55px 28px #fff8c254,0 0 115px 65px #ffffea20; }
+.trends-moon { position: absolute; width: 24px; height: 24px; border-radius: 50%; background: radial-gradient(circle at 32% 30%,#fffff5,#baccdf); box-shadow: 0 0 25px 6px #d6edff33; }
+.trends-stars { position: absolute; inset: 0; background-image: radial-gradient(circle at 51% 20%,#edf7ff 0 1px,transparent 1.4px),radial-gradient(circle at 65% 35%,#edf7ffbb 0 .8px,transparent 1.2px),radial-gradient(circle at 72% 13%,#edf7ff 0 1px,transparent 1.5px),radial-gradient(circle at 86% 32%,#edf7ffbb 0 1px,transparent 1.5px),radial-gradient(circle at 95% 18%,#edf7ff 0 1px,transparent 1.5px),radial-gradient(circle at 57% 48%,#edf7ff88 0 .7px,transparent 1.2px); }
+.trends-clouds { position: absolute; inset: 0; opacity: .18; background: radial-gradient(ellipse 25% 10% at 89% 52%,#fff,transparent),radial-gradient(ellipse 13% 7% at 54% 29%,#fff,transparent); }
+.trends-ridge { position: absolute; inset: 0; background: linear-gradient(0deg,#183f5838,transparent 32%); }
+.trends-time-controls { display: flex; align-items: center; gap: 16px; padding: 12px 0; margin-bottom: 16px; border-bottom: 1px solid var(--line); }
+#trends-time { flex: 1; min-width: 48px; width: 100%; accent-color: var(--green-2); cursor: ew-resize; }
+.trends-time-controls button { flex: 0 0 auto; }
+.trends-lane-heading { font-size: 11px; color: var(--muted); margin: 10px 0 3px; }
+#timeline .chart-shell { margin-top: 8px; }
+#allowance-timeline-chart svg { aspect-ratio: 900 / 260; max-height: none; }
+#usage-timeline-chart svg { aspect-ratio: 900 / 150; max-height: none; }
+#timeline-chart svg { aspect-ratio: 900 / 270; max-height: none; }
+#difference-timeline-chart svg { aspect-ratio: 900 / 125; max-height: none; }
+#residual-chart svg { aspect-ratio: 900 / 230; max-height: none; }
+#timeline .chart-heading { display: block; }
+#timeline .chart-heading h3 { font-size: 27px; }
+#timeline .chart-control-stack { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: flex-start; gap: 10px; margin-top: 16px; }
+#timeline .chart-control-stack .legend { width: 100%; justify-content: flex-start; }
+#timeline .chart-navigation { gap: 4px; }
+#timeline .chart-navigation button { min-height: 29px; padding: 4px 8px; font-size: 11px; }
+#timeline .chart-summary-grid { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 16px; }
+#timeline .chart-line-expected { stroke: var(--muted); stroke-dasharray: 5 4; stroke-width: 1.8; }
+#timeline .chart-line-observed { stroke: var(--green-2); stroke-width: 2.2; }
+.trends-reservoir-fill { fill: url(#trends-reservoir-gradient); }
+.trends-difference-above { fill: var(--trends-above); fill-opacity: .38; }
+.trends-difference-below { fill: var(--trends-below); fill-opacity: .32; }
+.trends-activity-fill { fill: var(--green-2); fill-opacity: .5; }
+.trends-guide { stroke: var(--green); stroke-width: 1; stroke-dasharray: 3 4; opacity: .65; }
+#timeline .trends-selected-point { fill: var(--surface-raised); stroke-width: 2; }
+.trends-readout { margin: 4px 0 12px; min-height: 19px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.trends-difference-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--line); padding-top: 15px; margin-top: 12px; font-size: 11px; color: var(--muted); }
+.trends-sign-key { display: inline-flex; gap: 6px; align-items: center; }
+.trends-sign-key i { width: 12px; height: 6px; background: var(--trends-above); border-radius: 2px; }
+.trends-sign-key i:nth-of-type(2) { margin-left: 8px; background: var(--trends-below); }
+.trends-evidence-details { margin-top: 16px; }
+.trends-evidence-details > summary { cursor: pointer; font-size: 13px; color: var(--muted); padding: 8px 0; }
+#timeline .trends-comparison-panel, #timeline .trends-drift-panel { margin-top: 20px; }
+#timeline .calibration-legend { font-size: 10px; gap: 9px 14px; }
+#timeline .calibration-legend .expected { background: var(--muted); }
+@media (max-width: 650px) {
+  .trends-horizon { height: 160px; }
+  .trends-clock-content { padding: 20px 28px; }
+  #trends-clock { font-size: 38px; }
+  #timeline .chart-heading { flex-direction: column; gap: 12px; }
+  #timeline .chart-control-stack { align-items: flex-start; width: 100%; }
+  #timeline .chart-navigation { flex-wrap: wrap; }
+  .trends-time-controls { gap: 8px; }
+  #timeline .chart-heading h3 { font-size: 24px; }
+  #timeline .chart-shell svg { min-height: 140px; }
+  #timeline #usage-timeline-chart svg, #timeline #difference-timeline-chart svg { min-height: 85px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .trends-sky, .trends-sun, .trends-moon, .trends-stars { transition: none; animation: none; }
+}
+#timeline .trends-capacity-panel .legend-dot.cost { background: var(--green-2); height: 7px; opacity: .55; }
+#timeline .trends-capacity-panel .legend-dot.allowance { border: 0; background: var(--green-2); height: 2px; }
