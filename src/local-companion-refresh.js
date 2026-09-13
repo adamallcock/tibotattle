@@ -7,6 +7,10 @@ import {
 } from "@app-usagemonitor/quota-analysis";
 import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
 import {
+  createDevelopmentAccountObservationSecretLoader,
+  readDevelopmentAccountObservationSecretFile,
+} from "./account-observation-secret.js";
+import {
   LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX,
   LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION,
   recordLocalCollectorLegacyRefreshAttempt,
@@ -888,6 +892,7 @@ export function createLocalCollectorRefreshRunner({
   accountObservationOperationLockFile = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
   environment = process.env,
+  platform = process.platform,
   readAccountAttributionBinding = null,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
@@ -977,8 +982,9 @@ export function createLocalCollectorRefreshRunner({
   }
   // The packaged macOS real-history QA lane runs against a copied profile and
   // must not read or mint the account-observation Keychain secret. Keep the
-  // ordinary quota result but leave its account scope unavailable; the
-  // development export identity is deliberately not an account-scope secret.
+  // ordinary quota result but leave its account scope unavailable by default.
+  // Interactive development can opt into a separate owner-only file identity;
+  // the export identity is deliberately never an account-scope secret.
   const accountObservationSecretDisabled =
     environment.USAGE_MONITOR_TEST_LANE === MACOS_ELECTRON_LOCAL_QA_TEST_LANE;
   // Cross-invocation backoff for a memory-budget miss. Held in the runner
@@ -1021,6 +1027,7 @@ export function createLocalCollectorRefreshRunner({
       }
       throw error;
     };
+    let developmentAccountLoader = null;
     try {
       return await (async () => {
     // Legacy is an explicit rollback authority, never an error fallback. Stamp
@@ -1059,7 +1066,29 @@ export function createLocalCollectorRefreshRunner({
       signal,
     );
     let selection = { loadAccountObservationSecret: null };
-    if (!accountObservationSecretDisabled) {
+    if (accountObservationSecretDisabled) {
+      let secret = null;
+      try {
+        if (platform === "darwin" && environment.USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY === "1"
+            && environment.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE !== undefined
+            && !environment.USAGE_MONITOR_CENTRAL_ORIGIN
+            && !environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN
+            && !environment.USAGE_MONITOR_ACCOUNTLESS_MODE
+            && environment.APP_USAGEMONITOR_EXPORT_SECRET === undefined) {
+          secret = await readDevelopmentAccountObservationSecretFile(
+            environment.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE,
+            { exportIdentityFile: environment.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE },
+          );
+          developmentAccountLoader = createDevelopmentAccountObservationSecretLoader(secret);
+          selection = { loadAccountObservationSecret: developmentAccountLoader };
+        }
+      } catch {
+        // Broken opt-in stays unattributed and cannot fall through to Keychain.
+        selection = { loadAccountObservationSecret: null };
+      } finally {
+        secret?.fill(0);
+      }
+    } else {
       try {
         selection = selectAccountObservationSecret(
           accountObservationOperationLockFile === null
@@ -1519,6 +1548,8 @@ export function createLocalCollectorRefreshRunner({
       })();
     } catch (error) {
       stampStep(error);
+    } finally {
+      developmentAccountLoader?.dispose();
     }
   };
 }

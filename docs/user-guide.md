@@ -55,14 +55,16 @@ Liquid motion is illustrative: the level stays at the observed percentage. Only
 a matching fresh forecast drives the outlet; greater pace produces more flow,
 with amber or red overflow for excessive pace. Overflow is a pace cue, not wasted
 quota. A discreet pause icon in the forecast header stops both tank and forecast-bar
-motion (it sits in the tank header when no forecast is available). The system
-reduced-motion preference is respected silently and hides the motion control.
+motion. The control is hidden when all tanks are stale, empty or unavailable.
+The system reduced-motion preference is respected silently and hides the motion control.
 The forecast bar has a subtle moving sheen; its extent and time markers do not
 move with the animation. Offscreen tanks stop animating. Unavailable capacity retains its text
 state and stale observations have no animated flow. The fill
 and percentage both represent remaining capacity. A single current Codex weekly
-forecast appears beneath the tanks when usable pacing evidence exists; choosing
-a historical plan on the Allowance page does not change that current forecast.
+forecast appears beneath the tanks when usable pacing evidence exists. Otherwise,
+a waiting panel explains that fresh or sufficient allowance evidence is needed;
+it does not display a guessed rate or run-out time. Choosing a historical plan
+on the Allowance page does not change that current forecast.
 
 The forecast names its pace assessment, estimated run-out, reset countdown and
 any time without allowance. Its timeline represents time until reset, not quota

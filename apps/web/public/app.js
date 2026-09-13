@@ -7713,6 +7713,31 @@ function weeklyPaceTrack(standing, hoursToReset, resetAt) {
   return track;
 }
 
+function renderWeeklyPaceWaiting(card, data) {
+  const primary = Array.isArray(data?.quotaWindows)
+    ? data.quotaWindows.find(isPrimaryCodexWeeklyQuotaWindow)
+    : null;
+  if (!primary) return;
+  const stale = primary.status === "stale";
+  const heading = node("div", "weekly-pace-forecast-heading");
+  const kicker = node("p", "panel-kicker");
+  const logo = node("img", "quota-codex-icon");
+  logo.setAttribute("src", "./codex-color.svg");
+  logo.setAttribute("alt", "");
+  logo.setAttribute("aria-hidden", "true");
+  kicker.append(logo, node("span", "", t("allowance.forecast")));
+  heading.append(kicker, node("span", "evidence-chip weekly-pace-forecast-collecting-chip",
+    t(stale ? "allowance.stale" : "allowance.waiting")));
+  const title = node("h3", "weekly-pace-forecast-title",
+    t(stale ? "allowance.waitingStaleTitle" : "allowance.waitingTitle"));
+  title.id = "weekly-pace-forecast-title";
+  card.setAttribute("aria-labelledby", title.id);
+  card.className = "weekly-pace-forecast is-insufficient is-waiting";
+  card.append(heading, title, node("p", "weekly-pace-forecast-copy",
+    t(stale ? "allowance.waitingStaleCopy" : "allowance.waitingCopy")));
+  card.hidden = false;
+}
+
 function renderWeeklyPaceForecast(data) {
   const card = ensureWeeklyPaceForecastCard();
   if (!card) return;
@@ -7725,7 +7750,12 @@ function renderWeeklyPaceForecast(data) {
   clear(card);
 
   const forecast = data?.weekly?.paceForecast;
-  if (!forecast || typeof forecast !== "object" || Array.isArray(forecast)) return;
+  const stalePrimary = Array.isArray(data?.quotaWindows)
+    && data.quotaWindows.some(window => isPrimaryCodexWeeklyQuotaWindow(window)
+      && window.status === "stale");
+  if (stalePrimary || !forecast || typeof forecast !== "object" || Array.isArray(forecast)) {
+    return renderWeeklyPaceWaiting(card, data);
+  }
   const pace = forecast.pace && typeof forecast.pace === "object"
     ? forecast.pace
     : {};
@@ -7741,7 +7771,7 @@ function renderWeeklyPaceForecast(data) {
     forecast.reset_at,
   );
   const now = Date.now();
-  if (resetAt === null || resetAt <= now) return;
+  if (resetAt === null || resetAt <= now) return renderWeeklyPaceWaiting(card, data);
 
   let remaining = firstFiniteForecastNumber(
     forecast.remainingPercent,
@@ -7799,13 +7829,13 @@ function renderWeeklyPaceForecast(data) {
   );
   // A contradiction between the status and dates is an integration error, not
   // a reason to show a confident-looking card. Wait for the next refresh.
-  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) return;
-  if (!available && !reachesResetFirst && !collectingEvidence) return;
-  if (collectingEvidence && remaining === null) return;
+  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) return renderWeeklyPaceWaiting(card, data);
+  if (!available && !reachesResetFirst && !collectingEvidence) return renderWeeklyPaceWaiting(card, data);
+  if (collectingEvidence && remaining === null) return renderWeeklyPaceWaiting(card, data);
   if (!collectingEvidence
       && remaining === null
       && headlinePace === null
-      && !reachesResetFirst) return;
+      && !reachesResetFirst) return renderWeeklyPaceWaiting(card, data);
 
   // The standing is computed from the headline rate, so the card's colour,
   // its heading and its arithmetic all come from one number. The engine's own
