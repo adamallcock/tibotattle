@@ -112,32 +112,42 @@ export function validateCredentialSnapshot(value, scenario) {
 // an arbitrary error message, Security stderr, returned value or filesystem path.
 export const MAC_CREDENTIAL_FIXTURE_FAILURE_CODES = Object.freeze([
   'ADOPTION_ROLLBACK_UNVERIFIED', 'ADOPTION_WRITE_READBACK_FAILED', 'CLEANUP_DELETE_FAILED',
-  'CLEANUP_INTENT_MISMATCH', 'CLEANUP_TARGET_CHANGED', 'CORE_DUMPS_NOT_DISABLED',
-  'CREATOR_READBACK_FAILED', 'DISPOSABLE_HOST_REQUIRED', 'EXISTING_KEYCHAIN_REFUSED',
-  'FIXTURE_ACCESS_FAILED', 'FIXTURE_ACL_UNAVAILABLE', 'FIXTURE_ALREADY_SEEDED',
-  'FIXTURE_CLEANUP_FAILED', 'FIXTURE_CLEANUP_NOT_READY', 'FIXTURE_COMMAND_INVALID',
-  'FIXTURE_CREATE_FAILED', 'FIXTURE_DEFAULT_RESTORE_FAILED', 'FIXTURE_DEFAULT_SELECT_FAILED',
-  'FIXTURE_EXISTS', 'FIXTURE_FAILED', 'FIXTURE_IDENTITY_INVALID',
-  'FIXTURE_IDENTITY_UNAVAILABLE', 'FIXTURE_ITEM_INVALID', 'FIXTURE_ITEM_MISSING',
-  'FIXTURE_LOCK_NOT_APPLIED', 'FIXTURE_LOCK_OPERATION_FAILED', 'FIXTURE_LOCK_STATE_INVALID',
-  'FIXTURE_METADATA_UNAVAILABLE', 'FIXTURE_NOT_READABLE', 'FIXTURE_NOT_SEEDED',
-  'FIXTURE_PROTOCOL_ENDED', 'FIXTURE_PROTOCOL_INVALID', 'FIXTURE_PROTOCOL_LIMIT',
-  'FIXTURE_PROTOCOL_READ_FAILED', 'FIXTURE_PROTOCOL_TRUNCATED', 'FIXTURE_READBACK_FAILED',
-  'FIXTURE_RECEIPT_CREATE_FAILED', 'FIXTURE_RECEIPT_INVALID', 'FIXTURE_RECEIPT_SYNC_FAILED',
-  'FIXTURE_RECEIPT_TRUNCATED', 'FIXTURE_RECEIPT_UNAVAILABLE', 'FIXTURE_RECEIPT_WRITE_FAILED',
-  'FIXTURE_SCOPE_ALREADY_SELECTED', 'FIXTURE_SCOPE_CHANGED', 'FIXTURE_SCOPE_CHANGED_DURING_SEED',
-  'FIXTURE_SCOPE_RESTORE_FAILED', 'FIXTURE_SCOPE_RESTORE_UNAVAILABLE', 'FIXTURE_SCOPE_SELECT_FAILED',
-  'FIXTURE_SCOPE_UNAVAILABLE', 'FIXTURE_SEARCH_RESTORE_FAILED', 'FIXTURE_SEED_FAILED',
+  'CLEANUP_INTENT_MISMATCH', 'CLEANUP_TARGET_CHANGED', 'CORE_DUMPS_NOT_DISABLED', 'CREATOR_READBACK_FAILED',
+  'DISPOSABLE_HOST_REQUIRED', 'EXISTING_KEYCHAIN_REFUSED', 'FIXTURE_ACCESS_FAILED', 'FIXTURE_ACL_UNAVAILABLE',
+  'FIXTURE_AGGREGATE_DOMAIN_MISMATCH', 'FIXTURE_ALREADY_SEEDED', 'FIXTURE_CLEANUP_FAILED',
+  'FIXTURE_CLEANUP_NOT_READY', 'FIXTURE_COMMAND_INVALID', 'FIXTURE_COMMON_DOMAIN_CHANGED',
+  'FIXTURE_COMMON_DOMAIN_REFUSED', 'FIXTURE_CREATE_FAILED', 'FIXTURE_DEFAULT_DOMAIN_MISMATCH',
+  'FIXTURE_DEFAULT_RESTORE_FAILED', 'FIXTURE_DEFAULT_SELECT_FAILED', 'FIXTURE_DYNAMIC_DOMAIN_REFUSED',
+  'FIXTURE_EXISTS', 'FIXTURE_FAILED', 'FIXTURE_IDENTITY_INVALID', 'FIXTURE_IDENTITY_UNAVAILABLE',
+  'FIXTURE_ITEM_INVALID', 'FIXTURE_ITEM_MISSING', 'FIXTURE_LOCK_NOT_APPLIED', 'FIXTURE_LOCK_OPERATION_FAILED',
+  'FIXTURE_LOCK_STATE_INVALID', 'FIXTURE_METADATA_UNAVAILABLE', 'FIXTURE_NOT_READABLE', 'FIXTURE_NOT_SEEDED',
+  'FIXTURE_PREFERENCE_DOMAIN_REFUSED', 'FIXTURE_PROTOCOL_ENDED', 'FIXTURE_PROTOCOL_INVALID',
+  'FIXTURE_PROTOCOL_LIMIT', 'FIXTURE_PROTOCOL_READ_FAILED', 'FIXTURE_PROTOCOL_TRUNCATED',
+  'FIXTURE_READBACK_FAILED', 'FIXTURE_RECEIPT_CREATE_FAILED', 'FIXTURE_RECEIPT_INVALID',
+  'FIXTURE_RECEIPT_SYNC_FAILED', 'FIXTURE_RECEIPT_TRUNCATED', 'FIXTURE_RECEIPT_UNAVAILABLE',
+  'FIXTURE_RECEIPT_WRITE_FAILED', 'FIXTURE_SCOPE_ALREADY_SELECTED', 'FIXTURE_SCOPE_NOT_SELECTED',
+  'FIXTURE_SCOPE_RESTORE_UNAVAILABLE', 'FIXTURE_SCOPE_SELECT_FAILED', 'FIXTURE_SCOPE_UNAVAILABLE',
+  'FIXTURE_SEARCH_RESTORE_FAILED', 'FIXTURE_SEED_FAILED', 'FIXTURE_SYSTEM_METADATA_CHANGED',
+  'FIXTURE_SYSTEM_METADATA_REFUSED', 'FIXTURE_SYSTEM_NAMESPACE_NOT_ABSENT', 'FIXTURE_SYSTEM_NOT_READABLE',
+  'FIXTURE_SYSTEM_PATH_REFUSED', 'FIXTURE_USER_DEFAULT_CHANGED', 'FIXTURE_USER_DOMAIN_CHANGED',
   'INTERACTION_NOT_DISABLED', 'KEYCHAIN_JOURNAL_INCOMPLETE_OR_INVALID', 'KEYCHAIN_JOURNAL_INVALID',
   'KEYCHAIN_OPEN_FAILED', 'KEYCHAIN_OPEN_TARGET_CHANGED', 'KEYCHAIN_OWNERSHIP_INVALID',
   'KEYCHAIN_RECEIPT_MISMATCH', 'KEYCHAIN_REFERENCE_MISMATCH', 'KEYCHAIN_WRITE_INTENT_CHANGED',
-  'KEYCHAIN_WRITE_LIMIT', 'KEYCHAIN_WRITE_PROOF_INVALID', 'KEYCHAIN_WRITE_TARGET_CHANGED',
-  'OWNER_MARKER_INVALID', 'RANDOM_UNAVAILABLE', 'ROOT_LINK_REFUSED',
-  'ROOT_OWNERSHIP_INVALID', 'SYNTHETIC_KEYCHAIN_CREATE_FAILED', 'SYNTHETIC_LEGACY_CREATE_FAILED',
-  'SYNTHETIC_RANDOM_FAILED',
+  'KEYCHAIN_WRITE_LIMIT', 'KEYCHAIN_WRITE_PROOF_INVALID', 'KEYCHAIN_WRITE_TARGET_CHANGED', 'OWNER_MARKER_INVALID',
+  'RANDOM_UNAVAILABLE', 'ROOT_LINK_REFUSED', 'ROOT_OWNERSHIP_INVALID', 'SYNTHETIC_KEYCHAIN_CREATE_FAILED',
+  'SYNTHETIC_LEGACY_CREATE_FAILED', 'SYNTHETIC_RANDOM_FAILED',
 ]);
 const fixtureFailureCodes = new Set(MAC_CREDENTIAL_FIXTURE_FAILURE_CODES);
-const fixtureCommands = new Set(['seed', 'snapshot', 'select', 'lock', 'unlock', 'restore', 'cleanup']);
+const fixtureCommands = new Set(['seed', 'snapshot', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']);
+export function validateCredentialScope(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join() !== 'aggregateMatchesDomains,commonDomain,defaultFixture,dynamicDomainEmpty,schemaVersion,systemNamespacesAbsent,userDomainFixtureOnly'
+    || value.schemaVersion !== 'mac-credential-isolated-scope-v1'
+    || !['aggregateMatchesDomains', 'defaultFixture', 'dynamicDomainEmpty', 'userDomainFixtureOnly'].every(key => value[key] === true)
+    || !['empty', 'verified_system'].includes(value.commonDomain)
+    || value.systemNamespacesAbsent !== (value.commonDomain === 'empty' ? 0 : 10)) fail('fixture_scope');
+  return value;
+}
 export function validateCredentialFixtureReply(value, { scenario, operation }) {
   if (!CREDENTIAL_FIXTURE_CASES.includes(scenario) || (operation !== null && !fixtureCommands.has(operation))) fail('fixture_protocol');
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('fixture_protocol');
@@ -146,10 +156,12 @@ export function validateCredentialFixtureReply(value, { scenario, operation }) {
     throw Object.assign(new Error('MAC_CREDENTIAL_QUALIFICATION_REFUSED'), { credentialStage: 'fixture_operation',
       fixtureFailure: Object.freeze({ scenario, command: operation ?? 'startup', code: value.code }) });
   }
-  const keys = operation === 'snapshot' ? 'items,ok' : operation === null ? 'ok,ready' : 'ok,operation';
+  const scoped = operation === 'select' || operation === 'scope';
+  const keys = operation === 'snapshot' ? 'items,ok' : operation === null ? 'ok,ready' : scoped ? 'ok,operation,scope' : 'ok,operation';
   if (value.ok !== true || Object.keys(value).sort().join() !== keys
     || (operation === null ? value.ready !== true : operation !== 'snapshot' && value.operation !== operation)) fail('fixture_response');
   if (operation === 'snapshot') validateCredentialSnapshot(value, scenario);
+  if (scoped) validateCredentialScope(value.scope);
   return value;
 }
 async function fixtureSession(input, executable, scenario, environment) {
@@ -240,7 +252,7 @@ export async function exerciseCredentialRefresh(dashboard, clock) {
 export async function runMacCredentialQualification({ intake, execute = false }) {
   const proof = { schemaVersion: SCHEMA, status: 'planned', credentialContinuityQualified: false,
     enforcedLoopbackOnly: false, fixtureCleaned: false, ownedProcessesStopped: false,
-    applicationBytesUnchanged: false, cases: [], failureStage: null, failurePhase: null, fixtureFailure: null,
+    applicationBytesUnchanged: false, cases: [], fixtureScopes: [], failureStage: null, failurePhase: null, fixtureFailure: null,
     nativeLegacyMigrationQualified: false, hostedUploadQualified: false, timeoutQualified: false,
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
@@ -281,7 +293,8 @@ export async function runMacCredentialQualification({ intake, execute = false })
     const launchOptions = { networkMode: MACOS_LOOPBACK_MODE };
     stage = 'modern_fixture'; fixture = await fixtureSession(input, helper, 'modern', environment);
     await fixture.request('seed'); const before = validateCredentialSnapshot(await fixture.request('snapshot'), 'modern');
-    await fixture.request('select');
+    proof.fixtureScopes.push({ scenario: 'modern', ...((await fixture.request('select')).scope) });
+    await fixture.request('scope');
     stage = 'predecessor_launch'; active = await launchVerifiedMacSharingApp(verified, environment, { ...launchOptions, untouched: true });
     await exerciseEmptyProfileSettings(active.settings);
     await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
@@ -296,6 +309,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     verified = await verifySparkleTransitionCandidate({ ...input.candidate, candidateCodeDirectoryHash: cdhash }, installed);
     for (let pass = 0; pass < 3; pass++) {
       stage = 'candidate_launch_' + pass;
+      await fixture.request('scope');
       active = await launchVerifiedMacSharingApp(verified, environment, launchOptions);
       if (dialog(active.pid, 'inspect') !== 'no_secure_storage_dialog') fail('unexpected_security_ui');
       await exerciseEmptyProfileSettings(active.settings);
@@ -314,8 +328,9 @@ export async function runMacCredentialQualification({ intake, execute = false })
     for (const scenario of CREDENTIAL_FIXTURE_CASES.filter(v => v !== 'modern')) {
       stage = scenario; fixture = await fixtureSession(input, helper, scenario, environment);
       await fixture.request('seed'); const original = validateCredentialSnapshot(await fixture.request('snapshot'), scenario);
-      await fixture.request('select');
+      proof.fixtureScopes.push({ scenario, ...((await fixture.request('select')).scope) });
       if (scenario === 'locked') await fixture.request('lock');
+      await fixture.request('scope');
       active = await launchVerifiedMacSharingApp(verified, environment, { ...launchOptions,
         observeBeforeDashboard: pid => observeRefusal(pid, scenario) });
       const observation = active.startupObservation;

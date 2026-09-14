@@ -11,7 +11,7 @@ import vm from 'node:vm';
 import { validateMacCredentialIntake, parseMacCredentialArguments, runMacCredentialQualification,
   MAC_CREDENTIAL_CONFIRMATION, credentialFixtureArchiveInspectionScript, validateCredentialSnapshot,
   expectedCredentialReason, macCredentialDialogScript, exerciseCredentialRefresh,
-  validateCredentialFixtureReply, MAC_CREDENTIAL_FIXTURE_FAILURE_CODES } from '../scripts/smoke-electron-macos-credentials.mjs';
+  validateCredentialFixtureReply, validateCredentialScope, MAC_CREDENTIAL_FIXTURE_FAILURE_CODES } from '../scripts/smoke-electron-macos-credentials.mjs';
 import { CREDENTIAL_FIXTURE_CASES, credentialFixtureRoot, credentialFixtureConfiguration,
   parseCredentialFixtureArguments, compileCredentialFixture } from '../scripts/prepare-electron-macos-credential-fixture.mjs';
 import { MACOS_LOOPBACK_POLICY, MACOS_LOOPBACK_MODE, macOSLoopbackLaunch,
@@ -140,7 +140,7 @@ with zipfile.ZipFile(sys.argv[1],'w') as z:
 const snapshot = () => ({ ok: true, items: ['account-observation', 'contribution-device', 'accountless-installation'].map(capability =>
   ({ capability, readable: true, itemDigest: 'a'.repeat(64), aclDigest: 'b'.repeat(64), valueDigest: 'c'.repeat(64) })) });
 test('helper failures retain only a known fixed code, closed scenario and actual protocol command', () => {
-  for (const operation of [null, 'seed', 'snapshot', 'select', 'lock', 'unlock', 'restore', 'cleanup']) {
+  for (const operation of [null, 'seed', 'snapshot', 'select', 'scope', 'lock', 'unlock', 'restore', 'cleanup']) {
     for (const code of MAC_CREDENTIAL_FIXTURE_FAILURE_CODES) {
       assert.throws(() => validateCredentialFixtureReply({ ok: false, code }, { scenario: 'modern', operation }), error => {
         assert.equal(error.credentialStage, 'fixture_operation');
@@ -166,6 +166,66 @@ test('helper failures retain only a known fixed code, closed scenario and actual
   assert.deepEqual(validateCredentialFixtureReply({ ok: true, operation: 'seed' }, { scenario: 'modern', operation: 'seed' }), { ok: true, operation: 'seed' });
   assert.deepEqual(validateCredentialFixtureReply(snapshot(), { scenario: 'modern', operation: 'snapshot' }), snapshot());
 });
+test('scope proof admits only a fixture-only user/default with empty dynamic and verified fixed common scope', () => {
+  const proof = commonDomain => ({ schemaVersion: 'mac-credential-isolated-scope-v1',
+    userDomainFixtureOnly: true, defaultFixture: true, dynamicDomainEmpty: true,
+    aggregateMatchesDomains: true, commonDomain, systemNamespacesAbsent: commonDomain === 'empty' ? 0 : 10 });
+  for (const commonDomain of ['empty', 'verified_system']) {
+    const scope = proof(commonDomain);
+    assert.deepEqual(validateCredentialScope(scope), scope);
+    for (const operation of ['select', 'scope']) {
+      const value = { ok: true, operation, scope };
+      assert.deepEqual(validateCredentialFixtureReply(value, { scenario: 'modern', operation }), value);
+      assert.throws(() => validateCredentialFixtureReply({ ok: true, operation }, { scenario: 'modern', operation }));
+    }
+    for (const field of Object.keys(scope)) {
+      const missing = { ...scope }; delete missing[field];
+      assert.throws(() => validateCredentialScope(missing));
+      if (typeof scope[field] === 'boolean') for (const replacement of [false, 1, 'true', null]) {
+        assert.throws(() => validateCredentialScope({ ...scope, [field]: replacement }));
+      }
+    }
+    for (const changed of [{ commonDomain: 'login' }, { commonDomain: ['verified_system'] },
+      { systemNamespacesAbsent: commonDomain === 'empty' ? 10 : 0 }, { systemNamespacesAbsent: 9 },
+      { systemNamespacesAbsent: '10' }, { schemaVersion: 'unverified' }, { path: 'PRIVATE_SENTINEL' },
+      { attributes: { private: 'PRIVATE_SENTINEL' } }]) {
+      assert.throws(() => validateCredentialScope({ ...scope, ...changed }), error => {
+        assert.equal(error.credentialStage, 'fixture_scope');
+        assert.doesNotMatch(error.message + JSON.stringify(error), /PRIVATE_SENTINEL/u);
+        return true;
+      });
+    }
+  }
+});
+
+test('System exception covers every native capability and requests status only from its fixed reference', async () => {
+  const fixture = await readFile(new URL('./fixtures/macos-keychain-migration/ElectronCredentialMain.swift', import.meta.url), 'utf8');
+  const native = await readFile(new URL('../native/macos-keychain/macos-keychain.mm', import.meta.url), 'utf8');
+  const nativeCapabilities = /constexpr std::array<CapabilitySpec, \d+> kCapabilities = \{\{([\s\S]+?)\}\};/u.exec(native)?.[1];
+  assert.ok(nativeCapabilities);
+  const services = value => [...value.matchAll(/"(app-usagemonitor\.[a-z-]+(?:\.app)?\.v1)"/gu)].map(match => match[1]);
+  const fixtureServices = /static let systemServices = \[([\s\S]+?)\]/u.exec(fixture)?.[1];
+  assert.ok(fixtureServices);
+  assert.equal(services(fixtureServices).length, 10);
+  assert.deepEqual(services(fixtureServices), services(nativeCapabilities));
+  assert.match(native, /kAccount\[\] = "installation"/u);
+  const support = await readFile(new URL('./fixtures/macos-keychain-migration/FixtureSupport.swift', import.meta.url), 'utf8');
+  assert.match(support, /static let account = "installation"/u);
+  const commonCheck = fixture.slice(fixture.indexOf('static func assertCommon('), fixture.indexOf('static func assertScope('));
+  assert.match(commonCheck, /kSecMatchSearchList as String: \[system\]/u);
+  assert.match(commonCheck, /kSecAttrAccount as String: F.account/u);
+  assert.match(commonCheck, /SecItemCopyMatching\(query as CFDictionary, nil\) == errSecItemNotFound/u);
+  assert.match(commonCheck, /SecKeychainGetStatus\(system, &status\) == errSecSuccess/u);
+  assert.match(commonCheck, /status & kSecReadPermStatus/u);
+  assert.doesNotMatch(commonCheck, /kSecReturn|SecKeychainUnlock|SecItemAdd|SecItemUpdate|SecItemDelete/u);
+  assert.equal([...fixture.matchAll(/SecKeychainSetDomain(?:SearchList|Default)\(\.user,/gu)].length, 4);
+  assert.doesNotMatch(fixture, /SecKeychainSet(?:SearchList|Default|PreferenceDomain)\(/u);
+  assert.match(fixture, /SecKeychainCopyDomainDefault\(\.user, &userDefault\)/u);
+  assert.match(fixture, /preference == \.user/u);
+  assert.match(fixture, /CFEqual\(ordinaryDefault, userDefault\)/u);
+  assert.match(fixture, /\(dynamic \+ user \+ common\) as CFArray/u);
+});
+
 test('the fixed failure-code allowlist stays aligned with current reviewed helper sources', async () => {
   const sources = await Promise.all(['FixtureSupport.swift', 'ElectronCredentialMain.swift'].map(name =>
     readFile(new URL('./fixtures/macos-keychain-migration/' + name, import.meta.url), 'utf8')));
