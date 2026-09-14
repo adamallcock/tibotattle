@@ -101,17 +101,18 @@ function mapError(error: unknown): Error {
   }
   return unavailable();
 }
-async function replayResult(db: D1Database, row: TelemetryV11StagedChunkRow, chunk: TelemetryV11Chunk,
-  namespaceId: number): Promise<TypedV11StagedChunkResult> {
+async function replayResult(db: D1Database, row: TelemetryV11StagedChunkRow, chunk: TelemetryV11Chunk): Promise<TypedV11StagedChunkResult> {
   if (row.chunk_digest !== chunk.chunkDigest || row.record_count !== chunk.records.length) {
     throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   }
   const complete = await db.prepare(`SELECT count(*) AS total FROM typed_v11_record_admissions p
     JOIN typed_telemetry_records r ON r.id=p.typed_record_id
     JOIN typed_v11_chunk_allocations a ON a.chunk_id=p.chunk_id
-    WHERE p.chunk_id=? AND p.manifest_id=? AND a.namespace_id=? AND r.namespace_id=a.namespace_id
+    JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=a.namespace_id
+      AND origin.v11_read_contract_version=2
+    WHERE p.chunk_id=? AND p.manifest_id=? AND r.namespace_id=a.namespace_id
       AND r.format=11 AND r.source_row_id>=a.first_source_row_id AND r.source_row_id<a.first_source_row_id+a.record_count`)
-    .bind(row.id, row.manifest_id, namespaceId).first<{ total: number }>();
+    .bind(row.id, row.manifest_id).first<{ total: number }>();
   if (complete?.total !== row.record_count) throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
   return { contributionId: row.id, manifestId: row.manifest_id, chunkId: chunk.chunkId, replay: true };
 }
@@ -147,7 +148,7 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
     .bind(principal.participantId, principal.deviceId, day, chunk.manifestDigest).first<{ id: string }>();
   if (!manifest) throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
   const existing = await existingTelemetryV11StagedChunk(db, principal, chunk);
-  if (existing) return replayResult(db, existing, chunk, state.namespace_id);
+  if (existing) return replayResult(db, existing, chunk);
   const rows: TypedTelemetrySourceRecord[] = chunk.records.map((record, index) => ({
     sourceNamespace: metadata.sourceNamespace, format: "v11", sourceRowId: state.next_source_row_id + index,
     participantId: principal.participantId, deviceId: principal.deviceId, chunkRowId: metadata.chunkRowId,
@@ -223,7 +224,7 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
     // A response can be lost after commit. Reconcile only this authenticated,
     // exact chunk and its complete typed membership; never blindly resend it.
     const replay = await existingTelemetryV11StagedChunk(db, principal, chunk);
-    if (replay) return replayResult(db, replay, chunk, state.namespace_id);
+    if (replay) return replayResult(db, replay, chunk);
     throw mapError(error);
   }
   return { contributionId: metadata.chunkRowId, manifestId: manifest.id, chunkId: chunk.chunkId, replay: false };

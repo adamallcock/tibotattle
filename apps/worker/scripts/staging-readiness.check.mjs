@@ -19,10 +19,13 @@ import {
   COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
   COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
   POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL,
   CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
   CURRENT_SCALE_SCHEMA_PROBE_SQL,
   PUBLIC_SOURCE_SCHEMA_PROBE_SQL,
   publicSourceSchemaComplete,
+  OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL,
+  ownerMoveAuthoritySchemaComplete,
   POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
   PRE_INCREMENTAL_ANALYSIS_WORK_SCHEMA_PROBE_SQL,
   PRE_INCREMENTAL_MODEL_HISTORY_SCHEMA_PROBE_SQL,
@@ -92,7 +95,7 @@ test("checked-in staging resources remain closed and require live qualification"
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-18), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-19), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
@@ -111,6 +114,7 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
     "0058_accountless_upload_ownership.sql",
     "0059_accountless_upload_renewal.sql",
     "0060_public_contribution_sources.sql",
+    "0061_owner_move_authority_seed.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -212,6 +216,8 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0057_accountless_enrollment_ledger.sql": "5cbf718449688bffc0fc5cf63d1de17351acb915f44459f1b32f3202c7378cd5",
     "0058_accountless_upload_ownership.sql": "b435fd92d41e7ce8067cc183d7ac153359a9c130a971cba2e1b8b8c1c9cab61b",
     "0059_accountless_upload_renewal.sql": "98afb99dd91e56a96960e6d99096e44c41eec0cd52d5a1e2969dea4ddee3d312",
+    "0060_public_contribution_sources.sql": "b260d8e25fd96b6572559734897ce12ab1ba60d214cb217f2876c33541284243",
+    "0061_owner_move_authority_seed.sql": "a489259b11bf65b6447c7a2d9def1a611e91d7418856c28cac8d1845f2e0d88c",
   };
   const legacyDigests = {
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
@@ -219,11 +225,11 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0048_accountless_upload_renewal.sql": "82297298f937489275756da93d9b116a7b83b280482000b0df51abd5c598d9b7",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 60);
+  assert.equal(names.length, 61);
   assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests).slice(0, 5));
-  assert.deepEqual(names.slice(56, 59), Object.keys(expectedDigests).slice(-3));
+  assert.deepEqual(names.slice(56), Object.keys(expectedDigests).slice(-5));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 60 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 61 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -2356,7 +2362,7 @@ test("live readiness reports R2 account enablement without leaking command outpu
 });
 
 
-test("current 0060 readiness binds the exact eligibility, bootstrap and withdrawal schema", async () => {
+test("historical 0060 and current 0061 readiness remain independently qualified", async () => {
   const { unstable_splitSqlQuery } = await import("wrangler");
   const database = new DatabaseSync(":memory:");
   try {
@@ -2373,10 +2379,12 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
     database.exec("SAVEPOINT public_source_format;");
     for (const sql of unstable_splitSqlQuery(readFileSync(join(workerDirectory, "migrations", "0060_public_contribution_sources.sql"), "utf8"))) database.exec(sql);
     assert.deepEqual(Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)), PUBLIC_SOURCE_SCHEMA_SQL);
-    for (const probe of [CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
+    for (const probe of [POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
       assert.ok(Buffer.byteLength(probe) < 100_000, "separate bounded metadata queries");
     }
-    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(attributionSchemaComplete(database.prepare(POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.throws(() => database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get(), /no such table: storage_owner_move_authority_contract/u);
+    assert.throws(() => database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get(), /no such table: storage_owner_move_authority_contract/u);
     assert.equal(scaleSchemaComplete(database.prepare(CURRENT_SCALE_SCHEMA_PROBE_SQL).get()), true);
     assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), true);
     for (const [name, sql] of Object.entries(PUBLIC_SOURCE_SCHEMA_SQL)) {
@@ -2410,5 +2418,52 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
       assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `remote altered ${name}`);
       database.exec("ROLLBACK TO altered_remote_source; RELEASE altered_remote_source;");
     }
+
+    database.exec(readFileSync(join(workerDirectory, "migrations", "0061_owner_move_authority_seed.sql"), "utf8"));
+    assert.ok(Buffer.byteLength(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL) < 100_000,
+      "the complete 0061 attribution proof remains one bounded metadata query");
+    assert.equal(attributionSchemaComplete(database.prepare(POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(ownerMoveAuthoritySchemaComplete(database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get()), true);
+    assert.deepEqual({ ...database.prepare(
+      "SELECT id,version FROM storage_owner_move_authority_contract",
+    ).get() }, { id: 1, version: 1 });
+
+    const objectTypes = {
+      storage_owner_move_authority_seeds: "TABLE",
+      storage_owner_move_authority_owner: "INDEX",
+      storage_owner_move_authority_seed_immutable: "TRIGGER",
+      storage_owner_move_authority_contract: "TABLE",
+      attribution_enrollment_created: "TRIGGER",
+      telemetry_transport_floor_created: "TRIGGER",
+    };
+    for (const [name, type] of Object.entries(objectTypes)) {
+      database.exec(`SAVEPOINT altered_owner_move_authority; DROP ${type} ${name};`);
+      if (name === "storage_owner_move_authority_contract") {
+        assert.throws(() => database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get(), /no such table/u, `missing ${name}`);
+      } else {
+        assert.equal(ownerMoveAuthoritySchemaComplete(database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get()), false, `missing ${name}`);
+      }
+      database.exec("ROLLBACK TO altered_owner_move_authority; RELEASE altered_owner_move_authority;");
+    }
+    const alteredObjects = {
+      storage_owner_move_authority_seeds: "CREATE TABLE storage_owner_move_authority_seeds(participant_id TEXT PRIMARY KEY) STRICT",
+      storage_owner_move_authority_owner: "CREATE INDEX storage_owner_move_authority_owner ON storage_owner_move_authority_seeds(participant_id)",
+      storage_owner_move_authority_seed_immutable: "CREATE TRIGGER storage_owner_move_authority_seed_immutable BEFORE UPDATE ON storage_owner_move_authority_seeds BEGIN SELECT 1; END",
+      storage_owner_move_authority_contract: "CREATE TABLE storage_owner_move_authority_contract(id INTEGER PRIMARY KEY,version INTEGER NOT NULL) STRICT; INSERT INTO storage_owner_move_authority_contract VALUES(1,1)",
+      attribution_enrollment_created: "CREATE TRIGGER attribution_enrollment_created AFTER INSERT ON participants BEGIN SELECT 1; END",
+      telemetry_transport_floor_created: "CREATE TRIGGER telemetry_transport_floor_created AFTER INSERT ON participants BEGIN SELECT 1; END",
+    };
+    for (const [name, sql] of Object.entries(alteredObjects)) {
+      const type = objectTypes[name];
+      database.exec(`SAVEPOINT altered_owner_move_authority; DROP ${type} ${name}; ${sql};`);
+      assert.equal(ownerMoveAuthoritySchemaComplete(database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get()), false, `altered ${name}`);
+      database.exec("ROLLBACK TO altered_owner_move_authority; RELEASE altered_owner_move_authority;");
+    }
+    database.exec("DELETE FROM storage_owner_move_authority_contract");
+    assert.equal(ownerMoveAuthoritySchemaComplete(database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get()), false);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    assert.equal(ownerMoveAuthoritySchemaComplete(undefined), false);
+    assert.equal(ownerMoveAuthoritySchemaComplete({ owner_move_authority_schema: true }), false);
   } finally { database.close(); }
 });

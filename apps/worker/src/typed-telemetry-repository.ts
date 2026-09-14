@@ -346,10 +346,19 @@ const READ_PAGE_SQL = `SELECT r.*, n.original_id AS source_namespace, o.original
  LEFT JOIN typed_telemetry_dictionary ap ON ap.id = a.plan_type_id
  WHERE r.namespace_id = (SELECT id FROM typed_telemetry_namespaces WHERE original_id = ?)
    AND r.format = ? AND r.source_row_id > ? ORDER BY r.source_row_id LIMIT ?`;
+const READ_OWNER_PAGE_SQL = READ_PAGE_SQL.replace(
+  " AND r.format = ? AND r.source_row_id > ?",
+  ` AND r.owner_id = (SELECT id FROM typed_telemetry_owners
+     WHERE namespace_id=r.namespace_id AND original_id=?)
+   AND r.format = ? AND r.source_row_id > ?`,
+);
 
 /** Internal migration/consumer read, not an unscoped public data endpoint. */
 export async function readTypedTelemetryPage(db: D1Database, options: {
   sourceNamespace: string; format: TypedTelemetryFormat; afterSourceRowId?: number; limit?: number;
+  /** Exact already-authenticated owner. Uses the owner/source cursor index and
+   * never scans unrelated owners in this physical database. */
+  participantId?: string;
 }): Promise<{ records: TypedTelemetryStoredRecord[]; nextAfterSourceRowId: number | null }> {
   const count = options.limit ?? 100;
   const after = options.afterSourceRowId ?? 0;
@@ -360,7 +369,11 @@ export async function readTypedTelemetryPage(db: D1Database, options: {
   try {
     const version = await db.prepare("SELECT version FROM typed_telemetry_schema WHERE id = 1").first<number>("version");
     if (version !== 1) throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
-    const page = await db.prepare(READ_PAGE_SQL).bind(namespaceBytes, format, after, count + 1).all<Stored>();
+    const participant = options.participantId;
+    if (participant !== undefined) encodeTypedTelemetryId(participant);
+    const page = participant === undefined
+      ? await db.prepare(READ_PAGE_SQL).bind(namespaceBytes, format, after, count + 1).all<Stored>()
+      : await db.prepare(READ_OWNER_PAGE_SQL).bind(namespaceBytes, id(participant), format, after, count + 1).all<Stored>();
     const rows = page.results.slice(0, count);
     const tools = new Map<number, [string, number][]>();
     const sessions = rows.filter((row) => row.stream === 3).map((row) => number(row, "id"));

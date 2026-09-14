@@ -53,7 +53,7 @@ test("accountless hosted rehearsal plan fixes one origin and stays blocked befor
     ["wrangler", "d1", "migrations", "apply", "DELETION_LEDGER", "--remote", "--env", "staging"],
   ]);
   assert.deepEqual(freshBootstrap.expectedFinalMigrations, {
-    USAGE_MONITOR_DB: "0060_public_contribution_sources.sql",
+    USAGE_MONITOR_DB: "0061_owner_move_authority_seed.sql",
     DELETION_LEDGER: "0005_catalog_deletion_replay_cursor.sql",
   });
   const disabledDeployment = plan.requiredRemoteActions.find(

@@ -11,11 +11,11 @@ The user approved implementation on September 13. Work starts from `ceeeca32e639
 
 ## Current checkpoint
 
-The parser-repaired source `bcbc2b5b` passed the complete local Worker gate on September 14: **128 test files and 1,523 tests**, workspace/type/script checks, and capacity, analytics, main and staging dry builds. Existing-owner import, concurrent upload headroom reservations, multi-origin analytics and authenticated shard-aware private exports are implemented and locally qualified. The fresh isolated cloud bootstrap rehearsal is prepared. Production catalog mode remains disabled.
+The hosted-readiness and bootstrap source `130b5fac` passed the complete local Worker gate on September 14: **129 test files and 1,533 tests**, workspace/type/script checks and capacity, analytics, main and staging dry builds. Existing-owner import, concurrent upload reservations, multi-origin analytics and authenticated shard-aware exports are locally qualified. The isolated cloud bootstrap rehearsal imported 35 synthetic owners, preserved issuance and revocation, released its test source and removed its resources. Production catalog mode remains disabled.
 
-The remaining implementation is the owner copier and final routing switch, complete moved-owner export/lifecycle coverage, qualified spare operations and measured capacity calibration. Cloud rollover/failure qualification and production activation follow those gates. The historical checkpoints below record what was proven at each stage; this section states the current boundary.
+The next integrated slice implements movement of accountless v1.1 owners whose history has one current origin. Independent review is clear on the corrected runtime; 23 movement tests and 162 focused integration tests passed before base integration. Main migration 0061 and its exact readiness probes are registered; historical 0060 and 0059 proofs remain distinct. The combined source still requires its full owning gate.
 
-A first isolated existing-owner bootstrap rehearsal applied the 60 primary migrations, then Cloudflare D1 refused the first ingestion-role migration because a complete trigger guard used the locally valid `SELECT CASE ... END;` form. The canonical fresh-role migration inputs now parenthesize every complete trigger `CASE` expression, matching the established 0044/0045 remote-parser convention. A source guard audits ingestion, routing, analytics and deletion roles while allowing ordinary scalar and top-level `CASE` projections. This changes role-input hashes, so earlier qualification receipts cannot qualify the repaired source. A new source-pinned role qualification and fresh cloud rehearsal remain required before bootstrap or spare activation.
+Remaining work is a maintained movement operator, hosted spare and rollover rehearsals, complete moved-owner lifecycle acceptance and measured physical-growth calibration. Re-moving mixed-origin owners and moving legacy v1, social or multi-enrollment owners are explicitly refused. Source retirement is separate from route switching. No client protocol, credential or app-version change is required by sharding, and this work does not alter the active production recovery.
 
 ## Accepted outcome
 
@@ -31,9 +31,9 @@ Sol High agents lead implementation; they may delegate bounded work to Luna Max 
 |---|---|---|
 | 1. Routing and capacity | Actual enrollment, ownership, credential lifecycle and upload paths across two ingestion shards and a spare; concurrent enrollment converges; cutoff, stale capacity, replay and route fences tested | In progress |
 | 2. Analytics and erasure | Independent source progress, complete combined publication, no moved-owner duplication; owner-only erasure covers current/prior sources and derived targets with completion receipts | In progress |
-| 3. Owner movement | Background copy plus catch-up, brief owner-specific final fence, exact verification and routing switch; restart/reconcile every phase | Origin prerequisites locally qualified; copier pending |
+| 3. Owner movement | Background copy plus catch-up, brief owner-specific final fence, exact verification and routing switch; restart/reconcile every phase | Accountless v1.1 copier and final switch implemented; operator and hosted journey pending |
 | 4. Operations | Wrangler-managed qualified spare capacity, size/growth alerts, safe allocation and movement controls; per-writer headroom reservations | Upload reservations qualified; immutable spare-readiness receipt implemented locally; hosted qualification pending |
-| 5. Qualification | Integrated local HTTP journeys, real isolated cloud rollover and failure rehearsal, measured final pause, then reviewed production activation | Local owning gate passed; cloud bootstrap preparation active |
+| 5. Qualification | Integrated local HTTP journeys, real isolated cloud rollover and failure rehearsal, measured final pause, then reviewed production activation | Base owning gate and cloud bootstrap passed; integrated movement and cloud rollover pending |
 
 Each stage must integrate its runtime callers. Uncalled interfaces, isolated mock tests or a configuration flag alone do not close a stage.
 
@@ -200,3 +200,12 @@ read-only recovery after acknowledgement loss. Its transitional containment
 state admits only the exact owned consumer until detachment is verified.
 These repairs have focused regression coverage; they do not activate production
 sharding or complete the existing-owner copy and routing-switch work.
+
+
+## Accountless owner movement follow-up
+
+The movement primitive stages bounded history while the source remains writable, then atomically fences the exact authenticated source authority and supported history. It preserves namespace, record, event and replay identities while remapping destination-local integer keys. A pinned source snapshot permits recovery after credential expiry once fencing has actually completed. Revocation or an unsupported v1 write that wins before the fence prevents movement without stranding the source.
+
+Destination schema probes precede catalog reservation. Every materializing history batch includes physical-capacity admission in the same destination transaction; unknown acknowledgements retain their reservations until exact reconciliation. Owner erasure includes incomplete and retained destinations, removes raw movement controls and leaves only a privacy-safe completion receipt that supports lost-acknowledgement recovery.
+
+Independent review drove regression coverage for stale readiness, near-capacity refusal, credential revocation/expiry, unsupported-history races, source-fence acknowledgement loss and erasure acknowledgement loss. The six migration/readiness integration scripts passed 146 checks before integration onto `130b5fac`. The main 0061 readiness proof independently verifies the complete seed schema, immutable guard, both replacement participant triggers and exact contract singleton; pre-migration or altered state refuses readiness. Every affected role still needs a newly qualified schema receipt before allocation or movement. These source checks neither provision a spare nor authorize production catalog activation.

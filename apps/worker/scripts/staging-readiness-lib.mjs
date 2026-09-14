@@ -122,6 +122,7 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0058_accountless_upload_ownership.sql",
     "0059_accountless_upload_renewal.sql",
     "0060_public_contribution_sources.sql",
+    "0061_owner_move_authority_seed.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
@@ -1565,7 +1566,7 @@ NOT EXISTS (
      AND dflt_value IS NULL AND pk = 0
 ) AS scale_columns;
 `;
-// Current 0060 probes retain all unaffected 0059 contracts. Every replaced or
+// The historical 0060 probes retain all unaffected 0059 contracts. Every replaced or
 // new object is checked separately against exact stored DDL in a third bounded
 // metadata query, including the eligibility view and withdrawal/bootstrap guards.
 function unaffectedPublicSourceProbe(objects, historicalSocialNames = []) {
@@ -1576,13 +1577,72 @@ function unaffectedPublicSourceProbe(objects, historicalSocialNames = []) {
 }
 const publicSourceComponentProbe = (objects, socialNames, field) =>
   `SELECT ${unaffectedPublicSourceProbe(objects, socialNames)} AS ${field}`;
-export const CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL
+export const POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL
   .replace(POST_ACCOUNTLESS_COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
     publicSourceComponentProbe(CURRENT_MODEL_HISTORY_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history, "community_model_history_schema"))
   .replace(POST_ACCOUNTLESS_COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
     publicSourceComponentProbe(CURRENT_GRAPH_PRESERVATION_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.graph, "community_graph_preservation_schema"))
   .replace(POST_ACCOUNTLESS_REFRESH_LANE_SCHEMA_PROBE_SQL,
     publicSourceComponentProbe(REFRESH_LANE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.refresh, "refresh_lane_schema"));
+
+// Migration 0061 adds the closed owner-move authority seed contract and
+// deliberately replaces the two participant-creation triggers. These expected
+// definitions are independently reviewed here rather than loaded from the
+// migration under test. The contract row is part of readiness; move seed rows
+// may legitimately exist while a move is in progress and are therefore not
+// required to be empty.
+const OWNER_MOVE_AUTHORITY_SCHEMA_SQL = Object.freeze({
+  storage_owner_move_authority_seeds: `CREATE TABLE storage_owner_move_authority_seeds (
+ participant_id TEXT PRIMARY KEY NOT NULL CHECK(length(participant_id) BETWEEN 1 AND 256),
+ device_id TEXT NOT NULL CHECK(length(device_id) BETWEEN 1 AND 256),
+ move_id TEXT NOT NULL UNIQUE CHECK(length(move_id) BETWEEN 1 AND 128),
+ owner_id TEXT NOT NULL CHECK(length(owner_id) BETWEEN 1 AND 128),
+ attribution_namespace TEXT NOT NULL UNIQUE CHECK(length(attribution_namespace)=64 AND attribution_namespace NOT GLOB '*[^0-9a-f]*'),
+ attribution_created_at TEXT NOT NULL,
+ floor_minimum_rank INTEGER NOT NULL CHECK(floor_minimum_rank IN(1,11)),
+ floor_revision INTEGER NOT NULL CHECK(floor_revision BETWEEN 0 AND 2147483647),
+ floor_changed_at TEXT NOT NULL,
+ authority_digest TEXT NOT NULL CHECK(length(authority_digest)=64 AND authority_digest NOT GLOB '*[^0-9a-f]*'),
+ state TEXT NOT NULL CHECK(state IN('prepared','materialized'))
+) STRICT`,
+  storage_owner_move_authority_owner: "CREATE INDEX storage_owner_move_authority_owner ON storage_owner_move_authority_seeds(owner_id,state)",
+  storage_owner_move_authority_seed_immutable: `CREATE TRIGGER storage_owner_move_authority_seed_immutable BEFORE UPDATE ON storage_owner_move_authority_seeds
+WHEN NEW.participant_id<>OLD.participant_id OR NEW.device_id<>OLD.device_id
+ OR NEW.move_id<>OLD.move_id OR NEW.owner_id<>OLD.owner_id
+ OR NEW.attribution_namespace<>OLD.attribution_namespace OR NEW.attribution_created_at<>OLD.attribution_created_at
+ OR NEW.floor_minimum_rank<>OLD.floor_minimum_rank OR NEW.floor_revision<>OLD.floor_revision
+ OR NEW.floor_changed_at<>OLD.floor_changed_at OR NEW.authority_digest<>OLD.authority_digest
+ OR OLD.state='materialized' OR NEW.state<>'materialized'
+BEGIN SELECT (RAISE(ABORT,'STORAGE_MOVE_AUTHORITY_CONFLICT')); END`,
+  storage_owner_move_authority_contract: `CREATE TABLE storage_owner_move_authority_contract (
+ id INTEGER PRIMARY KEY CHECK(id=1),
+ version INTEGER NOT NULL CHECK(version=1)
+) STRICT`,
+  attribution_enrollment_created: `CREATE TRIGGER attribution_enrollment_created AFTER INSERT ON participants BEGIN
+ INSERT INTO attribution_enrollments(participant_id,namespace,created_at)
+ SELECT NEW.id,seed.attribution_namespace,seed.attribution_created_at
+ FROM storage_owner_move_authority_seeds seed WHERE seed.participant_id=NEW.id AND seed.state='prepared'
+ UNION ALL SELECT NEW.id,lower(hex(randomblob(32))),strftime('%Y-%m-%dT%H:%M:%fZ','now')
+ WHERE NOT EXISTS(SELECT 1 FROM storage_owner_move_authority_seeds WHERE participant_id=NEW.id AND state='prepared');
+END`,
+  telemetry_transport_floor_created: `CREATE TRIGGER telemetry_transport_floor_created AFTER INSERT ON participants BEGIN
+ INSERT INTO telemetry_transport_participant_floors(participant_id,minimum_rank,revision,changed_at)
+ SELECT NEW.id,seed.floor_minimum_rank,seed.floor_revision,seed.floor_changed_at
+ FROM storage_owner_move_authority_seeds seed WHERE seed.participant_id=NEW.id AND seed.state='prepared'
+ UNION ALL SELECT NEW.id,(CASE WHEN NEW.owner_kind='accountless' THEN 11 ELSE 1 END),0,strftime('%Y-%m-%dT%H:%M:%fZ','now')
+ WHERE NOT EXISTS(SELECT 1 FROM storage_owner_move_authority_seeds WHERE participant_id=NEW.id AND state='prepared');
+END`,
+});
+export const OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL = `SELECT
+  ${exactStoredSchemaProbe(OWNER_MOVE_AUTHORITY_SCHEMA_SQL)}
+  AND (SELECT count(*) FROM storage_owner_move_authority_contract)=1
+  AND EXISTS(SELECT 1 FROM storage_owner_move_authority_contract WHERE id=1 AND version=1)
+  AS owner_move_authority_schema`;
+export const ownerMoveAuthoritySchemaComplete = row => row?.owner_move_authority_schema === 1;
+export const CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL = POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL.replace(
+  " AS attribution_objects,",
+  ` AND (${OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL}) AS attribution_objects,`,
+);
 export const CURRENT_SCALE_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL.replace(
   exactStoredSchemaProbe(SCALE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale)
     + " AND " + socialOwnerGatedTriggerProbe(ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale),

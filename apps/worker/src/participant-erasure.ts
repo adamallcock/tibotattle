@@ -3,6 +3,9 @@ import {invalidatePublicationsForOwnerErasure,prepareMultiSourceParticipantErasu
   requireMultiSourceParticipantErasureComplete,storageErasurePlanForOwnerRoute,
 } from './storage-multi-source-erasure';
 import {assertParticipantDeletionRouteRegistered,storageForParticipantOwner} from './storage-routing-runtime';
+import {completeAccountlessOwnerMoveErasure,eraseAccountlessOwnerMoveControls,
+  prepareAccountlessOwnerMoveErasure} from './storage-owner-movement';
+import type {StorageShardBindings} from './storage-routing';
 import { beginAdminOperation, finishAdminOperation } from "./admin-operations";
 import { revokeAccountlessEnrollment } from "./accountless-enrollment";
 import { MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT } from "./constants";
@@ -88,6 +91,19 @@ async function beginParticipantSourceDeletion(options:{global:D1Database;source:
     LEFT JOIN accountless_upload_owners owner ON owner.participant_id=participant.id AND owner.state='active'
     WHERE participant.id=?`).bind(participantId).first<{state:string;deletion_session_id:string|null;
       owner_kind:"social"|"accountless";enrollment_device_id:string|null}>();
+  if(expectedRouteOwnerId!==undefined){
+    // A pre-copy destination may not have materialized its participant yet.
+    // Its private canonical rows are still owner data and must be removed by
+    // the same exact catalog-target erasure, never by a shard scan.
+    await source.batch([
+      source.prepare(`DELETE FROM storage_owner_move_staged_records
+        WHERE participant_id=? AND owner_id=?`).bind(participantId,expectedRouteOwnerId),
+      source.prepare(`DELETE FROM storage_owner_move_authority_seeds
+        WHERE participant_id=? AND owner_id=?`).bind(participantId,expectedRouteOwnerId),
+      source.prepare(`DELETE FROM storage_owner_move_history_imports
+        WHERE participant_id=? AND owner_id=?`).bind(participantId,expectedRouteOwnerId),
+    ]);
+  }
   if(!participant)return null;
   if(expectedRouteOwnerId!==undefined&&await routedParticipantOwner(source,participantId)!==expectedRouteOwnerId){
     throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
@@ -167,9 +183,17 @@ async function eraseParticipantData(
   const ownerStorage=await storageForParticipantOwner(env,participantId);
   await assertParticipantDeletionRouteRegistered(env,participantId,ownerStorage.route);
   const catalogErasure=ownerStorage.route.mode==='catalog';
+  const routingCatalog=env.STORAGE_ROUTING_DB;
+  if(catalogErasure&&!routingCatalog)throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
   await invalidatePublicationsForOwnerErasure(env,ownerStorage.route);
   const replayMarker=catalogErasure
     ?await recordCatalogDeletionReplayPending(env.DELETION_LEDGER,participantId):null;
+  const moveErasure=catalogErasure?await prepareAccountlessOwnerMoveErasure({
+    catalog:routingCatalog!,
+    bindings:env as unknown as StorageShardBindings,
+    route:ownerStorage.route,
+    participantId,
+  }):null;
   const plan=await storageErasurePlanForOwnerRoute(env,ownerStorage.route);
   const participant = await ownerStorage.database.prepare(
     `SELECT participant.state,
@@ -244,6 +268,16 @@ async function eraseParticipantData(
   if(plan){
     await requireMultiSourceParticipantErasureComplete(env.DELETION_LEDGER,participantId,plan.targets);
   }else await requireStorageParticipantErasureComplete(env.DELETION_LEDGER,participantId,null);
+  if(moveErasure)await completeAccountlessOwnerMoveErasure({
+    catalog:routingCatalog!,
+    bindings:env as unknown as StorageShardBindings,
+    preparation:moveErasure,
+  });
+  if(catalogErasure&&plan){
+    for(const target of ordered){
+      await eraseAccountlessOwnerMoveControls({database:target.database,ownerId:target.ownerId,participantId});
+    }
+  }
   if(replayMarker&&!await completeCatalogDeletionReplayPending(env.DELETION_LEDGER,replayMarker)){
     throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
   }

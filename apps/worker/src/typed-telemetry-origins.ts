@@ -50,6 +50,26 @@ export async function assertCurrentTypedTelemetryOrigin(
   if (!row) throw conflict();
 }
 
+/** Install one already verified historical namespace on a move destination.
+ * The current-write origin is unchanged. The move id is retained as provenance
+ * and exact retries converge; conflicting reuse is rejected by schema guards. */
+export function retainedTypedTelemetryOriginStatements(
+  db: D1Database,
+  sourceNamespace: string,
+  moveId: string,
+  registeredAt: string,
+): D1PreparedStatement[] {
+  const original = binary(encodeTypedTelemetryId(sourceNamespace));
+  return [
+    db.prepare(`INSERT INTO typed_telemetry_origin_contracts(
+      namespace_id,namespace_original,access_mode,v1_read_contract_version,v11_read_contract_version,
+      source_schema_digest,registered_move_id,registered_at)
+      SELECT id,?,'retained-read',0,2,?,?,? FROM typed_telemetry_namespaces WHERE original_id=?
+      ON CONFLICT(namespace_id) DO NOTHING`)
+      .bind(original, TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST, moveId, registeredAt, original),
+  ];
+}
+
 interface OriginRow {
   namespace_id: number;
   namespace_original: ArrayBuffer;

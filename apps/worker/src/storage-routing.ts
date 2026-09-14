@@ -475,9 +475,12 @@ export function createCatalogStorageRouter({ catalog, bindings, clock }: {
             UNION
             SELECT destination_shard_id AS shard_id,destination_generation AS route_generation
               FROM storage_owner_moves WHERE owner_id=?
+            UNION
+            SELECT destination_shard_id AS shard_id,destination_generation AS route_generation
+              FROM storage_owner_move_preparations WHERE owner_id=? AND state<>'abandoned'
           ) target JOIN storage_shards s USING (shard_id)
           ORDER BY target.route_generation,target.shard_id LIMIT 65`)
-          .bind(route.ownerId, route.ownerId),
+          .bind(route.ownerId, route.ownerId, route.ownerId),
       ]));
       const rows = [...(results[0]?.results ?? []), ...(results[1]?.results ?? [])];
       if (rows.length > 65) fail('STORAGE_UNAVAILABLE');
@@ -865,8 +868,18 @@ export function createOwnerMoveCoordinator({ catalog, bindings, clock, verifyDes
       if (!current || !matches(route, current)) fail('ROUTE_STALE');
       const sourceDatabase = binding(bindings, current.binding_name);
       const sourceFence = await readFence(sourceDatabase, route.ownerId);
-      if (!sourceFence || sourceFence.state !== 'active' || sourceFence.shard_id !== route.shardId
+      if (!sourceFence || sourceFence.shard_id !== route.shardId
         || sourceFence.route_generation !== route.generation) fail('ROUTE_STALE');
+      if (sourceFence.state !== 'active') {
+        const preparation = sourceFence.state === 'fenced' && sourceFence.move_id === moveId
+          ? await storage(() => catalog.prepare(`SELECT 1 AS owned FROM storage_owner_move_preparations
+            WHERE move_id=? AND owner_id=? AND source_shard_id=? AND destination_shard_id=?
+             AND source_generation=? AND destination_generation=? AND state='fencing' LIMIT 1`)
+            .bind(moveId, route.ownerId, route.shardId, destinationShardId,
+              route.generation, route.generation + 1).first<number>('owned'))
+          : null;
+        if (preparation !== 1) fail('ROUTE_STALE');
+      }
       const dest = await readShard(catalog, destinationShardId);
       if (sourceDatabase === binding(bindings, dest.binding_name)) fail('MOVE_CONFLICT');
       await storage(() => catalog.prepare(`INSERT INTO storage_owner_moves
