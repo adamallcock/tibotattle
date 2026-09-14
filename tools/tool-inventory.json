@@ -2985,6 +2985,74 @@
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
       "provenanceReason": null,
       "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/prepare-electron-macos-credential-fixture.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Compile a nonce-bound synthetic hosted credential fixture without signing or Keychain execution.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "scripts/lib/macos-credential-qualification-intake.mjs",
+        "test/smoke-electron-macos-credentials.test.mjs",
+        "test/fixtures/macos-keychain-migration/README.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/smoke-electron-macos-credentials.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicitly qualify scoped credential continuity with unchanged signed apps in a disposable hosted ARM account; no production upload.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-macos-credentials.yml",
+        "test/smoke-electron-macos-credentials.test.mjs"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/macos-loopback-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Fixed inherited outbound denial and an actual bounded kernel enforcement probe for synthetic credential qualification.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "scripts/run-signed-electron-staging.mjs",
+        "test/smoke-electron-macos-credentials.test.mjs"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/macos-credential-qualification-intake.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Dependency-free closed fixture intake and reuse of source/package admission before dependencies or downloads.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-macos-credentials.yml",
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "test/smoke-electron-macos-credentials.test.mjs"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
     }
   ]
 }
