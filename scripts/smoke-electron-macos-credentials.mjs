@@ -108,6 +108,50 @@ export function validateCredentialSnapshot(value, scenario) {
       || !CREDENTIAL_FIXTURE_CASES.includes(scenario) || item.readable !== true)) fail('fixture_snapshot');
   return value.items;
 }
+// Only fixed fixture classifications may leave the owned helper. Never retain
+// an arbitrary error message, Security stderr, returned value or filesystem path.
+export const MAC_CREDENTIAL_FIXTURE_FAILURE_CODES = Object.freeze([
+  'ADOPTION_ROLLBACK_UNVERIFIED', 'ADOPTION_WRITE_READBACK_FAILED', 'CLEANUP_DELETE_FAILED',
+  'CLEANUP_INTENT_MISMATCH', 'CLEANUP_TARGET_CHANGED', 'CORE_DUMPS_NOT_DISABLED',
+  'CREATOR_READBACK_FAILED', 'DISPOSABLE_HOST_REQUIRED', 'EXISTING_KEYCHAIN_REFUSED',
+  'FIXTURE_ACCESS_FAILED', 'FIXTURE_ACL_UNAVAILABLE', 'FIXTURE_ALREADY_SEEDED',
+  'FIXTURE_CLEANUP_FAILED', 'FIXTURE_CLEANUP_NOT_READY', 'FIXTURE_COMMAND_INVALID',
+  'FIXTURE_CREATE_FAILED', 'FIXTURE_DEFAULT_RESTORE_FAILED', 'FIXTURE_DEFAULT_SELECT_FAILED',
+  'FIXTURE_EXISTS', 'FIXTURE_FAILED', 'FIXTURE_IDENTITY_INVALID',
+  'FIXTURE_IDENTITY_UNAVAILABLE', 'FIXTURE_ITEM_INVALID', 'FIXTURE_ITEM_MISSING',
+  'FIXTURE_LOCK_NOT_APPLIED', 'FIXTURE_LOCK_OPERATION_FAILED', 'FIXTURE_LOCK_STATE_INVALID',
+  'FIXTURE_METADATA_UNAVAILABLE', 'FIXTURE_NOT_READABLE', 'FIXTURE_NOT_SEEDED',
+  'FIXTURE_PROTOCOL_ENDED', 'FIXTURE_PROTOCOL_INVALID', 'FIXTURE_PROTOCOL_LIMIT',
+  'FIXTURE_PROTOCOL_READ_FAILED', 'FIXTURE_PROTOCOL_TRUNCATED', 'FIXTURE_READBACK_FAILED',
+  'FIXTURE_RECEIPT_CREATE_FAILED', 'FIXTURE_RECEIPT_INVALID', 'FIXTURE_RECEIPT_SYNC_FAILED',
+  'FIXTURE_RECEIPT_TRUNCATED', 'FIXTURE_RECEIPT_UNAVAILABLE', 'FIXTURE_RECEIPT_WRITE_FAILED',
+  'FIXTURE_SCOPE_ALREADY_SELECTED', 'FIXTURE_SCOPE_CHANGED', 'FIXTURE_SCOPE_CHANGED_DURING_SEED',
+  'FIXTURE_SCOPE_RESTORE_FAILED', 'FIXTURE_SCOPE_RESTORE_UNAVAILABLE', 'FIXTURE_SCOPE_SELECT_FAILED',
+  'FIXTURE_SCOPE_UNAVAILABLE', 'FIXTURE_SEARCH_RESTORE_FAILED', 'FIXTURE_SEED_FAILED',
+  'INTERACTION_NOT_DISABLED', 'KEYCHAIN_JOURNAL_INCOMPLETE_OR_INVALID', 'KEYCHAIN_JOURNAL_INVALID',
+  'KEYCHAIN_OPEN_FAILED', 'KEYCHAIN_OPEN_TARGET_CHANGED', 'KEYCHAIN_OWNERSHIP_INVALID',
+  'KEYCHAIN_RECEIPT_MISMATCH', 'KEYCHAIN_REFERENCE_MISMATCH', 'KEYCHAIN_WRITE_INTENT_CHANGED',
+  'KEYCHAIN_WRITE_LIMIT', 'KEYCHAIN_WRITE_PROOF_INVALID', 'KEYCHAIN_WRITE_TARGET_CHANGED',
+  'OWNER_MARKER_INVALID', 'RANDOM_UNAVAILABLE', 'ROOT_LINK_REFUSED',
+  'ROOT_OWNERSHIP_INVALID', 'SYNTHETIC_KEYCHAIN_CREATE_FAILED', 'SYNTHETIC_LEGACY_CREATE_FAILED',
+  'SYNTHETIC_RANDOM_FAILED',
+]);
+const fixtureFailureCodes = new Set(MAC_CREDENTIAL_FIXTURE_FAILURE_CODES);
+const fixtureCommands = new Set(['seed', 'snapshot', 'select', 'lock', 'unlock', 'restore', 'cleanup']);
+export function validateCredentialFixtureReply(value, { scenario, operation }) {
+  if (!CREDENTIAL_FIXTURE_CASES.includes(scenario) || (operation !== null && !fixtureCommands.has(operation))) fail('fixture_protocol');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail('fixture_protocol');
+  if (value.ok === false) {
+    if (Object.keys(value).sort().join() !== 'code,ok' || !fixtureFailureCodes.has(value.code)) fail('fixture_protocol');
+    throw Object.assign(new Error('MAC_CREDENTIAL_QUALIFICATION_REFUSED'), { credentialStage: 'fixture_operation',
+      fixtureFailure: Object.freeze({ scenario, command: operation ?? 'startup', code: value.code }) });
+  }
+  const keys = operation === 'snapshot' ? 'items,ok' : operation === null ? 'ok,ready' : 'ok,operation';
+  if (value.ok !== true || Object.keys(value).sort().join() !== keys
+    || (operation === null ? value.ready !== true : operation !== 'snapshot' && value.operation !== operation)) fail('fixture_response');
+  if (operation === 'snapshot') validateCredentialSnapshot(value, scenario);
+  return value;
+}
 async function fixtureSession(input, executable, scenario, environment) {
   if (!CREDENTIAL_FIXTURE_CASES.includes(scenario)) fail('fixture_case');
   const root = join(input.fixtureRoot, scenario); await mkdir(root, { mode: 0o700 });
@@ -123,7 +167,7 @@ async function fixtureSession(input, executable, scenario, environment) {
     buffer += chunk;
     if (buffer.length > 8192 || buffer.split('\n').length > 2) { protocolError = true; child.kill('SIGKILL'); return; }
     if (buffer.includes('\n') && pending) { const line = buffer.slice(0, -1); buffer = ''; const p = pending; pending = null;
-      try { const value = JSON.parse(line); if (value.ok !== true) fail('fixture_operation'); p.resolve(value); } catch (e) { p.reject(e); } }
+      try { p.resolve(JSON.parse(line)); } catch (e) { p.reject(e); } }
   });
   async function receive(operation) {
     if (pending || ended || protocolError) fail('fixture_protocol');
@@ -132,10 +176,9 @@ async function fixtureSession(input, executable, scenario, environment) {
       pending = { resolve: v => { clearTimeout(timer); resolve(v); }, reject: e => { clearTimeout(timer); pending = null; reject(e); } };
       if (operation) child.stdin.write(operation + '\n');
       else if (buffer.endsWith('\n')) { const line = buffer.trim(); buffer = ''; const p = pending; pending = null;
-        try { const value = JSON.parse(line); if (value.ok !== true) fail('fixture_operation'); p.resolve(value); } catch (e) { p.reject(e); } }
+        try { p.resolve(JSON.parse(line)); } catch (e) { p.reject(e); } }
     });
-    if (operation !== 'snapshot' && (operation ? result.operation !== operation : result.ready !== true)) fail('fixture_response');
-    return result;
+    return validateCredentialFixtureReply(result, { scenario, operation });
   }
   await receive(null);
   return { request: receive, async close() { child.stdin.end(); for (let n = 0; n < 30 && !ended; n++) await delay(100);
@@ -197,7 +240,7 @@ export async function exerciseCredentialRefresh(dashboard, clock) {
 export async function runMacCredentialQualification({ intake, execute = false }) {
   const proof = { schemaVersion: SCHEMA, status: 'planned', credentialContinuityQualified: false,
     enforcedLoopbackOnly: false, fixtureCleaned: false, ownedProcessesStopped: false,
-    applicationBytesUnchanged: false, cases: [], failureStage: null,
+    applicationBytesUnchanged: false, cases: [], failureStage: null, failurePhase: null, fixtureFailure: null,
     nativeLegacyMigrationQualified: false, hostedUploadQualified: false, timeoutQualified: false,
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
@@ -288,7 +331,10 @@ export async function runMacCredentialQualification({ intake, execute = false })
     await checkedFile(helper, input.fixtureExecutableSha256, 8 * 1024 ** 2);
     proof.applicationBytesUnchanged = true; proof.ownedProcessesStopped = true; proof.fixtureCleaned = true;
     proof.credentialContinuityQualified = true; proof.status = 'passed';
-  } catch (error) { proof.status = 'failed'; proof.failureStage = error.credentialStage ?? stage; }
+  } catch (error) {
+    proof.status = 'failed'; proof.failureStage = error.credentialStage ?? stage; proof.failurePhase = stage;
+    if (error.fixtureFailure) proof.fixtureFailure = error.fixtureFailure;
+  }
   finally {
     if (active) { try { await stopOwnedMacSharingApp(active); proof.ownedProcessesStopped = true; } catch { proof.ownedProcessesStopped = false; } }
     if (fixture) { try { await fixture.close(); } catch { /* Uncertain fixture scope/journal stays failed; hosted machine is disposable. */ } }
