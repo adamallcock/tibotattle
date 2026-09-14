@@ -483,6 +483,39 @@ test("native source handle holds its name, bounds reads and rejects links and fo
   } finally { await rm(junction, { force: true }); }
 }));
 
+function syntheticTimingRecords() {
+  const at = 1789200000000;
+  return [
+    { type: "session_meta", payload: { id: "synthetic-session" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "synthetic-turn" } },
+    { type: "turn_context", payload: { turn_id: "synthetic-turn", model: "gpt-5.6-sol" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "synthetic-turn",
+      duration_ms: 2_000, time_to_first_token_ms: 200 } },
+  ].map((record, index) => ({
+    ...record, timestamp: new Date(at + index * 1_000).toISOString(),
+  }));
+}
+
+test("native timing fixture qualifies a 200 ms TTFT with a valid task boundary", () => {
+  const parse = (records) => {
+    const turns = [];
+    const parser = createParser(Buffer.alloc(32, 7), null, (turn) => turns.push(turn));
+    records.forEach((record, index) => (
+      parser.line(Buffer.from(JSON.stringify(record)), index + 1, false)
+    ));
+    assert.equal(turns.length, 1);
+    return turns[0];
+  };
+  const qualified = parse(syntheticTimingRecords());
+  assert.equal(qualified.ttft, 200);
+  assert.equal(qualified.duration, null, "TTFT does not manufacture generation timing");
+  const missingDuration = syntheticTimingRecords();
+  delete missingDuration.at(-1).payload.duration_ms;
+  const unqualified = parse(missingDuration);
+  assert.equal(unqualified.ttft, null);
+  assert.equal(unqualified.quality, "invalid_boundary");
+});
+
 test("native timing SQLite retains guarded journal, reconstructs TTFT and reopens without duplication", {
   skip: NATIVE_SKIP,
 }, () => withSyntheticRoot(async ({ adapter, root }) => {
@@ -492,14 +525,8 @@ test("native timing SQLite retains guarded journal, reconstructs TTFT and reopen
   const filesystem = createTimingFilesystem({ platform: "win32", loadWindowsBinding: () => native });
   const options = { createParser, digest, METHOD, MAX_STATE_BYTES, filesystem };
   const source = join(root, "synthetic.jsonl"), dir = join(root, "timing");
-  const at = 1789200000000;
-  const records = [
-    { type: "session_meta", payload: { id: "synthetic-session" } },
-    { type: "event_msg", payload: { type: "task_started", turn_id: "synthetic-turn" } },
-    { type: "turn_context", payload: { turn_id: "synthetic-turn", model: "gpt-5.6-sol" } },
-    { type: "event_msg", payload: { type: "task_complete", turn_id: "synthetic-turn", time_to_first_token_ms: 200 } },
-  ];
-  await writeSyntheticOwnedSource(source, records.map((r, i) => JSON.stringify({ ...r, timestamp: new Date(at + i * 1000).toISOString() })).join("\n") + "\n");
+  await writeSyntheticOwnedSource(source,
+    syntheticTimingRecords().map((record) => JSON.stringify(record)).join("\n") + "\n");
   let store = await openTimingStore(dir, options);
   try {
     await ingestTimingFile(store, source);

@@ -21,7 +21,7 @@ it is not an installed-update or publication receipt.
   `0.1.22` / `1029`. The
   [existing allocation decision](../decisions/2026-09-11-electron-macos-bundle-version-allocation.md)
   still governs the distinction between bundle ordering and artifact provenance.
-- Next source-preparation build number: `2026091302`, shared across all four
+- Next source-preparation build number: `2026091303`, shared across all four
   targets. It is not an Apple bundle version or evidence of publication.
 - Freeze the exact clean candidate commit before source preparation. Keep draft
   release notes under Unreleased until final source/tag preparation.
@@ -89,7 +89,13 @@ transferred to new artifacts.
   the subsequent failure to the first PowerShell ACL read. The child environment
   removes inherited `PSModulePath` as documented for
   [intermediate PowerShell processes](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_psmodulepath?view=powershell-7.6),
-  preserving the parent environment. Native rerun must confirm this correction.
+  preserving the parent environment. Native rerun confirmed the source-handle
+  and ACL checks. The timing fixture now supplies the required two-second task
+  duration for its 200 ms TTFT; a portable parser test verifies this boundary
+  before the next native journal/reopen run.
+- Source `93ba64c31d97be0a882049544247ccd6ed21a26f`, build `2026091302`, also
+  passed the complete unsigned source-preparation workflow in
+  [run 34800291232](https://github.com/adamallcock/tibotattle/actions/runs/34800291232).
 - [Draft PR #140](https://github.com/adamallcock/tibotattle/pull/140) retains the
   candidate and its outstanding gates. The next clean commit receives fresh
   four-target build and source-preparation receipts; earlier receipts remain
