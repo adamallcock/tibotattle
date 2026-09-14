@@ -181,6 +181,54 @@ describe("cache-only graph recovery publication", () => {
     expect(options.budget.remainingQueries).toBe(48); // Metadata read plus conservative final-receipt reserve.
   });
 
+  it.each(["cache-only", "activity-only"] as const)("%s refuses pending bootstrap mutations below phase admission", async mode => {
+    await queue();
+    await db().prepare("UPDATE community_public_source_bootstrap SET completed=0 WHERE singleton=1").run();
+    const prior = await snapshot(), observation = observed();
+    const options = { ...recovery(mode === "cache-only" ? 50 : 14), mode };
+    expect(await rebuildPendingCommunityDailyAggregates(observation.database,NOW,1,{chunks:8},options))
+      .toMatchObject({processed:0,deferred:true});
+    expect(observation.mutations).toEqual([]);
+    expect(observation.prepared).toHaveLength(mode === "cache-only" ? 1 : 0);
+    expect(options.budget.remainingQueries).toBe(mode === "cache-only" ? 48 : 14);
+    expect(await snapshot()).toEqual(prior);
+    expect((await db().prepare("SELECT completed FROM community_public_source_bootstrap WHERE singleton=1").first())?.completed).toBe(0);
+    expect(readers.capture).not.toHaveBeenCalled();
+    expect(readers.rawFits).not.toHaveBeenCalled();
+  });
+
+  it.each(["cache-only", "activity-only"] as const)("%s preserves the phase and caller reserves during a pending bootstrap", async mode => {
+    await queue();
+    await db().prepare("UPDATE community_public_source_bootstrap SET completed=0 WHERE singleton=1").run();
+    const prior = await snapshot(), observation = observed();
+    const options = { mode, budget: { ...recovery(mode === "cache-only" ? 97 : 20).budget, reserveQueries:5 } };
+    expect(await rebuildPendingCommunityDailyAggregates(observation.database,NOW,1,{chunks:8},options))
+      .toMatchObject({processed:0,deferred:true});
+    expect(observation.mutations).toEqual([]);
+    expect(observation.prepared).toHaveLength(mode === "cache-only" ? 2 : 1);
+    expect(options.budget.remainingQueries).toBe(mode === "cache-only" ? 94 : 19);
+    expect(options.budget.reserveQueries).toBe(5);
+    expect(await snapshot()).toEqual(prior);
+    expect((await db().prepare("SELECT completed FROM community_public_source_bootstrap WHERE singleton=1").first())?.completed).toBe(0);
+    expect(readers.capture).not.toHaveBeenCalled();
+  });
+
+  it("admitted direct recovery finishes empty bootstrap before unavailable cache work", async () => {
+    await queue();
+    await db().prepare("UPDATE community_public_source_bootstrap SET completed=0 WHERE singleton=1").run();
+    readers.capture.mockResolvedValue(null); readers.advance.mockResolvedValue({status:"deferred"});
+    const prior = await snapshot(), observation = observed(), options = recovery();
+    expect(await rebuildPendingCommunityDailyAggregates(observation.database,NOW,1,{chunks:8},options))
+      .toMatchObject({processed:0,deferred:true});
+    expect(observation.mutations).toHaveLength(1);
+    expect(observation.mutations[0]).toContain("UPDATE community_public_source_bootstrap SET completed=1");
+    expect((await db().prepare("SELECT completed FROM community_public_source_bootstrap WHERE singleton=1").first())?.completed).toBe(1);
+    expect(await snapshot()).toEqual(prior);
+    expect(options.budget.remainingQueries).toBe(795); // Lane reservation and three bootstrap queries.
+    expect(options.budget).not.toHaveProperty("reserveQueries");
+    expect(readers.capture).toHaveBeenCalled(); expect(readers.rawFits).not.toHaveBeenCalled();
+  });
+
   it("missing model composition defers the admin graph without an empty model-day substitute", async () => {
     readers.capture.mockResolvedValue(null); const prior = await snapshot(), observation = observed();
     expect(await warmAdminCommunityAllowancePreviewCache(observation.database,NOW,recovery()))
@@ -277,8 +325,9 @@ describe("cache-only graph recovery publication", () => {
     const options = activityRecovery(), observation = observed();
     expect(await rebuildPendingCommunityDailyAggregates(observation.database,NOW,1,{chunks:8},options))
       .toMatchObject({processed:1,remaining:true});
-    expect(observation.prepared).toHaveLength(14);
-    expect(options.budget.remainingQueries).toBe(85);
+    expect(observation.prepared).toHaveLength(15);
+    expect(observation.prepared[0]).toContain("community_public_source_bootstrap");
+    expect(options.budget.remainingQueries).toBe(84); // Bootstrap lookup plus the existing 15-query phase reserve.
     const row = await db().prepare("SELECT revision,payload_json FROM community_daily_aggregates WHERE day=? ORDER BY revision DESC LIMIT 1")
       .bind(DAY).first<{revision:number;payload_json:string}>();
     const payload = JSON.parse(row!.payload_json);

@@ -13,6 +13,8 @@ import { V1_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v1";
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v11";
 import { SERVER_PRICING_METHOD_VERSION } from "../src/server-pricing";
 
+import { installPublicSourceOwnersForCacheFixture } from "./helpers/public-source-owners";
+
 interface Bindings extends Env { TEST_MIGRATIONS: D1Migration[] }
 const db = () => (env as Bindings).USAGE_MONITOR_DB;
 const NOW = Date.parse("2026-09-01T00:00:00.000Z");
@@ -47,6 +49,7 @@ async function fixture() {
     CREATE INDEX telemetry_contribution_occurrences_record ON telemetry_contribution_occurrences(participant_id,record_kind,occurrence_id);
     CREATE TABLE community_model_composition_cache(participant_id TEXT PRIMARY KEY,cache_key TEXT,composition_json TEXT,input_fingerprint TEXT,source_method_version TEXT);
   `);
+  await installPublicSourceOwnersForCacheFixture(db(), (env as Bindings).TEST_MIGRATIONS);
 }
 async function participant(id: string, source: "v1" | "legacy" | "mixed" | "v1.1" | "none" = "v1", state = "active") {
   await db().batch([
@@ -56,7 +59,7 @@ async function participant(id: string, source: "v1" | "legacy" | "mixed" | "v1.1
   ]);
   if (["v1", "mixed", "v1.1"].includes(source)) await db().prepare("INSERT INTO telemetry_v1_chunks VALUES(?,?,'device','quota','2026-08-01',0,NULL)").bind(`chunk:${id}`,id).run();
   if (["legacy", "mixed", "v1.1"].includes(source)) await db().prepare("INSERT INTO telemetry_contributions VALUES(?,?,'accepted','telemetry-contribution-v0.2','2026-08-01')").bind(`legacy:${id}`,id).run();
-  if (source === "v1.1") await db().prepare("INSERT INTO telemetry_v11_domain_heads VALUES(?)").bind(id).run();
+  if (source === "v1.1") await db().prepare("INSERT INTO telemetry_v11_domain_heads(participant_id) VALUES(?)").bind(id).run();
 }
 async function overlap(id: string, time = "2026-08-01T00:00:00.000Z") {
   await db().batch([

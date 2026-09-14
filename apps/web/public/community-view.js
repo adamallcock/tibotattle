@@ -766,6 +766,7 @@ export function renderCommunityDailySeries({
     quality.append(item);
   }
   container.append(quality);
+  container.append(node("p", "snapshot-disclosure", t("community.sample.sourcesDisclosure")));
   container.append(node(
     "p",
     "snapshot-disclosure",
@@ -1317,6 +1318,7 @@ export function renderCommunityAllowanceSection({
 
   setChip("community.allowance.available", true);
   const dollars = usdFormatter();
+  container.append(node("p", "snapshot-disclosure", t("community.sample.sourcesDisclosure")));
   container.append(node("p", "snapshot-disclosure", t("community.allowance.smallSampleDisclosure")));
   if (view !== "aggregate") {
     container.append(node("p", "allowance-summary-caption", t("community.allowance.cardsCaption")));
@@ -1358,7 +1360,7 @@ export function renderCommunityAllowanceSection({
     ));
   }
   // The participant count is a visible claim beside the number, never a
-  // tooltip: "from 1 contributing account" is part of the estimate.
+  // tooltip: "from 1 contribution source" is part of the estimate.
   headline.append(node(
     "p",
     "allowance-headline-caveat",
