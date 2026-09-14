@@ -61,6 +61,17 @@ function assertSyntheticOwnerSetup(result) {
   assert.equal(result.stderr?.length, 0, "fixture setup emits no error details");
 }
 
+function syntheticOwnerChildEnvironment(environment, path) {
+  // Node is an intermediate process between pwsh 7 and Windows PowerShell.
+  // Let the latter construct its own compatible module path at startup.
+  return {
+    ...Object.fromEntries(Object.entries(environment).filter(([key]) => (
+      key.toLowerCase() !== "psmodulepath"
+    ))),
+    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: path,
+  };
+}
+
 async function writeSyntheticOwnedSource(path, contents) {
   await writeFile(path, contents, { flag: "wx" });
   // An elevated Windows token can default new files to a group owner. Give
@@ -95,13 +106,31 @@ async function writeSyntheticOwnedSource(path, contents) {
     `,
   ], {
     encoding: "utf8",
-    env: { ...process.env, TIBOTATTLE_SYNTHETIC_SOURCE_FILE: path },
+    env: syntheticOwnerChildEnvironment(process.env, path),
     windowsHide: true,
     timeout: 10_000,
     maxBuffer: 4_096,
   });
   assertSyntheticOwnerSetup(result);
 }
+
+test("synthetic owner child removes inherited module paths without changing its parent", () => {
+  const parent = Object.freeze({
+    PSModulePath: "synthetic-pwsh7-modules",
+    pSmOdUlEpAtH: "synthetic-other-inherited-modules",
+    PATH: "synthetic-executable-search",
+    SystemRoot: "synthetic-windows-root",
+    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: "synthetic-previous-source",
+  });
+  const before = { ...parent };
+  const child = syntheticOwnerChildEnvironment(parent, "synthetic-new-source");
+  assert.deepEqual(child, {
+    PATH: parent.PATH,
+    SystemRoot: parent.SystemRoot,
+    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: "synthetic-new-source",
+  });
+  assert.deepEqual(parent, before);
+});
 
 test("synthetic owner setup failures report fixed categories without subprocess details", () => {
   const canary = "private-fixture-path-or-owner-canary";
