@@ -247,7 +247,9 @@ export async function verifyMaintenanceCutoverProof({plan,cutover,qualificationR
     ||state.next_source_row_id!==Math.max(last,high)+1||!Number.isSafeInteger(state.next_source_row_id))fail('RUNTIME_ADMISSION');
  }
  if(admission[0].namespace_id!==admission[1].namespace_id)fail('NAMESPACE');
- sequences(await rows(target,'sequences',[],128),contract);
+ // Typed telemetry continues its high-water mark in the admission allocator
+ // checked above; only retained authority tables still use sqlite_sequence.
+ sequences(await rows(target,'sequences',[],128),{authoritySequences:contract.authoritySequences.filter(row=>retained.has(row.name))});
  equal(one(await rows(target,'bootstrap',[],1)),{contract_digest:proof.restoreContractDigest,phase:'complete'},'BOOTSTRAP');
  equal(one(await rows(target,'publicBootstrap',[],1)),{policy_version:api.COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION,completed:1},'BOOTSTRAP');
  const separation=one(await rows(target,'separation',[],1));if(separation.phase!=='prepared'||separation.empty_source_check!==1||integer(separation.policy_revision)<1)fail('ISOLATION');
