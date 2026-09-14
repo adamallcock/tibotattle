@@ -30,8 +30,8 @@ on:
         description: Exact signed Electron source commit
         type: string
         required: true
-      build_number:
-        description: Exact Electron provenance build number
+      release_identity:
+        description: Closed JSON with exact version, bundleVersion and buildNumber
         type: string
         required: true
       dmg_sha256:
@@ -71,7 +71,7 @@ jobs:
       SELECTED_FEED_SCOPE: ${{ inputs.feed_scope }}
       SELECTED_RUNNER: ${{ inputs.runner_revision }}
       SELECTED_SOURCE: ${{ inputs.source_revision }}
-      SELECTED_BUILD: ${{ inputs.build_number }}
+      SELECTED_IDENTITY: ${{ inputs.release_identity }}
       SELECTED_DMG: ${{ inputs.dmg_sha256 }}
       SELECTED_ASAR: ${{ inputs.asar_sha256 }}
       SELECTED_FEED: ${{ inputs.feed_sha256 }}
@@ -105,7 +105,10 @@ jobs:
           source=e['SELECTED_SOURCE']; runner=e['SELECTED_RUNNER']
           assert re.fullmatch('[0-9a-f]{40}',source)
           assert re.fullmatch('[0-9a-f]{40}',runner) and runner==e['GITHUB_SHA']
-          assert re.fullmatch('[1-9][0-9]{0,9}',e['SELECTED_BUILD'])
+          assert len(e['SELECTED_IDENTITY'].encode())<=256
+          identity=json.loads(e['SELECTED_IDENTITY'])
+          assert type(identity) is dict and set(identity)=={'version','bundleVersion','buildNumber'}
+          assert all(type(v) is str for v in identity.values())
           for name in ['SELECTED_DMG','SELECTED_ASAR','SELECTED_FEED']:
             assert re.fullmatch('[0-9a-f]{64}',e[name])
           assert e['SELECTED_MODE'] in ['plan','execute']
@@ -119,14 +122,22 @@ jobs:
           prefix='intel/' if intel else ''
           native=('70630ba90e92a1cd8cb904e66e1aebe85b04e9d23a50bef7e4e41aca84c4d2f6' if intel else
             '2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae')
+          intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,
+            'target':target,'feedScope':scope,**identity,
+            'dmgSha256':e['SELECTED_DMG'],'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],
+            'nativeDmgSha256':native,'directory':str(root)}
+          subprocess.run(['node','--input-type=module','-e',
+            "import {readFileSync} from 'node:fs'; import {validateSparkleTransitionIntake} from './scripts/smoke-electron-macos-sparkle-transition.mjs'; validateSparkleTransitionIntake(JSON.parse(readFileSync(0,'utf8')));"],
+            input=json.dumps(intake),text=True,capture_output=True,check=True,timeout=30)
+          version=identity['version']; bundle=identity['bundleVersion']
           origin='https://updates.tibotattle.com'
           if scope=='isolated_test_feed':
-            base=f"{origin}/electron/test/native-sparkle/{source}/1029/{e['SELECTED_DMG']}"
+            base=f"{origin}/electron/test/native-sparkle/{source}/{bundle}/{e['SELECTED_DMG']}"
             feed=base+'/appcast.xml'
           else:
-            base=f"{origin}/{prefix}releases/1029/{e['SELECTED_DMG']}"
+            base=f"{origin}/{prefix}releases/{bundle}/{e['SELECTED_DMG']}"
             feed=f'{origin}/{prefix}appcast.xml'
-          candidate_name='TiboTattle-0.1.22-macOS-x64.dmg' if intel else 'TiboTattle-0.1.22-mac-arm64.dmg'
+          candidate_name=f'TiboTattle-{version}-macOS-x64.dmg' if intel else f'TiboTattle-{version}-mac-arm64.dmg'
           files=[
             ('native.dmg',f'{origin}/{prefix}releases/1026/{native}/TiboTattle-0.1.18-macOS-{architecture}.dmg',native,1024**3),
             ('candidate.dmg',base+'/'+candidate_name,e['SELECTED_DMG'],1024**3),
@@ -151,13 +162,9 @@ jobs:
               subprocess.run(['/usr/bin/ditto',str(app),str(extracted/'TiboTattle.app')],check=True,timeout=120)
             finally:
               subprocess.run(['/usr/bin/hdiutil','detach',str(mount)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
-          intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,
-            'target':target,'feedScope':scope,'version':'0.1.22','buildNumber':e['SELECTED_BUILD'],'bundleVersion':'1029',
-            'dmgSha256':e['SELECTED_DMG'],'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],
-            'nativeDmgSha256':native,'directory':str(root)}
           (root/'intake.json').write_text(json.dumps(intake)+'\n')
           pathlib.Path('sparkle-transition-receipts/intake.json').write_text(json.dumps({
-            'runnerRevision':runner,'sourceRevision':source,'target':target,'feedScope':scope,'dmgSha256':e['SELECTED_DMG'],
+            'runnerRevision':runner,'sourceRevision':source,'target':target,'feedScope':scope,**identity,'dmgSha256':e['SELECTED_DMG'],
             'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],'nativeDmgSha256':native,
             'downloadsVerified':True,'signedBundlesModified':False})+'\n')
           PY
@@ -192,7 +199,7 @@ jobs:
       SELECTED_FEED_SCOPE: ${{ inputs.feed_scope }}
       SELECTED_RUNNER: ${{ inputs.runner_revision }}
       SELECTED_SOURCE: ${{ inputs.source_revision }}
-      SELECTED_BUILD: ${{ inputs.build_number }}
+      SELECTED_IDENTITY: ${{ inputs.release_identity }}
       SELECTED_DMG: ${{ inputs.dmg_sha256 }}
       SELECTED_ASAR: ${{ inputs.asar_sha256 }}
       SELECTED_FEED: ${{ inputs.feed_sha256 }}
@@ -226,7 +233,10 @@ jobs:
           source=e['SELECTED_SOURCE']; runner=e['SELECTED_RUNNER']
           assert re.fullmatch('[0-9a-f]{40}',source)
           assert re.fullmatch('[0-9a-f]{40}',runner) and runner==e['GITHUB_SHA']
-          assert re.fullmatch('[1-9][0-9]{0,9}',e['SELECTED_BUILD'])
+          assert len(e['SELECTED_IDENTITY'].encode())<=256
+          identity=json.loads(e['SELECTED_IDENTITY'])
+          assert type(identity) is dict and set(identity)=={'version','bundleVersion','buildNumber'}
+          assert all(type(v) is str for v in identity.values())
           for name in ['SELECTED_DMG','SELECTED_ASAR','SELECTED_FEED']:
             assert re.fullmatch('[0-9a-f]{64}',e[name])
           assert e['SELECTED_MODE'] in ['plan','execute']
@@ -240,14 +250,22 @@ jobs:
           prefix='intel/' if intel else ''
           native=('70630ba90e92a1cd8cb904e66e1aebe85b04e9d23a50bef7e4e41aca84c4d2f6' if intel else
             '2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae')
+          intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,
+            'target':target,'feedScope':scope,**identity,
+            'dmgSha256':e['SELECTED_DMG'],'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],
+            'nativeDmgSha256':native,'directory':str(root)}
+          subprocess.run(['node','--input-type=module','-e',
+            "import {readFileSync} from 'node:fs'; import {validateSparkleTransitionIntake} from './scripts/smoke-electron-macos-sparkle-transition.mjs'; validateSparkleTransitionIntake(JSON.parse(readFileSync(0,'utf8')));"],
+            input=json.dumps(intake),text=True,capture_output=True,check=True,timeout=30)
+          version=identity['version']; bundle=identity['bundleVersion']
           origin='https://updates.tibotattle.com'
           if scope=='isolated_test_feed':
-            base=f"{origin}/electron/test/native-sparkle/{source}/1029/{e['SELECTED_DMG']}"
+            base=f"{origin}/electron/test/native-sparkle/{source}/{bundle}/{e['SELECTED_DMG']}"
             feed=base+'/appcast.xml'
           else:
-            base=f"{origin}/{prefix}releases/1029/{e['SELECTED_DMG']}"
+            base=f"{origin}/{prefix}releases/{bundle}/{e['SELECTED_DMG']}"
             feed=f'{origin}/{prefix}appcast.xml'
-          candidate_name='TiboTattle-0.1.22-macOS-x64.dmg' if intel else 'TiboTattle-0.1.22-mac-arm64.dmg'
+          candidate_name=f'TiboTattle-{version}-macOS-x64.dmg' if intel else f'TiboTattle-{version}-mac-arm64.dmg'
           files=[
             ('native.dmg',f'{origin}/{prefix}releases/1026/{native}/TiboTattle-0.1.18-macOS-{architecture}.dmg',native,1024**3),
             ('candidate.dmg',base+'/'+candidate_name,e['SELECTED_DMG'],1024**3),
@@ -272,13 +290,9 @@ jobs:
               subprocess.run(['/usr/bin/ditto',str(app),str(extracted/'TiboTattle.app')],check=True,timeout=120)
             finally:
               subprocess.run(['/usr/bin/hdiutil','detach',str(mount)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
-          intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,
-            'target':target,'feedScope':scope,'version':'0.1.22','buildNumber':e['SELECTED_BUILD'],'bundleVersion':'1029',
-            'dmgSha256':e['SELECTED_DMG'],'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],
-            'nativeDmgSha256':native,'directory':str(root)}
           (root/'intake.json').write_text(json.dumps(intake)+'\n')
           pathlib.Path('sparkle-transition-receipts/intake.json').write_text(json.dumps({
-            'runnerRevision':runner,'sourceRevision':source,'target':target,'feedScope':scope,'dmgSha256':e['SELECTED_DMG'],
+            'runnerRevision':runner,'sourceRevision':source,'target':target,'feedScope':scope,**identity,'dmgSha256':e['SELECTED_DMG'],
             'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],'nativeDmgSha256':native,
             'downloadsVerified':True,'signedBundlesModified':False})+'\n')
           PY

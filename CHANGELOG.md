@@ -35,8 +35,13 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-These changes are in the next-release source candidate; 0.1.22 remains the
-published release.
+No additional changes recorded.
+
+## [0.1.23](./release-notes/0.1.23.md) - 2026-09-14
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.23) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.23) ·
+[changes since v0.1.22](https://github.com/adamallcock/tibotattle/compare/v0.1.22...v0.1.23)
 
 - Redesign remaining allowances as animated fuel tanks with one shared pace
   forecast, explicit waiting states, reset countdowns and run-out timing.
@@ -49,12 +54,12 @@ published release.
 - Unify dashboard headers, reporting periods, model pickers, tables and loading
   states; preload reports and preserve cached results during refresh.
 - Add the local usage coach and Codex plugin through the bounded, content-free
-  agent protocol. The installed 0.1.22 application does not support this protocol.
+  agent protocol.
 - Preserve exact Windows file identities and recover collector/model-timing
   storage safely. Windows model performance remains unavailable until its
   separate native qualification gate passes.
 - Restore four-platform release reconciliation and strengthen Mac update and
-  empty-profile qualification. Each new installer still needs its own evidence.
+  empty-profile qualification, with final-package Linux runtime checks.
 
 ## [0.1.22](./release-notes/0.1.22.md) - 2026-09-11
 

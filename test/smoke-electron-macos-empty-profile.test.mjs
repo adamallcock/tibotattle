@@ -1,23 +1,56 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
 import { validateEmptyProfileIntake, parseEmptyProfileArguments, assertEmptyProfileSharing,
   emptyProfileSettingsScript, exerciseEmptyProfileSettings, runEmptyProfileSmoke, EMPTY_PROFILE_CONFIRMATION } from '../scripts/smoke-electron-macos-empty-profile.mjs';
-const intake = { runnerRevision: 'e'.repeat(40), target: 'darwin-arm64' };
-test('intake pins candidate bytes and rejects caller-selected source, paths, origins or extra fields', () => {
-  const value = validateEmptyProfileIntake(intake);
-  assert.equal(value.sourceRevision, 'a651ea130dd1460e4443a037c4434f57b911fec4');
-  assert.equal(value.buildNumber, '2026091107');
-  assert.equal(value.bundleVersion, '1028');
-  assert.match(value.url, /^https:\/\/updates\.tibotattle\.com\/electron\/test\/native-sparkle\//u);
-  for (const field of ['sourceRevision', 'directory', 'url', 'dmgSha256', 'asarSha256']) assert.throws(() => validateEmptyProfileIntake({ ...intake, [field]: 'different' }));
+const intake = { runnerRevision: 'e'.repeat(40), target: 'darwin-arm64', sourceRevision: 'a'.repeat(40),
+  version: '0.1.23', bundleVersion: '1030', buildNumber: '2026091401', dmgSha256: 'b'.repeat(64), asarSha256: 'c'.repeat(64) };
+const historicalIntake = target => ({ runnerRevision: 'e'.repeat(40), target,
+  sourceRevision: 'a651ea130dd1460e4443a037c4434f57b911fec4', version: '0.1.21', buildNumber: '2026091107', bundleVersion: '1028',
+  ...(target === 'darwin-arm64' ? {
+    dmgSha256: '0afab510adf250775e1401307b547cee1a7955e1d7ec8dce9852cc4ca143c7e2',
+    asarSha256: '11d053d35ae6e971adc27b3a30a8bb94592e09f5f1466cfb5d9c008634950175',
+  } : {
+    dmgSha256: '50960e1aac65eb2673a7634a18bf123b604680f2a526822a0ccccc1d3b0b52e4',
+    asarSha256: '8222cd3119e42b24d87adaee6d1a264514517504a12e2b7d728fb53ac81722e1',
+  }) });
+test('explicit successor and historical identities derive only exact architecture-specific test URLs', () => {
+  for (const target of ['darwin-arm64', 'darwin-x64']) {
+    for (const selected of [{ ...intake, target }, historicalIntake(target)]) {
+      const value = validateEmptyProfileIntake(selected);
+      const architecture = target === 'darwin-arm64' ? 'arm64' : 'x64';
+      assert.equal(value.architecture, architecture);
+      for (const key of Object.keys(selected)) assert.equal(value[key], selected[key], key);
+      const filename = `TiboTattle-${selected.version}-${architecture === 'arm64' ? 'mac-arm64' : 'macOS-x64'}.dmg`;
+      assert.equal(value.filename, filename);
+      assert.equal(value.url, `https://updates.tibotattle.com/electron/test/native-sparkle/${selected.sourceRevision}/${selected.bundleVersion}/${selected.dmgSha256}/${filename}`);
+      assert.equal(Object.isFrozen(value), true);
+    }
+  }
+});
+test('intake rejects missing identities, invalid source/hashes, mismatched allocations and transport overrides', () => {
+  for (const key of Object.keys(intake)) {
+    const missing = { ...intake }; delete missing[key];
+    assert.throws(() => validateEmptyProfileIntake(missing), { emptyProfileStage: 'intake' });
+  }
+  for (const field of ['directory', 'url', 'filename', 'architecture', 'feedScope']) {
+    assert.throws(() => validateEmptyProfileIntake({ ...intake, [field]: 'different' }), { emptyProfileStage: 'intake' });
+  }
   for (const target of [[], {}, null, 'darwin-ia32', 'toString']) assert.throws(() => validateEmptyProfileIntake({ ...intake, target }));
-  for (const runnerRevision of [[], null, 'main', 'E'.repeat(40)]) assert.throws(() => validateEmptyProfileIntake({ ...intake, runnerRevision }));
-  const intel = validateEmptyProfileIntake({ ...intake, target: 'darwin-x64' });
-  assert.equal(intel.architecture, 'x64');
-  assert.notEqual(intel.dmgSha256, value.dmgSha256);
-  assert.match(intel.url, /TiboTattle-0\.1\.21-macOS-x64\.dmg$/u);
+  for (const field of ['runnerRevision', 'sourceRevision']) for (const value of [[], null, 'main', 'E'.repeat(40), 'e'.repeat(39)]) {
+    assert.throws(() => validateEmptyProfileIntake({ ...intake, [field]: value }), { emptyProfileStage: 'intake' });
+  }
+  for (const field of ['dmgSha256', 'asarSha256']) for (const value of [[], null, 'E'.repeat(64), 'e'.repeat(63), '../artifact']) {
+    assert.throws(() => validateEmptyProfileIntake({ ...intake, [field]: value }), { emptyProfileStage: 'intake' });
+  }
+  for (const changed of [{ version: '0.1.21' }, { version: '0.1.22' }, { bundleVersion: '1029' },
+    { version: '0.1.24', bundleVersion: '1031' }, { version: '0.1.18', bundleVersion: '1026' },
+    { version: ['0.1.23'] }, { bundleVersion: 1030 }, { bundleVersion: '1030.0' },
+    { buildNumber: 2026091401 }, { buildNumber: '0' }, { buildNumber: '202609140100' }]) {
+    assert.throws(() => validateEmptyProfileIntake({ ...intake, ...changed }), { emptyProfileStage: 'intake' });
+  }
 });
 test('execution requires exact explicit confirmation; plan cannot smuggle arguments', () => {
   assert.deepEqual(parseEmptyProfileArguments(['--plan']), { execute: false });
@@ -25,9 +58,13 @@ test('execution requires exact explicit confirmation; plan cannot smuggle argume
   for (const args of [[], ['--execute'], ['--execute', '--confirm', 'yes'], ['--plan', '--confirm', EMPTY_PROFILE_CONFIRMATION], ['--plan', '--intake', '/tmp/a']]) assert.throws(() => parseEmptyProfileArguments(args));
 });
 test('plan has no host, download, installation or sharing side effects and claims no qualification', async () => {
-  const value = await runEmptyProfileSmoke({ intake });
-  assert.equal(value.status, 'planned');
-  for (const [key, flag] of Object.entries(value)) if (typeof flag === 'boolean') assert.equal(flag, false, key);
+  for (const target of ['darwin-arm64', 'darwin-x64']) for (const selected of [{ ...intake, target }, historicalIntake(target)]) {
+    const value = await runEmptyProfileSmoke({ intake: selected });
+    assert.equal(value.status, 'planned');
+    for (const key of Object.keys(selected)) assert.equal(value[key], selected[key], key);
+    for (const [key, flag] of Object.entries(value)) if (typeof flag === 'boolean') assert.equal(flag, false, key);
+  }
+  assert.equal((await runEmptyProfileSmoke({ intake: { ...intake, bundleVersion: '1029' } })).status, 'failed');
 });
 test('fresh projection refuses stale, unavailable, implicit prior choice or accepted payload', () => {
   const value = { available: true, current: true, enabled: true, basis: 'default_on', lastAcceptedAt: null };
@@ -90,4 +127,29 @@ test('manual workflow has static architecture hosts and no native fixtures or pu
   assert.match(script, /untouched: true/u);
   assert.match(script, /usageUploadQualified: false/u);
   assert.match(script, /setSharingEnabled\(false\)/u);
+  assert.match(script, /assertExtractedSignedMacBundle\(dmg, installed,/u);
+  assert.match(script, /verifySparkleTransitionCandidate\(\{ \.\.\.input, candidateCodeDirectoryHash \}, installed\)/u);
+});
+test('both workflow intake bodies bind the selected target and runner before any app execution', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/electron-macos-empty-profile.yml', import.meta.url), 'utf8');
+  const scripts = [...workflow.matchAll(/node --input-type=module - <<'JS'\n([\s\S]*?)          JS/gu)]
+    .map(match => match[1].replace(/^          /gmu, ''));
+  assert.equal(scripts.length, 2);
+  for (const [index, target] of ['darwin-arm64', 'darwin-x64'].entries()) {
+    const script = scripts[index];
+    for (const selected of [{ ...intake, target }, historicalIntake(target)]) {
+      const env = { PATH: process.env.PATH, EMPTY_PROFILE_INTAKE: JSON.stringify(selected), SELECTED_TARGET: target,
+        GITHUB_SHA: selected.runnerRevision, SELECTED_MODE: 'plan', SELECTED_CONFIRMATION: '' };
+      const run = changed => execFileSync(process.execPath, ['--input-type=module', '-'],
+        { input: script, env: { ...env, ...changed }, stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 });
+      run({});
+      run({ SELECTED_MODE: 'execute', SELECTED_CONFIRMATION: EMPTY_PROFILE_CONFIRMATION });
+      for (const changed of [{ GITHUB_SHA: 'f'.repeat(40) },
+        { SELECTED_TARGET: target === 'darwin-arm64' ? 'darwin-x64' : 'darwin-arm64' },
+        { SELECTED_MODE: 'execute' }, { SELECTED_CONFIRMATION: EMPTY_PROFILE_CONFIRMATION },
+        { EMPTY_PROFILE_INTAKE: JSON.stringify({ ...selected, sourceRevision: 'main' }) },
+        { EMPTY_PROFILE_INTAKE: JSON.stringify({ ...selected, dmgSha256: 'wrong' }) },
+        { EMPTY_PROFILE_INTAKE: JSON.stringify({ ...selected, bundleVersion: '1026' }) }]) assert.throws(() => run(changed));
+    }
+  }
 });

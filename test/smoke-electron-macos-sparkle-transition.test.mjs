@@ -100,6 +100,28 @@ test('intake binds the architecture, exact native predecessor and closed feed sc
   }
 });
 
+test('successor intake uses reviewed allocations while preserving historical candidate and predecessor identities', () => {
+  for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed']) {
+    for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030']]) {
+      const value = { ...intake(target, scope), version, bundleVersion, buildNumber: '2026091301' };
+      const result = runner.validateSparkleTransitionIntake(value);
+      assert.equal(result.nativeDmgSha256, nativeDigests[target]);
+      assert.equal(result.version, version);
+      assert.equal(result.bundleVersion, bundleVersion);
+      assert.equal(result.sourceRevision, source);
+      assert.equal(result.dmgFileName, `TiboTattle-${version}-${target === 'darwin-x64' ? 'macOS-x64' : 'mac-arm64'}.dmg`);
+      if (scope === 'isolated_test_feed') assert.equal(result.feedUrl,
+        `https://updates.tibotattle.com/electron/test/native-sparkle/${source}/${bundleVersion}/${value.dmgSha256}/appcast.xml`);
+    }
+  }
+  for (const change of [{ version: '0.1.23' }, { version: '0.1.24', bundleVersion: '1031' },
+    { version: '0.1.23', bundleVersion: '1030.0' }, { version: '0.1.18', bundleVersion: '1026' },
+    { version: '0.1.17', bundleVersion: '1024' }, { version: ['0.1.23'], bundleVersion: '1030' },
+    { version: '0.1.23', bundleVersion: 1030 }]) {
+    assert.throws(() => runner.validateSparkleTransitionIntake({ ...intake(), ...change }));
+  }
+});
+
 test('UI automation is PID-scoped, refuses ambiguous buttons, and returns fixed classifications', () => {
   for (const [pid, action] of [[0, 'check'], [1, 'check'], [3.5, 'check'], ['4;evil()', 'check'], [4, 'approve']]) {
     assert.throws(() => runner.sparkleTransitionUiScript(pid, action));
@@ -254,13 +276,33 @@ test('workflow download planning matches the runner for both architectures and s
   const python = pythonBlocks[0];
   execFileSync('python3', ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], { input: python });
   const planning = python.split('for name,url,digest,limit in files:')[0] + '\nprint(json.dumps(files))\n';
-  for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed']) {
+  for (const identity of [
+    { version: '0.1.23', bundleVersion: '1029', buildNumber: '2026091301' },
+    { version: '0.1.24', bundleVersion: '1031', buildNumber: '2026091301' },
+    { version: '0.1.23', bundleVersion: '1030', buildNumber: '2026091301', feedUrl: 'https://example.com' },
+    { version: '0.1.23', bundleVersion: 1030, buildNumber: '2026091301' },
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), 'sparkle-refused-plan-'));
+    try {
+      const value = intake();
+      assert.throws(() => execFileSync('python3', ['-c', planning], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: {
+        ...process.env, SELECTED_SOURCE: source, SELECTED_RUNNER: source, GITHUB_SHA: source,
+        SELECTED_IDENTITY: JSON.stringify(identity), SELECTED_DMG: value.dmgSha256, SELECTED_ASAR: value.asarSha256,
+        SELECTED_FEED: value.feedSha256, SELECTED_MODE: 'plan', SELECTED_CONFIRMATION: '',
+        SELECTED_TARGET: value.target, SELECTED_FEED_SCOPE: value.feedScope, RUNNER_TEMP: root,
+      } }), error => Number.isInteger(error.status) && error.status !== 0);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+  for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed'])
+    for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030']]) {
     const root = await mkdtemp(join(tmpdir(), 'sparkle-download-plan-'));
     try {
-      const value = intake(target, scope), normalized = runner.validateSparkleTransitionIntake(value);
+      const value = { ...intake(target, scope), version, bundleVersion };
+      const identity = { version, bundleVersion, buildNumber: value.buildNumber };
+      const normalized = runner.validateSparkleTransitionIntake(value);
       const files = JSON.parse(execFileSync('python3', ['-c', planning], { encoding: 'utf8', env: {
         ...process.env, SELECTED_SOURCE: source, SELECTED_RUNNER: source, GITHUB_SHA: source,
-        SELECTED_BUILD: value.buildNumber, SELECTED_DMG: value.dmgSha256, SELECTED_ASAR: value.asarSha256,
+        SELECTED_IDENTITY: JSON.stringify(identity), SELECTED_DMG: value.dmgSha256, SELECTED_ASAR: value.asarSha256,
         SELECTED_FEED: value.feedSha256, SELECTED_MODE: 'plan', SELECTED_CONFIRMATION: '',
         SELECTED_TARGET: target, SELECTED_FEED_SCOPE: scope, RUNNER_TEMP: root,
       } }));
@@ -270,8 +312,8 @@ test('workflow download planning matches the runner for both architectures and s
       assert.ok(files[1][1].endsWith('/' + normalized.dmgFileName));
       const prefix = target === 'darwin-x64' ? 'intel/' : '';
       const candidatePrefix = scope === 'production_feed'
-        ? `https://updates.tibotattle.com/${prefix}releases/1029/${value.dmgSha256}/`
-        : `https://updates.tibotattle.com/electron/test/native-sparkle/${source}/1029/${value.dmgSha256}/`;
+        ? `https://updates.tibotattle.com/${prefix}releases/${bundleVersion}/${value.dmgSha256}/`
+        : `https://updates.tibotattle.com/electron/test/native-sparkle/${source}/${bundleVersion}/${value.dmgSha256}/`;
       assert.equal(files[1][1], candidatePrefix + normalized.dmgFileName);
       assert.ok(files[0][1].startsWith(`https://updates.tibotattle.com/${prefix}releases/1026/${nativeDigests[target]}/`));
       // Exercise the actual extraction and JSON-writing block with only OS commands
@@ -280,10 +322,11 @@ test('workflow download planning matches the runner for both architectures and s
         'import pathlib,json,shutil',
         'root=pathlib.Path(' + JSON.stringify(root) + ')',
         'e=' + JSON.stringify({ SELECTED_DMG: value.dmgSha256, SELECTED_ASAR: value.asarSha256,
-          SELECTED_FEED: value.feedSha256, SELECTED_BUILD: value.buildNumber }),
+          SELECTED_FEED: value.feedSha256 }),
         'source=' + JSON.stringify(source), 'runner=source',
         'target=' + JSON.stringify(target), 'scope=' + JSON.stringify(scope),
         'native=' + JSON.stringify(nativeDigests[target]),
+        'identity=' + JSON.stringify(identity), 'intake=' + JSON.stringify({ ...value, directory: root }),
         "pathlib.Path('sparkle-transition-receipts').mkdir()",
         'class Commands:',
         '  DEVNULL=None',
@@ -298,9 +341,11 @@ test('workflow download planning matches the runner for both architectures and s
       execFileSync('python3', ['-c', extraction], { cwd: root, encoding: 'utf8' });
       const generated = JSON.parse(await readFile(join(root, 'intake.json'), 'utf8'));
       assert.equal(generated.target, target);
+      for (const key of ['sourceRevision', 'version', 'bundleVersion', 'buildNumber']) assert.equal(generated[key], value[key]);
       assert.equal(runner.validateSparkleTransitionIntake(generated).target, target);
       const receipt = JSON.parse(await readFile(join(root, 'sparkle-transition-receipts', 'intake.json'), 'utf8'));
       assert.equal(receipt.target, target);
+      for (const key of ['sourceRevision', 'version', 'bundleVersion', 'buildNumber']) assert.equal(receipt[key], value[key]);
     } finally { await rm(root, { recursive: true, force: true }); }
   }
 });

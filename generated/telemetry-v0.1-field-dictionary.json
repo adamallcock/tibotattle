@@ -26,7 +26,7 @@
     {
       "schemaName": "compatibility.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
-      "schemaSha256": "69c38f264b1d26651e44b20b0675de7417c83d9cd7748a81c3f40970e1662dfa",
+      "schemaSha256": "589d2b8eb021772f0eb0c4a29dbe032e95f6d0c64bfb755b59c6835b7ff359b3",
       "propertyCount": 66
     },
     {

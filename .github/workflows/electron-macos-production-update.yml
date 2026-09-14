@@ -21,7 +21,7 @@ on:
         type: string
         required: true
       identity_json:
-        description: Exact 022 source/build/DMG/ASAR/ZIP/feed and 020 ASAR identity JSON; directory is supplied by the workflow
+        description: Exact candidate source/version/bundle/build/DMG/ASAR/ZIP/feed and 020 ASAR identity JSON; directory is supplied by the workflow
         type: string
         required: true
       confirmation:

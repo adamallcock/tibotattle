@@ -38,6 +38,129 @@ async function withSyntheticRoot(run) {
   }
 }
 
+const SYNTHETIC_OWNER_FAILURES = Object.freeze({
+  31: "current_owner_read_failed",
+  32: "acl_before_read_failed",
+  33: "acl_before_snapshot_failed",
+  34: "owner_tool_invocation_failed",
+  35: "owner_tool_exit_failed",
+  36: "acl_after_read_failed",
+  37: "owner_after_read_failed",
+  38: "owner_readback_mismatch",
+  39: "acl_after_snapshot_failed",
+  40: "dacl_changed",
+});
+
+function assertSyntheticOwnerSetup(result) {
+  const category = result.error
+    ? (result.error.code === "ETIMEDOUT" ? "setup_timed_out" : "setup_launch_failed")
+    : (SYNTHETIC_OWNER_FAILURES[result.status] ?? "unexpected_setup_exit");
+  assert.equal(result.status === 0 && !result.error, true,
+    `synthetic source owner setup failed: ${category}`);
+  assert.equal(result.stdout?.length, 0, "fixture setup emits no ACL or owner details");
+  assert.equal(result.stderr?.length, 0, "fixture setup emits no error details");
+}
+
+function syntheticOwnerChildEnvironment(environment, path) {
+  // Node is an intermediate process between pwsh 7 and Windows PowerShell.
+  // Let the latter construct its own compatible module path at startup.
+  return {
+    ...Object.fromEntries(Object.entries(environment).filter(([key]) => (
+      key.toLowerCase() !== "psmodulepath"
+    ))),
+    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: path,
+  };
+}
+
+async function writeSyntheticOwnedSource(path, contents) {
+  await writeFile(path, contents, { flag: "wx" });
+  // An elevated Windows token can default new files to a group owner. Give
+  // only this disposable fixture the current user's owner SID; preserve its
+  // ordinary source DACL instead of turning it into protected derived state.
+  const result = spawnSync("powershell.exe", [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `
+      $ErrorActionPreference = 'Stop'
+      $stage = 31
+      try {
+        $path = $env:TIBOTATTLE_SYNTHETIC_SOURCE_FILE
+        $owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $stage = 32
+        $acl = Get-Acl -LiteralPath $path
+        $stage = 33
+        $access = [System.Security.AccessControl.AccessControlSections]::Access
+        $before = $acl.GetSecurityDescriptorSddlForm($access)
+        $stage = 34
+        $ownerTool = Join-Path $env:SystemRoot 'System32/icacls.exe'
+        & $ownerTool $path '/setowner' ('*' + $owner.Value) '/Q' *> $null
+        if ($LASTEXITCODE -ne 0) { exit 35 }
+        $stage = 36
+        $after = Get-Acl -LiteralPath $path
+        $stage = 37
+        $actualOwner = $after.GetOwner([System.Security.Principal.SecurityIdentifier])
+        if ($actualOwner.Value -ne $owner.Value) { exit 38 }
+        $stage = 39
+        $afterAccess = $after.GetSecurityDescriptorSddlForm($access)
+        if ($afterAccess -cne $before) { exit 40 }
+        exit 0
+      } catch { exit $stage }
+    `,
+  ], {
+    encoding: "utf8",
+    env: syntheticOwnerChildEnvironment(process.env, path),
+    windowsHide: true,
+    timeout: 10_000,
+    maxBuffer: 4_096,
+  });
+  assertSyntheticOwnerSetup(result);
+}
+
+test("synthetic owner child removes inherited module paths without changing its parent", () => {
+  const parent = Object.freeze({
+    PSModulePath: "synthetic-pwsh7-modules",
+    pSmOdUlEpAtH: "synthetic-other-inherited-modules",
+    PATH: "synthetic-executable-search",
+    SystemRoot: "synthetic-windows-root",
+    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: "synthetic-previous-source",
+  });
+  const before = { ...parent };
+  const child = syntheticOwnerChildEnvironment(parent, "synthetic-new-source");
+  assert.deepEqual(child, {
+    PATH: parent.PATH,
+    SystemRoot: parent.SystemRoot,
+    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: "synthetic-new-source",
+  });
+  assert.deepEqual(parent, before);
+});
+
+test("synthetic owner setup failures report fixed categories without subprocess details", () => {
+  const canary = "private-fixture-path-or-owner-canary";
+  for (const [result, category] of [
+    ...Object.entries(SYNTHETIC_OWNER_FAILURES).map(([status, category]) => (
+      [{ status: Number(status) }, category]
+    )),
+    [{ status: 1 }, "unexpected_setup_exit"],
+    [{ status: null, error: { code: "ETIMEDOUT", message: canary } }, "setup_timed_out"],
+    [{ status: null, error: { code: canary, message: canary } }, "setup_launch_failed"],
+  ]) {
+    assert.throws(() => assertSyntheticOwnerSetup({
+      ...result, stdout: canary, stderr: canary,
+    }), (error) => {
+      assert.equal(error.message.includes(category), true);
+      assert.equal(error.message.includes(canary), false);
+      return true;
+    });
+  }
+  assertSyntheticOwnerSetup({ status: 0, stdout: "", stderr: "" });
+  for (const field of ["stdout", "stderr"]) {
+    assert.throws(() => assertSyntheticOwnerSetup({
+      status: 0, stdout: "", stderr: "", [field]: canary,
+    }), (error) => {
+      assert.equal(error.message.includes(canary), false);
+      return true;
+    });
+  }
+});
+
 function fixedNativeError(code) {
   return (error) => {
     assert.equal(error?.code, code);
@@ -325,10 +448,13 @@ test("native source handle holds its name, bounds reads and rejects links and fo
   adapter.ensureDirectory(root);
   const native = loadWindowsFilesystemBinding();
   const source = join(root, "source Ω.jsonl");
-  // Codex's normal inherited ACL is accepted; derived state still requires
+  // Codex's ordinary source ACL is accepted; derived state still requires
   // the stricter owner-only protected DACL.
-  await writeFile(source, "synthetic\n");
-  const protectedFile = join(root, "protected.sqlite");
+  await writeSyntheticOwnedSource(source, "synthetic\n");
+  // Audit guards authenticate the file and its two nearest parent directories.
+  const privateRoot = join(root, "private");
+  adapter.ensureDirectory(privateRoot);
+  const protectedFile = join(privateRoot, "protected.sqlite");
   adapter.createFile(protectedFile, Buffer.alloc(0));
   const protectedLease = native.acquireCredentialAuditFileGuard(protectedFile);
   try {
@@ -357,6 +483,39 @@ test("native source handle holds its name, bounds reads and rejects links and fo
   } finally { await rm(junction, { force: true }); }
 }));
 
+function syntheticTimingRecords() {
+  const at = 1789200000000;
+  return [
+    { type: "session_meta", payload: { id: "synthetic-session" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "synthetic-turn" } },
+    { type: "turn_context", payload: { turn_id: "synthetic-turn", model: "gpt-5.6-sol" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "synthetic-turn",
+      duration_ms: 2_000, time_to_first_token_ms: 200 } },
+  ].map((record, index) => ({
+    ...record, timestamp: new Date(at + index * 1_000).toISOString(),
+  }));
+}
+
+test("native timing fixture qualifies a 200 ms TTFT with a valid task boundary", () => {
+  const parse = (records) => {
+    const turns = [];
+    const parser = createParser(Buffer.alloc(32, 7), null, (turn) => turns.push(turn));
+    records.forEach((record, index) => (
+      parser.line(Buffer.from(JSON.stringify(record)), index + 1, false)
+    ));
+    assert.equal(turns.length, 1);
+    return turns[0];
+  };
+  const qualified = parse(syntheticTimingRecords());
+  assert.equal(qualified.ttft, 200);
+  assert.equal(qualified.duration, null, "TTFT does not manufacture generation timing");
+  const missingDuration = syntheticTimingRecords();
+  delete missingDuration.at(-1).payload.duration_ms;
+  const unqualified = parse(missingDuration);
+  assert.equal(unqualified.ttft, null);
+  assert.equal(unqualified.quality, "invalid_boundary");
+});
+
 test("native timing SQLite retains guarded journal, reconstructs TTFT and reopens without duplication", {
   skip: NATIVE_SKIP,
 }, () => withSyntheticRoot(async ({ adapter, root }) => {
@@ -366,14 +525,8 @@ test("native timing SQLite retains guarded journal, reconstructs TTFT and reopen
   const filesystem = createTimingFilesystem({ platform: "win32", loadWindowsBinding: () => native });
   const options = { createParser, digest, METHOD, MAX_STATE_BYTES, filesystem };
   const source = join(root, "synthetic.jsonl"), dir = join(root, "timing");
-  const at = 1789200000000;
-  const records = [
-    { type: "session_meta", payload: { id: "synthetic-session" } },
-    { type: "event_msg", payload: { type: "task_started", turn_id: "synthetic-turn" } },
-    { type: "turn_context", payload: { turn_id: "synthetic-turn", model: "gpt-5.6-sol" } },
-    { type: "event_msg", payload: { type: "task_complete", turn_id: "synthetic-turn", time_to_first_token_ms: 200 } },
-  ];
-  await writeFile(source, records.map((r, i) => JSON.stringify({ ...r, timestamp: new Date(at + i * 1000).toISOString() })).join("\n") + "\n");
+  await writeSyntheticOwnedSource(source,
+    syntheticTimingRecords().map((record) => JSON.stringify(record)).join("\n") + "\n");
   let store = await openTimingStore(dir, options);
   try {
     await ingestTimingFile(store, source);

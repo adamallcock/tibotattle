@@ -5,19 +5,19 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Plan only or launch the pinned signed app on a disposable Mac
+        description: Plan only or launch the exact signed candidate on a disposable Mac
         type: choice
         options: [plan, execute]
         default: plan
         required: true
       target:
-        description: Pinned signed application architecture
+        description: Exact signed candidate architecture
         type: choice
         options: [darwin-arm64, darwin-x64]
         default: darwin-arm64
         required: true
       intake:
-        description: Closed JSON with target and exact runnerRevision only; app source and hashes are pinned in the runner
+        description: Closed JSON with runnerRevision, target, sourceRevision, version, bundleVersion, buildNumber, dmgSha256 and asarSha256
         type: string
         required: true
       confirmation:

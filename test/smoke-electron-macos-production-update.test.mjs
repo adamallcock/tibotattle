@@ -19,38 +19,46 @@ test('only exact confirmed execute can run an installed production update', () =
     ['--plan', '--intake', '/tmp/input.json', '--confirm', 'RUN_DISPOSABLE_PRODUCTION_ELECTRON_UPDATE'],
     ['--execute', '--intake', '/tmp/input.json', '--confirm', 'yes']]) assert.throws(() => runner.parseProductionUpdateArguments(args));
 });
-test('both targets bind immutable 020 and exact 021 identities to fixed stable transport', () => {
-  for (const target of ['darwin-arm64', 'darwin-x64']) {
-    const input = runner.validateProductionUpdateIntake(fixture(target));
+test('both targets bind immutable 020 and explicit allocated successors to fixed stable transport', () => {
+  for (const target of ['darwin-arm64', 'darwin-x64']) for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030']]) {
+    const input = runner.validateProductionUpdateIntake({ ...fixture(target), version, bundleVersion });
     assert.equal(input.predecessorDmgSha256, runner.ELECTRON_020_DMG[target]);
     assert.equal(input.feedUrl, 'https://updates.tibotattle.com/electron/stable/' + target + '/latest-mac.yml');
     assert.equal(input.predecessorUrl, 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.20/TiboTattle-0.1.20-mac-' + input.architecture + '.dmg');
-    assert.equal(input.zipFileName, 'TiboTattle-0.1.22-mac-' + input.architecture + '.zip');
+    assert.equal(input.zipFileName, 'TiboTattle-' + version + '-mac-' + input.architecture + '.zip');
+    assert.equal(input.candidateUrl, 'https://github.com/adamallcock/tibotattle/releases/download/v' + version + '/TiboTattle-' + version + '-mac-' + input.architecture + '.dmg');
   }
   for (const key of Object.keys(fixture())) { const bad = fixture(); delete bad[key]; assert.throws(() => runner.validateProductionUpdateIntake(bad)); }
   for (const bad of [{ feedUrl: 'https://example.com' }, { feedScope: 'isolated_test_feed' }, { version: '0.1.21' }, { version: '0.1.23' },
     { bundleVersion: '2026091106' }, { sourceRevision: 'main' }, { buildNumber: 1029 }, { target: 'linux-x64' },
-    { directory: 'relative' }, { predecessorAsarSha256: 'A'.repeat(64) }]) assert.throws(() => runner.validateProductionUpdateIntake({ ...fixture(), ...bad }));
+    { directory: 'relative' }, { predecessorAsarSha256: 'A'.repeat(64) }, { version: '0.1.24', bundleVersion: '1031' },
+    { version: '0.1.23', bundleVersion: '1030.0' }, { version: '0.1.18', bundleVersion: '1026' },
+    { version: '0.1.17', bundleVersion: '1024' }, { version: ['0.1.23'], bundleVersion: '1030' },
+    { version: '0.1.23', bundleVersion: 1030 }]) assert.throws(() => runner.validateProductionUpdateIntake({ ...fixture(), ...bad }));
 });
 test('live feed must bind both exact artifacts and cannot redirect the updater', () => {
-  const zip = Buffer.from('signed ZIP'), dmg = Buffer.from('signed DMG');
-  const input = runner.validateProductionUpdateIntake({ ...fixture(), zipSha256: hash(zip), dmgSha256: hash(dmg) });
-  const manifest = { version: '0.1.22', files: [[input.zipFileName, zip], [input.dmgFileName, dmg]].map(([url, b]) => ({ url, size: b.length, sha512: hash(b, 'sha512', 'base64') })),
-    path: input.zipFileName, sha512: hash(zip, 'sha512', 'base64') };
-  assert.equal(runner.validateProductionMacUpdateFeed(input, manifest, zip, dmg), true);
-  for (const change of [m => m.version = '0.1.20', m => m.path = '../candidate.zip', m => m.files[0].url = 'https://example.com/candidate.zip',
-    m => m.files[0].size++, m => m.files[0].sha512 = m.files[1].sha512, m => m.sha512 = m.files[1].sha512,
-    m => m.files.push(m.files[0]), m => m.packages = {}]) {
-    const bad = structuredClone(manifest); change(bad); assert.throws(() => runner.validateProductionMacUpdateFeed(input, bad, zip, dmg));
+  for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030']]) {
+    const zip = Buffer.from('signed ZIP'), dmg = Buffer.from('signed DMG');
+    const input = runner.validateProductionUpdateIntake({ ...fixture(), version, bundleVersion, zipSha256: hash(zip), dmgSha256: hash(dmg) });
+    const manifest = { version, files: [[input.zipFileName, zip], [input.dmgFileName, dmg]].map(([url, b]) => ({ url, size: b.length, sha512: hash(b, 'sha512', 'base64') })),
+      path: input.zipFileName, sha512: hash(zip, 'sha512', 'base64') };
+    assert.equal(runner.validateProductionMacUpdateFeed(input, manifest, zip, dmg), true);
+    for (const change of [m => m.version = version === '0.1.23' ? '0.1.22' : '0.1.23', m => m.path = '../candidate.zip', m => m.files[0].url = 'https://example.com/candidate.zip',
+      m => m.files[0].size++, m => m.files[0].sha512 = m.files[1].sha512, m => m.sha512 = m.files[1].sha512,
+      m => m.files.push(m.files[0]), m => m.packages = {}]) {
+      const bad = structuredClone(manifest); change(bad); assert.throws(() => runner.validateProductionMacUpdateFeed(input, bad, zip, dmg));
+    }
+    assert.throws(() => runner.validateProductionMacUpdateFeed(input, manifest, Buffer.from('altered'), dmg));
   }
-  assert.throws(() => runner.validateProductionMacUpdateFeed(input, manifest, Buffer.from('altered'), dmg));
 });
 test('plan reads intake only and makes no artifact, feed, process or signed-app acceptance claim', async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-update-plan-')));
   try {
-    const intakePath = join(directory, 'intake.json'); await writeFile(intakePath, JSON.stringify(fixture()), { mode: 0o600 });
+    const identity = { ...fixture(), version: '0.1.23', bundleVersion: '1030', buildNumber: '2026091301' };
+    const intakePath = join(directory, 'intake.json'); await writeFile(intakePath, JSON.stringify(identity), { mode: 0o600 });
     const result = await runner.runProductionUpdate({ execute: false, intakePath });
     assert.equal(result.status, 'planned');
+    for (const key of ['sourceRevision', 'version', 'bundleVersion', 'buildNumber']) assert.equal(result[key], identity[key]);
     for (const key of ['productionFeedVerified', 'signedArtifactVerified', 'disposableAccountVerified', 'updaterRelaunchedCandidate', 'candidateCopiedByRunner', 'ownedProcessesStopped']) assert.equal(result[key], false);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

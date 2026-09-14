@@ -1028,7 +1028,10 @@
         "test/macos-app-bundle.test.js",
         "scripts/reconcile-release-publication.mjs",
         "scripts/electron-sparkle-transition.js",
-        "test/electron-production-distribution.test.js"
+        "test/electron-production-distribution.test.js",
+        "scripts/smoke-electron-macos-empty-profile.mjs",
+        "scripts/smoke-electron-macos-production-update.mjs",
+        "scripts/smoke-electron-macos-sparkle-transition.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/decisions/2026-08-27-local-state-schema-and-release-channel-isolation.md",
@@ -2068,7 +2071,8 @@
         ".github/workflows/linux-portability.yml",
         "package.json#scripts.container:electron-linux:build",
         "package.json#scripts.container:electron-linux:build:amd64",
-        "test/linux-portability-workflow.test.js"
+        "test/linux-portability-workflow.test.js",
+        ".github/workflows/electron-linux-production-package.yml"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2219,7 +2223,9 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "test/electron-linux-normal-packaged-smoke.test.js",
-        "scripts/smoke-electron-linux-real-appimage-updater.mjs"
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "scripts/qualify-electron-linux-final-appimage.mjs",
+        ".github/workflows/electron-linux-production-package.yml"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2475,7 +2481,9 @@
         "scripts/qualify-electron-windows-frozen-installer.mjs",
         "scripts/prepare-electron-stable-publication.mjs",
         "test/electron-stable-publication.test.js",
-        "test/electron-stable-writer.test.js"
+        "test/electron-stable-writer.test.js",
+        "scripts/qualify-electron-linux-final-appimage.mjs",
+        "test/electron-linux-final-appimage.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2632,7 +2640,9 @@
         ".github/workflows/electron-development-packages.yml",
         "test/electron-linux-real-appimage-updater.test.js",
         "scripts/smoke-electron-linux-real-appimage-updater.mjs",
-        ".github/workflows/electron-linux-production-package.yml"
+        ".github/workflows/electron-linux-production-package.yml",
+        "scripts/qualify-electron-linux-final-appimage.mjs",
+        "test/electron-linux-final-appimage.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2936,6 +2946,23 @@
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/qualify-electron-linux-final-appimage.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Binds the isolated normal Linux runtime qualification to the exact final AppImage; does not rebuild, sign, publish, or exercise a public predecessor update.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-linux-production-package.yml",
+        "test/electron-linux-final-appimage.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
       "provenanceReason": null,
       "legacyPaths": []
     }

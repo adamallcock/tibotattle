@@ -34,7 +34,7 @@ jobs:
   package:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -95,7 +95,7 @@ jobs:
           node scripts/build-linux-credential-mutex-manifest.mjs
           node scripts/qualify-linux-credential-mutex.mjs
       - name: Validate packaging contracts
-        run: node --test test/electron-production-distribution.test.js test/electron-linux-production-package-workflow.test.js
+        run: node --test test/electron-production-distribution.test.js test/electron-linux-production-package-workflow.test.js test/electron-linux-final-appimage.test.js
       - name: Prepare normal production source
         run: |
           set -euo pipefail
@@ -147,6 +147,41 @@ jobs:
           await writeFile(`${root}/linux-production-package-receipt.json`,JSON.stringify(proof,null,2)+'\n',{flag:'wx',mode:0o600});
           console.log('LINUX_PRODUCTION_PACKAGE_BYTES_VERIFIED');
           NODE
+      - name: Extract only the verified final AppImage for native runtime qualification
+        run: node scripts/qualify-electron-linux-final-appimage.mjs --prepare --source-revision "$SOURCE_REVISION"
+      - name: Prepare the existing isolated native Linux desktop runtime
+        run: |
+          set -euo pipefail
+          node scripts/build-electron-linux-container.mjs --architecture amd64
+          docker build --platform=linux/amd64 \
+            --file containers/electron-linux-production/Dockerfile \
+            --build-arg "TIBOTATTLE_QUALIFICATION_REVISION=$SOURCE_REVISION" \
+            --tag tibotattle-electron-linux-production:test .
+      - name: Qualify exact final application startup refresh and cold restart offline
+        run: |
+          set -euo pipefail
+          candidate_root=/workspace/.release-build/electron-production/linux-x64
+          host_receipt=.release-build/electron-production/linux-x64/final-runtime/normal-packaged-smoke.json
+          timeout 600s docker run --rm --init --platform=linux/amd64 --cap-add=SYS_ADMIN --network none \
+            --tmpfs /home/node:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 \
+            --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config \
+            --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share \
+            --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            --env USAGE_MONITOR_LINUX_IMAGE_PLATFORM=linux/amd64 \
+            --env USAGE_MONITOR_LINUX_NETWORK_BOUNDARY=network-none \
+            tibotattle-electron-linux-production:test \
+            node scripts/smoke-electron-linux-packaged.mjs \
+            --app "$candidate_root/final-runtime/extracted/squashfs-root/tibotattle" \
+            --staged-app "$candidate_root/app" \
+            --source-candidate "$candidate_root/production-source-candidate.json" \
+            --source-revision "$SOURCE_REVISION" \
+            --receipt /run/user/1000/final-linux-normal-packaged-smoke.json \
+            > "$host_receipt"
+          node scripts/qualify-electron-linux-final-appimage.mjs --verify-runtime --source-revision "$SOURCE_REVISION"
       - name: Capture bounded package metadata for diagnosis
         if: always()
         env:
@@ -187,5 +222,8 @@ jobs:
             .release-build/electron-production/linux-x64/production-source-candidate.json
             .release-build/electron-production/linux-x64/app-update.yml
             .release-build/electron-production/linux-x64/linux-production-package-receipt.json
+            .release-build/electron-production/linux-x64/final-runtime/final-image-preparation.json
+            .release-build/electron-production/linux-x64/final-runtime/normal-packaged-smoke.json
+            .release-build/electron-production/linux-x64/final-runtime/final-image-runtime.json
           if-no-files-found: error
           retention-days: 14
