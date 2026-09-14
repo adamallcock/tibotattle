@@ -3025,7 +3025,8 @@ footer p { margin: 0; }
   font-size: .6rem;
   line-height: 1.35;
   scrollbar-width: none;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .community-site .homebrew-install code::-webkit-scrollbar {
   display: none;
@@ -5561,3 +5562,12 @@ html[data-theme="dark"] .quota-tank.stale { --tank-fluid: #8c9a8d; --tank-glow: 
 .quota-tank-header > .allowance-motion-controls { position: absolute; top: 0; right: 0; }
 
 .weekly-pace-forecast-heading .panel-kicker { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Keep release checksum copying discreet without reducing keyboard visibility. */
+.community-site .electron-checksum-copy,
+.community-site .electron-checksum-copy:hover:not(:disabled),
+.community-site .electron-checksum-copy[data-copy-state="copied"] {
+  border: 0;
+  background: transparent;
+  padding-inline: 0;
+}

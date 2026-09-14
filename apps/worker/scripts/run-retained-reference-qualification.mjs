@@ -24,7 +24,8 @@ export async function runRetainedReferenceQualification({manifestPath,expectedMa
  check(manifest.limits?.maxQueryBytes===262144&&manifest.limits?.maxSteps===256&&manifest.limits?.queryTimeoutMs===45000&&manifest.limits?.totalTimeoutMs===600000,'LIMITS');
  check(/^[a-f0-9]{40}$/.test(manifest.sourceRevision)&&Array.isArray(manifest.code)&&manifest.code.length>0&&new Set(manifest.code.map(e=>e.file)).size===manifest.code.length,'PROVENANCE');
  check(canonical(manifest.code.map(e=>e.file))===canonical(RETAINED_QUALIFICATION_CODE_FILES),'CODE_SET');
- const migrationNames=(await readdir(join(root,'migrations'))).sort();check(manifest.migrations?.length===59&&canonical(manifest.migrations.map(e=>e.name))===canonical(migrationNames),'CANONICAL_SET');
+ // Match the historical 0059 qualification, never silently include successor migrations.
+ const migrationNames=(await readdir(join(root,'migrations'))).filter(n=>/^\d{4}.*\.sql$/.test(n)&&Number(n.slice(0,4))<=59).sort();check(manifest.migrations?.length===59&&canonical(manifest.migrations.map(e=>e.name))===canonical(migrationNames),'CANONICAL_SET');
  for(const entry of manifest.code)check(entry.file==='../../config/deployment-endpoints.js'||(/^(scripts|src)\/[a-zA-Z0-9_.\/-]+$/.test(entry.file)&&!entry.file.includes('..')),'CODE_PATH');
  for(const entry of manifest.code)check(sha(await readFile(join(root,entry.file)))===entry.sha256,'CODE_DRIFT');
  for(const entry of manifest.migrations)check(sha(await readFile(join(directory,'canonical',entry.name)))===entry.sha256,'CANONICAL_DRIFT');

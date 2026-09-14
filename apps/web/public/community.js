@@ -263,6 +263,8 @@ export function setPublicDailyPresentation(documentRef, state, {
 }
 
 export function renderPublicInstallerJourney(documentRef = document) {
+  // Static Electron links are generated from the reviewed four-target plan.
+  if (documentRef.querySelector('meta[name="usage-monitor-electron-stable"]')?.content === "true") return null;
   const select = (selector) => documentRef.querySelector(selector);
   const renderArchitecture = (architecture) => {
     const prefix = architecture === "x64" ? "intel-" : "";
@@ -612,6 +614,8 @@ if (typeof document !== "undefined") {
   wireHomebrewInstallCommand("intel-");
   wireInstallerChecksumCopy();
   wireInstallerChecksumCopy("intel-");
+  wireInstallerChecksumCopy("windows-");
+  wireInstallerChecksumCopy("linux-");
   wireAllowanceRangeControls();
   wireAllowanceDialog();
   const refresh = createCommunityRefresh({
@@ -639,6 +643,9 @@ if (typeof document !== "undefined") {
     renderInstallerChecksumCopyState(
       $("#intel-installer-sha256-copy")?.dataset.copyState ?? "idle", "intel-",
     );
+    for (const prefix of ["windows-", "linux-"]) {
+      renderInstallerChecksumCopyState($(`#${prefix}installer-sha256-copy`)?.dataset.copyState ?? "idle", prefix);
+    }
     if (communityDailySettled) {
       renderCommunityDailyResult({
         payload: lastCommunityDailyPayload,

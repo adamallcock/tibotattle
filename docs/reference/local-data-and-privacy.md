@@ -46,9 +46,15 @@ credentials and while-open scheduling to the encrypted v1.1 upload transport.
 Enrollment alone grants no upload permission: the server separately binds an
 accountless owner and current versioned authorization to that installation.
 Usage and quota records retain the same owner, provider/account track and
-domain-generation boundaries. Revocation blocks future admission; it is
-separate from private owner erasure of previously accepted records. Accountless
-owners remain excluded from public fits under the current eligibility policy.
+domain-generation boundaries. Revocation blocks future admission and immediately
+withdraws the source from current public calculations; it is separate from
+private owner erasure of previously accepted records. The
+[shared public sample](../decisions/2026-09-11-public-contribution-sources.md)
+admits active, device-bound accountless v1.1 sources alongside signed-in sources.
+Renewable upload expiry alone does not withdraw retained accepted evidence.
+Public counts describe contribution sources, not unique people or verified
+provider accounts; separate installations can supply overlapping history.
+Sealed legacy weekly snapshots retain their original cohort rules.
 
 Only a validated production distribution manifest enables the hosted client;
 development/QA packages keep it disabled. The server's separate ownership flag

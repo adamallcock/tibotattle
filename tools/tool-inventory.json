@@ -126,7 +126,9 @@
         "test/release-publication.test.js",
         "scripts/prepare-electron-stable-publication.mjs",
         "scripts/publish-electron-stable-feed.mjs",
-        "test/electron-stable-writer.test.js"
+        "test/electron-stable-writer.test.js",
+        "scripts/lib/electron-public-site.mjs",
+        "test/electron-public-site.test.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/agent-release-operations.md",
@@ -312,7 +314,8 @@
         "package.json#scripts.product:release-site",
         "scripts/prepare-web-release.js",
         "scripts/preview-public-release-site.js",
-        "test/public-release-site.test.js"
+        "test/public-release-site.test.js",
+        "test/electron-public-site.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -2882,6 +2885,22 @@
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": ".github/workflows/electron-macos-sparkle-transition.yml",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "public_site_release",
+      "canonicalPath": "scripts/lib/electron-public-site.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Internal explicit reviewed Electron publication intake; no standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-public-release-site.js",
+        "test/electron-public-site.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
       "provenanceReason": null,
       "legacyPaths": []
     }
