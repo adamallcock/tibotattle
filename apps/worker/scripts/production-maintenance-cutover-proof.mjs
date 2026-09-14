@@ -26,7 +26,7 @@ const SQL=Object.freeze({
  capacity:'SELECT 1 AS capacity_probe',
  sourceSnapshot:'SELECT contract_digest,namespace,snapshot_digest FROM _authority_snapshot WHERE id=1',
  sequences:'SELECT name,seq FROM sqlite_sequence ORDER BY name LIMIT 129',
- sourceCounts:"SELECT 'v1' format,count(*) records,COALESCE(max(id),0) last_id FROM telemetry_v1_records UNION ALL SELECT 'v11',count(*),COALESCE(max(rowid),0) FROM telemetry_v11_records",
+ sourceCounts:"SELECT 'v1' format,(SELECT count(*) FROM telemetry_v1_records) records,COALESCE((SELECT max(id) FROM telemetry_v1_records),0) last_id UNION ALL SELECT 'v11',(SELECT count(*) FROM telemetry_v11_records),COALESCE((SELECT max(rowid) FROM telemetry_v11_records),0)",
  progress:'SELECT contract_digest,execution_digest,stage,steps,intent FROM _authority_operator_progress WHERE id=1',
  restore:'SELECT run_id,contract_digest,limit_bytes,phase FROM _authority_restore_run WHERE id=1',
  tables:'SELECT name,copied,verified,copy_done,verify_done,copy_cursor,verify_cursor FROM _authority_restore_tables ORDER BY name LIMIT 129',
@@ -172,7 +172,11 @@ export async function verifyMaintenanceCutoverProof({plan,cutover,qualificationR
  const roleSchemaBytes=await file(join(qualificationRoot,D1_STORAGE_SCHEMA_DIRECTORIES.ingestion,'final-role-schema.json'),ingestion.manifest.finalRoleSchemaSha256);
  // The restore-base loader's runtimeReady:false remains truthful. Final role
  // schema and runtime state are independently checked below against live D1.
- equal(parse(roleSchemaBytes),contract.finalSchema.filter(row=>row.tbl_name!=='d1_storage_migrations'),'QUALIFIED_FINAL_ROLE');
+ const qualifiedRole=parse(roleSchemaBytes);
+ // Rehearsals may include the exact operator ledger. It is checked separately
+ // from the application schema, just as the restored contract's ledger is.
+ if(qualifiedRole.some(row=>row.tbl_name==='d1_storage_migrations'))administrativeLedger(qualifiedRole,[],[]);
+ equal(qualifiedRole.filter(row=>row.tbl_name!=='d1_storage_migrations'),contract.finalSchema.filter(row=>row.tbl_name!=='d1_storage_migrations'),'QUALIFIED_FINAL_ROLE');
  const ledgerSchemaBytes=await file(ledgerSchemaPath,proof.ledgerSchemaFileSha256),ledgerSchema=parse(ledgerSchemaBytes);
  storageSchemaDigest(ledgerSchema);
  const ledgerDirectory=join(qualificationRoot,'deletion-ledger-migrations');
@@ -243,7 +247,9 @@ export async function verifyMaintenanceCutoverProof({plan,cutover,qualificationR
     ||state.next_source_row_id!==Math.max(last,high)+1||!Number.isSafeInteger(state.next_source_row_id))fail('RUNTIME_ADMISSION');
  }
  if(admission[0].namespace_id!==admission[1].namespace_id)fail('NAMESPACE');
- sequences(await rows(target,'sequences',[],128),contract);
+ // Typed telemetry continues its high-water mark in the admission allocator
+ // checked above; only retained authority tables still use sqlite_sequence.
+ sequences(await rows(target,'sequences',[],128),{authoritySequences:contract.authoritySequences.filter(row=>retained.has(row.name))});
  equal(one(await rows(target,'bootstrap',[],1)),{contract_digest:proof.restoreContractDigest,phase:'complete'},'BOOTSTRAP');
  equal(one(await rows(target,'publicBootstrap',[],1)),{policy_version:api.COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION,completed:1},'BOOTSTRAP');
  const separation=one(await rows(target,'separation',[],1));if(separation.phase!=='prepared'||separation.empty_source_check!==1||integer(separation.policy_revision)<1)fail('ISOLATION');

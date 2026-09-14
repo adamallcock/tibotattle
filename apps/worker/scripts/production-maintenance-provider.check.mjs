@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createMaintenanceProvider, maintenanceBindingDigest, MAINTENANCE_SCHEMA_QUERY } from './production-maintenance-provider.mjs';
 import { identityDigest } from '../../../scripts/lib/release-operation.mjs';
 import { maintenanceHash } from './production-maintenance.mjs';
+import { createMaintenanceTransport } from './production-maintenance-transport.mjs';
 const old='11111111-1111-4111-8111-111111111111',next='22222222-2222-4222-8222-222222222222',op='33333333-3333-4333-8333-333333333333';
 async function fixture(t){
  const root=await realpath(await mkdtemp(join(tmpdir(),'maintenance-provider-')));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -46,3 +47,14 @@ test('contained proof uses exact candidate/traffic/empty cron/assets/503; source
 test('dry build has no credentials; closed commands pin CLI and record only hashes, including uncertain failure',async t=>{const f=await fixture(t);await f.provider.dryRun();assert.equal(f.spawns[0].opts.env.CLOUDFLARE_API_TOKEN,undefined);assert.ok(f.spawns[0].args.includes('--dry-run'));await f.provider.mutate('activate',next);assert.ok(f.spawns[1].args.includes(next+'@100%'));assert.equal(f.spawns[1].opts.timeout,60000);const provider=await createMaintenanceProvider({...f.options,spawn:()=>({status:null,error:{code:'ETIMEDOUT'},stdout:f.token,stderr:f.token})});await assert.rejects(provider.mutate('upload',null),{code:'PRODUCTION_MAINTENANCE_COMMAND_UNCERTAIN'});for(const name of await readdir(f.root))if(name.startsWith('provider-'))assert.equal((await readFile(join(f.root,name),'utf8')).includes(f.token),false);await writeFile(f.options.cliPath,'changed');await assert.rejects(f.provider.dryRun());});
 test('API override, missing token and provider failures cannot select an alternate endpoint or launch a mutation',async t=>{const f=await fixture(t);await assert.rejects(createMaintenanceProvider({...f.options,environment:{...f.options.environment,CLOUDFLARE_API_BASE_URL:'https://foreign.example'}}),{code:'PRODUCTION_MAINTENANCE_ENVIRONMENT_OVERRIDE'});const missing=await createMaintenanceProvider({...f.options,environment:{}});await assert.rejects(missing.assertPredecessor(),{code:'PRODUCTION_MAINTENANCE_CREDENTIAL_REQUIRED'});assert.equal(f.spawns.length,0);});
 test('same-source unhealthy200 cannot qualify restoration or predecessor admission',async t=>{const f=await fixture(t);f.state.unhealthy=true;await assert.rejects(f.provider.assertPredecessor(),{code:'PRODUCTION_MAINTENANCE_RESTORE_UNVERIFIED'});assert.equal(f.spawns.length,0);});
+test('full foreign-key read can finish within D1 limits without extending mutations or retrying failed requests',async t=>{
+ const f=await fixture(t),deadlines=[];let calls=0;
+ t.mock.method(AbortSignal,'timeout',ms=>{deadlines.push(ms);return new AbortController().signal;});
+ const transport=createMaintenanceTransport({...f.options,fetcher:async()=>{calls++;throw Error('synthetic timeout');}});
+ const path=`/accounts/${f.plan.accountId}/d1/database/${old}/query`;
+ await assert.rejects(transport.api(path,{sql:'PRAGMA foreign_key_check',params:[]}),{code:'PRODUCTION_MAINTENANCE_READ_UNCERTAIN'});
+ await assert.rejects(transport.api(path,{sql:'SELECT 1',params:[]}),{code:'PRODUCTION_MAINTENANCE_READ_UNCERTAIN'});
+ await assert.rejects(transport.api(path,{sql:'PRAGMA foreign_key_check',params:[]},{mutation:true}),{code:'PRODUCTION_MAINTENANCE_MUTATION_UNCERTAIN'});
+ await assert.rejects(transport.api(path,{sql:'PRAGMA foreign_key_check; SELECT 1',params:[]}),{code:'PRODUCTION_MAINTENANCE_READ_UNCERTAIN'});
+ assert.deepEqual(deadlines,[35000,20000,20000,20000]);assert.equal(calls,4);assert.equal(f.spawns.length,0);
+});

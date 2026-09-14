@@ -30,7 +30,11 @@ export function createMaintenanceTransport({plan,operationDirectory,cliPath,fetc
     if(typeof token!=='string'||token.length<16)fail('CREDENTIAL_REQUIRED');
     if(++requests>600||!path.startsWith(account+'/'))fail('READ_BUDGET');
     let response,bytes;
-    try{response=await fetcher('https://api.cloudflare.com/client/v4'+path,{method:body?'POST':'GET',headers:{authorization:`Bearer ${token}`,...(body?{'content-type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{}),redirect:'error',signal:AbortSignal.timeout(20000)});bytes=await responseBytes(response);}catch{fail(mutation?'MUTATION_UNCERTAIN':'READ_UNCERTAIN');}
+    // A full relationship check can use D1's 30-second query allowance.
+    // Allow its response to arrive; ordinary reads and all writes stay bounded
+    // by the original deadline, and no failed request is retried here.
+    const timeoutMs=!mutation&&body?.sql==='PRAGMA foreign_key_check'&&path.endsWith('/query')?35000:20000;
+    try{response=await fetcher('https://api.cloudflare.com/client/v4'+path,{method:body?'POST':'GET',headers:{authorization:`Bearer ${token}`,...(body?{'content-type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{}),redirect:'error',signal:AbortSignal.timeout(timeoutMs)});bytes=await responseBytes(response);}catch{fail(mutation?'MUTATION_UNCERTAIN':'READ_UNCERTAIN');}
     await receipt({kind:'provider-read',method:body?(mutation?'POST_WRITE_QUERY':'POST_READ_QUERY'):'GET',pathSha256:hash(path),status:response.status,bytes:bytes.length,sha256:hash(bytes)});
     let json;try{json=JSON.parse(bytes);}catch{fail('RESPONSE_INVALID');}
     if(!response.ok||json.success!==true)fail('READ_REFUSED');

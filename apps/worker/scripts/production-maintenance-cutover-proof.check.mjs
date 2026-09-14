@@ -19,9 +19,20 @@ const ids=['10000000-0000-4000-8000-000000000001','10000000-0000-4000-8000-00000
 const schema=db=>db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*' ORDER BY type,name").all().map(row=>({...row}));
 const normalized=rows=>rows.map(row=>Object.fromEntries(Object.entries(row).map(([key,value])=>[key,value instanceof Uint8Array?Array.from(value):value])));
 const quote=name=>`"${name.replaceAll('"','""')}"`;
+test('source census uses native counts and indexed high-water seeks with sparse identifiers',()=>{
+ const db=new DatabaseSync(':memory:');
+ try{
+  db.exec('CREATE TABLE telemetry_v1_records(id INTEGER PRIMARY KEY,payload TEXT);CREATE TABLE telemetry_v11_records(payload TEXT);INSERT INTO telemetry_v1_records VALUES(2,\'x\'),(900,\'y\');INSERT INTO telemetry_v11_records(rowid,payload) VALUES(4,\'z\');');
+  const sql=MAINTENANCE_CUTOVER_PROOF_SQL.find(sql=>sql.includes("'v1' format")&&sql.includes('telemetry_v1_records'));
+  assert.deepEqual(db.prepare(sql).all().map(row=>({...row})),[{format:'v1',records:2,last_id:900},{format:'v11',records:1,last_id:4}]);
+  const bytecode=db.prepare('EXPLAIN '+sql).all();
+  assert.equal(bytecode.filter(row=>row.opcode==='Count').length,2);
+  assert.equal(bytecode.filter(row=>row.opcode==='Last').length,2);
+ }finally{db.close();}
+});
 let apiPromise;
 const api=()=>apiPromise??=(async()=>{const built=await build({stdin:{contents:"export {AUTHORITY_RESTORE_SCHEMA} from './authority-restore-schema'; export {authorityRestoreRetainedTableNames} from './authority-restore'; export {encodeTypedTelemetryId} from './typed-telemetry-codec'; export {participantDeletionDigest} from './participant-deletion-digest';",resolveDir:join(workerRoot,'src'),loader:'ts'},bundle:true,write:false,format:'esm',platform:'node',mainFields:['module','main'],logLevel:'silent'});return import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].contents).toString('base64')}`);})();
-async function fixture(t){
+async function fixture(t,{qualifiedOperatorLedger=false,retiredV1High=0}={}){
  const root=await realpath(await mkdtemp(join(tmpdir(),'maintenance-proof-')));t.after(()=>rm(root,{recursive:true,force:true}));
  const databases=ids.map(()=>new DatabaseSync(':memory:'));t.after(()=>databases.forEach(db=>db.close()));
  const [source,target,analytics,ledger]=databases,maintained=await api(),inputs=[];
@@ -34,13 +45,15 @@ async function fixture(t){
    inputs.push({directory,name,sha256:storageSha256(sql),bytes:sql.length});
   }
  }
- const finalRole=schema(target),operatorSQL='CREATE TABLE d1_storage_migrations (name TEXT PRIMARY KEY NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64)) STRICT';
+ let finalRole=schema(target);const operatorSQL='CREATE TABLE d1_storage_migrations (name TEXT PRIMARY KEY NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64)) STRICT';
  target.exec(operatorSQL);
+ if(qualifiedOperatorLedger)finalRole=schema(target);
  const baseSQL='CREATE TABLE fixture_restore_base(id INTEGER PRIMARY KEY);',operatorRows=[{name:'0001_restore_base.sql',sha256:storageSha256(baseSQL)}];
  target.prepare('INSERT INTO d1_storage_migrations VALUES(?,?)').run(operatorRows[0].name,operatorRows[0].sha256);
  const finalSchema=schema(target),retained=new Set(maintained.authorityRestoreRetainedTableNames()),sourceSchema=schema(source);
  const tables=sourceSchema.filter(row=>row.type==='table').map(row=>({name:row.name,disposition:retained.has(row.name)?'authority':row.name==='telemetry_v1_records'?'typed-v1':row.name==='telemetry_v11_records'?'typed-v11':'analytics'}));
  const authoritySequences=sourceSchema.filter(row=>row.type==='table'&&(retained.has(row.name)||row.name==='telemetry_v1_records')&&/\bAUTOINCREMENT\b/.test(row.sql)).map(row=>({name:row.name,sequence:0})).sort((a,b)=>a.name<b.name?-1:1);
+ if(retiredV1High){authoritySequences.find(row=>row.name==='telemetry_v1_records').sequence=retiredV1High;source.prepare('UPDATE sqlite_sequence SET seq=? WHERE name=?').run(retiredV1High,'telemetry_v1_records');if(!source.prepare('SELECT 1 FROM sqlite_sequence WHERE name=?').get('telemetry_v1_records'))source.prepare('INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)').run('telemetry_v1_records',retiredV1High);}
  const contract={version:'authority-restore-v1',runId:'synthetic-copy',sourceId,sourceNamespace:namespace,sourceSnapshotDigest:'b'.repeat(64),
   sourceSchema,sourceSchemaDigest:identityDigest(sourceSchema),targetBaseSchema:[],targetBaseSchemaDigest:identityDigest([]),targetOperatorLedgerDigest:identityDigest(operatorRows),
   tables,finalSchema,finalSchemaDigest:identityDigest(finalSchema),typedCopies:['v1','v11'].map(format=>({runId:`synthetic-${format}`,sourceNamespace:namespace,sourceSnapshotDigest:'b'.repeat(64),format})),
@@ -65,10 +78,11 @@ async function fixture(t){
  for(const format of ['v1','v11']){
   target.prepare('INSERT INTO _authority_restore_typed VALUES(?,?,0,0,1)').run(format,`synthetic-${format}`);
   target.prepare('INSERT INTO storage_raw_copy_runs VALUES(?,?,?,?,0,0)').run(`synthetic-${format}`,namespace,contract.sourceSnapshotDigest,format);
-  target.prepare('INSERT INTO _authority_restore_adoption VALUES(?,0,0,0,1,0,0,1)').run(format);
+  target.prepare('INSERT INTO _authority_restore_adoption VALUES(?,?,0,0,1,0,0,1)').run(format,format==='v1'?retiredV1High:0);
  }
  target.prepare('INSERT INTO typed_telemetry_namespaces(original_id) VALUES(?)').run(maintained.encodeTypedTelemetryId(namespace));
  for(const format of ['v1','v11'])target.prepare(`INSERT INTO typed_${format}_admission_state(id,source_namespace,namespace_id,next_source_row_id,runtime_contract_version) VALUES(1,?,1,1,1)`).run(namespace);
+ if(retiredV1High)target.prepare('UPDATE typed_v1_admission_state SET next_source_row_id=? WHERE id=1').run(retiredV1High+1);
  target.prepare('INSERT INTO storage_source_state VALUES(1,?,0)').run(sourceId);
  target.exec(MIGRATION_JOURNAL_DDL);
  target.prepare('INSERT INTO _authority_operator_progress VALUES(1,?,?,NULL,19,NULL)').run(contractDigest,'d'.repeat(64));
@@ -124,6 +138,20 @@ test('actual schema and bounded SQL observations admit copy/bootstrap and indepe
  assert.equal(receipt.stage,'full');assert.equal(receipt.analyticsCaughtUp,true);
  assert.equal(receipt.ledgerStateSha256,f.proof.ledgerStateSha256);assert.ok(!JSON.stringify(receipt).includes(f.deletedDigest));
  assert.ok(f.calls.every(call=>/^SELECT|^PRAGMA foreign_key_check$/.test(call.sql)));
+});
+test('qualified rehearsal including the exact operator ledger admits the same application schema',async t=>{
+ const f=await fixture(t,{qualifiedOperatorLedger:true});
+ const receipt=await verifyMaintenanceCutoverProof({...f.options,stage:'pre-analytics'});
+ assert.equal(receipt.status,'verified');assert.equal(receipt.stage,'pre-analytics');
+ f.target.exec('CREATE INDEX unexpected_operator_index ON d1_storage_migrations(sha256)');
+ await assert.rejects(f.run(),/TARGET_SCHEMA|OPERATOR_SCHEMA/);
+});
+test('retired telemetry high-water continuity is proved by the typed allocator, not a removed SQLite table',async t=>{
+ const f=await fixture(t,{retiredV1High:900});
+ assert.equal((await f.run()).status,'verified');
+ const read=f.options.readDatabase;
+ f.options.readDatabase=async(...args)=>{const result=await read(...args);if(args[1].includes('FROM typed_v1_admission_state'))result.results.find(row=>row.format==='v1').next_source_row_id=1;return result;};
+ await assert.rejects(f.run(),/RUNTIME_ADMISSION/);
 });
 test('pre-analytics is explicit, cannot bless a wrong registration or incomplete privacy reconciliation',async t=>{
  const f=await fixture(t),read=f.options.readDatabase;
