@@ -24,18 +24,35 @@ are separate owner-authorized operations. Do not execute this fixture locally.
 The fixture accepts only `modern`, `invalid` and `locked`, and refuses before
 Security interaction unless the actual account is the disposable GitHub-hosted
 ARM `runner` account. Its bounded stdin protocol permits only seeding,
-snapshotting, selecting, locking/unlocking, restoring and cleaning its one
-journal-owned synthetic keychain. The random keychain password remains in
+snapshotting, selecting, checking scope, locking/unlocking, restoring and
+cleaning its one journal-owned synthetic keychain. The random keychain password remains in
 process memory. Synthetic modern values use the existing three active app
 capabilities and the app-only ACL. Only content-free item/value/ACL digests leave
 the helper. No real login items are read.
 
 Unlike the original native fixture, this hosted fixture temporarily selects
-its keychain as the disposable runner's sole search/default keychain so the
-unchanged production app's fixed queries reach the synthetic items. It records
-the prior selection in memory, refuses foreign drift, and restores only a
-verified owned selection. Interrupted or unverified journals never authorize
-adoption or deletion. A failed restoration remains a failed job; destroy the
+its keychain as the disposable runner's sole **user-domain** search member and
+explicit user default. The ordinary default must agree and the current
+preference domain must be user. The dynamic domain must be empty. The common
+domain may be empty or contain only the exact root-owned, regular file with one hard link and
+no group/other write permission at `/Library/Keychains/System.keychain`; its ancestors,
+reference path and pinned file metadata must validate. For every one of the
+native adapter's five capabilities, both modern and legacy service queries must
+return `errSecItemNotFound` and the System keychain must report read permission.
+These ten existence/status-only queries use only that explicit System reference,
+fixed account `installation`, no return-data/ref/attributes flag and no result
+pointer. They never retrieve System values, unlock or modify System, or query
+login/user items. A namespace parity test refuses native capability drift.
+
+The aggregate list must equal dynamic, user, then common in exact order and
+multiplicity. macOS's aggregate list includes common members even after setting
+the user list ([Apple Security implementation](https://github.com/apple-oss-distributions/Security/blob/main/OSX/libsecurity_keychain/lib/StorageManager.cpp)).
+The fixture retains prior domain/default metadata in memory, rechecks containment
+before each app launch and after it stops, and restores only the exactly verified
+user list/default while preserving common/dynamic unchanged. Each selected
+scenario retains a closed `mac-credential-isolated-scope-v1` proof in the result;
+no path, attributes or item values enter that proof. Interrupted or unverified
+journals never authorize adoption or deletion. A failed restoration remains a failed job; destroy the
 disposable runner rather than repairing it through guessed ownership.
 
 [`electron-macos-credentials.yml`](../../../.github/workflows/electron-macos-credentials.yml)

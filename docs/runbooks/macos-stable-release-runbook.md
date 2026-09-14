@@ -221,8 +221,12 @@ opt-out fixture does not claim an existing Keychain credential rehearsal.
 The separately dispatched `electron-macos-credentials.yml` checks existing
 modern credentials through an installed Electron 0.1.20-to-candidate replacement
 on a disposable hosted ARM account. It uses a separately signed, nonce-bound
-synthetic fixture and kernel-enforced loopback-only app networking. Its reviewed
-intake, preparation, evidence and remaining failure-case boundaries are described
+synthetic fixture and kernel-enforced loopback-only app networking. The fixture
+requires a synthetic-only user search list/default, empty dynamic domain, and
+an empty common domain or the pinned root-owned System keychain with status-only
+absence for all ten current/legacy native namespaces. Scope is rechecked before
+each launch and after each stop; domain/default drift fails the receipt. Its
+reviewed intake, preparation, evidence and remaining failure-case boundaries are described
 in the [fixture README](../../test/fixtures/macos-keychain-migration/README.md#hosted-installed-electron-credentials).
 Neither signing the fixture nor passing this scoped journey proves the complete
 credential failure matrix. Retain each unexercised result as false.
