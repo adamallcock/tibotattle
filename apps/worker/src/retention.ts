@@ -1,4 +1,7 @@
 import {prepareStorageParticipantErasure,requireStorageParticipantErasureComplete,advanceStorageErasureJobs,type StorageErasureBindings} from './storage-erasure';
+import {advanceMultiSourceStorageErasureJobs,prepareMultiSourceParticipantErasure,
+  storageErasureTargetForRouteTarget,type StorageErasureTarget} from './storage-multi-source-erasure';
+import {storageForParticipantDeletionDigest,storageTargetsForOwnerRoute} from './storage-routing-runtime';
 import { participantDeletionDigest } from "./participant-deletion-digest";
 export { participantDeletionDigest } from "./participant-deletion-digest";
 import { revokeAccountlessEnrollment } from "./accountless-enrollment";
@@ -24,12 +27,20 @@ const DELETION_TOMBSTONE_DELETE_BATCH_SIZE = 100;
 const IDENTITY_REENROLLMENT_COOLDOWN_DELETE_BATCH_SIZE = 100;
 const MAX_RESTORE_SUPPRESSIONS_PER_PASS = 100;
 const MAX_LIFECYCLE_ROWS = 100_000;
+export const CATALOG_DELETION_REPLAY_PAGE_SIZE = 8;
 const IDENTITY_REENROLLMENT_COOLDOWN_DOMAIN =
   "app-usagemonitor/identity-reenrollment-cooldown/v1\0";
 
 interface TombstoneRow {
   participant_digest: string;
   retain_until?: string;
+}
+
+export interface CatalogReplayPendingReceipt {
+  participant_digest:string;
+  attempted_ms:number;
+  revision:number;
+  attempt_token:string;
 }
 
 interface ParticipantRow {
@@ -67,6 +78,7 @@ export interface ExpiredLedgerPurgeResult {
 }
 
 type LifecyclePhaseGuard = () => Promise<boolean>;
+type CatalogReplayGuard = () => Promise<boolean | void>;
 
 function canonicalInstant(epoch: number): string {
   return new Date(epoch).toISOString();
@@ -139,7 +151,13 @@ export async function recordDeletionTombstone(
   const retainUntil = canonicalInstant(
     nowEpoch + DELETION_TOMBSTONE_RETENTION_MILLISECONDS,
   );
-  await ledger.prepare(
+  await deletionTombstoneStatement(ledger,participantDigest,deletedAt,retainUntil).run();
+  await requireDeletionTombstone(ledger,participantDigest,retainUntil);
+}
+
+function deletionTombstoneStatement(ledger:D1Database,participantDigest:string,
+  deletedAt:string,retainUntil:string):D1PreparedStatement{
+  return ledger.prepare(
     `INSERT INTO deletion_tombstones (
       participant_digest, schema_version, deleted_at, retain_until
     ) VALUES (?, 'participant-deletion-tombstone-v0.1', ?, ?)
@@ -149,7 +167,11 @@ export async function recordDeletionTombstone(
           THEN excluded.retain_until
         ELSE deletion_tombstones.retain_until
       END`,
-  ).bind(participantDigest, deletedAt, retainUntil).run();
+  ).bind(participantDigest, deletedAt, retainUntil);
+}
+
+async function requireDeletionTombstone(ledger:D1Database,participantDigest:string,
+  retainUntil:string):Promise<void>{
   const row = await ledger.prepare(
     `SELECT participant_digest, retain_until
        FROM deletion_tombstones
@@ -160,6 +182,52 @@ export async function recordDeletionTombstone(
       || row.retain_until < retainUntil) {
     throw new ApiError(503, "DELETION_LEDGER_UNAVAILABLE");
   }
+}
+
+/** Same-ledger atomic authority for catalog erasure. The source is untouched
+ * unless both the retained tombstone and its replay marker commit together. */
+export async function recordCatalogDeletionReplayPending(
+  ledger:D1Database,participantId:string,nowEpoch=Date.now(),
+):Promise<CatalogReplayPendingReceipt>{
+  const participantDigest=await participantDeletionDigest(participantId);
+  const deletedAt=canonicalInstant(nowEpoch);
+  const retainUntil=canonicalInstant(nowEpoch+DELETION_TOMBSTONE_RETENTION_MILLISECONDS);
+  const attemptToken=crypto.randomUUID();
+  try{
+    const results=await ledger.batch<CatalogReplayPendingReceipt>([
+      deletionTombstoneStatement(ledger,participantDigest,deletedAt,retainUntil),
+      catalogReplayPendingStatement(ledger,participantDigest,nowEpoch,attemptToken),
+    ]);
+    const marker=catalogReplayPendingReceipt(results[1]?.results[0],participantDigest,attemptToken);
+    if(results.length!==2||results[1]?.results.length!==1||!marker){
+      throw new ApiError(503,'DELETION_LEDGER_UNAVAILABLE');
+    }
+    await requireDeletionTombstone(ledger,participantDigest,retainUntil);
+    return marker;
+  }catch(error){
+    if(error instanceof ApiError)throw error;
+    throw new ApiError(503,'DELETION_LEDGER_UNAVAILABLE');
+  }
+}
+
+function catalogReplayPendingStatement(ledger:D1Database,participantDigest:string,
+  nowEpoch:number,attemptToken:string):D1PreparedStatement{
+  return ledger.prepare(`INSERT INTO storage_catalog_deletion_replay_pending
+    (participant_digest,created_at,attempted_ms,revision,attempt_token) VALUES(?,?,?,1,?)
+    ON CONFLICT(participant_digest) DO UPDATE SET
+      attempted_ms=MAX(attempted_ms,excluded.attempted_ms),revision=revision+1,
+      attempt_token=excluded.attempt_token
+    WHERE revision<9007199254740990
+    RETURNING participant_digest,attempted_ms,revision,attempt_token`)
+    .bind(participantDigest,nowEpoch,nowEpoch,attemptToken);
+}
+
+function catalogReplayPendingReceipt(row:CatalogReplayPendingReceipt|undefined,
+  participantDigest:string,attemptToken:string):CatalogReplayPendingReceipt|null{
+  if(!row||row.participant_digest!==participantDigest||row.attempt_token!==attemptToken
+    ||!Number.isSafeInteger(row.attempted_ms)||row.attempted_ms<0
+    ||!Number.isSafeInteger(row.revision)||row.revision<1)return null;
+  return row;
 }
 
 export async function hasDeletionTombstone(
@@ -175,9 +243,12 @@ export async function hasDeletionTombstone(
   if(row.retain_until>canonicalInstant(nowEpoch))return true;
   // Pending cross-store cleanup retains the original deletion authority even
   // after its usual retention date; it cannot permit a restored enrollment.
-  if(!await ledger.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='storage_erasure_jobs'").first())return false;
-  return !!await ledger.prepare("SELECT 1 FROM storage_erasure_jobs WHERE participant_digest=? AND state='pending' LIMIT 1")
-    .bind(participantDigest).first();
+  const schema=await erasureLedgerTables(ledger);
+  if(!schema.jobs)return false;
+  const pending=`EXISTS(SELECT 1 FROM storage_erasure_jobs WHERE participant_digest=?1 AND state='pending')${schema.targets?`
+    OR EXISTS(SELECT 1 FROM storage_erasure_targets WHERE participant_digest=?1 AND state='pending')`:''}${schema.replay?`
+    OR EXISTS(SELECT 1 FROM storage_catalog_deletion_replay_pending WHERE participant_digest=?1)`:''}`;
+  return !!await ledger.prepare(`SELECT 1 AS pending WHERE ${pending}`).bind(participantDigest).first();
 }
 
 export async function recordIdentityReenrollmentCooldown(
@@ -301,6 +372,22 @@ export async function hasIdentityReenrollmentCooldown(
   return hasIdentityReenrollmentCooldownDigest(ledger, cooldownDigest, nowEpoch);
 }
 
+/** Discover the optional erasure tables in one statement so extending the
+ * ledger does not increase the scheduled lifecycle's fixed query budget. */
+async function erasureLedgerTables(ledger:D1Database):Promise<{jobs:boolean;targets:boolean;replay:boolean}>{
+  const row=await ledger.prepare(`SELECT
+    EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='storage_erasure_jobs') AS jobs,
+    EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='storage_erasure_targets') AS targets,
+    EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table'
+      AND name='storage_catalog_deletion_replay_pending') AS replay`)
+    .first<{jobs:number;targets:number;replay:number}>();
+  if(!row||![row.jobs,row.targets,row.replay].every(value=>value===0||value===1)
+    ||(row.targets===1&&row.jobs!==1)||(row.replay===1&&(row.jobs!==1||row.targets!==1))){
+    throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+  }
+  return {jobs:row.jobs===1,targets:row.targets===1,replay:row.replay===1};
+}
+
 async function purgeExpiredLedgerRows(
   ledger: D1Database,
   table: "deletion_tombstones" | "identity_reenrollment_cooldowns",
@@ -309,8 +396,14 @@ async function purgeExpiredLedgerRows(
   batchSize: number,
 ): Promise<ExpiredLedgerPurgeResult> {
   const now = canonicalInstant(nowEpoch);
-  const storageJobs=table==='deletion_tombstones'&&!!await ledger.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='storage_erasure_jobs'").first();
-  const pendingGuard=storageJobs?" AND NOT EXISTS(SELECT 1 FROM storage_erasure_jobs j WHERE j.participant_digest=deletion_tombstones.participant_digest AND j.state='pending')":"";
+  const schema=table==='deletion_tombstones'?await erasureLedgerTables(ledger):{jobs:false,targets:false,replay:false};
+  const storageJobs=schema.jobs,storageTargets=schema.targets;
+  const pendingGuard=storageJobs?` AND NOT EXISTS(SELECT 1 FROM storage_erasure_jobs j
+    WHERE j.participant_digest=deletion_tombstones.participant_digest AND j.state='pending')${storageTargets?`
+    AND NOT EXISTS(SELECT 1 FROM storage_erasure_targets t
+    WHERE t.participant_digest=deletion_tombstones.participant_digest AND t.state='pending')`:''}${schema.replay?`
+    AND NOT EXISTS(SELECT 1 FROM storage_catalog_deletion_replay_pending r
+    WHERE r.participant_digest=deletion_tombstones.participant_digest)`:''}`:"";
   const due = await ledger.prepare(
     `SELECT ${digestColumn}
        FROM ${table}
@@ -387,8 +480,13 @@ async function deletionDigests(
   nowEpoch: number,
 ): Promise<Set<string>> {
   const digests = new Set<string>();
-  const jobs=!!await ledger.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='storage_erasure_jobs'").first();
-  const pending=jobs?" OR EXISTS(SELECT 1 FROM storage_erasure_jobs j WHERE j.participant_digest=deletion_tombstones.participant_digest AND j.state='pending')":"";
+  const {jobs,targets,replay}=await erasureLedgerTables(ledger);
+  const pending=jobs?` OR EXISTS(SELECT 1 FROM storage_erasure_jobs j
+    WHERE j.participant_digest=deletion_tombstones.participant_digest AND j.state='pending')${targets?`
+    OR EXISTS(SELECT 1 FROM storage_erasure_targets t
+    WHERE t.participant_digest=deletion_tombstones.participant_digest AND t.state='pending')`:''}${replay?`
+    OR EXISTS(SELECT 1 FROM storage_catalog_deletion_replay_pending r
+    WHERE r.participant_digest=deletion_tombstones.participant_digest)`:''}`:"";
   let cursor = "";
   while (digests.size <= MAX_LIFECYCLE_ROWS) {
     const page = await ledger.prepare(
@@ -436,6 +534,7 @@ async function suppressRestoredParticipant(
   rawIdentityLinkSecret?: unknown,
   allowMissingIdentityLinkSecret = false,
   storage?: StorageErasureBindings,
+  requireStorageCompletion = true,
 ): Promise<boolean> {
   // Social restore replay retains its historical NULL fence. Accountless
   // owner shape requires a non-NULL deleting fence; reserve a deterministic,
@@ -512,8 +611,175 @@ async function suppressRestoredParticipant(
     }
   }
   await finishParticipantDeletion(db, participantId, restoreFence);
-  await requireStorageParticipantErasureComplete(ledger,participantId,storage??null);
+  if(requireStorageCompletion){
+    await requireStorageParticipantErasureComplete(ledger,participantId,storage??null);
+  }
   return true;
+}
+
+async function restoredParticipantForOwner(
+  source:D1Database,ownerId:string,
+):Promise<string|null>{
+  const rows=(await source.prepare(`SELECT owner.participant_id
+    FROM accountless_enrollment_ledger ledger
+    JOIN accountless_upload_owners owner ON owner.enrollment_device_id=ledger.device_id
+    JOIN participants participant ON participant.id=owner.participant_id
+    WHERE ledger.installation_principal_id=?
+    ORDER BY owner.participant_id LIMIT 2`).bind(ownerId)
+    .all<{participant_id:string}>()).results;
+  if(rows.length>1)throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+  return rows[0]?.participant_id??null;
+}
+
+async function refreshCatalogReplayPending(ledger:D1Database,participantDigest:string,
+  nowEpoch:number):Promise<CatalogReplayPendingReceipt>{
+  if(!/^[a-f0-9]{64}$/.test(participantDigest)||!Number.isSafeInteger(nowEpoch)||nowEpoch<0){
+    throw new ApiError(503,'DELETION_LEDGER_UNAVAILABLE');
+  }
+  const attemptToken=crypto.randomUUID();
+  try{
+    const row=await catalogReplayPendingStatement(ledger,participantDigest,nowEpoch,attemptToken)
+      .first<CatalogReplayPendingReceipt>();
+    const marker=catalogReplayPendingReceipt(row??undefined,participantDigest,attemptToken);
+    if(!marker)throw new ApiError(503,'DELETION_LEDGER_UNAVAILABLE');
+    return marker;
+  }catch(error){
+    if(error instanceof ApiError)throw error;
+    throw new ApiError(503,'DELETION_LEDGER_UNAVAILABLE');
+  }
+}
+
+export async function completeCatalogDeletionReplayPending(ledger:D1Database,
+  marker:CatalogReplayPendingReceipt):Promise<boolean>{
+  const removed=await ledger.prepare(`DELETE FROM storage_catalog_deletion_replay_pending
+    WHERE participant_digest=?1 AND attempted_ms=?2 AND revision=?3 AND attempt_token=?4
+      AND NOT EXISTS(SELECT 1 FROM storage_erasure_jobs
+        WHERE participant_digest=?1 AND state='pending')
+      AND NOT EXISTS(SELECT 1 FROM storage_erasure_targets
+        WHERE participant_digest=?1 AND state='pending')
+    RETURNING participant_digest`).bind(marker.participant_digest,marker.attempted_ms,marker.revision,
+      marker.attempt_token)
+    .first<string>('participant_digest');
+  return removed===marker.participant_digest;
+}
+
+/** Catalog restore replay follows only the immutable deletion locator and that
+ * owner's bounded route history. Each physical source resolves the raw id from
+ * its indexed, shard-local owner graph and verifies the tombstone digest before
+ * deletion. A failed source/analytics target stays pending for a later pass. */
+export async function replayCatalogDeletionTombstones(
+  env:Env,
+  nowEpoch=Date.now(),
+  rawIdentityLinkSecret?:unknown,
+  allowMissingIdentityLinkSecret=true,
+  beforeReplayUnit?:CatalogReplayGuard,
+):Promise<{suppressed:number;complete:boolean}>{
+  type CursorState={after_participant_digest:string;cycle_incomplete:number;
+    verification_required:number;updated_at:number};
+  const ledger=env.DELETION_LEDGER;
+  const state=await ledger.prepare(`SELECT after_participant_digest,cycle_incomplete,
+    verification_required,updated_at FROM storage_catalog_deletion_replay_state WHERE singleton_id=1`)
+    .first<CursorState>();
+  if(!state||![state.cycle_incomplete,state.verification_required].every(value=>value===0||value===1)
+    ||(state.after_participant_digest!==''&&!/^[a-f0-9]{64}$/.test(state.after_participant_digest))){
+    throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+  }
+  const assertReplayOwnership=async()=>{
+    if(beforeReplayUnit&&(await beforeReplayUnit())===false){
+      throw new ApiError(503,'LIFECYCLE_STATE_CONFLICT');
+    }
+  };
+  const active=`(retain_until>? OR EXISTS(SELECT 1 FROM storage_erasure_jobs job
+    WHERE job.participant_digest=deletion_tombstones.participant_digest AND job.state='pending')
+    OR EXISTS(SELECT 1 FROM storage_erasure_targets target
+    WHERE target.participant_digest=deletion_tombstones.participant_digest AND target.state='pending')
+    OR EXISTS(SELECT 1 FROM storage_catalog_deletion_replay_pending replay
+    WHERE replay.participant_digest=deletion_tombstones.participant_digest))`;
+  const page=(await ledger.prepare(`SELECT participant_digest FROM deletion_tombstones
+    WHERE participant_digest>? AND ${active} ORDER BY participant_digest LIMIT ?`)
+    .bind(state.after_participant_digest,canonicalInstant(nowEpoch),CATALOG_DELETION_REPLAY_PAGE_SIZE+1)
+    .all<TombstoneRow>()).results;
+  const updateCursor=async(expected:CursorState,next:Omit<CursorState,'updated_at'>):Promise<CursorState>=>{
+    await assertReplayOwnership();
+    const updated=await ledger.prepare(`UPDATE storage_catalog_deletion_replay_state
+      SET after_participant_digest=?,cycle_incomplete=?,verification_required=?,updated_at=?
+      WHERE singleton_id=1 AND after_participant_digest=? AND cycle_incomplete=?
+        AND verification_required=? AND updated_at=?
+      RETURNING after_participant_digest,cycle_incomplete,verification_required,updated_at`)
+      .bind(next.after_participant_digest,next.cycle_incomplete,next.verification_required,nowEpoch,
+        expected.after_participant_digest,expected.cycle_incomplete,expected.verification_required,expected.updated_at)
+      .first<CursorState>();
+    if(!updated)throw new ApiError(503,'LIFECYCLE_STATE_CONFLICT');
+    return updated;
+  };
+  if(page.length===0){
+    if(state.after_participant_digest===''){
+      if(state.cycle_incomplete===0&&state.verification_required===0){
+        return {suppressed:0,complete:true};
+      }
+      await updateCursor(state,{after_participant_digest:'',cycle_incomplete:0,verification_required:0});
+      return {suppressed:0,complete:true};
+    }
+    const incomplete=state.cycle_incomplete===1;
+    await updateCursor(state,{after_participant_digest:'',cycle_incomplete:0,
+      verification_required:incomplete?1:0});
+    return {suppressed:0,complete:!incomplete};
+  }
+  const digests=page.slice(0,CATALOG_DELETION_REPLAY_PAGE_SIZE);
+  let suppressed=0,cursor=state,cycleIncomplete=state.cycle_incomplete===1;
+  for(let index=0;index<digests.length;index++){
+    const participantDigest=digests[index]!.participant_digest;
+    await assertReplayOwnership();
+    let unitIncomplete=false;
+    // This exact marker commits before any catalog/source lookup. An outage can
+    // therefore never age the underlying deletion authority out of retention.
+    const marker=await refreshCatalogReplayPending(ledger,participantDigest,nowEpoch);
+    // Absence is an activation/backfill failure. Never scan shards to recover it.
+    const located=await storageForParticipantDeletionDigest(env,participantDigest);
+    const routeTargets=await storageTargetsForOwnerRoute(env,located.route);
+    if(routeTargets.length>8)throw new ApiError(503,'LIFECYCLE_BOUNDS_EXCEEDED');
+    const availableTargets:StorageErasureTarget[]=[];
+    let ownerSuppressed=false;
+    for(const routeTarget of routeTargets){
+      await assertReplayOwnership();
+      try{
+        const erasureTarget=await storageErasureTargetForRouteTarget(env,routeTarget);
+        availableTargets.push(erasureTarget);
+        const participantId=await restoredParticipantForOwner(routeTarget.database,located.route.ownerId);
+        if(participantId===null)continue;
+        if(await participantDeletionDigest(participantId)!==participantDigest){
+          throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+        }
+        await prepareMultiSourceParticipantErasure([erasureTarget],participantId);
+        ownerSuppressed=await suppressRestoredParticipant(routeTarget.database,env.DELETION_LEDGER,
+          env.QUARANTINE,participantId,rawIdentityLinkSecret,allowMissingIdentityLinkSecret,
+          undefined,false)||ownerSuppressed;
+      }catch(error){
+        if(error instanceof ApiError&&error.code==='LIFECYCLE_BOUNDS_EXCEEDED')throw error;
+        unitIncomplete=true;
+      }
+    }
+    if(ownerSuppressed)suppressed++;
+    if(availableTargets.length>0){
+      await assertReplayOwnership();
+      const advanced=await advanceMultiSourceStorageErasureJobs({targets:availableTargets,
+        participantDigest,maxJobsPerTarget:1});
+      if(advanced.pendingTargets>0||advanced.unavailableTargets.length>0)unitIncomplete=true;
+    }
+    if(availableTargets.length!==routeTargets.length)unitIncomplete=true;
+    if(!unitIncomplete){
+      await assertReplayOwnership();
+      if(!await completeCatalogDeletionReplayPending(ledger,marker))unitIncomplete=true;
+    }
+    cycleIncomplete ||= unitIncomplete;
+    const lastInCycle=page.length<=CATALOG_DELETION_REPLAY_PAGE_SIZE&&index===digests.length-1;
+    cursor=await updateCursor(cursor,lastInCycle
+      ?{after_participant_digest:'',cycle_incomplete:0,verification_required:cycleIncomplete?1:0}
+      :{after_participant_digest:participantDigest,cycle_incomplete:Number(cycleIncomplete),
+        verification_required:cursor.verification_required});
+    if(lastInCycle)return {suppressed,complete:!cycleIncomplete};
+  }
+  return {suppressed,complete:false};
 }
 
 export async function replayDeletionTombstones(
@@ -648,6 +914,7 @@ export async function runBackendLifecycle(
   rawIdentityLinkSecret?: unknown,
   allowMissingIdentityLinkSecret = true,
   storage?: StorageErasureBindings,
+  catalogEnv?:Env,
 ): Promise<LifecyclePassResult> {
   let ownershipLost = false;
   const assertOwnership = async (): Promise<void> => {
@@ -671,15 +938,11 @@ export async function runBackendLifecycle(
   try {
     // Replay can delete whole participant data sets; renew or fence before it.
     await assertOwnership();
-    const restoreReplay = await replayDeletionTombstones(
-      db,
-      ledger,
-      quarantine,
-      nowEpoch,
-      rawIdentityLinkSecret,
-      allowMissingIdentityLinkSecret,
-      storage,
-    );
+    const restoreReplay = catalogEnv
+      ?await replayCatalogDeletionTombstones(catalogEnv,nowEpoch,rawIdentityLinkSecret,
+        allowMissingIdentityLinkSecret,assertOwnership)
+      :await replayDeletionTombstones(db,ledger,quarantine,nowEpoch,rawIdentityLinkSecret,
+        allowMissingIdentityLinkSecret,storage);
     if(storage){const pending=await advanceStorageErasureJobs(storage,{maxJobs:1});
       if(pending.pending)restoreReplay.complete=false;}
     // R2 quarantine removal is a distinct destructive phase. An owner that

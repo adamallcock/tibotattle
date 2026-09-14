@@ -1,4 +1,5 @@
-import { assertTypedStorageAdmissionCapacity } from './typed-storage-capacity';
+import { assertTypedStorageAdmissionCapacity, prepareTypedStorageAdmissionReservation,
+  reconcileTypedStorageAdmissionReservation, type TypedStorageAdmissionReservation } from './typed-storage-capacity';
 import {
   canonicalTelemetryV11Json, parseTelemetryV11ChunkId, telemetryV11RecordAnchor,
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, type TelemetryV11Chunk,
@@ -12,6 +13,10 @@ import { telemetryV11LegacyProjection } from "./telemetry-v11-compatibility";
 import { existingTelemetryV11StagedChunk, validateTelemetryV11StagedChunk,
   type TelemetryV11StagedChunkRow } from "./telemetry-v11-repository";
 import { assertTelemetryTransportWriteAllowed, type TelemetryTransportPrincipal } from "./telemetry-transport-policy";
+import { ownerWriteFenceStatement } from "./storage-routing-fence";
+import type { OwnerStorageRoute } from "./storage-routing";
+import { assertCurrentTypedTelemetryOrigin, typedTelemetryOriginQualificationStatements,
+  TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST } from "./typed-telemetry-origins";
 
 export interface TypedV11ChunkMetadata {
   /** Stable original source namespace, never a destination shard or request ID. */
@@ -53,7 +58,9 @@ export async function initializeTypedV11Admission(db: D1Database, sourceNamespac
         .bind(sourceNamespace, source),
       db.prepare(`UPDATE typed_v11_admission_state SET runtime_contract_version=1
         WHERE id=1 AND source_namespace=? AND runtime_contract_version=0`).bind(sourceNamespace),
+      ...typedTelemetryOriginQualificationStatements(db, sourceNamespace, "v11"),
     ]);
+    await assertCurrentTypedTelemetryOrigin(db, sourceNamespace, "v11");
   } catch (error) {
     if (String(error).includes("typed_v11_unqualified_history") || String(error).includes("typed_v11_namespace_or_allocator_conflict")
         || String(error).includes("typed_v11_runtime_contract_unqualified")) {
@@ -94,17 +101,18 @@ function mapError(error: unknown): Error {
   }
   return unavailable();
 }
-async function replayResult(db: D1Database, row: TelemetryV11StagedChunkRow, chunk: TelemetryV11Chunk,
-  namespaceId: number): Promise<TypedV11StagedChunkResult> {
+async function replayResult(db: D1Database, row: TelemetryV11StagedChunkRow, chunk: TelemetryV11Chunk): Promise<TypedV11StagedChunkResult> {
   if (row.chunk_digest !== chunk.chunkDigest || row.record_count !== chunk.records.length) {
     throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   }
   const complete = await db.prepare(`SELECT count(*) AS total FROM typed_v11_record_admissions p
     JOIN typed_telemetry_records r ON r.id=p.typed_record_id
     JOIN typed_v11_chunk_allocations a ON a.chunk_id=p.chunk_id
-    WHERE p.chunk_id=? AND p.manifest_id=? AND a.namespace_id=? AND r.namespace_id=a.namespace_id
+    JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=a.namespace_id
+      AND origin.v11_read_contract_version=2
+    WHERE p.chunk_id=? AND p.manifest_id=? AND r.namespace_id=a.namespace_id
       AND r.format=11 AND r.source_row_id>=a.first_source_row_id AND r.source_row_id<a.first_source_row_id+a.record_count`)
-    .bind(row.id, row.manifest_id, namespaceId).first<{ total: number }>();
+    .bind(row.id, row.manifest_id).first<{ total: number }>();
   if (complete?.total !== row.record_count) throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
   return { contributionId: row.id, manifestId: row.manifest_id, chunkId: chunk.chunkId, replay: true };
 }
@@ -115,7 +123,8 @@ async function replayResult(db: D1Database, row: TelemetryV11StagedChunkRow, chu
  * no analytics database access, queue requirement or automatic domain activation.
  */
 export async function persistTypedV11StagedChunk(db: D1Database, principalValue: TelemetryTransportPrincipal,
-  value: unknown, metadataValue: TypedV11ChunkMetadata, nowEpoch = Date.now()): Promise<TypedV11StagedChunkResult> {
+  value: unknown, metadataValue: TypedV11ChunkMetadata, nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute): Promise<TypedV11StagedChunkResult> {
   const metadata = snapshotMetadata(metadataValue);
   const principal = { participantId: principalValue.participantId, deviceId: principalValue.deviceId };
   encoded(principal.participantId); encoded(principal.deviceId);
@@ -124,8 +133,12 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
   const chunk = await validateTelemetryV11StagedChunk(value);
   const { stream, day, seq } = parseTelemetryV11ChunkId(chunk.chunkId);
   await assertTelemetryTransportWriteAllowed(db, principal, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION);
-  const state = await db.prepare("SELECT source_namespace,namespace_id,next_source_row_id FROM typed_v11_admission_state WHERE id=1")
-    .first<AdmissionState>();
+  const state = await db.prepare(`SELECT s.source_namespace,s.namespace_id,s.next_source_row_id
+    FROM typed_v11_admission_state s
+    JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=s.namespace_id
+      AND origin.source_namespace=s.source_namespace AND origin.access_mode='current-write'
+      AND origin.v11_read_contract_version=2 AND origin.source_schema_digest=?
+    WHERE s.id=1`).bind(TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST).first<AdmissionState>();
   if (!state || state.source_namespace !== metadata.sourceNamespace || !Number.isSafeInteger(state.next_source_row_id)
       || state.next_source_row_id < 1 || !Number.isSafeInteger(state.next_source_row_id + chunk.records.length)) {
     throw new TypedTelemetryError("TYPED_TELEMETRY_CONFLICT");
@@ -135,8 +148,7 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
     .bind(principal.participantId, principal.deviceId, day, chunk.manifestDigest).first<{ id: string }>();
   if (!manifest) throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
   const existing = await existingTelemetryV11StagedChunk(db, principal, chunk);
-  if (existing) return replayResult(db, existing, chunk, state.namespace_id);
-  await assertTypedStorageAdmissionCapacity(db);
+  if (existing) return replayResult(db, existing, chunk);
   const rows: TypedTelemetrySourceRecord[] = chunk.records.map((record, index) => ({
     sourceNamespace: metadata.sourceNamespace, format: "v11", sourceRowId: state.next_source_row_id + index,
     participantId: principal.participantId, deviceId: principal.deviceId, chunkRowId: metadata.chunkRowId,
@@ -150,7 +162,8 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
     if (values.length > 100 || transactionBytes > MAX_TYPED_TELEMETRY_BATCH_BYTES) throw new TypedTelemetryError("TYPED_TELEMETRY_LIMIT");
     return db.prepare(sql).bind(...values);
   } });
-  const statements: D1PreparedStatement[] = [prepare(`INSERT INTO telemetry_v11_chunks (
+  const statements: D1PreparedStatement[] = [];
+  statements.push(prepare(`INSERT INTO telemetry_v11_chunks (
     id,manifest_id,participant_id,device_id,stream,chunk_day,chunk_seq,chunk_id,chunk_digest,envelope_digest,
     parser_version,record_count,r2_key,device_upload_authorization_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .bind(metadata.chunkRowId, manifest.id, principal.participantId, principal.deviceId, stream, day, seq, chunk.chunkId,
@@ -158,7 +171,7 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
       metadata.deviceUploadAuthorizationId, now),
     prepare(`INSERT INTO typed_v11_chunk_allocations(chunk_id,namespace_id,chunk_original,first_source_row_id,record_count)
       VALUES (?,?,?,?,?)`).bind(metadata.chunkRowId, state.namespace_id, encoded(metadata.chunkRowId), state.next_source_row_id, chunk.records.length),
-  ];
+  );
   // Keep the copy owner's per-page 800-statement contract. The final admitted
   // chunk is still indivisible, and the complete combined batch is capped below.
   for (let offset = 0; offset < rows.length; offset += 100) {
@@ -167,12 +180,12 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
     if (transactionBytes > MAX_TYPED_TELEMETRY_BATCH_BYTES) throw new TypedTelemetryError("TYPED_TELEMETRY_LIMIT");
     statements.push(...page.statements);
   }
-  statements.push(prepare(`INSERT INTO typed_v11_owner_memberships(participant_id,typed_owner_id)
-    SELECT ?,owner_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
-    ON CONFLICT(participant_id) DO UPDATE SET typed_owner_id=excluded.typed_owner_id`)
+  statements.push(prepare(`INSERT INTO typed_v11_owner_memberships(participant_id,namespace_id,typed_owner_id)
+    SELECT ?,namespace_id,owner_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
+    ON CONFLICT(participant_id,namespace_id) DO UPDATE SET typed_owner_id=excluded.typed_owner_id`)
     .bind(principal.participantId, state.namespace_id, state.next_source_row_id));
-  statements.push(prepare(`INSERT INTO typed_v11_manifest_memberships(manifest_id,typed_manifest_id)
-    SELECT ?,manifest_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
+  statements.push(prepare(`INSERT INTO typed_v11_manifest_memberships(manifest_id,namespace_id,typed_manifest_id)
+    SELECT ?,namespace_id,manifest_id FROM typed_telemetry_records WHERE namespace_id=? AND format=11 AND source_row_id=?
     ON CONFLICT DO NOTHING`).bind(manifest.id,state.namespace_id,state.next_source_row_id));
   const proofs = await Promise.all(chunk.records.map(async (record, index) => {
     const anchor = telemetryV11RecordAnchor(stream, record);
@@ -197,15 +210,21 @@ export async function persistTypedV11StagedChunk(db: D1Database, principalValue:
       AND NOT EXISTS (SELECT 1 FROM telemetry_v11_chunks c WHERE c.manifest_id=?
         AND c.record_count!=(SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id=c.id))`)
     .bind(now, manifest.id, manifest.id, manifest.id));
+  let reservation:TypedStorageAdmissionReservation|undefined;
+  if(ownerRoute?.mode==='catalog') {
+    reservation=await prepareTypedStorageAdmissionReservation(db,ownerRoute,{transactionBytes,recordCount:rows.length});
+    statements.unshift(ownerWriteFenceStatement(db,ownerRoute),reservation.statement);
+  } else await assertTypedStorageAdmissionCapacity(db);
   if (statements.length > MAX_STORAGE_TRANSACTION_STATEMENTS) throw new TypedTelemetryError("TYPED_TELEMETRY_LIMIT");
   try {
     const results = await db.batch(statements);
-    if (results.some(result => !result.success)) throw unavailable();
+    if (results.some(result => !result.success) || (reservation&&results[1]?.results.length!==1)) throw unavailable();
+    if(reservation) await reconcileTypedStorageAdmissionReservation(db,reservation,results[1],results.at(-1));
   } catch (error) {
     // A response can be lost after commit. Reconcile only this authenticated,
     // exact chunk and its complete typed membership; never blindly resend it.
     const replay = await existingTelemetryV11StagedChunk(db, principal, chunk);
-    if (replay) return replayResult(db, replay, chunk, state.namespace_id);
+    if (replay) return replayResult(db, replay, chunk);
     throw mapError(error);
   }
   return { contributionId: metadata.chunkRowId, manifestId: manifest.id, chunkId: chunk.chunkId, replay: false };

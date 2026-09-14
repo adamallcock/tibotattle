@@ -340,9 +340,9 @@ test("fixed scale admission rejects unknown profiles, override dimensions and wr
   assert.equal(historical.migrations.USAGE_MONITOR_DB.pending.length, 3);
   assert.equal(historical.migrations.USAGE_MONITOR_DB.pending.at(-1).name, LOCAL_SCALE_PROFILE.throughMigration);
   const current = await inspectMigrationPrefix({ prefix: p });
-  assert.equal(current.migrations.USAGE_MONITOR_DB.pending.at(-1).name, "0060_public_contribution_sources.sql");
+  assert.equal(current.migrations.USAGE_MONITOR_DB.pending.at(-1).name, "0061_owner_move_authority_seed.sql");
   assert.deepEqual(historical.migrations.DELETION_LEDGER.pending, []);
-  assert.deepEqual(current.migrations.DELETION_LEDGER.pending.map(row => row.name), ["0003_storage_erasure_jobs.sql"]);
+  assert.deepEqual(current.migrations.DELETION_LEDGER.pending.map(row => row.name), ["0003_storage_erasure_jobs.sql", "0004_storage_erasure_targets.sql", "0005_catalog_deletion_replay_cursor.sql"]);
   await assert.rejects(inspectMigrationPrefix({ prefix: p, throughMigration: "0058_accountless_upload_ownership.sql" }), /REHEARSAL_TARGET_INVALID/);
   for (const options of [{ profile: "unknown" }, { profile: LOCAL_SCALE_PROFILE.name, accounts: 2 },
     { profile: LOCAL_SCALE_PROFILE.name, timeoutMs: 1 }, { profile: LOCAL_SCALE_PROFILE.name, maxDatabaseBytes: 3 * 2 ** 30 }]) {

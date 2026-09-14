@@ -10,7 +10,7 @@ import { retireStorageGraphPage } from './storage-graph-retirement';
 import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview,
  retireStorageCommunityGraphPublications } from './storage-community-graph-publication';
 import { readCollectionControls } from './collection-controls';
-import { advanceStorageErasureJobs } from './storage-erasure';
+import { advanceStorageErasureJobs,reconcileStorageErasureTargetReceipts } from './storage-erasure';
 
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 export type { StorageAnalyticsBindings } from './analytics-delivery';
@@ -102,6 +102,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  maxSteps?:number;deadlineMs?:number;maxQueries?:number;signal?:AbortSignal;
  publishCommunity?:boolean;
  ledger?:D1Database;
+ erasureTargetId?:string;
 }):Promise<StorageAnalyticsPass> {
  const maxSteps=options.maxSteps??8,deadlineMs=options.deadlineMs??Date.now()+20_000;
  if(!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||!Number.isFinite(deadlineMs))throw invalid();
@@ -114,7 +115,11 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   if(Date.now()>=deadlineMs)return result('deferred','deadline');
   // Privacy cleanup is independent of publication and capacity admission for
   // new analytical work. The same invocation meter covers all three databases.
-  if(options.ledger)await advanceStorageErasureJobs({...scoped,ledger:meter.wrap(options.ledger)},{maxJobs:1});
+  if(options.ledger){
+   const ledger=meter.wrap(options.ledger);
+   await advanceStorageErasureJobs({...scoped,ledger},{maxJobs:1});
+   if(options.erasureTargetId)await reconcileStorageErasureTargetReceipts(ledger,options.sourceId,options.erasureTargetId);
+  }
   // Physical use is an observed operating guard. This is not a distributed
   // allocation reservation; the operator keeps concurrent writers within budget.
   const probe=await scoped.target.prepare('SELECT 1 AS capacity_probe').run();

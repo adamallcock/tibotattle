@@ -26,7 +26,7 @@ async function activate(db:D1Database,fixture:Awaited<ReturnType<typeof createV1
  const value:TelemetryV11DomainManifest={schemaVersion:'telemetry-domain-manifest-v1.1',fromDay:day.day,throughDay:day.day,predecessor:{token:previous.token,previousGenerationId:previous.previousGenerationId,legacyFingerprint:previous.legacyFingerprint},days:[{day:day.day,manifestId:day.manifestId,manifestDigest:day.manifestDigest}],manifestDigest:'0'.repeat(64)};
  value.manifestDigest=await sha256Hex(telemetryV11DomainManifestDigestInput(value));return activateTelemetryV11Domain(db,fixture,value);
 }
-async function prepare(withV1=false){
+async function prepare(withV1=false,withMoveAuthority=false){
  await applyD1Migrations(source(),b.TEST_MIGRATIONS);
  const fixture=await createV11DeviceFixture(source(),{grant:true});
  const records=[v11UsageRecord(today())];
@@ -49,6 +49,15 @@ async function prepare(withV1=false){
   source().prepare("INSERT INTO telemetry_contribution_occurrences(contribution_id,participant_id,record_kind,occurrence_id) VALUES(?,?,'quota','quota:synthetic-retained-v02')").bind(oldContribution,oldOwner.participantId),
  ]);
  await source().prepare("UPDATE telemetry_transport_formats SET lifecycle='blocked' WHERE schema_version='telemetry-contribution-v0.2'").run();
+ const moveAuthority=withMoveAuthority?{
+  participant_id:fixture.participantId,device_id:fixture.deviceId,move_id:'move:synthetic-restore',owner_id:'owner:synthetic-restore',
+  attribution_namespace:'a'.repeat(64),attribution_created_at:now,floor_minimum_rank:11,floor_revision:3,floor_changed_at:now,
+  authority_digest:'b'.repeat(64),state:'prepared',
+ } as const:undefined;
+ if(moveAuthority)await source().prepare(`INSERT INTO storage_owner_move_authority_seeds(
+  participant_id,device_id,move_id,owner_id,attribution_namespace,attribution_created_at,
+  floor_minimum_rank,floor_revision,floor_changed_at,authority_digest,state
+ ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(...Object.values(moveAuthority)).run();
  for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,b.TEST_TYPED_V11_ADMISSION_MIGRATIONS,b.TEST_TYPED_V1_ADMISSION_MIGRATIONS,b.TEST_INGESTION_ISOLATION_MIGRATIONS])await applyD1Migrations(reference(),migrations);
  const role=await prepareAuthorityRoleTarget(reference(),target(),await authoritySchemaDigest(await authoritySchemaInventory(reference())));
  const sourceSchema=await authoritySchemaInventory(source()),retained=new Set(authorityRestoreRetainedTableNames());
@@ -61,12 +70,12 @@ async function prepare(withV1=false){
  role.finalSchema.push({type:'table',name:'d1_storage_migrations',tbl_name:'d1_storage_migrations',sql:AUTHORITY_OPERATOR_LEDGER_SQL});
  role.baseSchema.sort((a,b)=>a.type<b.type?-1:a.type>b.type?1:a.name<b.name?-1:a.name>b.name?1:0);role.finalSchema.sort((a,b)=>a.type<b.type?-1:a.type>b.type?1:a.name<b.name?-1:a.name>b.name?1:0);
  const contract:AuthorityRestoreContract={targetOperatorLedgerDigest:await sha256Hex(canonicalTelemetryV11Json(ledgerRows)),version:'authority-restore-v1',runId:'synthetic-real-role',sourceId:'synthetic-restored-journal',sourceNamespace,sourceSnapshotDigest,sourceSchema,sourceSchemaDigest:await authoritySchemaDigest(sourceSchema),targetBaseSchema:role.baseSchema,targetBaseSchemaDigest:await authoritySchemaDigest(role.baseSchema),tables,finalSchema:role.finalSchema,finalSchemaDigest:await authoritySchemaDigest(role.finalSchema),typedCopies:['v1','v11'].map(format=>({runId:`restore-${format}`,sourceNamespace,sourceSnapshotDigest,format:format as 'v1'|'v11'})),authoritySequences,admissionContract:'typed-v1-v11-restore-v1',operatingLimitBytes:64*1024*1024};
- return {fixture,records,original,legacyChunk,contract,pin:await authorityRestoreContractDigest(contract)};
+ return {fixture,records,original,legacyChunk,moveAuthority,contract,pin:await authorityRestoreContractDigest(contract)};
 }
 async function drain(step:()=>Promise<boolean>){for(let n=0;n<256;n++)if(await step())return;throw new Error('Synthetic bounded operation did not complete');}
 describe('actual baseline to typed ingestion role',()=>{
  it('preserves a real accepted head and credentials, adopts typed history and accepts an ordinary successor',async()=>{
-  const f=await prepare(true);
+  const f=await prepare(true,true);
   const {targetOperatorLedgerDigest:excluded,...missing}=f.contract;void excluded;await expect(freezeAuthorityRestoreSource(source(),missing,await authorityRestoreContractDigest(missing))).rejects.toThrow();
   await freezeAuthorityRestoreSource(source(),f.contract,f.pin);
   await target().prepare('UPDATE d1_storage_migrations SET sha256=?').bind('e'.repeat(64)).run();
@@ -82,6 +91,8 @@ describe('actual baseline to typed ingestion role',()=>{
   expect(await target().prepare('SELECT id,used_percent,record_json FROM telemetry_records').first()).toEqual({id:41,used_percent:0.30000000000000004,record_json:'{"synthetic":true,"value":0.30000000000000004}'});
   expect(await target().prepare('SELECT count(*) n FROM telemetry_contribution_occurrences').first('n')).toBe(1);
   expect(await target().prepare("SELECT state FROM upload_authorizations WHERE consumed_contribution_id IS NOT NULL").first('state')).toBe('consumed');
+  expect(await target().prepare('SELECT * FROM storage_owner_move_authority_seeds').first()).toEqual(f.moveAuthority);
+  expect(await target().prepare('SELECT * FROM storage_owner_move_authority_contract').first()).toEqual({id:1,version:1});
   expect(await target().prepare('SELECT generation_id FROM telemetry_v11_domain_heads WHERE participant_id=?').bind(f.fixture.participantId).first('generation_id')).toBe(f.original.generationId);
   expect(await target().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(0);
   expect(await target().prepare('SELECT count(*) n FROM typed_v11_record_admissions').first('n')).toBe(1);

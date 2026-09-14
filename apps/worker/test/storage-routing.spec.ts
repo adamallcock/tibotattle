@@ -6,9 +6,12 @@ import { createSingleIngestionShardRouter, createCatalogStorageRouter, createOwn
 import { prepareTypedTelemetryInsert, readTypedTelemetryPage, type TypedTelemetrySourceRecord } from '../src/typed-telemetry-repository';
 import { MAX_STORAGE_APPLICATION_STATEMENTS, MAX_STORAGE_TRANSACTION_STATEMENTS, STORAGE_WRITE_FENCE_STATEMENTS } from '../src/storage-routing-batch-budget';
 import { v11UsageRecord } from './helpers/telemetry-v11';
-import { STORAGE_ROUTING_FENCE_SCHEMA_SQL, ownerWriteFenceStatement } from '../src/storage-routing-fence';
+import { ownerWriteFenceStatement } from '../src/storage-routing-fence';
+import { configureStorageShardAllocation, recordStorageCapacityObservation } from '../src/storage-capacity';
+import { qualifyStorageShardForTest } from './helpers/storage-shard-readiness';
 interface TestBindings extends Env { STORAGE_ROUTING_DB: D1Database; STORAGE_INGESTION_A: D1Database;
-  STORAGE_INGESTION_B: D1Database; TEST_ROUTING_MIGRATIONS: D1Migration[]; TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[]; }
+  STORAGE_INGESTION_B: D1Database; TEST_ROUTING_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_ROUTING_MIGRATIONS: D1Migration[]; TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[]; }
 const bindings = () => env as TestBindings;
 const catalog = () => bindings().STORAGE_ROUTING_DB;
 const source = () => bindings().STORAGE_INGESTION_A;
@@ -39,14 +42,22 @@ beforeEach(async () => {
   await reset();
   await applyD1Migrations(catalog(), bindings().TEST_ROUTING_MIGRATIONS);
   for (const database of [source(), destination()]) {
-    // D1 exec splits on newlines; migration helper preserves trigger bodies.
-    await applyD1Migrations(database, [{name:'0001_local_fences',queries:[STORAGE_ROUTING_FENCE_SCHEMA_SQL]}]);
+    await applyD1Migrations(database, bindings().TEST_INGESTION_ROUTING_MIGRATIONS);
     await database.prepare('CREATE TABLE synthetic_owner_rows (owner_id TEXT, source_sequence INTEGER, tokens INTEGER, PRIMARY KEY(owner_id, source_sequence))').run();
   }
   await catalog().batch([
     catalog().prepare("INSERT INTO storage_shards (shard_id,binding_name,state) VALUES ('a','INGESTION_A','active')"),
     catalog().prepare("INSERT INTO storage_shards (shard_id,binding_name,state) VALUES ('b','INGESTION_B','active')"),
   ]);
+  for (const shardId of ['a', 'b']) {
+    await recordStorageCapacityObservation(catalog(), {
+      shardId, observedBytes: 0, observedAt: 1000, validUntil: 2000,
+      pressureState: 'normal',
+    });
+    const readiness=await qualifyStorageShardForTest(catalog(),{shardId,bindingName:`INGESTION_${shardId.toUpperCase()}`,qualifiedAt:1000});
+    await configureStorageShardAllocation(catalog(), {shardId,
+      allocationTier:'active',allocationEnabled:true,qualificationDigest:readiness.readinessDigest,updatedAt:1000});
+  }
 });
 function typedChunkRows(): TypedTelemetrySourceRecord[] {
   return Array.from({length:32}, (_, index) => ({
@@ -142,7 +153,10 @@ describe('explicit owner storage routing', () => {
     expect(await catalog().prepare('SELECT count(*) AS n FROM storage_owner_routes').first('n')).toBe(1);
   });
   it('capacity includes reservations and observed bytes, never redirects to free shard', async () => {
-    await catalog().prepare("UPDATE storage_shards SET observed_bytes=? WHERE shard_id='a'").bind(STORAGE_SHARD_OPERATING_CAP_BYTES-100).run();
+    await catalog().prepare("UPDATE storage_shards SET capacity_bytes=6000000000 WHERE shard_id='a'").run();
+    await recordStorageCapacityObservation(catalog(), {shardId:'a',
+      observedBytes:5999999900,observedAt:1001,validUntil:2000,
+      pressureState:'normal'});
     await router().ensureOwner('owner-one','a',100);
     await expect(router().ensureOwner('owner-two','a',1)).rejects.toMatchObject({code:'CAPACITY_UNAVAILABLE'});
     expect(await catalog().prepare("SELECT reserved_bytes FROM storage_shards WHERE shard_id='b'").first('reserved_bytes')).toBe(0);
@@ -186,6 +200,10 @@ describe('explicit owner storage routing', () => {
     await expect(mover().begin('move-two',pending,'a')).rejects.toMatchObject({code:'ROUTE_STALE'});
     expect(await mover().activateDestination('move-one')).toEqual(pending);
     expect(await mover().activateDestination('move-one')).toEqual(pending);
+    expect(await router().ownerTargets(pending)).toEqual([
+      {ownerId:'owner-one',shardId:'a',bindingName:'INGESTION_A',generations:[1],current:false},
+      {ownerId:'owner-one',shardId:'b',bindingName:'INGESTION_B',generations:[2],current:true},
+    ]);
     await router().write(pending,db=>[db.prepare('INSERT INTO synthetic_owner_rows VALUES(?,?,?)').bind('owner-one',92,1)]);
     await expect(router().write(stale,db=>[db.prepare('SELECT 1')])).rejects.toMatchObject({code:'ROUTE_STALE'});
     expect(await destination().prepare('SELECT source_sequence FROM synthetic_owner_rows ORDER BY source_sequence').all()).toMatchObject({results:[{source_sequence:91},{source_sequence:92}]});
@@ -214,7 +232,7 @@ describe('explicit owner storage routing', () => {
     await expect(router().write(route,db=>[db.prepare('SELECT 1')])).rejects.toMatchObject({code:'ROUTE_STALE'});
   });
   it('partially initialized owner resumes the original preparing assignment exactly', async () => {
-    await catalog().prepare("INSERT INTO storage_owner_routes VALUES('owner-one','a',1,'preparing',100,1)").run();
+    await catalog().prepare("INSERT INTO storage_owner_routes VALUES('owner-one','a',1,'preparing',100,1234)").run();
     await expect(router().resolve('owner-one')).rejects.toMatchObject({code:'ROUTE_NOT_ACTIVE'});
     expect(await router().ensureOwner('owner-one','a',100)).toMatchObject({generation:1,shardId:'a'});
     expect(await catalog().prepare("SELECT reserved_bytes FROM storage_shards WHERE shard_id='a'").first('reserved_bytes')).toBe(100);
@@ -241,10 +259,12 @@ describe('routing catalog closed transitions', () => {
   });
   it('move cannot reserve an over-cap destination or change immutable move identity', async () => {
     const route=await router().ensureOwner('owner-one','a',100);
-    await catalog().prepare("UPDATE storage_shards SET observed_bytes=9000000000 WHERE shard_id='b'").run();
+    await recordStorageCapacityObservation(catalog(), {shardId:'b',observedBytes:9000000000,
+      observedAt:1001,validUntil:2000,pressureState:'normal'});
     await expect(mover().begin('move-one',route,'b')).rejects.toMatchObject({code:'CAPACITY_UNAVAILABLE'});
     expect(await router().resolve('owner-one')).toEqual(route);
-    await catalog().prepare("UPDATE storage_shards SET observed_bytes=0 WHERE shard_id='b'").run();
+    await recordStorageCapacityObservation(catalog(), {shardId:'b',observedBytes:0,
+      observedAt:1002,validUntil:2000,pressureState:'normal'});
     const first=await mover().begin('move-one',route,'b');expect(await mover().begin('move-one',route,'b')).toEqual(first);
     await expect(mover().begin('move-one',{...route,ownerId:'other'},'b')).rejects.toMatchObject({code:'MOVE_CONFLICT'});
     expect(await catalog().prepare("SELECT reserved_bytes FROM storage_shards WHERE shard_id='b'").first('reserved_bytes')).toBe(100);

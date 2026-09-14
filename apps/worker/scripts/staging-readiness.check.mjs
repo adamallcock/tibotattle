@@ -1,10 +1,15 @@
 import { PUBLIC_SOURCE_SCHEMA_SQL } from "./public-source-schema-contract.mjs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
+import {
+  findBareCompleteTriggerCases,
+  FRESH_D1_ROLE_MIGRATION_DIRECTORIES,
+  normalizeCompleteTriggerCaseWrappers,
+} from "./d1-trigger-parser-contract.mjs";
 import {
   assessStagingConfiguration,
   ATTRIBUTION_SCHEMA_COLUMNS,
@@ -14,10 +19,13 @@ import {
   COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
   COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
   POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL,
   CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
   CURRENT_SCALE_SCHEMA_PROBE_SQL,
   PUBLIC_SOURCE_SCHEMA_PROBE_SQL,
   publicSourceSchemaComplete,
+  OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL,
+  ownerMoveAuthoritySchemaComplete,
   POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
   PRE_INCREMENTAL_ANALYSIS_WORK_SCHEMA_PROBE_SQL,
   PRE_INCREMENTAL_MODEL_HISTORY_SCHEMA_PROBE_SQL,
@@ -87,7 +95,7 @@ test("checked-in staging resources remain closed and require live qualification"
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-18), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-19), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
@@ -106,6 +114,7 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
     "0058_accountless_upload_ownership.sql",
     "0059_accountless_upload_renewal.sql",
     "0060_public_contribution_sources.sql",
+    "0061_owner_move_authority_seed.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -207,6 +216,8 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0057_accountless_enrollment_ledger.sql": "5cbf718449688bffc0fc5cf63d1de17351acb915f44459f1b32f3202c7378cd5",
     "0058_accountless_upload_ownership.sql": "b435fd92d41e7ce8067cc183d7ac153359a9c130a971cba2e1b8b8c1c9cab61b",
     "0059_accountless_upload_renewal.sql": "98afb99dd91e56a96960e6d99096e44c41eec0cd52d5a1e2969dea4ddee3d312",
+    "0060_public_contribution_sources.sql": "b260d8e25fd96b6572559734897ce12ab1ba60d214cb217f2876c33541284243",
+    "0061_owner_move_authority_seed.sql": "a489259b11bf65b6447c7a2d9def1a611e91d7418856c28cac8d1845f2e0d88c",
   };
   const legacyDigests = {
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
@@ -214,11 +225,11 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0048_accountless_upload_renewal.sql": "82297298f937489275756da93d9b116a7b83b280482000b0df51abd5c598d9b7",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 60);
+  assert.equal(names.length, 61);
   assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests).slice(0, 5));
-  assert.deepEqual(names.slice(56, 59), Object.keys(expectedDigests).slice(-3));
+  assert.deepEqual(names.slice(56), Object.keys(expectedDigests).slice(-5));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 60 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 61 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -253,6 +264,76 @@ test("remote trigger parser repair changes only complete CASE expression parenth
       .replaceAll("THEN 20000 ELSE 2000 END)", "THEN 20000 ELSE 2000 END");
     assert.equal(createHash("sha256").update(original).digest("hex"), originalDigest, name);
   }
+});
+
+test("fresh D1 role migrations avoid remote parser-ambiguous complete trigger CASE expressions", () => {
+  const repaired = new Map([
+    ["analytics-migrations/0001_delivery_state.sql", [7, "c4103fa5e75b1d52750e0ad220fc1cb1a535907c73fd90720f105a4623f328bf"]],
+    ["analytics-migrations/0002_v11_daily_projection.sql", [4, "0b63b674d5c606155a67df473c8ff9c0f013ee8cd2928ff9aeef450ea794a8c2"]],
+    ["analytics-migrations/0004_v11_reusable_day_values.sql", [2, "2593dc67883d3eac866ad97aa3121c015e5d872cc3f8f2eca28c3fb3771abcc3"]],
+    ["analytics-migrations/0007_community_daily_publication.sql", [1, "3ea65e167c6f3196671c5fd4ddd6d575c119e2ef603061007156faa90a982b38"]],
+    ["analytics-migrations/0010_history_checkpoints.sql", [1, "b9a7aa6922c89b16f4cd3ac8ca6256d0f9250451b39eb4042d572c0439f9af9e"]],
+    ["analytics-migrations/0013_v11_daily_value_pages.sql", [2, "8235061e02e447a3249061b2b05c52a9600e0641ecf402c4c3ee34241f4d2b63"]],
+    ["analytics-migrations/0016_multi_source_publication.sql", [2, "8d9779251aba140bd58e8c00bb349d586e9f1352f1107dd287abb700bdd41f1b"]],
+    ["analytics-migrations/0017_v11_multi_origin_day_values.sql", [1, "1257b7542dd744cda2456e5016a8f210e46a78cd435178f4e7f481e2b89d6bcb"]],
+    ["ingestion-bridge-migrations/0001_v11_delivery_bridge.sql", [1, "04fdd38039e6ef586f44f92ce8f38f573193d14b537089bcb86126a5d103d761"]],
+    ["ingestion-routing-migrations/0001_owner_route_fences.sql", [2, "b1585bd72260743083fe30706ce1bcce9fe78b89ff23450180bd7a3af1184d00"]],
+    ["routing-migrations/0001_storage_routing_catalog.sql", [6, "53b8fcd734f1ab0e70b9f3e1020811d50a40759642262613628d2ebcf2ef92b8"]],
+    ["routing-migrations/0002_shard_capacity_observations.sql", [3, "404fe89e7b75d9e645b1b419ab3bb97725e2814510b7025dfff90f3d659fa173"]],
+    ["routing-migrations/0004_global_accountless_issuance.sql", [1, "ac506416524460556bd4a8dfa07e7eab18b9317a41a700e7fe2be5fb78121329"]],
+    ["routing-migrations/0006_historical_accountless_issuance.sql", [2, "00e206127e8023b038143043c8fbfe758233f213733c446f62d9b228ca408c05"]],
+    ["routing-migrations/0007_existing_accountless_bootstrap.sql", [1, "3f06af6eaf931c9858c1e229310e322905b57e31716a41357bcfd83a58af0ece"]],
+    ["typed-ingestion-migrations/0002_delivery_journal.sql", [7, "fb8f79822f5200ec43054d5959f1b0dd1035a2a251ccfad8188ae391df3fc896"]],
+    ["typed-ingestion-migrations/0005_typed_origin_contracts.sql", [1, "884f504679808b42618a479e743d1cbc48a765ace99a7467e43ca67c817caaaf"]],
+    ["typed-ingestion-migrations/0006_write_capacity_admission.sql", [3, "d50ae5a2029a2a94c23ea561a34fba7d0b1821f2063555ef92c98942ac272ca2"]],
+    ["typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql", [9, "dbeececefba5c0688bc26e9b1a675d2a6a8bd443f8adb6cea14348080b581908"]],
+    ["typed-v1-admission-migrations/0002_typed_v1_domain_preservation.sql", [3, "0f2fea179de2d03c7bd28155ed63ba31785ee8b2eeeac6591801f039b602a85a"]],
+    ["typed-v1-admission-migrations/0004_multi_origin_runtime.sql", [2, "01f0edd88e8b1fc31585dcd3a6f294ddb22a6f8b51aafc4a56e4cb84e81faef5"]],
+    ["typed-v11-admission-migrations/0001_typed_chunk_admission.sql", [7, "dc06baf104916b4e2ac82d0f5bbe6a4b837ef01228e9825d539cd253b0d78324"]],
+    ["typed-v11-admission-migrations/0003_typed_domain_closure.sql", [8, "83348d8764b437b81fa21821b28d01ff064c44886e5c45b5c94c3198e0996bad"]],
+    ["typed-v11-admission-migrations/0004_runtime_storage_contract.sql", [1, "18313de7cd7777345a551adde9f69941cd2677293b45d67d539ff4cc202b60eb"]],
+    ["typed-v11-admission-migrations/0006_compact_admission_proofs.sql", [3, "e1302c7fc08af91cca89107230591af4bf5a986bb0b333ba642e40e2f3b52ae5"]],
+    ["typed-v11-admission-migrations/0007_multi_origin_runtime.sql", [6, "bb84932f8dc3db08b217a60b59ba5a54b763dc5ea4378a89f74dfba218e2093a"]],
+  ]);
+  const seen = new Set();
+  for (const directory of FRESH_D1_ROLE_MIGRATION_DIRECTORIES) {
+    for (const name of readdirSync(join(workerDirectory, directory)).filter((entry) => entry.endsWith(".sql")).sort()) {
+      const relative = `${directory}/${name}`;
+      const sql = readFileSync(join(workerDirectory, relative), "utf8");
+      assert.deepEqual(findBareCompleteTriggerCases(sql), [], relative);
+      if (!repaired.has(relative)) continue;
+      const normalized = normalizeCompleteTriggerCaseWrappers(sql);
+      const [wrappers, digest] = repaired.get(relative);
+      assert.equal((sql.length - normalized.length) / 2, wrappers, relative);
+      assert.equal(createHash("sha256").update(normalized).digest("hex"), digest, relative);
+      seen.add(relative);
+    }
+  }
+  assert.deepEqual(seen, new Set(repaired.keys()));
+});
+
+test("route-fence trigger wrappers preserve SQLite behavior exactly", () => {
+  const canonical = readFileSync(join(workerDirectory, "ingestion-routing-migrations", "0001_owner_route_fences.sql"), "utf8");
+  const exercise = (sql) => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(sql);
+    db.exec("INSERT INTO storage_owner_fences(owner_id,shard_id,route_generation,state) VALUES('owner','a',1,'active')");
+    db.exec("INSERT INTO storage_route_write_checks(owner_id,shard_id,route_generation) VALUES('owner','a',1)");
+    const retainedChecks = db.prepare("SELECT count(*) AS count FROM storage_route_write_checks").get().count;
+    let stale, transition;
+    try { db.exec("INSERT INTO storage_route_write_checks(owner_id,shard_id,route_generation) VALUES('owner','b',1)"); }
+    catch (error) { stale = error.message; }
+    try { db.exec("UPDATE storage_owner_fences SET route_generation=2 WHERE owner_id='owner'"); }
+    catch (error) { transition = error.message; }
+    db.close();
+    return { retainedChecks, stale, transition };
+  };
+  assert.deepEqual(exercise(canonical), exercise(normalizeCompleteTriggerCaseWrappers(canonical)));
+  assert.deepEqual(exercise(canonical), {
+    retainedChecks: 0,
+    stale: "STORAGE_ROUTE_STALE",
+    transition: "STORAGE_FENCE_TRANSITION_INVALID",
+  });
 });
 
 test("the local-only staged checkpoint migration is pinned to its reviewed immutable schema", () => {
@@ -2281,7 +2362,7 @@ test("live readiness reports R2 account enablement without leaking command outpu
 });
 
 
-test("current 0060 readiness binds the exact eligibility, bootstrap and withdrawal schema", async () => {
+test("historical 0060 and current 0061 readiness remain independently qualified", async () => {
   const { unstable_splitSqlQuery } = await import("wrangler");
   const database = new DatabaseSync(":memory:");
   try {
@@ -2298,10 +2379,12 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
     database.exec("SAVEPOINT public_source_format;");
     for (const sql of unstable_splitSqlQuery(readFileSync(join(workerDirectory, "migrations", "0060_public_contribution_sources.sql"), "utf8"))) database.exec(sql);
     assert.deepEqual(Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)), PUBLIC_SOURCE_SCHEMA_SQL);
-    for (const probe of [CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
+    for (const probe of [POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
       assert.ok(Buffer.byteLength(probe) < 100_000, "separate bounded metadata queries");
     }
-    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(attributionSchemaComplete(database.prepare(POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.throws(() => database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get(), /no such table: storage_owner_move_authority_contract/u);
+    assert.throws(() => database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get(), /no such table: storage_owner_move_authority_contract/u);
     assert.equal(scaleSchemaComplete(database.prepare(CURRENT_SCALE_SCHEMA_PROBE_SQL).get()), true);
     assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), true);
     for (const [name, sql] of Object.entries(PUBLIC_SOURCE_SCHEMA_SQL)) {
@@ -2335,5 +2418,52 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
       assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `remote altered ${name}`);
       database.exec("ROLLBACK TO altered_remote_source; RELEASE altered_remote_source;");
     }
+
+    database.exec(readFileSync(join(workerDirectory, "migrations", "0061_owner_move_authority_seed.sql"), "utf8"));
+    assert.ok(Buffer.byteLength(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL) < 100_000,
+      "the complete 0061 attribution proof remains one bounded metadata query");
+    assert.equal(attributionSchemaComplete(database.prepare(POST_PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(ownerMoveAuthoritySchemaComplete(database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get()), true);
+    assert.deepEqual({ ...database.prepare(
+      "SELECT id,version FROM storage_owner_move_authority_contract",
+    ).get() }, { id: 1, version: 1 });
+
+    const objectTypes = {
+      storage_owner_move_authority_seeds: "TABLE",
+      storage_owner_move_authority_owner: "INDEX",
+      storage_owner_move_authority_seed_immutable: "TRIGGER",
+      storage_owner_move_authority_contract: "TABLE",
+      attribution_enrollment_created: "TRIGGER",
+      telemetry_transport_floor_created: "TRIGGER",
+    };
+    for (const [name, type] of Object.entries(objectTypes)) {
+      database.exec(`SAVEPOINT altered_owner_move_authority; DROP ${type} ${name};`);
+      if (name === "storage_owner_move_authority_contract") {
+        assert.throws(() => database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get(), /no such table/u, `missing ${name}`);
+      } else {
+        assert.equal(ownerMoveAuthoritySchemaComplete(database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get()), false, `missing ${name}`);
+      }
+      database.exec("ROLLBACK TO altered_owner_move_authority; RELEASE altered_owner_move_authority;");
+    }
+    const alteredObjects = {
+      storage_owner_move_authority_seeds: "CREATE TABLE storage_owner_move_authority_seeds(participant_id TEXT PRIMARY KEY) STRICT",
+      storage_owner_move_authority_owner: "CREATE INDEX storage_owner_move_authority_owner ON storage_owner_move_authority_seeds(participant_id)",
+      storage_owner_move_authority_seed_immutable: "CREATE TRIGGER storage_owner_move_authority_seed_immutable BEFORE UPDATE ON storage_owner_move_authority_seeds BEGIN SELECT 1; END",
+      storage_owner_move_authority_contract: "CREATE TABLE storage_owner_move_authority_contract(id INTEGER PRIMARY KEY,version INTEGER NOT NULL) STRICT; INSERT INTO storage_owner_move_authority_contract VALUES(1,1)",
+      attribution_enrollment_created: "CREATE TRIGGER attribution_enrollment_created AFTER INSERT ON participants BEGIN SELECT 1; END",
+      telemetry_transport_floor_created: "CREATE TRIGGER telemetry_transport_floor_created AFTER INSERT ON participants BEGIN SELECT 1; END",
+    };
+    for (const [name, sql] of Object.entries(alteredObjects)) {
+      const type = objectTypes[name];
+      database.exec(`SAVEPOINT altered_owner_move_authority; DROP ${type} ${name}; ${sql};`);
+      assert.equal(ownerMoveAuthoritySchemaComplete(database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get()), false, `altered ${name}`);
+      database.exec("ROLLBACK TO altered_owner_move_authority; RELEASE altered_owner_move_authority;");
+    }
+    database.exec("DELETE FROM storage_owner_move_authority_contract");
+    assert.equal(ownerMoveAuthoritySchemaComplete(database.prepare(OWNER_MOVE_AUTHORITY_SCHEMA_PROBE_SQL).get()), false);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    assert.equal(ownerMoveAuthoritySchemaComplete(undefined), false);
+    assert.equal(ownerMoveAuthoritySchemaComplete({ owner_move_authority_schema: true }), false);
   } finally { database.close(); }
 });

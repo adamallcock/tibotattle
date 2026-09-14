@@ -5,8 +5,9 @@ import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import { createV11DailyProjectionValues, foldV11DailyProjectionValues, mergeV11DailyProjectionValues } from "./v11-daily-projection-values";
 import { lookupV11StorageSource } from "./v11-storage-journal";
-import { readTypedV11ManifestPage } from "./typed-v11-record-reader";
+import { readTypedV11ManifestPage, resolveTypedV11ManifestOrigin } from "./typed-v11-record-reader";
 import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
+import { readQualifiedTypedTelemetryOwnerOrigins, TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST } from "./typed-telemetry-origins";
 
 export type V11ProjectionSourceLayout = { kind: "json-v11" } | { kind: "typed-v11"; sourceNamespace: string };
 
@@ -18,6 +19,7 @@ interface Work {
   after_stream: string; after_occurrence: string; day_records: number;
   values_json: string; revision: number; phase: "building" | "ready" | "retiring";
   source_layout: V11ProjectionSourceLayout["kind"]; source_namespace: string | null;
+  day_source_namespace: string | null; day_origin_set_digest: string | null;
 }
 interface Day {
   manifest_id: string; manifest_digest: string; state: string; expected_chunk_count: number;
@@ -49,6 +51,38 @@ function validateWork(work: Work, source: Generation, layout: V11ProjectionSourc
   if (work.phase === "building" && (work.next_day < work.from_day || work.next_day > work.through_day)) {
     throw new Error("V11_PROJECTION_STATE_INVALID");
   }
+  if ((work.day_source_namespace === null) !== (work.day_origin_set_digest === null)
+      || (work.day_origin_set_digest !== null && !/^[a-f0-9]{64}$/u.test(work.day_origin_set_digest))
+      || (work.day_records !== 0 && work.day_source_namespace === null)
+      || (work.phase === "ready" && work.day_source_namespace !== null)) {
+    throw new Error("V11_PROJECTION_SOURCE_ORIGIN_CONFLICT");
+  }
+}
+
+async function typedOriginSet(source: D1Database, participantId: string, configuredSourceNamespace: string): Promise<{
+  canonical: string; digest: string;
+}> {
+  const origins = await readQualifiedTypedTelemetryOwnerOrigins(source, participantId, "v11");
+  const current = await source.prepare(`SELECT s.namespace_id namespaceId,s.source_namespace sourceNamespace
+    FROM typed_v11_admission_state s JOIN typed_telemetry_origin_contracts origin
+      ON origin.namespace_id=s.namespace_id AND origin.source_namespace=s.source_namespace
+    WHERE s.id=1 AND s.runtime_contract_version=1 AND origin.access_mode='current-write'
+      AND origin.v11_read_contract_version=2 AND origin.source_schema_digest=?`)
+    .bind(TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST)
+    .first<{ namespaceId: number; sourceNamespace: string }>();
+  if (!current || current.sourceNamespace !== configuredSourceNamespace
+      || origins.some(origin => origin.accessMode === "current-write"
+        && (origin.namespaceId !== current.namespaceId || origin.sourceNamespace !== current.sourceNamespace))) {
+    throw new Error("V11_PROJECTION_SOURCE_ORIGIN_CONFLICT");
+  }
+  const members = origins.map(origin => ({ namespaceId: origin.namespaceId, sourceNamespace: origin.sourceNamespace,
+    typedOwnerId: origin.typedOwnerId as number | null, accessMode: origin.accessMode }));
+  if (!members.some(origin => origin.accessMode === "current-write")) members.push({ namespaceId: current.namespaceId,
+    sourceNamespace: current.sourceNamespace, typedOwnerId: null, accessMode: "current-write" });
+  members.sort((left, right) => left.sourceNamespace < right.sourceNamespace ? -1
+    : left.sourceNamespace > right.sourceNamespace ? 1 : left.namespaceId - right.namespaceId);
+  const canonical = canonicalJson(members);
+  return { canonical, digest: await sha256Hex(canonical) };
 }
 
 async function initializeWork(target: D1Database, change: StorageChange, source: Generation, layout: V11ProjectionSourceLayout): Promise<Work | null> {
@@ -95,9 +129,9 @@ async function sourceDay(source: D1Database, generation: Generation, work: Work)
 /** One keyset page, only on a cache miss. The work's admitted physical layout
  * cannot change during resumption and typed readers never fall back to JSON. */
 async function sourcePage(source: D1Database, generation: Generation, work: Work, layout: V11ProjectionSourceLayout,
-  day: Day): Promise<RecordRow[]> {
+  day: Day, daySourceNamespace: string): Promise<RecordRow[]> {
   if (layout.kind === "typed-v11") {
-    return readTypedV11ManifestPage(source, { sourceNamespace: layout.sourceNamespace,
+    return readTypedV11ManifestPage(source, { sourceNamespace: daySourceNamespace,
       participantId: generation.participantId, deviceId: generation.deviceId, manifestId: day.manifest_id,
       afterStream: work.after_stream, afterOccurrence: work.after_occurrence, limit: PAGE_SIZE });
   }
@@ -113,10 +147,11 @@ interface ReuseIdentity {
   schema_version: string; pricing_method: string; registry_sha256: string;
 }
 interface ReusableValue extends ReuseIdentity { record_count: number; values_digest: string; values_json: string }
-async function reuseIdentity(generation: Generation, layout: V11ProjectionSourceLayout, day: Day, date: string): Promise<ReuseIdentity> {
+async function reuseIdentity(generation: Generation, layout: V11ProjectionSourceLayout, day: Day, date: string,
+  daySourceNamespace: string): Promise<ReuseIdentity> {
   const method = createV11DailyProjectionValues(date);
   const identity = { source_id: generation.sourceId, source_layout: layout.kind,
-    source_namespace: layout.kind === "typed-v11" ? layout.sourceNamespace : "", owner_digest: generation.ownerDigest,
+    source_namespace: daySourceNamespace, owner_digest: generation.ownerDigest,
     device_id: generation.deviceId, manifest_id: day.manifest_id, manifest_digest: day.manifest_digest, day: date,
     schema_version: method.schemaVersion, pricing_method: method.pricingMethodVersion, registry_sha256: method.registrySha256 };
   return { value_key: await sha256Hex(canonicalJson(identity)), ...identity };
@@ -230,12 +265,18 @@ export async function advanceV11DailyProjection(options: {
     return { state: "applied", sequence: change.sequence, recordsRead: 0 };
   }
   const day = await sourceDay(source, input, work);
-  const identity = await reuseIdentity(input, layout, day, work.next_day);
+  const originSet = layout.kind === "typed-v11" ? await typedOriginSet(source, input.participantId, layout.sourceNamespace)
+    : { canonical: "json-v11", digest: await sha256Hex("json-v11") };
+  const daySourceNamespace = layout.kind === "typed-v11" ? await resolveTypedV11ManifestOrigin(source,
+    { participantId: input.participantId, deviceId: input.deviceId, manifestId: day.manifest_id }) : "";
+  if (work.day_source_namespace !== null && (work.day_source_namespace !== daySourceNamespace
+      || work.day_origin_set_digest !== originSet.digest)) throw new Error("V11_PROJECTION_SOURCE_ORIGIN_CONFLICT");
+  const identity = await reuseIdentity(input, layout, day, work.next_day, daySourceNamespace);
   // Validate the saved method/counters even when a concurrent generation has
   // since completed this same immutable day. Reuse cannot hide corrupt work.
   const priorValues = foldV11DailyProjectionValues(JSON.parse(work.values_json) as Values, []);
   const cached = await reusableValue(target, identity, day.expected_records);
-  const rows = cached ? [] : await sourcePage(source, input, work, layout, day);
+  const rows = cached ? [] : await sourcePage(source, input, work, layout, day, daySourceNamespace);
   options.signal?.throwIfAborted();
   const pageValues = cached ? null : foldV11DailyProjectionValues(createV11DailyProjectionValues(work.next_day),
     rows.map(row => JSON.parse(row.record_json) as TelemetryV11Record));
@@ -257,6 +298,14 @@ export async function advanceV11DailyProjection(options: {
     return { state: "discarded", sequence: change.sequence, recordsRead: rows.length };
   }
   validateWork(work, current, layout);
+  if (layout.kind === "typed-v11") {
+    const afterOrigins = await typedOriginSet(source, input.participantId, layout.sourceNamespace);
+    const afterNamespace = await resolveTypedV11ManifestOrigin(source,
+      { participantId: input.participantId, deviceId: input.deviceId, manifestId: day.manifest_id });
+    if (afterOrigins.canonical !== originSet.canonical || afterNamespace !== daySourceNamespace) {
+      throw new Error("V11_PROJECTION_SOURCE_ORIGIN_CONFLICT");
+    }
+  }
   const ready = completeDay && work.next_day === work.through_day;
   const last = rows.at(-1);
   const afterStream = completeDay ? "" : last!.stream;
@@ -264,8 +313,16 @@ export async function advanceV11DailyProjection(options: {
   const next = completeDay ? nextDay(work.next_day) : work.next_day;
   const nextValues = completeDay ? createV11DailyProjectionValues(next) : values;
   const stepDigest = await sha256Hex(canonicalJson({ eventDigest: change.eventDigest, revision: work.revision + 1,
-    day: work.next_day, afterStream, afterOccurrence, recordCount, completeDay, valueKey: identity.value_key, pageDigest, values }));
-  const statements = [target.prepare(`INSERT INTO analytics_v11_projection_steps(source_id,event_digest,revision,step_digest)
+    day: work.next_day, sourceNamespace: daySourceNamespace, originSetDigest: originSet.digest,
+    afterStream, afterOccurrence, recordCount, completeDay,
+    valueKey: identity.value_key, pageDigest, values }));
+  const statements = [target.prepare(`UPDATE analytics_v11_projection_work
+    SET day_source_namespace=?,day_origin_set_digest=?
+    WHERE source_id=? AND event_digest=? AND revision=?
+      AND (day_source_namespace IS NULL OR (day_source_namespace=? AND day_origin_set_digest=?))`)
+    .bind(daySourceNamespace, originSet.digest, sourceId, change.eventDigest, work.revision,
+      daySourceNamespace, originSet.digest),
+  target.prepare(`INSERT INTO analytics_v11_projection_steps(source_id,event_digest,revision,step_digest)
     VALUES(?,?,?,?)`).bind(sourceId, change.eventDigest, work.revision + 1, stepDigest)];
   if (!cached && rows.length > 0) {
     statements.push(target.prepare(`INSERT INTO analytics_v11_value_pages
@@ -284,10 +341,12 @@ export async function advanceV11DailyProjection(options: {
       VALUES(?,?,?,?)`).bind(sourceId, change.eventDigest, work.next_day, identity.value_key));
   }
   statements.push(target.prepare(`UPDATE analytics_v11_projection_work SET
-    next_day=?,after_stream=?,after_occurrence=?,day_records=?,values_json=?,revision=revision+1,phase=?
+    next_day=?,after_stream=?,after_occurrence=?,day_records=?,values_json=?,revision=revision+1,phase=?,
+    day_source_namespace=?,day_origin_set_digest=?
     WHERE source_id=? AND event_digest=? AND revision=?`)
     .bind(next, afterStream, afterOccurrence, completeDay ? 0 : recordCount, canonicalJson(nextValues),
-      ready ? "ready" : "building", sourceId, change.eventDigest, work.revision));
+      ready ? "ready" : "building", completeDay ? null : daySourceNamespace, completeDay ? null : originSet.digest,
+      sourceId, change.eventDigest, work.revision));
   try { await target.batch(statements); }
   catch {
     const receipt = await target.prepare(`SELECT step_digest FROM analytics_v11_projection_steps

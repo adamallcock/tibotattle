@@ -31,28 +31,28 @@ CREATE TABLE analytics_applied_events (
 
 CREATE TRIGGER analytics_delivery_validate BEFORE INSERT ON analytics_applied_events
 BEGIN
-  SELECT CASE WHEN NEW.sequence!=COALESCE((SELECT sequence FROM analytics_source_cursors WHERE source_id=NEW.source_id),0)+1
-    THEN RAISE(ABORT,'analytics_sequence_conflict') END;
-  SELECT CASE WHEN NEW.revision!=COALESCE((SELECT revision FROM analytics_owner_state
+  SELECT (CASE WHEN NEW.sequence!=COALESCE((SELECT sequence FROM analytics_source_cursors WHERE source_id=NEW.source_id),0)+1
+    THEN RAISE(ABORT,'analytics_sequence_conflict') END);
+  SELECT (CASE WHEN NEW.revision!=COALESCE((SELECT revision FROM analytics_owner_state
       WHERE source_id=NEW.source_id AND owner_digest=NEW.owner_digest),0)+1
-    THEN RAISE(ABORT,'analytics_owner_revision_conflict') END;
-  SELECT CASE WHEN EXISTS(SELECT 1 FROM analytics_owner_state
+    THEN RAISE(ABORT,'analytics_owner_revision_conflict') END);
+  SELECT (CASE WHEN EXISTS(SELECT 1 FROM analytics_owner_state
       WHERE source_id=NEW.source_id AND owner_digest=NEW.owner_digest AND state='erased')
-    THEN RAISE(ABORT,'analytics_owner_erased') END;
-  SELECT CASE WHEN NEW.kind NOT IN ('source-updated','owner-active','owner-withdrawn','owner-erased')
+    THEN RAISE(ABORT,'analytics_owner_erased') END);
+  SELECT (CASE WHEN NEW.kind NOT IN ('source-updated','owner-active','owner-withdrawn','owner-erased')
     OR (NEW.kind='source-updated' AND NOT EXISTS(SELECT 1 FROM analytics_owner_state
       WHERE source_id=NEW.source_id AND owner_digest=NEW.owner_digest AND state='active'))
-    THEN RAISE(ABORT,'analytics_owner_ineligible') END;
-  SELECT CASE WHEN NEW.kind!='owner-active' AND NOT EXISTS(SELECT 1 FROM analytics_owner_state
+    THEN RAISE(ABORT,'analytics_owner_ineligible') END);
+  SELECT (CASE WHEN NEW.kind!='owner-active' AND NOT EXISTS(SELECT 1 FROM analytics_owner_state
       WHERE source_id=NEW.source_id AND owner_digest=NEW.owner_digest)
-    THEN RAISE(ABORT,'analytics_owner_uninitialized') END;
-  SELECT CASE WHEN NEW.authority_epoch!=COALESCE((SELECT authority_epoch FROM analytics_owner_state
+    THEN RAISE(ABORT,'analytics_owner_uninitialized') END);
+  SELECT (CASE WHEN NEW.authority_epoch!=COALESCE((SELECT authority_epoch FROM analytics_owner_state
       WHERE source_id=NEW.source_id AND owner_digest=NEW.owner_digest),0)
       + CASE WHEN NEW.kind='source-updated' THEN 0 ELSE 1 END
-    THEN RAISE(ABORT,'analytics_authority_conflict') END;
-  SELECT CASE WHEN NEW.public_authority_epoch!=COALESCE((SELECT authority_epoch FROM analytics_source_cursors WHERE source_id=NEW.source_id),0)
+    THEN RAISE(ABORT,'analytics_authority_conflict') END);
+  SELECT (CASE WHEN NEW.public_authority_epoch!=COALESCE((SELECT authority_epoch FROM analytics_source_cursors WHERE source_id=NEW.source_id),0)
       + CASE WHEN NEW.kind='source-updated' THEN 0 ELSE 1 END
-    THEN RAISE(ABORT,'analytics_public_authority_conflict') END;
+    THEN RAISE(ABORT,'analytics_public_authority_conflict') END);
 END;
 CREATE TRIGGER analytics_delivery_commit AFTER INSERT ON analytics_applied_events
 BEGIN

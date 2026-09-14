@@ -10,7 +10,7 @@ BEGIN SELECT RAISE(ABORT,'typed_v11_runtime_contract_unqualified'); END;
 CREATE TRIGGER typed_v11_runtime_contract_qualify BEFORE UPDATE OF runtime_contract_version ON typed_v11_admission_state
 WHEN OLD.runtime_contract_version IS NOT NEW.runtime_contract_version
 BEGIN
-  SELECT CASE WHEN OLD.runtime_contract_version != 0 OR NEW.runtime_contract_version != 1
+  SELECT (CASE WHEN OLD.runtime_contract_version != 0 OR NEW.runtime_contract_version != 1
     OR NOT EXISTS (SELECT 1 FROM typed_telemetry_schema WHERE id=1 AND version=1)
     OR NOT EXISTS (SELECT 1 FROM storage_source_state WHERE singleton=1)
     OR EXISTS (SELECT 1 FROM telemetry_v11_records LIMIT 1)
@@ -31,5 +31,5 @@ BEGIN
       ('trigger','typed_v11_session_tools_delete_guard'),('trigger','typed_v11_session_tools_insert_guard'),
       ('trigger','typed_v11_record_time_guard'),('view','typed_v11_active_records'),('index','typed_v11_manifest_observed')
     )) != 22
-    THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END;
+    THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END);
 END;

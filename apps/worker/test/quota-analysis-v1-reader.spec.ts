@@ -11,6 +11,7 @@ import {
   validateV1QuotaWorkPart,
   validateV1QuotaPageReplay,
   validateV1CompletedQuotaAcquisition,
+  V1_ORIGIN_CURSOR_VERSION,
   V1_QUOTA_ACQUISITION_PAGE_SIZE,
 } from "../src/quota-analysis-v1-reader";
 import type {
@@ -246,6 +247,21 @@ describe("resumable v1 quota acquisition", () => {
     invalidReader.readPlanPage = async () => Array.from({ length: V1_QUOTA_ACQUISITION_PAGE_SIZE + 1 }, (_, id) => row(id + 1, 0));
     await expect(advanceV1QuotaAcquisition(invalidReader, IDENTITY, new Map(),
       { remainingQueries: 1, deadlineMs: 1, now: () => 0 })).rejects.toThrow("page overflow");
+  });
+
+  it("upgrades only an untouched checkpoint to the namespace cursor and refuses ambiguous legacy progress",async()=>{
+    const originReader:V1QuotaPageReader={cursorVersion:V1_ORIGIN_CURSOR_VERSION,
+      async readPlanPage(){return[];},async readFitPage(){return[];}};
+    const fresh=createV1QuotaAcquisitionCheckpoint(IDENTITY);
+    const advanced=await advanceV1QuotaAcquisitionPage(originReader,IDENTITY,new Map(),
+      {remainingQueries:1,deadlineMs:1,now:()=>0},fresh);
+    expect(advanced.replay?.from.cursor).toEqual({resetsAt:IDENTITY.resetsAtCutoff,observedAt:IDENTITY.observedAtCutoff,id:0});
+    expect(advanced.replay?.through.cursor).toMatchObject({cursorVersion:V1_ORIGIN_CURSOR_VERSION,sourceNamespace:""});
+    expect(validateV1QuotaPageReplay(advanced.replay)).toBe(true);
+    const ambiguous=createV1QuotaAcquisitionCheckpoint(IDENTITY);
+    ambiguous.cursor={resetsAt:IDENTITY.resetsAtCutoff,observedAt:at(0),id:1};
+    await expect(advanceV1QuotaAcquisition(originReader,IDENTITY,new Map(),
+      {remainingQueries:1,deadlineMs:1,now:()=>0},ambiguous)).rejects.toThrow("checkpoint invalid");
   });
 
   it("refuses private/unknown checkpoint fields and malformed cross-part state without repair", () => {

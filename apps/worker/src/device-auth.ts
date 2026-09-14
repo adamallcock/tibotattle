@@ -19,6 +19,8 @@ import {
   timingSafeEqual,
 } from "./crypto";
 import { ApiError } from "./errors";
+import { ownerWriteFenceStatement } from "./storage-routing-fence";
+import type { OwnerStorageRoute } from "./storage-routing";
 
 const UUID_V4 =
   "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
@@ -309,6 +311,10 @@ function deviceUploadHash(id: string, secret: string): Promise<Uint8Array> {
   return sha256(`app-usagemonitor/device-upload/v1\0${id}\0${secret}`);
 }
 
+function hex(bytes: Uint8Array): string {
+  return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
 export async function createDevicePairingMaterial(
   participantId: string,
   sessionId: string,
@@ -450,6 +456,22 @@ function parseDeviceUploadAuthorization(header: string | null): {
   ).exec(header.slice(7));
   if (!match?.[1] || !match[2]) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   return { id: match[1], secret: match[2] };
+}
+
+export async function deviceAuthorizationCapabilityHash(
+  header: string | null,
+): Promise<string> {
+  const parsed = parseDeviceAuthorization(header);
+  const value = await deviceHash(parsed.id, parsed.secret);
+  try { return hex(value); } finally { value.fill(0); }
+}
+
+export async function uploadAuthorizationCapabilityHash(
+  header: string | null,
+): Promise<string> {
+  const parsed = parseDeviceUploadAuthorization(header);
+  const value = await deviceUploadHash(parsed.id, parsed.secret);
+  try { return hex(value); } finally { value.fill(0); }
 }
 
 /**
@@ -1080,6 +1102,7 @@ export async function authenticateDevice(
   db: D1Database,
   authorizationHeader: string | null,
   options: DeviceLifecycleOptions = {},
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<DevicePrincipal> {
   const policy = lifecyclePolicy(options.policy);
   const nowEpoch = options.nowEpoch ?? Date.now();
@@ -1136,7 +1159,7 @@ export async function authenticateDevice(
         || !futureInstant(row.expires_at, nowEpoch)) {
       throw new ApiError(401, "DEVICE_AUTH_INVALID");
     }
-    const used = await db.prepare(
+    const useStatement = db.prepare(
       `UPDATE device_credentials
           SET last_used_at = ?
         WHERE id = ? AND state = 'active' AND authority_kind = 'accountless'
@@ -1160,8 +1183,11 @@ export async function authenticateDevice(
                AND grant_row.device_credential_id = device_credentials.id
                AND grant_row.state = 'active' AND grant_row.expires_at = ledger.expires_at
           )`,
-    ).bind(now, row.id, now, presentedHash, now).run();
-    if (used.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+    ).bind(now, row.id, now, presentedHash, now);
+    const used = ownerRoute?.mode === "catalog"
+      ? (await db.batch([ownerWriteFenceStatement(db, ownerRoute), useStatement]))[1]
+      : await useStatement.run();
+    if (!used || used.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
     return {
       deviceId: row.id,
       participantId: row.participant_id,
@@ -1207,7 +1233,7 @@ export async function authenticateDevice(
   if (!futureInstant(renewedExpiry, nowEpoch)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
-  const used = await db.prepare(
+  const useStatement = db.prepare(
     `UPDATE device_credentials
         SET last_used_at = ?, expires_at = ?
       WHERE id = ? AND state = 'active' AND expires_at > ?
@@ -1225,8 +1251,11 @@ export async function authenticateDevice(
     presentedHash,
     row.participant_id,
     row.participant_consent_version,
-  ).run();
-  if (used.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  );
+  const used = ownerRoute?.mode === "catalog"
+    ? (await db.batch([ownerWriteFenceStatement(db, ownerRoute), useStatement]))[1]
+    : await useStatement.run();
+  if (!used || used.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
   return {
     deviceId: row.id,
     participantId: row.participant_id,
@@ -1464,6 +1493,7 @@ export async function createDeviceUploadAuthorization(
   envelopeDigest: string,
   bodyBytes: number,
   nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<{ uploadAuthorization: string; expiresAt: string }> {
   const id = crypto.randomUUID();
   const secret = randomSecret(32);
@@ -1478,7 +1508,7 @@ export async function createDeviceUploadAuthorization(
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
   const secretHash = await deviceUploadHash(id, secret);
-  const result = await db.prepare(
+  const insertStatement = db.prepare(
     `INSERT INTO device_upload_authorizations (
       id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
       body_bytes, content_type, state, issued_at, expires_at
@@ -1531,12 +1561,32 @@ export async function createDeviceUploadAuthorization(
     device.authorityKind,
     device.participantConsentVersion,
     issuedAt,
-  ).run();
-  if (result.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  );
+  const result = ownerRoute?.mode === "catalog"
+    ? (await db.batch([ownerWriteFenceStatement(db, ownerRoute), insertStatement]))[1]
+    : await insertStatement.run();
+  if (!result || result.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
   return {
     uploadAuthorization: `um_device_upload_${id}.${secret}`,
     expiresAt,
   };
+}
+
+export async function revokeUnclaimedDeviceUploadAuthorization(
+  db: D1Database,
+  uploadAuthorization: string,
+  ownerRoute?: OwnerStorageRoute,
+): Promise<void> {
+  const parsed = parseDeviceUploadAuthorization(`Upload ${uploadAuthorization}`);
+  const now = new Date().toISOString();
+  const statement = db.prepare(`UPDATE device_upload_authorizations
+    SET state = 'revoked', revoked_at = ?
+    WHERE id = ? AND state = 'unused'`).bind(now, parsed.id);
+  if (ownerRoute?.mode === "catalog") {
+    await db.batch([ownerWriteFenceStatement(db, ownerRoute), statement]);
+  } else {
+    await statement.run();
+  }
 }
 
 export async function claimDeviceUploadAuthorization(
@@ -1551,6 +1601,7 @@ export async function claimDeviceUploadAuthorization(
     bodyBytes: number;
     contentType: string;
   },
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<DeviceUploadClaim> {
   const parsed = parseDeviceUploadAuthorization(authorizationHeader);
   const row = await db.prepare(
@@ -1581,7 +1632,7 @@ export async function claimDeviceUploadAuthorization(
   const leaseExpiresAt = new Date(
     Date.now() + UPLOAD_CONSUME_LEASE_MILLISECONDS,
   ).toISOString();
-  const result = await db.prepare(
+  const claimStatement = db.prepare(
     `UPDATE device_upload_authorizations
         SET state = 'consuming', consume_lease_expires_at = ?
       WHERE id = ? AND state = 'unused' AND expires_at > ?
@@ -1616,8 +1667,11 @@ export async function claimDeviceUploadAuthorization(
                 ))
              )
         )`,
-  ).bind(leaseExpiresAt, parsed.id, now, now, now).run();
-  if (result.meta.changes !== 1) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  ).bind(leaseExpiresAt, parsed.id, now, now, now);
+  const result = ownerRoute?.mode === "catalog"
+    ? (await db.batch([ownerWriteFenceStatement(db, ownerRoute), claimStatement]))[1]
+    : await claimStatement.run();
+  if (!result || result.meta.changes !== 1) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   return {
     authorizationId: parsed.id,
     participantId: row.participant_id,
@@ -1629,9 +1683,10 @@ export async function recordDeviceUploadReceipt(
   db: D1Database,
   authorizationId: string,
   contributionId: string,
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<void> {
   const now = new Date().toISOString();
-  const result = await db.prepare(
+  const receiptStatement = db.prepare(
     `UPDATE device_upload_authorizations
         SET state = 'consumed', consumed_at = ?,
             consumed_contribution_id = ?, consume_lease_expires_at = NULL
@@ -1667,8 +1722,11 @@ export async function recordDeviceUploadReceipt(
                AND grant_row.state = 'active' AND grant_row.expires_at = ledger.expires_at
           )
         )`,
-  ).bind(now, contributionId, authorizationId, now, now, now).run();
-  if (result.meta.changes === 1) return;
+  ).bind(now, contributionId, authorizationId, now, now, now);
+  const result = ownerRoute?.mode === "catalog"
+    ? (await db.batch([ownerWriteFenceStatement(db, ownerRoute), receiptStatement]))[1]
+    : await receiptStatement.run();
+  if (result?.meta.changes === 1) return;
   const existing = await db.prepare(
     `SELECT state, consumed_contribution_id
        FROM device_upload_authorizations WHERE id = ?`,
@@ -1685,13 +1743,19 @@ export async function recordDeviceUploadReceipt(
 export async function abandonDeviceUploadAuthorization(
   db: D1Database,
   authorizationId: string,
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<void> {
   const now = new Date().toISOString();
-  await db.prepare(
+  const abandonStatement = db.prepare(
     `UPDATE device_upload_authorizations
         SET state = 'revoked', revoked_at = ?, consume_lease_expires_at = NULL
       WHERE id = ? AND state = 'consuming'`,
-  ).bind(now, authorizationId).run();
+  ).bind(now, authorizationId);
+  if (ownerRoute?.mode === "catalog") {
+    await db.batch([ownerWriteFenceStatement(db, ownerRoute), abandonStatement]);
+  } else {
+    await abandonStatement.run();
+  }
 }
 
 export async function listParticipantDevices(
@@ -1766,6 +1830,7 @@ export async function revokeParticipantDevice(
 export async function disconnectAuthenticatedDevice(
   db: D1Database,
   authorizationHeader: string | null,
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<{ deviceId: string; revoked: true }> {
   const parsed = parseDeviceAuthorization(authorizationHeader);
   const presentedHash = await deviceHash(parsed.id, parsed.secret);
@@ -1793,6 +1858,8 @@ export async function disconnectAuthenticatedDevice(
       db,
       row.accountless_enrollment_device_id,
       "user_opt_out",
+      Date.now(),
+      ownerRoute,
     );
   } else {
     await revokeDeviceRows(db, row.id, new Date().toISOString());

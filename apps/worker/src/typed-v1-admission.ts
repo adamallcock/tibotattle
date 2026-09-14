@@ -1,4 +1,6 @@
-import { assertTypedStorageAdmissionCapacity } from './typed-storage-capacity';
+import { assertTypedStorageAdmissionCapacity, isTypedStorageCapacityRefusal,
+ prepareTypedStorageAdmissionReservation, reconcileTypedStorageAdmissionReservation,
+ type TypedStorageAdmissionReservation } from './typed-storage-capacity';
 import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
 import { ApiError } from './errors';
@@ -9,6 +11,10 @@ import { MAX_STORAGE_TRANSACTION_STATEMENTS } from './storage-routing-batch-budg
 import { prepareTelemetryV1ChunkWrite, existingTelemetryV1ChunkByEnvelopeDigest, type TelemetryV1ChunkInsert, type TelemetryV1ChunkRow } from './telemetry-v1-repository';
 import { parseTelemetryV1Chunk, assertTelemetryV1ConsentCurrent } from './telemetry-v1';
 import { readIngestionChanges, type StorageChange } from './analytics-delivery';
+import { ownerWriteFenceStatement } from './storage-routing-fence';
+import type { OwnerStorageRoute } from './storage-routing';
+import { assertCurrentTypedTelemetryOrigin, typedTelemetryOriginQualificationStatements,
+ TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST } from './typed-telemetry-origins';
 
 const encoded = (value: string): ArrayBuffer => Uint8Array.from(encodeTypedTelemetryId(value)).buffer;
 const conflict = () => new TypedTelemetryError('TYPED_TELEMETRY_CONFLICT');
@@ -21,12 +27,13 @@ export async function initializeTypedV1Admission(db: D1Database, namespace: stri
   if(pin && pin.source_namespace!==namespace) throw conflict();}
  await db.batch([
   db.prepare('INSERT INTO typed_telemetry_namespaces(original_id) VALUES(?) ON CONFLICT DO NOTHING').bind(bytes),
-  db.prepare(`INSERT INTO typed_v1_admission_state(id,source_namespace,namespace_id,next_source_row_id)
+ db.prepare(`INSERT INTO typed_v1_admission_state(id,source_namespace,namespace_id,next_source_row_id)
    VALUES(1,?,(SELECT id FROM typed_telemetry_namespaces WHERE original_id=?),1)
    ON CONFLICT(id) DO UPDATE SET source_namespace=excluded.source_namespace,namespace_id=excluded.namespace_id`).bind(namespace,bytes),
   db.prepare('UPDATE typed_v1_admission_state SET runtime_contract_version=1 WHERE id=1'),
+  ...typedTelemetryOriginQualificationStatements(db,namespace,'v1'),
  ]);
-
+ await assertCurrentTypedTelemetryOrigin(db,namespace,'v1');
 }
 /** Read-only committed receipt validation. A superseded receipt needs a newer
  * exact-slot journal proof; its removed old rows are never treated as current. */
@@ -35,9 +42,14 @@ export async function validateTypedTelemetryV1Receipt(db:D1Database, input:{sour
  const row=await db.prepare('SELECT * FROM telemetry_v1_chunks WHERE id=? AND participant_id=? AND device_id=?')
   .bind(scope.chunkRowId,scope.participantId,scope.deviceId).first<TelemetryV1ChunkRow>();
  if(!row)return null;
- const event=await db.prepare(`SELECT j.*,s.source_id FROM storage_source_state s CROSS JOIN typed_v1_event_sources e JOIN storage_ingestion_changes j ON j.event_digest=e.event_digest
+ const event=await db.prepare(`SELECT j.*,s.source_id FROM storage_source_state s
+  CROSS JOIN typed_v1_event_sources e
+  JOIN typed_telemetry_origin_contracts origin ON origin.source_namespace=e.source_namespace
+   AND origin.namespace_original=? AND origin.v1_read_contract_version=2 AND origin.source_schema_digest=?
+  JOIN storage_ingestion_changes j ON j.event_digest=e.event_digest
   WHERE e.chunk_id=? AND e.participant_id=? AND e.source_namespace=? AND j.owner_digest=e.owner_digest AND j.content_digest=?`)
-  .bind(row.id,scope.participantId,scope.sourceNamespace,row.chunk_digest).first<{source_id:string;sequence:number}>();
+  .bind(encoded(scope.sourceNamespace),TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST,row.id,scope.participantId,
+   scope.sourceNamespace,row.chunk_digest).first<{source_id:string;sequence:number}>();
  if(!event || row.record_count<1 || row.record_count>200 || row.accepted_record_count!==row.record_count)throw conflict();
  const change=(await readIngestionChanges(db,event.source_id,event.sequence-1,1))[0];
  if(!change)throw conflict();
@@ -71,7 +83,7 @@ async function replay(db: D1Database, insert: TelemetryV1ChunkInsert, namespace:
  * derived-data work separately. No analytics database is called by this adapter.
  */
 export async function insertTypedTelemetryV1Chunk(db: D1Database, value: TelemetryV1ChunkInsert & {authorizationEnvelopeDigest?:string},
- sourceNamespace: string): Promise<{acceptedRecords:number;replay:boolean}> {
+ sourceNamespace: string, ownerRoute?: OwnerStorageRoute): Promise<{acceptedRecords:number;replay:boolean}> {
  const insert=JSON.parse(JSON.stringify(value)) as TelemetryV1ChunkInsert & {authorizationEnvelopeDigest?:string};
  const authorizationEnvelopeDigest=insert.authorizationEnvelopeDigest??insert.envelopeDigest;
  if(!/^[a-f0-9]{64}$/.test(authorizationEnvelopeDigest))throw conflict();
@@ -86,11 +98,14 @@ export async function insertTypedTelemetryV1Chunk(db: D1Database, value: Telemet
   || prior.revision+1!==chunk.chunkRevision || prior.superseded_at!==null)) throw conflict();
  if(!prior && chunk.chunkRevision!==1) throw conflict();
  if(await sha256Hex(canonicalJson(chunk.records))!==chunk.chunkDigest) throw new ApiError(400,'CHUNK_DIGEST_MISMATCH');
- const state=await db.prepare('SELECT * FROM typed_v1_admission_state WHERE id=1').first<State>();
+ const state=await db.prepare(`SELECT s.* FROM typed_v1_admission_state s
+ JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=s.namespace_id
+  AND origin.source_namespace=s.source_namespace AND origin.access_mode='current-write'
+  AND origin.v1_read_contract_version=2 AND origin.source_schema_digest=?
+ WHERE s.id=1`).bind(TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST).first<State>();
  if(!state || state.runtime_contract_version!==1 || state.source_namespace!==sourceNamespace || !Number.isSafeInteger(state.next_source_row_id)
   || state.next_source_row_id<1 || !Number.isSafeInteger(state.next_source_row_id+chunk.records.length)) throw conflict();
  if(await replay(db,insert,sourceNamespace)) return {acceptedRecords:chunk.records.length,replay:true};
- await assertTypedStorageAdmissionCapacity(db);
  const start=state.next_source_row_id;
  const typed:D1PreparedStatement[]=[db.prepare(`INSERT INTO typed_v1_chunk_allocations(chunk_id,namespace_id,chunk_original,first_source_row_id,record_count)
  VALUES(?,?,?,?,?)`).bind(insert.chunkRowId,state.namespace_id,encoded(insert.chunkRowId),start,chunk.records.length)];
@@ -104,9 +119,10 @@ export async function insertTypedTelemetryV1Chunk(db: D1Database, value: Telemet
   if(transactionBytes>4*1024*1024)throw new TypedTelemetryError('TYPED_TELEMETRY_LIMIT');
   typed.push(...page.statements);
  }
- typed.push(db.prepare(`INSERT INTO typed_v1_owner_memberships(participant_id,typed_owner_id)
- SELECT ?,owner_id FROM typed_telemetry_records WHERE namespace_id=? AND format=10 AND source_row_id=?
- ON CONFLICT(participant_id) DO UPDATE SET typed_owner_id=excluded.typed_owner_id`).bind(insert.participantId,state.namespace_id,start));
+ typed.push(db.prepare(`INSERT INTO typed_v1_owner_memberships(participant_id,namespace_id,typed_owner_id)
+ SELECT ?,namespace_id,owner_id FROM typed_telemetry_records WHERE namespace_id=? AND format=10 AND source_row_id=?
+ ON CONFLICT(participant_id,namespace_id) DO UPDATE SET typed_owner_id=excluded.typed_owner_id`)
+ .bind(insert.participantId,state.namespace_id,start));
  typed.push(db.prepare(`INSERT INTO typed_v1_record_admissions(typed_record_id,chunk_id)
  SELECT id,? FROM typed_telemetry_records WHERE namespace_id=? AND format=10 AND source_row_id>=? AND source_row_id<?`)
  .bind(insert.chunkRowId,state.namespace_id,start,start+rows.length));
@@ -121,14 +137,24 @@ export async function insertTypedTelemetryV1Chunk(db: D1Database, value: Telemet
  const {statements,chunkStatementIndex}=prepareTelemetryV1ChunkWrite(db,insert,{insertStatements:typed,deleteSupersededStatements:deletes,authorizationEnvelopeDigest});
  statements.unshift(db.prepare(`INSERT INTO typed_v1_authority_requests(chunk_id,participant_id,device_id,authorization_id,authorization_digest,envelope_digest)
  VALUES(?,?,?,?,?,?)`).bind(insert.chunkRowId,insert.participantId,insert.deviceId,insert.deviceUploadAuthorizationId,authorizationEnvelopeDigest,insert.envelopeDigest));
+ let reservation:TypedStorageAdmissionReservation|undefined;
+ let admissionPrefixCount=0;
+ if(ownerRoute?.mode==='catalog') {
+  reservation=await prepareTypedStorageAdmissionReservation(db,ownerRoute,{transactionBytes,recordCount:rows.length});
+  statements.unshift(ownerWriteFenceStatement(db,ownerRoute),reservation.statement);
+  admissionPrefixCount=2;
+ } else await assertTypedStorageAdmissionCapacity(db);
  statements.push(db.prepare('DELETE FROM typed_v1_authority_requests WHERE chunk_id=?').bind(insert.chunkRowId));
  if(statements.length>MAX_STORAGE_TRANSACTION_STATEMENTS) throw new TypedTelemetryError('TYPED_TELEMETRY_LIMIT');
  try {
   const results=await db.batch(statements);
-  if(results.some(r=>!r.success) || results[chunkStatementIndex+1]?.results.length!==1) throw conflict();
+  if(results.some(r=>!r.success) || results[chunkStatementIndex+1+admissionPrefixCount]?.results.length!==1
+   || (reservation&&results[1]?.results.length!==1)) throw conflict();
+  if(reservation) await reconcileTypedStorageAdmissionReservation(db,reservation,results[1],results.at(-1));
  } catch(error) {
   if(await replay(db,insert,sourceNamespace)) return {acceptedRecords:rows.length,replay:true};
   const message=String(error);
+  if(isTypedStorageCapacityRefusal(error)) throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
   if(message.includes('typed_v1_allocator_conflict')) throw new ApiError(409,'UPLOAD_IN_PROGRESS');
   if(message.includes('typed_telemetry_records.device_id')) throw new ApiError(409,'RECORD_OWNED_BY_OTHER_CHUNK');
   if(message.includes('upload unavailable')) throw new ApiError(401,'UPLOAD_AUTH_INVALID');
@@ -146,8 +172,12 @@ export async function lookupTypedV1Source(db:D1Database, change:StorageChange):P
 }> {
  const actual=(await readIngestionChanges(db,change.sourceId,change.sequence-1,1))[0];
  if(!actual || canonicalJson(actual)!==canonicalJson(change)) throw conflict();
- const row=await db.prepare(`SELECT e.source_namespace,c.* FROM typed_v1_event_sources e JOIN telemetry_v1_chunks c ON c.id=e.chunk_id
- WHERE e.event_digest=? AND e.owner_digest=? AND c.chunk_digest=?`).bind(change.eventDigest,change.ownerDigest,change.contentDigest)
+ const row=await db.prepare(`SELECT e.source_namespace,c.* FROM typed_v1_event_sources e
+ JOIN typed_telemetry_origin_contracts origin ON origin.source_namespace=e.source_namespace
+  AND origin.v1_read_contract_version=2 AND origin.source_schema_digest=?
+ JOIN telemetry_v1_chunks c ON c.id=e.chunk_id
+ WHERE e.event_digest=? AND e.owner_digest=? AND c.chunk_digest=?`)
+ .bind(TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST,change.eventDigest,change.ownerDigest,change.contentDigest)
  .first<{source_namespace:string;id:string;participant_id:string;device_id:string;stream:string;chunk_day:string;chunk_seq:number;revision:number;chunk_digest:string;superseded_at:string|null}>();
  if(!row) throw conflict();
  let newer:string|null=null;

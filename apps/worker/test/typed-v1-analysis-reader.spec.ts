@@ -1,7 +1,8 @@
 import { createV1QuotaPageReader,backfillV1QuotaFitProjection } from '../src/quota-fit-projection';
 import { readV1UsagePage,accountScopedQuotaAnalysisV1,accountScopedModelCompositionV1 } from '../src/quota-analysis-v1';
 import { loadV1SourcePin } from '../src/telemetry-v1-source-selection';
-import { loadTypedV1AnalysisScope,TYPED_V1_PLAN_PAGE_SQL,TYPED_V1_FIT_PAGE_SQL,TYPED_V1_USAGE_AT_TIME_SQL } from '../src/typed-v1-analysis-reader';
+import { createTypedV1QuotaPageReader,loadTypedV1AnalysisScope,TYPED_V1_PLAN_PAGE_SQL,TYPED_V1_FIT_PAGE_SQL,
+ TYPED_V1_USAGE_AT_TIME_SQL,typedV1MultiPlanPageSql,typedV1MultiFitPageSql,typedV1MultiUsagePageSql } from '../src/typed-v1-analysis-reader';
 import { decodeTypedTelemetryUsageAnalysisRows,MAX_TYPED_V1_USAGE_ANALYSIS_BYTES } from '../src/typed-telemetry-compatibility';
 import { env, reset, applyD1Migrations, type D1Migration } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -15,6 +16,10 @@ import { sha256Hex } from '../src/crypto';
 import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk, lookupTypedV1Source, validateTypedTelemetryV1Receipt } from '../src/typed-v1-admission';
 import { initializeStorageSource, readIngestionChanges } from '../src/analytics-delivery';
 import { readTypedTelemetryRowsByStorageIds } from '../src/typed-telemetry-compatibility';
+import { persistTypedTelemetryBatch } from '../src/typed-telemetry-repository';
+import { encodeTypedTelemetryId } from '../src/typed-telemetry-codec';
+import { TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST } from '../src/typed-telemetry-origins';
+import { V1_ORIGIN_CURSOR_VERSION } from '../src/quota-analysis-v1-reader';
 const bindings=env as Env & {TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];
  STORAGE_ANALYTICS_DB:D1Database; TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[]; TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[]};
 const source=()=>bindings.USAGE_MONITOR_DB, namespace='synthetic-v1-source', sourceId='synthetic-v1-journal';
@@ -31,11 +36,11 @@ beforeEach(async()=>{
 });
 function withBatch(batch:D1Database['batch']):D1Database{return new Proxy(source(),{get(db,key){if(key==='batch')return batch;
  const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});}
-async function seed(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1, fixture = undefined as Awaited<ReturnType<typeof createV11DeviceFixture>> | undefined, revision=1, seq=0) {
+async function seed(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1, fixture = undefined as Awaited<ReturnType<typeof createV11DeviceFixture>> | undefined, revision=1, seq=0,recordOffset=0) {
   fixture ??= await createV11DeviceFixture(source());
   const records = Array.from({ length: count }, (_, i) => stream === 'usage'
-    ? JSON.parse(telemetryV11LegacyProjection('usage', v11UsageRecord(day(), 'a', { eventId: `event:v2:${i.toString(16).padStart(64, '0')}` }))!.canonicalRecord)
-    : stream === 'quota' ? { schemaVersion: 'quota-observation-v1.0', observationId: `quota-occurrence:v1:${i.toString(16).padStart(64, '0')}`,
+    ? JSON.parse(telemetryV11LegacyProjection('usage', v11UsageRecord(day(), 'a', { eventId: `event:v2:${(i+recordOffset).toString(16).padStart(64, '0')}` }))!.canonicalRecord)
+    : stream === 'quota' ? { schemaVersion: 'quota-observation-v1.0', observationId: `quota-occurrence:v1:${(i+recordOffset).toString(16).padStart(64, '0')}`,
       observedTime: `${day()}T12:00:00.000Z`, provider: 'openai_codex', planType: 'pro', planVariant: 'unknown',
       limitId: 'codex', slot: 'secondary', usedPercent: 0.30000000000000004, windowDurationMinutes: 10080,
       resetsAt: `${day()}T13:00:00.000Z` }
@@ -53,6 +58,55 @@ async function seed(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1, 
   return { fixture, insert: { chunkRowId: `chunk:${crypto.randomUUID()}`, participantId: fixture.participantId,
     deviceId: fixture.deviceId, chunk, envelopeDigest, r2Key: `synthetic/proof-${crypto.randomUUID()}`,
     deviceUploadAuthorizationId: claimed.authorizationId, createdAt: new Date().toISOString(), supersedes: null } as TelemetryV1ChunkInsert };
+}
+
+const bytes=(value:string)=>Uint8Array.from(encodeTypedTelemetryId(value)).buffer;
+async function admitRetainedV1(input:Awaited<ReturnType<typeof seed>>,sourceNamespace:string){
+ // Create the authenticated local header through the ordinary current lane,
+ // then replace only its synthetic typed copy with the retained provenance
+ // fixture that a future copier would have installed.
+ await insertTypedTelemetryV1Chunk(source(),input.insert,namespace);
+ const currentNamespaceId=(await source().prepare('SELECT namespace_id FROM typed_v1_chunk_allocations WHERE chunk_id=?')
+  .bind(input.insert.chunkRowId).first<number>('namespace_id'))!;
+ const retainedTrigger=(await source().prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='typed_v1_current_record_retained'")
+  .first<string>('sql'))!;
+ await source().exec('DROP TRIGGER typed_v1_current_record_retained');
+ await source().prepare('DELETE FROM typed_v1_record_admissions WHERE chunk_id=?').bind(input.insert.chunkRowId).run();
+ await source().prepare('DELETE FROM typed_v1_chunk_allocations WHERE chunk_id=?').bind(input.insert.chunkRowId).run();
+ await source().prepare('DELETE FROM typed_telemetry_chunks WHERE namespace_id=? AND format=10 AND original_id=?')
+  .bind(currentNamespaceId,bytes(input.insert.chunkRowId)).run();
+ await source().prepare(retainedTrigger).run();
+ const retainedRows=input.insert.chunk.records.map((record,index)=>({sourceNamespace,format:'v1' as const,
+  sourceRowId:index+1,participantId:input.insert.participantId,deviceId:input.insert.deviceId,
+  chunkRowId:input.insert.chunkRowId,manifestId:null,chunkDay:input.insert.chunk.chunkId.split(':')[1]!,
+  observedDay:(record as {observedTime?:string;eventTime?:string}).observedTime?.slice(0,10)
+    ??(record as {eventTime:string}).eventTime.slice(0,10),record}));
+ const allocationTrigger=(await source().prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='typed_v1_allocated_row'")
+  .first<string>('sql'))!;
+ await source().exec('DROP TRIGGER typed_v1_allocated_row');
+ await persistTypedTelemetryBatch(source(),retainedRows);
+ await source().prepare(allocationTrigger).run();
+ const namespaceId=(await source().prepare('SELECT id FROM typed_telemetry_namespaces WHERE original_id=?').bind(bytes(sourceNamespace)).first<number>('id'))!;
+ await source().prepare(`INSERT INTO typed_telemetry_origin_contracts(namespace_id,namespace_original,access_mode,
+  v1_read_contract_version,v11_read_contract_version,source_schema_digest,registered_move_id,registered_at)
+  VALUES(?,?,'retained-read',2,0,?,'synthetic-reader-move','2026-09-13T00:00:00.000Z')`)
+  .bind(namespaceId,bytes(sourceNamespace),TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST).run();
+ const ownerId=(await source().prepare('SELECT id FROM typed_telemetry_owners WHERE namespace_id=? AND original_id=?')
+  .bind(namespaceId,bytes(input.insert.participantId)).first<number>('id'))!;
+ await source().prepare('INSERT INTO typed_v1_owner_memberships(participant_id,namespace_id,typed_owner_id) VALUES(?,?,?)')
+  .bind(input.insert.participantId,namespaceId,ownerId).run();
+ const allocationGuards=[];
+ for(const name of ['typed_v1_allocation_guard','typed_v1_allocation_advance']){
+  allocationGuards.push((await source().prepare('SELECT sql FROM sqlite_schema WHERE type=\'trigger\' AND name=?').bind(name).first<string>('sql'))!);
+  await source().exec(`DROP TRIGGER ${name}`);
+ }
+ await source().prepare(`INSERT INTO typed_v1_chunk_allocations(chunk_id,namespace_id,chunk_original,first_source_row_id,record_count)
+  VALUES(?,?,?,?,?)`).bind(input.insert.chunkRowId,namespaceId,bytes(input.insert.chunkRowId),1,input.insert.chunk.records.length).run();
+ for(const sql of allocationGuards)await source().prepare(sql).run();
+ const records=(await source().prepare('SELECT id FROM typed_telemetry_records WHERE namespace_id=? AND format=10 ORDER BY source_row_id')
+  .bind(namespaceId).all<{id:number}>()).results;
+ await source().batch(records.map(record=>source().prepare('INSERT INTO typed_v1_record_admissions(typed_record_id,chunk_id) VALUES(?,?)')
+  .bind(record.id,input.insert.chunkRowId)));
 }
 
 
@@ -74,6 +128,65 @@ function quota(i:number,resetsAt=`${day()}T23:00:00.000Z`):TelemetryV1Record{ret
  observedTime:`${day()}T12:00:00.000Z`,provider:'openai_codex',planType:i%3?'pro':'plus',planVariant:'unknown',limitId:'codex',slot:'secondary',usedPercent:0.30000000000000004,windowDurationMinutes:10080,resetsAt};}
 function usage(i:number):TelemetryV1Record{return JSON.parse(telemetryV11LegacyProjection('usage',v11UsageRecord(day(),'a',{eventId:`event:v2:${i.toString(16).padStart(64,'0')}`}))!.canonicalRecord);}
 describe('typed v1 existing analytical reader parity',()=>{
+ it('pages two qualified origins by namespace without relabeling colliding source row IDs',async()=>{
+  const current=await seed('quota',1,undefined,1,0,100);await insertTypedTelemetryV1Chunk(source(),current.insert,namespace);
+  const retainedNamespace='synthetic-v1-origin-a';const retained=await seed('quota',1,current.fixture,1,1,0);
+  await admitRetainedV1(retained,retainedNamespace);
+  const scope=(await loadTypedV1AnalysisScope(source(),current.fixture.participantId))!;
+  expect(scope.origins.map(origin=>origin.sourceNamespace)).toEqual([retainedNamespace,namespace]);
+  const originBindings=scope.origins.flatMap(origin=>[origin.sourceNamespace,origin.typedOwnerId]);
+  const plans=await Promise.all([
+   source().prepare(`EXPLAIN QUERY PLAN ${typedV1MultiPlanPageSql(scope.origins.length)}`)
+    .bind(Date.parse(`${day()}T00:00:00.000Z`),'',0,1,8_640_000_000_000_001,...originBindings).all<{detail:string}>(),
+   source().prepare(`EXPLAIN QUERY PLAN ${typedV1MultiFitPageSql(scope.origins.length)}`)
+    .bind(2,Date.parse(`${day()}T13:00:00.000Z`),Date.parse(`${day()}T00:00:00.000Z`),'',0,1,...originBindings)
+    .all<{detail:string}>(),
+   source().prepare(`EXPLAIN QUERY PLAN ${typedV1MultiUsagePageSql(scope.origins.length)}`)
+    .bind('[]',Date.parse(`${day()}T00:00:00.000Z`),'',0,1,8_640_000_000_000_001,...originBindings).all<{detail:string}>(),
+  ]);
+  for(const plan of plans)expect(plan.results.some(row=>row.detail.includes('MATERIALIZE typed_v1_current_records'))).toBe(false);
+  expect(plans[0].results.filter(row=>row.detail.includes('SEARCH r USING')&&row.detail.includes('typed_v1_owner_observed')))
+   .toHaveLength(scope.origins.length);
+  expect(plans[1].results.filter(row=>row.detail.includes('SEARCH q USING INDEX typed_v1_quota_reset')))
+   .toHaveLength(scope.origins.length);
+  expect(plans[2].results.filter(row=>row.detail.includes('SEARCH base USING')&&row.detail.includes('typed_v1_owner_observed')))
+   .toHaveLength(scope.origins.length);
+  const reader=createTypedV1QuotaPageReader(source(),scope);
+  expect(reader.cursorVersion).toBe(V1_ORIGIN_CURSOR_VERSION);
+  const initial={cursorVersion:V1_ORIGIN_CURSOR_VERSION,sourceNamespace:'',observedAt:`${day()}T00:00:00.000Z`,id:0} as const;
+  const first=await reader.readPlanPage(initial,1);
+  expect(first).toMatchObject([{id:1,source_namespace:retainedNamespace}]);
+  const second=await reader.readPlanPage({...initial,observedAt:first[0]!.observed_at,
+    sourceNamespace:first[0]!.source_namespace!,id:first[0]!.id},1);
+  expect(second).toMatchObject([{id:1,source_namespace:namespace}]);
+  const fitInitial={cursorVersion:V1_ORIGIN_CURSOR_VERSION,sourceNamespace:'',resetsAt:'1970-01-01T00:00:00.000Z',
+    observedAt:'',id:0} as const;
+  const fitFirst=await reader.readFitPage(fitInitial,1);
+  expect(fitFirst).toMatchObject([{id:1,source_namespace:retainedNamespace}]);
+  const fitSecond=await reader.readFitPage({...fitInitial,resetsAt:fitFirst[0]!.resets_at,
+    observedAt:fitFirst[0]!.observed_at,sourceNamespace:fitFirst[0]!.source_namespace!,id:fitFirst[0]!.id},1);
+  expect(fitSecond).toMatchObject([{id:1,source_namespace:namespace}]);
+ expect((await source().prepare(`SELECT source_namespace,source_row_id FROM typed_v1_current_records
+    WHERE participant_id=? ORDER BY source_namespace COLLATE BINARY`).bind(current.fixture.participantId).all()).results)
+    .toEqual([{source_namespace:retainedNamespace,source_row_id:1},{source_namespace:namespace,source_row_id:1}]);
+ });
+ it('drains colliding usage row IDs from two origins exactly once',async()=>{
+  const current=await seed('usage',1,undefined,1,0,100);await insertTypedTelemetryV1Chunk(source(),current.insert,namespace);
+  const retainedNamespace='synthetic-v1-origin-a';const retained=await seed('usage',1,current.fixture,1,1,0);
+  await admitRetainedV1(retained,retainedNamespace);
+  const scope=(await loadTypedV1AnalysisScope(source(),current.fixture.participantId))!;
+  const pin=await loadV1SourcePin(source(),{participantId:current.fixture.participantId});
+  const first=await readV1UsagePage(source(),pin.winnersJson,current.fixture.participantId,`${day()}T00:00:00.000Z`,0,1,
+    undefined,scope,'');
+  expect(first).toMatchObject([{id:1,source_namespace:retainedNamespace}]);
+  const second=await readV1UsagePage(source(),pin.winnersJson,current.fixture.participantId,first[0]!.observed_at,first[0]!.id,1,
+    undefined,scope,first[0]!.source_namespace);
+  expect(second).toMatchObject([{id:1,source_namespace:namespace}]);
+  const done=await readV1UsagePage(source(),pin.winnersJson,current.fixture.participantId,second[0]!.observed_at,second[0]!.id,1,
+    undefined,scope,second[0]!.source_namespace);
+  expect(done).toEqual([]);
+  expect(new Set([...first,...second].map(row=>row.occurrence_id)).size).toBe(2);
+ });
  it('drains time and reset ties with original IDs, exact floats and original ISO reset ordering',async()=>{
   const f=await pair();const records=[quota(0,'+010000-01-01T00:00:00.000Z'),quota(1,'-000001-01-01T00:00:00.000Z'),...Array.from({length:8},(_,i)=>quota(i+2))];
   await both(f,records,'quota');const t=await createV1QuotaPageReader(source(),f.typed.participantId),r=await createV1QuotaPageReader(raw(),f.original.participantId);

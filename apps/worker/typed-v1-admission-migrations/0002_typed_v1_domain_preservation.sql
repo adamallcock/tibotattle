@@ -6,14 +6,14 @@ DROP TRIGGER typed_v1_v11_transition_unqualified;
 CREATE TRIGGER typed_v1_v11_transition_unqualified BEFORE INSERT ON telemetry_v11_domains
 WHEN EXISTS(SELECT 1 FROM typed_v1_admission_state)
 BEGIN
- SELECT CASE WHEN NOT EXISTS(
+ SELECT (CASE WHEN NOT EXISTS(
   SELECT 1 FROM typed_v1_admission_state a JOIN typed_v11_admission_state b
    ON b.namespace_id=a.namespace_id AND b.source_namespace=a.source_namespace
   WHERE a.id=1 AND b.id=1 AND a.runtime_contract_version=1 AND b.runtime_contract_version=1
- ) THEN RAISE(ABORT,'telemetry_domain_compatibility_unproven') END;
+ ) THEN RAISE(ABORT,'telemetry_domain_compatibility_unproven') END);
  -- Refuse a partially admitted current winner before proving its rows. The
  -- header count is authoritative, so an absent mapping cannot look like zero.
- SELECT CASE WHEN EXISTS(
+ SELECT (CASE WHEN EXISTS(
   SELECT 1 FROM telemetry_v1_chunks c JOIN telemetry_v11_domain_predecessors x
    ON x.token_hash=NEW.predecessor_token_hash
   WHERE c.participant_id=NEW.participant_id AND c.superseded_at IS NULL
@@ -24,8 +24,8 @@ BEGIN
     OR c.record_count!=(SELECT count(*) FROM typed_v1_record_admissions p WHERE p.chunk_id=c.id)
     OR NOT EXISTS(SELECT 1 FROM typed_v1_event_sources e WHERE e.chunk_id=c.id AND e.participant_id=c.participant_id
       AND e.source_namespace=(SELECT source_namespace FROM typed_v1_admission_state)))
- ) THEN RAISE(ABORT,'telemetry_domain_compatibility_unproven') END;
- SELECT CASE WHEN EXISTS(
+ ) THEN RAISE(ABORT,'telemetry_domain_compatibility_unproven') END);
+ SELECT (CASE WHEN EXISTS(
   WITH candidate_days AS MATERIALIZED (
    SELECT json_extract(e.value,'$.day') day,json_extract(e.value,'$.manifestId') manifest_id
    FROM json_each(NEW.days_json) e
@@ -47,5 +47,5 @@ BEGIN
     OR NOT EXISTS(SELECT 1 FROM typed_v11_record_admissions successor
      WHERE successor.manifest_id=candidate.manifest_id AND successor.stream=c.stream
       AND successor.legacy_occurrence_id=old_row.occurrence_id AND successor.legacy_digest=r.canonical_digest))
- ) THEN RAISE(ABORT,'telemetry_domain_compatibility_unproven') END;
+ ) THEN RAISE(ABORT,'telemetry_domain_compatibility_unproven') END);
 END;

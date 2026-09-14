@@ -556,7 +556,7 @@ test("deployment CLI captures the current clean candidate when no candidate over
   assert.equal(journal.state.outcome, "verified");
 });
 
-test("dependency digest ignores only root Wrangler runtime state", async (t) => {
+test("dependency digest ignores only approved root tooling runtime state", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-dependency-digest-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const installedPackage = join(root, "installed-package");
@@ -571,23 +571,42 @@ test("dependency digest ignores only root Wrangler runtime state", async (t) => 
   );
   await mkdir(join(root, ".mf"), { recursive: true });
   await writeFile(join(root, ".mf", "cf.json"), '{"runtime":"local"}\n');
+  await mkdir(join(root, ".vite", "vitest"), { recursive: true });
+  await writeFile(join(root, ".vite", "vitest", "results.json"), '{"tests":"cached"}\n');
+  await mkdir(join(root, ".vite-temp"), { recursive: true });
+  await writeFile(join(root, ".vite-temp", "config.mjs"), "export default {};\n");
   assert.equal(await dependencyTreeDigest(root), installedDigest);
 
   await writeFile(
     join(root, ".cache", "wrangler", "wrangler-account.json"),
     '{"account":"refreshed-cache"}\n',
   );
+  await writeFile(join(root, ".vite", "vitest", "results.json"), '{"tests":"refreshed"}\n');
+  await writeFile(join(root, ".vite-temp", "config.mjs"), "export default { refreshed: true };\n");
   assert.equal(await dependencyTreeDigest(root), installedDigest);
 
-  // The exception is root-scoped. Package content, including a nested path
-  // with the same name as a runtime cache, remains integrity-bound.
-  await mkdir(join(installedPackage, ".cache"), { recursive: true });
-  await writeFile(join(installedPackage, ".cache", "package-state"), "bound\n");
+  // The exception is root-scoped. Package content, including nested paths
+  // with the same names as runtime caches, remains integrity-bound.
+  for (const name of [".cache", ".mf", ".vite", ".vite-temp"]) {
+    await mkdir(join(installedPackage, name), { recursive: true });
+    await writeFile(join(installedPackage, name, "package-state"), `${name}:bound\n`);
+  }
   const nestedCacheDigest = await dependencyTreeDigest(root);
   assert.notEqual(nestedCacheDigest, installedDigest);
 
   await writeFile(join(installedPackage, "index.js"), "export const value = 2;\n");
-  assert.notEqual(await dependencyTreeDigest(root), nestedCacheDigest);
+  const changedPackageDigest = await dependencyTreeDigest(root);
+  assert.notEqual(changedPackageDigest, nestedCacheDigest);
+
+  const targets = join(root, "targets");
+  await mkdir(join(targets, "first"), { recursive: true });
+  await mkdir(join(targets, "second"), { recursive: true });
+  const linkedPackage = join(root, "linked-package");
+  await symlink("targets/first", linkedPackage);
+  const firstLinkDigest = await dependencyTreeDigest(root);
+  await rm(linkedPackage);
+  await symlink("targets/second", linkedPackage);
+  assert.notEqual(await dependencyTreeDigest(root), firstLinkDigest);
 });
 
 // Re-pin: this end-to-end path previously required an injected containment
@@ -1376,6 +1395,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     "USAGE_MONITOR_DB:0058_accountless_upload_ownership.sql",
     "USAGE_MONITOR_DB:0059_accountless_upload_renewal.sql",
     "USAGE_MONITOR_DB:0060_public_contribution_sources.sql",
+    "USAGE_MONITOR_DB:0061_owner_move_authority_seed.sql",
   ];
   const ledgerRows = (names) => names.map((name, index) => ({ id: index + 1, name }));
   const historicalPrefix = expected.USAGE_MONITOR_DB.slice(0, 41);
@@ -1453,7 +1473,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     [...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"],
     [...expected.USAGE_MONITOR_DB.slice(0, 47), "0048_unreviewed_model_history.sql"],
     [...expected.USAGE_MONITOR_DB.slice(0, 48), "0049_unreviewed_graph_preservation.sql"],
-    ...[50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60].map(number => [...expected.USAGE_MONITOR_DB.slice(0, number - 1),
+    ...[50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61].map(number => [...expected.USAGE_MONITOR_DB.slice(0, number - 1),
       `${String(number).padStart(4, "0")}_unreviewed.sql`]),
   ]) {
     const index = applied.findIndex((name, item) => name !== expected.USAGE_MONITOR_DB[item]);
@@ -1463,7 +1483,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 60,
+        localCount: 61,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });
@@ -1484,7 +1504,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 60,
+        localCount: 61,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });

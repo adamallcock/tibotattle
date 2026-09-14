@@ -46,12 +46,12 @@ BEGIN
 END;
 CREATE TRIGGER storage_v11_head_request_apply AFTER INSERT ON storage_v11_head_requests
 BEGIN
-  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM telemetry_v11_domain_heads h
+  SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM telemetry_v11_domain_heads h
     JOIN telemetry_v11_domains d ON d.id=h.generation_id AND d.participant_id=h.participant_id
     JOIN community_public_source_owners p ON p.participant_id=h.participant_id
       AND (p.device_id IS NULL OR p.device_id=d.device_id)
     WHERE h.participant_id=NEW.participant_id AND h.generation_id=NEW.generation_id AND h.revision=NEW.head_revision)
-    THEN RAISE(ABORT,'storage_v11_head_ineligible') END;
+    THEN RAISE(ABORT,'storage_v11_head_ineligible') END);
   INSERT INTO storage_v11_owner_links(participant_id,owner_digest,state)
     VALUES(NEW.participant_id,lower(hex(randomblob(32))),'active') ON CONFLICT(participant_id) DO NOTHING;
   INSERT INTO storage_v11_event_sources(event_digest,owner_digest,participant_id,device_id,generation_id,

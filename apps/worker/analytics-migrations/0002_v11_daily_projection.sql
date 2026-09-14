@@ -30,12 +30,12 @@ CREATE TABLE analytics_v11_projection_steps (
 ) STRICT, WITHOUT ROWID;
 CREATE TRIGGER analytics_v11_step_validate BEFORE INSERT ON analytics_v11_projection_steps
 BEGIN
-  SELECT CASE WHEN NEW.revision != COALESCE((SELECT revision+1 FROM analytics_v11_projection_work
+  SELECT (CASE WHEN NEW.revision != COALESCE((SELECT revision+1 FROM analytics_v11_projection_work
     WHERE source_id=NEW.source_id AND event_digest=NEW.event_digest AND phase='building'),-1)
-    THEN RAISE(ABORT,'analytics_v11_step_conflict') END;
-  SELECT CASE WHEN EXISTS(SELECT 1 FROM analytics_applied_events
+    THEN RAISE(ABORT,'analytics_v11_step_conflict') END);
+  SELECT (CASE WHEN EXISTS(SELECT 1 FROM analytics_applied_events
     WHERE source_id=NEW.source_id AND event_digest=NEW.event_digest)
-    THEN RAISE(ABORT,'analytics_v11_event_already_applied') END;
+    THEN RAISE(ABORT,'analytics_v11_event_already_applied') END);
 END;
 
 CREATE TABLE analytics_v11_day_values (
@@ -60,20 +60,20 @@ CREATE TABLE analytics_v11_owner_heads (
 ) STRICT, WITHOUT ROWID;
 CREATE TRIGGER analytics_v11_head_ready BEFORE INSERT ON analytics_v11_owner_heads
 BEGIN
-  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w
+  SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w
     JOIN analytics_applied_events e ON e.source_id=w.source_id AND e.event_digest=w.event_digest
     WHERE w.source_id=NEW.source_id AND w.event_digest=NEW.event_digest
       AND w.owner_digest=NEW.owner_digest AND w.phase='ready' AND e.sequence=NEW.sequence)
-    THEN RAISE(ABORT,'analytics_v11_generation_unready') END;
+    THEN RAISE(ABORT,'analytics_v11_generation_unready') END);
 END;
 CREATE TRIGGER analytics_v11_head_update_ready BEFORE UPDATE ON analytics_v11_owner_heads
 BEGIN
-  SELECT CASE WHEN NEW.source_id IS NOT OLD.source_id OR NEW.owner_digest IS NOT OLD.owner_digest
+  SELECT (CASE WHEN NEW.source_id IS NOT OLD.source_id OR NEW.owner_digest IS NOT OLD.owner_digest
     OR NEW.sequence<=OLD.sequence OR NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w
     JOIN analytics_applied_events e ON e.source_id=w.source_id AND e.event_digest=w.event_digest
     WHERE w.source_id=NEW.source_id AND w.event_digest=NEW.event_digest
       AND w.owner_digest=NEW.owner_digest AND w.phase='ready' AND e.sequence=NEW.sequence)
-    THEN RAISE(ABORT,'analytics_v11_generation_unready') END;
+    THEN RAISE(ABORT,'analytics_v11_generation_unready') END);
 END;
 
 -- An obsolete source is explicitly discarded, never labelled projected. These

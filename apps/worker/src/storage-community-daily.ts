@@ -16,7 +16,7 @@ import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuth
 export interface StorageCommunityDailyBindings {
   source: D1Database; target: D1Database; sourceId: string; sourceNamespace: string;
 }
-const METHOD = `${V11_DAILY_VALUES_SCHEMA}:${COMMUNITY_DAILY_SPEND_PRICING_METHOD}:${COMMUNITY_DAILY_SPEND_REGISTRY_SHA256}`;
+export const STORAGE_COMMUNITY_DAILY_METHOD = `${V11_DAILY_VALUES_SCHEMA}:${COMMUNITY_DAILY_SPEND_PRICING_METHOD}:${COMMUNITY_DAILY_SPEND_REGISTRY_SHA256}`;
 // A metadata/value payload limit, not a participant admission policy. Larger
 // cohorts remain explicitly deferred; they never publish a prefix as a total.
 export const STORAGE_DAILY_CAPTURE_BYTES = 2 * 1024 * 1024;
@@ -42,7 +42,7 @@ interface OwnerCache {
 }
 function current(row: OwnerCache|undefined, owner: StorageCommunityOwner): row is OwnerCache {
   return row !== undefined && row.input_revision === owner.inputRevision && row.owner_revision === owner.ownerRevision
-    && row.source_format === (owner.hasV11 ? 'v11':'v1') && row.method === METHOD;
+    && row.source_format === (owner.hasV11 ? 'v11':'v1') && row.method === STORAGE_COMMUNITY_DAILY_METHOD;
 }
 function member(owner: StorageCommunityOwner) {
   return {ownerDigest:owner.ownerDigest,inputRevision:owner.inputRevision,ownerRevision:owner.ownerRevision,
@@ -111,7 +111,7 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
       method=excluded.method,progress_revision=excluded.progress_revision,next_index=excluded.next_index,
       fingerprint=excluded.fingerprint,complete=excluded.complete,values_json=excluded.values_json
     WHERE analytics_community_daily_owners.progress_revision=?`).bind(sourceId,observedDay,ownerDigest,
-      owner.inputRevision,owner.ownerRevision,owner.hasV11?'v11':'v1',METHOD,progress+1,nextIndex,fingerprint,complete?1:0,valuesJson,progress);
+      owner.inputRevision,owner.ownerRevision,owner.hasV11?'v11':'v1',STORAGE_COMMUNITY_DAILY_METHOD,progress+1,nextIndex,fingerprint,complete?1:0,valuesJson,progress);
   try { await statement.run(); } catch { /* Only exact readback acknowledges a lost response or concurrent writer. */ }
   const receipt=await target.prepare(`SELECT * FROM analytics_community_daily_owners WHERE source_id=? AND day=? AND owner_digest=?`)
     .bind(sourceId,observedDay,ownerDigest).first<OwnerCache>();
@@ -120,7 +120,7 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
     && receipt.values_json===valuesJson ? 'advanced':'deferred';
 }
 
-function publicInputs(values: V11DailyProjectionValues[]) {
+export function buildStorageCommunityDailyPublicInputs(values: V11DailyProjectionValues[]) {
   const totals: DailyTotalsRow={contributing_participants:0,contributing_devices:0,usage_events:0,quota_observations:0,
     session_dimensions:0,input_uncached_tokens:0,input_cache_read_tokens:0,input_cache_write_tokens:0,
     output_text_tokens:0,output_reasoning_tokens:0,output_combined_tokens:0};
@@ -238,12 +238,12 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   for(const row of rows){if(!current(row,byOwner.get(row.owner_digest)!)||row.complete!==1)return deferred('projection_pending',ownersAdvanced);
     if(typeof row.values_json!=='string')return deferred('capacity',ownersAdvanced);
     bytes+=byteLength(row.values_json);if(bytes>STORAGE_DAILY_CAPTURE_BYTES)return deferred('capacity',ownersAdvanced);}
-  const cohortDigest=await sha256Hex(canonicalJson({members:requested,method:METHOD,
+  const cohortDigest=await sha256Hex(canonicalJson({members:requested,method:STORAGE_COMMUNITY_DAILY_METHOD,
     authority:{...authority,sourceEpoch:0,sequence:0}}));
   const nowMs=options.nowMs??Date.now();if(!Number.isFinite(nowMs))throw unavailable();
   const revision=(previous?.revision??0)+1,releasedAt=new Date(nowMs).toISOString();
   const payload=buildCommunityDailyPayload({day:options.day,revision,releasedAt,
-    ...publicInputs(rows.map(row=>JSON.parse(row.values_json) as V11DailyProjectionValues))});
+    ...buildStorageCommunityDailyPublicInputs(rows.map(row=>JSON.parse(row.values_json) as V11DailyProjectionValues))});
   const payloadJson=canonicalJson(payload),payloadHash=await sha256Hex(payloadJson);
   // Source metadata is reread after all target data. A changed member, policy,
   // revocation or collection revision cannot authorize this publication.
@@ -261,7 +261,7 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
       WHERE c.owner_digest IS NULL OR c.input_revision!=json_extract(m.value,'$.inputRevision')
        OR c.owner_revision!=json_extract(m.value,'$.ownerRevision') OR c.complete!=1 OR c.method!=?)`)
     .bind(sourceId,options.day,revision,cohortDigest,canonicalJson(authority),payloadJson,payloadHash,releasedAt,unchanged?1:0,
-      sourceId,options.day,revision,requestJson,sourceId,options.day,METHOD);
+      sourceId,options.day,revision,requestJson,sourceId,options.day,STORAGE_COMMUNITY_DAILY_METHOD);
   try {await target.batch([commit,target.prepare(`DELETE FROM analytics_community_daily_queue
     WHERE source_id=? AND day=? AND revision=? AND EXISTS(SELECT 1 FROM analytics_community_daily_publications
       WHERE source_id=? AND day=? AND cohort_digest=?)`).bind(sourceId,options.day,queueRevision,sourceId,options.day,cohortDigest)]);}catch{

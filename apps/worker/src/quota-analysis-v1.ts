@@ -199,6 +199,8 @@ interface PlanEvidenceRow {
 
 export interface WindowedUsageRow {
   id: number;
+  /** Immutable provenance key used only by the multi-origin typed cursor. */
+  source_namespace?: string;
   occurrence_id: string;
   observed_at: string;
   provider: string;
@@ -910,9 +912,10 @@ export async function readV1UsagePage(
   cursorObservedAt: string, cursorId: number, pageSize: number,
   observedAtBefore?: string,
   selectedLayout?:TypedV1AnalysisScope|null,
+  cursorSourceNamespace = "",
 ): Promise<WindowedUsageRow[]> {
   const typed=selectedLayout===undefined?await loadTypedV1AnalysisScope(db,participantId):selectedLayout;
-  if(typed)return readTypedV1UsageAnalysisPage(db,typed,winnersJson,cursorObservedAt,cursorId,pageSize,observedAtBefore);
+  if(typed)return readTypedV1UsageAnalysisPage(db,typed,winnersJson,cursorObservedAt,cursorId,pageSize,observedAtBefore,cursorSourceNamespace);
   if (observedAtBefore !== undefined) {
     const sameTime = await db.prepare(V1_HISTORY_USAGE_PAGE_AT_TIME_SQL)
       .bind(winnersJson, participantId, cursorObservedAt, cursorId, observedAtBefore, pageSize).all<WindowedUsageRow>();
@@ -1197,10 +1200,12 @@ async function readAndBucketUsage(
   let total = 0;
   let cursorObs = observedAtCutoff;
   let cursorId = 0;
+  let cursorSourceNamespace = "";
   for (;;) {
     const rows = preparedUsage
       ? await preparedUsage.readPage(cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore)
-      : await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore,selectedLayout);
+      : await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE,
+        observedAtBefore,selectedLayout,cursorSourceNamespace);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) {
@@ -1278,6 +1283,7 @@ async function readAndBucketUsage(
     const last = rows[rows.length - 1]!;
     cursorObs = last.observed_at;
     cursorId = last.id;
+    cursorSourceNamespace = last.source_namespace ?? "";
   }
   flushFirst();
   sessions.clear();
@@ -2182,9 +2188,10 @@ async function analyzeAccountScopedModelCompositionV1(
   // an unrelated provider cannot have debited this pool.
   const accumulator = createCompositionUsageAccumulator(quotaProviders, compositionQuotaBins(quotaRows.map(row => row.observedAtMs)));
   const selectedLayout=await loadTypedV1AnalysisScope(db,participantId);
-  let total = 0, cursorObs = observedAtCutoff, cursorId = 0;
+  let total = 0, cursorObs = observedAtCutoff, cursorId = 0, cursorSourceNamespace = "";
   for (;;) {
-    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE,history?.observedAtBefore,selectedLayout);
+    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE,
+      history?.observedAtBefore,selectedLayout,cursorSourceNamespace);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) return { status: "not_testable", reason: "windowed_usage_limit_exceeded" };
@@ -2196,7 +2203,7 @@ async function analyzeAccountScopedModelCompositionV1(
     }
     if (rows.length < USAGE_PAGE_SIZE) break;
     const last = rows[rows.length - 1]!;
-    cursorObs = last.observed_at; cursorId = last.id;
+    cursorObs = last.observed_at; cursorId = last.id; cursorSourceNamespace = last.source_namespace ?? "";
   }
   const folded = accumulator.finish();
   if (folded.status === "not_testable") return folded;

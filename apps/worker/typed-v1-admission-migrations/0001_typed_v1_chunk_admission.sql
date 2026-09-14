@@ -42,9 +42,9 @@ CREATE INDEX typed_v1_events_owner ON typed_v1_event_sources(participant_id,chun
 CREATE TRIGGER typed_v1_initialize_empty BEFORE INSERT ON typed_v1_admission_state
 WHEN NOT EXISTS(SELECT 1 FROM typed_v1_admission_state)
 BEGIN
- SELECT CASE WHEN NEW.runtime_contract_version!=0 OR NEW.next_source_row_id!=1 OR EXISTS(SELECT 1 FROM telemetry_v1_chunks)
+ SELECT (CASE WHEN NEW.runtime_contract_version!=0 OR NEW.next_source_row_id!=1 OR EXISTS(SELECT 1 FROM telemetry_v1_chunks)
  OR EXISTS(SELECT 1 FROM telemetry_v1_records) OR EXISTS(SELECT 1 FROM typed_telemetry_records WHERE format=10)
- THEN RAISE(ABORT,'typed_v1_unqualified_history') END;
+ THEN RAISE(ABORT,'typed_v1_unqualified_history') END);
 END;
 CREATE TRIGGER typed_v1_state_guard BEFORE UPDATE ON typed_v1_admission_state
 WHEN NEW.id IS NOT OLD.id OR NEW.source_namespace IS NOT OLD.source_namespace OR NEW.namespace_id IS NOT OLD.namespace_id
@@ -60,13 +60,13 @@ BEGIN SELECT RAISE(ABORT,'typed_v1_allocator_conflict'); END;
 CREATE TRIGGER typed_v1_state_retained BEFORE DELETE ON typed_v1_admission_state
 BEGIN SELECT RAISE(ABORT,'typed_v1_state_retained'); END;
 CREATE TRIGGER typed_v1_allocation_guard BEFORE INSERT ON typed_v1_chunk_allocations
-BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM typed_v1_admission_state s JOIN telemetry_v1_chunks c ON c.id=NEW.chunk_id
+BEGIN SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM typed_v1_admission_state s JOIN telemetry_v1_chunks c ON c.id=NEW.chunk_id
  WHERE s.namespace_id=NEW.namespace_id AND s.next_source_row_id=NEW.first_source_row_id AND c.record_count=NEW.record_count
- AND c.superseded_at IS NULL) THEN RAISE(ABORT,'typed_v1_allocator_conflict') END; END;
+ AND c.superseded_at IS NULL) THEN RAISE(ABORT,'typed_v1_allocator_conflict') END); END;
 CREATE TRIGGER typed_v1_allocation_advance AFTER INSERT ON typed_v1_chunk_allocations
 BEGIN UPDATE typed_v1_admission_state SET next_source_row_id=NEW.first_source_row_id+NEW.record_count
  WHERE id=1 AND namespace_id=NEW.namespace_id AND next_source_row_id=NEW.first_source_row_id;
- SELECT CASE WHEN changes()!=1 THEN RAISE(ABORT,'typed_v1_allocator_conflict') END; END;
+ SELECT (CASE WHEN changes()!=1 THEN RAISE(ABORT,'typed_v1_allocator_conflict') END); END;
 CREATE TRIGGER typed_v1_allocation_immutable BEFORE UPDATE ON typed_v1_chunk_allocations
 BEGIN SELECT RAISE(ABORT,'typed_v1_immutable'); END;
 CREATE TRIGGER typed_v1_no_json BEFORE INSERT ON telemetry_v1_records
@@ -74,12 +74,12 @@ WHEN EXISTS(SELECT 1 FROM typed_v1_admission_state)
 BEGIN SELECT RAISE(ABORT,'typed_v1_json_write_disabled'); END;
 CREATE TRIGGER typed_v1_allocated_row BEFORE INSERT ON typed_telemetry_records
 WHEN NEW.format=10 AND EXISTS(SELECT 1 FROM typed_v1_admission_state)
-BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM typed_v1_chunk_allocations a JOIN typed_telemetry_chunks c ON c.id=NEW.chunk_id
+BEGIN SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM typed_v1_chunk_allocations a JOIN typed_telemetry_chunks c ON c.id=NEW.chunk_id
  WHERE a.namespace_id=NEW.namespace_id AND c.namespace_id=a.namespace_id AND c.original_id=a.chunk_original
  AND NEW.source_row_id>=a.first_source_row_id AND NEW.source_row_id<a.first_source_row_id+a.record_count)
- THEN RAISE(ABORT,'typed_v1_unallocated_record') END; END;
+ THEN RAISE(ABORT,'typed_v1_unallocated_record') END); END;
 CREATE TRIGGER typed_v1_record_membership BEFORE INSERT ON typed_v1_record_admissions
-BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM typed_telemetry_compatibility_records r
+BEGIN SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM typed_telemetry_compatibility_records r
  JOIN typed_v1_chunk_allocations a ON a.chunk_id=NEW.chunk_id AND a.namespace_id=r.namespace_id
  JOIN typed_v1_admission_state s ON s.namespace_id=r.namespace_id AND s.source_namespace=r.source_namespace
  JOIN telemetry_v1_chunks c ON c.id=a.chunk_id
@@ -88,7 +88,7 @@ BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM typed_telemetry_compatibility_re
  AND r.observed_day=c.chunk_day AND r.chunk_day=c.chunk_day AND substr(r.observed_at,1,10)=c.chunk_day
  AND r.source_row_id>=a.first_source_row_id AND r.source_row_id<a.first_source_row_id+a.record_count
  AND c.superseded_at IS NULL AND (SELECT count(*) FROM typed_v1_record_admissions WHERE chunk_id=c.id)<c.record_count)
- THEN RAISE(ABORT,'typed_v1_record_membership_conflict') END; END;
+ THEN RAISE(ABORT,'typed_v1_record_membership_conflict') END); END;
 CREATE TRIGGER typed_v1_record_immutable BEFORE UPDATE ON typed_v1_record_admissions
 BEGIN SELECT RAISE(ABORT,'typed_v1_immutable'); END;
 CREATE TRIGGER typed_v1_current_record_retained BEFORE DELETE ON typed_v1_record_admissions
@@ -99,9 +99,9 @@ CREATE TRIGGER typed_v1_chunk_delete BEFORE DELETE ON telemetry_v1_chunks
 BEGIN DELETE FROM typed_telemetry_chunks WHERE format=10 AND namespace_id=(SELECT namespace_id FROM typed_v1_admission_state)
  AND original_id=(SELECT chunk_original FROM typed_v1_chunk_allocations WHERE chunk_id=OLD.id); END;
 CREATE TRIGGER typed_v1_owner_membership_guard BEFORE INSERT ON typed_v1_owner_memberships
-BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM typed_telemetry_compatibility_records r JOIN typed_v1_admission_state s ON s.namespace_id=r.namespace_id
+BEGIN SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM typed_telemetry_compatibility_records r JOIN typed_v1_admission_state s ON s.namespace_id=r.namespace_id
  WHERE r.owner_id=NEW.typed_owner_id AND r.participant_id=NEW.participant_id AND r.format_code=10)
- THEN RAISE(ABORT,'typed_v1_owner_mismatch') END; END;
+ THEN RAISE(ABORT,'typed_v1_owner_mismatch') END); END;
 CREATE TRIGGER typed_v1_owner_membership_immutable BEFORE UPDATE ON typed_v1_owner_memberships
 WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.typed_owner_id IS NOT NEW.typed_owner_id
 BEGIN SELECT RAISE(ABORT,'typed_v1_owner_mismatch'); END;
@@ -111,12 +111,12 @@ BEGIN SELECT RAISE(ABORT,'typed_v1_owner_retained'); END;
 CREATE TRIGGER typed_v1_owner_delete AFTER DELETE ON typed_v1_owner_memberships
 BEGIN DELETE FROM typed_telemetry_owners WHERE id=OLD.typed_owner_id; END;
 CREATE TRIGGER typed_v1_event_guard BEFORE INSERT ON typed_v1_event_sources
-BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM telemetry_v1_chunks c
+BEGIN SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM telemetry_v1_chunks c
  JOIN typed_v1_admission_state s ON s.source_namespace=NEW.source_namespace
  JOIN storage_v11_owner_links l ON l.participant_id=c.participant_id AND l.owner_digest=NEW.owner_digest AND l.state!='erased'
  WHERE c.id=NEW.chunk_id AND c.participant_id=NEW.participant_id AND c.superseded_at IS NULL
  AND c.accepted_record_count=c.record_count AND c.record_count=(SELECT count(*) FROM typed_v1_record_admissions WHERE chunk_id=c.id))
- THEN RAISE(ABORT,'typed_v1_source_incomplete') END; END;
+ THEN RAISE(ABORT,'typed_v1_source_incomplete') END); END;
 CREATE TRIGGER typed_v1_event_publish AFTER INSERT ON typed_v1_event_sources
 BEGIN
  INSERT INTO storage_ingestion_changes(event_digest,owner_digest,revision,kind,object_digest,content_digest,authority_epoch,public_authority_epoch,recorded_ms)
@@ -154,7 +154,7 @@ BEGIN SELECT RAISE(ABORT,'typed_v1_current_record_retained'); END;
 -- preservation marker can be absent; it is never an admission substitute.
 CREATE TRIGGER typed_v1_header_authority BEFORE INSERT ON telemetry_v1_chunks
 WHEN EXISTS(SELECT 1 FROM typed_v1_admission_state)
-BEGIN SELECT CASE WHEN NOT EXISTS(
+BEGIN SELECT (CASE WHEN NOT EXISTS(
  SELECT 1 FROM participants p JOIN device_credentials d ON d.participant_id=p.id
  JOIN device_upload_authorizations a ON a.participant_id=p.id AND a.issued_by_device_id=d.id
  JOIN telemetry_v1_device_consents c ON c.participant_id=p.id AND c.device_id=d.id
@@ -166,14 +166,14 @@ BEGIN SELECT CASE WHEN NOT EXISTS(
  AND a.consume_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') AND a.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
  AND c.telemetry_schema_version='telemetry-contribution-v1.0' AND c.field_dictionary_version='telemetry-v1.0-registry-2026-08-07.1'
  AND c.privacy_contract_version='ongoing-privacy-safe-telemetry-v1.0')
- THEN RAISE(ABORT,'upload unavailable') END; END;
+ THEN RAISE(ABORT,'upload unavailable') END); END;
 -- The original scoped marker pins the exact prior slot/revision and live upload
 -- before correction. If that prior changes during preparation, no rows retire.
 CREATE TRIGGER typed_v1_supersession_guard BEFORE UPDATE OF superseded_at ON telemetry_v1_chunks
 WHEN EXISTS(SELECT 1 FROM typed_v1_admission_state) AND OLD.superseded_at IS NOT NEW.superseded_at
-BEGIN SELECT CASE WHEN OLD.superseded_at IS NOT NULL OR NEW.superseded_at IS NULL OR NOT EXISTS(
+BEGIN SELECT (CASE WHEN OLD.superseded_at IS NOT NULL OR NEW.superseded_at IS NULL OR NOT EXISTS(
  SELECT 1 FROM community_graph_update_scope s WHERE s.old_chunk_id=OLD.id AND s.phase='supersede'
  AND s.participant_id=OLD.participant_id AND s.device_id=OLD.device_id AND s.stream=OLD.stream
  AND s.chunk_day=OLD.chunk_day AND s.chunk_seq=OLD.chunk_seq AND s.new_revision=OLD.revision+1
  AND s.created_at=NEW.superseded_at)
- THEN RAISE(ABORT,'typed_v1_supersession_conflict') END; END;
+ THEN RAISE(ABORT,'typed_v1_supersession_conflict') END); END;

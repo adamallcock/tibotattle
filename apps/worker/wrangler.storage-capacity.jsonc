@@ -1,0 +1,40 @@
+// Local synthetic role only. No hosted IDs, routes, credentials or enabled schedule.
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tibotattle-synthetic-storage-capacity",
+  "main": "src/storage-capacity-worker.ts",
+  "compatibility_date": "2026-07-26",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": false,
+  "preview_urls": false,
+  "triggers": {
+    "crons": []
+  },
+  "vars": {
+    "STORAGE_CAPACITY_MODE": "disabled"
+  },
+  "d1_databases": [
+    {
+      "binding": "STORAGE_ROUTING_DB",
+      "database_name": "synthetic-storage-routing-db",
+      "database_id": "00000000-0000-0000-0000-000000000002"
+    },
+    {
+      "binding": "STORAGE_INGESTION_A",
+      "database_name": "synthetic-storage-ingestion-a",
+      "database_id": "00000000-0000-0000-0000-000000000003"
+    },
+    {
+      "binding": "STORAGE_INGESTION_B",
+      "database_name": "synthetic-storage-ingestion-b",
+      "database_id": "00000000-0000-0000-0000-000000000004"
+    },
+    {
+      "binding": "STORAGE_INGESTION_C",
+      "database_name": "synthetic-storage-ingestion-c",
+      "database_id": "00000000-0000-0000-0000-000000000005"
+    }
+  ]
+}

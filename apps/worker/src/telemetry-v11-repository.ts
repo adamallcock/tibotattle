@@ -23,6 +23,8 @@ import {
   assertTelemetryTransportWriteAllowed,
   type TelemetryTransportPrincipal,
 } from "./telemetry-transport-policy";
+import { ownerWriteFenceStatement } from "./storage-routing-fence";
+import type { OwnerStorageRoute } from "./storage-routing";
 
 export interface TelemetryV11DayCandidate {
   manifestId: string;
@@ -91,6 +93,7 @@ async function manifestByDigest(
 
 export async function registerTelemetryV11DayManifest(
   db: D1Database, principal: TelemetryTransportPrincipal, value: unknown, nowEpoch = Date.now(),
+  ownerRoute?: OwnerStorageRoute,
 ): Promise<TelemetryV11DayCandidate> {
   const manifest = manifestSnapshot(value);
   const canonical = canonicalTelemetryV11Json(manifest);
@@ -107,6 +110,9 @@ export async function registerTelemetryV11DayManifest(
   const now = new Date(nowEpoch).toISOString();
   try {
     await db.batch([
+      ...(ownerRoute?.mode === "catalog"
+        ? [ownerWriteFenceStatement(db, ownerRoute)]
+        : []),
       db.prepare(
         `INSERT INTO telemetry_v11_day_manifests (
           id, participant_id, device_id, chunk_day, manifest_digest, parser_version,
@@ -350,7 +356,7 @@ export async function* telemetryV11ExportEntries(
       .first<ChunkRow>();
     if (!row) break;
     const stored = typedNamespace ? { results: await readTypedV11ChunkRecords(db, {
-      sourceNamespace: typedNamespace, participantId, chunkId: row.id, expectedCount: row.record_count,
+      participantId, chunkId: row.id, expectedCount: row.record_count,
     }) } : await db.prepare(
       "SELECT record_json FROM telemetry_v11_records WHERE chunk_id = ? ORDER BY observed_at, occurrence_id LIMIT 201",
     ).bind(row.id).all<{ record_json: string }>();

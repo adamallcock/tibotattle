@@ -7,6 +7,7 @@ import { canonicalTelemetryV11Json } from '@app-usagemonitor/telemetry-contract'
 import { insertTelemetryV1Chunk } from '../src/telemetry-v1-repository';
 import { parseTelemetryV1Chunk } from '../src/telemetry-v1';
 import { AUTHORITY_ADMISSION_TABLES, restoreTypedAdmissionPage } from '../src/authority-restore-adoption';
+import { TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST } from '../src/typed-telemetry-origins';
 import { sha256Hex } from '../src/crypto';
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from '../src/telemetry-v11-domain';
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from '../src/device-auth';
@@ -118,13 +119,13 @@ describe('bounded native D1 adoption reads',()=>{
  it('preserves 100 mixed records, exact proof bindings, all-page counts and replay while bounding statements and calls',async()=>{
   const {f,options}=await readyForAdoption();
   const copy=measured(target());expect(await restoreTypedAdmissionPage(copy.db,options)).toEqual({done:false,records:100});
-  expect(copy.stats.roundtrips).toBe(10);expect(copy.stats.statements).toBeLessThan(130);expect(copy.stats.readBatchSizes).toEqual([2,6]);
-  expect(copy.stats.writeTransactions.map(x=>x.length)).toEqual([107]);await assertFirstPage(f);
+  expect(copy.stats.roundtrips).toBe(9);expect(copy.stats.statements).toBeLessThan(130);expect(copy.stats.readBatchSizes).toEqual([2,6]);
+  expect(copy.stats.writeTransactions.map(x=>x.length)).toEqual([109]);await assertFirstPage(f);
   expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:false,records:4});expect(await restoreTypedAdmissionPage(target(),options)).toEqual({done:true,records:0});
   const replay=measured(target());expect(await restoreTypedAdmissionPage(replay.db,options)).toEqual({done:true,records:0});expect(replay.stats.writeTransactions).toEqual([]);
   const v1={...options,format:'v1' as const},copyV1=measured(target());
   expect(await restoreTypedAdmissionPage(copyV1.db,v1)).toEqual({done:false,records:32});
-  expect(copyV1.stats).toMatchObject({statements:45,roundtrips:9,readBatchSizes:[1,2]});expect(copyV1.stats.writeTransactions.map(x=>x.length)).toEqual([36]);
+  expect(copyV1.stats).toMatchObject({statements:46,roundtrips:8,readBatchSizes:[1,2]});expect(copyV1.stats.writeTransactions.map(x=>x.length)).toEqual([38]);
   expect(await restoreTypedAdmissionPage(target(),v1)).toEqual({done:true,records:0});
   await sealAuthorityRestore(source(),target(),f.contract,f.pin);
   const verify={...options,verify:true};
@@ -145,6 +146,13 @@ describe('bounded native D1 adoption reads',()=>{
    .toEqual([{format:'v1',copied:32,verified:32,done:1,verify_done:1},{format:'v11',copied:104,verified:104,done:1,verify_done:1}]);
   expect(await source().prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')).toBe(104);
   expect(await target().prepare('SELECT count(*) n FROM typed_telemetry_records WHERE format=11').first('n')).toBe(104);
+  const restoredOrigin=await target().prepare(`SELECT source_namespace,access_mode,v1_read_contract_version,v11_read_contract_version,
+    source_schema_digest,registered_move_id FROM typed_telemetry_origin_contracts`).first();
+  expect(restoredOrigin).toEqual({source_namespace:f.contract.sourceNamespace,access_mode:'current-write',
+    v1_read_contract_version:2,v11_read_contract_version:2,
+    source_schema_digest:TYPED_TELEMETRY_ORIGIN_SCHEMA_DIGEST,registered_move_id:null});
+  expect(await target().prepare(`SELECT count(*) n FROM typed_v11_owner_memberships m JOIN typed_telemetry_owners o
+    ON o.id=m.typed_owner_id AND o.namespace_id=m.namespace_id`).first('n')).toBe(1);
   const quota=(await target().prepare('SELECT used_percent FROM typed_telemetry_quota ORDER BY used_percent').all()).results;
   expect(quota.filter(r=>r.used_percent===null)).toHaveLength(1);expect(quota.filter(r=>r.used_percent===0.30000000000000004)).toHaveLength(32);
  },30000);
@@ -251,7 +259,7 @@ describe('bounded native D1 adoption reads',()=>{
   const {f}=await readyForAdoption(200),s=measured(source()),t=measured(target());
   expect(await adoptAuthorityTypedPage(s.db,t.db,f.contract,f.pin,'v11')).toEqual({done:false,records:200});
   expect(s.stats.statements+t.stats.statements).toBeLessThanOrEqual(900);
-  expect(t.stats.readBatchSizes).toEqual([3,6]);expect(t.stats.writeTransactions[0]).toHaveLength(207);
+  expect(t.stats.readBatchSizes).toEqual([3,6]);expect(t.stats.writeTransactions[0]).toHaveLength(209);
   expect(await target().prepare("SELECT after_id,copied FROM _authority_restore_adoption WHERE format='v11'").first()).toEqual({after_id:200,copied:200});
   expect(t.stats.maxParameters).toBeLessThanOrEqual(100);
  },30000);
@@ -285,7 +293,7 @@ describe('bounded native D1 adoption reads',()=>{
 
  it('maps reordered sets exactly and refuses duplicate, foreign and wrongly typed stored-row keys',async()=>{
   const {options}=await readyForAdoption(200);
-  for(const change of ['duplicate','foreign','wrong-type','wrong-id-type','conflicting-owner']){
+  for(const change of ['duplicate','foreign','wrong-type','wrong-id-type','conflicting-owner','owner-namespace','manifest-namespace','owner-origin','manifest-origin']){
    const wrapped=measured(target(),undefined,results=>results.map(result=>{
     const sourceRows=result.results as Record<string,unknown>[];
     if(sourceRows[0]?.source_row_id===undefined)return result;
@@ -294,7 +302,11 @@ describe('bounded native D1 adoption reads',()=>{
     else if(change==='foreign')rows[0]!.source_row_id=999999;
     else if(change==='wrong-type')rows[0]!.source_row_id=String(rows[0]!.source_row_id);
     else if(change==='wrong-id-type')rows[0]!.id=String(rows[0]!.id);
-    else rows[1]!.owner_id=Number(rows[0]!.owner_id)+100;
+    else if(change==='conflicting-owner')rows[1]!.owner_id=Number(rows[0]!.owner_id)+100;
+    else if(change==='owner-namespace')rows[0]!.owner_namespace_id=Number(rows[0]!.namespace_id)+1;
+    else if(change==='manifest-namespace')rows[0]!.manifest_namespace_id=Number(rows[0]!.namespace_id)+1;
+    else if(change==='owner-origin')rows[0]!.owner_namespace_original=[0,102,111,114,101,105,103,110];
+    else rows[0]!.manifest_namespace_original=[0,102,111,114,101,105,103,110];
     return {...result,results:rows};
    }));
    await expect(restoreTypedAdmissionPage(wrapped.db,{...options,limit:200}),change).rejects.toThrow('AUTHORITY_RESTORE_ADOPTION_MISMATCH');

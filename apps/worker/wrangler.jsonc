@@ -23,6 +23,15 @@
     "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
     "TELEMETRY_STORAGE_MODE": "json",
     "TELEMETRY_STORAGE_NAMESPACE": "",
+    // Shard routing remains opt-in. This reservation is a synthetic fixture,
+    // not a production physical-growth estimate or a per-write capacity cap.
+    "STORAGE_ROUTING_MODE": "single",
+    "STORAGE_CAPACITY_MODE": "disabled",
+    "STORAGE_ANALYTICS_MODE": "disabled",
+    "STORAGE_SOURCE_NAMESPACE_A": "synthetic-a",
+    "STORAGE_SOURCE_NAMESPACE_B": "synthetic-b",
+    "STORAGE_SOURCE_NAMESPACE_C": "synthetic-c",
+    "STORAGE_NEW_OWNER_RESERVATION_BYTES": "16777216",
     // Queue ingestion is deliberately deferred: a 2 MiB envelope requires an
     // R2-pointer/consumer-receipt protocol rather than a direct Queue body.
     "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
@@ -115,6 +124,51 @@
       "database_name": "app-usagemonitor-synthetic-deletion-ledger",
       "database_id": "00000000-0000-0000-0000-000000000001",
       "migrations_dir": "deletion-ledger-migrations"
+    },
+    {
+      "binding": "STORAGE_ROUTING_DB",
+      "database_name": "app-usagemonitor-synthetic-routing",
+      "database_id": "00000000-0000-0000-0000-000000000002",
+      "migrations_dir": "routing-migrations"
+    },
+    {
+      "binding": "STORAGE_INGESTION_A",
+      "database_name": "app-usagemonitor-synthetic-ingestion-a",
+      "database_id": "00000000-0000-0000-0000-000000000003"
+    },
+    {
+      "binding": "STORAGE_INGESTION_B",
+      "database_name": "app-usagemonitor-synthetic-ingestion-b",
+      "database_id": "00000000-0000-0000-0000-000000000004"
+    },
+    {
+      "binding": "STORAGE_INGESTION_C",
+      "database_name": "app-usagemonitor-synthetic-ingestion-c",
+      "database_id": "00000000-0000-0000-0000-000000000005"
+    },
+    {
+      "binding": "STORAGE_ANALYTICS_A",
+      "database_name": "app-usagemonitor-synthetic-analytics-a",
+      "database_id": "00000000-0000-0000-0000-000000000006",
+      "migrations_dir": "analytics-migrations"
+    },
+    {
+      "binding": "STORAGE_ANALYTICS_B",
+      "database_name": "app-usagemonitor-synthetic-analytics-b",
+      "database_id": "00000000-0000-0000-0000-000000000007",
+      "migrations_dir": "analytics-migrations"
+    },
+    {
+      "binding": "STORAGE_ANALYTICS_C",
+      "database_name": "app-usagemonitor-synthetic-analytics-c",
+      "database_id": "00000000-0000-0000-0000-000000000009",
+      "migrations_dir": "analytics-migrations"
+    },
+    {
+      "binding": "STORAGE_PUBLICATION_DB",
+      "database_name": "app-usagemonitor-synthetic-publication",
+      "database_id": "00000000-0000-0000-0000-000000000008",
+      "migrations_dir": "analytics-migrations"
     }
   ],
   "r2_buckets": [

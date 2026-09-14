@@ -13,9 +13,9 @@ BEFORE INSERT ON telemetry_v11_domains
 BEGIN
   -- This local new-target adapter does not constitute a qualified raw-v1.1
   -- migration. Never ignore retained JSON evidence, even outside the new range.
-  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM typed_v11_admission_state WHERE id=1)
+  SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM typed_v11_admission_state WHERE id=1)
     OR EXISTS(SELECT 1 FROM telemetry_v11_records LIMIT 1)
-    THEN RAISE(ABORT, 'telemetry_domain_compatibility_unproven') END;
+    THEN RAISE(ABORT, 'telemetry_domain_compatibility_unproven') END);
   SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM telemetry_v11_current_predecessors x
     WHERE x.token_hash = NEW.predecessor_token_hash AND x.participant_id = NEW.participant_id

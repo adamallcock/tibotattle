@@ -140,11 +140,13 @@ export async function loadStorageQualification({ workerRoot, plan, target }) {
     for(const name of ['participants','device_credentials','upload_authorizations','accountless_enrollment_ledger',
       'telemetry_contributions','telemetry_records','telemetry_contribution_occurrences','typed_telemetry_records',
       'typed_v1_admission_state','typed_v11_record_proofs','typed_v11_manifest_memberships','telemetry_v11_domain_heads','storage_v11_owner_links',
-      'storage_legacy_event_sources','ingestion_analytics_separation','storage_v11_append_transitions'])
+      'storage_legacy_event_sources','ingestion_analytics_separation','storage_v11_append_transitions',
+      'storage_owner_fences','storage_route_write_checks'])
       if(!objects.some(o=>o.type==='table'&&o.name===name))throw storageError('ROLE_QUALIFICATION_INCOMPLETE');
     if(!objects.some(o=>o.type==='view'&&o.name==='typed_v11_record_admissions'))throw storageError('ROLE_QUALIFICATION_INCOMPLETE');
     const expectedDirectories=['migrations','typed-ingestion-migrations','ingestion-bridge-migrations',
-      'typed-v11-admission-migrations','typed-v1-admission-migrations','ingestion-isolation-migrations'];
+      'typed-v11-admission-migrations','typed-v1-admission-migrations','ingestion-isolation-migrations',
+      'ingestion-routing-migrations'];
     if(JSON.stringify([...new Set(inputs.migrations.map(m=>m.directory))])!==JSON.stringify(expectedDirectories))throw storageError('ROLE_QUALIFICATION_INCOMPLETE');
     for(const directoryName of expectedDirectories){
       const pinned=inputs.migrations.filter(m=>m.directory===directoryName);
