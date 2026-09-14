@@ -32,6 +32,9 @@ async function fixture(count=35,auto=false){
  return {contract,pin:await authorityRestoreContractDigest(contract)};
 }
 async function prepared(count=35){const f=await fixture(count);await freezeAuthorityRestoreSource(source(),f.contract,f.pin);await beginAuthorityRestore(source(),target(),f.contract,f.pin);return f;}
+async function preparedWithPrebuiltIndex(sql='CREATE INDEX restored_base_value ON restored_base(value)'){
+ const f=await fixture(1);await target().prepare('CREATE TABLE restored_base(id INTEGER PRIMARY KEY,value TEXT NOT NULL) STRICT').run();f.contract.targetBaseSchema=await authoritySchemaInventory(target());f.contract.targetBaseSchemaDigest=await authoritySchemaDigest(f.contract.targetBaseSchema);f.contract.finalSchema=[...f.contract.finalSchema,...f.contract.targetBaseSchema,{type:'index' as const,name:'restored_base_value',tbl_name:'restored_base',sql:'CREATE INDEX restored_base_value ON restored_base(value)'}].sort((a,b)=>a.type<b.type?-1:a.type>b.type?1:a.name<b.name?-1:1);f.contract.finalSchemaDigest=await authoritySchemaDigest(f.contract.finalSchema);f.pin=await authorityRestoreContractDigest(f.contract);await freezeAuthorityRestoreSource(source(),f.contract,f.pin);await beginAuthorityRestore(source(),target(),f.contract,f.pin);await target().prepare("INSERT INTO restored_base VALUES(1,'synthetic')").run();await drain(f);await sealAuthorityRestore(source(),target(),f.contract,f.pin);await drain(f,'verify');await completeAuthorityVerification(source(),target(),f.contract,f.pin);await target().prepare(sql).run();return f;
+}
 async function drain(f:Awaited<ReturnType<typeof fixture>>,kind:'copy'|'verify'='copy',db=target()){
  for(let n=0;n<30;n++){const r=await copyAuthorityPage(source(),db,f.contract,f.pin,kind);expect(r.rows).toBeLessThanOrEqual(32);if(r.state==='complete')return;}throw new Error('Synthetic restore did not finish');
 }
@@ -115,6 +118,13 @@ describe('isolated authority restore protocol',()=>{
   expect(await target().prepare('SELECT phase FROM _authority_restore_run').first('phase')).toBe('verified');
   expect(await target().prepare("SELECT name FROM sqlite_master WHERE name='participants'").first()).toBeNull();
   expect(await target().prepare('SELECT count(*) n FROM _authority_stage_participants').first('n')).toBe(1);
+ });
+ it('accepts and skips an exact prebuilt final index on a populated target-base table',async()=>{
+  const f=await preparedWithPrebuiltIndex();await promoteAuthorityRestore(source(),target(),f.contract,f.pin);await finalizeAuthorityRestore(source(),target(),f.contract,f.pin);
+  expect(await target().prepare("SELECT value FROM restored_base WHERE id=1").first('value')).toBe('synthetic');expect(await authoritySchemaInventory(target())).toEqual(f.contract.finalSchema);
+ });
+ it('refuses a same-name prebuilt index whose SQL differs from the final contract',async()=>{
+  const f=await preparedWithPrebuiltIndex('CREATE INDEX restored_base_value ON restored_base(id,value)');await expect(promoteAuthorityRestore(source(),target(),f.contract,f.pin)).rejects.toThrow('AUTHORITY_RESTORE_EVIDENCE_MISMATCH');expect(await target().prepare('SELECT phase FROM _authority_restore_run').first('phase')).toBe('verified');expect(await target().prepare("SELECT name FROM sqlite_master WHERE name='participants'").first()).toBeNull();
  });
  it('preserves an empty AUTOINCREMENT table high-water mark without reinserting historical audit rows',async()=>{
   const f=await fixture(1,true);await freezeAuthorityRestoreSource(source(),f.contract,f.pin);await beginAuthorityRestore(source(),target(),f.contract,f.pin);await drain(f);

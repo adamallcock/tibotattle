@@ -322,13 +322,20 @@ export async function promoteAuthorityRestore(source:D1Database,target:D1Databas
   if(state.phase==='installed')return;
   const desc=await descriptors(source,contract);
   const controlTriggers=(await target.prepare("SELECT name,sql,tbl_name FROM sqlite_master WHERE type='trigger' AND (name GLOB '_authority_stage_*' OR name GLOB '_authority_seal_*') ORDER BY name LIMIT 800").all<{name:string;sql:string;tbl_name:string}>()).results;
+  const current=await authoritySchemaInventory(target),base=new Map(contract.targetBaseSchema.map(x=>[x.name,x])),final=new Map(contract.finalSchema.map(x=>[x.name,x])),preinstalledIndexes=new Set<string>();
+  for(const expected of base.values())if(canonicalJson(current.find(x=>x.name===expected.name))!==canonicalJson(expected))fail();
+  for(const object of current)if(!base.has(object.name)){
+    const expected=final.get(object.name);
+    if(object.type!=='index'||!expected||expected.type!=='index'||!base.has(object.tbl_name)||canonicalJson(object)!==canonicalJson(expected))fail();
+    preinstalledIndexes.add(object.name);
+  }
   const statements:D1PreparedStatement[]=[],guardProofs:{name:string;sql:string;tbl_name:string}[]=[];
   // Keep existing temporary guards attached while SQLite renames their tables.
   // Replacing all of them would needlessly double the atomic DDL batch.
   for(const guard of controlTriggers){let sql=guard.sql;for(const d of desc)sql=sql.split(q(PREFIX+d.name)).join(q(d.name));
     guardProofs.push({name:guard.name,sql,tbl_name:guard.tbl_name.startsWith(PREFIX)?guard.tbl_name.slice(PREFIX.length):guard.tbl_name});}
   for(const d of desc)statements.push(target.prepare(`ALTER TABLE ${q(PREFIX+d.name)} RENAME TO ${q(d.name)}`));
-  const existing=new Set([...contract.targetBaseSchema.map(x=>x.name),...desc.map(x=>x.name)]);
+  const existing=new Set([...contract.targetBaseSchema.map(x=>x.name),...desc.map(x=>x.name),...preinstalledIndexes]);
   for(const type of ['table','index','view','trigger'])for(const object of contract.finalSchema)if(object.type===type&&!existing.has(object.name))statements.push(target.prepare(object.sql));
   for(const object of contract.finalSchema.filter(x=>x.type==='table'&&!existing.has(x.name)))for(const verb of ['INSERT','UPDATE','DELETE']){const guard=frozenTrigger(verb,object.name,'_authority_final_guard_');statements.push(target.prepare(guard.sql));guardProofs.push({...guard,tbl_name:object.name});}
   for(let offset=0;offset<guardProofs.length;offset+=30){const page=guardProofs.slice(offset,offset+30);statements.push(target.prepare(`INSERT INTO _authority_restore_installed_guards VALUES ${page.map(()=>'(?,?,?)').join(',')}`).bind(...page.flatMap(x=>[x.name,x.sql,x.tbl_name])));}
