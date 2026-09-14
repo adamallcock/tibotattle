@@ -146,8 +146,9 @@ Apple's version grammar and the Electron inspection fuse.
    objects requires the existing test-publication authority and shared owner.
 3. Run electron-macos-sparkle-transition.yml on both native hosted architectures
    with exact source, installer, ASAR and feed hashes. Its `release_identity`
-   input is a closed JSON object containing string fields `version`,
-   `bundleVersion` and `buildNumber`. Select the exact signed candidate and its
+   input contains string fields `version`, `bundleVersion` and `buildNumber`,
+   plus `sourceCandidate` containing the unchanged source-preparation receipt.
+   Select the exact signed candidate and its
    reviewed stable allocation; the workflow validates this intake before
    downloading artifacts. The unchanged signed
    native predecessor receives a test-feed preference only in its disposable
@@ -172,7 +173,7 @@ Apple's version grammar and the Electron inspection fuse.
    0.1.20 app. Preserve these production receipts separately from the isolated
    test proof. Its `identity_json` supplies the exact candidate source, version,
    bundle version, provenance build and final artifact/feed hashes, including
-   the predecessor ASAR hash. Its signed app cannot be redirected with a Node
+   the predecessor ASAR hash, plus the same `sourceCandidate` receipt. Its signed app cannot be redirected with a Node
    inspector.
 
 Both harnesses preserve their pinned predecessors and require a reviewed stable
@@ -184,12 +185,36 @@ relabel historical evidence for a successor.
 Run `electron-macos-empty-profile.yml` separately on both architectures using
 the same final signed DMGs in the isolated test namespace. Its closed `intake`
 JSON requires `runnerRevision`, `target`, `sourceRevision`, `version`,
-`bundleVersion`, `buildNumber`, `dmgSha256` and `asarSha256`; the workflow checks
+`bundleVersion`, `buildNumber`, `dmgSha256`, `asarSha256` and `sourceCandidate`; the workflow checks
 the selected runner and target before execution. The harness verifies the
 candidate identity, empty profile, first launch, Settings, restart and persistent
 opt-out. A `--plan` result is intake validation only. This clean-install receipt
 does not qualify existing credentials, native clean quit or successful uploads;
 those fields remain explicitly false.
+
+### Current-candidate admission
+
+All three Mac qualification workflows admit the identity before installing
+verification dependencies or downloading signed apps. Copy the selected target's
+existing `production-source-candidate.json` into the `sourceCandidate` member of
+the workflow's JSON input. The shared
+[`electron-macos-qualification-identity.mjs`](../../scripts/lib/electron-macos-qualification-identity.mjs)
+derives the marketing version from the checked-out `package.json` and the stable
+bundle version from `config/macos-bundle-version-plan.cjs`. It verifies the exact
+runner commit, candidate ancestry and source package version, and matches the
+selected source, target and explicit provenance build against that receipt and
+its builder environment. It strips the receipt before passing the unchanged
+closed intake to the installed-app harness. It does not allocate a build number,
+replace signed-artifact checks or mark qualification passed.
+
+A future release needs its reviewed package version and bundle allocation, plus
+new source and final-artifact receipts; it does not need candidate-version edits
+in the qualification workflows. Keep the native 0.1.18 and Electron 0.1.20
+predecessor pins unchanged unless their separate migration contract is reviewed.
+Historical direct harness fixtures remain historical evidence; a current runner
+refuses a candidate from an older marketing version. Run
+`node --test test/electron-macos-qualification-identity.test.mjs` for admission
+regressions, including all six workflow bodies with a synthetic future release.
 
 Existing-credential coverage remains an explicit receipt field; the synthetic
 opt-out fixture does not claim an existing Keychain credential rehearsal.

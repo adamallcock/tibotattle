@@ -46,7 +46,7 @@ test('intake rejects missing identities, invalid source/hashes, mismatched alloc
     assert.throws(() => validateEmptyProfileIntake({ ...intake, [field]: value }), { emptyProfileStage: 'intake' });
   }
   for (const changed of [{ version: '0.1.21' }, { version: '0.1.22' }, { bundleVersion: '1029' },
-    { version: '0.1.24', bundleVersion: '1031' }, { version: '0.1.18', bundleVersion: '1026' },
+    { version: '9999.99.99', bundleVersion: '9999' }, { version: '0.1.18', bundleVersion: '1026' },
     { version: ['0.1.23'] }, { bundleVersion: 1030 }, { bundleVersion: '1030.0' },
     { buildNumber: 2026091401 }, { buildNumber: '0' }, { buildNumber: '202609140100' }]) {
     assert.throws(() => validateEmptyProfileIntake({ ...intake, ...changed }), { emptyProfileStage: 'intake' });

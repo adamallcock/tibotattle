@@ -1,6 +1,6 @@
 {
   "schemaVersion": "tool-inventory-v0.1",
-  "reviewedAt": "2026-09-13",
+  "reviewedAt": "2026-09-14",
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
@@ -1013,6 +1013,25 @@
     {
       "classification": "build_release_operation",
       "owner": "macos_release",
+      "canonicalPath": "scripts/lib/electron-macos-qualification-identity.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Read-only current-candidate identity admission shared by Mac qualification workflows; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-macos-empty-profile.yml",
+        ".github/workflows/electron-macos-production-update.yml",
+        ".github/workflows/electron-macos-sparkle-transition.yml",
+        "test/electron-macos-qualification-identity.test.mjs",
+        "docs/runbooks/macos-stable-release-runbook.md"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
       "canonicalPath": "scripts/macos-bundle-version.js",
       "stableAlias": null,
       "stableAliasReason": "Internal Apple bundle-version grammar, migration epoch, and comparator shared by macOS release tools; it is not a standalone command.",
@@ -1031,7 +1050,8 @@
         "test/electron-production-distribution.test.js",
         "scripts/smoke-electron-macos-empty-profile.mjs",
         "scripts/smoke-electron-macos-production-update.mjs",
-        "scripts/smoke-electron-macos-sparkle-transition.mjs"
+        "scripts/smoke-electron-macos-sparkle-transition.mjs",
+        "scripts/lib/electron-macos-qualification-identity.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/decisions/2026-08-27-local-state-schema-and-release-channel-isolation.md",

@@ -31,7 +31,7 @@ on:
         type: string
         required: true
       release_identity:
-        description: Closed JSON with exact version, bundleVersion and buildNumber
+        description: Closed JSON with exact version, bundleVersion, buildNumber and sourceCandidate from production-source-candidate.json
         type: string
         required: true
       dmg_sha256:
@@ -81,6 +81,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Set up pinned Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -88,6 +89,16 @@ jobs:
           node-version: 26.2.0
           architecture: arm64
           package-manager-cache: false
+      - name: Admit current release identity before dependencies or downloads
+        id: qualification
+        shell: bash
+        run: |
+          node --input-type=module <<'ADMISSION'
+          import { appendFileSync } from 'node:fs';
+          import { preflightMacOSQualificationEnvironment } from './scripts/lib/electron-macos-qualification-identity.mjs';
+          const identity = preflightMacOSQualificationEnvironment('sparkle');
+          appendFileSync(process.env.GITHUB_OUTPUT, 'identity=' + JSON.stringify(identity) + '\n');
+          ADMISSION
       - name: Install locked verification dependencies
         run: |
           npm install --global corepack@0.34.0 --force --ignore-scripts
@@ -95,6 +106,8 @@ jobs:
           corepack prepare pnpm@11.9.0 --activate
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Verify exact signed test intake and unchanged native predecessor
+        env:
+          SELECTED_IDENTITY: ${{ steps.qualification.outputs.identity }}
         shell: bash
         run: |
           umask 077
@@ -209,6 +222,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Set up pinned Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -216,6 +230,16 @@ jobs:
           node-version: 26.2.0
           architecture: x64
           package-manager-cache: false
+      - name: Admit current release identity before dependencies or downloads
+        id: qualification
+        shell: bash
+        run: |
+          node --input-type=module <<'ADMISSION'
+          import { appendFileSync } from 'node:fs';
+          import { preflightMacOSQualificationEnvironment } from './scripts/lib/electron-macos-qualification-identity.mjs';
+          const identity = preflightMacOSQualificationEnvironment('sparkle');
+          appendFileSync(process.env.GITHUB_OUTPUT, 'identity=' + JSON.stringify(identity) + '\n');
+          ADMISSION
       - name: Install locked verification dependencies
         run: |
           npm install --global corepack@0.34.0 --force --ignore-scripts
@@ -223,6 +247,8 @@ jobs:
           corepack prepare pnpm@11.9.0 --activate
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Verify exact signed test intake and unchanged native predecessor
+        env:
+          SELECTED_IDENTITY: ${{ steps.qualification.outputs.identity }}
         shell: bash
         run: |
           umask 077
