@@ -201,23 +201,40 @@ test('transport accepts the observed nested Queue consumer and refuses identity 
     {type:'plain_text',name:'STORAGE_EXISTING_BOOTSTRAP_OPERATION_DIGEST',text:identityDigest(plan)},
     {type:'plain_text',name:'STORAGE_EXISTING_BOOTSTRAP_BUNDLE_SHA256',text:preparation.bundleSha256},
   ];
-  let change=null;
-  const fetcher=async(url)=>{const parsed=new URL(url),path=parsed.pathname;let result;
+  let change=null,schedules={schedules:[]},consumerAttached=true,loseDetachAck=true;
+  const fetcher=async(url,init)=>{const parsed=new URL(url),path=parsed.pathname;let result;
     if(path.endsWith(`/workers/scripts/${plan.workerName}/settings`))result={bindings};
     else if(path.endsWith(`/workers/scripts/${plan.workerName}/subdomain`))result={enabled:false,previews_enabled:false};
     else if(path.endsWith('/routes'))result=[];
-    else if(path.endsWith('/schedules'))result=[];
+    else if(path.endsWith('/schedules'))result=schedules;
     else if(path.endsWith('/queues'))result=[{queue_id:queueId,queue_name:plan.queueName}];
+    else if(path.endsWith(`/queues/${queueId}/consumers/${consumerId}`)){
+      assert.equal(init.method,'DELETE');consumerAttached=false;
+      if(loseDetachAck){loseDetachAck=false;throw Error('synthetic response loss after consumer detach');}
+      result={};
+    }
     else if(path.endsWith(`/queues/${queueId}/consumers`)){const consumer={script:plan.workerName,type:'worker',
       queue_name:plan.queueName,queue_id:queueId,consumer_id:consumerId,created_on:'2026-09-13T19:50:49.046911Z',
       settings:{batch_size:1,max_retries:0,max_wait_time_ms:1000,max_concurrency:1,retry_delay:0}};
-      if(change)change(consumer);result=[consumer];}
+      if(change)change(consumer);result=consumerAttached?[consumer]:[];}
+    else if(path.endsWith(`/queues/${queueId}`))result={queue_id:queueId,queue_name:plan.queueName};
     else throw Error(`unexpected ${path}`);
     return json(result);
   };
   const make=()=>createExistingAccountlessBootstrapTransport({plan,packageDirectory:f.candidate,cliPath:cli,
     token:'synthetic-secret-token-value',fetcher,environment:{},receipt:async()=>{}});
   await make().inspectWorker('enabled');
+  schedules=[];await make().inspectWorker('enabled');
+  for(const value of [null,{}, {schedules:null}, {schedules:[],other:[]},
+    [{cron:'* * * * *'}], {schedules:[{cron:'* * * * *'}]}]){
+    schedules=value;await assert.rejects(make().inspectWorker('enabled'),
+      {code:'D1_STORAGE_EXISTING_BOOTSTRAP_WORKER_INGRESS_CHANGED'});
+  }
+  schedules={schedules:[]};
+  await assert.rejects(make().detachConsumer(queueId),
+    {code:'D1_STORAGE_EXISTING_BOOTSTRAP_MUTATION_UNCERTAIN'});
+  await make().inspectConsumerDetached(queueId);
+  consumerAttached=true;
   for(const mutate of [value=>{value.script_name='contradictory-worker';},value=>{delete value.script;},
     value=>{value.queue_id='f'.repeat(32);},value=>{value.type='http_pull';},
     value=>{value.settings.max_wait_time_ms=999;},value=>{value.settings.extra=true;}]){
@@ -242,9 +259,17 @@ test('staged operator re-proves containment before mutations and requires a sepa
   const parent = await mkdtemp(join(temporaryRoot, 'bootstrap-operation-parent-')); await chmod(parent, 0o700);
   const directory = join(parent, 'operation');
   const candidate = join(directory, 'candidate'), events = []; let queueId = 'e'.repeat(32), source = null, catalog = null;
+  let consumerAttached = true, loseDetachAck = true;
   const transport = { deploy: async mode => events.push(`deploy:${mode}`), createQueue: async () => (events.push('create-queue'), queueId),
     push: async (_id, body) => events.push(`push:${body.action}`), sourceStatus: async () => source,
-    catalogStatus: async () => catalog, deleteWorker: async () => events.push('delete-worker'),
+    catalogStatus: async () => catalog,
+    disableWorkerForCleanup: async () => events.push('disable-for-cleanup'),
+    inspectWorkerForCleanup: async () => events.push('inspect-disabled-for-cleanup'),
+    detachConsumer: async () => { events.push('detach-consumer'); consumerAttached = false;
+      if (loseDetachAck) { loseDetachAck = false; throw Error('synthetic detach acknowledgement loss'); } },
+    inspectConsumerDetached: async () => { events.push('inspect-consumer-detached');
+      if (consumerAttached) throw Error('consumer remains'); },
+    deleteWorker: async () => events.push('delete-worker'),
     deleteQueue: async () => events.push('delete-queue') };
   const contained = async () => events.push('contained'); const options = { plan, workerRoot: root, operationDirectory: directory,
     approvedPlanSha256: identityDigest(plan), transport, assertContained: contained,
@@ -283,11 +308,20 @@ test('staged operator re-proves containment before mutations and requires a sepa
   assert.equal(events.at(-1), 'push:release');
   await reconcileExistingAccountlessBootstrapOperator({ plan, operationDirectory: directory,
     transport: { ...transport, sourceStatus: async () => ({ ...source, state: 'released' }) }, assertContained: contained });
-  for (let i = 0; i < 3; i++) await runExistingAccountlessBootstrapOperator({ ...options, action: 'cleanup',
+  await runExistingAccountlessBootstrapOperator({ ...options, action: 'cleanup',
     confirmation: 'CLEAN_UP_EXISTING_ACCOUNTLESS_BOOTSTRAP_OPERATOR' });
-  const record = await readOperation(directory); assert.equal(record.state.phase, 'complete'); assert.equal(record.state.intent, null);
-  assert.deepEqual(events.slice(-7), ['push:release', 'contained', 'deploy:disabled', 'contained', 'delete-worker',
-    'contained', 'delete-queue', 'contained'].slice(-7));
+  await assert.rejects(runExistingAccountlessBootstrapOperator({ ...options, action: 'cleanup',
+    confirmation: 'CLEAN_UP_EXISTING_ACCOUNTLESS_BOOTSTRAP_OPERATOR' }), /synthetic detach acknowledgement loss/);
+  let record = await readOperation(directory); assert.equal(record.state.phase, 'worker-disabled');
+  assert.equal(record.state.intent, 'detach-consumer');
+  await reconcileExistingAccountlessBootstrapOperator({ plan, operationDirectory: directory, transport,
+    assertContained: contained });
+  assert.equal(events.filter(value => value === 'detach-consumer').length, 1);
+  for (let i = 0; i < 2; i++) await runExistingAccountlessBootstrapOperator({ ...options, action: 'cleanup',
+    confirmation: 'CLEAN_UP_EXISTING_ACCOUNTLESS_BOOTSTRAP_OPERATOR' });
+  record = await readOperation(directory); assert.equal(record.state.phase, 'complete'); assert.equal(record.state.intent, null);
+  assert.deepEqual(events.slice(-9), ['contained', 'detach-consumer', 'inspect-consumer-detached', 'contained',
+    'contained', 'delete-worker', 'contained', 'delete-queue', 'contained']);
   assert.equal(events.at(-1), 'contained');
 });
 

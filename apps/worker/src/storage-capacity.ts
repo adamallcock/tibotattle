@@ -15,6 +15,14 @@ export interface StorageCapacityObservation {
   readonly pressureState: "normal" | "pressure";
 }
 
+export interface StorageShardAllocationPolicy {
+  readonly shardId: string;
+  readonly allocationTier: "active" | "spare";
+  readonly allocationEnabled: boolean;
+  readonly qualificationDigest: string | null;
+  readonly updatedAt: number;
+}
+
 function validInteger(value: number, maximum = Number.MAX_SAFE_INTEGER): boolean {
   return Number.isSafeInteger(value) && value >= 0 && value <= maximum;
 }
@@ -93,13 +101,7 @@ export async function recordStorageCapacityObservation(
 
 export async function configureStorageShardAllocation(
   catalog: D1Database,
-  policy: Readonly<{
-    shardId: string;
-    allocationTier: "active" | "spare";
-    allocationEnabled: boolean;
-    qualificationDigest: string | null;
-    updatedAt: number;
-  }>,
+  policy: StorageShardAllocationPolicy,
 ): Promise<void> {
   if (!catalog || typeof catalog.prepare !== "function"
       || !SHARD_ID.test(policy.shardId)
@@ -136,6 +138,66 @@ export async function configureStorageShardAllocation(
       throw new StorageRoutingError("STORAGE_UNAVAILABLE");
     }
   } catch {
+    throw new StorageRoutingError("STORAGE_UNAVAILABLE");
+  }
+}
+
+/** Exact readback used by the root-only hosted qualification operator after a
+ * potentially lost write acknowledgement. It never infers a missing row. */
+export async function readStorageCapacityObservation(
+  catalog: D1Database,
+  shardId: string,
+): Promise<StorageCapacityObservation | null> {
+  if (!catalog || typeof catalog.prepare !== "function" || !SHARD_ID.test(shardId)) {
+    throw new StorageRoutingError("INVALID_ROUTING_INPUT");
+  }
+  try {
+    const row = await catalog.prepare(`SELECT shard_id,observed_bytes,observed_at,valid_until,pressure_state
+      FROM storage_shard_capacity_observations WHERE shard_id=? LIMIT 1`).bind(shardId).first<{
+        shard_id:string; observed_bytes:number; observed_at:number; valid_until:number;
+        pressure_state:"normal"|"pressure";
+      }>();
+    if (!row) return null;
+    if (row.shard_id !== shardId || !validInteger(row.observed_bytes)
+        || !validInteger(row.observed_at) || !validInteger(row.valid_until)
+        || row.valid_until < row.observed_at || !["normal", "pressure"].includes(row.pressure_state)) {
+      throw new StorageRoutingError("STORAGE_UNAVAILABLE");
+    }
+    return Object.freeze({ shardId: row.shard_id, observedBytes: row.observed_bytes,
+      observedAt: row.observed_at, validUntil: row.valid_until, pressureState: row.pressure_state });
+  } catch (error) {
+    if (error instanceof StorageRoutingError) throw error;
+    throw new StorageRoutingError("STORAGE_UNAVAILABLE");
+  }
+}
+
+/** Exact allocation-policy readback; qualification code treats null or any
+ * field mismatch as an uncertain activation rather than a default. */
+export async function readStorageShardAllocationPolicy(
+  catalog: D1Database,
+  shardId: string,
+): Promise<StorageShardAllocationPolicy | null> {
+  if (!catalog || typeof catalog.prepare !== "function" || !SHARD_ID.test(shardId)) {
+    throw new StorageRoutingError("INVALID_ROUTING_INPUT");
+  }
+  try {
+    const row = await catalog.prepare(`SELECT shard_id,allocation_tier,allocation_enabled,
+      updated_at,qualification_digest FROM storage_shard_allocation_policy
+      WHERE shard_id=? LIMIT 1`).bind(shardId).first<{
+        shard_id:string; allocation_tier:"active"|"spare"; allocation_enabled:number;
+        updated_at:number; qualification_digest:string|null;
+      }>();
+    if (!row) return null;
+    if (row.shard_id !== shardId || !["active", "spare"].includes(row.allocation_tier)
+        || ![0, 1].includes(row.allocation_enabled) || !validInteger(row.updated_at)
+        || (row.qualification_digest !== null && !DIGEST.test(row.qualification_digest))) {
+      throw new StorageRoutingError("STORAGE_UNAVAILABLE");
+    }
+    return Object.freeze({ shardId: row.shard_id, allocationTier: row.allocation_tier,
+      allocationEnabled: row.allocation_enabled === 1, qualificationDigest: row.qualification_digest,
+      updatedAt: row.updated_at });
+  } catch (error) {
+    if (error instanceof StorageRoutingError) throw error;
     throw new StorageRoutingError("STORAGE_UNAVAILABLE");
   }
 }

@@ -209,14 +209,25 @@ export function createExistingAccountlessBootstrapTransport({ plan, packageDirec
   const assertDatabases = async () => { await database(plan.sourceDatabase); await database(plan.catalogDatabase); };
   const findQueue = async () => { const matches = (await queues()).filter(item => item.queue_name === plan.queueName);
     if (matches.length > 1 || matches[0] && !QID.test(matches[0].queue_id ?? '')) fail('QUEUE_IDENTITY_CHANGED'); return matches[0] ?? null; };
-  const inspectWorker = async mode => {
+  const exactOwnedConsumer = (consumers, queueId, allowAbsent = false) => {
+    if (!Array.isArray(consumers) || consumers.length > 1 || !consumers.length && !allowAbsent) fail('QUEUE_CONSUMER_CHANGED');
+    if (!consumers.length) return null;
+    const consumer = consumers[0];
+    if (!QID.test(consumer?.consumer_id ?? '') || !matchesExactBootstrapQueueConsumer(consumer, {
+      workerName: plan.workerName, queueName: plan.queueName, queueId,
+    })) fail('QUEUE_CONSUMER_CHANGED');
+    return consumer;
+  };
+  const inspectWorkerState = async (mode, allowOwnedConsumer = false) => {
     const preparation = JSON.parse(await readFile(join(packageDirectory, 'preparation.json'), 'utf8'));
     if (preparation.planDigest !== identityDigest(plan) || !SHA.test(preparation.bundleSha256)
       || preparation[`${mode}ConfigSha256`] !== hash(await readFile(join(packageDirectory, `wrangler.${mode}.jsonc`)))) fail('PACKAGE_CHANGED');
     const settings = await api('GET', `${account}/workers/scripts/${plan.workerName}/settings`, undefined, false);
     const subdomain = await api('GET', `${account}/workers/scripts/${plan.workerName}/subdomain`, undefined, false);
     const routes = await api('GET', `${account}/workers/services/${plan.workerName}/environments/production/routes?show_zonename=true`, undefined, false);
-    const schedules = await api('GET', `${account}/workers/scripts/${plan.workerName}/schedules`, undefined, false);
+    const scheduleResponse = await api('GET', `${account}/workers/scripts/${plan.workerName}/schedules`, undefined, false);
+    const schedules = Array.isArray(scheduleResponse) ? scheduleResponse
+      : exact(scheduleResponse, ['schedules']) ? scheduleResponse.schedules : null;
     if (subdomain?.enabled !== false || subdomain?.previews_enabled !== false
       || !Array.isArray(routes) || routes.length || !Array.isArray(schedules) || schedules.length) fail('WORKER_INGRESS_CHANGED');
     const bindings = settings?.bindings;
@@ -232,17 +243,24 @@ export function createExistingAccountlessBootstrapTransport({ plan, packageDirec
     if (mode === 'enabled') {
       if (!found) fail('QUEUE_MISSING');
       const consumers = await api('GET', `${account}/queues/${found.queue_id}/consumers`, undefined, false);
-      if (!Array.isArray(consumers) || consumers.length !== 1 || !matchesExactBootstrapQueueConsumer(consumers[0],{
-        workerName:plan.workerName,queueName:plan.queueName,queueId:found.queue_id,
-      })) fail('QUEUE_CONSUMER_CHANGED');
+      exactOwnedConsumer(consumers, found.queue_id);
     } else if (found) {
       const consumers = await api('GET', `${account}/queues/${found.queue_id}/consumers`, undefined, false);
-      if (!Array.isArray(consumers) || consumers.length) fail('QUEUE_CONSUMER_CHANGED');
+      if (allowOwnedConsumer) exactOwnedConsumer(consumers, found.queue_id, true);
+      else if (!Array.isArray(consumers) || consumers.length) fail('QUEUE_CONSUMER_CHANGED');
     }
     return true;
   };
+  const inspectWorker = mode => inspectWorkerState(mode, false);
+  const inspectWorkerForCleanup = () => inspectWorkerState('disabled', true);
+  const inspectConsumerDetached = async queueId => {
+    await queue(queueId);
+    const consumers = await api('GET', `${account}/queues/${queueId}/consumers`, undefined, false);
+    if (!Array.isArray(consumers) || consumers.length) fail('QUEUE_CONSUMER_CHANGED');
+    return true;
+  };
   return {
-    assertDatabases, findQueue, queue, inspectWorker,
+    assertDatabases, findQueue, queue, inspectWorker, inspectWorkerForCleanup, inspectConsumerDetached,
     async findWorker() { const matches = (await workers()).filter(item => item.id === plan.workerName);
       if (matches.length > 1) fail('WORKER_IDENTITY_CHANGED'); return matches[0] ?? null; },
     async createQueue() { await assertDatabases(); if (await findQueue()) fail('QUEUE_ALREADY_EXISTS');
@@ -254,6 +272,14 @@ export function createExistingAccountlessBootstrapTransport({ plan, packageDirec
       if (!dry) { await assertDatabases(); if (mode === 'enabled' && !await findQueue()) fail('QUEUE_MISSING'); }
       await run(`${dry ? 'dry-' : ''}deploy-${mode}`, mode, ['deploy', ...(dry ? ['--dry-run', '--outdir', join(packageDirectory, `dry-${mode}`)] : [])], dry);
       if (!dry) await inspectWorker(mode); },
+    async disableWorkerForCleanup() { await assertDatabases(); await run('cleanup-deploy-disabled', 'disabled', ['deploy']);
+      await inspectWorkerForCleanup(); },
+    async detachConsumer(queueId) { await queue(queueId);
+      const consumers = await api('GET', `${account}/queues/${queueId}/consumers`, undefined, false);
+      const consumer = exactOwnedConsumer(consumers, queueId, true);
+      if (!consumer) return true;
+      await api('DELETE', `${account}/queues/${queueId}/consumers/${consumer.consumer_id}`, undefined, true);
+      await inspectConsumerDetached(queueId); return true; },
     async push(queueId, body) { await queue(queueId); return api('POST', `${account}/queues/${queueId}/messages`,
       { body, content_type: 'json' }, true); },
     sourceStatus: async () => (await d1(plan.sourceDatabase.id, SOURCE_STATUS_SQL))[0] ?? null,
@@ -284,7 +310,8 @@ export async function createExistingAccountlessBootstrapContainment({ plan, main
     createProductionDeploymentLock({ repositoryRoot }).assertOwned(current.owner);
     const phase = context?.phase, queueId = context?.queueId;
     const isolationPhase = phase === 'queue-created' || phase === 'worker-deleted' ? 'queue-only'
-      : phase === 'disabled' || phase === 'worker-disabled' ? 'disabled'
+      : phase === 'worker-disabled' ? 'disabled-before-detach'
+        : phase === 'disabled' || phase === 'consumer-detached' ? 'disabled'
         : ['enabled', 'frozen', 'importing', 'ready', 'released'].includes(phase) ? 'enabled' : null;
     let isolatedBootstrap = null;
     if (isolationPhase !== null) {
@@ -312,7 +339,7 @@ export async function createExistingAccountlessBootstrapContainment({ plan, main
 function stateValid(state) {
   if (!exact(state, ['schema', 'phase', 'intent', 'queueId', 'manifestDigest', 'ownerRosterDigest', 'importedCount', 'packageDigest'])
     || state.schema !== 1 || !SHA.test(state.packageDigest) || !['prepared', 'queue-created', 'disabled', 'enabled', 'frozen', 'importing', 'ready',
-      'released', 'worker-disabled', 'worker-deleted', 'complete'].includes(state.phase)
+      'released', 'worker-disabled', 'consumer-detached', 'worker-deleted', 'complete'].includes(state.phase)
     || !(state.intent === null || typeof state.intent === 'string') || !(state.queueId === null || QID.test(state.queueId))
     || !(state.manifestDigest === null || SHA.test(state.manifestDigest)) || !(state.ownerRosterDigest === null || SHA.test(state.ownerRosterDigest))
     || !Number.isSafeInteger(state.importedCount) || state.importedCount < 0) fail('JOURNAL_INVALID');
@@ -379,8 +406,9 @@ export async function runExistingAccountlessBootstrapOperator({ plan, workerRoot
       state.intent = null; await operation.save(state);
       return { code: 'EXISTING_ACCOUNTLESS_BOOTSTRAP_RELEASE_QUEUED', phase: state.phase };
     } else if (action === 'cleanup') {
-      if (state.phase === 'released') { await saveIntent('cleanup-disable'); await transport.deploy('disabled'); await settle('worker-disabled'); }
-      else if (state.phase === 'worker-disabled') { await saveIntent('delete-worker'); await transport.deleteWorker(); await settle('worker-deleted'); }
+      if (state.phase === 'released') { await saveIntent('cleanup-disable'); await transport.disableWorkerForCleanup(); await settle('worker-disabled'); }
+      else if (state.phase === 'worker-disabled') { await saveIntent('detach-consumer'); await transport.detachConsumer(state.queueId); await settle('consumer-detached'); }
+      else if (state.phase === 'consumer-detached') { await saveIntent('delete-worker'); await transport.deleteWorker(); await settle('worker-deleted'); }
       else if (state.phase === 'worker-deleted') { await saveIntent('delete-queue'); await transport.deleteQueue(state.queueId); await settle('complete');
         await assertContained({ phase: state.phase, queueId: state.queueId }); }
       else if (state.phase === 'complete') return { code: 'EXISTING_ACCOUNTLESS_BOOTSTRAP_COMPLETE', phase: state.phase };
@@ -404,9 +432,12 @@ export async function reconcileExistingAccountlessBootstrapOperator({ plan, oper
     if (state.intent === 'deploy-disabled' || state.intent === 'deploy-enabled') { const mode = state.intent.slice(7);
       await transport.inspectWorker(mode); await assertContained({ phase: mode, queueId: state.queueId });
       state.phase = mode; state.intent = null; await operation.save(state); return { code: 'EXISTING_ACCOUNTLESS_BOOTSTRAP_RECONCILED', phase: state.phase }; }
-    if (state.intent === 'cleanup-disable') { await transport.inspectWorker('disabled');
+    if (state.intent === 'cleanup-disable') { await transport.inspectWorkerForCleanup();
       await assertContained({ phase: 'worker-disabled', queueId: state.queueId });
       state.phase = 'worker-disabled'; state.intent = null; await operation.save(state); return { code: 'EXISTING_ACCOUNTLESS_BOOTSTRAP_RECONCILED', phase: state.phase }; }
+    if (state.intent === 'detach-consumer') { await transport.inspectConsumerDetached(state.queueId);
+      await assertContained({ phase: 'consumer-detached', queueId: state.queueId });
+      state.phase = 'consumer-detached'; state.intent = null; await operation.save(state); return { code: 'EXISTING_ACCOUNTLESS_BOOTSTRAP_RECONCILED', phase: state.phase }; }
     if (state.intent === 'delete-worker') { if (await transport.findWorker()) fail('RECONCILIATION_UNVERIFIED');
       await assertContained({ phase: 'worker-deleted', queueId: state.queueId });
       state.phase = 'worker-deleted'; state.intent = null; await operation.save(state); return { code: 'EXISTING_ACCOUNTLESS_BOOTSTRAP_RECONCILED', phase: state.phase }; }

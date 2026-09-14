@@ -20,17 +20,18 @@ const RECEIPT_KEYS=['qualificationId','shardId','catalogDatabaseId','catalogBind
 const SCHEMA_KEYS=['catalog','ingestion','analytics','deletionLedger','publication'];
 const RESOURCE_ROLES=['catalog','ingestion','analytics','deletionLedger','publication'];
 
-function expectedResources(plan){return [
+export function storageShardReadinessExpectedResources(plan){plan=validateStorageShardReadinessOperatorPlan(plan);return Object.freeze([
  {role:'catalog',bindingName:'STORAGE_ROUTING_DB',databaseId:plan.catalogDatabaseId},
  {role:'ingestion',bindingName:plan.bindingName,databaseId:plan.ingestionDatabaseId},
  {role:'analytics',bindingName:plan.analyticsBindingName,databaseId:plan.analyticsDatabaseId},
  {role:'deletionLedger',bindingName:plan.deletionLedgerBindingName,databaseId:plan.deletionLedgerDatabaseId},
  {role:'publication',bindingName:plan.publicationBindingName,databaseId:plan.publicationDatabaseId},
-];}
+].map(Object.freeze));}
 function validateResources(value,plan,code){
+ const expected=storageShardReadinessExpectedResources(plan);
  if(!Array.isArray(value)||value.length!==5||value.some((row,index)=>!exact(row,['role','bindingName','databaseId'])
-  ||row.role!==RESOURCE_ROLES[index]||row.bindingName!==expectedResources(plan)[index].bindingName
-  ||row.databaseId!==expectedResources(plan)[index].databaseId))fail(code);
+  ||row.role!==RESOURCE_ROLES[index]||row.bindingName!==expected[index].bindingName
+  ||row.databaseId!==expected[index].databaseId))fail(code);
  return value;
 }
 export function validateStorageShardReadinessConfiguration(configuration,plan){
@@ -40,7 +41,7 @@ export function validateStorageShardReadinessConfiguration(configuration,plan){
   ||!BINDING.test(row.binding)||!UUID.test(row.database_id)))fail('CONFIG_INVALID');
  if(new Set(rows.map(row=>row.binding)).size!==rows.length||new Set(rows.map(row=>row.database_id)).size!==rows.length)
   fail('CONFIG_INVALID');
- const resources=expectedResources(plan);
+ const resources=storageShardReadinessExpectedResources(plan);
  for(const expected of resources){const matches=rows.filter(row=>row.binding===expected.bindingName);
   if(matches.length!==1||matches[0].database_id!==expected.databaseId)fail('CONFIG_INVALID');}
  return Object.freeze(resources.map(Object.freeze));
@@ -88,9 +89,10 @@ export function validateStorageShardReadinessOperatorPlan(value){
  * entrypoint. A caller retries only by invoking the same pinned plan again. */
 export async function runStorageShardReadinessOperator({plan,api,configuration,clock=Date.now}){
  plan=validateStorageShardReadinessOperatorPlan(plan);
- const now=clock();
- if(!Number.isSafeInteger(now)||now>plan.expiresAt||plan.capacityObservation.observedAt>now
-  ||plan.qualifiedAt>now||plan.capacityObservation.validUntil<now)fail('WINDOW_CLOSED');
+ const current=()=>{const now=clock();
+  if(!Number.isSafeInteger(now)||now>plan.expiresAt||plan.capacityObservation.observedAt>now
+   ||plan.qualifiedAt>now||plan.capacityObservation.validUntil<now)fail('WINDOW_CLOSED');return now;};
+ const startedAt=current();
  const configured=validateStorageShardReadinessConfiguration(configuration,plan);
  if(!api||!['describeResources','measureIngestionSize','qualify','record','observe','configure','readPolicy']
   .every(name=>typeof api[name]==='function'))fail('API_INVALID');
@@ -102,6 +104,7 @@ export async function runStorageShardReadinessOperator({plan,api,configuration,c
   ||measured.observedAt!==plan.capacityObservation.observedAt
   ||measured.validUntil!==plan.capacityObservation.validUntil
   ||measured.evidenceDigest!==plan.capacityObservation.evidenceDigest)fail('CAPACITY_EVIDENCE_CHANGED');
+ current();
  const runtimePlan={qualificationId:plan.qualificationId,shardId:plan.shardId,
   catalogDatabaseId:plan.catalogDatabaseId,catalogBindingName:'STORAGE_ROUTING_DB',bindingName:plan.bindingName,
   ingestionDatabaseId:plan.ingestionDatabaseId,sourceId:plan.sourceId,sourceNamespace:plan.sourceNamespace,
@@ -131,10 +134,13 @@ export async function runStorageShardReadinessOperator({plan,api,configuration,c
   ||candidate.qualifiedAt!==plan.qualifiedAt||candidate.state!=='active'||candidate.revokedAt!==null
   ||candidate.contractVersion!==1
   ||!SHA.test(candidate.readinessDigest??''))fail('QUALIFICATION_CHANGED');
+ current();
  const receipt=await api.record(candidate);
  if(!exact(receipt,RECEIPT_KEYS)||RECEIPT_KEYS.some(key=>receipt[key]!==candidate[key]))fail('RECEIPT_CHANGED');
+ current();
  await api.observe({shardId:plan.shardId,observedBytes:measured.observedBytes,
   observedAt:measured.observedAt,validUntil:measured.validUntil,pressureState:'normal'});
+ current();
  await api.configure({shardId:plan.shardId,allocationTier:plan.allocationTier,allocationEnabled:true,
   qualificationDigest:receipt.readinessDigest,updatedAt:plan.qualifiedAt});
  const policy=await api.readPolicy(plan.shardId);
@@ -143,7 +149,7 @@ export async function runStorageShardReadinessOperator({plan,api,configuration,c
   ||policy.qualificationDigest!==receipt.readinessDigest||policy.updatedAt!==plan.qualifiedAt)fail('ACTIVATION_UNCERTAIN');
  return Object.freeze({schema:'storage-shard-readiness-activation-v1',shardId:plan.shardId,
   readinessDigest:receipt.readinessDigest,capacityEvidenceDigest:measured.evidenceDigest,
-  qualifiedAt:plan.qualifiedAt,observedAt:now,allocationTier:plan.allocationTier,
+  qualifiedAt:plan.qualifiedAt,observedAt:startedAt,allocationTier:plan.allocationTier,
   resourceDigest:digest(['storage-shard-readiness-resources-v1',configured])});
 }
 

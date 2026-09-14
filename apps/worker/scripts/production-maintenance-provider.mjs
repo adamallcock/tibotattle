@@ -19,7 +19,7 @@ function validateIsolatedBootstrap(value,plan){
   if(!exact(value,['schema','phase','operationDigest','workerName','queueName','queueId','sourceDatabaseId','catalogDatabaseId',
     'bundleSha256','disabledConfigSha256','enabledConfigSha256'])
     ||value.schema!=='storage-existing-accountless-bootstrap-isolation-v1'
-    ||!['queue-only','disabled','enabled'].includes(value.phase)||!sha(value.operationDigest)||!sha(value.bundleSha256)
+    ||!['queue-only','disabled','disabled-before-detach','enabled'].includes(value.phase)||!sha(value.operationDigest)||!sha(value.bundleSha256)
     ||!sha(value.disabledConfigSha256)||!sha(value.enabledConfigSha256)||!uuid(value.sourceDatabaseId)
     ||!uuid(value.catalogDatabaseId)||value.sourceDatabaseId!==plan.databaseId||value.catalogDatabaseId===value.sourceDatabaseId
     ||!/^tibotattle-[a-z0-9-]{1,52}$/.test(value.workerName)||!/^tibotattle-[a-z0-9-]{1,52}$/.test(value.queueName)
@@ -70,7 +70,8 @@ export async function createMaintenanceProvider({plan,packageDirectory,operation
       const id=await active(name);const v=await api(`${account}/workers/scripts/${name}/versions/${id}`);
       const settings=await api(`${account}/workers/scripts/${name}/settings`);
       if(name===isolatedBootstrap?.workerName){
-        const mode=isolatedBootstrap.phase,configDigest=mode==='enabled'?isolatedBootstrap.enabledConfigSha256:isolatedBootstrap.disabledConfigSha256;
+        const mode=isolatedBootstrap.phase==='enabled'?'enabled':'disabled';
+        const configDigest=mode==='enabled'?isolatedBootstrap.enabledConfigSha256:isolatedBootstrap.disabledConfigSha256;
         if(v.annotations?.['workers/tag']!==`existing-bootstrap-${mode}-${configDigest}`)fail('ISOLATION_CHANGED');
         const expected=[
           ['d1','SOURCE',isolatedBootstrap.sourceDatabaseId],['d1','STORAGE_ROUTING_DB',isolatedBootstrap.catalogDatabaseId],
@@ -108,6 +109,10 @@ export async function createMaintenanceProvider({plan,packageDirectory,operation
         if(q.queue_id!==isolatedBootstrap.queueId||q.queue_name!==isolatedBootstrap.queueName)fail('ISOLATION_CHANGED');
         if(isolatedBootstrap.phase==='enabled'){
           if(consumers.length!==1||!matchesExactBootstrapQueueConsumer(consumers[0],{
+            workerName:isolatedBootstrap.workerName,queueName:isolatedBootstrap.queueName,queueId:isolatedBootstrap.queueId,
+          }))fail('ISOLATION_CHANGED');
+        }else if(isolatedBootstrap.phase==='disabled-before-detach'){
+          if(consumers.length>1||consumers.length===1&&!matchesExactBootstrapQueueConsumer(consumers[0],{
             workerName:isolatedBootstrap.workerName,queueName:isolatedBootstrap.queueName,queueId:isolatedBootstrap.queueId,
           }))fail('ISOLATION_CHANGED');
         }else if(consumers.length)fail('ISOLATION_CHANGED');

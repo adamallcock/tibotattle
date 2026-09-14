@@ -11,7 +11,7 @@ The user approved implementation on September 13. Work starts from `ceeeca32e639
 
 ## Current checkpoint
 
-The integrated source `f787f705` passed the complete local Worker gate on September 13: **128 test files and 1,523 tests**, workspace/type/script checks, and capacity, analytics, main and staging dry builds. Existing-owner import, concurrent upload headroom reservations, multi-origin analytics and authenticated shard-aware private exports are implemented and locally qualified. The isolated cloud bootstrap rehearsal is in progress. Production catalog mode remains disabled.
+The parser-repaired source `bcbc2b5b` passed the complete local Worker gate on September 14: **128 test files and 1,523 tests**, workspace/type/script checks, and capacity, analytics, main and staging dry builds. Existing-owner import, concurrent upload headroom reservations, multi-origin analytics and authenticated shard-aware private exports are implemented and locally qualified. The fresh isolated cloud bootstrap rehearsal is prepared. Production catalog mode remains disabled.
 
 The remaining implementation is the owner copier and final routing switch, complete moved-owner export/lifecycle coverage, qualified spare operations and measured capacity calibration. Cloud rollover/failure qualification and production activation follow those gates. The historical checkpoints below record what was proven at each stage; this section states the current boundary.
 
@@ -176,3 +176,27 @@ root must apply routing migration 0008, run the root-only operator against the
 exact hosted bindings, retain its receipt and obtain a fresh capacity sample.
 No owner is copied or routed by qualification itself; the reviewed copier,
 move journey and isolated cloud failure rehearsal remain activation gates.
+
+The concrete hosted provider now composes the canonical readiness and capacity
+APIs through the existing maintenance transport. Its private input identifies
+exactly five database roles and pins the Worker version, source commit, Wrangler
+digest and deployed bindings. It verifies those identities before database
+queries, preserves the atomic D1 batch for capacity updates, and uses exact
+readback after an uncertain acknowledgement without automatically retrying a
+write. It neither creates databases nor changes client protocols or credentials.
+Focused provider/operator tests, Miniflare readiness/capacity tests and TypeScript
+pass. Review corrections pin the dependency tree and runtime bundle, recheck
+freshness and deployed bindings before activation, and persist each mutation's
+intent so a lost acknowledgement is reconciled without repeating the write.
+The combined owning gate and hosted spare qualification remain pending.
+
+The isolated cloud bootstrap rehearsal registered 35 synthetic owners, preserved
+issuance and revocation state, released the test source and removed its temporary
+resources. That run also exposed two operator gaps: the schedules API wraps its
+list, and omitting a Queue consumer during deployment does not detach it.
+The response parser now accepts only the two supported empty-list shapes. Cleanup
+has a separate journaled detachment step, with exact ownership checks and
+read-only recovery after acknowledgement loss. Its transitional containment
+state admits only the exact owned consumer until detachment is verified.
+These repairs have focused regression coverage; they do not activate production
+sharding or complete the existing-owner copy and routing-switch work.

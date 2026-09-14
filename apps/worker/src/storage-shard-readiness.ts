@@ -253,6 +253,24 @@ function same(left:StorageShardReadinessReceipt,right:StorageShardReadinessRecei
  return TUPLE_KEYS.every(key=>left[key]===right[key])&&left.readinessDigest===right.readinessDigest;
 }
 
+/** Exact read-only receipt seam for root operation recovery. Missing evidence
+ * remains null; callers may not create or refresh a receipt through this API. */
+export async function readStorageShardReadiness(catalog:D1Database,
+ readinessDigest:string):Promise<StorageShardReadinessReceipt|null>{
+ if(!catalog||typeof catalog.prepare!=='function'||!DIGEST.test(readinessDigest))throw invalid();
+ let row:ReceiptRow|null;
+ try{row=await catalog.prepare(READ_RECEIPT).bind(readinessDigest).first<ReceiptRow>();}
+ catch{throw unavailable();}
+ if(!row)return null;
+ const stored=receipt(row);
+ try{validateTuple(tupleFrom(stored));}catch{throw unavailable();}
+ if(stored.readinessDigest!==readinessDigest||!integer(stored.qualifiedAt)
+  ||stored.readinessDigest!==await storageShardReadinessDigest(tupleFrom(stored))
+  ||stored.state==='active'&&stored.revokedAt!==null
+  ||stored.state==='revoked'&&(!integer(stored.revokedAt)||stored.revokedAt<stored.qualifiedAt))throw unavailable();
+ return stored;
+}
+
 /** Durable catalog publication. Response loss converges by the digest; a
  * competing active tuple or a revoked prior attempt is never adopted. */
 export async function recordStorageShardReadiness(catalog:D1Database,
@@ -274,10 +292,8 @@ export async function recordStorageShardReadiness(catalog:D1Database,
   candidate.erasureTargetId,candidate.deletionLedgerBindingName,candidate.deletionLedgerDatabaseId,
   candidate.deletionSchemaDigest,candidate.publicationBindingName,candidate.publicationDatabaseId,candidate.publicationSchemaDigest,
   candidate.qualifiedAt).run();}catch{/* exact readback below distinguishes races */}
- let row:ReceiptRow|null;
- try{row=await catalog.prepare(READ_RECEIPT).bind(candidate.readinessDigest).first<ReceiptRow>();}
- catch{throw unavailable();}
- const stored=receipt(row??undefined);
+ const stored=await readStorageShardReadiness(catalog,candidate.readinessDigest);
+ if(!stored)throw unavailable();
  if(stored.state!=='active'||!same(stored,candidate))throw unavailable();
  return stored;
 }
@@ -288,10 +304,8 @@ export async function revokeStorageShardReadiness(catalog:D1Database,readinessDi
  try{await catalog.prepare(`UPDATE storage_shard_runtime_readiness SET state='revoked',revoked_at=?
   WHERE readiness_digest=? AND state='active' AND qualified_at<=?`).bind(revokedAt,readinessDigest,revokedAt).run();}
  catch{throw unavailable();}
- let row:ReceiptRow|null;
- try{row=await catalog.prepare(READ_RECEIPT).bind(readinessDigest).first<ReceiptRow>();}
- catch{throw unavailable();}
- const stored=receipt(row??undefined);
+ const stored=await readStorageShardReadiness(catalog,readinessDigest);
+ if(!stored)throw unavailable();
  if(stored.state!=='revoked'||stored.revokedAt===null||stored.revokedAt>revokedAt)throw unavailable();
  return stored;
 }

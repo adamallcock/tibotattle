@@ -4,9 +4,10 @@ import {initializeStorageSource} from '../src/analytics-delivery';
 import {initializeTypedV1Admission} from '../src/typed-v1-admission';
 import {initializeTypedV11Admission} from '../src/typed-v11-admission';
 import {initializeStorageAnalyticsRuntime} from '../src/storage-analytics-runtime';
-import {configureStorageShardAllocation,recordStorageCapacityObservation} from '../src/storage-capacity';
+import {configureStorageShardAllocation,readStorageCapacityObservation,readStorageShardAllocationPolicy,
+ recordStorageCapacityObservation} from '../src/storage-capacity';
 import {createCatalogStorageRouter,createOwnerMoveCoordinator} from '../src/storage-routing';
-import {captureStorageShardReadinessSchemaDigests,qualifyStorageShardRuntimeTuple,recordStorageShardReadiness,
+import {captureStorageShardReadinessSchemaDigests,qualifyStorageShardRuntimeTuple,readStorageShardReadiness,recordStorageShardReadiness,
  revokeStorageShardReadiness,type StorageShardReadinessPlan} from '../src/storage-shard-readiness';
 
 interface Bindings extends Env{
@@ -95,6 +96,15 @@ describe('storage shard runtime readiness',()=>{
 
  it('binds and replays one exact complete tuple before allocation',async()=>{
   const receipt=await enable('a');
+  await expect(readStorageCapacityObservation(b.STORAGE_ROUTING_DB,'a')).resolves.toEqual({
+   shardId:'a',observedBytes:0,observedAt:900,validUntil:2_000,pressureState:'normal'});
+  await expect(readStorageShardAllocationPolicy(b.STORAGE_ROUTING_DB,'a')).resolves.toEqual({
+   shardId:'a',allocationTier:'active',allocationEnabled:true,
+   qualificationDigest:receipt.readinessDigest,updatedAt:1_000});
+  await expect(readStorageCapacityObservation(b.STORAGE_ROUTING_DB,'missing')).resolves.toBeNull();
+  await expect(readStorageShardAllocationPolicy(b.STORAGE_ROUTING_DB,'missing')).resolves.toBeNull();
+  await expect(readStorageShardReadiness(b.STORAGE_ROUTING_DB,receipt.readinessDigest)).resolves.toEqual(receipt);
+  await expect(readStorageShardReadiness(b.STORAGE_ROUTING_DB,'0'.repeat(64))).resolves.toBeNull();
   expect(await recordStorageShardReadiness(b.STORAGE_ROUTING_DB,receipt)).toEqual(receipt);
   const router=createCatalogStorageRouter({catalog:b.STORAGE_ROUTING_DB,
    bindings:{STORAGE_INGESTION_A:b.STORAGE_INGESTION_A},clock:()=>1_100});

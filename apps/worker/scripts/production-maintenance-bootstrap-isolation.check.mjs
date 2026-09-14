@@ -33,11 +33,12 @@ async function fixture(t) {
       : index === 1 ? 'release-site-manifest.json' : `asset-${index}.js`, bytes: 5, sha256: maintenanceHash('bytes') })) };
   const mainBindings = [{ type: 'assets', name: 'ASSETS' },
     { type: 'plain_text', name: 'MAINTENANCE_PLAN_DIGEST', text: identityDigest(plan) }];
-  const state = { phase: 'enabled', rogue: false, wrongBinding: false, extraBinding: false, extraConsumer: false,
+  const state = { phase: 'enabled', consumerAttached: true, rogue: false, wrongBinding: false, extraBinding: false, extraConsumer: false,
     wrongTag: false, consumerChange: null };
+  const bootstrapMode = () => state.phase === 'enabled' ? 'enabled' : 'disabled';
   const isolatedBindings = () => [{ type: 'd1', name: 'SOURCE', id: state.wrongBinding ? catalogId : sourceId },
     { type: 'd1', name: 'STORAGE_ROUTING_DB', id: catalogId },
-    { type: 'plain_text', name: 'STORAGE_EXISTING_BOOTSTRAP_MODE', text: state.phase },
+    { type: 'plain_text', name: 'STORAGE_EXISTING_BOOTSTRAP_MODE', text: bootstrapMode() },
     { type: 'plain_text', name: 'STORAGE_EXISTING_BOOTSTRAP_OPERATION_DIGEST', text: bootstrap.operationDigest },
     { type: 'plain_text', name: 'STORAGE_EXISTING_BOOTSTRAP_BUNDLE_SHA256', text: bootstrap.bundleSha256 },
     ...(state.extraBinding ? [{ type: 'plain_text', name: 'EXTRA', text: 'bad' }] : [])];
@@ -51,7 +52,7 @@ async function fixture(t) {
       ...(state.rogue ? [{ id: 'rogue-worker' }] : [])];
     else if (path.endsWith('/deployments')) result = { deployments: [{ versions: [{ version_id: isolated ? bootstrapVersion : maintenanceVersion, percentage: 100 }] }] };
     else if (path.includes('/versions/')) result = { id: path.split('/').at(-1), annotations: isolated
-      ? { 'workers/tag': state.wrongTag ? 'wrong' : `existing-bootstrap-${state.phase}-${state.phase === 'enabled' ? bootstrap.enabledConfigSha256 : bootstrap.disabledConfigSha256}` }
+      ? { 'workers/tag': state.wrongTag ? 'wrong' : `existing-bootstrap-${bootstrapMode()}-${bootstrapMode() === 'enabled' ? bootstrap.enabledConfigSha256 : bootstrap.disabledConfigSha256}` }
       : { 'workers/tag': `maintenance-${operationId}` }, resources: { bindings: isolated ? isolatedBindings() : mainBindings } };
     else if (path.endsWith('/settings')) result = { bindings: isolated ? isolatedBindings() : mainBindings };
     else if (path.endsWith('/subdomain')) result = { enabled: false, previews_enabled: false };
@@ -64,7 +65,7 @@ async function fixture(t) {
       created_on: '2026-09-13T19:50:49.046911Z', settings: { batch_size: 1, max_retries: 0,
         max_wait_time_ms: 1000, max_concurrency: 1, retry_delay: 0 } };
       if(state.consumerChange)state.consumerChange(consumer);
-      result = state.phase === 'enabled' ? [consumer,...(state.extraConsumer ? [{ ...consumer,consumer_id:'7'.repeat(32),script:'rogue-worker' }] : [])] : []; }
+      result = state.consumerAttached ? [consumer,...(state.extraConsumer ? [{ ...consumer,consumer_id:'7'.repeat(32),script:'rogue-worker' }] : [])] : []; }
     else if (path.endsWith('/schedules')) result = { schedules: [] };
     else throw Error(`unexpected ${path}`);
     return Response.json({ success: true, result });
@@ -72,11 +73,13 @@ async function fixture(t) {
   const make = phase => createMaintenanceProvider({ plan, packageDirectory: root, operationDirectory: root,
     operationId, cliPath, fetcher, environment: { PATH: '/usr/bin', HOME: root, CLOUDFLARE_API_TOKEN: 'synthetic-token-value' },
     isolatedBootstrap: phase === null ? null : { ...bootstrap, phase } });
-  return { state, make, verify: async phase => { state.phase = phase; await (await make(phase)).verifyContained(maintenanceVersion); } };
+  return { state, make, verify: async (phase,consumerAttached=phase==='enabled') => {
+    state.phase = phase; state.consumerAttached = consumerAttached; await (await make(phase)).verifyContained(maintenanceVersion); } };
 }
 
 test('exact operation-bound queue-only, disabled and enabled bootstrap topology is admitted without changing baseline inventory', async t => {
   const f = await fixture(t); for (const phase of ['queue-only', 'disabled', 'enabled']) await f.verify(phase);
+  await f.verify('disabled-before-detach',true);await f.verify('disabled-before-detach',false);
 });
 
 test('wrong source binding, config tag, extra binding, consumer or unrelated Worker all refuse containment', async t => {
@@ -99,6 +102,8 @@ test('actual nested Queue consumer shape is exact and contradictory, missing or 
   ];
   for(const change of changes){f.state.consumerChange=change;
     await assert.rejects(f.verify('enabled'),{code:'PRODUCTION_MAINTENANCE_ISOLATION_CHANGED'});}
+  for(const change of changes){f.state.consumerChange=change;
+    await assert.rejects(f.verify('disabled-before-detach',true),{code:'PRODUCTION_MAINTENANCE_ISOLATION_CHANGED'});}
   f.state.consumerChange=null;await f.verify('enabled');
 });
 
