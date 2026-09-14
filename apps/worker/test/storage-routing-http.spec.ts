@@ -627,8 +627,13 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
   it("keeps the original budget day when a failed shard write retries after midnight", async () => {
     const deviceId = crypto.randomUUID();
     const secret = crypto.getRandomValues(new Uint8Array(32));
-    const firstInstant = Date.parse("2026-09-13T23:59:59.000Z");
-    const retryInstant = Date.parse("2026-09-14T00:00:01.000Z");
+    // Keep the boundary ahead of the issuance baseline seeded during setup.
+    const boundary = new Date(Date.now());
+    boundary.setUTCDate(boundary.getUTCDate() + 1);
+    boundary.setUTCHours(23, 59, 59, 0);
+    const firstInstant = boundary.getTime();
+    const firstBudgetDay = boundary.toISOString().slice(0, 10);
+    const retryInstant = firstInstant + 2_000;
     await recordStorageCapacityObservation(catalog(), {
       shardId: "a", observedBytes: 1_000, observedAt: firstInstant - 1_000,
       validUntil: retryInstant + 60_000, pressureState: "normal",
@@ -653,10 +658,10 @@ describe("catalog-routed accountless HTTP lifecycle", () => {
       expect(retry.status, await retry.clone().text()).toBe(201);
       expect(await catalog().prepare(`SELECT budget_day,reserved_at
         FROM storage_accountless_issuance_reservations`).first())
-        .toEqual({ budget_day: "2026-09-13", reserved_at: firstInstant });
+        .toEqual({ budget_day: firstBudgetDay, reserved_at: firstInstant });
       expect(await catalog().prepare(`SELECT budget_day,daily_reserved,lifetime_reserved
         FROM storage_accountless_issuance_state WHERE singleton_id=1`).first())
-        .toEqual({ budget_day: "2026-09-13", daily_reserved: 1, lifetime_reserved: 1 });
+        .toEqual({ budget_day: firstBudgetDay, daily_reserved: 1, lifetime_reserved: 1 });
     } finally {
       clock.mockRestore();
     }
