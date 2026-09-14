@@ -27,7 +27,7 @@ const sourceId = "synthetic-typed-source", namespace = "synthetic-original-typed
 const sourceLayout = { kind: "typed-v11" as const, sourceNamespace: namespace };
 const today = () => new Date().toISOString().slice(0, 10);
 const runtime = () => ({ ...b, ENVIRONMENT: "synthetic-development", ACCOUNT_SCOPED_INGEST_MODE: "disabled",
-  ACCOUNTLESS_ENROLLMENT_MODE: "enabled", ACCOUNTLESS_OWNERSHIP_MODE: "enabled" } as Env);
+  ACCOUNTLESS_ENROLLMENT_MODE: "enabled", ACCOUNTLESS_OWNERSHIP_MODE: "enabled", PUBLIC_ANALYTICS_MODE:"enabled" } as Env);
 const step = (db = target()) => advanceV11DailyProjection({ source: source(), target: db, sourceId, sourceLayout });
 const read = (ownerDigest: string) => readV11ProjectedOwnerDays({ source: source(), target: target(), sourceId,
   ownerDigest, fromDay: today(), throughDay: today() });
@@ -130,12 +130,19 @@ describe("typed accountless upload to isolated projection", () => {
     expect(await runStorageAnalyticsPass({...options,deadlineMs:0})).toMatchObject({state:"deferred",reason:"deadline",queriesUsed:0});
     const first=await runStorageAnalyticsPass({...options,maxSteps:1});
     expect(first).toMatchObject({state:"progress",recordsRead:200,steps:1});expect(first.queriesUsed).toBeLessThan(100);
+    await runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:"enabled",PUBLIC_ANALYTICS_MODE:"disabled",
+      STORAGE_SOURCE_ID:sourceId,TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),
+      STORAGE_ANALYTICS_DB:target(),DELETION_LEDGER:b.DELETION_LEDGER});
+    expect(await target().prepare("SELECT sequence FROM analytics_source_cursors WHERE source_id=?")
+      .bind(sourceId).first<number>("sequence")).toBe(1);
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_community_daily_publications")
+      .first<number>("n")).toBe(0);
     const unavailable={prepare(){throw new Error("synthetic analytics offline");}} as unknown as D1Database;
     await expect(runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:"enabled",STORAGE_SOURCE_ID:sourceId,
       TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:unavailable,DELETION_LEDGER:b.DELETION_LEDGER}))
       .rejects.toThrow("STORAGE_ANALYTICS_UNAVAILABLE");
     expect(await source().prepare("SELECT COUNT(*) n FROM typed_v11_record_admissions").first("n")).toBe(203);
-    expect(await runStorageAnalyticsPass(options)).toMatchObject({state:"idle",recordsRead:3});
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({state:"idle",recordsRead:0});
     expect((await read(value.event.ownerDigest)).values[0]!.counts.usage).toBe(203);
     await revokeAccountlessEnrollment(source(),value.deviceId,"user_opt_out",Date.now());
     expect((await read(value.event.ownerDigest)).state).toBe("authority-unavailable");

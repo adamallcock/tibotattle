@@ -34,8 +34,9 @@ export async function runProductionMaintenanceCutover({plan,cutover,operationDir
  qualificationRoot,restoreContractPath,ledgerSchemaPath,cliPath,action='dry-run',confirmation=null,executorStopped=false,
  analyticsCapturePath=null,lifecycleCapturePath=null,clock=()=>Date.now(),provider=null,analyticsProvider=null,coordinationFactory=createProductionDeploymentLock,checkSource=checkTooling}){
  plan=structuredClone(validateMaintenancePlan(plan));cutover=structuredClone(validateMaintenanceCutoverPlan(cutover,plan));
- if(!['dry-run','apply','reconcile'].includes(action))fail('ACTION_INVALID');
+ if(!['dry-run','apply','finalize','reconcile'].includes(action))fail('ACTION_INVALID');
  if(action==='apply'&&confirmation!=='CUT_OVER_QUALIFIED_TYPED_PRODUCTION')fail('CONFIRMATION_REQUIRED');
+ if(action==='finalize')fail('PUBLIC_FINALIZATION_UNAVAILABLE');
  if(action==='reconcile'&&(confirmation!=='RECONCILE_TYPED_PRODUCTION_CUTOVER'||!executorStopped))fail('RECONCILIATION_CONFIRMATION_REQUIRED');
  checkSource(repositoryRoot,plan.toolingCommit);
  const op=await openOperation({directory:operationDirectory,kind:'maintenance',binding:{planDigest:identityDigest(plan)},resume:true});
@@ -43,20 +44,14 @@ export async function runProductionMaintenanceCutover({plan,cutover,operationDir
   const state=validateMaintenanceState(op.record.state),pin=identityDigest(cutover),lock=coordinationFactory({repositoryRoot});
   if(op.record.id!==cutover.operationId||state.owner!==cutover.owner||state.uploadedVersion!==cutover.maintenanceVersionId||state.phase!=='contained'||state.intent!==null)fail('PARENT_MISMATCH');
   if(state.cutover&&state.cutover.planDigest!==pin)fail('PLAN_CHANGED');
-  if(state.lock==='released'){
-   if(state.cutover?.phase!=='verified'||state.cutover?.intent!==null)fail('PARENT_MISMATCH');
-   return {ok:true,code:'MAINTENANCE_CUTOVER_ALREADY_COMPLETE'};
-  }
+  if(state.lock==='released')fail('PARENT_MISMATCH');
   if(state.lock!=='held')fail('PARENT_MISMATCH');
   if(action==='apply'&&!state.cutover?.oldRestoreForbidden&&(clock()>=cutover.expiresAt||cutover.expiresAt-clock()>86400000))fail('PLAN_EXPIRED');
-  const pending=state.cutover;
-  if(action==='reconcile'&&pending?.intent==='release'){
-   const observed=lock.status();if(![null,state.owner].includes(observed))fail('OWNER_CHANGED');
-  }else lock.assertOwned(state.owner);
+  lock.assertOwned(state.owner);
   provider??=await createMaintenanceCutoverProvider({plan,cutover,operationDirectory:op.directory,candidateWorkerDirectory,qualificationRoot,restoreContractPath,ledgerSchemaPath,cliPath});
   analyticsProvider??=createMaintenanceAnalyticsProvider({plan,cutover,operationDirectory:op.directory,cliPath});
   if(!state.cutover){
-   if(action==='reconcile')fail('NOT_STARTED');
+   if(action==='reconcile'||action==='finalize')fail('NOT_STARTED');
    const snapshot=await provider.prepare();
    const descriptor=await analyticsProvider.prepare(snapshot);
    state.cutover={planDigest:pin,phase:'prepared',intent:null,versionId:null,oldRestoreForbidden:false,snapshot,analytics:{descriptor,registrationIntent:null,registrationDigest:null,preAdmissionDigest:null,phase:'prepared',disabledVersionId:null,enabledVersionId:null,notBeforeMs:null,naturalDigest:null},lifecycle:{scheduled:false,notBeforeMs:null,naturalDigest:null}};
@@ -68,14 +63,8 @@ export async function runProductionMaintenanceCutover({plan,cutover,operationDir
    await provider.dryRun(c.snapshot);await analyticsProvider.dryRun(c.snapshot,c.analytics.descriptor);return {ok:true,code:'MAINTENANCE_CUTOVER_DRY_RUN',remoteWrites:false};
   }
   const a=c.analytics,d=a.descriptor;
-  const verifyFinal=async()=>{await provider.verifyActivated(c.versionId,c.snapshot,{scheduled:true});await analyticsProvider.verifyEnabled(c.snapshot,d,a.enabledVersionId);if(!a.naturalDigest||!c.lifecycle.naturalDigest)fail('NATURAL_PROOF_MISSING');};
   if(action==='reconcile'){
-   if(c.intent==='release'){
-    if(c.phase!=='verified'||!c.oldRestoreForbidden)fail('STATE_INVALID');
-    await verifyFinal();
-    if(lock.status()===null){state.lock='released';c.intent=null;await op.save(state);return {ok:true,code:'MAINTENANCE_CUTOVER_RECONCILED',coordination:'released'};}
-    lock.assertOwned(state.owner);c.intent=null;
-   }else if(c.intent==='upload'){
+   if(c.intent==='upload'){
     try{c.versionId=await provider.reconcileUpload(c.versionId,c.snapshot);c.phase='uploaded';}
     catch{await provider.verifyUploadAbsent(c.snapshot);c.phase='prepared';}c.intent=null;
    }else if(c.intent==='analytics_deploy'){
@@ -98,14 +87,17 @@ export async function runProductionMaintenanceCutover({plan,cutover,operationDir
     c.intent=null;
    }else if(c.intent==='activate'){
     if(!c.oldRestoreForbidden||!c.snapshot.admissionDigest)fail('STATE_INVALID');
-    try{await provider.verifyActivated(c.versionId,c.snapshot);c.phase='active';}
+    try{await provider.verifyActivated(c.versionId,c.snapshot);c.phase='upload_active';}
     catch{await provider.verifyActivationPending(c.versionId,c.snapshot);c.phase='uploaded';}
     c.intent=null;
    }else if(c.intent==='main_cron'){
     try{await provider.verifyActivated(c.versionId,c.snapshot,{scheduled:true});c.lifecycle.scheduled=true;}
     catch{await provider.verifyActivated(c.versionId,c.snapshot);c.lifecycle.scheduled=false;}
     c.intent=null;
-   }else if(c.phase==='verified'){await verifyFinal();}
+   }else if(c.phase==='upload_active'){
+    await provider.verifyActivated(c.versionId,c.snapshot,{scheduled:c.lifecycle.scheduled});
+    await analyticsProvider.verifyEnabled(c.snapshot,d,a.enabledVersionId);
+   }
    await op.save(state);
    return {ok:true,code:'MAINTENANCE_CUTOVER_RECONCILED',phase:c.phase,coordination:state.lock};
   }
@@ -121,7 +113,7 @@ export async function runProductionMaintenanceCutover({plan,cutover,operationDir
   if(c.phase==='prepared'){
    await before();await provider.verifyContained();await analyticsProvider.verifyDisabled(c.snapshot,d,a.disabledVersionId);
    const proof=await provider.admit(c.snapshot,'pre-analytics');if(proof.stage!=='pre-analytics'||proof.analyticsCaughtUp!==false)fail('ADMISSION_STAGE_INVALID');
-   a.preAdmissionDigest=identityDigest(proof);await intent('upload');await provider.upload(c.snapshot);
+   a.preAdmissionDigest=identityDigest(proof);c.snapshot.admissionDigest=a.preAdmissionDigest;await intent('upload');await provider.upload(c.snapshot);
    c.versionId=await provider.reconcileUpload(null,c.snapshot);c.phase='uploaded';await saved();
   }
   if(!a.registrationDigest){
@@ -152,20 +144,18 @@ export async function runProductionMaintenanceCutover({plan,cutover,operationDir
   }
   if(c.phase==='uploaded'){
    await before();await provider.verifyContained();await analyticsProvider.verifyEnabled(c.snapshot,d,a.enabledVersionId);
-   if(!c.snapshot.admissionDigest){const proof=await provider.admit(c.snapshot,'full');if(proof.stage!=='full'||proof.analyticsCaughtUp!==true)fail('ADMISSION_STAGE_INVALID');c.snapshot.admissionDigest=identityDigest(proof);}
-   await intent('activate');await provider.activate(c.versionId,c.snapshot);await provider.verifyActivated(c.versionId,c.snapshot);c.phase='active';await saved();
+   if(c.snapshot.admissionDigest!==a.preAdmissionDigest)fail('ADMISSION_MISSING');
+   await intent('activate');await provider.activate(c.versionId,c.snapshot);await provider.verifyActivated(c.versionId,c.snapshot);c.phase='upload_active';await saved();
   }
-  if(c.phase==='active'&&!c.lifecycle.scheduled){
+  if(c.phase==='upload_active'&&!c.lifecycle.scheduled){
    c.lifecycle.notBeforeMs=clock();await intent('main_cron');await provider.enableMainCron(c.versionId,c.snapshot);await provider.verifyActivated(c.versionId,c.snapshot,{scheduled:true});c.lifecycle.scheduled=true;await saved();
   }
-  if(c.phase==='active'){
+  if(c.phase==='upload_active'&&!c.lifecycle.naturalDigest){
    if(!lifecycleCapturePath)return {ok:false,code:'MAINTENANCE_LIFECYCLE_NATURAL_PROOF_REQUIRED',coordination:'held'};
-   const proof=await provider.verifyMainNaturalInvocation(c.versionId,c.snapshot,lifecycleCapturePath,c.lifecycle.notBeforeMs);c.lifecycle.naturalDigest=identityDigest(proof);c.phase='verified';await op.save(state);
+   const proof=await provider.verifyMainNaturalInvocation(c.versionId,c.snapshot,lifecycleCapturePath,c.lifecycle.notBeforeMs);c.lifecycle.naturalDigest=identityDigest(proof);await op.save(state);
   }
-  if(c.phase!=='verified'||!c.oldRestoreForbidden)fail('STATE_INVALID');
-  await verifyFinal();lock.assertOwned(state.owner);
-  c.intent='release';await op.save(state);lock.release(state.owner);state.lock='released';c.intent=null;await op.save(state);
-  return {ok:true,code:'MAINTENANCE_TYPED_CUTOVER_VERIFIED',coordination:'released',oldSourceRestoreForbidden:true};
+  if(c.phase==='upload_active'&&action==='apply')return {ok:true,code:'MAINTENANCE_UPLOADS_ACTIVE_ANALYTICS_PENDING',coordination:'held',publicAnalytics:false,analyticsCaughtUp:false};
+  fail('STATE_INVALID');
  }finally{op.close();}
 }
 export function parseMaintenanceCutoverArguments(args){const r={action:'dry-run'},seen=new Set(),names={'--plan':'planPath','--cutover-plan':'cutoverPath','--operation':'operationDirectory','--repository':'repositoryRoot','--candidate-worker':'candidateWorkerDirectory','--qualification-root':'qualificationRoot','--restore-contract':'restoreContractPath','--ledger-schema':'ledgerSchemaPath','--wrangler-cli':'cliPath','--action':'action','--confirm':'confirmation','--analytics-tail':'analyticsCapturePath','--lifecycle-tail':'lifecycleCapturePath'};

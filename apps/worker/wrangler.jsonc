@@ -18,6 +18,7 @@
     "crons": ["* * * * *"]
   },
   "vars": {
+    "PUBLIC_ANALYTICS_MODE": "enabled",
     "ENVIRONMENT": "synthetic-development",
     "ENROLLMENT_MODE": "local_open",
     "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
@@ -152,6 +153,7 @@
         "crons": ["* * * * *"]
       },
       "vars": {
+        "PUBLIC_ANALYTICS_MODE": "enabled",
         "ENVIRONMENT": "staging",
         "ENROLLMENT_MODE": "disabled",
         // Accountless admission stays explicitly closed in the checked-in
@@ -292,6 +294,7 @@
         "crons": ["* * * * *"]
       },
       "vars": {
+        "PUBLIC_ANALYTICS_MODE": "enabled",
         "ENVIRONMENT": "production",
         // Owner-approved hosted recovery. Deploy only after migrations 0046/0047
         // and the maintained Worker checks pass; paused remains the incident brake.

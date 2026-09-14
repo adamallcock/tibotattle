@@ -79,8 +79,8 @@ export function validateMaintenanceState(s) {
     ||!['not_acquired','held','released'].includes(s.lock))fail('JOURNAL_INVALID');
   if(s.cutover!==null){
     exact(s.cutover,'planDigest phase intent versionId oldRestoreForbidden snapshot analytics lifecycle');
-    if(!SHA.test(s.cutover.planDigest)||!['prepared','uploaded','active','verified'].includes(s.cutover.phase)
-      ||![null,'upload','activate','release','analytics_deploy','analytics_initialize','analytics_upload','analytics_activate','analytics_cron','main_cron'].includes(s.cutover.intent)
+    if(!SHA.test(s.cutover.planDigest)||!['prepared','uploaded','upload_active'].includes(s.cutover.phase)
+      ||![null,'upload','activate','analytics_deploy','analytics_initialize','analytics_upload','analytics_activate','analytics_cron','main_cron'].includes(s.cutover.intent)
       ||!(s.cutover.versionId===null||ID.test(s.cutover.versionId))||typeof s.cutover.oldRestoreForbidden!=='boolean'
       ||!s.cutover.snapshot||typeof s.cutover.snapshot!=='object')fail('JOURNAL_INVALID');
     const a=s.cutover.analytics,l=s.cutover.lifecycle;
