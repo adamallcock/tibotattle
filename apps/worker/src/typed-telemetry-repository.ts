@@ -186,24 +186,27 @@ export async function prepareTypedTelemetryInsert(
   }
   // Parent order matters for immediate foreign keys; a mismatched existing
   // device/manifest/chunk goes through an immutable upsert and cannot be reused.
+  // Equal parents skip UPDATE: even an identical FK parent update can scan its
+  // children. Every assigned immutable field participates in the NULL-safe guard;
+  // any difference still reaches the existing aborting immutability trigger.
   for (const { row } of prepared) add(insert("typed_telemetry_namespaces", { original_id: parameter(id(row.sourceNamespace)) }), true);
   for (const { row } of prepared) add(insert("typed_telemetry_owners", {
     namespace_id: namespace(row.sourceNamespace), original_id: parameter(id(row.participantId)),
   }), true);
   for (const { row } of prepared) add(insert("typed_telemetry_devices", {
     namespace_id: namespace(row.sourceNamespace), owner_id: owner(row), original_id: parameter(id(row.deviceId)),
-  }, "ON CONFLICT(namespace_id, original_id) DO UPDATE SET owner_id = excluded.owner_id"), true);
+  }, "ON CONFLICT(namespace_id, original_id) DO UPDATE SET owner_id = excluded.owner_id WHERE typed_telemetry_devices.owner_id IS NOT excluded.owner_id"), true);
   for (const { row } of prepared) {
     if (row.manifestId !== null) add(insert("typed_telemetry_manifests", {
       namespace_id: namespace(row.sourceNamespace), owner_id: owner(row), device_id: device(row),
       original_id: parameter(id(row.manifestId)), chunk_day: parameter(typedTelemetryDayNumber(row.chunkDay)),
-    }, "ON CONFLICT(namespace_id, original_id) DO UPDATE SET owner_id = excluded.owner_id, device_id = excluded.device_id, chunk_day = excluded.chunk_day"), true);
+    }, "ON CONFLICT(namespace_id, original_id) DO UPDATE SET owner_id = excluded.owner_id, device_id = excluded.device_id, chunk_day = excluded.chunk_day WHERE typed_telemetry_manifests.owner_id IS NOT excluded.owner_id OR typed_telemetry_manifests.device_id IS NOT excluded.device_id OR typed_telemetry_manifests.chunk_day IS NOT excluded.chunk_day"), true);
   }
   for (const { row, fields } of prepared) add(insert("typed_telemetry_chunks", {
     namespace_id: namespace(row.sourceNamespace), format: parameter(formatCode(row.format)), owner_id: owner(row), device_id: device(row),
     manifest_id: manifest(row), original_id: parameter(id(row.chunkRowId)), stream: parameter(STREAMS.indexOf(fields.stream) + 1),
     chunk_day: parameter(typedTelemetryDayNumber(row.chunkDay)),
-  }, "ON CONFLICT(namespace_id, format, original_id) DO UPDATE SET owner_id = excluded.owner_id, device_id = excluded.device_id, manifest_id = excluded.manifest_id, stream = excluded.stream, chunk_day = excluded.chunk_day"), true);
+  }, "ON CONFLICT(namespace_id, format, original_id) DO UPDATE SET owner_id = excluded.owner_id, device_id = excluded.device_id, manifest_id = excluded.manifest_id, stream = excluded.stream, chunk_day = excluded.chunk_day WHERE typed_telemetry_chunks.owner_id IS NOT excluded.owner_id OR typed_telemetry_chunks.device_id IS NOT excluded.device_id OR typed_telemetry_chunks.manifest_id IS NOT excluded.manifest_id OR typed_telemetry_chunks.stream IS NOT excluded.stream OR typed_telemetry_chunks.chunk_day IS NOT excluded.chunk_day"), true);
   for (const { row, fields } of prepared) {
     if (fields.usage) add(insert("typed_telemetry_identifiers", {
       namespace_id: namespace(row.sourceNamespace), owner_id: owner(row), value: parameter(blob(fields.usage.sessionId)),
