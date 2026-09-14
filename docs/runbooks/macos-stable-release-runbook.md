@@ -194,7 +194,7 @@ those fields remain explicitly false.
 
 ### Current-candidate admission
 
-All three Mac qualification workflows admit the identity before installing
+The Mac qualification workflows admit the identity before installing
 verification dependencies or downloading signed apps. Copy the selected target's
 existing `production-source-candidate.json` into the `sourceCandidate` member of
 the workflow's JSON input. The shared
@@ -218,6 +218,14 @@ regressions, including all six workflow bodies with a synthetic future release.
 
 Existing-credential coverage remains an explicit receipt field; the synthetic
 opt-out fixture does not claim an existing Keychain credential rehearsal.
+The separately dispatched `electron-macos-credentials.yml` checks existing
+modern credentials through an installed Electron 0.1.20-to-candidate replacement
+on a disposable hosted ARM account. It uses a separately signed, nonce-bound
+synthetic fixture and kernel-enforced loopback-only app networking. Its reviewed
+intake, preparation, evidence and remaining failure-case boundaries are described
+in the [fixture README](../../test/fixtures/macos-keychain-migration/README.md#hosted-installed-electron-credentials).
+Neither signing the fixture nor passing this scoped journey proves the complete
+credential failure matrix. Retain each unexercised result as false.
 The active closure plan is
 [the installed update sequence](../plans/2026-09-11-electron-upgrade-release-closure.md).
 
@@ -369,6 +377,20 @@ release. Normal startup, refresh, background work, and automatic migration must
 not enable Keychain interaction. Preserve the last usable local state when
 access is unavailable; do not erase an identity, weaken access controls, disable
 macOS protections, or move secrets to plaintext to make a candidate appear ready.
+
+The native migration mechanics below apply to the native shell and its retained
+legacy approval route. Current Electron startup follows
+[`desktop-secure-storage-readiness.js`](../../apps/electron/desktop-secure-storage-readiness.js)
+and the [app-owned adapter contract](../../native/macos-keychain/README.md): it
+performs bounded silent credential reads, then offers a native **Quit** default
+and explicit silent **Retry**. It has no automatic three-attempt recovery loop
+or Electron **Secure upgrade** action. A legacy-only item yields
+`migration_required`; Electron does not perform partial legacy adoption, change
+its ACL, or mint over it. Do not claim those native migration journeys were
+exercised by an Electron startup check. Current signed Electron coverage still
+requires truthful locked/unavailable and denial/cancellation evidence; the
+hosted synthetic lane currently exercises locked and invalid Retry/Quit while
+reporting denial, timeout/unavailable and legacy-only behavior as unqualified.
 
 The silent-migration source change adds a separately signed native helper to
 the closed payload inventory. Its `node` signing identifier and exact Developer

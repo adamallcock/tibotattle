@@ -139,7 +139,7 @@ export function refreshProductionUpdateArchiveIndex(appPath) {
   if (typeof api.uncache !== 'function') fail('archive_cache_api');
   api.uncache(join(appPath, 'Contents', 'Resources', 'app.asar'));
 }
-async function verifyPredecessor(input, appPath) {
+export async function verifyPredecessor(input, appPath) {
   const asar = join(appPath, 'Contents', 'Resources', 'app.asar');
   if (hash(await bytes(asar, 512 * 1024 ** 2)) !== input.predecessorAsarSha256) fail('predecessor_asar');
   command('/usr/bin/codesign', macOSCredentialApplicationVerificationArguments(appPath));
