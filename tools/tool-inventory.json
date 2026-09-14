@@ -2605,6 +2605,7 @@
       "stableAliasReason": "Explicit disposable platform qualification; retained evidence is scoped to the exact source and artifacts.",
       "additionalAliases": [],
       "callers": [
+        "scripts/smoke-electron-macos-empty-profile.mjs",
         ".github/workflows/electron-signed-staging.yml",
         "test/electron-signed-staging-execution.test.js",
         "scripts/run-signed-electron-production-canary.mjs",
@@ -2811,6 +2812,7 @@
       "additionalAliases": [],
       "callers": [
         "scripts/publish-sparkle-update.js",
+        "scripts/reconcile-release-publication.mjs",
         "test/electron-sparkle-transition.test.js"
       ],
       "decision": "retain_as_internal_release_support",
@@ -2876,6 +2878,7 @@
       "stableAliasReason": "Explicit disposable native Sparkle-to-Electron qualification; preserves signed bytes and lets Sparkle perform the replacement.",
       "additionalAliases": [],
       "callers": [
+        "scripts/smoke-electron-macos-empty-profile.mjs",
         ".github/workflows/electron-macos-sparkle-transition.yml",
         "scripts/smoke-electron-macos-production-update.mjs",
         "test/smoke-electron-macos-sparkle-transition.test.mjs"
@@ -2884,6 +2887,38 @@
       "provenance": ".github/workflows/electron-macos-sparkle-transition.yml",
       "provenanceReason": null,
       "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release qualification helper; not a product command.",
+      "additionalAliases": [],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": [],
+      "canonicalPath": "scripts/lib/macos-transition-ui-diagnostics.mjs",
+      "callers": [
+        "scripts/smoke-electron-macos-sparkle-transition.mjs",
+        "test/macos-transition-ui-diagnostics.test.mjs"
+      ]
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release qualification helper; not a product command.",
+      "additionalAliases": [],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": [],
+      "canonicalPath": "scripts/smoke-electron-macos-empty-profile.mjs",
+      "callers": [
+        ".github/workflows/electron-macos-empty-profile.yml",
+        "test/smoke-electron-macos-empty-profile.test.mjs"
+      ]
     }
   ]
 }

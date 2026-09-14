@@ -4338,6 +4338,26 @@ function timelineResetBoundaryEvents(data) {
   return events;
 }
 
+// Reset classification comes from the validated companion DTO. Quota boundary
+// events follow the selected main weekly plan; credits belong to the account
+// and are explicitly labelled that way in the Horizon inspection text.
+function timelineTypedResetEvents(data) {
+  const planType = data.allowancePlanSelection?.planType ?? data.weekly?.planType;
+  return (data.timeline.resetEvents ?? []).flatMap(event => {
+    const lifecycle = event.kind === "reset_credit_granted" || event.kind === "reset_credit_expired";
+    if (!lifecycle && (event.planType !== planType || !isPrimaryCodexWeeklyQuotaWindow({
+      limitId: event.limitId, durationMinutes: event.windowDurationMins,
+    }))) return [];
+    return [{ ...event,
+      // An interval observation cannot provide an exact reset instant. Locate
+      // its marker at the confirming observation and show both interval ends.
+      timestampMs: Date.parse(event.precision === "observation_interval" ? event.observedAt : event.occurredAt),
+      observedAtMs: Date.parse(event.observedAt),
+      intervalStartedAtMs: Date.parse(event.intervalStartedAt),
+    }];
+  });
+}
+
 function liveTimelinePoints(
   data,
   {
@@ -5374,6 +5394,7 @@ function renderTimeline(data) {
         ? finite(row.remainingPercent) : null };
   }));
   trendsHorizonView?.setEvents([
+    ...timelineTypedResetEvents(data),
     ...timelineResetBoundaryEvents(data),
     ...points.flatMap(point => point.resetEvent ? [point.resetEvent] : []),
   ]);

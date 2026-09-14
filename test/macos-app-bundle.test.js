@@ -7326,6 +7326,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/reporting-period.js",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
+    "apps/web/public/trends-horizon.js",
     "apps/web/public/ui-format.js",
     "apps/web/public/work-usage-view.js",
   ]);
@@ -7395,6 +7396,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
     "apps/web/public/tibotattle-icon.png",
+    "apps/web/public/trends-horizon.js",
     "apps/web/public/ui-format.js",
     "apps/web/public/work-usage-view.js",
   ]);

@@ -108,6 +108,75 @@ export function createSpendRateLookup(buckets, { intervals, bucketMs = 900_000, 
   };
 }
 
+const RESET_MARKERS = Object.freeze({
+  scheduled_reset: { label: "trends.resetScheduled", icon: "↻" },
+  banked_reset_used: { label: "trends.resetBanked", icon: "ϟ" },
+  unknown_reset: { label: "trends.resetUnknown", icon: "?" },
+  reset_credit_granted: { label: "trends.resetCreditGranted", icon: "+", lifecycle: true },
+  reset_credit_expired: { label: "trends.resetCreditExpired", icon: "−", lifecycle: true },
+  observed_reset: { label: "trends.resetObserved", icon: "↺", fallback: true },
+  window_change: { label: "trends.resetBoundary", icon: "◇", fallback: true },
+});
+
+// Typed evidence replaces an unclassified observation only inside the evidence
+// interval for that boundary. Account-level credit lifecycle events do not
+// classify quota movement. Sorting and one interval sweep avoid a per-event
+// scan of the full retained history.
+export function mergeHorizonResetEvents(events) {
+  const typed = new Map(), fallback = new Map();
+  for (const event of events) {
+    const marker = Object.hasOwn(RESET_MARKERS, event?.kind) ? RESET_MARKERS[event.kind] : null;
+    if (!marker || !finite(event.timestampMs)) continue;
+    if (marker.fallback) {
+      if (fallback.get(event.timestampMs)?.kind !== "observed_reset") fallback.set(event.timestampMs, event);
+    } else {
+      if (!finite(event.intervalStartedAtMs) || !finite(event.observedAtMs)
+          || event.intervalStartedAtMs >= event.observedAtMs) continue;
+      const key = JSON.stringify([event.kind, event.reason, event.timestampMs,
+        event.intervalStartedAtMs, event.observedAtMs, event.precision,
+        event.planType, event.limitId, event.windowDurationMins]);
+      typed.set(key, event);
+    }
+  }
+  const intervals = [...typed.values()].filter(event => !RESET_MARKERS[event.kind].lifecycle)
+    .map(event => [event.intervalStartedAtMs, event.observedAtMs])
+    .sort((a, b) => a[0] - b[0]);
+  const coverage = [];
+  for (const interval of intervals) {
+    const last = coverage.at(-1);
+    if (last && interval[0] <= last[1]) last[1] = Math.max(last[1], interval[1]);
+    else coverage.push(interval);
+  }
+  const result = [...typed.values()];
+  let cursor = 0;
+  for (const event of [...fallback.values()].sort((a, b) => a.timestampMs - b.timestampMs)) {
+    while (cursor < coverage.length && coverage[cursor][1] < event.timestampMs) cursor += 1;
+    if (!coverage[cursor] || event.timestampMs <= coverage[cursor][0]) result.push(event);
+  }
+  return result.sort((a, b) => a.timestampMs - b.timestampMs || a.kind.localeCompare(b.kind));
+}
+
+export function resetEventPresentation(event, { t, formatInstant }) {
+  const marker = RESET_MARKERS[event.kind];
+  const label = t(marker.label);
+  let caption;
+  if (marker.fallback) {
+    caption = t("trends.resetDetail", { event: label, time: formatInstant(event.timestampMs) });
+    if (event.confirmedAtMs > event.timestampMs) caption += " " + t("trends.resetConfirmed", {
+      time: formatInstant(event.confirmedAtMs),
+    });
+  } else if (event.precision === "observation_interval") {
+    caption = t("trends.resetInterval", { event: label,
+      start: formatInstant(event.intervalStartedAtMs), end: formatInstant(event.observedAtMs) });
+  } else {
+    caption = t(event.precision === "provider_schedule" ? "trends.resetScheduleTime" : "trends.resetProviderTime", {
+      event: label, time: formatInstant(event.timestampMs), observed: formatInstant(event.observedAtMs),
+    });
+  }
+  if (marker.lifecycle) caption += " " + t("trends.resetAccountScope");
+  return { caption, icon: marker.icon };
+}
+
 // Neighboring markers share a badge at the latest event's actual time. Every
 // event remains in the inspection text; no timestamp is moved to avoid overlap.
 export function resetMarkerGroups(events, x, minimumSpacing = 24) {
@@ -287,20 +356,16 @@ export function mountTrendsHorizon(root, { t, locale, timeZone, formatMoney, for
     const layer = svgNode(document, "g", { class: "trends-reset-layer" });
     for (const group of resetMarkerGroups(visible, chart.x)) {
       const event = group.at(-1), x = chart.x(event);
-      const caption = group.map(item => {
-        const label = t(item.kind === "observed_reset" ? "trends.resetObserved" : "trends.resetBoundary");
-        const detail = t("trends.resetDetail", { event: label,
-          time: format(item.timestampMs, { dateStyle: "medium", timeStyle: "short" }) });
-        return item.confirmedAtMs > item.timestampMs ? detail + " " + t("trends.resetConfirmed", {
-          time: format(item.confirmedAtMs, { dateStyle: "medium", timeStyle: "short" }),
-        }) : detail;
-      }).join("\n");
-      const marker = svgNode(document, "g", { class: `trends-reset-marker ${event.kind}`, tabindex: 0, role: "button", "aria-label": caption });
+      const caption = group.map(item => resetEventPresentation(item, { t,
+        formatInstant: timestamp => format(timestamp, { dateStyle: "medium", timeStyle: "short" }),
+      }).caption).join("\n");
+      const markerKind = group.every(item => item.kind === event.kind) ? event.kind : "mixed";
+      const marker = svgNode(document, "g", { class: `trends-reset-marker ${markerKind}`, tabindex: 0, role: "button", "aria-label": caption });
       const title = svgNode(document, "title", {}); title.textContent = caption;
       const stem = svgNode(document, "line", { x1: x, x2: x, y1: 21, y2: chart.height - chart.margin.bottom });
       const badge = svgNode(document, "rect", { x: x - 9, y: 1, width: 18, height: 18, rx: 6 });
       const icon = svgNode(document, "text", { x, y: 14, "text-anchor": "middle", "aria-hidden": "true", "data-i18n-skip": "" });
-      icon.textContent = group.length > 1 ? String(group.length) : event.kind === "observed_reset" ? "↻" : "◇";
+      icon.textContent = group.length > 1 ? String(group.length) : RESET_MARKERS[event.kind].icon;
       if (group.length > 1) icon.setAttribute("class", "trends-reset-group-count");
       marker.append(title, stem, badge, icon);
       const inspect = () => {
@@ -396,12 +461,7 @@ export function mountTrendsHorizon(root, { t, locale, timeZone, formatMoney, for
       allowanceSamples = points.filter(point => finite(point.timestampMs)).sort((a, b) => a.timestampMs - b.timestampMs);
     },
     setEvents(events) {
-      const byTime = new Map();
-      for (const event of events) {
-        if (!finite(event.timestampMs) || !["observed_reset", "window_change"].includes(event.kind)) continue;
-        if (byTime.get(event.timestampMs)?.kind !== "observed_reset") byTime.set(event.timestampMs, event);
-      }
-      resetEvents = [...byTime.values()];
+      resetEvents = mergeHorizonResetEvents(events);
       $("#trends-event-detail").hidden = true;
       renderEvents();
     },
@@ -418,7 +478,7 @@ export function mountTrendsHorizon(root, { t, locale, timeZone, formatMoney, for
     },
     refreshLocale(next) {
       if (formatLocale !== next) { formatLocale = next; formatters.clear(); charts.forEach(chart => { delete chart.lastPoint; }); }
-      setPlayLabel(); if (at !== null) select(at);
+      setPlayLabel(); renderEvents(); if (at !== null) select(at);
     },
     dispose() { disposed = true; stop(); charts.forEach(chart => chart.cleanup()); charts.clear(); media.removeEventListener("change", motionChanged); document.removeEventListener("visibilitychange", visibilityChanged); pageObserver.disconnect(); },
   };

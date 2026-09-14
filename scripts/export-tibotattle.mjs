@@ -364,6 +364,7 @@ export const CLIENT_PACKAGE_FILES = Object.freeze([
   "packages/quota-analysis/src/quota-rolling.js",
   "packages/quota-analysis/src/quota-tracks.js",
   "packages/quota-analysis/src/quota-windows.js",
+  "packages/quota-analysis/src/reset-events.js",
   "packages/telemetry-contract/index.d.ts",
   "packages/telemetry-contract/index.js",
   "packages/telemetry-contract/package.json",

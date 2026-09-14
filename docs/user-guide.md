@@ -330,11 +330,13 @@ dash; the rate does not extend beyond the recorded usage history. Allowance
 readings also become unavailable when stale. These amounts are API equivalents,
 not subscription charges.
 
-Reset markers distinguish confirmed allowance drops from recorded changes to the
-reset boundary. Select a marker for its observation time; closely spaced events
-share a numbered marker with every event listed. A confirmed drop can have a
-later confirming observation. Scheduled versus banked reset types are not present
-in this payload and are not inferred. Plan-incompatible boundaries stay excluded.
+Reset markers distinguish scheduled resets, banked resets, unknown types,
+and account-level credit grants or expiry when that evidence is available.
+Select a marker to inspect it; nearby events share a numbered marker with every
+event listed. Interval observations show both interval ends; scheduled and
+provider timestamps retain their precision. Older unclassified boundaries stay
+explicit. Typed evidence replaces matching fallback markers without duplicating
+resets. Plan-incompatible allowance events stay excluded.
 
 **When usage and allowance disagree** lists sustained divergence periods as compact
 rows ranked by their largest signed percentage-point gap. The gap accumulates from the cycle comparison
