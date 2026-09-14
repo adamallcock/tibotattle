@@ -84,6 +84,28 @@ test("checked-in staging resources remain closed and require live qualification"
   assert.equal(result.checks.enrollmentDisabled, true);
   assert.equal(result.checks.accountlessAdmissionDisabled, true);
   assert.equal(result.checks.accountScopedIngestDisabled, true);
+  assert.equal(
+    checkedInConfig.env.staging.vars.PUBLIC_ANALYTICS_MODE,
+    "enabled",
+  );
+});
+
+test("staging rejects missing, disabled, or unknown public analytics deployment modes", () => {
+  for (const mode of [undefined, "disabled", "unexpected"]) {
+    const config = provisionedConfig();
+    if (mode === undefined) {
+      delete config.env.staging.vars.PUBLIC_ANALYTICS_MODE;
+    } else {
+      config.env.staging.vars.PUBLIC_ANALYTICS_MODE = mode;
+    }
+    const result = assessStagingConfiguration(config);
+    assert.equal(result.state, "unsafe_configuration");
+    assert.equal(result.checks.noUnexpectedVariables, false);
+    assert.equal(
+      result.blockers.includes("CONFIG_NO_UNEXPECTED_VARIABLES"),
+      true,
+    );
+  }
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
