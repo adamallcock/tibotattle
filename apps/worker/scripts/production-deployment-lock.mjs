@@ -16,8 +16,9 @@ export function createProductionDeploymentLock({ repositoryRoot, spawn = spawnSy
   });
 }
 
-// Only for separately reviewed immutable object uploads. The writer must bind
-// the complete allowlisted object set to planSha256 and refuse existing drift.
+// Only for separately reviewed immutable artifact publication. The writer binds
+// the complete object set and any explicit GitHub draft-to-immutable/latest
+// transition to planSha256, and refuses existing drift.
 // This factory never reads or changes production ownership. Stable discovery
 // feeds, deployment, migration and website operations keep the production lock.
 export function createImmutableArtifactPublicationLock(options) {
