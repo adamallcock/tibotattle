@@ -10332,7 +10332,7 @@ async function loadLiveTimelinePoints() {
     "isPrimaryCodexWeeklyQuotaWindow",
     "CALIBRATION_WINDOW_HOURS",
     "activeCalibrationRangeDays",
-    `${appSource.slice(usageStart, usageEnd)}\n${section}\nreturn Object.assign(liveTimelinePoints, { resetBoundaries: timelineResetBoundaryEvents });`,
+    `${appSource.slice(usageStart, usageEnd)}\n${section}\nreturn Object.assign(liveTimelinePoints, { resetEvents: timelineTypedResetEvents });`,
   )(
     finite,
     () => Number.NEGATIVE_INFINITY,
@@ -10366,7 +10366,7 @@ async function loadLiveTimelinePoints() {
       },
     }, options);
   };
-  wrapped.resetBoundaries = liveTimelinePoints.resetBoundaries;
+  wrapped.resetEvents = liveTimelinePoints.resetEvents;
   return wrapped;
 }
 
@@ -10455,21 +10455,29 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
   }]);
 });
 
-test("recorded reset boundaries remain visible without pricing, but not across unknown or incompatible history", async () => {
-  const { resetBoundaries } = await loadLiveTimelinePoints();
-  const row = (hour, resetAt) => ({ observedAt: `2026-08-05T0${hour}:00:00Z`, resetAt,
-    limitId: "codex", durationMinutes: 10_080 });
-  const first = "2026-08-10T00:00:00Z", next = "2026-08-17T00:00:00Z";
-  const quota = [row(1, first), row(2, "2026-08-10T00:00:22Z"), row(3, next)];
-  const data = { timeline: { quota } };
-  assert.deepEqual(resetBoundaries(data), [{ timestampMs: Date.parse(quota[2].observedAt),
-    confirmedAtMs: Date.parse(quota[2].observedAt), kind: "window_change" }]);
-  assert.deepEqual(resetBoundaries({ timeline: { quota: [quota[0], row(2, null), quota[2]] } }), []);
-  assert.deepEqual(resetBoundaries({ ...data, allowancePlanSelection: {}, timeline: {
-    quota, comparisonIntervals: [[Date.parse(quota[0].observedAt), Date.parse(quota[1].observedAt)]],
-  } }), []);
-  assert.deepEqual(resetBoundaries({ timeline: { quota: quota.map(item => ({ ...item, limitId: "spark" })) } }), []);
-  assert.deepEqual(resetBoundaries({ timeline: { quota: [row(1, null), row(2, next)] } }), []);
+test("Trends reset markers use classified evidence for the selected allowance, independently of pricing", async () => {
+  const { resetEvents } = await loadLiveTimelinePoints();
+  const classified = {
+    kind: "unknown_reset", planType: "pro", limitId: "codex", windowDurationMins: 10_080,
+    precision: "observation_interval", occurredAt: "2026-08-05T01:00:00.000Z",
+    intervalStartedAt: "2026-08-05T00:00:00.000Z", observedAt: "2026-08-05T02:00:00.000Z",
+  };
+  const scheduled = { ...classified, kind: "scheduled_reset", precision: "provider_schedule" };
+  const grant = { ...classified, kind: "reset_credit_granted", precision: "provider_timestamp",
+    planType: null, limitId: null, windowDurationMins: null };
+  const data = { weekly: { planType: "pro" }, timeline: { usage: [], quota: [], resetEvents: [classified, scheduled, grant,
+    { ...classified, planType: "plus" }, { ...classified, limitId: "spark" },
+    { ...classified, windowDurationMins: 300 }] } };
+  const selected = resetEvents(data);
+  assert.deepEqual(selected.map(row => row.kind), ["unknown_reset", "scheduled_reset", "reset_credit_granted"]);
+  assert.equal(selected[0].timestampMs, Date.parse(classified.observedAt), "interval marker uses confirmation, not an invented exact instant");
+  assert.equal(selected[1].timestampMs, Date.parse(scheduled.occurredAt), "scheduled marker uses provider schedule");
+  assert.equal(selected[0].intervalStartedAtMs, Date.parse(classified.intervalStartedAt));
+  assert.deepEqual(resetEvents({ ...data, allowancePlanSelection: { planType: "plus" } }).map(row => row.planType), [null, "plus"]);
+  assert.deepEqual(resetEvents({ weekly: { planType: "pro" }, timeline: { quota: [
+    { resetAt: "2026-08-10T00:00:00.000Z", remainingPercent: 0 },
+    { resetAt: "2026-08-17T00:00:00.000Z", remainingPercent: 100 },
+  ] } }), [], "missing classifications do not trigger a second browser reset detector");
 });
 
 test("an unweightable bucket creates a red-line gap instead of falling back to Standard cost", async () => {
