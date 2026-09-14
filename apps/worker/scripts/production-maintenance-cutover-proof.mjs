@@ -26,7 +26,7 @@ const SQL=Object.freeze({
  capacity:'SELECT 1 AS capacity_probe',
  sourceSnapshot:'SELECT contract_digest,namespace,snapshot_digest FROM _authority_snapshot WHERE id=1',
  sequences:'SELECT name,seq FROM sqlite_sequence ORDER BY name LIMIT 129',
- sourceCounts:"SELECT 'v1' format,count(*) records,COALESCE(max(id),0) last_id FROM telemetry_v1_records UNION ALL SELECT 'v11',count(*),COALESCE(max(rowid),0) FROM telemetry_v11_records",
+ sourceCounts:"SELECT 'v1' format,(SELECT count(*) FROM telemetry_v1_records) records,COALESCE((SELECT max(id) FROM telemetry_v1_records),0) last_id UNION ALL SELECT 'v11',(SELECT count(*) FROM telemetry_v11_records),COALESCE((SELECT max(rowid) FROM telemetry_v11_records),0)",
  progress:'SELECT contract_digest,execution_digest,stage,steps,intent FROM _authority_operator_progress WHERE id=1',
  restore:'SELECT run_id,contract_digest,limit_bytes,phase FROM _authority_restore_run WHERE id=1',
  tables:'SELECT name,copied,verified,copy_done,verify_done,copy_cursor,verify_cursor FROM _authority_restore_tables ORDER BY name LIMIT 129',

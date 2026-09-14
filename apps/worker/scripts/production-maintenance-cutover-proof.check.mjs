@@ -19,6 +19,17 @@ const ids=['10000000-0000-4000-8000-000000000001','10000000-0000-4000-8000-00000
 const schema=db=>db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*' ORDER BY type,name").all().map(row=>({...row}));
 const normalized=rows=>rows.map(row=>Object.fromEntries(Object.entries(row).map(([key,value])=>[key,value instanceof Uint8Array?Array.from(value):value])));
 const quote=name=>`"${name.replaceAll('"','""')}"`;
+test('source census uses native counts and indexed high-water seeks with sparse identifiers',()=>{
+ const db=new DatabaseSync(':memory:');
+ try{
+  db.exec('CREATE TABLE telemetry_v1_records(id INTEGER PRIMARY KEY,payload TEXT);CREATE TABLE telemetry_v11_records(payload TEXT);INSERT INTO telemetry_v1_records VALUES(2,\'x\'),(900,\'y\');INSERT INTO telemetry_v11_records(rowid,payload) VALUES(4,\'z\');');
+  const sql=MAINTENANCE_CUTOVER_PROOF_SQL.find(sql=>sql.includes("'v1' format")&&sql.includes('telemetry_v1_records'));
+  assert.deepEqual(db.prepare(sql).all().map(row=>({...row})),[{format:'v1',records:2,last_id:900},{format:'v11',records:1,last_id:4}]);
+  const bytecode=db.prepare('EXPLAIN '+sql).all();
+  assert.equal(bytecode.filter(row=>row.opcode==='Count').length,2);
+  assert.equal(bytecode.filter(row=>row.opcode==='Last').length,2);
+ }finally{db.close();}
+});
 let apiPromise;
 const api=()=>apiPromise??=(async()=>{const built=await build({stdin:{contents:"export {AUTHORITY_RESTORE_SCHEMA} from './authority-restore-schema'; export {authorityRestoreRetainedTableNames} from './authority-restore'; export {encodeTypedTelemetryId} from './typed-telemetry-codec'; export {participantDeletionDigest} from './participant-deletion-digest';",resolveDir:join(workerRoot,'src'),loader:'ts'},bundle:true,write:false,format:'esm',platform:'node',mainFields:['module','main'],logLevel:'silent'});return import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].contents).toString('base64')}`);})();
 async function fixture(t,{qualifiedOperatorLedger=false}={}){
