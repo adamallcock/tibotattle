@@ -789,6 +789,31 @@ reverse schema migration. The rollback readback checks exact predecessor bytes
 (or a definitive 404); authentication errors and redirects never mean absence.
 
 
+### Separate coordination for immutable qualification artifacts
+
+`createImmutableArtifactPublicationLock` in
+`apps/worker/scripts/production-deployment-lock.mjs` provides the fixed
+`refs/heads/codex/immutable-release-artifact-lock` coordination ref for reviewed
+immutable artifact writers. Its parentless owner commit records the closed
+`immutable-release-artifact-lock-v1` schema, operation `id`, exact `sourceCommit`
+and `planSha256`. It shares the production lock's compare-and-swap acquisition,
+ownership checks and uncertain-response handling, without reading or changing
+the production ref. Neither lock expires, steals ownership or accepts an
+arbitrary destination ref.
+
+The initial scope is native test DMGs and signed test appcasts under an exact
+source/build/artifact-digest namespace. The writer must bind its complete object
+allowlist and hashes to that plan, prove it is disjoint from any concurrent
+production operation, refuse existing different bytes and verify uploaded bytes.
+Uncertain writes retain the exact owner and operation journal for reconciliation.
+The lock coordinates participating writers; it does not supply conditional R2
+creation or fence legacy and external writers. Merely holding it does not prove
+immutable path admission or authorize publication.
+
+Stable discovery feeds, GitHub release publication, Homebrew, website deployment,
+Worker changes and migrations retain their existing coordination contracts.
+This helper neither changes those entrypoints nor qualifies an installed app.
+
 ### Explicit stable writes and rollback
 
 `scripts/publish-electron-stable-feed.mjs` is the separate protected write
