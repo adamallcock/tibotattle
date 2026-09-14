@@ -114,7 +114,7 @@ test('successor intake uses reviewed allocations while preserving historical can
         `https://updates.tibotattle.com/electron/test/native-sparkle/${source}/${bundleVersion}/${value.dmgSha256}/appcast.xml`);
     }
   }
-  for (const change of [{ version: '0.1.23' }, { version: '0.1.24', bundleVersion: '1031' },
+  for (const change of [{ version: '0.1.23' }, { version: '9999.99.99', bundleVersion: '9999' },
     { version: '0.1.23', bundleVersion: '1030.0' }, { version: '0.1.18', bundleVersion: '1026' },
     { version: '0.1.17', bundleVersion: '1024' }, { version: ['0.1.23'], bundleVersion: '1030' },
     { version: '0.1.23', bundleVersion: 1030 }]) {
@@ -278,7 +278,7 @@ test('workflow download planning matches the runner for both architectures and s
   const planning = python.split('for name,url,digest,limit in files:')[0] + '\nprint(json.dumps(files))\n';
   for (const identity of [
     { version: '0.1.23', bundleVersion: '1029', buildNumber: '2026091301' },
-    { version: '0.1.24', bundleVersion: '1031', buildNumber: '2026091301' },
+    { version: '9999.99.99', bundleVersion: '9999', buildNumber: '2026091301' },
     { version: '0.1.23', bundleVersion: '1030', buildNumber: '2026091301', feedUrl: 'https://example.com' },
     { version: '0.1.23', bundleVersion: 1030, buildNumber: '2026091301' },
   ]) {

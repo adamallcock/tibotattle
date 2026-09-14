@@ -31,7 +31,7 @@ test('both targets bind immutable 020 and explicit allocated successors to fixed
   for (const key of Object.keys(fixture())) { const bad = fixture(); delete bad[key]; assert.throws(() => runner.validateProductionUpdateIntake(bad)); }
   for (const bad of [{ feedUrl: 'https://example.com' }, { feedScope: 'isolated_test_feed' }, { version: '0.1.21' }, { version: '0.1.23' },
     { bundleVersion: '2026091106' }, { sourceRevision: 'main' }, { buildNumber: 1029 }, { target: 'linux-x64' },
-    { directory: 'relative' }, { predecessorAsarSha256: 'A'.repeat(64) }, { version: '0.1.24', bundleVersion: '1031' },
+    { directory: 'relative' }, { predecessorAsarSha256: 'A'.repeat(64) }, { version: '9999.99.99', bundleVersion: '9999' },
     { version: '0.1.23', bundleVersion: '1030.0' }, { version: '0.1.18', bundleVersion: '1026' },
     { version: '0.1.17', bundleVersion: '1024' }, { version: ['0.1.23'], bundleVersion: '1030' },
     { version: '0.1.23', bundleVersion: 1030 }]) assert.throws(() => runner.validateProductionUpdateIntake({ ...fixture(), ...bad }));

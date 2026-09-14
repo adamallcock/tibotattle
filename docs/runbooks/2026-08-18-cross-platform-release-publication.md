@@ -250,6 +250,22 @@ skip those attestation steps.
 13. Only after those post-publication checks pass, publish Sparkle/R2, Homebrew,
     website, Store, and updater metadata.
 
+Release documentation has two explicit check scopes. Pull-request CI runs
+`node scripts/check-release-notes.mjs --reachable-tags` against complete Git
+history: it requires the package candidate and every stable tag reachable from
+the PR checkout. A tag created on a separate release branch cannot require
+future notes in an older feature branch. Missing reachable history, candidate
+notes, malformed provenance and shallow history still fail.
+
+Main, manual release-trust runs and publication use
+`node scripts/check-release-notes.mjs` without that flag, covering the complete
+stable-tag inventory. Commit the dated changelog and notes before creating the
+annotated release tag, push the reviewed source and tag together, and merge the
+release PR preserving that source before publication. Do not copy future notes
+into unrelated branches, move the tag, or use PR scope to admit a publication.
+When a check fails, record its checkout SHA and scope before changing release
+inputs; a failure in another branch does not identify the signed candidate.
+
 A release that fails any stage remains a draft or is stopped. Do not replace
 assets in an immutable release. Rebuild from a new release tag if final bytes
 or evidence need to change.

@@ -89,7 +89,7 @@ test("signed Mac allocation is independent of candidate provenance and advances 
         }), /reviewed production allocation/u);
       }
       assert.throws(() => POLICY.productionElectronBuildVersionForTarget({
-        ...input, version: "0.1.24",
+        ...input, version: "9999.99.99",
       }), /explicit signed bundle version allocation/u);
     }
   }
@@ -151,7 +151,7 @@ test("historical Electron receipts keep their frozen bundle ordering without all
   }
   assert.equal(resolveSignedMacOSBundleVersion("0.1.19", "stable"), null);
   assert.equal(resolveSignedMacOSBundleVersion("0.1.20", "stable"), null);
-  assert.equal(resolveSignedMacOSBundleVersion("0.1.24", "stable"), null);
+  assert.equal(resolveSignedMacOSBundleVersion("9999.99.99", "stable"), null);
   const { AppUpdater } = require("electron-updater/out/AppUpdater");
   const updaterRequire = createRequire(require.resolve("electron-updater/package.json"));
   const updaterSemver = updaterRequire("semver");
