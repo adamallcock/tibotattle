@@ -27,12 +27,34 @@ function validateIsolatedBootstrap(value,plan){
     fail('ISOLATION_INVALID');
   return structuredClone(value);
 }
+function validateIsolatedMovement(value,plan){
+  if(value===null)return null;
+  const exact=(item,keys)=>item&&typeof item==='object'&&!Array.isArray(item)&&Object.keys(item).sort().join()===keys.sort().join();
+  if(!exact(value,['schema','phase','operationDigest','workerName','queueName','queueId','catalogDatabaseId',
+    'sourceDatabaseId','destinationDatabaseId','sourceBinding','destinationBinding','bundleSha256',
+    'disabledConfigSha256','enabledConfigSha256','workerVersionId'])
+    ||value.schema!=='storage-owner-movement-isolation-v1'
+    ||!['queue-only','disabled','disabled-before-detach','enabled'].includes(value.phase)
+    ||!sha(value.operationDigest)||!sha(value.bundleSha256)||!sha(value.disabledConfigSha256)||!sha(value.enabledConfigSha256)
+    ||!uuid(value.catalogDatabaseId)||!uuid(value.sourceDatabaseId)||!uuid(value.destinationDatabaseId)
+    ||new Set([value.catalogDatabaseId,value.sourceDatabaseId,value.destinationDatabaseId]).size!==3
+    ||value.phase==='queue-only'&&value.workerVersionId!==null
+    ||value.phase!=='queue-only'&&!uuid(value.workerVersionId)
+    ||value.sourceDatabaseId!==plan.databaseId||!/^STORAGE_INGESTION_[ABC]$/.test(value.sourceBinding)
+    ||!/^STORAGE_INGESTION_[ABC]$/.test(value.destinationBinding)||value.sourceBinding===value.destinationBinding
+    ||!/^tibotattle-[a-z0-9-]{1,52}$/.test(value.workerName)||!/^tibotattle-[a-z0-9-]{1,52}$/.test(value.queueName)
+    ||value.workerName===plan.workerName||!qid(value.queueId))fail('ISOLATION_INVALID');
+  return structuredClone(value);
+}
 
 /** Fixed-account provider. Only the five closed mutations below exist; schema
  * inspection is a fixed read, never a caller-supplied SQL execution escape. */
 export async function createMaintenanceProvider({plan,packageDirectory,operationDirectory,operationId,cliPath,
-  fetcher=fetch,spawn=spawnSync,environment=process.env,cutoverInventory=null,isolatedBootstrap=null}) {
+  fetcher=fetch,spawn=spawnSync,environment=process.env,cutoverInventory=null,isolatedBootstrap=null,isolatedMovement=null}) {
   isolatedBootstrap=validateIsolatedBootstrap(isolatedBootstrap,plan);
+  isolatedMovement=validateIsolatedMovement(isolatedMovement,plan);
+  if(isolatedBootstrap&&isolatedMovement)fail('ISOLATION_INVALID');
+  const isolated=isolatedBootstrap??isolatedMovement;
   const {api,receipt,publicRead,run:command}=createMaintenanceTransport({plan,operationDirectory,cliPath,fetcher,spawn,environment});
   const account=`/accounts/${plan.accountId}`,script=`${account}/workers/scripts/${plan.workerName}`;
   const tag=`maintenance-${operationId}`;
@@ -62,27 +84,40 @@ export async function createMaintenanceProvider({plan,packageDirectory,operation
   if(cutoverInventory!==null&&(!/^[a-f0-9]{64}$/.test(cutoverInventory.digest??'')||!/^tibotattle-analytics-[a-z0-9-]{1,42}$/.test(cutoverInventory.analyticsWorker??'')||cutoverInventory.analyticsWorker===plan.workerName))fail('INVENTORY_INVALID');
   const writerInventory=async expectOwn=>{
     const workers=list(await api(`${account}/workers/scripts?per_page=100`),'scripts',30);let own=false;const snapshot={workers:[],queues:[]};
-    const isolatedWorker=workers.filter(worker=>worker.id===isolatedBootstrap?.workerName);
-    if(isolatedWorker.length>1||isolatedBootstrap?.phase==='queue-only'&&isolatedWorker.length!==0
-      ||isolatedBootstrap&&!['queue-only'].includes(isolatedBootstrap.phase)&&isolatedWorker.length!==1)fail('ISOLATION_CHANGED');
+    const isolatedWorker=workers.filter(worker=>worker.id===isolated?.workerName);
+    if(isolatedWorker.length>1||isolated?.phase==='queue-only'&&isolatedWorker.length!==0
+      ||isolated&&!['queue-only'].includes(isolated.phase)&&isolatedWorker.length!==1)fail('ISOLATION_CHANGED');
     for(const worker of workers){
       const name=worker.id;if(!/^[a-zA-Z0-9_-]{1,63}$/.test(name??''))fail('INVENTORY_INVALID');
       const id=await active(name);const v=await api(`${account}/workers/scripts/${name}/versions/${id}`);
       const settings=await api(`${account}/workers/scripts/${name}/settings`);
-      if(name===isolatedBootstrap?.workerName){
-        const mode=isolatedBootstrap.phase==='enabled'?'enabled':'disabled';
-        const configDigest=mode==='enabled'?isolatedBootstrap.enabledConfigSha256:isolatedBootstrap.disabledConfigSha256;
-        if(v.annotations?.['workers/tag']!==`existing-bootstrap-${mode}-${configDigest}`)fail('ISOLATION_CHANGED');
-        const expected=[
-          ['d1','SOURCE',isolatedBootstrap.sourceDatabaseId],['d1','STORAGE_ROUTING_DB',isolatedBootstrap.catalogDatabaseId],
+      if(name===isolated?.workerName){
+        const mode=isolated.phase==='enabled'?'enabled':'disabled';
+        const configDigest=mode==='enabled'?isolated.enabledConfigSha256:isolated.disabledConfigSha256;
+        const movement=isolated.schema==='storage-owner-movement-isolation-v1';
+        if(movement&&id!==isolated.workerVersionId)fail('ISOLATION_CHANGED');
+        const runtime=v.resources?.script_runtime;
+        if(movement&&(runtime?.compatibility_date!=='2026-07-26'
+          ||JSON.stringify([...(runtime?.compatibility_flags??[])].sort())!==JSON.stringify(['nodejs_compat'])))fail('ISOLATION_CHANGED');
+        if(v.annotations?.['workers/tag']!==`${movement?'owner-movement':'existing-bootstrap'}-${mode}-${configDigest}`)fail('ISOLATION_CHANGED');
+        const expected=movement?[
+          ['d1','STORAGE_ROUTING_DB',isolated.catalogDatabaseId],['d1',isolated.sourceBinding,isolated.sourceDatabaseId],
+          ['d1',isolated.destinationBinding,isolated.destinationDatabaseId],
+          ['plain_text','STORAGE_OWNER_MOVEMENT_MODE',mode],
+          ['plain_text','STORAGE_OWNER_MOVEMENT_OPERATION_DIGEST',isolated.operationDigest],
+          ['plain_text','STORAGE_OWNER_MOVEMENT_BUNDLE_SHA256',isolated.bundleSha256],
+        ]:[
+          ['d1','SOURCE',isolated.sourceDatabaseId],['d1','STORAGE_ROUTING_DB',isolated.catalogDatabaseId],
           ['plain_text','STORAGE_EXISTING_BOOTSTRAP_MODE',mode],
-          ['plain_text','STORAGE_EXISTING_BOOTSTRAP_OPERATION_DIGEST',isolatedBootstrap.operationDigest],
-          ['plain_text','STORAGE_EXISTING_BOOTSTRAP_BUNDLE_SHA256',isolatedBootstrap.bundleSha256],
+          ['plain_text','STORAGE_EXISTING_BOOTSTRAP_OPERATION_DIGEST',isolated.operationDigest],
+          ['plain_text','STORAGE_EXISTING_BOOTSTRAP_BUNDLE_SHA256',isolated.bundleSha256],
         ];
         for(const bs of [v.resources?.bindings,settings.bindings]){
           if(!Array.isArray(bs)||bs.length!==expected.length)fail('ISOLATION_CHANGED');
-          for(const [type,name,value]of expected){const matches=bs.filter(b=>b.type===type&&b.name===name
-            &&(type==='d1'?(b.id??b.database_id)===value:b.text===value));if(matches.length!==1)fail('ISOLATION_CHANGED');}
+          for(const [type,name,value]of expected){const matches=bs.filter(b=>{
+            if(type==='d1'&&b.id!==undefined&&b.database_id!==undefined&&b.id!==b.database_id)fail('ISOLATION_CHANGED');
+            return b.type===type&&b.name===name&&(type==='d1'?(b.id??b.database_id)===value:b.text===value);
+          });if(matches.length!==1)fail('ISOLATION_CHANGED');}
         }
         const subdomain=await api(`${account}/workers/scripts/${name}/subdomain`);
         const isolatedRoutes=list(await api(`${account}/workers/services/${name}/environments/production/routes?show_zonename=true`),'routes',100);
@@ -102,25 +137,25 @@ export async function createMaintenanceProvider({plan,packageDirectory,operation
     }
     if(expectOwn&&!own||!workers.some(w=>w.id===plan.workerName))fail('WRITER_STATE_CHANGED');
     const queues=list(await api(`${account}/queues?page=1&per_page=100`),'queues',20);
-    const isolatedQueues=queues.filter(q=>q.queue_id===isolatedBootstrap?.queueId||q.queue_name===isolatedBootstrap?.queueName);
-    if(isolatedBootstrap&&isolatedQueues.length!==1)fail('ISOLATION_CHANGED');
+    const isolatedQueues=queues.filter(q=>q.queue_id===isolated?.queueId||q.queue_name===isolated?.queueName);
+    if(isolated&&isolatedQueues.length!==1)fail('ISOLATION_CHANGED');
     for(const q of queues){if(!/^[a-f0-9]{32}$/.test(q.queue_id??''))fail('INVENTORY_INVALID');const consumers=list(await api(`${account}/queues/${q.queue_id}/consumers`),'consumers',20);
       if(q===isolatedQueues[0]){
-        if(q.queue_id!==isolatedBootstrap.queueId||q.queue_name!==isolatedBootstrap.queueName)fail('ISOLATION_CHANGED');
-        if(isolatedBootstrap.phase==='enabled'){
+        if(q.queue_id!==isolated.queueId||q.queue_name!==isolated.queueName)fail('ISOLATION_CHANGED');
+        if(isolated.phase==='enabled'){
           if(consumers.length!==1||!matchesExactBootstrapQueueConsumer(consumers[0],{
-            workerName:isolatedBootstrap.workerName,queueName:isolatedBootstrap.queueName,queueId:isolatedBootstrap.queueId,
+            workerName:isolated.workerName,queueName:isolated.queueName,queueId:isolated.queueId,
           }))fail('ISOLATION_CHANGED');
-        }else if(isolatedBootstrap.phase==='disabled-before-detach'){
+        }else if(isolated.phase==='disabled-before-detach'){
           if(consumers.length>1||consumers.length===1&&!matchesExactBootstrapQueueConsumer(consumers[0],{
-            workerName:isolatedBootstrap.workerName,queueName:isolatedBootstrap.queueName,queueId:isolatedBootstrap.queueId,
+            workerName:isolated.workerName,queueName:isolated.queueName,queueId:isolated.queueId,
           }))fail('ISOLATION_CHANGED');
         }else if(consumers.length)fail('ISOLATION_CHANGED');
         continue;
       }
       snapshot.queues.push({queueId:q.queue_id,consumers:identityDigest(sorted(consumers))});
       for(const consumer of consumers){const name=queueConsumerWorkerName(consumer);if(name===null)fail('INVENTORY_INVALID');
-        if(name===plan.workerName||name===isolatedBootstrap?.workerName)fail('OTHER_INGRESS');}}
+        if(name===plan.workerName||name===isolated?.workerName)fail('OTHER_INGRESS');}}
     await ingress();
     snapshot.workers=sorted(snapshot.workers);snapshot.queues=sorted(snapshot.queues);
     if(identityDigest(snapshot)!==(cutoverInventory?.digest??plan.predecessor.inventoryDigest))fail('WRITER_INVENTORY_CHANGED');

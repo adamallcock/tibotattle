@@ -556,7 +556,7 @@ test("deployment CLI captures the current clean candidate when no candidate over
   assert.equal(journal.state.outcome, "verified");
 });
 
-test("dependency digest ignores only root Wrangler runtime state", async (t) => {
+test("dependency digest ignores only approved root tooling runtime state", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-dependency-digest-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const installedPackage = join(root, "installed-package");
@@ -571,23 +571,42 @@ test("dependency digest ignores only root Wrangler runtime state", async (t) => 
   );
   await mkdir(join(root, ".mf"), { recursive: true });
   await writeFile(join(root, ".mf", "cf.json"), '{"runtime":"local"}\n');
+  await mkdir(join(root, ".vite", "vitest"), { recursive: true });
+  await writeFile(join(root, ".vite", "vitest", "results.json"), '{"tests":"cached"}\n');
+  await mkdir(join(root, ".vite-temp"), { recursive: true });
+  await writeFile(join(root, ".vite-temp", "config.mjs"), "export default {};\n");
   assert.equal(await dependencyTreeDigest(root), installedDigest);
 
   await writeFile(
     join(root, ".cache", "wrangler", "wrangler-account.json"),
     '{"account":"refreshed-cache"}\n',
   );
+  await writeFile(join(root, ".vite", "vitest", "results.json"), '{"tests":"refreshed"}\n');
+  await writeFile(join(root, ".vite-temp", "config.mjs"), "export default { refreshed: true };\n");
   assert.equal(await dependencyTreeDigest(root), installedDigest);
 
-  // The exception is root-scoped. Package content, including a nested path
-  // with the same name as a runtime cache, remains integrity-bound.
-  await mkdir(join(installedPackage, ".cache"), { recursive: true });
-  await writeFile(join(installedPackage, ".cache", "package-state"), "bound\n");
+  // The exception is root-scoped. Package content, including nested paths
+  // with the same names as runtime caches, remains integrity-bound.
+  for (const name of [".cache", ".mf", ".vite", ".vite-temp"]) {
+    await mkdir(join(installedPackage, name), { recursive: true });
+    await writeFile(join(installedPackage, name, "package-state"), `${name}:bound\n`);
+  }
   const nestedCacheDigest = await dependencyTreeDigest(root);
   assert.notEqual(nestedCacheDigest, installedDigest);
 
   await writeFile(join(installedPackage, "index.js"), "export const value = 2;\n");
-  assert.notEqual(await dependencyTreeDigest(root), nestedCacheDigest);
+  const changedPackageDigest = await dependencyTreeDigest(root);
+  assert.notEqual(changedPackageDigest, nestedCacheDigest);
+
+  const targets = join(root, "targets");
+  await mkdir(join(targets, "first"), { recursive: true });
+  await mkdir(join(targets, "second"), { recursive: true });
+  const linkedPackage = join(root, "linked-package");
+  await symlink("targets/first", linkedPackage);
+  const firstLinkDigest = await dependencyTreeDigest(root);
+  await rm(linkedPackage);
+  await symlink("targets/second", linkedPackage);
+  assert.notEqual(await dependencyTreeDigest(root), firstLinkDigest);
 });
 
 // Re-pin: this end-to-end path previously required an injected containment

@@ -300,6 +300,28 @@ Use the reviewed scripts rather than direct ad-hoc Wrangler commands. Capture
 the source commit, environment, migration state, staged asset digest, deployment
 receipt, and bounded post-deploy observations as separate evidence.
 
+## Moving an accountless contributor between storage shards
+
+`scripts/storage-owner-movement-operator.mjs` supplies the private operating
+entrypoint for the accountless v1.1 movement primitive. Its closed plan binds
+the reviewed source, dependency and runtime digests, qualification receipt,
+source route, destination capacity, maintenance owner and bounded execution
+window. It does not require a client, credential or upload-protocol change.
+
+Prepare and dry-build the package locally before any approved remote action.
+`apply` advances bounded background copying; `finalize` separately fences the
+owner and switches the route after exact verification. `abort` is available
+before that fence. An uncertain operation must use `reconcile`, without
+resending a command whose outcome is unknown. `cleanup` verifies terminal
+movement evidence, disables the private Worker, explicitly detaches its owned
+Queue consumer, removes only those helper resources and rechecks containment.
+It preserves the parent maintenance operation and the original stored history.
+
+The initial operator supports accountless v1.1 owners with one current origin.
+Legacy v1, social accounts, multiple enrollments and repeated moves with mixed
+origins are refused. Source retirement and live rollover qualification are
+separate operations; local checks do not establish either.
+
 ## Validation
 
 The independent npm lockfile pins the Worker test toolchain. Vitest 4.1.11

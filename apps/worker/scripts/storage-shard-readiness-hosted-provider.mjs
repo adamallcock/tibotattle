@@ -198,7 +198,8 @@ async function buildCanonicalRuntime({workerRoot,sourceCommit}){
  const source=`export {captureStorageShardReadinessSchemaDigests,qualifyStorageShardRuntimeTuple,readStorageShardReadiness,recordStorageShardReadiness} from './src/storage-shard-readiness.ts';
 export {recordStorageCapacityObservation,configureStorageShardAllocation,readStorageCapacityObservation,readStorageShardAllocationPolicy} from './src/storage-capacity.ts';`;
  const built=await build({stdin:{contents:source,resolveDir:workerRoot,sourcefile:'storage-shard-readiness-hosted-runtime.ts',loader:'ts'},
-  bundle:true,platform:'node',target:'node26',format:'esm',mainFields:['module','main'],write:false,logLevel:'silent'});
+  absWorkingDir:workerRoot,bundle:true,platform:'node',target:'node26',format:'esm',mainFields:['module','main'],
+  write:false,logLevel:'silent'});
  if(built.outputFiles.length!==1)fail('RUNTIME_INVALID');
  const bytes=Buffer.from(built.outputFiles[0].contents),runtimeBundleSha256=hash(bytes);
  if(await dependencyTreeDigest(dependencyPath)!==dependencyDigest)fail('DEPENDENCIES_CHANGED');

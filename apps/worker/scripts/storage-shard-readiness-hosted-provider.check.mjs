@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {mkdtemp,chmod,realpath,rm,readdir,readFile} from 'node:fs/promises';
+import {mkdtemp,chmod,realpath,rm,readdir,readFile,appendFile,cp,mkdir,symlink,writeFile} from 'node:fs/promises';
+import {execFileSync} from 'node:child_process';
 import {createRequire} from 'node:module';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {Log,LogLevel,Miniflare} from 'miniflare';
 import {createStorageShardReadinessHostedProvider,createStorageShardReadinessMutationCoordinator,
- runHostedStorageShardReadiness,
+ captureStorageShardReadinessHostedProvenance,runHostedStorageShardReadiness,
  validateStorageShardReadinessHostedConfiguration} from './storage-shard-readiness-hosted-provider.mjs';
 import {runStorageShardReadinessOperator,storageShardCapacityEvidence} from './storage-shard-readiness-operator.mjs';
 import {maintenanceBindingDigest} from './production-maintenance-provider.mjs';
@@ -64,6 +65,33 @@ readStorageShardAllocationPolicy} from './src/storage-capacity.ts';`;
   bundle:true,platform:'node',target:'node26',format:'esm',mainFields:['module','main'],write:false,logLevel:'silent'});
  return import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].contents).toString('base64')}`);
 }
+
+test('canonical hosted runtime provenance is independent of the launch directory',async t=>{
+ const fixture=await realpath(await mkdtemp(join(tmpdir(),'storage-readiness-provenance-')));
+ t.after(()=>rm(fixture,{recursive:true,force:true}));
+ const sourceRoot=join(fixture,'worker'),launchA=join(fixture,'launch-a'),launchB=join(fixture,'launch-b');
+ await mkdir(sourceRoot,{mode:0o700});await cp(join(workerRoot,'src'),join(sourceRoot,'src'),{recursive:true});
+ await cp(join(workerRoot,'package.json'),join(sourceRoot,'package.json'));
+ await symlink(join(workerRoot,'node_modules'),join(sourceRoot,'node_modules'));
+ await writeFile(join(sourceRoot,'.gitignore'),'node_modules\n',{mode:0o600});
+ execFileSync('/usr/bin/git',['init','-q',sourceRoot]);
+ execFileSync('/usr/bin/git',['-C',sourceRoot,'config','user.name','Synthetic Test']);
+ execFileSync('/usr/bin/git',['-C',sourceRoot,'config','user.email','synthetic@example.invalid']);
+ execFileSync('/usr/bin/git',['-C',sourceRoot,'add','.']);
+ execFileSync('/usr/bin/git',['-C',sourceRoot,'commit','-q','-m','synthetic source']);
+ const sourceCommit=execFileSync('/usr/bin/git',['-C',sourceRoot,'rev-parse','HEAD'],{encoding:'utf8'}).trim();
+ await mkdir(launchA,{mode:0o700});await mkdir(launchB,{mode:0o700});
+ const original=process.cwd();let first,second;
+ try{
+  process.chdir(launchA);first=await captureStorageShardReadinessHostedProvenance({workerRoot:sourceRoot,sourceCommit});
+  process.chdir(launchB);second=await captureStorageShardReadinessHostedProvenance({workerRoot:sourceRoot,sourceCommit});
+ }finally{process.chdir(original);}
+ assert.equal(first.runtimeBundleSha256,second.runtimeBundleSha256);
+ assert.equal(first.dependencyDigest,second.dependencyDigest);
+ await appendFile(join(sourceRoot,'src','storage-capacity.ts'),'\n// synthetic source drift\n');
+ await assert.rejects(captureStorageShardReadinessHostedProvenance({workerRoot:sourceRoot,sourceCommit}),
+  {code:'STORAGE_SHARD_HOSTED_SOURCE_CHANGED'});
+});
 
 async function applyMigrations(database,directories){
  await database.exec('CREATE TABLE IF NOT EXISTS d1_migrations(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,applied_at TEXT DEFAULT CURRENT_TIMESTAMP);');
