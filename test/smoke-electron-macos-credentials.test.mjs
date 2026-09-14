@@ -10,7 +10,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { validateMacCredentialIntake, parseMacCredentialArguments, runMacCredentialQualification,
   MAC_CREDENTIAL_CONFIRMATION, credentialFixtureArchiveInspectionScript, validateCredentialSnapshot,
-  expectedCredentialReason, macCredentialDialogScript, exerciseCredentialRefresh } from '../scripts/smoke-electron-macos-credentials.mjs';
+  expectedCredentialReason, macCredentialDialogScript, exerciseCredentialRefresh,
+  validateCredentialFixtureReply, MAC_CREDENTIAL_FIXTURE_FAILURE_CODES } from '../scripts/smoke-electron-macos-credentials.mjs';
 import { CREDENTIAL_FIXTURE_CASES, credentialFixtureRoot, credentialFixtureConfiguration,
   parseCredentialFixtureArguments, compileCredentialFixture } from '../scripts/prepare-electron-macos-credential-fixture.mjs';
 import { MACOS_LOOPBACK_POLICY, MACOS_LOOPBACK_MODE, macOSLoopbackLaunch,
@@ -138,6 +139,41 @@ with zipfile.ZipFile(sys.argv[1],'w') as z:
 
 const snapshot = () => ({ ok: true, items: ['account-observation', 'contribution-device', 'accountless-installation'].map(capability =>
   ({ capability, readable: true, itemDigest: 'a'.repeat(64), aclDigest: 'b'.repeat(64), valueDigest: 'c'.repeat(64) })) });
+test('helper failures retain only a known fixed code, closed scenario and actual protocol command', () => {
+  for (const operation of [null, 'seed', 'snapshot', 'select', 'lock', 'unlock', 'restore', 'cleanup']) {
+    for (const code of MAC_CREDENTIAL_FIXTURE_FAILURE_CODES) {
+      assert.throws(() => validateCredentialFixtureReply({ ok: false, code }, { scenario: 'modern', operation }), error => {
+        assert.equal(error.credentialStage, 'fixture_operation');
+        assert.deepEqual(error.fixtureFailure, { scenario: 'modern', command: operation ?? 'startup', code });
+        assert.equal(error.message, 'MAC_CREDENTIAL_QUALIFICATION_REFUSED');
+        assert.equal(Object.isFrozen(error.fixtureFailure), true);
+        return true;
+      });
+    }
+  }
+  for (const value of [{ ok: false, code: 'PRIVATE_SENTINEL' }, { ok: false, code: 'FIXTURE_CREATE_FAILED', detail: 'PRIVATE_SENTINEL' },
+    { ok: false, code: ['FIXTURE_CREATE_FAILED'] }, { ok: false }, { ok: true, operation: 'select' },
+    { ok: true, operation: 'seed', value: 'PRIVATE_SENTINEL' }, null, [], 'PRIVATE_SENTINEL']) {
+    assert.throws(() => validateCredentialFixtureReply(value, { scenario: 'modern', operation: 'seed' }), error => {
+      assert.equal(error.fixtureFailure, undefined);
+      assert.doesNotMatch(error.message + JSON.stringify(error), /PRIVATE_SENTINEL/u);
+      return true;
+    });
+  }
+  assert.throws(() => validateCredentialFixtureReply({ ok: false, code: 'FIXTURE_CREATE_FAILED' }, { scenario: 'private', operation: 'seed' }));
+  assert.throws(() => validateCredentialFixtureReply({ ok: false, code: 'FIXTURE_CREATE_FAILED' }, { scenario: 'modern', operation: 'arbitrary' }));
+  assert.deepEqual(validateCredentialFixtureReply({ ok: true, ready: true }, { scenario: 'modern', operation: null }), { ok: true, ready: true });
+  assert.deepEqual(validateCredentialFixtureReply({ ok: true, operation: 'seed' }, { scenario: 'modern', operation: 'seed' }), { ok: true, operation: 'seed' });
+  assert.deepEqual(validateCredentialFixtureReply(snapshot(), { scenario: 'modern', operation: 'snapshot' }), snapshot());
+});
+test('the fixed failure-code allowlist stays aligned with current reviewed helper sources', async () => {
+  const sources = await Promise.all(['FixtureSupport.swift', 'ElectronCredentialMain.swift'].map(name =>
+    readFile(new URL('./fixtures/macos-keychain-migration/' + name, import.meta.url), 'utf8')));
+  const environmentNames = new Set(['GITHUB_ACTIONS', 'RUNNER_ENVIRONMENT', 'RUNNER_OS', 'RUNNER_ARCH', 'ARM64']);
+  const codes = new Set(sources.flatMap(source => [...source.matchAll(/"([A-Z][A-Z0-9_]{3,})"/gu)].map(match => match[1])));
+  for (const value of environmentNames) codes.delete(value);
+  assert.deepEqual([...MAC_CREDENTIAL_FIXTURE_FAILURE_CODES].sort(), [...codes].sort());
+});
 test('snapshot is closed, ordered and requires real readable bytes and complete value/item/ACL evidence', () => {
   for (const scenario of CREDENTIAL_FIXTURE_CASES) assert.equal(validateCredentialSnapshot(snapshot(), scenario).length, 3);
   for (const change of [{ readable: false }, { valueDigest: null }, { valueDigest: ['a'.repeat(64)] },

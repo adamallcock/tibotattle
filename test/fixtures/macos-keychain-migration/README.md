@@ -68,6 +68,12 @@ partial migration, legacy-only migration, ordinary native clean quit and
 successful hosted upload unqualified. A passing scoped receipt is not admission
 of the complete credential failure matrix or overall release.
 
+Failures retain the outer journey phase and, for a recognized helper failure,
+only its fixed allowlisted code, scenario and protocol command. Unknown codes,
+extra fields, raw stderr, error text and credential values are never copied into
+the result. A failed fixture operation is not classified as an app defect until
+its specific cause is established.
+
 ## Original native migration fixture
 
 The runner is deliberately inert unless `--run-signed` is supplied. A live run
