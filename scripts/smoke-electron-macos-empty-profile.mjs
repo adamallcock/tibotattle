@@ -11,26 +11,24 @@ import { assertExtractedSignedMacBundle, verifySparkleTransitionCandidate,
   validateSparkleTransitionHost, signedMacTransitionEnvironment } from './smoke-electron-macos-sparkle-transition.mjs';
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp,
   assertSignedStagingFreshProjection } from './run-signed-electron-staging.mjs';
+import { compareAppleMacOSBundleVersions, resolveSignedMacOSBundleVersion } from './macos-bundle-version.js';
 
 export const EMPTY_PROFILE_CONFIRMATION = 'RUN_DISPOSABLE_EMPTY_PROFILE';
-const SOURCE = 'a651ea130dd1460e4443a037c4434f57b911fec4';
-const CANDIDATES = Object.freeze({
-  'darwin-arm64': Object.freeze({ architecture: 'arm64',
-    dmgSha256: '0afab510adf250775e1401307b547cee1a7955e1d7ec8dce9852cc4ca143c7e2',
-    asarSha256: '11d053d35ae6e971adc27b3a30a8bb94592e09f5f1466cfb5d9c008634950175', filename: 'TiboTattle-0.1.21-mac-arm64.dmg' }),
-  'darwin-x64': Object.freeze({ architecture: 'x64',
-    dmgSha256: '50960e1aac65eb2673a7634a18bf123b604680f2a526822a0ccccc1d3b0b52e4',
-    asarSha256: '8222cd3119e42b24d87adaee6d1a264514517504a12e2b7d728fb53ac81722e1', filename: 'TiboTattle-0.1.21-macOS-x64.dmg' }),
-});
 function fail(stage) { const error = new Error('Empty-profile qualification failed'); error.emptyProfileStage = stage; throw error; }
 export function validateEmptyProfileIntake(input) {
+  const keys = ['runnerRevision', 'target', 'sourceRevision', 'version', 'bundleVersion', 'buildNumber', 'dmgSha256', 'asarSha256'];
   if (!input || typeof input !== 'object' || Array.isArray(input)
-    || Object.keys(input).sort().join(',') !== 'runnerRevision,target'
-    || typeof input.runnerRevision !== 'string' || !/^[a-f0-9]{40}$/u.test(input.runnerRevision)
-    || typeof input.target !== 'string' || !Object.hasOwn(CANDIDATES, input.target)) fail('intake');
-  const candidate = CANDIDATES[input.target];
-  return Object.freeze({ ...input, ...candidate, sourceRevision: SOURCE, version: '0.1.21', buildNumber: '2026091107', bundleVersion: '1028',
-    url: `https://updates.tibotattle.com/electron/test/native-sparkle/${SOURCE}/1028/${candidate.dmgSha256}/${candidate.filename}` });
+    || Object.keys(input).sort().join(',') !== keys.sort().join(',')
+    || !['runnerRevision', 'sourceRevision'].every(key => typeof input[key] === 'string' && /^[a-f0-9]{40}$/u.test(input[key]))
+    || !['darwin-arm64', 'darwin-x64'].includes(input.target)
+    || typeof input.bundleVersion !== 'string' || input.bundleVersion !== resolveSignedMacOSBundleVersion(input.version, 'stable')
+    || compareAppleMacOSBundleVersions('1026', input.bundleVersion) !== -1
+    || typeof input.buildNumber !== 'string' || !/^[1-9][0-9]{0,9}$/u.test(input.buildNumber)
+    || !['dmgSha256', 'asarSha256'].every(key => typeof input[key] === 'string' && /^[a-f0-9]{64}$/u.test(input[key]))) fail('intake');
+  const architecture = input.target === 'darwin-arm64' ? 'arm64' : 'x64';
+  const filename = `TiboTattle-${input.version}-${architecture === 'arm64' ? 'mac-arm64' : 'macOS-x64'}.dmg`;
+  return Object.freeze({ ...input, architecture, filename,
+    url: `https://updates.tibotattle.com/electron/test/native-sparkle/${input.sourceRevision}/${input.bundleVersion}/${input.dmgSha256}/${filename}` });
 }
 export function parseEmptyProfileArguments(args) {
   if (!Array.isArray(args) || ![1, 3].includes(args.length) || !['--plan', '--execute'].includes(args[0])) fail('arguments');
@@ -105,7 +103,8 @@ export async function runEmptyProfileSmoke({ intake, execute = false }) {
   try {
     const input = validateEmptyProfileIntake(intake);
     Object.assign(proof, { target: input.target, sourceRevision: input.sourceRevision, runnerRevision: input.runnerRevision,
-      version: input.version, buildNumber: input.buildNumber, dmgSha256: input.dmgSha256, asarSha256: input.asarSha256 });
+      version: input.version, bundleVersion: input.bundleVersion, buildNumber: input.buildNumber,
+      dmgSha256: input.dmgSha256, asarSha256: input.asarSha256 });
     if (!execute) return { ...proof, status: 'planned' };
     stage = 'host';
     const home = validateSparkleTransitionHost({ target: input.target, platform: process.platform,

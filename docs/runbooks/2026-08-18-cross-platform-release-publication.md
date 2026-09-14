@@ -630,6 +630,19 @@ credentials. It refuses real-product execution mode. Run it on Linux; a skip
 on another operating system is not Linux evidence. Retain the native packaged
 startup/credential/cold-restart receipts separately from this adapter receipt.
 
+The final Linux production-package workflow also qualifies the application
+extracted from its exact AppImage. `qualify-electron-linux-final-appimage.mjs`
+checks the final package receipt and original source stage before extraction,
+then binds the existing normal packaged startup, refresh, credential-service,
+settings/opt-out and cold-restart smoke to those extracted ASAR/executable bytes.
+The native amd64 test uses the existing disposable Secret Service and Xvfb
+runtime with external networking disabled. Retain `final-image-preparation.json`,
+`normal-packaged-smoke.json` and `final-image-runtime.json` with the final package;
+missing, failed or differently bound smoke evidence refuses final qualification.
+This proves the extracted application's runtime only. AppImage mounting/launcher
+integration, physical desktop behavior and replacement of the older public
+release remain separate observations; the receipt explicitly leaves them open.
+
 ### Stores and updater channels
 
 Store submissions must record their own provider/listing, publisher/build/

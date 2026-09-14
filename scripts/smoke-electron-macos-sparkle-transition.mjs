@@ -18,6 +18,7 @@ import { inspectNativeElectronHandoverCompletion } from '../apps/electron/deskto
 import { macOSCredentialApplicationVerificationArguments } from '../apps/electron/desktop-macos-keychain.js';
 import { validateProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 import distributionPolicy from '../config/electron-production-distribution.cjs';
+import { compareAppleMacOSBundleVersions, resolveSignedMacOSBundleVersion } from './macos-bundle-version.js';
 import { collectMacOSTransitionUIDiagnostics } from './lib/macos-transition-ui-diagnostics.mjs';
 
 export const NATIVE_SPARKLE_TRANSITION_SCHEMA = 'tibotattle-signed-macos-sparkle-transition-v1';
@@ -47,8 +48,10 @@ export function validateSparkleTransitionIntake(value) {
     || value.schemaVersion !== 'tibotattle-native-sparkle-test-intake-v1'
     || !['darwin-arm64', 'darwin-x64'].includes(value.target)
     || !['isolated_test_feed', 'production_feed'].includes(value.feedScope)
-    || typeof value.sourceRevision !== 'string' || !SOURCE.test(value.sourceRevision) || value.version !== '0.1.22'
-    || value.bundleVersion !== '1029' || typeof value.buildNumber !== 'string' || !/^[1-9][0-9]{0,9}$/u.test(value.buildNumber)
+    || typeof value.sourceRevision !== 'string' || !SOURCE.test(value.sourceRevision)
+    || typeof value.bundleVersion !== 'string' || value.bundleVersion !== resolveSignedMacOSBundleVersion(value.version, 'stable')
+    || compareAppleMacOSBundleVersions('1026', value.bundleVersion) !== -1
+    || typeof value.buildNumber !== 'string' || !/^[1-9][0-9]{0,9}$/u.test(value.buildNumber)
     || ![value.dmgSha256, value.asarSha256, value.feedSha256].every((v) => typeof v === 'string' && SHA.test(v))
     || value.nativeDmgSha256 !== (value.target === 'darwin-arm64' ? NATIVE_018_DMG_SHA256 : NATIVE_018_INTEL_DMG_SHA256)
     || !isAbsolute(value.directory ?? '')) fail('intake');

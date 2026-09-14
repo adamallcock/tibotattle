@@ -17,6 +17,7 @@ import { parseWindowsUpdaterYaml } from './verify-electron-windows-update-artifa
 import { validateProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 import { macOSCredentialApplicationVerificationArguments } from '../apps/electron/desktop-macos-keychain.js';
 import { inspectNativeElectronHandoverCompletion } from '../apps/electron/desktop-native-migration.js';
+import { compareAppleMacOSBundleVersions, resolveSignedMacOSBundleVersion } from './macos-bundle-version.js';
 
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA = 'tibotattle-signed-macos-production-update-v1';
 export const ELECTRON_020_SOURCE = 'f518126a05a6d165b9617f6417a87219d7047273';
@@ -50,7 +51,9 @@ export function validateProductionUpdateIntake(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).sort().join('|') !== keys.sort().join('|')
     || value.schemaVersion !== 'tibotattle-production-electron-update-intake-v1'
-    || !Object.hasOwn(ELECTRON_020_DMG, value.target) || value.version !== '0.1.22' || value.bundleVersion !== '1029'
+    || !Object.hasOwn(ELECTRON_020_DMG, value.target)
+    || typeof value.bundleVersion !== 'string' || value.bundleVersion !== resolveSignedMacOSBundleVersion(value.version, 'stable')
+    || compareAppleMacOSBundleVersions('1026', value.bundleVersion) !== -1
     || typeof value.sourceRevision !== 'string' || !/^[0-9a-f]{40}$/u.test(value.sourceRevision)
     || typeof value.buildNumber !== 'string' || !/^[1-9][0-9]{0,9}$/u.test(value.buildNumber)
     || !['dmgSha256', 'asarSha256', 'zipSha256', 'feedSha256', 'predecessorAsarSha256'].every(k => typeof value[k] === 'string' && SHA.test(value[k]))
@@ -62,11 +65,11 @@ export function validateProductionUpdateIntake(value) {
     feedUrl: feedBase + '/latest-mac.yml', zipFileName: file(value.version) + '.zip',
     dmgFileName: file(value.version) + '.dmg', predecessorDmgSha256: ELECTRON_020_DMG[value.target],
     predecessorUrl: 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.20/' + file('0.1.20') + '.dmg',
-    candidateUrl: 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.22/' + file(value.version) + '.dmg' };
+    candidateUrl: 'https://github.com/adamallcock/tibotattle/releases/download/v' + value.version + '/' + file(value.version) + '.dmg' };
 }
 export function validateProductionMacUpdateFeed(input, manifest, zip, dmg) {
   const entries = manifest?.files;
-  if (manifest?.version !== '0.1.22' || !Array.isArray(entries) || entries.length !== 2
+  if (manifest?.version !== input.version || !Array.isArray(entries) || entries.length !== 2
     || manifest.path !== input.zipFileName || Object.hasOwn(manifest, 'packages')) fail('feed_identity');
   for (const [name, bytes] of [[input.zipFileName, zip], [input.dmgFileName, dmg]]) {
     const selected = entries.filter(entry => entry.url === name);

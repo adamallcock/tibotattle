@@ -118,7 +118,7 @@ publication before showing the command on either website tab.
 
 ### Native Sparkle to Electron transition
 
-For the 0.1.21 transition, users of native 0.1.18 must be able to use its
+For each successor transition, users of native 0.1.18 must be able to use its
 existing Check for Updates and Install controls and continue with their retained
 history, settings and contribution choice. Publishing Electron installers or its
 YAML feeds alone does not update either native Sparkle feed.
@@ -126,8 +126,9 @@ YAML feeds alone does not update either native Sparkle feed.
 The final application remains the ordinary signed Electron build, with its own
 outgoing updater configuration. Follow the shared
 [Mac bundle-version allocation](../decisions/2026-09-11-electron-macos-bundle-version-allocation.md):
-0.1.21 uses bundle version 1028, above native 0.1.18's 1026. The provenance build
-number is a separate value. Retain the predecessor's exact public SUPublicEDKey
+0.1.23 uses bundle version 1030, above native 0.1.18's 1026; older allocations
+remain unchanged. The provenance build number is a separate value. Retain the
+predecessor's exact public SUPublicEDKey
 in the signed Electron Info.plist: Sparkle refuses removal of that key even
 after a valid archive signature. This passive compatibility value does not add
 a Sparkle framework, feed configuration or second running updater. Preserve
@@ -144,7 +145,11 @@ Apple's version grammar and the Electron inspection fuse.
    The production publisher refuses this test namespace. Uploading these test
    objects requires the existing test-publication authority and shared owner.
 3. Run electron-macos-sparkle-transition.yml on both native hosted architectures
-   with exact source, installer, ASAR and feed hashes. The unchanged signed
+   with exact source, installer, ASAR and feed hashes. Its `release_identity`
+   input is a closed JSON object containing string fields `version`,
+   `bundleVersion` and `buildNumber`. Select the exact signed candidate and its
+   reviewed stable allocation; the workflow validates this intake before
+   downloading artifacts. The unchanged signed
    native predecessor receives a test-feed preference only in its disposable
    account. Sparkle alone installs the candidate. Require successful actual
    update/relaunch, retained rows, settings, salt, opt-out and repeated restart.
@@ -158,14 +163,33 @@ Apple's version grammar and the Electron inspection fuse.
 5. Generate the final stable incoming feeds and use the existing guarded
    publish-sparkle-update.js operation below for both architectures. Preserve
    key continuity and atomic replacement. Intel's native route uses a
-   byte-identical TiboTattle-0.1.21-macOS-x64.dmg alias; the public GitHub download
-   retains the ordinary TiboTattle-0.1.21-mac-x64.dmg name and identical digest.
+   byte-identical `TiboTattle-<version>-macOS-x64.dmg` alias; the public GitHub download
+   retains the ordinary `TiboTattle-<version>-mac-x64.dmg` name and identical digest.
 6. Coordinate activation with the GitHub release, Electron feeds, Homebrew and
    website through the cross-platform runbook. Then rerun the native journey
    with production_feed and no override, and run
    electron-macos-production-update.yml using the unchanged released Electron
    0.1.20 app. Preserve these production receipts separately from the isolated
-   test proof. Its signed app cannot be redirected with a Node inspector.
+   test proof. Its `identity_json` supplies the exact candidate source, version,
+   bundle version, provenance build and final artifact/feed hashes, including
+   the predecessor ASAR hash. Its signed app cannot be redirected with a Node
+   inspector.
+
+Both harnesses preserve their pinned predecessors and require a reviewed stable
+allocation newer than native 0.1.18. A plan, a prior release's receipt or a
+newly accepted intake is not a successful installed update. Execute each required
+journey against the selected signed bytes and retain its new receipt; never
+relabel historical evidence for a successor.
+
+Run `electron-macos-empty-profile.yml` separately on both architectures using
+the same final signed DMGs in the isolated test namespace. Its closed `intake`
+JSON requires `runnerRevision`, `target`, `sourceRevision`, `version`,
+`bundleVersion`, `buildNumber`, `dmgSha256` and `asarSha256`; the workflow checks
+the selected runner and target before execution. The harness verifies the
+candidate identity, empty profile, first launch, Settings, restart and persistent
+opt-out. A `--plan` result is intake validation only. This clean-install receipt
+does not qualify existing credentials, native clean quit or successful uploads;
+those fields remain explicitly false.
 
 Existing-credential coverage remains an explicit receipt field; the synthetic
 opt-out fixture does not claim an existing Keychain credential rehearsal.
