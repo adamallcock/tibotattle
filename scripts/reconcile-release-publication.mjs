@@ -245,10 +245,52 @@ export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawn
   const downloaded = new Map();
   const attested = new Set();
   let appcastGuard;
-  const api = (route, { method = "GET", body, allow404 = false } = {}) => {
+  const api = (route, { method = "GET", body, allow404 = false, requireValue = false } = {}) => {
     const value = command(spawn, "gh", ["api", "--method", method, route, ...(body ? ["--input", "-"] : [])], { input: body ? JSON.stringify(body) : undefined, allow404 });
     if (value === null) return null;
-    try { return value.trim() === "" ? null : JSON.parse(value); } catch { fail("RELEASE_PUBLICATION_REMOTE_JSON_INVALID"); }
+    let parsed;
+    try { parsed = value.trim() === "" ? null : JSON.parse(value); } catch { fail("RELEASE_PUBLICATION_REMOTE_JSON_INVALID"); }
+    if (requireValue && parsed === null) fail("RELEASE_PUBLICATION_REMOTE_JSON_INVALID");
+    return parsed;
+  };
+  const discoverRelease = (tag) => {
+    const byTag = api(`repos/${REPOSITORY}/releases/tags/${tag}`, { allow404: true, requireValue: true });
+    if (byTag !== null) return byTag;
+    // The tag endpoint omits drafts. Listing is authoritative for drafts only
+    // when this authenticated principal has repository push access.
+    const repository = api(`repos/${REPOSITORY}`, { requireValue: true });
+    if (repository.full_name !== REPOSITORY || repository.permissions?.push !== true) {
+      fail("RELEASE_PUBLICATION_GITHUB_DRAFT_VISIBILITY_REQUIRED");
+    }
+    const ids = new Set();
+    let selected = null;
+    for (let page = 1; page <= 20; page += 1) {
+      const batch = api(`repos/${REPOSITORY}/releases?per_page=100&page=${page}`, { requireValue: true });
+      if (!Array.isArray(batch) || batch.length > 100) fail("RELEASE_PUBLICATION_RELEASE_LIST_INVALID");
+      for (const release of batch) {
+        if (!release || !Number.isSafeInteger(release.id) || release.id < 1
+            || typeof release.tag_name !== "string" || release.tag_name.length < 1 || release.tag_name.length > 256
+            || typeof release.draft !== "boolean" || typeof release.prerelease !== "boolean") {
+          fail("RELEASE_PUBLICATION_RELEASE_LIST_INVALID");
+        }
+        if (ids.has(release.id)) fail("RELEASE_PUBLICATION_RELEASE_LIST_CONFLICT");
+        ids.add(release.id);
+        if (release.tag_name === tag) {
+          if (selected !== null) fail("RELEASE_PUBLICATION_RELEASE_LIST_CONFLICT");
+          selected = release;
+        }
+      }
+      // Finish the bounded listing even after a match to detect ambiguity.
+      if (batch.length < 100) break;
+      if (page === 20) fail("RELEASE_PUBLICATION_RELEASE_LIST_TOO_LARGE");
+    }
+    if (selected === null) return null;
+    const release = api(`repos/${REPOSITORY}/releases/${selected.id}`, { requireValue: true });
+    if (release.id !== selected.id || release.tag_name !== tag
+        || release.draft !== selected.draft || release.prerelease !== selected.prerelease) {
+      fail("RELEASE_PUBLICATION_GITHUB_DISCOVERY_CHANGED");
+    }
+    return release;
   };
   const downloadAsset = async (id) => {
     if (!Number.isSafeInteger(id) || id < 1) fail("RELEASE_PUBLICATION_ASSET_ID_INVALID");
@@ -290,12 +332,13 @@ export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawn
   };
   const github = async (prepared, { fresh = false } = {}) => {
     const { plan } = prepared;
-    const release = api(`repos/${REPOSITORY}/releases/tags/${plan.source.tag}`, { allow404: true });
-    if (!release) {
+    const release = discoverRelease(plan.source.tag);
+    if (release === null) {
       admitDraft(plan);
       return { status: "missing", release: null, assets: [] };
     }
-    if (!Number.isSafeInteger(release.id) || release.tag_name !== plan.source.tag || release.prerelease !== false
+    if (!Number.isSafeInteger(release.id) || release.id < 1 || typeof release.draft !== "boolean"
+        || release.tag_name !== plan.source.tag || release.prerelease !== false || typeof release.body !== "string"
         || release.name !== `TiboTattle ${plan.version}` || digest(release.body ?? "") !== plan.notes.sha256) fail("RELEASE_PUBLICATION_GITHUB_IDENTITY_CONFLICT");
     const assets = [];
     for (let page = 1; page <= 20; page += 1) {
@@ -308,8 +351,18 @@ export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawn
         || assets.some((asset) => !plan.assets.some((expected) => expected.name === asset.name))) fail("RELEASE_PUBLICATION_ASSET_SET_CONFLICT");
     for (const asset of assets) {
       const expected = plan.assets.find((entry) => entry.name === asset.name);
+      const downloadPrefix = `https://github.com/${REPOSITORY}/releases/download/`;
+      const taggedUrl = `${downloadPrefix}${plan.source.tag}/${expected.name}`;
+      // GitHub may keep a draft's asset URLs under its provisional page token.
+      // Admit only this verified draft's exact token; never rewrite it as public.
+      const provisionalPage = release.draft === true && typeof release.html_url === "string"
+        ? /^https:\/\/github\.com\/adamallcock\/tibotattle\/releases\/tag\/(untagged-[a-f0-9]{20})$/.exec(release.html_url) : null;
+      const provisionalUrl = provisionalPage && provisionalPage[0] === release.html_url
+        ? `${downloadPrefix}${provisionalPage[1]}/${expected.name}` : null;
       if (asset.size !== expected.bytes || asset.state !== "uploaded"
-          || asset.browser_download_url !== `https://github.com/${REPOSITORY}/releases/download/${plan.source.tag}/${expected.name}`) fail("RELEASE_PUBLICATION_GITHUB_ASSET_METADATA_CONFLICT");
+          || (asset.browser_download_url !== taggedUrl && (provisionalUrl === null || asset.browser_download_url !== provisionalUrl))) {
+        fail("RELEASE_PUBLICATION_GITHUB_ASSET_METADATA_CONFLICT");
+      }
       // GitHub asset IDs identify immutable byte objects: replacement gets a
       // new ID. Reuse only inside this invocation and draft/publication phase;
       // final reconciliation explicitly forces a new network download.
