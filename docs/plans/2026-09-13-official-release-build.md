@@ -81,20 +81,48 @@ report `release_open`, all 19 resource ceilings remain unresolved, and supportin
 receipts retain their existing `partial` outcomes. No promotion gate, assertion,
 resource ceiling or receipt field was manually overridden.
 
+The maintained normal Electron publication lane requires current receipt
+provenance; it does not require changing this resource-ceiling decision to
+`release_ready`. The generated-evidence tests explicitly retain `release_open`.
+Native trust, installed behavior and publication remain separate release gates.
+
+## Final installer qualification preparation, 2026-09-14
+
+Commit `093b6248` removes historical candidate pins from Mac clean-install and
+upgrade intake while retaining reviewed bundle allocations and exact native and
+Electron predecessors. Windows retains its verified installed updater file
+before uninstall. Linux binds the existing isolated runtime smoke to the final
+AppImage's extracted application, preserving explicit launcher, physical desktop
+and public-predecessor update limitations.
+
+The focused Windows, Linux and Mac suites pass 25, 47 and 32 tests respectively;
+release-trust checks pass 82. The full Worker suite passes 1,048 tests across 80
+files. Its packaging dry run requires the final committed tree and remains to be
+rerun after the freeze. The broad root run passes 5,461 tests, skips 48 and finds
+two tool-inventory registration failures. The corrected canonical inventory and
+all static callers now pass all six owning tests. A clean final-source rerun
+remains part of the next gate. R7 freshness is unchanged by these tooling edits.
+
 ## Remaining release work
 
-1. Assess the still-open R7 promotion decision independently of receipt freshness.
-2. Prepare successor-specific Mac qualification intake. The current empty-profile
-   runner binds 0.1.21, update/transition validators bind 0.1.22/1029, and the
-   production canary retains older exact bytes; these cannot qualify 0.1.23 as-is.
-3. Freeze the final release source and prepare its exact platform artifacts;
-   separately authorize signing/finalization and complete installed/update
-   qualification before immutable publication, update feeds, Homebrew or website
-   activation. Keep draft release notes under Unreleased until that preparation.
+The owner authorized signing and public release on 2026-09-14, conditional on
+readiness. Final production preparation uses provenance build `2026091401` and
+the existing Mac allocation `1030`. The final notes and dated changelog are
+prepared for the annotated `v0.1.23` source freeze.
+
+1. Complete the broad source gates, freeze the exact annotated source tag and
+   run the four final packaging/signing lanes. Signing
+   preparation is private and does not itself exercise credentials or notarize.
+2. Execute the new Mac clean-install and update journeys and the Windows/Linux
+   final-package checks. Neither intake validation nor old receipts qualify the
+   new signed bytes.
+3. Review the resulting native trust and installed/update evidence before
+   immutable publication, update feeds, Homebrew or website activation. Any
+   remaining physical observations need an explicit, candidate-specific decision;
+   preservation, credential protection and update integrity cannot be waived.
 
 [Draft PR #140](https://github.com/adamallcock/tibotattle/pull/140) retains the
-candidate and outstanding gates. The R7 refresh changes only generated evidence
-and this plan. Existing application packages remain bound to their recorded
+candidate and outstanding gates. Existing application packages remain bound to their recorded
 `1ca31a45` source and cannot be relabeled as a later artifact build.
 
 The consolidation exclusions remain those in the
