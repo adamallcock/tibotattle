@@ -4317,27 +4317,6 @@ function timelineComparisonInterval(data, startMs, endMs) {
   return interval && endMs <= interval[1] ? interval : false;
 }
 
-// A recorded boundary change remains useful even when pricing comparison is
-// unavailable. Keep it distinct from a confirmed drop and from a reset type.
-function timelineResetBoundaryEvents(data) {
-  const rows = mainWeeklyQuotaTrack(data.timeline.quota)
-    .map(row => ({ row, timestampMs: Date.parse(row.observedAt) }))
-    .filter(entry => Number.isFinite(entry.timestampMs))
-    .sort((a, b) => a.timestampMs - b.timestampMs);
-  const events = [];
-  let previous = null;
-  for (const current of rows) {
-    if (!Number.isFinite(Date.parse(current.row.resetAt))) { previous = null; continue; }
-    if (previous && current.timestampMs > previous.timestampMs
-        && timelineComparisonInterval(data, previous.timestampMs, current.timestampMs) !== false
-        && !sameResetBoundary(previous.row.resetAt, current.row.resetAt)) {
-      events.push({ timestampMs: current.timestampMs, confirmedAtMs: current.timestampMs, kind: "window_change" });
-    }
-    previous = current;
-  }
-  return events;
-}
-
 // Reset classification comes from the validated companion DTO. Quota boundary
 // events follow the selected main weekly plan; credits belong to the account
 // and are explicitly labelled that way in the Horizon inspection text.
@@ -5393,11 +5372,7 @@ function renderTimeline(data) {
       timelineComparisonInterval(data, timestampMs, timestampMs) !== false
         ? finite(row.remainingPercent) : null };
   }));
-  trendsHorizonView?.setEvents([
-    ...timelineTypedResetEvents(data),
-    ...timelineResetBoundaryEvents(data),
-    ...points.flatMap(point => point.resetEvent ? [point.resetEvent] : []),
-  ]);
+  trendsHorizonView?.setEvents(timelineTypedResetEvents(data));
   trendsHorizonView?.refresh();
 }
 

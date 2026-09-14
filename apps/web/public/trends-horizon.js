@@ -114,58 +114,38 @@ const RESET_MARKERS = Object.freeze({
   unknown_reset: { label: "trends.resetUnknown", icon: "?" },
   reset_credit_granted: { label: "trends.resetCreditGranted", icon: "+", lifecycle: true },
   reset_credit_expired: { label: "trends.resetCreditExpired", icon: "−", lifecycle: true },
-  observed_reset: { label: "trends.resetObserved", icon: "↺", fallback: true },
-  window_change: { label: "trends.resetBoundary", icon: "◇", fallback: true },
 });
 
-// Typed evidence replaces an unclassified observation only inside the evidence
-// interval for that boundary. Account-level credit lifecycle events do not
-// classify quota movement. Sorting and one interval sweep avoid a per-event
-// scan of the full retained history.
+// The companion classifier is the only source of reset evidence. Raw schedule
+// changes and rolling-comparison recovery points are not additional resets.
+// Deduplicate exact DTO repeats, never distinct nearby events or evidence types.
 export function mergeHorizonResetEvents(events) {
-  const typed = new Map(), fallback = new Map();
+  const unique = new Map();
   for (const event of events) {
-    const marker = Object.hasOwn(RESET_MARKERS, event?.kind) ? RESET_MARKERS[event.kind] : null;
-    if (!marker || !finite(event.timestampMs)) continue;
-    if (marker.fallback) {
-      if (fallback.get(event.timestampMs)?.kind !== "observed_reset") fallback.set(event.timestampMs, event);
-    } else {
-      if (!finite(event.intervalStartedAtMs) || !finite(event.observedAtMs)
-          || event.intervalStartedAtMs >= event.observedAtMs) continue;
-      const key = JSON.stringify([event.kind, event.reason, event.timestampMs,
-        event.intervalStartedAtMs, event.observedAtMs, event.precision,
-        event.planType, event.limitId, event.windowDurationMins]);
-      typed.set(key, event);
-    }
+    if (!Object.hasOwn(RESET_MARKERS, event?.kind) || !finite(event.timestampMs)
+        || !finite(event.intervalStartedAtMs) || !finite(event.observedAtMs)
+        || event.intervalStartedAtMs >= event.observedAtMs) continue;
+    const key = JSON.stringify([event.provider, event.kind, event.reason, event.occurredAt,
+      event.timestampMs, event.intervalStartedAtMs, event.observedAtMs,
+      event.precision, event.planType, event.limitId, event.windowDurationMins]);
+    unique.set(key, event);
   }
-  const intervals = [...typed.values()].filter(event => !RESET_MARKERS[event.kind].lifecycle)
-    .map(event => [event.intervalStartedAtMs, event.observedAtMs])
-    .sort((a, b) => a[0] - b[0]);
-  const coverage = [];
-  for (const interval of intervals) {
-    const last = coverage.at(-1);
-    if (last && interval[0] <= last[1]) last[1] = Math.max(last[1], interval[1]);
-    else coverage.push(interval);
-  }
-  const result = [...typed.values()];
-  let cursor = 0;
-  for (const event of [...fallback.values()].sort((a, b) => a.timestampMs - b.timestampMs)) {
-    while (cursor < coverage.length && coverage[cursor][1] < event.timestampMs) cursor += 1;
-    if (!coverage[cursor] || event.timestampMs <= coverage[cursor][0]) result.push(event);
-  }
-  return result.sort((a, b) => a.timestampMs - b.timestampMs || a.kind.localeCompare(b.kind));
+  return [...unique.values()].sort((a, b) => a.timestampMs - b.timestampMs || a.kind.localeCompare(b.kind));
+}
+
+export function resetEventSummary(events, t) {
+  const credits = events.filter(event => RESET_MARKERS[event.kind]?.lifecycle).length;
+  const resets = events.length - credits;
+  return [resets ? t("trends.resetCount", { count: resets }) : null,
+    credits ? t("trends.resetCreditCount", { count: credits }) : null]
+    .filter(Boolean).join(" · ") || t("trends.resetUnavailable");
 }
 
 export function resetEventPresentation(event, { t, formatInstant }) {
   const marker = RESET_MARKERS[event.kind];
   const label = t(marker.label);
   let caption;
-  if (marker.fallback) {
-    caption = t("trends.resetDetail", { event: label, time: formatInstant(event.timestampMs) });
-    if (event.confirmedAtMs > event.timestampMs) caption += " " + t("trends.resetConfirmed", {
-      time: formatInstant(event.confirmedAtMs),
-    });
-  } else if (event.precision === "observation_interval") {
+  if (event.precision === "observation_interval") {
     caption = t("trends.resetInterval", { event: label,
       start: formatInstant(event.intervalStartedAtMs), end: formatInstant(event.observedAtMs) });
   } else {
@@ -352,11 +332,11 @@ export function mountTrendsHorizon(root, { t, locale, timeZone, formatMoney, for
     }
     chart.svg.querySelector(".trends-reset-layer")?.remove();
     const visible = resetEvents.filter(event => event.timestampMs >= chart.domain.startMs && event.timestampMs <= chart.domain.endMs);
-    setText("#trends-reset-count", visible.length ? t("trends.resetCount", { count: visible.length }) : t("trends.resetUnavailable"));
+    setText("#trends-reset-count", resetEventSummary(visible, t));
     const layer = svgNode(document, "g", { class: "trends-reset-layer" });
     for (const group of resetMarkerGroups(visible, chart.x)) {
       const event = group.at(-1), x = chart.x(event);
-      const caption = group.map(item => resetEventPresentation(item, { t,
+      const caption = (group.length > 1 ? resetEventSummary(group, t) + "\n" : "") + group.map(item => resetEventPresentation(item, { t,
         formatInstant: timestamp => format(timestamp, { dateStyle: "medium", timeStyle: "short" }),
       }).caption).join("\n");
       const markerKind = group.every(item => item.kind === event.kind) ? event.kind : "mixed";
@@ -365,7 +345,9 @@ export function mountTrendsHorizon(root, { t, locale, timeZone, formatMoney, for
       const stem = svgNode(document, "line", { x1: x, x2: x, y1: 21, y2: chart.height - chart.margin.bottom });
       const badge = svgNode(document, "rect", { x: x - 9, y: 1, width: 18, height: 18, rx: 6 });
       const icon = svgNode(document, "text", { x, y: 14, "text-anchor": "middle", "aria-hidden": "true", "data-i18n-skip": "" });
-      icon.textContent = group.length > 1 ? String(group.length) : RESET_MARKERS[event.kind].icon;
+      const mixedCreditGroup = group.some(item => RESET_MARKERS[item.kind].lifecycle)
+        && group.some(item => !RESET_MARKERS[item.kind].lifecycle);
+      icon.textContent = mixedCreditGroup ? "⋯" : group.length > 1 ? String(group.length) : RESET_MARKERS[event.kind].icon;
       if (group.length > 1) icon.setAttribute("class", "trends-reset-group-count");
       marker.append(title, stem, badge, icon);
       const inspect = () => {

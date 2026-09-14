@@ -334,9 +334,12 @@ Reset markers distinguish scheduled resets, banked resets, unknown types,
 and account-level credit grants or expiry when that evidence is available.
 Select a marker to inspect it; nearby events share a numbered marker with every
 event listed. Interval observations show both interval ends; scheduled and
-provider timestamps retain their precision. Older unclassified boundaries stay
-explicit. Typed evidence replaces matching fallback markers without duplicating
-resets. Plan-incompatible allowance events stay excluded.
+provider timestamps retain their precision. Markers use the companion’s existing
+reset classifications: schedule updates and comparison recovery points do not
+add extra resets. Credit grants and expiries have a separate count; a mixed group
+uses an ellipsis instead of a combined reset count. An unknown type means the
+evidence does not establish the reset mechanism.
+Plan-incompatible allowance events stay excluded.
 
 **When usage and allowance disagree** lists sustained divergence periods as compact
 rows ranked by their largest signed percentage-point gap. The gap accumulates from the cycle comparison
