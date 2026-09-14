@@ -11,100 +11,94 @@ Prepare the successor to published 0.1.22 from consolidation PR #139, merged as
 `a1e7c9f82e37c5d99a48e1117139b6b623833441`. The maintained process is the
 [Electron publication runbook](../runbooks/2026-08-18-cross-platform-release-publication.md#normal-electron-stable-feed-preparation),
 with [early admission](../runbooks/release-qualification-admission.md) before
-protected release qualification. This plan records source and build preparation;
-it is not an installed-update or publication receipt.
+protected release qualification. This checkpoint records unsigned build and
+R7 evidence preparation through 2026-09-14; it does not qualify a production
+installation, update or publication.
 
-## Candidate identity
+## Candidate identity and completed builds
 
 - Marketing and shared contract package version: `0.1.23`.
 - Both Mac architectures reserve stable `CFBundleVersion` `1030`, following
   `0.1.22` / `1029`. The
-  [existing allocation decision](../decisions/2026-09-11-electron-macos-bundle-version-allocation.md)
-  still governs the distinction between bundle ordering and artifact provenance.
-- Next source-preparation build number: `2026091304`, shared across all four
-  targets. It is not an Apple bundle version or evidence of publication.
-- Freeze the exact clean candidate commit before source preparation. Keep draft
-  release notes under Unreleased until final source/tag preparation.
+  [allocation decision](../decisions/2026-09-11-electron-macos-bundle-version-allocation.md)
+  distinguishes bundle ordering from artifact provenance.
+- Application source `1ca31a45753fae709cc30d6a91b599e96b0367ee` passed all six jobs
+  in the [official development workflow](https://github.com/adamallcock/tibotattle/actions/runs/34801384672):
+  Mac ARM, Mac Intel, Windows x64 and Linux x64 packages, Windows normal startup,
+  and Windows NSIS installation, whole-app restart and uninstall.
+- The same source passed all four
+  [unsigned production-source jobs](https://github.com/adamallcock/tibotattle/actions/runs/34801385483)
+  with build `2026091304`. Downloaded receipts and staged versions agree on the
+  exact source, version, build and target set. This build is not an Apple bundle
+  version and does not record signing or publication.
+- The official Mac ARM DMG, ZIP, executable and extracted ASAR were independently
+  checksum-verified. Native inspection with an isolated retained-data profile
+  confirmed completed refresh, animated allowance overflow and the shared weekly
+  pacing forecast. ASAR:
+  `5c2968b13753fc2f199ac4e4addeedd195f0005b36da1b02a1668813578be980`.
 
-## Verified starting point
+## Source corrections and local validation
 
-- Merged-main synthetic admission passed 169 tests. Its changed executable
-  profile is reported as `passed_not_reusable`; the result cannot be reused as
-  a reviewed cache receipt.
-- Local merged-main packaging passed 92 contract tests, with two existing
-  unavailable-environment skips. The official development packager produced a
-  verified Mac ARM app, DMG and ZIP. The app ASAR is
-  `15ea3eeddbf36f8692240bcf34c2e11b50c4619eb22ec505497ff31534ca49d2`.
-- Native inspection with an isolated retained-data profile showed the allowance
-  tanks, narrow five-hour tank, shared pacing forecast and removed observation
-  labels. Forecast evidence was available; the history refresh was still running.
-- [Official merged-main workflow](https://github.com/adamallcock/tibotattle/actions/runs/34798756100)
-  passed Mac ARM, Mac Intel and Linux development packaging, plus the Windows
-  normal app journey. Windows packaging failed two native fixture checks and
-  therefore did not run its dependent NSIS installed lifecycle.
-- The candidate corrects the Windows fixtures: the audit guard receives
-  its required two protected parents, and synthetic source files receive explicit
-  current-user ownership with unchanged DACLs. Native security policy is unchanged.
+Windows qualification exposed fixture gaps in protected parents, source ownership
+and task duration. The corrected fixtures preserve the native security assertions,
+verify unchanged DACLs after ownership setup, isolate the PowerShell child module
+environment and exercise the complete timing boundary. Darwin-only development
+identity validation uses explicit POSIX semantics with invalid-path refusal tests.
+The Worker copy-guard test includes the already-merged `reset-events.js`.
 
-## Remaining sequence
+- Focused release/telemetry checks passed 50 tests; preflight passed 20; current
+  synthetic admission passed 169 as `passed_not_reusable`; focused shell and
+  credential checks passed 107. Worker package-copy guards, generated types and
+  TypeScript checks pass.
+- The broad root run passed 5,391 tests and skipped 48. Five files failed to load
+  incomplete Worker dependencies; after the clean locked install, all 57 tests
+  in those files passed. Its two remaining stale R7 provenance failures are
+  resolved by the protected refresh below. This is focused follow-up evidence,
+  not a claim that the entire root suite was rerun after receipt replacement.
 
-1. Verify synchronized versions, regenerated telemetry contracts, documentation,
-   package consumers and the Windows fixture changes; commit the clean candidate.
-2. Run the official four-target development qualification and unsigned production
-   source preparation against that exact candidate. Retain target receipts and
-   actual native results; Mac portable tests cannot qualify Windows behavior.
-3. Refresh protected R7 receipts through the maintained dual-runtime process after
-   source closure is settled. Existing source-provenance failures remain failures.
-4. Prepare successor-specific Mac qualification intake. The current empty-profile
+## Authorized R7 refresh, 2026-09-14
+
+The owner-approved [dual-runtime regeneration](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md)
+completed in approximately 37 minutes with the exact pinned Node 24.14.0 and
+26.2.0 binaries and the registered 31-day interval. The generator validated and
+replaced all ten receipts, completed its journaled cleanup and emitted its final
+success summary. Private history stayed local.
+
+Both retained-data runs repeat deterministically within each runtime. The receipt
+review preserves runtime identities, privacy and preservation fields, profile
+names and decision states. Source/projection fingerprints, linked receipt hashes,
+measurements and the retained input inventory were refreshed. Changed input
+inventory and environment-sensitive measurements do not support attributing a
+performance difference to this code change.
+
+The two freshness/rebuild tests pass under Node 24.14.0. The focused Node 26.2.0
+suite passes all 48 tests covering freshness, decision reconstruction, closed
+schemas and regeneration recovery. Its native process-ownership tests require
+process inspection outside the restricted execution sandbox.
+
+R7 receipt freshness is separate from release approval: both decisions still
+report `release_open`, all 19 resource ceilings remain unresolved, and supporting
+receipts retain their existing `partial` outcomes. No promotion gate, assertion,
+resource ceiling or receipt field was manually overridden.
+
+## Remaining release work
+
+1. Assess the still-open R7 promotion decision independently of receipt freshness.
+2. Prepare successor-specific Mac qualification intake. The current empty-profile
    runner binds 0.1.21, update/transition validators bind 0.1.22/1029, and the
-   production canary retains older exact bytes. These cannot qualify 0.1.23 as-is.
-5. Complete separately authorized platform signing/finalization and exact
-   installed/update qualification before the four-target publication proposal,
-   immutable release, update feeds, Homebrew or website activation.
+   production canary retains older exact bytes; these cannot qualify 0.1.23 as-is.
+3. Freeze the final release source and prepare its exact platform artifacts;
+   separately authorize signing/finalization and complete installed/update
+   qualification before immutable publication, update feeds, Homebrew or website
+   activation. Keep draft release notes under Unreleased until that preparation.
+
+[Draft PR #140](https://github.com/adamallcock/tibotattle/pull/140) retains the
+candidate and outstanding gates. The R7 refresh changes only generated evidence
+and this plan. Existing application packages remain bound to their recorded
+`1ca31a45` source and cannot be relabeled as a later artifact build.
 
 The consolidation exclusions remain those in the
 [integration plan](./2026-09-13-release-integration.md): typed D1/sharding,
 unfinished provider/credential experiments and the superseded inference UI do
-not enter this candidate. Historical receipts and platform acceptances are not
-transferred to new artifacts.
-
-## Candidate preparation checkpoint
-
-- Source `519ce93e55dcdc784b398e08b2ce991c167dccd5`, version `0.1.23`, build
-  `2026091301` passed all four unsigned production-source jobs in
-  [run 34799444477](https://github.com/adamallcock/tibotattle/actions/runs/34799444477).
-  The four downloaded receipts agree on source, version, build and target set.
-- Its official Mac development DMG, ZIP and extracted ASAR were independently
-  checked against the receipt. ASAR:
-  `a663c08a810aabaefde3f9193a159b036c702f94a400506d634b34418277d225`.
-- The broad root suite passed 5,391 tests and skipped 48. Five files could not
-  load an incomplete Worker dependency install; after a clean pinned install,
-  all 57 tests in those files passed. The remaining two R7 provenance failures
-  are unchanged and not waived. Candidate admission also passed 169 tests.
-- Worker package-copy/type checks exposed a stale expected-file list. It now
-  includes the already-merged `reset-events.js`; the exact-copy guards, generated
-  types and TypeScript checks pass without changing the production guard.
-- Windows fixture setup now uses an ownership-only operation with mandatory
-  unchanged-DACL readback and fixed error categories. Native execution isolated
-  the subsequent failure to the first PowerShell ACL read. The child environment
-  removes inherited `PSModulePath` as documented for
-  [intermediate PowerShell processes](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_psmodulepath?view=powershell-7.6),
-  preserving the parent environment. Native rerun confirmed the source-handle
-  and ACL checks. The timing fixture now supplies the required two-second task
-  duration for its 200 ms TTFT; a portable parser test verifies this boundary
-  before native execution. Source `86022fe5b3bc3ef03ecfe9f855595eec866e721f`
-  passed all 66 native filesystem and credential checks, including journal,
-  reopen and crash recovery. The next shell contract exposed host-dependent
-  path normalization in the simulated Mac QA lane; its Darwin-only account-key
-  validation now uses explicit POSIX semantics and retains rejection coverage
-  for Windows, noncanonical and out-of-directory paths.
-- Source `93ba64c31d97be0a882049544247ccd6ed21a26f`, build `2026091302`, also
-  passed the complete unsigned source-preparation workflow in
-  [run 34800291232](https://github.com/adamallcock/tibotattle/actions/runs/34800291232).
-- Source `86022fe5b3bc3ef03ecfe9f855595eec866e721f`, build `2026091303`,
-  passed all four unsigned source-preparation jobs in
-  [run 34800701138](https://github.com/adamallcock/tibotattle/actions/runs/34800701138).
-- [Draft PR #140](https://github.com/adamallcock/tibotattle/pull/140) retains the
-  candidate and its outstanding gates. The next clean commit receives fresh
-  four-target build and source-preparation receipts; earlier receipts remain
-  evidence only for their recorded source.
+not enter this candidate. Historical platform acceptances are not transferred
+to new artifacts.
