@@ -30,10 +30,11 @@ import {
   ATTRIBUTION_SCHEMA_COLUMNS,
   ATTRIBUTION_SCHEMA_OBJECTS,
   EXPECTED_STAGING_MIGRATIONS,
-  POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
   SCALE_SCHEMA_COLUMNS,
   SCALE_SCHEMA_OBJECTS,
-  POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
+  CURRENT_SCALE_SCHEMA_PROBE_SQL,
+  PUBLIC_SOURCE_SCHEMA_PROBE_SQL,
 } from "./staging-readiness-lib.mjs";
 
 const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -185,6 +186,7 @@ async function standardFixture({
   schemaObjectMissing = null,
   attributionSchemaRows = [{ attribution_objects: 1, attribution_columns: 1 }],
   scaleSchemaRows = [{ scale_objects: 1, scale_columns: 1 }],
+  publicSourceSchemaRows = [{ public_source_objects: 1 }],
 } = {}) {
   const calls = [];
   const primaryMigrations = await migrationNames("migrations");
@@ -237,6 +239,9 @@ async function standardFixture({
     if (sql.includes("FROM collection_controls")) {
       assert.equal(/\b(?:INSERT|UPDATE|DELETE)\b/iu.test(sql), false);
       return { status: 0, stdout: jsonRows(collectionControlRows) };
+    }
+    if (sql.includes("AS public_source_objects")) {
+      return { status: 0, stdout: jsonRows(publicSourceSchemaRows) };
     }
     if (sql.includes("AS attribution_objects")) {
       return { status: 0, stdout: jsonRows(attributionSchemaRows) };
@@ -326,7 +331,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
   assert.equal(result.checks.collectionControlsCoherent, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
-  assert.equal(result.evidence.migrationWindow, "0001-0059");
+  assert.equal(result.evidence.migrationWindow, "0001-0060");
   assert.ok(statePath);
   await assert.rejects(access(statePath));
   assert.equal(calls.filter((args) => args.includes("migrations")).length, 4);
@@ -546,8 +551,8 @@ test("release preflight independently requires every scale object and exact meta
     assert.equal(result.checks.requiredSchemaPresent, false);
     assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"]);
     assert.equal(result.collectionAuthorized, false);
-    assert.equal(calls.filter(args => args.includes(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL)).length, 1);
-    assert.equal(calls.filter(args => args.includes(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
+    assert.equal(calls.filter(args => args.includes(CURRENT_SCALE_SCHEMA_PROBE_SQL)).length, 1);
+    assert.equal(calls.filter(args => args.includes(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
     assert.equal(calls.some(args => args.includes("--remote") || args.includes("deploy")), false);
   }
 });
@@ -563,7 +568,7 @@ test("release preflight uses the real independent scale column proof, including 
       columns.map(column => [table, column]))) {
       database.exec(`SAVEPOINT missing_scale_column;
         ALTER TABLE ${table} RENAME COLUMN ${column} TO synthetic_missing_column;`);
-      const actualProbe = { ...database.prepare(POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL).get() };
+      const actualProbe = { ...database.prepare(CURRENT_SCALE_SCHEMA_PROBE_SQL).get() };
       assert.equal(actualProbe.scale_columns, 0, `${table}.${column}`);
       const { spawn } = await standardFixture({ scaleSchemaRows: [actualProbe] });
       const result = await runReleasePreflight({
@@ -587,11 +592,11 @@ test("release preflight requires every staged checkpoint column without authoriz
       const sql = await readFile(join(workerDirectory, "migrations", name), "utf8");
       database.exec(name.startsWith("0058_") ? `BEGIN;\n${sql}\nCOMMIT;` : sql);
     }
-    assert.equal(database.prepare(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL).get().attribution_columns, 1);
+    assert.equal(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get().attribution_columns, 1);
     for (const column of ATTRIBUTION_SCHEMA_COLUMNS.community_analysis_work_stage) {
       database.exec(`SAVEPOINT missing_stage_column;
         ALTER TABLE community_analysis_work_stage RENAME COLUMN "${column}" TO synthetic_missing_column;`);
-      const actualProbe = { ...database.prepare(POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL).get() };
+      const actualProbe = { ...database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get() };
       assert.equal(actualProbe.attribution_columns, 0, column);
       const { calls, spawn } = await standardFixture({ attributionSchemaRows: [actualProbe] });
       const result = await runReleasePreflight({
@@ -655,6 +660,7 @@ test("missing deletion-ledger schema blocks the gate with a separate blocker", a
     if (sql.includes("FROM collection_controls")) {
       return { status: 0, stdout: jsonRows([containedCollectionControlRow()]) };
     }
+    if (sql.includes("AS public_source_objects")) return { status: 0, stdout: jsonRows([{ public_source_objects: 1 }]) };
     if (sql.includes("AS attribution_objects")) {
       return { status: 0, stdout: jsonRows([{
         attribution_objects: 1,
@@ -771,6 +777,7 @@ test("real Wrangler proves both local D1 streams, schema, and controls coherence
     assert.equal(result.state, "ready", JSON.stringify({
       blockers: result.blockers,
       checks: result.checks,
+      schemaProofs: commands.filter(({ sql }) => sql && [CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL].includes(sql)).map(({ result }) => rowsFromWrangler(result.stdout)),
       commandFailures: commands.filter(({ result }) => result.status !== 0).map(({ result }) => ({
         status: result.status,
         errorCode: result.error?.code ?? null,
@@ -849,5 +856,18 @@ test("real Wrangler proves both local D1 streams, schema, and controls coherence
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+
+test("current preflight refuses missing, malformed or duplicate public-source schema proof", async () => {
+  for (const publicSourceSchemaRows of [[], [{}], [{ public_source_objects: 0 }],
+    [{ public_source_objects: true }], [{ public_source_objects: 1 }, { public_source_objects: 1 }]]) {
+    const { calls, spawn } = await standardFixture({ publicSourceSchemaRows });
+    const result = await runReleasePreflight({ config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+      createState: disposableState, cleanupState: removeState });
+    assert.equal(result.state, "blocked");
+    assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"]);
+    assert.equal(calls.filter(args => args.includes(PUBLIC_SOURCE_SCHEMA_PROBE_SQL)).length, 1);
   }
 });

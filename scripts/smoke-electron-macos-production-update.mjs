@@ -8,7 +8,8 @@ import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateSparkleTransitionHost, captureMacTransitionProcesses, stopVerifiedMacTransitionProcesses,
-  assertExtractedSignedMacBundle, verifySparkleTransitionCandidate, signedMacTransitionEnvironment } from './smoke-electron-macos-sparkle-transition.mjs';
+  assertExtractedSignedMacBundle, verifySparkleTransitionCandidate, signedMacTransitionEnvironment,
+  selectMacTransitionApplicationProcess } from './smoke-electron-macos-sparkle-transition.mjs';
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp } from './run-signed-electron-staging.mjs';
 import { seedSignedReplacementNativeState, readSignedReplacementState,
   assertSignedReplacementContinuity } from './smoke-electron-macos-replacement.mjs';
@@ -26,6 +27,14 @@ export const ELECTRON_020_DMG = Object.freeze({
 const require = createRequire(import.meta.url), SHA = /^[0-9a-f]{64}$/u;
 const fail = stage => { throw Object.assign(new Error('SIGNED_PRODUCTION_UPDATE_REFUSED'), { updateStage: stage }); };
 const hash = (bytes, algorithm = 'sha256', encoding = 'hex') => createHash(algorithm).update(bytes).digest(encoding);
+export function classifyProductionUpdateFailure(error) {
+  // Only fixed machine classifications; never emit commands, paths or stderr.
+  const code = ['ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT', 'EEXIST', 'ENOSPC', 'EIO'].includes(error?.code) ? error.code : null;
+  const exitCode = Number.isInteger(error?.status) && error.status >= 0 && error.status <= 255 ? error.status : null;
+  const signal = ['SIGTERM', 'SIGKILL', 'SIGABRT'].includes(error?.signal) ? error.signal : null;
+  return { code, exitCode, signal, kind: code ? 'system_error' : exitCode !== null ? 'command_exit' : signal ? 'command_signal' : 'unclassified' };
+}
+
 const command = (file, args, timeout = 30000) => execFileSync(file, args,
   { encoding: 'utf8', timeout, maxBuffer: 4 * 1024 ** 2, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
 export function parseProductionUpdateArguments(argv) {
@@ -41,7 +50,7 @@ export function validateProductionUpdateIntake(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).sort().join('|') !== keys.sort().join('|')
     || value.schemaVersion !== 'tibotattle-production-electron-update-intake-v1'
-    || !Object.hasOwn(ELECTRON_020_DMG, value.target) || value.version !== '0.1.21' || value.bundleVersion !== '1028'
+    || !Object.hasOwn(ELECTRON_020_DMG, value.target) || value.version !== '0.1.22' || value.bundleVersion !== '1029'
     || typeof value.sourceRevision !== 'string' || !/^[0-9a-f]{40}$/u.test(value.sourceRevision)
     || typeof value.buildNumber !== 'string' || !/^[1-9][0-9]{0,9}$/u.test(value.buildNumber)
     || !['dmgSha256', 'asarSha256', 'zipSha256', 'feedSha256', 'predecessorAsarSha256'].every(k => typeof value[k] === 'string' && SHA.test(value[k]))
@@ -53,11 +62,11 @@ export function validateProductionUpdateIntake(value) {
     feedUrl: feedBase + '/latest-mac.yml', zipFileName: file(value.version) + '.zip',
     dmgFileName: file(value.version) + '.dmg', predecessorDmgSha256: ELECTRON_020_DMG[value.target],
     predecessorUrl: 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.20/' + file('0.1.20') + '.dmg',
-    candidateUrl: 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.21/' + file(value.version) + '.dmg' };
+    candidateUrl: 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.22/' + file(value.version) + '.dmg' };
 }
 export function validateProductionMacUpdateFeed(input, manifest, zip, dmg) {
   const entries = manifest?.files;
-  if (manifest?.version !== '0.1.21' || !Array.isArray(entries) || entries.length !== 2
+  if (manifest?.version !== '0.1.22' || !Array.isArray(entries) || entries.length !== 2
     || manifest.path !== input.zipFileName || Object.hasOwn(manifest, 'packages')) fail('feed_identity');
   for (const [name, bytes] of [[input.zipFileName, zip], [input.dmgFileName, dmg]]) {
     const selected = entries.filter(entry => entry.url === name);
@@ -105,11 +114,27 @@ async function until(check, timeout, stage) {
   do { const result = await check(); if (result) return result; await new Promise(r => setTimeout(r, 300)); } while (Date.now() < deadline);
   fail(stage);
 }
-function appPid(app) {
-  const executable = join(app, 'Contents', 'MacOS', 'TiboTattle');
-  const matches = command('/bin/ps', ['-axo', 'pid=,comm=']).split('\n')
-    .map(line => /^\s*(\d+)\s+(.+)$/u.exec(line)).filter(m => m && m[2] === executable);
-  if (matches.length > 1) fail('duplicate_process'); return matches.length ? +matches[0][1] : null;
+export function selectProductionUpdateSuccessor(rows, executable, predecessorPid, predecessorProcesses) {
+  if (!Number.isSafeInteger(predecessorPid) || predecessorPid < 2 || !(predecessorProcesses instanceof Set)
+    || !predecessorProcesses.has(predecessorPid)) fail('predecessor_process_identity');
+  // The old Node companion may outlive its parent and become a root itself.
+  // A PID already present before Install is never the updater-created successor.
+  if (rows.some(row => row.pid === predecessorPid)) return null;
+  return selectMacTransitionApplicationProcess(rows.filter(row => !predecessorProcesses.has(row.pid)), executable);
+}
+function productionUpdateProcesses() {
+  return command('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,comm=']).split('\n').map(line => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/u.exec(line);
+    if (!match) fail('process_inventory');
+    return { pid: +match[1], parent: +match[2], group: +match[3], command: match[4] };
+  });
+}
+export function refreshProductionUpdateArchiveIndex(appPath) {
+  const loaded = createRequire(require.resolve('electron-builder'))('@electron/asar'), api = loaded?.default ?? loaded;
+  // ASAR 3.4.1 caches headers by pathname. An in-place updater replaces this
+  // archive after predecessor inspection; reread its actual signed header.
+  if (typeof api.uncache !== 'function') fail('archive_cache_api');
+  api.uncache(join(appPath, 'Contents', 'Resources', 'app.asar'));
 }
 async function verifyPredecessor(input, appPath) {
   const asar = join(appPath, 'Contents', 'Resources', 'app.asar');
@@ -142,7 +167,8 @@ export async function runProductionUpdate(options) {
     checkForUpdatesInvoked: false, updateDiscoveredAutomatically: false, downloadUpdateInvoked: false, installUpdateInvoked: false,
     updaterRelaunchedCandidate: false, candidateCopiedByRunner: false, retainedRowsPreserved: false,
     preferencesPreserved: false, saltPreserved: false, optOutPreserved: false, restartNoDuplicates: false,
-    ownedProcessesStopped: false, existingCredentialFixture: false, failureStage: null };
+    ownedProcessesStopped: false, existingCredentialFixture: false, failureStage: null, failureClassification: null,
+    successorPIDObserved: false, successorWasPreexistingProcess: null, cleanupFailureClassification: null };
   let input, app, active, stage = 'intake'; const knownProcesses = new Map();
   try {
     input = validateProductionUpdateIntake(JSON.parse(await bytes(options.intakePath, 16384)));
@@ -223,15 +249,22 @@ export async function runProductionUpdate(options) {
     if (hash(await fetchBytes(input.feedUrl, 65536)) !== input.feedSha256) fail('production_feed_changed');
     stage = 'install_update'; const oldPid = active.pid;
     captureMacTransitionProcesses(app, oldPid, knownProcesses);
+    const predecessorProcesses = new Set(knownProcesses.keys());
     // The call can lose its CDP response when the updater exits the predecessor.
     const request = active.settings.evaluate('globalThis.tibotattleDesktop.installUpdateAndRestart()');
     proof.installUpdateInvoked = true; request.catch(() => {});
+    stage = 'successor_process_poll';
     const successor = await until(() => {
-      captureMacTransitionProcesses(app, oldPid, knownProcesses); const pid = appPid(app);
-      return pid && pid !== oldPid ? pid : null;
+      captureMacTransitionProcesses(app, oldPid, knownProcesses);
+      return selectProductionUpdateSuccessor(productionUpdateProcesses(), verified.executable, oldPid, predecessorProcesses)?.pid ?? null;
     }, 180000, 'updater_relaunch');
+    proof.successorPIDObserved = true; proof.successorWasPreexistingProcess = predecessorProcesses.has(successor);
+    stage = 'successor_archive_verification';
     input.candidateCodeDirectoryHash = await assertExtractedSignedMacBundle(candidateDmg, app, join(input.directory, 'successor-verification-mount'));
+    stage = 'successor_signed_verification';
+    refreshProductionUpdateArchiveIndex(app);
     await verifySparkleTransitionCandidate(input, app);
+    stage = 'successor_process_capture';
     captureMacTransitionProcesses(app, successor, knownProcesses);
     proof.updaterRelaunchedCandidate = true;
     for (const session of active.sessions) { try { session.close(); } catch {} } active = null;
@@ -248,17 +281,18 @@ export async function runProductionUpdate(options) {
     await stopOwnedMacSharingApp(active); active = null;
     Object.assign(proof, { retainedRowsPreserved: true, saltPreserved: true, preferencesPreserved: true,
       optOutPreserved: true, restartNoDuplicates: true, status: 'passed' });
-  } catch (error) { proof.failureStage = error?.updateStage ?? error?.transitionStage ?? stage; }
+  } catch (error) { proof.failureStage = error?.updateStage ?? error?.transitionStage ?? stage; proof.failureClassification = classifyProductionUpdateFailure(error); }
   finally {
-    if (active) { try { await stopOwnedMacSharingApp(active); } catch { proof.status = 'failed'; proof.failureStage ??= 'cleanup'; } }
+    if (active) { try { await stopOwnedMacSharingApp(active); } catch (error) { proof.status = 'failed'; proof.failureStage ??= 'cleanup'; proof.cleanupFailureClassification = classifyProductionUpdateFailure(error); } }
     if (app && input && knownProcesses.size) {
       try {
         proof.ownedProcessesStopped = await stopVerifiedMacTransitionProcesses({ appPath: app, knownProcesses,
           verifyApp: async path => {
+            refreshProductionUpdateArchiveIndex(path);
             try { return await verifySparkleTransitionCandidate(input, path); }
             catch { return verifyPredecessor(input, path); }
           } });
-      } catch { proof.ownedProcessesStopped = false; proof.status = 'failed'; proof.failureStage ??= 'cleanup'; }
+      } catch (error) { proof.ownedProcessesStopped = false; proof.status = 'failed'; proof.failureStage ??= 'cleanup'; proof.cleanupFailureClassification = classifyProductionUpdateFailure(error); }
     }
   }
   return proof;

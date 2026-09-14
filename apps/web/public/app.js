@@ -2,6 +2,7 @@ import { observationFreshness } from "./dashboard-ui.js";
 import { createReportingPeriod, reportingDays, reportingSelection, mountReportingPeriodDismissal } from "./reporting-period.js";
 import { createCacheReuseMatrix } from "./cache-reuse-matrix.js";
 import { cacheReuseMetricLines, cacheReuseCoverageNote } from "./cache-reuse-metrics.js";
+import { mountTrendsHorizon, createSpendRateLookup } from "./trends-horizon.js";
 import { mountAllowanceTanks } from "./allowance-tanks.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
@@ -240,6 +241,11 @@ let activeAccountingPeriod = "7d";
 // visible reason, which is the inconsistency this settles.
 let activeWeeklyRangeDays = 30;
 let activeWeeklyMinimumObservedSpanPp = 50;
+// The seven-day allowance stays the preferred initial view whenever it has
+// evidence. A user's explicit window choice survives redraws and refreshes;
+// if that duration disappears from a later payload, resolution falls back to
+// the best available window instead of leaving a stale selection on screen.
+let activeAllowanceWindowMinutes = null;
 // Null follows the latest observed plan, including an insufficient one. An
 // explicit choice stays in memory across refreshes, ranges and locale changes.
 let activeWeeklyPlanType = null;
@@ -1709,13 +1715,6 @@ function renderQuotaCards(data) {
     }
     bottom.append(amount, reset);
     card.append(header, bottom);
-    // Keep differing observation times explicit without repeating the shared
-    // freshness timestamp on every current card.
-    if (window.observedAt && (window.status === "stale"
-        || forecastTimestamp(window.observedAt) !== forecastTimestamp(data.freshness?.latestObservedAt))) {
-      card.append(allowanceTimestamp(t("allowance.observation"),
-        forecastTimestamp(window.observedAt)));
-    }
     container.append(card);
   }
 }
@@ -4042,13 +4041,13 @@ function resetTimelineViewport() {
  */
 const CALIBRATION_CHART_VIEWPORT = Object.freeze({
   read: () => timelineViewport,
-  write: (value) => { timelineViewport = value; },
-  render: () => scheduleTimelineRender(),
+  write: (value) => { timelineViewport = value; usageTimelineViewport = value; },
+  render: () => scheduleUsageTimelineRender(),
 });
 
 const USAGE_CHART_VIEWPORT = Object.freeze({
   read: () => usageTimelineViewport,
-  write: (value) => { usageTimelineViewport = value; },
+  write: (value) => { usageTimelineViewport = value; timelineViewport = value; },
   render: () => scheduleUsageTimelineRender(),
 });
 
@@ -4318,6 +4317,47 @@ function timelineComparisonInterval(data, startMs, endMs) {
   return interval && endMs <= interval[1] ? interval : false;
 }
 
+// A recorded boundary change remains useful even when pricing comparison is
+// unavailable. Keep it distinct from a confirmed drop and from a reset type.
+function timelineResetBoundaryEvents(data) {
+  const rows = mainWeeklyQuotaTrack(data.timeline.quota)
+    .map(row => ({ row, timestampMs: Date.parse(row.observedAt) }))
+    .filter(entry => Number.isFinite(entry.timestampMs))
+    .sort((a, b) => a.timestampMs - b.timestampMs);
+  const events = [];
+  let previous = null;
+  for (const current of rows) {
+    if (!Number.isFinite(Date.parse(current.row.resetAt))) { previous = null; continue; }
+    if (previous && current.timestampMs > previous.timestampMs
+        && timelineComparisonInterval(data, previous.timestampMs, current.timestampMs) !== false
+        && !sameResetBoundary(previous.row.resetAt, current.row.resetAt)) {
+      events.push({ timestampMs: current.timestampMs, confirmedAtMs: current.timestampMs, kind: "window_change" });
+    }
+    previous = current;
+  }
+  return events;
+}
+
+// Reset classification comes from the validated companion DTO. Quota boundary
+// events follow the selected main weekly plan; credits belong to the account
+// and are explicitly labelled that way in the Horizon inspection text.
+function timelineTypedResetEvents(data) {
+  const planType = data.allowancePlanSelection?.planType ?? data.weekly?.planType;
+  return (data.timeline.resetEvents ?? []).flatMap(event => {
+    const lifecycle = event.kind === "reset_credit_granted" || event.kind === "reset_credit_expired";
+    if (!lifecycle && (event.planType !== planType || !isPrimaryCodexWeeklyQuotaWindow({
+      limitId: event.limitId, durationMinutes: event.windowDurationMins,
+    }))) return [];
+    return [{ ...event,
+      // An interval observation cannot provide an exact reset instant. Locate
+      // its marker at the confirming observation and show both interval ends.
+      timestampMs: Date.parse(event.precision === "observation_interval" ? event.observedAt : event.occurredAt),
+      observedAtMs: Date.parse(event.observedAt),
+      intervalStartedAtMs: Date.parse(event.intervalStartedAt),
+    }];
+  });
+}
+
 function liveTimelinePoints(
   data,
   {
@@ -4524,6 +4564,7 @@ function liveTimelinePoints(
     // that crosses a boundary is never read as one continuous period across the
     // reset. Stamped on the point so the flag survives viewport filtering.
     let driftReanchor = false;
+    let resetEvent = null;
     if (capacity !== null && capacity > 0
         && currentWeightedCost !== null
         && after !== null
@@ -4549,6 +4590,17 @@ function liveTimelinePoints(
         && after.usedPercent
           <= driftAnchor.pendingDrop.usedPercent + RESET_DECREASE_THRESHOLD_PP;
       if (boundaryChanged || confirmedReset) {
+        // Expose the existing anchor decision; do not classify scheduled/banked
+        // resets without provider evidence. Initial anchors and recovery after
+        // missing pricing or a plan transition are not reset events.
+        if (driftAnchor !== null) {
+          resetEvent = {
+            timestampMs: confirmedReset ? driftAnchor.pendingDrop.timestampMs : afterMatch.timestampMs,
+            confirmedAtMs: afterMatch.timestampMs,
+            kind: confirmedReset || after.usedPercent < driftAnchor.maxUsedPercent - RESET_DECREASE_THRESHOLD_PP
+              ? "observed_reset" : "window_change",
+          };
+        }
         // A boundary or track change re-anchors the accumulation: drift is
         // zero by definition at the first observation of a new reset.
         driftAnchor = {
@@ -4608,6 +4660,7 @@ function liveTimelinePoints(
       residual: evidence.residual,
       cumulativeResidual,
       driftReanchor,
+      resetEvent,
       // Kept under the legacy internal key for downstream chart diagnostics,
       // but this is now the selected speed-priced amount, never Standard
       // dollars paired with a Fast-adjusted capacity.
@@ -4709,14 +4762,21 @@ function usagePointsWithAllowance(data, points, includeAllowance) {
     day: 12 * 60 * 60 * 1_000,
     week: 24 * 60 * 60 * 1_000
   }[activeUsageGrouping] ?? 6 * 60 * 60 * 1_000;
+  let allowanceSegment = 0;
+  let lastResetAt = null;
   return points.map((point) => {
     const endMs = Date.parse(point.periodEndAt ?? point.timestamp);
     const observationMatch = quotaLookup.atOrBefore(endMs);
     const observationAge = observationMatch
       ? endMs - observationMatch.timestampMs
       : Number.POSITIVE_INFINITY;
+    const resetAt = observationMatch?.row.resetAt ?? null;
+    if (lastResetAt !== null && !sameResetBoundary(lastResetAt, resetAt)) allowanceSegment += 1;
+    lastResetAt = resetAt;
     return {
       ...point,
+      allowanceSegment,
+      allowanceObservedAt: observationMatch?.row.observedAt ?? null,
       allowanceRemaining: includeAllowance
           && point.quotaWeightedCostUsd !== null
           && observationAge <= maximumObservationAgeMs
@@ -4793,6 +4853,7 @@ function usageChartAxisLabels(
 let usageSeriesMemo = null;
 
 function selectedUsagePoints(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   if (usageSeriesMemo !== null
       && usageSeriesMemo.data === data
       && usageSeriesMemo.grouping === activeUsageGrouping
@@ -4820,16 +4881,18 @@ function scheduleUsageTimelineRender() {
   if (!dashboard) return;
   if (typeof requestAnimationFrame !== "function") {
     renderUsageTimeline(dashboard);
+    renderTimeline(dashboard);
     return;
   }
   if (usageRenderFrame !== 0) return;
   usageRenderFrame = requestAnimationFrame(() => {
     usageRenderFrame = 0;
-    if (dashboard) renderUsageTimeline(dashboard);
+    if (dashboard) { renderUsageTimeline(dashboard); renderTimeline(dashboard); }
   });
 }
 
 function resetUsageTimelineViewport() {
+  timelineViewport = null;
   usageTimelineViewport = null;
 }
 
@@ -4844,6 +4907,7 @@ function completeUsageTimelineTotal(points, key) {
 }
 
 function renderUsageTimeline(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   syncUsageGroupingControls();
   const points = selectedUsagePoints(data);
   const viewport = withChartViewport(
@@ -4868,9 +4932,22 @@ function renderUsageTimeline(data) {
   // must never become a user-visible duration in a chart heading.
   setLocalizedText(
     $("#usage-timeline-title"),
-    quotaComparable ? "chart.usage.heading" : "chart.usage.standardHeading",
-    { unit },
+    "trends.allowanceActivity",
   );
+  const allowanceShell = $("#allowance-timeline-chart");
+  const hasAllowance = visiblePoints.some(point => finite(point.allowanceRemaining) !== null);
+  allowanceShell.hidden = !hasAllowance;
+  $("#allowance-timeline-empty").hidden = hasAllowance;
+  if (hasAllowance) drawChart(allowanceShell, lineChart({
+    points: visiblePoints,
+    series: [{ key: "allowanceRemaining", className: "chart-line-observed", label: { key: "trends.allowance" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY, format: value => formatPercent(value, 1),
+      segmentKey: "allowanceSegment", maxGapMs: { hour: 6, day: 36, week: 192 }[activeUsageGrouping] * 3_600_000 }],
+    yLabel: { key: "trends.remainingPercent" }, title: { key: "trends.allowance" },
+    description: { key: "trends.allowanceDescription" },
+    yDomain: { low: 0, high: 100, ticks: [0, 25, 50, 75, 100] }, height: 260, xDomain: viewport,
+    width: Math.max(360, allowanceShell.clientWidth || 900),
+  }));
   if (!visiblePoints.length) {
     shell.hidden = true;
     empty.hidden = false;
@@ -4896,20 +4973,12 @@ function renderUsageTimeline(data) {
             ? "chart.series.quotaWeightedUsage"
             : "chart.series.standardApiUsage",
         },
-        // Dense per-interval samples: dots would merge into a solid band, so
-        // the line carries the shape and each sample stays hoverable. This is
-        // the opposite of the allowance history chart, on purpose.
+        // Bars carry per-interval activity; hover targets retain exact values.
         pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+        connect: false,
         format: (value) => formatApiMoney(value),
       }],
       yLabel: axisLabels.primary,
-      secondarySeries: quotaComparable ? [{
-        key: "allowanceRemaining",
-        className: "chart-line-allowance",
-        label: { key: "chart.series.sevenDayAllowanceRemaining" },
-        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
-      }] : [],
-      secondaryYLabel: quotaComparable ? axisLabels.secondary : null,
       yTickFormat: (value) => formatApiMoney(value),
       title: {
         key: quotaComparable
@@ -4923,7 +4992,8 @@ function renderUsageTimeline(data) {
         values: { unit, timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
-      height: TIMELINE_CHART_HEIGHT,
+      height: 150,
+      width: Math.max(360, shell.clientWidth || 900),
       xDomain: viewport,
     }));
     bindUsageTimelineInteractions(shell, points, viewport);
@@ -5174,6 +5244,24 @@ function selectedTimelinePoints(data) {
   return selection;
 }
 
+let spendRateMemo = null;
+function selectedSpendRateLookup(data) {
+  if (spendRateMemo?.data === data) return spendRateMemo.lookup;
+  const capacity = timelineCalibrationCapacity(data);
+  const buckets = allowanceTimelineUsage(data).map(row => ({
+    startMs: Date.parse(row.startAt), endMs: Date.parse(row.endAt),
+    usd: timelineAllowanceWeightedCost(row, capacity),
+  }));
+  const lookup = createSpendRateLookup(buckets, {
+    intervals: data.allowancePlanSelection ? data.timeline.comparisonIntervals ?? [] : undefined,
+    // The plan-scoped contract publishes fixed fifteen-minute buckets even
+    // when the legacy all-plan timeline uses a different grouping.
+    bucketMs: data.allowancePlanSelection ? 900_000 : (data.timeline.bucketMinutes ?? 15) * 60_000,
+  });
+  spendRateMemo = { data, lookup };
+  return lookup;
+}
+
 function renderTimeline(data) {
   data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   const {
@@ -5182,7 +5270,8 @@ function renderTimeline(data) {
     usingLive,
     sideChatAdjusted,
   } = selectedTimelinePoints(data);
-  const viewport = normalizeTimelineViewport(points);
+  const usageBounds = timelineBounds(selectedUsagePoints(data));
+  const viewport = usageTimelineViewport ?? timelineViewport ?? usageBounds ?? normalizeTimelineViewport(points);
   const visiblePoints = timelinePointsInViewport(points, viewport);
   const visibleBaselinePoints = timelinePointsInViewport(
     baselinePoints,
@@ -5239,6 +5328,7 @@ function renderTimeline(data) {
           key: "observed",
           className: "chart-line-observed",
           label: { key: "dashboard.timeline.observedQuota" },
+          segmentKey: "residualSegment",
           pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
           format: formatPp,
         },
@@ -5246,6 +5336,7 @@ function renderTimeline(data) {
           key: "expected",
           className: "chart-line-expected",
           label: { key: "dashboard.timeline.expectedCost" },
+          segmentKey: "residualSegment",
           pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
           format: formatPp,
         }
@@ -5260,13 +5351,14 @@ function renderTimeline(data) {
         values: { timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
-      height: TIMELINE_CHART_HEIGHT,
+      height: 270,
+      width: Math.max(360, shell.clientWidth || 900),
       xDomain: viewport,
       statusIntervals: usingLive && viewport !== null
         ? timelineStatusIntervals(points, viewport)
         : [],
     }));
-    bindTimelineInteractions(shell, points, viewport);
+    bindTimelineInteractions(shell, selectedUsagePoints(data).length > 1 ? selectedUsagePoints(data) : points, viewport);
   }
   renderSeriesCoverage(
     $("#timeline-coverage"),
@@ -5275,11 +5367,38 @@ function renderTimeline(data) {
   );
   renderTimelineSummary(data, visiblePoints, visibleBaselinePoints, usingLive);
   renderTimelineConfidence(data, points, visiblePoints, usingLive, viewport);
+  const differenceShell = $("#difference-timeline-chart");
+  const differenceLimit = visiblePoints.reduce((maximum, point) => Math.max(maximum, Math.abs(finite(point.residual, 0))), 1) * 1.1;
+  differenceShell.hidden = shell.hidden;
+  if (!shell.hidden) drawChart(differenceShell, lineChart({
+    points: visiblePoints,
+    series: [{ key: "residual", className: "chart-line-value", label: { key: "trends.difference" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY, format: formatPp, connect: false }],
+    yLabel: { key: "dashboard.timeline.percentagePoints" }, title: { key: "trends.difference" },
+    description: { key: "trends.differenceDescription" }, includeZero: true, height: 125, xDomain: viewport,
+    width: Math.max(360, differenceShell.clientWidth || 900),
+    yDomain: { low: -differenceLimit, high: differenceLimit },
+  }));
   renderResiduals(data, visiblePoints, viewport);
   // The divergence panel reads the whole selected calibration range, not the
   // zoomed viewport: it answers "across this range, where did observed and
   // priced usage persistently disagree", so pan and zoom must not reshape it.
   renderDivergencePeriods(data, points);
+  trendsHorizonView?.setSpendLookup(selectedSpendRateLookup(data));
+  // The instrument reads observations, not the end-of-hour/day chart buckets.
+  // Incompatible intervals explicitly interrupt the sample stream.
+  trendsHorizonView?.setAllowanceSamples(mainWeeklyQuotaTrack(data.timeline.quota).map(row => {
+    const timestampMs = Date.parse(row.observedAt);
+    return { timestampMs, allowanceRemaining:
+      timelineComparisonInterval(data, timestampMs, timestampMs) !== false
+        ? finite(row.remainingPercent) : null };
+  }));
+  trendsHorizonView?.setEvents([
+    ...timelineTypedResetEvents(data),
+    ...timelineResetBoundaryEvents(data),
+    ...points.flatMap(point => point.resetEvent ? [point.resetEvent] : []),
+  ]);
+  trendsHorizonView?.refresh();
 }
 
 // The copy names each exclusion mechanism that actually fired, in classifier
@@ -5430,6 +5549,7 @@ function bindTimelineInteractions(shell, points, viewport) {
     } else if (event.key === "Home") {
       event.preventDefault();
       resetTimelineViewport();
+      renderUsageTimeline(dashboard);
       renderTimeline(dashboard);
     }
   };
@@ -5685,7 +5805,7 @@ function renderResiduals(data, points, viewport = null) {
   const domain = viewport ?? timelineBounds(points);
   const empty = $("#residual-empty");
   const shell = $("#residual-chart");
-  if (!computed.length) {
+  if (!residuals.some(row => finite(row.cumulativeResidual) !== null)) {
     empty.hidden = false;
     shell.hidden = true;
   } else {
@@ -5694,40 +5814,28 @@ function renderResiduals(data, points, viewport = null) {
     drawChart(shell, lineChart({
       points: residuals,
       series: [{
-        key: "residual",
-        className: "chart-line-value",
-        label: { key: "chart.residual.series" },
-        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
-        format: formatPp,
-      }, {
-        // The designed cumulative view (owner-directed, 2026-08-08): the
-        // running sum of per-bucket observed-minus-expected movement,
-        // re-anchored at each reset boundary or track change — computed in
-        // liveTimelinePoints beside the evidence it reads. Live points only:
-        // the historical artifact view carries no per-window reset
-        // annotations, so its rows have no such key and this series simply
-        // draws nothing there instead of inventing anchors.
-        key: "cumulativeResidual",
-        className: "chart-line-expected",
-        label: { key: "chart.residual.cumulativeSeries" },
-        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
-        format: formatPp,
+        key: "cumulativeResidual", className: "chart-line-observed",
+        label: { key: "trends.drift" }, pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+        format: formatPp, breakBefore: "driftReanchor",
       }],
       yLabel: { key: "dashboard.timeline.percentagePoints" },
-      title: { key: "chart.residual.title" },
+      title: { key: "trends.drift" },
       description: {
-        key: "chart.residual.description",
+        key: "trends.driftCopy",
         values: { timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
-      height: COMPACT_CHART_HEIGHT,
+      height: 230,
+      width: Math.max(360, shell.clientWidth || 900),
       xDomain: domain,
-      statusIntervals: domain === null
-        ? []
-        : timelineStatusIntervals(residuals, domain),
+
     }));
   }
   renderResidualCoverage(residuals, computed);
+  setLocalizedText($("#trends-drift-coverage"), "trends.driftCoverage", {
+    computed: formatNumber(residuals.filter(row => finite(row.cumulativeResidual) !== null).length),
+    total: formatNumber(residuals.length),
+  });
   const unmatched = points
     .filter((point) => point.timestamp && point.status
       && !["matched", "inactive"].includes(point.status))
@@ -5759,6 +5867,28 @@ function renderResiduals(data, points, viewport = null) {
   renderResidualInspectionTable();
 }
 
+// Explain the existing classification; do not promote absent quality metadata
+// or an absent estimate into a comparable window.
+function residualEvidence(row) {
+  const status = row.status;
+  if (status === "matched") {
+    if (finite(row.observed) === null) return ["trends.evidenceMissing", "trends.evidenceMissingWhy"];
+    if (finite(row.expected) === null) return ["trends.evidenceEstimate", "trends.evidenceEstimateWhy"];
+    return ["trends.evidenceComparable", "trends.evidenceComparableWhy"];
+  }
+  const keys = {
+    missing_quota_bracket: ["trends.evidenceMissing", "trends.evidenceMissingWhy"],
+    reset_or_track_change: ["trends.evidenceReset", "trends.evidenceResetWhy"],
+    backward_or_ambiguous: ["trends.evidenceBackward", "trends.evidenceBackwardWhy"],
+    pool_saturated: ["trends.evidenceExhausted", "trends.evidenceExhaustedWhy"],
+    quota_weighting_unavailable: ["trends.evidencePricing", "trends.evidencePricingWhy"],
+    unpriced_local_activity: ["trends.evidenceUnpriced", "trends.evidenceUnpricedWhy"],
+    unexplained_without_local_activity: ["trends.evidenceUnrecorded", "trends.evidenceUnrecordedWhy"],
+    inactive: ["trends.evidenceQuiet", "trends.evidenceQuietWhy"],
+  };
+  return Object.hasOwn(keys, status) ? keys[status] : ["trends.evidenceUnknown", "trends.evidenceUnknownWhy"];
+}
+
 /**
  * One page of the exact-windows inspection table, plus the pager beneath it.
  * Rendered from the module-held row set so Prev/Next can redraw the table
@@ -5787,12 +5917,19 @@ function renderResidualInspectionTable() {
     const residual = item.observed === null || item.expected === null
       ? null
       : item.residual;
+    const [labelKey, detailKey] = residualEvidence(item);
+    const evidence = node("td", "residual-evidence");
+    evidence.append(node("strong", "residual-evidence-label", t(labelKey)),
+      node("span", "residual-evidence-detail", t(detailKey)));
+    const time = node("td", "residual-window-time", formatChartTimestamp(item.timestamp));
+    if (finite(item.measuredSpanMs) > 0) time.append(node("small", "residual-window-span",
+      t("trends.measuredSpan", { duration: formatSpanLength(item.measuredSpanMs) })));
     row.append(
-      node("td", "", formatChartTimestamp(item.timestamp)),
+      time,
       node("td", "", formatPp(item.observed)),
       node("td", "", formatPp(item.expected)),
       node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? t("residual.table.notComparable") : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
-      node("td", "", timelineStatusLabel(item.status ?? "matched")),
+      evidence,
     );
     table.append(row);
   }
@@ -5820,8 +5957,21 @@ function renderResidualInspectionTable() {
  * exact cost/token/unpriced mix from its buckets; this line adds the range's
  * dominant priced model and observed speed as clearly-marked context.
  */
-// One id per rendered divergence period, so each period's expandable breakdown
-// panel has a stable target for its toggle's `aria-controls`.
+function focusTrendsPeriod(period) {
+  if (!dashboard) return;
+  const padding = Math.max(30 * 60_000, period.durationMs * .12);
+  updateTimelineViewport(selectedUsagePoints(dashboard), () => ({
+    startMs: period.startMs - padding, endMs: period.endMs + padding,
+  }));
+  requestAnimationFrame(() => {
+    trendsHorizonView?.select(period.endMs, true);
+    $("#timeline").scrollIntoView({ block: "start", behavior: "instant" });
+    $("#trends-time").focus({ preventScroll: true });
+  });
+}
+
+// One id per rendered divergence period, so each expandable breakdown has a
+// stable target for its toggle's aria-controls.
 let nextDivergenceBreakdownId = 0;
 
 // Display-only state for the detector's bounded set of visible windows. Index
@@ -5940,8 +6090,8 @@ function divergencePeriodItem(period, rangeContext, state) {
     "p",
     "divergence-period-finding",
     period.direction === "under_costed"
-      ? "divergence.underCosted"
-      : "divergence.overCosted",
+      ? "trends.faster"
+      : "trends.slower",
     { pp: formatPp(period.absPeakDriftPp) },
   );
 
@@ -5962,7 +6112,14 @@ function divergencePeriodItem(period, rangeContext, state) {
     events: compact(contributors.usageEvents),
   });
 
-  item.append(header, finding, magnitude, mix);
+  const gap = node("div", "divergence-gap");
+  gap.append(rawNode("strong", "divergence-gap-value", formatSignedPp(period.peakDriftPp)),
+    localizedNode("span", "", "trends.maxGap"));
+  gap.setAttribute("title", t("trends.gapExplanation"));
+  const focus = localizedNode("button", "button button-quiet compact divergence-focus", "trends.viewPeriod");
+  focus.type = "button";
+  focus.addEventListener("click", () => focusTrendsPeriod(period));
+  item.append(header, gap, finding, focus);
 
   if (contributors.unpricedEventShare !== null
       && contributors.unpricedEvents > 0) {
@@ -6001,6 +6158,17 @@ function divergencePeriodItem(period, rangeContext, state) {
         "divergence.breakdown.loading",
       ));
     }
+    panel.append(magnitude, mix);
+    if (state.failed && !state.pending && state.local) {
+      if (state.breakdown) panel.append(localizedNode("p", "divergence-breakdown-status", "trends.mixRetained"));
+      const retry = localizedNode("button", "button button-quiet compact divergence-retry", "trends.mixRetry");
+      retry.type = "button";
+      retry.addEventListener("click", () => {
+        state.toggle.focus({ preventScroll: true });
+        state.load();
+      });
+      panel.append(retry);
+    }
   };
   state.render = renderBreakdown;
   const loadBreakdown = async () => {
@@ -6008,6 +6176,7 @@ function divergencePeriodItem(period, rangeContext, state) {
         || state.loadedRevision === state.revision) return;
     const revision = state.revision;
     state.pending = true;
+    state.failed = false;
     renderBreakdown();
     let breakdown = null;
     try {
@@ -6021,6 +6190,7 @@ function divergencePeriodItem(period, rangeContext, state) {
       if (state.expanded) state.load();
       return;
     }
+    state.failed = breakdown?.status !== "available";
     if (breakdown?.status === "available") {
       state.breakdown = breakdown;
       state.loadedRevision = revision;
@@ -6064,6 +6234,7 @@ function divergenceModelLabel(model) {
 
 function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
   clear(panel);
+  panel.append(localizedNode("p", "divergence-breakdown-purpose", "trends.mixPurpose"));
   if (!breakdown || breakdown.status !== "available") {
     panel.append(rangeContext !== null
       ? localizedNode(
@@ -6109,7 +6280,8 @@ function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
   }
   panel.append(modelList);
 
-  const speedEntries = Object.values(breakdown.bySpeed)
+  const speedEntries = Object.entries(breakdown.bySpeed)
+    .map(([speed, row]) => ({ ...row, speed }))
     .filter((row) => row.events > 0)
     .sort((left, right) => right.costUsd - left.costUsd);
   if (speedEntries.length) {
@@ -6197,7 +6369,7 @@ function renderDivergencePeriods(data, points) {
   // expected line ships, every listed period carries this caveat.
   if (caveat) {
     caveat.hidden = false;
-    setLocalizedText(caveat, "divergence.methodCaveat");
+    setLocalizedText(caveat, "trends.divergenceBasis");
   }
   if (result.truncated) {
     setLocalizedText(summary, "divergence.truncated", {
@@ -6297,11 +6469,19 @@ function pointTimestampMs(point) {
  * without this the page kept one live observer per rendered frame, each still
  * watching a detached tree and each waking on the next real resize.
  */
+let trendsHorizonView = null;
+
 function drawChart(shell, chart) {
   for (const previous of shell.children ?? []) {
     previous.chartTickDensityObserver?.disconnect();
   }
   shell.replaceChildren(chart);
+  if (shell.closest?.("#timeline") && chart.timelinePresentation) {
+    trendsHorizonView ??= mountTrendsHorizon($("#timeline"), { t, locale: getFormattingLocale(), timeZone: USER_TIME_ZONE,
+      formatMoney: formatApiMoney, formatPercent, formatDuration: formatSpanLength });
+    trendsHorizonView.refreshLocale(getFormattingLocale());
+    trendsHorizonView.register(shell, chart.timelinePresentation);
+  }
 }
 
 function chartSeriesDrawsPoints(item, field) {
@@ -6410,6 +6590,7 @@ function lineChart({
   // pins an explicit height keeps the default, because raising this without
   // raising that one only reintroduces the letterbox it is meant to remove.
   height = 300,
+  width = 900,
 }) {
   // Hover, keyboard focus, and the accessible name are unconditional. Only the
   // visible dot is a per-chart decision, and every series has to state it.
@@ -6427,7 +6608,6 @@ function lineChart({
     focusable: item.focusable !== false,
     tooltip: item.tooltip !== false,
   }));
-  const width = 900;
   const hasSecondary = chartSecondarySeries.length > 0;
   const margin = {
     top: 12,
@@ -6554,7 +6734,7 @@ function lineChart({
     svg.setAttribute("aria-description", chartDescription);
   }
 
-  const tooltipWidth = 330;
+  const tooltipWidth = Math.min(330, width - margin.left - margin.right);
   const tooltipHeight = 48;
   const tooltip = document.createElementNS(svg.namespaceURI, "g");
   tooltip.setAttribute("class", "chart-hover-tooltip");
@@ -6576,8 +6756,8 @@ function lineChart({
       ? yPosition + 10
       : yPosition - tooltipHeight - 10;
     tooltip.setAttribute("transform", `translate(${tooltipX} ${tooltipY})`);
-    tooltipHeading.textContent = heading.slice(0, 72);
-    tooltipDetail.textContent = detail.slice(0, 86);
+    tooltipHeading.textContent = heading.slice(0, Math.min(72, Math.floor((tooltipWidth - 20) / 6)));
+    tooltipDetail.textContent = detail.slice(0, Math.min(86, Math.floor((tooltipWidth - 20) / 5.5)));
     tooltip.setAttribute("visibility", "visible");
     tooltip.setAttribute("aria-hidden", "false");
   };
@@ -6909,6 +7089,13 @@ function lineChart({
     let segment = [];
     points.forEach((point, index) => {
       const value = finite(point[item.key]);
+      const previous = segment.at(-1);
+      if (previous && ((item.segmentKey && previous.point[item.segmentKey] !== point[item.segmentKey])
+          || (item.breakBefore && point[item.breakBefore])
+          || (Number.isFinite(item.maxGapMs) && pointTimestampMs(point) - pointTimestampMs(previous.point) > item.maxGapMs))) {
+        segments.push(segment);
+        segment = [];
+      }
       if (value === null) {
         if (segment.length) segments.push(segment);
         segment = [];
@@ -7112,6 +7299,12 @@ function lineChart({
     }
   }
   svg.append(tooltip);
+  svg.timelinePresentation = {
+    svg, points: points.map((point, index) => ({ ...point, timestampMs: timestamps[index] })),
+    series: chartSeries.map(item => ({ ...item, format: item.format ?? formatMoney })),
+    x: point => margin.left + (point.timestampMs - domainStartMs) / (safeDomainEndMs - domainStartMs) * plotWidth,
+    y, domain: { startMs: domainStartMs, endMs: safeDomainEndMs }, margin, width, height,
+  };
   return svg;
 }
 
@@ -7359,7 +7552,11 @@ function weeklyPointDetail(point) {
   };
 }
 
-function renderAllowanceHistoryChart(history) {
+function renderAllowanceHistoryChart(
+  history,
+  windowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES,
+) {
+  const fiveHour = windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
   return lineChart({
     points: history.points,
     series: [
@@ -7425,10 +7622,16 @@ function renderAllowanceHistoryChart(history) {
     xTicks: history.xTicks,
     yDomain: history.axis,
     yTickFormat: (value, digits) => formatMoney(value, digits),
-    yLabel: { key: "chart.axis.apiEquivalentPerSevenDays" },
-    title: { key: "weekly.chart.title" },
+    yLabel: { key: fiveHour
+      ? "weekly.chart.fiveHourAxis"
+      : "chart.axis.apiEquivalentPerSevenDays" },
+    title: { key: fiveHour
+      ? "weekly.chart.fiveHourTitle"
+      : "weekly.chart.title" },
     description: {
-      key: "weekly.chart.description",
+      key: fiveHour
+        ? "weekly.chart.fiveHourDescription"
+        : "weekly.chart.description",
       values: {
         span: spanFloorSentenceLabel(history.spanFloorPp),
         timeZone: formatTimeZoneLabel(),
@@ -7713,6 +7916,31 @@ function weeklyPaceTrack(standing, hoursToReset, resetAt) {
   return track;
 }
 
+function renderWeeklyPaceWaiting(card, data) {
+  const primary = Array.isArray(data?.quotaWindows)
+    ? data.quotaWindows.find(isPrimaryCodexWeeklyQuotaWindow)
+    : null;
+  if (!primary) return;
+  const stale = primary.status === "stale";
+  const heading = node("div", "weekly-pace-forecast-heading");
+  const kicker = node("p", "panel-kicker");
+  const logo = node("img", "quota-codex-icon");
+  logo.setAttribute("src", "./codex-color.svg");
+  logo.setAttribute("alt", "");
+  logo.setAttribute("aria-hidden", "true");
+  kicker.append(logo, node("span", "", t("allowance.forecast")));
+  heading.append(kicker, node("span", "evidence-chip weekly-pace-forecast-collecting-chip",
+    t(stale ? "allowance.stale" : "allowance.waiting")));
+  const title = node("h3", "weekly-pace-forecast-title",
+    t(stale ? "allowance.waitingStaleTitle" : "allowance.waitingTitle"));
+  title.id = "weekly-pace-forecast-title";
+  card.setAttribute("aria-labelledby", title.id);
+  card.className = "weekly-pace-forecast is-insufficient is-waiting";
+  card.append(heading, title, node("p", "weekly-pace-forecast-copy",
+    t(stale ? "allowance.waitingStaleCopy" : "allowance.waitingCopy")));
+  card.hidden = false;
+}
+
 function renderWeeklyPaceForecast(data) {
   const card = ensureWeeklyPaceForecastCard();
   if (!card) return;
@@ -7725,7 +7953,12 @@ function renderWeeklyPaceForecast(data) {
   clear(card);
 
   const forecast = data?.weekly?.paceForecast;
-  if (!forecast || typeof forecast !== "object" || Array.isArray(forecast)) return;
+  const stalePrimary = Array.isArray(data?.quotaWindows)
+    && data.quotaWindows.some(window => isPrimaryCodexWeeklyQuotaWindow(window)
+      && window.status === "stale");
+  if (stalePrimary || !forecast || typeof forecast !== "object" || Array.isArray(forecast)) {
+    return renderWeeklyPaceWaiting(card, data);
+  }
   const pace = forecast.pace && typeof forecast.pace === "object"
     ? forecast.pace
     : {};
@@ -7741,7 +7974,7 @@ function renderWeeklyPaceForecast(data) {
     forecast.reset_at,
   );
   const now = Date.now();
-  if (resetAt === null || resetAt <= now) return;
+  if (resetAt === null || resetAt <= now) return renderWeeklyPaceWaiting(card, data);
 
   let remaining = firstFiniteForecastNumber(
     forecast.remainingPercent,
@@ -7799,13 +8032,13 @@ function renderWeeklyPaceForecast(data) {
   );
   // A contradiction between the status and dates is an integration error, not
   // a reason to show a confident-looking card. Wait for the next refresh.
-  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) return;
-  if (!available && !reachesResetFirst && !collectingEvidence) return;
-  if (collectingEvidence && remaining === null) return;
+  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) return renderWeeklyPaceWaiting(card, data);
+  if (!available && !reachesResetFirst && !collectingEvidence) return renderWeeklyPaceWaiting(card, data);
+  if (collectingEvidence && remaining === null) return renderWeeklyPaceWaiting(card, data);
   if (!collectingEvidence
       && remaining === null
       && headlinePace === null
-      && !reachesResetFirst) return;
+      && !reachesResetFirst) return renderWeeklyPaceWaiting(card, data);
 
   // The standing is computed from the headline rate, so the card's colour,
   // its heading and its arithmetic all come from one number. The engine's own
@@ -7982,15 +8215,123 @@ function renderWeeklyPaceForecast(data) {
   card.hidden = false;
 }
 
+function allowanceHistoryForWindow(data, windowMinutes) {
+  if (windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) return data?.weekly ?? null;
+  if (windowMinutes !== CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return null;
+  return data?.allowanceHistoryByWindow?.[
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+  ] ?? null;
+}
+
+function allowanceHistoryHasEvidence(history) {
+  return history !== null && (
+    history?.status === "available"
+    || (Array.isArray(history?.weeklyValues) && history.weeklyValues.length > 0)
+  );
+}
+
+function resolvedAllowanceWindowMinutes(data) {
+  const fiveHour = allowanceHistoryForWindow(
+    data,
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  );
+  if (activeAllowanceWindowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+      && fiveHour !== null) return CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  if (activeAllowanceWindowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return allowanceHistoryHasEvidence(data?.weekly) || fiveHour === null
+      ? CODEX_WEEKLY_ALLOWANCE_MINUTES
+      : CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  }
+  if (allowanceHistoryHasEvidence(data?.weekly)) {
+    return CODEX_WEEKLY_ALLOWANCE_MINUTES;
+  }
+  return fiveHour !== null
+    ? CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+    : CODEX_WEEKLY_ALLOWANCE_MINUTES;
+}
+
+function allowanceWindowView(data) {
+  const windowMinutes = resolvedAllowanceWindowMinutes(data);
+  if (windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return {
+      ...selectAllowancePlanPopulation(data, activeWeeklyPlanType),
+      allowanceWindowDurationMinutes: windowMinutes,
+    };
+  }
+  const windowData = {
+    ...data,
+    weekly: allowanceHistoryForWindow(data, windowMinutes),
+    quotaWindows: (Array.isArray(data?.quotaWindows) ? data.quotaWindows : [])
+      .filter((window) => (
+        isPrimaryCodexQuotaWindow(window)
+        && finite(window?.durationMinutes) === windowMinutes
+      )),
+    allowanceWindowDurationMinutes: windowMinutes,
+  };
+  return selectAllowancePlanPopulation(windowData, activeWeeklyPlanType);
+}
+
+function renderAllowanceWindowChrome(data, windowMinutes) {
+  const fiveHourSelected = windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES;
+  const fiveHourAvailable = allowanceHistoryForWindow(
+    data,
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  ) !== null;
+  const controls = $("#allowance-window-controls");
+  const buttons = typeof controls?.querySelectorAll === "function"
+    ? controls.querySelectorAll("button[data-window-minutes]")
+    : [];
+  for (const button of buttons) {
+    const duration = Number(button.dataset.windowMinutes);
+    const active = duration === windowMinutes;
+    const unavailable = duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+      && !fiveHourAvailable;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = unavailable;
+    button.title = unavailable ? t("weekly.window.unavailable") : "";
+    setLocalizedText(button, duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+      ? "weekly.window.fiveHour"
+      : "weekly.window.sevenDay");
+  }
+  setLocalizedText($("#weekly-title"), "page.weekly.title");
+  const note = $("#allowance-window-note");
+  note.hidden = !fiveHourSelected && fiveHourAvailable;
+  if (!note.hidden) setLocalizedText(note, fiveHourSelected
+    ? "weekly.window.historyOnly"
+    : "weekly.window.unavailable");
+  $("#share-panel").hidden = fiveHourSelected;
+  setLocalizedText($("#weekly-table-caption"), fiveHourSelected
+    ? "weekly.table.fiveHourCaption"
+    : "weekly.table.sevenDayCaption");
+}
+
 function renderWeeklyPlanControl(data) {
   const control = $("#weekly-plan-control");
   const select = $("#weekly-plan-select");
   const note = $("#weekly-plan-note");
   if (!control || !select || !note) return;
   const selection = data.allowancePlanSelection;
-  control.hidden = !selection;
+  const previewPlan = data.mode === "demo"
+    ? shareCardPlanLabel(data?.weekly?.planType)
+    : "";
+  control.hidden = !selection && previewPlan === "";
   note.hidden = !selection;
-  if (!selection) return;
+  if (!selection) {
+    if (previewPlan !== "") {
+      const signature = `preview:${data.weekly.planType}:${localization.locale()}`;
+      if (select.dataset.populationSignature !== signature) {
+        const option = node("option");
+        option.value = data.weekly.planType;
+        option.textContent = t("weekly.plan.latestOption", { plan: previewPlan });
+        select.replaceChildren(option);
+        select.dataset.populationSignature = signature;
+      }
+      select.value = data.weekly.planType;
+      select.disabled = true;
+    }
+    return;
+  }
   const populations = data.weekly.planPopulations ?? [];
   const signature = JSON.stringify([
     populations.map((row) => row.planType),
@@ -8018,7 +8359,10 @@ function renderWeeklyPlanControl(data) {
 }
 
 function renderWeekly(data) {
-  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
+  const rootData = data;
+  data = allowanceWindowView(data);
+  const windowMinutes = data.allowanceWindowDurationMinutes;
+  renderAllowanceWindowChrome(rootData, windowMinutes);
   renderWeeklyPlanControl(data);
   // A weekly estimate carried over from the previous app version while the
   // recalculation runs announces itself here, quietly.
@@ -8095,7 +8439,9 @@ function renderWeekly(data) {
     // no fits fall in the selected range at all, or fits are in range and the
     // span floor filtered every one of them (estimator audit, 2026-08-08).
     if (values.length === 0) {
-      setLocalizedText(empty, "weekly.chart.empty");
+      setLocalizedText(empty, windowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+        ? "weekly.chart.fiveHourEmpty"
+        : "weekly.chart.empty");
     } else if (history.inRangeCount === 0) {
       setLocalizedText(empty, "weekly.chart.emptyRange");
     } else {
@@ -8109,9 +8455,9 @@ function renderWeekly(data) {
   } else {
     empty.hidden = true;
     shell.hidden = false;
-    shell.replaceChildren(renderAllowanceHistoryChart(history));
+    shell.replaceChildren(renderAllowanceHistoryChart(history, windowMinutes));
   }
-  renderWeeklyTable(values);
+  renderWeeklyTable(values, windowMinutes);
   // The chart renderer owns the card re-render (owner-verified regression,
   // 2026-08-08). The old wiring re-rendered the card only where a caller
   // remembered to, so a path that redrew the chart without the extra call
@@ -8119,7 +8465,9 @@ function renderWeekly(data) {
   // the allowance history — the range buttons, the span slider, a dashboard
   // load, a locale change — now redraws the card from the SAME model
   // instance, so the two surfaces cannot disagree.
-  renderShareCard(data, { history });
+  if (windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    renderShareCard(data, { history });
+  }
 }
 
 // The Allowance page's reset-estimate table pages through its full row set
@@ -8131,8 +8479,9 @@ const WEEKLY_TABLE_PAGE_SIZE = 20;
 let weeklyTablePage = 0;
 let weeklyTableRows = [];
 let weeklyTableSignature = "";
+let weeklyTableWindowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES;
 
-function renderWeeklyTable(values) {
+function renderWeeklyTable(values, windowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES) {
   // Newest first over the FULL set: the old `.slice(-14)` silently dropped
   // every earlier reset estimate. A changed row set restarts at the first
   // page, exactly like the exact-windows inspection table: a page index only
@@ -8146,6 +8495,7 @@ function renderWeeklyTable(values) {
     weeklyTablePage = 0;
   }
   weeklyTableRows = rows;
+  weeklyTableWindowMinutes = windowMinutes;
   renderWeeklyTablePage();
 }
 
@@ -8158,7 +8508,11 @@ function renderWeeklyTablePage() {
   if (!rows.length) {
     if (pagination) pagination.hidden = true;
     const row = node("tr");
-    const cell = node("td", "empty-cell", t("weekly.table.empty"));
+    const cell = node("td", "empty-cell", t(
+      weeklyTableWindowMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+        ? "weekly.table.fiveHourEmpty"
+        : "weekly.table.empty",
+    ));
     cell.colSpan = 5;
     row.append(cell);
     table.append(row);
@@ -14938,7 +15292,8 @@ $("#usage-pan-forward").addEventListener("click", () => {
 });
 $("#usage-reset-zoom").addEventListener("click", () => {
   resetUsageTimelineViewport();
-  if (dashboard) renderUsageTimeline(dashboard);
+  resetTimelineViewport();
+  if (dashboard) { renderUsageTimeline(dashboard); renderTimeline(dashboard); }
 });
 
 $("#timeline-zoom-in").addEventListener("click", () => {
@@ -14959,7 +15314,7 @@ $("#timeline-pan-forward").addEventListener("click", () => {
 });
 $("#timeline-reset-zoom").addEventListener("click", () => {
   resetTimelineViewport();
-  if (dashboard) renderTimeline(dashboard);
+  if (dashboard) { renderUsageTimeline(dashboard); renderTimeline(dashboard); }
 });
 // The exact-windows pager (owner-directed, 2026-08-08). The page index is
 // clamped inside the renderer, so a click at either end can never leave the
@@ -15048,8 +15403,10 @@ $("#side-chat-historical-gap-focus").addEventListener("click", () => {
       || endMs <= startMs) return;
   reportingPeriod.select("all");
   timelineViewport = { startMs, endMs };
+  usageTimelineViewport = { startMs, endMs };
   timelineSeriesMemo = null;
   window.location.hash = "#timeline";
+  renderUsageTimeline(dashboard);
   renderTimeline(dashboard);
 });
 $("#usage-group-controls").addEventListener("click", (event) => {
@@ -15062,9 +15419,19 @@ $("#usage-group-controls").addEventListener("click", (event) => {
     control.setAttribute("aria-pressed", String(active));
   }
   resetUsageTimelineViewport();
+  resetTimelineViewport();
   renderUsageTimeline(dashboard);
+  renderTimeline(dashboard);
 });
-
+$("#allowance-window-controls")?.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-window-minutes]");
+  if (!button || !dashboard || button.disabled) return;
+  const windowMinutes = Number(button.dataset.windowMinutes);
+  if (![CODEX_FIVE_HOUR_ALLOWANCE_MINUTES, CODEX_WEEKLY_ALLOWANCE_MINUTES]
+      .includes(windowMinutes)) return;
+  activeAllowanceWindowMinutes = windowMinutes;
+  renderWeekly(dashboard);
+});
 $("#weekly-plan-select")?.addEventListener("change", (event) => {
   if (!dashboard || !dashboard.weekly.planPopulations.some(
     (population) => population.planType === event.target.value,
@@ -15072,6 +15439,8 @@ $("#weekly-plan-select")?.addEventListener("change", (event) => {
   activeWeeklyPlanType = event.target.value;
   timelineSeriesMemo = null;
   renderComparison(dashboard);
+  resetTimelineViewport();
+  renderUsageTimeline(dashboard);
   renderTimeline(dashboard);
   renderWeekly(dashboard);
 });
@@ -15095,6 +15464,7 @@ document.addEventListener("keydown", (event) => {
   closeInformationPopover({ restoreFocus: true });
 });
 window.addEventListener("resize", () => {
+  if (dashboard && !$("#timeline").inert) scheduleUsageTimelineRender();
   const current = activeInformationPopover;
   if (current) positionInformationPopover(current.popover, current.button);
 });

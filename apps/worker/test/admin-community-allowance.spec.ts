@@ -267,7 +267,7 @@ function expectPinnedCompositionRefresh(statements: string[]) {
   expect(statements[7]).toContain("p.state = 'active'");
   expect(statements[7]).toMatch(/\bLIMIT \?/u);
   expect(statements[8]).toContain("input_fingerprint = ? AND source_method_version = ?");
-  expect(statements[12]).toContain("p.state = 'active'");
+  expect(statements[12]).toContain("FROM community_public_source_owners p WHERE p.participant_id = v.participant_id");
   expect(statements[12]).toContain("v.revision = ?6");
   expect(statements[13]).toContain("mutation_epoch = ?4");
   expect(statements.join("\n")).not.toMatch(/\bFROM telemetry_(?:v1|v11_active|analytical)_records\b/u);

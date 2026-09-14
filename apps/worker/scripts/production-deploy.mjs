@@ -311,7 +311,7 @@ function checkedOutSourceTreeClean(workerDirectory) {
 
 function verifySourceSnapshot({
   workerDirectory,
-  expectedSourceCommit,
+  expectedSourceCommit = null,
   sourceCommitCheck,
   sourceTreeCleanCheck,
 }) {

@@ -44,7 +44,7 @@ function harness(locale = "en-US") {
   const document = { createElementNS: (_namespace, tag) => node(tag), createTextNode: text => node("text", "", text), activeElement: null };
   const constants = ["PACE_ON_TRACK_LOWER_RATIO", "PACE_ON_TRACK_UPPER_RATIO", "PACE_CRITICAL_RATIO", "PACE_AVERAGE_MINIMUM_HOURS", "PACE_STATE_LABELS"]
     .map(name => source.match(new RegExp(`\\nconst ${name} = [^;]+;`, "u"))[0]).join("\n");
-  const functions = ["formatAllowanceDuration", "allowanceTimestamp", "formatForecastDuration", "forecastTimestamp", "firstFiniteForecastNumber", "weeklyPaceRates", "weeklyPaceStanding", "formatPaceRatio", "weeklyPaceTrack", "renderWeeklyPaceForecast", "renderQuotaCards", "providerReportedPlanEvidence", "renderDashboardSkeleton"]
+  const functions = ["formatAllowanceDuration", "allowanceTimestamp", "formatForecastDuration", "forecastTimestamp", "firstFiniteForecastNumber", "weeklyPaceRates", "weeklyPaceStanding", "formatPaceRatio", "weeklyPaceTrack", "renderWeeklyPaceWaiting", "renderWeeklyPaceForecast", "renderQuotaCards", "providerReportedPlanEvidence", "renderDashboardSkeleton"]
     .map(declaration).join("\n");
   const factory = new Function("node", "document", "modelThemeIcon", "$", "t", "setLocalizedText", "isPrimaryCodexQuotaWindow", "isPrimaryCodexWeeklyQuotaWindow", "selectPrimaryCodexQuotaWindow", "isSparkQuotaLimitId", "isValidQuotaWindowDuration", "card", `
     const finite = value => typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -109,7 +109,7 @@ test("unknown capacity has no fill; zero is a real empty tank; stale evidence st
   assert.match(h.quota.children[0].textContent, /unknown/u);
   assert.equal(find(h.quota.children[1], "quota-tank-fuel")[0].style.blockSize, "0%");
   assert.match(h.quota.children[2].textContent, /Stale observation/u);
-  assert.match(h.quota.children[2].textContent, /Observation time/u);
+  assert.doesNotMatch(h.quota.textContent, /Observation time/u);
   h.renderQuotaCards(payload([]));
   assert.equal(h.context.hidden, true);
   assert.equal(h.quota.children.length, 1);
@@ -266,4 +266,57 @@ test("unavailable dashboard disposes tank observers before removing their DOM", 
   assert.equal(h.card.children.length, 0);
   h.renderDashboardSkeleton();
   assert.equal(disposals, 1, "repeated unavailable renders do not retain or dispose an old manager");
+});
+
+
+test("primary weekly allowance keeps a neutral forecast panel when pace evidence is unavailable", () => {
+  const h = harness();
+  for (const paceForecast of [null, {}, [], { status: "insufficient_observations" },
+    forecast({ status: "unbounded" }), forecast({ resetsAt: "invalid" }),
+    forecast({ resetsAt: observedAt }), forecast({ etaAt: "invalid" }),
+    forecast({ etaAt: new Date(now - 1000).toISOString() }),
+    forecast({ etaAt: new Date(now + 200 * 3_600_000).toISOString() })]) {
+    h.renderWeeklyPaceForecast({ ...payload([window()]), weekly: { paceForecast } });
+    assert.equal(h.card.hidden, false, JSON.stringify(paceForecast));
+    assert.match(h.card.className, /is-waiting/u);
+    assert.match(h.card.textContent, /More valid allowance observations/u);
+    assert.doesNotMatch(h.card.textContent, /out of date|refreshing|runs out in/iu);
+    assert.equal(find(h.card, "weekly-pace-track").length, 0);
+    assert.equal(find(h.card, "allowance-timestamp").length, 0);
+    assert.equal(h.card.dataset.tankRatio, undefined);
+  }
+  for (const windows of [[], [window({ durationMinutes: 300 })], [window({ limitId: "codex_bengalfox" })]]) {
+    h.renderWeeklyPaceForecast({ ...payload(windows), weekly: { paceForecast: null } });
+    assert.equal(h.card.hidden, true, "waiting applies only to the primary weekly pool");
+  }
+});
+
+test("stale allowance cannot retain a confident forecast and a fresh single observation keeps collecting", () => {
+  const h = harness();
+  h.renderWeeklyPaceForecast({ ...payload([window()]), weekly: { paceForecast: forecast() } });
+  assert.ok(h.card.dataset.tankRatio);
+  h.renderWeeklyPaceForecast({ ...payload([window({ status: "stale" })]), weekly: { paceForecast: forecast() } });
+  assert.equal(h.card.hidden, false);
+  assert.match(h.card.textContent, /Fresh allowance evidence needed/u);
+  assert.match(h.card.textContent, /observation is out of date/u);
+  assert.equal(h.card.dataset.tankRatio, undefined);
+  assert.equal(find(h.card, "weekly-pace-track").length, 0);
+  h.renderWeeklyPaceForecast({ ...payload([window()]), weekly: { paceForecast: forecast({
+    status: "insufficient_observations", observationCount: 1, etaAt: null, pace: {},
+  }) } });
+  assert.match(h.card.textContent, /one more refresh/u);
+  assert.doesNotMatch(h.card.className, /is-waiting/u);
+});
+
+test("waiting forecast copy translates without inventing dates or progress", () => {
+  for (const locale of ["es", "zh-Hans"]) {
+    const h = harness(locale);
+    for (const status of ["live", "stale"]) {
+      h.renderWeeklyPaceForecast(payload([window({ status })]));
+      assert.equal(h.card.hidden, false);
+      assert.doesNotMatch(h.card.textContent, /allowance\.|Waiting|Fresh allowance|Your pace/iu);
+      assert.equal(find(h.card, "allowance-timestamp").length, 0);
+      assert.equal(find(h.card, "weekly-pace-track").length, 0);
+    }
+  }
 });

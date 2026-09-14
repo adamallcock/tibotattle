@@ -1,13 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   AccountObservationSecretError,
   createAccountObservationSecretLoader,
   createDevelopmentAccountObservationSecretLoader,
+  readDevelopmentAccountObservationSecretFile,
 } from "../src/account-observation-secret.js";
 import { selectProductionAccountObservationSecret } from "../src/account-observation-production.js";
 import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "../src/export-identity-keychain.js";
@@ -915,10 +916,12 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
     assert.equal(capturedScope.status, "available");
 
     let collectorLoader;
+    let collectorResetEventClassifier;
     await run(["collect-once", "--state-file", join(root, "collector.sqlite")], {
       ...dependencies,
       async runCollectorOnceCommand(options) {
         collectorLoader = options.loadAccountObservationSecret;
+        collectorResetEventClassifier = options.resetEventClassifier;
         return {
           rolloutRecordsWritten: 0,
           refresh: { attempted: false, errorCode: null, recordWritten: false },
@@ -927,6 +930,8 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
       },
     });
     assert.deepEqual(await collectorLoader(), secret);
+    assert.equal(typeof collectorResetEventClassifier.observe, "function");
+    assert.equal(typeof collectorResetEventClassifier.snapshot, "function");
     assert.equal(selections, 3);
     assert.ok(credentialLoads >= 3);
   } finally {
@@ -973,5 +978,83 @@ test("doctor reports credential recovery states as distinct content-free codes",
     }
   } finally {
     console.log = originalLog;
+  }
+});
+
+
+test("development account file reads a distinct private key without mutating files", async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "development-account-key-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const identity = join(root, "identity");
+  await mkdir(identity, { mode: 0o700 });
+  const path = join(identity, "account-observation-development");
+  const exportIdentityFile = join(identity, "export-identity");
+  const expected = Buffer.alloc(32, 7);
+  const encoded = `${Buffer.alloc(32, 8).toString("base64url")}\n`;
+  await writeFile(path, expected, { mode: 0o600 });
+  await writeFile(exportIdentityFile, encoded, { mode: 0o600 });
+  const loaded = await readDevelopmentAccountObservationSecretFile(path, { exportIdentityFile });
+  assert.deepEqual(loaded, expected);
+  const loader = createDevelopmentAccountObservationSecretLoader(loaded);
+  loaded.fill(0);
+  const first = await loader();
+  assert.deepEqual(first, expected);
+  first.fill(0);
+  loader.dispose();
+  await assert.rejects(loader(), { code: "account_observation_credential_unavailable" });
+  assert.deepEqual(await readFile(path), expected);
+  assert.equal(await readFile(exportIdentityFile, "utf8"), encoded);
+});
+
+test("development account file rejects unsafe, malformed, missing and reused identities", async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "development-account-key-invalid-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const scenario of [
+    "missing", "short", "oversize", "public-file", "public-directory", "hardlink",
+    "symlink-file", "symlink-ancestor", "export-symlink", "export-malformed", "export-missing",
+    "export-reuse", "relative-path", "wrong-name", "wrong-sibling", "noncanonical-path",
+  ]) {
+    await t.test(scenario, async () => {
+      const directory = join(root, scenario);
+      const identity = join(directory, "identity");
+      await mkdir(identity, { recursive: true, mode: 0o700 });
+      let path = join(identity, "account-observation-development");
+      const exportIdentityFile = join(identity, "export-identity");
+      const expected = Buffer.alloc(32, 7);
+      await writeFile(path, expected, { mode: 0o600 });
+      await writeFile(exportIdentityFile, `${Buffer.alloc(32, 8).toString("base64url")}\n`, { mode: 0o600 });
+      switch (scenario) {
+        case "missing": await rm(path); break;
+        case "short": await writeFile(path, Buffer.alloc(31)); break;
+        case "oversize": await writeFile(path, Buffer.alloc(1024 * 1024)); break;
+        case "public-file": await chmod(path, 0o644); break;
+        case "public-directory": await chmod(identity, 0o755); break;
+        case "hardlink": await link(path, join(identity, "linked")); break;
+        case "symlink-file":
+          await rename(path, `${path}-real`);
+          await symlink(`${path}-real`, path);
+          break;
+        case "symlink-ancestor":
+          await rename(identity, `${identity}-real`);
+          await symlink(`${identity}-real`, identity);
+          break;
+        case "export-symlink":
+          await rename(exportIdentityFile, `${exportIdentityFile}-real`);
+          await symlink(`${exportIdentityFile}-real`, exportIdentityFile);
+          break;
+        case "export-malformed": await writeFile(exportIdentityFile, Buffer.alloc(44, 255)); break;
+        case "export-missing": await rm(exportIdentityFile); break;
+        case "export-reuse": await writeFile(path, Buffer.alloc(32, 8)); break;
+        case "relative-path": path = "identity/account-observation-development"; break;
+        case "wrong-name": path = exportIdentityFile; break;
+        case "wrong-sibling": path = join(root, "account-observation-development"); break;
+        case "noncanonical-path": path = `${identity}/../identity/account-observation-development`; break;
+      }
+      await assert.rejects(readDevelopmentAccountObservationSecretFile(path, { exportIdentityFile }),
+        (error) => error instanceof AccountObservationSecretError
+          && error.code === "account_observation_credential_unavailable"
+          && !error.message.includes(root));
+      if (scenario === "missing") await assert.rejects(readFile(path), { code: "ENOENT" });
+    });
   }
 });

@@ -3092,13 +3092,31 @@ describe("synthetic usage monitor service", () => {
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
   it("isolates an allowance-preview cache failure from scheduled maintenance", async () => {
-    await testBindings().USAGE_MONITOR_DB.prepare(
-      "DROP TABLE admin_community_allowance_preview_cache",
-    ).run();
+    // The cache table is also a dependency of required withdrawal triggers.
+    // Dropping it corrupts that schema and makes SQLite reject device updates
+    // before their WHERE/trigger WHEN clauses run. Model an optional cache
+    // operation failing while preserving those mandatory privacy fences.
+    let failedCacheOperations = 0;
+    const database = testBindings().USAGE_MONITOR_DB;
+    const unavailableCache = new Proxy(database, { get(target, property) {
+      if (property === "prepare") return (sql: string) => {
+        if (/^\s*(SELECT|INSERT)\b/iu.test(sql) && sql.includes("admin_community_allowance_preview_cache")) {
+          failedCacheOperations++;
+          throw new Error("synthetic optional preview cache unavailable");
+        }
+        return target.prepare(sql);
+      };
+      const value: unknown = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const runtime = new Proxy(testBindings(), { get(target, property) {
+      return property === "USAGE_MONITOR_DB" ? unavailableCache : Reflect.get(target, property);
+    } });
     const result = await runScheduledMaintenance(
-      testBindings(),
+      runtime,
       Date.parse("2026-08-23T12:00:00.000Z"),
     );
+    expect(failedCacheOperations).toBeGreaterThan(0);
     expect(result).toMatchObject({
       outcome: "success",
       event: "scheduled_backend_maintenance",

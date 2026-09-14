@@ -84,6 +84,7 @@ export function mountAllowanceTanks(container, forecast, { t }) {
   button.append(icon);
   controls.append(button);
   let forecastVisible = false;
+  let expiryTimer = null;
   let disposed = false,
     lastTime = 0;
   const paletteKeys = [
@@ -194,27 +195,39 @@ export function mountAllowanceTanks(container, forecast, { t }) {
         entry.velocity =
           (entry.velocity - entry.tilt * dt * 13) * Math.exp(-dt * 2.7);
         entry.tilt += entry.velocity * dt;
-        // An elapsed reset stops forecast flow even before the next data refresh.
-        if (
-          entry.pace !== null &&
-          number(entry.card.dataset.resetAt) <= Date.now()
-        ) {
-          entry.pace = null;
-          entry.card.dataset.flow = "unknown";
-          palette(entry);
-        }
         paint(entry, time);
       }
     },
   });
   function sync() {
+    // Expiry is independent of canvas visibility: the forecast can remain on
+    // screen while every tank is offscreen and its frame loop is asleep.
+    if (expiryTimer !== null) view.clearTimeout(expiryTimer);
+    expiryTimer = null;
+    const now = Date.now();
+    let nextExpiry = Infinity;
+    for (const entry of entries) {
+      if (entry.pace === null) continue;
+      if (allowanceTankPace(entry.card.dataset, forecastState, now) === null) {
+        entry.pace = null;
+        entry.card.dataset.flow = "unknown";
+        palette(entry);
+        paint(entry);
+      } else {
+        nextExpiry = Math.min(nextExpiry, number(entry.card.dataset.resetAt));
+      }
+    }
+    if (Number.isFinite(nextExpiry)) {
+      expiryTimer = view.setTimeout(sync, Math.min(2_147_483_647, nextExpiry - now));
+    }
     const label = t(
       userPaused ? "allowance.resumeMotion" : "allowance.pauseMotion",
     );
     button.setAttribute("aria-label", label);
     button.title = label;
     button.dataset.paused = String(userPaused);
-    controls.hidden = reduced.matches;
+    controls.hidden = reduced.matches
+      || !entries.some(entry => !entry.stale && entry.remaining > 0);
     button.setAttribute("aria-pressed", String(userPaused));
     if (forecast) {
       const ratio = number(forecastState?.tankRatio);
@@ -286,6 +299,7 @@ export function mountAllowanceTanks(container, forecast, { t }) {
   return {
     dispose() {
       disposed = true;
+      if (expiryTimer !== null) view.clearTimeout(expiryTimer);
       motion.dispose();
       resize.disconnect();
       intersection.disconnect();

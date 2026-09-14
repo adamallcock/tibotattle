@@ -57,6 +57,7 @@ import {
   buildPlanAttributionIndex,
   classifyUsageAttribution,
   calibrateCompositionCapacities,
+  FIVE_HOUR_WINDOW_MINUTES,
   isValidQuotaWindowDuration,
   MODEL_COMPOSITION_POLICY,
   planAttributionContextKey,
@@ -134,8 +135,12 @@ import {
 // usage timeline. The ordinary timeline remains the conserved all-plan ledger;
 // allowance-facing Trends may use the scoped timeline only when its plan,
 // generation, basis and fitted-reset cohort match the selected capacity.
+// v0.16: the calibration corpus retains both main Codex allowance durations
+// and stores a plan-separated five-hour fit. A v0.15 cache discarded every
+// 300-minute main-track snapshot, so that evidence cannot be reconstructed at
+// read time and the five-hour history must remain unavailable until rebuild.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.15";
+  "local-replay-safe-accounting-v0.16";
 const { scanCodexLogEvents } = localCodexLogScanner;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
@@ -199,6 +204,10 @@ const MAX_PLAN_TIMELINE_BYTES = 4 * 1024 * 1024;
 const PLAN_TIMELINE_ENCODING = "plan_bucket_v1";
 const MAX_QUOTA_TIMELINE_ROWS = 10_000;
 const WEEKLY_WINDOW_MINUTES = SEVEN_DAY_WINDOW_MINUTES;
+const ALLOWANCE_HISTORY_WINDOW_MINUTES = new Set([
+  FIVE_HOUR_WINDOW_MINUTES,
+  WEEKLY_WINDOW_MINUTES,
+]);
 const SPARK_MODEL = OPENAI_CODEX_SPARK_MODEL_ID;
 const PACE_CURRENT_MAX_AGE_MS = 30 * 60_000;
 const PACE_STATUSES = new Set([
@@ -2965,7 +2974,10 @@ async function deriveBoundedWeeklyCalibrationSeries({
       rateLimitSnapshots: snapshots,
       diagnostics,
       includeSnapshotIntervals: false,
-      windowDurationMins: WEEKLY_WINDOW_MINUTES,
+      // The retained corpus is already limited to the two reviewed main
+      // allowance durations. Derive both in the same bounded usage pass so
+      // five-hour history does not require a second raw-log scan.
+      windowDurationMins: null,
       signal,
       consumeInputs: true,
       includeNormalizedInputs: false,
@@ -3002,6 +3014,7 @@ async function deriveBoundedWeeklyCalibrationSeries({
     }
   }
   let totalTransitions = 0;
+  const deduplicatedSnapshotCountByWindow = {};
   for (const group of groups.values()) {
     const ordered = [...group.deduped].sort(
       (left, right) => left[1] - right[1] || left[8] - right[8],
@@ -3011,6 +3024,11 @@ async function deriveBoundedWeeklyCalibrationSeries({
       if (ordered[index][8] !== ordered[index - 1][8]) transitions += 1;
     }
     const durationMins = Number(ordered[0]?.[6]);
+    if (Number.isSafeInteger(durationMins)) {
+      deduplicatedSnapshotCountByWindow[durationMins] =
+        (deduplicatedSnapshotCountByWindow[durationMins] ?? 0)
+        + ordered.length;
+    }
     const resetsAt = Number(ordered[0]?.[7]);
     const windowStartMs = (resetsAt - durationMins * 60) * 1_000;
     group.transitions = transitions;
@@ -3064,6 +3082,7 @@ async function deriveBoundedWeeklyCalibrationSeries({
     return {
       transitions: series.transitions,
       deduplicatedSnapshotCount: series.deduplicatedSnapshotCount,
+      deduplicatedSnapshotCountByWindow,
     };
   }
 
@@ -3157,7 +3176,11 @@ async function deriveBoundedWeeklyCalibrationSeries({
     || left.resetIdentity.localeCompare(right.resetIdentity)
     || left.windowDurationMins - right.windowDurationMins
     || left.slot.localeCompare(right.slot));
-  return { transitions, deduplicatedSnapshotCount };
+  return {
+    transitions,
+    deduplicatedSnapshotCount,
+    deduplicatedSnapshotCountByWindow,
+  };
 }
 
 const UNIFIED_CALIBRATION_READ_BATCH_ROWS = 20_000;
@@ -3378,8 +3401,9 @@ async function fitCompositionFromCorpusStream({
         || !Number.isFinite(resetsAtSeconds)
         || !Number.isFinite(usedPercent)) continue;
     if (row[3] !== planType) continue;
+    const sevenDay = row[6] === WEEKLY_WINDOW_MINUTES;
     if (!planTimelineResourceLimited && row[2] === "openai_codex"
-        && row[4] === "codex" && row[6] === WEEKLY_WINDOW_MINUTES
+        && row[4] === "codex" && sevenDay
         && usedPercent >= 0 && usedPercent <= 100) {
       const match = planEraForInterval(attributionIndex, { contextKey, observedAtMs });
       if (match.status === "matched" && match.era.planType === planType) {
@@ -3397,6 +3421,11 @@ async function fitCompositionFromCorpusStream({
         }
       }
     }
+    // Composition and the selected-plan comparison remain seven-day
+    // contracts. The five-hour observations share the attribution index and
+    // calibration pass, but must not become duplicate quota points in the
+    // seven-day capacity fit.
+    if (!sevenDay) continue;
     quotaRows.push({
       observedAtMs,
       planType: typeof row[3] === "string" ? row[3] : "unknown",
@@ -3498,12 +3527,15 @@ async function probeUnifiedCalibrationCorpus(indexFile) {
     const hasUsage = database.prepare(
       "SELECT 1 AS present FROM usage_event LIMIT 1",
     ).get()?.present === 1;
-    const hasWeeklyQuota = database.prepare(`
+    const hasAllowanceQuota = database.prepare(`
       SELECT 1 AS present FROM quota_observation
-      WHERE limit_id = 'codex' AND duration_mins = ?
+      WHERE limit_id = 'codex' AND duration_mins IN (?, ?)
         AND used_percent IS NOT NULL AND resets_at_ms IS NOT NULL
-      LIMIT 1`).get(WEEKLY_WINDOW_MINUTES)?.present === 1;
-    return hasUsage && hasWeeklyQuota;
+      LIMIT 1`).get(
+      FIVE_HOUR_WINDOW_MINUTES,
+      WEEKLY_WINDOW_MINUTES,
+    )?.present === 1;
+    return hasUsage && hasAllowanceQuota;
   } catch {
     return false;
   } finally {
@@ -3985,7 +4017,7 @@ async function openUnifiedIndexCalibrationCorpus({
           planType: pending.planType,
           limitId: "codex",
           slot: pending.slot,
-          windowDurationMins: WEEKLY_WINDOW_MINUTES,
+          windowDurationMins: pending.durationMins,
           resetsAt: pending.resetsAtSec,
           usedPercent: pending.usedPercent,
         },
@@ -4012,8 +4044,9 @@ async function openUnifiedIndexCalibrationCorpus({
         }
         lastObservedPlan = row.plan_type;
       }
-      if (Number(row.duration_mins) !== WEEKLY_WINDOW_MINUTES || row.resets_at_ms === null
-          || row.used_percent === null) continue;
+      const durationMins = Number(row.duration_mins);
+      if (!ALLOWANCE_HISTORY_WINDOW_MINUTES.has(durationMins)
+          || row.resets_at_ms === null || row.used_percent === null) continue;
       const resetsAtSec = Math.floor(Number(row.resets_at_ms) / 1_000);
       const usedPercent = Number(row.used_percent);
       if (!Number.isSafeInteger(observedMs)
@@ -4027,13 +4060,14 @@ async function openUnifiedIndexCalibrationCorpus({
         planType: typeof row.plan_type === "string" && row.plan_type.length > 0
           ? row.plan_type
           : "unknown",
+        durationMins,
         usedPercent,
         resetsAtSec,
       };
       // Slot is a UI role, not identity: a run of identical displayed states
       // that crosses the server-side slot flip is still one run of the same
       // (limit, duration, reset) window.
-      const groupKey = `${projected.planType}\0${resetsAtSec}`;
+      const groupKey = `${projected.planType}\0${durationMins}\0${resetsAtSec}`;
       const run = groupRuns.get(groupKey);
       if (run !== undefined && run.usedPercent === usedPercent) {
         // Same displayed state as the previous observation of this window:
@@ -4565,20 +4599,26 @@ export async function buildReplaySafeAccountingCache({
           return;
         }
         if (window?.limitId === "codex"
-            && window.windowDurationMins === WEEKLY_WINDOW_MINUTES) {
+            && ALLOWANCE_HISTORY_WINDOW_MINUTES.has(
+              window.windowDurationMins,
+            )) {
           if (retainWindowedCalibrationInputs) {
             reserveTransitionInput("snapshot");
             weeklyRateLimitSnapshots.push(weeklyRateLimitProjection(snapshot));
           } else {
             observeUnretainedCalibrationInput();
           }
-          retainQuotaTimeline(
-            weeklyQuotaTimelineBuckets,
-            snapshot,
-            { limitId: "codex", durationMinutes: WEEKLY_WINDOW_MINUTES },
-          );
-          const paceSnapshot = weeklyPaceSnapshotProjection(snapshot);
-          if (paceSnapshot !== null) weeklyPaceSnapshots.push(paceSnapshot);
+          // The existing quota timeline and pace forecast remain seven-day
+          // contracts. Five-hour rows feed only the duration-keyed history.
+          if (window.windowDurationMins === WEEKLY_WINDOW_MINUTES) {
+            retainQuotaTimeline(
+              weeklyQuotaTimelineBuckets,
+              snapshot,
+              { limitId: "codex", durationMinutes: WEEKLY_WINDOW_MINUTES },
+            );
+            const paceSnapshot = weeklyPaceSnapshotProjection(snapshot);
+            if (paceSnapshot !== null) weeklyPaceSnapshots.push(paceSnapshot);
+          }
         }
       },
     });
@@ -4859,6 +4899,8 @@ export async function buildReplaySafeAccountingCache({
     summary: {
       deduplicatedRateLimitSnapshots:
         transitionSeries.deduplicatedSnapshotCount,
+      deduplicatedRateLimitSnapshotsByWindow:
+        transitionSeries.deduplicatedSnapshotCountByWindow,
     },
     transitions: transitionSeries.transitions,
   };
@@ -4896,6 +4938,14 @@ export async function buildReplaySafeAccountingCache({
   );
   const selectedAllowanceCalibration = allowanceScenarios
     .unresolved_as_standard.calibration;
+  const fiveHourAllowanceCalibration = projectBoundedWeeklyCalibrationSummary(
+    allowanceCapacityDataset,
+    {
+      forcedCandidateId:
+        ALLOWANCE_SCENARIO_CANDIDATES.unresolved_as_standard,
+      windowDurationMinutes: FIVE_HOUR_WINDOW_MINUTES,
+    },
+  );
   const capacityPlanScope = {
     methodVersion: PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION,
     planType: selectedAllowanceCalibration.selectedPlanType,
@@ -4959,6 +5009,7 @@ export async function buildReplaySafeAccountingCache({
       : { weekly: { paceForecast } }),
     weeklyCalibration,
     allowanceCapacityByScenario,
+    fiveHourAllowanceCalibration,
     weeklyCalibrationInput: {
       status: "complete",
       encoding: retainWindowedCalibrationInputs
@@ -6005,9 +6056,14 @@ function validTimelineSpeedWeighting(row) {
   return true;
 }
 
-function validAllowanceCalibrationSummary(value, forcedCandidateId) {
+function validAllowanceCalibrationSummary(
+  value,
+  forcedCandidateId,
+  { windowDurationMinutes = SEVEN_DAY_WINDOW_MINUTES } = {},
+) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.schemaVersion !== "weekly-calibration-summary-v0.1"
+      || value.windowDurationMinutes !== windowDurationMinutes
       || !["estimated", "insufficient_evidence"].includes(value.status)
       || canonicalInstant(value.generatedAt) === null
       || value.accountAttribution?.status !== "historical_unattributed"
@@ -6065,6 +6121,16 @@ function validAllowanceCapacityByScenario(value) {
   }
   const selectedCalibration = value.scenarios.unresolved_as_standard.calibration;
   return value.planScope.cohortId === calibrationCohortId(selectedCalibration);
+}
+
+function validFiveHourAllowanceCalibration(value) {
+  const selectedBasis =
+    ALLOWANCE_SCENARIO_CANDIDATES.unresolved_as_standard;
+  const options = { windowDurationMinutes: FIVE_HOUR_WINDOW_MINUTES };
+  return validAllowanceCalibrationSummary(value, selectedBasis, options)
+    && validWeeklyPlanPopulations(value, (population) => (
+      validAllowanceCalibrationSummary(population, selectedBasis, options)
+    ));
 }
 
 function validPlanScopedTimeline(value, sourceDescriptor, capacity) {
@@ -6296,6 +6362,9 @@ function validCache(value) {
       || !validAllowanceCapacityByScenario(
         value.allowanceCapacityByScenario,
       )
+      || !validFiveHourAllowanceCalibration(
+        value.fiveHourAllowanceCalibration,
+      )
       || !validPlanScopedTimeline(
         value.planScopedTimeline,
         value.sourceDescriptor,
@@ -6303,6 +6372,8 @@ function validCache(value) {
       )
       || value.weeklyCalibration?.schemaVersion
         !== "weekly-calibration-summary-v0.1"
+      || value.weeklyCalibration.windowDurationMinutes
+        !== SEVEN_DAY_WINDOW_MINUTES
       || !validWeeklyPlanPopulations(value.weeklyCalibration, (population) => (
         validAllowanceCalibrationSummary(population, population.validation?.selectedCostBasis)
           && validWeeklyCalibrationComposition(population.composition)

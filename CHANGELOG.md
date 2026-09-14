@@ -35,7 +35,26 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-No changes yet.
+These changes are in the next-release source candidate; 0.1.22 remains the
+published release.
+
+- Redesign remaining allowances as animated fuel tanks with one shared pace
+  forecast, explicit waiting states, reset countdowns and run-out timing.
+- Add the interactive Trends horizon with linked allowance, spending, quota
+  comparison and cumulative-drift charts, plus typed reset evidence.
+- Rename Allowance to Allowance Value and add plan-specific five-hour history
+  alongside seven-day estimates.
+- Add the cache continuity matrix with all time buckets visible, sample counts,
+  percentage-first inspection and model filtering.
+- Unify dashboard headers, reporting periods, model pickers, tables and loading
+  states; preload reports and preserve cached results during refresh.
+- Add the local usage coach and Codex plugin through the bounded, content-free
+  agent protocol. The installed 0.1.22 application does not support this protocol.
+- Preserve exact Windows file identities and recover collector/model-timing
+  storage safely. Windows model performance remains unavailable until its
+  separate native qualification gate passes.
+- Restore four-platform release reconciliation and strengthen Mac update and
+  empty-profile qualification. Each new installer still needs its own evidence.
 
 ## [0.1.22](./release-notes/0.1.22.md) - 2026-09-11
 

@@ -197,12 +197,15 @@ checkpoint. A later **Update local usage** resumes from that checkpoint. Raw
 prompts, responses, commands, source paths, repository names, and local files
 are not served to the browser or sent to a hosted service.
 
-The same lineage-aware raw-log pass now captures weekly rate-limit snapshots
-while it computes API-price-equivalent usage. It atomically writes only an
-owner-readable, versioned, content-free accounting cache. The weekly view uses
-that live cache and labels older observations as account-unattributed and
-potentially spanning multiple accounts. It does not read the replay-heavy
-collector record store as a substitute or perform a second raw-log pass.
+The same lineage-aware accounting pass captures both five-hour and seven-day main
+allowance snapshots while it computes API-price-equivalent usage. It folds both
+durations into bounded, plan-separated calibrations and atomically writes only
+an owner-readable, versioned, content-free accounting cache. The Allowance view
+uses that live cache and labels older observations as account-unattributed and
+potentially spanning multiple accounts. Five-hour history is published only
+after one plan-specific reset has enough observed movement to qualify for a
+fit. It does not read the replay-heavy collector record store as a substitute
+or perform a second raw-log pass.
 
 An automatic quick refresh preserves the last authoritative accounting
 projection while publishing the newly observed quota card; it never advances

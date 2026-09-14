@@ -1,4 +1,7 @@
-import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
+import {
+  FIVE_HOUR_WINDOW_MINUTES,
+  SEVEN_DAY_WINDOW_MINUTES,
+} from "@app-usagemonitor/quota-analysis";
 import { addUsdStrings } from "@app-usagemonitor/accounting";
 
 const SCHEMA_VERSION = "weekly-calibration-v0.2";
@@ -96,8 +99,8 @@ function resetParentKey(row) {
   return `${partitionKey(row, { includeSlot: false, includeEra: false })}|${row.resetsAt}`;
 }
 
-function isEligible(row) {
-  return row.windowDurationMins === WEEKLY_WINDOW_MINS
+function isEligible(row, windowDurationMinutes = WEEKLY_WINDOW_MINS) {
+  return row.windowDurationMins === windowDurationMinutes
     && row.aggregationEligibility !== "diagnostic_only"
     && row.limitId === "codex"
     && row.nextUsedPercent > row.priorUsedPercent
@@ -168,8 +171,14 @@ function midpointBoundary(row, candidate) {
   return Number.isFinite(lower) && Number.isFinite(upper) ? (lower + upper) / 2 : null;
 }
 
-function uniquePoints(rows, candidate) {
-  const ordered = [...rows].filter(isEligible).sort((left, right) => left.eventTime.localeCompare(right.eventTime));
+function uniquePoints(
+  rows,
+  candidate,
+  windowDurationMinutes = WEEKLY_WINDOW_MINS,
+) {
+  const ordered = [...rows]
+    .filter((row) => isEligible(row, windowDurationMinutes))
+    .sort((left, right) => left.eventTime.localeCompare(right.eventTime));
   if (ordered.length === 0) return [];
   const byPercent = new Map();
   const add = (percent, cost, observedAt) => {
@@ -292,8 +301,11 @@ function aggregateScores(records, scoreField) {
   };
 }
 
-function summarizeEvidence(rows) {
-  const eligible = rows.filter(isEligible);
+function summarizeEvidence(
+  rows,
+  windowDurationMinutes = WEEKLY_WINDOW_MINS,
+) {
+  const eligible = rows.filter((row) => isEligible(row, windowDurationMinutes));
   const components = {};
   const models = {};
   const tools = {};
@@ -647,8 +659,12 @@ function evaluateOnlineCalibration(rows) {
   };
 }
 
-function fitReset(rows, candidate) {
-  const points = uniquePoints(rows, candidate);
+function fitReset(
+  rows,
+  candidate,
+  windowDurationMinutes = WEEKLY_WINDOW_MINS,
+) {
+  const points = uniquePoints(rows, candidate, windowDurationMinutes);
   if (points.length < 8) return null;
   const fullSpanPp = points.at(-1).percent - points[0].percent;
   if (fullSpanPp < 5) return null;
@@ -745,10 +761,13 @@ function hasSimultaneousSlotConflict(rows) {
   return false;
 }
 
-function summarizeResetGroup(rows) {
+function summarizeResetGroup(
+  rows,
+  windowDurationMinutes = WEEKLY_WINDOW_MINS,
+) {
   const ordered = [...rows].sort((left, right) => left.eventTime.localeCompare(right.eventTime)
     || String(left.slot).localeCompare(String(right.slot)));
-  const eligible = ordered.filter(isEligible);
+  const eligible = ordered.filter((row) => isEligible(row, windowDurationMinutes));
   const percentages = eligible.flatMap((row) => [row.priorUsedPercent, row.nextUsedPercent])
     .filter(Number.isFinite);
   return {
@@ -807,9 +826,15 @@ function selectNonOverlappingGroups(groups) {
   return best.length === 0 ? [] : best.at(-1).indices.map((index) => ordered[index]);
 }
 
-function selectResetGroups(transitions) {
+function selectResetGroups(
+  transitions,
+  windowDurationMinutes = WEEKLY_WINDOW_MINS,
+) {
   const bySlotReset = new Map();
-  for (const row of transitions.filter((item) => item.windowDurationMins === WEEKLY_WINDOW_MINS && item.limitId === "codex")) {
+  for (const row of transitions.filter((item) => (
+    item.windowDurationMins === windowDurationMinutes
+    && item.limitId === "codex"
+  ))) {
     const values = bySlotReset.get(slotResetKey(row)) ?? [];
     values.push(row);
     bySlotReset.set(slotResetKey(row), values);
@@ -824,7 +849,7 @@ function selectResetGroups(transitions) {
   const suppressed = [];
   const logicalGroups = [];
   for (const rows of byLogicalReset.values()) {
-    const group = summarizeResetGroup(rows);
+    const group = summarizeResetGroup(rows, windowDurationMinutes);
     if (hasSimultaneousSlotConflict(group.rows)) {
       suppressed.push({
         resetsAt: group.first.resetsAt,
@@ -898,9 +923,11 @@ function selectResetGroups(transitions) {
   };
 }
 
-function speedCounts(rows) {
+function speedCounts(rows, windowDurationMinutes = WEEKLY_WINDOW_MINS) {
   const counts = {};
-  for (const row of rows.filter(isEligible)) {
+  for (const row of rows.filter((item) => (
+    isEligible(item, windowDurationMinutes)
+  ))) {
     for (const [speed, count] of Object.entries(row.tierUsageEventCounts ?? { unknown: row.marginalUsageEventCount })) {
       counts[speed] = (counts[speed] ?? 0) + count;
     }
@@ -944,11 +971,20 @@ function capacityDistribution(values) {
 
 export function analyzeWeeklyCalibration(
   dataset,
-  { priorWindow = 3, forcedCandidateId = null, planType = null } = {},
+  {
+    priorWindow = 3,
+    forcedCandidateId = null,
+    planType = null,
+    windowDurationMinutes = WEEKLY_WINDOW_MINS,
+  } = {},
 ) {
   if (forcedCandidateId !== null
       && !CANDIDATES.some((candidate) => candidate.id === forcedCandidateId)) {
     throw new TypeError("Unknown forced weekly calibration candidate");
+  }
+  if (windowDurationMinutes !== FIVE_HOUR_WINDOW_MINUTES
+      && windowDurationMinutes !== SEVEN_DAY_WINDOW_MINUTES) {
+    throw new TypeError("Unsupported allowance calibration window");
   }
   const inputTransitions = dataset.transitions ?? [];
   // Population selection must precede fragment selection and every median or
@@ -959,7 +995,7 @@ export function analyzeWeeklyCalibration(
     )).at(-1)?.planType ?? "unknown";
   const grouped = selectResetGroups(inputTransitions.filter((row) => (
     (row.planType ?? "unknown") === selectedPlanType
-  )));
+  )), windowDurationMinutes);
   const resetFits = grouped.selected.map((group) => {
     // A diagnostic-only transition may precede the clean observations that
     // actually qualify this reset for a fit. Project the fit's identity and
@@ -967,8 +1003,14 @@ export function analyzeWeeklyCalibration(
     // rejected row makes a valid estimate describe itself as diagnostic-only
     // and correctly fail the bounded cache validator.
     const first = group.firstEligible ?? group.first;
-    const fits = Object.fromEntries(CANDIDATES.map((candidate) => [candidate.id, fitReset(group.rows, candidate)]));
-    const lagFits = Object.fromEntries(LAG_CANDIDATES.map((candidate) => [candidate.id, fitReset(group.rows, candidate)]));
+    const fits = Object.fromEntries(CANDIDATES.map((candidate) => [
+      candidate.id,
+      fitReset(group.rows, candidate, windowDurationMinutes),
+    ]));
+    const lagFits = Object.fromEntries(LAG_CANDIDATES.map((candidate) => [
+      candidate.id,
+      fitReset(group.rows, candidate, windowDurationMinutes),
+    ]));
     return {
       accountScopeId: first.accountScopeId ?? "unattributed",
       provider: first.provider,
@@ -986,8 +1028,8 @@ export function analyzeWeeklyCalibration(
       continuityTrack: partitionKey(first, { includeSlot: false }),
       totalTransitions: group.rows.length,
       eligibleTransitions: group.eligibleCount,
-      speed: speedCounts(group.rows),
-      evidenceProfile: summarizeEvidence(group.rows),
+      speed: speedCounts(group.rows, windowDurationMinutes),
+      evidenceProfile: summarizeEvidence(group.rows, windowDurationMinutes),
       ...priceCardProvenance(group.rows),
       fits,
       lagFits,
@@ -1153,6 +1195,7 @@ export function analyzeWeeklyCalibration(
   };
   return {
     schemaVersion: SCHEMA_VERSION,
+    windowDurationMinutes,
     selectedPlanType,
     kind: "weekly_quota_cost_calibration",
     materializedAt: dataset.scope?.endAt ?? dataset.materializedAt ?? new Date().toISOString(),
@@ -1569,6 +1612,7 @@ function projectWeeklyPlanSummary(dataset, options) {
     }));
   return {
     schemaVersion: "weekly-calibration-summary-v0.1",
+    windowDurationMinutes: report.windowDurationMinutes,
     planType: report.selectedPlanType,
     planAttribution: {
       methodVersion: "plan-era-v1",
@@ -1620,11 +1664,28 @@ function projectWeeklyPlanSummary(dataset, options) {
     },
     sourceCounts: {
       rateLimitSnapshots:
-        Number.isSafeInteger(dataset.summary?.deduplicatedRateLimitSnapshots)
-          ? dataset.summary.deduplicatedRateLimitSnapshots
-          : 0,
+        dataset.summary?.deduplicatedRateLimitSnapshotsByWindow
+          && typeof dataset.summary.deduplicatedRateLimitSnapshotsByWindow
+            === "object"
+          && !Array.isArray(
+            dataset.summary.deduplicatedRateLimitSnapshotsByWindow,
+          )
+          ? Number.isSafeInteger(
+            dataset.summary.deduplicatedRateLimitSnapshotsByWindow[
+              report.windowDurationMinutes
+            ],
+          )
+            ? dataset.summary.deduplicatedRateLimitSnapshotsByWindow[
+              report.windowDurationMinutes
+            ]
+            : 0
+          : Number.isSafeInteger(
+            dataset.summary?.deduplicatedRateLimitSnapshots,
+          )
+            ? dataset.summary.deduplicatedRateLimitSnapshots
+            : 0,
       weeklyTransitions: (dataset.transitions ?? [])
-        .filter((row) => row.windowDurationMins === WEEKLY_WINDOW_MINS
+        .filter((row) => row.windowDurationMins === report.windowDurationMinutes
           && (row.planType ?? "unknown") === report.selectedPlanType)
         .length,
       qualifyingResetValues: report.quality.qualifyingResetValues,

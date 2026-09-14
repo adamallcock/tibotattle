@@ -345,10 +345,17 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const chartStart = appSource.indexOf("const CHART_POINT_STYLE = Object.freeze(");
   const chartEnd = appSource.indexOf("\nfunction firstFiniteForecastNumber", chartStart);
+  const allowanceWindowStart = appSource.indexOf("function allowanceHistoryForWindow");
+  const allowanceWindowEnd = appSource.indexOf("\nfunction renderWeeklyPlanControl", allowanceWindowStart);
   const weeklyStart = appSource.indexOf("function renderWeekly(data) {");
   const weeklyEnd = appSource.indexOf("\nfunction accountingPeriod(data)", weeklyStart);
-  assert.ok(chartStart >= 0 && weeklyStart > chartStart, "renderWeekly is available");
-  const section = `${appSource.slice(chartStart, chartEnd)}\n${appSource.slice(weeklyStart, weeklyEnd)}`;
+  assert.ok(
+    chartStart >= 0 && allowanceWindowStart > chartEnd && weeklyStart > allowanceWindowEnd,
+    "renderWeekly and its allowance-window selector are available",
+  );
+  const section = `${appSource.slice(chartStart, chartEnd)}\n`
+    + `${appSource.slice(allowanceWindowStart, allowanceWindowEnd)}\n`
+    + appSource.slice(weeklyStart, weeklyEnd);
 
   const elements = new Map();
   const element = (id) => {
@@ -387,6 +394,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
     "renderStaleServeNote",
     "activeWeeklyRangeDays", "activeWeeklyMinimumObservedSpanPp",
     "selectAllowancePlanPopulation", "activeWeeklyPlanType",
+    "activeAllowanceWindowMinutes", "CODEX_FIVE_HOUR_ALLOWANCE_MINUTES",
+    "CODEX_WEEKLY_ALLOWANCE_MINUTES", "isPrimaryCodexQuotaWindow",
     "renderWeeklyPlanControl", "shareCardPlanLabel",
     `${section}\nreturn renderWeekly;`,
   )(
@@ -423,6 +432,10 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
     span,
     selectAllowancePlanPopulation,
     planType,
+    null,
+    CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+    CODEX_WEEKLY_ALLOWANCE_MINUTES,
+    () => true,
     () => {},
     shareCardPlanLabel,
   )(data);
@@ -2666,7 +2679,8 @@ test("quota presentation keeps Spark separate and weekly surfaces exact", async 
   assert.match(appSource, /modelThemeIcon\(document, "spark"\)/u);
   assert.match(appSource, /const normalWindows = data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u);
   assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);
-  assert.match(appSource, /title: \{ key: "weekly\.chart\.title" \}/u);
+  assert.match(appSource, /"weekly\.chart\.title"/u);
+  assert.match(appSource, /"weekly\.chart\.fiveHourTitle"/u);
   assert.doesNotMatch(appSource, /renderAccountScopedQuotaAnalysis/u);
 });
 
@@ -5831,17 +5845,11 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   // and prepare button are removed with the legacy prepare flow.
   assert.doesNotMatch(html, /id="contribution-lookback-controls"/);
   assert.doesNotMatch(html, /Prepare and review last 24 hours/);
-  // Owner decision 2026-08-06: the calibration chart leads Trends and its
-  // disclosure is open by default. The previous assertion pinned the opposite
-  // order, on the reviewed consumer hierarchy that a first-time reader should
-  // meet the headline usage chart before the technical evidence. That
-  // hierarchy was deliberately reversed, so this pins the new order rather
-  // than being deleted - the ordering is still a decision, not an accident.
-  assert.ok(
-    html.indexOf('id="timeline-chart"') < html.indexOf('id="usage-timeline-chart"'),
-    "calibration chart leads Trends ahead of the usage chart",
-  );
-  assert.match(html, /<details class="advanced-calibration" open>/u);
+  // Owner decision 2026-09-13: allowance leads, with all three analyses visible.
+  assert.ok(html.indexOf('id="usage-timeline-chart"') < html.indexOf('id="timeline-chart"'));
+  assert.ok(html.indexOf('id="timeline-chart"') < html.indexOf('id="residual-chart"'));
+  assert.doesNotMatch(html, /<details class="advanced-calibration"/u);
+  assert.match(html, /class="panel trends-evidence-details"/u);
   // Owner decision 2026-08-06: the calibration rolling comparison window is
   // fixed at three hours — the 15-minute and 1-hour widths proved inaccurate,
   // and a segmented control with one honest option is clutter. The previous
@@ -6493,7 +6501,7 @@ test("weekly points carry measured ranges with pointer and keyboard detail", asy
     /if \(errorBars\) values\.push\([\s\S]*?errorBars\.low[\s\S]*?errorBars\.high/u,
   );
   const weeklyChart = appSource.match(
-    /function renderAllowanceHistoryChart\(history\) \{([\s\S]*?)\n\}/u,
+    /function renderAllowanceHistoryChart\([\s\S]*?\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
   assert.match(weeklyChart, /tooltip: false,/u);
   assert.match(weeklyChart, /detail: weeklyPointDetail,/u);
@@ -6746,7 +6754,7 @@ test("residuals span the calibration range and show uncomputable windows as gaps
   assert.match(appSource, /xDomain: domain,/u);
   assert.match(
     appSource,
-    /statusIntervals: domain === null\s*\?\s*\[\]\s*: timelineStatusIntervals\(residuals, domain\),/u,
+    /statusIntervals: usingLive && viewport !== null\s*\? timelineStatusIntervals\(points, viewport\)/u,
   );
   assert.match(
     appSource,
@@ -6755,6 +6763,8 @@ test("residuals span the calibration range and show uncomputable windows as gaps
   assert.match(appSource, /function residualGapReasons/u);
   assert.match(appSource, /"dashboard\.residual\.partial"/u);
   assert.match(html, /id="residual-coverage"/u);
+  assert.ok(html.indexOf('id="residual-coverage"') < html.indexOf('id="residual-chart"'));
+  assert.match(appSource, /"trends.driftCoverage"/u);
   assert.match(html, /Quiet periods with no\s+activity and no quota change are neutral, not errors/u);
 });
 
@@ -6770,7 +6780,7 @@ test("the weekly allowance chart leads the dashboard", async () => {
     html.indexOf('data-nav="weekly"') < html.indexOf('data-nav="trends"'),
     "primary navigation follows the same order as the sections",
   );
-  assert.match(html, /<h2 id="weekly-title" data-i18n="page.weekly.title">Allowance<\/h2>/u);
+  assert.match(html, /<h2 id="weekly-title" data-i18n="page.weekly.title">Allowance Value<\/h2>/u);
   assert.match(html, /<h2 id="timeline-title" data-i18n="page.timeline.title">Trends<\/h2>/u);
   assert.match(html, /class="dashboard-section lead-section(?: dashboard-page-inactive)?" id="weekly"/u);
   assert.match(html, /class="panel weekly-history-panel lead-chart-panel chart-card"/u);
@@ -6788,7 +6798,7 @@ test("weekly details keep reset evidence concise and do not present speed covera
   // Both halves of the paginated presentation (owner-directed 2026-08-10):
   // the row-set holder and the page renderer beneath it.
   const tableMatch = appSource.match(
-    /function renderWeeklyTable\(values\) \{([\s\S]*?)\nfunction accountingPeriod\(data\)/u,
+    /function renderWeeklyTable\(values, windowMinutes = CODEX_WEEKLY_ALLOWANCE_MINUTES\) \{([\s\S]*?)\nfunction accountingPeriod\(data\)/u,
   );
   assert.ok(tableMatch, "renderWeeklyTable source is available for contract review");
   const tableSource = tableMatch[1];
@@ -9396,7 +9406,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   // of each carrying its own card call that a new path could forget.
   assert.match(
     appSource,
-    /renderWeeklyTable\(values\);\s*\n[\s\S]{0,640}?renderShareCard\(data, \{ history \}\);\s*\n\}/u,
+    /renderWeeklyTable\(values, windowMinutes\);\s*\n[\s\S]{0,900}?if \(windowMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES\) \{\s*\n\s*renderShareCard\(data, \{ history \}\);/u,
   );
   assert.doesNotMatch(appSource, /renderShareCard\(dashboard\);/u);
 });
@@ -9568,7 +9578,7 @@ test("the posted allowance graph uses the exact history model from the dashboard
     appSource,
     /function renderWeekly\(data\) \{[\s\S]*?const history = allowanceHistoryChartModel\(data\);/u,
   );
-  assert.match(appSource, /shell\.replaceChildren\(renderAllowanceHistoryChart\(history\)\);/u);
+  assert.match(appSource, /shell\.replaceChildren\(renderAllowanceHistoryChart\(history, windowMinutes\)\);/u);
   assert.match(
     section,
     // Re-pinned 2026-08-08 (owner-verified regression): the chart renderer
@@ -10102,7 +10112,7 @@ test("a session-rejected repair clears the dead session and renders one sign-in 
 
 async function loadResidualInspectionTable({ rows, page = 0 }) {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = appSource.indexOf("function renderResidualInspectionTable()");
+  const start = appSource.indexOf("function residualEvidence(row)");
   const end = appSource.indexOf("\n/**\n * Whether a series draws its data points", start);
   assert.ok(start >= 0 && end > start, "the inspection-table renderer is available");
   const section = appSource.slice(start, end);
@@ -10124,7 +10134,7 @@ async function loadResidualInspectionTable({ rows, page = 0 }) {
   const state = { page };
   Function(
     "$", "clear", "node", "t", "setLocalizedText",
-    "formatNumber", "formatChartTimestamp", "formatPp", "timelineStatusLabel",
+    "formatNumber", "formatChartTimestamp", "formatPp", "finite", "formatSpanLength",
     "residualInspectionRows", "state",
     `const RESIDUAL_TABLE_PAGE_SIZE = 10;
 let residualTablePage = state.page;
@@ -10148,7 +10158,8 @@ state.page = residualTablePage;`,
     (value) => String(value),
     (value) => String(value),
     (value) => value === null ? "—" : `${value} pp`,
-    (status) => `status:${status}`,
+    finite,
+    String,
     rows,
     state,
   );
@@ -10200,6 +10211,38 @@ test("the exact-windows table pages ten rows at a time and states the shown rang
   assert.equal(empty.pagination.hidden, true);
   assert.equal(empty.table.children.length, 1);
   assert.equal(empty.table.children[0].children[0].textContent, "[residual.table.empty]");
+});
+
+test("exact comparisons explain quality without mistaking agreement, missing estimates, or unknown states", async () => {
+  const row = { timestamp: "2026-09-09T23:00:00Z", observed: 30, expected: 10, residual: 20, measuredSpanMs: 3_600_000 };
+  const checks = [
+    ["matched", "Comparable", {}],
+    ["matched", "Estimate", { expected: null, residual: null }],
+    ["matched", "Missing", { observed: null, residual: null }],
+    ["missing_quota_bracket", "Missing", {}],
+    ["reset_or_track_change", "Reset", {}],
+    ["backward_or_ambiguous", "Backward", {}],
+    ["pool_saturated", "Exhausted", {}],
+    ["quota_weighting_unavailable", "Pricing", {}],
+    ["unpriced_local_activity", "Unpriced", {}],
+    ["unexplained_without_local_activity", "Unrecorded", {}],
+    ["inactive", "Quiet", {}],
+    [undefined, "Unknown", {}],
+    ["future_state", "Unknown", {}],
+  ];
+  for (const [status, expectedKey, overrides] of checks) {
+    const h = await loadResidualInspectionTable({ rows: [{ ...row, status, ...overrides }] });
+    const cells = h.table.children[0].children;
+    assert.equal(cells[4].children[0].textContent, `[trends.evidence${expectedKey}]`);
+    assert.equal(cells[4].children[1].textContent, `[trends.evidence${expectedKey}Why]`);
+    assert.equal(cells[0].children[0].textContent, "[trends.measuredSpan]");
+    if (status === "matched" && expectedKey === "Comparable") assert.equal(cells[3].textContent, "+20 pp");
+    for (const locale of SUPPORTED_LOCALES) {
+      for (const key of [`trends.evidence${expectedKey}`, `trends.evidence${expectedKey}Why`]) {
+        assert.notEqual(translate(key, {}, locale), key);
+      }
+    }
+  }
 });
 
 test("the inspection list keeps every row and restarts paging when the selection changes", async () => {
@@ -10289,7 +10332,7 @@ async function loadLiveTimelinePoints() {
     "isPrimaryCodexWeeklyQuotaWindow",
     "CALIBRATION_WINDOW_HOURS",
     "activeCalibrationRangeDays",
-    `${appSource.slice(usageStart, usageEnd)}\n${section}\nreturn liveTimelinePoints;`,
+    `${appSource.slice(usageStart, usageEnd)}\n${section}\nreturn Object.assign(liveTimelinePoints, { resetBoundaries: timelineResetBoundaryEvents });`,
   )(
     finite,
     () => Number.NEGATIVE_INFINITY,
@@ -10302,7 +10345,7 @@ async function loadLiveTimelinePoints() {
   // Existing lifecycle tests predate the weighted DTO. Give those fixtures a
   // matching basis by default, while tests that exercise a mismatch provide
   // their own explicit weighting/capacity.
-  return (data, options) => {
+  const wrapped = (data, options) => {
     const legacyCapacity = finite(
       data?.weekly?.summary?.blended_capacity_usd
         ?? data?.weekly?.summary?.median_weekly_value_usd
@@ -10323,6 +10366,8 @@ async function loadLiveTimelinePoints() {
       },
     }, options);
   };
+  wrapped.resetBoundaries = liveTimelinePoints.resetBoundaries;
+  return wrapped;
 }
 
 test("selected-plan rolling windows and cumulative drift cannot bridge an omitted era or ambiguous bucket", async () => {
@@ -10405,6 +10450,26 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
   // three-hour window.
   assert.equal(points[2].measuredSpanMs, 2 * 60 * 60 * 1_000);
   assert.equal(points[2].allowanceWeightedUsd, 100);
+  assert.deepEqual(points.flatMap(point => point.resetEvent ?? []), [{
+    timestampMs: Date.parse(hour(4)), confirmedAtMs: Date.parse(hour(4)), kind: "observed_reset",
+  }]);
+});
+
+test("recorded reset boundaries remain visible without pricing, but not across unknown or incompatible history", async () => {
+  const { resetBoundaries } = await loadLiveTimelinePoints();
+  const row = (hour, resetAt) => ({ observedAt: `2026-08-05T0${hour}:00:00Z`, resetAt,
+    limitId: "codex", durationMinutes: 10_080 });
+  const first = "2026-08-10T00:00:00Z", next = "2026-08-17T00:00:00Z";
+  const quota = [row(1, first), row(2, "2026-08-10T00:00:22Z"), row(3, next)];
+  const data = { timeline: { quota } };
+  assert.deepEqual(resetBoundaries(data), [{ timestampMs: Date.parse(quota[2].observedAt),
+    confirmedAtMs: Date.parse(quota[2].observedAt), kind: "window_change" }]);
+  assert.deepEqual(resetBoundaries({ timeline: { quota: [quota[0], row(2, null), quota[2]] } }), []);
+  assert.deepEqual(resetBoundaries({ ...data, allowancePlanSelection: {}, timeline: {
+    quota, comparisonIntervals: [[Date.parse(quota[0].observedAt), Date.parse(quota[1].observedAt)]],
+  } }), []);
+  assert.deepEqual(resetBoundaries({ timeline: { quota: quota.map(item => ({ ...item, limitId: "spark" })) } }), []);
+  assert.deepEqual(resetBoundaries({ timeline: { quota: [row(1, null), row(2, next)] } }), []);
 });
 
 test("an unweightable bucket creates a red-line gap instead of falling back to Standard cost", async () => {
@@ -10493,6 +10558,7 @@ test("a single stale quota dip suspends one drift point instead of re-anchoring"
     [0],
   );
   assert.equal(points[4].cumulativeResidual, null);
+  assert.ok(points.every(point => point.resetEvent === null), "a stale dip must not gain a reset marker");
   // Drift resumes from the SAME anchor after the recovery — never a jump of
   // the dip's magnitude.
   for (const point of points) {
@@ -10546,6 +10612,10 @@ test("two consecutive confirming readings re-anchor the drift at a banked reset"
   assert.equal(points[3].driftReanchor, false);
   assert.equal(points[4].cumulativeResidual, 0);
   assert.equal(points[4].driftReanchor, true);
+  assert.deepEqual(points[4].resetEvent, {
+    timestampMs: Date.parse(hour(4)), confirmedAtMs: Date.parse(hour(5)), kind: "observed_reset",
+  });
+  assert.equal(points.filter(point => point.resetEvent).length, 1);
   // Post-reset drift measures from the new anchor, not the pre-reset level.
   for (const point of points.slice(5)) {
     assert.ok(point.cumulativeResidual === null
@@ -10766,11 +10836,10 @@ test("the residual panel draws the cumulative line and states the signed-AUC dri
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
 
-  // The second series reads the model's cumulative key with its own honest
-  // label; the residual series keeps its own.
+  // Cycle drift now has its own chart; the short-term residual has its own lane.
   assert.match(
     appSource,
-    /key: "cumulativeResidual",\s*\n\s*className: "chart-line-expected",\s*\n\s*label: \{ key: "chart\.residual\.cumulativeSeries" \},/u,
+    /key: "cumulativeResidual", className: "chart-line-observed",\s*label: \{ key: "trends\.drift" \}/u,
   );
   // The stat sits beside MAE and peak, live view integrating the visible
   // residuals and the historical view reporting the artifact's own figure.
@@ -10782,7 +10851,7 @@ test("the residual panel draws the cumulative line and states the signed-AUC dri
   // the legacy inventory (checked by the static-copy test).
   assert.match(
     html,
-    /The second line is cumulative drift: the running sum of each\s*\n?\s*bucket’s observed-minus-expected movement, restarted at every\s*\n?\s*window boundary or track change\./u,
+    /Observed minus calculated movement since the cycle anchor\. Gaps and changes of cycle interrupt the line\./u,
   );
   for (const locale of SUPPORTED_LOCALES) {
     for (const key of [
@@ -13581,4 +13650,31 @@ test("Forest Ink dark appearance is explicit, balanced, and live-updateable", as
     appSource,
     /theme === "dark" \? "#141a17" : "#f5f1e8"/u,
   );
+});
+
+test("responsive charts keep tooltips in bounds and interrupt an anchored cycle", async () => {
+  const documentRef = new FakeSvgDocument(360);
+  const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(documentRef);
+  const svg = lineChart({
+    width: 360, height: 230,
+    points: [
+      { timestamp: '2026-09-01T00:00:00Z', value: 2 },
+      { timestamp: '2026-09-01T01:00:00Z', value: 3 },
+      { timestamp: '2026-09-01T02:00:00Z', value: 0, reanchor: true },
+      { timestamp: '2026-09-01T03:00:00Z', value: -1 },
+    ],
+    series: [{ key: 'value', className: 'chart-line-observed',
+      label: { key: 'trends.drift' }, pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+      breakBefore: 'reanchor' }],
+    title: { key: 'trends.drift' }, description: { key: 'trends.driftCopy' },
+    yLabel: { key: 'dashboard.timeline.percentagePoints' }, includeZero: true,
+  });
+  assert.equal(svg.getAttribute('viewBox'), '0 0 360 230');
+  assert.equal(svg.querySelectorAll('polyline.chart-line-observed').length, 2);
+  const tooltip = svg.querySelector('.chart-hover-tooltip');
+  assert.equal(Number(tooltip.querySelector('rect').getAttribute('width')), 264);
+  const markers = svg.querySelectorAll('circle.chart-point-hit-target');
+  markers.at(-1).dispatchEvent({ type: 'focus' });
+  const [left] = tooltip.getAttribute('transform').match(/[\d.]+/g).map(Number);
+  assert.ok(left + 264 <= 360);
 });

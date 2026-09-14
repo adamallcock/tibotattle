@@ -14,6 +14,7 @@ import type {
 } from "./quota-analysis-v1";
 import { SERVER_PRICING_METHOD_VERSION } from "./server-pricing";
 import {
+  COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION,
   V1_SOURCE_SELECTION_METHOD_VERSION,
   assertV1SourcePinCurrent,
   loadV1SourcePin,
@@ -97,7 +98,8 @@ export const COMMUNITY_ATTRIBUTION_METHOD_VERSION =
     V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
     // Public readiness and derived admin output must invalidate alongside the
     // fit caches when the dollar-equivalent pricing semantics change.
-    V11_DOMAIN_METHOD_VERSION, SERVER_PRICING_METHOD_VERSION].join(":");
+    V11_DOMAIN_METHOD_VERSION, SERVER_PRICING_METHOD_VERSION,
+    COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION].join(":");
 // The tail of every v1 fit-cache key beyond the participant's chunk epoch.
 // One constant serves the writer and both readers so they can never diverge
 // (a 2026-08-30 regression had the corpus reader expecting one fewer segment,
@@ -217,8 +219,7 @@ const COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE = `participant_sources AS (
        WHERE c2.superseded_at IS NULL
       UNION ALL
       SELECT h.participant_id, 'v1.1' AS source FROM telemetry_v11_domain_heads h
-        JOIN participants p3 ON p3.id = h.participant_id AND p3.state = 'active'
-          AND p3.owner_kind = 'social'
+       WHERE EXISTS (SELECT 1 FROM community_public_source_owners p3 WHERE p3.participant_id = h.participant_id)
     )
    GROUP BY participant_id
 )`;
@@ -459,9 +460,8 @@ export async function collectCommunityAllowanceFits(
          ) SELECT ?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5
            WHERE EXISTS (
              SELECT 1 FROM community_analytical_input_versions v
-             JOIN participants p ON p.id = v.participant_id AND p.state = 'active'
-               AND p.owner_kind = 'social'
              WHERE v.participant_id = ?1 AND v.revision = ?6
+               AND EXISTS (SELECT 1 FROM community_public_source_owners p WHERE p.participant_id = v.participant_id)
            )
          ON CONFLICT(participant_id) DO UPDATE SET cache_key = excluded.cache_key,
            fits_json = excluded.fits_json, computed_at = excluded.computed_at,
@@ -752,7 +752,9 @@ export const COMMUNITY_PARTICIPANT_PAGE_CTE = `
 WITH participant_page AS MATERIALIZED (
   SELECT p.id, p.state FROM community_current_analysis_queue q
   JOIN participants p ON p.id = q.participant_id
-  WHERE q.participant_id > ?1 AND p.state != 'deleting' AND p.owner_kind = 'social' AND (
+  WHERE q.participant_id > ?1 AND p.state != 'deleting'
+    AND (p.owner_kind = 'social' OR EXISTS (
+      SELECT 1 FROM community_public_source_owners public_source WHERE public_source.participant_id = p.id)) AND (
     EXISTS (SELECT 1 FROM telemetry_v1_chunks c INDEXED BY telemetry_v1_chunks_current_identity
       WHERE c.participant_id = p.id AND c.superseded_at IS NULL)
     OR EXISTS (SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id = p.id)
@@ -1186,7 +1188,8 @@ export async function publishCommunityAnalysisCaches(db: D1Database,
   await assertCommunitySourcePinCurrent(db, sourcePin);
   const guard = `EXISTS (SELECT 1 FROM participants p
       JOIN community_analytical_input_versions v ON v.participant_id=p.id
-      WHERE p.id=?1 AND p.state='active' AND p.owner_kind='social' AND v.revision=?6
+      WHERE p.id=?1 AND v.revision=?6
+        AND EXISTS (SELECT 1 FROM community_public_source_owners public_source WHERE public_source.participant_id=p.id)
         AND EXISTS (SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id=p.id)=?7)
     AND EXISTS (SELECT 1 FROM retention_state
       WHERE singleton=1 AND maintenance_lease_token=?8
@@ -1460,9 +1463,8 @@ export async function collectCommunityModelCompositions(
              ) SELECT ?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5
                WHERE EXISTS (
                  SELECT 1 FROM community_analytical_input_versions v
-                 JOIN participants p ON p.id = v.participant_id AND p.state = 'active'
-                   AND p.owner_kind = 'social'
                  WHERE v.participant_id = ?1 AND v.revision = ?6
+                   AND EXISTS (SELECT 1 FROM community_public_source_owners p WHERE p.participant_id = v.participant_id)
                )
              ON CONFLICT(participant_id) DO UPDATE SET
                cache_key = excluded.cache_key,

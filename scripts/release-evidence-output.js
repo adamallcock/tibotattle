@@ -137,6 +137,8 @@ export async function validateReleaseEvidenceManifest(
   { artifactRoot = null, manifestPath = null } = {},
 ) {
   validateCanonicalManifest(manifest);
+  assert(manifest.artifacts.every(artifact => artifact.cleanInstallAcceptance?.status !== "pending"),
+    "RELEASE_EVIDENCE_ACCEPTANCE_PENDING", "release still has pending clean-install acceptance");
   if (artifactRoot !== null) await verifyManifestFiles(manifest, artifactRoot);
   if (manifestPath !== null) {
     assert(basename(resolve(manifestPath)) === RELEASE_EVIDENCE_MANIFEST_FILE_NAME,

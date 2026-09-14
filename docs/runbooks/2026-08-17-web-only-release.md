@@ -143,3 +143,64 @@ also changes it.
 This makes each web release and rollback a short, independently reviewable
 commit. Other agents can prepare their own candidates in separate worktrees;
 release one candidate at a time against the latest recorded deployed base.
+
+## Reviewed Electron stable downloads
+
+For a four-target normal Electron release, use the same public-site generator
+with `--electron-publication-plan`, `--electron-publication-root`, and
+`--electron-approved-plan-sha256`. These inputs exclude every native installer
+argument. The digest is the maintained `identityDigest(plan)` of the separately
+reviewed final stable publication plan; it is not the raw JSON file digest.
+The artifact root contains the plan's relative local paths. Do not put either
+input under the public source or inside the generated output.
+
+The site intake consumes that approved plan independently of the website
+checkout's package version. It verifies the stable origin, four targets, exact
+installer names, and every bound local artifact/feed byte, then verifies each
+public installer over HTTPS. It does not package, sign, notarize, publish feeds,
+or reperform the separate native-trust/source review. The public site manifest
+records only download metadata and verification scope, never the private plan
+or its local paths. Native 0.1.18 generation remains unchanged.
+
+Publish the exact canonical GitHub release assets before generating a production
+site. Every manual download button uses the exact GitHub release URL, and the
+site generator independently verifies its HTTPS bytes against the reviewed
+plan digest and size. The updates.tibotattle.com origin is reserved for app
+updater transport; never use its object URLs for manual website downloads.
+
+The download section uses compact platform buttons, requirements, a discreet
+checksum-copy control and accurate platform trust descriptions. It shows no
+file size or migration procedure. Docs explains normal Mac replacement and
+automatic retained-state transfer for 0.1.20 or later. The 0.1.21 docs also
+describe native 0.1.18 Check for Updates; publish those instructions only after
+the signed native journey passes and its stable Sparkle feeds are activated.
+Keep the Homebrew shortcut absent until the tap points
+to a qualified automatic-replacement release, rather than the older native app.
+
+A test-injected verifier may explicitly return `published: false` for a local
+preview using the frozen local bytes. Such output displays a preview warning
+and records `publishedInstallersVerified: false`; it is not a production
+publication receipt. The ordinary CLI always uses real HTTPS verification.
+
+The web-only scope admits the explicit Electron intake helper/test and the
+canonical i18n file only for literal `electron.site.*` catalog entries; runtime
+code or unrelated translations in that shared file still fail admission.
+The generated mirror remains subject to the i18n mirror check. A local-preview
+manifest is refused by the web-release receipt writer.
+
+Electron mode uses an exact copy of the existing 1024×1024 public brand PNG
+(outside the source/output roots) for `--social-image`. It verifies those bytes
+against `tibotattle-icon.png` and emits square Open Graph dimensions, logo alt
+text, and a summary Twitter card. Native generation retains its 1200×630 card.
+This avoids presenting an older native-version screenshot as the Electron
+release. Retained-state admission uses the app's schema compatibility check;
+users do not need an intermediate native version or a preserved predecessor
+executable. The 0.1.19 release cannot use these automatic-upgrade instructions.
+
+
+The exact public evidence controls `config/release-evidence.js`,
+`schemas/release-evidence-v1/manifest.schema.json`, the descriptor/policy/output
+modules under `scripts/release-evidence-*.js`, and their owning test are admitted
+for release evidence compatibility. These are tooling inputs, with no app,
+Worker or package-runtime imports. This does not admit deployment configuration,
+app/runtime source, other configuration files or unrelated schemas.

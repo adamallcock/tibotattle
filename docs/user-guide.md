@@ -55,14 +55,16 @@ Liquid motion is illustrative: the level stays at the observed percentage. Only
 a matching fresh forecast drives the outlet; greater pace produces more flow,
 with amber or red overflow for excessive pace. Overflow is a pace cue, not wasted
 quota. A discreet pause icon in the forecast header stops both tank and forecast-bar
-motion (it sits in the tank header when no forecast is available). The system
-reduced-motion preference is respected silently and hides the motion control.
+motion. The control is hidden when all tanks are stale, empty or unavailable.
+The system reduced-motion preference is respected silently and hides the motion control.
 The forecast bar has a subtle moving sheen; its extent and time markers do not
 move with the animation. Offscreen tanks stop animating. Unavailable capacity retains its text
 state and stale observations have no animated flow. The fill
 and percentage both represent remaining capacity. A single current Codex weekly
-forecast appears beneath the tanks when usable pacing evidence exists; choosing
-a historical plan on the Allowance page does not change that current forecast.
+forecast appears beneath the tanks when usable pacing evidence exists. Otherwise,
+a waiting panel explains that fresh or sufficient allowance evidence is needed;
+it does not display a guessed rate or run-out time. Choosing a historical plan
+on the Allowance Value page does not change that current forecast.
 
 The forecast names its pace assessment, estimated run-out, reset countdown and
 any time without allowance. Its timeline represents time until reset, not quota
@@ -91,6 +93,15 @@ selector keeps the headline, history, range, pace and share card on the same
 selected population. The newest observed plan is selected even if it does not
 yet have enough usable evidence; older-plan estimates remain selectable rather
 than being presented as the current plan's allowance.
+
+The Allowance window control defaults to **7-day** whenever seven-day evidence
+is available. Choose **5-hour** to replace the headline, history graph and reset
+table with the selected plan's five-hour capacity history. Pace forecasts and
+share cards remain seven-day-only. A grey five-hour choice is an evidence state,
+not a timer: run **Update local usage** so the detailed refresh can rebuild the
+local accounting cache. The choice becomes available only when that retained
+history contains a plan-specific five-hour reset with enough observed quota
+movement to fit; missing evidence is never presented as zero.
 
 These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
@@ -292,6 +303,55 @@ open it may make one automatic detailed attempt after an hour. Failed,
 cancelled, and interrupted detailed attempts count toward that hour so they do
 not become a retry loop. After an already-running quick quota check finishes,
 you can choose Refresh again to request detailed work.
+
+Trends shows three linked views: **Allowance and activity**, the **three-hour
+observed versus calculated comparison**, and **Cumulative drift**. The first
+view keeps remaining percentage separate from API-price-equivalent activity.
+Warm and cool fills in the comparison show movement above and below the
+estimate; the signed difference has its own strip. Cycle drift uses the existing
+cycle anchor calculation, not a sum of overlapping three-hour windows.
+
+Hover or tap a chart, or use the history slider, to inspect a shared time across
+all views. **Play history** advances that cursor; **Latest** returns to the end
+of the displayed range. The bright daytime and moonlit nighttime Horizon follows
+local clock time, not astronomical sunrise or sunset. Replay stops when the page
+is hidden and is omitted when reduced motion is enabled. The slider and exact
+sample timestamps remain available. Range and zoom controls move the views
+together; detailed comparison assumptions and exact evidence remain expandable.
+
+The Horizon readouts show allowance remaining at the selected time and a
+three-hour moving average of recorded API-equivalent usage per hour. The spending
+rate uses completed usage buckets, independently of whether allowance observations
+can be compared. It updates at fifteen-minute boundaries for the selected plan.
+The caption names the actual averaging window, which shortens after a coverage
+break. Quiet time within known coverage lowers the average, reaching $0 after
+three hours without recorded activity. Missing pricing or coverage displays a
+dash; the rate does not extend beyond the recorded usage history. Allowance
+readings also become unavailable when stale. These amounts are API equivalents,
+not subscription charges.
+
+Reset markers distinguish scheduled resets, banked resets, unknown types,
+and account-level credit grants or expiry when that evidence is available.
+Select a marker to inspect it; nearby events share a numbered marker with every
+event listed. Interval observations show both interval ends; scheduled and
+provider timestamps retain their precision. Older unclassified boundaries stay
+explicit. Typed evidence replaces matching fallback markers without duplicating
+resets. Plan-incompatible allowance events stay excluded.
+
+**When usage and allowance disagree** lists sustained divergence periods as compact
+rows ranked by their largest signed percentage-point gap. The gap accumulates from the cycle comparison
+anchor, not just within the listed period. **View on charts** focuses all views
+on that period. **Models & speeds** shows the recorded activity behind the period;
+it helps investigate a mismatch but cannot establish its cause. Failed lookups
+have a **Retry breakdown** action, and a failed update preserves and labels the
+previous successful result.
+
+The exact-window table names the measured span and explains each comparison.
+**Comparable** means measured and estimated values cover the same allowance cycle,
+not that the values agree. Missing or stale readings, reset or allowance changes,
+unavailable pricing, backwards readings and exhausted allowance each have a
+specific explanation. Unknown quality stays unknown. Differences are percentage
+points of allowance: falling from 60% to 50% remaining is 10 pp used.
 
 Trends compares the selected plan's compatible usage and quota history. Earlier
 history on another plan does not disable a usable current-plan fit, and it is

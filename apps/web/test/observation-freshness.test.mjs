@@ -50,6 +50,7 @@ test("quota cards preserve unknown percentages and label stale observations", as
     const value = descendants(card).find(child => child.className === "quota-tank-value");
     assert.equal(value.textContent, unknown ? "—" : `${remainingPercent}%`);
     assert.equal(descendants(card).some(child => child.textContent === "allowance.stale"), true);
-    assert.match(card.children.at(-1).textContent, /^allowance\.observation:/u);
+    assert.equal(descendants(card).some(child => /^allowance\.observation:/u.test(child.textContent)), false,
+      "observation time is disclosed once above the allowance section");
   }
 });
