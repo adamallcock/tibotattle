@@ -17,6 +17,11 @@ const git=(root,args)=>execFileSync('/usr/bin/git',['-c',`core.excludesFile=${jo
 function source(root,commit){if(git(root,['rev-parse','HEAD'])!==commit||git(root,['status','--porcelain','--untracked-files=all']))fail('SOURCE_CHANGED');}
 function object(value){return value&&typeof value==='object'&&!Array.isArray(value);}
 const rows=(value,key,limit)=>{const result=Array.isArray(value)?value:value?.[key];if(!Array.isArray(result)||result.length>limit)fail('OBSERVATION_INVALID');return result;};
+function databaseBindingId(binding,code){
+ const aliases=[binding.id,binding.database_id].filter(value=>value!==undefined);
+ if(!aliases.length||aliases.some(value=>!uuid(value))||new Set(aliases).size!==1)fail(code);
+ return aliases[0];
+}
 
 export function validateMaintenanceUploadActiveHealth(value,sourceCommit){
  if(!object(value)||Object.keys(value).sort().join()!=='capabilities,checks,collectionControls,contracts,deployment,enrollmentMode,mode,status'
@@ -157,7 +162,9 @@ export async function createMaintenanceCutoverProvider({plan,cutover,operationDi
  const version=async id=>{if(!uuid(id))fail('VERSION_INVALID');const v=await api(`${script}/versions/${id}`);if(v.id!==id||!Array.isArray(v.resources?.bindings))fail('VERSION_INVALID');return v;};
  const assertLedgerBinding=async()=>{
   const old=await version(plan.predecessor.versionId);if(maintenanceBindingDigest(old.resources.bindings)!==plan.predecessor.bindingDigest)fail('PREDECESSOR_CHANGED');
-  if(old.resources.bindings.filter(b=>b.type==='d1'&&b.name==='DELETION_LEDGER'&&(b.id??b.database_id)===c.deletionLedgerDatabaseId).length!==1)fail('LEDGER_SUBSTITUTED');
+  const oldDatabases=old.resources.bindings.filter(b=>b.type==='d1');
+  for(const binding of oldDatabases)databaseBindingId(binding,'LEDGER_SUBSTITUTED');
+  if(oldDatabases.filter(b=>b.name==='DELETION_LEDGER'&&databaseBindingId(b,'LEDGER_SUBSTITUTED')===c.deletionLedgerDatabaseId).length!==1)fail('LEDGER_SUBSTITUTED');
   for(const [id,name] of [[c.ingestionDatabaseId,c.ingestionDatabaseName],[c.analyticsDatabaseId,c.analyticsDatabaseName],[c.deletionLedgerDatabaseId,c.deletionLedgerDatabaseName]]){const info=await api(`${account}/d1/database/${id}`);if(info.uuid!==id||info.name!==name)fail('DATABASE_IDENTITY_CHANGED');}
  };
  const candidate=async(id,s,mode='disabled')=>{
@@ -167,7 +174,7 @@ export async function createMaintenanceCutoverProvider({plan,cutover,operationDi
   if(v.annotations?.['workers/tag']!==tag)fail('VERSION_CHANGED');
   const config=JSON.parse((await readMaintenanceFile(mode==='enabled'?s.publicConfigurationPath:s.configurationPath,256*1024)).toString());
   const expected=new Map(config.d1_databases.map(d=>[d.binding,d.database_id])),actual=bs.filter(b=>b.type==='d1');
-  if(actual.length!==3||actual.some(b=>expected.get(b.name)!==(b.id??b.database_id)))fail('DATABASE_BINDINGS_CHANGED');
+  if(actual.length!==3||actual.some(b=>expected.get(b.name)!==databaseBindingId(b,'DATABASE_BINDINGS_CHANGED')))fail('DATABASE_BINDINGS_CHANGED');
   const vars=bs.filter(b=>b.type==='plain_text');
   if(vars.length!==Object.keys(config.vars).length||vars.some(b=>config.vars[b.name]!==b.text))fail('CONFIG_BINDINGS_CHANGED');
   const secretNames=bs.filter(b=>['secret_text','secret_key'].includes(b.type)).map(b=>b.type+':'+b.name).sort();
