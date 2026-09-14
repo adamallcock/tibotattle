@@ -134,7 +134,10 @@ function refreshHarness({
     },
     setTimeout: (resolve) => resolve(),
     clearTimeout() {},
-    window: { setTimeout: (callback) => timers.push(callback) },
+    window: {
+      setTimeout: (callback) => timers.push(callback),
+      clearTimeout() {},
+    },
     showConnectionNotice: (notice) => notices.push(notice),
     refreshNeedsContinuation: () => false,
     scheduleReindexAutoContinuation: () => calls.push("continuation-check"),
@@ -142,7 +145,12 @@ function refreshHarness({
     describeFailure: async () => { calls.push("diagnostic"); return { text: "An update could not be started." }; },
     t: (key) => translate(key, {}, "en-US"),
   });
-  for (const name of ["localAnalysisLabel", "renderRefreshProgress", "updateLocalActionButtons"]) {
+  for (const name of [
+    "localAnalysisLabel",
+    "renderRefreshProgress",
+    "startRefreshProgressClock",
+    "updateLocalActionButtons",
+  ]) {
     runInContext(productionFunction(name), context);
   }
   runInContext(productionFunction("signalElectronRefreshLifecycle"), context);
@@ -183,6 +191,60 @@ test("refresh progress reserves distinct count and timer slots and clears them w
   assert.equal(button.getAttribute("title"), null);
   assert.equal(button.textContent, "Update local usage");
   assert.equal(harness.context.$("#cancel-refresh").hidden, true);
+});
+
+test("refresh elapsed clock follows wall-second boundaries independently of status polling", () => {
+  const harness = refreshHarness();
+  const button = harness.context.$("#refresh-button");
+  const scheduled = [];
+  const cancelled = [];
+  let nowMs = 0;
+  let nextTimer = 0;
+  const clock = harness.context.startRefreshProgressClock(button, "Analyzing files…", {
+    processed: 1,
+    selected: 100,
+    startedAtMs: 0,
+    now: () => nowMs,
+    schedule(callback, delayMs) {
+      const timer = ++nextTimer;
+      scheduled.push({ timer, callback, delayMs });
+      return timer;
+    },
+    cancel: (timer) => cancelled.push(timer),
+  });
+
+  assert.deepEqual(button.children.map((child) => child.textContent), [
+    "Analyzing files…", "1/100", "0:00",
+  ]);
+  assert.equal(scheduled[0].delayMs, 1_000);
+
+  // A companion poll at 750 ms may change the count, but it cannot advance or
+  // stall the elapsed clock; the timer still targets the one-second boundary.
+  nowMs = 750;
+  clock.update("Analyzing files…", { processed: 2, selected: 100 });
+  assert.equal(button.children[2].textContent, "0:00");
+  assert.equal(scheduled.length, 1);
+
+  nowMs = 1_000;
+  scheduled.shift().callback();
+  assert.equal(button.children[2].textContent, "0:01");
+  assert.equal(scheduled[0].delayMs, 1_000);
+
+  // If the renderer is busy, use real elapsed time and shorten the following
+  // delay so that callback latency is not accumulated into a repeating beat.
+  nowMs = 3_750;
+  scheduled.shift().callback();
+  assert.equal(button.children[2].textContent, "0:03");
+  assert.equal(scheduled[0].delayMs, 250);
+  nowMs = 4_000;
+  scheduled.shift().callback();
+  assert.equal(button.children[2].textContent, "0:04");
+
+  clock.reset("Continuing local analysis…");
+  assert.equal(button.children[2].textContent, "0:00");
+  assert.equal(cancelled.length, 1);
+  clock.stop();
+  assert.equal(cancelled.length, 2);
 });
 
 test("an active refresh keeps its progress affordance and cancellation action after a load lock is released", () => {

@@ -5764,7 +5764,7 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /renderDashboard\(data\)/u);
   assert.match(appSource, /refreshQuickResultStatus\(\{/u);
   assert.match(appSource, /refreshAccountingStatus\(\{ progress \}\)/u);
-  assert.match(appSource, /renderRefreshProgress\(button, phase, \{ processed, selected, elapsedSeconds \}\)/u);
+  assert.match(appSource, /refreshProgressClock\.update\(phase, \{ processed, selected \}\)/u);
   assert.match(appSource, /const accountingStatus = outcome === "running"/u);
   assert.match(appSource, /const collectorProgress = progress\?\.kind === undefined/u);
   assert.match(appSource, /if \(collectorProgress\s*&& progress\?\.phase === "quick_result"/u);

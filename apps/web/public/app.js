@@ -695,6 +695,79 @@ function renderRefreshProgress(button, phase, { processed = null, selected = nul
   button.replaceChildren(label, count, timer);
 }
 
+/**
+ * Keep the elapsed display on wall-clock second boundaries instead of tying it
+ * to the 750 ms companion-status poll. The self-correcting timeout deliberately
+ * recalculates its next boundary after every callback: a delayed renderer may
+ * skip a hidden second, but it does not accumulate drift or create a repeating
+ * fast-fast-fast-slow beat.
+ */
+function startRefreshProgressClock(button, phase, options = {}) {
+  let {
+    processed = null,
+    selected = null,
+    startedAtMs = Date.now(),
+    now = () => Date.now(),
+    schedule = (callback, delayMs) => window.setTimeout(callback, delayMs),
+    cancel = (timer) => window.clearTimeout(timer),
+  } = options;
+  let active = true;
+  let timer = null;
+  let currentPhase = phase;
+  let currentProcessed = processed;
+  let currentSelected = selected;
+
+  const elapsedMilliseconds = () => Math.max(0, now() - startedAtMs);
+  const paint = () => {
+    renderRefreshProgress(button, currentPhase, {
+      processed: currentProcessed,
+      selected: currentSelected,
+      elapsedSeconds: Math.floor(elapsedMilliseconds() / 1_000),
+    });
+  };
+  const scheduleNextBoundary = () => {
+    if (!active) return;
+    const remainder = elapsedMilliseconds() % 1_000;
+    const delayMs = remainder === 0 ? 1_000 : 1_000 - remainder;
+    timer = schedule(tick, Math.max(1, Math.ceil(delayMs)));
+  };
+  function tick() {
+    timer = null;
+    if (!active) return;
+    paint();
+    scheduleNextBoundary();
+  }
+
+  paint();
+  scheduleNextBoundary();
+  return Object.freeze({
+    update(nextPhase, { processed: nextProcessed = null, selected: nextSelected = null } = {}) {
+      if (!active) return;
+      currentPhase = nextPhase;
+      currentProcessed = nextProcessed;
+      currentSelected = nextSelected;
+      paint();
+    },
+    reset(nextPhase, { processed: nextProcessed = null, selected: nextSelected = null } = {}) {
+      if (!active) return;
+      if (timer !== null) cancel(timer);
+      timer = null;
+      startedAtMs = now();
+      currentPhase = nextPhase;
+      currentProcessed = nextProcessed;
+      currentSelected = nextSelected;
+      paint();
+      scheduleNextBoundary();
+    },
+    stop() {
+      if (!active) return;
+      active = false;
+      if (timer !== null) cancel(timer);
+      timer = null;
+    },
+  });
+}
+
 function updateLocalActionButtons() {
   const allowed = localAnalysisAllowed();
   const label = localAnalysisLabel();
@@ -11790,6 +11863,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   let refreshStartSignal = Promise.resolve(null);
   let lateRefreshLease = null;
   let refreshLifecycleFinished = false;
+  let refreshProgressClock = null;
   const handleLateRefreshLease = (lease) => {
     if (!Number.isSafeInteger(lease) || lease <= 0) return;
     if (!refreshLifecycleFinished) {
@@ -11823,7 +11897,9 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         { onLateValue: handleLateRefreshLease },
       );
     }
-    let activePassStartedMs = Date.now();
+    refreshProgressClock = startRefreshProgressClock(button, detailed
+      ? "Starting detailed accounting…"
+      : "Starting local analysis…");
     const pollingBudget = createRefreshPollingBudget();
     let consecutiveStatusFailures = 0;
     let outcome = "running";
@@ -11843,7 +11919,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         consecutiveStatusFailures = 0;
       } catch (error) {
         consecutiveStatusFailures += 1;
-        renderRefreshProgress(button, "Update running; reconnecting…");
+        refreshProgressClock.update("Update running; reconnecting…");
         if (consecutiveStatusFailures >= 8) throw error;
         continue;
       }
@@ -11873,10 +11949,6 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
           // deep accounting finishes, and no partial replacement is invented.
         }
       }
-      const elapsedSeconds = Math.max(
-        0,
-        Math.floor((Date.now() - activePassStartedMs) / 1_000),
-      );
       const accountingStatus = outcome === "running"
         ? refreshAccountingStatus({ progress })
         : null;
@@ -11904,7 +11976,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
           ? "Calculating usage and allowance…"
           : "Analyzing files…"
         : pollCount < 3 ? "Analyzing local evidence…" : "Analyzing…";
-      renderRefreshProgress(button, phase, { processed, selected, elapsedSeconds });
+      refreshProgressClock.update(phase, { processed, selected });
       if (refreshNeedsContinuation({
         outcome,
         errorCode: refresh.errorCode,
@@ -11919,9 +11991,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
             ? localClient.recalculateDetailedAccounting()
             : localClient.refresh());
           pollingBudget.noteContinuation();
-          activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
-          renderRefreshProgress(button, "Continuing local analysis…");
+          refreshProgressClock.reset("Continuing local analysis…");
         } catch (error) {
           // A 409 means a timed-out pass is still finishing its durable
           // checkpoint. Keep polling until it becomes resumable.
@@ -11936,7 +12007,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        renderRefreshProgress(button, "Finalizing bounded pause…");
+        refreshProgressClock.update("Finalizing bounded pause…");
         if (!timeoutSettlementNoted) {
           pollingBudget.noteSettling();
           timeoutSettlementNoted = true;
@@ -11946,6 +12017,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     cancelled = outcome === "cancelled";
     if (cancelled) {
+      refreshProgressClock.stop();
+      refreshProgressClock = null;
       renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
@@ -11957,6 +12030,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     if (outcome === "failed"
         && finalErrorCode === "refresh_resource_limited") {
+      refreshProgressClock.stop();
+      refreshProgressClock = null;
       renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
@@ -11967,6 +12042,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       return;
     }
     if (outcome === "degraded") {
+      refreshProgressClock.stop();
+      refreshProgressClock = null;
       renderRefreshProgress(button, t("refresh.degradedLoading"));
       await loadLocalDashboard();
       lastReindexProgressReceipt = historyProgressReceipt();
@@ -12016,6 +12093,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       throw failure;
     }
     archiveHistoryScanActive = false;
+    refreshProgressClock.stop();
+    refreshProgressClock = null;
     renderRefreshProgress(button, "Loading updated evidence…");
     await loadLocalDashboard();
     if (detailed) scheduleReindexAutoContinuation();
@@ -12067,6 +12146,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       showDemo: !dashboard
     });
   } finally {
+    refreshProgressClock?.stop();
     if (electronRefresh && refreshAccepted) {
       let lease = await refreshStartSignal;
       if (!Number.isSafeInteger(lease) || lease <= 0) lease = lateRefreshLease;
