@@ -40,6 +40,7 @@ function bindings(overrides: Partial<Env> = {}): Env {
     ENVELOPE_PRIVATE_JWK: "",
     ENVELOPE_PUBLIC_JWK: "",
     ENVIRONMENT: "synthetic-development",
+    PUBLIC_ANALYTICS_MODE: "enabled",
     ACCOUNT_SCOPED_INGEST_MODE: "disabled",
     QUARANTINE: runtime.QUARANTINE,
     PUBLIC_READ_RATE_LIMIT: runtime.PUBLIC_READ_RATE_LIMIT,

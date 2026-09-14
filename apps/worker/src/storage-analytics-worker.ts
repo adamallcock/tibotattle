@@ -1,9 +1,11 @@
 import { runStorageAnalyticsPass } from './storage-analytics-runtime';
+import { publicAnalyticsEnabled } from './public-analytics-gate';
 
 /** Separate scheduler entry point; it has no upload route or credential binding.
  * Resource binding/deployment belongs to the qualified Wrangler role plan. */
 export interface StorageAnalyticsWorkerEnv {
  STORAGE_ANALYTICS_MODE?:'disabled'|'enabled';
+ PUBLIC_ANALYTICS_MODE?:'disabled'|'enabled';
  STORAGE_SOURCE_ID?:string;
  TELEMETRY_STORAGE_NAMESPACE?:string;
  STORAGE_INGESTION_DB?:D1Database;
@@ -16,7 +18,8 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv)
   ||!env.DELETION_LEDGER||!env.STORAGE_SOURCE_ID||!env.TELEMETRY_STORAGE_NAMESPACE)throw new Error('STORAGE_ANALYTICS_CONFIGURATION_INVALID');
  try {
   const result=await runStorageAnalyticsPass({source:env.STORAGE_INGESTION_DB,target:env.STORAGE_ANALYTICS_DB,
-   sourceId:env.STORAGE_SOURCE_ID,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,ledger:env.DELETION_LEDGER,publishCommunity:true});
+   sourceId:env.STORAGE_SOURCE_ID,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,ledger:env.DELETION_LEDGER,
+   publishCommunity:publicAnalyticsEnabled(env)});
   console.log(JSON.stringify({event:'storage_analytics_schedule',...result}));
  }catch {
   // Do not expose account identifiers, SQL, credentials or a stored record in

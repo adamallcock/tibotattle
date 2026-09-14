@@ -1617,6 +1617,7 @@ export const REQUIRED_RATE_LIMITS = Object.freeze([
   Object.freeze({ name: "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", limit: 20 }),
 ]);
 export const REQUIRED_STAGING_VARIABLES = Object.freeze({
+  PUBLIC_ANALYTICS_MODE: "enabled",
   ENVIRONMENT: "staging",
   ENROLLMENT_MODE: "disabled",
   ACCOUNTLESS_ENROLLMENT_MODE: "disabled",

@@ -104,6 +104,10 @@ import {
   readCollectionControls,
 } from "./collection-controls";
 import {
+  assertPublicAnalyticsEnabled,
+  publicAnalyticsEnabled,
+} from "./public-analytics-gate";
+import {
   decryptSyntheticEnvelope,
   publicEnvelopeKey,
   randomSecret,
@@ -3491,6 +3495,7 @@ async function handleCommunityDaily(
   env: Env,
 ): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
+  assertPublicAnalyticsEnabled(env);
   await assertCollectionControl(env.USAGE_MONITOR_DB, "publication");
   await assertPublicAggregateReadAllowed(env.PUBLIC_READ_RATE_LIMIT, request, env);
   const parameters = new URL(request.url).searchParams;
@@ -3915,6 +3920,12 @@ export async function handleRequest(
       // branch, but no undocumented method can reach one of them.
       assertWorkerRouteMethod(request, route);
     }
+    if (route.id === "community_daily" && !publicAnalyticsEnabled(env)) {
+      return noStore(errorResponse(
+        new ApiError(503, "PUBLICATION_DISABLED"),
+        requestId,
+      ));
+    }
     if (route.id === "ready") {
       return noStore(await handleReady(request, env));
     }
@@ -3930,6 +3941,13 @@ export async function handleRequest(
       const collectionControls = await readCollectionControls(
         env.USAGE_MONITOR_DB,
       );
+      const publicAnalyticsConfigured = publicAnalyticsEnabled(env);
+      const publicAnalyticsAvailable = publicAnalyticsConfigured
+        && collectionControls.publication;
+      const publicCollectionState = !publicAnalyticsConfigured
+          && collectionControls.state === "operational"
+        ? "degraded"
+        : collectionControls.state;
       const retention = await env.USAGE_MONITOR_DB.prepare(
         `SELECT state, quarantine_retention_complete, restore_replay_complete
            FROM retention_state WHERE singleton = 1`,
@@ -3959,12 +3977,12 @@ export async function handleRequest(
           ? {}
           : { deployment: { sourceCommit: deploymentSourceCommit } }),
         collectionControls: {
-          state: collectionControls.state,
+          state: publicCollectionState,
           enrollment: collectionControls.enrollment
             && enrollmentMode !== "disabled",
           uploadRegistration: collectionControls.uploadRegistration,
           processing: collectionControls.processing,
-          publication: collectionControls.publication,
+          publication: publicAnalyticsAvailable,
         },
         checks: {
           database: "ok",
@@ -4004,7 +4022,7 @@ export async function handleRequest(
           encryptedUpload: collectionControls.processing,
           serverValidation: true,
           idempotentDeduplication: true,
-          communityDaily: collectionControls.publication,
+          communityDaily: publicAnalyticsAvailable,
           participantExport: true,
           participantDeletion: false,
           boundedQuarantineRetention: true,
@@ -4488,7 +4506,7 @@ export async function runScheduledMaintenance(
     preGraphPhase = "collection_controls";
     requiredPhaseStartedMs = Date.now();
     const controls = await readCollectionControls(env.USAGE_MONITOR_DB);
-    publicationEnabled = controls.publication;
+    publicationEnabled = controls.publication && publicAnalyticsEnabled(env);
     preGraphTiming.collectionControlsMs = Math.max(0, Date.now() - requiredPhaseStartedMs);
     // Community aggregates are computed from already-promoted telemetry rows.
     // Quarantine reconciliation (above) is orthogonal R2 orphan housekeeping and

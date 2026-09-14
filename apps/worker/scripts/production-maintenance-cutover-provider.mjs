@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { readFile, writeFile, mkdir, lstat, realpath, readdir, symlink, readlink } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
 import { parse } from 'jsonc-parser';
-import { createImmutableSourceSnapshot, dependencyTreeDigest, recheckProductionHealth, recheckProductionPublicSurface } from './production-deploy.mjs';
+import { createImmutableSourceSnapshot, dependencyTreeDigest, recheckProductionPublicSurface } from './production-deploy.mjs';
 import { stageProductionAssets } from './stage-production-assets.mjs';
 import { initializeMaintenanceAnalyticsRegistration, readMaintenanceAnalyticsRegistration, MAINTENANCE_ANALYTICS_REGISTRATION_SQL, MAINTENANCE_ANALYTICS_REGISTRATION_INSERT } from './production-maintenance-analytics-registration.mjs';
 import { parseMaintenanceTailCapture } from './production-maintenance-analytics-provider.mjs';
@@ -17,10 +17,28 @@ const git=(root,args)=>execFileSync('/usr/bin/git',['-c',`core.excludesFile=${jo
 function source(root,commit){if(git(root,['rev-parse','HEAD'])!==commit||git(root,['status','--porcelain','--untracked-files=all']))fail('SOURCE_CHANGED');}
 function object(value){return value&&typeof value==='object'&&!Array.isArray(value);}
 const rows=(value,key,limit)=>{const result=Array.isArray(value)?value:value?.[key];if(!Array.isArray(result)||result.length>limit)fail('OBSERVATION_INVALID');return result;};
+function databaseBindingId(binding,code){
+ const aliases=[binding.id,binding.database_id].filter(value=>value!==undefined);
+ if(!aliases.length||aliases.some(value=>!uuid(value))||new Set(aliases).size!==1)fail(code);
+ return aliases[0];
+}
+
+export function validateMaintenanceUploadActiveHealth(value,sourceCommit){
+ if(!object(value)||Object.keys(value).sort().join()!=='capabilities,checks,collectionControls,contracts,deployment,enrollmentMode,mode,status'
+  ||value.status!=='ok'||value.mode!=='synthetic-and-private-telemetry'||value.enrollmentMode!=='open'
+  ||!object(value.deployment)||Object.keys(value.deployment).join()!=='sourceCommit'||value.deployment.sourceCommit!==sourceCommit
+  ||!object(value.collectionControls)||Object.keys(value.collectionControls).sort().join()!=='enrollment,processing,publication,state,uploadRegistration'
+  ||value.collectionControls.state!=='degraded'||value.collectionControls.enrollment!==true
+  ||value.collectionControls.uploadRegistration!==true||value.collectionControls.processing!==true||value.collectionControls.publication!==false
+  ||!object(value.capabilities)||value.capabilities.encryptedUpload!==true
+  ||value.capabilities.ongoingDeviceUploadRegistration!==true||value.capabilities.communityDaily!==false)fail('HEALTH_UNVERIFIED');
+ return value;
+}
 
 /** The only configuration transform admitted at the typed boundary. Existing
  * production auth, R2, DO, rate limits and site settings remain source-owned. */
-export function renderMaintenanceCutoverConfig(config,plan,cutover){
+export function renderMaintenanceCutoverConfig(config,plan,cutover,publicAnalyticsMode='disabled'){
+ if(!['disabled','enabled'].includes(publicAnalyticsMode))fail('CONFIG_INVALID');
  if(!object(config)||!object(config.env?.production))fail('CONFIG_INVALID');
  const base={...config,...config.env.production};delete base.env;
  const c=cutover.candidate,host=new URL(plan.origin).hostname;
@@ -35,7 +53,8 @@ export function renderMaintenanceCutoverConfig(config,plan,cutover){
  base.account_id=plan.accountId;
  base.main='../../apps/worker/src/index.ts';
  base.d1_databases=[{binding:'USAGE_MONITOR_DB',database_id:c.ingestionDatabaseId,database_name:c.ingestionDatabaseName},{binding:'ANALYTICS_DB',database_id:c.analyticsDatabaseId,database_name:c.analyticsDatabaseName},{binding:'DELETION_LEDGER',database_id:c.deletionLedgerDatabaseId,database_name:c.deletionLedgerDatabaseName}];
- base.vars={...base.vars,TELEMETRY_STORAGE_MODE:'typed',TELEMETRY_STORAGE_NAMESPACE:c.sourceNamespace,DEPLOYMENT_SOURCE_COMMIT:c.sourceCommit};
+ base.vars={...base.vars,TELEMETRY_STORAGE_MODE:'typed',TELEMETRY_STORAGE_NAMESPACE:c.sourceNamespace,
+  PUBLIC_ANALYTICS_MODE:publicAnalyticsMode,DEPLOYMENT_SOURCE_COMMIT:c.sourceCommit};
  base.secrets={required:plan.predecessor.secretBindings.map(v=>v.slice(v.indexOf(':')+1))};delete base.keep_vars;
  // Cron stays paused until the independently qualified analytics/lifecycle lane
  // owns its explicit schedule; versions activation does not mutate triggers.
@@ -68,7 +87,8 @@ export async function createMaintenanceCutoverProvider({plan,cutover,operationDi
  snapshotFactory=createImmutableSourceSnapshot,dependencyDigest=dependencyTreeDigest,stageAssets=stageProductionAssets}){
  const transport=createMaintenanceTransport({plan,operationDirectory,cliPath,fetcher,spawn,environment});
  const maintenance=await createMaintenanceProvider({plan,packageDirectory:join(operationDirectory,'candidate'),operationDirectory,operationId:cutover.operationId,cliPath,fetcher,spawn,environment,cutoverInventory:{digest:cutover.inventoryDigest,analyticsWorker:cutover.analytics.workerName}});
- const {api,receipt}=transport,c=cutover.candidate,account=`/accounts/${plan.accountId}`,script=`${account}/workers/scripts/${plan.workerName}`,tag=`typed-cutover-${cutover.operationId}`;
+ const {api,receipt}=transport,c=cutover.candidate,account=`/accounts/${plan.accountId}`,script=`${account}/workers/scripts/${plan.workerName}`,
+  uploadTag=`typed-cutover-${cutover.operationId}-uploads`;
  const paths={qualificationRoot:resolve(qualificationRoot),restoreContractPath:resolve(restoreContractPath),ledgerSchemaPath:resolve(ledgerSchemaPath)};
  const readDatabase=async(id,sql,params=[])=>{
   if(![plan.databaseId,c.ingestionDatabaseId,c.analyticsDatabaseId,c.deletionLedgerDatabaseId].includes(id)||!MAINTENANCE_CUTOVER_PROOF_SQL.includes(sql)||!Array.isArray(params)||params.length>20)fail('QUERY_NOT_ADMITTED');
@@ -82,8 +102,8 @@ export async function createMaintenanceCutoverProvider({plan,cutover,operationDi
  };
  const privateJSON=async(path,value)=>{await writeFile(path,JSON.stringify(value)+'\n',{flag:'wx',mode:0o600});};
  const verifyFiles=async(s)=>{
-  if(!object(s)||Object.keys(s).sort().join()!=='admissionDigest,assetsDirectory,configurationPath,configurationSha256,cronConfigurationPath,cronConfigurationSha256,dependencyDigest,dependencyPath,repositoryRoot,sourceCommit,workerDirectory')fail('SNAPSHOT_INVALID');
-  if(s.sourceCommit!==c.sourceCommit||s.dependencyDigest!==c.dependencyDigest||s.workerDirectory!==join(s.repositoryRoot,'apps/worker')||s.dependencyPath!==join(s.workerDirectory,'node_modules')||s.assetsDirectory!==join(s.repositoryRoot,'.release-build/worker-assets')||s.configurationPath!==join(s.repositoryRoot,'.release-build/maintenance-cutover/wrangler.json')||s.cronConfigurationPath!==join(s.repositoryRoot,'.release-build/maintenance-cutover/lifecycle-cron.json'))fail('SNAPSHOT_INVALID');
+  if(!object(s)||Object.keys(s).sort().join()!=='admissionDigest,assetsDirectory,configurationPath,configurationSha256,cronConfigurationPath,cronConfigurationSha256,dependencyDigest,dependencyPath,publicConfigurationPath,publicConfigurationSha256,publicCronConfigurationPath,publicCronConfigurationSha256,repositoryRoot,sourceCommit,workerDirectory')fail('SNAPSHOT_INVALID');
+  if(s.sourceCommit!==c.sourceCommit||s.dependencyDigest!==c.dependencyDigest||s.workerDirectory!==join(s.repositoryRoot,'apps/worker')||s.dependencyPath!==join(s.workerDirectory,'node_modules')||s.assetsDirectory!==join(s.repositoryRoot,'.release-build/worker-assets')||s.configurationPath!==join(s.repositoryRoot,'.release-build/maintenance-cutover/wrangler.json')||s.cronConfigurationPath!==join(s.repositoryRoot,'.release-build/maintenance-cutover/lifecycle-cron.json')||s.publicConfigurationPath!==join(s.repositoryRoot,'.release-build/maintenance-cutover/public-wrangler.json')||s.publicCronConfigurationPath!==join(s.repositoryRoot,'.release-build/maintenance-cutover/public-lifecycle-cron.json'))fail('SNAPSHOT_INVALID');
   if(await realpath(s.repositoryRoot)!==s.repositoryRoot||!(await lstat(s.repositoryRoot)).isDirectory())fail('SNAPSHOT_INVALID');
   source(s.repositoryRoot,c.sourceCommit);
   const rootDependencies=join(s.repositoryRoot,'node_modules');
@@ -91,12 +111,18 @@ export async function createMaintenanceCutoverProvider({plan,cutover,operationDi
   if(await dependencyDigest(s.dependencyPath)!==s.dependencyDigest)fail('DEPENDENCIES_CHANGED');
   const originalErrors=[],original=parse(await readFile(join(s.workerDirectory,'wrangler.jsonc'),'utf8'),originalErrors);
   if(originalErrors.length)fail('CONFIG_INVALID');
-  const expected=JSON.stringify(renderMaintenanceCutoverConfig(original,plan,cutover))+'\n';
+  const expected=JSON.stringify(renderMaintenanceCutoverConfig(original,plan,cutover,'disabled'))+'\n';
   const bytes=await readMaintenanceFile(s.configurationPath,256*1024);
   if(bytes.toString()!==expected||maintenanceHash(bytes)!==s.configurationSha256)fail('CONFIG_CHANGED');
   const cron=JSON.parse(expected);cron.triggers={crons:[...plan.predecessor.cron]};
   const cronBytes=await readMaintenanceFile(s.cronConfigurationPath,256*1024);
   if(cronBytes.toString()!==JSON.stringify(cron)+'\n'||maintenanceHash(cronBytes)!==s.cronConfigurationSha256)fail('CONFIG_CHANGED');
+  const publicExpected=JSON.stringify(renderMaintenanceCutoverConfig(original,plan,cutover,'enabled'))+'\n';
+  const publicBytes=await readMaintenanceFile(s.publicConfigurationPath,256*1024);
+  if(publicBytes.toString()!==publicExpected||maintenanceHash(publicBytes)!==s.publicConfigurationSha256)fail('CONFIG_CHANGED');
+  const publicCron=JSON.parse(publicExpected);publicCron.triggers={crons:[...plan.predecessor.cron]};
+  const publicCronBytes=await readMaintenanceFile(s.publicCronConfigurationPath,256*1024);
+  if(publicCronBytes.toString()!==JSON.stringify(publicCron)+'\n'||maintenanceHash(publicCronBytes)!==s.publicCronConfigurationSha256)fail('CONFIG_CHANGED');
   const names=(await readdir(s.assetsDirectory)).sort();if(JSON.stringify(names)!==JSON.stringify(plan.assets.map(a=>a.path).sort()))fail('ASSETS_CHANGED');
   for(const a of plan.assets){const path=join(s.assetsDirectory,a.path),st=await lstat(path);if(!st.isFile()||st.nlink!==1||await realpath(path)!==path)fail('ASSETS_CHANGED');const b=await readFile(path);if(b.length!==a.bytes||maintenanceHash(b)!==a.sha256)fail('ASSETS_CHANGED');}
  };
@@ -123,9 +149,11 @@ export async function createMaintenanceCutoverProvider({plan,cutover,operationDi
   await stageAssets({repositoryRoot:snapshot.repositoryRoot,sourceDirectory:join(snapshot.repositoryRoot,'.release-build/public-release-site'),destinationDirectory:join(snapshot.repositoryRoot,'.release-build/worker-assets'),expectedSourceCommit:c.sourceCommit,git:snapshot.git});
   const directory=join(snapshot.repositoryRoot,'.release-build/maintenance-cutover');await mkdir(directory,{mode:0o700});
   const errors=[],config=parse(await readFile(join(snapshot.workerDirectory,'wrangler.jsonc'),'utf8'),errors);if(errors.length)fail('CONFIG_INVALID');
-  const configurationPath=join(directory,'wrangler.json'),configuration=renderMaintenanceCutoverConfig(config,plan,cutover);await privateJSON(configurationPath,configuration);
+  const configurationPath=join(directory,'wrangler.json'),configuration=renderMaintenanceCutoverConfig(config,plan,cutover,'disabled');await privateJSON(configurationPath,configuration);
   const cronConfigurationPath=join(directory,'lifecycle-cron.json');await privateJSON(cronConfigurationPath,{...configuration,triggers:{crons:[...plan.predecessor.cron]}});
-  const s={repositoryRoot:snapshot.repositoryRoot,workerDirectory:snapshot.workerDirectory,dependencyPath:snapshot.dependencyPath,dependencyDigest:snapshot.dependencyDigest,configurationPath,configurationSha256:maintenanceHash(await readFile(configurationPath)),cronConfigurationPath,cronConfigurationSha256:maintenanceHash(await readFile(cronConfigurationPath)),assetsDirectory:join(snapshot.repositoryRoot,'.release-build/worker-assets'),sourceCommit:c.sourceCommit,admissionDigest:null};
+  const publicConfigurationPath=join(directory,'public-wrangler.json'),publicConfiguration=renderMaintenanceCutoverConfig(config,plan,cutover,'enabled');await privateJSON(publicConfigurationPath,publicConfiguration);
+  const publicCronConfigurationPath=join(directory,'public-lifecycle-cron.json');await privateJSON(publicCronConfigurationPath,{...publicConfiguration,triggers:{crons:[...plan.predecessor.cron]}});
+  const s={repositoryRoot:snapshot.repositoryRoot,workerDirectory:snapshot.workerDirectory,dependencyPath:snapshot.dependencyPath,dependencyDigest:snapshot.dependencyDigest,configurationPath,configurationSha256:maintenanceHash(await readFile(configurationPath)),cronConfigurationPath,cronConfigurationSha256:maintenanceHash(await readFile(cronConfigurationPath)),publicConfigurationPath,publicConfigurationSha256:maintenanceHash(await readFile(publicConfigurationPath)),publicCronConfigurationPath,publicCronConfigurationSha256:maintenanceHash(await readFile(publicCronConfigurationPath)),assetsDirectory:join(snapshot.repositoryRoot,'.release-build/worker-assets'),sourceCommit:c.sourceCommit,admissionDigest:null};
   await verifyFiles(s);
   for(const name of ['check-local-workspace-packages.mjs','check-deployment-endpoints.mjs','release-preflight.mjs'])await localCheck(s,name);
   await receipt({kind:'cutover-prepared',sourceCommit:c.sourceCommit,configurationSha256:s.configurationSha256,dependencyDigest:s.dependencyDigest,remoteWrites:false});return s;
@@ -134,16 +162,19 @@ export async function createMaintenanceCutoverProvider({plan,cutover,operationDi
  const version=async id=>{if(!uuid(id))fail('VERSION_INVALID');const v=await api(`${script}/versions/${id}`);if(v.id!==id||!Array.isArray(v.resources?.bindings))fail('VERSION_INVALID');return v;};
  const assertLedgerBinding=async()=>{
   const old=await version(plan.predecessor.versionId);if(maintenanceBindingDigest(old.resources.bindings)!==plan.predecessor.bindingDigest)fail('PREDECESSOR_CHANGED');
-  if(old.resources.bindings.filter(b=>b.type==='d1'&&b.name==='DELETION_LEDGER'&&(b.id??b.database_id)===c.deletionLedgerDatabaseId).length!==1)fail('LEDGER_SUBSTITUTED');
+  const oldDatabases=old.resources.bindings.filter(b=>b.type==='d1');
+  for(const binding of oldDatabases)databaseBindingId(binding,'LEDGER_SUBSTITUTED');
+  if(oldDatabases.filter(b=>b.name==='DELETION_LEDGER'&&databaseBindingId(b,'LEDGER_SUBSTITUTED')===c.deletionLedgerDatabaseId).length!==1)fail('LEDGER_SUBSTITUTED');
   for(const [id,name] of [[c.ingestionDatabaseId,c.ingestionDatabaseName],[c.analyticsDatabaseId,c.analyticsDatabaseName],[c.deletionLedgerDatabaseId,c.deletionLedgerDatabaseName]]){const info=await api(`${account}/d1/database/${id}`);if(info.uuid!==id||info.name!==name)fail('DATABASE_IDENTITY_CHANGED');}
  };
- const candidate=async(id,s)=>{
+ const candidate=async(id,s,mode='disabled')=>{
   const v=await version(id),bs=v.resources.bindings;
   if(bs.some(b=>typeof b.name!=='string'||!b.name)||new Set(bs.map(b=>b.name)).size!==bs.length)fail('CONFIG_BINDINGS_CHANGED');
+  const tag=uploadTag;
   if(v.annotations?.['workers/tag']!==tag)fail('VERSION_CHANGED');
-  const config=JSON.parse((await readMaintenanceFile(s.configurationPath,256*1024)).toString());
+  const config=JSON.parse((await readMaintenanceFile(mode==='enabled'?s.publicConfigurationPath:s.configurationPath,256*1024)).toString());
   const expected=new Map(config.d1_databases.map(d=>[d.binding,d.database_id])),actual=bs.filter(b=>b.type==='d1');
-  if(actual.length!==3||actual.some(b=>expected.get(b.name)!==(b.id??b.database_id)))fail('DATABASE_BINDINGS_CHANGED');
+  if(actual.length!==3||actual.some(b=>expected.get(b.name)!==databaseBindingId(b,'DATABASE_BINDINGS_CHANGED')))fail('DATABASE_BINDINGS_CHANGED');
   const vars=bs.filter(b=>b.type==='plain_text');
   if(vars.length!==Object.keys(config.vars).length||vars.some(b=>config.vars[b.name]!==b.text))fail('CONFIG_BINDINGS_CHANGED');
   const secretNames=bs.filter(b=>['secret_text','secret_key'].includes(b.type)).map(b=>b.type+':'+b.name).sort();
@@ -156,30 +187,36 @@ export async function createMaintenanceCutoverProvider({plan,cutover,operationDi
   if(maintenanceBindingDigest(bs.filter(ordinary))!==maintenanceBindingDigest(old.resources.bindings.filter(ordinary)))fail('RESOURCE_BINDINGS_CHANGED');
   return v;
  };
- const command=async(s,step,args,dry=false)=>{await verifyFiles(s);await transport.run({step,args,config:s.configurationPath,directory:s.workerDirectory,dry});await verifyFiles(s);};
+ const command=async(s,step,args,{dry=false,mode='disabled',cron=false}={})=>{await verifyFiles(s);const config=mode==='enabled'?(cron?s.publicCronConfigurationPath:s.publicConfigurationPath):(cron?s.cronConfigurationPath:s.configurationPath);await transport.run({step,args,config,directory:s.workerDirectory,dry});await verifyFiles(s);};
  const verifyContained=()=>maintenance.verifyContained(cutover.maintenanceVersionId);
  const admit=async(s,stage='full')=>{await verifyFiles(s);await assertLedgerBinding();const proof=await verifyMaintenanceCutoverProof({plan,cutover,...paths,readDatabase,stage});await receipt({kind:'cutover-admission',planDigest:identityDigest(cutover),proof});return proof;};
- const reconcileUpload=async(id,s)=>{await verifyFiles(s);if(!id){const list=rows(await api(`${script}/versions?deployable=true`),'items',100).filter(v=>v.annotations?.['workers/tag']===tag);if(list.length!==1)fail('UPLOAD_UNCERTAIN');id=list[0].id;}await candidate(id,s);if(await active()!==cutover.maintenanceVersionId)fail('PREDECESSOR_CHANGED');return id;};
- const verifyActivated=async(id,s,{scheduled=false}={})=>{
+ const reconcileUpload=async(id,s)=>{await verifyFiles(s);if(!id){const list=rows(await api(`${script}/versions?deployable=true`),'items',100).filter(v=>v.annotations?.['workers/tag']===uploadTag);if(list.length!==1)fail('UPLOAD_UNCERTAIN');id=list[0].id;}await candidate(id,s,'disabled');if(await active()!==cutover.maintenanceVersionId)fail('PREDECESSOR_CHANGED');return id;};
+ const verifyCandidateActivated=async(id,s,mode,{scheduled=false}={})=>{
   // Pristine copy counts are not replayed after new-target writes may begin.
   // The fsynced admission + latch precede activation; immutable code/bindings
   // and the actual healthy new source are the forward reconciliation boundary.
-  if(!/^[a-f0-9]{64}$/.test(s.admissionDigest??''))fail('ADMISSION_MISSING');await verifyFiles(s);await candidate(id,s);if(await active()!==id)fail('DEPLOYMENT_CHANGED');
-  const health=await recheckProductionHealth({fetchImpl:fetcher});if(!health.ok||health.sourceCommit!==c.sourceCommit)fail('HEALTH_UNVERIFIED');
+  if(!/^[a-f0-9]{64}$/.test(s.admissionDigest??''))fail('ADMISSION_MISSING');await verifyFiles(s);await candidate(id,s,mode);if(await active()!==id)fail('DEPLOYMENT_CHANGED');
+  const healthUrl=new URL('/api/health',plan.origin);healthUrl.searchParams.set('cutover-proof',identityDigest(cutover));
+  const {response:healthResponse,bytes:healthBytes}=await transport.publicRead(healthUrl.href);
+  if(healthResponse.status!==200||healthResponse.headers.get('content-type')?.split(';',1)[0]!=='application/json'
+   ||healthResponse.headers.get('cache-control')!=='no-store'||healthResponse.headers.get('referrer-policy')!=='no-referrer'
+   ||healthResponse.headers.get('x-content-type-options')!=='nosniff'||healthBytes.length>65536)fail('HEALTH_UNVERIFIED');
+  let health;try{health=JSON.parse(healthBytes);}catch{fail('HEALTH_UNVERIFIED');}validateMaintenanceUploadActiveHealth(health,c.sourceCommit);
   if(!(await recheckProductionPublicSurface({fetchImpl:fetcher})).ok)fail('SURFACE_UNVERIFIED');
   for(const a of plan.assets){const path=a.path==='index.html'?'/':a.path.endsWith('.html')?'/'+a.path.slice(0,-5):'/'+a.path;const {response,bytes}=await transport.publicRead(plan.origin+path+'?cutover-proof='+identityDigest(cutover));if(response.status!==200||bytes.length!==a.bytes||maintenanceHash(bytes)!==a.sha256)fail('ASSETS_CHANGED');}
   const schedules=rows(await api(`${script}/schedules`),'schedules',16);if(JSON.stringify(schedules.map(x=>x.cron).sort())!==JSON.stringify(scheduled?[...plan.predecessor.cron].sort():[]))fail('SCHEDULE_CHANGED');
-  await receipt({kind:'typed-cutover-verified',sourceCommit:c.sourceCommit,versionId:id,planDigest:identityDigest(cutover),admissionDigest:s.admissionDigest});
+  await receipt({kind:'typed-cutover-verified',sourceCommit:c.sourceCommit,versionId:id,publicAnalyticsMode:mode,planDigest:identityDigest(cutover),admissionDigest:s.admissionDigest});
  };
+ const verifyActivated=(id,s,options)=>verifyCandidateActivated(id,s,'disabled',options);
  return {prepare,
   async initializeAnalytics(s){await verifyFiles(s);return initializeMaintenanceAnalyticsRegistration({cutover,sourceDirectory:s.workerDirectory,queryDatabase:registrationQuery});},
   async readAnalyticsRegistration(s){await verifyFiles(s);return readMaintenanceAnalyticsRegistration({cutover,sourceDirectory:s.workerDirectory,queryDatabase:registrationQuery});},
   verifySnapshot:verifyFiles,verifyContained,admit,reconcileUpload,verifyActivated,
-  async verifyUploadAbsent(s){await verifyFiles(s);const list=rows(await api(`${script}/versions?deployable=true`),'items',100).filter(v=>v.annotations?.['workers/tag']===tag);if(list.length)fail('UPLOAD_UNCERTAIN');await verifyContained();},
-  async verifyActivationPending(id,s){await verifyFiles(s);await candidate(id,s);await verifyContained();},
-  async enableMainCron(id,s){await verifyActivated(id,s);await transport.run({step:'cutover-main-cron',args:['triggers','deploy'],config:s.cronConfigurationPath,directory:s.workerDirectory});await verifyFiles(s);},
+  async verifyUploadAbsent(s){await verifyFiles(s);const list=rows(await api(`${script}/versions?deployable=true`),'items',100).filter(v=>v.annotations?.['workers/tag']===uploadTag);if(list.length)fail('UPLOAD_UNCERTAIN');await verifyContained();},
+  async verifyActivationPending(id,s){await verifyFiles(s);await candidate(id,s,'disabled');await verifyContained();},
+  async enableMainCron(id,s){await verifyActivated(id,s);await command(s,'cutover-main-cron',['triggers','deploy'],{cron:true});},
   async verifyMainNaturalInvocation(id,s,capturePath,notBeforeMs){await verifyActivated(id,s,{scheduled:true});const proof=proveMaintenanceLifecycleInvocation(await readMaintenanceFile(capturePath,2_000_000),{workerName:plan.workerName,versionId:id,notBeforeMs});await receipt({kind:'main-lifecycle-natural-invocation',sourceCommit:c.sourceCommit,versionId:id,...proof});return proof;},
-  dryRun:s=>command(s,'cutover-dry-run',['versions','upload','--dry-run','--outdir',join(operationDirectory,'cutover-dry-build')],true),
-  upload:s=>command(s,'cutover-upload',['versions','upload','--tag',tag,'--message',tag]),
-  async activate(id,s){await candidate(id,s);return command(s,'cutover-activate',['versions','deploy',`${id}@100%`,'--yes']);}};
+  async dryRun(s){await command(s,'cutover-dry-run',['versions','upload','--dry-run','--outdir',join(operationDirectory,'cutover-dry-build')],{dry:true});await command(s,'cutover-public-dry-run',['versions','upload','--dry-run','--outdir',join(operationDirectory,'cutover-public-dry-build')],{dry:true,mode:'enabled'});},
+  upload:s=>command(s,'cutover-upload',['versions','upload','--tag',uploadTag,'--message',uploadTag]),
+  async activate(id,s){await candidate(id,s,'disabled');return command(s,'cutover-activate',['versions','deploy',`${id}@100%`,'--yes']);}};
 }

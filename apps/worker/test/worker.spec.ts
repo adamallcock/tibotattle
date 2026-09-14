@@ -78,6 +78,7 @@ function testBindings(
 ): Env {
   const bindings = env as TestBindings;
   return {
+    PUBLIC_ANALYTICS_MODE: "enabled",
     ASSETS: bindings.ASSETS,
     DELETION_LEDGER: bindings.DELETION_LEDGER,
     ENROLLMENT_MODE: bindings.ENROLLMENT_MODE,
@@ -2084,6 +2085,29 @@ describe("synthetic usage monitor service", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       deployment: { sourceCommit: "c26823c" },
+    });
+  });
+
+  it("reports uploads open and public analytics paused when the deployment gate is disabled", async () => {
+    const response = await api("/api/health", {}, testBindings({
+      PUBLIC_ANALYTICS_MODE:
+        "disabled" as unknown as Env["PUBLIC_ANALYTICS_MODE"],
+    }));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      status: "ok",
+      collectionControls: {
+        state: "degraded",
+        enrollment: true,
+        uploadRegistration: true,
+        processing: true,
+        publication: false,
+      },
+      capabilities: {
+        encryptedUpload: true,
+        communityDaily: false,
+        ongoingDeviceUploadRegistration: true,
+      },
     });
   });
 
