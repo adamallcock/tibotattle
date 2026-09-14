@@ -38,6 +38,8 @@ remains accountable for release wording, validation, signing, and publication.
 These changes are in the next-release source candidate; 0.1.22 remains the
 published release.
 
+**Draft candidate notes:** [0.1.23](./release-notes/0.1.23.md)
+
 - Redesign remaining allowances as animated fuel tanks with one shared pace
   forecast, explicit waiting states, reset countdowns and run-out timing.
 - Add the interactive Trends horizon with linked allowance, spending, quota

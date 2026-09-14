@@ -38,6 +38,39 @@ async function withSyntheticRoot(run) {
   }
 }
 
+async function writeSyntheticOwnedSource(path, contents) {
+  await writeFile(path, contents, { flag: "wx" });
+  // An elevated Windows token can default new files to a group owner. Give
+  // only this disposable fixture the current user's owner SID; preserve its
+  // ordinary source DACL instead of turning it into protected derived state.
+  const result = spawnSync("powershell.exe", [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `
+      $ErrorActionPreference = 'Stop'
+      try {
+        $path = $env:TIBOTATTLE_SYNTHETIC_SOURCE_FILE
+        $owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl = Get-Acl -LiteralPath $path
+        $access = [System.Security.AccessControl.AccessControlSections]::Access
+        $before = $acl.GetSecurityDescriptorSddlForm($access)
+        $acl.SetOwner($owner)
+        Set-Acl -LiteralPath $path -AclObject $acl
+        $after = Get-Acl -LiteralPath $path
+        if ($after.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $owner.Value) { exit 1 }
+        if ($after.GetSecurityDescriptorSddlForm($access) -cne $before) { exit 1 }
+      } catch { exit 1 }
+    `,
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, TIBOTATTLE_SYNTHETIC_SOURCE_FILE: path },
+    windowsHide: true,
+    timeout: 10_000,
+    maxBuffer: 4_096,
+  });
+  assert.equal(result.status, 0, "synthetic source owner is current user and DACL is unchanged");
+  assert.equal(result.stdout?.length, 0, "fixture setup emits no ACL or owner details");
+  assert.equal(result.stderr?.length, 0, "fixture setup emits no error details");
+}
+
 function fixedNativeError(code) {
   return (error) => {
     assert.equal(error?.code, code);
@@ -325,10 +358,13 @@ test("native source handle holds its name, bounds reads and rejects links and fo
   adapter.ensureDirectory(root);
   const native = loadWindowsFilesystemBinding();
   const source = join(root, "source Ω.jsonl");
-  // Codex's normal inherited ACL is accepted; derived state still requires
+  // Codex's ordinary source ACL is accepted; derived state still requires
   // the stricter owner-only protected DACL.
-  await writeFile(source, "synthetic\n");
-  const protectedFile = join(root, "protected.sqlite");
+  await writeSyntheticOwnedSource(source, "synthetic\n");
+  // Audit guards authenticate the file and its two nearest parent directories.
+  const privateRoot = join(root, "private");
+  adapter.ensureDirectory(privateRoot);
+  const protectedFile = join(privateRoot, "protected.sqlite");
   adapter.createFile(protectedFile, Buffer.alloc(0));
   const protectedLease = native.acquireCredentialAuditFileGuard(protectedFile);
   try {
@@ -373,7 +409,7 @@ test("native timing SQLite retains guarded journal, reconstructs TTFT and reopen
     { type: "turn_context", payload: { turn_id: "synthetic-turn", model: "gpt-5.6-sol" } },
     { type: "event_msg", payload: { type: "task_complete", turn_id: "synthetic-turn", time_to_first_token_ms: 200 } },
   ];
-  await writeFile(source, records.map((r, i) => JSON.stringify({ ...r, timestamp: new Date(at + i * 1000).toISOString() })).join("\n") + "\n");
+  await writeSyntheticOwnedSource(source, records.map((r, i) => JSON.stringify({ ...r, timestamp: new Date(at + i * 1000).toISOString() })).join("\n") + "\n");
   let store = await openTimingStore(dir, options);
   try {
     await ingestTimingFile(store, source);
