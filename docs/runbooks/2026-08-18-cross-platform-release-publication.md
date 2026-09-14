@@ -810,9 +810,29 @@ The lock coordinates participating writers; it does not supply conditional R2
 creation or fence legacy and external writers. Merely holding it does not prove
 immutable path admission or authorize publication.
 
-Stable discovery feeds, GitHub release publication, Homebrew, website deployment,
+A separately reviewed GitHub-only release operation may use the same artifact
+coordination factory for an exact new-version draft, its complete allowlisted
+asset set, and finalization as an immutable release. Its closed plan must also
+explicitly name promotion to GitHub's `latest` release: that is a mutable
+discovery change, not an immutable object upload. Bind the source/tag, notes,
+canonical manifest/checksums and completed release-admission receipt before
+draft creation, then verify every downloaded draft and published asset. Require
+immutable finalization and fresh `latest` identity readback before releasing the
+artifact owner. Pending qualification or owner acceptance still blocks this
+operation; accepted limits must remain explicit in the manifest and review.
+
+This GitHub-only scope does not call the full publication reconciler or require
+a fabricated website receipt. It must retain a separate exact journal, refuse
+conflicting or extra assets, and never overwrite/delete assets or blindly repeat
+an uncertain mutation. An existing Homebrew workflow that polls GitHub `latest`
+may update its cask after this promotion, even without a manual tap dispatch.
+
+Native and Electron stable feeds, direct Homebrew mutation, website deployment,
 Worker changes and migrations retain their existing coordination contracts.
-This helper neither changes those entrypoints nor qualifies an installed app.
+In particular, native stable appcast replacement still requires the canonical
+Worker-hosted atomic guard; maintenance responses cannot be bypassed with an
+ordinary R2 write. This helper does not qualify an installed app or imply that
+stable updater discovery, hosted APIs or the public website have been updated.
 
 ### Explicit stable writes and rollback
 
