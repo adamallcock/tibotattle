@@ -5,7 +5,7 @@ import {admitMigrationContinuation,verifyMigrationHandoffEvidence,MIGRATION_CONT
 import {MIGRATION_JOURNAL_DDL,createStorageMigrationWorker} from './d1-storage-migration-worker.mjs';
 import {createStorageMigrationBackend,createStorageMigrationFront} from './d1-storage-migration-placed.mjs';
 import {SYNTHETIC_D1_WORKER,syntheticD1Binding,closeSyntheticD1Bindings} from './d1-storage-local-d1.mjs';
-const now=Date.parse('2026-09-12T15:00:00.000Z'),iso=ms=>new Date(ms).toISOString(),hash='a'.repeat(64),version='11111111-1111-4111-8111-111111111111';
+const now=Date.now(),iso=ms=>new Date(ms).toISOString(),hash='a'.repeat(64),version='11111111-1111-4111-8111-111111111111';
 function fixture(){
  const topology={schema:'d1-storage-placed-topology-v1',frontName:'synthetic-front',backendName:'synthetic-backend',queueName:'synthetic-queue',queueId:'a'.repeat(32),source:{name:'synthetic-source',id:version},target:{name:'synthetic-target',id:'22222222-2222-4222-8222-222222222222'},region:'gcp:us-east4'};
  const contract={version:'authority-restore-v1',runId:'synthetic',sourceId:'synthetic',sourceNamespace:'synthetic',sourceSnapshotDigest:'b'.repeat(64),sourceSchema:[],sourceSchemaDigest:identityDigest([]),targetBaseSchemaDigest:'synthetic-base',tables:[],authoritySequences:[]};
