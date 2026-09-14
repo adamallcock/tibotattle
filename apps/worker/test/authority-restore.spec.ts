@@ -149,6 +149,11 @@ describe('isolated authority restore protocol',()=>{
   await target().prepare('DELETE FROM storage_write_capacity_sample_clock').run();
   await expect(beginAuthorityRestore(source(),target(),f.contract,f.pin)).rejects.toThrow('AUTHORITY_RESTORE_TARGET_NOT_EMPTY');
  });
+ it('requires the exact owner-move cursor schema seed instead of accepting a partially migrated target',async()=>{
+  const f=await rawFixture();await freezeAuthorityRestoreSource(source(),f.contract,f.pin);
+  await target().prepare('DELETE FROM storage_owner_move_cursor_contract').run();
+  await expect(beginAuthorityRestore(source(),target(),f.contract,f.pin)).rejects.toThrow('AUTHORITY_RESTORE_TARGET_NOT_EMPTY');
+ });
  it('refuses a nonempty typed target even when its schema matches',async()=>{
   const f=await rawFixture();await freezeAuthorityRestoreSource(source(),f.contract,f.pin);
   await target().prepare("INSERT INTO typed_telemetry_dictionary(value) VALUES('foreign')").run();
