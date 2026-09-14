@@ -155,8 +155,9 @@ Architecture, both generated localization mirrors, and preflight checks passed.
 
 Source integration is committed at `ca58e3f47b688110be9fe7f5b89b3a73bf7a24c9`
 on `codex/release-0.1.23-integration`. It includes hosted source
-`a18fb6d75d80739077079c0a4cd34883011e9889`. All nine PRs remain open; no
-remote merge, closure, push or publication was performed by this task.
+`a18fb6d75d80739077079c0a4cd34883011e9889`. At the initial source handoff, all nine inventoried PRs remained open and
+no remote merge, closure, push or publication had been performed. The owner
+subsequently authorized pushing this candidate and opening a consolidation PR.
 
 Final combined-source checks:
 
@@ -189,3 +190,21 @@ waiting forecast is expected until it holds enough fresh, scoped observations;
 copied production history is not relabelled to manufacture that evidence.
 The public version remains 0.1.22. These source and development checks do not
 close the release gates listed above.
+
+## Submission scope follow-up
+
+The owner requested cancellation of the superseded inference-timing PR.
+GitHub lookup by the exact `codex/local-inference-timing` branch, PR title and
+PR body found no such PR, open or closed. The superseded work is a local
+prototype; it stays excluded and its dirty worktree remains preserved. The
+related model-performance PRs #121 and #131 are already merged. No unrelated
+PR is closed to stand in for the missing one.
+
+PR #138 appeared after the initial inventory. It targets the held typed-D1
+branch and changes the production contribution canary to the released 0.1.22
+artifact. It remains outside this candidate alongside that separate operational
+work; opening this consolidation PR does not authorize a production canary.
+
+The consolidation is submitted as a draft with the recorded R7 and release
+qualification gates still open. Pushing the source does not authorize merging
+or publishing the next application release.
