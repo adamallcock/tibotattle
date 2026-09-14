@@ -19,13 +19,13 @@ CREATE TABLE storage_route_write_checks (
 ) STRICT;
 
 CREATE TRIGGER storage_route_write_guard BEFORE INSERT ON storage_route_write_checks BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM storage_owner_fences
     WHERE owner_id = NEW.owner_id
       AND shard_id = NEW.shard_id
       AND route_generation = NEW.route_generation
       AND state = 'active'
-  ) THEN RAISE(ABORT, 'STORAGE_ROUTE_STALE') END;
+  ) THEN RAISE(ABORT, 'STORAGE_ROUTE_STALE') END);
 END;
 
 CREATE TRIGGER storage_route_write_check_cleanup AFTER INSERT ON storage_route_write_checks BEGIN
@@ -36,7 +36,7 @@ CREATE TRIGGER storage_route_write_check_cleanup AFTER INSERT ON storage_route_w
 END;
 
 CREATE TRIGGER storage_owner_fence_transition BEFORE UPDATE ON storage_owner_fences BEGIN
-  SELECT CASE WHEN NEW.owner_id <> OLD.owner_id
+  SELECT (CASE WHEN NEW.owner_id <> OLD.owner_id
     OR NEW.shard_id <> OLD.shard_id
     OR NEW.route_generation <> OLD.route_generation
     OR NOT (
@@ -45,5 +45,5 @@ CREATE TRIGGER storage_owner_fence_transition BEFORE UPDATE ON storage_owner_fen
       OR (OLD.state = 'prepared' AND NEW.state = 'active'
         AND NEW.move_id = OLD.move_id AND NEW.copy_digest = OLD.copy_digest)
     )
-  THEN RAISE(ABORT, 'STORAGE_FENCE_TRANSITION_INVALID') END;
+  THEN RAISE(ABORT, 'STORAGE_FENCE_TRANSITION_INVALID') END);
 END;

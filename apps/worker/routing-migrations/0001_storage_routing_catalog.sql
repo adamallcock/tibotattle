@@ -38,21 +38,21 @@ CREATE TABLE storage_owner_moves (
 ) STRICT;
 CREATE UNIQUE INDEX storage_owner_move_inflight ON storage_owner_moves(owner_id) WHERE state <> 'committed';
 CREATE TRIGGER storage_owner_reserve BEFORE INSERT ON storage_owner_routes BEGIN
-  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM storage_shards WHERE shard_id = NEW.shard_id
+  SELECT (CASE WHEN NOT EXISTS (SELECT 1 FROM storage_shards WHERE shard_id = NEW.shard_id
     AND state = 'active' AND observed_bytes + reserved_bytes + NEW.reservation_bytes <= capacity_bytes)
-    THEN RAISE(ABORT, 'STORAGE_CAPACITY_UNAVAILABLE') END;
+    THEN RAISE(ABORT, 'STORAGE_CAPACITY_UNAVAILABLE') END);
 END;
 CREATE TRIGGER storage_owner_reserved AFTER INSERT ON storage_owner_routes BEGIN
   UPDATE storage_shards SET reserved_bytes = reserved_bytes + NEW.reservation_bytes WHERE shard_id = NEW.shard_id;
 END;
 CREATE TRIGGER storage_move_reserve BEFORE INSERT ON storage_owner_moves BEGIN
-  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM storage_owner_routes WHERE owner_id = NEW.owner_id
+  SELECT (CASE WHEN NOT EXISTS (SELECT 1 FROM storage_owner_routes WHERE owner_id = NEW.owner_id
     AND shard_id = NEW.source_shard_id AND route_generation = NEW.source_generation AND state = 'active'
     AND reservation_bytes = NEW.reservation_bytes)
-    THEN RAISE(ABORT, 'STORAGE_ROUTE_STALE') END;
-  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM storage_shards WHERE shard_id = NEW.destination_shard_id
+    THEN RAISE(ABORT, 'STORAGE_ROUTE_STALE') END);
+  SELECT (CASE WHEN NOT EXISTS (SELECT 1 FROM storage_shards WHERE shard_id = NEW.destination_shard_id
     AND state = 'active' AND observed_bytes + reserved_bytes + NEW.reservation_bytes <= capacity_bytes)
-    THEN RAISE(ABORT, 'STORAGE_CAPACITY_UNAVAILABLE') END;
+    THEN RAISE(ABORT, 'STORAGE_CAPACITY_UNAVAILABLE') END);
 END;
 CREATE TRIGGER storage_move_reserved AFTER INSERT ON storage_owner_moves BEGIN
   UPDATE storage_shards SET reserved_bytes = reserved_bytes + NEW.reservation_bytes WHERE shard_id = NEW.destination_shard_id;
@@ -60,23 +60,23 @@ CREATE TRIGGER storage_move_reserved AFTER INSERT ON storage_owner_moves BEGIN
 END;
 -- Generations are routing metadata, never telemetry source sequence numbers.
 CREATE TRIGGER storage_route_transition BEFORE UPDATE ON storage_owner_routes BEGIN
-  SELECT CASE WHEN NEW.owner_id <> OLD.owner_id OR NEW.reservation_bytes <> OLD.reservation_bytes
+  SELECT (CASE WHEN NEW.owner_id <> OLD.owner_id OR NEW.reservation_bytes <> OLD.reservation_bytes
     OR NOT ((OLD.state = 'preparing' AND NEW.state = 'active' AND NEW.shard_id = OLD.shard_id AND NEW.route_generation = OLD.route_generation)
       OR (OLD.state = 'active' AND NEW.state = 'moving' AND NEW.shard_id = OLD.shard_id AND NEW.route_generation = OLD.route_generation)
       OR (OLD.state = 'moving' AND NEW.state = 'active' AND NEW.route_generation = OLD.route_generation + 1
         AND EXISTS (SELECT 1 FROM storage_owner_moves WHERE owner_id = OLD.owner_id AND state = 'committed'
           AND source_shard_id = OLD.shard_id AND destination_shard_id = NEW.shard_id AND destination_generation = NEW.route_generation)))
-    THEN RAISE(ABORT, 'STORAGE_ROUTE_TRANSITION_INVALID') END;
+    THEN RAISE(ABORT, 'STORAGE_ROUTE_TRANSITION_INVALID') END);
 END;
 CREATE TRIGGER storage_move_transition BEFORE UPDATE ON storage_owner_moves BEGIN
-  SELECT CASE WHEN NEW.move_id <> OLD.move_id OR NEW.owner_id <> OLD.owner_id
+  SELECT (CASE WHEN NEW.move_id <> OLD.move_id OR NEW.owner_id <> OLD.owner_id
     OR NEW.source_shard_id <> OLD.source_shard_id OR NEW.destination_shard_id <> OLD.destination_shard_id
     OR NEW.source_generation <> OLD.source_generation OR NEW.destination_generation <> OLD.destination_generation
     OR NEW.reservation_bytes <> OLD.reservation_bytes
     OR NOT ((OLD.state = 'prepared' AND NEW.state = 'source_fenced')
       OR (OLD.state = 'source_fenced' AND NEW.state = 'copied')
       OR (OLD.state = 'copied' AND NEW.state = 'committed' AND NEW.copy_digest = OLD.copy_digest))
-    THEN RAISE(ABORT, 'STORAGE_MOVE_TRANSITION_INVALID') END;
+    THEN RAISE(ABORT, 'STORAGE_MOVE_TRANSITION_INVALID') END);
 END;
 -- Capacity remains reserved on the source until separately measured/reconciled:
 -- a route switch is not proof that retained source bytes were erased.
@@ -93,7 +93,7 @@ CREATE TRIGGER storage_owner_move_no_delete BEFORE DELETE ON storage_owner_moves
 END;
 CREATE INDEX storage_capability_owner ON storage_capability_locators(owner_id, state, capability_hash);
 CREATE TRIGGER storage_capability_locator_transition BEFORE UPDATE ON storage_capability_locators BEGIN
-  SELECT CASE WHEN NEW.capability_hash <> OLD.capability_hash OR NEW.owner_id <> OLD.owner_id
+  SELECT (CASE WHEN NEW.capability_hash <> OLD.capability_hash OR NEW.owner_id <> OLD.owner_id
     OR OLD.state <> 'active' OR NEW.state <> 'revoked'
-    THEN RAISE(ABORT, 'STORAGE_CAPABILITY_LOCATOR_IMMUTABLE') END;
+    THEN RAISE(ABORT, 'STORAGE_CAPABILITY_LOCATOR_IMMUTABLE') END);
 END;

@@ -15,6 +15,8 @@ The integrated source `f787f705` passed the complete local Worker gate on Septem
 
 The remaining implementation is the owner copier and final routing switch, complete moved-owner export/lifecycle coverage, qualified spare operations and measured capacity calibration. Cloud rollover/failure qualification and production activation follow those gates. The historical checkpoints below record what was proven at each stage; this section states the current boundary.
 
+A first isolated existing-owner bootstrap rehearsal applied the 60 primary migrations, then Cloudflare D1 refused the first ingestion-role migration because a complete trigger guard used the locally valid `SELECT CASE ... END;` form. The canonical fresh-role migration inputs now parenthesize every complete trigger `CASE` expression, matching the established 0044/0045 remote-parser convention. A source guard audits ingestion, routing, analytics and deletion roles while allowing ordinary scalar and top-level `CASE` projections. This changes role-input hashes, so earlier qualification receipts cannot qualify the repaired source. A new source-pinned role qualification and fresh cloud rehearsal remain required before bootstrap or spare activation.
+
 ## Accepted outcome
 
 Capacity expansion must not require a service-wide upload freeze. Assign each authenticated contribution owner to a stable ingestion shard, stop new assignments at **6,000,000,000 bytes**, and preserve the **9,000,000,000-byte operating budget per database**. Keep prepared spare capacity. Move growing owners before capacity becomes urgent. Credentials, opt-outs, telemetry provenance, replay and owner-only erasure survive routing changes.

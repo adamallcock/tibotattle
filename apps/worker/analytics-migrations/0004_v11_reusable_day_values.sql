@@ -44,7 +44,7 @@ CREATE TABLE analytics_v11_day_references (
 CREATE INDEX analytics_v11_references_value ON analytics_v11_day_references(value_key);
 CREATE TRIGGER analytics_v11_reference_valid BEFORE INSERT ON analytics_v11_day_references
 BEGIN
-  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w JOIN analytics_v11_reusable_values v
+  SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w JOIN analytics_v11_reusable_values v
     ON v.value_key=NEW.value_key AND v.source_id=w.source_id AND v.owner_digest=w.owner_digest
       AND v.source_layout=w.source_layout AND v.source_namespace=COALESCE(w.source_namespace,'')
     WHERE w.source_id=NEW.source_id AND w.event_digest=NEW.event_digest AND w.next_day=NEW.day AND v.day=NEW.day AND w.phase='building'
@@ -52,7 +52,7 @@ BEGIN
       AND v.pricing_method=json_extract(w.values_json,'$.pricingMethodVersion')
       AND v.registry_sha256=json_extract(w.values_json,'$.registrySha256'))
     OR EXISTS(SELECT 1 FROM analytics_v11_legacy_day_values WHERE source_id=NEW.source_id AND event_digest=NEW.event_digest AND day=NEW.day)
-    THEN RAISE(ABORT,'analytics_v11_reference_conflict') END;
+    THEN RAISE(ABORT,'analytics_v11_reference_conflict') END);
 END;
 CREATE TRIGGER analytics_v11_reference_immutable BEFORE UPDATE ON analytics_v11_day_references
 BEGIN SELECT RAISE(ABORT,'analytics_v11_reference_conflict'); END;
@@ -71,8 +71,8 @@ CREATE TRIGGER analytics_v11_day_view_immutable INSTEAD OF UPDATE ON analytics_v
 BEGIN SELECT RAISE(ABORT,'analytics_v11_day_immutable'); END;
 CREATE TRIGGER analytics_v11_day_view_delete INSTEAD OF DELETE ON analytics_v11_day_values
 BEGIN
-  SELECT CASE WHEN EXISTS(SELECT 1 FROM analytics_v11_projection_work WHERE source_id=OLD.source_id AND event_digest=OLD.event_digest AND phase!='retiring')
-    THEN RAISE(ABORT,'analytics_v11_reference_retained') END;
+  SELECT (CASE WHEN EXISTS(SELECT 1 FROM analytics_v11_projection_work WHERE source_id=OLD.source_id AND event_digest=OLD.event_digest AND phase!='retiring')
+    THEN RAISE(ABORT,'analytics_v11_reference_retained') END);
   DELETE FROM analytics_v11_legacy_day_values WHERE source_id=OLD.source_id AND event_digest=OLD.event_digest AND day=OLD.day;
   DELETE FROM analytics_v11_day_references WHERE source_id=OLD.source_id AND event_digest=OLD.event_digest AND day=OLD.day;
 END;

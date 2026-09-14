@@ -31,9 +31,9 @@ CREATE TABLE analytics_community_daily_heads (
 CREATE TRIGGER analytics_community_daily_revision_order
  BEFORE INSERT ON analytics_community_daily_publications
 BEGIN
- SELECT CASE WHEN NEW.revision!=COALESCE((SELECT revision FROM analytics_community_daily_heads
+ SELECT (CASE WHEN NEW.revision!=COALESCE((SELECT revision FROM analytics_community_daily_heads
    WHERE source_id=NEW.source_id AND day=NEW.day),0)+1
-   THEN RAISE(ABORT,'analytics_community_daily_revision_conflict') END;
+   THEN RAISE(ABORT,'analytics_community_daily_revision_conflict') END);
 END;
 CREATE TRIGGER analytics_community_daily_head_advance
  AFTER INSERT ON analytics_community_daily_publications

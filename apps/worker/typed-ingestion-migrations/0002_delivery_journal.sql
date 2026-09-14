@@ -32,24 +32,24 @@ CREATE INDEX storage_ingestion_owner_cursor ON storage_ingestion_changes(owner_d
 
 CREATE TRIGGER storage_ingestion_change_validate BEFORE INSERT ON storage_ingestion_changes
 BEGIN
-  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM storage_source_state WHERE singleton=1)
-    THEN RAISE(ABORT,'storage_source_uninitialized') END;
-  SELECT CASE WHEN NEW.revision != COALESCE((SELECT revision FROM storage_owner_revisions WHERE owner_digest=NEW.owner_digest),0)+1
-    THEN RAISE(ABORT,'storage_owner_revision_conflict') END;
-  SELECT CASE WHEN EXISTS(SELECT 1 FROM storage_owner_revisions WHERE owner_digest=NEW.owner_digest AND state='erased')
-    THEN RAISE(ABORT,'storage_owner_erased') END;
-  SELECT CASE WHEN NEW.kind='source-updated' AND NOT EXISTS(
+  SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM storage_source_state WHERE singleton=1)
+    THEN RAISE(ABORT,'storage_source_uninitialized') END);
+  SELECT (CASE WHEN NEW.revision != COALESCE((SELECT revision FROM storage_owner_revisions WHERE owner_digest=NEW.owner_digest),0)+1
+    THEN RAISE(ABORT,'storage_owner_revision_conflict') END);
+  SELECT (CASE WHEN EXISTS(SELECT 1 FROM storage_owner_revisions WHERE owner_digest=NEW.owner_digest AND state='erased')
+    THEN RAISE(ABORT,'storage_owner_erased') END);
+  SELECT (CASE WHEN NEW.kind='source-updated' AND NOT EXISTS(
       SELECT 1 FROM storage_owner_revisions WHERE owner_digest=NEW.owner_digest AND state='active')
-    THEN RAISE(ABORT,'storage_owner_ineligible') END;
-  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM storage_owner_revisions WHERE owner_digest=NEW.owner_digest)
+    THEN RAISE(ABORT,'storage_owner_ineligible') END);
+  SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM storage_owner_revisions WHERE owner_digest=NEW.owner_digest)
       AND NEW.kind!='owner-active'
-    THEN RAISE(ABORT,'storage_owner_uninitialized') END;
-  SELECT CASE WHEN NEW.authority_epoch != COALESCE((SELECT authority_epoch FROM storage_owner_revisions WHERE owner_digest=NEW.owner_digest),0)
+    THEN RAISE(ABORT,'storage_owner_uninitialized') END);
+  SELECT (CASE WHEN NEW.authority_epoch != COALESCE((SELECT authority_epoch FROM storage_owner_revisions WHERE owner_digest=NEW.owner_digest),0)
       + CASE WHEN NEW.kind='source-updated' THEN 0 ELSE 1 END
-    THEN RAISE(ABORT,'storage_authority_conflict') END;
-  SELECT CASE WHEN NEW.public_authority_epoch != (SELECT authority_epoch FROM storage_source_state WHERE singleton=1)
+    THEN RAISE(ABORT,'storage_authority_conflict') END);
+  SELECT (CASE WHEN NEW.public_authority_epoch != (SELECT authority_epoch FROM storage_source_state WHERE singleton=1)
       + CASE WHEN NEW.kind='source-updated' THEN 0 ELSE 1 END
-    THEN RAISE(ABORT,'storage_public_authority_conflict') END;
+    THEN RAISE(ABORT,'storage_public_authority_conflict') END);
 END;
 
 CREATE TRIGGER storage_ingestion_change_commit AFTER INSERT ON storage_ingestion_changes

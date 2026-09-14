@@ -82,6 +82,19 @@ remain in the enclosing private output. Retain that complete output. Qualified
 manifests are checked by the maintained `loadStorageQualification` parser;
 unqualified rehearsal manifests are rejected by that parser.
 
+Complete `CASE` guard expressions inside a trigger must use
+`SELECT (CASE ... END);`. Cloudflare D1's remote migration parser can treat the
+`END;` in an unparenthesized expression as the end of the trigger even though
+local SQLite accepts it. The Worker script gate audits every migration directory
+used by fresh ingestion, control, analytics and deletion roles. Ordinary scalar
+subqueries and top-level `CASE` projections are outside this rule because their
+`END` is not followed by the statement terminator.
+
+Adding these wrappers changes the canonical migration bytes and therefore the
+role-input digest. Never reuse a qualification receipt produced from the
+unwrapped inputs; qualify the exact new source and rehearse it against a fresh
+remote D1 before activation.
+
 For a combined operator mirror, copy these role directories unchanged alongside
 the separately qualified ingestion restore base and all six original ingestion
 role input directories. Use the returned qualification hashes in the reviewed

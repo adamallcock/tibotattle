@@ -62,7 +62,7 @@ CREATE INDEX typed_v1_memberships_participant
  ON typed_v1_owner_memberships(participant_id,namespace_id,typed_owner_id);
 
 CREATE TRIGGER typed_v1_owner_membership_guard BEFORE INSERT ON typed_v1_owner_memberships
-BEGIN SELECT CASE WHEN NOT EXISTS(
+BEGIN SELECT (CASE WHEN NOT EXISTS(
  SELECT 1 FROM typed_telemetry_owners candidate
  JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=candidate.namespace_id
  WHERE candidate.id=NEW.typed_owner_id AND candidate.namespace_id=NEW.namespace_id
@@ -74,7 +74,7 @@ BEGIN SELECT CASE WHEN NOT EXISTS(
     JOIN typed_telemetry_owners existing_owner ON existing_owner.id=existing.typed_owner_id
     WHERE existing.participant_id=NEW.participant_id
      AND existing_owner.original_id=candidate.original_id))
-) THEN RAISE(ABORT,'typed_v1_owner_mismatch') END; END;
+) THEN RAISE(ABORT,'typed_v1_owner_mismatch') END); END;
 CREATE TRIGGER typed_v1_owner_membership_immutable BEFORE UPDATE ON typed_v1_owner_memberships
 WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.namespace_id IS NOT NEW.namespace_id
  OR OLD.typed_owner_id IS NOT NEW.typed_owner_id
@@ -87,7 +87,7 @@ BEGIN DELETE FROM typed_telemetry_owners
  WHERE id=OLD.typed_owner_id AND namespace_id=OLD.namespace_id; END;
 
 CREATE TRIGGER typed_v1_record_membership BEFORE INSERT ON typed_v1_record_admissions
-BEGIN SELECT CASE WHEN NOT EXISTS(
+BEGIN SELECT (CASE WHEN NOT EXISTS(
  SELECT 1 FROM typed_telemetry_compatibility_records r
  JOIN typed_v1_chunk_allocations a ON a.chunk_id=NEW.chunk_id AND a.namespace_id=r.namespace_id
  JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=r.namespace_id
@@ -100,7 +100,7 @@ BEGIN SELECT CASE WHEN NOT EXISTS(
   AND EXISTS(SELECT 1 FROM typed_v1_owner_memberships m
     WHERE m.participant_id=c.participant_id AND m.namespace_id=r.namespace_id AND m.typed_owner_id=r.owner_id)
   AND (SELECT count(*) FROM typed_v1_record_admissions WHERE chunk_id=c.id)<c.record_count
-) THEN RAISE(ABORT,'typed_v1_record_membership_conflict') END; END;
+) THEN RAISE(ABORT,'typed_v1_record_membership_conflict') END); END;
 
 CREATE TRIGGER typed_v1_chunk_delete BEFORE DELETE ON telemetry_v1_chunks
 BEGIN DELETE FROM typed_telemetry_chunks WHERE format=10

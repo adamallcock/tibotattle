@@ -82,7 +82,7 @@ INSERT INTO typed_v11_manifest_memberships(manifest_id,namespace_id,typed_manife
 DROP TABLE typed_v11_manifest_memberships_single_origin;
 
 CREATE TRIGGER typed_v11_owner_membership_guard BEFORE INSERT ON typed_v11_owner_memberships
-BEGIN SELECT CASE WHEN NOT EXISTS(
+BEGIN SELECT (CASE WHEN NOT EXISTS(
  SELECT 1 FROM typed_telemetry_owners candidate
  JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=candidate.namespace_id
  WHERE candidate.id=NEW.typed_owner_id AND candidate.namespace_id=NEW.namespace_id
@@ -94,7 +94,7 @@ BEGIN SELECT CASE WHEN NOT EXISTS(
     JOIN typed_telemetry_owners existing_owner ON existing_owner.id=existing.typed_owner_id
     WHERE existing.participant_id=NEW.participant_id
      AND existing_owner.original_id=candidate.original_id))
-) THEN RAISE(ABORT,'typed_v11_owner_membership_conflict') END; END;
+) THEN RAISE(ABORT,'typed_v11_owner_membership_conflict') END); END;
 CREATE TRIGGER typed_v11_owner_membership_immutable BEFORE UPDATE ON typed_v11_owner_memberships
 WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.namespace_id IS NOT NEW.namespace_id
  OR OLD.typed_owner_id IS NOT NEW.typed_owner_id
@@ -107,7 +107,7 @@ BEGIN DELETE FROM typed_telemetry_owners
  WHERE id=OLD.typed_owner_id AND namespace_id=OLD.namespace_id; END;
 
 CREATE TRIGGER typed_v11_manifest_membership_guard BEFORE INSERT ON typed_v11_manifest_memberships
-BEGIN SELECT CASE WHEN NOT EXISTS(
+BEGIN SELECT (CASE WHEN NOT EXISTS(
  SELECT 1 FROM typed_telemetry_records raw
  JOIN typed_telemetry_manifests manifest ON manifest.id=raw.manifest_id
   AND manifest.namespace_id=raw.namespace_id
@@ -116,7 +116,7 @@ BEGIN SELECT CASE WHEN NOT EXISTS(
  WHERE raw.manifest_id=NEW.typed_manifest_id AND raw.namespace_id=NEW.namespace_id
   AND raw.format=11 AND r.manifest_id=NEW.manifest_id
   AND origin.v11_read_contract_version=2
-) THEN RAISE(ABORT,'typed_v11_manifest_membership_conflict') END; END;
+) THEN RAISE(ABORT,'typed_v11_manifest_membership_conflict') END); END;
 CREATE TRIGGER typed_v11_manifest_membership_immutable BEFORE UPDATE ON typed_v11_manifest_memberships
 BEGIN SELECT RAISE(ABORT,'typed_v11_manifest_membership_conflict'); END;
 CREATE TRIGGER typed_v11_manifest_membership_retained BEFORE DELETE ON typed_v11_manifest_memberships
@@ -138,7 +138,7 @@ CREATE TRIGGER typed_v11_record_compat_delete INSTEAD OF DELETE ON typed_v11_rec
 BEGIN DELETE FROM typed_v11_record_proofs WHERE typed_record_id=OLD.typed_record_id; END;
 
 CREATE TRIGGER typed_v11_record_membership BEFORE INSERT ON typed_v11_record_proofs
-BEGIN SELECT CASE WHEN NOT EXISTS(
+BEGIN SELECT (CASE WHEN NOT EXISTS(
  SELECT 1 FROM typed_telemetry_records raw
  JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=raw.id
  JOIN typed_telemetry_origin_contracts origin ON origin.namespace_id=r.namespace_id
@@ -162,7 +162,7 @@ BEGIN SELECT CASE WHEN NOT EXISTS(
    WHERE owner.typed_owner_id=raw.owner_id AND owner.namespace_id=raw.namespace_id
     AND owner.participant_id=c.participant_id)
   AND (SELECT count(*) FROM typed_v11_record_proofs p WHERE p.chunk_key=raw.chunk_id)<c.record_count
-) THEN RAISE(ABORT,'typed_v11_record_staging_denied') END; END;
+) THEN RAISE(ABORT,'typed_v11_record_staging_denied') END); END;
 
 CREATE TRIGGER typed_v11_active_proof_delete_guard BEFORE DELETE ON typed_v11_record_proofs
 WHEN EXISTS(SELECT 1 FROM typed_v11_manifest_memberships membership
@@ -208,24 +208,24 @@ DROP TRIGGER typed_v11_runtime_contract_qualify;
 CREATE TRIGGER typed_v11_runtime_contract_qualify BEFORE UPDATE OF runtime_contract_version ON typed_v11_admission_state
 WHEN OLD.runtime_contract_version IS NOT NEW.runtime_contract_version
 BEGIN
- SELECT CASE WHEN OLD.runtime_contract_version!=0 OR NEW.runtime_contract_version!=1
+ SELECT (CASE WHEN OLD.runtime_contract_version!=0 OR NEW.runtime_contract_version!=1
   OR NOT EXISTS(SELECT 1 FROM typed_telemetry_schema WHERE id=1 AND version=1)
   OR NOT EXISTS(SELECT 1 FROM storage_source_state WHERE singleton=1)
   OR EXISTS(SELECT 1 FROM telemetry_v11_records LIMIT 1)
- THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END;
- SELECT CASE WHEN (SELECT count(*) FROM d1_migrations WHERE name IN (
+ THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END);
+ SELECT (CASE WHEN (SELECT count(*) FROM d1_migrations WHERE name IN (
    '0001_typed_telemetry.sql','0002_delivery_journal.sql','0004_read_compatibility.sql','0005_typed_origin_contracts.sql',
    '0001_v11_delivery_bridge.sql','0001_typed_chunk_admission.sql','0002_legacy_preservation_proofs.sql',
    '0003_typed_domain_closure.sql','0004_runtime_storage_contract.sql','0005_typed_active_reader.sql',
    '0006_compact_admission_proofs.sql','0007_multi_origin_runtime.sql'))!=12
- THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END;
- SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE name IN (
+ THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END);
+ SELECT (CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE name IN (
    'typed_telemetry_origin_contracts','typed_telemetry_one_current_origin',
    'typed_v11_owner_memberships','typed_v11_memberships_participant',
    'typed_v11_manifest_memberships','typed_v11_record_admissions',
    'typed_v11_active_records','typed_v11_record_membership',
    'typed_v11_chunk_delete','typed_v11_owner_membership_guard',
    'typed_v11_manifest_membership_guard'))!=11
- THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END;
+ THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END);
 END;
 PRAGMA legacy_alter_table=OFF;

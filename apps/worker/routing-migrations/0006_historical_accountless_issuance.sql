@@ -88,8 +88,8 @@ AFTER INSERT ON storage_accountless_historical_issuance_reservations BEGIN
     SET imported_count=imported_count+1,import_revision=import_revision+1,
       updated_at=MAX(updated_at,NEW.reserved_at)
     WHERE singleton_id=1 AND import_state='importing' AND imported_count<10000;
-  SELECT CASE WHEN changes()<>1
-    THEN RAISE(ABORT,'STORAGE_ACCOUNTLESS_ISSUANCE_UNINITIALIZED') END;
+  SELECT (CASE WHEN changes()<>1
+    THEN RAISE(ABORT,'STORAGE_ACCOUNTLESS_ISSUANCE_UNINITIALIZED') END);
 END;
 
 CREATE TRIGGER storage_accountless_historical_issuance_state_transition
@@ -125,14 +125,14 @@ WHEN OLD.import_state='importing' AND NEW.import_state='ready' BEGIN
       baseline_digest=NEW.baseline_digest,initialized_at=NEW.baseline_initialized_at,
       updated_at=NEW.baseline_initialized_at
     WHERE singleton_id=1 AND initialization_state='uninitialized';
-  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM storage_accountless_issuance_state
+  SELECT (CASE WHEN NOT EXISTS (SELECT 1 FROM storage_accountless_issuance_state
     WHERE singleton_id=1 AND initialization_state='ready'
       AND budget_day=NEW.baseline_budget_day
       AND daily_reserved=NEW.baseline_daily_reserved
       AND lifetime_reserved=NEW.baseline_lifetime_reserved
       AND baseline_digest=NEW.baseline_digest
       AND initialized_at=NEW.baseline_initialized_at)
-    THEN RAISE(ABORT,'STORAGE_ACCOUNTLESS_ISSUANCE_BASELINE_CONFLICT') END;
+    THEN RAISE(ABORT,'STORAGE_ACCOUNTLESS_ISSUANCE_BASELINE_CONFLICT') END);
 END;
 
 CREATE TRIGGER storage_accountless_historical_issuance_immutable

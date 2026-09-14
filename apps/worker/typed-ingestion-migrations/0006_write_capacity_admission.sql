@@ -31,28 +31,28 @@ CREATE TABLE storage_write_capacity_reservations (
 
 CREATE TRIGGER storage_write_capacity_reservation_guard
 BEFORE INSERT ON storage_write_capacity_reservations BEGIN
-  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM storage_write_capacity_sample_clock WHERE singleton_id = 1)
+  SELECT (CASE WHEN NOT EXISTS (SELECT 1 FROM storage_write_capacity_sample_clock WHERE singleton_id = 1)
     OR NOT EXISTS (
     SELECT 1 FROM storage_write_capacity_observations
     WHERE singleton_id = 1
       AND expires_at_epoch >= CAST(strftime('%s', 'now') AS INTEGER)
-  ) THEN RAISE(ABORT, 'STORAGE_WRITE_CAPACITY_UNAVAILABLE') END;
-  SELECT CASE WHEN (
+  ) THEN RAISE(ABORT, 'STORAGE_WRITE_CAPACITY_UNAVAILABLE') END);
+  SELECT (CASE WHEN (
     SELECT reserved_total_bytes < sampled_reserved_total_bytes
       OR reserved_total_bytes > 9007199254740990 - NEW.reserved_bytes
     FROM storage_write_capacity_sample_clock
     CROSS JOIN storage_write_capacity_observations
     WHERE storage_write_capacity_sample_clock.singleton_id = 1
       AND storage_write_capacity_observations.singleton_id = 1
-  ) THEN RAISE(ABORT, 'STORAGE_WRITE_CAPACITY_UNAVAILABLE') END;
-  SELECT CASE WHEN (
+  ) THEN RAISE(ABORT, 'STORAGE_WRITE_CAPACITY_UNAVAILABLE') END);
+  SELECT (CASE WHEN (
     SELECT observed_bytes
       + ((SELECT reserved_total_bytes FROM storage_write_capacity_sample_clock WHERE singleton_id = 1)
         - sampled_reserved_total_bytes)
       + NEW.reserved_bytes
     FROM storage_write_capacity_observations
     WHERE singleton_id = 1
-  ) > 9000000000 THEN RAISE(ABORT, 'STORAGE_WRITE_CAPACITY_UNAVAILABLE') END;
+  ) > 9000000000 THEN RAISE(ABORT, 'STORAGE_WRITE_CAPACITY_UNAVAILABLE') END);
   UPDATE storage_write_capacity_sample_clock
   SET revision = revision + 1, reserved_total_bytes = reserved_total_bytes + NEW.reserved_bytes
   WHERE singleton_id = 1;

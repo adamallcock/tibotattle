@@ -1,10 +1,15 @@
 import { PUBLIC_SOURCE_SCHEMA_SQL } from "./public-source-schema-contract.mjs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
+import {
+  findBareCompleteTriggerCases,
+  FRESH_D1_ROLE_MIGRATION_DIRECTORIES,
+  normalizeCompleteTriggerCaseWrappers,
+} from "./d1-trigger-parser-contract.mjs";
 import {
   assessStagingConfiguration,
   ATTRIBUTION_SCHEMA_COLUMNS,
@@ -253,6 +258,76 @@ test("remote trigger parser repair changes only complete CASE expression parenth
       .replaceAll("THEN 20000 ELSE 2000 END)", "THEN 20000 ELSE 2000 END");
     assert.equal(createHash("sha256").update(original).digest("hex"), originalDigest, name);
   }
+});
+
+test("fresh D1 role migrations avoid remote parser-ambiguous complete trigger CASE expressions", () => {
+  const repaired = new Map([
+    ["analytics-migrations/0001_delivery_state.sql", [7, "c4103fa5e75b1d52750e0ad220fc1cb1a535907c73fd90720f105a4623f328bf"]],
+    ["analytics-migrations/0002_v11_daily_projection.sql", [4, "0b63b674d5c606155a67df473c8ff9c0f013ee8cd2928ff9aeef450ea794a8c2"]],
+    ["analytics-migrations/0004_v11_reusable_day_values.sql", [2, "2593dc67883d3eac866ad97aa3121c015e5d872cc3f8f2eca28c3fb3771abcc3"]],
+    ["analytics-migrations/0007_community_daily_publication.sql", [1, "3ea65e167c6f3196671c5fd4ddd6d575c119e2ef603061007156faa90a982b38"]],
+    ["analytics-migrations/0010_history_checkpoints.sql", [1, "b9a7aa6922c89b16f4cd3ac8ca6256d0f9250451b39eb4042d572c0439f9af9e"]],
+    ["analytics-migrations/0013_v11_daily_value_pages.sql", [2, "8235061e02e447a3249061b2b05c52a9600e0641ecf402c4c3ee34241f4d2b63"]],
+    ["analytics-migrations/0016_multi_source_publication.sql", [2, "8d9779251aba140bd58e8c00bb349d586e9f1352f1107dd287abb700bdd41f1b"]],
+    ["analytics-migrations/0017_v11_multi_origin_day_values.sql", [1, "1257b7542dd744cda2456e5016a8f210e46a78cd435178f4e7f481e2b89d6bcb"]],
+    ["ingestion-bridge-migrations/0001_v11_delivery_bridge.sql", [1, "04fdd38039e6ef586f44f92ce8f38f573193d14b537089bcb86126a5d103d761"]],
+    ["ingestion-routing-migrations/0001_owner_route_fences.sql", [2, "b1585bd72260743083fe30706ce1bcce9fe78b89ff23450180bd7a3af1184d00"]],
+    ["routing-migrations/0001_storage_routing_catalog.sql", [6, "53b8fcd734f1ab0e70b9f3e1020811d50a40759642262613628d2ebcf2ef92b8"]],
+    ["routing-migrations/0002_shard_capacity_observations.sql", [3, "404fe89e7b75d9e645b1b419ab3bb97725e2814510b7025dfff90f3d659fa173"]],
+    ["routing-migrations/0004_global_accountless_issuance.sql", [1, "ac506416524460556bd4a8dfa07e7eab18b9317a41a700e7fe2be5fb78121329"]],
+    ["routing-migrations/0006_historical_accountless_issuance.sql", [2, "00e206127e8023b038143043c8fbfe758233f213733c446f62d9b228ca408c05"]],
+    ["routing-migrations/0007_existing_accountless_bootstrap.sql", [1, "3f06af6eaf931c9858c1e229310e322905b57e31716a41357bcfd83a58af0ece"]],
+    ["typed-ingestion-migrations/0002_delivery_journal.sql", [7, "fb8f79822f5200ec43054d5959f1b0dd1035a2a251ccfad8188ae391df3fc896"]],
+    ["typed-ingestion-migrations/0005_typed_origin_contracts.sql", [1, "884f504679808b42618a479e743d1cbc48a765ace99a7467e43ca67c817caaaf"]],
+    ["typed-ingestion-migrations/0006_write_capacity_admission.sql", [3, "d50ae5a2029a2a94c23ea561a34fba7d0b1821f2063555ef92c98942ac272ca2"]],
+    ["typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql", [9, "dbeececefba5c0688bc26e9b1a675d2a6a8bd443f8adb6cea14348080b581908"]],
+    ["typed-v1-admission-migrations/0002_typed_v1_domain_preservation.sql", [3, "0f2fea179de2d03c7bd28155ed63ba31785ee8b2eeeac6591801f039b602a85a"]],
+    ["typed-v1-admission-migrations/0004_multi_origin_runtime.sql", [2, "01f0edd88e8b1fc31585dcd3a6f294ddb22a6f8b51aafc4a56e4cb84e81faef5"]],
+    ["typed-v11-admission-migrations/0001_typed_chunk_admission.sql", [7, "dc06baf104916b4e2ac82d0f5bbe6a4b837ef01228e9825d539cd253b0d78324"]],
+    ["typed-v11-admission-migrations/0003_typed_domain_closure.sql", [8, "83348d8764b437b81fa21821b28d01ff064c44886e5c45b5c94c3198e0996bad"]],
+    ["typed-v11-admission-migrations/0004_runtime_storage_contract.sql", [1, "18313de7cd7777345a551adde9f69941cd2677293b45d67d539ff4cc202b60eb"]],
+    ["typed-v11-admission-migrations/0006_compact_admission_proofs.sql", [3, "e1302c7fc08af91cca89107230591af4bf5a986bb0b333ba642e40e2f3b52ae5"]],
+    ["typed-v11-admission-migrations/0007_multi_origin_runtime.sql", [6, "bb84932f8dc3db08b217a60b59ba5a54b763dc5ea4378a89f74dfba218e2093a"]],
+  ]);
+  const seen = new Set();
+  for (const directory of FRESH_D1_ROLE_MIGRATION_DIRECTORIES) {
+    for (const name of readdirSync(join(workerDirectory, directory)).filter((entry) => entry.endsWith(".sql")).sort()) {
+      const relative = `${directory}/${name}`;
+      const sql = readFileSync(join(workerDirectory, relative), "utf8");
+      assert.deepEqual(findBareCompleteTriggerCases(sql), [], relative);
+      if (!repaired.has(relative)) continue;
+      const normalized = normalizeCompleteTriggerCaseWrappers(sql);
+      const [wrappers, digest] = repaired.get(relative);
+      assert.equal((sql.length - normalized.length) / 2, wrappers, relative);
+      assert.equal(createHash("sha256").update(normalized).digest("hex"), digest, relative);
+      seen.add(relative);
+    }
+  }
+  assert.deepEqual(seen, new Set(repaired.keys()));
+});
+
+test("route-fence trigger wrappers preserve SQLite behavior exactly", () => {
+  const canonical = readFileSync(join(workerDirectory, "ingestion-routing-migrations", "0001_owner_route_fences.sql"), "utf8");
+  const exercise = (sql) => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(sql);
+    db.exec("INSERT INTO storage_owner_fences(owner_id,shard_id,route_generation,state) VALUES('owner','a',1,'active')");
+    db.exec("INSERT INTO storage_route_write_checks(owner_id,shard_id,route_generation) VALUES('owner','a',1)");
+    const retainedChecks = db.prepare("SELECT count(*) AS count FROM storage_route_write_checks").get().count;
+    let stale, transition;
+    try { db.exec("INSERT INTO storage_route_write_checks(owner_id,shard_id,route_generation) VALUES('owner','b',1)"); }
+    catch (error) { stale = error.message; }
+    try { db.exec("UPDATE storage_owner_fences SET route_generation=2 WHERE owner_id='owner'"); }
+    catch (error) { transition = error.message; }
+    db.close();
+    return { retainedChecks, stale, transition };
+  };
+  assert.deepEqual(exercise(canonical), exercise(normalizeCompleteTriggerCaseWrappers(canonical)));
+  assert.deepEqual(exercise(canonical), {
+    retainedChecks: 0,
+    stale: "STORAGE_ROUTE_STALE",
+    transition: "STORAGE_FENCE_TRANSITION_INVALID",
+  });
 });
 
 test("the local-only staged checkpoint migration is pinned to its reviewed immutable schema", () => {

@@ -28,7 +28,7 @@ BEGIN SELECT RAISE(ABORT,'analytics_v11_day_origin_pin_conflict'); END;
 DROP TRIGGER analytics_v11_reference_valid;
 CREATE TRIGGER analytics_v11_reference_valid BEFORE INSERT ON analytics_v11_day_references
 BEGIN
-  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w JOIN analytics_v11_reusable_values v
+  SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w JOIN analytics_v11_reusable_values v
     ON v.value_key=NEW.value_key AND v.source_id=w.source_id AND v.owner_digest=w.owner_digest
       AND v.source_layout=w.source_layout AND v.source_namespace=w.day_source_namespace
     WHERE w.source_id=NEW.source_id AND w.event_digest=NEW.event_digest AND w.next_day=NEW.day AND v.day=NEW.day
@@ -37,5 +37,5 @@ BEGIN
       AND v.pricing_method=json_extract(w.values_json,'$.pricingMethodVersion')
       AND v.registry_sha256=json_extract(w.values_json,'$.registrySha256'))
     OR EXISTS(SELECT 1 FROM analytics_v11_legacy_day_values WHERE source_id=NEW.source_id AND event_digest=NEW.event_digest AND day=NEW.day)
-    THEN RAISE(ABORT,'analytics_v11_reference_conflict') END;
+    THEN RAISE(ABORT,'analytics_v11_reference_conflict') END);
 END;

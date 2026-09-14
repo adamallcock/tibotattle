@@ -33,7 +33,7 @@ END;
 
 DROP TRIGGER storage_owner_reserve;
 CREATE TRIGGER storage_owner_reserve BEFORE INSERT ON storage_owner_routes BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1
       FROM storage_shards shard
       JOIN storage_shard_capacity_observations observation
@@ -49,20 +49,20 @@ CREATE TRIGGER storage_owner_reserve BEFORE INSERT ON storage_owner_routes BEGIN
        AND observation.observed_bytes < 6000000000
        AND observation.observed_bytes + shard.reserved_bytes
          + NEW.reservation_bytes <= shard.capacity_bytes
-  ) THEN RAISE(ABORT, 'STORAGE_CAPACITY_UNAVAILABLE') END;
+  ) THEN RAISE(ABORT, 'STORAGE_CAPACITY_UNAVAILABLE') END);
 END;
 
 DROP TRIGGER storage_move_reserve;
 CREATE TRIGGER storage_move_reserve BEFORE INSERT ON storage_owner_moves BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM storage_owner_routes
      WHERE owner_id = NEW.owner_id
        AND shard_id = NEW.source_shard_id
        AND route_generation = NEW.source_generation
        AND state = 'active'
        AND reservation_bytes = NEW.reservation_bytes
-  ) THEN RAISE(ABORT, 'STORAGE_ROUTE_STALE') END;
-  SELECT CASE WHEN NOT EXISTS (
+  ) THEN RAISE(ABORT, 'STORAGE_ROUTE_STALE') END);
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1
       FROM storage_shards shard
       JOIN storage_shard_capacity_observations observation
@@ -78,5 +78,5 @@ CREATE TRIGGER storage_move_reserve BEFORE INSERT ON storage_owner_moves BEGIN
        AND observation.observed_bytes < 6000000000
        AND observation.observed_bytes + shard.reserved_bytes
          + NEW.reservation_bytes <= shard.capacity_bytes
-  ) THEN RAISE(ABORT, 'STORAGE_CAPACITY_UNAVAILABLE') END;
+  ) THEN RAISE(ABORT, 'STORAGE_CAPACITY_UNAVAILABLE') END);
 END;

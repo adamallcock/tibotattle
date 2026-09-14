@@ -26,12 +26,12 @@ CREATE TRIGGER analytics_history_checkpoint_part_immutable BEFORE UPDATE ON anal
 BEGIN SELECT RAISE(ABORT,'history_checkpoint_immutable'); END;
 CREATE TRIGGER analytics_history_checkpoint_part_guard BEFORE INSERT ON analytics_history_checkpoint_parts
 BEGIN
- SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_history_checkpoint_stages s
+ SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_history_checkpoint_stages s
  JOIN analytics_owner_state o ON o.source_id=s.source_id AND o.owner_digest=s.owner_digest
  WHERE s.key_digest=NEW.key_digest AND s.generation=NEW.generation AND NEW.part_index<s.part_count
  AND o.state='active' AND o.authority_epoch=s.authority_epoch
  AND NOT EXISTS(SELECT 1 FROM analytics_history_checkpoint_heads h WHERE h.key_digest=s.key_digest
-  AND (h.retired=1 OR h.generation IS NOT s.expected_head))) THEN RAISE(ABORT,'history_checkpoint_source_conflict') END;
+  AND (h.retired=1 OR h.generation IS NOT s.expected_head))) THEN RAISE(ABORT,'history_checkpoint_source_conflict') END);
 END;
 CREATE TRIGGER analytics_history_checkpoint_live_part_delete BEFORE DELETE ON analytics_history_checkpoint_parts
 WHEN EXISTS(SELECT 1 FROM analytics_history_checkpoint_heads h WHERE h.key_digest=OLD.key_digest AND h.generation=OLD.generation AND h.retired=0)

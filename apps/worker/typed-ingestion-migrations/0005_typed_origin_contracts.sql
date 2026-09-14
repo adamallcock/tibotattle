@@ -33,9 +33,9 @@ CREATE UNIQUE INDEX typed_telemetry_one_current_origin
 
 CREATE TRIGGER typed_telemetry_origin_insert_guard BEFORE INSERT ON typed_telemetry_origin_contracts
 BEGIN
- SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM typed_telemetry_namespaces n
+ SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM typed_telemetry_namespaces n
    WHERE n.id=NEW.namespace_id AND n.original_id=NEW.namespace_original)
-  THEN RAISE(ABORT,'typed_origin_namespace_conflict') END;
+  THEN RAISE(ABORT,'typed_origin_namespace_conflict') END);
 END;
 CREATE TRIGGER typed_telemetry_origin_identity_immutable BEFORE UPDATE ON typed_telemetry_origin_contracts
 WHEN NEW.namespace_id IS NOT OLD.namespace_id OR NEW.namespace_original IS NOT OLD.namespace_original

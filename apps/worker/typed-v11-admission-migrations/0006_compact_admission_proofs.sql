@@ -61,10 +61,10 @@ CREATE VIEW typed_v11_record_admissions AS
  JOIN typed_v11_manifest_memberships m ON m.typed_manifest_id=p.manifest_key;
 CREATE TRIGGER typed_v11_manifest_membership_guard BEFORE INSERT ON typed_v11_manifest_memberships
 BEGIN
- SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM typed_telemetry_records tr
+ SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM typed_telemetry_records tr
   JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=tr.id
   WHERE tr.manifest_id=NEW.typed_manifest_id AND tr.format=11 AND r.manifest_id=NEW.manifest_id)
- THEN RAISE(ABORT,'typed_v11_manifest_membership_conflict') END;
+ THEN RAISE(ABORT,'typed_v11_manifest_membership_conflict') END);
 END;
 CREATE TRIGGER typed_v11_manifest_membership_immutable BEFORE UPDATE ON typed_v11_manifest_memberships
 BEGIN SELECT RAISE(ABORT,'typed_v11_manifest_membership_conflict'); END;
@@ -75,7 +75,7 @@ WHEN EXISTS(SELECT 1 FROM typed_v11_record_proofs WHERE manifest_key=OLD.typed_m
 BEGIN SELECT RAISE(ABORT,'typed_v11_manifest_membership_retained'); END;
 CREATE TRIGGER typed_v11_record_membership BEFORE INSERT ON typed_v11_record_proofs
 BEGIN
- SELECT CASE WHEN NOT EXISTS (
+ SELECT (CASE WHEN NOT EXISTS (
   SELECT 1 FROM typed_telemetry_records raw
   JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=raw.id
   JOIN typed_v11_admission_state s ON s.namespace_id=r.namespace_id AND s.source_namespace=r.source_namespace
@@ -95,7 +95,7 @@ BEGIN
    AND c.stream=NEW.stream AND r.stream=NEW.stream AND m.state='staged'
    AND EXISTS(SELECT 1 FROM typed_v11_owner_memberships o WHERE o.typed_owner_id=raw.owner_id AND o.participant_id=c.participant_id)
    AND (SELECT count(*) FROM typed_v11_record_proofs p WHERE p.chunk_key=raw.chunk_id)<c.record_count)
- THEN RAISE(ABORT,'typed_v11_record_staging_denied') END;
+ THEN RAISE(ABORT,'typed_v11_record_staging_denied') END);
 END;
 CREATE TRIGGER typed_v11_record_time_guard BEFORE INSERT ON typed_v11_record_proofs
 WHEN NEW.observed_at_ms IS NOT (SELECT observed_at_ms FROM typed_telemetry_records WHERE id=NEW.typed_record_id)
@@ -123,7 +123,7 @@ DROP TRIGGER typed_v11_runtime_contract_qualify;
 CREATE TRIGGER typed_v11_runtime_contract_qualify BEFORE UPDATE OF runtime_contract_version ON typed_v11_admission_state
 WHEN OLD.runtime_contract_version IS NOT NEW.runtime_contract_version
 BEGIN
-  SELECT CASE WHEN OLD.runtime_contract_version != 0 OR NEW.runtime_contract_version != 1
+  SELECT (CASE WHEN OLD.runtime_contract_version != 0 OR NEW.runtime_contract_version != 1
     OR NOT EXISTS (SELECT 1 FROM typed_telemetry_schema WHERE id=1 AND version=1)
     OR NOT EXISTS (SELECT 1 FROM storage_source_state WHERE singleton=1)
     OR EXISTS (SELECT 1 FROM telemetry_v11_records LIMIT 1)
@@ -147,5 +147,5 @@ BEGIN
       ('trigger','typed_v11_session_tools_delete_guard'),('trigger','typed_v11_session_tools_insert_guard'),
       ('trigger','typed_v11_record_time_guard'),('view','typed_v11_active_records'),('index','typed_v11_manifest_observed')
     )) != 30
-    THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END;
+    THEN RAISE(ABORT,'typed_v11_runtime_contract_unqualified') END);
 END;

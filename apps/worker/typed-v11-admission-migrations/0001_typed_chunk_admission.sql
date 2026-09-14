@@ -41,12 +41,12 @@ CREATE INDEX typed_v11_admissions_legacy
 CREATE TRIGGER typed_v11_initialize_empty BEFORE INSERT ON typed_v11_admission_state
 WHEN NOT EXISTS (SELECT 1 FROM typed_v11_admission_state)
 BEGIN
-  SELECT CASE WHEN NEW.next_source_row_id != 1
+  SELECT (CASE WHEN NEW.next_source_row_id != 1
     OR EXISTS (SELECT 1 FROM telemetry_v11_records)
     OR EXISTS (SELECT 1 FROM telemetry_v11_chunks)
     OR EXISTS (SELECT 1 FROM typed_telemetry_records WHERE format = 11)
     OR NOT EXISTS (SELECT 1 FROM typed_telemetry_schema WHERE id = 1 AND version = 1)
-    THEN RAISE(ABORT,'typed_v11_unqualified_history') END;
+    THEN RAISE(ABORT,'typed_v11_unqualified_history') END);
 END;
 CREATE TRIGGER typed_v11_state_immutable BEFORE UPDATE ON typed_v11_admission_state
 WHEN NEW.id IS NOT OLD.id OR NEW.source_namespace IS NOT OLD.source_namespace
@@ -60,17 +60,17 @@ CREATE TRIGGER typed_v11_state_retained BEFORE DELETE ON typed_v11_admission_sta
 BEGIN SELECT RAISE(ABORT,'typed_v11_namespace_retained'); END;
 CREATE TRIGGER typed_v11_allocation_guard BEFORE INSERT ON typed_v11_chunk_allocations
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM typed_v11_admission_state s JOIN telemetry_v11_chunks c ON c.id = NEW.chunk_id
     WHERE s.namespace_id = NEW.namespace_id AND s.next_source_row_id = NEW.first_source_row_id
       AND c.record_count = NEW.record_count)
-    THEN RAISE(ABORT,'typed_v11_allocator_race') END;
+    THEN RAISE(ABORT,'typed_v11_allocator_race') END);
 END;
 CREATE TRIGGER typed_v11_allocation_advance AFTER INSERT ON typed_v11_chunk_allocations
 BEGIN
   UPDATE typed_v11_admission_state SET next_source_row_id = NEW.first_source_row_id + NEW.record_count
     WHERE id = 1 AND namespace_id = NEW.namespace_id AND next_source_row_id = NEW.first_source_row_id;
-  SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT,'typed_v11_allocator_race') END;
+  SELECT (CASE WHEN changes() != 1 THEN RAISE(ABORT,'typed_v11_allocator_race') END);
 END;
 CREATE TRIGGER typed_v11_allocation_immutable BEFORE UPDATE ON typed_v11_chunk_allocations
 BEGIN SELECT RAISE(ABORT,'typed_v11_allocation_immutable'); END;
@@ -83,16 +83,16 @@ BEGIN SELECT RAISE(ABORT,'typed_v11_json_write_disabled'); END;
 CREATE TRIGGER typed_v11_typed_row_allocation BEFORE INSERT ON typed_telemetry_records
 WHEN NEW.format = 11 AND EXISTS (SELECT 1 FROM typed_v11_admission_state)
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM typed_v11_chunk_allocations a JOIN typed_telemetry_chunks c ON c.id = NEW.chunk_id
     WHERE a.namespace_id = NEW.namespace_id AND c.namespace_id = a.namespace_id
       AND c.original_id = a.chunk_original AND NEW.source_row_id >= a.first_source_row_id
       AND NEW.source_row_id < a.first_source_row_id + a.record_count)
-    THEN RAISE(ABORT,'typed_v11_unallocated_record') END;
+    THEN RAISE(ABORT,'typed_v11_unallocated_record') END);
 END;
 CREATE TRIGGER typed_v11_record_membership BEFORE INSERT ON typed_v11_record_admissions
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM typed_telemetry_compatibility_records r
       JOIN typed_v11_admission_state s ON s.namespace_id = r.namespace_id AND s.source_namespace = r.source_namespace
       JOIN typed_v11_chunk_allocations a ON a.chunk_id = NEW.chunk_id AND a.namespace_id = r.namespace_id
@@ -108,7 +108,7 @@ BEGIN
       AND r.occurrence_id = NEW.occurrence_id AND m.state = 'staged'
       AND EXISTS (SELECT 1 FROM typed_v11_owner_memberships o WHERE o.typed_owner_id=r.owner_id AND o.participant_id=c.participant_id)
       AND (SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id = c.id) < c.record_count)
-    THEN RAISE(ABORT,'typed_v11_record_staging_denied') END;
+    THEN RAISE(ABORT,'typed_v11_record_staging_denied') END);
 END;
 CREATE TRIGGER typed_v11_record_proof_immutable BEFORE UPDATE ON typed_v11_record_admissions
 BEGIN SELECT RAISE(ABORT,'typed_v11_record_proof_immutable'); END;
@@ -136,10 +136,10 @@ END;
 -- delivery bridge terminal erasure; correctness never depends on trigger order.
 CREATE TRIGGER typed_v11_owner_membership_guard BEFORE INSERT ON typed_v11_owner_memberships
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM typed_telemetry_compatibility_records r
+  SELECT (CASE WHEN NOT EXISTS (SELECT 1 FROM typed_telemetry_compatibility_records r
     JOIN typed_v11_admission_state s ON s.namespace_id=r.namespace_id
     WHERE r.owner_id=NEW.typed_owner_id AND r.participant_id=NEW.participant_id AND r.format_code=11)
-    THEN RAISE(ABORT,'typed_v11_owner_membership_conflict') END;
+    THEN RAISE(ABORT,'typed_v11_owner_membership_conflict') END);
 END;
 CREATE TRIGGER typed_v11_owner_membership_immutable BEFORE UPDATE ON typed_v11_owner_memberships
 WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.typed_owner_id IS NOT NEW.typed_owner_id
@@ -153,11 +153,11 @@ BEGIN DELETE FROM typed_telemetry_owners WHERE id=OLD.typed_owner_id; END;
 DROP TRIGGER telemetry_v11_manifest_ready;
 CREATE TRIGGER telemetry_v11_manifest_ready BEFORE UPDATE OF state ON telemetry_v11_day_manifests
 BEGIN
-  SELECT CASE WHEN OLD.state != 'staged' OR NEW.state != 'ready'
+  SELECT (CASE WHEN OLD.state != 'staged' OR NEW.state != 'ready'
     OR NEW.expected_chunk_count != (SELECT count(*) FROM telemetry_v11_chunks WHERE manifest_id = NEW.id)
     OR EXISTS (SELECT 1 FROM telemetry_v11_chunks c WHERE c.manifest_id = NEW.id
       AND c.record_count != (SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id = c.id))
-    THEN RAISE(ABORT,'telemetry_manifest_incomplete') END;
+    THEN RAISE(ABORT,'telemetry_manifest_incomplete') END);
 END;
 
 -- A digest/proof must never outlive only part of its admitted record. Actual

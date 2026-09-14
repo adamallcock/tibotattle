@@ -36,14 +36,14 @@ CREATE TABLE storage_existing_accountless_bootstrap_progress (
 
 CREATE TRIGGER storage_existing_accountless_bootstrap_manifest_gate
 BEFORE INSERT ON storage_existing_accountless_bootstrap_manifests BEGIN
-  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM storage_shards
+  SELECT (CASE WHEN NOT EXISTS (SELECT 1 FROM storage_shards
     WHERE shard_id=NEW.shard_id AND binding_name=NEW.binding_name AND state='active')
     OR NOT EXISTS (SELECT 1 FROM storage_accountless_historical_issuance_state
       WHERE singleton_id=1 AND import_state='importing' AND imported_count=0 AND import_revision=0)
     OR NOT EXISTS (SELECT 1 FROM storage_accountless_issuance_state
       WHERE singleton_id=1 AND initialization_state='uninitialized'
         AND daily_reserved=0 AND lifetime_reserved=0)
-  THEN RAISE(ABORT,'STORAGE_EXISTING_BOOTSTRAP_CLOSED') END;
+  THEN RAISE(ABORT,'STORAGE_EXISTING_BOOTSTRAP_CLOSED') END);
 END;
 
 CREATE TRIGGER storage_existing_accountless_bootstrap_manifest_immutable

@@ -97,12 +97,12 @@ AFTER INSERT ON storage_accountless_issuance_reservations BEGIN
      AND lifetime_reserved < 10000
      AND budget_day <= NEW.budget_day
      AND (budget_day <> NEW.budget_day OR daily_reserved < 1000);
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM storage_accountless_issuance_state
      WHERE singleton_id = 1
        AND last_reservation_key = NEW.reservation_key
   )
-    THEN RAISE(ABORT, 'STORAGE_ACCOUNTLESS_ISSUANCE_LIMIT') END;
+    THEN RAISE(ABORT, 'STORAGE_ACCOUNTLESS_ISSUANCE_LIMIT') END);
 END;
 
 CREATE TRIGGER storage_accountless_issuance_reservation_immutable

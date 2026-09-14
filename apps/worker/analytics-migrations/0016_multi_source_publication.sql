@@ -40,12 +40,12 @@ CREATE TABLE analytics_multi_source_heads (
 
 CREATE TRIGGER analytics_multi_source_revision_order BEFORE INSERT ON analytics_multi_source_publications
 BEGIN
- SELECT CASE WHEN NEW.revision!=COALESCE((SELECT revision FROM analytics_multi_source_heads
+ SELECT (CASE WHEN NEW.revision!=COALESCE((SELECT revision FROM analytics_multi_source_heads
    WHERE kind=NEW.kind AND publication_key=NEW.publication_key),0)+1
-  THEN RAISE(ABORT,'analytics_multi_source_revision_conflict') END;
- SELECT CASE WHEN NEW.routing_generation!=(SELECT routing_generation FROM analytics_multi_source_control WHERE singleton=1)
+  THEN RAISE(ABORT,'analytics_multi_source_revision_conflict') END);
+ SELECT (CASE WHEN NEW.routing_generation!=(SELECT routing_generation FROM analytics_multi_source_control WHERE singleton=1)
    OR NEW.erasure_generation!=(SELECT erasure_generation FROM analytics_multi_source_control WHERE singleton=1)
-  THEN RAISE(ABORT,'analytics_multi_source_generation_stale') END;
+  THEN RAISE(ABORT,'analytics_multi_source_generation_stale') END);
 END;
 
 CREATE TRIGGER analytics_multi_source_head_advance AFTER INSERT ON analytics_multi_source_publications

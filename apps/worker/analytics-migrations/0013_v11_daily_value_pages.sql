@@ -16,10 +16,10 @@ CREATE TABLE analytics_v11_value_pages (
 CREATE INDEX analytics_v11_pages_owner ON analytics_v11_value_pages(source_id,owner_digest,value_key,page_index);
 CREATE TRIGGER analytics_v11_page_valid BEFORE INSERT ON analytics_v11_value_pages
 BEGIN
-  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w
+  SELECT (CASE WHEN NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work w
     WHERE w.source_id=NEW.source_id AND w.event_digest=NEW.producer_event AND w.owner_digest=NEW.owner_digest
       AND w.phase='building' AND w.next_day=NEW.day AND w.day_records=NEW.page_index*200)
-    THEN RAISE(ABORT,'analytics_v11_page_conflict') END;
+    THEN RAISE(ABORT,'analytics_v11_page_conflict') END);
 END;
 CREATE TRIGGER analytics_v11_page_immutable BEFORE UPDATE ON analytics_v11_value_pages
 WHEN OLD.value_key IS NOT NEW.value_key OR OLD.page_index IS NOT NEW.page_index
@@ -35,13 +35,13 @@ BEGIN SELECT RAISE(ABORT,'analytics_v11_page_retained'); END;
 CREATE TRIGGER analytics_v11_summary_pages_complete BEFORE INSERT ON analytics_v11_reusable_values
 WHEN NEW.schema_version='v11-daily-projection-values-v2'
 BEGIN
-  SELECT CASE WHEN (SELECT COUNT(*) FROM analytics_v11_value_pages WHERE value_key=NEW.value_key)!=(NEW.record_count+199)/200
+  SELECT (CASE WHEN (SELECT COUNT(*) FROM analytics_v11_value_pages WHERE value_key=NEW.value_key)!=(NEW.record_count+199)/200
     OR COALESCE((SELECT SUM(record_count) FROM analytics_v11_value_pages WHERE value_key=NEW.value_key),0)!=NEW.record_count
     OR EXISTS(SELECT 1 FROM analytics_v11_value_pages p WHERE p.value_key=NEW.value_key
       AND (p.source_id!=NEW.source_id OR p.owner_digest!=NEW.owner_digest OR p.day!=NEW.day
         OR p.page_index>=(NEW.record_count+199)/200
         OR (p.page_index<(NEW.record_count-1)/200 AND p.record_count!=200)))
-    THEN RAISE(ABORT,'analytics_v11_pages_incomplete') END;
+    THEN RAISE(ABORT,'analytics_v11_pages_incomplete') END);
 END;
 -- Previous arithmetic checkpoints were complete <=200-cell states. This exact
 -- shape upgrade adds a zero omitted subtotal without changing any accounting.
