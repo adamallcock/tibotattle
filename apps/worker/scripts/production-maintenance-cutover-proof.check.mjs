@@ -21,7 +21,7 @@ const normalized=rows=>rows.map(row=>Object.fromEntries(Object.entries(row).map(
 const quote=name=>`"${name.replaceAll('"','""')}"`;
 let apiPromise;
 const api=()=>apiPromise??=(async()=>{const built=await build({stdin:{contents:"export {AUTHORITY_RESTORE_SCHEMA} from './authority-restore-schema'; export {authorityRestoreRetainedTableNames} from './authority-restore'; export {encodeTypedTelemetryId} from './typed-telemetry-codec'; export {participantDeletionDigest} from './participant-deletion-digest';",resolveDir:join(workerRoot,'src'),loader:'ts'},bundle:true,write:false,format:'esm',platform:'node',mainFields:['module','main'],logLevel:'silent'});return import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].contents).toString('base64')}`);})();
-async function fixture(t){
+async function fixture(t,{qualifiedOperatorLedger=false}={}){
  const root=await realpath(await mkdtemp(join(tmpdir(),'maintenance-proof-')));t.after(()=>rm(root,{recursive:true,force:true}));
  const databases=ids.map(()=>new DatabaseSync(':memory:'));t.after(()=>databases.forEach(db=>db.close()));
  const [source,target,analytics,ledger]=databases,maintained=await api(),inputs=[];
@@ -34,8 +34,9 @@ async function fixture(t){
    inputs.push({directory,name,sha256:storageSha256(sql),bytes:sql.length});
   }
  }
- const finalRole=schema(target),operatorSQL='CREATE TABLE d1_storage_migrations (name TEXT PRIMARY KEY NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64)) STRICT';
+ let finalRole=schema(target);const operatorSQL='CREATE TABLE d1_storage_migrations (name TEXT PRIMARY KEY NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64)) STRICT';
  target.exec(operatorSQL);
+ if(qualifiedOperatorLedger)finalRole=schema(target);
  const baseSQL='CREATE TABLE fixture_restore_base(id INTEGER PRIMARY KEY);',operatorRows=[{name:'0001_restore_base.sql',sha256:storageSha256(baseSQL)}];
  target.prepare('INSERT INTO d1_storage_migrations VALUES(?,?)').run(operatorRows[0].name,operatorRows[0].sha256);
  const finalSchema=schema(target),retained=new Set(maintained.authorityRestoreRetainedTableNames()),sourceSchema=schema(source);
@@ -124,6 +125,13 @@ test('actual schema and bounded SQL observations admit copy/bootstrap and indepe
  assert.equal(receipt.stage,'full');assert.equal(receipt.analyticsCaughtUp,true);
  assert.equal(receipt.ledgerStateSha256,f.proof.ledgerStateSha256);assert.ok(!JSON.stringify(receipt).includes(f.deletedDigest));
  assert.ok(f.calls.every(call=>/^SELECT|^PRAGMA foreign_key_check$/.test(call.sql)));
+});
+test('qualified rehearsal including the exact operator ledger admits the same application schema',async t=>{
+ const f=await fixture(t,{qualifiedOperatorLedger:true});
+ const receipt=await verifyMaintenanceCutoverProof({...f.options,stage:'pre-analytics'});
+ assert.equal(receipt.status,'verified');assert.equal(receipt.stage,'pre-analytics');
+ f.target.exec('CREATE INDEX unexpected_operator_index ON d1_storage_migrations(sha256)');
+ await assert.rejects(f.run(),/TARGET_SCHEMA|OPERATOR_SCHEMA/);
 });
 test('pre-analytics is explicit, cannot bless a wrong registration or incomplete privacy reconciliation',async t=>{
  const f=await fixture(t),read=f.options.readDatabase;

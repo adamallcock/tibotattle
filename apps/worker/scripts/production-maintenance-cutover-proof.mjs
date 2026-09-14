@@ -172,7 +172,11 @@ export async function verifyMaintenanceCutoverProof({plan,cutover,qualificationR
  const roleSchemaBytes=await file(join(qualificationRoot,D1_STORAGE_SCHEMA_DIRECTORIES.ingestion,'final-role-schema.json'),ingestion.manifest.finalRoleSchemaSha256);
  // The restore-base loader's runtimeReady:false remains truthful. Final role
  // schema and runtime state are independently checked below against live D1.
- equal(parse(roleSchemaBytes),contract.finalSchema.filter(row=>row.tbl_name!=='d1_storage_migrations'),'QUALIFIED_FINAL_ROLE');
+ const qualifiedRole=parse(roleSchemaBytes);
+ // Rehearsals may include the exact operator ledger. It is checked separately
+ // from the application schema, just as the restored contract's ledger is.
+ if(qualifiedRole.some(row=>row.tbl_name==='d1_storage_migrations'))administrativeLedger(qualifiedRole,[],[]);
+ equal(qualifiedRole.filter(row=>row.tbl_name!=='d1_storage_migrations'),contract.finalSchema.filter(row=>row.tbl_name!=='d1_storage_migrations'),'QUALIFIED_FINAL_ROLE');
  const ledgerSchemaBytes=await file(ledgerSchemaPath,proof.ledgerSchemaFileSha256),ledgerSchema=parse(ledgerSchemaBytes);
  storageSchemaDigest(ledgerSchema);
  const ledgerDirectory=join(qualificationRoot,'deletion-ledger-migrations');
