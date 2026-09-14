@@ -317,9 +317,143 @@ test("draft admission refuses promoting an older version to latest", async (t) =
   const adapter = createPublicationAdapters({ spawn: (_command, args) => {
     assert.equal(args[2], "GET");
     if (args[3].includes("/releases/tags/")) return { status: 1, stderr: "HTTP 404" };
+    if (args[3] === "repos/adamallcock/tibotattle") return { status: 0, stdout: JSON.stringify({ full_name: "adamallcock/tibotattle", permissions: { push: true } }) };
+    if (args[3].includes("/releases?")) return { status: 0, stdout: "[]" };
     return { status: 0, stdout: JSON.stringify(args[3].endsWith("/immutable-releases") ? { enabled: true } : { tag_name: "v1.2.4" }) };
   } });
   await assert.rejects(adapter.github({ plan: f.plan }), /DOWNGRADE_REFUSED/);
+});
+
+function draftDiscoverySpawn({ pages = [[]], byId, repository = { full_name: "adamallcock/tibotattle", permissions: { push: true } }, byTag, calls = [] } = {}) {
+  return (command, args) => {
+    assert.equal(command, "gh"); assert.equal(args[0], "api"); assert.equal(args[2], "GET");
+    const route = args[3]; calls.push(route);
+    if (route === "repos/adamallcock/tibotattle/releases/tags/v1.2.3") return byTag ?? { status: 1, stderr: "HTTP 404" };
+    if (route === "repos/adamallcock/tibotattle") return { status: 0, stdout: JSON.stringify(repository) };
+    const page = /^repos\/adamallcock\/tibotattle\/releases\?per_page=100&page=(\d+)$/u.exec(route);
+    if (page) return { status: 0, stdout: JSON.stringify(pages[Number(page[1]) - 1]) };
+    if (route === "repos/adamallcock/tibotattle/releases/7") return byId?.status !== undefined ? byId : { status: 0, stdout: JSON.stringify(byId) };
+    if (route === "repos/adamallcock/tibotattle/releases/7/assets?per_page=100&page=1") return { status: 0, stdout: "[]" };
+    if (route === "repos/adamallcock/tibotattle/immutable-releases") return { status: 0, stdout: '{"enabled":true}' };
+    if (route === "repos/adamallcock/tibotattle/releases/latest") return { status: 0, stdout: '{"tag_name":"v1.2.2"}' };
+    assert.fail("Unexpected remote request");
+  };
+}
+const discoveryDraft = () => ({ id: 7, tag_name: "v1.2.3", draft: true, prerelease: false,
+  name: "TiboTattle 1.2.3", body: "Synthetic release notes" });
+const unrelatedReleases = (page) => Array.from({ length: 100 }, (_, index) => ({
+  id: page * 100 + index + 100, tag_name: `other-${page}-${index}`, draft: false, prerelease: false,
+}));
+
+test("GitHub draft discovery scans beyond page one, re-reads exact ID and remains read-only", async (t) => {
+  const f = await fixture(t), calls = [], draft = discoveryDraft();
+  const adapter = createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages: [unrelatedReleases(1), [draft]], byId: draft, calls }) });
+  const result = await adapter.github({ plan: f.plan });
+  assert.equal(result.status, "draft"); assert.equal(result.release.id, 7); assert.deepEqual(result.assets, []);
+  assert.ok(calls.includes("repos/adamallcock/tibotattle/releases?per_page=100&page=2"));
+  assert.ok(calls.indexOf("repos/adamallcock/tibotattle/releases/7") > calls.indexOf("repos/adamallcock/tibotattle/releases?per_page=100&page=2"));
+});
+
+test("GitHub draft discovery proves absence only after complete visible listing", async (t) => {
+  const f = await fixture(t), calls = [];
+  const adapter = createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages: [[{ ...discoveryDraft(), tag_name: "v1.2.30" }]], calls }) });
+  assert.deepEqual(await adapter.github({ plan: f.plan }), { status: "missing", release: null, assets: [] });
+  assert.ok(!calls.includes("repos/adamallcock/tibotattle/releases/7"));
+  for (const repository of [{}, { full_name: "elsewhere/repository", permissions: { push: true } },
+    { full_name: "adamallcock/tibotattle", permissions: { push: false } },
+    { full_name: "adamallcock/tibotattle", permissions: { push: "true" } }]) {
+    const calls = [];
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ repository, calls }) }).github({ plan: f.plan }), /DRAFT_VISIBILITY_REQUIRED/u);
+    assert.equal(calls.length, 2);
+  }
+});
+
+test("GitHub draft discovery refuses malformed lists, duplicate IDs/tags and pagination overflow", async (t) => {
+  const f = await fixture(t), draft = discoveryDraft();
+  for (const pages of [[{}], [[null]], [[{ ...draft, id: 0 }]], [[{ ...draft, id: "7" }]],
+    [[{ ...draft, tag_name: null }]], [[{ ...draft, draft: undefined }]], [[{ ...draft, prerelease: "false" }]],
+    [[draft, draft]], [[draft, { ...draft, id: 8 }]],
+    [[draft, ...unrelatedReleases(1).slice(0, 99)], [{ ...draft, id: 8 }]],
+    [unrelatedReleases(1), [unrelatedReleases(1)[0]]],
+    [Array.from({ length: 101 }, (_, index) => ({ ...draft, id: index + 1 }))]]) {
+    const calls = [];
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages, byId: draft, calls }) }).github({ plan: f.plan }), /RELEASE_LIST_(INVALID|CONFLICT)/u);
+    assert.ok(!calls.includes("repos/adamallcock/tibotattle/releases/7"));
+  }
+  const calls = [], pages = Array.from({ length: 20 }, (_, index) => unrelatedReleases(index + 1));
+  pages[0][0] = draft;
+  await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages, byId: draft, calls }) }).github({ plan: f.plan }), /RELEASE_LIST_TOO_LARGE/u);
+  assert.equal(calls.filter(route => route.includes("/releases?")).length, 20);
+  assert.ok(!calls.includes("repos/adamallcock/tibotattle/releases/7"));
+});
+
+test("GitHub draft discovery rejects changed or unavailable ID readback and preserves title/body/asset checks", async (t) => {
+  const f = await fixture(t), draft = discoveryDraft();
+  for (const [byId, expected] of [[{ ...draft, id: 8 }, /DISCOVERY_CHANGED/u],
+    [{ ...draft, tag_name: "v9.9.9" }, /DISCOVERY_CHANGED/u], [{ ...draft, draft: false }, /DISCOVERY_CHANGED/u],
+    [{ ...draft, prerelease: true }, /DISCOVERY_CHANGED/u], [{ ...draft, name: "Unexpected title" }, /IDENTITY_CONFLICT/u],
+    [{ ...draft, body: "Unreviewed notes" }, /IDENTITY_CONFLICT/u], [null, /REMOTE_JSON_INVALID/u],
+    [{ status: 1, stderr: "HTTP 404" }, /REMOTE_COMMAND_FAILED/u]]) {
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ pages: [[draft]], byId }) }).github({ plan: f.plan }), expected);
+  }
+  for (const malformed of [false, 0, "", []]) {
+    const calls = [], byTag = { status: 0, stdout: JSON.stringify(malformed) };
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ byTag, calls }) }).github({ plan: f.plan }), /IDENTITY_CONFLICT/u);
+    assert.equal(calls.length, 1);
+  }
+  for (const change of [{ id: 0 }, { draft: undefined }, { draft: "false" }, { body: {} }]) {
+    const calls = [], byTag = { status: 0, stdout: JSON.stringify({ ...draft, ...change }) };
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ byTag, calls }) }).github({ plan: f.plan }), /IDENTITY_CONFLICT/u);
+    assert.equal(calls.length, 1);
+  }
+  for (const byTag of [{ status: 0, stdout: "null" }, { status: 0, stdout: "" }, { status: 0, stdout: "{" },
+    { status: 1, stderr: "HTTP 403" }]) {
+    const calls = [];
+    await assert.rejects(createPublicationAdapters({ spawn: draftDiscoverySpawn({ byTag, calls }) }).github({ plan: f.plan }), /REMOTE_(JSON_INVALID|COMMAND_FAILED)/u);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test("draft provisional asset URLs bind the exact draft page and still require downloaded API bytes", async (t) => {
+  const f = await fixture(t), expected = f.plan.assets[0], contents = await readFile(expected.path);
+  const token = "untagged-0123456789abcdefabcd";
+  const page = `https://github.com/adamallcock/tibotattle/releases/tag/${token}`;
+  const url = `https://github.com/adamallcock/tibotattle/releases/download/${token}/${expected.name}`;
+  async function inspect({ htmlUrl = page, assetUrl = url, draft = true, wrongBytes = false } = {}) {
+    let downloads = 0;
+    const release = { ...discoveryDraft(), html_url: htmlUrl, draft };
+    const delegate = draftDiscoverySpawn({ pages: [[release]], byId: release });
+    const asset = { name: expected.name, id: 10, size: expected.bytes, state: "uploaded", browser_download_url: assetUrl };
+    const adapter = createPublicationAdapters({ spawn: (command, args, options) => {
+      if (args.includes("Accept: application/octet-stream")) {
+        assert.equal(command, "gh"); assert.equal(args[1], "repos/adamallcock/tibotattle/releases/assets/10");
+        downloads += 1; writeSync(options.stdio[1], wrongBytes ? Buffer.from("altered bytes") : contents);
+        return { status: 0, stdout: "" };
+      }
+      if (args[3] === "repos/adamallcock/tibotattle/releases/7/assets?per_page=100&page=1") {
+        assert.equal(args[2], "GET"); return { status: 0, stdout: JSON.stringify([asset]) };
+      }
+      return delegate(command, args, options);
+    } });
+    try { return { result: await adapter.github({ plan: f.plan }), downloads }; }
+    catch (error) { return { error, downloads }; }
+  }
+  const passed = await inspect();
+  assert.equal(passed.result.status, "draft"); assert.equal(passed.downloads, 1);
+  assert.equal(passed.result.assets[0].browser_download_url, url); // Keep provisional evidence truthful.
+  for (const change of [{ draft: false }, { htmlUrl: undefined, assetUrl: url.replace(token, "untagged-abcdef0123456789abcd") },
+    { htmlUrl: page + "?other=1" }, { htmlUrl: page + "\n" }, { htmlUrl: page.replace(token, "untagged-ABCDEF0123456789ABCD") },
+    { htmlUrl: page.replace(token, "untagged-0123456789abcdefabc") },
+    { htmlUrl: page.replace("adamallcock/tibotattle", "elsewhere/tibotattle") },
+    { htmlUrl: null }, { assetUrl: url + "?other=1" }, { assetUrl: url + "#fragment" },
+    { assetUrl: url.replace("github.com", "github.example") }, { assetUrl: url.replace(expected.name, "unexpected.zip") }]) {
+    const refused = await inspect(change);
+    assert.match(refused.error?.code ?? refused.error?.message ?? "", /GITHUB_ASSET_METADATA_CONFLICT/u);
+    assert.equal(refused.downloads, 0);
+  }
+  const altered = await inspect({ wrongBytes: true });
+  assert.match(altered.error?.code ?? altered.error?.message ?? "", /IMMUTABLE_BYTES_CONFLICT/u);
+  assert.equal(altered.downloads, 1);
 });
 
 test("tap adapter detects stale Intel bytes and dispatches only the pinned existing updater", async (t) => {
