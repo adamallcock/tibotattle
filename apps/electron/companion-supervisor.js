@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { posix } from "node:path";
 
 import {
   LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
@@ -133,11 +133,12 @@ function companionEnvironment(environment, parentPid, credentialBrokerKind = nul
       selected.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE = file;
       selected.USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY = "1";
       if (accountFile !== undefined) {
+        // These are Darwin paths even when a contract test runs on Windows.
         if (platform !== "darwin" || typeof accountFile !== "string"
-            || !isAbsolute(accountFile) || accountFile.includes("\0")
-            || resolve(accountFile) !== accountFile || resolve(file) !== file
-            || basename(file) !== "export-identity" || basename(dirname(file)) !== "identity"
-            || accountFile !== join(dirname(file), "account-observation-development")
+            || !posix.isAbsolute(accountFile) || accountFile.includes("\0")
+            || posix.resolve(accountFile) !== accountFile || posix.resolve(file) !== file
+            || posix.basename(file) !== "export-identity" || posix.basename(posix.dirname(file)) !== "identity"
+            || accountFile !== posix.join(posix.dirname(file), "account-observation-development")
             || environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN
             || environment.USAGE_MONITOR_ACCOUNTLESS_MODE || credentialBrokerKind !== null) {
           throw shellError("electron_configuration_invalid");

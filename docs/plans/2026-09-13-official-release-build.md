@@ -21,7 +21,7 @@ it is not an installed-update or publication receipt.
   `0.1.22` / `1029`. The
   [existing allocation decision](../decisions/2026-09-11-electron-macos-bundle-version-allocation.md)
   still governs the distinction between bundle ordering and artifact provenance.
-- Next source-preparation build number: `2026091303`, shared across all four
+- Next source-preparation build number: `2026091304`, shared across all four
   targets. It is not an Apple bundle version or evidence of publication.
 - Freeze the exact clean candidate commit before source preparation. Keep draft
   release notes under Unreleased until final source/tag preparation.
@@ -42,7 +42,7 @@ it is not an installed-update or publication receipt.
   passed Mac ARM, Mac Intel and Linux development packaging, plus the Windows
   normal app journey. Windows packaging failed two native fixture checks and
   therefore did not run its dependent NSIS installed lifecycle.
-- The candidate corrects only those Windows fixtures: the audit guard receives
+- The candidate corrects the Windows fixtures: the audit guard receives
   its required two protected parents, and synthetic source files receive explicit
   current-user ownership with unchanged DACLs. Native security policy is unchanged.
 
@@ -92,10 +92,18 @@ transferred to new artifacts.
   preserving the parent environment. Native rerun confirmed the source-handle
   and ACL checks. The timing fixture now supplies the required two-second task
   duration for its 200 ms TTFT; a portable parser test verifies this boundary
-  before the next native journal/reopen run.
+  before native execution. Source `86022fe5b3bc3ef03ecfe9f855595eec866e721f`
+  passed all 66 native filesystem and credential checks, including journal,
+  reopen and crash recovery. The next shell contract exposed host-dependent
+  path normalization in the simulated Mac QA lane; its Darwin-only account-key
+  validation now uses explicit POSIX semantics and retains rejection coverage
+  for Windows, noncanonical and out-of-directory paths.
 - Source `93ba64c31d97be0a882049544247ccd6ed21a26f`, build `2026091302`, also
   passed the complete unsigned source-preparation workflow in
   [run 34800291232](https://github.com/adamallcock/tibotattle/actions/runs/34800291232).
+- Source `86022fe5b3bc3ef03ecfe9f855595eec866e721f`, build `2026091303`,
+  passed all four unsigned source-preparation jobs in
+  [run 34800701138](https://github.com/adamallcock/tibotattle/actions/runs/34800701138).
 - [Draft PR #140](https://github.com/adamallcock/tibotattle/pull/140) retains the
   candidate and its outstanding gates. The next clean commit receives fresh
   four-target build and source-preparation receipts; earlier receipts remain
