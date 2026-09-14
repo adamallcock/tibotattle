@@ -554,8 +554,13 @@ export function createCatalogStorageRouter({ catalog, bindings, clock }: {
             FROM storage_shards shard
             JOIN storage_shard_capacity_observations observation USING (shard_id)
             JOIN storage_shard_allocation_policy policy USING (shard_id)
+            JOIN storage_shard_runtime_readiness readiness
+              ON readiness.readiness_digest=policy.qualification_digest
+             AND readiness.shard_id=shard.shard_id
+             AND readiness.binding_name=shard.binding_name
             WHERE shard.state='active' AND observation.pressure_state='normal'
-              AND policy.allocation_enabled=1 AND observation.valid_until>=?
+              AND policy.allocation_enabled=1 AND readiness.state='active'
+              AND readiness.contract_version=1 AND observation.valid_until>=?
               AND observation.observed_bytes<?
               AND observation.observed_bytes+shard.reserved_bytes+?<=shard.capacity_bytes
             ORDER BY CASE policy.allocation_tier WHEN 'active' THEN 0 ELSE 1 END,
@@ -640,8 +645,13 @@ export function createCatalogStorageRouter({ catalog, bindings, clock }: {
           FROM storage_shards shard
           JOIN storage_shard_capacity_observations observation USING (shard_id)
           JOIN storage_shard_allocation_policy policy USING (shard_id)
+          JOIN storage_shard_runtime_readiness readiness
+            ON readiness.readiness_digest=policy.qualification_digest
+           AND readiness.shard_id=shard.shard_id
+           AND readiness.binding_name=shard.binding_name
           WHERE shard.shard_id = ? AND shard.state = 'active'
             AND policy.allocation_enabled = 1
+            AND readiness.state='active' AND readiness.contract_version=1
             AND observation.pressure_state = 'normal'
             AND observation.valid_until >= ?
             AND observation.observed_bytes < ?

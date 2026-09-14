@@ -2,6 +2,7 @@ import { applyD1Migrations, env, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { configureStorageShardAllocation, recordStorageCapacityObservation } from "../src/storage-capacity";
+import { qualifyStorageShardForTest } from './helpers/storage-shard-readiness';
 import {
   createCatalogStorageRouter,
   finalizeAccountlessIssuanceBaseline,
@@ -52,9 +53,16 @@ async function prepareCatalog(migrations = bindings().TEST_ROUTING_MIGRATIONS): 
     shardId: "a", observedBytes: 1_000, observedAt: 1_000,
     validUntil: Date.UTC(2030, 0, 1), pressureState: "normal",
   });
-  await configureStorageShardAllocation(catalog(), {
-    shardId: "a", allocationTier: "active", allocationEnabled: true, updatedAt: 1_000,
-  });
+  if(migrations.some(migration=>migration.name==='0008_storage_shard_runtime_readiness.sql')){
+    const readiness=await qualifyStorageShardForTest(catalog(),{shardId:'a',bindingName:'STORAGE_INGESTION_A',qualifiedAt:1_000});
+    await configureStorageShardAllocation(catalog(), {
+      shardId: "a", allocationTier: "active", allocationEnabled: true,
+      qualificationDigest:readiness.readinessDigest, updatedAt: 1_000,
+    });
+  }else{
+    await catalog().prepare(`INSERT INTO storage_shard_allocation_policy
+      (shard_id,allocation_tier,allocation_enabled,updated_at) VALUES('a','active',1,1000)`).run();
+  }
 }
 
 async function prepareOwner(input: HistoricalAccountlessIssuanceReservation): Promise<void> {
@@ -400,7 +408,12 @@ describe("historical accountless issuance activation", () => {
       WHERE singleton_id=1`).bind("9".repeat(64)).run();
     const currentKey = "5".repeat(64);
     const currentDevice = "e".repeat(64);
-    await router().ensureOwner("accountless:existing-current", "a", 4_096);
+    await catalog().prepare(`INSERT INTO storage_owner_routes
+      (owner_id,shard_id,route_generation,state,reservation_bytes,updated_at)
+      VALUES('accountless:existing-current','a',1,'active',4096,1000)`).run();
+    await shard().prepare(`INSERT INTO storage_owner_fences
+      (owner_id,shard_id,route_generation,state)
+      VALUES('accountless:existing-current','a',1,'active')`).run();
     await catalog().batch([
       catalog().prepare(`INSERT INTO storage_capability_locators
         (capability_hash,owner_id,state) VALUES (?,?,'active')`)

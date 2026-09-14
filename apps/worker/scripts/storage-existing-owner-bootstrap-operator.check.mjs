@@ -73,7 +73,22 @@ async function seedExistingOwners(f, count, { observedBytes = 1_000, validUntil 
     f.catalog.prepare("INSERT INTO storage_shards(shard_id,binding_name,state) VALUES('a','STORAGE_INGESTION_A','active')"),
     f.catalog.prepare("INSERT INTO storage_shard_capacity_observations(shard_id,observed_bytes,observed_at,valid_until,pressure_state) VALUES('a',?,?,?,'normal')")
       .bind(observedBytes, Math.min(Date.now(), validUntil - 1), validUntil),
-    f.catalog.prepare("INSERT INTO storage_shard_allocation_policy(shard_id,allocation_tier,allocation_enabled,updated_at) VALUES('a','active',1,?)").bind(Date.now()),
+    f.catalog.prepare(`INSERT INTO storage_shard_runtime_readiness(
+      readiness_digest,qualification_id,shard_id,catalog_database_id,catalog_binding_name,catalog_schema_digest,binding_name,
+      ingestion_database_id,source_id,source_namespace,ingestion_schema_digest,analytics_target_id,
+      analytics_binding_name,analytics_database_id,analytics_schema_digest,erasure_target_id,
+      deletion_ledger_binding_name,deletion_ledger_database_id,deletion_schema_digest,
+      publication_binding_name,publication_database_id,publication_schema_digest,qualified_at,state)
+      VALUES(?,?,'a',?,'STORAGE_ROUTING_DB',?,'STORAGE_INGESTION_A',?,?,?,?,'analytics-a','STORAGE_ANALYTICS_A',?,?,
+       'analytics-a','DELETION_LEDGER',?,?,'STORAGE_PUBLICATION_DB',?,?,?,'active')`)
+      .bind('f'.repeat(64),'55555555-5555-4555-8555-555555555555',plan.catalogDatabase.id,
+        '0'.repeat(64),plan.sourceDatabase.id,plan.sourceId,'existing-source-namespace','1'.repeat(64),
+        '66666666-6666-4666-8666-666666666666','2'.repeat(64),
+        '77777777-7777-4777-8777-777777777777','3'.repeat(64),
+        '88888888-8888-4888-8888-888888888888','4'.repeat(64),Date.now()),
+    f.catalog.prepare(`INSERT INTO storage_shard_allocation_policy
+      (shard_id,allocation_tier,allocation_enabled,updated_at,qualification_digest)
+      VALUES('a','active',1,?,?)`).bind(Date.now(),'f'.repeat(64)),
   ]);
 }
 

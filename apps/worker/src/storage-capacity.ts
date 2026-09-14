@@ -5,6 +5,7 @@ import {
 } from "./storage-routing";
 
 const SHARD_ID = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u;
+const DIGEST = /^[a-f0-9]{64}$/u;
 
 export interface StorageCapacityObservation {
   readonly shardId: string;
@@ -96,6 +97,7 @@ export async function configureStorageShardAllocation(
     shardId: string;
     allocationTier: "active" | "spare";
     allocationEnabled: boolean;
+    qualificationDigest: string | null;
     updatedAt: number;
   }>,
 ): Promise<void> {
@@ -103,20 +105,36 @@ export async function configureStorageShardAllocation(
       || !SHARD_ID.test(policy.shardId)
       || !["active", "spare"].includes(policy.allocationTier)
       || typeof policy.allocationEnabled !== "boolean"
+      || (policy.qualificationDigest !== null && !DIGEST.test(policy.qualificationDigest))
+      || (policy.allocationEnabled && policy.qualificationDigest === null)
       || !validInteger(policy.updatedAt)) {
     throw new StorageRoutingError("INVALID_ROUTING_INPUT");
   }
   try {
     await catalog.prepare(`INSERT INTO storage_shard_allocation_policy
-      (shard_id, allocation_tier, allocation_enabled, updated_at)
-      VALUES (?, ?, ?, ?)
+      (shard_id, allocation_tier, allocation_enabled, updated_at, qualification_digest)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT (shard_id) DO UPDATE SET
         allocation_tier = excluded.allocation_tier,
         allocation_enabled = excluded.allocation_enabled,
-        updated_at = excluded.updated_at
+        updated_at = excluded.updated_at,
+        qualification_digest = excluded.qualification_digest
       WHERE excluded.updated_at >= storage_shard_allocation_policy.updated_at`)
       .bind(policy.shardId, policy.allocationTier,
-        policy.allocationEnabled ? 1 : 0, policy.updatedAt).run();
+        policy.allocationEnabled ? 1 : 0, policy.updatedAt,
+        policy.qualificationDigest).run();
+    const stored = await catalog.prepare(`SELECT allocation_tier,allocation_enabled,
+      updated_at,qualification_digest FROM storage_shard_allocation_policy
+      WHERE shard_id=? LIMIT 1`).bind(policy.shardId).first<{
+        allocation_tier:string;allocation_enabled:number;updated_at:number;
+        qualification_digest:string|null;
+      }>();
+    if (!stored || stored.allocation_tier !== policy.allocationTier
+        || stored.allocation_enabled !== (policy.allocationEnabled ? 1 : 0)
+        || stored.updated_at !== policy.updatedAt
+        || stored.qualification_digest !== policy.qualificationDigest) {
+      throw new StorageRoutingError("STORAGE_UNAVAILABLE");
+    }
   } catch {
     throw new StorageRoutingError("STORAGE_UNAVAILABLE");
   }

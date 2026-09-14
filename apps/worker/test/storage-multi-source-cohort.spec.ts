@@ -24,6 +24,7 @@ import { createCatalogStorageRouter, initializeAccountlessIssuanceBaseline,
   type AccountlessIssuanceReservation, type OwnerStorageRoute } from "../src/storage-routing";
 import { configureStorageShardAllocation,
   recordStorageCapacityObservation } from "../src/storage-capacity";
+import { qualifyStorageShardForTest } from './helpers/storage-shard-readiness';
 import { captureStorageMultiSourceCohort,
   storageMultiSourceCohortPublicationQueryCeiling } from "../src/storage-multi-source-cohort";
 import { runStorageAnalyticsSchedule,
@@ -91,8 +92,12 @@ beforeEach(async () => {
   for (const shardId of ["a", "b", "c"] as const) {
     await recordStorageCapacityObservation(b.STORAGE_ROUTING_DB, { shardId,
       observedBytes: 0, observedAt: now, validUntil: now + 60_000, pressureState: "normal" });
+    const readiness=await qualifyStorageShardForTest(b.STORAGE_ROUTING_DB,{shardId,
+      bindingName:`STORAGE_INGESTION_${shardId.toUpperCase()}`,
+      qualifiedAt:now});
     await configureStorageShardAllocation(b.STORAGE_ROUTING_DB, { shardId,
-      allocationTier: "active", allocationEnabled: true, updatedAt: now });
+      allocationTier: "active", allocationEnabled: true,
+      qualificationDigest:readiness.readinessDigest, updatedAt: now });
   }
 });
 

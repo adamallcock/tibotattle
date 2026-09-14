@@ -56,7 +56,8 @@ beforeEach(async () => {
     });
   }
   await configureStorageShardAllocation(catalog(), {
-    shardId: 'a', allocationTier: 'spare', allocationEnabled: false, updatedAt: NOW - 1_000,
+    shardId: 'a', allocationTier: 'spare', allocationEnabled: false,
+    qualificationDigest:null, updatedAt: NOW - 1_000,
   });
   for (const database of [a(), b()]) {
     await database.prepare('CREATE TABLE synthetic_retained_rows (id INTEGER PRIMARY KEY, n INTEGER)').run();

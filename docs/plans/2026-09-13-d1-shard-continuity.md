@@ -32,7 +32,7 @@ Sol High agents lead implementation; they may delegate bounded work to Luna Max 
 | 1. Routing and capacity | Actual enrollment, ownership, credential lifecycle and upload paths across two ingestion shards and a spare; concurrent enrollment converges; cutoff, stale capacity, replay and route fences tested | In progress |
 | 2. Analytics and erasure | Independent source progress, complete combined publication, no moved-owner duplication; owner-only erasure covers current/prior sources and derived targets with completion receipts | In progress |
 | 3. Owner movement | Background copy plus catch-up, brief owner-specific final fence, exact verification and routing switch; restart/reconcile every phase | Origin prerequisites locally qualified; copier pending |
-| 4. Operations | Wrangler-managed qualified spare capacity, size/growth alerts, safe allocation and movement controls; per-writer headroom reservations | Upload reservations locally qualified; calibration and spare qualification pending |
+| 4. Operations | Wrangler-managed qualified spare capacity, size/growth alerts, safe allocation and movement controls; per-writer headroom reservations | Upload reservations qualified; immutable spare-readiness receipt implemented locally; hosted qualification pending |
 | 5. Qualification | Integrated local HTTP journeys, real isolated cloud rollover and failure rehearsal, measured final pause, then reviewed production activation | Local owning gate passed; cloud bootstrap preparation active |
 
 Each stage must integrate its runtime callers. Uncalled interfaces, isolated mock tests or a configuration flag alone do not close a stage.
@@ -146,3 +146,33 @@ The v1.1 private export iterator now resolves each chunk through its exact quali
 Private exports authenticate the global browser session and erasure tombstone before resolving the participant locator. Every existing export lane then reads the single assigned database; a missing locator fails closed without scanning shards or falling back to the global database. Retained records preserve their original provenance. Synthetic HTTP coverage proves a session in global authority can export typed records stored on a different physical shard, rejects missing routing, and rejects invalid authentication before catalog access. The combined focused selection passes 126 tests and TypeScript. The integrated `f787f705` source passes the complete local Worker gate: 128 files, 1,523 tests and four dry builds.
 
 Catalog activation must first backfill and verify locators for every historical session-authenticated owner. The existing v1.0 chunk journal has no private-export response lane; this slice preserves the response schema and routes every lane already exposed. It does not establish an end-to-end owner move. Qualified spare admission and the owner copier remain separate implementation gates.
+
+## Qualified spare readiness follow-up
+
+Routing migration `0008_storage_shard_runtime_readiness.sql` adds one immutable,
+revocable qualification receipt for each shard. The receipt binds the exact
+ingestion database, source ID and namespace, analytics target, deletion ledger,
+central publication database and each database's bounded application-schema
+digest. Allocation policy names that receipt explicitly. Both new-owner and
+move-reservation triggers recheck that it is still active and still matches the
+shard binding, in addition to the existing fresh physical-size observation,
+6 GB new-owner cutoff and 9 GB reservation budget.
+
+The root-only operator verifies the complete tuple before recording the receipt,
+then rechecks a pinned independent physical-size observation before enabling
+allocation. Repeating the same receipt converges; an uncertain acknowledgement
+does not authorize a different tuple. Revocation is one-way and immediately
+closes new allocation and move preparation while leaving existing routes and
+deletion work available. Single-database mode does not consult this catalog.
+
+The separate `5c951b3a` checkpoint passed 129 files and 1,533 tests, type/script
+checks and all four dry builds. Its original command stopped at a missing
+generated website prerequisite; after verifying those assets, the remaining
+build checks passed. This integration also carries the canonical migration
+parser repair and the calendar-independent midnight fixture. The combined
+source requires its own qualification after the concrete operator is complete.
+This is source and local migration readiness only. Before a shard can be used,
+root must apply routing migration 0008, run the root-only operator against the
+exact hosted bindings, retain its receipt and obtain a fresh capacity sample.
+No owner is copied or routed by qualification itself; the reviewed copier,
+move journey and isolated cloud failure rehearsal remain activation gates.

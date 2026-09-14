@@ -2,6 +2,7 @@ import { applyD1Migrations, env, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { configureStorageShardAllocation, recordStorageCapacityObservation } from "../src/storage-capacity";
+import { qualifyStorageShardForTest } from './helpers/storage-shard-readiness';
 import {
   assertStorageCatalogEpoch,
   captureActiveOwnerRouteSnapshot,
@@ -46,8 +47,11 @@ async function observe(
     validUntil,
     pressureState: "normal",
   });
+  const readiness=await qualifyStorageShardForTest(catalog(),{shardId,
+    bindingName:`STORAGE_INGESTION_${shardId.toUpperCase()}`,qualifiedAt:9_000});
   await configureStorageShardAllocation(catalog(), {
-    shardId, allocationTier, allocationEnabled: true, updatedAt: 9_000,
+    shardId, allocationTier, allocationEnabled: true, qualificationDigest:readiness.readinessDigest,
+    updatedAt: 9_000,
   });
 }
 
@@ -185,8 +189,9 @@ describe("owner shard allocation capacity", () => {
       shardId: "b", observedBytes: 1, observedAt: 9_000, validUntil: 20_000,
       pressureState: "pressure",
     });
+    const readiness=await qualifyStorageShardForTest(catalog(),{shardId:'b',bindingName:'STORAGE_INGESTION_B',qualifiedAt:9000});
     await configureStorageShardAllocation(catalog(), {shardId:'b',allocationTier:'active',
-      allocationEnabled:true,updatedAt:9000});
+      allocationEnabled:true,qualificationDigest:readiness.readinessDigest,updatedAt:9000});
     await observe("c", 5_999_999_999, "spare");
     await catalog().prepare("UPDATE storage_shards SET reserved_bytes=3000000001 WHERE shard_id='c'").run();
     await expect(router().ensureCapabilityOwner(

@@ -25,6 +25,7 @@ import {
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import { configureStorageShardAllocation, recordStorageCapacityObservation } from "../src/storage-capacity";
+import { qualifyStorageShardForTest } from './helpers/storage-shard-readiness';
 import {
   createCatalogStorageRouter,
   initializeAccountlessIssuanceBaseline,
@@ -432,8 +433,11 @@ async function observe(shardId: string, observedBytes: number,
     shardId, observedBytes, observedAt: Date.now() - 1000,
     validUntil: Date.now() + 60_000, pressureState: "normal",
   });
+  const readiness=await qualifyStorageShardForTest(catalog(),{shardId,
+    bindingName:`STORAGE_INGESTION_${shardId.toUpperCase()}`,qualifiedAt:Date.now()-1000});
   await configureStorageShardAllocation(catalog(), {
-    shardId, allocationTier, allocationEnabled: true, updatedAt: Date.now() - 1000,
+    shardId, allocationTier, allocationEnabled: true, qualificationDigest:readiness.readinessDigest,
+    updatedAt: Date.now() - 1000,
   });
 }
 

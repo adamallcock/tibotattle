@@ -12,6 +12,7 @@ import {encodeBase64Url} from '../src/crypto';
 import {deviceHash} from '../src/device-auth';
 import {participantDeletionDigest} from '../src/participant-deletion-digest';
 import {configureStorageShardAllocation,recordStorageCapacityObservation} from '../src/storage-capacity';
+import {qualifyStorageShardForTest} from './helpers/storage-shard-readiness';
 import {extractExistingAccountlessBootstrapManifest,
  importExistingAccountlessBootstrapPage,type ExistingAccountlessBootstrapPolicy} from '../src/storage-existing-owner-bootstrap';
 import {createCatalogStorageRouter} from '../src/storage-routing';
@@ -75,7 +76,9 @@ beforeEach(async()=>{
  ]);
  await recordStorageCapacityObservation(catalog(),{shardId:'a',observedBytes:1_000,observedAt:NOW,
   validUntil:NOW+10_000,pressureState:'normal'});
- await configureStorageShardAllocation(catalog(),{shardId:'a',allocationTier:'active',allocationEnabled:true,updatedAt:NOW});
+ const readiness=await qualifyStorageShardForTest(catalog(),{shardId:'a',bindingName:'STORAGE_INGESTION_A',qualifiedAt:NOW});
+ await configureStorageShardAllocation(catalog(),{shardId:'a',allocationTier:'active',allocationEnabled:true,
+  qualificationDigest:readiness.readinessDigest,updatedAt:NOW});
 });
 
 describe('trusted existing accountless owner bootstrap',()=>{
@@ -155,7 +158,9 @@ describe('trusted existing accountless owner bootstrap',()=>{
   const manifest=await extractExistingAccountlessBootstrapManifest(source(),policy());
   await recordStorageCapacityObservation(catalog(),{shardId:'b',observedBytes:1_000,observedAt:NOW,
    validUntil:NOW+10_000,pressureState:'normal'});
-  await configureStorageShardAllocation(catalog(),{shardId:'b',allocationTier:'active',allocationEnabled:true,updatedAt:NOW});
+  const readiness=await qualifyStorageShardForTest(catalog(),{shardId:'b',bindingName:'STORAGE_INGESTION_B',qualifiedAt:NOW});
+  await configureStorageShardAllocation(catalog(),{shardId:'b',allocationTier:'active',allocationEnabled:true,
+   qualificationDigest:readiness.readinessDigest,updatedAt:NOW});
   const wrong=createCatalogStorageRouter({catalog:catalog(),bindings:{STORAGE_INGESTION_B:b().STORAGE_INGESTION_B},clock:()=>NOW});
   await wrong.ensureOwner(row.ownerId,'b',RESERVATION);
   await expect(importExistingAccountlessBootstrapPage({catalog:catalog(),source:source(),manifest,policy:policy(),nowEpoch:NOW+100}))

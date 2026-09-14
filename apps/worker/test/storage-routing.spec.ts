@@ -8,6 +8,7 @@ import { MAX_STORAGE_APPLICATION_STATEMENTS, MAX_STORAGE_TRANSACTION_STATEMENTS,
 import { v11UsageRecord } from './helpers/telemetry-v11';
 import { ownerWriteFenceStatement } from '../src/storage-routing-fence';
 import { configureStorageShardAllocation, recordStorageCapacityObservation } from '../src/storage-capacity';
+import { qualifyStorageShardForTest } from './helpers/storage-shard-readiness';
 interface TestBindings extends Env { STORAGE_ROUTING_DB: D1Database; STORAGE_INGESTION_A: D1Database;
   STORAGE_INGESTION_B: D1Database; TEST_ROUTING_MIGRATIONS: D1Migration[];
   TEST_INGESTION_ROUTING_MIGRATIONS: D1Migration[]; TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[]; }
@@ -53,8 +54,9 @@ beforeEach(async () => {
       shardId, observedBytes: 0, observedAt: 1000, validUntil: 2000,
       pressureState: 'normal',
     });
+    const readiness=await qualifyStorageShardForTest(catalog(),{shardId,bindingName:`INGESTION_${shardId.toUpperCase()}`,qualifiedAt:1000});
     await configureStorageShardAllocation(catalog(), {shardId,
-      allocationTier:'active',allocationEnabled:true,updatedAt:1000});
+      allocationTier:'active',allocationEnabled:true,qualificationDigest:readiness.readinessDigest,updatedAt:1000});
   }
 });
 function typedChunkRows(): TypedTelemetrySourceRecord[] {

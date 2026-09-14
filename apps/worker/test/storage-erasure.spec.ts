@@ -29,6 +29,7 @@ import {ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,ACCOUNTLESS_UPLOAD_OWNER_PO
 import {createCatalogStorageRouter,createOwnerMoveCoordinator,
  initializeAccountlessIssuanceBaseline} from '../src/storage-routing';
 import {configureStorageShardAllocation,recordStorageCapacityObservation} from '../src/storage-capacity';
+import {qualifyStorageShardForTest} from './helpers/storage-shard-readiness';
 import {registerParticipantOwnerRoute} from '../src/storage-routing-runtime';
 import {publishMultiSourceCommunityDaily,readMultiSourcePublication} from '../src/storage-multi-source-publication';
 import {createV11DailyProjectionValues} from '../src/v11-daily-projection-values';
@@ -108,8 +109,11 @@ async function catalogReplayFixture(withTombstone=true){
  for(const shardId of ['a','b','c']){
   await recordStorageCapacityObservation(b.STORAGE_ROUTING_DB,{shardId,observedBytes:0,observedAt:1000,
    validUntil:2000,pressureState:'normal'});
+  const readiness=await qualifyStorageShardForTest(b.STORAGE_ROUTING_DB,{shardId,
+   bindingName:`STORAGE_INGESTION_${shardId.toUpperCase()}`,
+   qualifiedAt:1000});
   await configureStorageShardAllocation(b.STORAGE_ROUTING_DB,{shardId,allocationTier:'active',
-   allocationEnabled:true,updatedAt:1000});
+   allocationEnabled:true,qualificationDigest:readiness.readinessDigest,updatedAt:1000});
  }
  const shardBindings={STORAGE_INGESTION_A:b.STORAGE_INGESTION_A,
   STORAGE_INGESTION_B:b.STORAGE_INGESTION_B,STORAGE_INGESTION_C:b.STORAGE_INGESTION_C};
@@ -380,8 +384,11 @@ describe('cross-store physical erasure completion',()=>{
   for(const shardId of ['a','b','c']){
     await recordStorageCapacityObservation(b.STORAGE_ROUTING_DB,{shardId,observedBytes:0,observedAt:1000,
       validUntil:2000,pressureState:'normal'});
+    const readiness=await qualifyStorageShardForTest(b.STORAGE_ROUTING_DB,{shardId,
+      bindingName:`STORAGE_INGESTION_${shardId.toUpperCase()}`,
+      qualifiedAt:1000});
     await configureStorageShardAllocation(b.STORAGE_ROUTING_DB,{shardId,allocationTier:'active',
-      allocationEnabled:true,updatedAt:1000});
+      allocationEnabled:true,qualificationDigest:readiness.readinessDigest,updatedAt:1000});
   }
   const shardBindings={STORAGE_INGESTION_A:b.STORAGE_INGESTION_A,
     STORAGE_INGESTION_B:b.STORAGE_INGESTION_B,STORAGE_INGESTION_C:b.STORAGE_INGESTION_C};
