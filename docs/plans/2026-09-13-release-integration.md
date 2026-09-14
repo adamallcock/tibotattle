@@ -2,7 +2,7 @@
 title: Next release integration and qualification
 date: 2026-09-13
 type: plan
-status: in-progress
+status: source-integrated
 ---
 
 # Next release integration and qualification
@@ -131,8 +131,7 @@ Packaging/export/local-review checks then passed 47 tests; the process-sensitive
 R7 and native-network checks passed 49 tests under the required local process
 permissions, and the synthetic private benchmark passed separately. macOS
 bundle checks passed 73 with one skipped because this checkout has no prepared
-Preview framework. Browser and localization checks passed; final combined-source
-checks follow the hosted-source integration.
+Preview framework. The final combined-source checks are recorded below.
 
 Two retained R7 receipt assertions still reject current source provenance.
 The historical receipts are not rewritten or relabelled by this task. Fresh
@@ -151,3 +150,42 @@ gate. No truncation was added that could hide missing historical events.
 Electron shell tests completed 628 cases: 627 passed in the restricted shell,
 and the one Electron startup case passed when rerun with native process access.
 Architecture, both generated localization mirrors, and preflight checks passed.
+
+## Combined candidate and local handoff
+
+Source integration is committed at `ca58e3f47b688110be9fe7f5b89b3a73bf7a24c9`
+on `codex/release-0.1.23-integration`. It includes hosted source
+`a18fb6d75d80739077079c0a4cd34883011e9889`. All nine PRs remain open; no
+remote merge, closure, push or publication was performed by this task.
+
+Final combined-source checks:
+
+- 925 browser, localization, tool-inventory and public-site tests passed.
+- 341 reset/provider/collector/projection tests passed.
+- Hosted source passed its complete Worker check: 1,048 tests across 80 files,
+  package/type/script checks and both dry builds. After the combined merge,
+  package guards, generated types, TypeScript, 92 quota-consumer tests and both
+  dry builds passed again. Installed Worker package copies were refreshed from
+  the unchanged lockfile to match the new quota-analysis kernel.
+- Architecture passed with 542 production files, 2,145 imports and no approved
+  debt edges. Generated mirrors and combined preflight passed.
+
+A verified macOS arm64 development bundle was built from the exact combined
+source. Its app.asar SHA-256 is
+`15ea3eeddbf36f8692240bcf34c2e11b50c4619eb22ec505497ff31534ca49d2`.
+The bundle, persistent isolated profile and launch command are retained in the
+private local integration output. Nothing was installed into Applications.
+
+Native inspection confirmed the renamed Allowance Value navigation, narrower
+five-hour tank, removed per-tank observation timestamp, explicit forecast
+waiting state, retained data during recalculation, and the approved visual
+styles. The immediately preceding desktop build also demonstrated animated
+Trends playback over real retained history, all comparison charts, typed reset
+markers, and percentage-first cache matrix inspection. Public download/platform
+switching and localized release copy were inspected in the hosted preview.
+
+The development profile owns its own prospective pacing identity. An initial
+waiting forecast is expected until it holds enough fresh, scoped observations;
+copied production history is not relabelled to manufacture that evidence.
+The public version remains 0.1.22. These source and development checks do not
+close the release gates listed above.

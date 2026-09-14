@@ -2,7 +2,7 @@
 title: Hosted source stack integration for the next release
 date: 2026-09-13
 type: plan
-status: in-progress
+status: source-integrated
 ---
 
 # Hosted source stack integration
@@ -137,3 +137,13 @@ in recovery. Preserve the mutation limits, exact proofs and uncertain-outcome
 fences. The apparently unique `ea5f026a`/`bd085073` fixes are already represented
 semantically in `0631b2fb`; replaying their old inventory assertions would
 regress deletion-ledger coverage from `0005` to `0004`.
+
+## Integration result
+
+The selected hosted source was committed at `a18fb6d75d80739077079c0a4cd34883011e9889`
+and combined with the desktop candidate at `ca58e3f47b688110be9fe7f5b89b3a73bf7a24c9`.
+The full Worker gate passed 1,048 tests and dry builds. The combined source then
+passed 92 focused quota-consumer tests, package/type checks and both dry builds;
+925 combined browser/public-site/localization/inventory tests passed. See the
+[release integration plan](./2026-09-13-release-integration.md) for exact artifact
+and remaining release boundaries. Production flags and D1 drafts remain excluded.
