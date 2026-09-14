@@ -19,7 +19,7 @@ on:
         type: string
         required: true
       archive_url:
-        description: Approved normal Mac test ZIP on the fixed update host
+        description: Released 0.1.22 Mac ZIP on the fixed update host
         type: string
         required: true
       archive_sha256:
@@ -103,11 +103,11 @@ jobs:
           assert e['EXECUTION_CONFIRMATION']==('RUN_ONE_SYNTHETIC_PRODUCTION_CANARY' if e['SELECTED_MODE']=='execute' else '')
           url=e['SELECTED_URL']
           # One reviewed archive only. Inputs bind approval; they do not select arbitrary signed payloads.
-          assert source=='7293828ade187f6fd9e50c67d7018704150ca156'
-          assert digest=='98d32e2a25b4d860d1a60cbdc94fc2a2dbb2dc3e0af58510a0e85e6d1fa24936'
-          assert asar=='e7c725a0902a18a0970265a8b32535fbe8e447829754592af91fc709eb0a987e'
-          assert url=='https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64/TiboTattle-0.1.19-native-to-electron-handover.18-mac-arm64.zip'
-          assert re.fullmatch(r'https://updates\.tibotattle\.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64/TiboTattle-[A-Za-z0-9.-]+-mac-arm64\.zip',url)
+          assert source=='16a0d4dffad4b1213b28adaae139fc9ee6705837'
+          assert digest=='d1b35690c2b4afc7a225e64f25ad201fd18bda936e96220f7ee080c1791f7651'
+          assert asar=='e176d0d763b11f9aa90073b90d0bdd7fbdbb17cc61740331fb47e33899007579'
+          assert url=='https://updates.tibotattle.com/electron/stable/darwin-arm64/TiboTattle-0.1.22-mac-arm64.zip'
+          assert re.fullmatch(r'https://updates\.tibotattle\.com/electron/stable/darwin-arm64/TiboTattle-0\.1\.22-mac-arm64\.zip',url)
           key=base64.b64decode(e['CLEANUP_PUBLIC_KEY'],validate=True)
           assert len(key)<=16384 and key.startswith(b'-----BEGIN PUBLIC KEY-----\n') and hashlib.sha256(key).hexdigest()==key_digest
           root=pathlib.Path(e['RUNNER_TEMP'])/'production-canary-intake';root.mkdir(mode=0o700)

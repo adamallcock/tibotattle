@@ -79,12 +79,14 @@ test('dispatch intake rejects unapproved source, destination, key and execution 
   assert.equal(workflow.includes('--location'), false);
   const directory = await mkdtemp(join(tmpdir(), 'canary-intake-refusal-'));
   const environment = { PATH: process.env.PATH, RUNNER_TEMP: directory, GITHUB_SHA: 'a'.repeat(40),
-    SELECTED_RUNNER: 'a'.repeat(40), SELECTED_SOURCE: '7293828ade187f6fd9e50c67d7018704150ca156', SELECTED_ARCHIVE: '98d32e2a25b4d860d1a60cbdc94fc2a2dbb2dc3e0af58510a0e85e6d1fa24936',
-    SELECTED_ASAR: 'e7c725a0902a18a0970265a8b32535fbe8e447829754592af91fc709eb0a987e', CLEANUP_KEY_SHA256: 'e'.repeat(64), SELECTED_MODE: 'execute',
+    SELECTED_RUNNER: 'a'.repeat(40), SELECTED_SOURCE: '16a0d4dffad4b1213b28adaae139fc9ee6705837', SELECTED_ARCHIVE: 'd1b35690c2b4afc7a225e64f25ad201fd18bda936e96220f7ee080c1791f7651',
+    SELECTED_ASAR: 'e176d0d763b11f9aa90073b90d0bdd7fbdbb17cc61740331fb47e33899007579', CLEANUP_KEY_SHA256: 'e'.repeat(64), SELECTED_MODE: 'execute',
     EXECUTION_CONFIRMATION: 'RUN_ONE_SYNTHETIC_PRODUCTION_CANARY', CLEANUP_PUBLIC_KEY: 'aW52YWxpZA==',
-    SELECTED_URL: 'https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64/TiboTattle-0.1.19-native-to-electron-handover.18-mac-arm64.zip' };
+    SELECTED_URL: 'https://updates.tibotattle.com/electron/stable/darwin-arm64/TiboTattle-0.1.22-mac-arm64.zip' };
   try {
     for (const changed of [ { SELECTED_RUNNER: 'f'.repeat(40) }, { SELECTED_URL: 'https://other.test/app.zip' },
+      { SELECTED_SOURCE: '7293828ade187f6fd9e50c67d7018704150ca156' },
+      { SELECTED_ARCHIVE: 'f'.repeat(64) }, { SELECTED_ASAR: 'f'.repeat(64) },
       { EXECUTION_CONFIRMATION: '' }, { CLEANUP_PUBLIC_KEY: Buffer.from('-----BEGIN PRIVATE KEY-----\n').toString('base64') } ]) {
       assert.throws(() => execFileSync('python3', ['-c', python], { env: { ...environment, ...changed }, stdio: 'ignore', timeout: 3000 }));
       assert.deepEqual(await readdir(directory), []);
