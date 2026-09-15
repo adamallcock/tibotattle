@@ -64,16 +64,20 @@ async function readOrdinaryAdmission(options:StorageAnalyticsBindings):Promise<{
  if(targetResult.success!==true||!Array.isArray(targetResult.results)||targetResult.results.length!==1)throw invalid();
  const row=targetResult.results[0]!;
  if(row.runtime_namespace!==options.sourceNamespace||row.contract_version!==1)throw invalid();
- const sequence=row.cursor_sequence??0;if(!Number.isSafeInteger(sequence)||sequence<0)throw invalid();
+ const reconciliation=()=>new Error('ANALYTICS_SOURCE_RESTORE_RECONCILIATION_REQUIRED');
+ const sequence=row.cursor_sequence??0;if(!Number.isSafeInteger(sequence)||sequence<0)throw reconciliation();
  let prior:StorageChange|null=null;
  if(sequence===0){
-  if(row.cursor_sequence!==null&&row.cursor_epoch!==0||row.receipt_sequence!==null)throw invalid();
+  if(row.cursor_sequence!==null&&row.cursor_epoch!==0)throw reconciliation();
+  if(row.receipt_sequence!==null)throw invalid();
  }else{
-  prior=decodeStorageChangeRow(options.sourceId,{sequence:row.receipt_sequence,event_digest:row.event_digest,
-   owner_digest:row.owner_digest,revision:row.revision,kind:row.kind,object_digest:row.object_digest,
-   content_digest:row.content_digest,authority_epoch:row.authority_epoch,
-   public_authority_epoch:row.public_authority_epoch,recorded_ms:row.recorded_ms});
-  if(prior.sequence!==sequence||row.cursor_epoch!==prior.publicAuthorityEpoch)throw invalid();
+  try{
+   prior=decodeStorageChangeRow(options.sourceId,{sequence:row.receipt_sequence,event_digest:row.event_digest,
+    owner_digest:row.owner_digest,revision:row.revision,kind:row.kind,object_digest:row.object_digest,
+    content_digest:row.content_digest,authority_epoch:row.authority_epoch,
+    public_authority_epoch:row.public_authority_epoch,recorded_ms:row.recorded_ms});
+  }catch{throw reconciliation();}
+  if(prior.sequence!==sequence||row.cursor_epoch!==prior.publicAuthorityEpoch)throw reconciliation();
  }
  const sourceResults=await options.source.batch([
   options.source.prepare(SOURCE_IDENTITY_SQL),
@@ -83,12 +87,16 @@ async function readOrdinaryAdmission(options:StorageAnalyticsBindings):Promise<{
  if(!Array.isArray(sourceResults)||sourceResults.length!==3
    ||sourceResults.some(result=>result?.success!==true||!Array.isArray(result.results)))throw invalid();
  const [identityResult,priorResult,nextResult]=sourceResults;
- if(identityResult!.results.length!==1||priorResult!.results.length!==(sequence===0?0:1)||nextResult!.results.length>1)throw invalid();
+ if(identityResult!.results.length!==1||priorResult!.results.length>1||nextResult!.results.length>1)throw invalid();
+ if(sequence===0?priorResult!.results.length!==0:priorResult!.results.length!==1)throw reconciliation();
  const identity=identityResult!.results[0] as {source_id?:unknown;v1_namespace?:unknown;v11_namespace?:unknown};
  if(identity.source_id!==options.sourceId||identity.v1_namespace!==options.sourceNamespace
    ||identity.v11_namespace!==options.sourceNamespace)throw invalid();
- if(prior&&!exactChange(prior,decodeStorageChangeRow(options.sourceId,priorResult!.results[0])))
-  throw new Error('ANALYTICS_SOURCE_RESTORE_RECONCILIATION_REQUIRED');
+ if(prior){
+  let sourcePrior:StorageChange;try{sourcePrior=decodeStorageChangeRow(options.sourceId,priorResult!.results[0]);}
+  catch{throw reconciliation();}
+  if(!exactChange(prior,sourcePrior))throw reconciliation();
+ }
  if(nextResult!.results.length===0)return {sequence,change:null};
  const change=decodeStorageChangeRow(options.sourceId,nextResult!.results[0]);
  if(change.sequence!==sequence+1)throw new Error('ANALYTICS_SOURCE_GAP');

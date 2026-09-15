@@ -60,4 +60,10 @@ describe('analytics source restore continuity',()=>{
   await accepted();await target().prepare('UPDATE analytics_source_cursors SET authority_epoch=9').run();
   await expect(advanceStorageAnalytics(options())).rejects.toThrow(reconciliation);
  });
+ it('refuses a nonzero authority epoch on a zero cursor',async()=>{
+  await target().prepare('INSERT INTO analytics_source_cursors(source_id,sequence,authority_epoch) VALUES(?,0,1)')
+   .bind(sourceId).run();
+  const before=await targetState();await expect(advanceStorageAnalytics(options())).rejects.toThrow(reconciliation);
+  expect(await targetState()).toEqual(before);
+ });
 });
