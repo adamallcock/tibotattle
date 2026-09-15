@@ -23,6 +23,11 @@ import { caughtStorageGraphFailureFields, withStorageGraphFailureStage,
   type StorageGraphFailureFields } from './storage-analytics-failure';
 
 export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate-results-1';
+// Checkpoint storage is an implementation detail, separate from the semantic
+// result identity above. Bump only this namespace when a prior generation's
+// permanent anti-resurrection tombstones must remain valid but must not block
+// a repaired reader from making new resumable progress.
+export const STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':checkpoint-store-2';
 // Execution-only revision for the single optimistic direct historical read.
 // This is deliberately absent from result/checkpoint identities: a reader fix
 // may reopen one direct attempt without changing the analysis semantics.
@@ -212,7 +217,8 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         }
         else {
           const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
-            ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.dependencyDigest,method:STORAGE_GRAPH_METHOD};
+            ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.dependencyDigest,
+            method:STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD};
           let cursor:StorageHistoryLoadCursor|undefined;
           let head:string|null=null,checkpoint;
           for(;;) {

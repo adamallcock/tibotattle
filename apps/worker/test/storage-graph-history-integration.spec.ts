@@ -15,10 +15,11 @@ import {initializeStorageSource} from '../src/analytics-delivery';
 import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics,runStorageAnalyticsPass} from '../src/storage-analytics-runtime';
 import {drainCommunityPublicSourceBootstrap} from '../src/community-daily-aggregates';
 import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
-import {captureStorageGraphScope,computeStorageGraphResult,storageGraphDependencyDigest,STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
+import {captureStorageGraphScope,computeStorageGraphResult,storageGraphDependencyDigest,
+ STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
 import {advanceStorageCommunityGraphWork} from '../src/storage-community-graph-work';
-import {saveStorageHistoryCheckpoint,type StorageHistoryKey} from '../src/storage-history-checkpoint';
+import {retireStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,type StorageHistoryKey} from '../src/storage-history-checkpoint';
 import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
 
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];
@@ -190,7 +191,7 @@ it('defers an unavailable checkpoint after a newer exact head is promoted',async
  expect(direct.state).toBe('complete');
  await target().prepare('DELETE FROM analytics_community_graph_results').run();
  const key:StorageHistoryKey={sourceId,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day,
-  dependencyDigest:scope.dependencyDigest,method:STORAGE_GRAPH_METHOD};
+  dependencyDigest:scope.dependencyDigest,method:STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD};
  let promotedHead:string|undefined;
  const result=await computeStorageGraphResult({...bindings(),target:unavailableCheckpointOwner(target(),async()=>{
   const saved=await saveStorageHistoryCheckpoint({target:target(),key,checkpoint:checkpointForKey(key),expectedHead:null});
@@ -200,3 +201,25 @@ it('defers an unavailable checkpoint after a newer exact head is promoted',async
  expect(promotedHead).toMatch(/^[a-f0-9]{64}$/);
  expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first('n')).toBe(0);
 });
+
+it('preserves a retired legacy tombstone while a repaired checkpoint generation advances',async()=>{
+ const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
+ const direct=await computeStorageGraphResult(bindings(),scope);
+ expect(direct.state).toBe('complete');
+ await target().prepare('DELETE FROM analytics_community_graph_results').run();
+ const legacyKey:StorageHistoryKey={sourceId,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day,
+  dependencyDigest:scope.dependencyDigest,method:STORAGE_GRAPH_METHOD};
+ expect(await retireStorageHistoryCheckpoint({target:target(),key:legacyKey,expectedHead:null}))
+  .toEqual({status:'retired'});
+
+ const resumed=await computeStorageGraphResult(bindings(),scope);
+ expect(resumed).toMatchObject({state:'deferred',reason:'historical_checkpoint'});
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads WHERE retired=1').first('n')).toBe(1);
+ expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+  WHERE method=? AND dependency_digest=?`).bind(STORAGE_GRAPH_METHOD,scope.dependencyDigest).first('n')).toBe(0);
+ expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+  WHERE method=? AND dependency_digest=?`).bind(STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,scope.dependencyDigest).first<number>('n'))
+  .toBeGreaterThan(0);
+ expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_execution
+  WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,owner.ownerDigest,day).first('n')).toBe(1);
+},60000);
