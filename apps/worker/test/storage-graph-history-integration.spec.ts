@@ -41,6 +41,14 @@ function observeDirectAttempts(database:D1Database,failFirst:boolean){let attemp
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
  return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),attempts:()=>attempts};}
+function unavailableCheckpointOwner(database:D1Database):D1Database{
+ const statement=(inner:D1PreparedStatement,sql:string):D1PreparedStatement=>new Proxy(inner,{get(value,key){
+  if(key==='bind')return(...args:unknown[])=>statement(value.bind(...args),sql);
+  if(key==='first'&&sql.includes('SELECT revision,authority_epoch FROM analytics_owner_state'))return async()=>null;
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+ return new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+}
 beforeEach(async()=>{
  await reset();for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,
   b.TEST_TYPED_V1_ADMISSION_MIGRATIONS,b.TEST_TYPED_V11_ADMISSION_MIGRATIONS])await applyD1Migrations(source(),migrations);
@@ -155,3 +163,14 @@ it('reopens one repaired direct attempt, serializes concurrent claims, then fall
   event:'storage_analytics_schedule',graphFailure:{phase:'graph_history_direct_read',reason:'application'}});
  expect(scheduledDirect.attempts()).toBe(1);
 },60000);
+
+it('defers an unavailable checkpoint owner without aborting the graph pass',async()=>{
+ const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
+ const direct=await computeStorageGraphResult(bindings(),scope);
+ expect(direct.state).toBe('complete');
+ await target().prepare('DELETE FROM analytics_community_graph_results').run();
+ const result=await computeStorageGraphResult({...bindings(),target:unavailableCheckpointOwner(target())},scope);
+ expect(result).toEqual({state:'deferred',reason:'historical_checkpoint',failure:{phase:'graph_checkpoint_save',reason:'checkpoint_unavailable'}});
+ expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first('n')).toBe(0);
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
+});

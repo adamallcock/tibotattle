@@ -230,10 +230,16 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
           else {
             const checkpointToSave=next.checkpoint;
             if(checkpointToSave && await current(source,scope)) {
-              while(meter.remainingQueries>=40&&Date.now()<deadlineMs) {
-                const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
-                  ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:checkpointToSave,expectedHead:head}));
-                if(saved.status==='saved')break;
+              try {
+                while(meter.remainingQueries>=40&&Date.now()<deadlineMs) {
+                  const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
+                    ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:checkpointToSave,expectedHead:head}));
+                  if(saved.status==='saved')break;
+                }
+              } catch(error) {
+                const failure=caughtStorageGraphFailureFields('graph_checkpoint_save',error);
+                if(!failure||failure.reason!=='checkpoint_unavailable')throw error;
+                return {state:'deferred',reason:'historical_checkpoint',failure};
               }
             }
             return {state:'deferred',reason:'historical_checkpoint'};
