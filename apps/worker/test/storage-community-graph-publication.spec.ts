@@ -354,13 +354,11 @@ describe('isolated allowance graph publication',()=>{
   expect(meter.queriesUsed).toBeLessThan(250);
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(0);
  });
- it('requires the complete uploading cohort and hides old publication after new authority appears',async()=>{
+ it('reuses an unchanged owner result after another owner joins, while hiding the old publication',async()=>{
   await fixture();await compute('fits');await publishStorageCommunityGraphPreview(bindings());
   await fixture('participant:second-synthetic');
   expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
   await compute('fits',today(),0);
-  expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'deferred',reason:'cache_pending'});
-  await compute('fits',today(),1);
   expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'published',memberCount:2});
   const row=(await readPublishedStorageCommunityGraph(bindings()))!;
   expect(JSON.parse(row.payload_json).coverage).toMatchObject({uploadingParticipantCount:2,cachedParticipantCount:2});
@@ -485,8 +483,8 @@ describe('isolated allowance graph publication',()=>{
   const source=observed(typed(),async(sql,moment)=>{
    if(moment!=='before'||!sql.includes('SELECT s.source_id AS sourceId'))return;
    authorityReads++;
-   if(authorityReads===2){changed=true;await typed().prepare(`UPDATE storage_source_state
-     SET authority_epoch=authority_epoch+1 WHERE singleton=1`).run();}
+   if(authorityReads===2){changed=true;await typed().prepare(`UPDATE ingestion_analytics_separation
+     SET policy_revision=policy_revision+1 WHERE id=1`).run();}
   });
   expect(await advanceStorageCommunityGraphWork({...bindings(),source}))
    .toMatchObject({state:'complete',metric:'fits',day:today()});
@@ -498,8 +496,8 @@ describe('isolated allowance graph publication',()=>{
   const source=observed(typed(),async(sql,moment)=>{
    if(moment!=='before'||!sql.includes('SELECT s.source_id AS sourceId'))return;
    authorityReads++;
-   if(authorityReads===2||authorityReads===4)await typed().prepare(`UPDATE storage_source_state
-     SET authority_epoch=authority_epoch+1 WHERE singleton=1`).run();
+   if(authorityReads===2||authorityReads===4)await typed().prepare(`UPDATE ingestion_analytics_separation
+     SET policy_revision=policy_revision+1 WHERE id=1`).run();
   });
   await expect(advanceStorageCommunityGraphWork({...bindings(),source}))
    .rejects.toMatchObject({stage:'graph_scope',reason:'source_changed'});

@@ -11,7 +11,8 @@ import { modelHistoryWindow } from './model-history-window';
 import { communityAnalysisCacheVersion, loadCommunitySourcePin, parsedCachedFits,
   selectCommunityAllowanceAnalysisFits, validCompleteCachedComposition, validCompleteScalarAnalysis,
   type CommunityAllowanceFit } from './community-allowance';
-import { captureStorageCommunityAuthority, sameStorageCommunityAuthority, storageCommunityAuthorityIsCurrent,
+import { captureStorageCommunityAuthority, sameStorageCommunityCalculationAuthority,
+  storageCommunityCalculationAuthorityIsCurrent,
   type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { createD1InvocationBudget } from './d1-invocation-budget';
@@ -96,7 +97,7 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
   }
   const dependencyDigest=await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest,
     source,metric:options.metric,day:history.day,dependency});
-  if(!await storageCommunityAuthorityIsCurrent(sourceDb,authority))throw scopeChanged();
+  if(!await storageCommunityCalculationAuthorityIsCurrent(sourceDb,authority))throw scopeChanged();
   return {authority,owner:owner as StorageGraphScope['owner'],source,pin:loaded.sourcePin,
     day:history.day,fixedNow:history.fixedNow,metric:options.metric,dependencyDigest};
 }
@@ -104,7 +105,7 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
 async function current(source:D1Database,scope:StorageGraphScope):Promise<boolean> {
   if('source' in scope.pin)await assertV11SourcePinCurrent(source,scope.pin);
   else await assertV1SourcePinCurrent(source,scope.pin);
-  return storageCommunityAuthorityIsCurrent(source,scope.authority);
+  return storageCommunityCalculationAuthorityIsCurrent(source,scope.authority);
 }
 async function targetReady(target:D1Database,scope:StorageGraphScope):Promise<void> {
   if(!await target.prepare(`SELECT 1 FROM analytics_runtime_sources WHERE source_id=?
@@ -138,7 +139,7 @@ export async function readStorageGraphResult(bindings:StorageAnalyticsBindings,s
     .first<{payload_json:string;payload_fingerprint:string;payload_sha256:string;authority_json:string;source_kind:StorageGraphSource}>();
   if(!row)return null;
   let authority:StorageCommunityAuthority;try{authority=JSON.parse(row.authority_json)}catch{return null}
-  if(!authority||!sameStorageCommunityAuthority(authority,scope.authority)
+  if(!authority||!sameStorageCommunityCalculationAuthority(authority,scope.authority)
     ||new TextEncoder().encode(row.payload_json).byteLength>MAX_RESULT_BYTES
     ||await sha256Hex(row.payload_json)!==row.payload_sha256)return null;
   const result=decoded(row,scope);
