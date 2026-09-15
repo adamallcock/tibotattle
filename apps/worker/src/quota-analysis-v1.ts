@@ -700,10 +700,25 @@ async function loadPlanAttributionIndex(
   db: D1Database, participantId: string, winnersJson: string, observedAtCutoff: string, observedAtBefore?:string,
 ): Promise<PlanAttributionIndex | null> {
   const typed=await loadTypedV1AnalysisScope(db,participantId);
-  let sql=typed?PLAN_EVIDENCE_SQL.replaceAll('telemetry_v1_records','typed_v1_current_records'):PLAN_EVIDENCE_SQL;
+  let sql=PLAN_EVIDENCE_SQL;
   if(observedAtBefore)sql=sql.replace('r.observed_at >= ?', 'r.observed_at >= ? AND r.observed_at < ?');
+  const bindings:unknown[]=[winnersJson,participantId,observedAtCutoff,
+    ...(observedAtBefore?[observedAtBefore]:[]),MAX_PLAN_ATTRIBUTION_ROWS+1];
+  if(typed){
+    let parameter=0;sql=sql.replace(/\?/g,()=>`?${++parameter}`);
+    const ownerParameter=++parameter,fromParameter=++parameter,toParameter=observedAtBefore?++parameter:null;
+    sql=sql.replace('WITH plan_times',`WITH typed_plan_input AS MATERIALIZED (
+      SELECT v.observed_at,v.provider,v.limit_id,v.plan_type,v.plan_variant,
+        v.participant_id,v.device_id,v.observed_day,v.stream
+      FROM typed_telemetry_records base INDEXED BY typed_v1_owner_observed
+      JOIN typed_v1_current_records v ON v.storage_row_id=base.id
+      WHERE base.format=10 AND base.owner_id=?${ownerParameter} AND base.stream=2
+        AND base.observed_at_ms>=?${fromParameter}${toParameter===null?'':` AND base.observed_at_ms<?${toParameter}`}
+    ), plan_times`).replaceAll('telemetry_v1_records','typed_plan_input');
+    bindings.push(typed.ownerId,Date.parse(observedAtCutoff),...(observedAtBefore?[Date.parse(observedAtBefore)]:[]));
+  }
   const result = await db.prepare(sql)
-    .bind(winnersJson, participantId, observedAtCutoff, ...(observedAtBefore?[observedAtBefore]:[]), MAX_PLAN_ATTRIBUTION_ROWS + 1)
+    .bind(...bindings)
     .all<PlanEvidenceRow>();
   if (result.results.length > MAX_PLAN_ATTRIBUTION_ROWS) return null;
   const index = buildPlanAttributionIndex(result.results.map(planObservation));
@@ -888,21 +903,25 @@ export const V1_HISTORY_USAGE_PAGE_AFTER_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
      AND r.observed_at > ? AND r.observed_at < ?
    ORDER BY r.observed_at, r.id LIMIT ?`;
 
-async function v1QuotaAnalysisSql(db:D1Database,participantId:string,sql:string):Promise<string>{
-  if(!await loadTypedV1AnalysisScope(db,participantId))return sql;
+async function v1QuotaAnalysisSql(db:D1Database,participantId:string,sql:string,observedAtCutoff:string,
+ observedAtBefore?:string):Promise<{sql:string;typedBindings:unknown[]}>{
+  const typed=await loadTypedV1AnalysisScope(db,participantId);if(!typed)return {sql,typedBindings:[]};
   // Materialize the narrow owner/window once before the shared multi-stage
   // reduction. Flattening the full compatibility view through every window
   // expression makes SQLite exhaust its query-planner memory on a tiny corpus.
   // Explicit positions preserve the existing call's parameter order.
   let parameter=0;
   const positioned=sql.replace(/\?/g,()=>`?${++parameter}`);
-  const upper=sql.includes('r.observed_at >= ? AND r.observed_at < ?');
-  return positioned.replace('WITH era_markers',`WITH typed_quota_input AS MATERIALIZED (
-    SELECT occurrence_id,observed_at,provider,plan_type,plan_variant,limit_id,slot,
-      used_percent,window_duration_minutes,resets_at,id,participant_id,device_id,observed_day,stream
-    FROM typed_v1_current_records WHERE participant_id=?3 AND stream='quota' AND observed_at>=?4
-      ${upper?'AND observed_at<?5':''}
-  ), era_markers`).replaceAll('telemetry_v1_records','typed_quota_input');
+  const ownerParameter=++parameter,fromParameter=++parameter,toParameter=observedAtBefore?++parameter:null;
+  return {sql:positioned.replace('WITH era_markers',`WITH typed_quota_input AS MATERIALIZED (
+    SELECT v.occurrence_id,v.observed_at,v.provider,v.plan_type,v.plan_variant,v.limit_id,v.slot,
+      v.used_percent,v.window_duration_minutes,v.resets_at,v.id,v.participant_id,v.device_id,v.observed_day,v.stream
+    FROM typed_telemetry_records base INDEXED BY typed_v1_owner_observed
+    JOIN typed_v1_current_records v ON v.storage_row_id=base.id
+    WHERE base.format=10 AND base.owner_id=?${ownerParameter} AND base.stream=2
+      AND base.observed_at_ms>=?${fromParameter}${toParameter===null?'':` AND base.observed_at_ms<?${toParameter}`}
+  ), era_markers`).replaceAll('telemetry_v1_records','typed_quota_input'),
+  typedBindings:[typed.ownerId,Date.parse(observedAtCutoff),...(observedAtBefore?[Date.parse(observedAtBefore)]:[])]};
 }
 /** Shared page/cursor contract for both scalar and model-composition readers. */
 export async function readV1UsagePage(
@@ -1547,7 +1566,8 @@ async function analyzeAccountScopedQuotaV1(
   if (attributionIndex === null) return notTestable("plan_attribution_limit_exceeded");
   if (attributionIndex.status === "limit_exceeded") return notTestable("plan_attribution_limit_exceeded");
 
-  const quotaResult = prepared ?? await db.prepare(await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL)).bind(
+  const quotaQuery=prepared?null:await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL,observedAtCutoff);
+  const quotaResult = prepared ?? await db.prepare(quotaQuery!.sql).bind(
     eraMarkersJson(attributionIndex),
     sourcePin.winnersJson,
     participantId,
@@ -1556,7 +1576,7 @@ async function analyzeAccountScopedQuotaV1(
     SEVEN_DAY_WINDOW_MINUTES,
     MINIMUM_BOUNDARIES,
     MINIMUM_DISPLAYED_SPAN_PP,
-    maxDownsampledQuotaRows + 1,
+    maxDownsampledQuotaRows + 1,...quotaQuery!.typedBindings,
   ).all<DownsampledQuotaRow>();
 
   if (quotaResult.results.length > maxDownsampledQuotaRows) {
@@ -1628,7 +1648,8 @@ export async function downsampleQuotaForTest(
   if (sourcePin.winners.length === 0) return [];
   const attributionIndex = await loadPlanAttributionIndex(db, participantId, sourcePin.winnersJson, observedAtCutoff);
   if (!attributionIndex) return [];
-  const result = await db.prepare(await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL)).bind(
+  const quotaQuery=await v1QuotaAnalysisSql(db,participantId,QUOTA_DOWNSAMPLE_SQL,observedAtCutoff);
+  const result = await db.prepare(quotaQuery.sql).bind(
     eraMarkersJson(attributionIndex),
     sourcePin.winnersJson,
     participantId,
@@ -1637,7 +1658,7 @@ export async function downsampleQuotaForTest(
     SEVEN_DAY_WINDOW_MINUTES,
     MINIMUM_BOUNDARIES,
     MINIMUM_DISPLAYED_SPAN_PP,
-    MAX_DOWNSAMPLED_QUOTA_ROWS + 1,
+    MAX_DOWNSAMPLED_QUOTA_ROWS + 1,...quotaQuery.typedBindings,
   ).all<DownsampledQuotaRow>();
   return result.results;
 }
@@ -2109,9 +2130,9 @@ async function analyzeAccountScopedModelCompositionV1(
     return { status: "not_testable", reason: "multi_provider_window_unsupported" };
   }
 
-  let quotaSql=history?QUOTA_DOWNSAMPLE_SQL.replace('r.observed_at >= ?', 'r.observed_at >= ? AND r.observed_at < ?'):QUOTA_DOWNSAMPLE_SQL;
-  quotaSql=await v1QuotaAnalysisSql(db,participantId,quotaSql);
-  const quotaResult = prepared ?? await db.prepare(quotaSql).bind(
+  const quotaSql=history?QUOTA_DOWNSAMPLE_SQL.replace('r.observed_at >= ?', 'r.observed_at >= ? AND r.observed_at < ?'):QUOTA_DOWNSAMPLE_SQL;
+  const quotaQuery=prepared?null:await v1QuotaAnalysisSql(db,participantId,quotaSql,observedAtCutoff,history?.observedAtBefore);
+  const quotaResult = prepared ?? await db.prepare(quotaQuery!.sql).bind(
     eraMarkersJson(attributionIndex),
     winnersJsonArg,
     participantId,
@@ -2121,7 +2142,7 @@ async function analyzeAccountScopedModelCompositionV1(
     SEVEN_DAY_WINDOW_MINUTES,
     MINIMUM_BOUNDARIES,
     MINIMUM_DISPLAYED_SPAN_PP,
-    maxDownsampledQuotaRows + 1,
+    maxDownsampledQuotaRows + 1,...quotaQuery!.typedBindings,
   ).all<DownsampledQuotaRow>();
   if (quotaResult.results.length > maxDownsampledQuotaRows) {
     return { status: "not_testable", reason: "downsampled_quota_limit_exceeded" };
