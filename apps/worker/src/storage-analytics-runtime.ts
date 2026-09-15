@@ -17,8 +17,8 @@ import type { StorageAnalyticsBindings } from './analytics-delivery';
 export type { StorageAnalyticsBindings } from './analytics-delivery';
 const invalid=()=>new Error('STORAGE_ANALYTICS_CONTRACT_UNAVAILABLE');
 const SOURCE_IDENTITY_SQL=`SELECT s.source_id,a.source_namespace AS v1_namespace,b.source_namespace AS v11_namespace
- FROM storage_source_state s JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
- JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 WHERE s.singleton=1`;
+  FROM storage_source_state s JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
+  JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 WHERE s.singleton=1`;
 function identifiers(sourceId:string,namespace:string):void {
  if(!/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/.test(sourceId)
    || typeof namespace!=='string' || namespace.length<1 || namespace.length>256)throw invalid();
