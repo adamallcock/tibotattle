@@ -32,6 +32,18 @@ const runtime = () => ({ ...b, ENVIRONMENT: "synthetic-development", ACCOUNT_SCO
 const step = (db = target()) => advanceV11DailyProjection({ source: source(), target: db, sourceId, sourceLayout });
 const read = (ownerDigest: string) => readV11ProjectedOwnerDays({ source: source(), target: target(), sourceId,
   ownerDigest, fromDay: today(), throughDay: today() });
+function withObservedBatches(database: D1Database, sizes: number[], truncateFirst = false): D1Database {
+  let calls = 0;
+  return new Proxy(database, { get(value, property) {
+    if (property === "batch") return (async (statements: D1PreparedStatement[]) => {
+      calls += 1; sizes.push(statements.length);
+      const results = await database.batch(statements);
+      return truncateFirst && calls === 1 ? results.slice(0, 1) : results;
+    }) as D1Database["batch"];
+    const member: unknown = Reflect.get(value, property);
+    return typeof member === "function" ? member.bind(value) : member;
+  } });
+}
 async function drain() {
   for (let n = 0; n < 20; n++) {
     const result = await step(), retired = await retireV11DailyProjectionPage(target(), sourceId);
@@ -276,6 +288,17 @@ describe("typed accountless upload to isolated projection", () => {
       .bind(options.manifestId, "", "", 200).all<{ detail: string }>()).results.map(row => row.detail).join("\n");
     expect(plan).toMatch(/SEARCH p USING INDEX typed_v11_proof_manifest \(manifest_key=\? AND \(stream,occurrence_id\)>/);
     expect(plan).not.toMatch(/SCAN p\b|SCAN m\b|TEMP B-TREE/);
+  });
+
+  it("batches a 200-record manifest page and refuses a truncated membership snapshot", async () => {
+    const value = await fixture(203);
+    const options = { sourceNamespace: namespace, participantId: value.participantId, deviceId: value.deviceId,
+      manifestId: value.manifest.days[0]!.manifestId, afterStream: "", afterOccurrence: "", limit: 200 };
+    const sizes: number[] = [];
+    expect(await readTypedV11ManifestPage(withObservedBatches(source(), sizes), options)).toHaveLength(200);
+    expect(sizes).toEqual([2, 3]);
+    await expect(readTypedV11ManifestPage(withObservedBatches(source(), [], true), options))
+      .rejects.toThrow("TYPED_V11_READER_MEMBERSHIP_CONFLICT");
   });
 
   it("validates empty-day identity and rejects a bad initial namespace without pinning unusable work", async () => {

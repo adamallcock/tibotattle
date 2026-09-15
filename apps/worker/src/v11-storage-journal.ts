@@ -39,28 +39,38 @@ export async function lookupV11StorageSource(db: D1Database, change: StorageChan
   const actual = (await readIngestionChanges(db, change.sourceId, change.sequence - 1, 1))[0];
   if (!actual || !exactEvent(actual, change)) throw unavailable();
   if (change.kind === 'owner-withdrawn' || change.kind === 'owner-erased') return discard(actual);
-  const terminal = await db.prepare(`SELECT c.sequence FROM storage_owner_revisions r
-    JOIN storage_ingestion_changes c ON c.owner_digest=r.owner_digest AND c.revision=r.revision
-    WHERE r.owner_digest=? AND r.state IN ('withdrawn','erased')
-      AND c.kind=CASE r.state WHEN 'erased' THEN 'owner-erased' ELSE 'owner-withdrawn' END
-      AND c.revision>? AND c.sequence>?`)
-    .bind(change.ownerDigest, change.revision, change.sequence).first<{ sequence: number }>();
+  // Terminal state and immutable generation metadata depend only on the exact
+  // event proved above. Read both in one snapshot; terminal proof still wins
+  // and is independently re-read before returning a discard.
+  const results = await db.batch([
+    db.prepare(`SELECT c.sequence FROM storage_owner_revisions r
+      JOIN storage_ingestion_changes c ON c.owner_digest=r.owner_digest AND c.revision=r.revision
+      WHERE r.owner_digest=? AND r.state IN ('withdrawn','erased')
+        AND c.kind=CASE r.state WHEN 'erased' THEN 'owner-erased' ELSE 'owner-withdrawn' END
+        AND c.revision>? AND c.sequence>?`)
+      .bind(change.ownerDigest, change.revision, change.sequence),
+    db.prepare(`SELECT s.event_digest,s.owner_digest,s.participant_id,s.device_id,s.generation_id,
+        s.manifest_digest,s.from_day,s.through_day,s.head_revision,s.input_revision
+      FROM storage_v11_event_sources s
+      JOIN storage_v11_owner_links link ON link.participant_id=s.participant_id AND link.owner_digest=s.owner_digest AND link.state='active'
+      JOIN storage_owner_revisions r ON r.owner_digest=s.owner_digest AND r.state='active'
+      JOIN telemetry_v11_domains d ON d.id=s.generation_id AND d.participant_id=s.participant_id AND d.device_id=s.device_id
+        AND d.manifest_digest=s.manifest_digest AND d.from_day=s.from_day AND d.through_day=s.through_day AND d.input_revision=s.input_revision
+      JOIN community_public_source_owners p ON p.participant_id=s.participant_id AND (p.device_id IS NULL OR p.device_id=s.device_id)
+      WHERE s.event_digest=? AND s.owner_digest=? AND s.manifest_digest=?`)
+      .bind(change.objectDigest, change.ownerDigest, change.contentDigest),
+  ]);
+  if (!Array.isArray(results) || results.length !== 2
+      || results.some(result => result?.success !== true || !Array.isArray(result.results))) throw unavailable();
+  const [terminalResult, metadataResult] = results;
+  const terminal = terminalResult?.results[0] as { sequence: number } | undefined;
   if (terminal) {
     const proof = (await readIngestionChanges(db, change.sourceId, terminal.sequence - 1, 1))[0];
     if (!proof || proof.ownerDigest !== change.ownerDigest || proof.revision <= change.revision
         || proof.authorityEpoch <= change.authorityEpoch) throw unavailable();
     return discard(proof);
   }
-  const metadata = await db.prepare(`SELECT s.event_digest,s.owner_digest,s.participant_id,s.device_id,s.generation_id,
-      s.manifest_digest,s.from_day,s.through_day,s.head_revision,s.input_revision
-    FROM storage_v11_event_sources s
-    JOIN storage_v11_owner_links link ON link.participant_id=s.participant_id AND link.owner_digest=s.owner_digest AND link.state='active'
-    JOIN storage_owner_revisions r ON r.owner_digest=s.owner_digest AND r.state='active'
-    JOIN telemetry_v11_domains d ON d.id=s.generation_id AND d.participant_id=s.participant_id AND d.device_id=s.device_id
-      AND d.manifest_digest=s.manifest_digest AND d.from_day=s.from_day AND d.through_day=s.through_day AND d.input_revision=s.input_revision
-    JOIN community_public_source_owners p ON p.participant_id=s.participant_id AND (p.device_id IS NULL OR p.device_id=s.device_id)
-    WHERE s.event_digest=? AND s.owner_digest=? AND s.manifest_digest=?`)
-    .bind(change.objectDigest, change.ownerDigest, change.contentDigest).first<Metadata>();
+  const metadata = metadataResult!.results[0] as unknown as Metadata | undefined;
   if (!metadata || metadata.event_digest !== change.eventDigest || !Number.isSafeInteger(metadata.head_revision)
       || !Number.isSafeInteger(metadata.input_revision)) throw unavailable();
   return { disposition: 'generation', sourceId: change.sourceId, ownerDigest: change.ownerDigest, eventDigest: change.eventDigest,

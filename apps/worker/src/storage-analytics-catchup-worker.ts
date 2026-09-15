@@ -161,6 +161,25 @@ function exactImmutableInput(input:StorageAnalyticsV1CatchupMessage,row:RunRow):
   &&input.expectedCollectionRevision===row.expected_collection_revision
   &&input.expectedPublicationEnabled===(row.expected_publication_enabled===1);
 }
+interface SameCursorHintReceipt {run_id:string;generation:number;expected_sequence:number;observed_sequence:number;
+ events_applied:number;result_reason:string;}
+export function isDurableSameCursorOrdinaryHint(value:unknown,row:Pick<RunRow,'run_id'|'generation'|'expected_sequence'|'state'>):boolean{
+ if(!Array.isArray(value)||value.length!==1||row.state!=='running'||row.generation<=1)return false;
+ const receipt=value[0];if(!receipt||typeof receipt!=='object'||Array.isArray(receipt)
+  ||Object.keys(receipt).sort().join(',')!=='events_applied,expected_sequence,generation,observed_sequence,result_reason,run_id')return false;
+ const v=receipt as SameCursorHintReceipt;return v.run_id===row.run_id&&v.generation===row.generation-1
+  &&v.expected_sequence===row.expected_sequence&&v.observed_sequence===row.expected_sequence&&v.events_applied===0
+  &&['step_limit','deadline','query_budget'].includes(v.result_reason);
+}
+async function durableSameCursorOrdinaryHint(db:D1Database,row:RunRow):Promise<boolean>{
+ if(row.generation<=1)return false;
+ try{
+  const result=await db.prepare(`SELECT run_id,generation,expected_sequence,observed_sequence,events_applied,result_reason
+   FROM storage_analytics_v1_catchup_receipts WHERE run_id=? AND generation=? LIMIT 2`)
+   .bind(row.run_id,row.generation-1).all<SameCursorHintReceipt>();
+  return isDurableSameCursorOrdinaryHint(result.results,row);
+ }catch{return false;}
+}
 function measuredReceipt(row:RunRow,after:number,reason:CatchupResultReason,started:number,result?:{
  recordsRead:number;queriesUsed:number;metrics?:StorageAnalyticsCatchupMetrics;
 }):Receipt{return {run_id:row.run_id,generation:row.generation,expected_sequence:row.expected_sequence,observed_sequence:after,
@@ -207,6 +226,12 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
    expected_sequence:state.expected_sequence,state:'running',claim_id:delivered.id},env);
  if(state.state!=='running'||state.claim_id!==delivered.id)throw invalid();
  let before=state.expected_sequence,pagesThisInvocation=0,generationStarted=started,remainingPageQueries=PAGE_QUERY_BUDGET_PER_DELIVERY;
+ // A confirmed same-cursor ordinary step leaves the same format-dispatched
+ // event at the head. An exact adjacent receipt seeds this optimization across
+ // deliveries; it grants no authority. The ordinary runtime still rechecks
+ // source/owner/erasure state, while this loop retains its collection-control
+ // checks and per-step receipt. Cursor movement resets the in-memory hint.
+ let sameCursorOrdinary=await durableSameCursorOrdinaryHint(control,state);
  try{
   for(;;){
   before=await cursor(env.STORAGE_ANALYTICS_DB,env.STORAGE_SOURCE_ID);
@@ -217,7 +242,7 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
    throw new Error('STORAGE_ANALYTICS_PUBLICATION_CONTROL_CHANGED');
   if(Date.now()>=runDeadlineMs)throw new Error('STORAGE_ANALYTICS_CATCHUP_DEADLINE');
   let result:(StorageAnalyticsPass&{metrics?:StorageAnalyticsCatchupMetrics})|null=null,ordinaryBoundary=false;
-  if(before===state.expected_sequence)result=await runStorageAnalyticsV1CatchupPass({source:env.STORAGE_INGESTION_DB,
+  if(before===state.expected_sequence&&!sameCursorOrdinary)result=await runStorageAnalyticsV1CatchupPass({source:env.STORAGE_INGESTION_DB,
    target:env.STORAGE_ANALYTICS_DB,ledger:env.DELETION_LEDGER,sourceId:env.STORAGE_SOURCE_ID,
    sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,pageEvents:state.page_events,maxSteps:state.page_events,
    deadlineMs:invocationDeadlineMs,maxQueries:remainingPageQueries,publicationControlRevision:state.expected_collection_revision,
@@ -228,9 +253,11 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
   // handle exactly that one boundary with its owner, erasure and source fences,
   // without enabling public graph work. Its meter receives only the delivery's
   // remaining budget, so the two runtime calls cannot reset the 840-query cap.
-  if(result?.reason==='format_boundary'&&result.steps===0&&before===state.expected_sequence){
-   if(Date.now()>=invocationDeadlineMs)result={...result,state:'deferred',reason:'deadline'};
-   else if(remainingPageQueries<MIN_ORDINARY_BOUNDARY_QUERY_BUDGET)result={...result,state:'deferred',reason:'query_budget'};
+  if((sameCursorOrdinary||result?.reason==='format_boundary'&&result.steps===0)&&before===state.expected_sequence){
+   const boundary=result??{state:'deferred' as const,reason:'format_boundary' as const,steps:0,recordsRead:0,queriesUsed:0,
+    dailyPublications:0,graphCalculations:0};
+   if(Date.now()>=invocationDeadlineMs)result={...boundary,state:'deferred',reason:'deadline'};
+   else if(remainingPageQueries<MIN_ORDINARY_BOUNDARY_QUERY_BUDGET)result={...boundary,state:'deferred',reason:'query_budget'};
    else {
     ordinaryBoundary=true;
     const ordinary=await runStorageAnalyticsPass({source:env.STORAGE_INGESTION_DB,target:env.STORAGE_ANALYTICS_DB,
@@ -241,8 +268,8 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
     if(currentControls.publication!==(state.expected_publication_enabled===1)
      ||currentControls.revision!==state.expected_collection_revision)
      throw new Error('STORAGE_ANALYTICS_PUBLICATION_CONTROL_CHANGED');
-    result={...ordinary,recordsRead:result.recordsRead+ordinary.recordsRead,
-     queriesUsed:result.queriesUsed+ordinary.queriesUsed};
+    result={...ordinary,recordsRead:(result?.recordsRead??0)+ordinary.recordsRead,
+     queriesUsed:(result?.queriesUsed??0)+ordinary.queriesUsed};
    }
   }
   const after=await cursor(env.STORAGE_ANALYTICS_DB,env.STORAGE_SOURCE_ID);
@@ -250,6 +277,7 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
   if(after>state.expected_sequence+state.page_events)throw cursorAdvanced();
   const pagesCompleted=state.pages_completed+(result&&after>state.expected_sequence?1:0),reason=result?.reason;
   if(after>state.expected_sequence){
+   sameCursorOrdinary=false;
    let terminalReason:CatchupResultReason|null=null,terminalState:'complete'|'blocked'|null=null;
    if(pagesCompleted>=state.max_pages){terminalReason='page_limit';terminalState='complete';}
    else if(reason==='capacity'||Date.now()>=runDeadlineMs){
@@ -312,6 +340,7 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
    if(reason==='step_limit'&&state.page_events===16&&pagesThisInvocation<MAX_PAGES_PER_DELIVERY
     &&remainingPageQueries>=MIN_PAGE_QUERY_BUDGET
     &&Date.now()<invocationDeadlineMs){
+    sameCursorOrdinary=true;
     state=await transition(control,`UPDATE storage_analytics_v1_catchup_runs SET state='running',claim_id=?,updated_ms=?
      WHERE run_id=? AND generation=? AND expected_sequence=? AND state='send-pending'`,
      [delivered.id,Date.now(),state.run_id,state.generation,state.expected_sequence],{run_id:state.run_id,generation:state.generation,
