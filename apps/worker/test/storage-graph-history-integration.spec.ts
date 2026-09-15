@@ -2,6 +2,8 @@ import {env,reset,applyD1Migrations,type D1Migration} from 'cloudflare:test';
 import {beforeEach,it,expect} from 'vitest';
 import {createV11DeviceFixture,v11UsageRecord} from './helpers/telemetry-v11';
 import {pricedModelHistoryUsage,MODEL_HISTORY_TEST_CAPACITIES} from './helpers/model-history';
+import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reader';
+import {MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
 import {authenticateDevice,createDeviceUploadAuthorization,claimDeviceUploadAuthorization} from '../src/device-auth';
 import {parseTelemetryV1Chunk,type TelemetryV1Record} from '../src/telemetry-v1';
 import {initializeTypedV1Admission,insertTypedTelemetryV1Chunk} from '../src/typed-v1-admission';
@@ -13,9 +15,11 @@ import {initializeStorageSource} from '../src/analytics-delivery';
 import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics,runStorageAnalyticsPass} from '../src/storage-analytics-runtime';
 import {drainCommunityPublicSourceBootstrap} from '../src/community-daily-aggregates';
 import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
-import {captureStorageGraphScope,computeStorageGraphResult,storageGraphDependencyDigest} from '../src/storage-community-graph';
+import {captureStorageGraphScope,computeStorageGraphResult,storageGraphDependencyDigest,STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
 import {advanceStorageCommunityGraphWork} from '../src/storage-community-graph-work';
+import {saveStorageHistoryCheckpoint,type StorageHistoryKey} from '../src/storage-history-checkpoint';
+import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
 
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];
  TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];
@@ -41,13 +45,18 @@ function observeDirectAttempts(database:D1Database,failFirst:boolean){let attemp
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
  return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),attempts:()=>attempts};}
-function unavailableCheckpointOwner(database:D1Database):D1Database{
+function unavailableCheckpointOwner(database:D1Database,onUnavailable?:()=>Promise<void>):D1Database{
  const statement=(inner:D1PreparedStatement,sql:string):D1PreparedStatement=>new Proxy(inner,{get(value,key){
   if(key==='bind')return(...args:unknown[])=>statement(value.bind(...args),sql);
-  if(key==='first'&&sql.includes('SELECT revision,authority_epoch FROM analytics_owner_state'))return async()=>null;
+  if(key==='first'&&sql.includes('SELECT revision,authority_epoch FROM analytics_owner_state'))return async()=>{await onUnavailable?.();return null;};
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
  return new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+}
+function checkpointForKey(key:StorageHistoryKey):StorageV1HistoryCheckpoint{
+ const identity={participantId:'synthetic-checkpoint-participant',inputFingerprint:'c'.repeat(64),sourceMethodVersion:MODEL_HISTORY_METHOD_VERSION,
+  observedAtCutoff:'2026-05-28T00:00:00.000Z',resetsAtCutoff:'2026-06-04T00:00:00.000Z',windowMinutes:10080,maxQuotaRows:60000};
+ return {version:1,day:key.day,layout:`typed:${key.sourceNamespace}`,identity,phase:'acquisition',acquisition:createV1QuotaAcquisitionCheckpoint(identity)};
 }
 beforeEach(async()=>{
  await reset();for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,
@@ -164,13 +173,30 @@ it('reopens one repaired direct attempt, serializes concurrent claims, then fall
  expect(scheduledDirect.attempts()).toBe(1);
 },60000);
 
-it('defers an unavailable checkpoint owner without aborting the graph pass',async()=>{
+it('rethrows an unavailable checkpoint failure when the exact head is unchanged',async()=>{
  const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
  const direct=await computeStorageGraphResult(bindings(),scope);
  expect(direct.state).toBe('complete');
  await target().prepare('DELETE FROM analytics_community_graph_results').run();
- const result=await computeStorageGraphResult({...bindings(),target:unavailableCheckpointOwner(target())},scope);
- expect(result).toEqual({state:'deferred',reason:'historical_checkpoint',failure:{phase:'graph_checkpoint_save',reason:'checkpoint_unavailable'}});
+ await expect(computeStorageGraphResult({...bindings(),target:unavailableCheckpointOwner(target())},scope))
+  .rejects.toMatchObject({stage:'graph_checkpoint_save',reason:'checkpoint_unavailable'});
  expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first('n')).toBe(0);
  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
+});
+
+it('defers an unavailable checkpoint after a newer exact head is promoted',async()=>{
+ const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
+ const direct=await computeStorageGraphResult(bindings(),scope);
+ expect(direct.state).toBe('complete');
+ await target().prepare('DELETE FROM analytics_community_graph_results').run();
+ const key:StorageHistoryKey={sourceId,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day,
+  dependencyDigest:scope.dependencyDigest,method:STORAGE_GRAPH_METHOD};
+ let promotedHead:string|undefined;
+ const result=await computeStorageGraphResult({...bindings(),target:unavailableCheckpointOwner(target(),async()=>{
+  const saved=await saveStorageHistoryCheckpoint({target:target(),key,checkpoint:checkpointForKey(key),expectedHead:null});
+  if(saved.status!=='saved')throw new Error('synthetic promotion did not finish');promotedHead=saved.headDigest;
+ })},scope);
+ expect(result).toEqual({state:'deferred',reason:'historical_checkpoint',failure:{phase:'graph_checkpoint_save',reason:'checkpoint_unavailable'}});
+ expect(promotedHead).toMatch(/^[a-f0-9]{64}$/);
+ expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first('n')).toBe(0);
 });

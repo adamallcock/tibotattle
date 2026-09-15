@@ -11,6 +11,7 @@ interface Part {component:string;sha256:string;bytes:number}
 interface Frame {control:string;manifest:Part[];parts:string[]}
 interface Stage {generation:string;expected_head:string|null;control_json:string;manifest_json:string;part_count:number;owner_revision:number;authority_epoch:number}
 export interface StorageHistoryLoadCursor {generation:string;parts:string[]}
+export interface StorageHistoryCheckpointHead {generation:string|null;retired:number}
 const encoder=new TextEncoder(),hash=/^[a-f0-9]{64}$/u;
 const fail=()=>new Error('STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE');
 const size=(text:string)=>encoder.encode(text).byteLength;
@@ -64,7 +65,14 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageV1HistoryCheckpoint
 }
 const ACTIVE=`EXISTS(SELECT 1 FROM analytics_owner_state o WHERE o.source_id=s.source_id AND o.owner_digest=s.owner_digest
  AND o.state='active' AND o.authority_epoch=s.authority_epoch)`;
-async function current(target:D1Database,id:string){return target.prepare('SELECT generation,retired FROM analytics_history_checkpoint_heads WHERE key_digest=?').bind(id).first<{generation:string|null;retired:number}>();}
+async function current(target:D1Database,id:string){return target.prepare('SELECT generation,retired FROM analytics_history_checkpoint_heads WHERE key_digest=?').bind(id).first<StorageHistoryCheckpointHead>();}
+/** Read only the exact durable head for a checkpoint key. A malformed row is
+ * unavailable, rather than evidence of a concurrent promotion. */
+export async function readStorageHistoryCheckpointHead(input:{target:D1Database;key:StorageHistoryKey}):Promise<StorageHistoryCheckpointHead|null>{
+ const id=await keyDigest({...input.key}),head=await current(input.target,id);
+ if(head!==null&&(![0,1].includes(head.retired)||head.generation!==null&&!hash.test(head.generation)))throw fail();
+ return head;
+}
 /** The target key is a private dependency identity, not authorization. Caller
  * must prove source eligibility before saving and before promoting final fits.
  * Each call writes at most32 statements; replay sends the same immutable input. */

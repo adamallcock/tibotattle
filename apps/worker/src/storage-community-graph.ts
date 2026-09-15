@@ -17,7 +17,7 @@ import { captureStorageCommunityAuthority, sameStorageCommunityCalculationAuthor
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { createD1InvocationBudget } from './d1-invocation-budget';
 import { advanceStorageV1HistoricalAnalysis } from './storage-v1-history';
-import { loadStorageHistoryCheckpoint, saveStorageHistoryCheckpoint,
+import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
   type StorageHistoryKey, type StorageHistoryLoadCursor } from './storage-history-checkpoint';
 import { caughtStorageGraphFailureFields, withStorageGraphFailureStage,
   type StorageGraphFailureFields } from './storage-analytics-failure';
@@ -239,7 +239,12 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
               } catch(error) {
                 const failure=caughtStorageGraphFailureFields('graph_checkpoint_save',error);
                 if(!failure||failure.reason!=='checkpoint_unavailable')throw error;
-                return {state:'deferred',reason:'historical_checkpoint',failure};
+                let latest;
+                try { latest=await readStorageHistoryCheckpointHead({target:bindings.target,key}); }
+                catch { throw error; }
+                if(latest?.retired===0&&latest.generation!==null&&latest.generation!==head)
+                  return {state:'deferred',reason:'historical_checkpoint',failure};
+                throw error;
               }
             }
             return {state:'deferred',reason:'historical_checkpoint'};
