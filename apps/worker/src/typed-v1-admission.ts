@@ -4,7 +4,8 @@ import { sha256Hex } from './crypto';
 import { ApiError } from './errors';
 import { encodeTypedTelemetryId, TypedTelemetryError } from './typed-telemetry-codec';
 import { prepareTypedTelemetryInsert } from './typed-telemetry-repository';
-import { readTypedTelemetryRowsByStorageIds } from './typed-telemetry-compatibility';
+import { MAX_TYPED_TELEMETRY_STORAGE_ID_PAGES, readTypedTelemetryRowsByStorageIds, readTypedTelemetryRowsByStorageIdPages,
+ type TypedTelemetryCompatibilityRecord } from './typed-telemetry-compatibility';
 import { MAX_STORAGE_TRANSACTION_STATEMENTS } from './storage-routing-batch-budget';
 import { prepareTelemetryV1ChunkWrite, existingTelemetryV1ChunkByEnvelopeDigest, type TelemetryV1ChunkInsert, type TelemetryV1ChunkRow } from './telemetry-v1-repository';
 import { parseTelemetryV1Chunk, assertTelemetryV1ConsentCurrent } from './telemetry-v1';
@@ -163,4 +164,85 @@ export async function lookupTypedV1Source(db:D1Database, change:StorageChange):P
  return {disposition:newer?'superseded':'chunk',sourceNamespace:row.source_namespace,participantId:row.participant_id,
  deviceId:row.device_id,chunkId:row.id,stream:row.stream,day:row.chunk_day,chunkSeq:row.chunk_seq,revision:row.revision,
  chunkDigest:row.chunk_digest,supersedingEventDigest:newer};
+}
+
+export interface TypedV1ProjectionSource {
+ change:StorageChange;sourceNamespace:string;participantId:string;deviceId:string;chunkId:string;
+ stream:string;day:string;chunkSeq:number;revision:number;chunkDigest:string;
+ records:TypedTelemetryCompatibilityRecord[];
+}
+interface ProjectionMetadata {event_digest:string|null;source_namespace:string|null;participant_id:string|null;device_id:string|null;
+ id:string|null;stream:string|null;chunk_day:string|null;chunk_seq:number|null;revision:number|null;chunk_digest:string|null;
+ superseded_at:string|null;record_count:number|null;accepted_record_count:number|null;owner_state:string|null;
+ source_id:string|null;current_namespace:string|null;}
+const MAX_V1_PROJECTION_PAGE_BYTES=16*1024*1024;
+
+/** Authoritative multi-event read for the analytics catch-up lane. The returned
+ * prefix contains only current active typed-v1 chunks. A terminal, superseded,
+ * legacy or v1.1 event ends the prefix so the ordinary dispatcher owns it. */
+export async function readTypedV1ProjectionPage(db:D1Database,options:{sourceNamespace:string;changes:readonly StorageChange[]}):Promise<TypedV1ProjectionSource[]>{
+ encodeTypedTelemetryId(options.sourceNamespace);
+ const changes=options.changes;
+ if(!Array.isArray(changes)||changes.length<1||changes.length>MAX_TYPED_TELEMETRY_STORAGE_ID_PAGES)throw conflict();
+ changes.forEach((change,index)=>{if(change.sourceId!==changes[0]!.sourceId||(index&&change.sequence!==changes[index-1]!.sequence+1))throw conflict();});
+ const metadata=await db.batch<ProjectionMetadata>(changes.map(change=>db.prepare(`SELECT
+  e.event_digest,e.source_namespace,e.participant_id,c.device_id,c.id,c.stream,c.chunk_day,c.chunk_seq,c.revision,c.chunk_digest,
+  c.superseded_at,c.record_count,c.accepted_record_count,o.state owner_state,
+  (SELECT source_id FROM storage_source_state WHERE singleton=1) source_id,
+  (SELECT source_namespace FROM typed_v1_admission_state WHERE id=1 AND runtime_contract_version=1) current_namespace
+  FROM (SELECT 1) one LEFT JOIN typed_v1_event_sources e ON e.event_digest=? AND e.owner_digest=?
+  LEFT JOIN telemetry_v1_chunks c ON c.id=e.chunk_id LEFT JOIN storage_owner_revisions o ON o.owner_digest=e.owner_digest`)
+  .bind(change.eventDigest,change.ownerDigest)));
+ const selected:{change:StorageChange;meta:ProjectionMetadata}[]=[];
+ for(let index=0;index<changes.length;index++){
+  const rows=metadata[index]!.results;if(rows.length!==1)throw conflict();const row=rows[0]!;
+  if(row.event_digest===null)break;
+  if(row.source_id!==changes[index]!.sourceId||row.current_namespace!==options.sourceNamespace
+   ||row.source_namespace!==options.sourceNamespace||typeof row.participant_id!=="string"||typeof row.device_id!=="string"
+   ||typeof row.id!=="string"||typeof row.stream!=="string"||typeof row.chunk_day!=="string"||!Number.isSafeInteger(row.chunk_seq)
+   ||!Number.isSafeInteger(row.revision)||row.chunk_digest!==changes[index]!.contentDigest
+   ||!Number.isSafeInteger(row.record_count)||(row.record_count as number)<1||(row.record_count as number)>200
+   ||row.accepted_record_count!==row.record_count)throw conflict();
+  if(changes[index]!.kind!=="owner-active")throw conflict();
+  if(row.owner_state!=="active"||row.superseded_at!==null)break;
+  selected.push({change:changes[index]!,meta:row});
+ }
+ if(!selected.length)return [];
+ const admissions=await db.batch<{typed_record_id:number}>(selected.map(({meta})=>db.prepare(
+  'SELECT typed_record_id FROM typed_v1_record_admissions WHERE chunk_id=? ORDER BY typed_record_id LIMIT 201').bind(meta.id)));
+ const pages=selected.map(({meta},index)=>{
+  const ids=admissions[index]!.results.map(row=>row.typed_record_id);
+  if(ids.length!==meta.record_count||ids.some(id=>!Number.isSafeInteger(id)||id<1))throw conflict();
+  return {sourceNamespace:options.sourceNamespace,participantId:meta.participant_id!,storageRowIds:ids};
+ });
+ const decoded=await readTypedTelemetryRowsByStorageIdPages(db,pages);let bytes=0;const encoder=new TextEncoder();
+ const digests=await Promise.all(decoded.map(records=>sha256Hex(canonicalJson(records.map(record=>JSON.parse(record.record_json))))));
+ return selected.map(({change,meta},index)=>{
+  const records=decoded[index]!;if(records.some(record=>record.format!=="v1"||record.device_id!==meta.device_id||record.chunk_row_id!==meta.id)
+   ||digests[index]!==meta.chunk_digest)throw conflict();
+  bytes+=records.reduce((sum,record)=>sum+encoder.encode(record.record_json).byteLength,0);if(bytes>MAX_V1_PROJECTION_PAGE_BYTES)throw new TypedTelemetryError('TYPED_TELEMETRY_LIMIT');
+  return {change,sourceNamespace:meta.source_namespace!,participantId:meta.participant_id!,deviceId:meta.device_id!,chunkId:meta.id!,
+   stream:meta.stream!,day:meta.chunk_day!,chunkSeq:meta.chunk_seq!,revision:meta.revision!,chunkDigest:meta.chunk_digest!,records};
+ });
+}
+
+/** Final source linearization check immediately before the independent target
+ * transaction. It rechecks current authority, immutable journal identity,
+ * chunk membership and correction state without rereading record payloads. */
+export async function typedV1ProjectionPageIsCurrent(db:D1Database,page:readonly TypedV1ProjectionSource[]):Promise<boolean>{
+ if(!Array.isArray(page)||page.length<1||page.length>MAX_TYPED_TELEMETRY_STORAGE_ID_PAGES)return false;
+ const results=await db.batch<{valid:number}>(page.map(input=>db.prepare(`SELECT CASE WHEN EXISTS(
+  SELECT 1 FROM storage_ingestion_changes j JOIN typed_v1_event_sources e ON e.event_digest=j.event_digest AND e.owner_digest=j.owner_digest
+  JOIN telemetry_v1_chunks c ON c.id=e.chunk_id JOIN storage_owner_revisions o ON o.owner_digest=e.owner_digest
+  JOIN storage_source_state s ON s.singleton=1 JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
+  WHERE j.sequence=? AND j.event_digest=? AND j.owner_digest=? AND j.revision=? AND j.kind=? AND j.object_digest=?
+   AND j.content_digest=? AND j.authority_epoch=? AND j.public_authority_epoch=? AND j.recorded_ms=?
+   AND s.source_id=? AND a.source_namespace=? AND e.source_namespace=? AND e.participant_id=? AND c.id=? AND c.device_id=? AND c.stream=? AND c.chunk_day=?
+   AND c.chunk_seq=? AND c.revision=? AND c.chunk_digest=? AND c.superseded_at IS NULL AND o.state='active'
+   AND c.record_count=c.accepted_record_count AND c.record_count=(SELECT count(*) FROM typed_v1_record_admissions a WHERE a.chunk_id=c.id)
+ ) THEN 1 ELSE 0 END valid`).bind(input.change.sequence,input.change.eventDigest,input.change.ownerDigest,input.change.revision,
+ input.change.kind,input.change.objectDigest,input.change.contentDigest,input.change.authorityEpoch,input.change.publicAuthorityEpoch,
+ input.change.recordedMs,input.change.sourceId,input.sourceNamespace,input.sourceNamespace,input.participantId,input.chunkId,input.deviceId,input.stream,input.day,input.chunkSeq,
+ input.revision,input.chunkDigest)));
+ return results.every(result=>result.results.length===1&&result.results[0]!.valid===1);
 }

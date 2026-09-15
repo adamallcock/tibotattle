@@ -2,7 +2,7 @@ import { readIngestionChanges, STORAGE_OPERATING_BUDGET_BYTES } from './analytic
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from './d1-invocation-budget';
 import { lookupV11StorageSource } from './v11-storage-journal';
 import { advanceV11DailyProjection, retireV11DailyProjectionPage } from './v11-daily-projection';
-import { advanceV1DailyProjection, prepareV1ProjectionOwnerFence, retireV1DailyProjectionPage } from './v1-daily-projection';
+import { advanceV1DailyProjection, advanceV1DailyProjectionPage, prepareV1ProjectionOwnerFence, retireV1DailyProjectionPage } from './v1-daily-projection';
 import { isLegacyStorageChange, advanceLegacyStorageAcknowledgement } from './legacy-storage-journal';
 import { advanceNextStorageCommunityDaily, retireStorageCommunityDailyPage } from './storage-community-daily';
 import { advanceStorageCommunityGraphWork } from './storage-community-graph-work';
@@ -91,10 +91,22 @@ export async function advanceStorageAnalytics(options:StorageAnalyticsBindings&{
  return advanceV11DailyProjection({source,target,sourceId,signal:options.signal,
   sourceLayout:{kind:'typed-v11',sourceNamespace}});
 }
+async function advanceStorageAnalyticsV1Page(options:StorageAnalyticsBindings&{
+ signal?:AbortSignal;publicationControlRevision?:number;publicationEnabled?:boolean;
+},limit:number){
+ const sequence=await assertRuntime(options);options.signal?.throwIfAborted();
+ const changes=await readIngestionChanges(options.source,options.sourceId,sequence,limit);
+ if(!changes.length)return {state:'idle' as const,sequence,events:0,recordsRead:0,decodedBytes:0,
+  sourceReadMs:0,foldMs:0,sourceRecheckMs:0,targetWriteMs:0,pageDurationMs:0};
+ return advanceV1DailyProjectionPage({...options,changes});
+}
 export interface StorageAnalyticsPass {
  state:'idle'|'progress'|'deferred';steps:number;recordsRead:number;queriesUsed:number;
  dailyPublications:number;graphCalculations:number;
- reason:'complete'|'step_limit'|'deadline'|'query_budget'|'capacity';
+ reason:'complete'|'step_limit'|'deadline'|'query_budget'|'capacity'|'format_boundary';
+}
+export interface StorageAnalyticsCatchupMetrics {
+ decodedBytes:number;sourceReadMs:number;foldMs:number;sourceRecheckMs:number;targetWriteMs:number;pageDurationMs:number;
 }
 /** Runs in an independent scheduled invocation. The actual query meter is
  * shared by BOTH databases; a batch counts all statements. A failed calculation
@@ -149,7 +161,12 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    options.signal?.throwIfAborted();
    if(Date.now()>=deadlineMs)return result('deferred','deadline');
    if(meter.remainingQueries<100)return result('deferred','query_budget');
-   const step=await advanceStorageAnalytics(scoped);steps++;recordsRead+=step.recordsRead;
+   // Publication-paused catch-up can combine a current typed-v1 prefix. Public
+   // work retains the ordinary one-event cadence so serving gates and derived
+   // publication interleave exactly as before.
+   const page=!options.publishCommunity?await advanceStorageAnalyticsV1Page(scoped,Math.min(4,maxSteps-steps)):null;
+   const step=page&&page.events>0?page:await advanceStorageAnalytics(scoped);
+   steps+=page&&page.events>0?page.events:1;recordsRead+=step.recordsRead;
    // Retiring old generations cannot be starved by an always-busy journal.
    const v11=await retireV11DailyProjectionPage(scoped.target,options.sourceId);
    const v1=await retireV1DailyProjectionPage(scoped.target,options.sourceId);
@@ -173,6 +190,63 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     } else publicIdle=false;
    }
    if(step.state==='idle'&&v11.state==='idle'&&v1.state==='idle'&&retiredGraph.state==='idle'&&publicIdle)return result('idle','complete');
+  }
+  return result('progress','step_limit');
+ }catch(error){
+  if(error instanceof D1InvocationBudgetExceededError)return result('deferred','query_budget');
+  throw error;
+ }
+}
+
+/** Operator-only typed-v1 backlog pass. It never dispatches a legacy, v1.1,
+ * terminal or authority event and never publishes derived data. The ordinary
+ * scheduler remains responsible for that exact boundary. */
+export async function runStorageAnalyticsV1CatchupPass(options:StorageAnalyticsBindings&{
+ pageEvents?:number;maxSteps?:number;deadlineMs?:number;maxQueries?:number;signal?:AbortSignal;
+ ledger?:D1Database;publicationControlRevision?:number;publicationEnabled?:boolean;
+}):Promise<StorageAnalyticsPass&{metrics:StorageAnalyticsCatchupMetrics}>{
+ const pageEvents=options.pageEvents??16,maxSteps=options.maxSteps??pageEvents;
+ const deadlineMs=options.deadlineMs??Date.now()+20_000;
+ if(!Number.isSafeInteger(pageEvents)||pageEvents<1||pageEvents>16||!Number.isSafeInteger(maxSteps)
+  ||maxSteps<1||maxSteps>64||!Number.isFinite(deadlineMs)
+  ||(options.publicationControlRevision!==undefined&&(!Number.isSafeInteger(options.publicationControlRevision)||options.publicationControlRevision<1))
+  ||((options.publicationControlRevision===undefined)!==(options.publicationEnabled===undefined)))throw invalid();
+ const meter=createD1InvocationBudget(options.maxQueries??900);
+ const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
+ let steps=0,recordsRead=0;
+ const metrics:StorageAnalyticsCatchupMetrics={decodedBytes:0,sourceReadMs:0,foldMs:0,sourceRecheckMs:0,targetWriteMs:0,pageDurationMs:0};
+ const result=(state:StorageAnalyticsPass['state'],reason:StorageAnalyticsPass['reason']):StorageAnalyticsPass&{metrics:StorageAnalyticsCatchupMetrics}=>({
+  state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications:0,graphCalculations:0,
+  metrics:{...metrics},
+ });
+ try{
+  if(Date.now()>=deadlineMs)return result('deferred','deadline');
+  if(options.ledger)await advanceStorageErasureJobs({...scoped,ledger:meter.wrap(options.ledger)},{maxJobs:1});
+  const probe=await scoped.target.prepare('SELECT 1 AS capacity_probe').run();
+  const size=probe.meta.size_after;
+  if(!Number.isSafeInteger(size)||size<0)throw invalid();
+  if(size>STORAGE_OPERATING_BUDGET_BYTES-16*1024*1024){
+   await retireV11DailyProjectionPage(scoped.target,options.sourceId);
+   await retireV1DailyProjectionPage(scoped.target,options.sourceId);
+   await retireStorageGraphPage(scoped.target,options.sourceId);
+   return result('deferred','capacity');
+  }
+  while(steps<maxSteps){
+   options.signal?.throwIfAborted();
+   if(Date.now()>=deadlineMs)return result('deferred','deadline');
+   // A maximum 16-event page uses at most 48 record reads, 48 tool reads,
+   // 16 metadata, admission and final checks, plus 48 target statements.
+   // Refuse before source work if the shared invocation meter cannot hold it.
+   if(meter.remainingQueries<250)return result('deferred','query_budget');
+   const page=await advanceStorageAnalyticsV1Page(scoped,Math.min(pageEvents,maxSteps-steps));
+   metrics.decodedBytes+=page.decodedBytes;metrics.sourceReadMs+=page.sourceReadMs;metrics.foldMs+=page.foldMs;
+   metrics.sourceRecheckMs+=page.sourceRecheckMs;metrics.targetWriteMs+=page.targetWriteMs;metrics.pageDurationMs+=page.pageDurationMs;
+   if(page.state==='idle')return result(steps?'progress':'idle','complete');
+   if(page.state==='boundary')return result('deferred','format_boundary');
+   steps+=page.events;recordsRead+=page.recordsRead;
+   await retireV11DailyProjectionPage(scoped.target,options.sourceId);
+   await retireV1DailyProjectionPage(scoped.target,options.sourceId);
+   await retireStorageGraphPage(scoped.target,options.sourceId);
   }
   return result('progress','step_limit');
  }catch(error){

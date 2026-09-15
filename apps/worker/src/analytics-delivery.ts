@@ -10,6 +10,7 @@ export interface StorageAnalyticsBindings {
 export const STORAGE_OPERATING_BUDGET_BYTES = 9_000_000_000;
 export const MAX_DELIVERY_PAGE = 100;
 export const MAX_PROJECTION_STATEMENTS = 800;
+export const MAX_ANALYTICS_CHANGE_PAGE = 16;
 export type StorageChangeKind = "source-updated" | "owner-active" | "owner-withdrawn" | "owner-erased";
 export interface StorageChangeInput {
   sourceId: string;
@@ -102,6 +103,47 @@ async function receipt(db: D1Database, change: StorageChange): Promise<StorageCh
 }
 
 export type PrepareAnalyticsProjection = (target: D1Database, change: Readonly<StorageChange>) => Promise<D1PreparedStatement[]>;
+
+async function receipts(target:D1Database,changes:readonly StorageChange[]):Promise<(StorageChange|null)[]>{
+ if(!changes.length)return [];
+ const id=changes[0]!.sourceId;if(changes.some(change=>change.sourceId!==id))throw new Error("ANALYTICS_SOURCE_MISMATCH");
+ const rows=(await target.prepare(`SELECT * FROM analytics_applied_events WHERE source_id=? AND sequence BETWEEN ? AND ? ORDER BY sequence`)
+  .bind(id,changes[0]!.sequence,changes.at(-1)!.sequence).all<ChangeRow>()).results;
+ const bySequence=new Map(rows.map(row=>[row.sequence,decode(id,row)]));
+ return changes.map(change=>bySequence.get(change.sequence)??null);
+}
+
+/** Commits a short contiguous projection page as one D1 transaction while
+ * preserving the exact per-event guards and receipts. Unknown responses are
+ * acknowledged only when every durable receipt matches the submitted page. */
+export async function applyAnalyticsChangePage(target:D1Database,changes:readonly StorageChange[],
+ prepareProjection:PrepareAnalyticsProjection):Promise<{applied:number;alreadyApplied:number}>{
+ if(!Array.isArray(changes)||changes.length<1||changes.length>MAX_ANALYTICS_CHANGE_PAGE)throw new Error("ANALYTICS_PROJECTION_LIMIT");
+ changes.forEach((change,index)=>{validate(change);integer(change.sequence,1);integer(change.authorityEpoch,1);
+  integer(change.publicAuthorityEpoch,1);if(index&&change.sequence!==changes[index-1]!.sequence+1)throw new Error("ANALYTICS_SOURCE_GAP");});
+ const prior=await receipts(target,changes);
+ if(prior.some(Boolean)){
+  if(prior.every((value,index)=>value&&equal(value,changes[index]!)))return {applied:0,alreadyApplied:changes.length};
+  throw new Error("ANALYTICS_RECEIPT_CONFLICT");
+ }
+ const statements:D1PreparedStatement[]=[];
+ for(const change of changes){
+  const projection=await prepareProjection(target,Object.freeze({...change}));
+  if(!Array.isArray(projection)||projection.length>MAX_PROJECTION_STATEMENTS)throw new Error("ANALYTICS_PROJECTION_LIMIT");
+  if(change.kind!=="owner-active"&&!projection.length)throw new Error("ANALYTICS_PROJECTION_MISSING");
+  statements.push(target.prepare(`INSERT INTO analytics_applied_events
+   (source_id,sequence,event_digest,owner_digest,revision,kind,object_digest,content_digest,authority_epoch,public_authority_epoch,recorded_ms)
+   VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(change.sourceId,change.sequence,change.eventDigest,change.ownerDigest,change.revision,
+    change.kind,change.objectDigest,change.contentDigest,change.authorityEpoch,change.publicAuthorityEpoch,change.recordedMs),...projection);
+ }
+ if(statements.length>MAX_PROJECTION_STATEMENTS)throw new Error("ANALYTICS_PROJECTION_LIMIT");
+ try{await target.batch(statements);return {applied:changes.length,alreadyApplied:0};}
+ catch{
+  const durable=await receipts(target,changes);
+  if(durable.every((value,index)=>value&&equal(value,changes[index]!)))return {applied:0,alreadyApplied:changes.length};
+  throw new Error("ANALYTICS_DELIVERY_UNACKNOWLEDGED");
+ }
+}
 
 export async function applyAnalyticsChange(
   target: D1Database, change: StorageChange, prepareProjection: PrepareAnalyticsProjection,
