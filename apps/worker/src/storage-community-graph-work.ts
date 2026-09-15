@@ -5,6 +5,7 @@ import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowa
 import { COMMUNITY_MODEL_CACHE_MAX_BYTES, COMMUNITY_MODEL_CACHE_MAX_PAGES } from './community-allowance';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { validStorageModelPublication, type StorageModelPublicationValue } from './storage-community-publication-value';
+import { withStorageGraphFailureStage } from './storage-analytics-failure';
 
 const fail=()=>new Error('STORAGE_GRAPH_WORK_UNAVAILABLE');
 export interface StorageGraphWorkProgress {
@@ -71,9 +72,10 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  if(claimed.meta.changes!==1)return {state:'deferred',reason:'claim_changed'};
  if(day===null)return {state:'idle'};
  if(!owner.ownerDigest)return {state:'deferred',metric,day,reason:'source_bootstrap_pending'};
- const scope=await captureStorageGraphScope(options.source,{owner,day,metric,
-  sourceId:options.sourceId,sourceNamespace:options.sourceNamespace});
- const result=await computeStorageGraphResult(options,scope,{maxQueries:Math.max(1,(options.remainingQueries??900)-40),deadlineMs:options.deadlineMs});
+ const scope=await withStorageGraphFailureStage('graph_scope',()=>captureStorageGraphScope(options.source,{owner,day,metric,
+  sourceId:options.sourceId,sourceNamespace:options.sourceNamespace}));
+ const result=await withStorageGraphFailureStage(metric==='fits'?'graph_current_fit_compute':'graph_model_compute',
+  ()=>computeStorageGraphResult(options,scope,{maxQueries:Math.max(1,(options.remainingQueries??900)-40),deadlineMs:options.deadlineMs}));
  return result.state==='complete'?{state:result.reused?'reused':'complete',metric,day}
   :{state:'deferred',metric,day,reason:result.reason};
 }

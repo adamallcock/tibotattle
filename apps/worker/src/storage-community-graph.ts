@@ -18,6 +18,7 @@ import { createD1InvocationBudget } from './d1-invocation-budget';
 import { advanceStorageV1HistoricalAnalysis } from './storage-v1-history';
 import { loadStorageHistoryCheckpoint, saveStorageHistoryCheckpoint,
   type StorageHistoryKey, type StorageHistoryLoadCursor } from './storage-history-checkpoint';
+import { withStorageGraphFailureStage } from './storage-analytics-failure';
 
 export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate-results-1';
 const MAX_RESULT_BYTES = 1024 * 1024;
@@ -58,12 +59,18 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
     || !['fits','model'].includes(options.metric))throw fail();
   const authority=await captureStorageCommunityAuthority(sourceDb,options);
   const source:Source=owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
-  const loaded=await loadCommunitySourcePin(sourceDb,owner.participantId,history.fromDay,source,
+  // Pure-v1 history depends only on the closed model window. Loading the
+  // current-fit adapter first materialized the wider open-ended chunk vector,
+  // scanned irrelevant legacy metadata, reloaded that vector as an assertion,
+  // then discarded it for this same closed pin. Mixed sources still require
+  // the combined adapter and its legacy dependency vector.
+  let loaded:Awaited<ReturnType<typeof loadCommunitySourcePin>>;
+  if(options.metric==='model'&&source==='v1') {
+    const sourcePin=await withStorageGraphFailureStage('graph_historical_pin',()=>loadV1SourcePin(sourceDb,
+      {participantId:owner.participantId,fromDay:history.fromDay,throughDay:history.day},{includeDayDependencies:true}));
+    loaded={sourcePin,fingerprint:sourcePin.fingerprint};
+  } else loaded=await loadCommunitySourcePin(sourceDb,owner.participantId,history.fromDay,source,
     {includeDayDependencies:true});
-  if(options.metric==='model' && !('source' in loaded.sourcePin)) {
-    loaded.sourcePin=await loadV1SourcePin(sourceDb,{participantId:owner.participantId,fromDay:history.fromDay,
-      throughDay:history.day},{includeDayDependencies:true});
-  }
   if(loaded.sourcePin.inputRevision!==owner.inputRevision)throw fail();
   let dependency:unknown=loaded.fingerprint;
   if('source' in loaded.sourcePin) {
@@ -197,7 +204,8 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
           let head:string|null=null,checkpoint;
           for(;;) {
             if(meter.remainingQueries<50||Date.now()>=deadlineMs)return {state:'deferred',reason:'checkpoint_read_budget'};
-            const loaded=await loadStorageHistoryCheckpoint({target:bindings.target,key,cursor});
+            const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
+              ()=>loadStorageHistoryCheckpoint({target:bindings.target,key,cursor}));
             if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
             head=loaded.headDigest??null;
             if(loaded.status==='ready')checkpoint=loaded.checkpoint;
@@ -207,9 +215,11 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
             day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs}});
           if(next.status==='complete')composition=next.analysis;
           else {
-            if(next.checkpoint && await current(source,scope)) {
+            const checkpointToSave=next.checkpoint;
+            if(checkpointToSave && await current(source,scope)) {
               while(meter.remainingQueries>=40&&Date.now()<deadlineMs) {
-                const saved=await saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:next.checkpoint,expectedHead:head});
+                const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
+                  ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:checkpointToSave,expectedHead:head}));
                 if(saved.status==='saved')break;
               }
             }

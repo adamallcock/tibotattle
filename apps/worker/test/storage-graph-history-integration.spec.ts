@@ -13,7 +13,7 @@ import {initializeStorageSource} from '../src/analytics-delivery';
 import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics} from '../src/storage-analytics-runtime';
 import {drainCommunityPublicSourceBootstrap} from '../src/community-daily-aggregates';
 import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
-import {captureStorageGraphScope,computeStorageGraphResult} from '../src/storage-community-graph';
+import {captureStorageGraphScope,computeStorageGraphResult,storageGraphDependencyDigest} from '../src/storage-community-graph';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
 
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];
@@ -23,6 +23,14 @@ const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[
 const source=()=>b.USAGE_MONITOR_DB,target=()=>b.STORAGE_ANALYTICS_DB,sourceId='synthetic-history-integration';
 const namespace='synthetic-history-origin',day='2026-09-05';
 const bindings=()=>({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+function observePreparedSql(database:D1Database){
+ const queries:string[]=[];
+ const observed=new Proxy(database,{get(target,key){
+  if(key==='prepare')return (sql:string)=>{queries.push(sql);return target.prepare(sql)};
+  const value:unknown=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;
+ }});
+ return {database:observed,queries};
+}
 beforeEach(async()=>{
  await reset();for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,
   b.TEST_TYPED_V1_ADMISSION_MIGRATIONS,b.TEST_TYPED_V11_ADMISSION_MIGRATIONS])await applyD1Migrations(source(),migrations);
@@ -66,7 +74,17 @@ async function fixture(){
 }
 
 it('restarts a lost direct attempt through durable bounded checkpoints and matches the completed typed historical fit',async()=>{
- const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
+ const owner=await fixture(),observed=observePreparedSql(source());
+ const scope=await captureStorageGraphScope(observed.database,{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
+ const vectors=observed.queries.filter(sql=>sql.includes('FROM telemetry_analytical_chunks c'));
+ expect(vectors).toHaveLength(1);
+ expect(vectors[0]).toContain('c.chunk_day <= ?');
+ expect(observed.queries.some(sql=>sql.includes('FROM telemetry_contributions'))).toBe(false);
+ expect('source' in scope.pin).toBe(false);
+ if('source' in scope.pin)throw new Error('unexpected v1.1 pin');
+ expect(scope.pin.scope).toEqual({participantId:owner.participantId,fromDay:'2026-05-28',throughDay:day});
+ expect(scope.dependencyDigest).toBe(await storageGraphDependencyDigest({authority:scope.authority,
+  ownerDigest:owner.ownerDigest!,source:'v1',metric:'model',day,dependency:scope.pin.dayDependencies}));
  const direct=await computeStorageGraphResult(bindings(),scope);
  expect(direct.state).toBe('complete');if(direct.state!=='complete')throw new Error('direct missing');
  expect(direct.result.composition?.status).toBe('ready');

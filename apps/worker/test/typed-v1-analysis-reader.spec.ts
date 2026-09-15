@@ -1,7 +1,8 @@
 import { createV1QuotaPageReader,backfillV1QuotaFitProjection } from '../src/quota-fit-projection';
 import { readV1UsagePage,accountScopedQuotaAnalysisV1,accountScopedModelCompositionV1 } from '../src/quota-analysis-v1';
 import { loadV1SourcePin } from '../src/telemetry-v1-source-selection';
-import { loadTypedV1AnalysisScope,TYPED_V1_PLAN_PAGE_SQL,TYPED_V1_FIT_PAGE_SQL,TYPED_V1_USAGE_AT_TIME_SQL } from '../src/typed-v1-analysis-reader';
+import { loadTypedV1AnalysisScope,TYPED_V1_PLAN_PAGE_SQL,TYPED_V1_HISTORY_PLAN_PAGE_SQL,
+ TYPED_V1_FIT_PAGE_SQL,TYPED_V1_USAGE_AT_TIME_SQL } from '../src/typed-v1-analysis-reader';
 import { decodeTypedTelemetryUsageAnalysisRows,MAX_TYPED_V1_USAGE_ANALYSIS_BYTES } from '../src/typed-telemetry-compatibility';
 import { env, reset, applyD1Migrations, type D1Migration } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -98,6 +99,20 @@ describe('typed v1 existing analytical reader parity',()=>{
   expect(await backfillV1QuotaFitProjection(source())).toMatchObject({status:'complete',pagesRun:0,queriesUsed:2,throughRecordId:10});
   await expect(source().prepare('UPDATE typed_telemetry_quota SET analysis_source_row_id=999').run()).rejects.toThrow();
  });
+ it('selects the typed reader when the isolated source has no legacy backfill singleton',async()=>{
+  const f=await pair();await both(f,[quota(0)],'quota');
+  await source().prepare('DELETE FROM telemetry_v1_quota_fit_backfill').run();
+  const reader=await createV1QuotaPageReader(source(),f.typed.participantId);
+  expect(await reader.readPlanPage({observedAt:`${day()}T00:00:00.000Z`,id:0},3)).toHaveLength(1);
+ });
+ it('fails closed when a bounded physical page has no compatibility admission',async()=>{
+  const f=await pair();await both(f,[quota(0)],'quota');
+  await source().prepare('DROP TRIGGER typed_v1_current_record_retained').run();
+  await source().prepare('DELETE FROM typed_v1_record_admissions').run();
+  const reader=await createV1QuotaPageReader(source(),f.typed.participantId);
+  await expect(reader.readPlanPage({observedAt:`${day()}T00:00:00.000Z`,id:0},3))
+   .rejects.toThrow('TYPED_V1_ANALYSIS_NOT_READY');
+ });
  it('returns a complete5000-row usage page with the original JSON and two physical queries',async()=>{
   const f=await pair();for(let chunk=0;chunk<25;chunk++)await both(f,Array.from({length:200},(_,i)=>usage(chunk*200+i)),'usage',chunk);
   const tp=await loadV1SourcePin(source(),{participantId:f.typed.participantId}),rp=await loadV1SourcePin(raw(),{participantId:f.original.participantId});
@@ -137,13 +152,30 @@ describe('typed v1 existing analytical reader parity',()=>{
  });
  it('uses declared seek indexes before bounded compatibility expansion',async()=>{
   const f=await pair();await both(f,[quota(0)],'quota');await both(f,[usage(0)],'usage');
+  const unrelated=await pair();
+  for(let chunk=0;chunk<5;chunk++)await write(source(),unrelated.typed,
+   Array.from({length:200},(_,i)=>quota(chunk*200+i+1000)),'quota',chunk);
+  await source().prepare('ANALYZE').run();
   const scope=(await loadTypedV1AnalysisScope(source(),f.typed.participantId))!;
   for(const [sql,args,index] of [
    [TYPED_V1_PLAN_PAGE_SQL,[scope.ownerId,Date.parse(`${day()}T12:00:00.000Z`),0,3],'typed_v1_owner_observed'],
+   [TYPED_V1_HISTORY_PLAN_PAGE_SQL,[scope.ownerId,Date.parse(`${day()}T12:00:00.000Z`),0,3,
+    Date.parse(`${day()}T23:59:59.999Z`)],'typed_v1_owner_observed'],
    [TYPED_V1_FIT_PAGE_SQL,[scope.ownerId,2,Date.parse(`${day()}T23:00:00.000Z`),Date.parse(`${day()}T12:00:00.000Z`),0,3],'typed_v1_quota_reset'],
    [TYPED_V1_USAGE_AT_TIME_SQL,[scope.ownerId,JSON.stringify([[f.typed.participantId,day(),f.typed.deviceId]]),Date.parse(`${day()}T12:05:00.000Z`),0,3],'typed_v1_owner_observed'],
   ] as const){const plan=await source().prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...args).all<{detail:string}>();
-   expect(plan.results.some(row=>row.detail.includes('SEARCH')&&row.detail.includes(index))).toBe(true);}
+   expect(plan.results.some(row=>row.detail.includes('SEARCH')&&row.detail.includes(index))).toBe(true);
+   if(sql!==TYPED_V1_USAGE_AT_TIME_SQL){
+    const pageScan=plan.results.findIndex(row=>row.detail==='SCAN page');
+    const keyedExpansion=plan.results.findIndex(row=>row.detail.includes('SEARCH r USING INTEGER PRIMARY KEY'));
+    expect(plan.results.some(row=>row.detail==='MATERIALIZE expanded')).toBe(true);
+    expect(pageScan).toBeGreaterThan(-1);
+    expect(keyedExpansion).toBeGreaterThan(pageScan);
+    expect(plan.results.some(row=>row.detail.includes('sqlite_autoindex_typed_telemetry_records_1 (namespace_id='))).toBe(false);
+    expect(plan.results.some(row=>row.detail.includes('MATERIALIZE typed_v1_current_records'))).toBe(false);
+    expect(plan.results.some(row=>row.detail.includes('SCAN typed_v1_current_records'))).toBe(false);
+   }
+  }
  });
  it('refuses unqualified analytical schema instead of returning an empty JSON result',async()=>{
   const f=await pair();await source().prepare('DROP TABLE typed_v1_analytical_schema').run();
