@@ -9,7 +9,7 @@ import { advanceNextStorageCommunityDaily, retireStorageCommunityDailyPage } fro
 import { advanceStorageCommunityGraphWork } from './storage-community-graph-work';
 import { retireStorageGraphPage } from './storage-graph-retirement';
 import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview,
- retireStorageCommunityGraphPublications } from './storage-community-graph-publication';
+ retireStorageCommunityGraphPublications, storageCommunityGraphPreviewReadyHint } from './storage-community-graph-publication';
 import { readCollectionControls } from './collection-controls';
 import { advanceStorageErasureJobs } from './storage-erasure';
 import { captureStorageAdminMetricSnapshot, warmStorageAdminMetricsHistoryCache } from './admin-metrics-history';
@@ -240,6 +240,17 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    if(snapshot.code!=='SNAPSHOT_UNAVAILABLE'&&adminMeter.remainingQueries>0&&Date.now()<deadlineMs) {
     await warmStorageAdminMetricsHistoryCache(adminScoped,Date.now());
    }
+  }
+  // Completed current fits can arrive at the deadline of an earlier invocation.
+  // Give them one cheap publication chance before another graph calculation.
+  // The aggregate hint is advisory; the existing publisher repeats the full
+  // cohort, payload, source and privacy-authority validation before any write.
+  if(options.publishCommunity&&meter.remainingQueries>=253&&deadlineMs-Date.now()>=5_000
+    &&(await readCollectionControls(scoped.source)).publication) {
+   options.signal?.throwIfAborted();
+   const ready=await storageCommunityGraphPreviewReadyHint(scoped);
+   options.signal?.throwIfAborted();
+   if(ready&&meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped);
   }
   for(;steps<maxSteps;) {
    options.signal?.throwIfAborted();

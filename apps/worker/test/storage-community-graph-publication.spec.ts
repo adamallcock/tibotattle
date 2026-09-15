@@ -1,5 +1,6 @@
 import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview, readPublishedStorageCommunityGraph,
-  readPublishedStorageCommunityAdminPreview, retireStorageCommunityGraphPublications } from '../src/storage-community-graph-publication';
+  readPublishedStorageCommunityAdminPreview, retireStorageCommunityGraphPublications,
+  storageCommunityGraphPreviewReadyHint } from '../src/storage-community-graph-publication';
 import { advanceStorageCommunityDaily } from '../src/storage-community-daily';
 import { handleRequest } from '../src/index';
 import { captureStorageCommunityAuthority } from '../src/storage-community-authority';
@@ -15,7 +16,7 @@ import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from 
 import { sha256Hex } from "../src/crypto";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
-import { initializeStorageAnalyticsRuntime, advanceStorageAnalytics } from "../src/storage-analytics-runtime";
+import { initializeStorageAnalyticsRuntime, advanceStorageAnalytics, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
 import { captureStorageGraphScope, computeStorageGraphResult } from "../src/storage-community-graph";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
@@ -220,6 +221,45 @@ async function api(){
  return handleRequest(new Request(`https://synthetic.example.test/api/v1/community/daily?from=${day()}&to=${day()}`),configured);
 }
 describe('isolated allowance graph publication',()=>{
+ it('uses an aggregate hint and publishes ready fits before later graph work',async()=>{
+  await fixture();
+  const incompleteMeter=createD1InvocationBudget(10);
+  expect(await storageCommunityGraphPreviewReadyHint({...bindings(),source:incompleteMeter.wrap(typed()),
+   target:incompleteMeter.wrap(b.STORAGE_ANALYTICS_DB)})).toBe(false);
+  expect(incompleteMeter.queriesUsed).toBe(2);
+  await compute('fits');
+  let reachedHeavyGraph=false;
+  const laterUnavailable=new Proxy(b.STORAGE_ANALYTICS_DB,{get(db,key){
+   if(key==='prepare')return(sql:string)=>{if(sql.includes('INSERT INTO analytics_community_graph_scan')){
+    reachedHeavyGraph=true;throw new Error('synthetic later graph unavailable');}
+    return db.prepare(sql);};
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  await expect(runStorageAnalyticsPass({...bindings(),target:laterUnavailable,publishCommunity:true,maxSteps:1,
+   deadlineMs:Date.now()+20_000})).rejects.toThrow('synthetic later graph unavailable');
+  expect(reachedHeavyGraph).toBe(true);
+  expect(await readPublishedStorageCommunityGraph(bindings())).not.toBeNull();
+ });
+ it('treats a positive hint as advisory and cannot publish a false cohort',async()=>{
+  await fixture();await compute('fits');
+  const template=(await b.STORAGE_ANALYTICS_DB.prepare("SELECT * FROM analytics_community_graph_results WHERE metric='fits'")
+   .first<Record<string,unknown>>())!;
+  await fixture('participant:second-hint-member');
+  const fake={...template,owner_digest:'f'.repeat(64)};
+  await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_results
+    (${Object.keys(fake).join(',')}) VALUES(${Object.keys(fake).map(()=>'?').join(',')})`).bind(...Object.values(fake)).run();
+  expect(await storageCommunityGraphPreviewReadyHint(bindings())).toBe(true);
+  expect(await publishStorageCommunityGraphPreview(bindings()))
+   .toMatchObject({state:'deferred',reason:'cache_pending'});
+  expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
+ });
+ it('rechecks privacy authority after a positive hint',async()=>{
+  await fixture();await compute('fits');
+  expect(await storageCommunityGraphPreviewReadyHint(bindings())).toBe(true);
+  await typed().prepare("UPDATE collection_controls SET publication_enabled=0,control_state='degraded',revision=revision+1 WHERE singleton=1").run();
+  await expect(publishStorageCommunityGraphPreview(bindings())).rejects.toThrow('STORAGE_COMMUNITY_AUTHORITY_UNAVAILABLE');
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(0);
+ });
  it('publishes actual fitted allowance through the real daily route while missing historical models remain gaps',async()=>{
   const f=await fixture();
   expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'deferred',reason:'cache_pending'});
