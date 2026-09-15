@@ -75,7 +75,7 @@ export function sameStorageCommunityCalculationAuthority(a: StorageCommunityAuth
 export async function storageCommunityCalculationAuthorityIsCurrent(source:D1Database,
   snapshot:StorageCommunityAuthority):Promise<boolean> {
   const controls=await readCollectionControls(source);
-  if(!controls.publication)return false;
+  if(!controls.publication)throw unavailable();
   const row=await source.prepare(`SELECT s.source_id AS sourceId,a.source_namespace AS sourceNamespace,
     i.policy_revision AS policyRevision,c.revision AS collectionRevision
     FROM storage_source_state s
