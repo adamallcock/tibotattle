@@ -33,7 +33,7 @@ export function classifyStorageGraphFailure(error:unknown):StorageGraphFailureRe
  const message=error instanceof Error?error.message.toLowerCase():'';
  if(message==='storage_history_checkpoint_unavailable')return 'checkpoint_unavailable';
  if(message==='storage_v1_history_checkpoint_mismatch')return 'checkpoint_mismatch';
- if(message==='v1 source changed during analysis')return 'source_changed';
+ if(message==='v1 source changed during analysis'||message==='storage graph scope changed')return 'source_changed';
  const name=error instanceof Error?error.name.toLowerCase():'';
  const d1=name.includes('d1')||message.startsWith('d1_error:')||message.startsWith('d1_exec_error:')
   ||message.includes('d1 db storage')||message.includes('error 7429');

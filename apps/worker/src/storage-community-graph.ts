@@ -28,6 +28,7 @@ export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate
 const STORAGE_GRAPH_DIRECT_HISTORY_READER_REVISION = 'typed-v1-direct-cross-1';
 const MAX_RESULT_BYTES = 1024 * 1024;
 const fail = () => new Error('STORAGE_GRAPH_RESULT_UNAVAILABLE');
+const scopeChanged = () => new Error('storage graph scope changed');
 export type StorageGraphSource = 'v0.2' | 'v1' | 'v1.1' | 'mixed';
 type Source = StorageGraphSource;
 type Pin = Awaited<ReturnType<typeof loadCommunitySourcePin>>['sourcePin'];
@@ -76,7 +77,7 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
     loaded={sourcePin,fingerprint:sourcePin.fingerprint};
   } else loaded=await loadCommunitySourcePin(sourceDb,owner.participantId,history.fromDay,source,
     {includeDayDependencies:true});
-  if(loaded.sourcePin.inputRevision!==owner.inputRevision)throw fail();
+  if(loaded.sourcePin.inputRevision!==owner.inputRevision)throw scopeChanged();
   let dependency:unknown=loaded.fingerprint;
   if('source' in loaded.sourcePin) {
     const rows=(await sourceDb.prepare(`SELECT d.observed_day,m.id,m.manifest_digest,m.device_id
@@ -95,7 +96,7 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
   }
   const dependencyDigest=await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest,
     source,metric:options.metric,day:history.day,dependency});
-  if(!await storageCommunityAuthorityIsCurrent(sourceDb,authority))throw fail();
+  if(!await storageCommunityAuthorityIsCurrent(sourceDb,authority))throw scopeChanged();
   return {authority,owner:owner as StorageGraphScope['owner'],source,pin:loaded.sourcePin,
     day:history.day,fixedNow:history.fixedNow,metric:options.metric,dependencyDigest};
 }

@@ -480,6 +480,31 @@ describe('isolated allowance graph publication',()=>{
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT inputs_current FROM analytics_community_graph_previews').first('inputs_current')).toBe(1);
   expect((await readStorageCommunityProgress(bindings(),Date.now())).work.phase).toBe('history');
  });
+ it('retries one current-authority race from a fresh graph scope',async()=>{
+  await fixture();let authorityReads=0,changed=false;
+  const source=observed(typed(),async(sql,moment)=>{
+   if(moment!=='before'||!sql.includes('SELECT s.source_id AS sourceId'))return;
+   authorityReads++;
+   if(authorityReads===2){changed=true;await typed().prepare(`UPDATE storage_source_state
+     SET authority_epoch=authority_epoch+1 WHERE singleton=1`).run();}
+  });
+  expect(await advanceStorageCommunityGraphWork({...bindings(),source}))
+   .toMatchObject({state:'complete',metric:'fits',day:today()});
+  expect(changed).toBe(true);
+  expect(authorityReads).toBeGreaterThanOrEqual(5);
+ });
+ it('bounds graph scope authority retry and reports a second race as source changed',async()=>{
+  await fixture();let authorityReads=0;
+  const source=observed(typed(),async(sql,moment)=>{
+   if(moment!=='before'||!sql.includes('SELECT s.source_id AS sourceId'))return;
+   authorityReads++;
+   if(authorityReads===2||authorityReads===4)await typed().prepare(`UPDATE storage_source_state
+     SET authority_epoch=authority_epoch+1 WHERE singleton=1`).run();
+  });
+  await expect(advanceStorageCommunityGraphWork({...bindings(),source}))
+   .rejects.toMatchObject({stage:'graph_scope',reason:'source_changed'});
+  expect(authorityReads).toBe(4);
+ });
  it('prioritizes missing current fits without changing the four-history, one-fit, one-model cadence',async()=>{
   for(const suffix of ['a','b','c'])await fixture(`participant:fit-priority-${suffix}`);
   const owners=await readStorageCommunityOwnerPage(typed());expect(owners).toHaveLength(3);

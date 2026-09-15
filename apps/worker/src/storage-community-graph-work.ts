@@ -5,10 +5,12 @@ import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowa
 import { COMMUNITY_MODEL_CACHE_MAX_BYTES, COMMUNITY_MODEL_CACHE_MAX_PAGES } from './community-allowance';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { validStorageModelPublication, type StorageModelPublicationValue } from './storage-community-publication-value';
-import { withStorageGraphFailureStage, type StorageGraphFailureFields } from './storage-analytics-failure';
+import { StorageGraphOperationError, withStorageGraphFailureStage,
+ type StorageGraphFailureFields } from './storage-analytics-failure';
 
 const fail=()=>new Error('STORAGE_GRAPH_WORK_UNAVAILABLE');
 const CURRENT_FIT_CACHE_PAGE=64;
+const SCOPE_RETRY_HEADROOM_MS=4_000;
 type CachedCurrentFit={owner_digest:string;source_kind:'v0.2'|'v1'|'v1.1'|'mixed'};
 export interface StorageGraphWorkProgress {
  state:'complete'|'reused'|'deferred'|'idle';metric?:'fits'|'model';day?:string;reason?:string;
@@ -108,8 +110,18 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  if(claimed.meta.changes!==1)return {state:'deferred',reason:'claim_changed'};
  if(day===null)return {state:'idle'};
  if(!owner.ownerDigest)return {state:'deferred',metric,day,reason:'source_bootstrap_pending'};
- const scope=await withStorageGraphFailureStage('graph_scope',()=>captureStorageGraphScope(options.source,{owner,day,metric,
+ const capture=()=>withStorageGraphFailureStage('graph_scope',()=>captureStorageGraphScope(options.source,{owner,day,metric,
   sourceId:options.sourceId,sourceNamespace:options.sourceNamespace}));
+ let scope:Awaited<ReturnType<typeof capture>>;
+ try {scope=await capture()}
+ catch(error) {
+  // A concurrent owner-authority change invalidates the first captured scope.
+  // Retry that exact claimed owner once from a fresh authority snapshot. Every
+  // source/input/final fence still runs; a second race remains a closed error.
+  if(!(error instanceof StorageGraphOperationError)||error.reason!=='source_changed'
+    ||Date.now()+SCOPE_RETRY_HEADROOM_MS>=(options.deadlineMs??Date.now()+20_000))throw error;
+  scope=await capture();
+ }
  const result=await withStorageGraphFailureStage(metric==='fits'?'graph_current_fit_compute':'graph_model_compute',
   ()=>computeStorageGraphResult(options,scope,{maxQueries:Math.max(1,(options.remainingQueries??900)-40),deadlineMs:options.deadlineMs}));
  return result.state==='complete'?{state:result.reused?'reused':'complete',metric,day}
