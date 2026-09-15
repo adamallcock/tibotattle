@@ -18,7 +18,8 @@ import { createD1InvocationBudget } from './d1-invocation-budget';
 import { advanceStorageV1HistoricalAnalysis } from './storage-v1-history';
 import { loadStorageHistoryCheckpoint, saveStorageHistoryCheckpoint,
   type StorageHistoryKey, type StorageHistoryLoadCursor } from './storage-history-checkpoint';
-import { withStorageGraphFailureStage } from './storage-analytics-failure';
+import { caughtStorageGraphFailureFields, withStorageGraphFailureStage,
+  type StorageGraphFailureFields } from './storage-analytics-failure';
 
 export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate-results-1';
 // Execution-only revision for the single optimistic direct historical read.
@@ -148,7 +149,8 @@ export async function readStorageGraphResult(bindings:StorageAnalyticsBindings,s
  * no transaction, cache write or backpressure hook in ingestion. */
 export async function computeStorageGraphResult(bindings:StorageAnalyticsBindings,scope:StorageGraphScope,
   options:{maxQueries?:number;deadlineMs?:number}={}):Promise<
-  {state:'complete';result:StorageGraphResult;reused:boolean}|{state:'deferred';reason:string}> {
+  {state:'complete';result:StorageGraphResult;reused:boolean}
+  |{state:'deferred';reason:string;failure?:StorageGraphFailureFields}> {
   if(bindings.source===bindings.target)throw fail();
   const meter=createD1InvocationBudget(options.maxQueries??900),deadlineMs=options.deadlineMs??Date.now()+20_000;
   bindings={...bindings,source:meter.wrap(bindings.source),target:meter.wrap(bindings.target)};
@@ -201,7 +203,10 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         if(attempt.meta.changes===1) {
           try {composition=await accountScopedHistoricalModelCompositionV1(source,
             scope.owner.participantId,scope.day,{sourcePin:scope.pin});}
-          catch {return {state:'deferred',reason:'direct_read_unavailable'};}
+          catch(error) {
+            const failure=caughtStorageGraphFailureFields('graph_history_direct_read',error);
+            return {state:'deferred',reason:'direct_read_unavailable',...(failure?{failure}:{})};
+          }
         }
         else {
           const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,

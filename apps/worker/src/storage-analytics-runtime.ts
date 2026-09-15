@@ -13,6 +13,7 @@ import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview,
 import { readCollectionControls } from './collection-controls';
 import { advanceStorageErasureJobs } from './storage-erasure';
 import { captureStorageAdminMetricSnapshot, warmStorageAdminMetricsHistoryCache } from './admin-metrics-history';
+import type { StorageGraphFailureFields } from './storage-analytics-failure';
 
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 export type { StorageAnalyticsBindings } from './analytics-delivery';
@@ -186,6 +187,7 @@ async function advanceStorageAnalyticsV1Page(options:StorageAnalyticsBindings&{
 export interface StorageAnalyticsPass {
  state:'idle'|'progress'|'deferred';steps:number;recordsRead:number;queriesUsed:number;
  dailyPublications:number;graphCalculations:number;
+ graphFailure?:StorageGraphFailureFields;
  reason:'complete'|'step_limit'|'deadline'|'query_budget'|'capacity'|'format_boundary';
 }
 export interface StorageAnalyticsCatchupMetrics {
@@ -204,9 +206,10 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    ||(options.skipV1PrefixProbe!==undefined&&typeof options.skipV1PrefixProbe!=='boolean'))throw invalid();
  const meter=createD1InvocationBudget(options.maxQueries??900);
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
- let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0;
+ let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,graphFailure:StorageGraphFailureFields|undefined;
  const result=(state:StorageAnalyticsPass['state'],reason:StorageAnalyticsPass['reason']):StorageAnalyticsPass=>
-  ({state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications,graphCalculations});
+  ({state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications,graphCalculations,
+   ...(graphFailure?{graphFailure}:{})});
  try {
   if(Date.now()>=deadlineMs)return result('deferred','deadline');
   // Privacy cleanup is independent of publication and capacity admission for
@@ -277,6 +280,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     await retireStorageCommunityDailyPage(scoped);
     if(meter.remainingQueries>=550 && Date.now()<deadlineMs) {
      const graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs});
+     if(graph.failure)graphFailure??=graph.failure;
      if(graph.state==='complete')graphCalculations++;
      if((graph.state==='complete'||graph.state==='reused')&&meter.remainingQueries>=250&&Date.now()<deadlineMs) {
       if(graph.metric==='model'&&graph.day)await publishStorageCommunityModelDay(scoped,{day:graph.day});

@@ -10,11 +10,12 @@ import {telemetryV11LegacyProjection} from '../src/telemetry-v11-repository';
 import {canonicalJson} from '../src/canonical-json';
 import {sha256Hex} from '../src/crypto';
 import {initializeStorageSource} from '../src/analytics-delivery';
-import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics} from '../src/storage-analytics-runtime';
+import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics,runStorageAnalyticsPass} from '../src/storage-analytics-runtime';
 import {drainCommunityPublicSourceBootstrap} from '../src/community-daily-aggregates';
 import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
 import {captureStorageGraphScope,computeStorageGraphResult,storageGraphDependencyDigest} from '../src/storage-community-graph';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
+import {advanceStorageCommunityGraphWork} from '../src/storage-community-graph-work';
 
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];
  TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];
@@ -107,6 +108,8 @@ it('reopens one repaired direct attempt, serializes concurrent claims, then fall
  const concurrent=await Promise.all([
   computeStorageGraphResult(concurrentBindings,scope),computeStorageGraphResult(concurrentBindings,scope)]);
  expect(concurrent.every(result=>result.state==='deferred')).toBe(true);
+ expect(concurrent.flatMap(result=>result.state==='deferred'&&result.failure?[result.failure]:[]))
+  .toEqual([{phase:'graph_history_direct_read',reason:'application'}]);
  expect(attempts.attempts()).toBe(1);
  const executionDigest=await target().prepare(`SELECT dependency_digest FROM analytics_community_graph_execution
   WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,owner.ownerDigest,day).first<string>('dependency_digest');
@@ -132,4 +135,23 @@ it('reopens one repaired direct attempt, serializes concurrent claims, then fall
  expect(await source().prepare('SELECT count(*) n FROM community_prepared_usage_rows').first('n')).toBe(0);
  expect(await source().prepare('SELECT count(*) n FROM telemetry_v1_records').first('n')).toBe(0);
  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads').first<number>('n')).toBeGreaterThan(0);
+
+ const directWork=observeDirectAttempts(source(),true);
+ await target().prepare(`INSERT INTO analytics_community_graph_scan(source_id,revision,tick,current_position,history_position)
+  VALUES(?,1,1,0,0) ON CONFLICT(source_id) DO UPDATE SET revision=revision+1,tick=1`).bind(sourceId).run();
+ const work=await advanceStorageCommunityGraphWork({...bindings(),source:directWork.database});
+ expect(work).toMatchObject({state:'deferred',metric:'model',reason:'direct_read_unavailable',
+  failure:{phase:'graph_history_direct_read',reason:'application'}});
+ expect(directWork.attempts()).toBe(1);
+
+ await target().prepare(`UPDATE analytics_community_graph_execution SET dependency_digest=? WHERE source_id=? AND day=?`)
+  .bind('0'.repeat(64),sourceId,work.day).run();
+ await target().prepare('UPDATE analytics_community_graph_scan SET revision=revision+1,tick=1').run();
+ const scheduledDirect=observeDirectAttempts(source(),true);
+ const pass=await runStorageAnalyticsPass({...bindings(),source:scheduledDirect.database,publishCommunity:true,maxSteps:1,
+  deadlineMs:Date.now()+20_000});
+ expect(pass.graphFailure).toEqual({phase:'graph_history_direct_read',reason:'application'});
+ expect(JSON.parse(JSON.stringify({event:'storage_analytics_schedule',...pass}))).toMatchObject({
+  event:'storage_analytics_schedule',graphFailure:{phase:'graph_history_direct_read',reason:'application'}});
+ expect(scheduledDirect.attempts()).toBe(1);
 },60000);
