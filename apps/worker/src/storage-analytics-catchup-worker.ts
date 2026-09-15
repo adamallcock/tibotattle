@@ -262,7 +262,8 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
     ordinaryBoundary=true;
     const ordinary=await runStorageAnalyticsPass({source:env.STORAGE_INGESTION_DB,target:env.STORAGE_ANALYTICS_DB,
      ledger:env.DELETION_LEDGER,sourceId:env.STORAGE_SOURCE_ID,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,
-     maxSteps:1,deadlineMs:invocationDeadlineMs,maxQueries:remainingPageQueries,publishCommunity:false});
+     maxSteps:1,deadlineMs:invocationDeadlineMs,maxQueries:remainingPageQueries,publishCommunity:false,
+     skipV1PrefixProbe:true});
     remainingPageQueries-=ordinary.queriesUsed;
     const currentControls=await readCollectionControls(env.STORAGE_INGESTION_DB);
     if(currentControls.publication!==(state.expected_publication_enabled===1)
