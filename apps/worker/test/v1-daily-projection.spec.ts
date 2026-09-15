@@ -1,8 +1,9 @@
 import { advanceV1DailyProjection,advanceV1DailyProjectionPage,readV1ProjectedChunkPage,retireV1DailyProjectionPage } from '../src/v1-daily-projection';
 import { initializeStorageAnalyticsRuntime,runStorageAnalyticsPass,runStorageAnalyticsV1CatchupPass } from '../src/storage-analytics-runtime';
+import * as storageAnalyticsRuntime from '../src/storage-analytics-runtime';
 import { mergeV11DailyProjectionValues,createV11DailyProjectionValues } from '../src/v11-daily-projection-values';
 import { env, reset, applyD1Migrations, type D1Migration } from 'cloudflare:test';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { canonicalTelemetryV11Json } from '@app-usagemonitor/telemetry-contract';
 import { createV11DeviceFixture, v11UsageRecord } from './helpers/telemetry-v11';
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from '../src/device-auth';
@@ -93,8 +94,8 @@ const catchupMessage=(run:{runId:string;expectedCollectionRevision:number;expect
  expectedSequence=0,pageEvents=4,maxPages=1)=>({schema:'storage-analytics-v1-catchup-message-v3' as const,runId:run.runId,
  generation,expectedSequence,pageEvents,maxPages,expectedCollectionRevision:run.expectedCollectionRevision,
  expectedPublicationEnabled:run.expectedPublicationEnabled});
-function queueBatch(body:StorageAnalyticsV1CatchupMessage){let acknowledgements=0;
- const message={id:crypto.randomUUID(),timestamp:new Date(),body,attempts:1,retry(){},ack(){acknowledgements++;}};
+function queueBatch(body:StorageAnalyticsV1CatchupMessage,id=crypto.randomUUID()){let acknowledgements=0;
+ const message={id,timestamp:new Date(),body,attempts:1,retry(){},ack(){acknowledgements++;}};
  const batch={messages:[message],queue:'synthetic-analytics-catchup',metadata:{metrics:{backlogCount:0,backlogBytes:0}},retryAll(){},ackAll(){}} as MessageBatch<StorageAnalyticsV1CatchupMessage>;
  return {batch,acks:()=>acknowledgements};}
 describe('separate typed v1 analytical projection',()=>{
@@ -282,7 +283,7 @@ describe('separate typed v1 analytical projection',()=>{
  const duplicate=queueBatch(first.batch.messages[0]!.body);await runStorageAnalyticsV1CatchupQueue(duplicate.batch,env);
   expect(duplicate.acks()).toBe(1);expect(await target().prepare('SELECT count(*) n FROM analytics_applied_events').first('n')).toBe(4);
  });
- it('chains maximum sixteen-event pages and stops at the exact page bound',async()=>{
+ it('processes up to three maximum pages per delivery and stops at the exact page bound',async()=>{
   await seedPage(32,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
   const run=await catchupRun(16,2,true),sent:StorageAnalyticsV1CatchupMessage[]=[];
   const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
@@ -291,15 +292,187 @@ describe('separate typed v1 analytical projection',()=>{
    TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
    DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
   const first=queueBatch(catchupMessage(run,1,0,16,2));await runStorageAnalyticsV1CatchupQueue(first.batch,workerEnv);
-  expect(first.acks()).toBe(1);expect(sent).toHaveLength(1);expect(sent[0]).toMatchObject({generation:2,expectedSequence:16,pageEvents:16,maxPages:2});
-  const second=queueBatch(sent[0]!);await runStorageAnalyticsV1CatchupQueue(second.batch,workerEnv);
-  expect(second.acks()).toBe(1);expect(sent).toHaveLength(1);
+  expect(first.acks()).toBe(1);expect(sent).toHaveLength(0);
   expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
    .toEqual({generation:3,expected_sequence:32,pages_completed:2,state:'complete',result_reason:'page_limit'});
   expect((await target().prepare(`SELECT generation,expected_sequence,observed_sequence,events_applied,result_reason
    FROM storage_analytics_v1_catchup_receipts ORDER BY generation`).all()).results).toEqual([
     {generation:1,expected_sequence:0,observed_sequence:16,events_applied:16,result_reason:'step_limit'},
     {generation:2,expected_sequence:16,observed_sequence:32,events_applied:16,result_reason:'page_limit'}]);
+ });
+ it('enqueues once after three internal pages and resumes the exact next generation',async()=>{
+  await seedPage(64,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,4,true),sent:StorageAnalyticsV1CatchupMessage[]=[];
+  const ledger=observe(bindings.DELETION_LEDGER);
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const workerEnv={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:ledger.db,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const first=queueBatch(catchupMessage(run,1,0,16,4));await runStorageAnalyticsV1CatchupQueue(first.batch,workerEnv);
+  expect(first.acks()).toBe(1);expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({generation:4,expectedSequence:48,pageEvents:16,maxPages:4});
+  expect(ledger.stats().calls).toBeGreaterThanOrEqual(3);
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:4,expected_sequence:48,pages_completed:3,state:'sent'});
+  const second=queueBatch(sent[0]!);await runStorageAnalyticsV1CatchupQueue(second.batch,workerEnv);
+  expect(second.acks()).toBe(1);expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:5,expected_sequence:64,pages_completed:4,state:'complete',result_reason:'page_limit'});
+  expect(await target().prepare('SELECT count(*) n FROM storage_analytics_v1_catchup_receipts').first('n')).toBe(4);
+ });
+ it('carries a costly first page budget into page two and gracefully yields on a late budget race',async()=>{
+  await seedPage(48,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,3,true),sent:StorageAnalyticsV1CatchupMessage[]=[];
+  const ledger=observe(bindings.DELETION_LEDGER),original=storageAnalyticsRuntime.runStorageAnalyticsV1CatchupPass;
+  let secondBudget:number|undefined;
+  const pass=vi.spyOn(storageAnalyticsRuntime,'runStorageAnalyticsV1CatchupPass').mockImplementationOnce(async options=>{
+   const result=await original(options);return {...result,queriesUsed:500};
+  }).mockImplementationOnce(async options=>{secondBudget=options.maxQueries;return original({...options,maxQueries:20});});
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const workerEnv={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:ledger.db,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const first=queueBatch(catchupMessage(run,1,0,16,3));await runStorageAnalyticsV1CatchupQueue(first.batch,workerEnv);pass.mockRestore();
+  expect(first.acks()).toBe(1);expect(sent).toHaveLength(1);expect(sent[0]).toMatchObject({generation:2,expectedSequence:16});
+  expect(ledger.stats().calls).toBeGreaterThan(0);expect(secondBudget).toBe(340);
+  expect(await target().prepare('SELECT metered_queries FROM storage_analytics_v1_catchup_receipts WHERE generation=1').first('metered_queries')).toBe(500);
+  expect(await target().prepare('SELECT count(*) n FROM storage_analytics_v1_catchup_receipts').first('n')).toBe(1);
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:2,expected_sequence:16,pages_completed:1,state:'sent'});
+  const resumed=queueBatch(sent[0]!);await runStorageAnalyticsV1CatchupQueue(resumed.batch,workerEnv);
+  expect(resumed.acks()).toBe(1);expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:4,expected_sequence:48,pages_completed:3,state:'complete',result_reason:'page_limit'});
+ });
+ it.each(['deadline','query_budget'] as const)('retains and re-enqueues a partial page that reports %s',async reason=>{
+  await seedPage(5,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,3,true),sent:StorageAnalyticsV1CatchupMessage[]=[];
+  const original=storageAnalyticsRuntime.runStorageAnalyticsV1CatchupPass;
+  const pass=vi.spyOn(storageAnalyticsRuntime,'runStorageAnalyticsV1CatchupPass').mockImplementationOnce(async options=>{
+   const result=await original(options);return {...result,state:'deferred' as const,reason};
+  });
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const workerEnv={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const first=queueBatch(catchupMessage(run,1,0,16,3));await runStorageAnalyticsV1CatchupQueue(first.batch,workerEnv);pass.mockRestore();
+  expect(first.acks()).toBe(1);expect(sent).toHaveLength(1);expect(sent[0]).toMatchObject({generation:2,expectedSequence:5});
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:2,expected_sequence:5,pages_completed:1,state:'sent',result_reason:null});
+  expect(await target().prepare('SELECT observed_sequence,events_applied,result_reason FROM storage_analytics_v1_catchup_receipts').first())
+   .toEqual({observed_sequence:5,events_applied:5,result_reason:reason});
+  const resumed=queueBatch(sent[0]!);await runStorageAnalyticsV1CatchupQueue(resumed.batch,workerEnv);
+  expect(resumed.acks()).toBe(1);expect(await target().prepare('SELECT expected_sequence,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({expected_sequence:5,state:'complete',result_reason:'complete'});
+  expect(await target().prepare('SELECT count(*) n FROM analytics_applied_events').first('n')).toBe(5);
+ });
+ it('retains the first page and blocks before a second page when publication controls change',async()=>{
+  await seedPage(32,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,2,true);let controlReads=0;
+  const changingSource=new Proxy(source(),{get(database,key){if(key==='prepare')return(sql:string)=>{
+   const statement=database.prepare(sql);if(!sql.includes('FROM collection_controls'))return statement;
+   return new Proxy(statement,{get(value,member){if(member==='first')return async(...args:unknown[])=>{
+    controlReads++;if(controlReads===3)await source().prepare('UPDATE collection_controls SET revision=revision+1 WHERE singleton=1').run();
+    return Reflect.apply(Reflect.get(value,member) as Function,value,args);};const result=Reflect.get(value,member);
+    return typeof result==='function'?result.bind(value):result;}});};const value=Reflect.get(database,key);
+   return typeof value==='function'?value.bind(database):value;}});
+  const queue={async send(){throw new Error('unexpected send');}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const env={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:changingSource,STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const delivery=queueBatch(catchupMessage(run,1,0,16,2));await runStorageAnalyticsV1CatchupQueue(delivery.batch,env);
+  expect(delivery.acks()).toBe(1);expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:3,expected_sequence:16,pages_completed:1,state:'blocked',result_reason:'publication_control'});
+  expect((await target().prepare('SELECT generation,events_applied,result_reason FROM storage_analytics_v1_catchup_receipts ORDER BY generation').all()).results)
+   .toEqual([{generation:1,events_applied:16,result_reason:'step_limit'},{generation:2,events_applied:0,result_reason:'publication_control'}]);
+ });
+ it('recovers a crash at the internal checkpoint from a stale delivery without replay',async()=>{
+  await seedPage(32,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,2,true),sent:StorageAnalyticsV1CatchupMessage[]=[];let claims=0;
+  const crashingControl=new Proxy(target(),{get(database,key){if(key==='prepare')return(sql:string)=>{
+   const statement=database.prepare(sql);if(!sql.includes("SET state='running'"))return statement;
+   return new Proxy(statement,{get(value,member){if(member==='bind')return(...args:unknown[])=>{
+    const bound=value.bind(...args);return new Proxy(bound,{get(inner,operation){if(operation==='run')return async()=>{
+     claims++;if(claims===2)throw new Error('synthetic crash at internal checkpoint');return inner.run();};
+     const result=Reflect.get(inner,operation);return typeof result==='function'?result.bind(inner):result;}});};
+    const result=Reflect.get(value,member);return typeof result==='function'?result.bind(value):result;}});};
+   const value=Reflect.get(database,key);return typeof value==='function'?value.bind(database):value;}});
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const common={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const first=queueBatch(catchupMessage(run,1,0,16,2));
+  await expect(runStorageAnalyticsV1CatchupQueue(first.batch,{...common,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:crashingControl})).rejects.toThrow();
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:2,expected_sequence:16,pages_completed:1,state:'send-pending'});
+  const retry=queueBatch(first.batch.messages[0]!.body);await runStorageAnalyticsV1CatchupQueue(retry.batch,{...common,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target()});
+  expect(retry.acks()).toBe(1);expect(sent).toHaveLength(1);expect(sent[0]).toMatchObject({generation:2,expectedSequence:16});
+  const resumed=queueBatch(sent[0]!);await runStorageAnalyticsV1CatchupQueue(resumed.batch,{...common,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target()});
+  expect(resumed.acks()).toBe(1);expect(await target().prepare('SELECT expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({expected_sequence:32,pages_completed:2,state:'complete',result_reason:'page_limit'});
+  expect(await target().prepare('SELECT count(*) n FROM analytics_applied_events').first('n')).toBe(32);
+ });
+ it('continues a retried delivery from its exact retained internal claim',async()=>{
+  await seedPage(32,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,2,true),claim='synthetic-retained-delivery';
+  const first=await runStorageAnalyticsV1CatchupPass({source:source(),target:target(),sourceId,sourceNamespace:namespace,
+   pageEvents:16,maxSteps:16,publicationControlRevision:run.expectedCollectionRevision,publicationEnabled:true});
+  expect(first.steps).toBe(16);
+  await target().batch([
+   target().prepare(`INSERT INTO storage_analytics_v1_catchup_receipts
+    (run_id,generation,expected_sequence,observed_sequence,events_applied,records_read,decoded_bytes,metered_queries,
+     source_read_ms,fold_ms,source_recheck_ms,target_write_ms,page_duration_ms,invocation_duration_ms,result_reason,completed_ms)
+    VALUES(?,1,0,16,16,?,?,?,?,?,?,?,?,?,'step_limit',?)`).bind(run.runId,first.recordsRead,first.metrics.decodedBytes,first.queriesUsed,
+      first.metrics.sourceReadMs,first.metrics.foldMs,first.metrics.sourceRecheckMs,first.metrics.targetWriteMs,
+      first.metrics.pageDurationMs,1,Date.now()),
+   target().prepare(`UPDATE storage_analytics_v1_catchup_runs SET generation=2,expected_sequence=16,pages_completed=1,
+    state='running',claim_id=?,updated_ms=? WHERE run_id=?`).bind(claim,Date.now(),run.runId),
+  ]);
+  const queue={async send(){throw new Error('unexpected send');}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const env={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const altered=queueBatch({...catchupMessage(run,1,0,16,2),maxPages:3},claim);
+  await expect(runStorageAnalyticsV1CatchupQueue(altered.batch,env)).rejects.toThrow('STORAGE_ANALYTICS_CATCHUP_INVALID');
+  expect(await target().prepare('SELECT generation,expected_sequence,state,claim_id FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:2,expected_sequence:16,state:'running',claim_id:claim});
+  const retry=queueBatch(catchupMessage(run,1,0,16,2),claim);await runStorageAnalyticsV1CatchupQueue(retry.batch,env);
+  expect(retry.acks()).toBe(1);expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:3,expected_sequence:32,pages_completed:2,state:'complete',result_reason:'page_limit'});
+  expect(await target().prepare('SELECT count(*) n FROM analytics_applied_events').first('n')).toBe(32);
+ });
+ it('gracefully yields when the shared invocation deadline expires after the next page claim',async()=>{
+  await seedPage(32,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,2,true),sent:StorageAnalyticsV1CatchupMessage[]=[];const base=Date.now();let now=base,claims=0;
+  const clock=vi.spyOn(Date,'now').mockImplementation(()=>now);
+  const expiringControl=new Proxy(target(),{get(database,key){if(key==='prepare')return(sql:string)=>{
+   const statement=database.prepare(sql);if(!sql.includes("SET state='running'"))return statement;
+   return new Proxy(statement,{get(value,member){if(member==='bind')return(...args:unknown[])=>{
+    const bound=value.bind(...args);return new Proxy(bound,{get(inner,operation){if(operation==='run')return async()=>{
+     const result=await inner.run();claims++;if(claims===2)now=base+20_001;return result;};
+     const result=Reflect.get(inner,operation);return typeof result==='function'?result.bind(inner):result;}});};
+    const result=Reflect.get(value,member);return typeof result==='function'?result.bind(value):result;}});};
+   const value=Reflect.get(database,key);return typeof value==='function'?value.bind(database):value;}});
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const common={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_SOURCE_ID:sourceId,TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const first=queueBatch(catchupMessage(run,1,0,16,2));await runStorageAnalyticsV1CatchupQueue(first.batch,{...common,
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(base+60_000).toISOString(),STORAGE_INGESTION_DB:source(),
+   STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:expiringControl});
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:2,expected_sequence:16,pages_completed:1,state:'sent',result_reason:null});
+  expect(sent).toHaveLength(1);expect(sent[0]).toMatchObject({generation:2,expectedSequence:16});
+  expect(await target().prepare('SELECT count(*) n FROM storage_analytics_v1_catchup_receipts').first('n')).toBe(1);
+  const resumed=queueBatch(sent[0]!);await runStorageAnalyticsV1CatchupQueue(resumed.batch,{...common,
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(base+120_000).toISOString(),STORAGE_INGESTION_DB:source()});
+  clock.mockRestore();expect(resumed.acks()).toBe(1);
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:3,expected_sequence:32,pages_completed:2,state:'complete',result_reason:'page_limit'});
  });
  it('stops the initial four-event canary after one page and persists content-free measurements',async()=>{
   await seedPage(4,2);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
