@@ -6,6 +6,7 @@ import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reade
 import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
 import {MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
 import {retireStorageGraphPage} from '../src/storage-graph-retirement';
+import {STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
 const bindings=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_ANALYTICS_MIGRATIONS:D1Migration[]};
 const target=()=>bindings.STORAGE_ANALYTICS_DB;
 const key:StorageHistoryKey={sourceId:'synthetic-history-source',ownerDigest:'a'.repeat(64),day:'2026-09-05',dependencyDigest:'b'.repeat(64),sourceNamespace:'synthetic-origin',method:'synthetic-graph-v1'};
@@ -19,14 +20,29 @@ function checkpoint(count=0,finish=false):StorageV1HistoryCheckpoint{
  if(finish)return {...base,phase:'finish',acquisition:{planAnchors:anchors,quotaRows:[]}};
  const acquisition=createV1QuotaAcquisitionCheckpoint(identity);acquisition.plan.anchors=anchors;return {...base,phase:'acquisition',acquisition};
 }
-async function drain(value:StorageV1HistoryCheckpoint,expectedHead:string|null=null){for(let i=0;i<100;i++){
- const result=await save({target:target(),key,checkpoint:value,expectedHead,maxWrites:4});if(result.status==='saved')return result.headDigest;}
+async function drain(value:StorageV1HistoryCheckpoint,expectedHead:string|null=null,storageKey=key){for(let i=0;i<100;i++){
+ const result=await save({target:target(),key:storageKey,checkpoint:value,expectedHead,maxWrites:4});if(result.status==='saved')return result.headDigest;}
  throw new Error('synthetic staging did not finish');}
 async function read(){let cursor:StorageHistoryLoadCursor|undefined;for(let i=0;i<140;i++){
  const result=await load({target:target(),key,cursor,maxParts:2});if(result.status!=='deferred')return result;cursor=result.cursor;}
  throw new Error('synthetic load did not finish');}
 function batchAdapter(batch:D1Database['batch']):D1Database{return new Proxy(target(),{get(db,p){if(p==='batch')return batch;const v=Reflect.get(db,p);return typeof v==='function'?v.bind(db):v;}});}
 describe('private paged historical checkpoint store',()=>{
+ it('retires current-fit checkpoints only after their exact semantic fit result exists',async()=>{
+  const currentKey={...key,method:STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD};
+  await drain(checkpoint(),null,currentKey);
+  const insert=async(metric:'fits'|'model')=>target().prepare(`INSERT INTO analytics_community_graph_results
+   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(currentKey.sourceId,currentKey.ownerDigest,metric,currentKey.day,
+    STORAGE_GRAPH_METHOD,currentKey.dependencyDigest,1,'c'.repeat(64),'{}','d'.repeat(64),'{}',Date.now(),'v1').run();
+  await insert('model');
+  expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).toEqual({state:'idle',deleted:0});
+  expect(await load({target:target(),key:currentKey})).toMatchObject({status:'ready'});
+  await insert('fits');
+  expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).toEqual({state:'retiring',deleted:0});
+  expect(await load({target:target(),key:currentKey})).toEqual({status:'absent'});
+  expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_results
+   WHERE source_id=? AND owner_digest=?`).bind(key.sourceId,key.ownerDigest).first('n')).toBe(2);
+ });
  it('keeps an in-flight successor then removes superseded checkpoint generations after promotion',async()=>{
   const old=await drain(checkpoint(10000)),next=checkpoint(18000);
   expect((await save({target:target(),key,checkpoint:next,expectedHead:old,maxWrites:4})).status).toBe('staging');

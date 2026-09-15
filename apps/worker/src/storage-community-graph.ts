@@ -16,7 +16,7 @@ import { captureStorageCommunityAuthority, sameStorageCommunityCalculationAuthor
   type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { createD1InvocationBudget } from './d1-invocation-budget';
-import { advanceStorageV1HistoricalAnalysis } from './storage-v1-history';
+import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis } from './storage-v1-history';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
   type StorageHistoryKey, type StorageHistoryLoadCursor } from './storage-history-checkpoint';
 import { caughtStorageGraphFailureFields, withStorageGraphFailureStage,
@@ -28,6 +28,7 @@ export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate
 // permanent anti-resurrection tombstones must remain valid but must not block
 // a repaired reader from making new resumable progress.
 export const STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':checkpoint-store-2';
+export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':current-fit-checkpoint-1';
 // Execution-only revision for the single optimistic direct historical read.
 // This is deliberately absent from result/checkpoint identities: a reader fix
 // may reopen one direct attempt without changing the analysis semantics.
@@ -177,11 +178,48 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     const analyses:Array<{source:'v0.2'|'v1'|'v1.1';analysis:object}>=[];
     if('source' in scope.pin)analyses.push({source:'v1.1',analysis:await accountScopedQuotaAnalysisV11(source,
       scope.owner.participantId,{nowMs,sourcePin:scope.pin})});
+    else if(scope.source==='v1'){
+      const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
+       ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.dependencyDigest,
+       method:STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD};
+      let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint;
+      for(;;){
+       if(meter.remainingQueries<50||Date.now()>=deadlineMs)return {state:'deferred',reason:'current_fit_checkpoint_read_budget'};
+       const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
+        ()=>loadStorageHistoryCheckpoint({target:bindings.target,key,cursor}));
+       if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
+       head=loaded.headDigest??null;if(loaded.status==='ready')checkpoint=loaded.checkpoint;break;
+      }
+      const next=await advanceStorageV1CurrentFitAnalysis({source,participantId:scope.owner.participantId,
+       day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs}});
+      if(next.status==='complete')analyses.push({source:'v1',analysis:next.analysis});
+      else {
+       const checkpointToSave=next.checkpoint;
+       if(checkpointToSave&&await current(source,scope)){
+        try{
+         while(meter.remainingQueries>=40&&Date.now()<deadlineMs){
+          const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
+           ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:checkpointToSave,expectedHead:head}));
+          if(saved.status==='saved')break;
+         }
+        }catch(error){
+         const failure=caughtStorageGraphFailureFields('graph_checkpoint_save',error);
+         if(!failure||failure.reason!=='checkpoint_unavailable')throw error;
+         let latest;try{latest=await readStorageHistoryCheckpointHead({target:bindings.target,key});}catch{throw error;}
+         if(latest?.retired===0&&latest.generation!==null&&latest.generation!==head)
+          return {state:'deferred',reason:'current_fit_checkpoint',failure};
+         throw error;
+        }
+       }
+       return {state:'deferred',reason:'current_fit_checkpoint'};
+      }
+    }
     else if(scope.source!=='v0.2')analyses.push({source:'v1',analysis:await accountScopedQuotaAnalysisV1(source,
       scope.owner.participantId,{nowMs,sourcePin:scope.pin})});
     if(scope.source==='mixed'||scope.source==='v0.2')analyses.push({source:'v0.2',
       analysis:await accountScopedQuotaAnalysis(source,scope.owner.participantId)});
-    if(analyses.some(a=>!validCompleteScalarAnalysis(a.analysis,a.source,scope.pin.fingerprint,true)))throw fail();
+    if(analyses.some(a=>!validCompleteScalarAnalysis(a.analysis,a.source,scope.pin.fingerprint,
+      !(scope.source==='v1'&&a.source==='v1'))))throw fail();
     payload=canonicalJson(selectCommunityAllowanceAnalysisFits(scope.owner.ownerDigest,analyses));
   } else {
     let composition:V1ModelCompositionResult | null=null;

@@ -16,7 +16,8 @@ import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics,runStorageAnal
 import {drainCommunityPublicSourceBootstrap} from '../src/community-daily-aggregates';
 import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
 import {captureStorageGraphScope,computeStorageGraphResult,storageGraphDependencyDigest,
- STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
+ STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
+ STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
 import {advanceStorageCommunityGraphWork} from '../src/storage-community-graph-work';
 import {retireStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,type StorageHistoryKey} from '../src/storage-history-checkpoint';
@@ -100,6 +101,32 @@ async function fixture(){
  for(let n=0;n<30;n++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
  return (await readStorageCommunityOwnerPage(source()))[0]!;
 }
+
+it('advances current v1 fits through a durable bounded acquisition before semantic result promotion',async()=>{
+ const owner=await fixture(),observed=observePreparedSql(source());
+ const scope=await captureStorageGraphScope(observed.database,{owner,day,metric:'fits',sourceId,sourceNamespace:namespace});
+ const first=await computeStorageGraphResult({...bindings(),source:observed.database},scope);
+ expect(first).toEqual({state:'deferred',reason:'current_fit_checkpoint'});
+ expect(observed.queries.some(sql=>sql.includes('typed_quota_input AS MATERIALIZED'))).toBe(false);
+ expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+  WHERE source_id=? AND owner_digest=? AND day=? AND dependency_digest=? AND method=?`)
+  .bind(sourceId,owner.ownerDigest,day,scope.dependencyDigest,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD).first('n')).toBe(1);
+ expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_results
+  WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(sourceId,owner.ownerDigest,day).first('n')).toBe(0);
+
+ let completed:Awaited<ReturnType<typeof computeStorageGraphResult>>|undefined;
+ for(let attempt=0;attempt<4;attempt++){
+  const next=await computeStorageGraphResult(bindings(),scope);
+  if(next.state==='complete'){completed=next;break;}
+  expect(next.reason).toBe('current_fit_checkpoint');
+ }
+ expect(completed?.state).toBe('complete');
+ if(completed?.state!=='complete')throw new Error('current fit did not complete');
+ expect(completed.result.fits).not.toBeNull();
+ expect(await target().prepare(`SELECT method,dependency_digest FROM analytics_community_graph_results
+  WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(sourceId,owner.ownerDigest,day).first())
+  .toEqual({method:STORAGE_GRAPH_METHOD,dependency_digest:scope.dependencyDigest});
+},60000);
 
 it('reopens one repaired direct attempt, serializes concurrent claims, then falls back to the same semantic checkpoint',async()=>{
  const owner=await fixture(),observed=observePreparedSql(source());
