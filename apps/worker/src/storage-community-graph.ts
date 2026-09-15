@@ -34,6 +34,10 @@ export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD 
 // may reopen one direct attempt without changing the analysis semantics.
 const STORAGE_GRAPH_DIRECT_HISTORY_READER_REVISION = 'typed-v1-direct-cross-1';
 const MAX_RESULT_BYTES = 1024 * 1024;
+// Acquisition may consume its cooperative work deadline exactly. Keep an
+// outer window for the final source proof and one bounded checkpoint-save
+// batch, otherwise a deadline-limited pass can discard the page it acquired.
+const STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS = 6_000;
 const fail = () => new Error('STORAGE_GRAPH_RESULT_UNAVAILABLE');
 const scopeChanged = () => new Error('storage graph scope changed');
 export type StorageGraphSource = 'v0.2' | 'v1' | 'v1.1' | 'mixed';
@@ -156,11 +160,14 @@ export async function readStorageGraphResult(bindings:StorageAnalyticsBindings,s
  * completed, validated output is persisted in analytics. A target failure has
  * no transaction, cache write or backpressure hook in ingestion. */
 export async function computeStorageGraphResult(bindings:StorageAnalyticsBindings,scope:StorageGraphScope,
-  options:{maxQueries?:number;deadlineMs?:number}={}):Promise<
+  options:{maxQueries?:number;deadlineMs?:number;now?:()=>number}={}):Promise<
   {state:'complete';result:StorageGraphResult;reused:boolean}
   |{state:'deferred';reason:string;failure?:StorageGraphFailureFields}> {
   if(bindings.source===bindings.target)throw fail();
-  const meter=createD1InvocationBudget(options.maxQueries??900),deadlineMs=options.deadlineMs??Date.now()+20_000;
+  const meter=createD1InvocationBudget(options.maxQueries??900),now=options.now??Date.now,
+    startedMs=now(),deadlineMs=options.deadlineMs??startedMs+20_000,
+    checkpointWorkDeadlineMs=deadlineMs-STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS;
+  if(!Number.isFinite(startedMs)||!Number.isFinite(deadlineMs))throw fail();
   bindings={...bindings,source:meter.wrap(bindings.source),target:meter.wrap(bindings.target)};
   const cached=await readStorageGraphResult(bindings,scope);
   if(cached) {
@@ -184,20 +191,22 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
        method:STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD};
       let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint;
       for(;;){
-       if(meter.remainingQueries<50||Date.now()>=deadlineMs)return {state:'deferred',reason:'current_fit_checkpoint_read_budget'};
+       if(meter.remainingQueries<50||now()>=checkpointWorkDeadlineMs)
+        return {state:'deferred',reason:'current_fit_checkpoint_read_budget'};
        const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
         ()=>loadStorageHistoryCheckpoint({target:bindings.target,key,cursor}));
        if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
        head=loaded.headDigest??null;if(loaded.status==='ready')checkpoint=loaded.checkpoint;break;
       }
       const next=await advanceStorageV1CurrentFitAnalysis({source,participantId:scope.owner.participantId,
-       day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs}});
+       day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),
+        deadlineMs:checkpointWorkDeadlineMs,now}});
       if(next.status==='complete')analyses.push({source:'v1',analysis:next.analysis});
       else {
        const checkpointToSave=next.checkpoint;
        if(checkpointToSave&&await current(source,scope)){
         try{
-         while(meter.remainingQueries>=40&&Date.now()<deadlineMs){
+         while(meter.remainingQueries>=40&&now()<deadlineMs){
           const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
            ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:checkpointToSave,expectedHead:head}));
           if(saved.status==='saved')break;
@@ -260,7 +269,8 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
           let cursor:StorageHistoryLoadCursor|undefined;
           let head:string|null=null,checkpoint;
           for(;;) {
-            if(meter.remainingQueries<50||Date.now()>=deadlineMs)return {state:'deferred',reason:'checkpoint_read_budget'};
+            if(meter.remainingQueries<50||now()>=checkpointWorkDeadlineMs)
+              return {state:'deferred',reason:'checkpoint_read_budget'};
             const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
               ()=>loadStorageHistoryCheckpoint({target:bindings.target,key,cursor}));
             if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
@@ -269,13 +279,14 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
             break;
           }
           const next=await advanceStorageV1HistoricalAnalysis({source,participantId:scope.owner.participantId,
-            day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs}});
+            day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),
+              deadlineMs:checkpointWorkDeadlineMs,now}});
           if(next.status==='complete')composition=next.analysis;
           else {
             const checkpointToSave=next.checkpoint;
             if(checkpointToSave && await current(source,scope)) {
               try {
-                while(meter.remainingQueries>=40&&Date.now()<deadlineMs) {
+                while(meter.remainingQueries>=40&&now()<deadlineMs) {
                   const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
                     ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:checkpointToSave,expectedHead:head}));
                   if(saved.status==='saved')break;

@@ -38,6 +38,16 @@ function observePreparedSql(database:D1Database){
  }});
  return {database:observed,queries};
 }
+function advanceClockAfterQuotaPages(database:D1Database,setNow:(value:number)=>void){let pages=0;
+ const statement=(inner:D1PreparedStatement,sql:string):D1PreparedStatement=>new Proxy(inner,{get(value,key){
+  if(key==='bind')return(...args:unknown[])=>statement(value.bind(...args),sql);
+  if(key==='all'&&(sql.includes('WITH same_time AS MATERIALIZED')||sql.includes('WITH same_key AS MATERIALIZED')))
+   return async(...args:unknown[])=>{const result=await Reflect.apply(Reflect.get(value,key) as Function,value,args);
+    pages++;setNow(pages===1?14_000:20_000);return result;};
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+ return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),pages:()=>pages};
+}
 function observeDirectAttempts(database:D1Database,failFirst:boolean){let attempts=0;
  const statement=(inner:D1PreparedStatement,sql:string):D1PreparedStatement=>new Proxy(inner,{get(value,key){
   if(key==='bind')return(...args:unknown[])=>statement(value.bind(...args),sql);
@@ -126,6 +136,21 @@ it('advances current v1 fits through a durable bounded acquisition before semant
  expect(await target().prepare(`SELECT method,dependency_digest FROM analytics_community_graph_results
   WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(sourceId,owner.ownerDigest,day).first())
   .toEqual({method:STORAGE_GRAPH_METHOD,dependency_digest:scope.dependencyDigest});
+},60000);
+
+it('saves current-fit progress acquired at the work deadline inside the outer deadline',async()=>{
+ const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'fits',sourceId,sourceNamespace:namespace});
+ let now=0;const observed=advanceClockAfterQuotaPages(source(),value=>{now=value});
+ const result=await computeStorageGraphResult({...bindings(),source:observed.database},scope,
+  {deadlineMs:20_000,now:()=>now});
+ expect(result).toEqual({state:'deferred',reason:'current_fit_checkpoint'});
+ expect(observed.pages()).toBe(1);
+ expect(now).toBe(14_000);
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads WHERE retired=0').first('n')).toBe(1);
+ expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+  WHERE source_id=? AND owner_digest=? AND day=? AND dependency_digest=? AND method=?`)
+  .bind(sourceId,owner.ownerDigest,day,scope.dependencyDigest,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD).first<number>('n'))
+  .toBeGreaterThan(0);
 },60000);
 
 it('reopens one repaired direct attempt, serializes concurrent claims, then falls back to the same semantic checkpoint',async()=>{
