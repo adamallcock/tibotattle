@@ -3,7 +3,10 @@ import {
   expandAdminModelHistoryDay,
 } from "./telemetry-shared.generated.js";
 
-const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
+const ADMIN_OVERVIEW_SCHEMA_VERSIONS = new Set([
+  "admin-overview-v0.3",
+  "admin-overview-v0.4",
+]);
 const ADMIN_RECONSTRUCTION_SCHEMA_VERSION = "admin-reconstruction-progress-v0.1";
 const ADMIN_RECONSTRUCTION_STATUSES = new Set(["available", "unavailable"]);
 const ADMIN_RECONSTRUCTION_MODES = new Set([
@@ -814,6 +817,38 @@ function projectDailyPublication(value) {
   });
 }
 
+function projectHistoricalPublication(value) {
+  if (value === null) return null;
+  const publication = record(value, "ADMIN_OVERVIEW_INVALID");
+  return Object.freeze({
+    publishedDays: count(
+      publication.publishedDays,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    publishedDaysBounded: boolean(
+      publication.publishedDaysBounded,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    latestEvidenceDay: nullableString(
+      publication.latestEvidenceDay,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    latestComputedAt: nullableString(
+      publication.latestComputedAt,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    previewState: enumValue(
+      publication.previewState,
+      new Set(["current", "stale", "not_published"]),
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    previewGeneratedAt: nullableString(
+      publication.previewGeneratedAt,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+  });
+}
+
 function projectDistributionWindow(value) {
   const window = record(value, "ADMIN_OVERVIEW_INVALID");
   return Object.freeze({
@@ -1432,10 +1467,14 @@ function projectErrors(value) {
  */
 export function projectAdminOverview(value) {
   const overview = record(value, "ADMIN_OVERVIEW_INVALID");
-  if (overview.schemaVersion !== ADMIN_OVERVIEW_SCHEMA_VERSION) {
+  if (!ADMIN_OVERVIEW_SCHEMA_VERSIONS.has(overview.schemaVersion)) {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
+  const typed = overview.schemaVersion === "admin-overview-v0.4";
   const service = record(overview.service, "ADMIN_OVERVIEW_INVALID");
+  if (typed && service.telemetryStorageMode !== "typed") {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
   const snapshots = array(overview.snapshots, "ADMIN_OVERVIEW_INVALID").map((value) => {
     const snapshot = record(value, "ADMIN_OVERVIEW_INVALID");
     return Object.freeze({
@@ -1459,10 +1498,17 @@ export function projectAdminOverview(value) {
       createdAt: string(item.createdAt, "ADMIN_OVERVIEW_INVALID"),
     });
   });
+  const historicalPublication = typed
+    ? projectHistoricalPublication(overview.historicalPublication)
+    : null;
+  if (typed && historicalPublication === null) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
   return Object.freeze({
     generatedAt: string(overview.generatedAt, "ADMIN_OVERVIEW_INVALID"),
     service: Object.freeze({
       environment: string(service.environment, "ADMIN_OVERVIEW_INVALID"),
+      telemetryStorageMode: typed ? "typed" : "json",
     }),
     collection: projectCollection(overview.collection),
     counts: projectOverviewCounts(overview.counts),
@@ -1474,10 +1520,12 @@ export function projectAdminOverview(value) {
     distribution: projectDistribution(overview.distribution),
     snapshots: Object.freeze(snapshots),
     dailyPublication: projectDailyPublication(overview.dailyPublication),
-    pendingHistoricalRebuilds: count(
-      overview.pendingHistoricalRebuilds,
-      "ADMIN_OVERVIEW_INVALID",
-    ),
+    pendingHistoricalRebuilds: typed
+      ? overview.pendingHistoricalRebuilds === null
+        ? null
+        : invalid("ADMIN_OVERVIEW_INVALID")
+      : count(overview.pendingHistoricalRebuilds, "ADMIN_OVERVIEW_INVALID"),
+    historicalPublication,
     errors: projectErrors(overview.errors),
     audit: Object.freeze(audit),
   });

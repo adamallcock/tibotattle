@@ -914,6 +914,19 @@ test("admin tables preserve row order, text rendering, and empty states", async 
       publication: false,
     },
   };
+  const typedOverview = structuredClone(overview);
+  typedOverview.schemaVersion = "admin-overview-v0.4";
+  typedOverview.service.telemetryStorageMode = "typed";
+  typedOverview.snapshots = [];
+  typedOverview.pendingHistoricalRebuilds = null;
+  typedOverview.historicalPublication = {
+    publishedDays: 69,
+    publishedDaysBounded: false,
+    latestEvidenceDay: "2026-08-16",
+    latestComputedAt: "2026-08-17T11:55:00.000Z",
+    previewState: "current",
+    previewGeneratedAt: "2026-08-17T11:56:00.000Z",
+  };
   // The admin host authenticates from the Cloudflare Access JWT and sends the
   // x-usage-monitor-admin CSRF header, so load() no longer pre-fetches a session
   // token — each load is a single /api/v1/admin/overview request.
@@ -922,6 +935,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     githubUnavailableOverview,
     emptyOverview,
     alertOverview,
+    typedOverview,
   ];
   let fetchCount = 0;
   const documentRef = fakeDocument();
@@ -1203,6 +1217,25 @@ test("admin tables preserve row order, text rendering, and empty states", async 
         "Collection is contained",
         "enrollment, upload registration, processing, publication are disabled.",
       ],
+    );
+
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(fetchCount, 5);
+    assert.deepEqual(
+      statusTexts(documentRef, "lifecycle-status").slice(3, 10),
+      [
+        ["Latest accepted upload: ", formatReportingTime(typedOverview.counts.contributions.latestAcceptedAt)],
+        ["Historical model days: ", "69"],
+        ["Latest historical evidence: ", "2026-08-16"],
+        ["Latest historical calculation: ", formatReportingTime("2026-08-17T11:55:00.000Z")],
+        ["Historical graph preview: ", `current · ${formatReportingTime("2026-08-17T11:56:00.000Z")}`],
+        ["Daily rebuild queue: ", String(typedOverview.dailyPublication.pendingRebuilds)],
+        ["Latest daily evidence: ", typedOverview.dailyPublication.latestEvidenceDay],
+      ],
+    );
+    assert.equal(
+      documentRef.byId.get("snapshot-empty").textContent,
+      "Typed analytics publishes dated model history instead of legacy weekly snapshots.",
     );
   } finally {
     if (previousDocument === undefined) delete globalThis.document;

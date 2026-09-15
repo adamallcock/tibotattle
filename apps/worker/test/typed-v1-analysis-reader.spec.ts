@@ -70,6 +70,16 @@ async function write(database:D1Database,f:Fixture,records:TelemetryV1Record[],s
 }
 async function both(f:Awaited<ReturnType<typeof pair>>,records:TelemetryV1Record[],stream:'quota'|'usage',seq=0){await write(source(),f.typed,records,stream,seq);await write(raw(),f.original,records,stream,seq);}
 const normalize=(rows:unknown[])=>JSON.parse(JSON.stringify(rows).replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'synthetic-device'));
+function observeAnalysisPlans(database:D1Database){const plans:{sql:string;details:string[]}[]=[];
+ const statement=(inner:D1PreparedStatement,sql:string,args:unknown[]=[]):D1PreparedStatement=>new Proxy(inner,{get(value,key){
+  if(key==='bind')return(...bindings:unknown[])=>statement(value.bind(...bindings),sql,bindings);
+  if(key==='all')return async(...call:unknown[])=>{if(sql.includes('typed_plan_input AS MATERIALIZED')||sql.includes('typed_quota_input AS MATERIALIZED')){
+   const explained=await database.prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...args).all<{detail:string}>();
+   plans.push({sql,details:explained.results.map(row=>row.detail)});}
+   return Reflect.apply(Reflect.get(value,key) as Function,value,call);};
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+ return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),plans};}
 function quota(i:number,resetsAt=`${day()}T23:00:00.000Z`):TelemetryV1Record{return {schemaVersion:'quota-observation-v1.0',observationId:`synthetic-quota-${i.toString().padStart(8,'0')}`,
  observedTime:`${day()}T12:00:00.000Z`,provider:'openai_codex',planType:i%3?'pro':'plus',planVariant:'unknown',limitId:'codex',slot:'secondary',usedPercent:0.30000000000000004,windowDurationMinutes:10080,resetsAt};}
 function usage(i:number):TelemetryV1Record{return JSON.parse(telemetryV11LegacyProjection('usage',v11UsageRecord(day(),'a',{eventId:`event:v2:${i.toString(16).padStart(64,'0')}`}))!.canonicalRecord);}
@@ -107,7 +117,18 @@ describe('typed v1 existing analytical reader parity',()=>{
   const q=Array.from({length:34},(_,i)=>({...quota(i,at(168)),planType:'pro',observedTime:at(i/2),usedPercent:i*2.5})) as TelemetryV1Record[];
   const u=Array.from({length:33},(_,i)=>({...usage(i),eventTime:at(i/2+0.25)})) as TelemetryV1Record[];
   await both(f,q,'quota');await both(f,u,'usage');const options={nowMs:base+86400000};
-  const scalar=await accountScopedQuotaAnalysisV1(source(),f.typed.participantId,options);
+  const observed=observeAnalysisPlans(source());
+  const scalar=await accountScopedQuotaAnalysisV1(observed.database,f.typed.participantId,options);
+  expect(observed.plans.map(plan=>plan.sql.includes('typed_plan_input AS MATERIALIZED')?'plan':'quota').sort()).toEqual(['plan','quota']);
+  for(const plan of observed.plans){
+   const ownerSeek=plan.details.findIndex(detail=>detail.includes('SEARCH base USING')&&detail.includes('typed_v1_owner_observed'));
+   const compatibilityRow=plan.details.findIndex(detail=>detail.includes('SEARCH r USING INTEGER PRIMARY KEY'));
+   const materializedScan=plan.details.findIndex(detail=>detail==='SCAN r');
+   expect(ownerSeek,JSON.stringify(plan.details)).toBeGreaterThan(-1);
+   expect(compatibilityRow,JSON.stringify(plan.details)).toBeGreaterThan(ownerSeek);
+   expect(materializedScan,JSON.stringify(plan.details)).toBeGreaterThan(compatibilityRow);
+   expect(plan.details.some(detail=>detail.includes('SCAN base'))).toBe(false);
+  }
   const clean=(value:object)=>{const {inputFingerprint,...rest}=value as Record<string,unknown>;if(inputFingerprint!==undefined)expect(inputFingerprint).toMatch(/^[0-9a-f]{64}$/);return rest;};
   expect(clean(scalar)).toEqual(clean(await accountScopedQuotaAnalysisV1(raw(),f.original.participantId,options)));
   expect(Reflect.get(scalar,'status')).not.toBe('not_testable');

@@ -367,6 +367,7 @@ import {
 import {
   captureAdminMetricSnapshot,
   readCachedAdminMetricsHistory,
+  readCachedStorageAdminMetricsHistory,
   warmAdminMetricsHistoryCache,
 } from "./admin-metrics-history";
 import {
@@ -3155,10 +3156,12 @@ async function handleAdminMetricsHistory(
     }
     await adminSession(request, env);
   }
-  const history = await readCachedAdminMetricsHistory(
-    env.USAGE_MONITOR_DB,
-    Date.now(),
-  );
+  const storage = await optionalStorageAnalyticsBindings(env, {
+    operational: true,
+  });
+  const history = storage
+    ? await readCachedStorageAdminMetricsHistory(storage, Date.now())
+    : await readCachedAdminMetricsHistory(env.USAGE_MONITOR_DB, Date.now());
   return jsonResponse(history, 200, {
     "cache-control": "no-store",
     vary: "Cookie",
@@ -3207,13 +3210,25 @@ async function handleAdminReconstructionProgress(
   return jsonResponse(progress, 200, { "cache-control": "no-store", vary: "Cookie" });
 }
 
-async function optionalStorageAnalyticsBindings(env:Env):Promise<StorageAnalyticsBindings|null> {
+async function optionalStorageAnalyticsBindings(env:Env,
+ options:{operational?:boolean}={}):Promise<StorageAnalyticsBindings|null> {
  const mode=parseTelemetryStorageMode(env);if(mode.kind==='json')return null;
  const target:unknown=Reflect.get(env,'ANALYTICS_DB');
  if(!target||typeof target!=='object'||typeof Reflect.get(target,'prepare')!=='function'
   ||typeof Reflect.get(target,'batch')!=='function')throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
- const authority=await captureStorageCommunityAuthority(env.USAGE_MONITOR_DB,{sourceNamespace:mode.sourceNamespace});
- return {source:env.USAGE_MONITOR_DB,target:target as D1Database,sourceId:authority.sourceId,sourceNamespace:mode.sourceNamespace};
+ let sourceId:string;
+ if(options.operational){
+  const row=await env.USAGE_MONITOR_DB.prepare(`SELECT source.source_id
+   FROM storage_source_state source
+   JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
+   JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
+   WHERE source.singleton=1 AND v1.source_namespace=? AND v11.source_namespace=? LIMIT 1`)
+   .bind(mode.sourceNamespace,mode.sourceNamespace).first<{source_id:string}>();
+  if(!row?.source_id)throw new ApiError(503,'BACKEND_STORAGE_UNAVAILABLE');
+  sourceId=row.source_id;
+ }else sourceId=(await captureStorageCommunityAuthority(env.USAGE_MONITOR_DB,
+  {sourceNamespace:mode.sourceNamespace})).sourceId;
+ return {source:env.USAGE_MONITOR_DB,target:target as D1Database,sourceId,sourceNamespace:mode.sourceNamespace};
 }
 
 async function handleAdminOverview(
@@ -3238,6 +3253,9 @@ async function handleAdminOverview(
   }
   const nowEpoch = Date.now();
   const distributionEnabled = env.ENVIRONMENT === "production";
+  const storage = await optionalStorageAnalyticsBindings(env, {
+    operational: true,
+  });
   const [overview, ingress, githubSnapshot, reconstruction] = await Promise.all([
     readAdminOverview(env.USAGE_MONITOR_DB, env.DELETION_LEDGER, {
       environment: env.ENVIRONMENT,
@@ -3245,6 +3263,7 @@ async function handleAdminOverview(
       accountScopedIngestMode: env.ACCOUNT_SCOPED_INGEST_MODE,
       diagnosticReference: reference ?? undefined,
       nowEpoch,
+      storage: storage ?? undefined,
     }),
     readUploadIngressStatus(env),
     distributionEnabled

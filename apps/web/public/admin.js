@@ -115,6 +115,10 @@ const INFO_HINTS = Object.freeze({
   "Quarantine reconciliation": "The latest upload-object housekeeping state and whether its bounded pass cleared all eligible work.",
   "Latest accepted upload": "The newest accepted whole contribution or incremental chunk received by the service.",
   "Weekly rebuild queue": "Weekly community snapshots waiting to be rebuilt from accepted evidence.",
+  "Historical model days": "Dated model-composition publications retained in the typed analytics store. This is recorded publication evidence, not a count of work remaining.",
+  "Latest historical evidence": "The newest evidence day with a retained typed model-composition publication.",
+  "Latest historical calculation": "The most recent calculation time across retained typed model-composition publications.",
+  "Historical graph preview": "Whether the latest typed analytics preview is current with its captured inputs, stale, or not yet published.",
   "Daily rebuild queue": "Daily community aggregates waiting to be rebuilt from accepted evidence.",
   "Latest daily evidence": "The newest evidence day represented by a published daily community aggregate.",
   "Latest daily publication": "When a daily community aggregate was most recently published.",
@@ -1289,7 +1293,7 @@ function collectAttentionItems(overview) {
     );
   }
 
-  const queuedRebuilds = overview.pendingHistoricalRebuilds
+  const queuedRebuilds = (overview.pendingHistoricalRebuilds ?? 0)
     + daily.pendingRebuilds;
   if (queuedRebuilds > 0) {
     addAttentionItem(
@@ -1298,7 +1302,9 @@ function collectAttentionItems(overview) {
       "maintenance",
       "warning",
       `${queuedRebuilds} publication ${queuedRebuilds === 1 ? "rebuild is" : "rebuilds are"} queued`,
-      `${overview.pendingHistoricalRebuilds} weekly · ${daily.pendingRebuilds} daily.`,
+      overview.pendingHistoricalRebuilds === null
+        ? `${daily.pendingRebuilds} daily. Typed historical work is measured by completed publication evidence.`
+        : `${overview.pendingHistoricalRebuilds} weekly · ${daily.pendingRebuilds} daily.`,
       "#readiness-title",
       "Review queues",
     );
@@ -1837,13 +1843,27 @@ function renderOperational(overview) {
   const lifecycle = overview.lifecycle;
   const reconciliation = overview.reconciliation;
   const daily = overview.dailyPublication;
+  const historical = overview.historicalPublication;
+  const publicationRows = historical
+    ? [
+      ["Historical model days", count(
+        historical.publishedDays,
+        historical.publishedDaysBounded,
+      )],
+      ["Latest historical evidence", text(historical.latestEvidenceDay)],
+      ["Latest historical calculation", formatTime(historical.latestComputedAt)],
+      ["Historical graph preview", historical.previewState === "not_published"
+        ? "not published"
+        : `${historical.previewState} · ${formatTime(historical.previewGeneratedAt)}`],
+    ]
+    : [["Weekly rebuild queue", text(overview.pendingHistoricalRebuilds)]];
   $("#lifecycle-status").replaceChildren(
     ...[
       ["Retention lifecycle", `${lifecycle.state} · ${lifecycle.quarantineRetentionComplete ? "complete" : "incomplete"}`],
       ["Restore replay", lifecycle.restoreReplayComplete ? "complete" : "incomplete"],
       ["Quarantine reconciliation", `${reconciliation.state} · ${reconciliation.reconciliationComplete ? "complete" : "incomplete"}`],
       ["Latest accepted upload", formatTime(overview.counts.contributions.latestAcceptedAt)],
-      ["Weekly rebuild queue", text(overview.pendingHistoricalRebuilds)],
+      ...publicationRows,
       ["Daily rebuild queue", count(daily.pendingRebuilds, daily.pendingRebuildsBounded)],
       ["Latest daily evidence", text(daily.latestEvidenceDay)],
       ["Latest daily publication", formatTime(daily.latestReleasedAt)],
@@ -1858,6 +1878,9 @@ function renderOperational(overview) {
     snapshot.releaseState,
     formatTime(snapshot.releasedAt),
   ])));
+  $("#snapshot-empty").textContent = historical
+    ? "Typed analytics publishes dated model history instead of legacy weekly snapshots."
+    : "No immutable snapshot has been sealed.";
   $("#snapshot-empty").hidden = rows.length !== 0;
 }
 
