@@ -43,6 +43,8 @@ describe('source-only resumable v1 historical composition',()=>{
   if(pending.status!=='deferred'||!pending.checkpoint)throw new Error('expected checkpoint');
   await expect(advanceStorageV1HistoricalAnalysis({...args,budget:budget(),checkpoint:{...pending.checkpoint,day:'2026-09-04'}})).rejects.toThrow('CHECKPOINT_MISMATCH');
   await db().prepare("UPDATE telemetry_v1_chunks SET parser_version='synthetic-changed'").run();
-  await expect(advanceStorageV1HistoricalAnalysis({...args,budget:budget(),checkpoint:pending.checkpoint})).rejects.toThrow('source changed');
+  await expect(advanceStorageV1HistoricalAnalysis({...args,budget:budget(),checkpoint:pending.checkpoint}))
+   .rejects.toMatchObject({message:'STORAGE_GRAPH_OPERATION_UNAVAILABLE',
+    stage:'graph_history_source_precheck',reason:'source_changed'});
  });
 });

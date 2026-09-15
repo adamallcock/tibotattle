@@ -6,7 +6,7 @@ import { buildAdminCommunityAllowancePreview, buildCommunityModelCompositionDay,
   ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS, ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
   PREVIEW_CACHE_JSON_LIMIT_BYTES, validCachedAdminCommunityAllowancePreview,
   type AdminCommunityModelCompositionDay, type AdminCommunityAllowancePreview } from './admin-community-allowance';
-import { parsedCachedFits, validCompleteCachedComposition,
+import { COMMUNITY_MODEL_CACHE_MAX_PAGES, parsedCachedFits, validCompleteCachedComposition,
   type CommunityAllowanceFit, type CachedCommunityModelCompositions } from './community-allowance';
 import { MODEL_HISTORY_METHOD_VERSION, type V1ModelCompositionResult } from './quota-analysis-v1';
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
@@ -26,6 +26,41 @@ export type StorageGraphPublicationProgress = {state:'published'|'unchanged';mem
   |{state:'deferred';reason:'cache_pending'|'source_changed'|'capacity';memberCount:number};
 function validDay(day:string):void {
   if(!/^\d{4}-\d{2}-\d{2}$/.test(day)||!Number.isFinite(Date.parse(day))||new Date(day).toISOString().slice(0,10)!==day)throw fail();
+}
+
+/** Aggregate-only hint for the ordinary scheduler. A positive result merely
+ * earns the existing full publication attempt; it proves neither cohort
+ * identity, cache validity nor authority. Those remain publication's job. */
+export async function storageCommunityGraphPreviewReadyHint(bindings:StorageAnalyticsBindings,
+  options:{nowMs?:number}={}):Promise<boolean> {
+  if(bindings.source===bindings.target)throw fail();
+  const nowMs=options.nowMs??Date.now();if(!Number.isFinite(nowMs))throw fail();
+  const day=new Date(nowMs).toISOString().slice(0,10);validDay(day);
+  const [sourceRow,targetRow]=await Promise.all([
+    bindings.source.prepare(`WITH members AS MATERIALIZED (
+      SELECT p.id,l.owner_digest FROM participants p
+      LEFT JOIN storage_v11_owner_links l ON l.participant_id=p.id AND l.state='active'
+      WHERE p.state='active' AND EXISTS(
+        SELECT 1 FROM community_public_source_owners eligible WHERE eligible.participant_id=p.id)
+      AND (EXISTS(SELECT 1 FROM telemetry_v1_chunks c WHERE c.participant_id=p.id
+          AND c.superseded_at IS NULL AND c.accepted_record_count>0)
+        OR EXISTS(SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id=p.id)
+        OR EXISTS(SELECT 1 FROM telemetry_contributions c WHERE c.participant_id=p.id
+          AND c.status='accepted' AND c.transport_schema_version='telemetry-contribution-v0.2'))
+      LIMIT ?)
+      SELECT count(*) member_count,COALESCE(sum(owner_digest IS NOT NULL),0) identified_count FROM members`)
+      .bind(COMMUNITY_MODEL_CACHE_MAX_PAGES*64+1).first<{member_count:number;identified_count:number}>(),
+    bindings.target.prepare(`SELECT count(*) cached_count FROM (
+      SELECT 1 FROM analytics_community_graph_results r
+      JOIN analytics_runtime_sources s ON s.source_id=r.source_id AND s.source_namespace=? AND s.contract_version=1
+      WHERE r.source_id=? AND r.metric='fits' AND r.day=? AND r.method=? LIMIT ?)`)
+      .bind(bindings.sourceNamespace,bindings.sourceId,day,STORAGE_GRAPH_METHOD,COMMUNITY_MODEL_CACHE_MAX_PAGES*64+1)
+      .first<{cached_count:number}>(),
+  ]);
+  const values=[sourceRow?.member_count,sourceRow?.identified_count,targetRow?.cached_count];
+  if(!values.every(value=>Number.isSafeInteger(value)&&Number(value)>=0))throw fail();
+  return sourceRow!.member_count===sourceRow!.identified_count
+    && targetRow!.cached_count>=sourceRow!.member_count;
 }
 function identity(owner:StorageCommunityOwner) {
   return {ownerDigest:owner.ownerDigest,inputRevision:owner.inputRevision,ownerRevision:owner.ownerRevision,
