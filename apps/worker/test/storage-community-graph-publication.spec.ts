@@ -17,7 +17,7 @@ import { sha256Hex } from "../src/crypto";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, advanceStorageAnalytics, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
-import { captureStorageGraphScope, computeStorageGraphResult } from "../src/storage-community-graph";
+import { captureStorageGraphScope, computeStorageGraphResult, STORAGE_GRAPH_METHOD } from "../src/storage-community-graph";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { createV11DeviceFixture, makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
@@ -479,6 +479,69 @@ describe('isolated allowance graph publication',()=>{
   expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'published'});
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT inputs_current FROM analytics_community_graph_previews').first('inputs_current')).toBe(1);
   expect((await readStorageCommunityProgress(bindings(),Date.now())).work.phase).toBe('history');
+ });
+ it('prioritizes missing current fits without changing the four-history, one-fit, one-model cadence',async()=>{
+  for(const suffix of ['a','b','c'])await fixture(`participant:fit-priority-${suffix}`);
+  const owners=await readStorageCommunityOwnerPage(typed());expect(owners).toHaveLength(3);
+  for(let index=0;index<owners.length;index++)expect((await compute('fits',today(),index)).state).toBe('complete');
+  expect(owners[0]!.inputRevision).toBeGreaterThan(0);
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_results SET input_revision=?
+    WHERE owner_digest=? AND metric='fits'`).bind(owners[0]!.inputRevision-1,owners[0]!.ownerDigest).run();
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_results SET source_kind='v1'
+    WHERE owner_digest=? AND metric='fits'`).bind(owners[1]!.ownerDigest).run();
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_results SET method='obsolete'
+    WHERE owner_digest=? AND metric='fits'`).bind(owners[2]!.ownerDigest).run();
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_scan
+    SET revision=revision+1,tick=0,current_position=0,history_position=0`).run();
+
+  let failedOwner='';
+  const unavailable=new Proxy(b.STORAGE_ANALYTICS_DB,{get(db,key){
+   if(key==='prepare')return(sql:string)=>{
+    const statement=db.prepare(sql);
+    if(!sql.includes('owner_digest=? AND metric=? AND day=?'))return statement;
+    return new Proxy(statement,{get(s,property){
+     if(property==='bind')return(...args:unknown[])=>{
+      const bound=s.bind(...args);return new Proxy(bound,{get(original,member){
+       if(member==='first')return async()=>{failedOwner=String(args[1]);throw new Error('synthetic fit read unavailable');};
+       const value=Reflect.get(original,member);return typeof value==='function'?value.bind(original):value;
+      }});
+     };
+     const value=Reflect.get(s,property);return typeof value==='function'?value.bind(s):value;
+    }});
+   };
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  await expect(advanceStorageCommunityGraphWork({...bindings(),target:unavailable})).rejects.toThrow();
+  expect(failedOwner).toBe(owners[1]!.ownerDigest);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
+   .first()).toMatchObject({tick:1,current_position:3,history_position:0});
+
+  const intervening=[];
+  for(let claim=0;claim<5;claim++)intervening.push(await advanceStorageCommunityGraphWork(bindings()));
+  expect(intervening.map(result=>[result.metric,result.day])).toEqual([
+   ['model',day()],['model',day()],['model',today()],['model',day()],['model',day()]
+  ]);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
+   .first()).toMatchObject({tick:0,current_position:4,history_position:1});
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({metric:'fits',day:today()});
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT method,source_kind FROM analytics_community_graph_results
+    WHERE owner_digest=? AND metric='fits'`).bind(owners[2]!.ownerDigest).first())
+   .toMatchObject({method:STORAGE_GRAPH_METHOD,source_kind:'v1.1'});
+
+  expect((await compute('fits',today(),1)).state).toBe('complete');
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_scan
+    SET revision=revision+1,tick=0,current_position=0`).run();
+  const target=capturedQueries();
+  expect(await advanceStorageCommunityGraphWork({...bindings(),target:target.database}))
+   .toMatchObject({state:'reused',metric:'fits',day:today()});
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
+   .first()).toMatchObject({tick:1,current_position:1,history_position:1});
+  const cacheRead=target.queries.find(query=>query.sql.includes("metric='fits'")&&query.sql.includes('owner_digest IN'))!;
+  expect(cacheRead.args.slice(0,3)).toEqual([namespace,today(),STORAGE_GRAPH_METHOD]);
+  const plan=JSON.stringify((await b.STORAGE_ANALYTICS_DB.prepare('EXPLAIN QUERY PLAN '+cacheRead.sql)
+   .bind(...cacheRead.args).all()).results);
+  expect(plan).toMatch(/SEARCH analytics_community_graph_results USING (PRIMARY KEY|INDEX analytics_community_graph_day)/);
+  expect(plan).not.toMatch(/SCAN analytics_community_graph_results/);
  });
  it('refreshes only the proof of an unchanged preview after an actual outside-window append',async()=>{
   const f=await fixture(),days=await activeDays(f);
