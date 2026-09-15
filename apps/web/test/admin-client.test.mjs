@@ -491,7 +491,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
   assert.deepEqual(overview, {
     generatedAt: "2026-08-17T12:00:00.000Z",
     reconstruction: null,
-    service: { environment: "production" },
+    service: { environment: "production", telemetryStorageMode: "json" },
     collection: {
       state: "operational",
       revision: 7,
@@ -684,6 +684,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
       pendingRebuildsBounded: false,
     },
     pendingHistoricalRebuilds: 0,
+    historicalPublication: null,
     errors: {
       retentionDays: 30,
       sampled: true,
@@ -714,6 +715,36 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
   });
   assert.equal(Object.isFrozen(overview), true);
   assert.equal(Object.isFrozen(overview.collection), true);
+});
+
+test("typed admin overview projects target publication evidence without a legacy queue zero", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.schemaVersion = "admin-overview-v0.4";
+  payload.service.telemetryStorageMode = "typed";
+  payload.snapshots = [];
+  payload.pendingHistoricalRebuilds = null;
+  payload.historicalPublication = {
+    publishedDays: 69,
+    publishedDaysBounded: false,
+    latestEvidenceDay: "2026-08-16",
+    latestComputedAt: "2026-08-17T11:55:00.000Z",
+    previewState: "current",
+    previewGeneratedAt: "2026-08-17T11:56:00.000Z",
+  };
+  const overview = projectAdminOverview(payload);
+  assert.equal(overview.service.telemetryStorageMode, "typed");
+  assert.equal(overview.pendingHistoricalRebuilds, null);
+  assert.deepEqual(overview.historicalPublication, payload.historicalPublication);
+
+  for (const mutate of [
+    value => { value.pendingHistoricalRebuilds = 0; },
+    value => { value.historicalPublication.previewState = "unknown"; },
+    value => { value.service.telemetryStorageMode = "json"; },
+  ]) {
+    const invalid = structuredClone(payload);
+    mutate(invalid);
+    assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u);
+  }
 });
 
 test("admin overview projects isolated reconstruction evidence and omits unknown fields", async () => {

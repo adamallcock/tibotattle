@@ -16,6 +16,7 @@ import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
 import { runStorageAnalyticsSchedule } from "../src/storage-analytics-worker";
+import { readAdminOverview } from "../src/admin-operations";
 
 interface Bindings extends Env { STORAGE_ANALYTICS_DB: D1Database; TEST_MIGRATIONS: D1Migration[];
   TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[]; TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[];
@@ -93,6 +94,68 @@ async function fixture(count = 1) {
 }
 
 describe("typed accountless upload to isolated projection", () => {
+  it("reports the typed current corpus from headers and publication state from analytics", async () => {
+    await applyD1Migrations(source(), b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(source(), namespace);
+    await initializeStorageAnalyticsRuntime({ source: source(), target: target(), sourceId,
+      sourceNamespace: namespace });
+    const value = await fixture(203);
+    const releasedAt = new Date().toISOString();
+    const authority = JSON.stringify({ sourceId, publicAuthorityEpoch: 0 });
+    await target().batch([
+      target().prepare(`INSERT INTO analytics_community_daily_publications(
+        source_id,day,revision,cohort_digest,authority_json,payload_json,payload_sha256,released_at)
+        VALUES(?,?,1,?,?,'{}',?,?)`).bind(sourceId, today(), "a".repeat(64), authority, "b".repeat(64), releasedAt),
+      target().prepare("INSERT INTO analytics_community_daily_queue VALUES(?,?,1)")
+        .bind(sourceId, "2026-09-12"),
+      target().prepare(`INSERT INTO analytics_community_model_publications(
+        source_id,day,revision,method,cohort_digest,authority_json,payload_json,payload_sha256,computed_ms)
+        VALUES(?,?,1,'synthetic',?,?,'{}',?,?)`)
+        .bind(sourceId, today(), "c".repeat(64), authority, "d".repeat(64), Date.now()),
+    ]);
+    const adminSourceQueries: string[] = [];
+    const adminSource = new Proxy(source(), {
+      get(base, property) {
+        if (property === "prepare") return (sql: string) => {
+          adminSourceQueries.push(sql);
+          return base.prepare(sql);
+        };
+        const candidate: unknown = Reflect.get(base, property);
+        return typeof candidate === "function" ? candidate.bind(base) : candidate;
+      },
+    });
+    const overview = await readAdminOverview(adminSource, b.DELETION_LEDGER, {
+      environment: "synthetic-development", enrollmentMode: "local_open",
+      accountScopedIngestMode: "disabled", storage: { source: adminSource, target: target(),
+        sourceId, sourceNamespace: namespace },
+    }) as Record<string, any>;
+    expect(overview).toMatchObject({
+      schemaVersion: "admin-overview-v0.4",
+      service: { telemetryStorageMode: "typed" },
+      counts: { contributions: {
+        contributingAccounts: { total: 1, bounded: false },
+        incrementalChunks: { total: 2, current: 2, bounded: false },
+        storedTelemetryRecords: 203,
+        storedTelemetryRecordsBounded: false,
+      } },
+      dailyPublication: { latestEvidenceDay: today(), latestReleasedAt: releasedAt,
+        pendingRebuilds: 1, pendingRebuildsBounded: false },
+      historicalPublication: { publishedDays: 1, publishedDaysBounded: false,
+        latestEvidenceDay: today(), previewState: "not_published" },
+      pendingHistoricalRebuilds: null,
+      snapshots: [],
+    });
+    expect(overview.counts.contributions.latestAcceptedAt).not.toBeNull();
+    expect(JSON.stringify(overview)).not.toContain(value.participantId);
+    expect(adminSourceQueries.some(sql => (
+      sql.includes("FROM telemetry_analytical_chunks")
+    ))).toBe(true);
+    const retiredOverviewSource = /\bFROM\s+(?:typed_telemetry_records|telemetry_records|community_daily_aggregates|community_weekly_snapshots|community_weekly_snapshot_rebuilds)\b/u;
+    expect(adminSourceQueries.every(sql => (
+      !retiredOverviewSource.test(sql)
+    ))).toBe(true);
+  });
+
   it("refuses trigger separation on a target containing old analytical payloads",async()=>{
     await source().prepare("INSERT INTO community_model_composition_days(day,payload_json,computed_at) VALUES('2026-09-01','{}','2026-09-01T00:00:00.000Z')").run();
     await expect(applyD1Migrations(source(),b.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(m=>/^(0001|0002)_/.test(m.name)))).rejects.toThrow();
@@ -130,6 +193,30 @@ describe("typed accountless upload to isolated projection", () => {
     expect(await runStorageAnalyticsPass({...options,deadlineMs:0})).toMatchObject({state:"deferred",reason:"deadline",queriesUsed:0});
     const first=await runStorageAnalyticsPass({...options,maxSteps:1});
     expect(first).toMatchObject({state:"progress",recordsRead:200,steps:1});expect(first.queriesUsed).toBeLessThan(100);
+    // Owner summaries have their own bounded phase, so journal catch-up does
+    // not leave the authenticated Admin history blank for days.
+    expect(await target().prepare(`SELECT COUNT(*) AS n
+      FROM analytics_admin_metric_snapshots WHERE source_id=?`).bind(sourceId).first<number>("n")).toBe(1);
+    expect(await target().prepare(`SELECT COUNT(*) AS n
+      FROM analytics_admin_metrics_history_cache WHERE source_id=?`).bind(sourceId).first<number>("n")).toBe(1);
+    const snapshotJson = await target().prepare(`SELECT metrics_json
+      FROM analytics_admin_metric_snapshots WHERE source_id=?`).bind(sourceId)
+      .first<string>("metrics_json");
+    expect(JSON.parse(snapshotJson!)).toMatchObject({
+      corpusChunks: 2,
+      corpusCurrentChunks: 2,
+      corpusCurrentRecords: 203,
+      contributingAccountsTotal: 1,
+    });
+    const historyJson = await target().prepare(`SELECT payload_json
+      FROM analytics_admin_metrics_history_cache WHERE source_id=?`).bind(sourceId)
+      .first<string>("payload_json");
+    expect(JSON.parse(historyJson!).events).toMatchObject({
+      uploadedChunks: { total: 2 },
+      acceptedUploads: { total: 2 },
+      uploadedRecords: { total: 203 },
+      uploadingParticipants: { total: 1 },
+    });
     await runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:"enabled",PUBLIC_ANALYTICS_MODE:"disabled",
       STORAGE_SOURCE_ID:sourceId,TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),
       STORAGE_ANALYTICS_DB:target(),DELETION_LEDGER:b.DELETION_LEDGER});

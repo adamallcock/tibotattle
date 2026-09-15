@@ -11,6 +11,7 @@ import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview,
  retireStorageCommunityGraphPublications } from './storage-community-graph-publication';
 import { readCollectionControls } from './collection-controls';
 import { advanceStorageErasureJobs } from './storage-erasure';
+import { captureStorageAdminMetricSnapshot, warmStorageAdminMetricsHistoryCache } from './admin-metrics-history';
 
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 export type { StorageAnalyticsBindings } from './analytics-delivery';
@@ -130,6 +131,19 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    await retireStorageCommunityDailyPage(scoped);
    await retireStorageCommunityGraphPublications(scoped);
    return result('deferred','capacity');
+  }
+  // Restore the owner dashboard even while the ordered analytics journal is
+  // catching up. This optional phase has its own hard 40-query sub-budget and
+  // leaves 100 queries for mandatory delivery. Its source readers are also
+  // capped by row count, so failure preserves the prior cache and cannot turn
+  // missing evidence into zero.
+  if(meter.remainingQueries>=140&&deadlineMs-Date.now()>=5_000){
+   const adminMeter=createD1InvocationBudget(40);
+   const adminScoped={...scoped,source:adminMeter.wrap(scoped.source),target:adminMeter.wrap(scoped.target)};
+   const snapshot=await captureStorageAdminMetricSnapshot(adminScoped,Date.now());
+   if(snapshot.code!=='SNAPSHOT_UNAVAILABLE'&&adminMeter.remainingQueries>0&&Date.now()<deadlineMs) {
+    await warmStorageAdminMetricsHistoryCache(adminScoped,Date.now());
+   }
   }
   for(;steps<maxSteps;) {
    options.signal?.throwIfAborted();

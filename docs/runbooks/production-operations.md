@@ -254,6 +254,19 @@ The display survives an unavailable allowance preview; a failed overview refresh
 labels its last observation stale. Missing diagnostics do not take Operations
 down or become zero work. Refresh never starts a calculation.
 
+In typed-storage mode, admin overview v0.4 keeps operational authority in the
+ingestion source and reads derived publication state only from that source's
+registered analytics target. Current account, upload, chunk and stored-record
+counts come from compact v1/v1.1 upload headers; the interactive route never
+counts `typed_telemetry_records`. Header record counts therefore remain exact
+when the physical typed corpus is much larger than the 10,000-row safety bound
+used for raw operational samples. Daily publication and queue state come from
+the source-keyed analytics tables. The old weekly rebuild queue has no typed
+equivalent and is reported as unavailable, while retained dated model
+publications and graph-preview freshness are shown separately. Do not replace
+that unavailable state with zero or read legacy source-side derived tables as a
+fallback.
+
 Acquisition completion is not a finished allowance estimate. The account census
 is capped at 10,000 tracked checkpoints and explicitly indicates truncation.
 Publication coverage uses 366 indexed day lookups; a day with known price data
