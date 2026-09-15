@@ -1,19 +1,22 @@
-import { applyAnalyticsChange, readIngestionChanges, type StorageChange } from './analytics-delivery';
+import { applyAnalyticsChange, applyAnalyticsChangePage, readIngestionChanges, type StorageChange } from './analytics-delivery';
 import { lookupV11StorageSource, type V11StorageDiscard } from './v11-storage-journal';
-import { lookupTypedV1Source, validateTypedTelemetryV1Receipt } from './typed-v1-admission';
-import { readTypedTelemetryRowsByStorageIds } from './typed-telemetry-compatibility';
+import { lookupTypedV1Source, readTypedV1ProjectionPage, typedV1ProjectionPageIsCurrent,
+ validateTypedTelemetryV1Receipt, type TypedV1ProjectionSource } from './typed-v1-admission';
+import { MAX_TYPED_TELEMETRY_STORAGE_ID_PAGES, readTypedTelemetryRowsByStorageIds } from './typed-telemetry-compatibility';
 import { encodeTypedTelemetryId } from './typed-telemetry-codec';
 import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
 import { MAX_V1_SOURCE_CHUNKS, selectV1WinningDevices, type V1SourceChunk } from './telemetry-v1-source-selection';
 import { createV11DailyProjectionValues, foldV1DailyProjectionValues, validateV11DailyProjectionValues,
  type V11DailyProjectionValues } from './v11-daily-projection-values';
+import { readCollectionControls } from './collection-controls';
 
 const fail=()=>new Error('V1_PROJECTION_SOURCE_UNAVAILABLE');
 const digest=(value:unknown)=>typeof value==='string'&&/^[a-f0-9]{64}$/.test(value);
 const scoped=(kind:string,value:unknown)=>sha256Hex(canonicalJson({method:'typed-v1-projection-v1',kind,value}));
 function integer(n:number,min=0){if(!Number.isSafeInteger(n)||n<min)throw fail();}
 function day(value:string){if(!/^\d{4}-\d{2}-\d{2}$/.test(value)||new Date(`${value}T00:00:00.000Z`).toISOString().slice(0,10)!==value)throw fail();}
+const elapsed=(started:number)=>Math.max(0,Math.ceil(performance.now()-started));
 type Input=Awaited<ReturnType<typeof lookupTypedV1Source>>;
 async function references(owner:string,input:Pick<Input,'sourceNamespace'|'deviceId'|'day'|'stream'|'chunkSeq'|'chunkId'>){
  const [namespaceDigest,deviceDigest,slotDigest,chunkDigest]=await Promise.all([
@@ -21,6 +24,18 @@ async function references(owner:string,input:Pick<Input,'sourceNamespace'|'devic
   scoped('slot',[input.sourceNamespace,owner,input.deviceId,input.day,input.stream,input.chunkSeq]),
   scoped('chunk',[input.sourceNamespace,owner,input.chunkId]),
  ]);return {namespaceDigest,deviceDigest,slotDigest,chunkDigest};
+}
+function prepareChunkProjection(target:D1Database,change:StorageChange,input:Pick<TypedV1ProjectionSource,
+ 'day'|'revision'>,refs:Awaited<ReturnType<typeof references>>,values:V11DailyProjectionValues):D1PreparedStatement[]{
+ return [target.prepare(`INSERT INTO analytics_v1_chunk_values(source_id,owner_digest,slot_digest,namespace_digest,device_digest,
+   chunk_digest,event_digest,content_digest,observed_day,chunk_revision,owner_revision,values_json)
+   VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id,owner_digest,slot_digest) DO UPDATE SET
+    chunk_digest=excluded.chunk_digest,event_digest=excluded.event_digest,content_digest=excluded.content_digest,
+    chunk_revision=excluded.chunk_revision,owner_revision=excluded.owner_revision,values_json=excluded.values_json`)
+   .bind(change.sourceId,change.ownerDigest,refs.slotDigest,refs.namespaceDigest,refs.deviceDigest,refs.chunkDigest,
+    change.eventDigest,change.contentDigest,input.day,input.revision,change.revision,canonicalJson(values)),
+  target.prepare(`INSERT INTO analytics_v1_projection_receipts(source_id,event_digest,owner_digest,disposition,proof_event_digest)
+   VALUES(?,?,?,'chunk',NULL)`).bind(change.sourceId,change.eventDigest,change.ownerDigest)];
 }
 
 /** Caller must obtain terminal from the protected source resolver. Safe to
@@ -88,19 +103,53 @@ export async function advanceV1DailyProjection(options:{source:D1Database;target
  // A correction may retire rows while the CPU fold runs. Recheck the exact
  // event, not a latest owner generation. A changed source retries safely.
  if(canonicalJson(await lookupTypedV1Source(source,change))!==canonicalJson(input))throw fail();
- await applyAnalyticsChange(target,change,async()=>[
-  target.prepare(`INSERT INTO analytics_v1_chunk_values(source_id,owner_digest,slot_digest,namespace_digest,device_digest,
-   chunk_digest,event_digest,content_digest,observed_day,chunk_revision,owner_revision,values_json)
-   VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id,owner_digest,slot_digest) DO UPDATE SET
-    chunk_digest=excluded.chunk_digest,event_digest=excluded.event_digest,content_digest=excluded.content_digest,
-    chunk_revision=excluded.chunk_revision,owner_revision=excluded.owner_revision,values_json=excluded.values_json
-   `)
-   .bind(sourceId,change.ownerDigest,refs.slotDigest,refs.namespaceDigest,refs.deviceDigest,refs.chunkDigest,
-    change.eventDigest,change.contentDigest,input.day,input.revision,change.revision,canonicalJson(values)),
-  target.prepare(`INSERT INTO analytics_v1_projection_receipts(source_id,event_digest,owner_digest,disposition,proof_event_digest)
-   VALUES(?,?,?,'chunk',NULL)`).bind(sourceId,change.eventDigest,change.ownerDigest),
- ]);
+ await applyAnalyticsChange(target,change,async()=>prepareChunkProjection(target,change,input,refs,values));
  return {state:'applied',sequence:change.sequence,recordsRead:rows.length};
+}
+
+/** Fast path for a contiguous current typed-v1 prefix. Every source record is
+ * validated by the shared compatibility decoder, then all existing per-event
+ * projection units commit in one ordered target transaction. */
+export async function advanceV1DailyProjectionPage(options:{source:D1Database;target:D1Database;sourceId:string;
+ sourceNamespace:string;changes:readonly StorageChange[];signal?:AbortSignal;publicationControlRevision?:number;publicationEnabled?:boolean}):Promise<{
+ state:'boundary'|'applied';sequence:number;events:number;recordsRead:number;decodedBytes:number;
+ sourceReadMs:number;foldMs:number;sourceRecheckMs:number;targetWriteMs:number;pageDurationMs:number;
+}>{
+ const {source,target,sourceId,sourceNamespace,changes,signal}=options;encodeTypedTelemetryId(sourceNamespace);signal?.throwIfAborted();
+ if(options.publicationControlRevision!==undefined)integer(options.publicationControlRevision,1);
+ if((options.publicationControlRevision===undefined)!==(options.publicationEnabled===undefined))throw fail();
+ if(!Array.isArray(changes)||changes.length<1||changes.length>MAX_TYPED_TELEMETRY_STORAGE_ID_PAGES
+  ||changes.some(change=>change.sourceId!==sourceId))throw fail();
+ const pageStarted=performance.now(),sourceStarted=performance.now();
+ const page=await readTypedV1ProjectionPage(source,{sourceNamespace,changes});
+ const sourceReadMs=elapsed(sourceStarted);
+ if(!page.length)return {state:'boundary',sequence:changes[0]!.sequence-1,events:0,recordsRead:0,decodedBytes:0,
+  sourceReadMs,foldMs:0,sourceRecheckMs:0,targetWriteMs:0,pageDurationMs:elapsed(pageStarted)};
+ const prepared=new Map<string,D1PreparedStatement[]>();let recordsRead=0,decodedBytes=0;const encoder=new TextEncoder();
+ const foldStarted=performance.now();
+ for(const input of page){
+  const records=input.records.map(record=>JSON.parse(record.record_json));
+  decodedBytes+=input.records.reduce((sum,record)=>sum+encoder.encode(record.record_json).byteLength,0);
+  const values=foldV1DailyProjectionValues(createV11DailyProjectionValues(input.day),records);
+  const refs=await references(input.change.ownerDigest,input);recordsRead+=records.length;
+  prepared.set(input.change.eventDigest,prepareChunkProjection(target,input.change,input,refs,values));
+ }
+ const foldMs=elapsed(foldStarted);
+ signal?.throwIfAborted();
+ const recheckStarted=performance.now();
+ if(!await typedV1ProjectionPageIsCurrent(source,page))throw fail();
+ if(options.publicationControlRevision!==undefined){
+  const controls=await readCollectionControls(source);
+  if(controls.publication!==options.publicationEnabled||controls.revision!==options.publicationControlRevision)
+   throw new Error('STORAGE_ANALYTICS_PUBLICATION_CONTROL_CHANGED');
+ }
+ const sourceRecheckMs=elapsed(recheckStarted),targetStarted=performance.now();
+ await applyAnalyticsChangePage(target,page.map(input=>input.change),async(_target,change)=>{
+  const statements=prepared.get(change.eventDigest);if(!statements)throw fail();return statements;
+ });
+ const targetWriteMs=elapsed(targetStarted);
+ return {state:'applied',sequence:page.at(-1)!.change.sequence,events:page.length,recordsRead,decodedBytes,
+  sourceReadMs,foldMs,sourceRecheckMs,targetWriteMs,pageDurationMs:elapsed(pageStarted)};
 }
 
 interface Header extends V1SourceChunk {chunk_seq:number;record_count:number}
