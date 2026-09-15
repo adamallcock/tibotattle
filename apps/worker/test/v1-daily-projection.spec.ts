@@ -11,15 +11,17 @@ import { currentTelemetryV1Chunk, insertTelemetryV1Chunk, type TelemetryV1ChunkI
 import { telemetryV11LegacyProjection } from '../src/telemetry-v11-repository';
 import { parseTelemetryV1Chunk, type TelemetryV1Record } from '../src/telemetry-v1';
 import { sha256Hex } from '../src/crypto';
-import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk, lookupTypedV1Source, validateTypedTelemetryV1Receipt } from '../src/typed-v1-admission';
+import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk, lookupTypedV1Source, readTypedV1ProjectionPage,
+ validateTypedTelemetryV1Receipt } from '../src/typed-v1-admission';
 import { initializeTypedV11Admission } from '../src/typed-v11-admission';
-import { initializeStorageSource, readIngestionChanges } from '../src/analytics-delivery';
+import { initializeStorageSource, readIngestionChanges, type StorageChange } from '../src/analytics-delivery';
 import { readTypedTelemetryRowsByStorageIds } from '../src/typed-telemetry-compatibility';
 import { runStorageAnalyticsV1CatchupQueue,STORAGE_ANALYTICS_CATCHUP_CONTROL_SQL,STORAGE_ANALYTICS_CATCHUP_RECEIPT_SQL,
  type StorageAnalyticsV1CatchupMessage } from '../src/storage-analytics-catchup-worker';
 const bindings=env as Env & {TEST_MIGRATIONS:D1Migration[];TEST_TYPED_INGESTION_MIGRATIONS:D1Migration[];
  TEST_ANALYTICS_MIGRATIONS:D1Migration[]; STORAGE_ANALYTICS_DB:D1Database; TEST_INGESTION_BRIDGE_MIGRATIONS:D1Migration[];
- TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];TEST_DELETION_LEDGER_MIGRATIONS:D1Migration[]};
+ TEST_TYPED_V1_ADMISSION_MIGRATIONS:D1Migration[];TEST_INGESTION_ISOLATION_MIGRATIONS:D1Migration[];
+ TEST_DELETION_LEDGER_MIGRATIONS:D1Migration[]};
 const source=()=>bindings.USAGE_MONITOR_DB, namespace='synthetic-v1-source', sourceId='synthetic-v1-journal';
 const day=()=>new Date().toISOString().slice(0,10);
 const changes=()=>readIngestionChanges(source(),sourceId,0);
@@ -30,6 +32,7 @@ beforeEach(async()=>{
  await applyD1Migrations(source(),bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
  await applyD1Migrations(source(),(bindings as typeof bindings&{TEST_TYPED_V11_ADMISSION_MIGRATIONS:D1Migration[]}).TEST_TYPED_V11_ADMISSION_MIGRATIONS);
  await applyD1Migrations(source(),bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+ await applyD1Migrations(source(),bindings.TEST_INGESTION_ISOLATION_MIGRATIONS);
  await initializeStorageSource(source(),sourceId);await initializeTypedV11Admission(source(),namespace);await initializeTypedV1Admission(source(),namespace);
  await applyD1Migrations(bindings.STORAGE_ANALYTICS_DB,bindings.TEST_ANALYTICS_MIGRATIONS);
  await applyD1Migrations(bindings.DELETION_LEDGER,bindings.TEST_DELETION_LEDGER_MIGRATIONS);
@@ -256,7 +259,7 @@ describe('separate typed v1 analytical projection',()=>{
    maxQueries:20,publishCommunity:false})).toMatchObject({state:'deferred',reason:'query_budget',steps:0});
   expect(await target().prepare('SELECT count(*) n FROM analytics_applied_events').first('n')).toBe(0);
   const pass=await runStorageAnalyticsPass({source:source(),target:target(),sourceId,sourceNamespace:namespace,maxSteps:4,publishCommunity:false});
-  expect(pass).toMatchObject({state:'progress',reason:'step_limit',steps:4,recordsRead:800});expect(pass.queriesUsed).toBe(78);
+  expect(pass).toMatchObject({state:'progress',reason:'step_limit',steps:4,recordsRead:800});expect(pass.queriesUsed).toBe(79);
  });
  it('runs the separate maximum backlog page within the shared query budget and rejects broader pages',async()=>{
   await seedPage(16,200);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
@@ -299,6 +302,133 @@ describe('separate typed v1 analytical projection',()=>{
    FROM storage_analytics_v1_catchup_receipts ORDER BY generation`).all()).results).toEqual([
     {generation:1,expected_sequence:0,observed_sequence:16,events_applied:16,result_reason:'step_limit'},
     {generation:2,expected_sequence:16,observed_sequence:32,events_applied:16,result_reason:'page_limit'}]);
+ });
+ it('keeps a current source-updated append inside the same fast typed-v1 page and rejects unknown kinds',async()=>{
+  const first=await seed('usage',1);await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+  const append=await seed('usage',200,first.fixture,1,1);await insertTypedTelemetryV1Chunk(source(),append.insert,namespace);
+  const journal=await changes();expect(journal.map(change=>change.kind)).toEqual(['owner-active','source-updated']);
+  await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,1,true),sent:StorageAnalyticsV1CatchupMessage[]=[];
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const workerEnv={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const delivery=queueBatch(catchupMessage(run,1,0,16,1));await runStorageAnalyticsV1CatchupQueue(delivery.batch,workerEnv);
+  expect(delivery.acks()).toBe(1);expect(sent).toHaveLength(0);
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:2,expected_sequence:2,pages_completed:1,state:'complete',result_reason:'page_limit'});
+  expect(await target().prepare('SELECT events_applied,records_read,result_reason FROM storage_analytics_v1_catchup_receipts').first())
+   .toEqual({events_applied:2,records_read:201,result_reason:'page_limit'});
+  expect((await target().prepare('SELECT kind FROM analytics_applied_events ORDER BY sequence').all()).results)
+   .toEqual([{kind:'owner-active'},{kind:'source-updated'}]);
+  await expect(readTypedV1ProjectionPage(source(),{sourceNamespace:namespace,
+   changes:[{...journal[0]!,kind:'unknown'} as unknown as StorageChange]})).rejects.toThrow('TYPED_TELEMETRY_CONFLICT');
+ });
+ it('checkpoints a partial fast prefix and uses the ordinary owner fence for the superseded boundary',async()=>{
+  const first=await seed('quota',1);await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+  const old=await seed('usage',1,first.fixture);await insertTypedTelemetryV1Chunk(source(),old.insert,namespace);
+  const replacement=await seed('usage',2,first.fixture,2);
+  replacement.insert.supersedes=await currentTelemetryV1Chunk(source(),old.fixture.participantId,old.fixture.deviceId,'usage',day(),0);
+  await insertTypedTelemetryV1Chunk(source(),replacement.insert,namespace);
+  await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,3,true),sent:StorageAnalyticsV1CatchupMessage[]=[];
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const workerEnv={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const delivery=queueBatch(catchupMessage(run,1,0,16,3));await runStorageAnalyticsV1CatchupQueue(delivery.batch,workerEnv);
+  expect(delivery.acks()).toBe(1);expect(sent).toHaveLength(0);
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:4,expected_sequence:3,pages_completed:3,state:'complete',result_reason:'page_limit'});
+  expect((await target().prepare(`SELECT generation,expected_sequence,observed_sequence,events_applied,result_reason
+   FROM storage_analytics_v1_catchup_receipts ORDER BY generation`).all()).results).toEqual([
+    {generation:1,expected_sequence:0,observed_sequence:1,events_applied:1,result_reason:'format_boundary'},
+    {generation:2,expected_sequence:1,observed_sequence:2,events_applied:1,result_reason:'step_limit'},
+    {generation:3,expected_sequence:2,observed_sequence:3,events_applied:1,result_reason:'page_limit'},
+   ]);
+  expect((await target().prepare('SELECT disposition FROM analytics_v1_projection_receipts ORDER BY event_digest').all()).results)
+   .toContainEqual({disposition:'superseded'});
+ });
+ it.each(['deadline','query_budget'] as const)('shares the remaining budget with an ordinary boundary that reports %s',async reason=>{
+  const first=await seed('usage',1);await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+  await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,2,true),fast=vi.spyOn(storageAnalyticsRuntime,'runStorageAnalyticsV1CatchupPass');
+  const ordinary=vi.spyOn(storageAnalyticsRuntime,'runStorageAnalyticsPass');let ordinaryBudget:number|undefined;
+  fast.mockResolvedValueOnce({state:'deferred',reason:'format_boundary',steps:0,recordsRead:0,queriesUsed:700,
+   dailyPublications:0,graphCalculations:0,metrics:{decodedBytes:0,sourceReadMs:0,foldMs:0,sourceRecheckMs:0,targetWriteMs:0,pageDurationMs:0}});
+  ordinary.mockImplementationOnce(async options=>{ordinaryBudget=options.maxQueries;return {state:'deferred',reason,steps:0,
+   recordsRead:0,queriesUsed:140,dailyPublications:0,graphCalculations:0};});
+  const queue={async send(){throw new Error('unexpected send');}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const workerEnv={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const delivery=queueBatch(catchupMessage(run,1,0,16,2));await runStorageAnalyticsV1CatchupQueue(delivery.batch,workerEnv);
+  fast.mockRestore();ordinary.mockRestore();expect(delivery.acks()).toBe(1);expect(ordinaryBudget).toBe(140);
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:2,expected_sequence:0,pages_completed:0,state:'blocked',result_reason:reason});
+  expect(await target().prepare('SELECT metered_queries,result_reason FROM storage_analytics_v1_catchup_receipts').first())
+   .toEqual({metered_queries:840,result_reason:reason});
+ });
+ it('checkpoints same-cursor ordinary work and replays a lost send without redoing that work',async()=>{
+  const first=await seed('usage',1);await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+  await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,4,true),fast=vi.spyOn(storageAnalyticsRuntime,'runStorageAnalyticsV1CatchupPass');
+  const ordinary=vi.spyOn(storageAnalyticsRuntime,'runStorageAnalyticsPass');
+  fast.mockResolvedValue({state:'deferred',reason:'format_boundary',steps:0,recordsRead:0,queriesUsed:10,
+   dailyPublications:0,graphCalculations:0,metrics:{decodedBytes:0,sourceReadMs:1,foldMs:0,sourceRecheckMs:0,targetWriteMs:0,pageDurationMs:1}});
+  ordinary.mockResolvedValue({state:'progress',reason:'step_limit',steps:1,recordsRead:200,queriesUsed:20,
+   dailyPublications:0,graphCalculations:0});
+  const sent:StorageAnalyticsV1CatchupMessage[]=[];let sends=0;
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sends++;sent.push(value);
+   if(sends===1)throw new Error('synthetic lost local-work send');}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const workerEnv={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const initial=queueBatch(catchupMessage(run,1,0,16,4));
+  await expect(runStorageAnalyticsV1CatchupQueue(initial.batch,workerEnv)).rejects.toThrow('synthetic lost local-work send');
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:4,expected_sequence:0,pages_completed:3,state:'send-pending'});
+  expect((await target().prepare(`SELECT events_applied,records_read,metered_queries,decoded_bytes,fold_ms,result_reason
+   FROM storage_analytics_v1_catchup_receipts ORDER BY generation`).all()).results)
+   .toEqual(Array.from({length:3},()=>({events_applied:0,records_read:200,metered_queries:30,
+    decoded_bytes:null,fold_ms:null,result_reason:'step_limit'})));
+  const retry=queueBatch(catchupMessage(run,1,0,16,4));await runStorageAnalyticsV1CatchupQueue(retry.batch,workerEnv);
+  expect(retry.acks()).toBe(1);expect(ordinary).toHaveBeenCalledTimes(3);expect(sent.at(-1)).toMatchObject({generation:4,expectedSequence:0});
+  const resumed=queueBatch(sent.at(-1)!);await runStorageAnalyticsV1CatchupQueue(resumed.batch,workerEnv);
+  fast.mockRestore();ordinary.mockRestore();expect(resumed.acks()).toBe(1);
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:5,expected_sequence:0,pages_completed:4,state:'complete',result_reason:'page_limit'});
+  expect((await target().prepare('SELECT events_applied,result_reason FROM storage_analytics_v1_catchup_receipts ORDER BY generation').all()).results)
+   .toEqual([{events_applied:0,result_reason:'step_limit'},{events_applied:0,result_reason:'step_limit'},
+    {events_applied:0,result_reason:'step_limit'},{events_applied:0,result_reason:'page_limit'}]);
+ });
+ it.each(['deadline','query_budget'] as const)('checkpoints a durable same-cursor ordinary unit that ends with %s',async reason=>{
+  const first=await seed('usage',1);await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+  await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,2,true),fast=vi.spyOn(storageAnalyticsRuntime,'runStorageAnalyticsV1CatchupPass');
+  const ordinary=vi.spyOn(storageAnalyticsRuntime,'runStorageAnalyticsPass');
+  fast.mockResolvedValueOnce({state:'deferred',reason:'format_boundary',steps:0,recordsRead:0,queriesUsed:10,
+   dailyPublications:0,graphCalculations:0,metrics:{decodedBytes:0,sourceReadMs:1,foldMs:0,sourceRecheckMs:0,targetWriteMs:0,pageDurationMs:1}});
+  ordinary.mockResolvedValueOnce({state:'deferred',reason,steps:1,recordsRead:200,queriesUsed:820,
+   dailyPublications:0,graphCalculations:0});
+  const sent:StorageAnalyticsV1CatchupMessage[]=[];
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const workerEnv={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const delivery=queueBatch(catchupMessage(run,1,0,16,2));await runStorageAnalyticsV1CatchupQueue(delivery.batch,workerEnv);
+  fast.mockRestore();ordinary.mockRestore();expect(delivery.acks()).toBe(1);expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({generation:2,expectedSequence:0});
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:2,expected_sequence:0,pages_completed:1,state:'sent',result_reason:null});
+  expect(await target().prepare(`SELECT events_applied,records_read,metered_queries,decoded_bytes,page_duration_ms,result_reason
+   FROM storage_analytics_v1_catchup_receipts`).first()).toEqual({events_applied:0,records_read:200,metered_queries:830,
+    decoded_bytes:null,page_duration_ms:null,result_reason:reason});
  });
  it('enqueues once after three internal pages and resumes the exact next generation',async()=>{
   await seedPage(64,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});

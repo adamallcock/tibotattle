@@ -178,13 +178,16 @@ interface ProjectionMetadata {event_digest:string|null;source_namespace:string|n
 const MAX_V1_PROJECTION_PAGE_BYTES=16*1024*1024;
 
 /** Authoritative multi-event read for the analytics catch-up lane. The returned
- * prefix contains only current active typed-v1 chunks. A terminal, superseded,
- * legacy or v1.1 event ends the prefix so the ordinary dispatcher owns it. */
+ * prefix contains only current active typed-v1 chunks, including conservative
+ * source-updated appends whose immutable chunk proof is identical. A terminal,
+ * superseded, legacy or v1.1 event ends the prefix so the ordinary dispatcher
+ * owns it. */
 export async function readTypedV1ProjectionPage(db:D1Database,options:{sourceNamespace:string;changes:readonly StorageChange[]}):Promise<TypedV1ProjectionSource[]>{
  encodeTypedTelemetryId(options.sourceNamespace);
  const changes=options.changes;
  if(!Array.isArray(changes)||changes.length<1||changes.length>MAX_TYPED_TELEMETRY_STORAGE_ID_PAGES)throw conflict();
- changes.forEach((change,index)=>{if(change.sourceId!==changes[0]!.sourceId||(index&&change.sequence!==changes[index-1]!.sequence+1))throw conflict();});
+ changes.forEach((change,index)=>{if(change.sourceId!==changes[0]!.sourceId||(index&&change.sequence!==changes[index-1]!.sequence+1)
+  ||!['owner-active','source-updated','owner-withdrawn','owner-erased'].includes(change.kind))throw conflict();});
  const metadata=await db.batch<ProjectionMetadata>(changes.map(change=>db.prepare(`SELECT
   e.event_digest,e.source_namespace,e.participant_id,c.device_id,c.id,c.stream,c.chunk_day,c.chunk_seq,c.revision,c.chunk_digest,
   c.superseded_at,c.record_count,c.accepted_record_count,o.state owner_state,
@@ -196,6 +199,7 @@ export async function readTypedV1ProjectionPage(db:D1Database,options:{sourceNam
  const selected:{change:StorageChange;meta:ProjectionMetadata}[]=[];
  for(let index=0;index<changes.length;index++){
   const rows=metadata[index]!.results;if(rows.length!==1)throw conflict();const row=rows[0]!;
+  const kind=changes[index]!.kind;if(kind==='owner-withdrawn'||kind==='owner-erased')break;
   if(row.event_digest===null)break;
   if(row.source_id!==changes[index]!.sourceId||row.current_namespace!==options.sourceNamespace
    ||row.source_namespace!==options.sourceNamespace||typeof row.participant_id!=="string"||typeof row.device_id!=="string"
@@ -203,7 +207,6 @@ export async function readTypedV1ProjectionPage(db:D1Database,options:{sourceNam
    ||!Number.isSafeInteger(row.revision)||row.chunk_digest!==changes[index]!.contentDigest
    ||!Number.isSafeInteger(row.record_count)||(row.record_count as number)<1||(row.record_count as number)>200
    ||row.accepted_record_count!==row.record_count)throw conflict();
-  if(changes[index]!.kind!=="owner-active")throw conflict();
   if(row.owner_state!=="active"||row.superseded_at!==null)break;
   selected.push({change:changes[index]!,meta:row});
  }
