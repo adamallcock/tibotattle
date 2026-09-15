@@ -738,3 +738,20 @@ describe('isolated allowance graph publication',()=>{
   expect(await readPublishedStorageCommunityAdminPreview({...bindings(),target:readRace})).toBeNull();expect(raced).toBe(true);
  });
 });
+
+
+it('admits a real graph calculation with pending delivery after the scheduler reserves 175 statements',async()=>{
+ await fixture();
+ const incoming=await createV11DeviceFixture(typed(),{participantId:'participant:z-busy',grant:true});
+ await activate(typed(),incoming,await makeV11Day(day(),evidence()),true);
+ const meter=createD1InvocationBudget(900);
+ const scoped={...bindings(),source:meter.wrap(typed()),target:meter.wrap(b.STORAGE_ANALYTICS_DB),
+  ledger:meter.wrap(b.DELETION_LEDGER)};
+ for(let i=0;i<175;i++)await scoped.source.prepare('SELECT 1').run();
+ const result=await runStorageAnalyticsPass({...scoped,publishCommunity:true,maxQueries:meter.remainingQueries,
+  maxSteps:1,deadlineMs:Date.now()+20_000});
+ expect(result.graphCalculations).toBe(1);
+ expect(meter.queriesUsed).toBeLessThanOrEqual(900);
+ expect(await b.STORAGE_ANALYTICS_DB.prepare(
+  "SELECT COUNT(*) AS n FROM analytics_community_graph_results WHERE metric='fits'").first<number>('n')).toBe(1);
+});

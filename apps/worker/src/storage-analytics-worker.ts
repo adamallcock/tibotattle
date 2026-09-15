@@ -28,7 +28,7 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv)
   // not create competing cursor writers or two independent query allowances.
   const started=Date.now(),deadlineMs=started+40_000;
   const delivery=publishCommunity?await runStorageAnalyticsPass({...bindings,publishCommunity:false,
-   maxSteps:32,maxQueries:250,deadlineMs:started+10_000}):null;
+   maxSteps:32,maxQueries:175,deadlineMs:started+10_000}):null;
   if(Date.now()>=deadlineMs){
    console.log(JSON.stringify({event:'storage_analytics_schedule',...delivery,state:'deferred',reason:'deadline',
     queriesUsed:meter.queriesUsed}));return;

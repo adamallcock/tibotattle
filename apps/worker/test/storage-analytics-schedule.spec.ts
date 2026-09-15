@@ -17,17 +17,17 @@ afterEach(()=>{vi.restoreAllMocks();vi.useRealTimers();});
 describe('ordered ingestion before public analytics',()=>{
  it('reserves delivery time, then uses only the remaining invocation query budget',async()=>{
   pass.mockImplementationOnce(async options=>{
-   expect(options).toMatchObject({publishCommunity:false,maxSteps:32,maxQueries:250,deadlineMs:11000});
-   for(let i=0;i<250;i++)await options.source.prepare('SELECT 1').run();
-   return {...result,steps:16,recordsRead:3200,queriesUsed:250};
+   expect(options).toMatchObject({publishCommunity:false,maxSteps:32,maxQueries:175,deadlineMs:11000});
+   for(let i=0;i<175;i++)await options.source.prepare('SELECT 1').run();
+   return {...result,steps:16,recordsRead:3200,queriesUsed:175};
   }).mockImplementationOnce(async options=>{
-   expect(options).toMatchObject({publishCommunity:true,maxQueries:650,deadlineMs:21000});
+   expect(options).toMatchObject({publishCommunity:true,maxQueries:725,deadlineMs:21000});
    await options.target.prepare('SELECT 1').run();
    return {...result,recordsRead:4,graphCalculations:1};
   });
   await runStorageAnalyticsSchedule(environment());
   expect(pass).toHaveBeenCalledTimes(2);
-  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({steps:17,recordsRead:3204,queriesUsed:251,graphCalculations:1});
+  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({steps:17,recordsRead:3204,queriesUsed:176,graphCalculations:1});
  });
  it('stops instead of starting graph work after delivery fails',async()=>{
   pass.mockRejectedValueOnce(new Error('synthetic failure'));
