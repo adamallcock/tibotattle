@@ -71,6 +71,13 @@ const cursorAdvanced=()=>new Error('STORAGE_ANALYTICS_CATCHUP_CURSOR_ADVANCED');
 const cursorRegressed=()=>new Error('STORAGE_ANALYTICS_CATCHUP_CURSOR_REGRESSED');
 const resultReasons:ReadonlySet<string>=new Set(['complete','step_limit','page_limit','format_boundary','deadline','query_budget','capacity',
  'cursor_reconciled','cursor_advanced','cursor_regressed','publication_control','failed']);
+// Amortize Queue delivery latency without widening a 16-event D1 transaction.
+// Every internal page retains its own authority checks, generation and receipt;
+// three pages remain inside the existing 20-second invocation deadline.
+const MAX_PAGES_PER_DELIVERY=3;
+// D1 permits 1,000 queries per Worker invocation. Leave explicit headroom for
+// cursor/control checks, checkpoint receipts, recovery and the final send.
+const PAGE_QUERY_BUDGET_PER_DELIVERY=840,MIN_PAGE_QUERY_BUDGET=250;
 const runId=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const sourceId=/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/;
 const elapsed=(started:number)=>Math.max(0,Math.ceil(performance.now()-started));
@@ -147,6 +154,11 @@ async function sendPending(row:RunRow,env:StorageAnalyticsCatchupWorkerEnv):Prom
 function exactInput(input:StorageAnalyticsV1CatchupMessage,row:RunRow):boolean{
  const expected=exactMessage(row);return Object.keys(expected).every(key=>input[key as keyof StorageAnalyticsV1CatchupMessage]===expected[key as keyof StorageAnalyticsV1CatchupMessage]);
 }
+function exactImmutableInput(input:StorageAnalyticsV1CatchupMessage,row:RunRow):boolean{
+ return input.runId===row.run_id&&input.pageEvents===row.page_events&&input.maxPages===row.max_pages
+  &&input.expectedCollectionRevision===row.expected_collection_revision
+  &&input.expectedPublicationEnabled===(row.expected_publication_enabled===1);
+}
 function measuredReceipt(row:RunRow,after:number,reason:CatchupResultReason,started:number,result?:{
  recordsRead:number;queriesUsed:number;metrics:StorageAnalyticsCatchupMetrics;
 }):Receipt{return {run_id:row.run_id,generation:row.generation,expected_sequence:row.expected_sequence,observed_sequence:after,
@@ -170,26 +182,31 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
   ||typeof env.STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT!=='string')throw invalid();
  const runDeadlineMs=Date.parse(env.STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT);
  if(!Number.isFinite(runDeadlineMs)||new Date(runDeadlineMs).toISOString()!==env.STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT)throw invalid();
+ const invocationDeadlineMs=Math.min(runDeadlineMs,Date.now()+20_000);
  const delivered=batch.messages[0]!,input=message(delivered.body),control=env.STORAGE_ANALYTICS_CATCHUP_CONTROL_DB;
  if(typeof delivered.id!=='string'||delivered.id.length<1||delivered.id.length>128)throw invalid();
- let state=await readRun(control,input.runId,env);
+ let state=await readRun(control,input.runId,env),retryingInternalClaim=false;
  if(state.state==='complete'||state.state==='blocked'){delivered.ack();return;}
  if(input.generation<state.generation){
-  if(input.generation+1===state.generation&&state.state==='send-pending')await sendPending(state,env);
-  delivered.ack();return;
+  if(state.state==='send-pending'){await sendPending(state,env);delivered.ack();return;}
+  else if(state.state==='running'&&state.claim_id===delivered.id){
+   if(!exactImmutableInput(input,state))throw invalid();retryingInternalClaim=true;
+  }
+  else {delivered.ack();return;}
  }
- if(!exactInput(input,state))throw invalid();
- if(state.state==='send-pending')state=await transition(control,`UPDATE storage_analytics_v1_catchup_runs SET state='running',claim_id=?,updated_ms=?
+ if(!retryingInternalClaim&&!exactInput(input,state))throw invalid();
+ if(!retryingInternalClaim&&state.state==='send-pending')state=await transition(control,`UPDATE storage_analytics_v1_catchup_runs SET state='running',claim_id=?,updated_ms=?
   WHERE run_id=? AND generation=? AND expected_sequence=? AND state='send-pending'`,
   [delivered.id,Date.now(),state.run_id,state.generation,state.expected_sequence],{run_id:state.run_id,generation:state.generation,
    expected_sequence:state.expected_sequence,state:'running',claim_id:delivered.id},env);
- else if(state.state==='sent')state=await transition(control,`UPDATE storage_analytics_v1_catchup_runs SET state='running',claim_id=?,updated_ms=?
+ else if(!retryingInternalClaim&&state.state==='sent')state=await transition(control,`UPDATE storage_analytics_v1_catchup_runs SET state='running',claim_id=?,updated_ms=?
   WHERE run_id=? AND generation=? AND expected_sequence=? AND state='sent'`,
   [delivered.id,Date.now(),state.run_id,state.generation,state.expected_sequence],{run_id:state.run_id,generation:state.generation,
    expected_sequence:state.expected_sequence,state:'running',claim_id:delivered.id},env);
  if(state.state!=='running'||state.claim_id!==delivered.id)throw invalid();
- let before=state.expected_sequence;
+ let before=state.expected_sequence,pagesThisInvocation=0,generationStarted=started,remainingPageQueries=PAGE_QUERY_BUDGET_PER_DELIVERY;
  try{
+  for(;;){
   before=await cursor(env.STORAGE_ANALYTICS_DB,env.STORAGE_SOURCE_ID);
   if(before<state.expected_sequence)throw cursorRegressed();
   if(before>state.expected_sequence+state.page_events)throw cursorAdvanced();
@@ -201,8 +218,9 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
   if(before===state.expected_sequence)result=await runStorageAnalyticsV1CatchupPass({source:env.STORAGE_INGESTION_DB,
    target:env.STORAGE_ANALYTICS_DB,ledger:env.DELETION_LEDGER,sourceId:env.STORAGE_SOURCE_ID,
    sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,pageEvents:state.page_events,maxSteps:state.page_events,
-   deadlineMs:Math.min(runDeadlineMs,Date.now()+20_000),publicationControlRevision:state.expected_collection_revision,
+   deadlineMs:invocationDeadlineMs,maxQueries:remainingPageQueries,publicationControlRevision:state.expected_collection_revision,
    publicationEnabled:state.expected_publication_enabled===1});
+  if(result)remainingPageQueries-=result.queriesUsed;
   const after=await cursor(env.STORAGE_ANALYTICS_DB,env.STORAGE_SOURCE_ID);
   if(after<state.expected_sequence||after<before)throw cursorRegressed();
   if(after>state.expected_sequence+state.page_events)throw cursorAdvanced();
@@ -220,7 +238,7 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
      AND state='running' AND claim_id=?`,[after,pagesCompleted,terminalState,terminalReason,Date.now(),state.run_id,state.generation,
       state.expected_sequence,delivered.id],{run_id:state.run_id,generation:state.generation+1,expected_sequence:after,
       pages_completed:pagesCompleted,state:terminalState,claim_id:null,result_reason:terminalReason},
-     measuredReceipt(state,after,terminalReason,started,result??undefined),env);
+     measuredReceipt(state,after,terminalReason,generationStarted,result??undefined),env);
     delivered.ack();return;
    }
    state=await transitionWithReceipt(control,`UPDATE storage_analytics_v1_catchup_runs SET generation=generation+1,expected_sequence=?,
@@ -228,17 +246,36 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
     AND expected_sequence=? AND state='running' AND claim_id=?`,[after,pagesCompleted,Date.now(),state.run_id,state.generation,
      state.expected_sequence,delivered.id],{run_id:state.run_id,generation:state.generation+1,expected_sequence:after,
      pages_completed:pagesCompleted,state:'send-pending',claim_id:null,result_reason:null},
-    measuredReceipt(state,after,reason??'cursor_reconciled',started,result??undefined),env);
+    measuredReceipt(state,after,reason??'cursor_reconciled',generationStarted,result??undefined),env);
+   pagesThisInvocation+=result?1:0;
+   if(result&&state.page_events===16&&pagesThisInvocation<MAX_PAGES_PER_DELIVERY
+    &&remainingPageQueries>=MIN_PAGE_QUERY_BUDGET&&Date.now()<invocationDeadlineMs){
+    state=await transition(control,`UPDATE storage_analytics_v1_catchup_runs SET state='running',claim_id=?,updated_ms=?
+     WHERE run_id=? AND generation=? AND expected_sequence=? AND state='send-pending'`,
+     [delivered.id,Date.now(),state.run_id,state.generation,state.expected_sequence],{run_id:state.run_id,generation:state.generation,
+      expected_sequence:state.expected_sequence,state:'running',claim_id:delivered.id},env);
+    generationStarted=performance.now();
+    continue;
+   }
    await sendPending(state,env);delivered.ack();return;
   }
   if(!reason||!['complete','format_boundary','deadline','query_budget','capacity'].includes(reason))throw invalid();
+  if(pagesThisInvocation>0&&(reason==='deadline'||reason==='query_budget')&&Date.now()<runDeadlineMs){
+   state=await transition(control,`UPDATE storage_analytics_v1_catchup_runs SET state='send-pending',claim_id=NULL,updated_ms=?
+    WHERE run_id=? AND generation=? AND expected_sequence=? AND state='running' AND claim_id=?`,
+    [Date.now(),state.run_id,state.generation,state.expected_sequence,delivered.id],{run_id:state.run_id,generation:state.generation,
+     expected_sequence:state.expected_sequence,state:'send-pending',claim_id:null},env);
+   await sendPending(state,env);delivered.ack();return;
+  }
   const terminal=reason==='complete'||reason==='format_boundary'?'complete':'blocked';
   await transitionWithReceipt(control,`UPDATE storage_analytics_v1_catchup_runs SET generation=generation+1,state=?,claim_id=NULL,
    result_reason=?,updated_ms=? WHERE run_id=? AND generation=? AND expected_sequence=? AND state='running' AND claim_id=?`,
    [terminal,reason,Date.now(),state.run_id,state.generation,state.expected_sequence,delivered.id],{run_id:state.run_id,
     generation:state.generation+1,expected_sequence:state.expected_sequence,state:terminal,claim_id:null,result_reason:reason},
-   measuredReceipt(state,state.expected_sequence,reason,started,result??undefined),env);
+   measuredReceipt(state,state.expected_sequence,reason,generationStarted,result??undefined),env);
   delivered.ack();
+  return;
+  }
  }catch(error){
   const retained=await readRun(control,state.run_id,env);
   if(retained.state!=='running'||retained.generation!==state.generation||retained.claim_id!==delivered.id)throw error;
@@ -254,7 +291,7 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
    AND expected_sequence=? AND state='running' AND claim_id=?`,[after,pagesCompleted,reason,Date.now(),state.run_id,
     state.generation,state.expected_sequence,delivered.id],{run_id:state.run_id,generation:state.generation+1,
     expected_sequence:after,pages_completed:pagesCompleted,state:'blocked',claim_id:null,result_reason:reason},
-   measuredReceipt(state,after,reason,started),env);
+   measuredReceipt(state,after,reason,generationStarted),env);
   delivered.ack();
  }
 }
