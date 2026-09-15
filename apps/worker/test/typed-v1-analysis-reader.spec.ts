@@ -98,6 +98,12 @@ describe('typed v1 existing analytical reader parity',()=>{
   expect(await backfillV1QuotaFitProjection(source())).toMatchObject({status:'complete',pagesRun:0,queriesUsed:2,throughRecordId:10});
   await expect(source().prepare('UPDATE typed_telemetry_quota SET analysis_source_row_id=999').run()).rejects.toThrow();
  });
+ it('selects the typed reader when the isolated source has no legacy backfill singleton',async()=>{
+  const f=await pair();await both(f,[quota(0)],'quota');
+  await source().prepare('DELETE FROM telemetry_v1_quota_fit_backfill').run();
+  const reader=await createV1QuotaPageReader(source(),f.typed.participantId);
+  expect(await reader.readPlanPage({observedAt:`${day()}T00:00:00.000Z`,id:0},3)).toHaveLength(1);
+ });
  it('returns a complete5000-row usage page with the original JSON and two physical queries',async()=>{
   const f=await pair();for(let chunk=0;chunk<25;chunk++)await both(f,Array.from({length:200},(_,i)=>usage(chunk*200+i)),'usage',chunk);
   const tp=await loadV1SourcePin(source(),{participantId:f.typed.participantId}),rp=await loadV1SourcePin(raw(),{participantId:f.original.participantId});

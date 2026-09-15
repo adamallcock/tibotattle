@@ -185,12 +185,14 @@ export async function createV1QuotaPageReader(db: D1Database, participantId: str
   if (typeof participantId !== "string" || participantId.length === 0) throw new TypeError("participant required");
   if (observedAtBefore !== undefined && (!Number.isFinite(Date.parse(observedAtBefore))
     || new Date(observedAtBefore).toISOString() !== observedAtBefore)) throw new TypeError("quota upper bound invalid");
-  const ready = await db.prepare(`SELECT s.through_record_id, s.last_record_id, s.is_complete,
-      EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='typed_v1_admission_state') typed_present
+  // Typed storage is an independent complete analytical layout. Resolve it
+  // before consulting the retired JSON projection state: a successfully
+  // isolated source may deliberately have no legacy backfill singleton.
+  const typed = await loadTypedV1AnalysisScope(db, participantId);
+  if (typed) return createTypedV1QuotaPageReader(db, typed, observedAtBefore);
+  const ready = await db.prepare(`SELECT s.through_record_id, s.last_record_id, s.is_complete
     FROM telemetry_v1_quota_fit_backfill s JOIN participants p ON p.id = ? AND p.state = 'active'
     WHERE s.singleton_id = 1`).bind(participantId).first<BackfillState>();
-  if(ready?.typed_present===1){const scope=await loadTypedV1AnalysisScope(db,participantId,true);
-    if(scope)return createTypedV1QuotaPageReader(db,scope,observedAtBefore);}
   if (!validState(ready) || ready.is_complete !== 1) throw new V1QuotaFitProjectionUnavailableError();
   return {
     async readPlanPage(cursor, limit) {
