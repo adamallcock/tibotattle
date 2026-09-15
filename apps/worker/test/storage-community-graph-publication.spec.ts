@@ -363,6 +363,27 @@ describe('isolated allowance graph publication',()=>{
   const row=(await readPublishedStorageCommunityGraph(bindings()))!;
   expect(JSON.parse(row.payload_json).coverage).toMatchObject({uploadingParticipantCount:2,cachedParticipantCount:2});
  });
+ it('finishes an exact owner pin across another owner hard change and rejects a same-owner correction',async()=>{
+  const first=await fixture('participant:calculation-owner-a');
+  const second=await fixture('participant:calculation-owner-b');
+  const owner=(await readStorageCommunityOwnerPage(typed())).find(value=>value.participantId===first.participantId)!;
+  const scope=await captureStorageGraphScope(typed(),{owner,day:today(),metric:'fits',
+   sourceId:namespace,sourceNamespace:namespace});
+  const before=await captureStorageCommunityAuthority(typed());
+  const secondDays=await activeDays(second),secondCorrected=evidence();
+  for(const record of [...secondCorrected.quota,...secondCorrected.usage])record.accountPlanAttribution={
+   ...record.accountPlanAttribution,accountTrackId:'account-track:v2:'+'c'.repeat(64)};
+  const secondRevision=await stage(typed(),second,await makeV11Day(day(),secondCorrected),true);
+  await activateDays(second,[...secondDays.filter(value=>value.day!==day()),secondRevision]);
+  expect((await captureStorageCommunityAuthority(typed())).publicAuthorityEpoch).toBeGreaterThan(before.publicAuthorityEpoch);
+  expect(await computeStorageGraphResult(bindings(),scope)).toMatchObject({state:'complete'});
+  const firstDays=await activeDays(first),firstCorrected=evidence();
+  for(const record of [...firstCorrected.quota,...firstCorrected.usage])record.accountPlanAttribution={
+   ...record.accountPlanAttribution,accountTrackId:'account-track:v2:'+'d'.repeat(64)};
+  const firstRevision=await stage(typed(),first,await makeV11Day(day(),firstCorrected),true);
+  await activateDays(first,[...firstDays.filter(value=>value.day!==day()),firstRevision]);
+  await expect(computeStorageGraphResult(bindings(),scope)).rejects.toThrow('v11 source changed during analysis');
+ });
  it('repairs corrupt completed days instead of permanently skipping them',async()=>{
   await fixture();await compute('model');await compute('fits');
   await publishStorageCommunityModelDay(bindings(),{day:day()});
@@ -423,6 +444,8 @@ describe('isolated allowance graph publication',()=>{
   const after=await captureStorageCommunityAuthority(typed());
   expect(after.graphInvalidationEpoch).toBeGreaterThan(appended.graphInvalidationEpoch);
   expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
+  expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'deferred',reason:'cache_pending'});
+  expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'deferred',reason:'cache_pending'});
   await retireStorageCommunityGraphPublications(bindings());
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_model_publications').first('n')).toBe(0);
  });
