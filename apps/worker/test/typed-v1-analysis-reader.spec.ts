@@ -121,7 +121,12 @@ describe('typed v1 existing analytical reader parity',()=>{
   const scalar=await accountScopedQuotaAnalysisV1(observed.database,f.typed.participantId,options);
   expect(observed.plans.map(plan=>plan.sql.includes('typed_plan_input AS MATERIALIZED')?'plan':'quota').sort()).toEqual(['plan','quota']);
   for(const plan of observed.plans){
-   expect(plan.details.some(detail=>detail.includes('SEARCH base USING')&&detail.includes('typed_v1_owner_observed')),JSON.stringify(plan.details)).toBe(true);
+   const ownerSeek=plan.details.findIndex(detail=>detail.includes('SEARCH base USING')&&detail.includes('typed_v1_owner_observed'));
+   const compatibilityRow=plan.details.findIndex(detail=>detail.includes('SEARCH r USING INTEGER PRIMARY KEY'));
+   const materializedScan=plan.details.findIndex(detail=>detail==='SCAN r');
+   expect(ownerSeek,JSON.stringify(plan.details)).toBeGreaterThan(-1);
+   expect(compatibilityRow,JSON.stringify(plan.details)).toBeGreaterThan(ownerSeek);
+   expect(materializedScan,JSON.stringify(plan.details)).toBeGreaterThan(compatibilityRow);
    expect(plan.details.some(detail=>detail.includes('SCAN base'))).toBe(false);
   }
   const clean=(value:object)=>{const {inputFingerprint,...rest}=value as Record<string,unknown>;if(inputFingerprint!==undefined)expect(inputFingerprint).toMatch(/^[0-9a-f]{64}$/);return rest;};
