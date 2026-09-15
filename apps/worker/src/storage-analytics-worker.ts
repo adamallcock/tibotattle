@@ -1,5 +1,6 @@
 import { runStorageAnalyticsPass } from './storage-analytics-runtime';
 import { publicAnalyticsEnabled } from './public-analytics-gate';
+import { storageGraphFailureFields } from './storage-analytics-failure';
 
 /** Separate scheduler entry point; it has no upload route or credential binding.
  * Resource binding/deployment belongs to the qualified Wrangler role plan. */
@@ -21,10 +22,10 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv)
    sourceId:env.STORAGE_SOURCE_ID,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,ledger:env.DELETION_LEDGER,
    publishCommunity:publicAnalyticsEnabled(env)});
   console.log(JSON.stringify({event:'storage_analytics_schedule',...result}));
- }catch {
+ }catch (error) {
   // Do not expose account identifiers, SQL, credentials or a stored record in
   // diagnostics. Retain the durable cursor and make scheduler failure visible.
-  console.error(JSON.stringify({event:'storage_analytics_schedule',state:'unavailable'}));
+  console.error(JSON.stringify({event:'storage_analytics_schedule',state:'unavailable',...storageGraphFailureFields(error)}));
   throw new Error('STORAGE_ANALYTICS_UNAVAILABLE');
  }
 }

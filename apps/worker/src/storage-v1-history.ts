@@ -5,6 +5,7 @@ import { assertV1SourcePinCurrent,V1_SOURCE_SELECTION_METHOD_VERSION,type V1Sour
 import { advanceV1QuotaAcquisition,createV1QuotaAcquisitionCheckpoint,type V1QuotaAcquisitionIdentity,
  type V1QuotaAcquisitionCheckpoint,type V1CompletedQuotaAcquisition,type V1QuotaInvocationBudget } from './quota-analysis-v1-reader';
 import { finishHistoricalModelCompositionV1,MODEL_HISTORY_METHOD_VERSION,type V1ModelCompositionResult } from './quota-analysis-v1';
+import { withStorageGraphFailureStage } from './storage-analytics-failure';
 
 export type StorageV1HistoryCheckpoint={version:1;day:string;layout:string;identity:V1QuotaAcquisitionIdentity}&(
  {phase:'acquisition';acquisition:V1QuotaAcquisitionCheckpoint}|{phase:'finish';acquisition:V1CompletedQuotaAcquisition});
@@ -33,22 +34,29 @@ export async function advanceStorageV1HistoricalAnalysis(input:{source:D1Databas
  // + final successor1. Reserve before starting, never after an effect.
  if(budget.remainingQueries<10||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:prior};
  budget.remainingQueries-=10;
- const selected=await loadTypedV1AnalysisScope(source,participantId),layout=selected?`typed:${selected.sourceNamespace}`:'json';
+ const selected=await withStorageGraphFailureStage('graph_history_layout',
+  ()=>loadTypedV1AnalysisScope(source,participantId));
+ const layout=selected?`typed:${selected.sourceNamespace}`:'json';
  if(prior&&prior.layout!==layout)throw fail();
  const assertSource=async()=>{await assertV1SourcePinCurrent(source,sourcePin);
   if(await source.prepare('SELECT 1 FROM telemetry_v11_domain_heads WHERE participant_id=? LIMIT 1').bind(participantId).first())throw fail();};
- await assertSource();
+ await withStorageGraphFailureStage('graph_history_source_precheck',assertSource);
  let checkpoint:StorageV1HistoryCheckpoint=prior??{version:1,day,layout,identity,phase:'acquisition',acquisition:createV1QuotaAcquisitionCheckpoint(identity)};
  if(checkpoint.phase==='acquisition'){
-  const reader=await createV1QuotaPageReader(source,participantId,history.observedAtBefore);
-  const result=await advanceV1QuotaAcquisition(reader,identity,new Map(sourcePin.winners.map(w=>[w.observed_day,w.device_id])),budget,checkpoint.acquisition,{maxPages:1});
-  await assertSource();
+  const acquisition=checkpoint.acquisition;
+  const reader=await withStorageGraphFailureStage('graph_history_reader',
+   ()=>createV1QuotaPageReader(source,participantId,history.observedAtBefore));
+  const result=await withStorageGraphFailureStage('graph_history_acquisition_page',
+   ()=>advanceV1QuotaAcquisition(reader,identity,new Map(sourcePin.winners.map(w=>[w.observed_day,w.device_id])),budget,
+    acquisition,{maxPages:1}));
+  await withStorageGraphFailureStage('graph_history_source_postcheck',assertSource);
   if(result.status==='deferred')return {status:'deferred',checkpoint:{...checkpoint,acquisition:result.checkpoint}};
   if(result.status==='not_testable')return {status:'complete',analysis:{status:'not_testable',reason:result.reason}};
   checkpoint={version:1,day,layout,identity,phase:'finish',acquisition:{planAnchors:result.planAnchors,quotaRows:result.quotaRows}};
   return {status:'deferred',checkpoint};
  }
- const finished=await finishHistoricalModelCompositionV1(source,participantId,day,{identity,acquisition:checkpoint.acquisition},budget,{sourcePin});
+ const finished=await withStorageGraphFailureStage('graph_history_finish',
+  ()=>finishHistoricalModelCompositionV1(source,participantId,day,{identity,acquisition:checkpoint.acquisition},budget,{sourcePin}));
  if(finished.status==='deferred')return {status:'deferred',checkpoint};
  // The maintained finisher performs its own final source check. The caller
  // must still fence source dependency and authority when promoting this value.

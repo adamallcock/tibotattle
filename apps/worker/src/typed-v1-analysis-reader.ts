@@ -39,8 +39,16 @@ function planSql(upper:boolean){return `WITH same_time AS MATERIALIZED (
  SELECT r.id,r.observed_at_ms,r.source_row_id FROM typed_telemetry_records r INDEXED BY typed_v1_owner_observed
  WHERE r.format=10 AND r.owner_id=?1 AND r.stream=2 AND r.observed_at_ms>?2${upper?' AND r.observed_at_ms<?5':''}
  ORDER BY r.observed_at_ms,r.source_row_id LIMIT (SELECT ?4-count(*) FROM same_time)
-),page AS MATERIALIZED (SELECT * FROM same_time UNION ALL SELECT * FROM later)
-SELECT page.id physical_id,v.* FROM page LEFT JOIN typed_v1_current_records v ON v.storage_row_id=page.id
+),page AS MATERIALIZED (SELECT * FROM same_time UNION ALL SELECT * FROM later),
+-- Expand only the bounded physical page. A direct outer join makes SQLite
+-- materialize the complete compatibility view before applying the page IDs.
+expanded AS MATERIALIZED (
+ SELECT page.id physical_id,v.* FROM page CROSS JOIN typed_v1_current_records v
+ WHERE v.storage_row_id=page.id
+)
+-- Keep the outer page row so missing compatibility evidence remains a null row
+-- that quotaRow rejects, rather than being mistaken for end-of-input.
+SELECT expanded.* FROM page LEFT JOIN expanded ON expanded.physical_id=page.id
 ORDER BY page.observed_at_ms,page.source_row_id`;}
 export const TYPED_V1_PLAN_PAGE_SQL=planSql(false);
 export const TYPED_V1_HISTORY_PLAN_PAGE_SQL=planSql(true);
@@ -56,8 +64,12 @@ export const TYPED_V1_FIT_PAGE_SQL=`WITH same_key AS MATERIALIZED (
  FROM typed_telemetry_quota q INDEXED BY typed_v1_quota_reset WHERE ${fitScope}
  AND ((${GROUP}),(${VALUE}),q.analysis_observed_at_ms)>(?2,?3,?4)
  ORDER BY (${GROUP}),(${VALUE}),q.analysis_observed_at_ms,q.analysis_source_row_id LIMIT (SELECT ?6-count(*) FROM same_key)
-),page AS MATERIALIZED (SELECT * FROM same_key UNION ALL SELECT * FROM later)
-SELECT page.record_id physical_id,v.* FROM page LEFT JOIN typed_v1_current_records v ON v.storage_row_id=page.record_id
+),page AS MATERIALIZED (SELECT * FROM same_key UNION ALL SELECT * FROM later),
+expanded AS MATERIALIZED (
+ SELECT page.record_id physical_id,v.* FROM page CROSS JOIN typed_v1_current_records v
+ WHERE v.storage_row_id=page.record_id
+)
+SELECT expanded.* FROM page LEFT JOIN expanded ON expanded.physical_id=page.record_id
 ORDER BY page.sort_group,page.sort_value,page.analysis_observed_at_ms,page.analysis_source_row_id`;
 type Row=Record<string,unknown>;
 function quotaRow(row:Row,scope:TypedV1AnalysisScope):V1PlanSourceRow{
