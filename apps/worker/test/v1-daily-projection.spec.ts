@@ -344,6 +344,29 @@ describe('separate typed v1 analytical projection',()=>{
   expect(resumed.acks()).toBe(1);expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
    .toEqual({generation:4,expected_sequence:48,pages_completed:3,state:'complete',result_reason:'page_limit'});
  });
+ it.each(['deadline','query_budget'] as const)('retains and re-enqueues a partial page that reports %s',async reason=>{
+  await seedPage(5,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const run=await catchupRun(16,3,true),sent:StorageAnalyticsV1CatchupMessage[]=[];
+  const original=storageAnalyticsRuntime.runStorageAnalyticsV1CatchupPass;
+  const pass=vi.spyOn(storageAnalyticsRuntime,'runStorageAnalyticsV1CatchupPass').mockImplementationOnce(async options=>{
+   const result=await original(options);return {...result,state:'deferred' as const,reason};
+  });
+  const queue={async send(value:StorageAnalyticsV1CatchupMessage){sent.push(value);}} as unknown as Queue<StorageAnalyticsV1CatchupMessage>;
+  const workerEnv={STORAGE_ANALYTICS_CATCHUP_MODE:'enabled' as const,STORAGE_ANALYTICS_CATCHUP_QUEUE_NAME:'synthetic-analytics-catchup',
+   STORAGE_ANALYTICS_CATCHUP_EXPIRES_AT:new Date(Date.now()+60_000).toISOString(),STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:namespace,STORAGE_INGESTION_DB:source(),STORAGE_ANALYTICS_DB:target(),
+   DELETION_LEDGER:bindings.DELETION_LEDGER,STORAGE_ANALYTICS_CATCHUP_CONTROL_DB:target(),STORAGE_ANALYTICS_CATCHUP_QUEUE:queue};
+  const first=queueBatch(catchupMessage(run,1,0,16,3));await runStorageAnalyticsV1CatchupQueue(first.batch,workerEnv);pass.mockRestore();
+  expect(first.acks()).toBe(1);expect(sent).toHaveLength(1);expect(sent[0]).toMatchObject({generation:2,expectedSequence:5});
+  expect(await target().prepare('SELECT generation,expected_sequence,pages_completed,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({generation:2,expected_sequence:5,pages_completed:1,state:'sent',result_reason:null});
+  expect(await target().prepare('SELECT observed_sequence,events_applied,result_reason FROM storage_analytics_v1_catchup_receipts').first())
+   .toEqual({observed_sequence:5,events_applied:5,result_reason:reason});
+  const resumed=queueBatch(sent[0]!);await runStorageAnalyticsV1CatchupQueue(resumed.batch,workerEnv);
+  expect(resumed.acks()).toBe(1);expect(await target().prepare('SELECT expected_sequence,state,result_reason FROM storage_analytics_v1_catchup_runs').first())
+   .toEqual({expected_sequence:5,state:'complete',result_reason:'complete'});
+  expect(await target().prepare('SELECT count(*) n FROM analytics_applied_events').first('n')).toBe(5);
+ });
  it('retains the first page and blocks before a second page when publication controls change',async()=>{
   await seedPage(32,1);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
   const run=await catchupRun(16,2,true);let controlReads=0;

@@ -229,7 +229,7 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
    let terminalReason:CatchupResultReason|null=null,terminalState:'complete'|'blocked'|null=null;
    if(pagesCompleted>=state.max_pages){terminalReason='page_limit';terminalState='complete';}
    else if(reason==='format_boundary'){terminalReason='format_boundary';terminalState='complete';}
-   else if(reason==='deadline'||reason==='query_budget'||reason==='capacity'||Date.now()>=runDeadlineMs){
+   else if(reason==='capacity'||Date.now()>=runDeadlineMs){
     terminalReason=Date.now()>=runDeadlineMs?'deadline':reason!;terminalState='blocked';
    }
    if(terminalState&&terminalReason){
@@ -248,7 +248,7 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
      pages_completed:pagesCompleted,state:'send-pending',claim_id:null,result_reason:null},
     measuredReceipt(state,after,reason??'cursor_reconciled',generationStarted,result??undefined),env);
    pagesThisInvocation+=result?1:0;
-   if(result&&state.page_events===16&&pagesThisInvocation<MAX_PAGES_PER_DELIVERY
+   if(result&&reason!=='deadline'&&reason!=='query_budget'&&state.page_events===16&&pagesThisInvocation<MAX_PAGES_PER_DELIVERY
     &&remainingPageQueries>=MIN_PAGE_QUERY_BUDGET&&Date.now()<invocationDeadlineMs){
     state=await transition(control,`UPDATE storage_analytics_v1_catchup_runs SET state='running',claim_id=?,updated_ms=?
      WHERE run_id=? AND generation=? AND expected_sequence=? AND state='send-pending'`,
