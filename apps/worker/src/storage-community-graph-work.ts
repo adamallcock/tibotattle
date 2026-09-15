@@ -8,8 +8,42 @@ import { validStorageModelPublication, type StorageModelPublicationValue } from 
 import { withStorageGraphFailureStage } from './storage-analytics-failure';
 
 const fail=()=>new Error('STORAGE_GRAPH_WORK_UNAVAILABLE');
+const CURRENT_FIT_CACHE_PAGE=64;
+type CachedCurrentFit={owner_digest:string;source_kind:'v0.2'|'v1'|'v1.1'|'mixed'};
 export interface StorageGraphWorkProgress {
  state:'complete'|'reused'|'deferred'|'idle';metric?:'fits'|'model';day?:string;reason?:string;
+}
+
+function ownerSource(owner:StorageCommunityOwner):CachedCurrentFit['source_kind'] {
+ return owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
+}
+
+/** A current fit is publishable as a completed snapshot across later appends,
+ * so presence under the exact method and source format is the recovery hint.
+ * The graph kernel and publisher retain their full input and authority checks. */
+async function nextMissingCurrentFitPosition(target:D1Database,sourceId:string,owners:StorageCommunityOwner[],
+ position:number,day:string):Promise<number> {
+ const cached=new Map<string,CachedCurrentFit['source_kind']>();
+ const digests=owners.flatMap(owner=>owner.ownerDigest?[owner.ownerDigest]:[]);
+ for(let offset=0;offset<digests.length;offset+=CURRENT_FIT_CACHE_PAGE) {
+  const page=digests.slice(offset,offset+CURRENT_FIT_CACHE_PAGE);
+  const rows=(await target.prepare(`SELECT owner_digest,source_kind FROM analytics_community_graph_results
+   WHERE source_id=? AND metric='fits' AND day=? AND method=?
+     AND owner_digest IN(${page.map(()=>'?').join(',')}) ORDER BY owner_digest LIMIT ?`)
+   .bind(sourceId,day,STORAGE_GRAPH_METHOD,...page,page.length+1).all<CachedCurrentFit>()).results;
+  if(rows.length>page.length)throw fail();
+  const expected=new Set(page);
+  for(const row of rows) {
+   if(!expected.has(row.owner_digest)||!['v0.2','v1','v1.1','mixed'].includes(row.source_kind))throw fail();
+   cached.set(row.owner_digest,row.source_kind);
+  }
+ }
+ const start=Math.floor(position/2);
+ for(let offset=0;offset<owners.length;offset++) {
+  const index=(start+offset)%owners.length,owner=owners[index]!;
+  if(!owner.ownerDigest||cached.get(owner.ownerDigest)!==ownerSource(owner))return index*2;
+ }
+ return position;
 }
 
 /** Fair selection is durable BEFORE an expensive query. One problematic source
@@ -46,11 +80,12 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  if(!scan||![scan.revision,scan.tick,scan.current_position,scan.history_position].every(Number.isSafeInteger)
   ||scan.revision<1||scan.tick<0||scan.tick>2||scan.current_position<0||scan.history_position<0)throw fail();
  const current=scan.tick===0;
- const position=current?scan.current_position%(owners.length*2)
+ let position=current?scan.current_position%(owners.length*2)
   :scan.history_position%owners.length;
+ const today=new Date(nowMs).toISOString().slice(0,10);
+ if(current&&position%2===0)position=await nextMissingCurrentFitPosition(options.target,options.sourceId,owners,position,today);
  const owner=owners[current?Math.floor(position/2):position%owners.length]!;
  const metric=current&&position%2===0?'fits':'model';
- const today=new Date(nowMs).toISOString().slice(0,10);
  let day:string|null=today;
  if(!current) {
   const authority=await captureStorageCommunityAuthority(options.source,options);
