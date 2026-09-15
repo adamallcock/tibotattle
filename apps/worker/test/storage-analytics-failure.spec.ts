@@ -1,7 +1,7 @@
 import { describe,expect,it } from 'vitest';
 import { D1InvocationBudgetExceededError } from '../src/d1-invocation-budget';
 import { V11ProjectionDeadlineExceededError } from '../src/v11-daily-projection';
-import { classifyStorageGraphFailure,storageGraphFailureFields,StorageGraphOperationError,
+import { caughtStorageGraphFailureFields,classifyStorageGraphFailure,storageGraphFailureFields,StorageGraphOperationError,
  withStorageGraphFailureStage } from '../src/storage-analytics-failure';
 
 describe('storage analytics graph failure diagnostics',()=>{
@@ -37,5 +37,14 @@ describe('storage analytics graph failure diagnostics',()=>{
  it('preserves the innermost classified stage',async()=>{
   const inner=new StorageGraphOperationError('graph_checkpoint_load','d1_timeout');
   await expect(withStorageGraphFailureStage('graph_model_compute',async()=>{throw inner})).rejects.toBe(inner);
+ });
+
+ it('classifies a caught direct read without exposing details or relabeling controlled deferrals',()=>{
+  const failure=caughtStorageGraphFailureFields('graph_history_direct_read',
+   new Error('D1_ERROR: Exceeded CPU time limit. error 7429 private participant detail'));
+  expect(failure).toEqual({phase:'graph_history_direct_read',reason:'d1_cpu_limit'});
+  expect(JSON.stringify(failure)).not.toContain('private participant detail');
+  expect(caughtStorageGraphFailureFields('graph_history_direct_read',new D1InvocationBudgetExceededError())).toBeUndefined();
+  expect(caughtStorageGraphFailureFields('graph_history_direct_read',new V11ProjectionDeadlineExceededError())).toBeUndefined();
  });
 });

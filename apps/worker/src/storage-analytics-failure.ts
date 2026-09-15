@@ -3,6 +3,7 @@ import { V11ProjectionDeadlineExceededError } from './v11-daily-projection';
 
 export const STORAGE_GRAPH_OPERATION_STAGES=[
  'graph_scope','graph_historical_pin','graph_checkpoint_load',
+ 'graph_history_direct_read',
  'graph_history_layout','graph_history_source_precheck','graph_history_reader',
  'graph_history_acquisition_page','graph_history_source_postcheck','graph_history_finish',
  'graph_checkpoint_save','graph_current_fit_compute','graph_model_compute',
@@ -63,4 +64,13 @@ export async function withStorageGraphFailureStage<T>(stage:StorageGraphOperatio
  * its message, a query, bindings, or identifiers to the scheduler log. */
 export function storageGraphFailureFields(error:unknown):StorageGraphFailureFields|Record<string,never>{
  return error instanceof StorageGraphOperationError?{phase:error.stage,reason:error.reason}:{};
+}
+
+/** Classify a caught best-effort graph operation without converting controlled
+ * query-budget or deadline exhaustion into a scheduler failure. */
+export function caughtStorageGraphFailureFields(stage:StorageGraphOperationStage,
+ error:unknown):StorageGraphFailureFields|undefined {
+ if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError)return undefined;
+ if(error instanceof StorageGraphOperationError)return {phase:error.stage,reason:error.reason};
+ return {phase:stage,reason:classifyStorageGraphFailure(error)};
 }
