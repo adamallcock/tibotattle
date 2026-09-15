@@ -16,7 +16,8 @@ import { captureStorageCommunityAuthority, sameStorageCommunityCalculationAuthor
   type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { createD1InvocationBudget } from './d1-invocation-budget';
-import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis } from './storage-v1-history';
+import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis,
+  type StorageV1HistoryCheckpoint } from './storage-v1-history';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
   type StorageHistoryKey, type StorageHistoryLoadCursor } from './storage-history-checkpoint';
 import { caughtStorageGraphFailureFields, withStorageGraphFailureStage,
@@ -38,6 +39,7 @@ const MAX_RESULT_BYTES = 1024 * 1024;
 // outer window for the final source proof and one bounded checkpoint-save
 // batch, otherwise a deadline-limited pass can discard the page it acquired.
 const STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS = 6_000;
+const STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM = 10;
 const fail = () => new Error('STORAGE_GRAPH_RESULT_UNAVAILABLE');
 const scopeChanged = () => new Error('storage graph scope changed');
 export type StorageGraphSource = 'v0.2' | 'v1' | 'v1.1' | 'mixed';
@@ -180,6 +182,26 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     return {state:'complete',result:cached,reused:true};
   }
   const nowMs=Date.parse(scope.fixedNow),source=bindings.source;
+  const persistCheckpoint=async(key:StorageHistoryKey,checkpoint:StorageV1HistoryCheckpoint,
+    expectedHead:string|null,reason:string):Promise<
+    {state:'saved';head:string}|{state:'deferred';reason:string;failure?:StorageGraphFailureFields}>=>{
+    if(!await current(source,scope))return {state:'deferred',reason};
+    try{
+      while(meter.remainingQueries>=40&&now()<deadlineMs){
+        const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
+          ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint,expectedHead}));
+        if(saved.status==='saved')return {state:'saved',head:saved.headDigest};
+      }
+    }catch(error){
+      const failure=caughtStorageGraphFailureFields('graph_checkpoint_save',error);
+      if(!failure||failure.reason!=='checkpoint_unavailable')throw error;
+      let latest;try{latest=await readStorageHistoryCheckpointHead({target:bindings.target,key});}catch{throw error;}
+      if(latest?.retired===0&&latest.generation!==null&&latest.generation!==expectedHead)
+        return {state:'deferred',reason,failure};
+      throw error;
+    }
+    return {state:'deferred',reason};
+  };
   let payload='';
   if(scope.metric==='fits') {
     const analyses:Array<{source:'v0.2'|'v1'|'v1.1';analysis:object}>=[];
@@ -198,28 +220,18 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
        if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
        head=loaded.headDigest??null;if(loaded.status==='ready')checkpoint=loaded.checkpoint;break;
       }
-      const next=await advanceStorageV1CurrentFitAnalysis({source,participantId:scope.owner.participantId,
-       day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),
-        deadlineMs:checkpointWorkDeadlineMs,now}});
-      if(next.status==='complete')analyses.push({source:'v1',analysis:next.analysis});
-      else {
-       const checkpointToSave=next.checkpoint;
-       if(checkpointToSave&&await current(source,scope)){
-        try{
-         while(meter.remainingQueries>=40&&now()<deadlineMs){
-          const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
-           ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:checkpointToSave,expectedHead:head}));
-          if(saved.status==='saved')break;
-         }
-        }catch(error){
-         const failure=caughtStorageGraphFailureFields('graph_checkpoint_save',error);
-         if(!failure||failure.reason!=='checkpoint_unavailable')throw error;
-         let latest;try{latest=await readStorageHistoryCheckpointHead({target:bindings.target,key});}catch{throw error;}
-         if(latest?.retired===0&&latest.generation!==null&&latest.generation!==head)
-          return {state:'deferred',reason:'current_fit_checkpoint',failure};
-         throw error;
-        }
-       }
+      for(let page=0;page<STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM;page++){
+       const next=await advanceStorageV1CurrentFitAnalysis({source,participantId:scope.owner.participantId,
+        day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),
+         deadlineMs:checkpointWorkDeadlineMs,now}});
+       if(next.status==='complete'){analyses.push({source:'v1',analysis:next.analysis});break;}
+       if(!next.checkpoint)return {state:'deferred',reason:'current_fit_checkpoint'};
+       const saved=await persistCheckpoint(key,next.checkpoint,head,'current_fit_checkpoint');
+       if(saved.state==='deferred')return saved;
+       if(saved.head===head)return {state:'deferred',reason:'current_fit_checkpoint'};
+       head=saved.head;checkpoint=next.checkpoint;
+      }
+      if(!analyses.some(analysis=>analysis.source==='v1')){
        return {state:'deferred',reason:'current_fit_checkpoint'};
       }
     }
@@ -278,32 +290,18 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
             if(loaded.status==='ready')checkpoint=loaded.checkpoint;
             break;
           }
-          const next=await advanceStorageV1HistoricalAnalysis({source,participantId:scope.owner.participantId,
-            day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),
-              deadlineMs:checkpointWorkDeadlineMs,now}});
-          if(next.status==='complete')composition=next.analysis;
-          else {
-            const checkpointToSave=next.checkpoint;
-            if(checkpointToSave && await current(source,scope)) {
-              try {
-                while(meter.remainingQueries>=40&&now()<deadlineMs) {
-                  const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
-                    ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:checkpointToSave,expectedHead:head}));
-                  if(saved.status==='saved')break;
-                }
-              } catch(error) {
-                const failure=caughtStorageGraphFailureFields('graph_checkpoint_save',error);
-                if(!failure||failure.reason!=='checkpoint_unavailable')throw error;
-                let latest;
-                try { latest=await readStorageHistoryCheckpointHead({target:bindings.target,key}); }
-                catch { throw error; }
-                if(latest?.retired===0&&latest.generation!==null&&latest.generation!==head)
-                  return {state:'deferred',reason:'historical_checkpoint',failure};
-                throw error;
-              }
-            }
-            return {state:'deferred',reason:'historical_checkpoint'};
+          for(let page=0;page<STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM;page++){
+            const next=await advanceStorageV1HistoricalAnalysis({source,participantId:scope.owner.participantId,
+              day:scope.day,sourcePin:scope.pin,checkpoint,budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),
+                deadlineMs:checkpointWorkDeadlineMs,now}});
+            if(next.status==='complete'){composition=next.analysis;break;}
+            if(!next.checkpoint)return {state:'deferred',reason:'historical_checkpoint'};
+            const saved=await persistCheckpoint(key,next.checkpoint,head,'historical_checkpoint');
+            if(saved.state==='deferred')return saved;
+            if(saved.head===head)return {state:'deferred',reason:'historical_checkpoint'};
+            head=saved.head;checkpoint=next.checkpoint;
           }
+          if(composition===null)return {state:'deferred',reason:'historical_checkpoint'};
         }
       }
     }

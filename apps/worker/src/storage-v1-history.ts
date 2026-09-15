@@ -67,10 +67,9 @@ export async function advanceStorageV1HistoricalAnalysis(input:{source:D1Databas
 }
 
 /** Current scalar fit acquisition uses the same exact source pin and maintained
- * page reducer as historical composition. Up to64 indexed pages may advance per
- * claim; the shared deadline/query budget stops cleanly between whole pages.
- * The caller persists the returned checkpoint under a metric-specific key and
- * performs the final graph source/privacy fence before result promotion. */
+ * page reducer as historical composition. Each call advances exactly one page;
+ * the caller must durably promote that deterministic successor before asking
+ * for another page in the same claim. */
 export async function advanceStorageV1CurrentFitAnalysis(input:{source:D1Database;participantId:string;day:string;
  sourcePin:V1SourcePin;budget:V1QuotaInvocationBudget;checkpoint?:StorageV1HistoryCheckpoint|null}):Promise<StorageV1CurrentFitResult>{
  const {source,participantId,day,budget}=input,sourcePin=structuredClone(input.sourcePin),window=modelHistoryWindow(day);
@@ -99,7 +98,7 @@ export async function advanceStorageV1CurrentFitAnalysis(input:{source:D1Databas
   if(checkpoint.phase==='acquisition'){
    const reader=await createV1QuotaPageReader(source,participantId);
    const result=await advanceV1QuotaAcquisition(reader,identity,
-    new Map(sourcePin.winners.map(w=>[w.observed_day,w.device_id])),budget,checkpoint.acquisition,{maxPages:64});
+    new Map(sourcePin.winners.map(w=>[w.observed_day,w.device_id])),budget,checkpoint.acquisition,{maxPages:1});
    await assertSource();
    if(result.status==='deferred')return {status:'deferred',checkpoint:{...checkpoint,acquisition:result.checkpoint}};
    if(result.status==='not_testable')return {status:'complete',analysis:{schemaVersion:'account-scoped-quota-analysis-v0.1',

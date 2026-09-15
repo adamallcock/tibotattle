@@ -65,6 +65,12 @@ function unavailableCheckpointOwner(database:D1Database,onUnavailable?:()=>Promi
  return new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
 }
+function loseFirstCheckpointBatchResponse(database:D1Database){let losses=0;
+ return {database:new Proxy(database,{get(value,key){
+  if(key==='batch')return async(statements:D1PreparedStatement[])=>{const result=await value.batch(statements);
+   if(losses++===0)throw new Error('synthetic committed checkpoint response loss');return result;};
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),losses:()=>losses};
+}
 function checkpointForKey(key:StorageHistoryKey):StorageV1HistoryCheckpoint{
  const identity={participantId:'synthetic-checkpoint-participant',inputFingerprint:'c'.repeat(64),sourceMethodVersion:MODEL_HISTORY_METHOD_VERSION,
   observedAtCutoff:'2026-05-28T00:00:00.000Z',resetsAtCutoff:'2026-06-04T00:00:00.000Z',windowMinutes:10080,maxQuotaRows:60000};
@@ -115,17 +121,19 @@ async function fixture(){
 it('advances current v1 fits through a durable bounded acquisition before semantic result promotion',async()=>{
  const owner=await fixture(),observed=observePreparedSql(source());
  const scope=await captureStorageGraphScope(observed.database,{owner,day,metric:'fits',sourceId,sourceNamespace:namespace});
- const first=await computeStorageGraphResult({...bindings(),source:observed.database},scope);
- expect(first).toEqual({state:'deferred',reason:'current_fit_checkpoint'});
+ const meter=createD1InvocationBudget(900);
+ const first=await computeStorageGraphResult({...bindings(),source:meter.wrap(observed.database),target:meter.wrap(target())},scope);
+ expect(first.state).toBe('complete');
+ expect(meter.queriesUsed).toBeLessThanOrEqual(900);
  expect(observed.queries.some(sql=>sql.includes('typed_quota_input AS MATERIALIZED'))).toBe(false);
  expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
   WHERE source_id=? AND owner_digest=? AND day=? AND dependency_digest=? AND method=?`)
-  .bind(sourceId,owner.ownerDigest,day,scope.dependencyDigest,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD).first('n')).toBe(1);
- expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_results
-  WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(sourceId,owner.ownerDigest,day).first('n')).toBe(0);
+  .bind(sourceId,owner.ownerDigest,day,scope.dependencyDigest,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD).first<number>('n'))
+  .toBeGreaterThan(1);
 
- let completed:Awaited<ReturnType<typeof computeStorageGraphResult>>|undefined;
+ let completed:Awaited<ReturnType<typeof computeStorageGraphResult>>|undefined=first;
  for(let attempt=0;attempt<4;attempt++){
+  if(completed.state==='complete')break;
   const next=await computeStorageGraphResult(bindings(),scope);
   if(next.state==='complete'){completed=next;break;}
   expect(next.reason).toBe('current_fit_checkpoint');
@@ -153,6 +161,21 @@ it('saves current-fit progress acquired at the work deadline inside the outer de
   .toBeGreaterThan(0);
 },60000);
 
+it('resumes from a page promoted before its response was lost',async()=>{
+ const owner=await fixture(),scope=await captureStorageGraphScope(source(),{owner,day,metric:'fits',sourceId,sourceNamespace:namespace});
+ const lost=loseFirstCheckpointBatchResponse(target());
+ await expect(computeStorageGraphResult({...bindings(),target:lost.database},scope))
+  .rejects.toMatchObject({message:'STORAGE_GRAPH_OPERATION_UNAVAILABLE',stage:'graph_checkpoint_save',reason:'application'});
+ expect(lost.losses()).toBe(1);
+ expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads WHERE retired=0').first('n')).toBe(1);
+ const resumed=await computeStorageGraphResult(bindings(),scope);
+ expect(resumed).toMatchObject({state:'complete'});
+ expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+  WHERE source_id=? AND owner_digest=? AND day=? AND dependency_digest=? AND method=?`)
+  .bind(sourceId,owner.ownerDigest,day,scope.dependencyDigest,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD).first<number>('n'))
+  .toBeGreaterThan(1);
+},60000);
+
 it('reopens one repaired direct attempt, serializes concurrent claims, then falls back to the same semantic checkpoint',async()=>{
  const owner=await fixture(),observed=observePreparedSql(source());
  const scope=await captureStorageGraphScope(observed.database,{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
@@ -177,22 +200,23 @@ it('reopens one repaired direct attempt, serializes concurrent claims, then fall
  const attempts=observeDirectAttempts(source(),true),concurrentBindings={...bindings(),source:attempts.database};
  const concurrent=await Promise.all([
   computeStorageGraphResult(concurrentBindings,scope),computeStorageGraphResult(concurrentBindings,scope)]);
- expect(concurrent.every(result=>result.state==='deferred')).toBe(true);
+ expect(concurrent.some(result=>result.state==='complete')).toBe(true);
  expect(concurrent.flatMap(result=>result.state==='deferred'&&result.failure?[result.failure]:[]))
   .toEqual([{phase:'graph_history_direct_read',reason:'application'}]);
  expect(attempts.attempts()).toBe(1);
  const executionDigest=await target().prepare(`SELECT dependency_digest FROM analytics_community_graph_execution
   WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,owner.ownerDigest,day).first<string>('dependency_digest');
  expect(executionDigest).toMatch(/^[a-f0-9]{64}$/);expect(executionDigest).not.toBe(scope.dependencyDigest);
- let deferred=0,completed=false;
+ let completed=concurrent.some(result=>result.state==='complete');
  for(let i=0;i<24;i++){
+  if(completed)break;
   const meter=createD1InvocationBudget(900);
   const result=await computeStorageGraphResult({...bindings(),source:meter.wrap(attempts.database),target:meter.wrap(target())},scope);
   expect(meter.queriesUsed).toBeLessThanOrEqual(900);
-  if(result.state==='deferred'){deferred++;continue;}
+  if(result.state==='deferred')continue;
   expect(result.result.composition).toEqual(expected);completed=true;break;
  }
- expect(deferred).toBeGreaterThan(0);expect(completed).toBe(true);
+ expect(completed).toBe(true);
  expect(attempts.attempts()).toBe(1);
  expect(await target().prepare(`SELECT dependency_digest FROM analytics_community_graph_execution
   WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,owner.ownerDigest,day).first('dependency_digest')).toBe(executionDigest);
@@ -265,13 +289,13 @@ it('preserves a retired legacy tombstone while a repaired checkpoint generation 
   .toEqual({status:'retired'});
 
  const resumed=await computeStorageGraphResult(bindings(),scope);
- expect(resumed).toMatchObject({state:'deferred',reason:'historical_checkpoint'});
+ expect(resumed).toMatchObject({state:'complete'});
  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads WHERE retired=1').first('n')).toBe(1);
  expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
   WHERE method=? AND dependency_digest=?`).bind(STORAGE_GRAPH_METHOD,scope.dependencyDigest).first('n')).toBe(0);
  expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
   WHERE method=? AND dependency_digest=?`).bind(STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,scope.dependencyDigest).first<number>('n'))
-  .toBeGreaterThan(0);
+  .toBeGreaterThan(1);
  expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_execution
   WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,owner.ownerDigest,day).first('n')).toBe(1);
 },60000);
