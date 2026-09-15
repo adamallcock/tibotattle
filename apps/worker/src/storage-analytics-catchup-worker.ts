@@ -1,5 +1,6 @@
 import { readCollectionControls } from './collection-controls';
-import { runStorageAnalyticsV1CatchupPass, type StorageAnalyticsCatchupMetrics } from './storage-analytics-runtime';
+import { runStorageAnalyticsPass, runStorageAnalyticsV1CatchupPass, type StorageAnalyticsCatchupMetrics,
+ type StorageAnalyticsPass } from './storage-analytics-runtime';
 
 export const STORAGE_ANALYTICS_CATCHUP_CONTROL_SQL=`CREATE TABLE storage_analytics_v1_catchup_runs(
  run_id TEXT PRIMARY KEY,
@@ -78,6 +79,7 @@ const MAX_PAGES_PER_DELIVERY=3;
 // D1 permits 1,000 queries per Worker invocation. Leave explicit headroom for
 // cursor/control checks, checkpoint receipts, recovery and the final send.
 const PAGE_QUERY_BUDGET_PER_DELIVERY=840,MIN_PAGE_QUERY_BUDGET=250;
+const MIN_ORDINARY_BOUNDARY_QUERY_BUDGET=140;
 const runId=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const sourceId=/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/;
 const elapsed=(started:number)=>Math.max(0,Math.ceil(performance.now()-started));
@@ -160,12 +162,12 @@ function exactImmutableInput(input:StorageAnalyticsV1CatchupMessage,row:RunRow):
   &&input.expectedPublicationEnabled===(row.expected_publication_enabled===1);
 }
 function measuredReceipt(row:RunRow,after:number,reason:CatchupResultReason,started:number,result?:{
- recordsRead:number;queriesUsed:number;metrics:StorageAnalyticsCatchupMetrics;
+ recordsRead:number;queriesUsed:number;metrics?:StorageAnalyticsCatchupMetrics;
 }):Receipt{return {run_id:row.run_id,generation:row.generation,expected_sequence:row.expected_sequence,observed_sequence:after,
- events_applied:after-row.expected_sequence,records_read:result?.recordsRead??null,decoded_bytes:result?.metrics.decodedBytes??null,
- metered_queries:result?.queriesUsed??null,source_read_ms:result?.metrics.sourceReadMs??null,fold_ms:result?.metrics.foldMs??null,
- source_recheck_ms:result?.metrics.sourceRecheckMs??null,target_write_ms:result?.metrics.targetWriteMs??null,
- page_duration_ms:result?.metrics.pageDurationMs??null,invocation_duration_ms:elapsed(started),result_reason:reason,completed_ms:Date.now()};}
+ events_applied:after-row.expected_sequence,records_read:result?.recordsRead??null,decoded_bytes:result?.metrics?.decodedBytes??null,
+ metered_queries:result?.queriesUsed??null,source_read_ms:result?.metrics?.sourceReadMs??null,fold_ms:result?.metrics?.foldMs??null,
+ source_recheck_ms:result?.metrics?.sourceRecheckMs??null,target_write_ms:result?.metrics?.targetWriteMs??null,
+ page_duration_ms:result?.metrics?.pageDurationMs??null,invocation_duration_ms:elapsed(started),result_reason:reason,completed_ms:Date.now()};}
 
 /** Queue batches are configured size one/max concurrency one. Every generation
  * is bounded by the run row. A failed generation advances to a retained blocked
@@ -214,13 +216,35 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
   if(controls.publication!==(state.expected_publication_enabled===1)||controls.revision!==state.expected_collection_revision)
    throw new Error('STORAGE_ANALYTICS_PUBLICATION_CONTROL_CHANGED');
   if(Date.now()>=runDeadlineMs)throw new Error('STORAGE_ANALYTICS_CATCHUP_DEADLINE');
-  let result:Awaited<ReturnType<typeof runStorageAnalyticsV1CatchupPass>>|null=null;
+  let result:(StorageAnalyticsPass&{metrics?:StorageAnalyticsCatchupMetrics})|null=null,ordinaryBoundary=false;
   if(before===state.expected_sequence)result=await runStorageAnalyticsV1CatchupPass({source:env.STORAGE_INGESTION_DB,
    target:env.STORAGE_ANALYTICS_DB,ledger:env.DELETION_LEDGER,sourceId:env.STORAGE_SOURCE_ID,
    sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,pageEvents:state.page_events,maxSteps:state.page_events,
    deadlineMs:invocationDeadlineMs,maxQueries:remainingPageQueries,publicationControlRevision:state.expected_collection_revision,
    publicationEnabled:state.expected_publication_enabled===1});
   if(result)remainingPageQueries-=result.queriesUsed;
+  // The fast page deliberately stops before a superseded, non-active-owner,
+  // terminal or different-format event. Let the maintained ordinary runtime
+  // handle exactly that one boundary with its owner, erasure and source fences,
+  // without enabling public graph work. Its meter receives only the delivery's
+  // remaining budget, so the two runtime calls cannot reset the 840-query cap.
+  if(result?.reason==='format_boundary'&&result.steps===0&&before===state.expected_sequence){
+   if(Date.now()>=invocationDeadlineMs)result={...result,state:'deferred',reason:'deadline'};
+   else if(remainingPageQueries<MIN_ORDINARY_BOUNDARY_QUERY_BUDGET)result={...result,state:'deferred',reason:'query_budget'};
+   else {
+    ordinaryBoundary=true;
+    const ordinary=await runStorageAnalyticsPass({source:env.STORAGE_INGESTION_DB,target:env.STORAGE_ANALYTICS_DB,
+     ledger:env.DELETION_LEDGER,sourceId:env.STORAGE_SOURCE_ID,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,
+     maxSteps:1,deadlineMs:invocationDeadlineMs,maxQueries:remainingPageQueries,publishCommunity:false});
+    remainingPageQueries-=ordinary.queriesUsed;
+    const currentControls=await readCollectionControls(env.STORAGE_INGESTION_DB);
+    if(currentControls.publication!==(state.expected_publication_enabled===1)
+     ||currentControls.revision!==state.expected_collection_revision)
+     throw new Error('STORAGE_ANALYTICS_PUBLICATION_CONTROL_CHANGED');
+    result={...ordinary,recordsRead:result.recordsRead+ordinary.recordsRead,
+     queriesUsed:result.queriesUsed+ordinary.queriesUsed};
+   }
+  }
   const after=await cursor(env.STORAGE_ANALYTICS_DB,env.STORAGE_SOURCE_ID);
   if(after<state.expected_sequence||after<before)throw cursorRegressed();
   if(after>state.expected_sequence+state.page_events)throw cursorAdvanced();
@@ -228,7 +252,6 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
   if(after>state.expected_sequence){
    let terminalReason:CatchupResultReason|null=null,terminalState:'complete'|'blocked'|null=null;
    if(pagesCompleted>=state.max_pages){terminalReason='page_limit';terminalState='complete';}
-   else if(reason==='format_boundary'){terminalReason='format_boundary';terminalState='complete';}
    else if(reason==='capacity'||Date.now()>=runDeadlineMs){
     terminalReason=Date.now()>=runDeadlineMs?'deadline':reason!;terminalState='blocked';
    }
@@ -256,6 +279,44 @@ export async function runStorageAnalyticsV1CatchupQueue(batch:MessageBatch<Stora
       expected_sequence:state.expected_sequence,state:'running',claim_id:delivered.id},env);
     generationStarted=performance.now();
     continue;
+   }
+   await sendPending(state,env);delivered.ack();return;
+  }
+  // Some maintained ordinary projections (notably a large typed-v1.1 domain)
+  // commit bounded, replay-safe work while intentionally leaving the global
+  // event cursor in place. The ordinary pass reports that durable unit as one
+  // successful step. Checkpoint a content-free zero-event receipt and revisit
+  // the same cursor in the next generation; deadline/query exhaustion still
+  // uses the no-receipt graceful-yield path below.
+  if(ordinaryBoundary&&result?.steps===1&&['step_limit','deadline','query_budget'].includes(reason!)
+   &&before===state.expected_sequence){
+   const workPagesCompleted=state.pages_completed+1;
+   if(workPagesCompleted>=state.max_pages||Date.now()>=runDeadlineMs){
+    const terminalReason:CatchupResultReason=workPagesCompleted>=state.max_pages?'page_limit':'deadline';
+    const terminalState:'complete'|'blocked'=terminalReason==='page_limit'?'complete':'blocked';
+    await transitionWithReceipt(control,`UPDATE storage_analytics_v1_catchup_runs SET generation=generation+1,pages_completed=?,
+     state=?,claim_id=NULL,result_reason=?,updated_ms=? WHERE run_id=? AND generation=?
+     AND expected_sequence=? AND state='running' AND claim_id=?`,[workPagesCompleted,terminalState,terminalReason,Date.now(),state.run_id,state.generation,
+      state.expected_sequence,delivered.id],{run_id:state.run_id,generation:state.generation+1,expected_sequence:state.expected_sequence,
+      pages_completed:workPagesCompleted,state:terminalState,claim_id:null,result_reason:terminalReason},
+     measuredReceipt(state,state.expected_sequence,terminalReason,generationStarted,result),env);
+    delivered.ack();return;
+   }
+   state=await transitionWithReceipt(control,`UPDATE storage_analytics_v1_catchup_runs SET generation=generation+1,pages_completed=?,
+    state='send-pending',claim_id=NULL,result_reason=NULL,updated_ms=? WHERE run_id=? AND generation=?
+    AND expected_sequence=? AND state='running' AND claim_id=?`,[workPagesCompleted,Date.now(),state.run_id,state.generation,
+     state.expected_sequence,delivered.id],{run_id:state.run_id,generation:state.generation+1,expected_sequence:state.expected_sequence,
+     pages_completed:workPagesCompleted,state:'send-pending',claim_id:null,result_reason:null},
+    measuredReceipt(state,state.expected_sequence,reason!,generationStarted,result),env);
+   pagesThisInvocation+=1;
+   if(reason==='step_limit'&&state.page_events===16&&pagesThisInvocation<MAX_PAGES_PER_DELIVERY
+    &&remainingPageQueries>=MIN_PAGE_QUERY_BUDGET
+    &&Date.now()<invocationDeadlineMs){
+    state=await transition(control,`UPDATE storage_analytics_v1_catchup_runs SET state='running',claim_id=?,updated_ms=?
+     WHERE run_id=? AND generation=? AND expected_sequence=? AND state='send-pending'`,
+     [delivered.id,Date.now(),state.run_id,state.generation,state.expected_sequence],{run_id:state.run_id,generation:state.generation,
+      expected_sequence:state.expected_sequence,state:'running',claim_id:delivered.id},env);
+    generationStarted=performance.now();continue;
    }
    await sendPending(state,env);delivered.ack();return;
   }
