@@ -32,6 +32,7 @@ import { sha256Hex } from "./crypto";
 import { parseStoredRecordJson } from "./stored-record";
 import { assertV11SourcePinCurrent, loadV11SourcePin } from "./telemetry-v11-domain";
 import type { V11SourcePin } from "./telemetry-v11-domain";
+import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
 import { typedTelemetryReadNamespace } from "./typed-telemetry-read-layout";
 import { readTypedV11UsageAnalysisPage, TYPED_V11_ANALYSIS_PAGE_SIZE } from "./typed-v11-analysis-reader";
 
@@ -136,11 +137,26 @@ const QUOTA_INPUT = `
        AND observed_at >= ? AND observed_at < ? AND limit_id = 'codex'
   )`;
 
+// Keep the active-domain view as the semantic authority, but make the physical
+// owner/time index the outer loop.  A direct join lets SQLite expand the view
+// once per already bounded physical row instead of materializing every admitted
+// compatibility row before applying participant, generation and time filters.
+// The source namespace and owner are both resolved from the initialized typed
+// namespace; the active view still supplies the complete admission/domain fence.
 const TYPED_QUOTA_INPUT = `input AS MATERIALIZED (
-  SELECT r.*, CASE WHEN account_basis='same_source' THEN account_track_id ELSE '' END AS account_scope_id,
-    plan_era_id AS continuity_id FROM typed_v11_active_records r
-  WHERE participant_id=? AND generation_id=? AND stream='quota'
-    AND observed_day>=? AND observed_day<? AND observed_at>=? AND observed_at<? AND limit_id='codex'
+  SELECT v.*, CASE WHEN v.account_basis='same_source' THEN v.account_track_id ELSE '' END AS account_scope_id,
+    v.plan_era_id AS continuity_id
+  FROM typed_telemetry_records base INDEXED BY typed_telemetry_owner_time
+  CROSS JOIN typed_v11_active_records v
+  WHERE v.storage_row_id=base.id
+    AND v.participant_id=? AND v.generation_id=? AND v.stream='quota'
+    AND v.observed_day>=? AND v.observed_day<? AND v.observed_at>=? AND v.observed_at<?
+    AND v.limit_id='codex' AND v.source_namespace=?
+    AND base.format=11 AND base.stream=2
+    AND base.observed_at_ms>=? AND base.observed_at_ms<?
+    AND base.owner_id=(SELECT o.id FROM typed_telemetry_owners o
+      JOIN typed_telemetry_namespaces n ON n.id=o.namespace_id
+      WHERE n.original_id=? AND o.original_id=?)
 )`;
 
 // All durations and non-fitting plan observations participate BEFORE the
@@ -209,6 +225,11 @@ const QUOTA_SQL = `WITH markers AS MATERIALIZED (
     FROM marked WHERE previous IS NULL OR next IS NULL OR previous != used_percent OR next != used_percent
     ORDER BY observed_at, id LIMIT ?`;
 
+// Export the exact typed statements so the owning query-plan regression can
+// EXPLAIN the production SQL without reconstructing a private replacement.
+export const TYPED_V11_PLAN_SQL = PLAN_SQL.replace(QUOTA_INPUT, TYPED_QUOTA_INPUT);
+export const TYPED_V11_QUOTA_SQL = QUOTA_SQL.replace(QUOTA_INPUT, TYPED_QUOTA_INPUT);
+
 function markers(index: PlanAttributionIndex): string {
   return JSON.stringify(index.eras.map((era, ordinal) => [
     era.contextKey.split("|")[0], era.accountScopeId ?? "", "codex", era.planType, era.planVariant,
@@ -238,8 +259,14 @@ async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11Analy
   // a predecessor query would scan the entire historical domain. Keep this
   // bounded horizon explicit and conditional until an indexed predecessor
   // lane exists; never assert a verified pre-window plan or quantity interval.
-  const inputSql = options.typedSourceNamespace ? TYPED_QUOTA_INPUT : QUOTA_INPUT;
-  const evidence = await db.prepare(PLAN_SQL.replace(QUOTA_INPUT, inputSql)).bind(...bindings, MAX_PLAN_ATTRIBUTION_ROWS + 1).all<PlanRow>();
+  const typed = options.typedSourceNamespace !== null && options.typedSourceNamespace !== undefined;
+  const typedBindings = typed ? [
+    ...bindings, options.typedSourceNamespace!, Date.parse(start), Date.parse(end),
+    Uint8Array.from(encodeTypedTelemetryId(options.typedSourceNamespace!)).buffer,
+    Uint8Array.from(encodeTypedTelemetryId(pin.participantId)).buffer,
+  ] : bindings;
+  const evidence = await db.prepare(typed ? TYPED_V11_PLAN_SQL : PLAN_SQL)
+    .bind(...typedBindings, MAX_PLAN_ATTRIBUTION_ROWS + 1).all<PlanRow>();
   if (evidence.results.length > MAX_PLAN_ATTRIBUTION_ROWS) return refused("plan_attribution_limit_exceeded");
   const index = buildPlanAttributionIndex(evidence.results.filter((row) => TOKEN.test(row.provider)).map((row) => ({
     contextKey: planAttributionContextKey(row.provider, row.limit_id),
@@ -249,8 +276,8 @@ async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11Analy
   })));
   if (index.status !== "ready") return refused("plan_attribution_limit_exceeded");
   const maximum = options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
-  const result = await db.prepare(QUOTA_SQL.replace(QUOTA_INPUT, inputSql)).bind(
-    markers(index), ...bindings, SEVEN_DAY_WINDOW_MINUTES,
+  const result = await db.prepare(typed ? TYPED_V11_QUOTA_SQL : QUOTA_SQL).bind(
+    markers(index), ...typedBindings, SEVEN_DAY_WINDOW_MINUTES,
     new Date(Date.parse(cutoff) + WEEK_MS).toISOString(),
     QUOTA_CALIBRATION_POLICY.minimumBoundaries, QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, maximum + 1,
   ).all<QuotaRow>();
