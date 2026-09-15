@@ -137,8 +137,10 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
 /** One automatic bounded retry page, independent of ordered ingestion backlog. */
 export async function advanceStorageErasureJobs(b:StorageErasureBindings,options:{maxJobs?:number}={}):Promise<{completed:number;pending:boolean}>{
  const max=options.maxJobs??1;if(!Number.isSafeInteger(max)||max<1||max>4)throw unavailable();
- const jobs=(await b.ledger.prepare(`SELECT * FROM storage_erasure_jobs WHERE source_id=? AND state='pending'
- ORDER BY attempted_ms,participant_digest,owner_digest LIMIT ?`).bind(b.sourceId,max).all<Job>()).results;
+ const result=await b.ledger.prepare(`SELECT * FROM storage_erasure_jobs WHERE source_id=? AND state='pending'
+ ORDER BY attempted_ms,participant_digest,owner_digest LIMIT ?`).bind(b.sourceId,max).all<Job>();
+ if(result.success!==true||!Array.isArray(result.results))throw unavailable();const jobs=result.results;
+ if(jobs.length===0)return {completed:0,pending:false};
  let completed=0;for(const job of jobs){
   // A mapping saved before an interrupted source deletion must not starve
   // already-erased owners later in the independent queue.

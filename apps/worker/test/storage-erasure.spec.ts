@@ -53,6 +53,17 @@ async function deliver(){for(let i=0;i<30;i++)if((await advanceStorageAnalytics(
 const count=(table:string)=>target().prepare(`SELECT COUNT(*) n FROM ${table}`).first<number>('n');
 async function drain(){for(let n=0;n<20;n++)if(!(await advanceStorageErasureJobs(bindings())).pending)return;throw new Error('synthetic erasure bound');}
 describe('cross-store physical erasure completion',()=>{
+ it('accepts only a structurally successful empty ledger result',async()=>{
+  const malformed=new Proxy(b.DELETION_LEDGER,{get(db,key){if(key==='prepare')return(sql:string)=>{
+   const statement=db.prepare(sql);if(!sql.includes("FROM storage_erasure_jobs WHERE source_id=? AND state='pending'"))return statement;
+   return new Proxy(statement,{get(value,member){if(member==='bind')return(...args:unknown[])=>new Proxy(value.bind(...args),{
+    get(bound,boundMember){if(boundMember==='all')return async()=>({success:false,results:[]});
+     const candidate=Reflect.get(bound,boundMember);return typeof candidate==='function'?candidate.bind(bound):candidate;}});
+    const candidate=Reflect.get(value,member);return typeof candidate==='function'?candidate.bind(value):candidate;}});};
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});
+  await expect(advanceStorageErasureJobs({...bindings(),ledger:malformed})).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await advanceStorageErasureJobs(bindings())).toEqual({completed:0,pending:false});
+ });
  it('fails closed when analytics is offline, then resumes from independent mapping after source deletion',async()=>{
   const f=await fixture(5);await deliver();expect(await count('analytics_v11_value_pages')).toBe(5);
   const offline=new Proxy(target(),{get(db,key){if(key==='prepare')return()=>{throw new Error('synthetic analytics offline');};const v=Reflect.get(db,key);return typeof v==='function'?v.bind(db):v;}});

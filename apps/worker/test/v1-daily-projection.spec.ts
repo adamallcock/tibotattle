@@ -271,6 +271,17 @@ describe('separate typed v1 analytical projection',()=>{
   const pass=await runStorageAnalyticsPass({source:source(),target:target(),sourceId,sourceNamespace:namespace,maxSteps:4,publishCommunity:false});
   expect(pass).toMatchObject({state:'progress',reason:'step_limit',steps:4,recordsRead:800});expect(pass.queriesUsed).toBe(79);
  });
+ it('still classifies and applies a real typed-v1 event when the speculative prefix probe is skipped',async()=>{
+  const value=await seed('usage',3);await insertTypedTelemetryV1Chunk(source(),value.insert,namespace);
+  await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
+  const result=await runStorageAnalyticsPass({source:source(),target:target(),sourceId,sourceNamespace:namespace,
+   maxSteps:1,publishCommunity:false,skipV1PrefixProbe:true});
+  expect(result).toMatchObject({state:'progress',reason:'step_limit',steps:1,recordsRead:3});
+  expect(await target().prepare('SELECT sequence FROM analytics_source_cursors WHERE source_id=?')
+   .bind(sourceId).first<number>('sequence')).toBe(1);
+  expect(await target().prepare('SELECT disposition FROM analytics_v1_projection_receipts').first('disposition')).toBe('chunk');
+  const projected=await read();expect(projected).not.toBeNull();expect(projected!.values[0]!.counts.usage).toBe(3);
+ });
  it('runs the separate maximum backlog page within the shared query budget and rejects broader pages',async()=>{
   await seedPage(16,200);await initializeStorageAnalyticsRuntime({source:source(),target:target(),sourceId,sourceNamespace:namespace});
   await expect(runStorageAnalyticsV1CatchupPass({source:source(),target:target(),sourceId,sourceNamespace:namespace,

@@ -48,14 +48,16 @@ function validate(input: StorageChangeInput): void {
   integer(input.revision, 1); integer(input.recordedMs);
   if (!kinds.has(input.kind)) throw new Error("STORAGE_CHANGE_INVALID");
 }
-function decode(id: string, row: ChangeRow): StorageChange {
+export function decodeStorageChangeRow(id: string, input: unknown): StorageChange {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("STORAGE_CHANGE_INVALID");
+  const row = input as ChangeRow;
   const value = { sourceId: id, sequence: row.sequence, eventDigest: row.event_digest,
     ownerDigest: row.owner_digest, revision: row.revision, kind: row.kind,
     objectDigest: row.object_digest, contentDigest: row.content_digest,
     authorityEpoch: row.authority_epoch, publicAuthorityEpoch: row.public_authority_epoch,
     recordedMs: row.recorded_ms };
   validate(value); integer(value.sequence, 1); integer(value.authorityEpoch, 1); integer(value.publicAuthorityEpoch, 1);
-  return value;
+  return Object.freeze(value);
 }
 
 export async function initializeStorageSource(db: D1Database, id: string): Promise<void> {
@@ -97,7 +99,7 @@ export async function readIngestionChanges(db: D1Database, id: string, afterSequ
   const [stateResult, rowsResult] = results;
   const state = stateResult?.results[0] as { source_id?: unknown } | undefined;
   if (state?.source_id !== id) throw new Error("STORAGE_SOURCE_MISMATCH");
-  return rowsResult!.results.map(row => decode(id, row as unknown as ChangeRow));
+  return rowsResult!.results.map(row => decodeStorageChangeRow(id, row));
 }
 
 function equal(a: StorageChange, b: StorageChange): boolean {
@@ -110,7 +112,7 @@ function equal(a: StorageChange, b: StorageChange): boolean {
 async function receipt(db: D1Database, change: StorageChange): Promise<StorageChange | null> {
   const row = await db.prepare("SELECT * FROM analytics_applied_events WHERE source_id=? AND sequence=?")
     .bind(change.sourceId, change.sequence).first<ChangeRow>();
-  return row ? decode(change.sourceId, row) : null;
+  return row ? decodeStorageChangeRow(change.sourceId, row) : null;
 }
 
 export type PrepareAnalyticsProjection = (target: D1Database, change: Readonly<StorageChange>) => Promise<D1PreparedStatement[]>;
@@ -120,7 +122,7 @@ async function receipts(target:D1Database,changes:readonly StorageChange[]):Prom
  const id=changes[0]!.sourceId;if(changes.some(change=>change.sourceId!==id))throw new Error("ANALYTICS_SOURCE_MISMATCH");
  const rows=(await target.prepare(`SELECT * FROM analytics_applied_events WHERE source_id=? AND sequence BETWEEN ? AND ? ORDER BY sequence`)
   .bind(id,changes[0]!.sequence,changes.at(-1)!.sequence).all<ChangeRow>()).results;
- const bySequence=new Map(rows.map(row=>[row.sequence,decode(id,row)]));
+ const bySequence=new Map(rows.map(row=>[row.sequence,decodeStorageChangeRow(id,row)]));
  return changes.map(change=>bySequence.get(change.sequence)??null);
 }
 

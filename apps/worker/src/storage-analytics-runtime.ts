@@ -1,9 +1,9 @@
-import { readIngestionChanges, STORAGE_OPERATING_BUDGET_BYTES } from './analytics-delivery';
+import { decodeStorageChangeRow, readIngestionChanges, STORAGE_OPERATING_BUDGET_BYTES, type StorageChange } from './analytics-delivery';
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from './d1-invocation-budget';
 import { lookupV11StorageSource } from './v11-storage-journal';
-import { advanceV11DailyProjection, retireV11DailyProjectionPage } from './v11-daily-projection';
+import { advanceAdmittedV11DailyProjection, retireV11DailyProjectionPage } from './v11-daily-projection';
 import { advanceV1DailyProjection, advanceV1DailyProjectionPage, prepareV1ProjectionOwnerFence, retireV1DailyProjectionPage } from './v1-daily-projection';
-import { isLegacyStorageChange, advanceLegacyStorageAcknowledgement } from './legacy-storage-journal';
+import { advanceLegacyStorageAcknowledgement } from './legacy-storage-journal';
 import { advanceNextStorageCommunityDaily, retireStorageCommunityDailyPage } from './storage-community-daily';
 import { advanceStorageCommunityGraphWork } from './storage-community-graph-work';
 import { retireStorageGraphPage } from './storage-graph-retirement';
@@ -16,6 +16,9 @@ import { captureStorageAdminMetricSnapshot, warmStorageAdminMetricsHistoryCache 
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 export type { StorageAnalyticsBindings } from './analytics-delivery';
 const invalid=()=>new Error('STORAGE_ANALYTICS_CONTRACT_UNAVAILABLE');
+const SOURCE_IDENTITY_SQL=`SELECT s.source_id,a.source_namespace AS v1_namespace,b.source_namespace AS v11_namespace
+  FROM storage_source_state s JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
+  JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 WHERE s.singleton=1`;
 function identifiers(sourceId:string,namespace:string):void {
  if(!/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/.test(sourceId)
    || typeof namespace!=='string' || namespace.length<1 || namespace.length>256)throw invalid();
@@ -32,11 +35,86 @@ export async function initializeStorageAnalyticsRuntime(options:StorageAnalytics
  await assertRuntime(options);
 }
 async function assertSource({source,sourceId,sourceNamespace}:StorageAnalyticsBindings):Promise<void> {
- const row=await source.prepare(`SELECT s.source_id,a.source_namespace AS v1_namespace,b.source_namespace AS v11_namespace
-  FROM storage_source_state s JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
-  JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 WHERE s.singleton=1`).first<{
+ const row=await source.prepare(SOURCE_IDENTITY_SQL).first<{
    source_id:string;v1_namespace:string;v11_namespace:string}>();
  if(!row||row.source_id!==sourceId||row.v1_namespace!==sourceNamespace||row.v11_namespace!==sourceNamespace)throw invalid();
+}
+
+interface RuntimeCursorRow {
+ runtime_namespace:string;contract_version:number;cursor_sequence:number|null;cursor_epoch:number|null;
+ receipt_sequence:number|null;event_digest:string|null;owner_digest:string|null;revision:number|null;kind:string|null;
+ object_digest:string|null;content_digest:string|null;authority_epoch:number|null;public_authority_epoch:number|null;recorded_ms:number|null;
+}
+function exactChange(a:StorageChange,b:StorageChange):boolean{
+ return a.sourceId===b.sourceId&&a.sequence===b.sequence&&a.eventDigest===b.eventDigest&&a.ownerDigest===b.ownerDigest
+  &&a.revision===b.revision&&a.kind===b.kind&&a.objectDigest===b.objectDigest&&a.contentDigest===b.contentDigest
+  &&a.authorityEpoch===b.authorityEpoch&&a.publicAuthorityEpoch===b.publicAuthorityEpoch&&a.recordedMs===b.recordedMs;
+}
+/** One closed ordinary-dispatch admission. The Queue's same-cursor hint never
+ * reaches this function: all runtime, source identity, prior receipt and next
+ * event fields are read again from their current databases. */
+async function readOrdinaryAdmission(options:StorageAnalyticsBindings):Promise<{sequence:number;change:StorageChange|null}>{
+ identifiers(options.sourceId,options.sourceNamespace);if(options.source===options.target)throw invalid();
+ const targetResult=await options.target.prepare(`SELECT r.source_namespace AS runtime_namespace,r.contract_version,
+   c.sequence AS cursor_sequence,c.authority_epoch AS cursor_epoch,e.sequence AS receipt_sequence,e.event_digest,
+   e.owner_digest,e.revision,e.kind,e.object_digest,e.content_digest,e.authority_epoch,e.public_authority_epoch,e.recorded_ms
+  FROM analytics_runtime_sources r LEFT JOIN analytics_source_cursors c ON c.source_id=r.source_id
+  LEFT JOIN analytics_applied_events e ON e.source_id=c.source_id AND e.sequence=c.sequence WHERE r.source_id=?`)
+  .bind(options.sourceId).all<RuntimeCursorRow>();
+ if(targetResult.success!==true||!Array.isArray(targetResult.results)||targetResult.results.length!==1)throw invalid();
+ const row=targetResult.results[0]!;
+ if(row.runtime_namespace!==options.sourceNamespace||row.contract_version!==1)throw invalid();
+ const reconciliation=()=>new Error('ANALYTICS_SOURCE_RESTORE_RECONCILIATION_REQUIRED');
+ const sequence=row.cursor_sequence??0;if(!Number.isSafeInteger(sequence)||sequence<0)throw reconciliation();
+ let prior:StorageChange|null=null;
+ if(sequence===0){
+  if(row.cursor_sequence!==null&&row.cursor_epoch!==0)throw reconciliation();
+  if(row.receipt_sequence!==null)throw invalid();
+ }else{
+  try{
+   prior=decodeStorageChangeRow(options.sourceId,{sequence:row.receipt_sequence,event_digest:row.event_digest,
+    owner_digest:row.owner_digest,revision:row.revision,kind:row.kind,object_digest:row.object_digest,
+    content_digest:row.content_digest,authority_epoch:row.authority_epoch,
+    public_authority_epoch:row.public_authority_epoch,recorded_ms:row.recorded_ms});
+  }catch{throw reconciliation();}
+  if(prior.sequence!==sequence||row.cursor_epoch!==prior.publicAuthorityEpoch)throw reconciliation();
+ }
+ const sourceResults=await options.source.batch([
+  options.source.prepare(SOURCE_IDENTITY_SQL),
+  options.source.prepare('SELECT * FROM storage_ingestion_changes WHERE sequence=?').bind(sequence),
+  options.source.prepare('SELECT * FROM storage_ingestion_changes WHERE sequence>? ORDER BY sequence LIMIT 1').bind(sequence),
+ ]);
+ if(!Array.isArray(sourceResults)||sourceResults.length!==3
+   ||sourceResults.some(result=>result?.success!==true||!Array.isArray(result.results)))throw invalid();
+ const [identityResult,priorResult,nextResult]=sourceResults;
+ if(identityResult!.results.length!==1||priorResult!.results.length>1||nextResult!.results.length>1)throw invalid();
+ if(sequence===0?priorResult!.results.length!==0:priorResult!.results.length!==1)throw reconciliation();
+ const identity=identityResult!.results[0] as {source_id?:unknown;v1_namespace?:unknown;v11_namespace?:unknown};
+ if(identity.source_id!==options.sourceId||identity.v1_namespace!==options.sourceNamespace
+   ||identity.v11_namespace!==options.sourceNamespace)throw invalid();
+ if(prior){
+  let sourcePrior:StorageChange;try{sourcePrior=decodeStorageChangeRow(options.sourceId,priorResult!.results[0]);}
+  catch{throw reconciliation();}
+  if(!exactChange(prior,sourcePrior))throw reconciliation();
+ }
+ if(nextResult!.results.length===0)return {sequence,change:null};
+ const change=decodeStorageChangeRow(options.sourceId,nextResult!.results[0]);
+ if(change.sequence!==sequence+1)throw new Error('ANALYTICS_SOURCE_GAP');
+ return {sequence,change};
+}
+
+async function classifyOrdinaryChange(source:D1Database,change:StorageChange):Promise<'legacy'|'v1'|'v11'>{
+ const results=await source.batch([
+  source.prepare('SELECT 1 AS present FROM storage_legacy_event_sources WHERE event_digest=? AND owner_digest=? LIMIT 2')
+   .bind(change.eventDigest,change.ownerDigest),
+  source.prepare('SELECT 1 AS present FROM typed_v1_event_sources WHERE event_digest=? AND owner_digest=? LIMIT 2')
+   .bind(change.eventDigest,change.ownerDigest),
+ ]);
+ if(!Array.isArray(results)||results.length!==2||results.some(result=>result?.success!==true
+   ||!Array.isArray(result.results)||result.results.length>1
+   ||result.results.some(row=>(row as {present?:unknown}).present!==1)))throw invalid();
+ const legacy=results[0]!.results.length===1,v1=results[1]!.results.length===1;
+ if(legacy&&v1)throw invalid();return legacy?'legacy':v1?'v1':'v11';
 }
 async function assertRuntime(options:StorageAnalyticsBindings):Promise<number> {
  identifiers(options.sourceId,options.sourceNamespace);if(options.source===options.target)throw invalid();
@@ -79,20 +157,17 @@ async function assertRuntime(options:StorageAnalyticsBindings):Promise<number> {
  * a conservative fence, never a falsely acknowledged or publicly eligible row. */
 export async function advanceStorageAnalytics(options:StorageAnalyticsBindings&{signal?:AbortSignal}) {
  const {source,target,sourceId,sourceNamespace}=options;
- const sequence=await assertRuntime(options);options.signal?.throwIfAborted();
- const change=(await readIngestionChanges(source,sourceId,sequence,1))[0];
+ const {sequence,change}=await readOrdinaryAdmission(options);options.signal?.throwIfAborted();
  if(!change)return {state:'idle' as const,sequence,recordsRead:0};
- if(change.sequence!==sequence+1)throw new Error('ANALYTICS_SOURCE_GAP');
- if(await isLegacyStorageChange(source,change))return advanceLegacyStorageAcknowledgement({source,target,sourceId,signal:options.signal});
- const v1=await source.prepare('SELECT 1 FROM typed_v1_event_sources WHERE event_digest=? AND owner_digest=?')
-  .bind(change.eventDigest,change.ownerDigest).first();
- if(v1)return advanceV1DailyProjection({...options});
+ const format=await classifyOrdinaryChange(source,change);
+ if(format==='legacy')return advanceLegacyStorageAcknowledgement({source,target,sourceId,signal:options.signal});
+ if(format==='v1')return advanceV1DailyProjection({...options});
  const proof=await lookupV11StorageSource(source,change);
  if(proof.disposition==='discard') {
   const statements=prepareV1ProjectionOwnerFence(target,change,proof);
   if(statements.length)await target.batch(statements);
  }
- return advanceV11DailyProjection({source,target,sourceId,signal:options.signal,
+ return advanceAdmittedV11DailyProjection({source,target,sourceId,change, input:proof,signal:options.signal,
   sourceLayout:{kind:'typed-v11',sourceNamespace}});
 }
 async function advanceStorageAnalyticsV1Page(options:StorageAnalyticsBindings&{
@@ -118,10 +193,11 @@ export interface StorageAnalyticsCatchupMetrics {
 export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  maxSteps?:number;deadlineMs?:number;maxQueries?:number;signal?:AbortSignal;
  publishCommunity?:boolean;
- ledger?:D1Database;
+  ledger?:D1Database;skipV1PrefixProbe?:boolean;
 }):Promise<StorageAnalyticsPass> {
  const maxSteps=options.maxSteps??8,deadlineMs=options.deadlineMs??Date.now()+20_000;
- if(!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||!Number.isFinite(deadlineMs))throw invalid();
+ if(!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||!Number.isFinite(deadlineMs)
+   ||(options.skipV1PrefixProbe!==undefined&&typeof options.skipV1PrefixProbe!=='boolean'))throw invalid();
  const meter=createD1InvocationBudget(options.maxQueries??900);
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0;
@@ -168,7 +244,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    // Publication-paused catch-up can combine a current typed-v1 prefix. Public
    // work retains the ordinary one-event cadence so serving gates and derived
    // publication interleave exactly as before.
-   const page=!options.publishCommunity?await advanceStorageAnalyticsV1Page(scoped,Math.min(4,maxSteps-steps)):null;
+   const page=!options.publishCommunity&&!options.skipV1PrefixProbe
+    ?await advanceStorageAnalyticsV1Page(scoped,Math.min(4,maxSteps-steps)):null;
    const step=page&&page.events>0?page:await advanceStorageAnalytics(scoped);
    steps+=page&&page.events>0?page.events:1;recordsRead+=step.recordsRead;
    // Retiring old generations cannot be starved by an always-busy journal.

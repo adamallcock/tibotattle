@@ -8,15 +8,16 @@ import { initializeStorageSource, readIngestionChanges } from "../src/analytics-
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
 import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
-import { advanceV11DailyProjection, readV11ProjectedOwnerDays, retireV11DailyProjectionPage } from "../src/v11-daily-projection";
+import { advanceAdmittedV11DailyProjection, advanceV11DailyProjection, readV11ProjectedOwnerDays, retireV11DailyProjectionPage } from "../src/v11-daily-projection";
 import { revokeAccountlessEnrollment } from "../src/accountless-enrollment";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
 import { readTypedV11ManifestPage, TYPED_V11_MANIFEST_PAGE_SQL } from "../src/typed-v11-record-reader";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
-import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
+import { advanceStorageAnalytics, initializeStorageAnalyticsRuntime, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
 import { runStorageAnalyticsSchedule } from "../src/storage-analytics-worker";
 import { readAdminOverview } from "../src/admin-operations";
+import { lookupV11StorageSource } from "../src/v11-storage-journal";
 
 interface Bindings extends Env { STORAGE_ANALYTICS_DB: D1Database; TEST_MIGRATIONS: D1Migration[];
   TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[]; TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[];
@@ -42,6 +43,28 @@ function withObservedBatches(database: D1Database, sizes: number[], truncateFirs
     }) as D1Database["batch"];
     const member: unknown = Reflect.get(value, property);
     return typeof member === "function" ? member.bind(value) : member;
+  } });
+}
+function observedDatabase(database: D1Database, stats: { prepared: number; roundTrips: number }): D1Database {
+  const raw = Symbol("raw-statement");
+  const statement = (value: D1PreparedStatement): D1PreparedStatement => new Proxy(value, { get(inner, property) {
+    if (property === raw) return inner;
+    if (property === "bind") return (...values: unknown[]) => statement(inner.bind(...values));
+    if (["all", "first", "raw", "run"].includes(String(property))) return (...values: unknown[]) => {
+      stats.roundTrips += 1;
+      return (inner[property as keyof D1PreparedStatement] as (...args: unknown[]) => unknown).apply(inner, values);
+    };
+    const candidate: unknown = Reflect.get(inner, property);
+    return typeof candidate === "function" ? candidate.bind(inner) : candidate;
+  } });
+  return new Proxy(database, { get(value, property) {
+    if (property === "prepare") return (sql: string) => { stats.prepared += 1; return statement(value.prepare(sql)); };
+    if (property === "batch") return (statements: D1PreparedStatement[]) => {
+      stats.roundTrips += 1;
+      return value.batch(statements.map(candidate => Reflect.get(candidate, raw)));
+    };
+    const candidate: unknown = Reflect.get(value, property);
+    return typeof candidate === "function" ? candidate.bind(value) : candidate;
   } });
 }
 async function drain() {
@@ -265,6 +288,93 @@ describe("typed accountless upload to isolated projection", () => {
     await drain();
     expect(await read(value.event.ownerDigest)).toEqual({ state: "available", values: [] });
     expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_day_values").first("n")).toBe(0);
+  });
+
+  it("uses one admitted ordinary path, preserves a final owner fence, and measures the resumed-page reduction", async () => {
+    await applyD1Migrations(source(), b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(source(), namespace);
+    await fixture(1_200);
+    const options = { source: source(), target: target(), ledger: b.DELETION_LEDGER, sourceId, sourceNamespace: namespace,
+      maxSteps: 1, publishCommunity: false, skipV1PrefixProbe: true };
+    await initializeStorageAnalyticsRuntime(options);
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({ state: "progress", recordsRead: 200 });
+    const stats = { prepared: 0, roundTrips: 0 };
+    const measured = await runStorageAnalyticsPass({ ...options, source: observedDatabase(source(), stats),
+      target: observedDatabase(target(), stats), ledger: observedDatabase(b.DELETION_LEDGER, stats) });
+    expect(measured).toMatchObject({ state: "progress", reason: "step_limit", steps: 1, recordsRead: 200 });
+    expect({ queries: measured.queriesUsed, prepared: stats.prepared, roundTrips: stats.roundTrips })
+      .toEqual({ queries: 41, prepared: 41, roundTrips: 28 });
+  });
+
+  it("does not let a later terminal proof skip its journal row when the prefix hint is stale", async () => {
+    await applyD1Migrations(source(), b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(source(), namespace);
+    const value = await fixture();
+    await initializeStorageAnalyticsRuntime({ source: source(), target: target(), sourceId, sourceNamespace: namespace });
+    await source().prepare("UPDATE participants SET state='deleting' WHERE id=?").bind(value.participantId).run();
+    const options = { source: source(), target: target(), sourceId, sourceNamespace: namespace,
+      maxSteps: 1, publishCommunity: false, skipV1PrefixProbe: true };
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({ state: "progress", steps: 1, recordsRead: 0 });
+    expect(await target().prepare("SELECT sequence FROM analytics_source_cursors WHERE source_id=?")
+      .bind(sourceId).first<number>("sequence")).toBe(1);
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({ state: "progress", steps: 1, recordsRead: 0 });
+    expect(await target().prepare("SELECT sequence FROM analytics_source_cursors WHERE source_id=?")
+      .bind(sourceId).first<number>("sequence")).toBe(2);
+  });
+
+  it("rejects forged admitted objects and rechecks owner authority after reading a page", async () => {
+    const value = await fixture(203), input = await lookupV11StorageSource(source(), value.event);
+    if (input.disposition !== "generation") throw new Error("synthetic generation missing");
+    const admitted = { source: source(), target: target(), sourceId, change: value.event, input,
+      sourceLayout } as const;
+    await expect(advanceAdmittedV11DailyProjection({ ...admitted,
+      input: { ...input, manifestDigest: "f".repeat(64) } })).rejects.toThrow("V11_PROJECTION_SOURCE_CONFLICT");
+    await expect(advanceAdmittedV11DailyProjection({ ...admitted,
+      input: { disposition: "discard", reason: "owner-erased", sourceId, ownerDigest: value.event.ownerDigest,
+        terminalRevision: value.event.revision, terminalSequence: value.event.sequence,
+        authorityEpoch: value.event.authorityEpoch, publicAuthorityEpoch: value.event.publicAuthorityEpoch } }))
+      .rejects.toThrow("V11_PROJECTION_SOURCE_CONFLICT");
+    let batches = 0, erased = false;
+    const observed = new Proxy(source(), { get(database, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        batches += 1;
+        if (batches === 3 && !erased) {
+          erased = true;
+          await source().prepare("UPDATE participants SET state='deleting' WHERE id=?").bind(value.participantId).run();
+        }
+        return database.batch(statements);
+      };
+      const member: unknown = Reflect.get(database, property);
+      return typeof member === "function" ? member.bind(database) : member;
+    } });
+    const fresh = await lookupV11StorageSource(source(), value.event);
+    expect(await advanceAdmittedV11DailyProjection({ ...admitted, source: observed, input: fresh }))
+      .toMatchObject({ state: "discarded", sequence: 1, recordsRead: 200 });
+    expect(erased).toBe(true);
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_value_pages").first<number>("n")).toBe(0);
+  });
+
+  it("reconciles a lost admitted-page response without applying the page twice", async () => {
+    await applyD1Migrations(source(), b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(source(), namespace);
+    await fixture(203);
+    await initializeStorageAnalyticsRuntime({ source: source(), target: target(), sourceId, sourceNamespace: namespace });
+    let lost = false;
+    const flaky = new Proxy(target(), { get(database, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        const result = await database.batch(statements);
+        if (!lost) { lost = true; throw new Error("synthetic lost admitted page response"); }
+        return result;
+      };
+      const member: unknown = Reflect.get(database, property);
+      return typeof member === "function" ? member.bind(database) : member;
+    } });
+    expect(await advanceStorageAnalytics({ source: source(), target: flaky, sourceId, sourceNamespace: namespace }))
+      .toMatchObject({ recordsRead: 200 });
+    expect(await advanceStorageAnalytics({ source: source(), target: target(), sourceId, sourceNamespace: namespace }))
+      .toMatchObject({ recordsRead: 3 });
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_projection_steps").first<number>("n")).toBe(2);
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_value_pages").first<number>("n")).toBe(2);
   });
 
   it("refuses to switch a partly processed generation to JSON or a different original namespace", async () => {
