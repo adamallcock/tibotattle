@@ -23,8 +23,9 @@ more useful work per admitted transaction.
 
 This is a point-in-time investigation, with production measurements through
 **September 15, 2026, 08:35 UTC**. Deployed analytics recovery source:
-`79048a39a7e2f4f8f1e5d948b4de4b0365308f4a`. Later improvements described below
-are proposals or work in progress, not claims about deployed behavior.
+`79048a39a7e2f4f8f1e5d948b4de4b0365308f4a`. The dated addendum below records
+subsequent deployed and local-qualification evidence without changing this
+original snapshot.
 
 The original data migration is complete. Enrollment and uploads are operational,
 and the website and update feeds have been published for 0.1.23. The unfinished
@@ -62,7 +63,7 @@ not automatically parallelize this single large contribution.
 |---|---:|---|
 | Records in the large v1.1 contribution | 2,122,823 | Read-only aggregate of accepted source chunk counts |
 | Historical days represented | 122 | Exact generation membership |
-| Required physical calculation steps | 10,680 | Sum of `floor(records_in_day / 200) + 1` over the accepted days |
+| Required calculation steps | 10,680 | Sum of `floor(records_in_day / 200) + 1` over the accepted days; this includes one completion step per day and is not a count of non-empty physical value pages |
 | Progress at 08:35 UTC | 201,317 records; 1,016 steps | Durable recovery receipts; the contribution is still building |
 | Earlier implementation | 6,103.6 ms and 85 queries per step | 172 production steps on source `18b38f1d` |
 | Deployed improvement | 4,228.1 ms and 60.1 queries per step | 585 production steps on source `79048a3` |
@@ -74,7 +75,7 @@ but not completion. Partial final pages explain why records per step are not
 always exactly 200. A day with an exact multiple of 200 records currently needs
 an additional empty read to establish completion.
 
-At the 08:35 checkpoint, 9,664 of these physical steps remained. At 4.68 seconds
+At the 08:35 checkpoint, 9,664 of these calculation steps remained. At 4.68 seconds
 per step, that is approximately **12.6 hours for this contribution alone** if the
 implementation and cadence do not change. This is a calculation from observed
 processing speed, not a planned verification delay or a full-service completion
@@ -85,6 +86,43 @@ probe of the ordinary path reduced binding calls from 55 to 43 by batching
 reads, without reducing its 58 SQL statements. That fixture has a different
 cursor state from production; its counts must not be substituted for the live
 60-query measurement. Nor does a local benchmark prove cloud latency.
+
+## September 15, 2026 addendum: later repairs
+
+Later live evidence is version-specific and does not replace the 08:35 UTC
+snapshot above. For the first 45 calculation steps on deployed source
+`614e42eb8095c6b37a6afe12693b71dfc7c46f3e`, receipts recorded an average of
+**41 queries and 2,863.3 ms of work per step**. The earlier `79048a3` sample
+recorded **60.1 queries and 4,228.1 ms per step**. This is an encouraging initial
+reduction, but the samples differ in size and time window, so it is not a
+complete rebuild benchmark.
+
+The bounded five-page implementation at source
+`b482cf8093175b2c06e9b014a0ea2a9d12eaba69` is fully qualified locally and is
+now deployed as version `ca092738-a7e3-406d-8943-d262ffafdd85`, with content
+SHA-256 `ace058ec1197c654a565489b11b44a651aba704e7922f8e09ed15ee7da8ae725`.
+Its complete Worker gate passed **121 test files and 1,475 tests**, plus the
+production and staging dry builds. The exact local receipt is
+`/private/tmp/tibotattle-analytics-v11-page-groups-full-qualification-20260915/qualification-receipt.json`
+(SHA-256
+`1158a24188cf3487a8fae82ef6b2aaea62bad79f17e5e4a3f86702ea4bd96c98`).
+This receipt proves the named source and local qualification only. Separate
+deployment evidence verifies that the Queue resumed and produced its first
+receipt at generation 4,519.
+
+At **September 15, 2026, 11:27:38 UTC**, the completed `614e42e` sample had
+processed 285,493 records after its first receipt over 4,670.402 elapsed seconds,
+or **61.13 records per elapsed second**. The first 93 `b482cf8` units processed
+86,701 records after the first receipt over 367.535 seconds, or **235.90 records
+per elapsed second**: a **3.86× initial effective-rate improvement**. Normalized
+record-processing rates were 70.1 and 265.7 records per recorded work second,
+respectively.
+
+The b482 units averaged 74.8 queries and 3,549 ms, compared with 41 queries and
+2,830.7 ms for the 1,440-unit 614e sample. Those per-unit figures are not directly
+comparable because a b482 unit can process up to five existing 200-record pages,
+rather than one. Both samples cover first-cache work on the same large event but
+different day pages and durations. This is not a whole-graph benchmark or ETA.
 
 ## Why it is slow
 
@@ -170,8 +208,8 @@ format. We should retain those pages and improve how we process them.
 | Queue-driven resumable catch-up | Deployed | Continues work independently of the ordinary scheduled pass |
 | Resume known partial work without repeating older-format detection | Deployed in `79048a3` | Part of the measured reduction from 85 to about 60 queries |
 | Batch independent source and typed-record reads | Deployed in `79048a3` | Fewer database round trips; combined live improvement about 44% |
-| Consolidate repeated ordinary v1.1 admission | Implementation and independent review in progress | Source audit identified about 19 potentially removable queries; live benefit is not yet measured |
-| Process a bounded group of existing physical pages together | Design under review | Larger opportunity to share fixed overhead without changing the retained 200-record format |
+| Consolidate repeated ordinary v1.1 admission | Deployed in `614e42e`; first 45 steps measured | Initial receipts averaged 41 queries and 2,863.3 ms per step; the limited sample is not a complete benchmark |
+| Process a bounded group of existing physical pages together | Deployed from fully qualified source `b482cf8`; first 93 units measured | Shares fixed work across at most five retained 200-record pages; the initial sample processed records at 3.86× the prior elapsed rate |
 | Increase Queue concurrency | Deferred for this cursor | Extra consumers can contend for the same ordered work rather than divide it safely |
 | Change Worker placement | Not a direct Queue fix | Documented placement applies to fetch handlers, so a placement flag alone does not relocate this Queue execution path |
 | Move analytics compute to GCP | Longer-term option | Evaluate if bounded batching still cannot meet recovery and ongoing throughput needs; moving platforms alone does not remove repeated calls |
@@ -185,13 +223,14 @@ For the next admission repair, a saved Queue receipt remains only a routing hint
 The worker must still verify current authority. The final source and owner check
 after reading records remains immediately before saving calculated values.
 
-A promising subsequent design groups at most five existing 200-record pages
-from one immutable day. Each page keeps its own values, digest, revision and
-checkpoint; their ordered writes share one database transaction. This requires
-bounded reads and memory, reserved query/time headroom, a final source check,
-and exact recovery of all page receipts after a lost response. It must stop at
-a day or generation boundary. It is **not implemented or qualified at this
-snapshot**, and no speedup is claimed for it.
+The deployed, locally qualified `b482cf8` implementation groups at most five existing
+200-record pages from one immutable day. Each page keeps its own values, digest,
+revision and checkpoint; their ordered writes share one database transaction.
+The implementation retains bounded reads and memory, reserved query/time
+headroom, a final source check, exact recovery of all page receipts after a lost
+response, and stops at day or generation boundaries. Deployment is separately
+verified. The initial 93-unit production sample measured a 3.86× effective
+elapsed-rate improvement; first-cache and sample-window limits still apply.
 
 Cloudflare documents ordered transactional batches, while individual statement
 limits still apply. D1 is also single-threaded per database: adding concurrent
@@ -235,6 +274,12 @@ payloads, credentials or private session content are included.
 | Live repair bundle SHA-256 | `6f79ac7703f43e14d4b8e4ebacc82782f10668f9d62bd77ea31bb6e093773d69` |
 | Full Worker qualification receipt SHA-256 | `241a10833225c670e4af79fef84620a112e529b685dfea7a4237646f8de361a2` |
 | Initial batching and hint review | [PR #157](https://github.com/adamallcock/tibotattle/pull/157) |
+| Later deployed admission repair source | `614e42eb8095c6b37a6afe12693b71dfc7c46f3e` |
+| Locally qualified five-page candidate | `b482cf8093175b2c06e9b014a0ea2a9d12eaba69` |
+| Five-page complete Worker qualification | `/private/tmp/tibotattle-analytics-v11-page-groups-full-qualification-20260915/qualification-receipt.json`; SHA-256 `1158a24188cf3487a8fae82ef6b2aaea62bad79f17e5e4a3f86702ea4bd96c98` |
+| Deployed five-page Worker version | `ca092738-a7e3-406d-8943-d262ffafdd85` |
+| Deployed five-page Worker content SHA-256 | `ace058ec1197c654a565489b11b44a651aba704e7922f8e09ed15ee7da8ae725` |
+| Initial live five-page comparison | `/private/tmp/tibotattle-analytics-v11-page-groups-20260915/live-comparison-1131.json`; SHA-256 `22f49e763649bc50bb9484b456a676b11fde2fed11ae8acb173c0701881505a4` |
 
 Source references should be read at the deployed revision above when reproducing
 this snapshot; the checkout may contain later work:
