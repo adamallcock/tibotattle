@@ -40,10 +40,14 @@ async function assertSource({source,sourceId,sourceNamespace}:StorageAnalyticsBi
 }
 async function assertRuntime(options:StorageAnalyticsBindings):Promise<number> {
  identifiers(options.sourceId,options.sourceNamespace);if(options.source===options.target)throw invalid();
- const row=await options.target.prepare('SELECT source_namespace,contract_version FROM analytics_runtime_sources WHERE source_id=?')
-  .bind(options.sourceId).first<{source_namespace:string;contract_version:number}>();
+ // The target contract row and source identity are independent reads. Start
+ // both together without removing the later cursor-to-journal receipt proof.
+ const [row]=await Promise.all([
+  options.target.prepare('SELECT source_namespace,contract_version FROM analytics_runtime_sources WHERE source_id=?')
+   .bind(options.sourceId).first<{source_namespace:string;contract_version:number}>(),
+  assertSource(options),
+ ]);
  if(!row||row.source_namespace!==options.sourceNamespace||row.contract_version!==1)throw invalid();
- await assertSource(options);
  // A cursor is meaningful only against the exact journal that produced its
  // retained receipt. The legacy-to-fresh-typed restore operator does not repair
  // typed rollback: a new source incarnation or explicit journal reconciliation

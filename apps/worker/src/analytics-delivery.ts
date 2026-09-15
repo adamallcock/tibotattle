@@ -82,11 +82,22 @@ export function prepareIngestionChange(db: D1Database, input: StorageChangeInput
 export async function readIngestionChanges(db: D1Database, id: string, afterSequence: number, limit = MAX_DELIVERY_PAGE): Promise<StorageChange[]> {
   sourceId(id); integer(afterSequence); integer(limit, 1);
   if (limit > MAX_DELIVERY_PAGE) throw new Error("STORAGE_PAGE_LIMIT");
-  const state = await db.prepare("SELECT source_id FROM storage_source_state WHERE singleton=1").first<{ source_id: string }>();
+  // These reads are independent and D1 batch gives them one binding round trip
+  // and one ordered snapshot. Keep validating the source row before decoding
+  // any returned event; a missing or mismatched source is never an empty page.
+  const results = await db.batch([
+    db.prepare("SELECT source_id FROM storage_source_state WHERE singleton=1"),
+    db.prepare("SELECT * FROM storage_ingestion_changes WHERE sequence>? ORDER BY sequence LIMIT ?")
+      .bind(afterSequence, limit),
+  ]);
+  if (!Array.isArray(results) || results.length !== 2
+      || results.some(result => result?.success !== true || !Array.isArray(result.results))) {
+    throw new Error("STORAGE_SOURCE_MISMATCH");
+  }
+  const [stateResult, rowsResult] = results;
+  const state = stateResult?.results[0] as { source_id?: unknown } | undefined;
   if (state?.source_id !== id) throw new Error("STORAGE_SOURCE_MISMATCH");
-  const rows = await db.prepare("SELECT * FROM storage_ingestion_changes WHERE sequence>? ORDER BY sequence LIMIT ?")
-    .bind(afterSequence, limit).all<ChangeRow>();
-  return rows.results.map(row => decode(id, row));
+  return rowsResult!.results.map(row => decode(id, row as unknown as ChangeRow));
 }
 
 function equal(a: StorageChange, b: StorageChange): boolean {

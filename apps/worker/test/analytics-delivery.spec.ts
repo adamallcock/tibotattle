@@ -23,6 +23,13 @@ const projection: PrepareAnalyticsProjection = async (db, event) => event.kind =
 const deliver = (prepareProjection = projection, limit?: number) => deliverAnalyticsPage({ source: source(), target: target(), sourceId: id, prepareProjection, limit });
 const append = (event: StorageChangeInput) => source().batch([prepareIngestionChange(source(), event)]);
 const values = async () => (await target().prepare("SELECT * FROM synthetic_projection ORDER BY owner_digest").all()).results;
+function withBatch(database: D1Database, batch: D1Database["batch"]): D1Database {
+  return new Proxy(database, { get(value, property) {
+    if (property === "batch") return batch;
+    const member: unknown = Reflect.get(value, property);
+    return typeof member === "function" ? member.bind(value) : member;
+  } });
+}
 
 beforeEach(async () => {
   await reset();
@@ -34,6 +41,21 @@ beforeEach(async () => {
 });
 
 describe("independent analytics delivery", () => {
+  it("reads source identity and journal rows in one complete D1 batch", async () => {
+    await append(change(1, "owner-active"));
+    let calls = 0;
+    const observed = withBatch(source(), (async statements => {
+      calls += 1;
+      return source().batch(statements);
+    }) as D1Database["batch"]);
+    expect(await readIngestionChanges(observed, id, 0)).toHaveLength(1);
+    expect(calls).toBe(1);
+    const truncated = withBatch(source(), (async statements => (
+      (await source().batch(statements)).slice(0, 1)
+    )) as D1Database["batch"]);
+    await expect(readIngestionChanges(truncated, id, 0)).rejects.toThrow("STORAGE_SOURCE_MISMATCH");
+  });
+
   it("commits source records and a replayable event even while analytics is broken", async () => {
     await append(change(1, "owner-active"));
     await target().prepare("DROP TABLE synthetic_projection").run();

@@ -18,6 +18,13 @@ const changes = () => readIngestionChanges(db(), sourceId, 0);
 const today = () => new Date().toISOString().slice(0, 10);
 const runtime = () => ({ ...bindings, ENVIRONMENT: 'synthetic-development', ACCOUNT_SCOPED_INGEST_MODE: 'disabled',
   ACCOUNTLESS_ENROLLMENT_MODE: 'enabled', ACCOUNTLESS_OWNERSHIP_MODE: 'enabled' } as Env);
+function withBatch(database: D1Database, batch: D1Database['batch']): D1Database {
+  return new Proxy(database, { get(value, property) {
+    if (property === 'batch') return batch;
+    const member: unknown = Reflect.get(value, property);
+    return typeof member === 'function' ? member.bind(value) : member;
+  } });
+}
 
 beforeEach(async () => {
   await reset();
@@ -58,6 +65,25 @@ async function accountlessFixture(): Promise<Awaited<ReturnType<typeof createV11
 }
 
 describe('optional baseline v1.1 storage journal bridge', () => {
+  it('batches active terminal and metadata reads and refuses a truncated response', async () => {
+    const fixture = await createV11DeviceFixture(db(), { grant: true }); await activate(fixture);
+    const event = (await changes())[0]!;
+    let calls = 0;
+    const observed = withBatch(db(), (async statements => {
+      calls += 1;
+      return db().batch(statements);
+    }) as D1Database['batch']);
+    await expect(lookupV11StorageSource(observed, event)).resolves.toMatchObject({ disposition: 'generation' });
+    expect(calls).toBe(2);
+    calls = 0;
+    const truncated = withBatch(db(), (async statements => {
+      calls += 1;
+      const results = await db().batch(statements);
+      return calls === 2 ? results.slice(0, 1) : results;
+    }) as D1Database['batch']);
+    await expect(lookupV11StorageSource(truncated, event)).rejects.toThrow('V11_STORAGE_SOURCE_UNAVAILABLE');
+  });
+
   it('does not publish enrollment, binds real accepted generations, and converges activation/bootstrap replay', async () => {
     const fixture = await createV11DeviceFixture(db(), { grant: true });
     expect(await bootstrapV11StorageHead(db(), fixture.participantId)).toBe('ineligible'); expect(await changes()).toEqual([]);
