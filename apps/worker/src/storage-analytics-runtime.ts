@@ -1,7 +1,8 @@
 import { decodeStorageChangeRow, readIngestionChanges, STORAGE_OPERATING_BUDGET_BYTES, type StorageChange } from './analytics-delivery';
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from './d1-invocation-budget';
 import { lookupV11StorageSource } from './v11-storage-journal';
-import { advanceAdmittedV11DailyProjection, retireV11DailyProjectionPage } from './v11-daily-projection';
+import { advanceAdmittedV11DailyProjection, retireV11DailyProjectionPage,
+ V11ProjectionDeadlineExceededError } from './v11-daily-projection';
 import { advanceV1DailyProjection, advanceV1DailyProjectionPage, prepareV1ProjectionOwnerFence, retireV1DailyProjectionPage } from './v1-daily-projection';
 import { advanceLegacyStorageAcknowledgement } from './legacy-storage-journal';
 import { advanceNextStorageCommunityDaily, retireStorageCommunityDailyPage } from './storage-community-daily';
@@ -155,7 +156,9 @@ async function assertRuntime(options:StorageAnalyticsBindings):Promise<number> {
 /** One format-dispatched journal step. A terminal fence is committed before an
  * acknowledgement which could let later work proceed. Response loss may leave
  * a conservative fence, never a falsely acknowledged or publicly eligible row. */
-export async function advanceStorageAnalytics(options:StorageAnalyticsBindings&{signal?:AbortSignal}) {
+export async function advanceStorageAnalytics(options:StorageAnalyticsBindings&{
+ signal?:AbortSignal;maxV11PhysicalPages?:number;deadlineMs?:number;
+}) {
  const {source,target,sourceId,sourceNamespace}=options;
  const {sequence,change}=await readOrdinaryAdmission(options);options.signal?.throwIfAborted();
  if(!change)return {state:'idle' as const,sequence,recordsRead:0};
@@ -167,7 +170,8 @@ export async function advanceStorageAnalytics(options:StorageAnalyticsBindings&{
   const statements=prepareV1ProjectionOwnerFence(target,change,proof);
   if(statements.length)await target.batch(statements);
  }
- return advanceAdmittedV11DailyProjection({source,target,sourceId,change, input:proof,signal:options.signal,
+ return advanceAdmittedV11DailyProjection({source,target,sourceId,change,input:proof,signal:options.signal,
+  maxPhysicalPages:options.maxV11PhysicalPages,deadlineMs:options.deadlineMs,
   sourceLayout:{kind:'typed-v11',sourceNamespace}});
 }
 async function advanceStorageAnalyticsV1Page(options:StorageAnalyticsBindings&{
@@ -246,7 +250,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    // publication interleave exactly as before.
    const page=!options.publishCommunity&&!options.skipV1PrefixProbe
     ?await advanceStorageAnalyticsV1Page(scoped,Math.min(4,maxSteps-steps)):null;
-   const step=page&&page.events>0?page:await advanceStorageAnalytics(scoped);
+   const v11Pages=Math.min(5,Math.max(1,1+Math.floor(Math.max(0,meter.remainingQueries-100)/12)));
+   const step=page&&page.events>0?page:await advanceStorageAnalytics({...scoped,maxV11PhysicalPages:v11Pages,deadlineMs});
    steps+=page&&page.events>0?page.events:1;recordsRead+=step.recordsRead;
    // Retiring old generations cannot be starved by an always-busy journal.
    const v11=await retireV11DailyProjectionPage(scoped.target,options.sourceId);
@@ -275,6 +280,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   return result('progress','step_limit');
  }catch(error){
   if(error instanceof D1InvocationBudgetExceededError)return result('deferred','query_budget');
+  if(error instanceof V11ProjectionDeadlineExceededError)return result('deferred','deadline');
   throw error;
  }
 }

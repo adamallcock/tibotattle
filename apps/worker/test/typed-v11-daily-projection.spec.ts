@@ -1,5 +1,5 @@
 import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from "@app-usagemonitor/telemetry-contract";
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
@@ -125,7 +125,36 @@ async function fixture(count = 1) {
   manifest.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
   await activateTelemetryV11Domain(source(), principal, manifest);
   const event = (await readIngestionChanges(source(), sourceId, 0)).at(-1)!;
-  return { participantId, deviceId, event, manifest };
+  return { participantId, deviceId, authorization, event, manifest };
+}
+
+async function activateSuccessor(value: Awaited<ReturnType<typeof fixture>>) {
+  const principal = { participantId: value.participantId, deviceId: value.deviceId };
+  const prepared = await makeV11Day(today(), { usage: Array.from({ length: 1_201 }, (_, n) =>
+    v11UsageRecord(today(), "a", { eventId: `event:v2:${n.toString(16).padStart(64, "0")}` })) });
+  const day = await registerTelemetryV11DayManifest(source(), principal, prepared.manifest);
+  for (const chunk of prepared.chunks) {
+    const envelopeDigest = await sha256Hex(`synthetic-successor:${crypto.randomUUID()}`);
+    const device = await authenticateDevice(source(), value.authorization);
+    const upload = await createDeviceUploadAuthorization(source(), device, envelopeDigest, 200);
+    const claimed = await claimDeviceUploadAuthorization(source(), `Upload ${upload.uploadAuthorization}`,
+      { envelopeDigest, bodyBytes: 200, contentType: "application/json" });
+    await persistTypedV11StagedChunk(source(), principal, chunk, { sourceNamespace: namespace,
+      chunkRowId: `chunk:${crypto.randomUUID()}`, r2Key: `synthetic/${crypto.randomUUID()}`, envelopeDigest,
+      deviceUploadAuthorizationId: claimed.authorizationId });
+  }
+  const prior = await createTelemetryV11DomainPredecessor(source(), principal);
+  const manifest: TelemetryV11DomainManifest = { schemaVersion: "telemetry-domain-manifest-v1.1",
+    fromDay: day.day, throughDay: day.day,
+    predecessor: { token: prior.token, previousGenerationId: prior.previousGenerationId,
+      legacyFingerprint: prior.legacyFingerprint },
+    days: [{ day: day.day, manifestId: day.manifestId, manifestDigest: day.manifestDigest }],
+    manifestDigest: "0".repeat(64) };
+  manifest.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
+  await activateTelemetryV11Domain(source(), principal, manifest);
+  const event = (await readIngestionChanges(source(), sourceId, value.event.sequence)).at(-1);
+  if (!event) throw new Error("synthetic successor event missing");
+  return event;
 }
 
 describe("typed accountless upload to isolated projection", () => {
@@ -290,20 +319,250 @@ describe("typed accountless upload to isolated projection", () => {
     expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_day_values").first("n")).toBe(0);
   });
 
-  it("uses one admitted ordinary path, preserves a final owner fence, and measures the resumed-page reduction", async () => {
+  it("groups five admitted physical pages and measures the exact bounded work", async () => {
     await applyD1Migrations(source(), b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
     await initializeTypedV1Admission(source(), namespace);
-    await fixture(1_200);
+    await fixture(2_200);
     const options = { source: source(), target: target(), ledger: b.DELETION_LEDGER, sourceId, sourceNamespace: namespace,
       maxSteps: 1, publishCommunity: false, skipV1PrefixProbe: true };
     await initializeStorageAnalyticsRuntime(options);
-    expect(await runStorageAnalyticsPass(options)).toMatchObject({ state: "progress", recordsRead: 200 });
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({ state: "progress", recordsRead: 1_000 });
     const stats = { prepared: 0, roundTrips: 0 };
     const measured = await runStorageAnalyticsPass({ ...options, source: observedDatabase(source(), stats),
       target: observedDatabase(target(), stats), ledger: observedDatabase(b.DELETION_LEDGER, stats) });
-    expect(measured).toMatchObject({ state: "progress", reason: "step_limit", steps: 1, recordsRead: 200 });
+    expect(measured).toMatchObject({ state: "progress", reason: "step_limit", steps: 1, recordsRead: 1_000 });
+    expect(await target().prepare(`SELECT revision,day_records FROM analytics_v11_projection_work
+      WHERE source_id=?`).bind(sourceId).first()).toEqual({ revision: 10, day_records: 2_000 });
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_projection_steps").first<number>("n")).toBe(10);
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_value_pages").first<number>("n")).toBe(10);
+    expect(await target().prepare("SELECT MAX(length(values_json)) n FROM analytics_v11_value_pages").first<number>("n"))
+      .toBeLessThanOrEqual(262_144);
     expect({ queries: measured.queriesUsed, prepared: stats.prepared, roundTrips: stats.roundTrips })
-      .toEqual({ queries: 41, prepared: 41, roundTrips: 28 });
+      .toEqual({ queries: 77, prepared: 77, roundTrips: 40 });
+    expect(measured.queriesUsed).toBeLessThan(840);
+  });
+
+  it("keeps the reserved query headroom ahead of any grouped target write", async () => {
+    await applyD1Migrations(source(), b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(source(), namespace);
+    await fixture(1_200);
+    const options = { source: source(), target: target(), ledger: b.DELETION_LEDGER, sourceId,
+      sourceNamespace: namespace, maxSteps: 1, publishCommunity: false, skipV1PrefixProbe: true };
+    await initializeStorageAnalyticsRuntime(options);
+    expect(await runStorageAnalyticsPass({ ...options, maxQueries: 99 }))
+      .toMatchObject({ state: "deferred", reason: "query_budget", steps: 0, recordsRead: 0 });
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_projection_steps").first<number>("n")).toBe(0);
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_value_pages").first<number>("n")).toBe(0);
+    const resumed = await runStorageAnalyticsPass({ ...options, maxQueries: 840 });
+    expect(resumed).toMatchObject({ state: "progress", recordsRead: 1_000 });
+    expect(resumed.queriesUsed).toBeLessThan(840);
+  });
+
+  it("keeps the final partial page and ready transition outside a physical-page group", async () => {
+    await applyD1Migrations(source(), b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(source(), namespace);
+    await fixture(1_050);
+    const options = { source: source(), target: target(), sourceId, sourceNamespace: namespace,
+      maxSteps: 1, publishCommunity: false, skipV1PrefixProbe: true };
+    await initializeStorageAnalyticsRuntime(options);
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({ recordsRead: 1_000, steps: 1 });
+    expect(await target().prepare("SELECT revision,day_records,phase FROM analytics_v11_projection_work")
+      .first()).toEqual({ revision: 5, day_records: 1_000, phase: "building" });
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({ recordsRead: 50, steps: 1 });
+    expect(await target().prepare("SELECT revision,day_records,phase FROM analytics_v11_projection_work")
+      .first()).toEqual({ revision: 6, day_records: 0, phase: "ready" });
+    expect(await runStorageAnalyticsPass(options)).toMatchObject({ recordsRead: 0, steps: 1 });
+    expect(await target().prepare("SELECT sequence FROM analytics_source_cursors WHERE source_id=?")
+      .bind(sourceId).first<number>("sequence")).toBe(1);
+  });
+
+  it("accepts a lost grouped response only when all five exact step receipts exist", async () => {
+    const value = await fixture(1_200);
+    const input = await lookupV11StorageSource(source(), value.event);
+    if (input.disposition !== "generation") throw new Error("synthetic generation missing");
+    let lost = false;
+    const flaky = new Proxy(target(), { get(database, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        const result = await database.batch(statements);
+        if (!lost && statements.length === 15) { lost = true; throw new Error("synthetic grouped ACK loss"); }
+        return result;
+      };
+      const member: unknown = Reflect.get(database, property);
+      return typeof member === "function" ? member.bind(database) : member;
+    } });
+    expect(await advanceAdmittedV11DailyProjection({ source: source(), target: flaky, sourceId,
+      change: value.event, input, sourceLayout, maxPhysicalPages: 5 }))
+      .toMatchObject({ state: "building", recordsRead: 1_000 });
+    expect(lost).toBe(true);
+    expect((await target().prepare(`SELECT revision,step_digest FROM analytics_v11_projection_steps
+      ORDER BY revision`).all()).results).toHaveLength(5);
+    expect(await target().prepare("SELECT revision,day_records FROM analytics_v11_projection_work")
+      .first()).toEqual({ revision: 5, day_records: 1_000 });
+
+    await reset();
+    await applyD1Migrations(source(), b.TEST_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_TYPED_INGESTION_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_INGESTION_BRIDGE_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
+    await applyD1Migrations(target(), b.TEST_ANALYTICS_MIGRATIONS);
+    await initializeStorageSource(source(), sourceId);
+    await initializeTypedV11Admission(source(), namespace);
+    await source().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();
+    const other = await fixture(1_200);
+    const otherInput = await lookupV11StorageSource(source(), other.event);
+    if (otherInput.disposition !== "generation") throw new Error("synthetic generation missing");
+    let partial = false;
+    const impossiblePartial = new Proxy(target(), { get(database, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        if (!partial && statements.length === 15) {
+          partial = true;
+          await database.batch(statements.slice(0, 3));
+          throw new Error("synthetic non-atomic partial group");
+        }
+        return database.batch(statements);
+      };
+      const member: unknown = Reflect.get(database, property);
+      return typeof member === "function" ? member.bind(database) : member;
+    } });
+    await expect(advanceAdmittedV11DailyProjection({ source: source(), target: impossiblePartial, sourceId,
+      change: other.event, input: otherInput, sourceLayout, maxPhysicalPages: 5 }))
+      .rejects.toThrow("V11_PROJECTION_STEP_UNACKNOWLEDGED");
+    expect(partial).toBe(true);
+    expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_v11_projection_steps
+      WHERE event_digest=?`).bind(other.event.eventDigest).first<number>("n")).toBe(1);
+  });
+
+  it("rolls back every grouped page when one statement fails", async () => {
+    const value = await fixture(1_200);
+    const input = await lookupV11StorageSource(source(), value.event);
+    if (input.disposition !== "generation") throw new Error("synthetic generation missing");
+    const broken = new Proxy(target(), { get(database, property) {
+      if (property === "batch") return (statements: D1PreparedStatement[]) => database.batch(statements.length === 15
+        ? [...statements, database.prepare("INSERT INTO synthetic_missing_table VALUES(1)")] : statements);
+      const member: unknown = Reflect.get(database, property);
+      return typeof member === "function" ? member.bind(database) : member;
+    } });
+    await expect(advanceAdmittedV11DailyProjection({ source: source(), target: broken, sourceId,
+      change: value.event, input, sourceLayout, maxPhysicalPages: 5 }))
+      .rejects.toThrow("V11_PROJECTION_STEP_UNACKNOWLEDGED");
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_projection_steps").first<number>("n")).toBe(0);
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_value_pages").first<number>("n")).toBe(0);
+    expect(await target().prepare("SELECT revision,day_records FROM analytics_v11_projection_work")
+      .first()).toEqual({ revision: 0, day_records: 0 });
+  });
+
+  it("rechecks owner authority after all grouped reads and isolates a successor generation", async () => {
+    const withdrawn = await fixture(1_200);
+    const withdrawnInput = await lookupV11StorageSource(source(), withdrawn.event);
+    if (withdrawnInput.disposition !== "generation") throw new Error("synthetic generation missing");
+    let sourceBatches = 0, withdrew = false;
+    const withdrawingSource = new Proxy(source(), { get(database, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        const result = await database.batch(statements); sourceBatches += 1;
+        if (sourceBatches === 10) {
+          withdrew = true;
+          await source().prepare("UPDATE participants SET state='deleting' WHERE id=?")
+            .bind(withdrawn.participantId).run();
+        }
+        return result;
+      };
+      const member: unknown = Reflect.get(database, property);
+      return typeof member === "function" ? member.bind(database) : member;
+    } });
+    expect(await advanceAdmittedV11DailyProjection({ source: withdrawingSource, target: target(), sourceId,
+      change: withdrawn.event, input: withdrawnInput, sourceLayout, maxPhysicalPages: 5 }))
+      .toMatchObject({ state: "discarded", sequence: withdrawn.event.sequence, recordsRead: 1_000 });
+    expect(withdrew).toBe(true);
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_value_pages").first<number>("n")).toBe(0);
+
+    await reset();
+    await applyD1Migrations(source(), b.TEST_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_TYPED_INGESTION_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_INGESTION_BRIDGE_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
+    await applyD1Migrations(target(), b.TEST_ANALYTICS_MIGRATIONS);
+    await initializeStorageSource(source(), sourceId);
+    await initializeTypedV11Admission(source(), namespace);
+    await source().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();
+    const original = await fixture(1_200);
+    const originalInput = await lookupV11StorageSource(source(), original.event);
+    if (originalInput.disposition !== "generation") throw new Error("synthetic generation missing");
+    let batches = 0;
+    const activation: { sequence?: number } = {};
+    const racingSource = new Proxy(source(), { get(database, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        const result = await database.batch(statements); batches += 1;
+        if (batches === 1) activation.sequence = (await activateSuccessor(original)).sequence;
+        return result;
+      };
+      const member: unknown = Reflect.get(database, property);
+      return typeof member === "function" ? member.bind(database) : member;
+    } });
+    expect(await advanceAdmittedV11DailyProjection({ source: racingSource, target: target(), sourceId,
+      change: original.event, input: originalInput, sourceLayout, maxPhysicalPages: 5 }))
+      .toMatchObject({ state: "building", sequence: 0, recordsRead: 1_000 });
+    expect(activation.sequence).toBe(2);
+    expect(await target().prepare("SELECT generation_id,day_records FROM analytics_v11_projection_work")
+      .first()).toEqual({ generation_id: originalInput.generationId, day_records: 1_000 });
+    expect((await target().prepare("SELECT DISTINCT producer_event FROM analytics_v11_value_pages").all()).results)
+      .toEqual([{ producer_event: original.event.eventDigest }]);
+  });
+
+  it("refuses a grouped target write after an erasure fence or elapsed deadline", async () => {
+    const value = await fixture(1_200);
+    const input = await lookupV11StorageSource(source(), value.event);
+    if (input.disposition !== "generation") throw new Error("synthetic generation missing");
+    let fenced = false;
+    const fencingTarget = new Proxy(target(), { get(database, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        if (!fenced && statements.length === 15) {
+          fenced = true;
+          await target().prepare(`INSERT INTO analytics_storage_erasure_fences
+            (source_id,owner_digest,terminal_event_digest,terminal_sequence,terminal_revision,authority_epoch,public_authority_epoch)
+            VALUES(?,?,?,?,?,?,?)`).bind(sourceId, value.event.ownerDigest, "f".repeat(64), value.event.sequence + 1,
+            value.event.revision + 1, value.event.authorityEpoch + 1, value.event.publicAuthorityEpoch + 1).run();
+        }
+        return database.batch(statements);
+      };
+      const member: unknown = Reflect.get(database, property);
+      return typeof member === "function" ? member.bind(database) : member;
+    } });
+    await expect(advanceAdmittedV11DailyProjection({ source: source(), target: fencingTarget, sourceId,
+      change: value.event, input, sourceLayout, maxPhysicalPages: 5 }))
+      .rejects.toThrow("V11_PROJECTION_STEP_UNACKNOWLEDGED");
+    expect(fenced).toBe(true);
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_value_pages").first<number>("n")).toBe(0);
+
+    await reset();
+    await applyD1Migrations(source(), b.TEST_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_TYPED_INGESTION_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_INGESTION_BRIDGE_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
+    await applyD1Migrations(target(), b.TEST_ANALYTICS_MIGRATIONS);
+    await initializeStorageSource(source(), sourceId);
+    await initializeTypedV11Admission(source(), namespace);
+    await source().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();
+    const late = await fixture(1_200);
+    const lateInput = await lookupV11StorageSource(source(), late.event);
+    if (lateInput.disposition !== "generation") throw new Error("synthetic generation missing");
+    let now = 1_000, batches = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const lateSource = new Proxy(source(), { get(database, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        const result = await database.batch(statements); batches += 1;
+        if (batches === 10) now = 20_000;
+        return result;
+      };
+      const member: unknown = Reflect.get(database, property);
+      return typeof member === "function" ? member.bind(database) : member;
+    } });
+    try {
+      await expect(advanceAdmittedV11DailyProjection({ source: lateSource, target: target(), sourceId,
+        change: late.event, input: lateInput, sourceLayout, maxPhysicalPages: 5, deadlineMs: 20_000 }))
+        .rejects.toThrow("V11_PROJECTION_DEADLINE_EXCEEDED");
+    } finally { clock.mockRestore(); }
+    expect(batches).toBeGreaterThanOrEqual(10);
+    expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_projection_steps").first<number>("n")).toBe(0);
   });
 
   it("does not let a later terminal proof skip its journal row when the prefix hint is stale", async () => {
