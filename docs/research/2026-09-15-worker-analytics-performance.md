@@ -124,6 +124,14 @@ comparable because a b482 unit can process up to five existing 200-record pages,
 rather than one. Both samples cover first-cache work on the same large event but
 different day pages and durations. This is not a whole-graph benchmark or ETA.
 
+At **September 15, 2026, 14:15 UTC**, a fresh read confirmed that the historical
+run had completed. The large contribution's cache was ready, covering all
+**2,122,823 records across 122 days**. The run had reached journal sequence
+24,759; seven new events had arrived afterward. This closes the first-cache
+rebuild milestone. Processing the new tail, restoring the ordinary schedule and
+verifying publication remain separate steps; completion does not yet establish
+sustained capacity under future incoming load.
+
 ## Why it is slow
 
 ### 1. Small pages pay substantial fixed overhead
