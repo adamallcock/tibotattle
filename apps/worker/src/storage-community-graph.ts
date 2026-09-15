@@ -21,6 +21,10 @@ import { loadStorageHistoryCheckpoint, saveStorageHistoryCheckpoint,
 import { withStorageGraphFailureStage } from './storage-analytics-failure';
 
 export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate-results-1';
+// Execution-only revision for the single optimistic direct historical read.
+// This is deliberately absent from result/checkpoint identities: a reader fix
+// may reopen one direct attempt without changing the analysis semantics.
+const STORAGE_GRAPH_DIRECT_HISTORY_READER_REVISION = 'typed-v1-direct-cross-1';
 const MAX_RESULT_BYTES = 1024 * 1024;
 const fail = () => new Error('STORAGE_GRAPH_RESULT_UNAVAILABLE');
 export type StorageGraphSource = 'v0.2' | 'v1' | 'v1.1' | 'mixed';
@@ -188,10 +192,12 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         // Durable intent precedes the direct read. If its response is lost or
         // execution fails, a retry takes the resumable reader instead of
         // repeating an oversized SQL reduction indefinitely.
+        const executionAttemptDigest=await sha256Hex(canonicalJson([
+          scope.dependencyDigest,STORAGE_GRAPH_DIRECT_HISTORY_READER_REVISION]));
         const attempt=await bindings.target.prepare(`INSERT INTO analytics_community_graph_execution
           VALUES(?,?,?,?,'checkpoint') ON CONFLICT(source_id,owner_digest,day) DO UPDATE SET
           dependency_digest=excluded.dependency_digest WHERE dependency_digest!=excluded.dependency_digest`)
-          .bind(bindings.sourceId,scope.owner.ownerDigest,scope.day,scope.dependencyDigest).run();
+          .bind(bindings.sourceId,scope.owner.ownerDigest,scope.day,executionAttemptDigest).run();
         if(attempt.meta.changes===1) {
           try {composition=await accountScopedHistoricalModelCompositionV1(source,
             scope.owner.participantId,scope.day,{sourcePin:scope.pin});}
