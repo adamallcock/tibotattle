@@ -711,8 +711,9 @@ async function loadPlanAttributionIndex(
       SELECT v.observed_at,v.provider,v.limit_id,v.plan_type,v.plan_variant,
         v.participant_id,v.device_id,v.observed_day,v.stream
       FROM typed_telemetry_records base INDEXED BY typed_v1_owner_observed
-      JOIN typed_v1_current_records v ON v.storage_row_id=base.id
-      WHERE base.format=10 AND base.owner_id=?${ownerParameter} AND base.stream=2
+      CROSS JOIN typed_v1_current_records v
+      WHERE v.storage_row_id=base.id
+        AND base.format=10 AND base.owner_id=?${ownerParameter} AND base.stream=2
         AND base.observed_at_ms>=?${fromParameter}${toParameter===null?'':` AND base.observed_at_ms<?${toParameter}`}
     ), plan_times`).replaceAll('telemetry_v1_records','typed_plan_input');
     bindings.push(typed.ownerId,Date.parse(observedAtCutoff),...(observedAtBefore?[Date.parse(observedAtBefore)]:[]));
@@ -917,8 +918,9 @@ async function v1QuotaAnalysisSql(db:D1Database,participantId:string,sql:string,
     SELECT v.occurrence_id,v.observed_at,v.provider,v.plan_type,v.plan_variant,v.limit_id,v.slot,
       v.used_percent,v.window_duration_minutes,v.resets_at,v.id,v.participant_id,v.device_id,v.observed_day,v.stream
     FROM typed_telemetry_records base INDEXED BY typed_v1_owner_observed
-    JOIN typed_v1_current_records v ON v.storage_row_id=base.id
-    WHERE base.format=10 AND base.owner_id=?${ownerParameter} AND base.stream=2
+    CROSS JOIN typed_v1_current_records v
+    WHERE v.storage_row_id=base.id
+      AND base.format=10 AND base.owner_id=?${ownerParameter} AND base.stream=2
       AND base.observed_at_ms>=?${fromParameter}${toParameter===null?'':` AND base.observed_at_ms<?${toParameter}`}
   ), era_markers`).replaceAll('telemetry_v1_records','typed_quota_input'),
   typedBindings:[typed.ownerId,Date.parse(observedAtCutoff),...(observedAtBefore?[Date.parse(observedAtBefore)]:[])]};

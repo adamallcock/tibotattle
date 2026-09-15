@@ -97,8 +97,8 @@ export function createTypedV1QuotaPageReader(db:D1Database,input:TypedV1Analysis
 
 function usageSql(same:boolean,upper:boolean){return `WITH page AS MATERIALIZED (
  SELECT r.storage_row_id,r.observed_at_ms,r.source_row_id FROM typed_telemetry_records base INDEXED BY typed_v1_owner_observed
- JOIN typed_v1_current_records r ON r.storage_row_id=base.id
- WHERE base.format=10 AND base.owner_id=?1 AND base.stream=1
+ CROSS JOIN typed_v1_current_records r
+ WHERE r.storage_row_id=base.id AND base.format=10 AND base.owner_id=?1 AND base.stream=1
  AND ${V1_WINNER_FILTER_SQL.replace('json_each(?)','json_each(?2)')}
  AND base.observed_at_ms${same?'=':'>'}?3${same?' AND base.source_row_id>?4':''}${upper?' AND base.observed_at_ms<?6':''}
  ORDER BY base.observed_at_ms,base.source_row_id LIMIT ?5

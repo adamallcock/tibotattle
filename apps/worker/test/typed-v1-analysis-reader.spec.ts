@@ -132,6 +132,10 @@ describe('typed v1 existing analytical reader parity',()=>{
   const q=Array.from({length:34},(_,i)=>({...quota(i,at(168)),planType:'pro',observedTime:at(i/2),usedPercent:i*2.5})) as TelemetryV1Record[];
   const u=Array.from({length:33},(_,i)=>({...usage(i),eventTime:at(i/2+0.25)})) as TelemetryV1Record[];
   await both(f,q,'quota');await both(f,u,'usage');const options={nowMs:base+86400000};
+  const unrelated=await pair();
+  for(let chunk=0;chunk<5;chunk++)await write(source(),unrelated.typed,
+   Array.from({length:200},(_,i)=>quota(chunk*200+i+1000)),'quota',chunk);
+  await source().prepare('ANALYZE').run();
   const observed=observeAnalysisPlans(source());
   const scalar=await accountScopedQuotaAnalysisV1(observed.database,f.typed.participantId,options);
   expect(observed.plans.map(plan=>plan.sql.includes('typed_plan_input AS MATERIALIZED')?'plan':'quota').sort()).toEqual(['plan','quota']);
@@ -143,6 +147,7 @@ describe('typed v1 existing analytical reader parity',()=>{
    expect(compatibilityRow,JSON.stringify(plan.details)).toBeGreaterThan(ownerSeek);
    expect(materializedScan,JSON.stringify(plan.details)).toBeGreaterThan(compatibilityRow);
    expect(plan.details.some(detail=>detail.includes('SCAN base'))).toBe(false);
+   expect(plan.details.some(detail=>detail.includes('sqlite_autoindex_typed_telemetry_records_1 (namespace_id='))).toBe(false);
   }
   const clean=(value:object)=>{const {inputFingerprint,...rest}=value as Record<string,unknown>;if(inputFingerprint!==undefined)expect(inputFingerprint).toMatch(/^[0-9a-f]{64}$/);return rest;};
   expect(clean(scalar)).toEqual(clean(await accountScopedQuotaAnalysisV1(raw(),f.original.participantId,options)));
@@ -155,6 +160,8 @@ describe('typed v1 existing analytical reader parity',()=>{
   const unrelated=await pair();
   for(let chunk=0;chunk<5;chunk++)await write(source(),unrelated.typed,
    Array.from({length:200},(_,i)=>quota(chunk*200+i+1000)),'quota',chunk);
+  for(let chunk=0;chunk<5;chunk++)await write(source(),unrelated.typed,
+   Array.from({length:200},(_,i)=>usage(chunk*200+i+1000)),'usage',chunk);
   await source().prepare('ANALYZE').run();
   const scope=(await loadTypedV1AnalysisScope(source(),f.typed.participantId))!;
   for(const [sql,args,index] of [
@@ -165,7 +172,14 @@ describe('typed v1 existing analytical reader parity',()=>{
    [TYPED_V1_USAGE_AT_TIME_SQL,[scope.ownerId,JSON.stringify([[f.typed.participantId,day(),f.typed.deviceId]]),Date.parse(`${day()}T12:05:00.000Z`),0,3],'typed_v1_owner_observed'],
   ] as const){const plan=await source().prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...args).all<{detail:string}>();
    expect(plan.results.some(row=>row.detail.includes('SEARCH')&&row.detail.includes(index))).toBe(true);
-   if(sql!==TYPED_V1_USAGE_AT_TIME_SQL){
+   if(sql===TYPED_V1_USAGE_AT_TIME_SQL){
+    const ownerSeek=plan.results.findIndex(row=>row.detail.includes('SEARCH base USING')&&row.detail.includes('typed_v1_owner_observed'));
+    const keyedExpansion=plan.results.findIndex(row=>row.detail.includes('SEARCH r USING INTEGER PRIMARY KEY'));
+    expect(ownerSeek,JSON.stringify(plan.results)).toBeGreaterThan(-1);
+    expect(keyedExpansion,JSON.stringify(plan.results)).toBeGreaterThan(ownerSeek);
+    expect(plan.results.some(row=>row.detail.includes('SCAN base'))).toBe(false);
+    expect(plan.results.some(row=>row.detail.includes('sqlite_autoindex_typed_telemetry_records_1 (namespace_id='))).toBe(false);
+   }else{
     const pageScan=plan.results.findIndex(row=>row.detail==='SCAN page');
     const keyedExpansion=plan.results.findIndex(row=>row.detail.includes('SEARCH r USING INTEGER PRIMARY KEY'));
     expect(plan.results.some(row=>row.detail==='MATERIALIZE expanded')).toBe(true);

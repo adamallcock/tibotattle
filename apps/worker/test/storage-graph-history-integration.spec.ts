@@ -31,6 +31,15 @@ function observePreparedSql(database:D1Database){
  }});
  return {database:observed,queries};
 }
+function observeDirectAttempts(database:D1Database,failFirst:boolean){let attempts=0;
+ const statement=(inner:D1PreparedStatement,sql:string):D1PreparedStatement=>new Proxy(inner,{get(value,key){
+  if(key==='bind')return(...args:unknown[])=>statement(value.bind(...args),sql);
+  if(key==='all'&&sql.includes('typed_plan_input AS MATERIALIZED'))return async(...args:unknown[])=>{
+   attempts++;if(failFirst&&attempts===1)throw new Error('synthetic direct read unavailable');
+   return Reflect.apply(Reflect.get(value,key) as Function,value,args);};
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+ return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),attempts:()=>attempts};}
 beforeEach(async()=>{
  await reset();for(const migrations of [b.TEST_MIGRATIONS,b.TEST_TYPED_INGESTION_MIGRATIONS,b.TEST_INGESTION_BRIDGE_MIGRATIONS,
   b.TEST_TYPED_V1_ADMISSION_MIGRATIONS,b.TEST_TYPED_V11_ADMISSION_MIGRATIONS])await applyD1Migrations(source(),migrations);
@@ -73,7 +82,7 @@ async function fixture(){
  return (await readStorageCommunityOwnerPage(source()))[0]!;
 }
 
-it('restarts a lost direct attempt through durable bounded checkpoints and matches the completed typed historical fit',async()=>{
+it('reopens one repaired direct attempt, serializes concurrent claims, then falls back to the same semantic checkpoint',async()=>{
  const owner=await fixture(),observed=observePreparedSql(source());
  const scope=await captureStorageGraphScope(observed.database,{owner,day,metric:'model',sourceId,sourceNamespace:namespace});
  const vectors=observed.queries.filter(sql=>sql.includes('FROM telemetry_analytical_chunks c'));
@@ -87,18 +96,39 @@ it('restarts a lost direct attempt through durable bounded checkpoints and match
   ownerDigest:owner.ownerDigest!,source:'v1',metric:'model',day,dependency:scope.pin.dayDependencies}));
  const direct=await computeStorageGraphResult(bindings(),scope);
  expect(direct.state).toBe('complete');if(direct.state!=='complete')throw new Error('direct missing');
- expect(direct.result.composition?.status).toBe('ready');
- // Simulate a lost process after direct intent committed but before final result.
+ const expected=direct.result.composition;expect(expected?.status).toBe('ready');
+ // A marker from the prior reader revision must permit exactly one repaired
+ // direct attempt. Fail that attempt synthetically so both concurrent callers
+ // converge on the unchanged durable-checkpoint fallback.
  await target().prepare('DELETE FROM analytics_community_graph_results').run();
+ await target().prepare(`UPDATE analytics_community_graph_execution SET dependency_digest=?
+  WHERE source_id=? AND owner_digest=? AND day=?`).bind(scope.dependencyDigest,sourceId,owner.ownerDigest,day).run();
+ const attempts=observeDirectAttempts(source(),true),concurrentBindings={...bindings(),source:attempts.database};
+ const concurrent=await Promise.all([
+  computeStorageGraphResult(concurrentBindings,scope),computeStorageGraphResult(concurrentBindings,scope)]);
+ expect(concurrent.every(result=>result.state==='deferred')).toBe(true);
+ expect(attempts.attempts()).toBe(1);
+ const executionDigest=await target().prepare(`SELECT dependency_digest FROM analytics_community_graph_execution
+  WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,owner.ownerDigest,day).first<string>('dependency_digest');
+ expect(executionDigest).toMatch(/^[a-f0-9]{64}$/);expect(executionDigest).not.toBe(scope.dependencyDigest);
  let deferred=0,completed=false;
  for(let i=0;i<24;i++){
   const meter=createD1InvocationBudget(900);
-  const result=await computeStorageGraphResult({...bindings(),source:meter.wrap(source()),target:meter.wrap(target())},scope);
+  const result=await computeStorageGraphResult({...bindings(),source:meter.wrap(attempts.database),target:meter.wrap(target())},scope);
   expect(meter.queriesUsed).toBeLessThanOrEqual(900);
   if(result.state==='deferred'){deferred++;continue;}
-  expect(result.result.composition).toEqual(direct.result.composition);completed=true;break;
+  expect(result.result.composition).toEqual(expected);completed=true;break;
  }
  expect(deferred).toBeGreaterThan(0);expect(completed).toBe(true);
+ expect(attempts.attempts()).toBe(1);
+ expect(await target().prepare(`SELECT dependency_digest FROM analytics_community_graph_execution
+  WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,owner.ownerDigest,day).first('dependency_digest')).toBe(executionDigest);
+ expect(await target().prepare(`SELECT dependency_digest FROM analytics_community_graph_results
+  WHERE source_id=? AND owner_digest=? AND metric='model' AND day=?`).bind(sourceId,owner.ownerDigest,day).first('dependency_digest'))
+  .toBe(scope.dependencyDigest);
+ expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+  WHERE source_id=? AND owner_digest=? AND day=? AND dependency_digest!=?`)
+  .bind(sourceId,owner.ownerDigest,day,scope.dependencyDigest).first('n')).toBe(0);
  expect(await source().prepare('SELECT count(*) n FROM community_prepared_usage_rows').first('n')).toBe(0);
  expect(await source().prepare('SELECT count(*) n FROM telemetry_v1_records').first('n')).toBe(0);
  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads').first<number>('n')).toBeGreaterThan(0);
