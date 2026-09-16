@@ -1,6 +1,6 @@
 import { canonicalJson } from './canonical-json';
-import { accountScopedModelCompositionV11,accountScopedQuotaAnalysisV11,
-  createV11QuotaAcquisitionIdentity,v11AnalysisWindow } from './quota-analysis-v11';
+import { advanceV11UsageReduction,createV11QuotaAcquisitionIdentity,finishV11UsageReduction,
+  v11AnalysisWindow,type V11UsageReductionCheckpoint } from './quota-analysis-v11';
 import { advanceV11QuotaAcquisition,createV11QuotaAcquisitionCheckpoint,
   type V11CompletedQuotaAcquisition,type V11QuotaAcquisitionCheckpoint,
   type V11QuotaAcquisitionIdentity,type V11QuotaInvocationBudget } from './quota-analysis-v11-reader';
@@ -10,7 +10,8 @@ import { createTypedV11QuotaPageReader } from './typed-v11-quota-reader';
 export type StorageV11HistoryCheckpoint={version:1;source:'v1.1';day:string;layout:string;
  identity:V11QuotaAcquisitionIdentity}&(
  {phase:'acquisition';acquisition:V11QuotaAcquisitionCheckpoint}|
- {phase:'finish';acquisition:V11CompletedQuotaAcquisition});
+ {phase:'finish';acquisition:V11CompletedQuotaAcquisition}|
+ {phase:'usage';acquisition:V11CompletedQuotaAcquisition;usage:V11UsageReductionCheckpoint});
 export type StorageV11HistoryResult={status:'deferred';checkpoint:StorageV11HistoryCheckpoint|null}|
  {status:'complete';analysis:object};
 
@@ -38,7 +39,7 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   identity={...liveIdentity,inputFingerprint:input.closedDependencyDigest},layout=`typed-v11:${sourceNamespace}`;
  const prior=input.checkpoint?structuredClone(input.checkpoint):null;
  if(prior&&(prior.version!==1||prior.source!=='v1.1'||prior.day!==day||prior.layout!==layout
-  ||!['acquisition','finish'].includes(prior.phase)||!sameIdentity(prior.identity,identity)))throw fail();
+  ||!['acquisition','finish','usage'].includes(prior.phase)||!sameIdentity(prior.identity,identity)))throw fail();
  const now=()=>{const value=(budget.now??Date.now)();if(!Number.isFinite(value))throw fail();return value;};
  // Reader scope1 + source pre/post2 + successor checks are fixed per group.
  // Preserve a bounded local reserve before starting a group; the outer D1 meter remains
@@ -77,9 +78,14 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  // manifest vector, so a new domain generation outside this closed window can
  // reuse it. The maintained finisher still accepts only a live-pin identity;
  // rebind after the current-pin assertion above, without changing evidence.
- const options={nowMs,sourcePin,quotaAcquisition:{...checkpoint.acquisition,identity:liveIdentity}};
- const analysis=metric==='fits'
-  ?await accountScopedQuotaAnalysisV11(source,participantId,options)
-  :await accountScopedModelCompositionV11(source,participantId,options);
- return {status:'complete',analysis};
+ const acquisition={...checkpoint.acquisition,identity:liveIdentity},options={nowMs,sourcePin,
+  typedSourceNamespace:sourceNamespace,quotaAcquisition:acquisition};
+ if(checkpoint.phase==='usage'&&checkpoint.usage.complete){
+  return {status:'complete',analysis:await finishV11UsageReduction(source,sourcePin,options,checkpoint.usage,metric,identity)};
+ }
+ const usage=await advanceV11UsageReduction(source,sourcePin,options,budget,
+  checkpoint.phase==='usage'?checkpoint.usage:null,input.maxPages??1,identity);
+ await assertV11SourcePinCurrent(source,sourcePin);
+ return {status:'deferred',checkpoint:{version:1,source:'v1.1',day,layout,identity,phase:'usage',
+  acquisition:checkpoint.acquisition,usage}};
 }

@@ -7,7 +7,8 @@ import { initializeStorageSource, STORAGE_OPERATING_BUDGET_BYTES } from "../src/
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
 import { registerTelemetryV11DayManifest, telemetryV11ExportEntries } from "../src/telemetry-v11-repository";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor, loadV11SourcePin } from "../src/telemetry-v11-domain";
-import { accountScopedQuotaAnalysisV11 } from "../src/quota-analysis-v11";
+import { accountScopedModelCompositionV11,accountScopedQuotaAnalysisV11,createV11QuotaAcquisitionIdentity,
+  finishV11UsageReduction } from "../src/quota-analysis-v11";
 import { readTypedV11UsageAnalysisPage, readTypedV11ChunkRecords, TYPED_V11_USAGE_PAGE_SQL } from "../src/typed-v11-analysis-reader";
 import { typedTelemetryReadNamespace } from "../src/typed-telemetry-read-layout";
 import { sha256Hex } from "../src/crypto";
@@ -22,6 +23,7 @@ import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggr
 import { readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
 import { readPublishedStorageCommunityGraph } from "../src/storage-community-graph-publication";
 import { readStorageCommunityProgress } from "../src/storage-community-progress";
+import { loadStorageHistoryCheckpoint } from "../src/storage-history-checkpoint";
 import { handleRequest } from "../src/index";
 import { runBackendLifecycle } from "../src/retention";
 import { reconcilePendingQuarantineObjects } from "../src/quarantine-reconciliation";
@@ -255,15 +257,34 @@ describe("typed active-domain analytical reads",()=>{
     expect(computed.reused).toBe(false);
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
       WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
-       STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n')).toBe(1);
+       STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n')).toBe(2);
     const modelScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:"model",sourceId:namespace,sourceNamespace:namespace});
-    const model=await computeStorageGraphResult(bindings,modelScope);
+    expect(modelScope.dependencyDigest).not.toBe(scope.dependencyDigest);
+    expect(modelScope.checkpointDependencyDigest).toBe(scope.checkpointDependencyDigest);
+    const modelReads=observePreparedSql(typed());
+    const model=await computeStorageGraphResult({...bindings,source:modelReads.database},modelScope);
     expect(model.state).toBe('complete');
     if(model.state!=='complete')throw new Error('synthetic model did not complete');
     expect(model.result.composition?.status).toBe('ready');
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
       WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
-       STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).first<number>('n')).toBe(1);
+       STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).first<number>('n')).toBe(2);
+    expect(modelReads.queries.filter(sql=>sql.includes("stream='usage'")
+      ||sql.includes("stream = 'usage'")||sql.includes("stream=3"))).toHaveLength(0);
+    const shared=await loadStorageHistoryCheckpoint({target:bindings.target,key:{sourceId:namespace,
+      sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day:scope.day,
+      dependencyDigest:scope.checkpointDependencyDigest,method:STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD}});
+    expect(shared.status).toBe('ready');
+    if(shared.status!=='ready'||!('source'in shared.checkpoint)||shared.checkpoint.phase!=='usage'
+      ||!('source'in scope.pin))throw new Error('expected completed shared v11 usage checkpoint');
+    const liveAcquisition={...shared.checkpoint.acquisition,
+      identity:createV11QuotaAcquisitionIdentity(scope.pin,Date.parse(scope.fixedNow))};
+    const reductionOptions={nowMs:Date.parse(scope.fixedNow),sourcePin:scope.pin,typedSourceNamespace:namespace,
+      quotaAcquisition:liveAcquisition};
+    expect(await finishV11UsageReduction(typed(),scope.pin,reductionOptions,shared.checkpoint.usage,'fits',shared.checkpoint.identity))
+      .toEqual(await accountScopedQuotaAnalysisV11(typed(),participantId,{nowMs:Date.parse(scope.fixedNow),sourcePin:scope.pin}));
+    expect(await finishV11UsageReduction(typed(),scope.pin,reductionOptions,shared.checkpoint.usage,'model',shared.checkpoint.identity))
+      .toEqual(await accountScopedModelCompositionV11(typed(),participantId,{nowMs:Date.parse(scope.fixedNow),sourcePin:scope.pin}));
     const meter=createD1InvocationBudget(20);
     const repeated=await computeStorageGraphResult({...bindings,source:meter.wrap(typed()),target:meter.wrap(bindings.target)},scope);
     expect(repeated.state==="complete"&&repeated.reused).toBe(true);
@@ -304,13 +325,48 @@ describe("typed active-domain analytical reads",()=>{
     expect(JSON.parse(control!).phase).toBe('finish');
     expect(observed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s')).length).toBe(1);
     expect(observed.queries.filter(sql=>sql.includes('r.id AS physical_id'))).toHaveLength(9);
-    expect(observed.queries.length).toBeLessThanOrEqual(15);
-    expect(targetObserved.queries.length).toBeLessThanOrEqual(22);
-    expect(observed.queries.length+targetObserved.queries.length).toBeLessThanOrEqual(40);
+    expect(observed.queries.length).toBeLessThanOrEqual(25);
+    expect(targetObserved.queries.length).toBeLessThanOrEqual(40);
+    expect(observed.queries.length+targetObserved.queries.length).toBeLessThanOrEqual(65);
     const completed=await computeStorageGraphResult(bindings,scope,{maxQueries:900});
     expect(completed.state).toBe('complete');
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_community_graph_results
       WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind(namespace,owner.ownerDigest).first<number>('n')).toBe(1);
+  },120_000);
+
+  it("persists a compact multi-page usage cursor once and reuses it for both v1.1 metrics",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true}),prepared=evidence();
+    const attribution=prepared.quota[0]!.accountPlanAttribution,start=Date.parse(day()+"T01:00:00.000Z");
+    prepared.usage=Array.from({length:5003},(_,index)=>v11UsageRecord(day(),"a",{
+      eventId:`event:reduction:${index.toString().padStart(5,"0")}`,
+      eventTime:new Date(start+index*1000).toISOString(),accountPlanAttribution:{...attribution}}));
+    await activate(typed(),f,await makeV11Day(day(),prepared),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const fitScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    expect((await computeStorageGraphResult(bindings,fitScope,{maxQueries:900})).state).toBe('complete');
+    const loaded=await loadStorageHistoryCheckpoint({target:bindings.target,key:{sourceId:namespace,
+      sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day:fitScope.day,
+      dependencyDigest:fitScope.checkpointDependencyDigest,method:STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD}});
+    expect(loaded.status).toBe('ready');
+    if(loaded.status!=='ready'||!('source'in loaded.checkpoint)||loaded.checkpoint.phase!=='usage')
+      throw new Error('expected usage checkpoint');
+    expect(loaded.checkpoint.usage).toMatchObject({complete:true,rowsRead:5003,dayIndex:1});
+    const encoded=JSON.stringify(loaded.checkpoint.usage);
+    expect(encoded).not.toContain('record_json');expect(encoded).not.toContain('event:reduction:');
+    expect(new TextEncoder().encode(encoded).byteLength).toBeLessThan(250_000);
+    const modelScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'model',sourceId:namespace,sourceNamespace:namespace});
+    const reads=observePreparedSql(typed());
+    expect((await computeStorageGraphResult({...bindings,source:reads.database},modelScope,{maxQueries:900})).state).toBe('complete');
+    expect(reads.queries.filter(sql=>sql.includes("stream='usage'")||sql.includes("stream = 'usage'"))).toHaveLength(0);
   },120_000);
 
   it("resumes a grouped v1.1 acquisition after the promoted response is lost without rereading source pages",async()=>{

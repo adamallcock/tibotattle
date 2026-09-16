@@ -29,8 +29,9 @@ export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate
 // a repaired reader from making new resumable progress.
 export const STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':checkpoint-store-2';
 export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':current-fit-checkpoint-1';
-export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-fit-checkpoint-1';
-export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-model-checkpoint-1';
+export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-2';
+export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
+export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
 // Execution-only revision for the single optimistic direct historical read.
 // This is deliberately absent from result/checkpoint identities: a reader fix
 // may reopen one direct attempt without changing the analysis semantics.
@@ -50,7 +51,7 @@ type Pin = Awaited<ReturnType<typeof loadCommunitySourcePin>>['sourcePin'];
 export interface StorageGraphScope {
   authority: StorageCommunityAuthority; owner: StorageCommunityOwner & {ownerDigest:string};
   source: Source; pin: Pin; day: string; fixedNow: string; metric:'fits'|'model';
-  dependencyDigest:string;
+  dependencyDigest:string; checkpointDependencyDigest:string;
 }
 export interface StorageGraphResult {
   scope:StorageGraphScope; fits:CommunityAllowanceFit[] | null; composition:V1ModelCompositionResult | null;
@@ -66,6 +67,15 @@ export async function storageGraphDependencyDigest(options:{
   const history=modelHistoryWindow(options.day);
   return sha256Hex(canonicalJson([options.authority.sourceId,options.authority.sourceNamespace,
     options.ownerDigest,options.source,options.metric,history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency]));
+}
+
+async function storageGraphCheckpointDependencyDigest(options:{
+ authority:Pick<StorageCommunityAuthority,'sourceId'|'sourceNamespace'>;ownerDigest:string;
+ source:StorageGraphSource;day:string;dependency:unknown;
+}):Promise<string>{
+ const history=modelHistoryWindow(options.day);
+ return sha256Hex(canonicalJson([options.authority.sourceId,options.authority.sourceNamespace,
+  options.ownerDigest,options.source,'shared-v11-usage',history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency]));
 }
 
 /** The cache key is the exact selected evidence in this window, not the newest
@@ -111,9 +121,11 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
   }
   const dependencyDigest=await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest,
     source,metric:options.metric,day:history.day,dependency});
+  const checkpointDependencyDigest=source==='v1.1'?await storageGraphCheckpointDependencyDigest({authority,
+    ownerDigest:owner.ownerDigest,source,day:history.day,dependency}):dependencyDigest;
   if(!await storageCommunityCalculationAuthorityIsCurrent(sourceDb,authority))throw scopeChanged();
   return {authority,owner:owner as StorageGraphScope['owner'],source,pin:loaded.sourcePin,
-    day:history.day,fixedNow:history.fixedNow,metric:options.metric,dependencyDigest};
+    day:history.day,fixedNow:history.fixedNow,metric:options.metric,dependencyDigest,checkpointDependencyDigest};
 }
 
 async function current(source:D1Database,scope:StorageGraphScope):Promise<boolean> {
@@ -214,7 +226,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       .first<number>('ready');
     if(ownerReady!==1)return {state:'deferred',reason:'v11_owner_pending'};
     const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
-      ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.dependencyDigest,
+      ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
       method:metric==='fits'?STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD:STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD};
     let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageV11HistoryCheckpoint|undefined;
     for(;;){
@@ -234,23 +246,30 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     // or promotion fails, the last durable head remains the replay point.
     const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
       participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
-      closedDependencyDigest:scope.dependencyDigest,checkpoint,maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
+      closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
       budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
     if(next.status==='complete')return {state:'complete',analysis:next.analysis};
     if(!next.checkpoint)return {state:'deferred',reason:'v11_checkpoint'};
     const saved=await persistCheckpoint(key,next.checkpoint,head,'v11_checkpoint');
     if(saved.state==='deferred')return saved;
     if(saved.head===head)return {state:'deferred',reason:'v11_checkpoint'};
-    // A group that reaches the finish phase is durably recoverable before the
-    // potentially expensive finisher starts. Use the remaining invocation
-    // budget immediately, while a failure still resumes from the saved finish
-    // checkpoint rather than rereading the group.
-    if(next.checkpoint.phase==='finish'){
-      const finished=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
+    // Persist each phase boundary before doing more work. Small owners can
+    // acquire, reduce and finish in one invocation; large owners return after
+    // one compact usage successor and resume from its exact cursor.
+    let staged=next.checkpoint,stagedHead=saved.head;
+    for(let transition=0;transition<2;transition++){
+      if(staged.phase!=='finish'&&!(staged.phase==='usage'&&staged.usage.complete))break;
+      const advanced=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
         participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
-        closedDependencyDigest:scope.dependencyDigest,checkpoint:next.checkpoint,maxPages:1,
+        closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint:staged,
+        maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
         budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
-      if(finished.status==='complete')return {state:'complete',analysis:finished.analysis};
+      if(advanced.status==='complete')return {state:'complete',analysis:advanced.analysis};
+      if(!advanced.checkpoint)break;
+      const promoted=await persistCheckpoint(key,advanced.checkpoint,stagedHead,'v11_checkpoint');
+      if(promoted.state==='deferred')return promoted;
+      if(promoted.head===stagedHead)break;
+      staged=advanced.checkpoint;stagedHead=promoted.head;
     }
     return {state:'deferred',reason:'v11_checkpoint'};
   };

@@ -5,6 +5,8 @@ import { encodeV1QuotaWorkCheckpoint,decodeV1QuotaWorkCheckpoint,createV1QuotaAc
  validateV1CompletedQuotaAcquisition,V1_QUOTA_WORK_COMPONENTS,type V1QuotaWorkComponent } from './quota-analysis-v1-reader';
 import { createV11QuotaAcquisitionCheckpoint,decodeV11QuotaWorkCheckpoint,encodeV11QuotaWorkCheckpoint,
  validateV11CompletedQuotaAcquisition,V11_QUOTA_WORK_COMPONENTS } from './quota-analysis-v11-reader';
+import { decodeV11UsageReductionCheckpoint,encodeV11UsageReductionCheckpoint,
+ V11_USAGE_REDUCTION_COMPONENTS } from './quota-analysis-v11';
 import type { StorageV1HistoryCheckpoint } from './storage-v1-history';
 import type { StorageV11HistoryCheckpoint } from './storage-v11-history';
 export type StorageHistoryCheckpoint=StorageV1HistoryCheckpoint|StorageV11HistoryCheckpoint;
@@ -32,7 +34,8 @@ function pin(value:string|null){if(value!==null&&!hash.test(value))throw fail();
 async function keyDigest(key:StorageHistoryKey){keys(key);return sha256Hex(canonicalJson(key));}
 function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistoryCheckpoint{
  const control=parse(controlText),components:Record<string,unknown[]>={};
- if(size(controlText)>STORAGE_HISTORY_CONTROL_BYTES||!control||control.version!==1||!['acquisition','finish'].includes(control.phase))throw fail();
+ if(size(controlText)>STORAGE_HISTORY_CONTROL_BYTES||!control||control.version!==1
+  ||!['acquisition','finish','usage'].includes(control.phase))throw fail();
  for(let i=0;i<parts.length;i++){
   const part=parse(parts[i]!);if(!Array.isArray(part))throw fail();
   (components[manifest[i]!.component]??=[]).push(...part);
@@ -46,11 +49,16 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
   }
   const acquisition={identity:control.identity,planAnchors:components.planAnchors??[],quotaRows:components.quotaRows??[]};
   if(!validateV11CompletedQuotaAcquisition(acquisition)
-   ||Object.keys(components).some(k=>!['planAnchors','quotaRows'].includes(k)))throw fail();
+   ||Object.keys(components).some(k=>!['planAnchors','quotaRows',...V11_USAGE_REDUCTION_COMPONENTS].includes(k)))throw fail();
+  if(control.phase==='usage')return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
+   phase:'usage',acquisition,usage:decodeV11UsageReductionCheckpoint(control.usage,
+    Object.fromEntries(V11_USAGE_REDUCTION_COMPONENTS.map(name=>[name,components[name]??[]])))};
+  if(Object.keys(components).some(k=>!['planAnchors','quotaRows'].includes(k)))throw fail();
   return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
    phase:'finish',acquisition};
  }
  if(Object.hasOwn(control,'source'))throw fail();
+ if(control.phase==='usage')throw fail();
  createV1QuotaAcquisitionCheckpoint(control.identity);
  if(control.phase==='acquisition'){
   for(const name of V1_QUOTA_WORK_COMPONENTS)components[name]??=[];
@@ -67,12 +75,15 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):
   if(checkpoint.source!=='v1.1')throw fail();
   if(checkpoint.layout!==`typed-v11:${key.sourceNamespace}`)throw fail();
   createV11QuotaAcquisitionCheckpoint(checkpoint.identity);
+  const usage=checkpoint.phase==='usage'?encodeV11UsageReductionCheckpoint(checkpoint.usage):null;
   const components:Record<string,unknown[]>=checkpoint.phase==='acquisition'
    ?{...encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).components}
-   :{planAnchors:checkpoint.acquisition.planAnchors,quotaRows:checkpoint.acquisition.quotaRows};
+   :{planAnchors:checkpoint.acquisition.planAnchors,quotaRows:checkpoint.acquisition.quotaRows,
+     ...(usage?.components??{})};
   const control=canonicalJson({version:1,source:'v1.1',day:checkpoint.day,layout:checkpoint.layout,
    identity:checkpoint.identity,phase:checkpoint.phase,
-   acquisition:checkpoint.phase==='acquisition'?encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).control:null});
+   acquisition:checkpoint.phase==='acquisition'?encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).control:null,
+   usage:usage?.control??null});
   if(size(control)>STORAGE_HISTORY_CONTROL_BYTES)throw fail();
   const manifest:Part[]=[],parts:string[]=[];
   for(const component of Object.keys(components).sort()){

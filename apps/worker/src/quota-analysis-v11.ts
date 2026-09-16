@@ -37,6 +37,7 @@ import { typedTelemetryReadNamespace } from "./typed-telemetry-read-layout";
 import { readTypedV11UsageAnalysisPage, TYPED_V11_ANALYSIS_PAGE_SIZE } from "./typed-v11-analysis-reader";
 import {
   V11_QUOTA_ACQUISITION_VERSION,
+  createV11QuotaAcquisitionCheckpoint,
   v11QuotaAcquisitionIdentityMatches,
   validateV11CompletedQuotaAcquisition,
 } from "./quota-analysis-v11-reader";
@@ -503,6 +504,11 @@ class Hazards {
   private indexes = new Map<string, { starts: number[]; maximumEnds: number[] }>();
   private intervalCount = 0;
   exceeded = false;
+  snapshot(): Array<{ key: string; intervals: Interval[] }> {
+    if (this.indexes.size > 0) throw new Error("v11 hazards already finalized");
+    return [...this.entries].map(([key, intervals]) => ({ key,
+      intervals: intervals.map(interval => ({ ...interval })) }));
+  }
   add(key: string, interval: Interval): void {
     if (this.exceeded) return;
     const bucket = this.entries.get(key) ?? [];
@@ -737,4 +743,388 @@ export async function accountScopedModelCompositionV11(
   const analysis = "status" in context ? context : await compositionAnalysis(db, context, options);
   await assertV11SourcePinCurrent(db, pin);
   return analysis;
+}
+
+/** Compact, replayable state for the single v1.1 usage traversal shared by the
+ * scalar fit and model-composition finishers.  It retains only session tails,
+ * merged attribution hazards, quota-grid cost buckets and model-grain cost
+ * buckets. Raw usage records are never copied into the analytics database. */
+export interface V11UsageReductionCheckpoint {
+  version: 1;
+  identity: V11QuotaAcquisitionIdentity;
+  days: string[];
+  dayIndex: number;
+  cursorTime: string;
+  cursorOccurrence: string;
+  rowsRead: number;
+  complete: boolean;
+  commonRefusal: string | null;
+  scalarRefusal: string | null;
+  modelRefusal: string | null;
+  previous: Array<{ key: string; time: number; scope: string | null }>;
+  hazards: Array<{ key: string; intervals: Interval[] }>;
+  scalarBuckets: Array<{ key: string; value: CostBucket }>;
+  modelCosts: Array<{ key: string; observedAtMs: number; model: string; costNanousd: number }>;
+  poisoned: number[];
+  usageEventCount: number;
+  unpricedUsageEventCount: number;
+  attributionUnresolved: boolean;
+}
+
+export interface V11UsageReductionBudget {
+  remainingQueries: number;
+  deadlineMs: number;
+  now?: () => number;
+}
+
+export const V11_USAGE_REDUCTION_COMPONENTS = ["usagePrevious","usageHazards","usageScalarBuckets",
+  "usageModelCosts","usagePoisoned"] as const;
+
+export function encodeV11UsageReductionCheckpoint(checkpoint:V11UsageReductionCheckpoint):{
+  control:Omit<V11UsageReductionCheckpoint,"previous"|"hazards"|"scalarBuckets"|"modelCosts"|"poisoned">;
+  components:Record<(typeof V11_USAGE_REDUCTION_COMPONENTS)[number],unknown[]>;
+}{
+  if(!validateV11UsageReductionCheckpoint(checkpoint))throw new Error("v11 usage reduction checkpoint invalid");
+  const {previous,hazards,scalarBuckets,modelCosts,poisoned,...control}=structuredClone(checkpoint);
+  return {control,components:{usagePrevious:previous,usageHazards:hazards,usageScalarBuckets:scalarBuckets,
+    usageModelCosts:modelCosts,usagePoisoned:poisoned}};
+}
+
+export function decodeV11UsageReductionCheckpoint(control:unknown,components:Record<string,unknown[]>):V11UsageReductionCheckpoint{
+  if(!control||typeof control!=="object"||Object.keys(components).some(key=>
+    !V11_USAGE_REDUCTION_COMPONENTS.includes(key as (typeof V11_USAGE_REDUCTION_COMPONENTS)[number])))
+    throw new Error("v11 usage reduction checkpoint invalid");
+  const checkpoint={...(control as Omit<V11UsageReductionCheckpoint,"previous"|"hazards"|"scalarBuckets"|"modelCosts"|"poisoned">),
+    previous:components.usagePrevious??[],hazards:components.usageHazards??[],
+    scalarBuckets:components.usageScalarBuckets??[],modelCosts:components.usageModelCosts??[],
+    poisoned:components.usagePoisoned??[]} as V11UsageReductionCheckpoint;
+  if(!validateV11UsageReductionCheckpoint(checkpoint))throw new Error("v11 usage reduction checkpoint invalid");
+  return checkpoint;
+}
+
+function safeCount(value: unknown, maximum = Number.MAX_SAFE_INTEGER): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= maximum;
+}
+
+/** Closed validation is used again by the durable checkpoint decoder. */
+export function validateV11UsageReductionCheckpoint(value: unknown): value is V11UsageReductionCheckpoint {
+  if (!value || typeof value !== "object") return false;
+  const row = value as V11UsageReductionCheckpoint;
+  if (Object.keys(row).sort().join(",") !== ["attributionUnresolved","commonRefusal","complete","cursorOccurrence",
+    "cursorTime","dayIndex","days","hazards","modelCosts","modelRefusal","poisoned","previous","rowsRead",
+    "scalarBuckets","scalarRefusal","unpricedUsageEventCount","usageEventCount","version","identity"].sort().join(",")
+      || row.version !== 1 || !row.identity || typeof row.identity!=="object"
+      || !Array.isArray(row.days) || row.days.length > MAX_USAGE_DAYS
+      || row.days.some((day, index) => !/^\d{4}-\d{2}-\d{2}$/u.test(day)
+        || index > 0 && row.days[index - 1]! >= day)
+      || !safeCount(row.dayIndex, row.days.length) || typeof row.cursorTime !== "string"
+      || !Number.isSafeInteger(Date.parse(row.cursorTime)) || typeof row.cursorOccurrence !== "string"
+      || !safeCount(row.rowsRead, MAX_WINDOWED_USAGE_ROWS) || typeof row.complete !== "boolean"
+      || ![row.commonRefusal,row.scalarRefusal,row.modelRefusal].every(reason => reason === null
+        || typeof reason === "string" && TOKEN.test(reason))
+      || !Array.isArray(row.previous) || row.previous.length > MAX_SESSIONS
+      || row.previous.some(entry => !entry || typeof entry.key !== "string" || !Number.isSafeInteger(entry.time)
+        || entry.scope !== null && typeof entry.scope !== "string")
+      || !Array.isArray(row.hazards) || row.hazards.reduce((n, entry) => n + (entry?.intervals?.length ?? MAX_HAZARD_INTERVALS + 1), 0) > MAX_HAZARD_INTERVALS
+      || row.hazards.some(entry => !entry || typeof entry.key !== "string" || !Array.isArray(entry.intervals)
+        || entry.intervals.some(interval => !Number.isSafeInteger(interval?.start)
+          || !Number.isSafeInteger(interval?.end) || interval.start > interval.end))
+      || !Array.isArray(row.scalarBuckets) || row.scalarBuckets.length > MAX_USAGE_BUCKETS
+      || row.scalarBuckets.some(entry => !entry || typeof entry.key !== "string" || !entry.value
+        || typeof entry.value.provider !== "string" || entry.value.scope !== null && typeof entry.value.scope !== "string"
+        || typeof entry.value.eraKey !== "string" || !Number.isSafeInteger(entry.value.placement)
+        || !safeCount(entry.value.costNanousd, 90_000_000_000_000) || typeof entry.value.fullyPriced !== "boolean")
+      || !Array.isArray(row.modelCosts) || row.modelCosts.length > MAX_USAGE_BUCKETS
+      || row.modelCosts.some(entry => !entry || typeof entry.key !== "string" || typeof entry.model !== "string"
+        || !Number.isSafeInteger(entry.observedAtMs) || !safeCount(entry.costNanousd, 90_000_000_000_000))
+      || !Array.isArray(row.poisoned) || row.poisoned.length > MAX_USAGE_BUCKETS
+      || row.poisoned.some(time => !Number.isSafeInteger(time))
+      || !safeCount(row.usageEventCount, MAX_WINDOWED_USAGE_ROWS)
+      || !safeCount(row.unpricedUsageEventCount, MAX_WINDOWED_USAGE_ROWS)
+      || typeof row.attributionUnresolved !== "boolean") return false;
+  return new Set(row.previous.map(entry => entry.key)).size === row.previous.length
+    && new Set(row.hazards.map(entry => entry.key)).size === row.hazards.length
+    && new Set(row.scalarBuckets.map(entry => entry.key)).size === row.scalarBuckets.length
+    && new Set(row.modelCosts.map(entry => entry.key)).size === row.modelCosts.length
+    && new Set(row.poisoned).size === row.poisoned.length;
+}
+
+function sortedReduction(state: V11UsageReductionCheckpoint): V11UsageReductionCheckpoint {
+  state.previous.sort((a, b) => a.key.localeCompare(b.key));
+  state.hazards.sort((a, b) => a.key.localeCompare(b.key));
+  state.scalarBuckets.sort((a, b) => a.key.localeCompare(b.key));
+  state.modelCosts.sort((a, b) => a.key.localeCompare(b.key));
+  state.poisoned.sort((a, b) => a - b);
+  return state;
+}
+
+function reductionHazards(state: V11UsageReductionCheckpoint): Hazards {
+  const hazards = new Hazards();
+  for (const entry of state.hazards) for (const interval of entry.intervals) hazards.add(entry.key, interval);
+  return hazards;
+}
+
+function serializeHazards(hazards: Hazards): V11UsageReductionCheckpoint["hazards"] {
+  return hazards.snapshot();
+}
+
+async function usageDays(db: D1Database, context: Context): Promise<string[] | Refusal> {
+  const rows = (await db.prepare(`SELECT day_row.observed_day FROM telemetry_v11_domain_days day_row
+    WHERE day_row.generation_id = ? AND day_row.observed_day >= ? AND day_row.observed_day < ?
+      AND EXISTS (SELECT 1 FROM telemetry_v11_chunks c
+        WHERE c.manifest_id = day_row.manifest_id AND c.stream = 'usage')
+    ORDER BY day_row.observed_day LIMIT ?`).bind(context.pin.generationId, context.start.slice(0, 10),
+      context.end.slice(0, 10), MAX_USAGE_DAYS + 1).all<{ observed_day: string }>()).results;
+  return rows.length > MAX_USAGE_DAYS ? refused("usage_day_limit_exceeded") : rows.map(row => row.observed_day);
+}
+
+async function usageEvent(context: Context, previous: Map<string, { time: number; scope: string | null }>,
+  row: UsageRow): Promise<UsageEvidence | Refusal | null> {
+  if (!TOKEN.test(row.provider)) return null;
+  const record = parseStoredRecordJson(row.record_json);
+  if (!record) return refused("invalid_attribution_record");
+  let attribution: TelemetryV11Attribution;
+  try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
+  catch { return refused("invalid_attribution_record"); }
+  const scope = attribution.accountBasis === "same_source" ? attribution.accountTrackId : null;
+  const end = Date.parse(row.observed_at);
+  if (!Number.isSafeInteger(end)) return refused("invalid_attribution_record");
+  const session = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
+  const prior = session === null ? undefined : previous.get(session);
+  if (session !== null) {
+    if (!previous.has(session) && previous.size >= MAX_SESSIONS) return refused("session_interval_scope_limit_exceeded");
+    previous.set(session, { time: end, scope });
+  }
+  const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
+  if (priced === null) return null;
+  const accountBreak = prior !== undefined && prior.scope !== scope;
+  const match = planEraForInterval(context.index, { contextKey: planAttributionContextKey(row.provider, "codex"),
+    accountScopeId: scope, observedAtMs: end, ...(prior ? { intervalStartMs: prior.time } : {}) });
+  const planConflict = attribution.planBasis === "conflicted"
+    || match.status === "matched" && attribution.planBasis === "same_source_occurrence"
+      && attribution.planType !== match.era.planType
+    || match.status === "matched" && attribution.planEraId !== null
+      && attribution.planEraId !== match.era.continuityId;
+  return { provider: row.provider, scope, accountBreak,
+    eraKey: !accountBreak && !planConflict && match.status === "matched" ? match.era.eraKey : null,
+    interval: { start: prior?.time ?? end, end }, priced };
+}
+
+function reduceScalar(context: Context, state: V11UsageReductionCheckpoint, hazards: Hazards,
+  buckets: Map<string, CostBucket>, event: UsageEvidence): void {
+  if (state.scalarRefusal || !context.grids.has(event.provider)) return;
+  const knownTargets = new Set([...context.seeds.values()].filter(seed => seed.accountScopeId !== null).map(seed => seed.provider));
+  const unknownTargets = new Set([...context.seeds.values()].filter(seed => seed.accountScopeId === null).map(seed => seed.provider));
+  const ownKey = scopeKey(event.provider, event.scope);
+  if (event.accountBreak) hazards.add("all|" + event.provider, event.interval);
+  else {
+    if (event.scope === null && knownTargets.has(event.provider)
+        || event.scope !== null && unknownTargets.has(event.provider)) {
+      hazards.add((event.scope === null ? "unknown|" : "known|") + event.provider, event.interval);
+    }
+    if (event.eraKey === null) hazards.add(ownKey, event.interval);
+  }
+  if (hazards.exceeded) { state.scalarRefusal = "attribution_hazard_limit_exceeded"; return; }
+  if (event.eraKey === null) return;
+  const grid = context.grids.get(event.provider)!;
+  const exact = grid.exact.has(event.interval.end);
+  const anchor = exact ? event.interval.end : ceiling(grid.ordered, event.interval.end);
+  if (anchor === null) return;
+  const key = JSON.stringify([event.provider, event.scope, event.eraKey, exact ? "s" : "b", anchor]);
+  const bucket = buckets.get(key);
+  if (bucket) {
+    bucket.placement = Math.max(bucket.placement, event.interval.end);
+    bucket.costNanousd += event.priced.costNanousd;
+    bucket.fullyPriced &&= event.priced.pricingStatus === "fully_priced";
+    if (!Number.isSafeInteger(bucket.costNanousd) || bucket.costNanousd > 90_000_000_000_000) state.scalarRefusal = "usage_cost_limit_exceeded";
+  } else {
+    buckets.set(key, { provider: event.provider, scope: event.scope, eraKey: event.eraKey,
+      placement: event.interval.end, costNanousd: event.priced.costNanousd,
+      fullyPriced: event.priced.pricingStatus === "fully_priced" });
+    if (buckets.size > MAX_USAGE_BUCKETS) state.scalarRefusal = "reduced_usage_limit_exceeded";
+    if (!Number.isSafeInteger(event.priced.costNanousd) || event.priced.costNanousd > 90_000_000_000_000) state.scalarRefusal = "usage_cost_limit_exceeded";
+  }
+}
+
+function reduceModel(context: Context, state: V11UsageReductionCheckpoint,
+  costs: Map<string, { observedAtMs: number; model: string; costNanousd: number }>, poisoned: Set<number>,
+  event: UsageEvidence): void {
+  if (state.modelRefusal) return;
+  const plans = new Set(context.index.eras.map(era => era.planType));
+  const accounts = new Set(context.index.eras.map(era => era.accountScopeId));
+  if (plans.size > 1 || context.index.conflicts.length > 0) { state.modelRefusal = "multi_plan_window_unsupported"; return; }
+  if (accounts.size > 1) { state.modelRefusal = "multi_account_window_unsupported"; return; }
+  if (context.index.eras.length > 1) { state.modelRefusal = "multi_era_window_unsupported"; return; }
+  const seed = context.seeds.values().next().value as Seed | undefined;
+  if (!seed) { state.modelRefusal = "supported_quota_track_unavailable"; return; }
+  if (event.provider !== seed.provider) return;
+  if (event.scope !== null && seed.accountScopeId !== null && event.scope !== seed.accountScopeId
+      && !event.accountBreak && event.eraKey !== null) return;
+  if (event.scope !== seed.accountScopeId || event.accountBreak || event.eraKey !== seed.planEraKey) {
+    state.attributionUnresolved = true; return;
+  }
+  const observedAtMs = Math.floor(event.interval.end / MODEL_COMPOSITION_POLICY.grainMs) * MODEL_COMPOSITION_POLICY.grainMs;
+  if (event.priced.pricingStatus !== "fully_priced") {
+    poisoned.add(observedAtMs); state.unpricedUsageEventCount += 1; return;
+  }
+  state.usageEventCount += 1;
+  if (!Number.isSafeInteger(event.priced.costNanousd) || event.priced.costNanousd > 90_000_000_000_000) {
+    state.modelRefusal = "usage_cost_limit_exceeded"; return;
+  }
+  const model = event.priced.modelId ?? "unknown", key = JSON.stringify([observedAtMs, model]);
+  const existing = costs.get(key);
+  if (existing) {
+    existing.costNanousd += event.priced.costNanousd;
+    if (!Number.isSafeInteger(existing.costNanousd) || existing.costNanousd > 90_000_000_000_000) state.modelRefusal = "usage_cost_limit_exceeded";
+  } else costs.set(key, { observedAtMs, model, costNanousd: event.priced.costNanousd });
+  if (costs.size > MAX_USAGE_BUCKETS) state.modelRefusal = "reduced_usage_limit_exceeded";
+}
+
+function initialModelRefusal(context:Context):string|null{
+ const plans=new Set(context.index.eras.map(era=>era.planType));
+ if(plans.size>1||context.index.conflicts.length>0)return "multi_plan_window_unsupported";
+ const accounts=new Set(context.index.eras.map(era=>era.accountScopeId));
+ if(accounts.size>1)return "multi_account_window_unsupported";
+ if(context.index.eras.length>1)return "multi_era_window_unsupported";
+ return context.seeds.size===0?"supported_quota_track_unavailable":null;
+}
+
+/** Advance at most maxPages physical usage pages. The returned checkpoint is a
+ * deterministic successor and can be promoted with exact-head CAS. */
+export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin,
+  options: V11AnalysisOptions & { quotaAcquisition: V11CompletedQuotaAcquisition }, budget: V11UsageReductionBudget,
+  prior?: V11UsageReductionCheckpoint | null, maxPages = 1,
+  reductionIdentity:V11QuotaAcquisitionIdentity=options.quotaAcquisition.identity): Promise<V11UsageReductionCheckpoint> {
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 32 || !Number.isSafeInteger(budget.remainingQueries)
+      || budget.remainingQueries < 0 || !Number.isFinite(budget.deadlineMs)) throw new Error("v11 usage reduction budget invalid");
+  createV11QuotaAcquisitionCheckpoint(reductionIdentity);
+  const context = await quotaContext(db, pin, options);
+  if ("status" in context) {
+    return { version:1, identity:structuredClone(reductionIdentity),days:[], dayIndex:0, cursorTime:options.quotaAcquisition.identity.observedAtCutoff,
+      cursorOccurrence:"", rowsRead:0, complete:true, commonRefusal:context.reason, scalarRefusal:null,
+      modelRefusal:null, previous:[], hazards:[], scalarBuckets:[], modelCosts:[], poisoned:[],
+      usageEventCount:0, unpricedUsageEventCount:0, attributionUnresolved:false };
+  }
+  let state = prior ? structuredClone(prior) : null;
+  if (state && (!validateV11UsageReductionCheckpoint(state)
+      ||!v11QuotaAcquisitionIdentityMatches(state.identity,reductionIdentity)))
+    throw new Error("v11 usage reduction checkpoint invalid");
+  const now = budget.now ?? Date.now;
+  if (!state) {
+    if (budget.remainingQueries < 1 || now() >= budget.deadlineMs) throw new Error("v11 usage reduction initialization unavailable");
+    budget.remainingQueries -= 1;
+    const selected = await usageDays(db, context);
+    if (!Array.isArray(selected)) return { version:1,identity:structuredClone(reductionIdentity),days:[], dayIndex:0, cursorTime:context.start,
+      cursorOccurrence:"", rowsRead:0, complete:true, commonRefusal:selected.reason, scalarRefusal:null,
+      modelRefusal:null, previous:[], hazards:[], scalarBuckets:[], modelCosts:[], poisoned:[],
+      usageEventCount:0, unpricedUsageEventCount:0, attributionUnresolved:false };
+    state = { version:1,identity:structuredClone(reductionIdentity),days:selected, dayIndex:0, cursorTime:selected[0] ? `${selected[0]}T00:00:00.000Z` : context.start,
+      cursorOccurrence:"", rowsRead:0, complete:selected.length===0, commonRefusal:null,
+      scalarRefusal:context.seeds.size===0?"supported_quota_track_unavailable":null,
+      modelRefusal:initialModelRefusal(context),
+      previous:[], hazards:[], scalarBuckets:[], modelCosts:[], poisoned:[], usageEventCount:0,
+      unpricedUsageEventCount:0, attributionUnresolved:false };
+  }
+  if (state.complete) return sortedReduction(state);
+  const previous = new Map(state.previous.map(entry => [entry.key, { time:entry.time, scope:entry.scope }]));
+  const hazards = reductionHazards(state);
+  const scalarBuckets = new Map(state.scalarBuckets.map(entry => [entry.key, { ...entry.value }]));
+  const modelCosts = new Map(state.modelCosts.map(entry => [entry.key,
+    { observedAtMs:entry.observedAtMs, model:entry.model, costNanousd:entry.costNanousd }]));
+  const poisoned = new Set(state.poisoned);
+  const maximum = options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
+  for (let page = 0; page < maxPages && state.dayIndex < state.days.length; page += 1) {
+    if (budget.remainingQueries < 1 || now() >= budget.deadlineMs) break;
+    const day = state.days[state.dayIndex]!;
+    budget.remainingQueries -= 1;
+    const rows = options.typedSourceNamespace ? await readTypedV11UsageAnalysisPage(db, { sourceNamespace:options.typedSourceNamespace,
+      pin, day, from:context.start, to:context.end, afterTime:state.cursorTime, afterOccurrence:state.cursorOccurrence })
+      : (await db.prepare(V11_USAGE_PAGE_SQL).bind(pin.participantId,pin.generationId,day,context.start,context.end,
+        state.cursorTime,state.cursorOccurrence,PAGE_SIZE).all<UsageRow>()).results;
+    state.rowsRead += rows.length;
+    if (state.rowsRead > maximum) { state.commonRefusal = "windowed_usage_limit_exceeded"; state.complete = true; break; }
+    for (const row of rows) {
+      const event = await usageEvent(context, previous, row);
+      if (event && "status" in event) { state.commonRefusal = event.reason; state.complete = true; break; }
+      if (!event) continue;
+      reduceScalar(context,state,hazards,scalarBuckets,event);
+      reduceModel(context,state,modelCosts,poisoned,event);
+    }
+    if (state.complete) break;
+    const pageSize = options.typedSourceNamespace ? TYPED_V11_ANALYSIS_PAGE_SIZE : PAGE_SIZE;
+    if (rows.length < pageSize) {
+      state.dayIndex += 1;
+      state.cursorTime = state.days[state.dayIndex] ? `${state.days[state.dayIndex]}T00:00:00.000Z` : context.end;
+      state.cursorOccurrence = "";
+    } else {
+      const last = rows[rows.length - 1]!;
+      state.cursorTime = last.observed_at; state.cursorOccurrence = last.occurrence_id;
+    }
+  }
+  state.complete ||= state.dayIndex >= state.days.length;
+  state.previous = [...previous].map(([key,value]) => ({ key,...value }));
+  state.hazards = serializeHazards(hazards);
+  state.scalarBuckets = [...scalarBuckets].map(([key,value]) => ({ key,value }));
+  state.modelCosts = [...modelCosts].map(([key,value]) => ({ key,...value }));
+  state.poisoned = [...poisoned];
+  const sorted = sortedReduction(state);
+  if (!validateV11UsageReductionCheckpoint(sorted)) throw new Error("v11 usage reduction successor invalid");
+  return sorted;
+}
+
+async function scalarFromReduction(context: Context, state: V11UsageReductionCheckpoint): Promise<object> {
+  const reason = state.commonRefusal ?? state.scalarRefusal;
+  if (reason) return refused(reason);
+  const hazards = reductionHazards(state), eventsByEra = new Map<string, QuotaUsageEventInput[]>();
+  const seedByEra = new Map([...context.seeds.values()].map(seed => [seed.planEraKey,seed]));
+  for (const {key,value:bucket} of state.scalarBuckets) {
+    const seed=seedByEra.get(bucket.eraKey);if(!seed)continue;
+    const events=eventsByEra.get(bucket.eraKey)??[];
+    events.push({eventId:"u:v1:"+await sha256Hex(key),datasetId:context.datasetId,accountTrackId:seed.accountTrackId,
+      provider:seed.provider,planType:seed.planType,planVariant:seed.planVariant,limitId:seed.limitId,
+      policyEpoch:seed.policyEpoch,observedAt:new Date(bucket.placement).toISOString(),costNanousd:bucket.costNanousd,
+      pricingStatus:bucket.fullyPriced?"fully_priced":"partially_priced"});eventsByEra.set(bucket.eraKey,events);
+  }
+  const tracks=[];
+  for(const [key,seed] of context.seeds){const evidence=buildResetEvidence({datasets:[{datasetId:context.datasetId,complete:true}],
+    quotaSnapshots:context.snapshots.get(key)!,usageEvents:eventsByEra.get(seed.planEraKey)??[]});
+    const excluded=evidence.resets.filter(reset=>{const first=Date.parse(reset.firstObservedAt),last=Date.parse(reset.lastObservedAt);
+      return hazards.overlaps("all|"+seed.provider,first,last)||hazards.overlaps(scopeKey(seed.provider,seed.accountScopeId),first,last)
+        ||hazards.overlaps((seed.accountScopeId===null?"known|":"unknown|")+seed.provider,first,last);});
+    const excludedKeys=new Set(excluded.map(reset=>reset.resetKey)),resets=evidence.resets.filter(reset=>!excludedKeys.has(reset.resetKey));
+    tracks.push({continuity:seed,calibration:analyzeQuotaCalibration({...evidence,resetCount:resets.length,resets}),
+      attribution:{status:"legacy_conditional",accountScope:seed.accountScopeId===null?"unknown":"declared",
+        quantityBinding:"conditional_no_wire_interval",planEvidenceScope:"bounded_analysis_window",planEvidenceStart:context.start,
+        planEraKey:seed.planEraKey,refusedResets:excluded.map(reset=>({resetKey:reset.resetKey,firstObservedAt:reset.firstObservedAt,
+          lastObservedAt:reset.lastObservedAt,reason:"usage_attribution_unresolved"}))}});}
+  return {schemaVersion:"account-scoped-quota-analysis-v0.1",status:"ready",fragmentSelection:"unselected_diagnostics",tracks};
+}
+
+function modelFromReduction(context: Context, state: V11UsageReductionCheckpoint): V1ModelCompositionResult {
+  const reason=state.commonRefusal??state.modelRefusal??(state.attributionUnresolved?"usage_attribution_unresolved":null);
+  if(reason)return refused(reason);
+  const seed=context.seeds.values().next().value! as Seed;
+  const quotaRows:CompositionQuotaRow[]=context.quota.map(row=>({observedAtMs:Date.parse(row.observed_at),
+    resetsAtMs:Date.parse(row.resets_at),usedPercent:row.used_percent,planType:row.plan_type}));
+  const poisoned=new Set(state.poisoned),usageRows:CompositionUsageRow[]=state.modelCosts
+    .filter(row=>row.costNanousd>0&&!poisoned.has(row.observedAtMs))
+    .map(row=>({observedAtMs:row.observedAtMs,model:row.model,costUsd:row.costNanousd/1_000_000_000}));
+  const corpus=buildCompositionObservations({quotaRows,usageRows});
+  return {status:"ready",planType:seed.planType,fit:calibrateCompositionCapacities(corpus.observations),
+    voidedBinCount:corpus.voidedBinCount,poolCount:corpus.poolCount,quotaRowCount:quotaRows.length,
+    usageEventCount:state.usageEventCount,unpricedUsageEventCount:state.unpricedUsageEventCount,
+    poisonedBinCount:poisoned.size,latestQuotaObservedAt:context.quota[context.quota.length-1]!.observed_at,
+    attributionStatus:"legacy_conditional",attributionMethod:V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+    inputFingerprint:context.pin.fingerprint};
+}
+
+/** Derive either result without touching usage rows after a completed reduction. */
+export async function finishV11UsageReduction(db:D1Database,pin:V11SourcePin,
+  options:V11AnalysisOptions & {quotaAcquisition:V11CompletedQuotaAcquisition},state:V11UsageReductionCheckpoint,
+  metric:"fits"|"model",reductionIdentity:V11QuotaAcquisitionIdentity=options.quotaAcquisition.identity):Promise<object>{
+  if(!validateV11UsageReductionCheckpoint(state)||!state.complete
+    ||!v11QuotaAcquisitionIdentityMatches(state.identity,reductionIdentity))throw new Error("v11 usage reduction incomplete");
+  const context=await quotaContext(db,pin,options);if("status" in context)return context;
+  const analysis=metric==="fits"?await scalarFromReduction(context,state):modelFromReduction(context,state);
+  return metric==="fits"?{...analysis,attributionMethod:V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,inputFingerprint:pin.fingerprint}:analysis;
 }

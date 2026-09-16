@@ -7,6 +7,7 @@ import {createV11QuotaAcquisitionCheckpoint,type V11QuotaAcquisitionIdentity} fr
 import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
 import type {StorageV11HistoryCheckpoint} from '../src/storage-v11-history';
 import {MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
+import type {V11UsageReductionCheckpoint} from '../src/quota-analysis-v11';
 import {retireStorageGraphPage} from '../src/storage-graph-retirement';
 import {STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_METHOD,
  STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD} from '../src/storage-community-graph';
@@ -31,7 +32,7 @@ async function read(storageKey=key){let cursor:StorageHistoryLoadCursor|undefine
  throw new Error('synthetic load did not finish');}
 function batchAdapter(batch:D1Database['batch']):D1Database{return new Proxy(target(),{get(db,p){if(p==='batch')return batch;const v=Reflect.get(db,p);return typeof v==='function'?v.bind(db):v;}});}
 describe('private paged historical checkpoint store',()=>{
- it('roundtrips v1.1 acquisition and finish generations under a distinct exact key',async()=>{
+ it('roundtrips v1.1 acquisition, compact usage, and shared-result generations under a distinct exact key',async()=>{
   const identity:V11QuotaAcquisitionIdentity={participantId:'synthetic-v11-participant',inputFingerprint:'e'.repeat(64),
    sourceMethodVersion:'synthetic-v11-reader-1',observedAtCutoff:'2026-05-28T00:00:00.000Z',
    resetsAtCutoff:'2026-06-04T00:00:00.000Z',windowMinutes:10080,maxQuotaRows:60000};
@@ -50,15 +51,25 @@ describe('private paged historical checkpoint store',()=>{
   const finish:StorageV11HistoryCheckpoint={...acquisition,phase:'finish',acquisition:{identity,planAnchors:[],quotaRows:[]}};
   const second=await drain(finish,largeHead,v11Key);
   expect(second).not.toBe(largeHead);expect(await read(v11Key)).toEqual({status:'ready',headDigest:second,checkpoint:finish});
+  const reduced:V11UsageReductionCheckpoint={version:1,identity,days:[],dayIndex:0,cursorTime:identity.observedAtCutoff,
+   cursorOccurrence:'',rowsRead:0,complete:true,commonRefusal:'supported_quota_track_unavailable',scalarRefusal:null,
+   modelRefusal:null,previous:[],hazards:[],scalarBuckets:[],modelCosts:[],poisoned:[],usageEventCount:0,
+   unpricedUsageEventCount:0,attributionUnresolved:false};
+  const usage:StorageV11HistoryCheckpoint={...finish,phase:'usage',usage:reduced};
+  const usageHead=await drain(usage,second,v11Key);
+  expect(await read(v11Key)).toEqual({status:'ready',headDigest:usageHead,checkpoint:usage});
   for(let i=0;i<10;i++)if((await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).state==='idle')break;
   const insert=async(metric:'fits'|'model')=>target().prepare(`INSERT INTO analytics_community_graph_results
    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(v11Key.sourceId,v11Key.ownerDigest,metric,v11Key.day,
     STORAGE_GRAPH_METHOD,v11Key.dependencyDigest,1,'c'.repeat(64),'{}','d'.repeat(64),'{}',Date.now(),'v1.1').run();
   await insert('model');expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z')))
    .toEqual({state:'idle',deleted:0});
-  expect(await read(v11Key)).toMatchObject({status:'ready',headDigest:second});
+  expect(await read(v11Key)).toMatchObject({status:'ready',headDigest:usageHead});
   await insert('fits');expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z')))
-   .toEqual({state:'retiring',deleted:0});
+   .toEqual({state:'idle',deleted:0});
+  expect(await read(v11Key)).toMatchObject({status:'ready',headDigest:usageHead});
+  expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2027-09-06T12:00:00Z')))
+   .toEqual({state:'retiring',deleted:2});
   expect(await read(v11Key)).toEqual({status:'absent'});
  },30000);
  it('retires current-fit checkpoints only after their exact semantic fit result exists',async()=>{
