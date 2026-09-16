@@ -20,9 +20,23 @@ export type StorageGraphFailureReason=typeof STORAGE_GRAPH_FAILURE_REASONS[numbe
 
 export class StorageGraphOperationError extends Error {
  readonly stage:StorageGraphOperationStage;readonly reason:StorageGraphFailureReason;
- constructor(stage:StorageGraphOperationStage,reason:StorageGraphFailureReason){
-  super('STORAGE_GRAPH_OPERATION_UNAVAILABLE');this.stage=stage;this.reason=reason;
+ /** One-way correlation token of the wrapped error, never its text. */
+ readonly detail:string|undefined;
+ constructor(stage:StorageGraphOperationStage,reason:StorageGraphFailureReason,detail?:string){
+  super('STORAGE_GRAPH_OPERATION_UNAVAILABLE');this.stage=stage;this.reason=reason;this.detail=detail;
  }
+}
+
+/** 32-bit FNV-1a of the error name and message. The scheduler log carries
+ * only this token; an operator matches it offline against the kernel's static
+ * error strings. A provider message with SQL or identifiers is not recoverable
+ * from it and is never logged. */
+export function storageGraphFailureDetail(error:unknown):string|undefined{
+ if(error instanceof StorageGraphOperationError)return error.detail;
+ if(!(error instanceof Error))return undefined;
+ const text=`${error.name}:${error.message}`;let hash=0x811c9dc5;
+ for(let i=0;i<text.length;i++){hash^=text.charCodeAt(i);hash=Math.imul(hash,0x01000193)>>>0;}
+ return hash.toString(16).padStart(8,'0');
 }
 
 export interface StorageGraphFailureFields {
@@ -54,7 +68,7 @@ export function classifyStorageGraphFailure(error:unknown):StorageGraphFailureRe
 export function rethrowStorageGraphFailure(stage:StorageGraphOperationStage,error:unknown):never{
  if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError
    ||error instanceof StorageGraphOperationError)throw error;
- throw new StorageGraphOperationError(stage,classifyStorageGraphFailure(error));
+ throw new StorageGraphOperationError(stage,classifyStorageGraphFailure(error),storageGraphFailureDetail(error));
 }
 
 export async function withStorageGraphFailureStage<T>(stage:StorageGraphOperationStage,

@@ -13,7 +13,8 @@ import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview,
 import { readCollectionControls } from './collection-controls';
 import { advanceStorageErasureJobs } from './storage-erasure';
 import { captureStorageAdminMetricSnapshot, warmStorageAdminMetricsHistoryCache } from './admin-metrics-history';
-import { caughtStorageGraphFailureFields, type StorageGraphFailureFields } from './storage-analytics-failure';
+import { caughtStorageGraphFailureFields, storageGraphFailureDetail,
+ type StorageGraphFailureFields } from './storage-analytics-failure';
 
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 export type { StorageAnalyticsBindings } from './analytics-delivery';
@@ -266,7 +267,12 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   let graphExhausted=false;
   const laneFailure=(stage:'daily_publish'|'graph_work',error:unknown):void=>{
    if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError)throw error;
-   graphFailure??=caughtStorageGraphFailureFields(stage,error);
+   const fields=caughtStorageGraphFailureFields(stage,error);
+   graphFailure??=fields;
+   // Closed fields plus a one-way token of the wrapped error: enough to match
+   // a kernel's static error string offline, never a message or identifier.
+   if(fields)console.log(JSON.stringify({event:'storage_analytics_lane_failure',lane:stage,phase:fields.phase,
+    reason:fields.reason,detail:storageGraphFailureDetail(error)??null}));
    if(stage==='graph_work')graphExhausted=true;
   };
   if(options.publishCommunity&&meter.remainingQueries>=253&&deadlineMs-Date.now()>=5_000

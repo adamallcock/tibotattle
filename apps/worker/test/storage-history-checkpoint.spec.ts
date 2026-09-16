@@ -115,7 +115,7 @@ describe('private paged historical checkpoint store',()=>{
   const old=await drain(checkpoint()),large=checkpoint(18000);
   const first=await save({target:target(),key,checkpoint:large,expectedHead:old,maxWrites:4});
   expect(first.status).toBe('staging');if(first.status!=='staging')throw new Error('expected staging');
-  const observed=countRoundTrips(target());let cursor=first.cursor,result=first;
+  const observed=countRoundTrips(target());let cursor=first.cursor,result:Awaited<ReturnType<typeof save>>=first;
   for(let i=0;i<100&&result.status==='staging';i++){
    const before={...observed.counts};
    result=await save({target:observed.database,key,checkpoint:large,expectedHead:old,maxWrites:4,cursor});
