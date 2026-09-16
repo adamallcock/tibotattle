@@ -371,12 +371,24 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       if(next.status==='complete')analyses.push({source:'v1',analysis:next.analysis});
       else {
        if(!next.checkpoint)return {state:'deferred',reason:'current_fit_checkpoint'};
-       const saved=await persistCheckpoint(key,next.checkpoint,head,'current_fit_checkpoint');
-       if(saved.state==='deferred')return saved;
-       if(saved.head===head)return {state:'deferred',reason:'current_fit_checkpoint'};
-       if(next.checkpoint.phase==='finish'){
-        const finished=await advance(next.checkpoint,1);
-        if(finished.status==='complete')analyses.push({source:'v1',analysis:finished.analysis});
+       // Persist every phase successor before advancing it. In particular, a
+       // finish->usage transition may itself be deferred; dropping that
+       // returned cursor would make the next invocation replay the page and
+       // can strand a large current-fit corpus forever.
+       let staged=next.checkpoint,stagedHead=head;
+       for(let transition=0;transition<3;transition++){
+        const saved=await persistCheckpoint(key,staged,stagedHead,'current_fit_checkpoint');
+        if(saved.state==='deferred')return saved;
+        if(saved.head===stagedHead)return {state:'deferred',reason:'current_fit_checkpoint'};
+        stagedHead=saved.head;
+        if(staged.phase!=='finish'&&!(staged.phase==='usage'&&staged.usage.complete))
+         return {state:'deferred',reason:'current_fit_checkpoint'};
+        const advanced=await advance(staged,1);
+        if(advanced.status==='complete'){
+         analyses.push({source:'v1',analysis:advanced.analysis});break;
+        }
+        if(!advanced.checkpoint)return {state:'deferred',reason:'current_fit_checkpoint'};
+        staged=advanced.checkpoint;
        }
       }
       if(!analyses.some(analysis=>analysis.source==='v1')){

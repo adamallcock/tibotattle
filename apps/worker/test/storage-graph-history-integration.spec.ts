@@ -3,9 +3,11 @@ import {beforeEach,it,expect} from 'vitest';
 import {createV11DeviceFixture,v11UsageRecord} from './helpers/telemetry-v11';
 import {pricedModelHistoryUsage,MODEL_HISTORY_TEST_CAPACITIES} from './helpers/model-history';
 import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reader';
-import {MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
+import {accountScopedQuotaAnalysisV1,MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
+import {selectCommunityAllowanceAnalysisFits} from '../src/community-allowance';
 import {authenticateDevice,createDeviceUploadAuthorization,claimDeviceUploadAuthorization} from '../src/device-auth';
 import {parseTelemetryV1Chunk,type TelemetryV1Record} from '../src/telemetry-v1';
+import type {V1SourcePin} from '../src/telemetry-v1-source-selection';
 import {initializeTypedV1Admission,insertTypedTelemetryV1Chunk} from '../src/typed-v1-admission';
 import {initializeTypedV11Admission} from '../src/typed-v11-admission';
 import {telemetryV11LegacyProjection} from '../src/telemetry-v11-repository';
@@ -20,7 +22,7 @@ import {captureStorageGraphScope,computeStorageGraphResult,storageGraphDependenc
  STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
 import {advanceStorageCommunityGraphWork} from '../src/storage-community-graph-work';
-import {retireStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,type StorageHistoryKey} from '../src/storage-history-checkpoint';
+import {loadStorageHistoryCheckpoint,retireStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,type StorageHistoryKey} from '../src/storage-history-checkpoint';
 import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
 
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];
@@ -47,6 +49,17 @@ function advanceClockAfterQuotaPages(database:D1Database,setNow:(value:number)=>
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
  return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
   const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),pages:()=>pages};
+}
+function advanceClockAfterUsagePages(database:D1Database,setNow:(value:number)=>void){let pages=0,rowsRead=0;
+ const statement=(inner:D1PreparedStatement,sql:string):D1PreparedStatement=>new Proxy(inner,{get(value,key){
+  if(key==='bind')return(...args:unknown[])=>statement(value.bind(...args),sql);
+  const usagePage=sql.includes('WITH page AS MATERIALIZED')
+    &&(sql.includes('base.stream=1')||sql.includes("r.stream = 'usage'"));
+  if(key==='all'&&usagePage)return async(...args:unknown[])=>{const result=await Reflect.apply(Reflect.get(value,key) as Function,value,args);
+   pages++;rowsRead+=result.results.length;setNow(pages===1?10_000:12_000);return result;};
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}});
+ return {database:new Proxy(database,{get(value,key){if(key==='prepare')return(sql:string)=>statement(value.prepare(sql),sql);
+  const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;}}),pages:()=>pages,rowsRead:()=>rowsRead};
 }
 function observeDirectAttempts(database:D1Database,failFirst:boolean){let attempts=0;
  const statement=(inner:D1PreparedStatement,sql:string):D1PreparedStatement=>new Proxy(inner,{get(value,key){
@@ -84,7 +97,7 @@ beforeEach(async()=>{
  expect((await drainCommunityPublicSourceBootstrap(source())).completed).toBe(true);
  await initializeStorageAnalyticsRuntime(bindings());
 });
-async function fixture(){
+async function fixture(extraUsageCount=0){
  const owner=await createV11DeviceFixture(source()),groups=new Map<string,TelemetryV1Record[]>();
  const base=Date.parse('2026-09-01T00:00:00Z'),at=(h:number)=>new Date(base+h*3600000).toISOString();
  const push=(stream:string,time:string,record:TelemetryV1Record)=>{const key=`${stream}:${time.slice(0,10)}`;
@@ -104,15 +117,22 @@ async function fixture(){
   }
   quota(at(bin*2+1));
  }
+ for(let index=0;index<extraUsageCount;index++){
+  const time=at(3+index/3_600_000),priced=pricedModelHistoryUsage('gpt-5.6-sol',0.0001,time),fields=JSON.parse(priced.record.recordJson!);
+  const record=v11UsageRecord(time.slice(0,10),'x',{...fields,eventTime:time,eventId:`synthetic:extra:${index}`});
+  push('usage',time,JSON.parse(telemetryV11LegacyProjection('usage',record)!.canonicalRecord));
+ }
  for(const [key,records] of groups){
-  const digest=await sha256Hex(`synthetic:${key}`),principal=await authenticateDevice(source(),owner.authorization);
-  const auth=await createDeviceUploadAuthorization(source(),principal,digest,200);
-  const claim=await claimDeviceUploadAuthorization(source(),`Upload ${auth.uploadAuthorization}`,{envelopeDigest:digest,bodyBytes:200,contentType:'application/json'});
-  const chunk=parseTelemetryV1Chunk({schemaVersion:'telemetry-contribution-v1.0',chunkId:`${key}:0`,chunkRevision:1,
-   chunkDigest:await sha256Hex(canonicalJson(records)),parserVersion:'synthetic-history',consent:{telemetrySchemaVersion:'telemetry-contribution-v1.0',
-    fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'},records});
-  await insertTypedTelemetryV1Chunk(source(),{chunkRowId:`chunk:${crypto.randomUUID()}`,participantId:owner.participantId,deviceId:owner.deviceId,
-   chunk,envelopeDigest:digest,r2Key:`synthetic/${key}`,deviceUploadAuthorizationId:claim.authorizationId,createdAt:new Date().toISOString(),supersedes:null},namespace);
+  for(let offset=0;offset<records.length;offset+=200){
+   const page=records.slice(offset,offset+200),digest=await sha256Hex(`synthetic:${key}:${offset}`),principal=await authenticateDevice(source(),owner.authorization);
+   const auth=await createDeviceUploadAuthorization(source(),principal,digest,200);
+   const claim=await claimDeviceUploadAuthorization(source(),`Upload ${auth.uploadAuthorization}`,{envelopeDigest:digest,bodyBytes:200,contentType:'application/json'});
+   const chunk=parseTelemetryV1Chunk({schemaVersion:'telemetry-contribution-v1.0',chunkId:`${key}:${offset/200}`,chunkRevision:1,
+    chunkDigest:await sha256Hex(canonicalJson(page)),parserVersion:'synthetic-history',consent:{telemetrySchemaVersion:'telemetry-contribution-v1.0',
+     fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'},records:page});
+   await insertTypedTelemetryV1Chunk(source(),{chunkRowId:`chunk:${crypto.randomUUID()}`,participantId:owner.participantId,deviceId:owner.deviceId,
+    chunk,envelopeDigest:digest,r2Key:`synthetic/${key}:${offset/200}`,deviceUploadAuthorizationId:claim.authorizationId,createdAt:new Date().toISOString(),supersedes:null},namespace);
+  }
  }
  for(let n=0;n<30;n++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
  return (await readStorageCommunityOwnerPage(source()))[0]!;
@@ -144,6 +164,35 @@ it('advances current v1 fits through a durable bounded acquisition before semant
  expect(await target().prepare(`SELECT method,dependency_digest FROM analytics_community_graph_results
   WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(sourceId,owner.ownerDigest,day).first())
   .toEqual({method:STORAGE_GRAPH_METHOD,dependency_digest:scope.dependencyDigest});
+},60000);
+
+it('persists and resumes the current-fit usage phase before publishing the equivalent fit',async()=>{
+ const owner=await fixture(5_001),scope=await captureStorageGraphScope(source(),{owner,day,metric:'fits',sourceId,sourceNamespace:namespace});
+ let now=0;const observed=advanceClockAfterUsagePages(source(),value=>{now=value});
+ const first=await computeStorageGraphResult({...bindings(),source:observed.database},scope,{deadlineMs:20_000,now:()=>now});
+ expect(first).toEqual({state:'deferred',reason:'current_fit_checkpoint'});
+ expect(observed.pages()).toBeGreaterThanOrEqual(1);expect(observed.rowsRead()).toBe(5_000);
+ const key:StorageHistoryKey={sourceId,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day,
+  dependencyDigest:scope.dependencyDigest,method:STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD};
+ const saved=await loadStorageHistoryCheckpoint({target:target(),key});
+ expect(saved.status).toBe('ready');
+ if(saved.status!=='ready')throw new Error('current-fit usage checkpoint missing');
+ if('source'in saved.checkpoint)throw new Error('unexpected v1.1 checkpoint');
+ expect(saved.checkpoint.phase).toBe('usage');
+ if(saved.checkpoint.phase!=='usage')throw new Error('current-fit usage phase missing');
+ expect(saved.checkpoint.usage.rowsRead).toBe(5_000);
+ expect(saved.checkpoint.usage.cursorId).toBeGreaterThan(0);
+
+ const resumed=await computeStorageGraphResult({...bindings(),source:observed.database},scope);
+ expect(resumed.state).toBe('complete');
+ if(resumed.state!=='complete')throw new Error('resumed current fit did not complete');
+ expect(observed.pages()).toBeGreaterThan(1);expect(observed.rowsRead()).toBe(5_121);
+ const baseline=await accountScopedQuotaAnalysisV1(source(),owner.participantId,{nowMs:Date.parse(scope.fixedNow),sourcePin:scope.pin as V1SourcePin});
+ type FitInput=Parameters<typeof selectCommunityAllowanceAnalysisFits>[1][number];
+ const expected=selectCommunityAllowanceAnalysisFits(scope.owner.ownerDigest!,[{source:'v1',analysis:baseline as FitInput['analysis']}]);
+ expect(resumed.result.fits).toEqual(expected);
+ expect(await target().prepare(`SELECT payload_json FROM analytics_community_graph_results
+  WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(sourceId,owner.ownerDigest,day).first()).not.toBeNull();
 },60000);
 
 it('saves current-fit progress acquired at the work deadline inside the outer deadline',async()=>{
