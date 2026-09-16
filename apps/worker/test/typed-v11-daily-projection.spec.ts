@@ -227,8 +227,9 @@ describe("typed accountless upload to isolated projection", () => {
     const trigger=await source().prepare("SELECT sql FROM sqlite_schema WHERE name='telemetry_v11_head_insert_publish'").first<string>("sql");
     expect(trigger).toContain("INSERT INTO community_daily_aggregate_rebuilds");
   });
-  it("removes synchronous analytical work while retaining admission, head CAS and opt-out",async()=>{
+  it("removes synchronous analytical work and retains accepted history after opt-out",async()=>{
     await applyD1Migrations(source(),b.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(m=>/^(0001|0002)_/.test(m.name)));
+    await applyD1Migrations(source(),b.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(m=>/^0005_/.test(m.name)));
     const value=await fixture(203);
     expect(await source().prepare("SELECT revision FROM community_analytical_input_versions WHERE participant_id=?")
       .bind(value.participantId).first<number>("revision")).toBeGreaterThan(0);
@@ -241,9 +242,13 @@ describe("typed accountless upload to isolated projection", () => {
     await expect(source().prepare("INSERT INTO community_model_composition_days(day,payload_json,computed_at) VALUES('2026-09-01','{}','2026-09-01T00:00:00.000Z')")
       .run()).rejects.toThrow("analytics_write_requires_separate_database");
     await drain();expect((await read(value.event.ownerDigest)).values[0]!.counts.usage).toBe(203);
+    const retained = await read(value.event.ownerDigest);
     await revokeAccountlessEnrollment(source(),value.deviceId,"user_opt_out",Date.now());
-    expect((await read(value.event.ownerDigest)).state).toBe("authority-unavailable");
-    await drain();expect((await read(value.event.ownerDigest)).values).toEqual([]);
+    await expect(authenticateDevice(source(),value.authorization)).rejects.toThrow();
+    expect(await read(value.event.ownerDigest)).toEqual(retained);
+    await drain();expect(await read(value.event.ownerDigest)).toEqual(retained);
+    expect(await source().prepare("SELECT COUNT(*) n FROM typed_v11_record_admissions").first("n")).toBe(203);
+    expect(await source().prepare("SELECT COUNT(*) n FROM storage_ingestion_changes").first("n")).toBe(1);
     expect(await source().prepare("SELECT COUNT(*) n FROM community_daily_aggregate_rebuilds").first("n")).toBe(0);
   });
   it("runs the independently metered scheduler and preserves a committed cursor across failure",async()=>{
@@ -295,13 +300,13 @@ describe("typed accountless upload to isolated projection", () => {
     expect(await source().prepare("SELECT COUNT(*) n FROM typed_v11_record_admissions").first("n")).toBe(203);
     expect(await runStorageAnalyticsPass(options)).toMatchObject({state:"idle",recordsRead:0});
     expect((await read(value.event.ownerDigest)).values[0]!.counts.usage).toBe(203);
-    await revokeAccountlessEnrollment(source(),value.deviceId,"user_opt_out",Date.now());
+    await revokeAccountlessEnrollment(source(),value.deviceId,"security_reset",Date.now());
     expect((await read(value.event.ownerDigest)).state).toBe("authority-unavailable");
     expect(await runStorageAnalyticsPass(options)).toMatchObject({state:"idle"});
     expect((await read(value.event.ownerDigest)).values).toEqual([]);
     await expect(runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:"disabled"})).resolves.toBeUndefined();
   });
-  it("accepts typed-only records without analytics, resumes bounded pages, and withdraws before the consumer catches up", async () => {
+  it("accepts typed-only records without analytics and honors a security withdrawal before the consumer catches up", async () => {
     const value = await fixture(203);
     expect(await source().prepare("SELECT COUNT(*) n FROM telemetry_v11_records").first("n")).toBe(0);
     expect(await source().prepare("SELECT COUNT(*) n FROM typed_v11_record_admissions").first("n")).toBe(203);
@@ -312,7 +317,7 @@ describe("typed accountless upload to isolated projection", () => {
     expect(await step()).toMatchObject({ state: "building", recordsRead: 3 });
     await drain();
     expect((await read(value.event.ownerDigest)).values[0]!.counts.usage).toBe(203);
-    expect(await revokeAccountlessEnrollment(source(), value.deviceId, "user_opt_out", Date.now())).toBe(true);
+    expect(await revokeAccountlessEnrollment(source(), value.deviceId, "security_reset", Date.now())).toBe(true);
     expect(await read(value.event.ownerDigest)).toEqual({ state: "authority-unavailable", values: [] });
     await drain();
     expect(await read(value.event.ownerDigest)).toEqual({ state: "available", values: [] });
