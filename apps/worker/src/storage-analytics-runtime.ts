@@ -257,9 +257,11 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   // pass continues with the other lanes. Budget and deadline exhaustion keep
   // their deferred semantics, so one failing owner-day or one malformed row
   // can no longer stall daily activity and graph work for every minute.
+  let graphExhausted=false;
   const laneFailure=(stage:'daily_publish'|'graph_work',error:unknown):void=>{
    if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError)throw error;
    graphFailure??=caughtStorageGraphFailureFields(stage,error);
+   if(stage==='graph_work')graphExhausted=true;
   };
   if(options.publishCommunity&&meter.remainingQueries>=253&&deadlineMs-Date.now()>=5_000
     &&(await readCollectionControls(scoped.source)).publication) {
@@ -323,7 +325,11 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     }
     publicIdle=dailyIdle;
     try{await retireStorageCommunityDailyPage(scoped);}catch(error){laneFailure('daily_publish',error);}
-    if(meter.remainingQueries>=550 && Date.now()<deadlineMs) {
+    // A graph attempt that failed or was deferred with a recorded failure has
+    // already spent this isolate's memory on one heavy owner-day read. Do not
+    // start another heavy calculation in the same invocation; the next
+    // scheduled pass retries from its durable checkpoint and selection.
+    if(meter.remainingQueries>=550 && Date.now()<deadlineMs && !graphExhausted) {
      let graph:StorageGraphWorkProgress={state:'deferred',reason:'graph_failure'};
      try{
       graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs});
@@ -335,8 +341,9 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
       }
       if(meter.remainingQueries>=30)await retireStorageCommunityGraphPublications(scoped);
      }catch(error){laneFailure('graph_work',error);}
+     if(graph.failure||graph.reason==='graph_failure')graphExhausted=true;
      publicIdle=publicIdle&&graph.state==='idle';
-    } else publicIdle=false;
+    } else if(!graphExhausted)publicIdle=false;
    }
    if(step.state==='idle'&&v11.state==='idle'&&v1.state==='idle'&&retiredGraph.state==='idle'&&publicIdle)return result('idle','complete');
   }
