@@ -108,5 +108,15 @@ Before Cloud SQL wiring for contribution traffic:
 
 Portable compilation and all 37 portable tests passed. Worker package-copy
 guards, TypeScript, architecture (546 production files, 2,149 imports, no debt),
-documentation and preflight checks passed. The complete Worker gate is recorded
-below after its result is available.
+documentation and preflight checks passed. Implementation and qualification
+committed as `04200c78`.
+
+`npm run product:worker:check` passed generated types, package-copy and endpoint
+guards, TypeScript, script checks, portable compilation/tests, GCS smoke/asset
+plan checks and all 1,071 Worker tests across 86 files (598.83 seconds). It then
+exited at `production:stage-assets`: the generated public release manifest is
+missing from this worktree. Production/staging dry deployment remains unqualified;
+no release artifact was fabricated and no deployment was performed. The suite
+also emitted a sandbox warning about its default Wrangler log location; the
+reported test counts above are the completed test result, not a claim that the
+combined command exited successfully.
