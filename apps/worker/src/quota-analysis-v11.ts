@@ -35,9 +35,20 @@ import type { V11SourcePin } from "./telemetry-v11-domain";
 import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
 import { typedTelemetryReadNamespace } from "./typed-telemetry-read-layout";
 import { readTypedV11UsageAnalysisPage, TYPED_V11_ANALYSIS_PAGE_SIZE } from "./typed-v11-analysis-reader";
+import {
+  V11_QUOTA_ACQUISITION_VERSION,
+  v11QuotaAcquisitionIdentityMatches,
+  validateV11CompletedQuotaAcquisition,
+} from "./quota-analysis-v11-reader";
+import type {
+  V11CompletedQuotaAcquisition,
+  V11QuotaAcquisitionIdentity,
+} from "./quota-analysis-v11-reader";
 
 export const V11_PLAN_ATTRIBUTION_ADAPTER_VERSION =
   PLAN_ATTRIBUTION_POLICY.methodVersion + ":v11-account-era-buckets-1";
+export const V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION =
+  `${V11_PLAN_ATTRIBUTION_ADAPTER_VERSION}:${V11_QUOTA_ACQUISITION_VERSION}`;
 
 const DAY_MS = 86_400_000;
 const WEEK_MS = SEVEN_DAY_WINDOW_MINUTES * 60_000;
@@ -57,17 +68,28 @@ export interface V11AnalysisOptions {
   maxWindowedUsageRows?: number;
   /** Resolved from the database contract at the public entrypoint. */
   typedSourceNamespace?: string | null;
+  /** A complete bounded quota acquisition. When present, quota PLAN/QUOTA SQL
+   * is skipped; the caller remains responsible for source-pin fences and any
+   * resumable checkpoint durability. */
+  quotaAcquisition?: V11CompletedQuotaAcquisition;
+}
+
+export interface V11AnalysisWindow {
+  cutoff: string;
+  start: string;
+  end: string;
+  resetsAtCutoff: string;
 }
 
 interface PlanRow {
   observed_at: string;
   provider: string;
   limit_id: string;
-  account_scope_id: string;
+  account_scope_id: string | null;
   plan_type: string;
   plan_variant: string;
   continuity_id: string | null;
-  plan_basis: TelemetryV11Attribution["planBasis"];
+  plan_basis: TelemetryV11Attribution["planBasis"] | null;
 }
 
 interface QuotaRow extends PlanRow {
@@ -247,48 +269,101 @@ async function sourcePin(db: D1Database, participantId: string, supplied?: V11So
   return supplied;
 }
 
-async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11AnalysisOptions): Promise<Context | Refusal> {
-  const nowMs = options.nowMs ?? Date.now();
-  const cutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_DAYS * DAY_MS).toISOString().slice(0, 10) + "T00:00:00.000Z";
+/** The closed horizon used by both the SQL reference and the resumable typed
+ * reader. Dates are snapped to UTC midnight before the seven-day reset cutoff
+ * is derived, so a checkpoint can be resumed without a moving wall-clock
+ * boundary. */
+export function v11AnalysisWindow(pin: V11SourcePin, nowMs = Date.now()): V11AnalysisWindow {
+  if (!Number.isSafeInteger(nowMs)) throw new TypeError("v11 analysis clock invalid");
+  const cutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_DAYS * DAY_MS).toISOString().slice(0, 10)
+    + "T00:00:00.000Z";
   const start = cutoff > pin.fromDay + "T00:00:00.000Z" ? cutoff : pin.fromDay + "T00:00:00.000Z";
   const domainEnd = new Date(Date.parse(pin.throughDay + "T00:00:00.000Z") + DAY_MS).toISOString();
   const analysisEnd = new Date(Date.parse(cutoff) + MAX_USAGE_DAYS * DAY_MS).toISOString();
   const end = domainEnd < analysisEnd ? domainEnd : analysisEnd;
-  const bindings = [pin.participantId, pin.generationId, start.slice(0, 10), end.slice(0, 10), start, end];
-  // Context/account/time are currently JSON-derived in the activated view, so
-  // a predecessor query would scan the entire historical domain. Keep this
-  // bounded horizon explicit and conditional until an indexed predecessor
-  // lane exists; never assert a verified pre-window plan or quantity interval.
-  const typed = options.typedSourceNamespace !== null && options.typedSourceNamespace !== undefined;
-  const typedBindings = typed ? [
-    ...bindings, options.typedSourceNamespace!, Date.parse(start), Date.parse(end),
-    Uint8Array.from(encodeTypedTelemetryId(options.typedSourceNamespace!)).buffer,
-    Uint8Array.from(encodeTypedTelemetryId(pin.participantId)).buffer,
-  ] : bindings;
-  const evidence = await db.prepare(typed ? TYPED_V11_PLAN_SQL : PLAN_SQL)
-    .bind(...typedBindings, MAX_PLAN_ATTRIBUTION_ROWS + 1).all<PlanRow>();
-  if (evidence.results.length > MAX_PLAN_ATTRIBUTION_ROWS) return refused("plan_attribution_limit_exceeded");
-  const index = buildPlanAttributionIndex(evidence.results.filter((row) => TOKEN.test(row.provider)).map((row) => ({
-    contextKey: planAttributionContextKey(row.provider, row.limit_id),
-    accountScopeId: row.account_scope_id || null,
-    observedAtMs: Date.parse(row.observed_at), planType: row.plan_type, planVariant: row.plan_variant,
-    continuityId: row.continuity_id, conflicted: row.plan_basis === "conflicted",
-  })));
-  if (index.status !== "ready") return refused("plan_attribution_limit_exceeded");
+  return { cutoff, start, end, resetsAtCutoff: new Date(Date.parse(cutoff) + WEEK_MS).toISOString() };
+}
+
+/** Bind a completed acquisition to the exact pin and horizon before any fit or
+ * composition kernel consumes it. The fingerprint is the source dependency;
+ * the method version also invalidates old checkpoint formats. */
+export function createV11QuotaAcquisitionIdentity(
+  pin: V11SourcePin,
+  nowMs = Date.now(),
+  maxQuotaRows = MAX_DOWNSAMPLED_QUOTA_ROWS,
+): V11QuotaAcquisitionIdentity {
+  const window = v11AnalysisWindow(pin, nowMs);
+  if (!Number.isSafeInteger(maxQuotaRows) || maxQuotaRows < 1 || maxQuotaRows > MAX_DOWNSAMPLED_QUOTA_ROWS) {
+    throw new TypeError("v11 acquisition quota bound invalid");
+  }
+  return { participantId: pin.participantId, inputFingerprint: pin.fingerprint,
+    sourceMethodVersion: V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+    observedAtCutoff: window.start, resetsAtCutoff: window.resetsAtCutoff,
+    windowMinutes: SEVEN_DAY_WINDOW_MINUTES, maxQuotaRows };
+}
+
+async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11AnalysisOptions): Promise<Context | Refusal> {
+  const nowMs = options.nowMs ?? Date.now();
+  const window = v11AnalysisWindow(pin, nowMs);
+  const { start, end } = window;
   const maximum = options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
-  const result = await db.prepare(typed ? TYPED_V11_QUOTA_SQL : QUOTA_SQL).bind(
-    markers(index), ...typedBindings, SEVEN_DAY_WINDOW_MINUTES,
-    new Date(Date.parse(cutoff) + WEEK_MS).toISOString(),
-    QUOTA_CALIBRATION_POLICY.minimumBoundaries, QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, maximum + 1,
-  ).all<QuotaRow>();
-  if (result.results.length > maximum) return refused("downsampled_quota_limit_exceeded");
+  if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > MAX_DOWNSAMPLED_QUOTA_ROWS) {
+    throw new TypeError("v11 analysis quota bound invalid");
+  }
+  let index: PlanAttributionIndex;
+  let quotaRows: readonly QuotaRow[];
+  if (options.quotaAcquisition !== undefined) {
+    const identity = createV11QuotaAcquisitionIdentity(pin, nowMs, maximum);
+    const acquisition = options.quotaAcquisition;
+    if (!validateV11CompletedQuotaAcquisition(acquisition)
+        || !v11QuotaAcquisitionIdentityMatches(acquisition.identity, identity)
+        || acquisition.planAnchors.some((row) => row.observedAtMs < Date.parse(start)
+          || row.observedAtMs >= Date.parse(end))
+        || acquisition.quotaRows.some((row) => Date.parse(row.observed_at) < Date.parse(start)
+          || Date.parse(row.observed_at) >= Date.parse(end))) {
+      throw new Error("v11 acquired quota evidence mismatch");
+    }
+    index = buildPlanAttributionIndex(acquisition.planAnchors);
+    if (index.status !== "ready") return refused("plan_attribution_limit_exceeded");
+    quotaRows = acquisition.quotaRows;
+    if (quotaRows.length > identity.maxQuotaRows) return refused("downsampled_quota_limit_exceeded");
+  } else {
+    const bindings = [pin.participantId, pin.generationId, start.slice(0, 10), end.slice(0, 10), start, end];
+    // Context/account/time are currently JSON-derived in the activated view, so
+    // a predecessor query would scan the entire historical domain. Keep this
+    // bounded horizon explicit and conditional until an indexed predecessor
+    // lane exists; never assert a verified pre-window plan or quantity interval.
+    const typed = options.typedSourceNamespace !== null && options.typedSourceNamespace !== undefined;
+    const typedBindings = typed ? [
+      ...bindings, options.typedSourceNamespace!, Date.parse(start), Date.parse(end),
+      Uint8Array.from(encodeTypedTelemetryId(options.typedSourceNamespace!)).buffer,
+      Uint8Array.from(encodeTypedTelemetryId(pin.participantId)).buffer,
+    ] : bindings;
+    const evidence = await db.prepare(typed ? TYPED_V11_PLAN_SQL : PLAN_SQL)
+      .bind(...typedBindings, MAX_PLAN_ATTRIBUTION_ROWS + 1).all<PlanRow>();
+    if (evidence.results.length > MAX_PLAN_ATTRIBUTION_ROWS) return refused("plan_attribution_limit_exceeded");
+    index = buildPlanAttributionIndex(evidence.results.filter((row) => TOKEN.test(row.provider)).map((row) => ({
+      contextKey: planAttributionContextKey(row.provider, row.limit_id),
+      accountScopeId: row.account_scope_id || null,
+      observedAtMs: Date.parse(row.observed_at), planType: row.plan_type, planVariant: row.plan_variant,
+      continuityId: row.continuity_id, conflicted: row.plan_basis === "conflicted",
+    })));
+    if (index.status !== "ready") return refused("plan_attribution_limit_exceeded");
+    const result = await db.prepare(typed ? TYPED_V11_QUOTA_SQL : QUOTA_SQL).bind(
+      markers(index), ...typedBindings, SEVEN_DAY_WINDOW_MINUTES,
+      window.resetsAtCutoff,
+      QUOTA_CALIBRATION_POLICY.minimumBoundaries, QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, maximum + 1,
+    ).all<QuotaRow>();
+    if (result.results.length > maximum) return refused("downsampled_quota_limit_exceeded");
+    quotaRows = result.results;
+  }
   const datasetId = "dataset:v1:" + await sha256Hex(pin.participantId + "|" + pin.generationId);
   const seeds = new Map<string, Seed>();
   const snapshots = new Map<string, QuotaSnapshotInput[]>();
   const gridSets = new Map<string, Set<number>>();
   const unknownTracks = new Map<string, string>();
   const quota: QuotaRow[] = [];
-  for (const row of result.results) {
+  for (const row of quotaRows) {
     if (!SLOTS.has(row.slot) || !TOKEN.test(row.plan_type) || !TOKEN.test(row.plan_variant)
         || !TOKEN.test(row.provider) || Date.parse(row.resets_at) <= Date.parse(row.observed_at)) continue;
     const accountScopeId = row.account_scope_id || null;
