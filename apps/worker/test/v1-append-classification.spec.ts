@@ -74,12 +74,28 @@ describe('isolated typed v1 conservative append classification',()=>{
   expect((await changes()).map(e=>e.kind)).toEqual(['owner-active','owner-active']);
   expect((await stamp()).authority).toBeGreaterThan(before.authority!);
  });
- it('keeps another device hard even with disjoint occurrences and a unique chunk slot',async()=>{
-  const first=await seed();await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);const before=await stamp();
+ it('keeps authority stable when a newer device wins one changed day, while a correction remains hard',async()=>{
+  const first=await seed();first.insert.createdAt=`${day()}T01:00:00.000Z`;
+  await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);const before=await stamp();
+  const {loadV1SourcePin}=await import('../src/telemetry-v1-source-selection');
+  const beforePin=await loadV1SourcePin(source(),{participantId:first.fixture.participantId},{includeDayDependencies:true});
   const other=await createV11DeviceFixture(source(),{participantId:first.fixture.participantId});
-  const next=await seed('usage',1,other,1,1,4);await insertTypedTelemetryV1Chunk(source(),next.insert,namespace);
-  expect((await changes()).at(-1)!.kind).toBe('owner-active');expect((await stamp()).authority).toBeGreaterThan(before.authority!);
+  const next=await seed('usage',1,other,1,1,4);next.insert.createdAt=`${day()}T02:00:00.000Z`;
+  await insertTypedTelemetryV1Chunk(source(),next.insert,namespace);
+  const afterPin=await loadV1SourcePin(source(),{participantId:first.fixture.participantId},{includeDayDependencies:true});
+  expect((await changes()).map(event=>event.kind)).toEqual(['owner-active','source-updated']);
+  expect(await stamp()).toEqual(before);
+  expect(beforePin.winners).toEqual([expect.objectContaining({device_id:first.fixture.deviceId})]);
+  expect(afterPin.winners).toEqual([expect.objectContaining({device_id:other.deviceId})]);
+  expect(afterPin.fingerprint).not.toBe(beforePin.fingerprint);
+  expect(afterPin.dayDependencies).toEqual([expect.objectContaining({day:day(),deviceId:other.deviceId})]);
   expect(await count('typed_telemetry_records')).toBe(2);
+  const correction=await seed('usage',1,other,2,1,4);
+  correction.insert.createdAt=`${day()}T03:00:00.000Z`;
+  correction.insert.supersedes=await currentTelemetryV1Chunk(source(),other.participantId,other.deviceId,'usage',day(),1);
+  await insertTypedTelemetryV1Chunk(source(),correction.insert,namespace);
+  expect((await changes()).at(-1)!.kind).toBe('owner-active');
+  expect((await stamp()).authority).toBeGreaterThan(before.authority!);
  });
  it('keeps a legacy-format crossover hard even for a unique same-device append',async()=>{
   const first=await seed();await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
