@@ -24,6 +24,14 @@ remain the operational and product authorities.
 | Large v1 current-fit usage calculations could reach a deadline before saving their usage cursor. | Persist bounded usage-reduction state and every deferred phase transition. | Resume after a full page without rereading it and produce the same fit as the direct calculation, including equal-time boundaries. |
 | Ordinary accountless opt-out was coupled to historical withdrawal. | Add a prospective exact-head retention marker and separate revoked upload permission from retained-history eligibility. | Refuse later uploads; retain accepted records, calculation progress, source eligibility and completed publication. |
 
+Combined validation also found two integration gaps: the default 20-second
+analytics pass could never enter a daily batch after initialization had spent
+any of its deadline, and the restore tool did not classify the new retention
+table as durable source state. Short passes now admit one bounded day per
+public iteration; a populated restore regression checks the exact retention
+record and its guards after restoration. Longer runs retain the bounded batch
+and graph query reserve.
+
 The v1 reducer must also return a valid bounded refusal when row or checkpoint
 limits are reached. Checkpoint validation and synthesis must avoid repeated
 scope-by-bucket scans. No raw telemetry is mirrored into analytics by these
