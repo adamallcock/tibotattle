@@ -19,6 +19,7 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
 } from "../src/accountless-ownership";
+import { initializeStorageSource } from "../src/analytics-delivery";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
@@ -33,9 +34,13 @@ import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
   TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
+  TEST_TYPED_INGESTION_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_BRIDGE_MIGRATIONS: D1Migration[];
+  TEST_INGESTION_ISOLATION_MIGRATIONS: D1Migration[];
 }
 
 const ORIGIN = "https://example.test";
+const STORAGE_SOURCE_ID = "synthetic-accountless-ownership-source";
 const DAY_MILLISECONDS = 86_400_000;
 const PUBLIC_FIXTURE_AT = "2026-09-01T12:00:00.000Z";
 let publicJwk: JsonWebKey;
@@ -431,7 +436,17 @@ describe("accountless owner-to-v1.1 transport", () => {
     }
   });
 
-  it("creates a direct owner, accepts encrypted usage and quota exactly once, then revokes every active authority", async () => {
+  it("creates a direct owner, accepts encrypted usage and quota exactly once, then retains accepted history while revoking upload authority", async () => {
+    await applyD1Migrations(
+      db(),
+      bindings().TEST_TYPED_INGESTION_MIGRATIONS.filter((item) => item.name.startsWith("0002_")),
+    );
+    await applyD1Migrations(db(), bindings().TEST_INGESTION_BRIDGE_MIGRATIONS);
+    await applyD1Migrations(
+      db(),
+      bindings().TEST_INGESTION_ISOLATION_MIGRATIONS.filter((item) => item.name.startsWith("0005_")),
+    );
+    await initializeStorageSource(db(), STORAGE_SOURCE_ID);
     const deviceId = crypto.randomUUID();
     const secret = crypto.getRandomValues(new Uint8Array(32));
     const authorization = `Device um_device_${deviceId}.${encodeBase64Url(secret)}`;
@@ -770,20 +785,37 @@ describe("accountless owner-to-v1.1 transport", () => {
         pending_upload_state: "revoked",
         consumed_uploads: prepared.chunks.length + 1,
       });
-      // Withdrawal fences already-captured data before a scheduler can rebuild.
-      // The upload remains retained until the separately confirmed erasure.
-      expect(await db().prepare(`SELECT participant_id FROM community_public_source_owners
-        WHERE participant_id = ?`).bind(participantId).first()).toBeNull();
+      // Ordinary opt-out revokes future upload authority while the exact
+      // accepted head remains eligible for historical analytics and public
+      // source selection.
+      expect(await db().prepare(`SELECT generation_id, head_revision
+        FROM accountless_public_history_retention WHERE participant_id = ?`)
+        .bind(participantId).first()).toEqual({
+          generation_id: accountlessSourcePin.generationId,
+          head_revision: 1,
+        });
+      expect(await db().prepare(`SELECT state FROM storage_v11_owner_links
+        WHERE participant_id = ?`).bind(participantId).first()).toEqual({ state: "active" });
+      expect(await db().prepare(`SELECT participant_id, owner_kind, device_id
+        FROM community_public_source_owners WHERE participant_id = ?`)
+        .bind(participantId).first()).toEqual({
+          participant_id: participantId,
+          owner_kind: "accountless",
+          device_id: deviceId,
+        });
+      // The current publication generation is retired for a bounded rebuild,
+      // while its source, accepted records, and fit cache remain retained.
       expect(await readCapturedCommunityPublication(db(), publicationTime, {
         budget: { remainingQueries: 64, deadlineMs: Date.now() + 30_000 },
       })).toBeNull();
       expect((await db().batch([markCommunityPublicationPublished(db(), captured!)]))[0]!.results)
         .toHaveLength(0);
-      expect(await collectCommunityAllowanceFits(db(), publicationTime)).toEqual([]);
+      expect(await collectCommunityAllowanceFits(db(), publicationTime))
+        .toEqual(captured!.corpus.fits);
       expect(await db().prepare(`SELECT COUNT(*) AS count FROM telemetry_v11_active_records
         WHERE participant_id = ?`).bind(participantId).first()).toEqual({ count: 17 });
-      const publicAfterWithdrawal = await publicPublicationSnapshot();
-      expect(publicAfterWithdrawal.daily).toEqual(expect.arrayContaining([
+      const publicAfterInvalidation = await publicPublicationSnapshot();
+      expect(publicAfterInvalidation.daily).toEqual(expect.arrayContaining([
         expect.objectContaining({ aggregate_id: "public-daily-fixture", release_state: "withdrawn" }),
       ]));
 
@@ -811,8 +843,8 @@ describe("accountless owner-to-v1.1 transport", () => {
       expect(await errorCode(blockedPending)).toBe("UPLOAD_AUTH_INVALID");
 
       // The direct authority root was already revoked by the device opt-out.
-      // Operator erasure removes the retained participant subtree. It cannot
-      // restore a withdrawn public source or resurrect the captured generation.
+      // Operator erasure removes the retained participant subtree and the
+      // captured generation after the ordinary opt-out retention period.
       const erased = await eraseParticipantAsOwner(
         runtime(),
         "e".repeat(64),
