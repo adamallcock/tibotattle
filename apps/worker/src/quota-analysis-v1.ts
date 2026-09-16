@@ -493,11 +493,14 @@ export function validateV1UsageReductionCheckpoint(value: unknown): value is V1U
       || row.scopes.length > MAX_V1_USAGE_REDUCTION_BUCKETS || !row.scopes.every(validV1UsageScope)
       || !Array.isArray(row.buckets) || row.buckets.length > MAX_V1_USAGE_REDUCTION_BUCKETS
       || !row.buckets.every(validV1UsageBucket)) return false;
+  const scopeByKey = new Map(row.scopes.map(scope => [scope.key, scope]));
   return new Set(row.sessions.map(entry => entry.key)).size === row.sessions.length
-    && new Set(row.scopes.map(entry => entry.key)).size === row.scopes.length
+    && scopeByKey.size === row.scopes.length
     && new Set(row.buckets.map(entry => entry.key)).size === row.buckets.length
-    && row.buckets.every(bucket => row.scopes.some(scope => scope.key === bucket.scopeKey
-      && scope.provider === bucket.provider && scope.planEraKey === bucket.planEraKey));
+    && row.buckets.every(bucket => {
+      const scope = scopeByKey.get(bucket.scopeKey);
+      return scope?.provider === bucket.provider && scope.planEraKey === bucket.planEraKey;
+    });
 }
 
 export function encodeV1UsageReductionCheckpoint(checkpoint: V1UsageReductionCheckpoint): {
@@ -1623,17 +1626,22 @@ async function synthesizeV1UsageReduction(
   context: V1UsageReductionContext, state: V1UsageReductionCheckpoint,
 ): Promise<AttributedUsageEventPartial[]> {
   const usageEvents: AttributedUsageEventPartial[] = [];
+  const bucketsByScope = new Map<string, { singletons: V1UsageReductionBucket[]; intervals: V1UsageReductionBucket[] }>();
+  for (const bucket of state.buckets) {
+    const group = bucketsByScope.get(bucket.scopeKey) ?? { singletons: [], intervals: [] };
+    (bucket.singleton ? group.singletons : group.intervals).push(bucket);
+    bucketsByScope.set(bucket.scopeKey, group);
+  }
   for (const scope of state.scopes) {
     const accountTrackId = context.accountTrackByProvider.get(scope.provider);
     if (accountTrackId === undefined) continue;
-    for (const bucket of state.buckets) {
-      if (bucket.scopeKey !== scope.key || !bucket.singleton) continue;
+    const grouped = bucketsByScope.get(scope.key);
+    for (const bucket of grouped?.singletons ?? []) {
       usageEvents.push(await synthUsageRow(accountTrackId, context.datasetId, bucket.provider,
         { costNanousd: bucket.costNanousd, allFullyPriced: bucket.allFullyPriced, placementMs: bucket.placementMs },
         `s|${bucket.anchorMs}|${bucket.planEraKey}`, bucket.planEraKey));
     }
-    for (const bucket of state.buckets) {
-      if (bucket.scopeKey !== scope.key || bucket.singleton) continue;
+    for (const bucket of grouped?.intervals ?? []) {
       usageEvents.push(await synthUsageRow(accountTrackId, context.datasetId, bucket.provider,
         { costNanousd: bucket.costNanousd, allFullyPriced: bucket.allFullyPriced, placementMs: bucket.placementMs },
         `b|${bucket.anchorMs}|${bucket.planEraKey}`, bucket.planEraKey));
@@ -1747,6 +1755,7 @@ export async function advanceV1UsageReduction(
     if (rows.length > USAGE_PAGE_SIZE) throw new Error("v1 usage reduction page overflow");
     state.rowsRead += rows.length;
     if (state.rowsRead > maxWindowedUsageRows) {
+      state.rowsRead = maxWindowedUsageRows;
       state.commonRefusal = "windowed_usage_limit_exceeded"; state.complete = true; clearReducer(); break;
     }
     for (const row of rows) {
@@ -1809,7 +1818,7 @@ export async function advanceV1UsageReduction(
     state.cursorObservedAt = last.observed_at; state.cursorId = last.id;
   }
   state.sessions = [...sessions.values()]; state.scopes = [...scopes.values()]; state.buckets = [...buckets.values()];
-  if (!state.complete && v1UsageReductionPayloadBytes(state) > MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES) {
+  if (v1UsageReductionPayloadBytes(state) > MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES) {
     state.commonRefusal = "reduced_usage_limit_exceeded"; state.complete = true; clearReducer();
   }
   if (!validateV1UsageReductionCheckpoint(state)) throw new Error("v1 usage reduction successor invalid");

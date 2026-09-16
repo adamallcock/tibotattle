@@ -1,7 +1,8 @@
 import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { advanceStorageV1CurrentFitAnalysis, type StorageV1HistoryCheckpoint } from "../src/storage-v1-history";
-import { accountScopedQuotaAnalysisV1, createV1UsageReductionCheckpoint,
+import { accountScopedQuotaAnalysisV1, advanceV1UsageReduction, createV1UsageReductionCheckpoint,
+  MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES, MAX_WINDOWED_USAGE_ROWS,
   V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v1";
 import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
 import { modelHistoryWindow } from "../src/model-history-window";
@@ -48,11 +49,30 @@ function observeUsageReads(database: D1Database) {
   };
 }
 
-async function seedPagedFixture() {
+async function seedPagedFixture(equalTime = false) {
   const fixture = await seedModelHistoryFixture();
   await insertModelHistoryRecords(fixture, "paged", Array.from({ length: 5_001 }, (_, index) =>
     pricedModelHistoryUsage("gpt-5.6-sol", 0.0001,
-      new Date(BASE + 3 * 3_600_000 + index * 1_000).toISOString()).record));
+      new Date(BASE + (equalTime ? 8.5 * 3_600_000 : 3 * 3_600_000 + index * 1_000)).toISOString()).record));
+  if (equalTime) {
+    const prior = await db().prepare(`SELECT id FROM telemetry_v1_records WHERE participant_id=? AND stream='usage'
+      AND observed_at=? ORDER BY id LIMIT 1`).bind(fixture.participantId,
+        new Date(BASE + 6.5 * 3_600_000).toISOString()).first<number>('id');
+    const final = await db().prepare(`SELECT MAX(id) AS id FROM telemetry_v1_records
+      WHERE participant_id=? AND stream='usage' AND chunk_row_id LIKE '%-paged-%'`).bind(fixture.participantId).first<number>('id');
+    if (prior === null || final === null) throw new Error('synthetic equal-time fixture missing');
+    await db().batch([
+      db().prepare("UPDATE telemetry_v1_records SET plan_type='plus' WHERE stream='quota' AND observed_at=?")
+        .bind(new Date(BASE + 7 * 3_600_000).toISOString()),
+      db().prepare("UPDATE telemetry_v1_records SET session_uuid='synthetic-equal-time-session',occurrence_id='prior' WHERE id=?")
+        .bind(prior),
+      db().prepare(`UPDATE telemetry_v1_records SET session_uuid='synthetic-equal-time-session',
+        occurrence_id=CASE WHEN id=? THEN 'a-final-drop' ELSE printf('z-%08d',id) END,
+        record_json=CASE WHEN id=? THEN '{}' ELSE record_json END
+        WHERE participant_id=? AND stream='usage' AND chunk_row_id LIKE '%-paged-%'`)
+        .bind(final,final,fixture.participantId),
+    ]);
+  }
   const window = modelHistoryWindow(DAY);
   const sourcePin = await loadV1SourcePin(db(), { participantId: fixture.participantId, fromDay: window.fromDay });
   return { fixture, sourcePin, window };
@@ -137,6 +157,63 @@ describe("resumable current-fit v1 usage reduction", () => {
       budget: budget(), checkpoint: usageCheckpoint, maxPages: 1 })).rejects
       .toMatchObject({ message: "STORAGE_GRAPH_OPERATION_UNAVAILABLE",
         stage: "graph_current_fit_compute", reason: "source_changed" });
+  }, 60_000);
+
+  it("persists valid terminal refusals at the row and encoded-payload boundaries", async () => {
+    const input = await seedPagedFixture();
+    const finishCheckpoint = await acquireFinishCheckpoint(input);
+    const rowBound = createV1UsageReductionCheckpoint(finishCheckpoint.identity);
+    rowBound.rowsRead = MAX_WINDOWED_USAGE_ROWS - 1;
+    const rowResult = await advanceV1UsageReduction(db(), input.fixture.participantId,
+      { identity: finishCheckpoint.identity, acquisition: finishCheckpoint.acquisition },
+      { remainingQueries: 9, deadlineMs: Date.now() + 60_000 },
+      { nowMs: Date.parse(input.window.fixedNow), sourcePin: input.sourcePin }, rowBound, 1);
+    expect(rowResult.status).toBe('deferred');
+    if (rowResult.status !== 'deferred') throw new Error('expected bounded row refusal');
+    expect(rowResult.checkpoint).toMatchObject({ complete: true, rowsRead: MAX_WINDOWED_USAGE_ROWS,
+      commonRefusal: 'windowed_usage_limit_exceeded', sessions: [], scopes: [], buckets: [] });
+
+    const payloadBound = createV1UsageReductionCheckpoint(finishCheckpoint.identity);
+    payloadBound.complete = true;
+    payloadBound.sessions = Array.from({ length: 16_000 }, (_, index) => {
+      const suffix = String(index).padStart(5, '0');
+      const session = `${suffix}${'x'.repeat(500 - suffix.length)}`;
+      return { key: JSON.stringify(['openai_codex',session]), time: null, pending: null };
+    });
+    expect(new TextEncoder().encode(JSON.stringify({ sessions: payloadBound.sessions, scopes: [], buckets: [] })).byteLength)
+      .toBeGreaterThan(MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES);
+    const payloadResult = await advanceV1UsageReduction(db(), input.fixture.participantId,
+      { identity: finishCheckpoint.identity, acquisition: finishCheckpoint.acquisition },
+      { remainingQueries: 7, deadlineMs: Date.now() + 60_000 },
+      { nowMs: Date.parse(input.window.fixedNow), sourcePin: input.sourcePin }, payloadBound, 1);
+    expect(payloadResult.status).toBe('deferred');
+    if (payloadResult.status !== 'deferred') throw new Error('expected bounded payload refusal');
+    expect(payloadResult.checkpoint).toMatchObject({ complete: true, commonRefusal: 'reduced_usage_limit_exceeded',
+      sessions: [], scopes: [], buckets: [] });
+  }, 60_000);
+
+  it("preserves occurrence-first equal-time interval semantics across a resumed page seam", async () => {
+    const input = await seedPagedFixture(true);
+    const finishCheckpoint = await acquireFinishCheckpoint(input);
+    const first = await advanceStorageV1CurrentFitAnalysis({ source: db(), participantId: input.fixture.participantId,
+      day: DAY, sourcePin: input.sourcePin, budget: budget(), checkpoint: finishCheckpoint, maxPages: 1 });
+    expect(first.status).toBe('deferred');
+    if (first.status !== 'deferred' || !first.checkpoint || first.checkpoint.phase !== 'usage') {
+      throw new Error('expected equal-time usage checkpoint');
+    }
+    expect(first.checkpoint.usage.cursorObservedAt).toBe(new Date(BASE + 8.5 * 3_600_000).toISOString());
+    const resumed = await advanceStorageV1CurrentFitAnalysis({ source: db(), participantId: input.fixture.participantId,
+      day: DAY, sourcePin: input.sourcePin, budget: budget(), checkpoint: first.checkpoint, maxPages: 1 });
+    expect(resumed.status).toBe('complete');
+    if (resumed.status !== 'complete') throw new Error('expected equal-time resumed result');
+    const baseline = await accountScopedQuotaAnalysisV1(db(), input.fixture.participantId,
+      { nowMs: Date.parse(input.window.fixedNow), sourcePin: input.sourcePin });
+    const normalize = (value: object) => {
+      const copy = structuredClone(value) as Record<string, unknown>;
+      delete copy.attributionMethod;
+      return copy;
+    };
+    expect(normalize(resumed.analysis)).toEqual(normalize(baseline));
   }, 60_000);
 
   it("round trips the mid-usage cursor through the paged private checkpoint store", async () => {
