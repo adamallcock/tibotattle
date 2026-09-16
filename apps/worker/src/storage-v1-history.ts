@@ -17,12 +17,11 @@ export type StorageV1CurrentFitResult={status:'deferred';checkpoint:StorageV1His
 const fail=()=>new Error('STORAGE_V1_HISTORY_CHECKPOINT_MISMATCH');
 /** Source-only historical kernel driver. The caller persists the returned
  * private checkpoint in its separately fenced analytics store; this function
- * never writes either database. Each acquisition call advances exactly one page
- * so an interrupted staged save can replay from the committed head regardless
- * of the next invocation budget. A completed acquisition survives a short
- * finishing budget, rather than rereading quota history on every invocation. */
+ * never writes either database. Each acquisition call advances one bounded page
+ * group. An interrupted group can replay from the last committed head. Completed
+ * acquisition survives a short finishing budget, avoiding another history read. */
 export async function advanceStorageV1HistoricalAnalysis(input:{source:D1Database;participantId:string;day:string;
- sourcePin:V1SourcePin;budget:V1QuotaInvocationBudget;checkpoint?:StorageV1HistoryCheckpoint|null}):Promise<StorageV1HistoryResult>{
+ sourcePin:V1SourcePin;budget:V1QuotaInvocationBudget;checkpoint?:StorageV1HistoryCheckpoint|null;maxPages?:number}):Promise<StorageV1HistoryResult>{
  const {source,participantId,day,budget}=input,sourcePin=structuredClone(input.sourcePin),history=modelHistoryWindow(day);
  if(!('participantId'in sourcePin.scope)||sourcePin.scope.participantId!==participantId||sourcePin.scope.fromDay!==history.fromDay
   ||sourcePin.scope.throughDay!==day||sourcePin.methodVersion!==V1_SOURCE_SELECTION_METHOD_VERSION)throw fail();
@@ -32,6 +31,7 @@ export async function advanceStorageV1HistoricalAnalysis(input:{source:D1Databas
  if(prior&&(prior.version!==1||prior.day!==day||!['acquisition','finish'].includes(prior.phase)
   ||Object.keys(prior.identity).length!==Object.keys(identity).length||Object.entries(identity).some(([key,value])=>Reflect.get(prior.identity,key)!==value)))throw fail();
  if(!Number.isSafeInteger(budget.remainingQueries)||budget.remainingQueries<0||!Number.isFinite(budget.deadlineMs))throw fail();
+ if(input.maxPages!==undefined&&(!Number.isSafeInteger(input.maxPages)||input.maxPages<1||input.maxPages>32))throw fail();
  const now=()=>{const value=(budget.now??Date.now)();if(!Number.isFinite(value))throw fail();return value;};
  // At most: layout2 + initial source2 + successor1 + factory2 + final source2
  // + final successor1. Reserve before starting, never after an effect.
@@ -51,7 +51,7 @@ export async function advanceStorageV1HistoricalAnalysis(input:{source:D1Databas
    ()=>createV1QuotaPageReader(source,participantId,history.observedAtBefore));
   const result=await withStorageGraphFailureStage('graph_history_acquisition_page',
    ()=>advanceV1QuotaAcquisition(reader,identity,new Map(sourcePin.winners.map(w=>[w.observed_day,w.device_id])),budget,
-    acquisition,{maxPages:1}));
+    acquisition,{maxPages:input.maxPages??1}));
   await withStorageGraphFailureStage('graph_history_source_postcheck',assertSource);
   if(result.status==='deferred')return {status:'deferred',checkpoint:{...checkpoint,acquisition:result.checkpoint}};
   if(result.status==='not_testable')return {status:'complete',analysis:{status:'not_testable',reason:result.reason}};
@@ -67,11 +67,11 @@ export async function advanceStorageV1HistoricalAnalysis(input:{source:D1Databas
 }
 
 /** Current scalar fit acquisition uses the same exact source pin and maintained
- * page reducer as historical composition. Each call advances exactly one page;
- * the caller must durably promote that deterministic successor before asking
- * for another page in the same claim. */
+ * page reducer as historical composition. Each call advances a bounded group;
+ * the caller durably promotes its deterministic successor before finishing.
+ * Source checks cover the complete group, and failed groups replay the saved head. */
 export async function advanceStorageV1CurrentFitAnalysis(input:{source:D1Database;participantId:string;day:string;
- sourcePin:V1SourcePin;budget:V1QuotaInvocationBudget;checkpoint?:StorageV1HistoryCheckpoint|null}):Promise<StorageV1CurrentFitResult>{
+ sourcePin:V1SourcePin;budget:V1QuotaInvocationBudget;checkpoint?:StorageV1HistoryCheckpoint|null;maxPages?:number}):Promise<StorageV1CurrentFitResult>{
  const {source,participantId,day,budget}=input,sourcePin=structuredClone(input.sourcePin),window=modelHistoryWindow(day);
  if(!('participantId'in sourcePin.scope)||sourcePin.scope.participantId!==participantId
   ||sourcePin.scope.fromDay!==window.fromDay||sourcePin.scope.throughDay!==undefined
@@ -84,6 +84,7 @@ export async function advanceStorageV1CurrentFitAnalysis(input:{source:D1Databas
   ||Object.keys(prior.identity).length!==Object.keys(identity).length
   ||Object.entries(identity).some(([key,value])=>Reflect.get(prior.identity,key)!==value)))throw fail();
  if(!Number.isSafeInteger(budget.remainingQueries)||budget.remainingQueries<0||!Number.isFinite(budget.deadlineMs))throw fail();
+ if(input.maxPages!==undefined&&(!Number.isSafeInteger(input.maxPages)||input.maxPages<1||input.maxPages>32))throw fail();
  const now=()=>{const value=(budget.now??Date.now)();if(!Number.isFinite(value))throw fail();return value;};
  if(budget.remainingQueries<10||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:prior};
  budget.remainingQueries-=10;
@@ -98,7 +99,7 @@ export async function advanceStorageV1CurrentFitAnalysis(input:{source:D1Databas
   if(checkpoint.phase==='acquisition'){
    const reader=await createV1QuotaPageReader(source,participantId);
    const result=await advanceV1QuotaAcquisition(reader,identity,
-    new Map(sourcePin.winners.map(w=>[w.observed_day,w.device_id])),budget,checkpoint.acquisition,{maxPages:1});
+    new Map(sourcePin.winners.map(w=>[w.observed_day,w.device_id])),budget,checkpoint.acquisition,{maxPages:input.maxPages??1});
    await assertSource();
    if(result.status==='deferred')return {status:'deferred',checkpoint:{...checkpoint,acquisition:result.checkpoint}};
    if(result.status==='not_testable')return {status:'complete',analysis:{schemaVersion:'account-scoped-quota-analysis-v0.1',

@@ -129,7 +129,7 @@ it('advances current v1 fits through a durable bounded acquisition before semant
  expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
   WHERE source_id=? AND owner_digest=? AND day=? AND dependency_digest=? AND method=?`)
   .bind(sourceId,owner.ownerDigest,day,scope.dependencyDigest,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD).first<number>('n'))
-  .toBeGreaterThan(1);
+  .toBe(1);
 
  let completed:Awaited<ReturnType<typeof computeStorageGraphResult>>|undefined=first;
  for(let attempt=0;attempt<4;attempt++){
@@ -173,7 +173,7 @@ it('resumes from a page promoted before its response was lost',async()=>{
  expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
   WHERE source_id=? AND owner_digest=? AND day=? AND dependency_digest=? AND method=?`)
   .bind(sourceId,owner.ownerDigest,day,scope.dependencyDigest,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD).first<number>('n'))
-  .toBeGreaterThan(1);
+  .toBe(1);
 },60000);
 
 it('reopens one repaired direct attempt, serializes concurrent claims, then falls back to the same semantic checkpoint',async()=>{
@@ -295,7 +295,7 @@ it('preserves a retired legacy tombstone while a repaired checkpoint generation 
   WHERE method=? AND dependency_digest=?`).bind(STORAGE_GRAPH_METHOD,scope.dependencyDigest).first('n')).toBe(0);
  expect(await target().prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
   WHERE method=? AND dependency_digest=?`).bind(STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,scope.dependencyDigest).first<number>('n'))
-  .toBeGreaterThan(1);
+  .toBe(1);
  expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_execution
   WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,owner.ownerDigest,day).first('n')).toBe(1);
 },60000);
