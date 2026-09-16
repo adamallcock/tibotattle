@@ -138,14 +138,14 @@ async function modelFixture(){
  for(let n=0;n<40;n++){if((await advanceStorageAnalytics(bindings())).state==='idle')break;}
  await advanceStorageCommunityDaily({...bindings(),day:day()});return f;
 }
-async function activateDays(f:Fixture,days:Array<{day:string;manifestId:string;manifestDigest:string}>){
- const prior=await createTelemetryV11DomainPredecessor(typed(),f),ordered=[...days].sort((a,b)=>a.day.localeCompare(b.day));
+async function activateDays(f:Fixture,days:Array<{day:string;manifestId:string;manifestDigest:string}>,nowMs=Date.now()){
+ const prior=await createTelemetryV11DomainPredecessor(typed(),f,nowMs),ordered=[...days].sort((a,b)=>a.day.localeCompare(b.day));
  const manifest:TelemetryV11DomainManifest={schemaVersion:'telemetry-domain-manifest-v1.1',
   fromDay:ordered[0]!.day,throughDay:ordered.at(-1)!.day,predecessor:{token:prior.token,
    previousGenerationId:prior.previousGenerationId,legacyFingerprint:prior.legacyFingerprint},
   days:ordered.map(({day,manifestId,manifestDigest})=>({day,manifestId,manifestDigest})),manifestDigest:'0'.repeat(64)};
  manifest.manifestDigest=await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
- return activateTelemetryV11Domain(typed(),f,manifest);
+ return activateTelemetryV11Domain(typed(),f,manifest,nowMs);
 }
 async function activeDays(f:Fixture){
  return (await typed().prepare(`SELECT d.observed_day AS day,m.id AS manifestId,m.manifest_digest AS manifestDigest
@@ -446,6 +446,23 @@ describe('isolated allowance graph publication',()=>{
   expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT input_revision FROM analytics_community_graph_results
    WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(namespace,initial.owner.ownerDigest,today())
    .first('input_revision')).toBe(current.inputRevision);
+ });
+ it('selects a dormant owner when the calculation day is after its last uploaded day',async()=>{
+  const f=await createV11DeviceFixture(typed(),{participantId:'participant:selected-dormant',grant:true});
+  const uploaded=await stage(typed(),f,await makeV11Day(day(),evidence()),true);
+  await activateDays(f,[uploaded],Date.parse(day()+'T12:00:00.000Z'));
+  for(let pass=0;pass<32;pass++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
+  const selected=await selectedEnvelope('fits',today());
+  expect(selected.envelope.snapshot.throughDay).toBe(day());
+  expect(selected.envelope.day).toBe(today());
+  expect(selected.envelope.day>selected.envelope.snapshot.throughDay).toBe(true);
+  const ensured=await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   envelope:selected.envelope,nowMs:10});
+  expect(ensured.status).toBe('created');
+  await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_scan
+   (source_id,revision,tick,current_position,history_position) VALUES(?,1,0,0,0)
+   ON CONFLICT(source_id) DO UPDATE SET revision=revision+1,tick=0,current_position=0`).bind(namespace).run();
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({state:'complete',metric:'fits',day:today()});
  });
  it('invalidates a claimed snapshot across an authority epoch and cannot resurrect it after reactivation',async()=>{
   await fixture('participant:selected-revocation');
