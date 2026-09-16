@@ -2,7 +2,7 @@
 title: Hosted portability recovery and transaction slice
 date: 2026-09-15
 type: plan
-status: implementation-complete-validation-pending
+status: source-qualified
 ---
 
 # Hosted portability recovery and transaction slice
@@ -33,8 +33,18 @@ migration, deployment, or GCS quarantine support is implied.
   graph preservation, corrections, rollback and domain isolation. The extracted
   SQL and bind sequences were mechanically compared to the committed source.
   Worker and portable typechecks passed.
-- The complete final Worker gate is running; keep release-site artifact
-  requirements explicit before claiming that gate passed.
+- Transaction extraction committed as `cbc24452`. On that runtime source,
+  `npm run product:worker:check` passed workspace-package guards, endpoint checks,
+  generated types, TypeScript, scripts, portable compilation, 21 portable tests,
+  14 smoke/cleanup tests, four asset-plan tests, and all 1,055 Worker tests across
+  85 files (352.57 seconds).
+- The combined command exited at `production:stage-assets` with “Generated
+  public release manifest is missing or cannot be inspected.” No release-site
+  artifact was supplied in this worktree, so production/staging dry deployment
+  remains unqualified. The separate GCS test dry bundle passed (59.83 KiB).
+- Architecture checks passed at 545 production files / 2,146 imports / no debt;
+  documentation and preflight checks passed. No source push or deployment was
+  performed.
 - PostgreSQL parity and a hosted GCP runtime remain separate qualification work.
 
 ## Transaction boundary decision
@@ -56,3 +66,16 @@ PostgreSQL was not available at the local inspection: PostgreSQL binaries and
 client dependency were absent, and the installed Docker client could not reach
 its Colima daemon. A faithful proof needs real transactions, constraints and
 concurrent clients; mocks do not qualify PostgreSQL behavior.
+
+## Next executable qualification
+
+Provide a disposable local PostgreSQL runtime and implement this one operation
+against real transactions. Before considering a GCP-hosted contribution service,
+prove append, replay, correction, record-ownership rollback, expired authorization,
+concurrent admission, projection invalidation and lost-response recovery. Preserve
+the current five-minute authorization lease and one-hour quarantine reconciliation
+separation; do not infer erasure guarantees from a live-object 404.
+
+This completes the scoped source extraction and repeatable release-object lane.
+PostgreSQL, a refreshable deployed identity, runtime hosting and GCS quarantine
+remain explicit future work rather than claims implied by these adapters.
