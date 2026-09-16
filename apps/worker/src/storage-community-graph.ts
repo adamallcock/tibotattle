@@ -479,11 +479,14 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     }
     const method=scope.source==='v1.1'?V11_PLAN_ATTRIBUTION_ADAPTER_VERSION:MODEL_HISTORY_METHOD_VERSION;
     if(composition!==null) {
-      if(!validCompleteCachedComposition(composition,scope.pin.fingerprint,method))throw fail();
+      const completedFingerprint=scope.source==='v1.1'?v11CompletedFingerprint:scope.pin.fingerprint;
+      if(!completedFingerprint||!validCompleteCachedComposition(composition,completedFingerprint,method))throw fail();
       payload=canonicalJson(composition);
     }
   }
   if(!payload)throw fail();
+  const payloadFingerprint=scope.source==='v1.1'?v11CompletedFingerprint:scope.pin.fingerprint;
+  if(!payloadFingerprint)throw fail();
   if(new TextEncoder().encode(payload).byteLength>MAX_RESULT_BYTES)return {state:'deferred',reason:'result_size_limit'};
   if(!await current(source,scope))return {state:'deferred',reason:'authority_changed'};
   await targetReady(bindings.target,scope);
@@ -498,7 +501,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       source_kind=excluded.source_kind
     WHERE excluded.input_revision>=analytics_community_graph_results.input_revision`)
     .bind(bindings.sourceId,scope.owner.ownerDigest,scope.metric,scope.day,STORAGE_GRAPH_METHOD,
-      scope.dependencyDigest,scope.owner.inputRevision,scope.pin.fingerprint,payload,hash,
+      scope.dependencyDigest,scope.owner.inputRevision,payloadFingerprint,payload,hash,
       canonicalJson(scope.authority),Date.now(),scope.source).run();
   const result=await readStorageGraphResult(bindings,scope);
   return result?{state:'complete',result,reused:false}:{state:'deferred',reason:'source_changed'};

@@ -518,7 +518,7 @@ describe("typed active-domain analytical reads",()=>{
     expect(complete).toBe(true);expect(checkpoint.snapshot?.fingerprint).toBe(snapshot.fingerprint);
   },180_000);
 
-  it("finishes a persisted usage reduction on its selected generation after a successor upload",async()=>{
+  it("persists and rereads a model finished from an older selected generation after a successor upload",async()=>{
     await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
     await initializeTypedV1Admission(typed(),namespace);
     await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
@@ -559,16 +559,21 @@ describe("typed active-domain analytical reads",()=>{
     const successor=await stage(typed(),f,await makeV11Day(nextDay,evidence(1,nextDay,'usage-successor')),true);
     await activateCandidates(typed(),f,[selected,successor]);
     const currentPin=await loadV11SourcePin(typed(),participantId);if(!currentPin)throw new Error('synthetic successor pin unavailable');
-    let checkpoint=await loadedCheckpoint(key),complete=false;
-    for(let pass=0;pass<4&&!complete;pass++){
-      const advanced=await advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
-        day:scope.day,metric:'model',nowMs,sourcePin:currentPin,closedDependencyDigest:scope.checkpointDependencyDigest,
-        checkpoint,maxPages:32,budget:{remainingQueries:900,deadlineMs:Date.now()+120_000}});
-      if(advanced.status==='complete'){complete=true;break;}
-      if(!advanced.checkpoint)throw new Error('synthetic resumed usage checkpoint unavailable');
-      checkpoint=advanced.checkpoint;
-    }
-    expect(complete).toBe(true);expect(checkpoint.snapshot?.fingerprint).toBe(snapshot.fingerprint);
+    expect(currentPin.fingerprint).not.toBe(snapshot.fingerprint);
+    const currentOwner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    const successorScope=await captureStorageGraphScope(typed(),{owner:currentOwner,day:scope.day,metric:'model',
+      sourceId:namespace,sourceNamespace:namespace});
+    expect(successorScope.checkpointDependencyDigest).toBe(scope.checkpointDependencyDigest);
+    expect(successorScope.pin.fingerprint).toBe(currentPin.fingerprint);
+    expect((await computeStorageGraphResult(bindings,successorScope,{maxQueries:900})).state).toBe('complete');
+    const stored=await bindings.target.prepare(`SELECT input_revision,payload_fingerprint,payload_json
+      FROM analytics_community_graph_results WHERE source_id=? AND owner_digest=? AND metric='model' AND day=?`)
+      .bind(namespace,currentOwner.ownerDigest,scope.day)
+      .first<{input_revision:number;payload_fingerprint:string;payload_json:string}>();
+    expect(stored).toMatchObject({input_revision:currentOwner.inputRevision,payload_fingerprint:snapshot.fingerprint});
+    expect(JSON.parse(stored!.payload_json)).toMatchObject({inputFingerprint:snapshot.fingerprint});
+    expect(await readStorageGraphResult(bindings,successorScope)).toMatchObject({scope:{metric:'model'},composition:{
+      inputFingerprint:snapshot.fingerprint}});
   },240_000);
 
   it("resumes a closed v1.1 window across an outside append and rejects changed or erased evidence",async()=>{
