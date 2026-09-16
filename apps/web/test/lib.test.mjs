@@ -13665,6 +13665,7 @@ test("Forest Ink dark appearance is explicit, balanced, and live-updateable", as
   );
   assert.match(appSource, /document\.documentElement\.dataset\.theme = theme/u);
   assert.match(appSource, /__TIBOTATTLE_APPEARANCE__\?\.resolvedTheme/u);
+  assert.match(appSource, /resolveElectronStartupAppearance\(\)/u);
   assert.match(appSource, /"tibotattle:appearance-override"/u);
   assert.match(
     appSource,

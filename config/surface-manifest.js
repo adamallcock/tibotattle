@@ -19,6 +19,7 @@ const SHARED_WEB_FILES = Object.freeze([
   "apps/web/public/allowance-tank-renderer.js",
   "apps/web/public/community-data.js",
   "apps/web/public/data-client.js",
+  "apps/web/public/desktop-appearance.js",
   "apps/web/public/dashboard-report-preload.js",
   "apps/web/public/dashboard-ui.js",
   "apps/web/public/desktop-shell.js",

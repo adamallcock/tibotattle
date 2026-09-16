@@ -130,6 +130,25 @@ test("desktop command bridge forwards only the closed automatic refresh mode", (
   mounted.teardown();
 });
 
+test("desktop startup reapplies the persisted forced appearance", async () => {
+  const { events, windowRef } = fakeWindow();
+  windowRef.matchMedia = () => ({ matches: true });
+  windowRef.tibotattleDesktop.getSettings = async () => ({
+    settings: { appearance: "light" },
+  });
+  const mounted = mountDesktopShell({
+    documentRef: fakeDocument(),
+    windowRef,
+  });
+
+  await Promise.resolve();
+  assert.deepEqual(events.map(({ type, detail }) => ({ type, detail })), [{
+    type: "tibotattle:appearance-override",
+    detail: { preference: "light", resolvedTheme: "light" },
+  }]);
+  mounted.teardown();
+});
+
 test("Electron Share selects Allowance and focuses the existing results card", () => {
   const { windowRef } = fakeWindow();
   const shareButton = fakeButton();

@@ -2062,6 +2062,28 @@ test("runtime persists the fixed Electron appearance and updates live renderers"
   await desktop.lifecycle.dispose();
 });
 
+test("runtime applies the persisted appearance before creating the first window", async () => {
+  for (const appearance of ["system", "light", "dark"]) {
+    const nativeTheme = new EventEmitter();
+    nativeTheme.themeSource = "system";
+    nativeTheme.shouldUseDarkColors = true;
+    const themeSourcesAtWindowCreation = [];
+    class AppearanceWindow extends FakeWindow {
+      constructor(options) {
+        themeSourcesAtWindowCreation.push(nativeTheme.themeSource);
+        super(options);
+      }
+    }
+    const { desktop } = await launchFixture({
+      load: async () => ({ ...DESKTOP_DEFAULT_SETTINGS, appearance }),
+      runtimeOverrides: { BrowserWindow: AppearanceWindow, nativeTheme },
+    });
+
+    assert.equal(themeSourcesAtWindowCreation[0], appearance);
+    await desktop.lifecycle.dispose();
+  }
+});
+
 test("runtime accepts Codex handoff only from the ready dashboard main frame", async () => {
   const opened = [];
   const ipcMain = {

@@ -49,6 +49,7 @@ import {
 import {
   mountDashboardNavigation,
 } from "./navigation.js";
+import { resolveElectronStartupAppearance } from "./desktop-appearance.js";
 import {
   renderInstallerJourney as renderSharedInstallerJourney,
 } from "./install-cta.js";
@@ -109,11 +110,14 @@ function applyNativeAppearanceTheme(theme) {
 }
 
 // WKWebView installs this handoff at document start, before the stylesheet can
-// paint. Reapplying it here owns live Settings changes and keeps the browser
-// metadata in step without reloading a dashboard or losing in-memory state.
+// paint. Electron applies nativeTheme before creating its BrowserWindow, so
+// Chromium's effective color-scheme synchronously covers its first render.
+// Reapplying both here owns live Settings changes and keeps the browser metadata
+// in step without reloading a dashboard or losing in-memory state.
 applyNativeAppearanceTheme(
   globalThis.__TIBOTATTLE_APPEARANCE__?.resolvedTheme,
 );
+applyNativeAppearanceTheme(resolveElectronStartupAppearance());
 window.addEventListener("tibotattle:appearance-override", (event) => {
   applyNativeAppearanceTheme(event.detail?.resolvedTheme);
 });
