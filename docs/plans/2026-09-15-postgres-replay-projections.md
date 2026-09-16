@@ -93,5 +93,13 @@ owner-erasure workflow and deletion-ledger replay remain unqualified on PostgreS
   still be well-formed, and SQL row order must be sorted before exact comparison.
   These were corrected without weakening the tested contracts. No flaky test
   was suppressed.
-- Complete Worker gate and final documentation checks are recorded below when
-  available. This report does not imply cloud-hosting or release qualification.
+- Implementation committed as `1954c6d0`. `npm run product:worker:check`
+  passed generated types, package/endpoint guards, TypeScript, script checks,
+  portable checks, GCS smoke/asset checks and all 1,092 Worker tests across 88
+  files (483.07 seconds). It then failed at `production:stage-assets` because
+  the generated public release manifest is absent from this worktree. The
+  complete command did not pass; production/staging dry deployment remains
+  unqualified. No artifact was fabricated or deployment performed.
+- Documentation governance, preflight and diff whitespace checks passed. This
+  record proves the scoped local source/test result, not cloud hosting or release
+  qualification.
