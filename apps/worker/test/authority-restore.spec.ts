@@ -9,22 +9,75 @@ import { authoritySchemaInventory, authoritySchemaDigest, authorityMigrationLedg
 const source=()=>env.USAGE_MONITOR_DB;
 const target=()=>(env as Env & {STORAGE_INGESTION_A:D1Database}).STORAGE_INGESTION_A;
 beforeEach(async()=>reset());
-async function fixture(count=35,auto=false){
+async function fixture(count=35,auto=false,retention=false){
  const sql=[
  `CREATE TABLE participants(id TEXT PRIMARY KEY NOT NULL,state TEXT NOT NULL,secret_hash BLOB NOT NULL,note TEXT) STRICT`,
  `CREATE TABLE device_credentials(id TEXT PRIMARY KEY NOT NULL,participant_id TEXT NOT NULL REFERENCES participants(id),state TEXT NOT NULL,expires_at TEXT NOT NULL,secret_hash BLOB NOT NULL) STRICT`,
  `CREATE TABLE telemetry_v11_device_consents(participant_id TEXT NOT NULL REFERENCES participants(id),device_id TEXT NOT NULL REFERENCES device_credentials(id),version TEXT NOT NULL,PRIMARY KEY(participant_id,device_id)) STRICT, WITHOUT ROWID`,
  `CREATE TABLE telemetry_v11_day_manifests(id TEXT PRIMARY KEY NOT NULL,participant_id TEXT NOT NULL REFERENCES participants(id),device_id TEXT NOT NULL REFERENCES device_credentials(id),state TEXT NOT NULL,manifest_json TEXT NOT NULL) STRICT`,
- `CREATE TABLE device_upload_authorizations(id TEXT PRIMARY KEY NOT NULL,participant_id TEXT NOT NULL REFERENCES participants(id),device_id TEXT NOT NULL REFERENCES device_credentials(id),state TEXT NOT NULL,consumed_contribution_id TEXT,secret_hash BLOB NOT NULL) STRICT`];
+ `CREATE TABLE device_upload_authorizations(id TEXT PRIMARY KEY NOT NULL,participant_id TEXT NOT NULL REFERENCES participants(id),device_id TEXT NOT NULL REFERENCES device_credentials(id),state TEXT NOT NULL,consumed_contribution_id TEXT,secret_hash BLOB NOT NULL) STRICT`,
+ ...(retention?[`CREATE TABLE accountless_enrollment_ledger(device_id TEXT PRIMARY KEY NOT NULL,state TEXT NOT NULL) STRICT`,
+ `CREATE TABLE accountless_upload_owners(participant_id TEXT PRIMARY KEY NOT NULL,enrollment_device_id TEXT NOT NULL,device_credential_id TEXT NOT NULL,state TEXT NOT NULL) STRICT`,
+ `CREATE TABLE accountless_v11_device_authorizations(enrollment_device_id TEXT PRIMARY KEY NOT NULL,participant_id TEXT NOT NULL,device_credential_id TEXT NOT NULL,state TEXT NOT NULL) STRICT`,
+ `CREATE TABLE telemetry_v11_domain_heads(participant_id TEXT PRIMARY KEY NOT NULL,generation_id TEXT NOT NULL,revision INTEGER NOT NULL) STRICT`,
+ `CREATE VIEW community_public_source_owners(participant_id,owner_kind,device_id) AS
+   SELECT participant_id,'accountless',device_credential_id FROM accountless_upload_owners WHERE state='active'`,
+ `CREATE TABLE accountless_public_history_retention (
+  participant_id TEXT PRIMARY KEY NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  enrollment_device_id TEXT NOT NULL UNIQUE,
+  device_credential_id TEXT NOT NULL UNIQUE,
+  generation_id TEXT NOT NULL,
+  head_revision INTEGER NOT NULL CHECK (head_revision > 0),
+  retained_at TEXT NOT NULL,
+  CHECK (retained_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z')
+) STRICT`,
+ `CREATE TRIGGER accountless_public_history_retention_insert
+BEFORE INSERT ON accountless_public_history_retention
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM community_public_source_owners public_owner
+    JOIN accountless_upload_owners owner
+      ON owner.participant_id = public_owner.participant_id
+    JOIN accountless_enrollment_ledger ledger
+      ON ledger.device_id = owner.enrollment_device_id
+    JOIN device_credentials device
+      ON device.id = owner.device_credential_id
+    JOIN accountless_v11_device_authorizations grant_row
+      ON grant_row.enrollment_device_id = owner.enrollment_device_id
+     AND grant_row.participant_id = owner.participant_id
+     AND grant_row.device_credential_id = owner.device_credential_id
+    JOIN telemetry_v11_domain_heads head
+      ON head.participant_id = owner.participant_id
+   WHERE public_owner.owner_kind = 'accountless'
+     AND public_owner.participant_id = NEW.participant_id
+     AND public_owner.device_id = NEW.device_credential_id
+     AND owner.enrollment_device_id = NEW.enrollment_device_id
+     AND owner.device_credential_id = NEW.device_credential_id
+     AND ledger.state = 'active' AND owner.state = 'active'
+     AND device.state = 'active' AND grant_row.state = 'active'
+     AND head.generation_id = NEW.generation_id
+     AND head.revision = NEW.head_revision
+)
+BEGIN SELECT RAISE(ABORT, 'accountless_history_retention_unavailable'); END`,
+ `CREATE TRIGGER accountless_public_history_retention_immutable
+BEFORE UPDATE ON accountless_public_history_retention
+BEGIN SELECT RAISE(ABORT, 'accountless_history_retention_immutable'); END`]:[])];
  await source().batch(sql.map(s=>source().prepare(s)));
- await source().batch(Array.from({length:count},(_,n)=>source().prepare('INSERT INTO participants VALUES(?,?,?,?)').bind(`synthetic-${n}`,n?'active':'deleting',new Uint8Array([0,1,255]).buffer,n?'':null)));
+ await source().batch(Array.from({length:count},(_,n)=>source().prepare('INSERT INTO participants VALUES(?,?,?,?)').bind(`synthetic-${n}`,retention||n?'active':'deleting',new Uint8Array([0,1,255]).buffer,n?'':null)));
  await source().batch([
- source().prepare("INSERT INTO device_credentials VALUES('device','synthetic-0','revoked','2000-01-01',?)").bind(new Uint8Array([255,0,2]).buffer),
+ source().prepare(`INSERT INTO device_credentials VALUES('device','synthetic-0','${retention?'active':'revoked'}','2000-01-01',?)`).bind(new Uint8Array([255,0,2]).buffer),
  source().prepare("INSERT INTO telemetry_v11_device_consents VALUES('synthetic-0','device','old-version')"),
  source().prepare("INSERT INTO telemetry_v11_day_manifests VALUES('manifest','synthetic-0','device','ready','{}')"),
  source().prepare("INSERT INTO device_upload_authorizations VALUES('claim','synthetic-0','device','consumed','retained-contribution',?)").bind(new Uint8Array([4,5]).buffer),
  source().prepare('CREATE INDEX synthetic_device_owner ON device_credentials(participant_id)'),
  source().prepare("CREATE TRIGGER synthetic_current_guard BEFORE INSERT ON participants WHEN NEW.state!='active' BEGIN SELECT RAISE(ABORT,'current_admission'); END")]);
+ if(retention)await source().batch([
+  source().prepare("INSERT INTO accountless_enrollment_ledger VALUES('enrollment-device','active')"),
+  source().prepare("INSERT INTO accountless_upload_owners VALUES('synthetic-0','enrollment-device','device','active')"),
+  source().prepare("INSERT INTO accountless_v11_device_authorizations VALUES('enrollment-device','synthetic-0','device','active')"),
+  source().prepare("INSERT INTO telemetry_v11_domain_heads VALUES('synthetic-0','generation-retained',7)"),
+  source().prepare("INSERT INTO accountless_public_history_retention VALUES('synthetic-0','enrollment-device','device','generation-retained',7,'2026-09-16T00:00:00.000Z')"),
+ ]);
  if(auto){await source().prepare('CREATE TABLE admin_action_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,details_json TEXT NOT NULL) STRICT').run();await source().prepare("INSERT INTO admin_action_audit VALUES(500,'synthetic')").run();await source().prepare('DELETE FROM admin_action_audit').run();}
  const sourceSchema=await authoritySchemaInventory(source());
  const finalSchema=sourceSchema.map(o=>({...o,sql:o.type==='table'?o.sql.replace(/\b(CREATE TABLE|REFERENCES) ([A-Za-z_][A-Za-z0-9_]*)/g,'$1 "$2"'):o.sql}));
@@ -61,6 +114,23 @@ async function rawFixture(){
  f.pin=await authorityRestoreContractDigest(f.contract);return f;
 }
 describe('isolated authority restore protocol',()=>{
+ it('restores a populated accountless history marker with both guards intact',async()=>{
+  const f=await fixture(1,false,true);await freezeAuthorityRestoreSource(source(),f.contract,f.pin);
+  await beginAuthorityRestore(source(),target(),f.contract,f.pin);await drain(f);
+  await sealAuthorityRestore(source(),target(),f.contract,f.pin);await drain(f,'verify');
+  await completeAuthorityVerification(source(),target(),f.contract,f.pin);
+  await promoteAuthorityRestore(source(),target(),f.contract,f.pin);await finalizeAuthorityRestore(source(),target(),f.contract,f.pin);
+  expect(await target().prepare(`SELECT participant_id,enrollment_device_id,device_credential_id,generation_id,
+    head_revision,retained_at FROM accountless_public_history_retention`).first()).toEqual({
+    participant_id:'synthetic-0',enrollment_device_id:'enrollment-device',device_credential_id:'device',
+    generation_id:'generation-retained',head_revision:7,retained_at:'2026-09-16T00:00:00.000Z',
+  });
+  await expect(target().prepare("UPDATE accountless_public_history_retention SET retained_at='2026-09-17T00:00:00.000Z'").run())
+   .rejects.toThrow('accountless_history_retention_immutable');
+  await expect(target().prepare(`INSERT INTO accountless_public_history_retention VALUES(
+    'synthetic-0','enrollment-device','device','generation-retained',8,'2026-09-17T00:00:00.000Z')`).run())
+   .rejects.toThrow('accountless_history_retention_unavailable');
+ });
  it('preserves historical authority exactly and installs final guards only after second-pass verification',async()=>{
   const f=await prepared();
   await expect(source().prepare("UPDATE participants SET state='active'").run()).rejects.toThrow('AUTHORITY_SNAPSHOT_FROZEN');
