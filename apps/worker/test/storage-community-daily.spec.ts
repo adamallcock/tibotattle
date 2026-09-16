@@ -8,7 +8,7 @@ import { advanceStorageCommunityDaily, advanceNextStorageCommunityDaily, readPub
 import { captureStorageCommunityAuthority, storageCommunityAuthorityIsCurrent, readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from "@app-usagemonitor/telemetry-contract";
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
@@ -267,6 +267,25 @@ describe('independent public daily publication',()=>{
     expect(12-remaining!).toBe(result.dailyPublications);
     expect(result).toMatchObject({steps:1,recordsRead:0});
     expect(result.queriesUsed).toBeLessThan(300);
+  });
+  it('publishes one prepared day and advances graph work in a default 20-second iteration',async()=>{
+    await fixture();await ready();await publish();
+    const days=[1,2].map(offset=>new Date(Date.parse(today())-offset*86_400_000).toISOString().slice(0,10));
+    await target().batch(days.map(day=>target().prepare(
+      'INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)',
+    ).bind(sourceId,day)));
+    await target().prepare(`INSERT INTO analytics_community_graph_scan
+      (source_id,revision,tick,current_position,history_position) VALUES(?,1,1,0,0)`).bind(sourceId).run();
+    const clock=vi.spyOn(Date,'now').mockReturnValue(Date.now());
+    try{
+      const result=await runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,maxSteps:1,maxQueries:725});
+      expect(result.dailyPublications).toBe(1);
+      expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue WHERE source_id=?')
+        .bind(sourceId).first('n')).toBe(1);
+      expect(await target().prepare('SELECT tick,history_position FROM analytics_community_graph_scan WHERE source_id=?')
+        .bind(sourceId).first()).toMatchObject({tick:2,history_position:1});
+      expect(result.queriesUsed).toBeLessThanOrEqual(725);
+    }finally{clock.mockRestore();}
   });
   it('leaves pending delivery for its bounded phase while advancing retained graph work',async()=>{
     const value=await fixture();await ready();await publish();

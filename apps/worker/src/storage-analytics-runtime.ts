@@ -287,11 +287,15 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     // fall back to the other lane when their preferred lane is empty.
     const dailyAllowance=Math.min(90,Math.max(0,meter.remainingQueries-560));
     let dailyIdle=false;
-    if(dailyAllowance>0&&deadlineMs-Date.now()>=20_000){
+    const dailyTimeRemaining=deadlineMs-Date.now();
+    if(dailyAllowance>0&&dailyTimeRemaining>=5_000){
      const dailyMeter=createD1InvocationBudget(dailyAllowance);
      const dailyScoped={...scoped,source:dailyMeter.wrap(scoped.source),target:dailyMeter.wrap(scoped.target)};
+     // A normal 20-second direct pass has already spent part of its deadline
+     // on setup. Admit one bounded day there; only longer passes batch days.
+     const dailyAttempts=dailyTimeRemaining>20_000?4:1;
      try{
-      for(let attempt=0;attempt<4&&deadlineMs-Date.now()>=15_000;attempt++){
+      for(let attempt=0;attempt<dailyAttempts&&deadlineMs-Date.now()>=(attempt===0?5_000:15_000);attempt++){
        const slot=Math.floor(Date.now()/60_000)+attempt;
        const daily=await advanceNextStorageCommunityDaily({...dailyScoped,preferStaleHead:slot%4!==3});
        if(daily.state==='published')dailyPublications++;
