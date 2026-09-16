@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 const start = source.indexOf("let nextDivergenceBreakdownId = 0;");
 const end = source.indexOf("\n/**\n * Whether a series draws its data points", start);
 assert.ok(start >= 0 && end > start);
@@ -47,7 +49,10 @@ function harness() {
     focus() { document.activeElement = this; }
     get textContent() { return this.text + this.children.map((child) => child.textContent).join(""); }
   }
-  const elements = new Map(["list", "empty", "summary", "caveat"]
+  const elements = new Map([
+    "list", "empty", "summary", "caveat", "pagination", "page-status",
+    "page-prev", "page-next",
+  ]
     .map((key) => [`#divergence-${key}`, new Element("div")]));
   const requests = [];
   const focusedPeriods = [];
@@ -71,9 +76,15 @@ function harness() {
     "formatSignedPp", "formatSignedPpHours", "formatApiMoney", "compact",
     "formatPercent", "formatNumber", "formatModelName"]) dependencies[name] = String;
   const api = Function(...Object.keys(dependencies), `${source.slice(start, end)}
-    return { render: renderDivergencePeriods, state: divergenceDetails };`
+    return {
+      render: renderDivergencePeriods,
+      state: divergenceDetails,
+      next() { divergenceTablePage += 1; renderDivergencePeriodPage(); },
+      previous() { divergenceTablePage -= 1; renderDivergencePeriodPage(); },
+    };`
   )(...Object.values(dependencies));
   return { ...api, requests, document, focusedPeriods,
+    element: (id) => elements.get(id),
     card: () => elements.get("#divergence-list").children[0],
     toggle: () => elements.get("#divergence-list").children[0].children.at(-2),
     panel: () => elements.get("#divergence-list").children[0].children.at(-1),
@@ -189,14 +200,93 @@ test("different windows, evidence, plan cohorts and demo do not inherit pending 
   }
 });
 
-test("retention is bounded to displayed windows and discarded when no periods remain", () => {
+test("detail retention covers every pageable window and clears with the result set", () => {
   const h = harness();
   h.render(snapshot(), Array.from({ length: 25 }, (_, i) => period(100 * i)));
-  assert.equal(h.state.size, 20);
+  assert.equal(h.state.size, 25);
   h.render(snapshot(), [period(999)]);
   assert.equal(h.state.size, 1);
   h.render(snapshot(), []);
   assert.equal(h.state.size, 0);
+});
+
+test("all divergence periods are reachable ten rows at a time", () => {
+  const h = harness();
+  h.render(snapshot(), Array.from({ length: 25 }, (_, i) => period(100 * i)));
+
+  assert.equal(h.element("#divergence-list").children.length, 10);
+  assert.equal(h.element("#divergence-pagination").hidden, false);
+  assert.equal(h.element("#divergence-page-prev").disabled, true);
+  assert.equal(h.element("#divergence-page-next").disabled, false);
+  assert.match(h.element("#divergence-page-status").textContent, /1 10 25/u);
+
+  h.next();
+  assert.equal(h.element("#divergence-list").children.length, 10);
+  assert.equal(h.element("#divergence-page-prev").disabled, false);
+  assert.equal(h.element("#divergence-page-next").disabled, false);
+  assert.match(h.element("#divergence-page-status").textContent, /11 20 25/u);
+
+  h.next();
+  assert.equal(h.element("#divergence-list").children.length, 5);
+  assert.equal(h.element("#divergence-page-prev").disabled, false);
+  assert.equal(h.element("#divergence-page-next").disabled, true);
+  assert.match(h.element("#divergence-page-status").textContent, /21 25 25/u);
+
+  h.next();
+  assert.equal(h.element("#divergence-list").children.length, 5);
+  h.previous();
+  assert.equal(h.element("#divergence-list").children.length, 10);
+});
+
+test("a changed divergence population returns to the first page", () => {
+  const h = harness();
+  h.render(snapshot(), Array.from({ length: 25 }, (_, i) => period(100 * i)));
+  h.next();
+  assert.match(h.element("#divergence-page-status").textContent, /11 20 25/u);
+
+  h.render(snapshot(), Array.from({ length: 12 }, (_, i) => period(1_000 + 100 * i)));
+  assert.equal(h.element("#divergence-list").children.length, 10);
+  assert.equal(h.element("#divergence-page-prev").disabled, true);
+  assert.match(h.element("#divergence-page-status").textContent, /1 10 12/u);
+});
+
+test("paging away and back preserves an expanded loaded breakdown", async () => {
+  const h = harness();
+  h.render(snapshot(), Array.from({ length: 25 }, (_, i) => period(100 * i)));
+  h.toggle().click();
+  h.requests[0].resolve(result());
+  await settle();
+
+  h.next();
+  h.previous();
+  assert.equal(h.toggle().getAttribute("aria-expanded"), "true");
+  assert.equal(h.panel().hidden, false);
+  assert.match(h.panel().textContent, /gpt-6-astra/u);
+  assert.equal(h.requests.length, 1);
+});
+
+test("single-page divergence results hide the pager", () => {
+  const h = harness();
+  h.render(snapshot(), Array.from({ length: 10 }, (_, i) => period(100 * i)));
+  assert.equal(h.element("#divergence-list").children.length, 10);
+  assert.equal(h.element("#divergence-pagination").hidden, true);
+});
+
+test("the Trends page ships accessible divergence pager controls", () => {
+  assert.match(html, /id="divergence-pagination"[^>]*hidden/u);
+  assert.match(
+    html,
+    /id="divergence-page-prev"[^>]*aria-controls="divergence-list"/u,
+  );
+  assert.match(html, /id="divergence-page-status"[^>]*role="status"/u);
+  assert.match(
+    html,
+    /id="divergence-page-next"[^>]*aria-controls="divergence-list"/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 520px\)[\s\S]*?\.divergence-panel \.table-pagination-status \{[\s\S]*?grid-column: 1 \/ -1;/u,
+  );
 });
 
 

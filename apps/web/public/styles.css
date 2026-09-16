@@ -2728,6 +2728,17 @@ footer p { margin: 0; }
     padding-inline: .35rem;
     font-size: .62rem;
   }
+  .divergence-panel .table-pagination {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .divergence-panel .table-pagination-status {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    text-align: center;
+  }
+  #divergence-page-prev { grid-column: 1; grid-row: 2; }
+  #divergence-page-next { grid-column: 2; grid-row: 2; }
 }
 
 @media (prefers-reduced-motion: reduce) {

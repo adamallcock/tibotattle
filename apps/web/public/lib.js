@@ -670,10 +670,6 @@ export const DEVIATION_MIN_DURATION_MS = 2 * 60 * 60 * 1_000;
 // buckets — long enough to bridge a shallow wobble, short enough that a real
 // return to zero still ends the period.
 export const DEVIATION_MERGE_GAP_MS = 45 * 60 * 1_000;
-// The list is capped so the panel stays readable. Anything beyond the cap is
-// counted and reported (see `totalFound`/`truncated`), never silently dropped.
-export const DEVIATION_MAX_PERIODS = 20;
-
 function deviationNumberOrNull(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -794,7 +790,9 @@ export function detectDeviationPeriods(points, {
   thresholdPp = DEVIATION_DRIFT_THRESHOLD_PP,
   minDurationMs = DEVIATION_MIN_DURATION_MS,
   mergeGapMs = DEVIATION_MERGE_GAP_MS,
-  maxPeriods = DEVIATION_MAX_PERIODS,
+  // Preserve the full ranked result for pageable consumers. Callers that need
+  // a diagnostic bound can still pass an explicit finite cap.
+  maxPeriods = Number.POSITIVE_INFINITY,
 } = {}) {
   const series = (Array.isArray(points) ? points : [])
     .map((point) => ({

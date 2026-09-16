@@ -6026,11 +6026,17 @@ function focusTrendsPeriod(period) {
 // stable target for its toggle's aria-controls.
 let nextDivergenceBreakdownId = 0;
 
-// Display-only state for the detector's bounded set of visible windows. Index
-// revisions refresh details without changing a window's identity; a changed
-// population or contributor mix cannot inherit another window's answer.
+// Display-only state for the detector's ranked windows. Index revisions refresh
+// details without changing a window's identity; a changed population or
+// contributor mix cannot inherit another window's answer. Pagination controls
+// readability without dropping evidence from the detector result.
 const divergenceDetails = new Map();
-const MAX_DIVERGENCE_DETAILS = 20;
+const DIVERGENCE_PAGE_SIZE = 10;
+let divergenceTablePage = 0;
+let divergencePeriodRows = [];
+let divergencePeriodDetailScope = "";
+let divergencePeriodRangeContext = null;
+let divergencePeriodSignature = "";
 
 function divergenceDetailScope(data) {
   const scope = data?.timeline?.planScoped?.planScope;
@@ -6057,7 +6063,7 @@ function prepareDivergenceDetails(data, periods) {
     : JSON.stringify([generation, data?.accounting?.generationFingerprint,
       planScope?.sourceGeneration, planScope?.sourceGenerationFingerprint]);
   const retained = new Set();
-  for (const period of periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+  for (const period of periods) {
     const key = divergenceDetailKey(period, scope);
     retained.add(key);
     let state = divergenceDetails.get(key);
@@ -6376,6 +6382,71 @@ function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
   }
 }
 
+function divergenceRowsSignature(periods, detailScope) {
+  return JSON.stringify([
+    detailScope,
+    periods.map((period) => [
+      period.startMs,
+      period.endMs,
+      period.contributors,
+    ]),
+  ]);
+}
+
+/**
+ * Render one readable page of the complete, widest-first divergence set.
+ * Detail state is retained for every detected window, so a reader can page
+ * away from an expanded row and return without losing its loaded evidence.
+ */
+function renderDivergencePeriodPage({ focusedKey = null } = {}) {
+  const list = $("#divergence-list");
+  const pagination = $("#divergence-pagination");
+  if (!list) return;
+  clear(list);
+
+  const pageCount = Math.max(
+    1,
+    Math.ceil(divergencePeriodRows.length / DIVERGENCE_PAGE_SIZE),
+  );
+  divergenceTablePage = Math.min(
+    Math.max(0, divergenceTablePage),
+    pageCount - 1,
+  );
+  const start = divergenceTablePage * DIVERGENCE_PAGE_SIZE;
+  const pageRows = divergencePeriodRows.slice(
+    start,
+    start + DIVERGENCE_PAGE_SIZE,
+  );
+
+  for (const period of pageRows) {
+    const key = divergenceDetailKey(period, divergencePeriodDetailScope);
+    const state = divergenceDetails.get(key);
+    list.append(divergencePeriodItem(
+      period,
+      divergencePeriodRangeContext,
+      state,
+    ));
+    if (key === focusedKey) state.toggle.focus({ preventScroll: true });
+  }
+
+  if (!pagination) return;
+  pagination.hidden = pageCount <= 1;
+  if (pagination.hidden) return;
+  setLocalizedText(
+    $("#divergence-page-status"),
+    "divergence.pagination.page",
+    {
+      start: formatNumber(start + 1),
+      end: formatNumber(start + pageRows.length),
+      total: formatNumber(divergencePeriodRows.length),
+    },
+  );
+  const previous = $("#divergence-page-prev");
+  const next = $("#divergence-page-next");
+  if (previous) previous.disabled = divergenceTablePage === 0;
+  if (next) next.disabled = divergenceTablePage >= pageCount - 1;
+}
+
 /**
  * The "Where observed and priced usage diverge" panel. It runs the pure
  * detector over the whole selected calibration range and lists each sustained
@@ -6386,6 +6457,7 @@ function renderDivergencePeriods(data, points) {
   const empty = $("#divergence-empty");
   const summary = $("#divergence-summary");
   const caveat = $("#divergence-caveat");
+  const pagination = $("#divergence-pagination");
   if (!list || !empty || !summary) return;
   const focusedKey = [...divergenceDetails.values()]
     .find((state) => state.toggle === document.activeElement)?.key;
@@ -6395,10 +6467,19 @@ function renderDivergencePeriods(data, points) {
     usageBuckets: data?.timeline?.usage ?? [],
   });
   const detailScope = prepareDivergenceDetails(data, result.periods);
+  const signature = divergenceRowsSignature(result.periods, detailScope);
+  if (signature !== divergencePeriodSignature) {
+    divergencePeriodSignature = signature;
+    divergenceTablePage = 0;
+  }
+  divergencePeriodRows = result.periods;
+  divergencePeriodDetailScope = detailScope;
+  divergencePeriodRangeContext = divergenceRangeContext(data);
 
   if (!result.periods.length) {
     list.hidden = true;
     summary.hidden = true;
+    if (pagination) pagination.hidden = true;
     if (caveat) caveat.hidden = true;
     empty.hidden = false;
     // "Nothing diverged" and "there is no drift series to judge" are different
@@ -6423,30 +6504,10 @@ function renderDivergencePeriods(data, points) {
     caveat.hidden = false;
     setLocalizedText(caveat, "trends.divergenceBasis");
   }
-  if (result.truncated) {
-    setLocalizedText(summary, "divergence.truncated", {
-      shown: formatNumber(result.periods.length),
-      total: formatNumber(result.totalFound),
-    });
-    // No silent truncation: the cap is a display bound, and the full count is
-    // both stated above and recorded here.
-    console.info(
-      `[divergence] ${result.totalFound} periods detected; showing the `
-        + `${result.periods.length} widest.`,
-    );
-  } else {
-    setLocalizedPluralText(summary, "divergence.count", result.totalFound, {
-      count: formatNumber(result.totalFound),
-    });
-  }
-
-  const rangeContext = divergenceRangeContext(data);
-  for (const period of result.periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
-    const key = divergenceDetailKey(period, detailScope);
-    const state = divergenceDetails.get(key);
-    list.append(divergencePeriodItem(period, rangeContext, state));
-    if (key === focusedKey) state.toggle.focus({ preventScroll: true });
-  }
+  setLocalizedPluralText(summary, "divergence.count", result.totalFound, {
+    count: formatNumber(result.totalFound),
+  });
+  renderDivergencePeriodPage({ focusedKey });
 }
 
 /**
@@ -15400,6 +15461,14 @@ $("#weekly-table-prev").addEventListener("click", () => {
 $("#weekly-table-next").addEventListener("click", () => {
   weeklyTablePage += 1;
   renderWeeklyTablePage();
+});
+$("#divergence-page-prev").addEventListener("click", () => {
+  divergenceTablePage -= 1;
+  renderDivergencePeriodPage();
+});
+$("#divergence-page-next").addEventListener("click", () => {
+  divergenceTablePage += 1;
+  renderDivergencePeriodPage();
 });
 $("#accounting-model-page-prev").addEventListener("click", () => {
   accountingModelsTablePagination.page -= 1;
