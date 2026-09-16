@@ -14,7 +14,8 @@ import { sha256Hex } from "../src/crypto";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
-import { captureStorageGraphScope, computeStorageGraphResult, readStorageGraphResult } from "../src/storage-community-graph";
+import { captureStorageGraphScope, computeStorageGraphResult, readStorageGraphResult,
+  STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD } from "../src/storage-community-graph";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
@@ -215,18 +216,33 @@ describe("typed active-domain analytical reads",()=>{
     await activate(typed(),f,await makeV11Day(day(),evidence()),true);
     const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
     const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:"fits",sourceId:namespace,sourceNamespace:namespace});
+    expect(await computeStorageGraphResult(bindings,scope)).toEqual({state:'deferred',reason:'v11_owner_pending'});
+    expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
     const computed=await computeStorageGraphResult(bindings,scope);
     expect(computed.state).toBe("complete");
     if(computed.state!=="complete")throw new Error("synthetic fit did not complete");
     expect(computed.result.fits!.length).toBeGreaterThan(0);
     expect(computed.result.fits!.every(fit=>fit.participantId===owner.ownerDigest)).toBe(true);
     expect(computed.reused).toBe(false);
+    expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+      WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
+       STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n')).toBeGreaterThan(1);
+    const modelScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:"model",sourceId:namespace,sourceNamespace:namespace});
+    const model=await computeStorageGraphResult(bindings,modelScope);
+    expect(model.state).toBe('complete');
+    if(model.state!=='complete')throw new Error('synthetic model did not complete');
+    expect(model.result.composition?.status).toBe('ready');
+    expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+      WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
+       STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).first<number>('n')).toBeGreaterThan(1);
     const meter=createD1InvocationBudget(20);
     const repeated=await computeStorageGraphResult({...bindings,source:meter.wrap(typed()),target:meter.wrap(bindings.target)},scope);
     expect(repeated.state==="complete"&&repeated.reused).toBe(true);
     expect(await typed().prepare("SELECT count(*) FROM community_allowance_fit_cache").first("count(*)")).toBe(0);
     expect(await typed().prepare("SELECT count(*) FROM telemetry_v11_records").first("count(*)")).toBe(0);
-    expect(await bindings.target.prepare("SELECT count(*) FROM analytics_community_graph_results").first("count(*)")).toBe(1);
+    expect(await bindings.target.prepare("SELECT count(*) FROM analytics_community_graph_results").first("count(*)")).toBe(2);
     await typed().prepare("UPDATE collection_controls SET publication_enabled=0,control_state='degraded',revision=revision+1 WHERE singleton=1").run();
     await expect(readStorageGraphResult(bindings,scope)).rejects.toThrow();
     expect(await typed().prepare("SELECT count(*) FROM typed_telemetry_records").first("count(*)")).toBe(17);

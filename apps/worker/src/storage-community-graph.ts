@@ -3,8 +3,7 @@ import { sha256Hex } from './crypto';
 import { accountScopedQuotaAnalysis } from './quota-analysis';
 import { accountScopedQuotaAnalysisV1, accountScopedHistoricalModelCompositionV1,
   MODEL_HISTORY_METHOD_VERSION, type V1ModelCompositionResult } from './quota-analysis-v1';
-import { accountScopedQuotaAnalysisV11, accountScopedModelCompositionV11,
-  V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
+import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
 import { assertV11SourcePinCurrent } from './telemetry-v11-domain';
 import { assertV1SourcePinCurrent, loadV1SourcePin } from './telemetry-v1-source-selection';
 import { modelHistoryWindow } from './model-history-window';
@@ -16,10 +15,10 @@ import { captureStorageCommunityAuthority, sameStorageCommunityCalculationAuthor
   type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { createD1InvocationBudget } from './d1-invocation-budget';
-import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis,
-  type StorageV1HistoryCheckpoint } from './storage-v1-history';
+import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis } from './storage-v1-history';
+import { advanceStorageV11Analysis,type StorageV11HistoryCheckpoint } from './storage-v11-history';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
-  type StorageHistoryKey, type StorageHistoryLoadCursor } from './storage-history-checkpoint';
+  type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor } from './storage-history-checkpoint';
 import { caughtStorageGraphFailureFields, withStorageGraphFailureStage,
   type StorageGraphFailureFields } from './storage-analytics-failure';
 
@@ -30,6 +29,8 @@ export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate
 // a repaired reader from making new resumable progress.
 export const STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':checkpoint-store-2';
 export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':current-fit-checkpoint-1';
+export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-fit-checkpoint-1';
+export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-model-checkpoint-1';
 // Execution-only revision for the single optimistic direct historical read.
 // This is deliberately absent from result/checkpoint identities: a reader fix
 // may reopen one direct attempt without changing the analysis semantics.
@@ -182,7 +183,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     return {state:'complete',result:cached,reused:true};
   }
   const nowMs=Date.parse(scope.fixedNow),source=bindings.source;
-  const persistCheckpoint=async(key:StorageHistoryKey,checkpoint:StorageV1HistoryCheckpoint,
+  const persistCheckpoint=async(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint,
     expectedHead:string|null,reason:string):Promise<
     {state:'saved';head:string}|{state:'deferred';reason:string;failure?:StorageGraphFailureFields}>=>{
     if(!await current(source,scope))return {state:'deferred',reason};
@@ -202,11 +203,51 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     }
     return {state:'deferred',reason};
   };
+  const computeV11=async(metric:'fits'|'model',pin:Extract<Pin,{source:'v1.1'}>):Promise<
+    {state:'complete';analysis:object}|{state:'deferred';reason:string;failure?:StorageGraphFailureFields}>=>{
+    // A typed domain can become source-visible before its ordered owner-active
+    // journal event reaches the analytics target. Do not read or stage private
+    // evidence until the target has the matching active owner authority.
+    const ownerReady=await bindings.target.prepare(`SELECT 1 AS ready FROM analytics_owner_state
+      WHERE source_id=? AND owner_digest=? AND state='active'`).bind(bindings.sourceId,scope.owner.ownerDigest)
+      .first<number>('ready');
+    if(ownerReady!==1)return {state:'deferred',reason:'v11_owner_pending'};
+    const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
+      ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.dependencyDigest,
+      method:metric==='fits'?STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD:STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD};
+    let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageV11HistoryCheckpoint|undefined;
+    for(;;){
+      if(meter.remainingQueries<50||now()>=checkpointWorkDeadlineMs)return {state:'deferred',reason:'v11_checkpoint_read_budget'};
+      const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
+        ()=>loadStorageHistoryCheckpoint({target:bindings.target,key,cursor}));
+      if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
+      head=loaded.headDigest??null;
+      if(loaded.status==='ready'){
+        if(!('source'in loaded.checkpoint)||loaded.checkpoint.source!=='v1.1')throw fail();
+        checkpoint=loaded.checkpoint;
+      }
+      break;
+    }
+    for(let page=0;page<STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM;page++){
+      const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
+        participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,checkpoint,
+        budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
+      if(next.status==='complete')return {state:'complete',analysis:next.analysis};
+      if(!next.checkpoint)return {state:'deferred',reason:'v11_checkpoint'};
+      const saved=await persistCheckpoint(key,next.checkpoint,head,'v11_checkpoint');
+      if(saved.state==='deferred')return saved;
+      if(saved.head===head)return {state:'deferred',reason:'v11_checkpoint'};
+      head=saved.head;checkpoint=next.checkpoint;
+    }
+    return {state:'deferred',reason:'v11_checkpoint'};
+  };
   let payload='';
   if(scope.metric==='fits') {
     const analyses:Array<{source:'v0.2'|'v1'|'v1.1';analysis:object}>=[];
-    if('source' in scope.pin)analyses.push({source:'v1.1',analysis:await accountScopedQuotaAnalysisV11(source,
-      scope.owner.participantId,{nowMs,sourcePin:scope.pin})});
+    if('source' in scope.pin){
+      const next=await computeV11('fits',scope.pin);if(next.state==='deferred')return next;
+      analyses.push({source:'v1.1',analysis:next.analysis});
+    }
     else if(scope.source==='v1'){
       const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
        ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.dependencyDigest,
@@ -218,7 +259,9 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
        const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
         ()=>loadStorageHistoryCheckpoint({target:bindings.target,key,cursor}));
        if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
-       head=loaded.headDigest??null;if(loaded.status==='ready')checkpoint=loaded.checkpoint;break;
+       head=loaded.headDigest??null;if(loaded.status==='ready'){
+        if('source'in loaded.checkpoint)throw fail();checkpoint=loaded.checkpoint;
+       }break;
       }
       for(let page=0;page<STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM;page++){
        const next=await advanceStorageV1CurrentFitAnalysis({source,participantId:scope.owner.participantId,
@@ -244,8 +287,10 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     payload=canonicalJson(selectCommunityAllowanceAnalysisFits(scope.owner.ownerDigest,analyses));
   } else {
     let composition:V1ModelCompositionResult | null=null;
-    if('source' in scope.pin)composition=await accountScopedModelCompositionV11(source,scope.owner.participantId,
-      {nowMs,sourcePin:scope.pin});
+    if('source' in scope.pin){
+      const next=await computeV11('model',scope.pin);if(next.state==='deferred')return next;
+      composition=next.analysis as V1ModelCompositionResult;
+    }
     else {
       const window=modelHistoryWindow(scope.day);
       const overlap=scope.source==='mixed'?await source.prepare(`SELECT 1 FROM telemetry_records r
@@ -287,7 +332,9 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
               ()=>loadStorageHistoryCheckpoint({target:bindings.target,key,cursor}));
             if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
             head=loaded.headDigest??null;
-            if(loaded.status==='ready')checkpoint=loaded.checkpoint;
+            if(loaded.status==='ready'){
+              if('source'in loaded.checkpoint)throw fail();checkpoint=loaded.checkpoint;
+            }
             break;
           }
           for(let page=0;page<STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM;page++){
