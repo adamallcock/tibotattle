@@ -198,11 +198,13 @@ export interface StorageAnalyticsCatchupMetrics {
  * cannot participate in, roll back or delay an upload transaction. */
 export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  maxSteps?:number;deadlineMs?:number;maxQueries?:number;signal?:AbortSignal;
- publishCommunity?:boolean;
+ publishCommunity?:boolean;publicOnly?:boolean;
   ledger?:D1Database;skipV1PrefixProbe?:boolean;
 }):Promise<StorageAnalyticsPass> {
  const maxSteps=options.maxSteps??8,deadlineMs=options.deadlineMs??Date.now()+20_000;
  if(!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||!Number.isFinite(deadlineMs)
+   ||(options.publicOnly!==undefined&&typeof options.publicOnly!=='boolean')
+   ||(options.publicOnly===true&&options.publishCommunity!==true)
    ||(options.skipV1PrefixProbe!==undefined&&typeof options.skipV1PrefixProbe!=='boolean'))throw invalid();
  const meter=createD1InvocationBudget(options.maxQueries??900);
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
@@ -236,7 +238,10 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   // leaves 100 queries for mandatory delivery. Its source readers are also
   // capped by row count, so failure preserves the prior cache and cannot turn
   // missing evidence into zero.
-  if(meter.remainingQueries>=140&&deadlineMs-Date.now()>=5_000){
+  // The scheduler's second phase is intentionally public-only: the bounded
+  // delivery phase already had this opportunity and public work must retain
+  // its graph admission budget while an ordered source backlog remains.
+  if(!options.publicOnly&&meter.remainingQueries>=140&&deadlineMs-Date.now()>=5_000){
    const adminMeter=createD1InvocationBudget(40);
    const adminScoped={...scoped,source:adminMeter.wrap(scoped.source),target:adminMeter.wrap(scoped.target)};
    const snapshot=await captureStorageAdminMetricSnapshot(adminScoped,Date.now());
@@ -259,14 +264,16 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    options.signal?.throwIfAborted();
    if(Date.now()>=deadlineMs)return result('deferred','deadline');
    if(meter.remainingQueries<100)return result('deferred','query_budget');
-   // Publication-paused catch-up can combine a current typed-v1 prefix. Public
-   // work retains the ordinary one-event cadence so serving gates and derived
-   // publication interleave exactly as before.
-   const page=!options.publishCommunity&&!options.skipV1PrefixProbe
+   // Publication-paused catch-up can combine a current typed-v1 prefix. The
+   // scheduler's public-only phase never opens the ordered journal: its finite
+   // steps count public iterations, leaving pending delivery for the next
+   // bounded delivery phase instead of consuming the public deadline.
+   const page=!options.publicOnly&&!options.publishCommunity&&!options.skipV1PrefixProbe
     ?await advanceStorageAnalyticsV1Page(scoped,Math.min(4,maxSteps-steps)):null;
    const v11Pages=Math.min(5,Math.max(1,1+Math.floor(Math.max(0,meter.remainingQueries-100)/12)));
-   const step=page&&page.events>0?page:await advanceStorageAnalytics({...scoped,maxV11PhysicalPages:v11Pages,deadlineMs});
-   steps+=page&&page.events>0?page.events:1;recordsRead+=step.recordsRead;
+   const step=options.publicOnly?{state:'idle' as const,recordsRead:0}
+    :page&&page.events>0?page:await advanceStorageAnalytics({...scoped,maxV11PhysicalPages:v11Pages,deadlineMs});
+   steps+=!options.publicOnly&&page&&page.events>0?page.events:1;recordsRead+=step.recordsRead;
    // Retiring old generations cannot be starved by an always-busy journal.
    const v11=await retireV11DailyProjectionPage(scoped.target,options.sourceId);
    const v1=await retireV1DailyProjectionPage(scoped.target,options.sourceId);

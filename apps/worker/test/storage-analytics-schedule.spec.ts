@@ -21,13 +21,15 @@ describe('ordered ingestion before public analytics',()=>{
    for(let i=0;i<175;i++)await options.source.prepare('SELECT 1').run();
    return {...result,steps:16,recordsRead:3200,queriesUsed:175};
   }).mockImplementationOnce(async options=>{
-   expect(options).toMatchObject({publishCommunity:true,maxSteps:32,maxQueries:725,deadlineMs:56000});
+   expect(options).toMatchObject({publishCommunity:true,publicOnly:true,maxSteps:32,maxQueries:725,deadlineMs:56000});
    await options.target.prepare('SELECT 1').run();
-   return {...result,recordsRead:4,graphCalculations:1};
+   return {...result,steps:2,recordsRead:0,queriesUsed:1,graphCalculations:1};
   });
   await runStorageAnalyticsSchedule(environment());
   expect(pass).toHaveBeenCalledTimes(2);
-  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({steps:17,recordsRead:3204,queriesUsed:176,graphCalculations:1});
+  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({steps:18,recordsRead:3200,queriesUsed:176,
+   deliverySteps:16,deliveryRecordsRead:3200,deliveryQueriesUsed:175,
+   publicIterations:2,publicRecordsRead:0,publicQueriesUsed:1,graphCalculations:1});
  });
  it('stops instead of starting graph work after delivery fails',async()=>{
   pass.mockRejectedValueOnce(new Error('synthetic failure'));
@@ -38,13 +40,15 @@ describe('ordered ingestion before public analytics',()=>{
   pass.mockImplementationOnce(async()=>{vi.setSystemTime(57000);return {...result,state:'deferred',reason:'deadline'};});
   await runStorageAnalyticsSchedule(environment());
   expect(pass).toHaveBeenCalledTimes(1);
-  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({state:'deferred',reason:'deadline'});
+  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({state:'deferred',reason:'deadline',
+   deliverySteps:1,deliveryRecordsRead:0,deliveryQueriesUsed:0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0});
  });
- it('does not extend the shared deadline after slow delivery',async()=>{
+  it('does not extend the shared deadline after slow delivery',async()=>{
   pass.mockImplementationOnce(async()=>{vi.setSystemTime(42000);return result;})
    .mockImplementationOnce(async options=>{
     expect(options.deadlineMs).toBe(56000);
     expect(options.deadlineMs!-Date.now()).toBe(14000);
+    expect(options).toMatchObject({publishCommunity:true,publicOnly:true});
     return result;
    });
   await runStorageAnalyticsSchedule(environment());
@@ -55,6 +59,8 @@ describe('ordered ingestion before public analytics',()=>{
   await runStorageAnalyticsSchedule({...environment(),PUBLIC_ANALYTICS_MODE:'disabled'});
   expect(pass).toHaveBeenCalledTimes(1);
   expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:900,deadlineMs:21000});
+  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({deliverySteps:1,deliveryRecordsRead:0,
+   deliveryQueriesUsed:0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0});
  });
  it('does no work when the scheduler is disabled',async()=>{
   await runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:'disabled'});

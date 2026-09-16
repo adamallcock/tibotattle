@@ -35,13 +35,21 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv)
    maxSteps:32,maxQueries:175,deadlineMs:started+10_000}):null;
   if(Date.now()>=deadlineMs){
    console.log(JSON.stringify({event:'storage_analytics_schedule',...delivery,state:'deferred',reason:'deadline',
+    deliverySteps:delivery?.steps??0,deliveryRecordsRead:delivery?.recordsRead??0,
+    deliveryQueriesUsed:delivery?.queriesUsed??0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0,
     queriesUsed:meter.queriesUsed}));return;
   }
-  const result=await runStorageAnalyticsPass({...bindings,publishCommunity,maxQueries:meter.remainingQueries,
+  const result=await runStorageAnalyticsPass({...bindings,publishCommunity,
+   ...(publishCommunity?{publicOnly:true}:{}),maxQueries:meter.remainingQueries,
    ...(publishCommunity?{maxSteps:32}:{}),
    deadlineMs:publishCommunity?deadlineMs:started+20_000});
   console.log(JSON.stringify({event:'storage_analytics_schedule',...result,
    steps:result.steps+(delivery?.steps??0),recordsRead:result.recordsRead+(delivery?.recordsRead??0),
+   deliverySteps:publishCommunity?delivery?.steps??0:result.steps,
+   deliveryRecordsRead:publishCommunity?delivery?.recordsRead??0:result.recordsRead,
+   deliveryQueriesUsed:publishCommunity?delivery?.queriesUsed??0:result.queriesUsed,
+   publicIterations:publishCommunity?result.steps:0,
+   publicRecordsRead:publishCommunity?result.recordsRead:0,publicQueriesUsed:publishCommunity?result.queriesUsed:0,
    queriesUsed:meter.queriesUsed}));
  }catch (error) {
   // Do not expose account identifiers, SQL, credentials or a stored record in

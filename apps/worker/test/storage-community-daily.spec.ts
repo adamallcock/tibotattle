@@ -13,7 +13,7 @@ import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest 
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
-import { initializeStorageSource, readIngestionChanges } from "../src/analytics-delivery";
+import { initializeStorageSource, prepareIngestionChange, readIngestionChanges } from "../src/analytics-delivery";
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
 import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
@@ -259,13 +259,34 @@ describe('independent public daily publication',()=>{
     await target().batch(days.map(day=>target().prepare(
       'INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)',
     ).bind(sourceId,day)));
-    const result=await runStorageAnalyticsPass({...options(),publishCommunity:true,maxSteps:1,maxQueries:725,
+    const result=await runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,maxSteps:1,maxQueries:725,
       deadlineMs:Date.now()+55_000});
     const remaining=await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue WHERE source_id=?')
       .bind(sourceId).first<number>('n');
     expect(result.dailyPublications).toBe(3);
     expect(12-remaining!).toBe(result.dailyPublications);
+    expect(result).toMatchObject({steps:1,recordsRead:0});
     expect(result.queriesUsed).toBeLessThan(300);
+  });
+  it('leaves pending delivery for its bounded phase while advancing retained graph work',async()=>{
+    const value=await fixture();await ready();await publish();
+    await target().prepare(`INSERT INTO analytics_community_graph_scan
+      (source_id,revision,tick,current_position,history_position) VALUES(?,1,1,0,0)`).bind(sourceId).run();
+    const cursor=await target().prepare('SELECT sequence FROM analytics_source_cursors WHERE source_id=?')
+      .bind(sourceId).first<number>('sequence');
+    await source().batch([prepareIngestionChange(source(),{sourceId,ownerDigest:value.event.ownerDigest,
+      revision:value.event.revision+1,kind:'source-updated',eventDigest:await sha256Hex('pending-public-only-event'),
+      objectDigest:await sha256Hex('pending-public-only-object'),contentDigest:await sha256Hex('pending-public-only-content'),
+      recordedMs:Date.now()})]);
+    expect((await readIngestionChanges(source(),sourceId,cursor!,1))).toHaveLength(1);
+    const result=await runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,maxSteps:1,maxQueries:725,
+      deadlineMs:Date.now()+55_000});
+    const scan=await target().prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan WHERE source_id=?')
+      .bind(sourceId).first<{tick:number;current_position:number;history_position:number}>();
+    expect(result).toMatchObject({steps:1,recordsRead:0});
+    expect(await target().prepare('SELECT sequence FROM analytics_source_cursors WHERE source_id=?')
+      .bind(sourceId).first('sequence')).toBe(cursor);
+    expect(scan).toMatchObject({tick:2,current_position:0,history_position:1});
   });
   it('reuses unchanged owners after a correction without restarting their completed folds',async()=>{
     const a=await seedV1(),b=await seedV1();await insertTypedTelemetryV1Chunk(source(),a.insert,namespace);
