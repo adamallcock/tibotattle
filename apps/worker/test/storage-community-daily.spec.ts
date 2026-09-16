@@ -178,13 +178,15 @@ describe('independent public daily publication',()=>{
     expect((await publicRead()).rows).toEqual([]);expect((await publish()).state).toBe('published');
     expect((await publicRead()).rows[0]!.revision).toBe(3);
   });
-  it('fences opt-out before delivery and publishes zero only after the surviving cohort is verified',async()=>{
-    const value=await fixture();await ready();await publish();
+  it('keeps completed public history visible when opt-out stops future uploads',async()=>{
+    const value=await fixture();await ready();await publish();const authority=await captureStorageCommunityAuthority(source());
     await revokeAccountlessEnrollment(source(),value.deviceId,'user_opt_out',Date.now());
-    expect((await publicRead()).rows).toEqual([]);await ready();
-    expect((await publish()).state).toBe('published');const rows=(await publicRead()).rows;
-    expect(JSON.parse(rows[0]!.payload_json).totals).toMatchObject({contributingParticipants:0,contributingDevices:0,usageEvents:0});
-    expect(JSON.parse(rows[0]!.payload_json).apiEquivalentSpend).toMatchObject({coverage:'complete',knownCostUsd:0});
+    expect(await storageCommunityAuthorityIsCurrent(source(),authority)).toBe(true);
+    const rows=(await publicRead()).rows;expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.payload_json).totals).toMatchObject({contributingParticipants:1,contributingDevices:1,usageEvents:1});
+    expect(await target().prepare("SELECT state FROM analytics_owner_state WHERE owner_digest=?")
+      .bind(value.event.ownerDigest).first('state')).toBe('active');
+    expect(await publish()).toEqual({state:'unchanged',ownersAdvanced:0});
   });
   it('acknowledges only an exact committed publication after response loss',async()=>{
     await fixture();await ready();let lost=false;
@@ -279,20 +281,20 @@ describe('independent public daily publication',()=>{
       outputReasoningTokens:25,outputCombinedTokens:0});
     expect(payload.apiEquivalentSpend).toMatchObject({coverage:'partial',partiallyPricedUsageEvents:1});
   });
-  it('hides a publication when opt-out races between source authorization and the target commit',async()=>{
+  it('hides a publication when containment races between source authorization and the target commit',async()=>{
     const value=await fixture();await ready();let raced=false;
     const db=targetBatch(async <T>(statements:D1PreparedStatement[])=>{
       // The first batch is read-only. Inject after it, before the builder's
       // authoritative recheck, so no stale cohort is allowed to commit.
       const result=await target().batch<T>(statements);
-      if(!raced){raced=true;await revokeAccountlessEnrollment(source(),value.deviceId,'user_opt_out',Date.now());}
+      if(!raced){raced=true;await revokeAccountlessEnrollment(source(),value.deviceId,'security_reset',Date.now());}
       return result;
     });
     expect(await advanceStorageCommunityDaily({...options(),target:db})).toMatchObject({state:'deferred',reason:'source_changed'});
     expect((await publicRead()).rows).toEqual([]);
     expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_publications').first('n')).toBe(0);
   });
-  it('keeps the public route read-only and fails closed if revocation happens during the target read',async()=>{
+  it('keeps the public route read-only and fails closed if containment happens during the target read',async()=>{
     const value=await fixture();await ready();await publish();let raced=false;
     const db=new Proxy(target(),{get(original,key){
       if(key==='prepare')return (sql:string)=>{
@@ -303,7 +305,7 @@ describe('independent public daily publication',()=>{
           if(member==='bind')return (...args:Parameters<D1PreparedStatement['bind']>)=>{
             const bound=s.bind(...args);return new Proxy(bound,{get(b,k){
               if(k==='all')return async()=>{const result=await b.all();
-                if(!raced){raced=true;await revokeAccountlessEnrollment(source(),value.deviceId,'user_opt_out',Date.now());}return result;};
+                if(!raced){raced=true;await revokeAccountlessEnrollment(source(),value.deviceId,'security_reset',Date.now());}return result;};
               const v=Reflect.get(b,k);return typeof v==='function'?v.bind(b):v;}});};
           const v=Reflect.get(s,member);return typeof v==='function'?v.bind(s):v;}});
       };
