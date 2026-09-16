@@ -45,7 +45,8 @@ latest verified external state.
   This extracts one transaction; it does not make the full contribution API
   portable. A replacement adapter must preserve authorization consumption,
   admission, record ownership, correction rollback and all projection effects.
-  PostgreSQL parity remains untested.
+  The opt-in PostgreSQL experiment below qualifies the core transaction; full
+  projection, deletion and application parity remain open.
 - `ContributionCoordinator` is the Durable Object used for contribution
   coordination; it is not a substitute for D1 durability.
 - Static assets under `apps/web/public` provide the acquisition, documentation,
@@ -377,3 +378,39 @@ adapter with a persistent local D1 nonce database. Use `npm run gcs:test:db:loca
 for repeatable run namespaces, credential handling, receipts and bounded cleanup.
 The [live test asset receipt](../../docs/reviews/2026-09-15-gcs-test-assets.md)
 records the first real-GCS qualification; it is not deployment evidence.
+
+
+### Experimental PostgreSQL contribution lane
+
+`createExperimentalPostgresTelemetryV1ContributionStore` accepts an injected
+pool through a structural interface. Production continues to compose D1.
+The candidate calls a function in the deliberately named `tibotattle_v1_test`
+schema; `postgres-test/schema.sql` is a disposable fixture, not a deployment
+migration. The `pg` driver is a pinned development dependency only.
+
+Provision PostgreSQL 16 or newer under a canonical, owner-only directory named
+`/private/tmp/tibotattle-pg-<unique>/socket`, with TCP disabled, an owner-only Unix
+socket, and local role `postgres` able to create databases. Run:
+
+```sh
+PG_TEST_SOCKET=/private/tmp/tibotattle-pg-<unique>/socket npm run test:postgres
+```
+
+Set `PG_TEST_PORT` if the socket uses a port other than 5432. This explicit lane
+refuses an absent or unsafe socket path and does not accept a connection URL.
+It creates a random database, checks pre-schema refusal, installs only the test
+schema, and drops only that newly created database in teardown. Stop the
+disposable server afterwards. A forcibly interrupted run can leave its random
+test database behind; inspect ownership before cleanup. The normal Worker test
+lane excludes these tests and does not need PostgreSQL.
+
+The qualification covers append/correction, record ownership, authorization,
+admission races and transaction failure. It records dirty projection requests,
+not D1's materialized projections, graph-preservation behavior, deletion ledger,
+or account-scoped v1.1 transport. Lost COMMIT acknowledgement returns a sanitized
+503 without retry; the test verifies durable state by readback. Application-level
+receipt reconciliation still needs a PostgreSQL read adapter.
+
+See the [qualification record](../../docs/plans/2026-09-15-postgres-contribution-qualification.md)
+for evidence and remaining gates. No GCP database or runtime is configured by
+this lane.

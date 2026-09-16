@@ -19,6 +19,7 @@
     "src/release-guard-application.ts",
     "src/gcs-release-object-store.ts",
     "src/quarantine-object-store.ts",
-    "src/telemetry-v1-contribution-store.ts"
+    "src/telemetry-v1-contribution-store.ts",
+    "src/postgres-telemetry-v1-contribution-store.ts"
   ]
 }

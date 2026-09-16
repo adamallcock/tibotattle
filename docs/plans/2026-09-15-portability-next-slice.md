@@ -67,6 +67,12 @@ client dependency were absent, and the installed Docker client could not reach
 its Colima daemon. A faithful proof needs real transactions, constraints and
 concurrent clients; mocks do not qualify PostgreSQL behavior.
 
+## Follow-up qualification
+
+The [PostgreSQL qualification](./2026-09-15-postgres-contribution-qualification.md)
+tracks the subsequent disposable-database experiment. The results above remain
+the evidence for the original extraction.
+
 ## Next executable qualification
 
 Provide a disposable local PostgreSQL runtime and implement this one operation

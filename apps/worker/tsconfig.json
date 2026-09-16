@@ -28,6 +28,7 @@
     "worker-configuration.d.ts",
     "portable-test/**/*.ts",
     "vitest.portable.config.ts",
-    "gcs-test/worker.ts"
+    "gcs-test/worker.ts",
+    "vitest.postgres.config.ts"
   ]
 }

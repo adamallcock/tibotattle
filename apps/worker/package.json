@@ -57,11 +57,13 @@
     "gcs:test:types": "wrangler types gcs-test/worker-configuration.d.ts --config gcs-test/wrangler.jsonc --env-interface GcsTestRuntimeEnv --include-runtime=false",
     "gcs:test:smoke:check": "node --check scripts/gcs-live-smoke.mjs && node --check scripts/gcs-live-cleanup.mjs && node --test scripts/gcs-live-smoke.check.mjs scripts/gcs-live-cleanup.check.mjs",
     "gcs:test:assets:plan": "node scripts/gcs-test-assets-plan.mjs",
-    "gcs:test:assets:check": "node --check scripts/gcs-test-assets-plan.mjs && node --test scripts/gcs-test-assets-plan.check.mjs"
+    "gcs:test:assets:check": "node --check scripts/gcs-test-assets-plan.mjs && node --test scripts/gcs-test-assets-plan.check.mjs",
+    "test:postgres": "vitest run --config vitest.postgres.config.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.18.8",
     "@types/node": "^26.1.1",
+    "pg": "8.23.0",
     "typescript": "7.0.2",
     "vitest": "4.1.11",
     "wrangler": "4.114.0"

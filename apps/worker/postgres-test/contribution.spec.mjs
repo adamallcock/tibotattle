@@ -1,0 +1,272 @@
+import { beforeAll, afterAll, beforeEach, expect, it, vi } from 'vitest';
+import { readFile, lstat, realpath } from 'node:fs/promises';
+import { randomBytes, randomUUID, createHash } from 'node:crypto';
+import { isAbsolute } from 'node:path';
+import pg from 'pg';
+import { createExperimentalPostgresTelemetryV1ContributionStore } from '../src/postgres-telemetry-v1-contribution-store.ts';
+import { parseTelemetryV1Chunk } from '../src/telemetry-v1.ts';
+import { canonicalJson } from '../src/canonical-json.ts';
+
+const schema = 'tibotattle_v1_test';
+const database = `tibotattle_pg_test_${randomBytes(12).toString('hex')}`;
+const tables = ['records','chunks','authorizations','consents','devices','admission_windows',
+  'input_versions','projection_requests','pending_objects','participants'];
+const pid = 'synthetic-participant', did = 'synthetic-device';
+const day = '2026-09-01';
+const consent = {telemetrySchemaVersion:'telemetry-contribution-v1.0',
+  fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',
+  privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'};
+const digest = value => createHash('sha256').update(canonicalJson(value)).digest('hex');
+let admin, pool, store, created = false;
+
+beforeAll(async () => {
+  const socket = process.env.PG_TEST_SOCKET;
+  if (!socket || !isAbsolute(socket) || !socket.startsWith('/private/tmp/tibotattle-pg-')) {
+    throw new Error('PG_TEST_SOCKET must name an explicitly provisioned temporary PostgreSQL socket directory');
+  }
+  const stat = await lstat(socket);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(socket) !== socket
+      || (stat.mode & 0o777) !== 0o700 || stat.uid !== process.getuid()) {
+    throw new Error('PG_TEST_SOCKET must be a canonical owner-only directory');
+  }
+  const port = Number(process.env.PG_TEST_PORT ?? '5432');
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid PG_TEST_PORT');
+  // pg falls back to environment for falsy options. Remove ambient provider
+  // configuration inside this isolated test worker before constructing clients.
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('PG') && !key.startsWith('PG_TEST_')) vi.stubEnv(key, undefined);
+  }
+  const options = {host:socket, port, user:'postgres', password:'synthetic-local-only', database:'postgres',
+    ssl:false, options:'', application_name:'tibotattle-pg-test',
+    connectionTimeoutMillis:3000, statement_timeout:12000, idleTimeoutMillis:1000, max:6};
+  admin = new pg.Pool(options);
+  expect(Number((await admin.query('SHOW server_version_num')).rows[0].server_version_num)).toBeGreaterThanOrEqual(160000);
+  await admin.query(`CREATE DATABASE "${database}"`);
+  created = true;
+  pool = new pg.Pool({...options, database});
+  store = createExperimentalPostgresTelemetryV1ContributionStore(pool);
+  // Qualification cannot silently succeed before its schema is installed.
+  await expect(store.insert(await input())).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  await pool.query(await readFile(new URL('./schema.sql', import.meta.url),'utf8'));
+});
+afterAll(async () => {
+  try {
+    await pool?.end();
+    if (created) await admin.query(`DROP DATABASE "${database}"`);
+  } finally {
+    await admin?.end();
+    vi.unstubAllEnvs();
+  }
+});
+beforeEach(async () => {
+  await pool.query(`TRUNCATE ${tables.map(name=>`${schema}.${name}`).join(', ')} CASCADE`);
+  await pool.query(`INSERT INTO ${schema}.participants(id,state,owner_kind) VALUES($1,'active','social')`,[pid]);
+  await pool.query(`INSERT INTO ${schema}.devices VALUES($1,$2,'active',clock_timestamp()-interval '30 days',clock_timestamp()+interval '1 day')`,[did,pid]);
+  await pool.query(`INSERT INTO ${schema}.consents VALUES($1,$2,$3,$4,$5)`,[pid,did,...Object.values(consent)]);
+});
+
+async function input({sequence=0, revision=1, supersedes=null, occurrence=randomUUID(), count=1, stream='session'}={}) {
+  const records = Array.from({length:count},(_,i)=> {
+    const identity = `${occurrence}-${i}`;
+    if (stream==='quota') return {schemaVersion:'quota-observation-v1.0', observationId:identity,
+      observedTime:`${day}T12:00:00.000Z`,provider:'synthetic',planType:'pro',planVariant:'unknown',
+      limitId:'synthetic',slot:'primary',usedPercent:20,windowDurationMinutes:300,resetsAt:`${day}T17:00:00.000Z`};
+    if (stream==='usage') return {schemaVersion:'usage-event-v1.0',eventId:identity,eventTime:`${day}T12:00:00.000Z`,
+      sessionUuid:identity,provider:'synthetic',modelId:'synthetic',speedMode:'unknown',apiServiceTier:'unknown',
+      surface:'unknown',billingSurface:'unknown',reasoningEffort:'unknown',agentScope:'unknown',outcome:'unknown',
+      totalInputContextTokens:null,components:{inputUncachedTokens:1,inputCacheReadTokens:null,inputCacheWriteTokens:null,
+        outputTextTokens:2,outputReasoningTokens:null,outputCombinedTokens:null}};
+    return {schemaVersion:'session-dimension-v1.0',sessionUuid:identity,firstEventTime:`${day}T12:00:00.000Z`,
+      provider:'synthetic',toolClassCounts:{read:1}};
+  });
+  const chunk = parseTelemetryV1Chunk({schemaVersion:'telemetry-contribution-v1.0',chunkId:`${stream}:${day}:${sequence}`,
+    chunkRevision:revision,chunkDigest:digest(records),parserVersion:'synthetic',consent,records});
+  const id = `synthetic-${randomUUID()}`;
+  return {participantId:pid,deviceId:did,uploadAuthorizationId:`auth-${id}`,chunkId:id,
+    objectKey:`synthetic/${id}`,envelopeDigest:digest(id),chunk,supersedes,createdAt:new Date().toISOString()};
+}
+async function grant(value) {
+  await pool.query(`INSERT INTO ${schema}.authorizations(id,participant_id,device_id,envelope_digest,state,lease_expires_at,expires_at)
+    VALUES($1,$2,$3,$4,'consuming',clock_timestamp()+interval '5 minutes',clock_timestamp()+interval '10 minutes')`,
+    [value.uploadAuthorizationId,value.participantId,value.deviceId,value.envelopeDigest]);
+  await pool.query(`INSERT INTO ${schema}.pending_objects VALUES($1,$2)`,[value.chunkId,value.objectKey]);
+  return value;
+}
+async function rows(table) {return (await pool.query(`SELECT * FROM ${schema}.${table}`)).rows;}
+async function snapshot() {
+  const result={};
+  for (const table of tables) result[table]=(await rows(table)).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  return result;
+}
+
+// Hold the shared admission row until both real client transactions are waiting.
+async function race(a,b) {
+  const blocker=await pool.connect();let outcomes;
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query(`SELECT id FROM ${schema}.participants WHERE id=$1 FOR UPDATE`,[pid]);
+    outcomes=Promise.allSettled([store.insert(a),store.insert(b)]);
+    let waiting=0;
+    for(let attempt=0;attempt<80;attempt++) {
+      waiting=(await pool.query(`SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
+        AND query LIKE 'SELECT accepted_records%' AND wait_event_type='Lock'`)).rowCount;
+      if(waiting===2) break;
+      await pool.query('SELECT pg_sleep(0.025)');
+    }
+    expect(waiting).toBe(2);
+    await blocker.query('ROLLBACK');
+    return await outcomes;
+  } finally {await blocker.query('ROLLBACK');blocker.release();await outcomes;}
+}
+
+it.each(['usage','quota','session'])('commits %s records, authorization, admission and dirty journal atomically',async stream=> {
+  const value = await grant(await input({stream,count:3}));
+  await expect(store.insert(value)).resolves.toEqual({acceptedRecords:3});
+  expect(await rows('chunks')).toHaveLength(1);
+  expect((await rows('records')).map(r=>r.payload).sort((a,b)=>canonicalJson(a).localeCompare(canonicalJson(b))))
+    .toEqual([...value.chunk.records].sort((a,b)=>canonicalJson(a).localeCompare(canonicalJson(b))));
+  expect((await rows('authorizations'))[0]).toMatchObject({state:'consumed',lease_expires_at:null,consumed_contribution_id:value.chunkId});
+  expect((await rows('admission_windows'))[0].accepted_count).toBe(1);
+  expect((await rows('input_versions'))[0].revision).toBe('1');
+  expect((await rows('projection_requests')).map(r=>r.projection).sort()).toEqual([
+    'current_analysis','daily_aggregate','model_history','prepared_source','public_graph','quota_fit']);
+  expect(await rows('pending_objects')).toHaveLength(1);
+});
+it('inserts a maximum-size chunk in one bulk record operation',async()=> {
+  const value=await grant(await input({count:200}));
+  expect(await store.insert(value)).toEqual({acceptedRecords:200});
+  expect(await rows('records')).toHaveLength(200);
+});
+it('corrects exactly the predecessor and increments analytical revision twice',async()=> {
+  const first=await grant(await input({occurrence:'synthetic-occurrence'})); await store.insert(first);
+  const second=await grant(await input({occurrence:'synthetic-occurrence',revision:2,supersedes:{id:first.chunkId}}));
+  await store.insert(second);
+  expect((await rows('chunks')).filter(r=>r.superseded_at===null).map(r=>r.id)).toEqual([second.chunkId]);
+  expect((await rows('records')).map(r=>r.chunk_id)).toEqual([second.chunkId]);
+  expect((await rows('input_versions'))[0].revision).toBe('3');
+  expect((await rows('admission_windows'))[0].accepted_count).toBe(2);
+  expect(await rows('pending_objects')).toHaveLength(2);
+});
+it('rolls back correction, records, admission, authorization and journal on ownership conflict',async()=> {
+  const first=await grant(await input({occurrence:'original-occurrence'})); await store.insert(first);
+  const other=await grant(await input({sequence:1,occurrence:'occupied-occurrence'})); await store.insert(other);
+  const replacement=await grant(await input({revision:2,supersedes:{id:first.chunkId},occurrence:'occupied-occurrence'}));
+  const before=await snapshot();
+  await expect(store.insert(replacement)).rejects.toMatchObject({code:'RECORD_OWNED_BY_OTHER_CHUNK'});
+  expect(await snapshot()).toEqual(before);
+});
+it('refuses replay after commit without counting twice',async()=> {
+  const value=await grant(await input()); await store.insert(value);
+  const before=await snapshot();
+  await expect(store.insert(value)).rejects.toMatchObject({code:'UPLOAD_AUTH_INVALID'});
+  expect(await snapshot()).toEqual(before);
+});
+it('refuses an unrelated predecessor before deleting records',async()=> {
+  const first=await grant(await input()); await store.insert(first);
+  const wrong=await grant(await input({sequence:1,revision:2,supersedes:{id:first.chunkId}}));
+  const before=await snapshot();
+  await expect(store.insert(wrong)).rejects.toMatchObject({code:'CHUNK_REVISION_CONFLICT'});
+  expect(await snapshot()).toEqual(before);
+});
+it.each([
+  ['participant deletion',`UPDATE ${schema}.participants SET state='deleting'`,'PARTICIPANT_DELETING'],
+  ['accountless owner',`UPDATE ${schema}.participants SET owner_kind='accountless'`,'TELEMETRY_TRANSPORT_BLOCKED'],
+  ['transport floor',`UPDATE ${schema}.participants SET transport_floor=20`,'TELEMETRY_TRANSPORT_BLOCKED'],
+  ['revoked device',`UPDATE ${schema}.devices SET state='revoked'`,'UPLOAD_AUTH_INVALID'],
+  ['expired device',`UPDATE ${schema}.devices SET expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
+  ['revoked upload',`UPDATE ${schema}.authorizations SET state='revoked'`,'UPLOAD_AUTH_INVALID'],
+  ['expired lease',`UPDATE ${schema}.authorizations SET lease_expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
+  ['expired upload',`UPDATE ${schema}.authorizations SET expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
+  ['wrong digest',`UPDATE ${schema}.authorizations SET envelope_digest='wrong'`,'UPLOAD_AUTH_INVALID'],
+  ['consent drift',`UPDATE ${schema}.consents SET dictionary_version='stale'`,'TELEMETRY_CONSENT_INVALID'],
+])('refuses %s without any partial state',async(_label,sql,code)=> {
+  const value=await grant(await input()); await pool.query(sql); const before=await snapshot();
+  await expect(store.insert(value)).rejects.toMatchObject({code}); expect(await snapshot()).toEqual(before);
+});
+it.each([1999,19999])('does not overshoot the admission budget under concurrent clients at %s',async prior=> {
+  if(prior===19999) await pool.query(`UPDATE ${schema}.devices SET issued_at=clock_timestamp()`);
+  const a=await grant(await input()),b=await grant(await input({sequence:1}));
+  await pool.query(`INSERT INTO ${schema}.admission_windows VALUES($1,$2,$3,$4)`,[pid,did,a.createdAt.slice(0,10),prior]);
+  const outcomes=await race(a,b);
+  expect(outcomes.filter(r=>r.status==='fulfilled')).toHaveLength(1);
+  expect(outcomes.find(r=>r.status==='rejected').reason.code).toBe('CHUNK_ADMISSION_LIMIT_REACHED');
+  expect((await rows('admission_windows'))[0].accepted_count).toBe(prior+1);
+  expect(await rows('chunks')).toHaveLength(1);
+});
+it('allows one winner when two clients claim the same identity',async()=> {
+  const a=await grant(await input()), b=await grant(await input());
+  const outcomes=await race(a,b);
+  expect(outcomes.filter(r=>r.status==='fulfilled')).toHaveLength(1);
+  expect(outcomes.find(r=>r.status==='rejected').reason.code).toBe('CHUNK_REVISION_CONFLICT');
+  expect((await rows('admission_windows'))[0].accepted_count).toBe(1);
+});
+it('allows one consumption of a shared authorization',async()=> {
+  const a=await grant(await input()), b=await input({sequence:1});
+  b.uploadAuthorizationId=a.uploadAuthorizationId; b.envelopeDigest=a.envelopeDigest;
+  const outcomes=await race(a,b);
+  expect(outcomes.filter(r=>r.status==='fulfilled')).toHaveLength(1);
+  expect(outcomes.find(r=>r.status==='rejected').reason.code).toBe('UPLOAD_AUTH_INVALID');
+  expect(await rows('chunks')).toHaveLength(1);
+});
+it('reconciles a real commit whose acknowledgement is lost, with no automatic retry',async()=> {
+  let commits=0,discarded=false;
+  const uncertain=createExperimentalPostgresTelemetryV1ContributionStore({async connect(){
+    const client=await pool.connect();return {async query(sql,values){
+      const result=await client.query(sql,values);
+      if(sql==='COMMIT'){commits++;throw new Error('synthetic lost acknowledgement');} return result;
+    },release(discard){discarded=discard;client.release(discard);}};
+  }});
+  const value=await grant(await input());
+  await expect(uncertain.insert(value)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(commits).toBe(1);expect(discarded).toBe(true);
+  expect((await rows('chunks'))[0]).toMatchObject({id:value.chunkId,envelope_digest:value.envelopeDigest,object_key:value.objectKey});
+  expect((await rows('records'))[0].payload).toEqual(value.chunk.records[0]);
+  const before=await snapshot();await expect(store.insert(value)).rejects.toMatchObject({code:'UPLOAD_AUTH_INVALID'});
+  expect(await snapshot()).toEqual(before);
+});
+it('rolls back a real transaction if its connection is lost before commit',async()=> {
+  const broken=createExperimentalPostgresTelemetryV1ContributionStore({async connect(){
+    const client=await pool.connect();return {async query(sql,values){
+      const result=await client.query(sql,values);
+      if(sql.startsWith('SELECT accepted_records')) {await client.end();throw new Error('synthetic disconnect');}
+      return result;
+    },release(discard){client.release(discard);}};
+  }});
+  const value=await grant(await input()),before=await snapshot();
+  await expect(broken.insert(value)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await snapshot()).toEqual(before);
+});
+it('checks authorization expiry after waiting for a participant lock',async()=> {
+  const value=await grant(await input());
+  await pool.query(`UPDATE ${schema}.authorizations SET lease_expires_at=clock_timestamp()+interval '1 second'`);
+  const before=await snapshot(), blocker=await pool.connect();
+  let outcome;
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query(`SELECT id FROM ${schema}.participants WHERE id=$1 FOR UPDATE`,[pid]);
+    outcome=store.insert(value).then(receipt=>({receipt}),error=>({error}));
+    let waiting=false;
+    for(let attempt=0;attempt<40;attempt++) {
+      const result=await pool.query(`SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
+        AND query LIKE 'SELECT accepted_records%' AND wait_event_type='Lock'`);
+      if(result.rowCount>0){waiting=true;break;}
+      await pool.query('SELECT pg_sleep(0.025)');
+    }
+    expect(waiting).toBe(true);
+    await blocker.query('SELECT pg_sleep(1.1)');
+    await blocker.query('ROLLBACK');
+    expect((await outcome).error).toMatchObject({code:'UPLOAD_AUTH_INVALID'});
+    expect(await snapshot()).toEqual(before);
+  } finally {
+    await blocker.query('ROLLBACK');blocker.release();await outcome;
+  }
+});
+it('bounds lock contention and leaves no partial state',async()=> {
+  const value=await grant(await input()),before=await snapshot(),blocker=await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query(`SELECT id FROM ${schema}.participants WHERE id=$1 FOR UPDATE`,[pid]);
+    await expect(store.insert(value)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+    expect(await snapshot()).toEqual(before);
+  } finally {await blocker.query('ROLLBACK');blocker.release();}
+});
