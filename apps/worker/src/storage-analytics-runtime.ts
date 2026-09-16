@@ -304,13 +304,17 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
      // A normal 20-second direct pass has already spent part of its deadline
      // on setup. Admit one bounded day there; only longer passes batch days.
      const dailyAttempts=dailyTimeRemaining>20_000?4:1;
+     const skipDays:string[]=[];
      try{
       for(let attempt=0;attempt<dailyAttempts&&deadlineMs-Date.now()>=(attempt===0?5_000:15_000);attempt++){
        const slot=Math.floor(Date.now()/60_000)+attempt;
-       const daily=await advanceNextStorageCommunityDaily({...dailyScoped,preferStaleHead:slot%4!==3});
+       const daily=await advanceNextStorageCommunityDaily({...dailyScoped,preferStaleHead:slot%4!==3,skipDays});
        if(daily.state==='published')dailyPublications++;
        if(daily.state==='idle'){dailyIdle=true;break;}
-       if(daily.state==='progress'||daily.state==='deferred')break;
+       // A day waiting on a pending projection or on capacity yields to the
+       // next candidate within this pass; one blocked day cannot hold the lane.
+       if(daily.state==='deferred'&&daily.reason!=='source_changed')skipDays.push(daily.day);
+       if(daily.state==='deferred'&&daily.reason==='source_changed')break;
       }
      }catch(error){
       if(error instanceof D1InvocationBudgetExceededError)dailyIdle=false;

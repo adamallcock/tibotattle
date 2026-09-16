@@ -185,8 +185,12 @@ export async function readV1ProjectedChunkPage(options:{source:D1Database;target
  const headers=headerResult!.results as Header[];if(headers.length>MAX_V1_SOURCE_CHUNKS)throw fail();
  const winner=selectV1WinningDevices(headers)[0];const selected=headers.filter(h=>h.device_id===winner?.device_id);
  if(after>selected.length)throw fail();
- const fingerprint=await scoped('page',[sourceId,sourceNamespace,ownerDigest,observedDay,scope.revision,scope.authority_epoch,selected]);
- if(requestedFingerprint&&requestedFingerprint!==fingerprint)throw fail();
+ // The page identity is this owner's input revision and immutable winning
+ // chunk vector. The global public epoch moves on other owners' uploads and is
+ // enforced separately below as freshness; folding it into the identity made
+ // every multi-page day unresumable after any unrelated hard event.
+ const fingerprint=await scoped('page',[sourceId,sourceNamespace,ownerDigest,observedDay,scope.revision,selected]);
+ if(requestedFingerprint&&requestedFingerprint!==fingerprint)throw new Error('V1_PROJECTION_PAGE_CHANGED');
  const page=selected.slice(after,after+limit),refs=await Promise.all(page.map(h=>references(ownerDigest,{sourceNamespace,
   deviceId:h.device_id,day:h.chunk_day,stream:h.stream,chunkSeq:h.chunk_seq,chunkId:h.id})));
  const projected=await target.prepare(`SELECT c.authority_epoch FROM analytics_source_cursors c JOIN analytics_owner_state o

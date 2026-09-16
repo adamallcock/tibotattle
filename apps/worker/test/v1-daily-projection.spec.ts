@@ -269,7 +269,9 @@ describe('separate typed v1 analytical projection',()=>{
    maxQueries:20,publishCommunity:false})).toMatchObject({state:'deferred',reason:'query_budget',steps:0});
   expect(await target().prepare('SELECT count(*) n FROM analytics_applied_events').first('n')).toBe(0);
   const pass=await runStorageAnalyticsPass({source:source(),target:target(),sourceId,sourceNamespace:namespace,maxSteps:4,publishCommunity:false});
-  expect(pass).toMatchObject({state:'progress',reason:'step_limit',steps:4,recordsRead:800});expect(pass.queriesUsed).toBe(79);
+  expect(pass).toMatchObject({state:'progress',reason:'step_limit',steps:4,recordsRead:800});
+  // The admin snapshot inside this pass reads the source and delivered containment epochs (two bounded statements).
+  expect(pass.queriesUsed).toBe(81);
  });
  it('still classifies and applies a real typed-v1 event when the speculative prefix probe is skipped',async()=>{
   const value=await seed('usage',3);await insertTypedTelemetryV1Chunk(source(),value.insert,namespace);

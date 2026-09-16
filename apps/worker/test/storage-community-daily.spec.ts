@@ -392,6 +392,43 @@ describe('independent public daily publication',()=>{
     const rebuilt=(await readPublishedStorageCommunityDaily({...options(),fromDay:today(),throughDay:today()})).rows;
     expect(JSON.parse(rebuilt[0]!.payload_json).totals.usageEvents).toBe(0);
   });
+  it('restarts a partially folded multi-page v1 owner after an unrelated hard event instead of failing every pass',async()=>{
+    const first=await seedV1();await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+    for(let n=1;n<51;n++){
+      const next=await seedV1('usage',1,first.fixture,1,n);await insertTypedTelemetryV1Chunk(source(),next.insert,namespace);
+    }
+    await ready();
+    expect(await advanceStorageCommunityDaily({...options(),maxOwners:1})).toMatchObject({state:'progress',ownersAdvanced:1});
+    expect(await target().prepare('SELECT next_index FROM analytics_community_daily_owners').first('next_index')).toBe(50);
+    const before=await captureStorageCommunityAuthority(source());
+    // Another owner's first upload is a hard event: the global epoch moves
+    // between this owner's first and second page.
+    const other=await seedV1();await insertTypedTelemetryV1Chunk(source(),other.insert,namespace);await ready();
+    expect((await captureStorageCommunityAuthority(source())).publicAuthorityEpoch).toBeGreaterThan(before.publicAuthorityEpoch);
+    expect((await advanceNextStorageCommunityDaily(options())).state).toBe('published');
+    expect(JSON.parse((await publicRead()).rows[0]!.payload_json).totals).toMatchObject({contributingParticipants:2,usageEvents:52});
+  });
+  it('yields a queued day waiting on capacity to the next queued day within one pass',async()=>{
+    const first=await seedV1();await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);await ready();await publish();
+    const owner=(await target().prepare('SELECT * FROM analytics_community_daily_owners').first<Record<string,unknown>>())!;
+    // The queue serves oldest first, so the blocked day is the older one.
+    const blocked=new Date(Date.parse(today())-2*86_400_000).toISOString().slice(0,10);
+    const next=new Date(Date.parse(today())-86_400_000).toISOString().slice(0,10);
+    // A complete, current fold whose retained value exceeds the capture budget
+    // defers that day with 'capacity' on every attempt.
+    await target().batch([
+      target().prepare(`INSERT INTO analytics_community_daily_owners (${Object.keys(owner).join(',')}) VALUES(${Object.keys(owner).map(()=>'?').join(',')})`)
+        .bind(...Object.values({...owner,day:blocked,values_json:JSON.stringify({pad:'a'.repeat(2*1024*1024+1)})})),
+      target().prepare('INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)').bind(sourceId,blocked),
+      target().prepare('INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)').bind(sourceId,next),
+    ]);
+    expect(await advanceNextStorageCommunityDaily(options())).toMatchObject({state:'deferred',reason:'capacity',day:blocked});
+    const result=await runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,maxSteps:1,maxQueries:900,
+      deadlineMs:Date.now()+55_000});
+    expect(result.dailyPublications).toBe(1);expect(result.graphFailure).toBeUndefined();
+    expect((await target().prepare('SELECT day FROM analytics_community_daily_queue WHERE source_id=? ORDER BY day').bind(sourceId).all())
+      .results.map(row=>row.day)).toEqual([blocked]);
+  });
   it('records a daily lane failure and still claims graph work in the same pass',async()=>{
     await fixture();await ready();await publish();
     await target().prepare(`UPDATE analytics_community_daily_owners SET values_json='{"corrupt":true}'`).run();

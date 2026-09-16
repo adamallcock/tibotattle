@@ -95,8 +95,17 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
     if (read.state !== 'available' || read.values.length > 1) return 'deferred';
     values=read.values[0]??createV11DailyProjectionValues(observedDay);
   } else {
-    const read=await readV1ProjectedChunkPage({source,target,sourceId,sourceNamespace,ownerDigest,day:observedDay,
-      afterIndex:reuse?old.next_index:0,limit:50,...(reuse&&old.fingerprint?{fingerprint:old.fingerprint}:{})});
+    const page=(afterIndex:number,requested?:string|null)=>readV1ProjectedChunkPage({source,target,sourceId,sourceNamespace,
+      ownerDigest,day:observedDay,afterIndex,limit:50,...(requested?{fingerprint:requested}:{})});
+    let read:Awaited<ReturnType<typeof page>>;
+    try { read=await page(reuse?old.next_index:0,reuse?old.fingerprint:null); }
+    catch (error) {
+      // The immutable chunk vector behind a partially folded day changed, for
+      // example a correction of this owner landed between pages. Restart the
+      // fold from its first page instead of failing every later attempt.
+      if(!(error instanceof Error)||error.message!=='V1_PROJECTION_PAGE_CHANGED')throw error;
+      values=createV11DailyProjectionValues(observedDay);read=await page(0);
+    }
     if (!read) return 'deferred';
     for (const value of read.values) values=mergeV11DailyProjectionValues(values,value);
     nextIndex=read.nextIndex??0; fingerprint=read.fingerprint; complete=read.nextIndex===null;
@@ -180,15 +189,22 @@ const hardAuthority=(authority:StorageCommunityAuthority)=>({sourceId:authority.
  * already names every day whose inputs actually changed. */
 export async function advanceNextStorageCommunityDaily(options:StorageCommunityDailyBindings & {
   nowMs?:number;maxOwners?:number;preferStaleHead?:boolean;
-}):Promise<StorageCommunityDailyProgress|{state:'idle';ownersAdvanced:0}> {
+  /** Days already deferred in this pass; they yield to the next candidate. */
+  skipDays?:readonly string[];
+}):Promise<(StorageCommunityDailyProgress&{day:string})|{state:'idle';ownersAdvanced:0}> {
   if(options.preferStaleHead!==undefined&&typeof options.preferStaleHead!=='boolean')throw unavailable();
+  const skipDays=options.skipDays??[];
+  if(!Array.isArray(skipDays)||skipDays.length>64)throw unavailable();
+  for(const value of skipDays)day(value);
+  const skipJson=JSON.stringify(skipDays);
   await assertTarget(options);
   const authority=await captureStorageCommunityAuthority(options.source,options);
   const queuedDay=()=>options.target.prepare(`SELECT day FROM analytics_community_daily_queue
-    WHERE source_id=? ORDER BY day LIMIT 1`).bind(options.sourceId).first<string>('day');
+    WHERE source_id=? AND day NOT IN(SELECT value FROM json_each(?)) ORDER BY day LIMIT 1`)
+    .bind(options.sourceId,skipJson).first<string>('day');
   const staleHead=()=>options.target.prepare(`SELECT h.day FROM analytics_community_daily_heads h
       LEFT JOIN analytics_community_daily_publications p ON p.source_id=h.source_id AND p.day=h.day AND p.revision=h.revision
-      WHERE h.source_id=? AND (p.revision IS NULL
+      WHERE h.source_id=? AND h.day NOT IN(SELECT value FROM json_each(?)) AND (p.revision IS NULL
        OR json_extract(p.authority_json,'$.sourceId') IS NOT ? OR json_extract(p.authority_json,'$.sourceNamespace') IS NOT ?
        OR json_extract(p.authority_json,'$.policyRevision') IS NOT ? OR json_extract(p.authority_json,'$.collectionRevision') IS NOT ?
        OR COALESCE(json_extract(p.authority_json,'$.publicAuthorityEpoch'),-1)<${CONTAINMENT_EPOCH_SQL}
@@ -196,11 +212,12 @@ export async function advanceNextStorageCommunityDaily(options:StorageCommunityD
        OR json_extract(p.payload_json,'$.apiEquivalentSpend.registrySha256')!=?)
        AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_queue q WHERE q.source_id=h.source_id AND q.day=h.day)
        ORDER BY h.day DESC LIMIT 1`)
-      .bind(options.sourceId,authority.sourceId,authority.sourceNamespace,authority.policyRevision,authority.collectionRevision,
+      .bind(options.sourceId,skipJson,authority.sourceId,authority.sourceNamespace,authority.policyRevision,authority.collectionRevision,
         COMMUNITY_DAILY_SPEND_PRICING_METHOD,COMMUNITY_DAILY_SPEND_REGISTRY_SHA256).first<string>('day');
   let observedDay=options.preferStaleHead?await staleHead():await queuedDay();
   if(observedDay===null)observedDay=options.preferStaleHead?await queuedDay():await staleHead();
-  return observedDay===null?{state:'idle',ownersAdvanced:0}:advanceStorageCommunityDaily({...options,day:observedDay});
+  if(observedDay===null)return {state:'idle',ownersAdvanced:0};
+  return {...await advanceStorageCommunityDaily({...options,day:observedDay}),day:observedDay};
 }
 /** One bounded derived step. Completed owner folds survive other owners'
  * appends; a large v1 day resumes at its exact immutable chunk fingerprint. */
