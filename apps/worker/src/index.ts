@@ -1,3 +1,5 @@
+import { createD1TelemetryV1ContributionStore } from "./d1-telemetry-v1-contribution-store";
+import type { TelemetryV1ContributionStore } from "./telemetry-v1-contribution-store";
 import { allowanceReconstructionMode } from "./allowance-reconstruction";
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
@@ -193,7 +195,7 @@ import {
 } from "./telemetry-v11-repository";
 import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "./telemetry-v11-domain";
 import { parseTelemetryStorageMode, resolveTelemetryStorageMode, readTelemetryV11StorageReplay, persistTelemetryV11StorageChunk,
-  readTelemetryV1StorageReceipt, persistTelemetryV1StorageChunk } from "./telemetry-storage-mode";
+  readTelemetryV1StorageReceipt } from "./telemetry-storage-mode";
 import {
   claimPendingAppleSignInHandoff,
   completeAppleSignInHandoff,
@@ -280,6 +282,11 @@ function configuredDeploymentSourceCommit(env: Env): string | null {
 /** Worker composition root for the contribution quarantine port. */
 function quarantineObjectStore(env: Env): QuarantineObjectStore {
   return createR2QuarantineObjectStore(env.QUARANTINE);
+}
+
+/** Select the provider for the atomic v1 contribution write at composition. */
+function telemetryV1ContributionStore(env: Env): TelemetryV1ContributionStore {
+  return createD1TelemetryV1ContributionStore(env.USAGE_MONITOR_DB);
 }
 
 /**
@@ -2568,6 +2575,7 @@ async function handleTelemetryV1Contribution(
   },
   env: Env,
   quarantine: QuarantineObjectStore,
+  contributions: TelemetryV1ContributionStore,
 ): Promise<Response> {
   if (uploadAuthorization.authorizationKind !== "device") {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
@@ -2677,31 +2685,17 @@ async function handleTelemetryV1Contribution(
     },
   );
   try {
-    const result = await persistTelemetryV1StorageChunk(env.USAGE_MONITOR_DB, storageMode, {
+    const result = await contributions.insert({
       participantId: participant.id,
       deviceId,
-      deviceUploadAuthorizationId: uploadAuthorization.authorizationId,
-      chunkRowId,
-      r2Key,
+      uploadAuthorizationId: uploadAuthorization.authorizationId,
+      chunkId: chunkRowId,
+      objectKey: r2Key,
       envelopeDigest: envelopeDigestValue,
-      authorizationEnvelopeDigest: await sha256Hex(body.raw),
       chunk,
-      supersedes: current,
+      supersedes: current === null ? null : { id: current.id },
       createdAt,
     });
-    if (result.replay) {
-      // A recovered batch response must acknowledge its committed ID, never
-      // this request's proposed ID when another request won the same content.
-      const row = await existingTelemetryV1ChunkByEnvelopeDigest(
-        env.USAGE_MONITOR_DB, participant.id, envelopeDigestValue);
-      if (!row) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-      const retained = await readTelemetryV1StorageReceipt(env.USAGE_MONITOR_DB, storageMode, row, deviceId);
-      if (retained.id !== chunkRowId) {
-        await env.QUARANTINE.delete(r2Key);
-        await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
-      }
-      return telemetryV1ChunkReceipt(env, retained, deviceId);
-    }
     const [acknowledgedThroughDay, settledAdmission] = await Promise.all([
       telemetryV1AcknowledgedThroughDay(
         env.USAGE_MONITOR_DB,
@@ -2993,7 +2987,9 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     const response = declaredEnvelopeVersion === "telemetry-envelope-v0.1"
       ? await handleTelemetryContribution(request, body, participant, claimed, env, quarantine)
       : declaredEnvelopeVersion === TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION
-        ? await handleTelemetryV1Contribution(body, participant, claimed, env, quarantine)
+        ? await handleTelemetryV1Contribution(
+          body, participant, claimed, env, quarantine, telemetryV1ContributionStore(env),
+        )
         : declaredEnvelopeVersion === TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION
           ? await handleTelemetryV11Contribution(body, participant, sourceDeviceId, claimed.authorizationId, env, quarantine)
           : await handleSyntheticContribution(body, participant, claimed, env, quarantine);

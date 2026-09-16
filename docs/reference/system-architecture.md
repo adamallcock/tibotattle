@@ -272,7 +272,10 @@ Worker composes R2 and D1. The GCS release adapter has portable mocked-HTTP
 coverage and a synthetic local-Worker-to-GCS qualification recorded in the
 [test asset receipt](../reviews/2026-09-15-gcs-test-assets.md). Quarantine ingestion, reconciliation, retention and owner erasure share
 `QuarantineObjectStore`, selected in one Worker composition function. GCS
-quarantine erasure and transactional database portability remain unimplemented.
+quarantine erasure remains unimplemented. The v1 chunk transaction is now
+injected through `TelemetryV1ContributionStore` with a D1 implementation;
+read paths and the rest of the database remain D1-specific. A PostgreSQL adapter
+and transaction/trigger parity are not implemented or qualified.
 These source interfaces do not change the deployed topology. See the
 [Worker README](../../apps/worker/README.md) for entrypoints and local checks.
 

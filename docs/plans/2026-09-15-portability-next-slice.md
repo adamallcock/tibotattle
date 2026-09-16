@@ -2,7 +2,7 @@
 title: Hosted portability recovery and transaction slice
 date: 2026-09-15
 type: plan
-status: in-progress
+status: implementation-complete-validation-pending
 ---
 
 # Hosted portability recovery and transaction slice
@@ -22,12 +22,20 @@ migration, deployment, or GCS quarantine support is implied.
    contribution boundary. Preserve D1 admission, deduplication, correction,
    quarantine, and authorization semantics; assess PostgreSQL proof explicitly.
 
-## Remaining gates
+## Progress and remaining gates
 
-- Integrate repeatability, infrastructure plans, and failure tests.
-- Run uninterrupted validation and review the complete diff.
-- Extract the smallest coherent transaction operation after source investigation.
-- PostgreSQL parity and a hosted GCP runtime require separate evidence.
+- Portability and repeatable GCS lane committed as `a135579d`; 1,055 Worker
+  tests, 21 portable tests and two isolated live GCS runs passed.
+- The v1 transaction extraction is wired through the Worker composition root;
+  its neutral port compiles without Cloudflare ambient types. Existing D1 SQL,
+  bindings and error mapping are preserved.
+- Focused transaction regressions passed 72 tests across four files, covering
+  graph preservation, corrections, rollback and domain isolation. The extracted
+  SQL and bind sequences were mechanically compared to the committed source.
+  Worker and portable typechecks passed.
+- The complete final Worker gate is running; keep release-site artifact
+  requirements explicit before claiming that gate passed.
+- PostgreSQL parity and a hosted GCP runtime remain separate qualification work.
 
 ## Transaction boundary decision
 

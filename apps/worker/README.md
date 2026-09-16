@@ -35,6 +35,17 @@ latest verified external state.
   those callers. GCS quarantine erasure is not implemented. See the
   [GCP adapter integration review](../../docs/reviews/2026-09-15-gcp-adapter-integration.md)
   for wiring and remaining qualification gates.
+- The atomic v1 contribution write is injected through
+  `TelemetryV1ContributionStore` in `src/telemetry-v1-contribution-store.ts`.
+  `telemetryV1ContributionStore(env)` selects the D1 adapter in `src/index.ts`.
+  The input carries an `objectKey` and opaque predecessor ID; it contains no
+  D1 binding or provider row. The existing repository entrypoint delegates to
+  the same adapter. Authentication, schema/current-predecessor validation,
+  quarantine journaling, reads and receipts remain in the existing application.
+  This extracts one transaction; it does not make the full contribution API
+  portable. A replacement adapter must preserve authorization consumption,
+  admission, record ownership, correction rollback and all projection effects.
+  PostgreSQL parity remains untested.
 - `ContributionCoordinator` is the Durable Object used for contribution
   coordination; it is not a substitute for D1 durability.
 - Static assets under `apps/web/public` provide the acquisition, documentation,
