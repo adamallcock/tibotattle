@@ -63,9 +63,11 @@ export async function verifyRestoredRuntime({api,source,ingestion,analytics,ledg
  assert(values.values.reduce((n,v)=>n+BigInt(v.tokens.nonOverlappingTotal.knownSum),0n)===BigInt(records+1)*1075n);
  assert(values.values.every(v=>v.tokens.nonOverlappingTotal.unavailable===0&&v.counts.quota===0&&v.counts.session===0));
  assert(await api.revokeAccountlessEnrollment(ingestion,fixture.deviceId,'user_opt_out',Date.now()));
- assert((await read()).state==='authority-unavailable');
+ const retained=await read();
+ assert(retained.state==='available'&&JSON.stringify(retained.values)===JSON.stringify(values.values));
  let refused=false;try{await api.authenticateDevice(ingestion,fixture.authorization);}catch{refused=true;}assert(refused);
- await drain();assert((await read()).values.length===0);
+ await drain();const afterDrain=await read();
+ assert(afterDrain.state==='available'&&JSON.stringify(afterDrain.values)===JSON.stringify(values.values));
  const erased=await api.eraseParticipantAsOwner(runtime,'synthetic-restore-owner',fixture.participantId);assert(erased.deleted);
  await drain();
  assert(await api.hasDeletionTombstone(ledger,fixture.participantId));
@@ -74,9 +76,9 @@ export async function verifyRestoredRuntime({api,source,ingestion,analytics,ledg
  assert(await analytics.prepare('SELECT count(*) n FROM analytics_v11_value_pages').first('n')===0);
  assert(await source.prepare('SELECT count(*) n FROM telemetry_v11_records').first('n')===records);
  assert(await source.prepare('SELECT 1 FROM accountless_enrollment_ledger WHERE device_id=? AND state=\'active\'').bind(fixture.deviceId).first());
- return {schema:'d1-storage-restored-runtime-v1',status:'passed',scope:'synthetic-restored-ingestion-analytics-erasure',
+ return {schema:'d1-storage-restored-runtime-v2',status:'passed',scope:'synthetic-restored-ingestion-analytics-erasure',
   credentialsPreserved:true,acceptedReceiptReplayVerified:true,newUploadAccepted:true,journalDrained:true,dailyValuesExact:true,
-  retainedTombstoneSuppressed:true,optOutImmediate:true,revokedCredentialsRefused:true,physicalErasureComplete:true,
+  retainedTombstoneSuppressed:true,optOutImmediate:true,optOutRetainsAcceptedHistory:true,revokedCredentialsRefused:true,physicalErasureComplete:true,
   independentLedgerPreserved:true,sourceUnchanged:true,passes,recordsBefore:records,recordsAfterAccepted:records+1,
   publicGraphQualification:'separate',remoteOperations:false,runtimeActivationAuthorized:false};
 }
