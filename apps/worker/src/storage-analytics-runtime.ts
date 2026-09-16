@@ -274,9 +274,26 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    let publicIdle=true;
    if(options.publishCommunity && meter.remainingQueries>=100 && Date.now()<deadlineMs
      && (await readCollectionControls(scoped.source)).publication) {
-    const daily=await advanceNextStorageCommunityDaily(scoped);
-    if(daily.state==='published')dailyPublications++;
-    publicIdle=daily.state==='idle';
+    // Recover several already prepared days without consuming the graph's
+    // 550-statement admission floor. Stale published heads receive three of
+    // four selection slots while a durable queue exists, and both selectors
+    // fall back to the other lane when their preferred lane is empty.
+    const dailyAllowance=Math.min(90,Math.max(0,meter.remainingQueries-560));
+    let dailyIdle=false;
+    if(dailyAllowance>0&&deadlineMs-Date.now()>=20_000){
+     const dailyMeter=createD1InvocationBudget(dailyAllowance);
+     const dailyScoped={...scoped,source:dailyMeter.wrap(scoped.source),target:dailyMeter.wrap(scoped.target)};
+     try{
+      for(let attempt=0;attempt<4&&deadlineMs-Date.now()>=15_000;attempt++){
+       const slot=Math.floor(Date.now()/60_000)+attempt;
+       const daily=await advanceNextStorageCommunityDaily({...dailyScoped,preferStaleHead:slot%4!==3});
+       if(daily.state==='published')dailyPublications++;
+       if(daily.state==='idle'){dailyIdle=true;break;}
+       if(daily.state==='progress'||daily.state==='deferred')break;
+      }
+     }catch(error){if(!(error instanceof D1InvocationBudgetExceededError))throw error;}
+    }
+    publicIdle=dailyIdle;
     await retireStorageCommunityDailyPage(scoped);
     if(meter.remainingQueries>=550 && Date.now()<deadlineMs) {
      const graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs});

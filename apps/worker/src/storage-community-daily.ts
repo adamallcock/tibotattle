@@ -170,23 +170,26 @@ export interface StorageCommunityDailyProgress {
  * transactionally. Policy changes revisit old heads without any ingestion-side
  * analytical write, and only one day advances in this call. */
 export async function advanceNextStorageCommunityDaily(options:StorageCommunityDailyBindings & {
-  nowMs?:number;maxOwners?:number;
+  nowMs?:number;maxOwners?:number;preferStaleHead?:boolean;
 }):Promise<StorageCommunityDailyProgress|{state:'idle';ownersAdvanced:0}> {
+  if(options.preferStaleHead!==undefined&&typeof options.preferStaleHead!=='boolean')throw unavailable();
   await assertTarget(options);
   const authority=await captureStorageCommunityAuthority(options.source,options);
-  let observedDay=await options.target.prepare(`SELECT day FROM analytics_community_daily_queue
+  const queuedDay=()=>options.target.prepare(`SELECT day FROM analytics_community_daily_queue
     WHERE source_id=? ORDER BY day LIMIT 1`).bind(options.sourceId).first<string>('day');
-  if(observedDay===null){
-    observedDay=await options.target.prepare(`SELECT h.day FROM analytics_community_daily_heads h
+  const staleHead=()=>options.target.prepare(`SELECT h.day FROM analytics_community_daily_heads h
       LEFT JOIN analytics_community_daily_publications p ON p.source_id=h.source_id AND p.day=h.day AND p.revision=h.revision
       WHERE h.source_id=? AND (p.revision IS NULL OR json_extract(p.authority_json,'$.publicAuthorityEpoch')!=?
        OR json_extract(p.authority_json,'$.policyRevision')!=? OR json_extract(p.authority_json,'$.collectionRevision')!=?
        OR json_extract(p.authority_json,'$.graphInvalidationEpoch')!=?
        OR json_extract(p.payload_json,'$.apiEquivalentSpend.pricingMethodVersion')!=?
-       OR json_extract(p.payload_json,'$.apiEquivalentSpend.registrySha256')!=?) ORDER BY h.day LIMIT 1`)
+       OR json_extract(p.payload_json,'$.apiEquivalentSpend.registrySha256')!=?)
+       AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_queue q WHERE q.source_id=h.source_id AND q.day=h.day)
+       ORDER BY h.day DESC LIMIT 1`)
       .bind(options.sourceId,authority.publicAuthorityEpoch,authority.policyRevision,authority.collectionRevision,
         authority.graphInvalidationEpoch,COMMUNITY_DAILY_SPEND_PRICING_METHOD,COMMUNITY_DAILY_SPEND_REGISTRY_SHA256).first<string>('day');
-  }
+  let observedDay=options.preferStaleHead?await staleHead():await queuedDay();
+  if(observedDay===null)observedDay=options.preferStaleHead?await queuedDay():await staleHead();
   return observedDay===null?{state:'idle',ownersAdvanced:0}:advanceStorageCommunityDaily({...options,day:observedDay});
 }
 /** One bounded derived step. Completed owner folds survive other owners'

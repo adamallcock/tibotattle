@@ -238,6 +238,35 @@ describe('independent public daily publication',()=>{
     expect(payload.apiEquivalentSpend).toMatchObject({usageEvents:51,fullyPricedUsageEvents:51});
     expect((await advanceNextStorageCommunityDaily(options())).state).toBe('idle');
   });
+  it('prioritizes a stale visible head without starving the durable day queue',async()=>{
+    await fixture();await ready();await publish();
+    await source().prepare('UPDATE community_snapshot_policy SET maturity_days=maturity_days+1 WHERE singleton_id=1').run();
+    const queuedDay=new Date(Date.parse(today())+86_400_000).toISOString().slice(0,10);
+    await target().prepare('INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)')
+      .bind(sourceId,queuedDay).run();
+    expect(await advanceNextStorageCommunityDaily({...options(),preferStaleHead:true})).toMatchObject({state:'published'});
+    expect(await target().prepare('SELECT revision FROM analytics_community_daily_heads WHERE source_id=? AND day=?')
+      .bind(sourceId,today()).first('revision')).toBe(2);
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue WHERE source_id=? AND day=?')
+      .bind(sourceId,queuedDay).first('n')).toBe(1);
+    expect(await advanceNextStorageCommunityDaily(options())).toMatchObject({state:'published'});
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue WHERE source_id=? AND day=?')
+      .bind(sourceId,queuedDay).first('n')).toBe(0);
+  });
+  it('advances several prepared days in one bounded public pass while preserving the graph query floor',async()=>{
+    await fixture();await ready();await publish();
+    const days=Array.from({length:12},(_,offset)=>new Date(Date.parse(today())-(offset+1)*86_400_000).toISOString().slice(0,10));
+    await target().batch(days.map(day=>target().prepare(
+      'INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)',
+    ).bind(sourceId,day)));
+    const result=await runStorageAnalyticsPass({...options(),publishCommunity:true,maxSteps:1,maxQueries:725,
+      deadlineMs:Date.now()+55_000});
+    const remaining=await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue WHERE source_id=?')
+      .bind(sourceId).first<number>('n');
+    expect(result.dailyPublications).toBe(3);
+    expect(12-remaining!).toBe(result.dailyPublications);
+    expect(result.queriesUsed).toBeLessThan(300);
+  });
   it('reuses unchanged owners after a correction without restarting their completed folds',async()=>{
     const a=await seedV1(),b=await seedV1();await insertTypedTelemetryV1Chunk(source(),a.insert,namespace);
     await insertTypedTelemetryV1Chunk(source(),b.insert,namespace);await ready();await publish();
