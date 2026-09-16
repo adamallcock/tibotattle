@@ -777,7 +777,7 @@ describe("community daily aggregate cross-device dedupe", () => {
     expect((await db().prepare("SELECT day FROM community_daily_aggregate_rebuilds").all()).results).toEqual([]);
   });
 
-  it("includes genuine accountless v1.1 alongside the elected social device and withdraws it on revocation", async () => {
+  it("includes genuine accountless v1.1 alongside the elected social device and withdraws it on security containment", async () => {
     const accountless = await seedAcceptedAccountlessDay();
     // Other required domain manifests are empty; this test isolates the target day.
     await db().prepare("DELETE FROM community_daily_aggregate_rebuilds WHERE day<>?").bind(DAY).run();
@@ -800,7 +800,7 @@ describe("community daily aggregate cross-device dedupe", () => {
     expect((await rebuildAndReadDay("2026-08-03T12:00:00.000Z")).totals).toMatchObject({
       contributingParticipants: 2, contributingDevices: 2, usageEvents: 2, inputUncachedTokens: 142,
     });
-    await revokeAccountlessEnrollment(db(), accountless.deviceId, "user_opt_out");
+    await revokeAccountlessEnrollment(db(), accountless.deviceId, "security_reset");
     expect((await readLatestCommunityDailyAggregate(db(), DAY))?.release_state).toBe("withdrawn");
     await db().prepare("DELETE FROM community_daily_aggregate_rebuilds WHERE day<>?").bind(DAY).run();
     await expect(assertV1SourcePinCurrent(db(), pin)).rejects.toThrow("v1 source changed during analysis");
@@ -818,7 +818,7 @@ describe("community daily aggregate cross-device dedupe", () => {
     const accountlessId = await seedOversizedAccountlessSourceJournal();
     const owner = await db().prepare("SELECT device_credential_id FROM accountless_upload_owners WHERE participant_id=?")
       .bind(accountlessId).first<{ device_credential_id: string }>();
-    await revokeAccountlessEnrollment(db(), owner!.device_credential_id, "user_opt_out");
+    await revokeAccountlessEnrollment(db(), owner!.device_credential_id, "security_reset");
     const scope = { day: DAY, publicSourcePolicy: COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION } as const;
     const publicPin = await loadV1SourcePin(db(), scope, { maxChunks: 1 });
     const oldPin = await loadV1SourcePin(db(), { day: DAY, ownerKind: "social" }, { maxChunks: 1 });
