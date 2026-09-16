@@ -122,6 +122,7 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0058_accountless_upload_ownership.sql",
     "0059_accountless_upload_renewal.sql",
     "0060_public_contribution_sources.sql",
+    "0061_accountless_history_retention.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
@@ -1563,7 +1564,7 @@ NOT EXISTS (
      AND dflt_value IS NULL AND pk = 0
 ) AS scale_columns;
 `;
-// Current 0060 probes retain all unaffected 0059 contracts. Every replaced or
+// The current public-source probes retain all unaffected 0059 contracts. Every replaced or
 // new object is checked separately against exact stored DDL in a third bounded
 // metadata query, including the eligibility view and withdrawal/bootstrap guards.
 function unaffectedPublicSourceProbe(objects, historicalSocialNames = []) {
@@ -1574,13 +1575,69 @@ function unaffectedPublicSourceProbe(objects, historicalSocialNames = []) {
 }
 const publicSourceComponentProbe = (objects, socialNames, field) =>
   `SELECT ${unaffectedPublicSourceProbe(objects, socialNames)} AS ${field}`;
-export const CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL
+export const PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL
   .replace(POST_ACCOUNTLESS_COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
     publicSourceComponentProbe(CURRENT_MODEL_HISTORY_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history, "community_model_history_schema"))
   .replace(POST_ACCOUNTLESS_COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
     publicSourceComponentProbe(CURRENT_GRAPH_PRESERVATION_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.graph, "community_graph_preservation_schema"))
   .replace(POST_ACCOUNTLESS_REFRESH_LANE_SCHEMA_PROBE_SQL,
     publicSourceComponentProbe(REFRESH_LANE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.refresh, "refresh_lane_schema"));
+export const ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL = Object.freeze({
+  accountless_public_history_retention: `CREATE TABLE accountless_public_history_retention (
+  participant_id TEXT PRIMARY KEY NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  enrollment_device_id TEXT NOT NULL UNIQUE,
+  device_credential_id TEXT NOT NULL UNIQUE,
+  generation_id TEXT NOT NULL,
+  head_revision INTEGER NOT NULL CHECK (head_revision > 0),
+  retained_at TEXT NOT NULL,
+  CHECK (retained_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z')
+) STRICT`,
+  accountless_public_history_retention_insert: `CREATE TRIGGER accountless_public_history_retention_insert
+BEFORE INSERT ON accountless_public_history_retention
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM community_public_source_owners public_owner
+    JOIN accountless_upload_owners owner
+      ON owner.participant_id = public_owner.participant_id
+    JOIN accountless_enrollment_ledger ledger
+      ON ledger.device_id = owner.enrollment_device_id
+    JOIN device_credentials device
+      ON device.id = owner.device_credential_id
+    JOIN accountless_v11_device_authorizations grant_row
+      ON grant_row.enrollment_device_id = owner.enrollment_device_id
+     AND grant_row.participant_id = owner.participant_id
+     AND grant_row.device_credential_id = owner.device_credential_id
+    JOIN telemetry_v11_domain_heads head
+      ON head.participant_id = owner.participant_id
+   WHERE public_owner.owner_kind = 'accountless'
+     AND public_owner.participant_id = NEW.participant_id
+     AND public_owner.device_id = NEW.device_credential_id
+     AND owner.enrollment_device_id = NEW.enrollment_device_id
+     AND owner.device_credential_id = NEW.device_credential_id
+     AND ledger.state = 'active' AND owner.state = 'active'
+     AND device.state = 'active' AND grant_row.state = 'active'
+     AND head.generation_id = NEW.generation_id
+     AND head.revision = NEW.head_revision
+)
+BEGIN SELECT RAISE(ABORT, 'accountless_history_retention_unavailable'); END`,
+  accountless_public_history_retention_immutable: `CREATE TRIGGER accountless_public_history_retention_immutable
+BEFORE UPDATE ON accountless_public_history_retention
+BEGIN SELECT RAISE(ABORT, 'accountless_history_retention_immutable'); END`,
+});
+export const ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL)}
+  AS accountless_history_retention_objects
+`;
+export const accountlessHistoryRetentionSchemaComplete = row =>
+  row?.accountless_history_retention_objects === 1;
+// Migration 0061 is part of the current attribution contract. Folding its
+// exact three-object proof into the existing bounded query keeps release and
+// live staging gates aligned without an extra remote round trip.
+export const CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL =
+  PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL.replace(
+    " AS attribution_objects,",
+    ` AND (${exactStoredSchemaProbe(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL)}) AS attribution_objects,`,
+  );
 export const CURRENT_SCALE_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL.replace(
   exactStoredSchemaProbe(SCALE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale)
     + " AND " + socialOwnerGatedTriggerProbe(ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale),

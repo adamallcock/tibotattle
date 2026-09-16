@@ -6,6 +6,9 @@ import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import {
+  ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL,
+  ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL,
+  accountlessHistoryRetentionSchemaComplete,
   assessStagingConfiguration,
   ATTRIBUTION_SCHEMA_COLUMNS,
   ATTRIBUTION_SCHEMA_OBJECTS,
@@ -14,6 +17,7 @@ import {
   COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
   COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
   POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+  PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL,
   CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
   CURRENT_SCALE_SCHEMA_PROBE_SQL,
   PUBLIC_SOURCE_SCHEMA_PROBE_SQL,
@@ -109,7 +113,7 @@ test("staging rejects missing, disabled, or unknown public analytics deployment 
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-18), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-19), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
@@ -128,6 +132,7 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
     "0058_accountless_upload_ownership.sql",
     "0059_accountless_upload_renewal.sql",
     "0060_public_contribution_sources.sql",
+    "0061_accountless_history_retention.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -229,6 +234,7 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0057_accountless_enrollment_ledger.sql": "5cbf718449688bffc0fc5cf63d1de17351acb915f44459f1b32f3202c7378cd5",
     "0058_accountless_upload_ownership.sql": "b435fd92d41e7ce8067cc183d7ac153359a9c130a971cba2e1b8b8c1c9cab61b",
     "0059_accountless_upload_renewal.sql": "98afb99dd91e56a96960e6d99096e44c41eec0cd52d5a1e2969dea4ddee3d312",
+    "0061_accountless_history_retention.sql": "0d6d9d23390770aab5c2cb9b1bbb27586ed72b9921a420468efb05ee225435d6",
   };
   const legacyDigests = {
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
@@ -236,11 +242,12 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0048_accountless_upload_renewal.sql": "82297298f937489275756da93d9b116a7b83b280482000b0df51abd5c598d9b7",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 60);
+  assert.equal(names.length, 61);
   assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests).slice(0, 5));
-  assert.deepEqual(names.slice(56, 59), Object.keys(expectedDigests).slice(-3));
+  assert.deepEqual(names.slice(56, 59), Object.keys(expectedDigests).slice(-4, -1));
+  assert.equal(names.at(-1), Object.keys(expectedDigests).at(-1));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 60 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 61 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -2320,10 +2327,11 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
     database.exec("SAVEPOINT public_source_format;");
     for (const sql of unstable_splitSqlQuery(readFileSync(join(workerDirectory, "migrations", "0060_public_contribution_sources.sql"), "utf8"))) database.exec(sql);
     assert.deepEqual(Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)), PUBLIC_SOURCE_SCHEMA_SQL);
-    for (const probe of [CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
+    for (const probe of [PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
       assert.ok(Buffer.byteLength(probe) < 100_000, "separate bounded metadata queries");
     }
-    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(attributionSchemaComplete(database.prepare(PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
     assert.equal(scaleSchemaComplete(database.prepare(CURRENT_SCALE_SCHEMA_PROBE_SQL).get()), true);
     assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), true);
     for (const [name, sql] of Object.entries(PUBLIC_SOURCE_SCHEMA_SQL)) {
@@ -2356,6 +2364,57 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
       database.exec(altered);
       assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `remote altered ${name}`);
       database.exec("ROLLBACK TO altered_remote_source; RELEASE altered_remote_source;");
+    }
+  } finally { database.close(); }
+});
+
+test("current 0061 readiness binds the exact history-retention table and guards", async () => {
+  const { unstable_splitSqlQuery } = await import("wrangler");
+  const database = new DatabaseSync(":memory:");
+  try {
+    const snapshot = () => Object.fromEntries(database.prepare(
+      "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
+    ).all().map(({ name, sql }) => [name, sql]));
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, -1)) {
+      const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
+      database.exec(name.startsWith("0058_") ? `BEGIN;${sql}COMMIT;` : sql);
+    }
+    const before = snapshot();
+    assert.equal(accountlessHistoryRetentionSchemaComplete(
+      database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
+    ), false);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    for (const sql of unstable_splitSqlQuery(readFileSync(
+      join(workerDirectory, "migrations", "0061_accountless_history_retention.sql"), "utf8",
+    ))) database.exec(sql);
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)),
+      ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL,
+    );
+    assert.ok(Buffer.byteLength(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL) < 100_000);
+    assert.equal(accountlessHistoryRetentionSchemaComplete(
+      database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
+    ), true);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    for (const [name, sql] of Object.entries(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL)) {
+      const type = /^CREATE (TABLE|TRIGGER)/u.exec(sql)[1];
+      database.exec(`SAVEPOINT altered_history_retention; DROP ${type} ${name};`);
+      assert.equal(accountlessHistoryRetentionSchemaComplete(
+        database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
+      ), false, `missing ${name}`);
+      const altered = type === "TRIGGER"
+        ? `${sql.slice(0, sql.indexOf("BEGIN"))}BEGIN SELECT 1; END`
+        : "CREATE TABLE accountless_public_history_retention(participant_id TEXT PRIMARY KEY)";
+      database.exec(altered);
+      assert.equal(accountlessHistoryRetentionSchemaComplete(
+        database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
+      ), false, `altered ${name}`);
+      assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+      database.exec("ROLLBACK TO altered_history_retention; RELEASE altered_history_retention;");
+    }
+    for (const row of [undefined, {}, { accountless_history_retention_objects: true },
+      { accountless_history_retention_objects: 0 }]) {
+      assert.equal(accountlessHistoryRetentionSchemaComplete(row), false);
     }
   } finally { database.close(); }
 });
