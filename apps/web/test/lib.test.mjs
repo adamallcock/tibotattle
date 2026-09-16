@@ -35,7 +35,6 @@ import {
   DEVIATION_DRIFT_THRESHOLD_PP,
   DEVIATION_MIN_DURATION_MS,
   DEVIATION_MERGE_GAP_MS,
-  DEVIATION_MAX_PERIODS,
   parseJsonWithUniqueObjectKeys,
   isContributionReviewableQueueState,
   refreshAccountingStatus,
@@ -808,16 +807,29 @@ test("deviation detector attaches exact per-period contributor totals from bucke
   assert.equal(priced.contributors.bucketCount, 2);
 });
 
-test("deviation detector caps the list and reports the full count", () => {
+test("deviation detector retains the full ranked set by default", () => {
+  const entries = [];
+  for (let index = 0; index < 21; index += 1) {
+    entries.push(
+      ...Array.from({ length: 10 }, () => 8 + index),
+      ...Array.from({ length: 4 }, () => 0),
+    );
+  }
+  const result = detectDeviationPeriods(driftSeries(entries));
+  assert.equal(result.totalFound, 21);
+  assert.equal(result.periods.length, 21);
+  assert.equal(result.truncated, false);
+  assert.equal(result.periods[0].absPeakDriftPp, 28);
+});
+
+test("deviation detector supports an explicit diagnostic cap", () => {
   const constants = {
     thresholdPp: DEVIATION_DRIFT_THRESHOLD_PP,
     minDurationMs: DEVIATION_MIN_DURATION_MS,
     mergeGapMs: DEVIATION_MERGE_GAP_MS,
-    maxPeriods: DEVIATION_MAX_PERIODS,
   };
   assert.equal(constants.thresholdPp, 5);
   assert.equal(constants.minDurationMs, 2 * 60 * 60 * 1_000);
-  assert.equal(constants.maxPeriods, 20);
 
   // Two well-separated sustained runs; capping to one keeps the widest and
   // still reports both were found, so nothing is silently dropped.

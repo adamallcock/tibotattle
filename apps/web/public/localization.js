@@ -880,10 +880,10 @@ export const WEB_MESSAGES = Object.freeze({
     "此范围尚无累计漂移序列——请在已连接本地伴随程序的情况下打开，以检测背离时段。",
     "Aún no hay una serie de deriva acumulada para este intervalo: ábrelo con el acompañante local conectado para detectar períodos de divergencia.",
   ],
-  "divergence.truncated": [
-    "Showing the {shown} widest of {total} detected periods.",
-    "在检测到的 {total} 个时段中显示最显著的 {shown} 个。",
-    "Mostrando los {shown} más amplios de {total} períodos detectados.",
+  "divergence.pagination.page": [
+    "{start}–{end} of {total} periods · largest gap first",
+    "第 {start}–{end} 个，共 {total} 个时段 · 最大差距优先",
+    "{start}–{end} de {total} períodos · mayor diferencia primero",
   ],
   "divergence.methodCaveat": [
     "Known limitation: the expected line prices every model at one blended rate, so a stretch dominated by a single model can read as divergence. A per-model expected line is planned.",
