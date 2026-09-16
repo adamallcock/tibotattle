@@ -216,6 +216,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     }
     return {state:'deferred',reason};
   };
+  let v11CompletedFingerprint:string|null=null;
   const computeV11=async(metric:'fits'|'model',pin:Extract<Pin,{source:'v1.1'}>):Promise<
     {state:'complete';analysis:object}|{state:'deferred';reason:string;failure?:StorageGraphFailureFields}>=>{
     // A typed domain can become source-visible before its ordered owner-active
@@ -248,7 +249,10 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
       closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
       budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
-    if(next.status==='complete')return {state:'complete',analysis:next.analysis};
+    if(next.status==='complete'){
+      v11CompletedFingerprint=checkpoint?.snapshot?.fingerprint??pin.fingerprint;
+      return {state:'complete',analysis:next.analysis};
+    }
     if(!next.checkpoint)return {state:'deferred',reason:'v11_checkpoint'};
     const saved=await persistCheckpoint(key,next.checkpoint,head,'v11_checkpoint');
     if(saved.state==='deferred')return saved;
@@ -264,7 +268,10 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint:staged,
         maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
         budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
-      if(advanced.status==='complete')return {state:'complete',analysis:advanced.analysis};
+      if(advanced.status==='complete'){
+        v11CompletedFingerprint=staged.snapshot?.fingerprint??pin.fingerprint;
+        return {state:'complete',analysis:advanced.analysis};
+      }
       if(!advanced.checkpoint)break;
       const promoted=await persistCheckpoint(key,advanced.checkpoint,stagedHead,'v11_checkpoint');
       if(promoted.state==='deferred')return promoted;
@@ -321,7 +328,8 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       scope.owner.participantId,{nowMs,sourcePin:scope.pin})});
     if(scope.source==='mixed'||scope.source==='v0.2')analyses.push({source:'v0.2',
       analysis:await accountScopedQuotaAnalysis(source,scope.owner.participantId)});
-    if(analyses.some(a=>!validCompleteScalarAnalysis(a.analysis,a.source,scope.pin.fingerprint,
+    if(analyses.some(a=>!validCompleteScalarAnalysis(a.analysis,a.source,
+      a.source==='v1.1'?v11CompletedFingerprint??scope.pin.fingerprint:scope.pin.fingerprint,
       !(scope.source==='v1'&&a.source==='v1'))))throw fail();
     payload=canonicalJson(selectCommunityAllowanceAnalysisFits(scope.owner.ownerDigest,analyses));
   } else {

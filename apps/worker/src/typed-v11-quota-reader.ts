@@ -118,78 +118,58 @@ SELECT page.physical_id,page.source_row_id,page.observed_at_ms,
 FROM page LEFT JOIN active ON active.physical_id=page.physical_id
 ORDER BY page.observed_at_ms,page.source_row_id`;
 
-/**
- * Read one retained generation directly from its immutable proof and manifest
- * membership. Unlike the current-head query above, this does not join
- * telemetry_v11_domain_heads. The snapshot CTE still requires the participant,
- * device, owner revision and retained generation journal to be live. The page
- * starts from the generation's manifest proofs, so a successor corpus cannot
- * expand the physical scan or displace a prior snapshot's cursor.
- */
-export const TYPED_V11_QUOTA_SNAPSHOT_PAGE_SQL = `WITH snapshot AS MATERIALIZED (
-  SELECT s.namespace_id,s.source_namespace,o.typed_owner_id,g.id AS generation_id,g.device_id
-  FROM typed_v11_admission_state s
-  JOIN typed_v11_owner_memberships o ON o.participant_id=?9
-  JOIN typed_telemetry_owners owner ON owner.id=o.typed_owner_id
-    AND owner.namespace_id=s.namespace_id AND owner.id=?2
-  JOIN telemetry_v11_domains g ON g.id=?8 AND g.participant_id=?9
-    AND g.manifest_digest=?13 AND g.from_day=?14 AND g.through_day=?15
-  JOIN participants participant ON participant.id=g.participant_id AND participant.state='active'
-  JOIN device_credentials generation_device ON generation_device.id=g.device_id
-    AND generation_device.participant_id=g.participant_id AND generation_device.state='active'
-  JOIN storage_v11_owner_links owner_link ON owner_link.participant_id=g.participant_id
-    AND owner_link.state='active'
-  JOIN storage_owner_revisions owner_revision ON owner_revision.owner_digest=owner_link.owner_digest
-    AND owner_revision.state='active'
-  WHERE s.id=1 AND s.runtime_contract_version=1 AND s.namespace_id=?1
-    AND s.source_namespace=?11
-    AND EXISTS (SELECT 1 FROM storage_v11_event_sources retained_source
-      WHERE retained_source.owner_digest=owner_link.owner_digest
-        AND retained_source.participant_id=g.participant_id
-        AND retained_source.generation_id=g.id)
-), page AS MATERIALIZED (
-  SELECT raw.id AS physical_id,raw.source_row_id,raw.observed_at_ms,
-    snapshot.device_id AS device_id,raw.provider_id,
+/** Retained pages keep the proven owner-time physical driver and apply exact
+ * generation membership as a residual. Starting from all generation manifests
+ * makes SQLite sort/revisit the retained corpus for every cursor page. */
+export const TYPED_V11_QUOTA_SNAPSHOT_PAGE_SQL = `WITH page AS MATERIALIZED (
+  SELECT raw.id AS physical_id,raw.source_row_id,raw.observed_at_ms,raw.device_id,raw.provider_id
+  FROM typed_telemetry_records raw INDEXED BY typed_telemetry_owner_time
+  WHERE raw.namespace_id=?1 AND raw.owner_id=?2 AND raw.format=11 AND raw.stream=2
+    AND raw.observed_at_ms>=?3 AND raw.observed_at_ms<?4
+    AND (raw.observed_at_ms,raw.source_row_id)>(?5,?6)
+  ORDER BY raw.observed_at_ms,raw.source_row_id LIMIT ?7
+), active AS MATERIALIZED (
+  SELECT page.physical_id,page.source_row_id,page.observed_at_ms,
     proof.occurrence_id AS active_occurrence_id,proof.observed_at_ms AS proof_observed_at_ms,
-    domain_day.observed_day,provider.value AS provider,
+    domain_day.observed_day,g.device_id,provider.value AS provider,
     plan.value AS plan_type,variant.value AS plan_variant,
     lim.value AS limit_id,slot.value AS slot,q.used_percent,
     q.window_duration_minutes,q.resets_at_ms,
     attribution.account_basis,attribution.account_track,attribution.plan_basis,
     attribution_plan.value AS attribution_plan_type,attribution.plan_era
-  FROM snapshot
-  CROSS JOIN telemetry_v11_domain_days domain_day
+  FROM page
+  CROSS JOIN typed_v11_record_proofs proof
+    ON proof.typed_record_id=page.physical_id AND proof.stream_code=2
+  JOIN typed_v11_manifest_memberships membership ON membership.typed_manifest_id=proof.manifest_key
+  JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=membership.manifest_id
+    AND domain_day.generation_id=?8
   JOIN telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id
-    AND manifest.participant_id=?9 AND manifest.device_id=snapshot.device_id
-    AND manifest.chunk_day=domain_day.observed_day AND manifest.state='ready'
-  JOIN typed_v11_manifest_memberships membership ON membership.manifest_id=domain_day.manifest_id
-  JOIN typed_v11_record_proofs proof INDEXED BY typed_v11_manifest_observed
-    ON proof.manifest_key=membership.typed_manifest_id AND proof.stream_code=2
-  JOIN typed_telemetry_records raw ON raw.id=proof.typed_record_id
-    AND raw.namespace_id=snapshot.namespace_id AND raw.owner_id=snapshot.typed_owner_id
-    AND raw.format=11 AND raw.stream=2
-  JOIN typed_telemetry_devices current_device ON current_device.id=raw.device_id
+    AND manifest.participant_id=?9 AND manifest.chunk_day=domain_day.observed_day AND manifest.state='ready'
+  JOIN telemetry_v11_domains g ON g.id=domain_day.generation_id AND g.participant_id=?9
+    AND g.manifest_digest=?13 AND g.from_day=?14 AND g.through_day=?15
+  JOIN typed_telemetry_devices current_device ON current_device.id=page.device_id
     AND current_device.namespace_id=?10 AND current_device.owner_id=?2
     AND current_device.original_id=?12
-  JOIN typed_telemetry_quota q ON q.record_id=raw.id
+  JOIN typed_v11_admission_state admission ON admission.id=1 AND admission.runtime_contract_version=1
+    AND admission.namespace_id=?10 AND admission.source_namespace=?11
+  JOIN typed_telemetry_quota q ON q.record_id=page.physical_id
   JOIN typed_telemetry_quota_dimensions dimensions ON dimensions.id=q.dimensions_id
-  JOIN typed_telemetry_dictionary provider ON provider.id=raw.provider_id
+  JOIN typed_telemetry_dictionary provider ON provider.id=page.provider_id
   JOIN typed_telemetry_dictionary plan ON plan.id=dimensions.plan_type_id
   JOIN typed_telemetry_dictionary variant ON variant.id=dimensions.plan_variant_id
   JOIN typed_telemetry_dictionary lim ON lim.id=q.limit_id
   JOIN typed_telemetry_dictionary slot ON slot.id=q.slot_id
   JOIN typed_telemetry_attributions attribution ON attribution.id=dimensions.attribution_id
   JOIN typed_telemetry_dictionary attribution_plan ON attribution_plan.id=attribution.plan_type_id
-  WHERE domain_day.generation_id=snapshot.generation_id
-    AND raw.observed_at_ms>=?3 AND raw.observed_at_ms<?4
-    AND (raw.observed_at_ms,raw.source_row_id)>(?5,?6)
-  ORDER BY raw.observed_at_ms,raw.source_row_id LIMIT ?7
 )
-SELECT physical_id,source_row_id,observed_at_ms,
-  active_occurrence_id,proof_observed_at_ms,observed_day,device_id,provider,
-  plan_type,plan_variant,limit_id,slot,used_percent,window_duration_minutes,
-  resets_at_ms,account_basis,account_track,plan_basis,attribution_plan_type,plan_era
-FROM page ORDER BY observed_at_ms,source_row_id`;
+SELECT page.physical_id,page.source_row_id,page.observed_at_ms,
+  active.active_occurrence_id,active.proof_observed_at_ms,active.observed_day,
+  active.device_id,active.provider,active.plan_type,active.plan_variant,
+  active.limit_id,active.slot,active.used_percent,active.window_duration_minutes,
+  active.resets_at_ms,active.account_basis,active.account_track,
+  active.plan_basis,active.attribution_plan_type,active.plan_era
+FROM page LEFT JOIN active ON active.physical_id=page.physical_id
+ORDER BY page.observed_at_ms,page.source_row_id`;
 
 interface ReaderScope {
   sourceNamespace: string;
@@ -318,7 +298,7 @@ function utcDay(value: unknown): value is string {
     && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
 }
 
-function validSnapshotShape(value: unknown): value is V11GenerationSnapshot {
+export function isV11GenerationSnapshot(value: unknown): value is V11GenerationSnapshot {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const snapshot = value as Record<string, unknown>;
   if (Object.keys(snapshot).sort().join(",") !==
@@ -344,7 +324,7 @@ function validSnapshotShape(value: unknown): value is V11GenerationSnapshot {
 }
 
 async function normalizeSnapshot(value: unknown, sourceNamespace: string): Promise<V11GenerationSnapshot> {
-  if (!validSnapshotShape(value) || value.sourceNamespace !== sourceNamespace) fail();
+  if (!isV11GenerationSnapshot(value) || value.sourceNamespace !== sourceNamespace) fail();
   const expectedFingerprint = await sha256Hex(canonicalJson({
     method: V11_DOMAIN_METHOD_VERSION,
     participantId: value.participantId,
@@ -507,6 +487,9 @@ export async function createTypedV11QuotaPageReader(db: D1Database, options: {
   sourceNamespace: string;
   pin?: V11SourcePin;
   snapshot?: V11GenerationSnapshot;
+  /** Graph groups fence the immutable snapshot once before and after the whole
+   * bounded group; direct callers retain the per-page fence by default. */
+  fenceSnapshotPages?: boolean;
   fromObservedAtMs: number;
   beforeObservedAtMs: number;
 }): Promise<{
@@ -531,7 +514,7 @@ export async function createTypedV11QuotaPageReader(db: D1Database, options: {
     async readPage(after: V11QuotaPageCursor, limit = TYPED_V11_QUOTA_PAGE_SIZE) {
       cursor(after);
       const pageLimit = limitPage(limit);
-      if (retained) await assertTypedV11GenerationSnapshotLive(db, scope.snapshot);
+      if (retained && options.fenceSnapshotPages !== false) await assertTypedV11GenerationSnapshotLive(db, scope.snapshot);
       const statement = db.prepare(retained ? TYPED_V11_QUOTA_SNAPSHOT_PAGE_SQL : TYPED_V11_QUOTA_PAGE_SQL);
       const rows = (await (retained
         ? statement.bind(

@@ -10,9 +10,11 @@ import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor, loadV1
   V11_DOMAIN_METHOD_VERSION } from "../src/telemetry-v11-domain";
 import { sha256Hex } from "../src/crypto";
 import { canonicalJson } from "../src/canonical-json";
+import { encodeTypedTelemetryId } from "../src/typed-telemetry-codec";
 import { createTypedV11QuotaPageReader, loadTypedV11GenerationSnapshot,
+  TYPED_V11_QUOTA_SNAPSHOT_PAGE_SQL,
   type V11GenerationSnapshot } from "../src/typed-v11-quota-reader";
-import { readTypedV11UsageAnalysisPage } from "../src/typed-v11-analysis-reader";
+import { readTypedV11UsageAnalysisPage, TYPED_V11_USAGE_SNAPSHOT_PAGE_SQL } from "../src/typed-v11-analysis-reader";
 import { createV11DeviceFixture, makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 
 const bindings = env as Env & { STORAGE_INGESTION_A: D1Database; TEST_MIGRATIONS: D1Migration[];
@@ -186,4 +188,27 @@ describe("typed v1.1 fixed graph snapshots", () => {
       afterTime: `${DAY}T00:00:00.000Z`, afterOccurrence: "", pageSize: 10,
     })).rejects.toThrow("TYPED_V11_QUOTA_READER_UNAVAILABLE");
   }, 120_000);
+
+  it("keeps retained quota and usage pages on bounded indexed drivers after planner statistics",async()=>{
+    const {snapshot}=await scenario();
+    const reader=await createTypedV11QuotaPageReader(database(),{sourceNamespace:SOURCE_NAMESPACE,snapshot,
+      fromObservedAtMs:START,beforeObservedAtMs:START+86_400_000});
+    await database().prepare("ANALYZE").run();
+    const quota=(await database().prepare("EXPLAIN QUERY PLAN "+TYPED_V11_QUOTA_SNAPSHOT_PAGE_SQL).bind(
+      reader.scope.namespaceId,reader.scope.ownerId,START,START+86_400_000,START,0,1024,
+      snapshot.generationId,snapshot.participantId,reader.scope.namespaceId,SOURCE_NAMESPACE,
+      reader.scope.deviceIdBlob,snapshot.manifestDigest,snapshot.fromDay,snapshot.throughDay)
+      .all<{detail:string}>()).results.map(row=>row.detail);
+    expect(quota.some(detail=>detail.includes("typed_telemetry_owner_time"))).toBe(true);
+    expect(quota.some(detail=>detail.includes("USE TEMP B-TREE FOR ORDER BY"))).toBe(false);
+    const usage=(await database().prepare("EXPLAIN QUERY PLAN "+TYPED_V11_USAGE_SNAPSHOT_PAGE_SQL).bind(
+      SOURCE_NAMESPACE,snapshot.participantId,snapshot.generationId,snapshot.deviceId,DAY,
+      START,START+86_400_000,START,"",5000,
+      Uint8Array.from(encodeTypedTelemetryId(snapshot.deviceId)).buffer,
+      snapshot.manifestDigest,snapshot.fromDay,snapshot.throughDay).all<{detail:string}>()).results.map(row=>row.detail);
+    expect(usage.some(detail=>detail.includes("typed_v11_manifest_observed (manifest_key=? AND stream=? AND observed_at_ms>? AND observed_at_ms<?)"))).toBe(true);
+    // Compatibility expansion reorders only the already limited 5,000-row
+    // page. The proof seek above occurs before that one bounded temp sort.
+    expect(usage.filter(detail=>detail.includes("USE TEMP B-TREE FOR ORDER BY")),usage.join("\n")).toHaveLength(1);
+  },120_000);
 });

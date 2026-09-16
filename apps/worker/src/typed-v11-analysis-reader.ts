@@ -54,19 +54,19 @@ export const TYPED_V11_USAGE_SNAPSHOT_PAGE_SQL = `WITH snapshot AS MATERIALIZED 
     AND manifest.chunk_day=domain_day.observed_day AND manifest.state='ready'
   JOIN typed_v11_manifest_memberships membership ON membership.manifest_id=domain_day.manifest_id
 ), page AS MATERIALIZED (
-  SELECT raw.id AS storage_row_id,raw.observed_at_ms,proof.occurrence_id
-  FROM manifest_scope
-  CROSS JOIN typed_v11_record_proofs proof INDEXED BY typed_v11_manifest_observed
-    ON proof.manifest_key=manifest_scope.typed_manifest_id AND proof.stream_code=1
+  SELECT raw.id AS storage_row_id,proof.observed_at_ms,proof.occurrence_id
+  FROM typed_v11_record_proofs proof INDEXED BY typed_v11_manifest_observed
   JOIN typed_telemetry_records raw ON raw.id=proof.typed_record_id
-    AND raw.namespace_id=manifest_scope.namespace_id
-    AND raw.owner_id=manifest_scope.typed_owner_id AND raw.format=11 AND raw.stream=1
+    AND raw.namespace_id=(SELECT namespace_id FROM manifest_scope)
+    AND raw.owner_id=(SELECT typed_owner_id FROM manifest_scope) AND raw.format=11 AND raw.stream=1
   JOIN typed_telemetry_devices typed_device ON typed_device.id=raw.device_id
-    AND typed_device.namespace_id=manifest_scope.namespace_id
-    AND typed_device.owner_id=manifest_scope.typed_owner_id AND typed_device.original_id=?11
-  WHERE raw.observed_at_ms>=?6 AND raw.observed_at_ms<?7
-    AND (raw.observed_at_ms,proof.occurrence_id)>(?8,?9)
-  ORDER BY raw.observed_at_ms,proof.occurrence_id LIMIT ?10
+    AND typed_device.namespace_id=(SELECT namespace_id FROM manifest_scope)
+    AND typed_device.owner_id=(SELECT typed_owner_id FROM manifest_scope) AND typed_device.original_id=?11
+  WHERE proof.manifest_key=(SELECT typed_manifest_id FROM manifest_scope) AND proof.stream='usage'
+    AND proof.observed_at_ms>=?6 AND proof.observed_at_ms<?7
+    AND (proof.observed_at_ms,proof.occurrence_id)>(?8,?9)
+    AND raw.observed_at_ms=proof.observed_at_ms
+  ORDER BY proof.observed_at_ms,proof.occurrence_id LIMIT ?10
 )
 SELECT records.* FROM page CROSS JOIN typed_telemetry_compatibility_records records
   ON records.storage_row_id=page.storage_row_id
@@ -74,7 +74,7 @@ ORDER BY page.observed_at_ms,page.occurrence_id`;
 
 export async function readTypedV11UsageAnalysisPage(db: D1Database, options: {
   sourceNamespace: string; pin?: V11SourcePin; snapshot?: V11GenerationSnapshot; day: string; from: string; to: string;
-  afterTime: string; afterOccurrence: string; pageSize?: number;
+  afterTime: string; afterOccurrence: string; pageSize?: number; fenceSnapshot?: boolean;
 }): Promise<Array<{ occurrence_id: string; observed_at: string; provider: string; session_uuid: string | null; record_json: string }>> {
   const { sourceNamespace, day, from, to, afterTime, afterOccurrence } = options;
   if (options.pin !== undefined && options.snapshot !== undefined) {
@@ -108,7 +108,7 @@ export async function readTypedV11UsageAnalysisPage(db: D1Database, options: {
     ? (await db.prepare(TYPED_V11_USAGE_PAGE_SQL).bind(pin!.participantId, pin!.generationId,
       day, Date.parse(from), Date.parse(to), Date.parse(afterTime), afterOccurrence,
       pageSize).all<Record<string, unknown>>()).results
-    : (await assertTypedV11GenerationSnapshotLive(db, snapshotCopy),
+    : (options.fenceSnapshot === false ? undefined : await assertTypedV11GenerationSnapshotLive(db, snapshotCopy),
       (await db.prepare(TYPED_V11_USAGE_SNAPSHOT_PAGE_SQL).bind(
         snapshotCopy.sourceNamespace, snapshotCopy.participantId, snapshotCopy.generationId, snapshotCopy.deviceId, day,
         Date.parse(from), Date.parse(to), Date.parse(afterTime), afterOccurrence, pageSize,

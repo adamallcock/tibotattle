@@ -35,6 +35,7 @@ import type { V11SourcePin } from "./telemetry-v11-domain";
 import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
 import { typedTelemetryReadNamespace } from "./typed-telemetry-read-layout";
 import { readTypedV11UsageAnalysisPage, TYPED_V11_ANALYSIS_PAGE_SIZE } from "./typed-v11-analysis-reader";
+import type { V11GenerationSnapshot } from "./typed-v11-quota-reader";
 import {
   V11_QUOTA_ACQUISITION_VERSION,
   createV11QuotaAcquisitionCheckpoint,
@@ -59,6 +60,7 @@ const MAX_TRACKS = 256;
 const MAX_SESSIONS = 100_000;
 const MAX_USAGE_BUCKETS = 120_000;
 const MAX_HAZARD_INTERVALS = 240_000;
+export const MAX_V11_USAGE_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 const TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
 const SLOTS = new Set(["primary", "secondary", "five_hour", "seven_day", "other", "unknown"]);
 
@@ -69,6 +71,14 @@ export interface V11AnalysisOptions {
   maxWindowedUsageRows?: number;
   /** Resolved from the database contract at the public entrypoint. */
   typedSourceNamespace?: string | null;
+  /** Exact retained generation for graph-only resumable work. Ordinary public
+   * readers omit this and remain current-head strict. */
+  generationSnapshot?: V11GenerationSnapshot;
+  /** The graph driver has fenced generationSnapshot around this bounded group. */
+  generationSnapshotFenced?: boolean;
+  /** Testable hard cap for durable reducer state. Production uses 8 MiB so
+   * frame encoding, hashing and D1 transport stay below the Worker heap. */
+  maxUsageCheckpointBytes?: number;
   /** A complete bounded quota acquisition. When present, quota PLAN/QUOTA SQL
    * is skipped; the caller remains responsible for source-pin fences and any
    * resumable checkpoint durability. */
@@ -445,7 +455,9 @@ async function visitUsage(
     for (;;) {
       const pageSize = options.typedSourceNamespace ? TYPED_V11_ANALYSIS_PAGE_SIZE : PAGE_SIZE;
       const result = options.typedSourceNamespace ? { results: await readTypedV11UsageAnalysisPage(db, {
-        sourceNamespace: options.typedSourceNamespace, pin: context.pin, day: day.observed_day,
+        sourceNamespace: options.typedSourceNamespace,
+        ...(options.generationSnapshot ? { snapshot: options.generationSnapshot,
+          fenceSnapshot:!options.generationSnapshotFenced } : { pin: context.pin }), day: day.observed_day,
         from: context.start, to: context.end, afterTime: cursorTime, afterOccurrence: cursorId,
       }) } : await db.prepare(V11_USAGE_PAGE_SQL).bind(
         context.pin.participantId, context.pin.generationId, day.observed_day, context.start, context.end,
@@ -504,6 +516,7 @@ class Hazards {
   private indexes = new Map<string, { starts: number[]; maximumEnds: number[] }>();
   private intervalCount = 0;
   exceeded = false;
+  get size():number{return this.intervalCount;}
   snapshot(): Array<{ key: string; intervals: Interval[] }> {
     if (this.indexes.size > 0) throw new Error("v11 hazards already finalized");
     return [...this.entries].map(([key, intervals]) => ({ key,
@@ -868,6 +881,14 @@ function serializeHazards(hazards: Hazards): V11UsageReductionCheckpoint["hazard
   return hazards.snapshot();
 }
 
+function reductionPayloadBytes(previous:Map<string,{time:number;scope:string|null}>,hazards:Hazards,
+  scalarBuckets:Map<string,CostBucket>,modelCosts:Map<string,{observedAtMs:number;model:string;costNanousd:number}>,
+  poisoned:Set<number>):number{
+  const payload=JSON.stringify({previous:[...previous],hazards:serializeHazards(hazards),
+    scalarBuckets:[...scalarBuckets],modelCosts:[...modelCosts],poisoned:[...poisoned]});
+  return new TextEncoder().encode(payload).byteLength;
+}
+
 async function usageDays(db: D1Database, context: Context): Promise<string[] | Refusal> {
   const rows = (await db.prepare(`SELECT day_row.observed_day FROM telemetry_v11_domain_days day_row
     WHERE day_row.generation_id = ? AND day_row.observed_day >= ? AND day_row.observed_day < ?
@@ -1010,6 +1031,9 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
       usageEventCount:0, unpricedUsageEventCount:0, attributionUnresolved:false };
   }
   const runtime=usageReductionRuntime(context);
+  const checkpointByteLimit=options.maxUsageCheckpointBytes??MAX_V11_USAGE_CHECKPOINT_BYTES;
+  if(!Number.isSafeInteger(checkpointByteLimit)||checkpointByteLimit<64*1024
+    ||checkpointByteLimit>MAX_V11_USAGE_CHECKPOINT_BYTES)throw new Error("v11 usage reduction checkpoint byte limit invalid");
   let state = prior ? structuredClone(prior) : null;
   if (state && (!validateV11UsageReductionCheckpoint(state)
       ||!v11QuotaAcquisitionIdentityMatches(state.identity,reductionIdentity)))
@@ -1043,7 +1067,9 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
     const day = state.days[state.dayIndex]!;
     budget.remainingQueries -= 1;
     const rows = options.typedSourceNamespace ? await readTypedV11UsageAnalysisPage(db, { sourceNamespace:options.typedSourceNamespace,
-      pin, day, from:context.start, to:context.end, afterTime:state.cursorTime, afterOccurrence:state.cursorOccurrence })
+      ...(options.generationSnapshot ? { snapshot:options.generationSnapshot,
+        fenceSnapshot:!options.generationSnapshotFenced } : { pin }),
+      day, from:context.start, to:context.end, afterTime:state.cursorTime, afterOccurrence:state.cursorOccurrence })
       : (await db.prepare(V11_USAGE_PAGE_SQL).bind(pin.participantId,pin.generationId,day,context.start,context.end,
         state.cursorTime,state.cursorOccurrence,PAGE_SIZE).all<UsageRow>()).results;
     if(rows.length>maximum-state.rowsRead){state.rowsRead=maximum;state.commonRefusal="windowed_usage_limit_exceeded";
@@ -1055,6 +1081,11 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
       if (!event) continue;
       reduceScalar(context,runtime,state,hazards,scalarBuckets,event);
       reduceModel(context,runtime,state,modelCosts,poisoned,event);
+    }
+    const retainedEntries=previous.size+hazards.size+scalarBuckets.size+modelCosts.size+poisoned.size;
+    if((checkpointByteLimit<MAX_V11_USAGE_CHECKPOINT_BYTES||retainedEntries>4096)
+      &&reductionPayloadBytes(previous,hazards,scalarBuckets,modelCosts,poisoned)>checkpointByteLimit){
+      state.commonRefusal="reduced_usage_limit_exceeded";state.complete=true;break;
     }
     if (state.complete) break;
     const pageSize = options.typedSourceNamespace ? TYPED_V11_ANALYSIS_PAGE_SIZE : PAGE_SIZE;

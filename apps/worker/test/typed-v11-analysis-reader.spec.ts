@@ -290,6 +290,17 @@ describe("typed active-domain analytical reads",()=>{
     expect(capped).toMatchObject({complete:true,rowsRead:1,commonRefusal:'windowed_usage_limit_exceeded',
       previous:[],hazards:[],scalarBuckets:[],modelCosts:[],poisoned:[]});
     expect(validateV11UsageReductionCheckpoint(capped)).toBe(true);
+    const oversized=structuredClone(shared.checkpoint.usage);
+    oversized.complete=false;oversized.dayIndex=0;oversized.cursorTime=day()+"T00:00:00.000Z";
+    oversized.cursorOccurrence="";oversized.rowsRead=2000;oversized.commonRefusal=null;
+    oversized.previous=Array.from({length:2000},(_,index)=>({key:`session:${index.toString().padStart(5,'0')}:`+'x'.repeat(64),
+      time:Date.parse(day()+"T01:00:00.000Z")+index,scope:null}));
+    expect(validateV11UsageReductionCheckpoint(oversized)).toBe(true);
+    const bounded=await advanceV11UsageReduction(typed(),scope.pin,{...reductionOptions,maxUsageCheckpointBytes:64*1024},
+      {remainingQueries:32,deadlineMs:Date.now()+20_000},oversized,1,shared.checkpoint.identity);
+    expect(bounded).toMatchObject({complete:true,commonRefusal:'reduced_usage_limit_exceeded',
+      previous:[],hazards:[],scalarBuckets:[],modelCosts:[],poisoned:[]});
+    expect(validateV11UsageReductionCheckpoint(bounded)).toBe(true);
     const meter=createD1InvocationBudget(20);
     const repeated=await computeStorageGraphResult({...bindings,source:meter.wrap(typed()),target:meter.wrap(bindings.target)},scope);
     expect(repeated.state==="complete"&&repeated.reused).toBe(true);
@@ -328,8 +339,11 @@ describe("typed active-domain analytical reads",()=>{
       WHERE s.source_id=? AND s.owner_digest=? AND s.method=? AND h.retired=0`)
       .bind(namespace,owner.ownerDigest,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<string>('control_json');
     expect(JSON.parse(control!).phase).toBe('finish');
-    expect(observed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s')).length).toBe(1);
-    expect(observed.queries.filter(sql=>sql.includes('r.id AS physical_id'))).toHaveLength(9);
+    // Retained-generation work performs a fixed capture/live fence around the
+    // whole grouped read; it must not repeat the authority query per page.
+    expect(observed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s')).length).toBe(5);
+    expect(observed.queries.filter(sql=>sql.includes('AS physical_id')
+      &&sql.includes('typed_telemetry_owner_time'))).toHaveLength(9);
     expect(observed.queries.length).toBeLessThanOrEqual(25);
     expect(targetObserved.queries.length).toBeLessThanOrEqual(40);
     expect(observed.queries.length+targetObserved.queries.length).toBeLessThanOrEqual(65);
@@ -441,7 +455,7 @@ describe("typed active-domain analytical reads",()=>{
     const resumed=observePreparedSql(typed());
     expect((await computeStorageGraphResult({...bindings,source:resumed.database},scope,{maxQueries:900})).state).toBe('complete');
     expect(resumed.queries.filter(sql=>sql.includes('r.id AS physical_id'))).toHaveLength(0);
-    expect(resumed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s'))).toHaveLength(0);
+    expect(resumed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s'))).toHaveLength(5);
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_community_graph_results
       WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind(namespace,owner.ownerDigest).first<number>('n')).toBe(1);
   },120_000);

@@ -9,6 +9,7 @@ import { decodeV11UsageReductionCheckpoint,encodeV11UsageReductionCheckpoint,
  V11_USAGE_REDUCTION_COMPONENTS } from './quota-analysis-v11';
 import type { StorageV1HistoryCheckpoint } from './storage-v1-history';
 import type { StorageV11HistoryCheckpoint } from './storage-v11-history';
+import { isV11GenerationSnapshot } from './typed-v11-quota-reader';
 export type StorageHistoryCheckpoint=StorageV1HistoryCheckpoint|StorageV11HistoryCheckpoint;
 export const STORAGE_HISTORY_PART_BYTES=128*1024,STORAGE_HISTORY_CONTROL_BYTES=16*1024;
 export const STORAGE_HISTORY_MAX_PARTS=1024,STORAGE_HISTORY_MAX_WRITES=32;
@@ -42,9 +43,12 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
  }
  if(control.source==='v1.1'){
   createV11QuotaAcquisitionCheckpoint(control.identity);
+  const snapshot=control.snapshot===null||control.snapshot===undefined?undefined:control.snapshot;
+  if(snapshot!==undefined&&(!isV11GenerationSnapshot(snapshot)||snapshot.sourceNamespace!==control.layout.slice('typed-v11:'.length)))throw fail();
+  const snapshotField=snapshot===undefined?{}:{snapshot};
   if(control.phase==='acquisition'){
    for(const name of V11_QUOTA_WORK_COMPONENTS)components[name]??=[];
-   return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
+   return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,...snapshotField,
     phase:'acquisition',acquisition:decodeV11QuotaWorkCheckpoint(control.identity,control.acquisition,components)};
   }
   const acquisition={identity:control.identity,planAnchors:components.planAnchors??[],quotaRows:components.quotaRows??[]};
@@ -54,11 +58,11 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
    const usage=decodeV11UsageReductionCheckpoint(control.usage,
     Object.fromEntries(V11_USAGE_REDUCTION_COMPONENTS.map(name=>[name,components[name]??[]])));
    if(!same(usage.identity,control.identity))throw fail();
-   return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
+   return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,...snapshotField,
     phase:'usage',acquisition,usage};
   }
   if(Object.keys(components).some(k=>!['planAnchors','quotaRows'].includes(k)))throw fail();
-  return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
+  return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,...snapshotField,
    phase:'finish',acquisition};
  }
  if(Object.hasOwn(control,'source'))throw fail();
@@ -78,6 +82,8 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):
  if('source'in checkpoint){
   if(checkpoint.source!=='v1.1')throw fail();
   if(checkpoint.layout!==`typed-v11:${key.sourceNamespace}`)throw fail();
+  if(checkpoint.snapshot!==undefined&&(!isV11GenerationSnapshot(checkpoint.snapshot)
+    ||checkpoint.snapshot.sourceNamespace!==key.sourceNamespace))throw fail();
   createV11QuotaAcquisitionCheckpoint(checkpoint.identity);
   const usage=checkpoint.phase==='usage'?encodeV11UsageReductionCheckpoint(checkpoint.usage):null;
   const components:Record<string,unknown[]>=checkpoint.phase==='acquisition'
@@ -85,7 +91,7 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):
    :{planAnchors:checkpoint.acquisition.planAnchors,quotaRows:checkpoint.acquisition.quotaRows,
      ...(usage?.components??{})};
   const control=canonicalJson({version:1,source:'v1.1',day:checkpoint.day,layout:checkpoint.layout,
-   identity:checkpoint.identity,phase:checkpoint.phase,
+   identity:checkpoint.identity,snapshot:checkpoint.snapshot??null,phase:checkpoint.phase,
    acquisition:checkpoint.phase==='acquisition'?encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).control:null,
    usage:usage?.control??null});
   if(size(control)>STORAGE_HISTORY_CONTROL_BYTES)throw fail();
