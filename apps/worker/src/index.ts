@@ -1,5 +1,14 @@
 import { createD1TelemetryV1ContributionStore } from "./d1-telemetry-v1-contribution-store";
 import type { TelemetryV1ContributionStore } from "./telemetry-v1-contribution-store";
+import { createD1TelemetryV1ContributionReader } from "./d1-telemetry-v1-contribution-reader";
+import type {
+  StoredTelemetryV1Chunk,
+  TelemetryV1ContributionReader,
+} from "./telemetry-v1-contribution-reader";
+import {
+  buildTelemetryV1ReplayReceipt,
+  resolveTelemetryV1Replay,
+} from "./telemetry-v1-contribution-reader";
 import { allowanceReconstructionMode } from "./allowance-reconstruction";
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
@@ -194,8 +203,8 @@ import {
   validateTelemetryV11StagedChunk,
 } from "./telemetry-v11-repository";
 import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "./telemetry-v11-domain";
-import { parseTelemetryStorageMode, resolveTelemetryStorageMode, readTelemetryV11StorageReplay, persistTelemetryV11StorageChunk,
-  readTelemetryV1StorageReceipt } from "./telemetry-storage-mode";
+import { parseTelemetryStorageMode, resolveTelemetryStorageMode, readTelemetryV11StorageReplay,
+  persistTelemetryV11StorageChunk } from "./telemetry-storage-mode";
 import {
   claimPendingAppleSignInHandoff,
   completeAppleSignInHandoff,
@@ -289,6 +298,11 @@ function telemetryV1ContributionStore(env: Env): TelemetryV1ContributionStore {
   return createD1TelemetryV1ContributionStore(env.USAGE_MONITOR_DB);
 }
 
+/** Select the provider for v1 replay/current metadata reads at composition. */
+function telemetryV1ContributionReader(env: Env): TelemetryV1ContributionReader {
+  return createD1TelemetryV1ContributionReader(env.USAGE_MONITOR_DB);
+}
+
 /**
  * The reviewed migration-only snapshot has one deliberately storage-free
  * liveness response. It lets the normal deployment wrapper bind the immutable
@@ -352,18 +366,13 @@ import {
 } from "./telemetry-v1";
 import {
   MAX_SYNC_MANIFEST_RANGE_DAYS,
-  currentTelemetryV1Chunk,
-  existingTelemetryV1ChunkByEnvelopeDigest,
-  telemetryV1AcknowledgedThroughDay,
   telemetryV1ChunkAdmission,
   telemetryV1ChunkAdmissionError,
   telemetryV1ChunkCount,
-  telemetryV1ChunkId,
   telemetryV1DeviceConsentCurrent,
   telemetryV1DeviceForUploadAuthorization,
   telemetryV1SyncManifest,
   telemetryV1SyncState,
-  type TelemetryV1ChunkRow,
 } from "./telemetry-v1-repository";
 import {
   readPublishedCommunityDailyAggregatesWithAllowanceState,
@@ -2453,29 +2462,12 @@ async function handleTelemetryContribution(
 }
 
 async function telemetryV1ChunkReceipt(
-  env: Env,
-  row: TelemetryV1ChunkRow,
+  reader: TelemetryV1ContributionReader,
+  row: StoredTelemetryV1Chunk,
   deviceId: string,
 ): Promise<Response> {
-  const acknowledgedThroughDay = await telemetryV1AcknowledgedThroughDay(
-    env.USAGE_MONITOR_DB,
-    row.participant_id,
-    deviceId,
-  );
   return jsonResponse(
-    {
-      schemaVersion: "telemetry-chunk-receipt-v1.0",
-      contributionId: row.id,
-      chunkId: telemetryV1ChunkId(row),
-      chunkRevision: row.revision,
-      status: row.superseded_at === null ? "accepted" : "superseded",
-      replayed: true,
-      recordCounts: {
-        declared: row.record_count,
-        accepted: row.accepted_record_count,
-      },
-      acknowledgedThroughDay,
-    },
+    await buildTelemetryV1ReplayReceipt(reader, row, deviceId),
     202,
     { "idempotency-replayed": "true" },
   );
@@ -2576,6 +2568,7 @@ async function handleTelemetryV1Contribution(
   env: Env,
   quarantine: QuarantineObjectStore,
   contributions: TelemetryV1ContributionStore,
+  reader: TelemetryV1ContributionReader,
 ): Promise<Response> {
   if (uploadAuthorization.authorizationKind !== "device") {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
@@ -2590,15 +2583,12 @@ async function handleTelemetryV1Contribution(
     uploadAuthorization.authorizationId,
   );
   if (deviceId === null) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
-  const storageMode = await resolveTelemetryStorageMode(env.USAGE_MONITOR_DB, env, "v1");
-  const envelopeReplay = await existingTelemetryV1ChunkByEnvelopeDigest(
-    env.USAGE_MONITOR_DB,
+  const envelopeReplay = await reader.byEnvelope(
     participant.id,
     envelopeDigestValue,
   );
   if (envelopeReplay) {
-    return telemetryV1ChunkReceipt(env, await readTelemetryV1StorageReceipt(
-      env.USAGE_MONITOR_DB, storageMode, envelopeReplay, deviceId), deviceId);
+    return telemetryV1ChunkReceipt(reader, envelopeReplay, deviceId);
   }
 
   const plaintext = await decryptSyntheticEnvelope(
@@ -2629,20 +2619,18 @@ async function handleTelemetryV1Contribution(
   if (await sha256Hex(canonicalRecords) !== chunk.chunkDigest) {
     throw new ApiError(400, "CHUNK_DIGEST_MISMATCH");
   }
-  const current = await currentTelemetryV1Chunk(
-    env.USAGE_MONITOR_DB,
-    participant.id,
+  const current = await reader.current({
+    participantId: participant.id,
     deviceId,
-    chunk.stream,
-    chunk.chunkDay,
-    chunk.chunkSeq,
-  );
+    stream: chunk.stream,
+    chunkDay: chunk.chunkDay,
+    chunkSeq: chunk.chunkSeq,
+  });
   // Content replay is scoped to the FULL chunk identity: only this exact
   // (device, stream, day, seq) chunk with an equal digest is a replay. An
   // equal digest anywhere else is a coincidence and proceeds as an insert.
-  if (current && current.chunk_digest === chunk.chunkDigest) {
-    return telemetryV1ChunkReceipt(env, await readTelemetryV1StorageReceipt(
-      env.USAGE_MONITOR_DB, storageMode, current, deviceId), deviceId);
+  if (current && current.chunkDigest === chunk.chunkDigest) {
+    return telemetryV1ChunkReceipt(reader, current, deviceId);
   }
   // Same-digest replay answered above, so a declared revision must extend
   // the current one by exactly one; anything else means the client's cursor
@@ -2697,8 +2685,7 @@ async function handleTelemetryV1Contribution(
       createdAt,
     });
     const [acknowledgedThroughDay, settledAdmission] = await Promise.all([
-      telemetryV1AcknowledgedThroughDay(
-        env.USAGE_MONITOR_DB,
+      reader.acknowledgedThroughDay(
         participant.id,
         deviceId,
       ),
@@ -2720,28 +2707,23 @@ async function handleTelemetryV1Contribution(
     }, 202);
   } catch (error) {
     // The journal batch can have committed before this response was built.
-    // The exact envelope can already have been superseded by a newer chunk;
-    // its retained receipt still owns its ciphertext. Only a completed lookup
-    // and validation can distinguish our committed object from an orphan.
-    const envelopeResult = await existingTelemetryV1ChunkByEnvelopeDigest(
-      env.USAGE_MONITOR_DB, participant.id, envelopeDigestValue);
-    const replay = envelopeResult ?? await currentTelemetryV1Chunk(
-      env.USAGE_MONITOR_DB,
-      participant.id,
-      deviceId,
-      chunk.stream,
-      chunk.chunkDay,
-      chunk.chunkSeq,
+    // Recover the retained envelope even if a correction has superseded it,
+    // then check an equal-content current winner. Only successful reads proving
+    // both absent permit removing this request's orphaned quarantine object.
+    const replay = await resolveTelemetryV1Replay(
+      reader,
+      envelopeDigestValue,
+      {
+        participantId: participant.id,
+        deviceId,
+        stream: chunk.stream,
+        chunkDay: chunk.chunkDay,
+        chunkSeq: chunk.chunkSeq,
+      },
+      chunk.chunkDigest,
     );
-    if (replay && replay.chunk_digest === chunk.chunkDigest) {
-      const retained = await readTelemetryV1StorageReceipt(env.USAGE_MONITOR_DB, storageMode, replay, deviceId);
-      if (retained.id !== chunkRowId) {
-        try {
-          await env.QUARANTINE.delete(r2Key);
-          await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
-        } catch { /* durable pending registration retains the cleanup obligation */ }
-      }
-      return telemetryV1ChunkReceipt(env, retained, deviceId);
+    if (replay !== null) {
+      return telemetryV1ChunkReceipt(reader, replay, deviceId);
     }
     try {
       await quarantine.delete(r2Key);
@@ -2988,7 +2970,13 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       ? await handleTelemetryContribution(request, body, participant, claimed, env, quarantine)
       : declaredEnvelopeVersion === TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION
         ? await handleTelemetryV1Contribution(
-          body, participant, claimed, env, quarantine, telemetryV1ContributionStore(env),
+          body,
+          participant,
+          claimed,
+          env,
+          quarantine,
+          telemetryV1ContributionStore(env),
+          telemetryV1ContributionReader(env),
         )
         : declaredEnvelopeVersion === TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION
           ? await handleTelemetryV11Contribution(body, participant, sourceDeviceId, claimed.authorizationId, env, quarantine)

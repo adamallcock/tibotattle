@@ -23,6 +23,7 @@ CREATE TABLE consents (
 CREATE TABLE authorizations (
   id text PRIMARY KEY, participant_id text NOT NULL REFERENCES participants,
   device_id text NOT NULL REFERENCES devices, envelope_digest text NOT NULL,
+  CHECK(envelope_digest ~ '^[0-9a-f]{64}$'),
   state text NOT NULL CHECK(state IN ('consuming','consumed','revoked')),
   lease_expires_at timestamptz, expires_at timestamptz NOT NULL,
   consumed_contribution_id text, consumed_at timestamptz
@@ -31,8 +32,10 @@ CREATE TABLE chunks (
   id text PRIMARY KEY, participant_id text NOT NULL REFERENCES participants,
   device_id text NOT NULL REFERENCES devices, stream text NOT NULL CHECK(stream IN ('usage','quota','session')),
   chunk_day date NOT NULL, chunk_seq integer NOT NULL CHECK(chunk_seq >= 0), revision integer NOT NULL CHECK(revision > 0),
-  chunk_digest text NOT NULL, envelope_digest text NOT NULL,
+  chunk_digest text NOT NULL CHECK(chunk_digest ~ '^[0-9a-f]{64}$'),
+  envelope_digest text NOT NULL CHECK(envelope_digest ~ '^[0-9a-f]{64}$'),
   parser_version text NOT NULL, record_count integer NOT NULL CHECK(record_count BETWEEN 1 AND 200),
+  accepted_record_count integer NOT NULL CHECK(accepted_record_count BETWEEN 0 AND record_count),
   object_key text NOT NULL UNIQUE, authorization_id text NOT NULL UNIQUE REFERENCES authorizations,
   created_at timestamptz NOT NULL, superseded_at timestamptz,
   UNIQUE(participant_id,envelope_digest),
@@ -58,6 +61,35 @@ CREATE TABLE projection_requests (
   projection text NOT NULL CHECK(projection IN ('daily_aggregate','current_analysis','model_history','prepared_source','quota_fit','public_graph')),
   revision bigint NOT NULL, PRIMARY KEY(participant_id,chunk_day,projection)
 );
+
+-- This is the one PostgreSQL projection effect qualified in this lane. It
+-- mirrors the v1 dependency trigger from migrations/0051 and the social-owner
+-- gate added by migrations/0059. Dependencies are participant-scoped; the
+-- composition cache has no participant identity, so a social source evicts
+-- every matching retained history day in the affected inclusive 100-day
+-- range. This is a test-only projection fragment, not full D1 parity.
+CREATE TABLE community_model_history_dependencies (
+  participant_id text NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  day date NOT NULL,
+  from_day date NOT NULL,
+  dependency_revision bigint NOT NULL DEFAULT 0
+    CHECK(dependency_revision >= 0 AND dependency_revision < 9007199254740991),
+  input_fingerprint text CHECK(input_fingerprint IS NULL OR input_fingerprint ~ '^[0-9a-f]{64}$'),
+  verified_input_revision bigint CHECK(verified_input_revision IS NULL OR
+    (verified_input_revision >= 0 AND verified_input_revision < 9007199254740991)),
+  PRIMARY KEY(participant_id, day),
+  CHECK(from_day = day - 100)
+);
+CREATE INDEX community_model_history_dependencies_day
+  ON community_model_history_dependencies(day, participant_id);
+
+CREATE TABLE community_model_composition_days (
+  day date PRIMARY KEY,
+  payload_json text NOT NULL,
+  computed_at timestamptz NOT NULL,
+  history_method_version text
+);
+
 -- Separate durable object journal: insert does not delete this row on success or failure.
 CREATE TABLE pending_objects (contribution_id text PRIMARY KEY, object_key text NOT NULL UNIQUE);
 
@@ -122,9 +154,9 @@ BEGIN
   END IF;
   BEGIN
     INSERT INTO chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,chunk_digest,
-      envelope_digest,parser_version,record_count,object_key,authorization_id,created_at)
+      envelope_digest,parser_version,record_count,accepted_record_count,object_key,authorization_id,created_at)
     VALUES(cid,pid,did,stream_name,day_value,sequence_value,revision_value,chunk->>'chunkDigest',
-      input->>'envelopeDigest',chunk->>'parserVersion',n,input->>'objectKey',aid,created);
+      input->>'envelopeDigest',chunk->>'parserVersion',n,n,input->>'objectKey',aid,created);
   EXCEPTION WHEN unique_violation THEN RAISE EXCEPTION USING ERRCODE='P1005', MESSAGE='revision conflict'; END;
   BEGIN
     INSERT INTO records(chunk_id,participant_id,device_id,stream,occurrence_id,observed_at,payload)
@@ -146,4 +178,111 @@ BEGIN
 END;
 $$;
 REVOKE ALL ON FUNCTION insert_contribution(jsonb) FROM PUBLIC;
+
+-- Keep the model-history invalidation in the same transaction as the chunk
+-- journal. An append invalidates the participant's dependency rows and, only
+-- for social owners, evicts matching history composition days. A correction
+-- is intentionally two source mutations in this harness (supersede then
+-- insert), so it produces the same +2 dependency revision effect as the D1
+-- update/insert path. The composition DELETE is global across the
+-- materialized day table while retaining the D1 day-range bound.
+CREATE FUNCTION invalidate_model_history_v1_insert() RETURNS trigger
+LANGUAGE plpgsql SET search_path = tibotattle_v1_test, pg_catalog AS $$
+BEGIN
+  UPDATE community_model_history_dependencies
+     SET dependency_revision = dependency_revision + 1,
+         input_fingerprint = NULL,
+         verified_input_revision = NULL
+   WHERE participant_id = NEW.participant_id
+     AND day BETWEEN NEW.chunk_day AND NEW.chunk_day + 100;
+
+  IF EXISTS (
+    SELECT 1 FROM participants
+     WHERE id = NEW.participant_id AND owner_kind = 'social'
+  ) THEN
+    DELETE FROM community_model_composition_days
+     WHERE history_method_version IS NOT NULL
+       AND day BETWEEN NEW.chunk_day AND NEW.chunk_day + 100;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER community_model_history_v1_insert
+AFTER INSERT ON chunks FOR EACH ROW
+WHEN (NEW.superseded_at IS NULL)
+EXECUTE FUNCTION invalidate_model_history_v1_insert();
+
+CREATE FUNCTION invalidate_model_history_v1_update() RETURNS trigger
+LANGUAGE plpgsql SET search_path = tibotattle_v1_test, pg_catalog AS $$
+BEGIN
+  UPDATE community_model_history_dependencies
+     SET dependency_revision = dependency_revision + 1,
+         input_fingerprint = NULL,
+         verified_input_revision = NULL
+   WHERE (participant_id = OLD.participant_id
+          AND day BETWEEN OLD.chunk_day AND OLD.chunk_day + 100)
+      OR (participant_id = NEW.participant_id
+          AND day BETWEEN NEW.chunk_day AND NEW.chunk_day + 100);
+
+  IF EXISTS (
+    SELECT 1 FROM participants
+     WHERE owner_kind = 'social'
+       AND (id = OLD.participant_id OR id = NEW.participant_id)
+  ) THEN
+    DELETE FROM community_model_composition_days
+     WHERE history_method_version IS NOT NULL
+       AND (day BETWEEN OLD.chunk_day AND OLD.chunk_day + 100
+            OR day BETWEEN NEW.chunk_day AND NEW.chunk_day + 100);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER community_model_history_v1_update
+AFTER UPDATE ON chunks FOR EACH ROW
+WHEN ((OLD.superseded_at IS NULL OR NEW.superseded_at IS NULL)
+ AND (OLD.id IS DISTINCT FROM NEW.id
+      OR OLD.participant_id IS DISTINCT FROM NEW.participant_id
+      OR OLD.device_id IS DISTINCT FROM NEW.device_id
+      OR OLD.stream IS DISTINCT FROM NEW.stream
+      OR OLD.chunk_day IS DISTINCT FROM NEW.chunk_day
+      OR OLD.chunk_seq IS DISTINCT FROM NEW.chunk_seq
+      OR OLD.revision IS DISTINCT FROM NEW.revision
+      OR OLD.chunk_digest IS DISTINCT FROM NEW.chunk_digest
+      OR OLD.parser_version IS DISTINCT FROM NEW.parser_version
+      OR OLD.record_count IS DISTINCT FROM NEW.record_count
+      OR OLD.accepted_record_count IS DISTINCT FROM NEW.accepted_record_count
+      OR OLD.authorization_id IS DISTINCT FROM NEW.authorization_id
+      OR OLD.created_at IS DISTINCT FROM NEW.created_at
+      OR OLD.superseded_at IS DISTINCT FROM NEW.superseded_at))
+EXECUTE FUNCTION invalidate_model_history_v1_update();
+
+CREATE FUNCTION invalidate_model_history_v1_delete() RETURNS trigger
+LANGUAGE plpgsql SET search_path = tibotattle_v1_test, pg_catalog AS $$
+BEGIN
+  UPDATE community_model_history_dependencies
+     SET dependency_revision = dependency_revision + 1,
+         input_fingerprint = NULL,
+         verified_input_revision = NULL
+   WHERE participant_id = OLD.participant_id
+     AND day BETWEEN OLD.chunk_day AND OLD.chunk_day + 100;
+
+  IF EXISTS (
+    SELECT 1 FROM participants
+     WHERE id = OLD.participant_id AND owner_kind = 'social'
+  ) THEN
+    DELETE FROM community_model_composition_days
+     WHERE history_method_version IS NOT NULL
+       AND day BETWEEN OLD.chunk_day AND OLD.chunk_day + 100;
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER community_model_history_v1_delete
+AFTER DELETE ON chunks FOR EACH ROW
+WHEN (OLD.superseded_at IS NULL)
+EXECUTE FUNCTION invalidate_model_history_v1_delete();
+
 RESET search_path;

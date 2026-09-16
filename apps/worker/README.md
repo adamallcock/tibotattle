@@ -41,7 +41,9 @@ latest verified external state.
   The input carries an `objectKey` and opaque predecessor ID; it contains no
   D1 binding or provider row. The existing repository entrypoint delegates to
   the same adapter. Authentication, schema/current-predecessor validation,
-  quarantine journaling, reads and receipts remain in the existing application.
+  quarantine journaling and admission remain in the existing application.
+  Replay/current-chunk reads and the shared replay receipt now use
+  `TelemetryV1ContributionReader`; D1 is selected at the composition root.
   This extracts one transaction; it does not make the full contribution API
   portable. A replacement adapter must preserve authorization consumption,
   admission, record ownership, correction rollback and all projection effects.
@@ -405,12 +407,25 @@ test database behind; inspect ownership before cleanup. The normal Worker test
 lane excludes these tests and does not need PostgreSQL.
 
 The qualification covers append/correction, record ownership, authorization,
-admission races and transaction failure. It records dirty projection requests,
-not D1's materialized projections, graph-preservation behavior, deletion ledger,
-or account-scoped v1.1 transport. Lost COMMIT acknowledgement returns a sanitized
-503 without retry; the test verifies durable state by readback. Application-level
-receipt reconciliation still needs a PostgreSQL read adapter.
+admission races and transaction failure. The PostgreSQL reader implements
+historical envelope replay, exact current identity and acknowledgement dates;
+D1 and PostgreSQL use the same replay receipt builder. A failed read is never
+reported as a missing contribution. Storage calls require prior authentication;
+the reader does not make consumed upload authorizations reusable.
+
+Lost COMMIT acknowledgement returns a sanitized storage error without retry.
+The application reconciles retained envelopes before checking current content;
+this preserves a committed object's reference even if a later correction has
+superseded it. The PostgreSQL lane tests the same receipt construction after an
+uncertain commit, but does not yet compose the full HTTP/auth/quarantine flow.
+
+The test schema performs actual model-history dependency invalidation and
+composition-day eviction for append/correction. Other projection families remain
+dirty requests; graph preservation, publication, deletion ledger, quarantine
+reconciliation and account-scoped v1.1 transport remain open.
 
 See the [qualification record](../../docs/plans/2026-09-15-postgres-contribution-qualification.md)
-for evidence and remaining gates. No GCP database or runtime is configured by
-this lane.
+for the first transaction evidence and the
+[read/projection follow-up](../../docs/plans/2026-09-15-postgres-replay-projections.md)
+for subsequent qualification. No GCP database or runtime is configured by this
+lane.

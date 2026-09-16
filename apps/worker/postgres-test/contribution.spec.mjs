@@ -3,13 +3,16 @@ import { readFile, lstat, realpath } from 'node:fs/promises';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import pg from 'pg';
+import { registerModelHistoryTests } from './model-history-fixtures.mjs';
 import { createExperimentalPostgresTelemetryV1ContributionStore } from '../src/postgres-telemetry-v1-contribution-store.ts';
+import { createExperimentalPostgresTelemetryV1ContributionReader } from '../src/postgres-telemetry-v1-contribution-reader.ts';
+import { buildTelemetryV1ReplayReceipt, resolveTelemetryV1Replay } from '../src/telemetry-v1-contribution-reader.ts';
 import { parseTelemetryV1Chunk } from '../src/telemetry-v1.ts';
 import { canonicalJson } from '../src/canonical-json.ts';
 
 const schema = 'tibotattle_v1_test';
 const database = `tibotattle_pg_test_${randomBytes(12).toString('hex')}`;
-const tables = ['records','chunks','authorizations','consents','devices','admission_windows',
+const tables = ['community_model_history_dependencies','community_model_composition_days','records','chunks','authorizations','consents','devices','admission_windows',
   'input_versions','projection_requests','pending_objects','participants'];
 const pid = 'synthetic-participant', did = 'synthetic-device';
 const day = '2026-09-01';
@@ -17,7 +20,7 @@ const consent = {telemetrySchemaVersion:'telemetry-contribution-v1.0',
   fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',
   privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'};
 const digest = value => createHash('sha256').update(canonicalJson(value)).digest('hex');
-let admin, pool, store, created = false;
+let admin, pool, store, reader, created = false;
 
 beforeAll(async () => {
   const socket = process.env.PG_TEST_SOCKET;
@@ -38,6 +41,7 @@ beforeAll(async () => {
   }
   const options = {host:socket, port, user:'postgres', password:'synthetic-local-only', database:'postgres',
     ssl:false, options:'', application_name:'tibotattle-pg-test',
+    types:{getTypeParser(oid,format){return oid===1082 ? value=>value : pg.types.getTypeParser(oid,format);}},
     connectionTimeoutMillis:3000, statement_timeout:12000, idleTimeoutMillis:1000, max:6};
   admin = new pg.Pool(options);
   expect(Number((await admin.query('SHOW server_version_num')).rows[0].server_version_num)).toBeGreaterThanOrEqual(160000);
@@ -45,8 +49,10 @@ beforeAll(async () => {
   created = true;
   pool = new pg.Pool({...options, database});
   store = createExperimentalPostgresTelemetryV1ContributionStore(pool);
+  reader = createExperimentalPostgresTelemetryV1ContributionReader(pool);
   // Qualification cannot silently succeed before its schema is installed.
   await expect(store.insert(await input())).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  await expect(reader.byEnvelope(pid,'synthetic-missing')).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   await pool.query(await readFile(new URL('./schema.sql', import.meta.url),'utf8'));
 });
 afterAll(async () => {
@@ -65,21 +71,21 @@ beforeEach(async () => {
   await pool.query(`INSERT INTO ${schema}.consents VALUES($1,$2,$3,$4,$5)`,[pid,did,...Object.values(consent)]);
 });
 
-async function input({sequence=0, revision=1, supersedes=null, occurrence=randomUUID(), count=1, stream='session'}={}) {
+async function input({sequence=0, revision=1, supersedes=null, occurrence=randomUUID(), count=1, stream='session',chunkDay=day}={}) {
   const records = Array.from({length:count},(_,i)=> {
     const identity = `${occurrence}-${i}`;
     if (stream==='quota') return {schemaVersion:'quota-observation-v1.0', observationId:identity,
-      observedTime:`${day}T12:00:00.000Z`,provider:'synthetic',planType:'pro',planVariant:'unknown',
-      limitId:'synthetic',slot:'primary',usedPercent:20,windowDurationMinutes:300,resetsAt:`${day}T17:00:00.000Z`};
-    if (stream==='usage') return {schemaVersion:'usage-event-v1.0',eventId:identity,eventTime:`${day}T12:00:00.000Z`,
+      observedTime:`${chunkDay}T12:00:00.000Z`,provider:'synthetic',planType:'pro',planVariant:'unknown',
+      limitId:'synthetic',slot:'primary',usedPercent:20,windowDurationMinutes:300,resetsAt:`${chunkDay}T17:00:00.000Z`};
+    if (stream==='usage') return {schemaVersion:'usage-event-v1.0',eventId:identity,eventTime:`${chunkDay}T12:00:00.000Z`,
       sessionUuid:identity,provider:'synthetic',modelId:'synthetic',speedMode:'unknown',apiServiceTier:'unknown',
       surface:'unknown',billingSurface:'unknown',reasoningEffort:'unknown',agentScope:'unknown',outcome:'unknown',
       totalInputContextTokens:null,components:{inputUncachedTokens:1,inputCacheReadTokens:null,inputCacheWriteTokens:null,
         outputTextTokens:2,outputReasoningTokens:null,outputCombinedTokens:null}};
-    return {schemaVersion:'session-dimension-v1.0',sessionUuid:identity,firstEventTime:`${day}T12:00:00.000Z`,
+    return {schemaVersion:'session-dimension-v1.0',sessionUuid:identity,firstEventTime:`${chunkDay}T12:00:00.000Z`,
       provider:'synthetic',toolClassCounts:{read:1}};
   });
-  const chunk = parseTelemetryV1Chunk({schemaVersion:'telemetry-contribution-v1.0',chunkId:`${stream}:${day}:${sequence}`,
+  const chunk = parseTelemetryV1Chunk({schemaVersion:'telemetry-contribution-v1.0',chunkId:`${stream}:${chunkDay}:${sequence}`,
     chunkRevision:revision,chunkDigest:digest(records),parserVersion:'synthetic',consent,records});
   const id = `synthetic-${randomUUID()}`;
   return {participantId:pid,deviceId:did,uploadAuthorizationId:`auth-${id}`,chunkId:id,
@@ -177,7 +183,7 @@ it.each([
   ['revoked upload',`UPDATE ${schema}.authorizations SET state='revoked'`,'UPLOAD_AUTH_INVALID'],
   ['expired lease',`UPDATE ${schema}.authorizations SET lease_expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
   ['expired upload',`UPDATE ${schema}.authorizations SET expires_at=clock_timestamp()-interval '1 second'`,'UPLOAD_AUTH_INVALID'],
-  ['wrong digest',`UPDATE ${schema}.authorizations SET envelope_digest='wrong'`,'UPLOAD_AUTH_INVALID'],
+  ['wrong digest',`UPDATE ${schema}.authorizations SET envelope_digest='${'f'.repeat(64)}'`,'UPLOAD_AUTH_INVALID'],
   ['consent drift',`UPDATE ${schema}.consents SET dictionary_version='stale'`,'TELEMETRY_CONSENT_INVALID'],
 ])('refuses %s without any partial state',async(_label,sql,code)=> {
   const value=await grant(await input()); await pool.query(sql); const before=await snapshot();
@@ -219,6 +225,11 @@ it('reconciles a real commit whose acknowledgement is lost, with no automatic re
   const value=await grant(await input());
   await expect(uncertain.insert(value)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   expect(commits).toBe(1);expect(discarded).toBe(true);
+  const retained=await reader.byEnvelope(pid,value.envelopeDigest);
+  expect(await buildTelemetryV1ReplayReceipt(reader,retained,did)).toEqual({
+    schemaVersion:'telemetry-chunk-receipt-v1.0',contributionId:value.chunkId,chunkId:value.chunk.chunkId,
+    chunkRevision:1,status:'accepted',replayed:true,recordCounts:{declared:1,accepted:1},acknowledgedThroughDay:day,
+  });
   expect((await rows('chunks'))[0]).toMatchObject({id:value.chunkId,envelope_digest:value.envelopeDigest,object_key:value.objectKey});
   expect((await rows('records'))[0].payload).toEqual(value.chunk.records[0]);
   const before=await snapshot();await expect(store.insert(value)).rejects.toMatchObject({code:'UPLOAD_AUTH_INVALID'});
@@ -269,4 +280,57 @@ it('bounds lock contention and leaves no partial state',async()=> {
     await expect(store.insert(value)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
     expect(await snapshot()).toEqual(before);
   } finally {await blocker.query('ROLLBACK');blocker.release();}
+});
+
+it('replays historical envelopes and selects only the current exact identity',async()=> {
+  expect(await reader.byEnvelope(pid,'synthetic-missing')).toBeNull();
+  expect(await reader.acknowledgedThroughDay(pid,did)).toBeNull();
+  const first=await grant(await input());await store.insert(first);
+  const second=await grant(await input({revision:2,supersedes:{id:first.chunkId}}));await store.insert(second);
+  const historical=await reader.byEnvelope(pid,first.envelopeDigest);
+  expect(await buildTelemetryV1ReplayReceipt(reader,historical,did)).toMatchObject({
+    contributionId:first.chunkId,chunkRevision:1,status:'superseded',replayed:true,acknowledgedThroughDay:day,
+  });
+  const identity={participantId:pid,deviceId:did,stream:first.chunk.stream,chunkDay:day,chunkSeq:0};
+  expect((await reader.current(identity)).id).toBe(second.chunkId);
+  // A later correction must not hide the committed envelope during recovery.
+  expect((await resolveTelemetryV1Replay(reader,first.envelopeDigest,identity,first.chunk.chunkDigest)).id).toBe(first.chunkId);
+  expect(await resolveTelemetryV1Replay(reader,'synthetic-missing',identity,'different-digest')).toBeNull();
+  expect((await resolveTelemetryV1Replay(reader,'synthetic-missing',identity,second.chunk.chunkDigest)).id).toBe(second.chunkId);
+  expect(await reader.current({...identity,chunkSeq:1})).toBeNull();
+  expect(await reader.current({...identity,stream:'quota'})).toBeNull();
+  expect(await reader.current({...identity,deviceId:'synthetic-other-device'})).toBeNull();
+  expect(await reader.current({...identity,participantId:'synthetic-other-owner'})).toBeNull();
+  expect(await reader.byEnvelope('synthetic-other-owner',first.envelopeDigest)).toBeNull();
+  expect(await reader.acknowledgedThroughDay(pid,'synthetic-other-device')).toBeNull();
+  expect(await reader.acknowledgedThroughDay('synthetic-other-owner',did)).toBeNull();
+});
+it('does not convert a failed PostgreSQL replay lookup into absence',async()=> {
+  const broken=createExperimentalPostgresTelemetryV1ContributionReader({async connect(){
+    const client=await pool.connect();return {async query(sql,values){
+      if(sql.startsWith('SELECT')) {await client.end();throw new Error('synthetic disconnect');}
+      return client.query(sql,values);
+    },release(discard){client.release(discard);}};
+  }});
+  const value=await grant(await input());await store.insert(value);const before=await snapshot();
+  await expect(broken.byEnvelope(pid,value.envelopeDigest)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await snapshot()).toEqual(before);
+  expect((await reader.byEnvelope(pid,value.envelopeDigest)).id).toBe(value.chunkId);
+});
+
+it('builds replay counts from stored acceptance and acknowledges the requesting device',async()=> {
+  const value=await grant(await input({count:2}));await store.insert(value);
+  await pool.query(`UPDATE ${schema}.chunks SET accepted_record_count=1 WHERE id=$1`,[value.chunkId]);
+  const retained=await reader.byEnvelope(pid,value.envelopeDigest);
+  expect(await buildTelemetryV1ReplayReceipt(reader,retained,'synthetic-other-device')).toMatchObject({
+    status:'accepted',recordCounts:{declared:2,accepted:1},acknowledgedThroughDay:null,
+  });
+});
+
+registerModelHistoryTests({pool:()=>pool,store:()=>store,input,grant,rows,snapshot,schema,pid,did});
+
+it('acknowledges the maximum current day without inferring contiguous coverage',async()=> {
+  const first=await grant(await input());await store.insert(first);
+  const later=await grant(await input({chunkDay:'2026-09-03'}));await store.insert(later);
+  expect(await reader.acknowledgedThroughDay(pid,did)).toBe('2026-09-03');
 });
