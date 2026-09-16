@@ -3,7 +3,9 @@
     "allowJs": false,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "lib": ["ES2024"],
+    "lib": [
+      "ES2024"
+    ],
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "noEmit": true,
@@ -23,6 +25,9 @@
     "src/**/*.ts",
     "test/**/*.ts",
     "vitest.config.ts",
-    "worker-configuration.d.ts"
+    "worker-configuration.d.ts",
+    "portable-test/**/*.ts",
+    "vitest.portable.config.ts",
+    "gcs-test/worker.ts"
   ]
 }

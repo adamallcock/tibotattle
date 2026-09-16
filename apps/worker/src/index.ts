@@ -211,6 +211,10 @@ import {
   reconcilePendingQuarantineObjects,
 } from "./quarantine-reconciliation";
 import {
+  createR2QuarantineObjectStore,
+} from "./r2-quarantine-object-store";
+import type { QuarantineObjectStore } from "./quarantine-object-store";
+import {
   hasIdentityReenrollmentCooldownDigest,
   hasDeletionTombstone,
   identityReenrollmentCooldownDigest,
@@ -231,7 +235,7 @@ import {
   type WorkerRouteMatch,
   type WorkerRouteMethod,
 } from "./route-registry";
-import { handleSparkleAppcastGuard } from "./sparkle-appcast-guard";
+import { handleSparkleAppcastGuard } from "./cloudflare-release-guard";
 import {
   assertAdminCsrf,
   assertCsrf,
@@ -271,6 +275,11 @@ function configuredDeploymentSourceCommit(env: Env): string | null {
     throw new ApiError(503, "DEPLOYMENT_SOURCE_COMMIT_INVALID");
   }
   return configured;
+}
+
+/** Worker composition root for the contribution quarantine port. */
+function quarantineObjectStore(env: Env): QuarantineObjectStore {
+  return createR2QuarantineObjectStore(env.QUARANTINE);
 }
 
 /**
@@ -2149,6 +2158,7 @@ async function handleSyntheticContribution(
     authorizationKind: "session" | "device";
   },
   env: Env,
+  quarantine: QuarantineObjectStore,
 ): Promise<Response> {
   if (participant.consentVersion !== "synthetic-preview-v0.1") {
     throw new ApiError(400, "SYNTHETIC_REQUIRED");
@@ -2180,7 +2190,7 @@ async function handleSyntheticContribution(
 
   await putTrackedQuarantineObject(
     env.USAGE_MONITOR_DB,
-    env.QUARANTINE,
+    quarantine,
     {
       contributionId,
       objectKind: "synthetic",
@@ -2189,7 +2199,7 @@ async function handleSyntheticContribution(
     },
     JSON.stringify(envelope),
     {
-      httpMetadata: { contentType: "application/json" },
+      contentType: "application/json",
       customMetadata: {
         contributionId,
         schemaVersion: envelope.schemaVersion,
@@ -2210,7 +2220,7 @@ async function handleSyntheticContribution(
       createdAt,
     );
   } catch (error) {
-    await env.QUARANTINE.delete(r2Key);
+    await quarantine.delete(r2Key);
     await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
       contributionId,
       r2Key,
@@ -2244,6 +2254,7 @@ async function handleTelemetryContribution(
     authorizationKind: "session" | "device";
   },
   env: Env,
+  quarantine: QuarantineObjectStore,
 ): Promise<Response> {
   const accountScoped = participant.consentVersion
     === ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION;
@@ -2325,7 +2336,7 @@ async function handleTelemetryContribution(
   const createdAt = new Date().toISOString();
   await putTrackedQuarantineObject(
     env.USAGE_MONITOR_DB,
-    env.QUARANTINE,
+    quarantine,
     {
       contributionId,
       objectKind: "telemetry",
@@ -2334,7 +2345,7 @@ async function handleTelemetryContribution(
     },
     JSON.stringify(envelope),
     {
-      httpMetadata: { contentType: "application/json" },
+      contentType: "application/json",
       customMetadata: {
         contributionId,
         schemaVersion: envelope.schemaVersion,
@@ -2415,7 +2426,7 @@ async function handleTelemetryContribution(
     // remove the object later instead of treating that storage failure as
     // permission to lose a committed envelope.
     try {
-      await env.QUARANTINE.delete(r2Key);
+      await quarantine.delete(r2Key);
       await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
         contributionId,
         r2Key,
@@ -2473,6 +2484,7 @@ async function handleTelemetryV11Contribution(
   deviceId: string,
   authorizationId: string,
   env: Env,
+  quarantine: QuarantineObjectStore,
 ): Promise<Response> {
   if ((participant.ownerKind === "social"
       && participant.consentVersion !== TELEMETRY_CONSENT_VERSION)
@@ -2505,11 +2517,11 @@ async function handleTelemetryV11Contribution(
   // The one-use authorization binds the exact HTTP body, including its
   // envelope serialization, rather than a second digest definition.
   const envelopeDigest = await sha256Hex(body.raw);
-  await putTrackedQuarantineObject(env.USAGE_MONITOR_DB, env.QUARANTINE, {
+  await putTrackedQuarantineObject(env.USAGE_MONITOR_DB, quarantine, {
     contributionId: chunkRowId, objectKind: "telemetry", r2Key,
     registeredAt: new Date().toISOString(),
   }, body.raw, {
-    httpMetadata: { contentType: "application/json" },
+    contentType: "application/json",
     customMetadata: { contributionId: chunkRowId,
       schemaVersion: TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION,
       plaintextSchemaVersion: chunk.schemaVersion, synthetic: "false" },
@@ -2520,9 +2532,8 @@ async function handleTelemetryV11Contribution(
     });
     if (result.replay && result.contributionId !== chunkRowId) {
       // A content replay won after our first lookup. Only our unreferenced
-      // object is removable; the retained winner is never touched. A lost
-      // response from OUR committed transaction keeps its own retained object.
-      await env.QUARANTINE.delete(r2Key);
+      // object is removable; the retained winner is never touched.
+      await quarantine.delete(r2Key);
       await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
     }
     return receipt(result.contributionId, result.manifestId, result.replay);
@@ -2534,7 +2545,7 @@ async function handleTelemetryV11Contribution(
     // A completed lookup proves there is no retained matching write. Failed
     // cleanup leaves its registration for owner-safe reconciliation.
     try {
-      await env.QUARANTINE.delete(r2Key);
+      await quarantine.delete(r2Key);
       await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, { contributionId: chunkRowId, r2Key });
     } catch { /* durable pending registration is the cleanup journal */ }
     throw error;
@@ -2556,6 +2567,7 @@ async function handleTelemetryV1Contribution(
     authorizationKind: "session" | "device";
   },
   env: Env,
+  quarantine: QuarantineObjectStore,
 ): Promise<Response> {
   if (uploadAuthorization.authorizationKind !== "device") {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
@@ -2646,7 +2658,7 @@ async function handleTelemetryV1Contribution(
   const createdAt = new Date().toISOString();
   await putTrackedQuarantineObject(
     env.USAGE_MONITOR_DB,
-    env.QUARANTINE,
+    quarantine,
     {
       contributionId: chunkRowId,
       objectKind: "telemetry",
@@ -2655,7 +2667,7 @@ async function handleTelemetryV1Contribution(
     },
     JSON.stringify(envelope),
     {
-      httpMetadata: { contentType: "application/json" },
+      contentType: "application/json",
       customMetadata: {
         contributionId: chunkRowId,
         schemaVersion: TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION,
@@ -2738,7 +2750,7 @@ async function handleTelemetryV1Contribution(
       return telemetryV1ChunkReceipt(env, retained, deviceId);
     }
     try {
-      await env.QUARANTINE.delete(r2Key);
+      await quarantine.delete(r2Key);
       await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
         contributionId: chunkRowId,
         r2Key,
@@ -2917,6 +2929,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertUploadIngressConfiguration(env);
   assertUploadIngressRateLimitBindings(env);
+  const quarantine = quarantineObjectStore(env);
   const bodyReadPolicy = uploadIngressBodyReadPolicy(env);
   const authorizationHeader = contributionRequestPreflight(request);
   await assertUploadIngressRequestAllowed(
@@ -2978,12 +2991,12 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       { participantId: participant.id, deviceId: sourceDeviceId },
       telemetryTransportSchemaForEnvelope(declaredEnvelopeVersion));
     const response = declaredEnvelopeVersion === "telemetry-envelope-v0.1"
-      ? await handleTelemetryContribution(request, body, participant, claimed, env)
+      ? await handleTelemetryContribution(request, body, participant, claimed, env, quarantine)
       : declaredEnvelopeVersion === TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION
-        ? await handleTelemetryV1Contribution(body, participant, claimed, env)
+        ? await handleTelemetryV1Contribution(body, participant, claimed, env, quarantine)
         : declaredEnvelopeVersion === TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION
-          ? await handleTelemetryV11Contribution(body, participant, sourceDeviceId, claimed.authorizationId, env)
-          : await handleSyntheticContribution(body, participant, claimed, env);
+          ? await handleTelemetryV11Contribution(body, participant, sourceDeviceId, claimed.authorizationId, env, quarantine)
+          : await handleSyntheticContribution(body, participant, claimed, env, quarantine);
     await heartbeat.assertActive();
     const receipt = await response.clone().json<{ contributionId?: unknown }>();
     if (typeof receipt.contributionId !== "string") {
@@ -3331,7 +3344,12 @@ async function handleAdminAction(
     }
     if (Object.hasOwn(body.value, "participantErasure")) {
       const participantId = parseParticipantErasureRequest(body.value);
-      const result = await eraseParticipantAsOwner(env, identityKey, participantId);
+      const result = await eraseParticipantAsOwner(
+        env,
+        identityKey,
+        participantId,
+        quarantineObjectStore(env),
+      );
       return jsonResponse(
         { schemaVersion: "admin-action-v0.1", action, result },
         200,
@@ -4001,17 +4019,17 @@ export async function handleRequest(
         restore_replay_complete: number;
       }>();
       if (!retention) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-      if (!env.QUARANTINE
-          || typeof Reflect.get(env.QUARANTINE, "head") !== "function"
-          || typeof Reflect.get(env.QUARANTINE, "put") !== "function"
-          || typeof Reflect.get(env.QUARANTINE, "delete") !== "function") {
-        throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-      }
       await env.USAGE_MONITOR_DB.prepare("SELECT 1").first();
       await env.DELETION_LEDGER.prepare(
         "SELECT schema_version FROM deletion_tombstones LIMIT 1",
       ).first();
-      await env.QUARANTINE.head("__usage_monitor_health_probe__");
+      let quarantine: QuarantineObjectStore;
+      try {
+        quarantine = quarantineObjectStore(env);
+        await quarantine.head("__usage_monitor_health_probe__");
+      } catch {
+        throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+      }
       const deploymentSourceCommit = configuredDeploymentSourceCommit(env);
       return noStore(jsonResponse({
         status: "ok",
@@ -4330,6 +4348,7 @@ export async function runScheduledMaintenance(
     console.warn(JSON.stringify(log));
     return log;
   }
+  const quarantine = quarantineObjectStore(env);
   const reconstructionMode = allowanceReconstructionMode(env);
   // Typed ingestion is serviced by the independent analytics scheduler. Never
   // run the old raw-JSON backfill against empty compatibility tables or create
@@ -4503,7 +4522,7 @@ export async function runScheduledMaintenance(
     const lifecycle = await runBackendLifecycle(
       env.USAGE_MONITOR_DB,
       env.DELETION_LEDGER,
-      env.QUARANTINE,
+      quarantine,
       scheduledTime,
       () => ownsRenewedMaintenanceLease(
         env.USAGE_MONITOR_DB,
@@ -4540,7 +4559,7 @@ export async function runScheduledMaintenance(
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const reconciliation = await reconcilePendingQuarantineObjects(
       env.USAGE_MONITOR_DB,
-      env.QUARANTINE,
+      quarantine,
       scheduledTime,
     );
     quarantineReconciliationComplete =

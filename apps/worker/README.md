@@ -22,6 +22,19 @@ latest verified external state.
   operational control state.
 - R2 stores bounded encrypted/quarantined contribution objects and signed-update
   publication objects under separate lifecycle contracts.
+- Release publication is composed through `src/release-guard-application.ts`.
+  Its `createReleaseGuardApplication` accepts a `ReleaseObjectStore`, a durable
+  `ReleaseNonceStore`, signing settings and a reviewed channel contract.
+  `src/cloudflare-release-guard.ts` keeps the existing Worker bound to R2/D1.
+  `src/gcs-release-object-store.ts` implements the object contract for GCS using
+  an injected access-token provider; no environment flag switches production.
+  Opaque conditional tokens stay separate from wire ETags and content SHA-256.
+  Contribution quarantine uses `src/quarantine-object-store.ts` across ingest,
+  reconciliation, retention and owner erasure; `quarantineObjectStore(env)` in
+  `src/index.ts` selects its R2 adapter. The journal/lifecycle policy stays in
+  those callers. GCS quarantine erasure is not implemented. See the
+  [GCP adapter integration review](../../docs/reviews/2026-09-15-gcp-adapter-integration.md)
+  for wiring and remaining qualification gates.
 - `ContributionCoordinator` is the Durable Object used for contribution
   coordination; it is not a substitute for D1 durability.
 - Static assets under `apps/web/public` provide the acquisition, documentation,
@@ -335,3 +348,21 @@ storage, commands, or this README:
 ```bash
 npm run docs:check
 ```
+
+## Portable release checks
+
+Run `npm run typecheck:portable` and `npm run test:portable` in this directory.
+The typecheck excludes Cloudflare ambient types. The test lane runs in Node,
+uses synthetic signatures and a mocked GCS HTTP transport, and proves the
+application can use a non-Cloudflare adapter. These checks also run in `check`.
+They do not authenticate to Google or qualify real cloud resources.
+
+### Isolated GCS test host
+
+The separate `gcs-test/wrangler.jsonc` configuration composes the GCS release
+adapter with a persistent local D1 nonce database. Use `npm run gcs:test:db:local`,
+`npm run gcs:test:bundle`, and `npm run gcs:test:dev`. See the
+[GCS test runbook](../../docs/runbooks/2026-09-15-gcs-adapter-tests.md)
+for repeatable run namespaces, credential handling, receipts and bounded cleanup.
+The [live test asset receipt](../../docs/reviews/2026-09-15-gcs-test-assets.md)
+records the first real-GCS qualification; it is not deployment evidence.

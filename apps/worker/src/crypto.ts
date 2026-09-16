@@ -1,3 +1,5 @@
+import { sha256 } from "./content-digest";
+export { sha256, sha256Hex } from "./content-digest";
 import { MAX_PLAINTEXT_BYTES } from "./constants";
 import { ApiError } from "./errors";
 import type { SyntheticEnvelope } from "./validation";
@@ -5,7 +7,6 @@ import type { TelemetryEnvelope } from "./telemetry-validation";
 import type { TelemetryV11Envelope } from "@app-usagemonitor/telemetry-contract";
 import { parseStrictJson } from "./strict-json";
 
-const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 
 interface PublicRsaJwk extends JsonWebKey {
@@ -102,16 +103,6 @@ export function encodeBase64Url(value: Uint8Array): string {
 
 export function randomSecret(byteLength = 32): string {
   return encodeBase64Url(crypto.getRandomValues(new Uint8Array(byteLength)));
-}
-
-export async function sha256(value: string | Uint8Array): Promise<Uint8Array> {
-  const bytes = typeof value === "string" ? encoder.encode(value) : value;
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-}
-
-export async function sha256Hex(value: string | Uint8Array): Promise<string> {
-  const digest = await sha256(value);
-  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export async function hashCapability(

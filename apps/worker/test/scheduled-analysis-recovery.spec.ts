@@ -54,6 +54,7 @@ import { runScheduledMaintenance } from "../src/index";
 import { validCachedAdminCommunityAllowancePreview } from "../src/admin-community-allowance";
 import { readCachedAdminMetricsHistory } from "../src/admin-metrics-history";
 import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
+import { createR2QuarantineObjectStore } from "../src/r2-quarantine-object-store";
 import { createV11DeviceFixture } from "./helpers/telemetry-v11";
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
 import { V1_PLAN_QUOTA_PAGE_SQL, V1_FIT_QUOTA_PAGE_SQL, V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL } from "../src/quota-fit-projection";
@@ -61,6 +62,7 @@ import { V1PreparedEvidenceUnavailableError } from "../src/prepared-v1-evidence"
 
 interface Bindings extends Env { TEST_MIGRATIONS: D1Migration[]; TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[] }
 const runtime = env as Bindings, db = () => runtime.USAGE_MONITOR_DB;
+const quarantineStore = () => createR2QuarantineObjectStore(runtime.QUARANTINE);
 const NOW = Date.parse("2026-09-01T12:00:00.000Z"), DAY = "2026-08-01", TIME = `${DAY}T00:00:00.000Z`;
 const PARTICIPANT = "synthetic-scheduled-participant";
 type Observation = { binding: "primary" | "ledger"; sql: string };
@@ -222,7 +224,7 @@ describe("actual scheduled resumable analysis recovery", () => {
     for (const database of [db(), runtime.DELETION_LEDGER]) await database.prepare(insert)
       .bind("d".repeat(64), new Date(Date.now() - 7_200_000).toISOString(), expired).run();
     const r2Key = "telemetry/synthetic-scheduled-orphan";
-    await putTrackedQuarantineObject(db(), runtime.QUARANTINE, { contributionId: "contribution:synthetic-orphan", objectKind: "telemetry",
+    await putTrackedQuarantineObject(db(), quarantineStore(), { contributionId: "contribution:synthetic-orphan", objectKind: "telemetry",
       r2Key, registeredAt: new Date(NOW - 7_200_000).toISOString() }, "{}");
     await queue();
     let optionalSeen = false;

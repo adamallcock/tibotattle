@@ -45,6 +45,7 @@ import { initializeStorageSource } from "../src/analytics-delivery";
 import { initializeStorageAnalyticsRuntime } from "../src/storage-analytics-runtime";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeTypedV11Admission } from "../src/typed-v11-admission";
+import { createR2QuarantineObjectStore } from "../src/r2-quarantine-object-store";
 import { ownerErase, ownerErasureRequest } from "./helpers/owner-erasure";
 import { beginAdminOperation } from "../src/admin-operations";
 import { finishParticipantDeletion, markParticipantDeleting } from "../src/repository";
@@ -125,6 +126,10 @@ function testBindings(
     USAGE_MONITOR_DB: bindings.USAGE_MONITOR_DB,
     ...overrides,
   } as Env;
+}
+
+function quarantineStore(bucket: R2Bucket = testBindings().QUARANTINE) {
+  return createR2QuarantineObjectStore(bucket);
 }
 
 function d1PrepareProxy(
@@ -2093,6 +2098,20 @@ describe("synthetic usage monitor service", () => {
     });
   });
 
+  it("fails health closed when the quarantine binding is missing a capability", async () => {
+    const malformed = {
+      head: async () => null,
+      put: async () => undefined,
+    } as unknown as R2Bucket;
+    const health = await api("/api/health", {}, testBindings({
+      QUARANTINE: malformed,
+    }));
+    expect(health.status).toBe(503);
+    await expect(health.json()).resolves.toMatchObject({
+      error: { code: "BACKEND_STORAGE_UNAVAILABLE" },
+    });
+  });
+
   it("exposes the validated non-secret deployment source commit when configured", async () => {
     const response = await api("/api/health", {}, testBindings({
       DEPLOYMENT_SOURCE_COMMIT: "c26823c",
@@ -3582,7 +3601,7 @@ describe("synthetic usage monitor service", () => {
         .bind(participant.participantId).first<{ state: string; deletion_session_id: string }>();
       expect(before?.state).toBe("deleting");
       expect(await hasDeletionTombstone(testBindings().DELETION_LEDGER, participant.participantId)).toBe(true);
-      const maintenance = await runBackendLifecycle(database, testBindings().DELETION_LEDGER, baseBucket);
+      const maintenance = await runBackendLifecycle(database, testBindings().DELETION_LEDGER, quarantineStore(baseBucket));
       expect(maintenance).toMatchObject({ restoredParticipantsSuppressed: 0, restoreReplayComplete: true });
       expect(await database.prepare("SELECT state, deletion_session_id FROM participants WHERE id = ?")
         .bind(participant.participantId).first()).toEqual(before);
@@ -3611,13 +3630,16 @@ describe("synthetic usage monitor service", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    await expect(runBackendLifecycle(testBindings().USAGE_MONITOR_DB, testBindings().DELETION_LEDGER, bucket))
-      .rejects.toThrow("interrupted restore cleanup");
+    await expect(runBackendLifecycle(testBindings().USAGE_MONITOR_DB, testBindings().DELETION_LEDGER, quarantineStore(bucket)))
+      .rejects.toMatchObject({
+        name: "QuarantineObjectStorageUnavailableError",
+        message: "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE",
+      });
     expect(await testBindings().USAGE_MONITOR_DB.prepare("SELECT state, deletion_session_id FROM participants WHERE id = ?")
       .bind(participant.participantId).first()).toEqual({ state: "deleting", deletion_session_id: null });
     expect((await ownerErase(testBindings(), participant.participantId)).status).toBe(409);
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(1);
-    const retry = await runBackendLifecycle(testBindings().USAGE_MONITOR_DB, testBindings().DELETION_LEDGER, testBindings().QUARANTINE);
+    const retry = await runBackendLifecycle(testBindings().USAGE_MONITOR_DB, testBindings().DELETION_LEDGER, quarantineStore());
     expect(retry).toMatchObject({ restoredParticipantsSuppressed: 1, restoreReplayComplete: true });
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
     expect(await testBindings().USAGE_MONITOR_DB.prepare("SELECT id FROM participants WHERE id = ?")
@@ -3910,7 +3932,7 @@ describe("synthetic usage monitor service", () => {
     const result = await runBackendLifecycle(
       testBindings().USAGE_MONITOR_DB,
       testBindings().DELETION_LEDGER,
-      testBindings().QUARANTINE,
+      quarantineStore(),
       Date.parse("2026-07-25T00:00:00.000Z"),
     );
     expect(result).toEqual({
@@ -4027,7 +4049,7 @@ describe("synthetic usage monitor service", () => {
     await expect(runBackendLifecycle(
       baseDb,
       testBindings().DELETION_LEDGER,
-      testBindings().QUARANTINE,
+      quarantineStore(),
       Date.parse("2026-07-25T00:00:00.000Z"),
     )).resolves.toMatchObject({ quarantineObjectsDeleted: 0 });
     expect(await testBindings().QUARANTINE.head(accepted!.r2_key)).not.toBeNull();
@@ -4072,9 +4094,12 @@ describe("synthetic usage monitor service", () => {
     // R2 delete must never leave a row claiming its envelope is gone.
     await expect(deleteDueQuarantineObjects(
       testBindings().USAGE_MONITOR_DB,
-      failingBucket,
+      quarantineStore(failingBucket),
       "2026-07-18T00:00:00.000Z",
-    )).rejects.toThrow("injected retention R2 deletion failure");
+    )).rejects.toMatchObject({
+      name: "QuarantineObjectStorageUnavailableError",
+      message: "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE",
+    });
     const contribution = await testBindings().USAGE_MONITOR_DB.prepare(
       `SELECT quarantine_deleted_at FROM telemetry_contributions WHERE id = ?`,
     ).bind(receipt.contributionId)
@@ -4083,7 +4108,7 @@ describe("synthetic usage monitor service", () => {
 
     await expect(deleteDueQuarantineObjects(
       testBindings().USAGE_MONITOR_DB,
-      testBindings().QUARANTINE,
+      quarantineStore(),
       "2026-07-18T00:00:00.000Z",
     )).resolves.toMatchObject({ deleted: 1, complete: true });
   });
@@ -4183,7 +4208,7 @@ describe("synthetic usage monitor service", () => {
     const result = await runBackendLifecycle(
       testBindings().USAGE_MONITOR_DB,
       testBindings().DELETION_LEDGER,
-      testBindings().QUARANTINE,
+      quarantineStore(),
       Date.parse("2026-07-25T01:00:00.000Z"),
     );
     expect(result.restoredParticipantsSuppressed).toBe(1);
@@ -4268,7 +4293,7 @@ describe("synthetic usage monitor service", () => {
     const first = await runBackendLifecycle(
       testBindings().USAGE_MONITOR_DB,
       testBindings().DELETION_LEDGER,
-      testBindings().QUARANTINE,
+      quarantineStore(),
       Date.parse("2026-07-26T00:00:00.000Z"),
     );
     expect(first).toMatchObject({
@@ -4283,7 +4308,7 @@ describe("synthetic usage monitor service", () => {
     const second = await runBackendLifecycle(
       testBindings().USAGE_MONITOR_DB,
       testBindings().DELETION_LEDGER,
-      testBindings().QUARANTINE,
+      quarantineStore(),
       Date.parse("2026-07-26T01:00:00.000Z"),
     );
     expect(second).toMatchObject({
@@ -4746,7 +4771,7 @@ describe("synthetic usage monitor service", () => {
       const lifecycle = await runBackendLifecycle(
         env.USAGE_MONITOR_DB,
         env.DELETION_LEDGER,
-        env.QUARANTINE,
+        quarantineStore(env.QUARANTINE),
         now,
         undefined,
         configuredIdentityLinkSecret(env),

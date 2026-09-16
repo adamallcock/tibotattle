@@ -18,6 +18,7 @@ import {
   type QuarantineObjectKind,
 } from "../src/quarantine-reconciliation";
 import { runBackendLifecycle } from "../src/retention";
+import { createR2QuarantineObjectStore } from "../src/r2-quarantine-object-store";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -62,6 +63,10 @@ function bindings(overrides: Partial<Env> = {}): Env {
     USAGE_MONITOR_DB: runtime.USAGE_MONITOR_DB,
     ...overrides,
   } as Env;
+}
+
+function quarantineStore(bucket: R2Bucket = bindings().QUARANTINE) {
+  return createR2QuarantineObjectStore(bucket);
 }
 
 function registration(
@@ -338,12 +343,12 @@ async function markLifecycleAndReconciliationComplete(
   await runBackendLifecycle(
     bindings().USAGE_MONITOR_DB,
     bindings().DELETION_LEDGER,
-    bindings().QUARANTINE,
+    quarantineStore(),
     nowEpoch,
   );
   await reconcilePendingQuarantineObjects(
     bindings().USAGE_MONITOR_DB,
-    bindings().QUARANTINE,
+    quarantineStore(),
     nowEpoch,
   );
 }
@@ -382,17 +387,20 @@ describe("quarantine crash reconciliation", () => {
 
     await expect(putTrackedQuarantineObject(
       bindings().USAGE_MONITOR_DB,
-      terminatingBucket,
+      quarantineStore(terminatingBucket),
       object,
       "{}",
-      { httpMetadata: { contentType: "application/json" } },
-    )).rejects.toThrow("injected termination after R2 put");
+      { contentType: "application/json" },
+    )).rejects.toMatchObject({
+      name: "QuarantineObjectStorageUnavailableError",
+      message: "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE",
+    });
     expect(await pendingCount()).toBe(1);
     expect(await baseBucket.head(object.r2Key)).not.toBeNull();
 
     await expect(reconcilePendingQuarantineObjects(
       bindings().USAGE_MONITOR_DB,
-      baseBucket,
+      quarantineStore(baseBucket),
       RECONCILIATION_NOW,
     )).resolves.toEqual({
       reconciliationCutoffAt: "2026-07-27T01:00:00.000Z",
@@ -410,13 +418,13 @@ describe("quarantine crash reconciliation", () => {
     const object = registration("inside-grace", { registeredAt });
     await putTrackedQuarantineObject(
       bindings().USAGE_MONITOR_DB,
-      bindings().QUARANTINE,
+      quarantineStore(),
       object,
       "{}",
     );
     const result = await reconcilePendingQuarantineObjects(
       bindings().USAGE_MONITOR_DB,
-      bindings().QUARANTINE,
+      quarantineStore(),
       Date.parse(registeredAt)
         + QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS - 1,
     );
@@ -538,13 +546,13 @@ describe("quarantine crash reconciliation", () => {
       );
       await putTrackedQuarantineObject(
         bindings().USAGE_MONITOR_DB,
-        bindings().QUARANTINE,
+        quarantineStore(),
         object,
         "{}",
       );
       const result = await reconcilePendingQuarantineObjects(
         bindings().USAGE_MONITOR_DB,
-        bindings().QUARANTINE,
+        quarantineStore(),
         RECONCILIATION_NOW,
       );
       expect(result).toMatchObject({
@@ -562,7 +570,7 @@ describe("quarantine crash reconciliation", () => {
     const object = registration("canonical-trigger");
     await putTrackedQuarantineObject(
       bindings().USAGE_MONITOR_DB,
-      bindings().QUARANTINE,
+      quarantineStore(),
       object,
       "{}",
     );
@@ -577,7 +585,7 @@ describe("quarantine crash reconciliation", () => {
     const baseBucket = bindings().QUARANTINE;
     await putTrackedQuarantineObject(
       bindings().USAGE_MONITOR_DB,
-      baseBucket,
+      quarantineStore(baseBucket),
       object,
       "{}",
     );
@@ -588,9 +596,12 @@ describe("quarantine crash reconciliation", () => {
     });
     await expect(reconcilePendingQuarantineObjects(
       bindings().USAGE_MONITOR_DB,
-      failingBucket,
+      quarantineStore(failingBucket),
       RECONCILIATION_NOW,
-    )).rejects.toThrow("injected R2 delete failure");
+    )).rejects.toMatchObject({
+      name: "QuarantineObjectStorageUnavailableError",
+      message: "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE",
+    });
     const failed = await bindings().USAGE_MONITOR_DB.prepare(
       `SELECT state, reconciliation_complete, failure_code
          FROM quarantine_reconciliation_state WHERE singleton = 1`,
@@ -609,7 +620,7 @@ describe("quarantine crash reconciliation", () => {
 
     await expect(reconcilePendingQuarantineObjects(
       bindings().USAGE_MONITOR_DB,
-      baseBucket,
+      quarantineStore(baseBucket),
       RECONCILIATION_NOW + 1,
     )).resolves.toMatchObject({
       orphanObjectsDeleted: 1,
@@ -619,12 +630,47 @@ describe("quarantine crash reconciliation", () => {
     expect(await baseBucket.head(object.r2Key)).toBeNull();
   });
 
+  it("retains the pending journal when R2 head fails before an orphan decision", async () => {
+    const object = registration("head-retry");
+    const baseBucket = bindings().QUARANTINE;
+    await putTrackedQuarantineObject(
+      bindings().USAGE_MONITOR_DB,
+      quarantineStore(baseBucket),
+      object,
+      "{}",
+    );
+    const failingBucket = r2Proxy(baseBucket, {
+      async head() {
+        throw new Error("injected R2 head failure");
+      },
+    });
+
+    await expect(reconcilePendingQuarantineObjects(
+      bindings().USAGE_MONITOR_DB,
+      quarantineStore(failingBucket),
+      RECONCILIATION_NOW,
+    )).rejects.toMatchObject({
+      name: "QuarantineObjectStorageUnavailableError",
+      message: "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE",
+    });
+    expect(await pendingCount()).toBe(1);
+    expect(await baseBucket.head(object.r2Key)).not.toBeNull();
+
+    await expect(reconcilePendingQuarantineObjects(
+      bindings().USAGE_MONITOR_DB,
+      quarantineStore(baseBucket),
+      RECONCILIATION_NOW + 1,
+    )).resolves.toMatchObject({ orphanObjectsDeleted: 1 });
+    expect(await pendingCount()).toBe(0);
+    expect(await baseBucket.head(object.r2Key)).toBeNull();
+  });
+
   it("marks a D1 read failure retryable without deleting the object", async () => {
     const object = registration("d1-retry");
     const baseDb = bindings().USAGE_MONITOR_DB;
     await putTrackedQuarantineObject(
       baseDb,
-      bindings().QUARANTINE,
+      quarantineStore(),
       object,
       "{}",
     );
@@ -638,7 +684,7 @@ describe("quarantine crash reconciliation", () => {
     });
     await expect(reconcilePendingQuarantineObjects(
       failingDb,
-      bindings().QUARANTINE,
+      quarantineStore(),
       RECONCILIATION_NOW,
     )).rejects.toThrow("injected D1 reference read failure");
     await expect(baseDb.prepare(
@@ -649,7 +695,7 @@ describe("quarantine crash reconciliation", () => {
 
     await expect(reconcilePendingQuarantineObjects(
       baseDb,
-      bindings().QUARANTINE,
+      quarantineStore(),
       RECONCILIATION_NOW + 1,
     )).resolves.toMatchObject({
       orphanObjectsDeleted: 1,
@@ -666,7 +712,7 @@ describe("quarantine crash reconciliation", () => {
     }
     const first = await reconcilePendingQuarantineObjects(
       bindings().USAGE_MONITOR_DB,
-      bindings().QUARANTINE,
+      quarantineStore(),
       RECONCILIATION_NOW,
       2,
     );
@@ -694,7 +740,7 @@ describe("quarantine crash reconciliation", () => {
 
     const second = await reconcilePendingQuarantineObjects(
       bindings().USAGE_MONITOR_DB,
-      bindings().QUARANTINE,
+      quarantineStore(),
       RECONCILIATION_NOW + 1,
       2,
     );
@@ -725,7 +771,7 @@ describe("quarantine crash reconciliation", () => {
     const object = registration("expired-lease-race");
     const baseDb = bindings().USAGE_MONITOR_DB;
     const baseBucket = bindings().QUARANTINE;
-    await putTrackedQuarantineObject(baseDb, baseBucket, object, "{}");
+    await putTrackedQuarantineObject(baseDb, quarantineStore(baseBucket), object, "{}");
 
     const staleReferenceReached = deferred();
     const releaseStaleReference = deferred();
@@ -743,7 +789,7 @@ describe("quarantine crash reconciliation", () => {
     });
     const staleRun = reconcilePendingQuarantineObjects(
       staleDb,
-      staleBucket,
+      quarantineStore(staleBucket),
       RECONCILIATION_NOW,
     );
     const staleOutcome = expect(staleRun).rejects.toThrow(
@@ -763,7 +809,7 @@ describe("quarantine crash reconciliation", () => {
     });
     const replacementRun = reconcilePendingQuarantineObjects(
       baseDb,
-      replacementBucket,
+      quarantineStore(replacementBucket),
       RECONCILIATION_NOW + HOUR_MILLISECONDS,
     );
     await replacementHeadReached.promise;
@@ -799,7 +845,7 @@ describe("quarantine crash reconciliation", () => {
     const object = registration("expired-after-claim");
     const baseDb = bindings().USAGE_MONITOR_DB;
     const baseBucket = bindings().QUARANTINE;
-    await putTrackedQuarantineObject(baseDb, baseBucket, object, "{}");
+    await putTrackedQuarantineObject(baseDb, quarantineStore(baseBucket), object, "{}");
 
     const staleFenceReached = deferred();
     const releaseStaleFence = deferred();
@@ -817,7 +863,7 @@ describe("quarantine crash reconciliation", () => {
     });
     const staleRun = reconcilePendingQuarantineObjects(
       staleDb,
-      staleBucket,
+      quarantineStore(staleBucket),
       RECONCILIATION_NOW,
     );
     const staleOutcome = expect(staleRun).rejects.toThrow(
@@ -837,7 +883,7 @@ describe("quarantine crash reconciliation", () => {
     });
     const replacementRun = reconcilePendingQuarantineObjects(
       baseDb,
-      replacementBucket,
+      quarantineStore(replacementBucket),
       RECONCILIATION_NOW + HOUR_MILLISECONDS,
     );
     await replacementHeadReached.promise;
@@ -861,14 +907,14 @@ describe("backend readiness and scheduled observability", () => {
     const object = registration("lifecycle-phase-fence");
     const baseDb = bindings().USAGE_MONITOR_DB;
     const baseBucket = bindings().QUARANTINE;
-    await putTrackedQuarantineObject(baseDb, baseBucket, object, "{}");
+    await putTrackedQuarantineObject(baseDb, quarantineStore(baseBucket), object, "{}");
     await insertCanonicalContribution(object, "lifecycle-phase-fence");
 
     let guardCalls = 0;
     await expect(runBackendLifecycle(
       baseDb,
       bindings().DELETION_LEDGER,
-      baseBucket,
+      quarantineStore(baseBucket),
       Date.parse("2026-08-04T00:00:00.000Z"),
       async () => {
         guardCalls += 1;
@@ -888,7 +934,7 @@ describe("backend readiness and scheduled observability", () => {
   it("fences an expired maintenance owner before it can begin reconciliation", async () => {
     const object = registration("maintenance-expiry-fence");
     const baseDb = bindings().USAGE_MONITOR_DB;
-    await putTrackedQuarantineObject(baseDb, bindings().QUARANTINE, object, "{}");
+    await putTrackedQuarantineObject(baseDb, quarantineStore(), object, "{}");
 
     let successorToken = "";
     let takeoverComplete = false;
@@ -965,7 +1011,7 @@ describe("backend readiness and scheduled observability", () => {
     const object = registration("maintenance-release-takeover");
     const baseDb = bindings().USAGE_MONITOR_DB;
     const baseBucket = bindings().QUARANTINE;
-    await putTrackedQuarantineObject(baseDb, baseBucket, object, "{}");
+    await putTrackedQuarantineObject(baseDb, quarantineStore(baseBucket), object, "{}");
     let successorToken = "";
     const failingBucket = r2Proxy(baseBucket, {
       async delete() {
@@ -995,7 +1041,10 @@ describe("backend readiness and scheduled observability", () => {
     await expect(runScheduledMaintenance(
       bindings({ QUARANTINE: failingBucket }),
       RECONCILIATION_NOW,
-    )).rejects.toThrow("injected original reconciliation failure");
+    )).rejects.toMatchObject({
+      name: "QuarantineObjectStorageUnavailableError",
+      message: "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE",
+    });
     await expect(baseDb.prepare(
       `SELECT maintenance_lease_token FROM retention_state WHERE singleton = 1`,
     ).first<{ maintenance_lease_token: string | null }>()).resolves.toEqual({
@@ -1046,14 +1095,14 @@ describe("backend readiness and scheduled observability", () => {
     const object = registration("crash-before-reconciliation");
     await putTrackedQuarantineObject(
       bindings().USAGE_MONITOR_DB,
-      bindings().QUARANTINE,
+      quarantineStore(),
       object,
       "{}",
     );
     await runBackendLifecycle(
       bindings().USAGE_MONITOR_DB,
       bindings().DELETION_LEDGER,
-      bindings().QUARANTINE,
+      quarantineStore(),
       firstRunAt + 1,
     );
 
@@ -1246,7 +1295,7 @@ describe("backend readiness and scheduled observability", () => {
     for (let index = 0; index < 101; index += 1) {
       await putTrackedQuarantineObject(
         db,
-        bindings().QUARANTINE,
+        quarantineStore(),
         registration(`bulk-orphan-${index}`),
         "{}",
       );
@@ -1275,7 +1324,7 @@ describe("backend readiness and scheduled observability", () => {
     const baseBucket = bindings().QUARANTINE;
     await putTrackedQuarantineObject(
       bindings().USAGE_MONITOR_DB,
-      baseBucket,
+      quarantineStore(baseBucket),
       object,
       "{}",
     );
@@ -1293,7 +1342,10 @@ describe("backend readiness and scheduled observability", () => {
       await expect(runScheduledMaintenance(
         bindings({ QUARANTINE: failingBucket }),
         RECONCILIATION_NOW,
-      )).rejects.toThrow("injected deletion failure");
+      )).rejects.toMatchObject({
+        name: "QuarantineObjectStorageUnavailableError",
+        message: "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE",
+      });
     } finally {
       console.error = originalError;
     }

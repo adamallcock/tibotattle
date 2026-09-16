@@ -1,6 +1,6 @@
 import dogfoodSparkleReleaseContract from "./dogfood-sparkle-release-contract.json";
 import { ApiError, errorResponse } from "./errors";
-import { handleSparkleAppcastGuardForContract } from "./sparkle-appcast-guard";
+import { handleSparkleAppcastGuardForContract } from "./cloudflare-release-guard";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

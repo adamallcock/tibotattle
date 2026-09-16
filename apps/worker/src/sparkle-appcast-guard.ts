@@ -1,5 +1,12 @@
 import { ApiError, jsonResponse } from "./errors";
-import { sha256, sha256Hex } from "./crypto";
+import type { ReleaseNonceStore } from "./release-nonce-store";
+import type {
+  ReleaseObjectMetadata,
+  ReleaseObjectRead,
+  ReleaseObjectStore,
+  ReleaseObjectWriteResult,
+} from "./release-object-store";
+import { sha256, sha256Hex } from "./content-digest";
 import stableSparkleReleaseContract from "./sparkle-release-contract.json";
 
 export interface SparkleAppcastGuardContract {
@@ -45,7 +52,8 @@ export const SPARKLE_APPCAST_GUARD_MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
 export const SPARKLE_APPCAST_GUARD_MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 export const SPARKLE_APPCAST_GUARD_TIMESTAMP_SKEW_SECONDS = 300;
 export const SPARKLE_APPCAST_GUARD_NONCE_RETENTION_SECONDS =
-  SPARKLE_APPCAST_GUARD_TIMESTAMP_SKEW_SECONDS + 1;
+  // A request may arrive one skew window early and remain valid one window late.
+  2 * SPARKLE_APPCAST_GUARD_TIMESTAMP_SKEW_SECONDS + 1;
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const NONCE_PATTERN = /^[A-Za-z0-9._~-]{16,128}$/u;
@@ -95,49 +103,25 @@ interface GuardPayload {
 export interface SparkleAppcastGuardConfiguration {
   readonly enabled: boolean;
   readonly token: string | null;
-  readonly bucket: R2Bucket | null;
-  readonly nonceDatabase: D1Database | null;
+  readonly bucket: ReleaseObjectStore | null;
+  readonly nonceStore: ReleaseNonceStore | null;
   readonly publicEdKey: string | null;
   readonly publicEdKeySha256: string | null;
 }
 
-function setting(env: Env, name: string): unknown {
-  return Reflect.get(env, name);
-}
-
-function configuredBucket(env: Env): R2Bucket | null {
-  const value = setting(env, "SPARKLE_RELEASES");
-  if (value === null || typeof value !== "object"
-      || typeof Reflect.get(value, "head") !== "function"
-      || typeof Reflect.get(value, "get") !== "function"
-      || typeof Reflect.get(value, "put") !== "function") {
-    return null;
-  }
-  return value as R2Bucket;
-}
-
-function configuredNonceDatabase(env: Env): D1Database | null {
-  const value = setting(env, "USAGE_MONITOR_DB");
-  if (value === null || typeof value !== "object"
-      || typeof Reflect.get(value, "prepare") !== "function") {
-    return null;
-  }
-  return value as D1Database;
-}
-
-function disabledSparkleAppcastGuardConfiguration():
+export function disabledSparkleAppcastGuardConfiguration():
 SparkleAppcastGuardConfiguration {
   return Object.freeze({
     enabled: false,
     token: null,
     bucket: null,
-    nonceDatabase: null,
+    nonceStore: null,
     publicEdKey: null,
     publicEdKeySha256: null,
   });
 }
 
-function canonicalBase64Bytes(value: string): Uint8Array | null {
+function canonicalBase64Bytes(value: string): Uint8Array<ArrayBuffer> | null {
   if (!BASE64_PATTERN.test(value) || value.length % 4 !== 0) return null;
   let binary: string;
   try {
@@ -154,66 +138,18 @@ function configurationError(): never {
   throw new ApiError(503, "SPARKLE_APPCAST_GUARD_CONFIGURATION_INVALID");
 }
 
-/**
- * The guard is deliberately absent unless the owner supplies every reviewed
- * setting and the separately provisioned SPARKLE_RELEASES binding. Keeping
- * this check in code means a copied endpoint, bucket, or channel cannot turn
- * the route into a general R2 write API.
- */
-export function readSparkleAppcastGuardConfiguration(
-  env: Env,
-  contract: SparkleAppcastGuardContract = sparkleReleaseContract,
-): SparkleAppcastGuardConfiguration {
-  const mode = setting(env, "SPARKLE_APPCAST_GUARD_MODE");
-  if (mode === undefined || mode === "disabled") {
-    return disabledSparkleAppcastGuardConfiguration();
-  }
-  if (mode !== "enabled") configurationError();
-
-  const expectedSettings: ReadonlyArray<readonly [string, string]> = [
-    ["SPARKLE_APPCAST_GUARD_CHANNEL", contract.channel],
-    ["SPARKLE_APPCAST_GUARD_BUCKET", contract.r2Bucket],
-    ["SPARKLE_APPCAST_GUARD_APPCAST_KEY", contract.appcastObjectKey],
-    ["SPARKLE_APPCAST_GUARD_ENDPOINT_PATH", contract.guardRoute],
-    ["SPARKLE_APPCAST_GUARD_CONTENT_TYPE", contract.appcastContentType],
-    ["SPARKLE_APPCAST_GUARD_CACHE_CONTROL", contract.appcastCacheControl],
-    ["SPARKLE_APPCAST_GUARD_MAX_XML_BYTES", String(SPARKLE_APPCAST_GUARD_MAX_XML_BYTES)],
-  ];
-  for (const [name, expected] of expectedSettings) {
-    if (setting(env, name) !== expected) configurationError();
-  }
-  // A partially bound enabled route must remain indistinguishable from an
-  // absent route. The reviewed R2 bucket identity is checked statically by the
-  // deployment gate; Workers cannot introspect an R2 binding's bucket name.
-  const bucket = configuredBucket(env);
-  const nonceDatabase = configuredNonceDatabase(env);
-  if (bucket === null || nonceDatabase === null) {
-    return disabledSparkleAppcastGuardConfiguration();
-  }
-  const token = setting(env, "SPARKLE_APPCAST_GUARD_TOKEN");
-  if (typeof token !== "string" || !TOKEN_PATTERN.test(token)) {
-    configurationError();
-  }
-  const publicEdKey = setting(env, SPARKLE_APPCAST_GUARD_PUBLIC_KEY_ENV);
-  const publicEdKeySha256 = setting(
-    env,
-    SPARKLE_APPCAST_GUARD_PUBLIC_KEY_SHA256_ENV,
-  );
-  if (typeof publicEdKey !== "string"
+/** Validate owner-supplied signing configuration before admitting a request. */
+export function validateReleaseGuardSigningSettings(settings: {
+  token: unknown; publicEdKey: unknown; publicEdKeySha256: unknown;
+}): { token: string; publicEdKey: string; publicEdKeySha256: string } {
+  const { token, publicEdKey, publicEdKeySha256 } = settings;
+  if (typeof token !== "string" || !TOKEN_PATTERN.test(token)
+      || typeof publicEdKey !== "string"
       || !ED25519_PUBLIC_KEY_PATTERN.test(publicEdKey)
       || canonicalBase64Bytes(publicEdKey)?.byteLength !== 32
       || typeof publicEdKeySha256 !== "string"
-      || !SHA256_PATTERN.test(publicEdKeySha256)) {
-    configurationError();
-  }
-  return Object.freeze({
-    enabled: true,
-    token,
-    bucket,
-    nonceDatabase,
-    publicEdKey,
-    publicEdKeySha256,
-  });
+      || !SHA256_PATTERN.test(publicEdKeySha256)) configurationError();
+  return { token, publicEdKey, publicEdKeySha256 };
 }
 
 function invalidRequest(): never {
@@ -224,7 +160,7 @@ function invalidAuth(): never {
   throw new ApiError(401, "SPARKLE_APPCAST_GUARD_AUTH_INVALID");
 }
 
-function base64UrlDecode(value: string): Uint8Array {
+function base64UrlDecode(value: string): Uint8Array<ArrayBuffer> {
   if (value.length === 0 || !BASE64_URL_PATTERN.test(value)
       || value.length % 4 === 1) invalidRequest();
   const standard = value.replaceAll("-", "+").replaceAll("_", "/")
@@ -242,7 +178,7 @@ function base64UrlDecode(value: string): Uint8Array {
   return bytes;
 }
 
-async function readBoundedRequestBody(request: Request): Promise<Uint8Array> {
+async function readBoundedRequestBody(request: Request): Promise<Uint8Array<ArrayBuffer>> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
   if (contentType !== "application/json") invalidRequest();
   const declaredLength = request.headers.get("content-length");
@@ -322,7 +258,7 @@ function parseExpectedCurrent(value: unknown): ExpectedCurrentState {
 }
 
 function parsePayload(
-  body: Uint8Array,
+  body: Uint8Array<ArrayBuffer>,
   contract: SparkleAppcastGuardContract,
 ): GuardPayload {
   let value: unknown;
@@ -716,7 +652,7 @@ function storageUnavailable(
     | "appcast_put",
 ): never {
   // This endpoint is owner-authenticated and release-only. Emit only the
-  // bounded operation phase so an operator can distinguish an R2 outage from
+  // bounded operation phase so an operator can distinguish an object-store outage from
   // a malformed candidate without logging object names, request data, or
   // credentials.
   console.error(JSON.stringify({
@@ -731,16 +667,16 @@ function canonicalRequest(
   nonce: string,
   bodySha256: string,
   contract: SparkleAppcastGuardContract,
-): Uint8Array {
-  return encoder.encode(
+): Uint8Array<ArrayBuffer> {
+  return new Uint8Array(encoder.encode(
     `${contract.guardSchema}\0POST\0${contract.guardRoute}`
     + `\0${timestamp}\0${nonce}\0${bodySha256}`,
-  );
+  ));
 }
 
 async function authenticateRequest(
   request: Request,
-  body: Uint8Array,
+  body: Uint8Array<ArrayBuffer>,
   token: string,
   nowEpoch: number,
   contract: SparkleAppcastGuardContract,
@@ -757,7 +693,7 @@ async function authenticateRequest(
         > SPARKLE_APPCAST_GUARD_TIMESTAMP_SKEW_SECONDS) {
     throw new ApiError(401, "SPARKLE_APPCAST_GUARD_REPLAY_INVALID");
   }
-  let signatureBytes: Uint8Array;
+  let signatureBytes: Uint8Array<ArrayBuffer>;
   try {
     signatureBytes = base64UrlDecode(signature);
   } catch {
@@ -788,30 +724,23 @@ async function authenticateRequest(
   return { nonce };
 }
 
-/**
- * Consume the signed nonce before touching R2. D1's unique constraint makes
- * concurrent duplicate requests deterministic; the short TTL keeps this
- * coordination table bounded without introducing a global Durable Object. The
- * extra second retains a nonce through the exact accepted timestamp boundary.
+/** Consume the signed nonce before any object access. Policy owns the clock
+ * and retention window; the adapter owns the atomic claim across instances.
  */
 export async function consumeSparkleAppcastGuardNonce(
-  db: D1Database,
+  store: ReleaseNonceStore,
   nonce: string,
   nowEpoch = Date.now(),
 ): Promise<void> {
   const nowSeconds = Math.floor(nowEpoch / 1000);
-  await db.prepare(
-    "DELETE FROM sparkle_appcast_guard_nonces WHERE expires_at <= ?",
-  ).bind(nowSeconds).run();
-  const result = await db.prepare(
-    "INSERT OR IGNORE INTO sparkle_appcast_guard_nonces (nonce, expires_at) VALUES (?, ?)",
-  ).bind(
-    nonce,
-    nowSeconds + SPARKLE_APPCAST_GUARD_NONCE_RETENTION_SECONDS,
-  ).run();
-  if (result.meta.changes !== 1) {
+  const result = await store.consume(nonce, {
+    nowSeconds,
+    expiresAtSeconds: nowSeconds + SPARKLE_APPCAST_GUARD_NONCE_RETENTION_SECONDS,
+  });
+  if (result === "replay") {
     throw new ApiError(401, "SPARKLE_APPCAST_GUARD_REPLAY_INVALID");
   }
+  if (result !== "consumed") throw new Error("RELEASE_NONCE_STORAGE_UNAVAILABLE");
 }
 
 function conflictResponse(
@@ -826,27 +755,24 @@ function conflictResponse(
 }
 
 async function currentStateMatches(
-  bucket: R2Bucket,
+  bucket: ReleaseObjectStore,
   key: string,
   expected: ExpectedCurrentState,
   contract: SparkleAppcastGuardContract,
-): Promise<{ bytes: Uint8Array | null; head: R2Object | null; matches: boolean }> {
+): Promise<{ bytes: Uint8Array<ArrayBuffer> | null; head: ReleaseObjectMetadata | null; matches: boolean }> {
   const head = await bucket.head(key);
   if (expected.state === "empty") {
     return { bytes: null, head, matches: head === null };
   }
   if (head === null || head.size !== expected.bytes
-      || head.httpMetadata?.contentType
-        !== contract.appcastContentType
-      || head.httpMetadata?.cacheControl
-        !== contract.appcastCacheControl
+      || head.contentType !== contract.appcastContentType
+      || head.cacheControl !== contract.appcastCacheControl
       || (expected.etag !== null
-        && expected.etag !== head.etag
-        && expected.etag !== head.httpEtag)) {
+        && !head.entityTags.includes(expected.etag))) {
     return { bytes: null, head, matches: false };
   }
-  const object = await bucket.get(key, { onlyIf: { etagMatches: head.etag } });
-  if (object === null || !("arrayBuffer" in object)) {
+  const object = await bucket.get(key, head.version);
+  if (object.status !== "found") {
     return { bytes: null, head, matches: false };
   }
   const bytes = new Uint8Array(await object.arrayBuffer());
@@ -883,7 +809,7 @@ async function configuredSparklePublicKey(
 }
 
 async function verifySignedAppcastEnvelope(
-  bytes: Uint8Array,
+  bytes: Uint8Array<ArrayBuffer>,
   appcast: ParsedSparkleAppcast,
   publicKey: CryptoKey,
 ): Promise<void> {
@@ -907,7 +833,7 @@ async function verifySignedAppcastEnvelope(
 }
 
 async function verifyCandidateArtifact(
-  bucket: R2Bucket,
+  bucket: ReleaseObjectStore,
   enclosure: SparkleAppcastEnclosure,
   publicKey: CryptoKey,
   contract: SparkleAppcastGuardContract,
@@ -916,7 +842,7 @@ async function verifyCandidateArtifact(
       || enclosure.length > SPARKLE_APPCAST_GUARD_MAX_ARTIFACT_BYTES) {
     invalidCandidate();
   }
-  let head: R2Object | null;
+  let head: ReleaseObjectMetadata | null;
   try {
     head = await bucket.head(enclosure.objectKey);
   } catch {
@@ -924,23 +850,21 @@ async function verifyCandidateArtifact(
   }
   if (head === null
       || head.size !== enclosure.length
-      || head.httpMetadata?.contentType
-        !== contract.artifactContentType
-      || head.httpMetadata?.cacheControl
-        !== contract.artifactCacheControl) {
+      || head.contentType !== contract.artifactContentType
+      || head.cacheControl !== contract.artifactCacheControl) {
     invalidCandidate();
   }
-  let object: R2Object | R2ObjectBody | null;
+  let object: ReleaseObjectRead;
   try {
     object = await bucket.get(
       enclosure.objectKey,
-      { onlyIf: { etagMatches: head.etag } },
+      head.version,
     );
   } catch {
     storageUnavailable("artifact_get");
   }
-  if (object === null || !("arrayBuffer" in object)) invalidCandidate();
-  let bytes: Uint8Array;
+  if (object.status !== "found") invalidCandidate();
+  let bytes: Uint8Array<ArrayBuffer>;
   try {
     bytes = new Uint8Array(await object.arrayBuffer());
   } catch {
@@ -966,20 +890,26 @@ async function verifyCandidateArtifact(
   if (!verified) invalidCandidate();
 }
 
-export async function handleSparkleAppcastGuardForContract(
-  request: Request,
-  env: Env,
-  contract: SparkleAppcastGuardContract,
-  nowEpoch = Date.now(),
-): Promise<Response> {
+export function assertGuardRoute(request: Request, contract: SparkleAppcastGuardContract): void {
   const requestUrl = new URL(request.url);
   if (requestUrl.pathname !== contract.guardRoute
       || requestUrl.search || requestUrl.hash) {
     throw new ApiError(404, "NOT_FOUND");
   }
-  const configuration = readSparkleAppcastGuardConfiguration(env, contract);
+}
+
+/** Trusted composition entrypoint: providers supply the object contract while
+ * the guard retains route, authentication, nonce, signature, and publication policy.
+ */
+export async function handleConfiguredSparkleAppcastGuard(
+  request: Request,
+  configuration: SparkleAppcastGuardConfiguration,
+  contract: SparkleAppcastGuardContract,
+  nowEpoch = Date.now(),
+): Promise<Response> {
+  assertGuardRoute(request, contract);
   if (!configuration.enabled || configuration.bucket === null
-      || configuration.nonceDatabase === null
+      || configuration.nonceStore === null
       || configuration.token === null) {
     // Keep a disabled route indistinguishable from an unregistered route.
     throw new ApiError(404, "NOT_FOUND");
@@ -997,7 +927,7 @@ export async function handleSparkleAppcastGuardForContract(
     nowEpoch,
     contract,
   );
-  const db = configuration.nonceDatabase;
+  const db = configuration.nonceStore;
   try {
     await consumeSparkleAppcastGuardNonce(db, authentication.nonce, nowEpoch);
   } catch (error) {
@@ -1055,7 +985,7 @@ export async function handleSparkleAppcastGuardForContract(
     const currentAppcast = parseSparkleAppcast(currentText, contract);
     await verifySignedAppcastEnvelope(current.bytes, currentAppcast, publicKey);
     // A non-empty appcast is a trusted monotonic baseline only after its
-    // canonical active artifact has independently passed the same R2 and
+    // canonical active artifact has independently passed the same object-store and
     // Sparkle signature checks as the candidate.
     for (const enclosure of currentAppcast.enclosures) {
       await verifyCandidateArtifact(
@@ -1100,27 +1030,25 @@ export async function handleSparkleAppcastGuardForContract(
     );
   }
 
-  const onlyIf = current.head === null
-    ? { etagDoesNotMatch: "*" }
-    : { etagMatches: current.head.etag };
-  let committed: R2Object | null;
+  const condition = current.head === null
+    ? { kind: "absent" as const }
+    : { kind: "version" as const, version: current.head.version };
+  let committed: ReleaseObjectWriteResult;
   try {
     committed = await configuration.bucket.put(
       payload.key,
       candidateBytes,
       {
-        onlyIf,
+        condition,
         sha256: await sha256(candidateBytes),
-        httpMetadata: {
-          contentType: payload.contentType,
-          cacheControl: payload.cacheControl,
-        },
+        contentType: payload.contentType,
+        cacheControl: payload.cacheControl,
       },
     );
   } catch {
     storageUnavailable("appcast_put");
   }
-  if (committed === null) {
+  if (committed.status === "conflict") {
     return conflictResponse("r2_conditional_write_conflict", contract);
   }
   return jsonResponse({
@@ -1129,17 +1057,4 @@ export async function handleSparkleAppcastGuardForContract(
     bytes: candidateBytes.byteLength,
     sha256: payload.candidate.sha256,
   }, 200, { "cache-control": "no-store" });
-}
-
-export async function handleSparkleAppcastGuard(
-  request: Request,
-  env: Env,
-  nowEpoch = Date.now(),
-): Promise<Response> {
-  return handleSparkleAppcastGuardForContract(
-    request,
-    env,
-    sparkleReleaseContract,
-    nowEpoch,
-  );
 }

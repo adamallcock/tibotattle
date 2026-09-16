@@ -23,6 +23,7 @@ import { initializeStorageSource } from "../src/analytics-delivery";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
+import { createR2QuarantineObjectStore } from "../src/r2-quarantine-object-store";
 import { accountScopedModelCompositionV11, accountScopedQuotaAnalysisV11 } from "../src/quota-analysis-v11";
 import { collectCommunityAllowanceFits, publishCommunityAnalysisCaches } from "../src/community-allowance";
 import { advanceCommunityPublication, readCapturedCommunityPublication,
@@ -54,6 +55,10 @@ function bindings(): TestBindings {
 
 function db(): D1Database {
   return bindings().USAGE_MONITOR_DB;
+}
+
+function quarantineStore() {
+  return createR2QuarantineObjectStore(bindings().QUARANTINE);
 }
 
 function runtime(overrides: Record<string, unknown> = {}): Env {
@@ -852,6 +857,7 @@ describe("accountless owner-to-v1.1 transport", () => {
         runtime(),
         "e".repeat(64),
         participantId!,
+        quarantineStore(),
       );
       expect(erased).toMatchObject({ deleted: true, alreadyDeleted: false });
       expect(await readCapturedCommunityPublication(db(), publicationTime, {
@@ -904,6 +910,7 @@ describe("accountless owner-to-v1.1 transport", () => {
         runtime(),
         "e".repeat(64),
         owner!.participant_id,
+        quarantineStore(),
       );
       expect(erased).toMatchObject({
         task: "participant_erasure",

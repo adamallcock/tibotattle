@@ -13,6 +13,7 @@ import { createSessionMaterial, sessionCookie, sessionInsert } from "../../src/s
 import { grantTelemetryV11Consent } from "../../src/telemetry-transport-policy";
 import { registerTelemetryV11DayManifest, persistTelemetryV11StagedChunk } from "../../src/telemetry-v11-repository";
 import { putTrackedQuarantineObject } from "../../src/quarantine-reconciliation";
+import type { QuarantineObjectStore } from "../../src/quarantine-object-store";
 
 /** Synthetic local fixtures only. Accepted successor lifecycle is an explicit opt-in. */
 export async function createV11DeviceFixture(db: D1Database, options: {
@@ -97,7 +98,7 @@ export async function makeV11Day(day: string, recordsByStream: Partial<Record<Te
 export async function stageV11Day(db: D1Database,
   fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>,
   prepared: Awaited<ReturnType<typeof makeV11Day>>,
-  options: { quarantine?: R2Bucket } = {}) {
+  options: { quarantine?: QuarantineObjectStore } = {}) {
   await registerTelemetryV11DayManifest(db, fixture, prepared.manifest);
   for (const chunk of prepared.chunks) {
     const rawEnvelope = canonicalTelemetryV11Json({ syntheticTestEnvelope: chunk.chunkDigest,

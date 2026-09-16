@@ -26,6 +26,7 @@ import { makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11
 import { createTelemetryV11DomainPredecessor, activateTelemetryV11Domain } from "../src/telemetry-v11-domain";
 import { telemetryV11DomainManifestDigestInput } from "@app-usagemonitor/telemetry-contract";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
+import { createR2QuarantineObjectStore } from "../src/r2-quarantine-object-store";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -57,6 +58,10 @@ function bindings(): TestBindings {
 
 function db(): D1Database {
   return bindings().USAGE_MONITOR_DB;
+}
+
+function quarantineStore() {
+  return createR2QuarantineObjectStore(bindings().QUARANTINE);
 }
 
 function runtime(overrides: Record<string, unknown> = {}): Env {
@@ -505,6 +510,7 @@ describe("accountless owner lease renewal", () => {
         runtime(),
         "e".repeat(64),
         erased.participantId,
+        quarantineStore(),
       )).resolves.toMatchObject({ deleted: true });
       const erasedRenewal = await api("/api/v1/accountless/renewal", {
         method: "POST",

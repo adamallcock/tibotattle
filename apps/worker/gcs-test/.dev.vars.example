@@ -1,0 +1,11 @@
+# Copy to .dev.vars in this directory with owner-only permissions.
+# Never use production release signing material. Blank values fail closed.
+GCS_TEST_BUCKET=""
+# Lower-case run namespace; use one fresh value for each live qualification.
+GCS_TEST_RUN_ID=""
+GCS_ACCESS_TOKEN=""
+# Actual token expiry as Unix epoch seconds; at most one hour in the future.
+GCS_ACCESS_TOKEN_EXPIRES_AT=""
+GCS_TEST_RELEASE_TOKEN=""
+GCS_TEST_PUBLIC_ED_KEY=""
+GCS_TEST_PUBLIC_ED_KEY_SHA256=""

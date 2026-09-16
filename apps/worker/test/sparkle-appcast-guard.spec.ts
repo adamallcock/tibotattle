@@ -1,12 +1,11 @@
+import { handleSparkleAppcastGuard, handleSparkleAppcastGuardForContract, readSparkleAppcastGuardConfiguration } from "../src/cloudflare-release-guard";
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
-  handleSparkleAppcastGuard,
-  handleSparkleAppcastGuardForContract,
-  readSparkleAppcastGuardConfiguration,
+  handleConfiguredSparkleAppcastGuard,
   SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
   SPARKLE_APPCAST_GUARD_CHANNEL,
   SPARKLE_APPCAST_GUARD_CONTENT_TYPE,
@@ -20,6 +19,8 @@ import {
   SPARKLE_APPCAST_GUARD_SCHEMA,
 } from "../src/sparkle-appcast-guard";
 
+import type { ReleaseObjectStore } from "../src/release-object-store";
+import stableContract from "../src/sparkle-release-contract.json";
 import dogfoodContract from "../src/dogfood-sparkle-release-contract.json";
 
 interface TestBindings extends Env {
@@ -420,6 +421,56 @@ beforeEach(async () => {
 });
 
 describe("Sparkle appcast atomic guard", () => {
+  it.each(["1-appcast-etag", '"1-appcast-etag"'])(
+    "keeps wire tag %s separate from opaque storage versions and consumes nonce first",
+    async (wireTag) => {
+      const bucket = new FakeR2Bucket();
+      const current = await seedAppcast(bucket, "1");
+      await installArtifact(bucket, "1");
+      await installArtifact(bucket, "2");
+      const configuration = readSparkleAppcastGuardConfiguration(bindings(bucket));
+      const underlying = configuration.bucket!;
+      const request = await signedRequest(await payload({
+        candidate: await appcastBytes("2"),
+        expectedCurrent: {
+          state: "present", bytes: current.byteLength,
+          sha256: await sha256Hex(current), etag: wireTag,
+        },
+      }));
+      const nonce = request.headers.get("x-usage-monitor-release-nonce")!;
+      const reads: string[] = [];
+      const store: ReleaseObjectStore = {
+        async head(key) {
+          const row = await env.USAGE_MONITOR_DB.prepare(
+            "SELECT nonce FROM sparkle_appcast_guard_nonces WHERE nonce = ?",
+          ).bind(nonce).first();
+          expect(row).not.toBeNull();
+          const head = await underlying.head(key);
+          return head === null ? null : { ...head, version: `generation:${head.version}` };
+        },
+        async get(key, version) {
+          expect(version).toMatch(/^generation:/u);
+          reads.push(version);
+          return underlying.get(key, version.slice("generation:".length));
+        },
+        async put(key, bytes, options) {
+          expect(options.condition).toEqual({ kind: "version", version: "generation:1-appcast-etag" });
+          return underlying.put(key, bytes, {
+            ...options, condition: { kind: "version", version: "1-appcast-etag" },
+          });
+        },
+      };
+      const response = await handleConfiguredSparkleAppcastGuard(
+        request, { ...configuration, bucket: store }, stableContract, NOW,
+      );
+      expect(response.status).toBe(200);
+      expect(reads).toEqual([
+        "generation:1-appcast-etag", "generation:1-artifact-etag", "generation:2-artifact-etag",
+      ]);
+      expect(bucket.putCalls).toBe(1);
+    },
+  );
+
   it("is disabled and indistinguishable from an unregistered route by default", async () => {
     const bucket = new FakeR2Bucket();
     const disabled = bindings(bucket, { SPARKLE_APPCAST_GUARD_MODE: undefined });
@@ -570,6 +621,24 @@ describe("Sparkle appcast atomic guard", () => {
     );
     expect(first.status).toBe(200);
     expect(replayAtBoundary.status).toBe(401);
+    expect(bucket.putCalls).toBe(1);
+  });
+
+  it("retains future-dated authenticated nonces through their full acceptance window", async () => {
+    const bucket = new FakeR2Bucket();
+    await installArtifact(bucket, "1");
+    const body = await payload();
+    const timestamp = Math.floor(NOW / 1000) + 300;
+    const nonce = "future-boundary-nonce-0001";
+    const first = await invoke(await signedRequest(body, TOKEN, timestamp, nonce), bindings(bucket), NOW);
+    expect(first.status).toBe(200);
+    for (const elapsed of [301_000, 600_000]) {
+      const replay = await invoke(
+        await signedRequest(body, TOKEN, timestamp, nonce), bindings(bucket), NOW + elapsed,
+      );
+      expect(replay.status).toBe(401);
+      expect(await replay.json()).toEqual({ error: { code: "SPARKLE_APPCAST_GUARD_REPLAY_INVALID" } });
+    }
     expect(bucket.putCalls).toBe(1);
   });
 

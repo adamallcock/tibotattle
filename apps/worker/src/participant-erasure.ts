@@ -29,6 +29,7 @@ import {
   telemetryV1ChunkR2KeyPage,
 } from "./telemetry-v1-repository";
 import { telemetryV11ChunkCount, telemetryV11ChunkR2KeyPage } from "./telemetry-v11-repository";
+import type { QuarantineObjectStore } from "./quarantine-object-store";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -67,6 +68,7 @@ export function parseParticipantErasureRequest(value: unknown): string {
  */
 async function eraseParticipantData(
   env: Env,
+  quarantine: QuarantineObjectStore,
   participantId: string,
   operationId: string,
 ): Promise<ErasureResult> {
@@ -183,14 +185,14 @@ async function eraseParticipantData(
   const telemetryV11Total = await telemetryV11ChunkCount(env.USAGE_MONITOR_DB, participantId);
   if (contributions.length > 0) {
     await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-    await env.QUARANTINE.delete(contributions.map((row) => row.r2_key));
+    await quarantine.deleteMany(contributions.map((row) => row.r2_key));
   }
   let cursor: { createdAt: string; contributionId: string } | null = null;
   do {
     const page = await telemetryContributionR2KeyPage(env.USAGE_MONITOR_DB, participantId, cursor);
     if (page.rows.length > 0) {
       await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
+      await quarantine.deleteMany(page.rows.map((row) => row.r2Key));
     }
     cursor = page.nextCursor;
   } while (cursor);
@@ -199,7 +201,7 @@ async function eraseParticipantData(
     const page = await telemetryV1ChunkR2KeyPage(env.USAGE_MONITOR_DB, participantId, chunkCursor);
     if (page.rows.length > 0) {
       await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
+      await quarantine.deleteMany(page.rows.map((row) => row.r2Key));
     }
     chunkCursor = page.nextCursor;
   } while (chunkCursor);
@@ -208,7 +210,7 @@ async function eraseParticipantData(
     const page = await telemetryV11ChunkR2KeyPage(env.USAGE_MONITOR_DB, participantId, stagedCursor);
     if (page.rows.length > 0) {
       await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
+      await quarantine.deleteMany(page.rows.map((row) => row.r2Key));
     }
     stagedCursor = page.nextCursor;
   } while (stagedCursor);
@@ -233,6 +235,7 @@ export async function eraseParticipantAsOwner(
   env: Env,
   actorIdentityKey: string,
   participantId: string,
+  quarantine: QuarantineObjectStore,
 ): Promise<ErasureResult & { task: "participant_erasure"; operationId: string }> {
   if (!PARTICIPANT_ID_PATTERN.test(participantId)) throw new ApiError(400, "BODY_INVALID");
   const details = {
@@ -244,7 +247,7 @@ export async function eraseParticipantAsOwner(
     env.USAGE_MONITOR_DB, actorIdentityKey, "run_maintenance", details,
   );
   try {
-    const result = await eraseParticipantData(env, participantId, operationId);
+    const result = await eraseParticipantData(env, quarantine, participantId, operationId);
     await finishAdminOperation(env.USAGE_MONITOR_DB, operationId, "success", { ...details, ...result });
     return { task: "participant_erasure", operationId, ...result };
   } catch (error) {

@@ -7,6 +7,7 @@ import { finishParticipantDeletion } from "./repository";
 import { telemetryV1ChunkR2KeyPage } from "./telemetry-v1-repository";
 import { telemetryV11ChunkR2KeyPage } from "./telemetry-v11-repository";
 import { QUARANTINE_RETENTION_MILLISECONDS } from "./constants";
+import type { QuarantineObjectStore } from "./quarantine-object-store";
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 export const DELETION_TOMBSTONE_RETENTION_MILLISECONDS = 400 * DAY_MILLISECONDS;
@@ -431,7 +432,7 @@ async function participantQuarantineKeys(
 async function suppressRestoredParticipant(
   db: D1Database,
   ledger: D1Database,
-  quarantine: R2Bucket,
+  quarantine: QuarantineObjectStore,
   participantId: string,
   rawIdentityLinkSecret?: unknown,
   allowMissingIdentityLinkSecret = false,
@@ -466,7 +467,7 @@ async function suppressRestoredParticipant(
   if (claimed === null) return false;
   if(storage)await prepareStorageParticipantErasure(storage,participantId);
   const keys = await participantQuarantineKeys(db, participantId);
-  if (keys.length > 0) await quarantine.delete(keys);
+  if (keys.length > 0) await quarantine.deleteMany(keys);
   // v1.0 chunk journals can far exceed the bounded v0.1 key scan above, so
   // their quarantine objects purge through a dedicated page loop.
   let chunkCursor: { createdAt: string; chunkRowId: string } | null = null;
@@ -474,7 +475,7 @@ async function suppressRestoredParticipant(
   do {
     const page = await telemetryV1ChunkR2KeyPage(db, participantId, chunkCursor);
     if (page.rows.length > 0) {
-      await quarantine.delete(page.rows.map((row) => row.r2Key));
+      await quarantine.deleteMany(page.rows.map((row) => row.r2Key));
     }
     chunkCursor = page.nextCursor;
     chunkPages += 1;
@@ -485,7 +486,7 @@ async function suppressRestoredParticipant(
   let stagedCursor: { createdAt: string; chunkRowId: string } | null = null;
   do {
     const page = await telemetryV11ChunkR2KeyPage(db, participantId, stagedCursor);
-    if (page.rows.length > 0) await quarantine.delete(page.rows.map((row) => row.r2Key));
+    if (page.rows.length > 0) await quarantine.deleteMany(page.rows.map((row) => row.r2Key));
     stagedCursor = page.nextCursor;
     chunkPages += 1;
     if (chunkPages > MAX_LIFECYCLE_ROWS / 100) throw new ApiError(503, "LIFECYCLE_BOUNDS_EXCEEDED");
@@ -519,7 +520,7 @@ async function suppressRestoredParticipant(
 export async function replayDeletionTombstones(
   db: D1Database,
   ledger: D1Database,
-  quarantine: R2Bucket,
+  quarantine: QuarantineObjectStore,
   nowEpoch = Date.now(),
   rawIdentityLinkSecret?: unknown,
   // Direct offline lifecycle callers have no Env from which to identify a
@@ -611,7 +612,7 @@ async function dueQuarantineObjects(
  */
 export async function deleteDueQuarantineObjects(
   db: D1Database,
-  quarantine: R2Bucket,
+  quarantine: QuarantineObjectStore,
   cutoffAt: string,
 ): Promise<{
   deleted: number;
@@ -620,7 +621,7 @@ export async function deleteDueQuarantineObjects(
   const due = await dueQuarantineObjects(db, cutoffAt);
   if (due.length === 0) return { deleted: 0, complete: true };
   const batch = due.slice(0, QUARANTINE_DELETE_BATCH_SIZE);
-  await quarantine.delete(batch.map((row) => row.r2_key));
+  await quarantine.deleteMany(batch.map((row) => row.r2_key));
   const deletedAt = new Date().toISOString();
   const updates = batch.map((row) => db.prepare(
     `UPDATE ${QUARANTINE_SOURCE_TABLES[row.source]}
@@ -642,7 +643,7 @@ export async function deleteDueQuarantineObjects(
 export async function runBackendLifecycle(
   db: D1Database,
   ledger: D1Database,
-  quarantine: R2Bucket,
+  quarantine: QuarantineObjectStore,
   nowEpoch = Date.now(),
   beforeDestructivePhase?: LifecyclePhaseGuard,
   rawIdentityLinkSecret?: unknown,

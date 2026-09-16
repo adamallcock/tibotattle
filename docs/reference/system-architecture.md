@@ -265,6 +265,17 @@ scoped-primary account billing claim is introduced by the new transport.
 | Upload ingress Durable Object | Shared concurrency and start-rate admission. | It protects expensive body reads/processing; it is not participant storage. |
 | Static assets | Public website and application UI assets. | Unknown API routes never fall through to the SPA. |
 
+Development source now defines separate object-storage contracts for release
+publication and contribution quarantine. Release policy accepts object and
+replay-nonce adapters through `createReleaseGuardApplication`; the existing
+Worker composes R2 and D1. The GCS release adapter has portable mocked-HTTP
+coverage and a synthetic local-Worker-to-GCS qualification recorded in the
+[test asset receipt](../reviews/2026-09-15-gcs-test-assets.md). Quarantine ingestion, reconciliation, retention and owner erasure share
+`QuarantineObjectStore`, selected in one Worker composition function. GCS
+quarantine erasure and transactional database portability remain unimplemented.
+These source interfaces do not change the deployed topology. See the
+[Worker README](../../apps/worker/README.md) for entrypoints and local checks.
+
 ## Release and deployment gates
 
 These are independent:

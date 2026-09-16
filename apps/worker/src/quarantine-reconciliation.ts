@@ -2,6 +2,10 @@ import {
   QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS,
 } from "./constants";
 import { ApiError } from "./errors";
+import type {
+  QuarantineObjectPutOptions,
+  QuarantineObjectStore,
+} from "./quarantine-object-store";
 
 const QUARANTINE_RECONCILIATION_BATCH_SIZE = 100;
 const QUARANTINE_RECONCILIATION_LEASE_MILLISECONDS = 15 * 60 * 1000;
@@ -106,10 +110,10 @@ export async function registerPendingQuarantineObject(
 
 export async function putTrackedQuarantineObject(
   db: D1Database,
-  quarantine: R2Bucket,
+  quarantine: QuarantineObjectStore,
   registration: PendingQuarantineRegistration,
-  value: string,
-  options?: R2PutOptions,
+  value: string | Uint8Array,
+  options?: QuarantineObjectPutOptions,
 ): Promise<void> {
   await registerPendingQuarantineObject(db, registration);
   await quarantine.put(registration.r2Key, value, options);
@@ -411,7 +415,7 @@ async function assertActiveReconciliationLease(
 
 async function reconcileRegistration(
   db: D1Database,
-  quarantine: R2Bucket,
+  quarantine: QuarantineObjectStore,
   row: PendingQuarantineRow,
   leaseId: string,
 ): Promise<{
@@ -470,7 +474,7 @@ async function recordReconciliationFailure(
 
 export async function reconcilePendingQuarantineObjects(
   db: D1Database,
-  quarantine: R2Bucket,
+  quarantine: QuarantineObjectStore,
   nowEpoch = Date.now(),
   maximumRegistrations = QUARANTINE_RECONCILIATION_BATCH_SIZE,
 ): Promise<QuarantineReconciliationResult> {

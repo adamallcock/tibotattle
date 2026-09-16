@@ -10,6 +10,7 @@ import { authenticateDevice, createDeviceUploadAuthorization } from "../src/devi
 import { handleRequest } from "../src/index";
 import { deleteDueQuarantineObjects, recordDeletionTombstone, replayDeletionTombstones } from "../src/retention";
 import { reconcilePendingQuarantineObjects } from "../src/quarantine-reconciliation";
+import { createR2QuarantineObjectStore } from "../src/r2-quarantine-object-store";
 import { personalStats } from "../src/telemetry-repository";
 import { createUploadAuthorizationMaterial, storeUploadAuthorization, claimUploadAuthorization } from "../src/session";
 import { assertTelemetryTransportWriteAllowed, grantTelemetryV11Consent, telemetryTransportCapabilities } from "../src/telemetry-transport-policy";
@@ -21,6 +22,7 @@ import { createV11DeviceFixture, makeV11Day, stageV11Day, v11UsageRecord } from 
 interface TestBindings extends Env { TEST_MIGRATIONS: D1Migration[]; TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[] }
 const bindings = () => env as TestBindings;
 const db = () => bindings().USAGE_MONITOR_DB;
+const quarantineStore = () => createR2QuarantineObjectStore(bindings().QUARANTINE);
 let publicJwk: JsonWebKey;
 let publicJwkJson = "";
 let privateJwkJson = "";
@@ -571,7 +573,7 @@ describe("staged attribution transport and enrollment floor", () => {
 
   it("owner erasure removes staged objects, identities, grants and journals through the existing pipeline", async () => {
     const fixture = await createV11DeviceFixture(db(), { grant: true });
-    await stageV11Day(db(), fixture, await makeV11Day(day, { usage: [v11UsageRecord(day)] }), { quarantine: bindings().QUARANTINE });
+    await stageV11Day(db(), fixture, await makeV11Day(day, { usage: [v11UsageRecord(day)] }), { quarantine: quarantineStore() });
     expect((await bindings().QUARANTINE.list()).objects).toHaveLength(1);
     const result = await ownerErase(runtime(), fixture.participantId);
     expect(result.status).toBe(200);
@@ -599,12 +601,12 @@ describe("staged attribution transport and enrollment floor", () => {
 
   it("orphan reconciliation preserves v11 references and restore replay erases both bytes and derived state", async () => {
     const fixture = await createV11DeviceFixture(db(), { grant: true });
-    await stageV11Day(db(), fixture, await makeV11Day(day, { usage: [v11UsageRecord(day)] }), { quarantine: bindings().QUARANTINE });
-    const reconciliation = await reconcilePendingQuarantineObjects(db(), bindings().QUARANTINE, Date.now() + 2 * 3_600_000);
+    await stageV11Day(db(), fixture, await makeV11Day(day, { usage: [v11UsageRecord(day)] }), { quarantine: quarantineStore() });
+    const reconciliation = await reconcilePendingQuarantineObjects(db(), quarantineStore(), Date.now() + 2 * 3_600_000);
     expect(reconciliation).toMatchObject({ orphanObjectsDeleted: 0, referencedObjectsPreserved: 1, reconciliationComplete: true });
     expect((await bindings().QUARANTINE.list()).objects).toHaveLength(1);
     await recordDeletionTombstone(bindings().DELETION_LEDGER, fixture.participantId);
-    expect(await replayDeletionTombstones(db(), bindings().DELETION_LEDGER, bindings().QUARANTINE))
+    expect(await replayDeletionTombstones(db(), bindings().DELETION_LEDGER, quarantineStore()))
       .toEqual({ suppressed: 1, complete: true });
     expect((await bindings().QUARANTINE.list()).objects).toHaveLength(0);
     expect((await db().prepare("SELECT count(*) AS n FROM telemetry_v11_records").first<{ n: number }>())?.n).toBe(0);
@@ -613,8 +615,8 @@ describe("staged attribution transport and enrollment floor", () => {
 
   it("age retention can delete staged quarantine bytes while retaining the analytical records", async () => {
     const fixture = await createV11DeviceFixture(db(), { grant: true });
-    await stageV11Day(db(), fixture, await makeV11Day(day, { usage: [v11UsageRecord(day)] }), { quarantine: bindings().QUARANTINE });
-    const result = await deleteDueQuarantineObjects(db(), bindings().QUARANTINE, new Date(Date.now() + 1000).toISOString());
+    await stageV11Day(db(), fixture, await makeV11Day(day, { usage: [v11UsageRecord(day)] }), { quarantine: quarantineStore() });
+    const result = await deleteDueQuarantineObjects(db(), quarantineStore(), new Date(Date.now() + 1000).toISOString());
     expect(result).toEqual({ deleted: 1, complete: true });
     expect((await bindings().QUARANTINE.list()).objects).toHaveLength(0);
     expect((await db().prepare("SELECT count(*) AS n FROM telemetry_v11_records").first<{ n: number }>())?.n).toBe(1);
@@ -628,7 +630,7 @@ describe("staged attribution transport and enrollment floor", () => {
       .bind(fixture.participantId).first<{ n: number }>())?.n).toBe(2);
     expect((await bindings().QUARANTINE.list()).objects).toHaveLength(1);
     await recordDeletionTombstone(bindings().DELETION_LEDGER, fixture.participantId);
-    expect(await replayDeletionTombstones(db(), bindings().DELETION_LEDGER, bindings().QUARANTINE))
+    expect(await replayDeletionTombstones(db(), bindings().DELETION_LEDGER, quarantineStore()))
       .toEqual({ suppressed: 1, complete: true });
     for (const table of ["telemetry_v11_domain_heads", "telemetry_v11_domains", "telemetry_v11_domain_days",
       "telemetry_v11_domain_predecessors", "telemetry_v11_records", "telemetry_v11_chunks", "telemetry_v11_day_manifests",
