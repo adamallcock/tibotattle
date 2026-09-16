@@ -4,7 +4,7 @@ import type { V11SourcePin } from "./telemetry-v11-domain";
 /** The physical page is deliberately smaller than the compatibility reader's
  * public page. It bounds both the normalized joins and the decoder work that a
  * single resumable acquisition step can perform. */
-export const TYPED_V11_QUOTA_PAGE_SIZE = 128;
+export const TYPED_V11_QUOTA_PAGE_SIZE = 1024;
 const MIN_TIME = -8_640_000_000_000_000;
 const MAX_TIME = 8_640_000_000_000_000;
 

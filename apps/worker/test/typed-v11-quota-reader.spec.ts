@@ -31,15 +31,15 @@ beforeEach(async () => {
   await initializeTypedV11Admission(database(), SOURCE_NAMESPACE);
 });
 
-async function stageAndActivate() {
+async function stageAndActivate(count = 9) {
   const fixture = await createV11DeviceFixture(database(), { participantId: PARTICIPANT, grant: true });
   const attribution = { accountBasis: "same_source" as const, accountTrackId: ACCOUNT,
     planBasis: "same_source_occurrence" as const, planType: "pro" as const, planEraId: null };
-  const quota: TelemetryV11QuotaObservation[] = Array.from({ length: 9 }, (_, index) => ({
+  const quota: TelemetryV11QuotaObservation[] = Array.from({ length: count }, (_, index) => ({
     schemaVersion: "quota-observation-v1.1" as const,
-    observationId: `quota:synthetic-reader:${index}`, observedTime: new Date(START + index * 300_000).toISOString(),
+    observationId: `quota:synthetic-reader:${index}`, observedTime: new Date(START + index * 1_000).toISOString(),
     provider: "openai_codex", planType: "pro" as const, planVariant: "unknown", limitId: "codex",
-    slot: "seven_day", usedPercent: 10 + index * 5, windowDurationMinutes: 10_080,
+    slot: "seven_day", usedPercent: 10 + index % 19 * 5, windowDurationMinutes: 10_080,
     resetsAt: new Date(START + 7 * 86_400_000).toISOString(), accountPlanAttribution: { ...attribution },
   }));
   const prepared = await makeV11Day(DAY, { quota });
@@ -88,4 +88,19 @@ describe("typed v1.1 quota physical reader", () => {
       [...first, ...rest].map((row) => row.sourceRowId).sort((left, right) => left - right));
     expect(await reader.readPage({ observedAtMs: rest.at(-1)!.observedAtMs, sourceRowId: rest.at(-1)!.sourceRowId })).toEqual([]);
   }, 60_000);
+
+  it("keeps a 1024-row page bounded across the next physical cursor", async () => {
+    const pin = await stageAndActivate(2048);
+    const reader = await createTypedV11QuotaPageReader(database(), {
+      sourceNamespace: SOURCE_NAMESPACE, pin, fromObservedAtMs: START, beforeObservedAtMs: START + 86_400_000,
+    });
+    const first = await reader.readPage({ observedAtMs: START, sourceRowId: 0 });
+    expect(first).toHaveLength(1024);
+    const second = await reader.readPage({ observedAtMs: first.at(-1)!.observedAtMs,
+      sourceRowId: first.at(-1)!.sourceRowId });
+    expect(second).toHaveLength(1024);
+    expect(new Set([...first, ...second].map((row) => row.sourceRowId)).size).toBe(2048);
+    expect(await reader.readPage({ observedAtMs: second.at(-1)!.observedAtMs,
+      sourceRowId: second.at(-1)!.sourceRowId })).toEqual([]);
+  }, 120_000);
 });

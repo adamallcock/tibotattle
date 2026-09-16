@@ -92,29 +92,32 @@ describe("resumable v1.1 quota acquisition", () => {
     expect(result.quotaRows.map((row) => row.occurrence_id)).toEqual(expected);
     expect(result.attributionIndex.eras).toHaveLength(1);
     expect([...phases].sort()).toEqual(["endpoints", "fitability", "plan"]);
-    expect(calls).toBe(33);
+    expect(calls).toBe(6);
   });
 
   it("keeps retired rows in the physical cursor and excludes them from evidence", async () => {
     const rows = [
       ...Array.from({ length: V11_QUOTA_ACQUISITION_PAGE_SIZE * 2 }, (_, index) =>
         sourceRow(index + 1, 10, index * 1_000)),
-      ...Array.from({ length: 9 }, (_, index) => sourceRow(300 + index, index * 10, 300_000 + index * 1_000)),
+      ...Array.from({ length: 9 }, (_, index) => sourceRow(V11_QUOTA_ACQUISITION_PAGE_SIZE * 3 + index,
+        index * 10, V11_QUOTA_ACQUISITION_PAGE_SIZE * 3_000 + index * 1_000)),
     ];
-    for (const row of rows.slice(0, 256)) row.active = null;
+    for (const row of rows.slice(0, V11_QUOTA_ACQUISITION_PAGE_SIZE * 2)) row.active = null;
     const { result, calls } = await finish(rows);
     expect(result.status).toBe("complete");
     if (result.status !== "complete") throw new Error("expected complete");
     expect(result.quotaRows).toHaveLength(9);
-    expect(calls).toBeGreaterThan(6);
+    expect(calls).toBe(9);
   });
 
   it("matches the shared plan builder at equal-time plan changes", async () => {
-    const rows = [
-      sourceRow(1, 0, 0),
-      sourceRow(2, 10, 1_000, { planType: "plus" }),
-      sourceRow(3, 20, 1_000, { planType: "pro" }),
-      sourceRow(4, 30, 2_000, { planType: "pro" }),
+    const prefix = Array.from({ length: V11_QUOTA_ACQUISITION_PAGE_SIZE - 1 }, (_, index) =>
+      sourceRow(index + 1, 0, index * 1_000));
+    const boundary = V11_QUOTA_ACQUISITION_PAGE_SIZE * 1_000;
+    const rows = [...prefix,
+      sourceRow(V11_QUOTA_ACQUISITION_PAGE_SIZE, 10, boundary, { planType: "plus" }),
+      sourceRow(V11_QUOTA_ACQUISITION_PAGE_SIZE + 1, 20, boundary, { planType: "pro" }),
+      sourceRow(V11_QUOTA_ACQUISITION_PAGE_SIZE + 2, 30, boundary + 1_000, { planType: "pro" }),
     ];
     const full = buildPlanAttributionIndex(rows.map((row) => ({
       contextKey: "openai_codex|codex", accountScopeId: ACCOUNT, observedAtMs: row.observedAtMs,
