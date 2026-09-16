@@ -20,6 +20,7 @@ import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from 
 import { advanceV11DailyProjection, readV11ProjectedOwnerDays, retireV11DailyProjectionPage } from "../src/v11-daily-projection";
 import { revokeAccountlessEnrollment } from "../src/accountless-enrollment";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
+import { advanceStorageErasureJobs, requireStorageParticipantErasureComplete } from "../src/storage-erasure";
 import { readTypedV11ManifestPage, TYPED_V11_MANIFEST_PAGE_SQL } from "../src/typed-v11-record-reader";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
@@ -121,22 +122,24 @@ const api=(configured=publicEnv())=>handleRequest(new Request(`https://typed.exa
 function targetBatch(batch:D1Database['batch']):D1Database{return new Proxy(target(),{get(db,key){if(key==='batch')return batch;
   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});}
 
-async function seedV1(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1, fixture = undefined as Awaited<ReturnType<typeof createV11DeviceFixture>> | undefined, revision=1, seq=0) {
+async function seedV1(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1,
+  fixture = undefined as Awaited<ReturnType<typeof createV11DeviceFixture>> | undefined, revision=1, seq=0,
+  observedDay=today()) {
   fixture ??= await createV11DeviceFixture(source());
   const records = Array.from({ length: count }, (_, i) => stream === 'usage'
-    ? JSON.parse(telemetryV11LegacyProjection('usage', v11UsageRecord(today(), 'a', { eventId: `event:v2:${(seq*200+i).toString(16).padStart(64, '0')}` }))!.canonicalRecord)
+    ? JSON.parse(telemetryV11LegacyProjection('usage', v11UsageRecord(observedDay, 'a', { eventId: `event:v2:${(seq*200+i).toString(16).padStart(64, '0')}` }))!.canonicalRecord)
     : stream === 'quota' ? { schemaVersion: 'quota-observation-v1.0', observationId: `quota-occurrence:v1:${(seq*200+i).toString(16).padStart(64, '0')}`,
-      observedTime: `${today()}T12:00:00.000Z`, provider: 'openai_codex', planType: 'pro', planVariant: 'unknown',
+      observedTime: `${observedDay}T12:00:00.000Z`, provider: 'openai_codex', planType: 'pro', planVariant: 'unknown',
       limitId: 'codex', slot: 'secondary', usedPercent: 0.30000000000000004, windowDurationMinutes: 10080,
-      resetsAt: `${today()}T13:00:00.000Z` }
+      resetsAt: `${observedDay}T13:00:00.000Z` }
     : { schemaVersion: 'session-dimension-v1.0', sessionUuid: '0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b',
-      firstEventTime: `${today()}T12:00:00.000Z`, provider: 'openai_codex', toolClassCounts: { shell: 0, other: 3 } }) as TelemetryV1Record[];
+      firstEventTime: `${observedDay}T12:00:00.000Z`, provider: 'openai_codex', toolClassCounts: { shell: 0, other: 3 } }) as TelemetryV1Record[];
   const envelopeDigest = await sha256Hex(`synthetic-proof-${crypto.randomUUID()}`);
   const auth = await authenticateDevice(source(), fixture.authorization);
   const uploaded = await createDeviceUploadAuthorization(source(), auth, envelopeDigest, 200);
   const claimed = await claimDeviceUploadAuthorization(source(), `Upload ${uploaded.uploadAuthorization}`,
     { envelopeDigest, bodyBytes: 200, contentType: 'application/json' });
-  const chunk = parseTelemetryV1Chunk({ schemaVersion: 'telemetry-contribution-v1.0', chunkId: `${stream}:${today()}:${seq}`,
+  const chunk = parseTelemetryV1Chunk({ schemaVersion: 'telemetry-contribution-v1.0', chunkId: `${stream}:${observedDay}:${seq}`,
     chunkRevision: revision, chunkDigest: await sha256Hex(canonicalTelemetryV11Json(records)), parserVersion: 'synthetic-proof-v1',
     consent: { telemetrySchemaVersion: 'telemetry-contribution-v1.0', fieldDictionaryVersion: 'telemetry-v1.0-registry-2026-08-07.1',
       privacyContractVersion: 'ongoing-privacy-safe-telemetry-v1.0' }, records });
@@ -307,19 +310,98 @@ describe('independent public daily publication',()=>{
       .bind(sourceId).first('sequence')).toBe(cursor);
     expect(scan).toMatchObject({tick:2,current_position:0,history_position:1});
   });
-  it('reuses unchanged owners after a correction without restarting their completed folds',async()=>{
+  it('keeps the last completed day visible across a correction and reuses unchanged owners',async()=>{
     const a=await seedV1(),b=await seedV1();await insertTypedTelemetryV1Chunk(source(),a.insert,namespace);
     await insertTypedTelemetryV1Chunk(source(),b.insert,namespace);await ready();await publish();
     const before=(await target().prepare('SELECT owner_digest,progress_revision FROM analytics_community_daily_owners ORDER BY owner_digest').all()).results;
     const changed=await seedV1('usage',2,a.fixture,2);
     changed.insert.supersedes=await currentTelemetryV1Chunk(source(),a.fixture.participantId,a.fixture.deviceId,'usage',today(),0);
     await insertTypedTelemetryV1Chunk(source(),changed.insert,namespace);
-    // A corrected existing source is a hard invalidation, not append-only freshness.
-    expect((await publicRead()).rows).toEqual([]);
-    await ready();expect(await publish()).toEqual({state:'published',ownersAdvanced:1});
-    expect(JSON.parse((await publicRead()).rows[0]!.payload_json).totals.usageEvents).toBe(3);
+    // A corrected existing source queues a replacement. The completed day stays
+    // visible while the source is ahead of delivery and until the swap commits.
+    const held=(await publicRead()).rows;expect(held).toHaveLength(1);expect(held[0]).toMatchObject({revision:1});
+    expect(JSON.parse(held[0]!.payload_json).totals.usageEvents).toBe(2);
+    expect(await retireStorageCommunityDailyPage(options())).toBe(0);
+    await ready();expect((await publicRead()).rows[0]).toMatchObject({revision:1});
+    expect(await publish()).toEqual({state:'published',ownersAdvanced:1});
+    const swapped=(await publicRead()).rows;expect(swapped).toHaveLength(1);expect(swapped[0]).toMatchObject({revision:2});
+    expect(JSON.parse(swapped[0]!.payload_json).totals.usageEvents).toBe(3);
     const after=(await target().prepare('SELECT owner_digest,progress_revision FROM analytics_community_daily_owners ORDER BY owner_digest').all()).results;
     expect(after.map((row,i)=>Number(row.progress_revision)-Number(before[i]!.progress_revision)).sort()).toEqual([0,1]);
+    // Only the superseded revision is retired; the replacement is untouched.
+    expect(await retireStorageCommunityDailyPage(options())).toBe(1);
+    expect((await publicRead()).rows[0]).toMatchObject({revision:2});
+  });
+  it('keeps every completed day visible and unretired across an unrelated hard upload',async()=>{
+    const priorDay=new Date(Date.parse(today())-86_400_000).toISOString().slice(0,10);
+    const a=await seedV1(),b=await seedV1();
+    const priorA=await seedV1('usage',1,a.fixture,1,1,priorDay),priorB=await seedV1('usage',1,b.fixture,1,1,priorDay);
+    for(const value of [a,b,priorA,priorB])await insertTypedTelemetryV1Chunk(source(),value.insert,namespace);
+    await ready();expect((await publish()).state).toBe('published');
+    expect((await advanceStorageCommunityDaily({...options(),day:priorDay})).state).toBe('published');
+    const range=async()=>(await readPublishedStorageCommunityDaily({...options(),fromDay:priorDay,throughDay:today()}))
+      .rows.map(row=>[row.day,row.revision]);
+    const before=await captureStorageCommunityAuthority(source());
+    // A same-day revision 2 is classified hard and advances the global epoch.
+    const changed=await seedV1('usage',2,a.fixture,2);
+    changed.insert.supersedes=await currentTelemetryV1Chunk(source(),a.fixture.participantId,a.fixture.deviceId,'usage',today(),0);
+    await insertTypedTelemetryV1Chunk(source(),changed.insert,namespace);
+    expect((await captureStorageCommunityAuthority(source())).publicAuthorityEpoch).toBeGreaterThan(before.publicAuthorityEpoch);
+    expect(await range()).toEqual([[priorDay,1],[today(),1]]);
+    expect(await retireStorageCommunityDailyPage(options())).toBe(0);
+    await ready();
+    expect(await range()).toEqual([[priorDay,1],[today(),1]]);
+    // Only the corrected day is queued; an older epoch alone is not staleness.
+    expect((await target().prepare('SELECT day FROM analytics_community_daily_queue WHERE source_id=?').bind(sourceId).all())
+      .results.map(row=>row.day)).toEqual([today()]);
+    expect(await advanceNextStorageCommunityDaily({...options(),preferStaleHead:true})).toMatchObject({state:'published'});
+    expect(await range()).toEqual([[priorDay,1],[today(),2]]);
+    expect(await advanceNextStorageCommunityDaily({...options(),preferStaleHead:true})).toEqual({state:'idle',ownersAdvanced:0});
+    expect(await retireStorageCommunityDailyPage(options())).toBe(1);
+    expect(await range()).toEqual([[priorDay,1],[today(),2]]);
+  });
+  it('hides only the days that folded an erased owner and completes erasure while unrelated days stay published',async()=>{
+    const priorDay=new Date(Date.parse(today())-86_400_000).toISOString().slice(0,10);
+    const a=await seedV1(),priorB=await seedV1('usage',1,undefined,1,1,priorDay);
+    await insertTypedTelemetryV1Chunk(source(),a.insert,namespace);await insertTypedTelemetryV1Chunk(source(),priorB.insert,namespace);
+    await ready();expect((await publish()).state).toBe('published');
+    expect((await advanceStorageCommunityDaily({...options(),day:priorDay})).state).toBe('published');
+    const range=async()=>(await readPublishedStorageCommunityDaily({...options(),fromDay:priorDay,throughDay:today()}))
+      .rows.map(row=>[row.day,row.revision]);
+    expect(await range()).toEqual([[priorDay,1],[today(),1]]);
+    expect(await eraseParticipantAsOwner(runtime(),'e'.repeat(64),a.fixture.participantId)).toMatchObject({deleted:true});
+    // Before delivery the affected days are unknown: everything older than the
+    // source terminal is withheld. Delivery then narrows that to the one day
+    // which folded the erased owner's records; the empty prior-day fold is not containment.
+    expect(await range()).toEqual([]);
+    await ready();
+    expect(await range()).toEqual([[priorDay,1]]);
+    expect((await target().prepare('SELECT day FROM analytics_community_daily_containment WHERE source_id=? ORDER BY day').bind(sourceId).all())
+      .results.map(row=>row.day)).toEqual([today()]);
+    for(let n=0;n<8;n++)await retireStorageCommunityDailyPage(options());
+    expect((await target().prepare('SELECT day FROM analytics_community_daily_publications WHERE source_id=?').bind(sourceId).all())
+      .results.map(row=>row.day)).toEqual([priorDay]);
+    const ledger={...options(),ledger:b.DELETION_LEDGER};
+    for(let n=0;n<8;n++)if(!(await advanceStorageErasureJobs(ledger)).pending)break;
+    await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,a.fixture.participantId,ledger);
+    expect(await range()).toEqual([[priorDay,1]]);
+    // The terminal queued every day the erased owner had a fold row; the
+    // prior day republishes for its smaller cohort and today is rebuilt.
+    for(let n=0;n<6;n++){if((await advanceNextStorageCommunityDaily(options())).state==='idle')break;}
+    expect(await range()).toEqual([[priorDay,2],[today(),2]]);
+    const rebuilt=(await readPublishedStorageCommunityDaily({...options(),fromDay:today(),throughDay:today()})).rows;
+    expect(JSON.parse(rebuilt[0]!.payload_json).totals.usageEvents).toBe(0);
+  });
+  it('records a daily lane failure and still claims graph work in the same pass',async()=>{
+    await fixture();await ready();await publish();
+    await target().prepare(`UPDATE analytics_community_daily_owners SET values_json='{"corrupt":true}'`).run();
+    await target().prepare('INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)').bind(sourceId,today()).run();
+    const result=await runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,maxSteps:1,maxQueries:900,
+      deadlineMs:Date.now()+55_000});
+    expect(result.graphFailure).toEqual({phase:'daily_publish',reason:'application'});
+    expect(result.dailyPublications).toBe(0);
+    expect(Number(await target().prepare('SELECT revision FROM analytics_community_graph_scan WHERE source_id=?').bind(sourceId).first('revision')))
+      .toBeGreaterThanOrEqual(1);
   });
   it('keeps complete totals and unknown-price counts when more than a hundred model cells are displayed',async()=>{
     await fixture(101,n=>({modelId:`unknown-a-${String(n).padStart(3,'0')}`}));

@@ -54,7 +54,11 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv)
  }catch (error) {
   // Do not expose account identifiers, SQL, credentials or a stored record in
   // diagnostics. Retain the durable cursor and make scheduler failure visible.
-  console.error(JSON.stringify({event:'storage_analytics_schedule',state:'unavailable',...storageGraphFailureFields(error)}));
+  // Internal failure constants are closed uppercase identifiers; provider or
+  // runtime messages (spaces, SQL, punctuation) never match and stay hidden.
+  const message=error instanceof Error?error.message:'';
+  const code=/^[A-Z][A-Z0-9_]{2,63}$/.test(message)?{code:message}:{};
+  console.error(JSON.stringify({event:'storage_analytics_schedule',state:'unavailable',...code,...storageGraphFailureFields(error)}));
   throw new Error('STORAGE_ANALYTICS_UNAVAILABLE');
  }
 }

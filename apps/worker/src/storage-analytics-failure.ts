@@ -7,6 +7,9 @@ export const STORAGE_GRAPH_OPERATION_STAGES=[
  'graph_history_layout','graph_history_source_precheck','graph_history_reader',
  'graph_history_acquisition_page','graph_history_source_postcheck','graph_history_finish',
  'graph_checkpoint_save','graph_current_fit_compute','graph_model_compute',
+ // Scheduler lanes: a failure in one lane is recorded here and the pass
+ // continues with the others instead of abandoning the whole invocation.
+ 'daily_publish','graph_work',
 ] as const;
 export type StorageGraphOperationStage=typeof STORAGE_GRAPH_OPERATION_STAGES[number];
 export const STORAGE_GRAPH_FAILURE_REASONS=[

@@ -58,3 +58,38 @@ changes.
 Do not reset historical cursors or delete accepted telemetry. Preserve the
 original database and all previous operation receipts. The current credential
 renewal block affects remote execution; it does not prevent local qualification.
+
+## 2026-09-16 root cause and repair (last-good publication)
+
+Live inspection on 2026-09-16 (analytics cursor 26,981 delivered at public epoch
+23,928) established that the daily series collapse was not a rebuild-speed
+problem but a validity-model problem: 23,924 of 26,981 journal events were
+classified as hard `owner-active` changes, every one advanced the global public
+epoch, and every daily, model and preview publication pinned that exact epoch.
+`readPublishedStorageCommunityDaily` hid every day after any hard upload and
+`retireStorageCommunityDailyPage` deleted four such publications per minute
+without a queue row, leaving 133 heads with neither a publication nor a queue
+entry. Isolation migration `0004` stopped the multi-device classification (all
+1,871 post-classifier hard revision-1 uploads had another device on the same
+day), but same-day revision-2 corrections remain hard by design and still reset
+the whole series under the previous readers.
+
+The repair follows the accepted
+[published analytics continuity](../decisions/2026-09-16-published-analytics-continuity.md)
+contract:
+
+| Change | Where | Effect |
+|---|---|---|
+| Analytics migration `0018` | `apps/worker/analytics-migrations/0018_last_good_publication_containment.sql` | Terminal watermark and per-day containment captured in the same transaction as any delivered or fenced withdrawal/erasure; backfill retires only contaminated or unprovable old publications |
+| Visibility predicate | `storageCommunityPublicationVisible` in `storage-community-authority.ts` | Hard authority (source, namespace, policy, collection) plus pin epoch not below the applicable containment epoch; older public epochs alone never hide a completed result |
+| Daily reader, selector, retirement, builder | `storage-community-daily.ts` | Last-good day stays visible during rebuild; retirement deletes only superseded, incompatible or contained revisions; an undelivered source terminal withholds everything pinned below it until delivery narrows it to the affected days |
+| Graph preview and model days | `storage-community-graph-publication.ts`, `storage-community-graph-work.ts`, `storage-community-progress.ts` | Same predicate with the larger of the source and delivered terminal epochs; stale owner fits remain the last completed result with `inputs_current=0` |
+| Erasure completion | `storage-erasure.ts` | Completion requires no daily publication pinned below the containment epoch of a day that folded the erased owner, instead of no publication pinned below the erasure epoch anywhere |
+| Scheduler lane isolation | `storage-analytics-runtime.ts`, `storage-analytics-worker.ts` | A daily or graph lane failure is recorded with a closed stage and the pass continues; the scheduler log names closed internal error codes |
+| Retained V11 model fingerprint | `97f14ae3` | Completes the resumed v1.1 model composition that failed every minute on the newest history day |
+
+Acceptance is the focused Worker suites plus the populated `0018` rehearsal,
+then the full Worker gate. Production acceptance additionally requires the
+migration applied before the code deploy, both Workers deployed, and observing
+the 245 daily heads and the 69 model days regrow without any published day
+disappearing across a new upload.

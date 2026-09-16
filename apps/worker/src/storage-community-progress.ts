@@ -1,5 +1,6 @@
-import { captureStorageCommunityAuthority, sameStorageCommunityAuthority, storageCommunityAuthorityIsCurrent,
- type StorageCommunityAuthority } from './storage-community-authority';
+import { captureStorageCommunityAuthority, readStorageCommunityDeliveredTerminalEpoch,
+ readStorageCommunitySourceTerminalEpoch, storageCommunityCalculationAuthorityIsCurrent,
+ storageCommunityPublicationVisible, type StorageCommunityAuthority } from './storage-community-authority';
 import { STORAGE_GRAPH_METHOD } from './storage-community-graph';
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowance';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
@@ -13,6 +14,8 @@ export async function readStorageCommunityProgress(bindings:StorageAnalyticsBind
  options:{includePreparation?:boolean}={}) {
  try {
   const authority=await captureStorageCommunityAuthority(bindings.source,bindings);
+  const terminalEpoch=Math.max(await readStorageCommunitySourceTerminalEpoch(bindings.source),
+   await readStorageCommunityDeliveredTerminalEpoch(bindings.target,bindings.sourceId));
   const generatedAt=new Date(nowMs).toISOString(),today=generatedAt.slice(0,10);
   const requiredDays=ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS-1;
   const from=new Date(Date.parse(today)-requiredDays*86400000).toISOString().slice(0,10);
@@ -28,7 +31,7 @@ export async function readStorageCommunityProgress(bindings:StorageAnalyticsBind
   const days=new Set<string>();
   for(const raw of metadata[0]!.results){
    const row=raw as StorageModelPublicationValue;
-   if(await validStorageModelPublication(row,authority))days.add(row.day);
+   if(await validStorageModelPublication(row,authority,terminalEpoch))days.add(row.day);
   }
   if(days.size>requiredDays)throw new Error('history count unavailable');
   let activeDay:string|null=null;
@@ -38,13 +41,13 @@ export async function readStorageCommunityProgress(bindings:StorageAnalyticsBind
   }
   const preview=metadata[1]!.results[0] as {authority_json:string;generated_at:string;inputs_current:number}|undefined;
   const published=preview?JSON.parse(preview.authority_json) as StorageCommunityAuthority:null;
-  const ready=published!==null&&sameStorageCommunityAuthority(published,authority);
+  const ready=published!==null&&storageCommunityPublicationVisible(published,authority,terminalEpoch);
   const current=ready&&preview!.inputs_current===1&&published!.sourceEpoch===authority.sourceEpoch&&preview!.generated_at.slice(0,10)===today;
   const phase=!current?'current' as const:activeDay!==null?'history' as const
    :metadata[3]!.results.length?'daily' as const:null;
   const updatedMs=Number((metadata[2]!.results[0] as {updated_ms:number}|undefined)?.updated_ms??0);
   if(!Number.isSafeInteger(updatedMs)||updatedMs<0)throw new Error('work time unavailable');
-  if(!await storageCommunityAuthorityIsCurrent(bindings.source,authority,true))throw new Error('source changed');
+  if(!await storageCommunityCalculationAuthorityIsCurrent(bindings.source,authority))throw new Error('source changed');
   return {...(options.includePreparation?{schemaVersion:2 as const,preparation:null}:{schemaVersion:1 as const}),generatedAt,
    publication:{state:ready?'ready' as const:preview?'invalidated' as const:'empty' as const,
     requestedGeneration:authority.sourceEpoch,preparedGeneration:phase===null?authority.sourceEpoch:null,

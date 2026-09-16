@@ -1,6 +1,7 @@
 import { captureSelectedStorageGraphScope,captureStorageGraphScope,computeStorageGraphResult,
  STORAGE_GRAPH_METHOD,STORAGE_GRAPH_V11_CHECKPOINT_METHOD,type StorageGraphScope } from './storage-community-graph';
 import { readStorageCommunityOwnerPage, captureStorageCommunityAuthority,
+ readStorageCommunityDeliveredTerminalEpoch, readStorageCommunitySourceTerminalEpoch,
  type StorageCommunityOwner } from './storage-community-authority';
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowance';
 import { COMMUNITY_MODEL_CACHE_MAX_BYTES, COMMUNITY_MODEL_CACHE_MAX_PAGES } from './community-allowance';
@@ -125,12 +126,14 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  let day:string|null=today;
  if(!current) {
   const authority=await captureStorageCommunityAuthority(options.source,options);
+  const terminalEpoch=Math.max(await readStorageCommunitySourceTerminalEpoch(options.source),
+   await readStorageCommunityDeliveredTerminalEpoch(options.target,options.sourceId));
   const from=new Date(Date.parse(today)-(ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS-1)*86400000).toISOString().slice(0,10);
   const published=(await options.target.prepare(`SELECT day,authority_json,payload_json,payload_sha256 FROM analytics_community_model_publications
    WHERE source_id=? AND day>=? AND day<? AND method=? ORDER BY day LIMIT ?`)
    .bind(options.sourceId,from,today,STORAGE_GRAPH_METHOD,ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS).all<StorageModelPublicationValue>()).results;
   const completed=new Set<string>();
-  for(const row of published)if(await validStorageModelPublication(row,authority))completed.add(row.day);
+  for(const row of published)if(await validStorageModelPublication(row,authority,terminalEpoch))completed.add(row.day);
   day=null;
   for(let offset=1;offset<ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS;offset++) {
    const candidate=new Date(Date.parse(today)-offset*86400000).toISOString().slice(0,10);

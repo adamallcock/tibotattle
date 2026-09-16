@@ -57,8 +57,9 @@ const payloadAbsence=`
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_execution WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_history_checkpoint_stages WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_owners WHERE source_id=?1 AND owner_digest=?2)
- AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_publications WHERE source_id=?1
-   AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)
+ AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_publications p
+   JOIN analytics_community_daily_containment c ON c.source_id=p.source_id AND c.day=p.day AND c.owner_digest=?2
+   WHERE p.source_id=?1 AND COALESCE(json_extract(p.authority_json,'$.publicAuthorityEpoch'),-1)<c.terminal_public_authority_epoch)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_model_publications WHERE source_id=?1
    AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_previews WHERE source_id=?1

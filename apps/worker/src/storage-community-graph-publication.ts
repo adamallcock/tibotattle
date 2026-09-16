@@ -14,8 +14,9 @@ import { STORAGE_GRAPH_METHOD, storageGraphDependencyDigest } from './storage-co
 import { modelHistoryWindow } from './model-history-window';
 import { MAX_V1_SOURCE_CHUNKS, selectV1SourceDayDependencies, type V1SourceChunk } from './telemetry-v1-source-selection';
 import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuthority, readStorageCommunityOwnerPage,
-  sameStorageCommunityAuthority, sameStorageCommunityCalculationAuthority,
-  storageCommunityAuthorityIsCurrent, type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
+  readStorageCommunityDeliveredTerminalEpoch, readStorageCommunitySourceTerminalEpoch,
+  sameStorageCommunityCalculationAuthority, sameStorageCommunityHardAuthority, storageCommunityCalculationAuthorityIsCurrent,
+  storageCommunityPublicationVisible, type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import type { PublicAllowanceBreakdownsCacheRow } from './public-allowance-breakdowns';
 
@@ -91,7 +92,15 @@ interface CapturedResult {
   fits:CommunityAllowanceFit[]|null;composition:V1ModelCompositionResult|null;unsupportedSource?:boolean;
   inputCurrent:boolean;computedMs:number;sourceEpoch:number;sequence:number;
 }
-interface Capture {authority:StorageCommunityAuthority;members:StorageCommunityOwner[];results:CapturedResult[];}
+interface Capture {authority:StorageCommunityAuthority;members:StorageCommunityOwner[];results:CapturedResult[];
+  /** Highest containment epoch known to source or target at capture time. */
+  terminalEpoch:number;}
+/** Both containment views: a source-journaled terminal not yet delivered, and
+ * the delivered/fenced watermark. Cohort-wide aggregates honour the larger. */
+async function terminalEpoch(bindings:StorageAnalyticsBindings):Promise<number> {
+  return Math.max(await readStorageCommunitySourceTerminalEpoch(bindings.source),
+    await readStorageCommunityDeliveredTerminalEpoch(bindings.target,bindings.sourceId));
+}
 interface CaptureCapacity {deferred:'capacity';memberCount:number;}
 interface ResultRow {
   owner_digest:string;input_revision:number;dependency_digest:string;payload_json:string|null;
@@ -165,6 +174,7 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
   const authority=await captureStorageCommunityAuthority(bindings.source,bindings),members=await owners(bindings.source);
   if(members===null)return null;
   if(members==='capacity')return {deferred:'capacity',memberCount:0};
+  const containment=await terminalEpoch(bindings);
   const results:CapturedResult[]=[],dependencyBudget={remaining:MAX_DEPENDENCY_BYTES};let size=0;
   for(let offset=0;offset<members.length;offset+=32){
     const page=members.slice(offset,offset+32);
@@ -199,13 +209,12 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
         ||!Number.isSafeInteger(row.input_revision)||row.input_revision<0||row.source_kind!==source
         ||(metric==='model'&&row.input_revision!==owner.inputRevision&&revalidated?.get(owner.ownerDigest!)!==row.dependency_digest)
         ||!/^[a-f0-9]{64}$/.test(row.dependency_digest)
+        // A closed historical result proves its exact old window above. A
+        // stale current fit is that owner's last completed result: it stays
+        // reusable under the same hard authority while the owner's own
+        // recalculation is queued, and the preview reports it as not current.
+        // Containment of the owner itself deletes the row rather than aging it.
         ||!rowAuthority||!sameStorageCommunityCalculationAuthority(rowAuthority,authority)
-        // A closed historical result can prove its exact old window below.
-        // A stale current fit is reusable only across append-only churn under
-        // the same global hard authority; hard changes require a current owner
-        // input before the aggregate can be published.
-        ||(metric==='fits'&&row.input_revision!==owner.inputRevision
-          &&!sameStorageCommunityAuthority(rowAuthority,authority))
         ||!Number.isSafeInteger(rowAuthority.sourceEpoch)||rowAuthority.sourceEpoch<0||rowAuthority.sourceEpoch>authority.sourceEpoch
         ||!Number.isSafeInteger(rowAuthority.sequence)||rowAuthority.sequence<0||rowAuthority.sequence>authority.sequence
         ||!Number.isSafeInteger(row.computed_ms)||row.computed_ms<0||row.computed_ms>Date.now()+300_000
@@ -229,30 +238,41 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
       results.push(result);
     }
   }
-  return {authority,members,results};
+  return {authority,members,results,terminalEpoch:containment};
 }
-async function current(bindings:StorageAnalyticsBindings,captured:Capture):Promise<boolean> {
+/** Final source fence. The exact member set, the hard authority and the
+ * absence of a newer containment terminal are re-proved; the returned fresh
+ * stamp pins the epoch that proof was made against. An unrelated concurrent
+ * upload changes none of these and therefore defers nothing. */
+async function current(bindings:StorageAnalyticsBindings,captured:Capture):Promise<StorageCommunityAuthority|null> {
   const latest=await owners(bindings.source);
-  return Array.isArray(latest)&&canonicalJson(latest.map(identity))===canonicalJson(captured.members.map(identity))
-    && await storageCommunityAuthorityIsCurrent(bindings.source,captured.authority,true);
+  if(!Array.isArray(latest)||canonicalJson(latest.map(identity))!==canonicalJson(captured.members.map(identity)))return null;
+  let fresh:StorageCommunityAuthority;
+  try{fresh=await captureStorageCommunityAuthority(bindings.source,bindings);}catch{return null;}
+  if(!sameStorageCommunityHardAuthority(fresh,captured.authority))return null;
+  if(await readStorageCommunitySourceTerminalEpoch(bindings.source)>captured.terminalEpoch)return null;
+  return fresh;
 }
 function cohortProof(captured:Capture) {
   // Exact window dependencies decide value reuse. Global inputRevision is a
   // calculation fence, never the identity of an unchanged historical result.
   return captured.results.map(s=>[s.owner.ownerDigest,s.source,s.dependencyDigest]);
 }
-function hardAuthority(authority:StorageCommunityAuthority) {return {...authority,sequence:0,sourceEpoch:0};}
+function hardAuthority(authority:StorageCommunityAuthority) {
+  return {sourceId:authority.sourceId,sourceNamespace:authority.sourceNamespace,
+    policyRevision:authority.policyRevision,collectionRevision:authority.collectionRevision};
+}
 interface PreviewFreshness {
   snapshot_source_epoch:number;inputs_current:0|1;oldest_computed_ms:number|null;newest_computed_ms:number|null;
 }
-function previewProof(captured:Capture):{authority:StorageCommunityAuthority;freshness:PreviewFreshness} {
+function previewProof(captured:Capture,pinned:StorageCommunityAuthority):{authority:StorageCommunityAuthority;freshness:PreviewFreshness} {
   const inputsCurrent=captured.results.every(result=>result.inputCurrent),times=captured.results.map(result=>result.computedMs);
-  return {authority:inputsCurrent?captured.authority:{...captured.authority,
+  return {authority:inputsCurrent?pinned:{...pinned,
     // This lower watermark is a completed-input proof, not a fabricated common
     // raw snapshot. The separately captured epoch owns the publication CAS.
     sourceEpoch:Math.min(...captured.results.map(result=>result.sourceEpoch)),
     sequence:Math.min(...captured.results.map(result=>result.sequence))},
-    freshness:{snapshot_source_epoch:captured.authority.sourceEpoch,inputs_current:inputsCurrent?1:0,
+    freshness:{snapshot_source_epoch:pinned.sourceEpoch,inputs_current:inputsCurrent?1:0,
       oldest_computed_ms:times.length?Math.min(...times):null,newest_computed_ms:times.length?Math.max(...times):null}};
 }
 function sameFreshness(left:PreviewFreshness,right:PreviewFreshness):boolean {
@@ -293,7 +313,8 @@ export async function publishStorageCommunityModelDay(bindings:StorageAnalyticsB
   const previous=await bindings.target.prepare(`SELECT revision,cohort_digest,payload_json,payload_sha256 FROM analytics_community_model_publications
     WHERE source_id=? AND day=?`).bind(bindings.sourceId,options.day).first<{
       revision:number;cohort_digest:string;payload_json:string;payload_sha256:string}>();
-  if(!await current(bindings,captured))return {state:'deferred',reason:'source_changed',memberCount:captured.members.length};
+  const pinned=await current(bindings,captured);
+  if(!pinned)return {state:'deferred',reason:'source_changed',memberCount:captured.members.length};
   if(previous?.cohort_digest===cohortDigest&&previous.payload_json===payloadJson
     &&await sha256Hex(previous.payload_json)===previous.payload_sha256)
     return {state:'unchanged',memberCount:captured.members.length};
@@ -307,8 +328,8 @@ export async function publishStorageCommunityModelDay(bindings:StorageAnalyticsB
     WHERE analytics_community_model_publications.revision=?
       AND json_extract(analytics_community_model_publications.authority_json,'$.sourceEpoch')<=?
       AND analytics_community_model_publications.computed_ms<=?`).bind(bindings.sourceId,options.day,(previous?.revision??0)+1,
-      STORAGE_GRAPH_METHOD,cohortDigest,canonicalJson(captured.authority),payloadJson,payloadHash,computedMs,
-      previous?.revision??0,captured.authority.sourceEpoch,computedMs).run();}catch{ /* Reconcile an uncertain write by its exact cohort receipt. */ }
+      STORAGE_GRAPH_METHOD,cohortDigest,canonicalJson(pinned),payloadJson,payloadHash,computedMs,
+      previous?.revision??0,pinned.sourceEpoch,computedMs).run();}catch{ /* Reconcile an uncertain write by its exact cohort receipt. */ }
   const receipt=await bindings.target.prepare(`SELECT cohort_digest,payload_json,payload_sha256 FROM analytics_community_model_publications
     WHERE source_id=? AND day=?`).bind(bindings.sourceId,options.day)
     .first<{cohort_digest:string;payload_json:string;payload_sha256:string}>();
@@ -343,7 +364,7 @@ export async function publishStorageCommunityGraphPreview(bindings:StorageAnalyt
   for(const raw of results[0]!.results){
     const row=raw as {day:string;payload_json:string;payload_sha256:string;authority_json:string};
     const pin=JSON.parse(row.authority_json) as StorageCommunityAuthority;
-    if(!sameStorageCommunityAuthority(pin,captured.authority))continue;
+    if(!storageCommunityPublicationVisible(pin,captured.authority,captured.terminalEpoch))continue;
     if(bytes(row.payload_json)>16*1024||await sha256Hex(row.payload_json)!==row.payload_sha256)throw fail();
     const parsed=projectAdminModelHistoryDay(JSON.parse(row.payload_json));
     if(!parsed||parsed.day!==row.day)throw fail();days.push(parsed);
@@ -358,8 +379,9 @@ export async function publishStorageCommunityGraphPreview(bindings:StorageAnalyt
   const cohortDigest=await sha256Hex(canonicalJson([STORAGE_GRAPH_METHOD,today,cohortProof(captured),modelRevision,hardAuthority(captured.authority)]));
   const previous=results[2]!.results[0] as (PreviewFreshness&{revision:number;cohort_digest:string;payload_json:string;
     payload_sha256:string;authority_json:string})|undefined;
-  const proof=previewProof(captured),authorityJson=canonicalJson(proof.authority),freshness=proof.freshness;
-  if(!await current(bindings,captured))return {state:'deferred',reason:'source_changed',memberCount:captured.members.length};
+  const pinned=await current(bindings,captured);
+  if(!pinned)return {state:'deferred',reason:'source_changed',memberCount:captured.members.length};
+  const proof=previewProof(captured,pinned),authorityJson=canonicalJson(proof.authority),freshness=proof.freshness;
   const previousPayload:unknown=previous?JSON.parse(previous.payload_json):null;
   if(previous?.cohort_digest===cohortDigest&&await sha256Hex(previous.payload_json)===previous.payload_sha256
     &&previousPayload!==null&&typeof previousPayload==='object'&&'generatedAt' in previousPayload
@@ -377,7 +399,7 @@ export async function publishStorageCommunityGraphPreview(bindings:StorageAnalyt
         AND COALESCE((SELECT model_revision FROM analytics_community_graph_publication_state WHERE source_id=?),0)=?`)
       .bind(authorityJson,freshness.snapshot_source_epoch,freshness.inputs_current,freshness.oldest_computed_ms,
         freshness.newest_computed_ms,bindings.sourceId,previous.revision,cohortDigest,previous.payload_sha256,
-        captured.authority.sourceEpoch,bindings.sourceId,modelRevision).run();}catch{ /* Exact proof readback below. */ }
+        pinned.sourceEpoch,bindings.sourceId,modelRevision).run();}catch{ /* Exact proof readback below. */ }
     const receipt=await bindings.target.prepare(`SELECT authority_json,payload_json,payload_sha256,
       snapshot_source_epoch,inputs_current,oldest_computed_ms,newest_computed_ms FROM analytics_community_graph_previews WHERE source_id=?`)
       .bind(bindings.sourceId).first<PreviewFreshness&{authority_json:string;payload_json:string;payload_sha256:string}>();
@@ -400,7 +422,7 @@ export async function publishStorageCommunityGraphPreview(bindings:StorageAnalyt
       AND analytics_community_graph_previews.generated_at<=?`).bind(bindings.sourceId,(previous?.revision??0)+1,STORAGE_GRAPH_METHOD,
       cohortDigest,authorityJson,modelRevision,payloadJson,payloadHash,preview.generatedAt,
       freshness.snapshot_source_epoch,freshness.inputs_current,freshness.oldest_computed_ms,freshness.newest_computed_ms,
-      bindings.sourceId,modelRevision,previous?.revision??0,captured.authority.sourceEpoch,preview.generatedAt).run();}catch{ /* Exact readback owns uncertain success. */ }
+      bindings.sourceId,modelRevision,previous?.revision??0,pinned.sourceEpoch,preview.generatedAt).run();}catch{ /* Exact readback owns uncertain success. */ }
   const receipt=await bindings.target.prepare(`SELECT cohort_digest,payload_json,payload_sha256,authority_json,
     snapshot_source_epoch,inputs_current,oldest_computed_ms,newest_computed_ms FROM analytics_community_graph_previews WHERE source_id=?`)
     .bind(bindings.sourceId).first<PreviewFreshness&{cohort_digest:string;payload_json:string;payload_sha256:string;authority_json:string}>();
@@ -415,18 +437,22 @@ export async function publishStorageCommunityGraphPreview(bindings:StorageAnalyt
 export async function readPublishedStorageCommunityGraph(bindings:StorageAnalyticsBindings,
   nowMs=Date.now()):Promise<PublicAllowanceBreakdownsCacheRow|null> {
   await ready(bindings);const authority=await captureStorageCommunityAuthority(bindings.source,bindings);
+  const sourceTerminal=await readStorageCommunitySourceTerminalEpoch(bindings.source);
+  const containment=Math.max(sourceTerminal,await readStorageCommunityDeliveredTerminalEpoch(bindings.target,bindings.sourceId));
   const row=await bindings.target.prepare(`SELECT payload_json,payload_sha256,authority_json,generated_at,
     snapshot_source_epoch,inputs_current,oldest_computed_ms,newest_computed_ms
     FROM analytics_community_graph_previews WHERE source_id=? AND method=?`)
     .bind(bindings.sourceId,STORAGE_GRAPH_METHOD).first<PreviewFreshness&{payload_json:string;payload_sha256:string;authority_json:string;generated_at:string}>();
   if(!row)return null;
   const publishedAuthority=JSON.parse(row.authority_json) as StorageCommunityAuthority;
-  if(!sameStorageCommunityAuthority(publishedAuthority,authority)
+  if(!storageCommunityPublicationVisible(publishedAuthority,authority,containment)
     ||!validFreshness(row,publishedAuthority,nowMs)||row.snapshot_source_epoch>authority.sourceEpoch
-    ||publishedAuthority.sequence>authority.sequence
     ||bytes(row.payload_json)>PREVIEW_CACHE_JSON_LIMIT_BYTES||await sha256Hex(row.payload_json)!==row.payload_sha256
     ||!validCachedAdminCommunityAllowancePreview(JSON.parse(row.payload_json),row.generated_at,nowMs))return null;
-  if(!await storageCommunityAuthorityIsCurrent(bindings.source,authority))return null;
+  // Final source fence: a containment terminal or hard-authority change that
+  // raced the target read withholds the aggregate; an ordinary upload does not.
+  if(await readStorageCommunitySourceTerminalEpoch(bindings.source)!==sourceTerminal
+    ||!await storageCommunityCalculationAuthorityIsCurrent(bindings.source,authority))return null;
   return {payload_json:row.payload_json,generated_at:row.generated_at};
 }
 
@@ -442,21 +468,26 @@ export async function retireStorageCommunityGraphPublications(bindings:StorageAn
   nowMs=Date.now()):Promise<number> {
   if(!Number.isFinite(nowMs))throw fail();
   const authority=await captureStorageCommunityRetirementAuthority(bindings.source,bindings);
+  // Cohort-wide aggregates embed every member, so any containment terminal
+  // newer than their pin retires them; a merely older public epoch does not.
+  const containment=await terminalEpoch(bindings);
   const from=new Date(Date.parse(new Date(nowMs).toISOString().slice(0,10))
     -(ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS-1)*DAY_MS).toISOString().slice(0,10);
   const results=await bindings.target.batch([
     bindings.target.prepare(`DELETE FROM analytics_community_model_publications WHERE (source_id,day) IN(
-      SELECT source_id,day FROM analytics_community_model_publications WHERE source_id=? AND (
-       day<? OR method!=? OR json_extract(authority_json,'$.publicAuthorityEpoch')!=?
-       OR json_extract(authority_json,'$.policyRevision')!=? OR json_extract(authority_json,'$.collectionRevision')!=?
-       OR json_extract(authority_json,'$.graphInvalidationEpoch')!=?) ORDER BY day LIMIT 4)`)
-      .bind(bindings.sourceId,from,STORAGE_GRAPH_METHOD,authority.publicAuthorityEpoch,authority.policyRevision,
-        authority.collectionRevision,authority.graphInvalidationEpoch),
-    bindings.target.prepare(`DELETE FROM analytics_community_graph_previews WHERE source_id=? AND (method!=?
-      OR json_extract(authority_json,'$.publicAuthorityEpoch')!=? OR json_extract(authority_json,'$.policyRevision')!=?
-      OR json_extract(authority_json,'$.collectionRevision')!=? OR json_extract(authority_json,'$.graphInvalidationEpoch')!=?)`)
-      .bind(bindings.sourceId,STORAGE_GRAPH_METHOD,authority.publicAuthorityEpoch,authority.policyRevision,
-        authority.collectionRevision,authority.graphInvalidationEpoch),
+      SELECT source_id,day FROM analytics_community_model_publications WHERE source_id=?1 AND (
+       day<?2 OR method!=?3 OR json_extract(authority_json,'$.sourceId') IS NOT ?1
+       OR json_extract(authority_json,'$.sourceNamespace') IS NOT ?4
+       OR json_extract(authority_json,'$.policyRevision') IS NOT ?5 OR json_extract(authority_json,'$.collectionRevision') IS NOT ?6
+       OR COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?7) ORDER BY day LIMIT 4)`)
+      .bind(bindings.sourceId,from,STORAGE_GRAPH_METHOD,authority.sourceNamespace,authority.policyRevision,
+        authority.collectionRevision,containment),
+    bindings.target.prepare(`DELETE FROM analytics_community_graph_previews WHERE source_id=?1 AND (method!=?2
+      OR json_extract(authority_json,'$.sourceId') IS NOT ?1 OR json_extract(authority_json,'$.sourceNamespace') IS NOT ?3
+      OR json_extract(authority_json,'$.policyRevision') IS NOT ?4 OR json_extract(authority_json,'$.collectionRevision') IS NOT ?5
+      OR COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?6)`)
+      .bind(bindings.sourceId,STORAGE_GRAPH_METHOD,authority.sourceNamespace,authority.policyRevision,
+        authority.collectionRevision,containment),
   ]);
   return results.reduce((n,r)=>n+r.meta.changes,0);
 }

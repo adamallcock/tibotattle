@@ -69,6 +69,47 @@ export function sameStorageCommunityCalculationAuthority(a: StorageCommunityAuth
     && a.policyRevision === b.policyRevision && a.collectionRevision === b.collectionRevision;
 }
 
+/** Hard publication authority. A completed public aggregate becomes
+ * incompatible, rather than merely older, only across a source identity,
+ * policy or collection revision change. Ordinary accepted uploads and
+ * corrections advance the public epoch; queued work replaces the aggregate
+ * atomically instead of withdrawing it. */
+export function sameStorageCommunityHardAuthority(a: StorageCommunityAuthority,
+  b: StorageCommunityAuthority): boolean {
+  return sameStorageCommunityCalculationAuthority(a, b);
+}
+
+/** Source-ahead containment: a terminal (owner-withdrawn/erased) already
+ * journaled by the source withholds every aggregate pinned below it even
+ * before ordered delivery. One bounded aggregate read; no owner identity. */
+export async function readStorageCommunitySourceTerminalEpoch(source: D1Database): Promise<number> {
+  const row = await source.prepare(`SELECT COALESCE(MAX(public_authority_epoch),0) AS epoch
+    FROM storage_ingestion_changes WHERE kind IN('owner-withdrawn','owner-erased')`).first<{ epoch: number }>();
+  if (!row || !count(row.epoch)) throw unavailable();
+  return row.epoch;
+}
+
+/** Highest containment epoch the analytics target has delivered or fenced.
+ * Migration 0018 maintains it transactionally with the terminal itself. */
+export async function readStorageCommunityDeliveredTerminalEpoch(target: D1Database, sourceId: string): Promise<number> {
+  const row = await target.prepare(`SELECT terminal_public_authority_epoch AS epoch
+    FROM analytics_community_terminal_watermarks WHERE source_id=?`).bind(sourceId).first<{ epoch: number }>();
+  if (row === null) return 0;
+  if (!row || !count(row.epoch)) throw unavailable();
+  return row.epoch;
+}
+
+/** A completed publication remains servable while its hard authority matches,
+ * it was pinned at or after every applicable containment epoch, and it does
+ * not claim inputs newer than the source. Older epochs alone never hide it. */
+export function storageCommunityPublicationVisible(pin: StorageCommunityAuthority, current: StorageCommunityAuthority,
+  terminalPublicAuthorityEpoch: number): boolean {
+  return sameStorageCommunityHardAuthority(pin, current)
+    && count(pin.publicAuthorityEpoch) && count(pin.sourceEpoch) && count(pin.sequence) && count(terminalPublicAuthorityEpoch)
+    && pin.publicAuthorityEpoch >= terminalPublicAuthorityEpoch && pin.publicAuthorityEpoch <= current.publicAuthorityEpoch
+    && pin.sourceEpoch <= current.sourceEpoch && pin.sequence <= current.sequence;
+}
+
 /** Lightweight final fence for private per-owner work. This deliberately does
  * not scan the ingestion journal or compare global owner mutation epochs. The
  * caller must also assert its exact owner source pin. */

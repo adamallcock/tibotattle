@@ -6,14 +6,14 @@ import { advanceAdmittedV11DailyProjection, retireV11DailyProjectionPage,
 import { advanceV1DailyProjection, advanceV1DailyProjectionPage, prepareV1ProjectionOwnerFence, retireV1DailyProjectionPage } from './v1-daily-projection';
 import { advanceLegacyStorageAcknowledgement } from './legacy-storage-journal';
 import { advanceNextStorageCommunityDaily, retireStorageCommunityDailyPage } from './storage-community-daily';
-import { advanceStorageCommunityGraphWork } from './storage-community-graph-work';
+import { advanceStorageCommunityGraphWork, type StorageGraphWorkProgress } from './storage-community-graph-work';
 import { retireStorageGraphPage } from './storage-graph-retirement';
 import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview,
  retireStorageCommunityGraphPublications, storageCommunityGraphPreviewReadyHint } from './storage-community-graph-publication';
 import { readCollectionControls } from './collection-controls';
 import { advanceStorageErasureJobs } from './storage-erasure';
 import { captureStorageAdminMetricSnapshot, warmStorageAdminMetricsHistoryCache } from './admin-metrics-history';
-import type { StorageGraphFailureFields } from './storage-analytics-failure';
+import { caughtStorageGraphFailureFields, type StorageGraphFailureFields } from './storage-analytics-failure';
 
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 export type { StorageAnalyticsBindings } from './analytics-delivery';
@@ -253,12 +253,22 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   // Give them one cheap publication chance before another graph calculation.
   // The aggregate hint is advisory; the existing publisher repeats the full
   // cohort, payload, source and privacy-authority validation before any write.
+  // A lane's application failure is recorded with its closed stage and the
+  // pass continues with the other lanes. Budget and deadline exhaustion keep
+  // their deferred semantics, so one failing owner-day or one malformed row
+  // can no longer stall daily activity and graph work for every minute.
+  const laneFailure=(stage:'daily_publish'|'graph_work',error:unknown):void=>{
+   if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError)throw error;
+   graphFailure??=caughtStorageGraphFailureFields(stage,error);
+  };
   if(options.publishCommunity&&meter.remainingQueries>=253&&deadlineMs-Date.now()>=5_000
     &&(await readCollectionControls(scoped.source)).publication) {
    options.signal?.throwIfAborted();
-   const ready=await storageCommunityGraphPreviewReadyHint(scoped);
-   options.signal?.throwIfAborted();
-   if(ready&&meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped);
+   try{
+    const ready=await storageCommunityGraphPreviewReadyHint(scoped);
+    options.signal?.throwIfAborted();
+    if(ready&&meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped);
+   }catch(error){laneFailure('graph_work',error);}
   }
   for(;steps<maxSteps;) {
    options.signal?.throwIfAborted();
@@ -302,19 +312,25 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
        if(daily.state==='idle'){dailyIdle=true;break;}
        if(daily.state==='progress'||daily.state==='deferred')break;
       }
-     }catch(error){if(!(error instanceof D1InvocationBudgetExceededError))throw error;}
+     }catch(error){
+      if(error instanceof D1InvocationBudgetExceededError)dailyIdle=false;
+      else laneFailure('daily_publish',error);
+     }
     }
     publicIdle=dailyIdle;
-    await retireStorageCommunityDailyPage(scoped);
+    try{await retireStorageCommunityDailyPage(scoped);}catch(error){laneFailure('daily_publish',error);}
     if(meter.remainingQueries>=550 && Date.now()<deadlineMs) {
-     const graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs});
-     if(graph.failure)graphFailure??=graph.failure;
-     if(graph.state==='complete')graphCalculations++;
-     if((graph.state==='complete'||graph.state==='reused')&&meter.remainingQueries>=250&&Date.now()<deadlineMs) {
-      if(graph.metric==='model'&&graph.day)await publishStorageCommunityModelDay(scoped,{day:graph.day});
-      if(meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped);
-     }
-     if(meter.remainingQueries>=30)await retireStorageCommunityGraphPublications(scoped);
+     let graph:StorageGraphWorkProgress={state:'deferred',reason:'graph_failure'};
+     try{
+      graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs});
+      if(graph.failure)graphFailure??=graph.failure;
+      if(graph.state==='complete')graphCalculations++;
+      if((graph.state==='complete'||graph.state==='reused')&&meter.remainingQueries>=250&&Date.now()<deadlineMs) {
+       if(graph.metric==='model'&&graph.day)await publishStorageCommunityModelDay(scoped,{day:graph.day});
+       if(meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped);
+      }
+      if(meter.remainingQueries>=30)await retireStorageCommunityGraphPublications(scoped);
+     }catch(error){laneFailure('graph_work',error);}
      publicIdle=publicIdle&&graph.state==='idle';
     } else publicIdle=false;
    }

@@ -256,8 +256,11 @@ describe('isolated allowance graph publication',()=>{
     return db.prepare(sql);};
    const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
   }});
-  await expect(runStorageAnalyticsPass({...bindings(),target:laterUnavailable,publishCommunity:true,maxSteps:1,
-   deadlineMs:Date.now()+20_000})).rejects.toThrow('synthetic later graph unavailable');
+  // A failure inside the graph lane is recorded with its closed stage and the
+  // pass completes; the ready fits were already published before that lane.
+  const pass=await runStorageAnalyticsPass({...bindings(),target:laterUnavailable,publishCommunity:true,maxSteps:1,
+   deadlineMs:Date.now()+20_000});
+  expect(pass.graphFailure).toEqual({phase:'graph_work',reason:'application'});
   expect(reachedHeavyGraph).toBe(true);
   expect(await readPublishedStorageCommunityGraph(bindings())).not.toBeNull();
  });
@@ -320,9 +323,9 @@ describe('isolated allowance graph publication',()=>{
    .toMatchObject({state:'published',memberCount:16});
   expect({owners:16,modelQueries:modelMeter.queriesUsed,previewQueries:previewMeter.queriesUsed}).toMatchInlineSnapshot(`
     {
-      "modelQueries": 11,
+      "modelQueries": 14,
       "owners": 16,
-      "previewQueries": 13,
+      "previewQueries": 16,
     }
   `);
   expect(modelMeter.queriesUsed).toBeLessThanOrEqual(250);expect(previewMeter.queriesUsed).toBeLessThanOrEqual(250);
@@ -352,7 +355,7 @@ describe('isolated allowance graph publication',()=>{
   expect({owners:1000,previewQueries:meter.queriesUsed}).toMatchInlineSnapshot(`
     {
       "owners": 1000,
-      "previewQueries": 74,
+      "previewQueries": 77,
     }
   `);
   expect(meter.queriesUsed).toBeLessThanOrEqual(100);
@@ -375,10 +378,13 @@ describe('isolated allowance graph publication',()=>{
   expect(meter.queriesUsed).toBeLessThan(250);
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(0);
  });
- it('reuses an unchanged owner result after another owner joins, while hiding the old publication',async()=>{
+ it('keeps the last preview visible while another owner joins, then republishes the enlarged cohort',async()=>{
   await fixture();await compute('fits');await publishStorageCommunityGraphPreview(bindings());
   await fixture('participant:second-synthetic');
-  expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
+  const held=await readPublishedStorageCommunityGraph(bindings());expect(held).not.toBeNull();
+  expect(JSON.parse(held!.payload_json).coverage).toMatchObject({uploadingParticipantCount:1,cachedParticipantCount:1});
+  expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'deferred',reason:'cache_pending'});
+  expect(await readPublishedStorageCommunityGraph(bindings())).not.toBeNull();
   await compute('fits',today(),0);
   expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'published',memberCount:2});
   const row=(await readPublishedStorageCommunityGraph(bindings()))!;
@@ -542,7 +548,7 @@ describe('isolated allowance graph publication',()=>{
   await retireStorageCommunityGraphPublications(bindings());
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(0);
  });
- it('retains a proved historical point across a real outside-window append, but hides attribution corrections',async()=>{
+ it('retains a proved historical point across a real outside-window append and keeps it visible while a correction recomputes',async()=>{
   const f=await fixture();await compute('model');await compute('fits');
   await publishStorageCommunityModelDay(bindings(),{day:day()});await publishStorageCommunityGraphPreview(bindings());
   const old=await b.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_community_model_publications').first();
@@ -565,11 +571,17 @@ describe('isolated allowance graph publication',()=>{
   await activateDays(f,[revised,current]);
   const after=await captureStorageCommunityAuthority(typed());
   expect(after.graphInvalidationEpoch).toBeGreaterThan(appended.graphInvalidationEpoch);
-  expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
-  expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'deferred',reason:'cache_pending'});
+  // The correction queues that owner's recalculation. The completed point and
+  // the preview remain the last good result; the preview now reports that its
+  // inputs are no longer current instead of disappearing.
+  expect(await readPublishedStorageCommunityGraph(bindings())).not.toBeNull();
   expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'deferred',reason:'cache_pending'});
+  expect(['published','unchanged']).toContain((await publishStorageCommunityGraphPreview(bindings())).state);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT inputs_current FROM analytics_community_graph_previews').first('inputs_current')).toBe(0);
+  expect(await readPublishedStorageCommunityGraph(bindings())).not.toBeNull();
   await retireStorageCommunityGraphPublications(bindings());
-  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_model_publications').first('n')).toBe(0);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_community_model_publications').first()).toEqual(old);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(1);
  });
  it('publishes closed history for two active owners while both append today before every attempt',async()=>{
   const fixtures=[await fixture('participant:continuous-a'),await fixture('participant:continuous-b')];
