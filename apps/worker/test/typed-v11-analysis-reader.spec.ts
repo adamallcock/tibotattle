@@ -8,7 +8,9 @@ import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/
 import { registerTelemetryV11DayManifest, telemetryV11ExportEntries } from "../src/telemetry-v11-repository";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor, loadV11SourcePin } from "../src/telemetry-v11-domain";
 import { accountScopedModelCompositionV11,accountScopedQuotaAnalysisV11,advanceV11UsageReduction,
-  createV11QuotaAcquisitionIdentity,finishV11UsageReduction,validateV11UsageReductionCheckpoint } from "../src/quota-analysis-v11";
+  createV11QuotaAcquisitionIdentity,finishV11UsageReduction,validateV11UsageReductionCheckpoint,
+  V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v11";
+import { validCompleteCachedComposition,validCompleteScalarAnalysis } from "../src/community-allowance";
 import { readTypedV11UsageAnalysisPage, readTypedV11ChunkRecords, TYPED_V11_USAGE_PAGE_SQL } from "../src/typed-v11-analysis-reader";
 import { typedTelemetryReadNamespace } from "../src/typed-telemetry-read-layout";
 import { sha256Hex } from "../src/crypto";
@@ -662,5 +664,42 @@ describe("typed active-domain analytical reads",()=>{
     }
     expect([...reasons].sort()).toEqual(['v11_checkpoint_group_budget','v11_checkpoint_read_budget']);
     expect((await computeStorageGraphResult(bindings,scope,{maxQueries:900})).state).toBe('complete');
+  },180_000);
+
+  it("returns a refused v1.1 acquisition in the metric's own publishable result shape",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    await activate(typed(),f,await makeV11Day(day(),evidence()),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'model',sourceId:namespace,sourceNamespace:namespace});
+    if(!('source'in scope.pin))throw new Error('synthetic v1.1 pin unavailable');
+    const pin=scope.pin,snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin});
+    const advance=(metric:'fits'|'model')=>advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+      day:scope.day,metric,nowMs:Date.parse(scope.fixedNow),sourcePin:pin,generationSnapshot:snapshot,
+      closedDependencyDigest:scope.checkpointDependencyDigest,maxPages:32,maxQuotaRows:1,
+      budget:{remainingQueries:900,deadlineMs:Date.now()+120_000}});
+    // A one-row downsampled bound refuses this owner's acquisition. The model
+    // history receives the bare composition refusal that the cached validator
+    // accepts; the scalar fit keeps its analysis-shaped refusal.
+    const model=await advance('model');
+    expect(model).toEqual({status:'complete',analysis:{status:'not_testable',reason:'downsampled_quota_limit_exceeded',tracks:[]}});
+    if(model.status!=='complete')throw new Error('expected a complete refusal');
+    expect(validCompleteCachedComposition(model.analysis,snapshot.fingerprint,V11_PLAN_ATTRIBUTION_ADAPTER_VERSION)).toBe(true);
+    const fits=await advance('fits');
+    expect(fits).toEqual({status:'complete',analysis:{schemaVersion:'account-scoped-quota-analysis-v0.1',
+      status:'not_testable',reason:'downsampled_quota_limit_exceeded',tracks:[]}});
+    if(fits.status!=='complete')throw new Error('expected a complete refusal');
+    expect(validCompleteScalarAnalysis(fits.analysis,'v1.1',snapshot.fingerprint)).toBe(true);
+    // The scalar shape is not a composition: returned for a model day it would
+    // fail result validation on every pass and withhold the whole model day.
+    expect(validCompleteCachedComposition(fits.analysis,snapshot.fingerprint,V11_PLAN_ATTRIBUTION_ADAPTER_VERSION)).toBe(false);
   },180_000);
 });

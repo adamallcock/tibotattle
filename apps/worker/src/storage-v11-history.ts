@@ -39,7 +39,10 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  participantId:string;day:string;metric:'fits'|'model';nowMs:number;sourcePin:V11SourcePin;
  generationSnapshot?:V11GenerationSnapshot;
  closedDependencyDigest:string;
- budget:V11QuotaInvocationBudget;checkpoint?:StorageV11HistoryCheckpoint|null;maxPages?:number}):Promise<StorageV11HistoryResult>{
+ budget:V11QuotaInvocationBudget;checkpoint?:StorageV11HistoryCheckpoint|null;maxPages?:number;
+ /** Kernel downsampled-quota bound; part of the acquisition identity. Tests
+  * lower it to reach the refusal path; production keeps the kernel default. */
+ maxQuotaRows?:number}):Promise<StorageV11HistoryResult>{
  const {source,sourceNamespace,participantId,day,metric,nowMs,budget}=input,sourcePin=structuredClone(input.sourcePin);
  if(sourcePin.source!=='v1.1'||sourcePin.participantId!==participantId
   ||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(day)||new Date(`${day}T00:00:00.000Z`).toISOString().slice(0,10)!==day
@@ -61,7 +64,7 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  const snapshot=prior?.snapshot??input.generationSnapshot
   ??await loadTypedV11GenerationSnapshot(source,{sourceNamespace,pin:sourcePin});
  await assertTypedV11GenerationSnapshotLive(source,snapshot);
- const analysisPin=pinForSnapshot(snapshot,sourcePin),liveIdentity=createV11QuotaAcquisitionIdentity(analysisPin,nowMs),
+ const analysisPin=pinForSnapshot(snapshot,sourcePin),liveIdentity=createV11QuotaAcquisitionIdentity(analysisPin,nowMs,input.maxQuotaRows),
   identity={...liveIdentity,inputFingerprint:input.closedDependencyDigest};
  if(prior&&!sameIdentity(prior.identity,identity))throw fail();
  let checkpoint:StorageV11HistoryCheckpoint=prior??{version:1,source:'v1.1',day,layout,identity,snapshot,
@@ -87,8 +90,14 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   // `maxPages` pages means a budget cut rather than a natural group boundary.
   if(result.status==='deferred')return before-budget.remainingQueries<maxPages?{status:'deferred',checkpoint:prior,cut:true}
    :{status:'deferred',checkpoint:{...checkpoint,snapshot,acquisition:result.checkpoint}};
-  if(result.status==='not_testable')return {status:'complete',analysis:{
-   schemaVersion:'account-scoped-quota-analysis-v0.1',status:'not_testable',reason:result.reason,tracks:[]}};
+  // A refused acquisition is a complete, publishable result in the shape the
+  // metric's maintained finisher would return: the bare composition refusal
+  // for the model history, the scalar analysis refusal for fits. The cached
+  // composition validator rejects any other keys, so the fits shape must not
+  // leak into a model result.
+  if(result.status==='not_testable')return {status:'complete',analysis:metric==='model'
+   ?{status:'not_testable',reason:result.reason,tracks:[]}
+   :{schemaVersion:'account-scoped-quota-analysis-v0.1',status:'not_testable',reason:result.reason,tracks:[]}};
   checkpoint={version:1,source:'v1.1',day,layout,identity,snapshot,phase:'finish',
    acquisition:{identity:result.identity,planAnchors:result.planAnchors,quotaRows:result.quotaRows}};
   return {status:'deferred',checkpoint};

@@ -118,6 +118,16 @@ withholds a day while any owner result is missing.
 | Lane order | `runStorageAnalyticsPass` (`graphLaneFirst`) | The public phase alternates by minute which lane opens, so a live daily queue and a resumable graph checkpoint share the scheduled windows instead of one starving the other |
 | Abandoned successor sweep | existing `retireStorageGraphPage` | Verified by test: once a different successor promotes, partial stages that expected the old head are removed in bounded pages |
 
+Once loads completed, the same owner failed every pass with
+`graph_model_compute`/`application`. A one-way token of the wrapped error in
+the new `storage_analytics_lane_failure` log line resolved it to
+`STORAGE_GRAPH_RESULT_UNAVAILABLE`: the owner's acquisition exceeds the kernel's
+60,000 downsampled quota rows and is refused, but `advanceStorageV11Analysis`
+returned every refusal in the scalar-analysis shape, which the cached
+composition validator rejects for a model day. The model history now receives
+the bare composition refusal (`status`, `reason`, `tracks`) that the maintained
+finisher returns, so the day publishes with that owner as a refusal count.
+
 Still open: the acquisition checkpoint itself (up to 60,000 quota rows per
 owner) is the structural cost; a compact representation is the next step if a
 group plus its save does not fit one window at production latency.
