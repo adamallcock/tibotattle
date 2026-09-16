@@ -1,7 +1,7 @@
 import { canonicalJson } from './canonical-json';
 import { accountScopedModelCompositionV11,accountScopedQuotaAnalysisV11,
   createV11QuotaAcquisitionIdentity,v11AnalysisWindow } from './quota-analysis-v11';
-import { advanceV11QuotaAcquisitionPage,createV11QuotaAcquisitionCheckpoint,
+import { advanceV11QuotaAcquisition,createV11QuotaAcquisitionCheckpoint,
   type V11CompletedQuotaAcquisition,type V11QuotaAcquisitionCheckpoint,
   type V11QuotaAcquisitionIdentity,type V11QuotaInvocationBudget } from './quota-analysis-v11-reader';
 import { assertV11SourcePinCurrent,type V11SourcePin } from './telemetry-v11-domain';
@@ -19,28 +19,29 @@ function sameIdentity(left:V11QuotaAcquisitionIdentity,right:V11QuotaAcquisition
  return canonicalJson(left)===canonicalJson(right);
 }
 
-/** One source-only v1.1 quota page. The graph caller durably promotes the
- * returned deterministic checkpoint before requesting another page. The
+/** One bounded source-only v1.1 quota-page group. The graph caller durably
+ * promotes the returned deterministic checkpoint before requesting another group. The
  * maintained finisher retains its own final source-pin check; graph result
  * promotion still performs the independent source/privacy fence. */
 export async function advanceStorageV11Analysis(input:{source:D1Database;sourceNamespace:string;
  participantId:string;day:string;metric:'fits'|'model';nowMs:number;sourcePin:V11SourcePin;
  closedDependencyDigest:string;
- budget:V11QuotaInvocationBudget;checkpoint?:StorageV11HistoryCheckpoint|null}):Promise<StorageV11HistoryResult>{
+ budget:V11QuotaInvocationBudget;checkpoint?:StorageV11HistoryCheckpoint|null;maxPages?:number}):Promise<StorageV11HistoryResult>{
  const {source,sourceNamespace,participantId,day,metric,nowMs,budget}=input,sourcePin=structuredClone(input.sourcePin);
  if(sourcePin.source!=='v1.1'||sourcePin.participantId!==participantId
   ||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(day)||new Date(`${day}T00:00:00.000Z`).toISOString().slice(0,10)!==day
   ||!Number.isSafeInteger(nowMs)||!Number.isSafeInteger(budget.remainingQueries)||budget.remainingQueries<0
   ||!Number.isFinite(budget.deadlineMs))throw fail();
  if(!/^[0-9a-f]{64}$/.test(input.closedDependencyDigest))throw fail();
+ if(input.maxPages!==undefined&&(!Number.isSafeInteger(input.maxPages)||input.maxPages<1||input.maxPages>32))throw fail();
  const liveIdentity=createV11QuotaAcquisitionIdentity(sourcePin,nowMs),
   identity={...liveIdentity,inputFingerprint:input.closedDependencyDigest},layout=`typed-v11:${sourceNamespace}`;
  const prior=input.checkpoint?structuredClone(input.checkpoint):null;
  if(prior&&(prior.version!==1||prior.source!=='v1.1'||prior.day!==day||prior.layout!==layout
   ||!['acquisition','finish'].includes(prior.phase)||!sameIdentity(prior.identity,identity)))throw fail();
  const now=()=>{const value=(budget.now??Date.now)();if(!Number.isFinite(value))throw fail();return value;};
- // Reader scope1 + source pre/post2 + lower page1 + successor checks. Preserve
- // a bounded local reserve before starting a page; the outer D1 meter remains
+ // Reader scope1 + source pre/post2 + successor checks are fixed per group.
+ // Preserve a bounded local reserve before starting a group; the outer D1 meter remains
  // the actual statement authority.
  if(budget.remainingQueries<8||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:prior};
  budget.remainingQueries-=7;
@@ -60,13 +61,16 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   }
   const reader=await createTypedV11QuotaPageReader(source,{sourceNamespace,pin:sourcePin,
    fromObservedAtMs:Date.parse(window.start),beforeObservedAtMs:Date.parse(window.end)});
-  const step=await advanceV11QuotaAcquisitionPage(reader,identity,budget,checkpoint.acquisition);
+  const before=budget.remainingQueries;
+  const result=await advanceV11QuotaAcquisition(reader,identity,budget,checkpoint.acquisition,
+   {maxPages:input.maxPages??1});
   await assertV11SourcePinCurrent(source,sourcePin);
-  if(step.result.status==='deferred')return {status:'deferred',checkpoint:{...checkpoint,acquisition:step.result.checkpoint}};
-  if(step.result.status==='not_testable')return {status:'complete',analysis:{
-   schemaVersion:'account-scoped-quota-analysis-v0.1',status:'not_testable',reason:step.result.reason,tracks:[]}};
+  if(result.status==='deferred')return {status:'deferred',checkpoint:before===budget.remainingQueries?prior:
+   {...checkpoint,acquisition:result.checkpoint}};
+  if(result.status==='not_testable')return {status:'complete',analysis:{
+   schemaVersion:'account-scoped-quota-analysis-v0.1',status:'not_testable',reason:result.reason,tracks:[]}};
   checkpoint={version:1,source:'v1.1',day,layout,identity,phase:'finish',
-   acquisition:{identity:step.result.identity,planAnchors:step.result.planAnchors,quotaRows:step.result.quotaRows}};
+   acquisition:{identity:result.identity,planAnchors:result.planAnchors,quotaRows:result.quotaRows}};
   return {status:'deferred',checkpoint};
  }
  // The durable acquisition is identified by the exact selected historical

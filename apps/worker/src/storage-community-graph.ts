@@ -229,17 +229,28 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       }
       break;
     }
-    for(let page=0;page<STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM;page++){
-      const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
+    // Resolve and fence the source once around a bounded page group, then
+    // promote its deterministic successor once. If the read, final pin check,
+    // or promotion fails, the last durable head remains the replay point.
+    const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
+      participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
+      closedDependencyDigest:scope.dependencyDigest,checkpoint,maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
+      budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
+    if(next.status==='complete')return {state:'complete',analysis:next.analysis};
+    if(!next.checkpoint)return {state:'deferred',reason:'v11_checkpoint'};
+    const saved=await persistCheckpoint(key,next.checkpoint,head,'v11_checkpoint');
+    if(saved.state==='deferred')return saved;
+    if(saved.head===head)return {state:'deferred',reason:'v11_checkpoint'};
+    // A group that reaches the finish phase is durably recoverable before the
+    // potentially expensive finisher starts. Use the remaining invocation
+    // budget immediately, while a failure still resumes from the saved finish
+    // checkpoint rather than rereading the group.
+    if(next.checkpoint.phase==='finish'){
+      const finished=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
         participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
-        closedDependencyDigest:scope.dependencyDigest,checkpoint,
+        closedDependencyDigest:scope.dependencyDigest,checkpoint:next.checkpoint,maxPages:1,
         budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
-      if(next.status==='complete')return {state:'complete',analysis:next.analysis};
-      if(!next.checkpoint)return {state:'deferred',reason:'v11_checkpoint'};
-      const saved=await persistCheckpoint(key,next.checkpoint,head,'v11_checkpoint');
-      if(saved.state==='deferred')return saved;
-      if(saved.head===head)return {state:'deferred',reason:'v11_checkpoint'};
-      head=saved.head;checkpoint=next.checkpoint;
+      if(finished.status==='complete')return {state:'complete',analysis:finished.analysis};
     }
     return {state:'deferred',reason:'v11_checkpoint'};
   };

@@ -589,6 +589,39 @@ describe('isolated allowance graph publication',()=>{
   expect(plan).toMatch(/SEARCH analytics_community_graph_results USING (PRIMARY KEY|INDEX analytics_community_graph_day)/);
   expect(plan).not.toMatch(/SCAN analytics_community_graph_results/);
  });
+ it('prioritizes missing historical models while retaining the durable history cadence',async()=>{
+  for(const suffix of ['a','b','c'])await fixture(`participant:model-priority-${suffix}`);
+  const owners=await readStorageCommunityOwnerPage(typed());expect(owners).toHaveLength(3);
+  for(let index=0;index<owners.length;index++)expect((await compute('model',day(),index)).state).toBe('complete');
+  await b.STORAGE_ANALYTICS_DB.prepare(`DELETE FROM analytics_community_graph_results
+    WHERE source_id=? AND owner_digest=? AND metric='model' AND day=?`).bind(namespace,owners[1]!.ownerDigest,day()).run();
+  await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_scan
+    (source_id,revision,tick,current_position,history_position) VALUES(?,1,1,0,0)
+    ON CONFLICT(source_id) DO UPDATE SET revision=revision+1,tick=1,current_position=0,history_position=0`)
+   .bind(namespace).run();
+
+  let failedOwner='';
+  const unavailable=new Proxy(b.STORAGE_ANALYTICS_DB,{get(db,key){
+  if(key==='prepare')return(sql:string)=>{
+   const statement=db.prepare(sql);
+   if(!sql.includes('owner_digest=? AND metric=? AND day=?'))return statement;
+    return new Proxy(statement,{get(s,property){
+     if(property==='bind')return(...args:unknown[])=>{
+      const bound=s.bind(...args);return new Proxy(bound,{get(original,member){
+       if(member==='first')return async()=>{failedOwner=String(args[1]);throw new Error('synthetic model read unavailable');};
+       const value=Reflect.get(original,member);return typeof value==='function'?value.bind(original):value;
+      }});
+     };
+     const value=Reflect.get(s,property);return typeof value==='function'?value.bind(s):value;
+    }});
+   };
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  await expect(advanceStorageCommunityGraphWork({...bindings(),target:unavailable})).rejects.toThrow();
+  expect(failedOwner).toBe(owners[1]!.ownerDigest);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
+   .first()).toMatchObject({tick:2,current_position:0,history_position:2});
+ });
  it('refreshes only the proof of an unchanged preview after an actual outside-window append',async()=>{
   const f=await fixture(),days=await activeDays(f);
   const date=(age:number)=>new Date(Date.parse(today())-age*86400000).toISOString().slice(0,10);
