@@ -78,10 +78,20 @@ until a separately qualified composition is deliberately selected.
 - Architecture, documentation and preflight checks pass. The full Worker run
   passed 1,111 tests across 91 files (410.27 seconds), followed by the final
   targeted checks above.
-  Deployment dry-run stopped at the required clean, committed tree guard.
+  The initial deployment dry-run stopped at the clean-tree guard. Repeating
+  `npm run deploy:dry` on committed implementation `df1fbbd3` passed that guard
+  and stopped because the generated public release manifest is absent. No
+  deployment or staging qualification is claimed.
   Independent review found and fixed lifecycle withdrawal invalidation and
   unbounded PostgreSQL erasure reads. A real table-lock test verifies the
   configured read timeout; rollback and lost-commit connection tests also pass.
+
+## Delivery
+
+Implementation committed as `df1fbbd3` on `codex/hosted-object-storage-adapter`.
+Both disposable database lifecycles were checked: zero qualification databases
+remained, and the owned PostgreSQL server was stopped. No cloud writes, push,
+merge or deployment were performed.
 
 ## Remaining qualification boundaries
 
