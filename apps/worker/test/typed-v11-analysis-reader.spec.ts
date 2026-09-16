@@ -7,8 +7,8 @@ import { initializeStorageSource, STORAGE_OPERATING_BUDGET_BYTES } from "../src/
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
 import { registerTelemetryV11DayManifest, telemetryV11ExportEntries } from "../src/telemetry-v11-repository";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor, loadV11SourcePin } from "../src/telemetry-v11-domain";
-import { accountScopedModelCompositionV11,accountScopedQuotaAnalysisV11,createV11QuotaAcquisitionIdentity,
-  finishV11UsageReduction } from "../src/quota-analysis-v11";
+import { accountScopedModelCompositionV11,accountScopedQuotaAnalysisV11,advanceV11UsageReduction,
+  createV11QuotaAcquisitionIdentity,finishV11UsageReduction,validateV11UsageReductionCheckpoint } from "../src/quota-analysis-v11";
 import { readTypedV11UsageAnalysisPage, readTypedV11ChunkRecords, TYPED_V11_USAGE_PAGE_SQL } from "../src/typed-v11-analysis-reader";
 import { typedTelemetryReadNamespace } from "../src/typed-telemetry-read-layout";
 import { sha256Hex } from "../src/crypto";
@@ -285,6 +285,11 @@ describe("typed active-domain analytical reads",()=>{
       .toEqual(await accountScopedQuotaAnalysisV11(typed(),participantId,{nowMs:Date.parse(scope.fixedNow),sourcePin:scope.pin}));
     expect(await finishV11UsageReduction(typed(),scope.pin,reductionOptions,shared.checkpoint.usage,'model',shared.checkpoint.identity))
       .toEqual(await accountScopedModelCompositionV11(typed(),participantId,{nowMs:Date.parse(scope.fixedNow),sourcePin:scope.pin}));
+    const capped=await advanceV11UsageReduction(typed(),scope.pin,{...reductionOptions,maxWindowedUsageRows:1},
+      {remainingQueries:32,deadlineMs:Date.now()+20_000},null,32,shared.checkpoint.identity);
+    expect(capped).toMatchObject({complete:true,rowsRead:1,commonRefusal:'windowed_usage_limit_exceeded',
+      previous:[],hazards:[],scalarBuckets:[],modelCosts:[],poisoned:[]});
+    expect(validateV11UsageReductionCheckpoint(capped)).toBe(true);
     const meter=createD1InvocationBudget(20);
     const repeated=await computeStorageGraphResult({...bindings,source:meter.wrap(typed()),target:meter.wrap(bindings.target)},scope);
     expect(repeated.state==="complete"&&repeated.reused).toBe(true);
@@ -367,6 +372,50 @@ describe("typed active-domain analytical reads",()=>{
     const reads=observePreparedSql(typed());
     expect((await computeStorageGraphResult({...bindings,source:reads.database},modelScope,{maxQueries:900})).state).toBe('complete');
     expect(reads.queries.filter(sql=>sql.includes("stream='usage'")||sql.includes("stream = 'usage'"))).toHaveLength(0);
+  },120_000);
+
+  it("persists a valid terminal refusal instead of an overflowing usage accumulator",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true}),prepared=evidence();
+    prepared.usage[0]={...prepared.usage[0]!,totalInputContextTokens:1_000_000_000_000,
+      components:{inputUncachedTokens:1_000_000_000_000,inputCacheReadTokens:0,inputCacheWriteTokens:0,
+        outputTextTokens:0,outputReasoningTokens:0,outputCombinedTokens:null}};
+    await activate(typed(),f,await makeV11Day(day(),prepared),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    expect((await computeStorageGraphResult(bindings,scope,{maxQueries:900})).state).toBe('complete');
+    const loaded=await loadStorageHistoryCheckpoint({target:bindings.target,key:{sourceId:namespace,
+      sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day:scope.day,
+      dependencyDigest:scope.checkpointDependencyDigest,method:STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD}});
+    expect(loaded.status).toBe('ready');
+    if(loaded.status!=='ready'||!('source'in loaded.checkpoint)||loaded.checkpoint.phase!=='usage')
+      throw new Error('expected terminal usage checkpoint');
+    expect(loaded.checkpoint.usage.complete).toBe(true);
+    if(!('source'in scope.pin))throw new Error('expected v11 pin');
+    const stressed=structuredClone(loaded.checkpoint.usage);
+    stressed.complete=false;stressed.dayIndex=0;stressed.cursorTime=day()+"T00:00:00.000Z";
+    stressed.cursorOccurrence='';stressed.rowsRead=0;stressed.previous=[];stressed.hazards=[];stressed.poisoned=[];
+    stressed.commonRefusal=null;stressed.scalarRefusal=null;stressed.modelRefusal=null;
+    stressed.usageEventCount=0;stressed.unpricedUsageEventCount=0;stressed.attributionUnresolved=false;
+    stressed.scalarBuckets.forEach(bucket=>{bucket.value.costNanousd=90_000_000_000_000});
+    stressed.modelCosts.forEach(bucket=>{bucket.costNanousd=90_000_000_000_000});
+    expect(validateV11UsageReductionCheckpoint(stressed)).toBe(true);
+    const liveAcquisition={...loaded.checkpoint.acquisition,
+      identity:createV11QuotaAcquisitionIdentity(scope.pin,Date.parse(scope.fixedNow))};
+    const refused=await advanceV11UsageReduction(typed(),scope.pin,{nowMs:Date.parse(scope.fixedNow),
+      sourcePin:scope.pin,typedSourceNamespace:namespace,quotaAcquisition:liveAcquisition},
+      {remainingQueries:32,deadlineMs:Date.now()+20_000},stressed,32,loaded.checkpoint.identity);
+    expect(refused).toMatchObject({complete:true,scalarRefusal:'usage_cost_limit_exceeded',
+      modelRefusal:'usage_cost_limit_exceeded',scalarBuckets:[],modelCosts:[],poisoned:[]});
+    expect(validateV11UsageReductionCheckpoint(refused)).toBe(true);
   },120_000);
 
   it("resumes a grouped v1.1 acquisition after the promoted response is lost without rereading source pages",async()=>{

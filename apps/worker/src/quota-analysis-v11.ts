@@ -910,16 +910,32 @@ async function usageEvent(context: Context, previous: Map<string, { time: number
     interval: { start: prior?.time ?? end, end }, priced };
 }
 
-function reduceScalar(context: Context, state: V11UsageReductionCheckpoint, hazards: Hazards,
+interface UsageReductionRuntime {
+  knownTargets:Set<string>;
+  unknownTargets:Set<string>;
+  modelSeed:Seed|undefined;
+  modelRefusal:string|null;
+}
+
+function usageReductionRuntime(context:Context):UsageReductionRuntime{
+ const plans=new Set(context.index.eras.map(era=>era.planType));
+ const accounts=new Set(context.index.eras.map(era=>era.accountScopeId));
+ const modelRefusal=plans.size>1||context.index.conflicts.length>0?"multi_plan_window_unsupported"
+  :accounts.size>1?"multi_account_window_unsupported":context.index.eras.length>1?"multi_era_window_unsupported"
+  :context.seeds.size===0?"supported_quota_track_unavailable":null;
+ return {knownTargets:new Set([...context.seeds.values()].filter(seed=>seed.accountScopeId!==null).map(seed=>seed.provider)),
+  unknownTargets:new Set([...context.seeds.values()].filter(seed=>seed.accountScopeId===null).map(seed=>seed.provider)),
+  modelSeed:context.seeds.values().next().value as Seed|undefined,modelRefusal};
+}
+
+function reduceScalar(context: Context, runtime:UsageReductionRuntime,state: V11UsageReductionCheckpoint, hazards: Hazards,
   buckets: Map<string, CostBucket>, event: UsageEvidence): void {
   if (state.scalarRefusal || !context.grids.has(event.provider)) return;
-  const knownTargets = new Set([...context.seeds.values()].filter(seed => seed.accountScopeId !== null).map(seed => seed.provider));
-  const unknownTargets = new Set([...context.seeds.values()].filter(seed => seed.accountScopeId === null).map(seed => seed.provider));
   const ownKey = scopeKey(event.provider, event.scope);
   if (event.accountBreak) hazards.add("all|" + event.provider, event.interval);
   else {
-    if (event.scope === null && knownTargets.has(event.provider)
-        || event.scope !== null && unknownTargets.has(event.provider)) {
+    if (event.scope === null && runtime.knownTargets.has(event.provider)
+        || event.scope !== null && runtime.unknownTargets.has(event.provider)) {
       hazards.add((event.scope === null ? "unknown|" : "known|") + event.provider, event.interval);
     }
     if (event.eraKey === null) hazards.add(ownKey, event.interval);
@@ -946,17 +962,12 @@ function reduceScalar(context: Context, state: V11UsageReductionCheckpoint, haza
   }
 }
 
-function reduceModel(context: Context, state: V11UsageReductionCheckpoint,
+function reduceModel(context: Context, runtime:UsageReductionRuntime,state: V11UsageReductionCheckpoint,
   costs: Map<string, { observedAtMs: number; model: string; costNanousd: number }>, poisoned: Set<number>,
   event: UsageEvidence): void {
   if (state.modelRefusal) return;
-  const plans = new Set(context.index.eras.map(era => era.planType));
-  const accounts = new Set(context.index.eras.map(era => era.accountScopeId));
-  if (plans.size > 1 || context.index.conflicts.length > 0) { state.modelRefusal = "multi_plan_window_unsupported"; return; }
-  if (accounts.size > 1) { state.modelRefusal = "multi_account_window_unsupported"; return; }
-  if (context.index.eras.length > 1) { state.modelRefusal = "multi_era_window_unsupported"; return; }
-  const seed = context.seeds.values().next().value as Seed | undefined;
-  if (!seed) { state.modelRefusal = "supported_quota_track_unavailable"; return; }
+  const seed=runtime.modelSeed;
+  if(runtime.modelRefusal||!seed){state.modelRefusal=runtime.modelRefusal??"supported_quota_track_unavailable";return;}
   if (event.provider !== seed.provider) return;
   if (event.scope !== null && seed.accountScopeId !== null && event.scope !== seed.accountScopeId
       && !event.accountBreak && event.eraKey !== null) return;
@@ -965,7 +976,9 @@ function reduceModel(context: Context, state: V11UsageReductionCheckpoint,
   }
   const observedAtMs = Math.floor(event.interval.end / MODEL_COMPOSITION_POLICY.grainMs) * MODEL_COMPOSITION_POLICY.grainMs;
   if (event.priced.pricingStatus !== "fully_priced") {
-    poisoned.add(observedAtMs); state.unpricedUsageEventCount += 1; return;
+    poisoned.add(observedAtMs); state.unpricedUsageEventCount += 1;
+    if(poisoned.size>MAX_USAGE_BUCKETS)state.modelRefusal="reduced_usage_limit_exceeded";
+    return;
   }
   state.usageEventCount += 1;
   if (!Number.isSafeInteger(event.priced.costNanousd) || event.priced.costNanousd > 90_000_000_000_000) {
@@ -978,15 +991,6 @@ function reduceModel(context: Context, state: V11UsageReductionCheckpoint,
     if (!Number.isSafeInteger(existing.costNanousd) || existing.costNanousd > 90_000_000_000_000) state.modelRefusal = "usage_cost_limit_exceeded";
   } else costs.set(key, { observedAtMs, model, costNanousd: event.priced.costNanousd });
   if (costs.size > MAX_USAGE_BUCKETS) state.modelRefusal = "reduced_usage_limit_exceeded";
-}
-
-function initialModelRefusal(context:Context):string|null{
- const plans=new Set(context.index.eras.map(era=>era.planType));
- if(plans.size>1||context.index.conflicts.length>0)return "multi_plan_window_unsupported";
- const accounts=new Set(context.index.eras.map(era=>era.accountScopeId));
- if(accounts.size>1)return "multi_account_window_unsupported";
- if(context.index.eras.length>1)return "multi_era_window_unsupported";
- return context.seeds.size===0?"supported_quota_track_unavailable":null;
 }
 
 /** Advance at most maxPages physical usage pages. The returned checkpoint is a
@@ -1005,6 +1009,7 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
       modelRefusal:null, previous:[], hazards:[], scalarBuckets:[], modelCosts:[], poisoned:[],
       usageEventCount:0, unpricedUsageEventCount:0, attributionUnresolved:false };
   }
+  const runtime=usageReductionRuntime(context);
   let state = prior ? structuredClone(prior) : null;
   if (state && (!validateV11UsageReductionCheckpoint(state)
       ||!v11QuotaAcquisitionIdentityMatches(state.identity,reductionIdentity)))
@@ -1021,7 +1026,7 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
     state = { version:1,identity:structuredClone(reductionIdentity),days:selected, dayIndex:0, cursorTime:selected[0] ? `${selected[0]}T00:00:00.000Z` : context.start,
       cursorOccurrence:"", rowsRead:0, complete:selected.length===0, commonRefusal:null,
       scalarRefusal:context.seeds.size===0?"supported_quota_track_unavailable":null,
-      modelRefusal:initialModelRefusal(context),
+      modelRefusal:runtime.modelRefusal,
       previous:[], hazards:[], scalarBuckets:[], modelCosts:[], poisoned:[], usageEventCount:0,
       unpricedUsageEventCount:0, attributionUnresolved:false };
   }
@@ -1041,14 +1046,15 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
       pin, day, from:context.start, to:context.end, afterTime:state.cursorTime, afterOccurrence:state.cursorOccurrence })
       : (await db.prepare(V11_USAGE_PAGE_SQL).bind(pin.participantId,pin.generationId,day,context.start,context.end,
         state.cursorTime,state.cursorOccurrence,PAGE_SIZE).all<UsageRow>()).results;
+    if(rows.length>maximum-state.rowsRead){state.rowsRead=maximum;state.commonRefusal="windowed_usage_limit_exceeded";
+      state.complete=true;break;}
     state.rowsRead += rows.length;
-    if (state.rowsRead > maximum) { state.commonRefusal = "windowed_usage_limit_exceeded"; state.complete = true; break; }
     for (const row of rows) {
       const event = await usageEvent(context, previous, row);
       if (event && "status" in event) { state.commonRefusal = event.reason; state.complete = true; break; }
       if (!event) continue;
-      reduceScalar(context,state,hazards,scalarBuckets,event);
-      reduceModel(context,state,modelCosts,poisoned,event);
+      reduceScalar(context,runtime,state,hazards,scalarBuckets,event);
+      reduceModel(context,runtime,state,modelCosts,poisoned,event);
     }
     if (state.complete) break;
     const pageSize = options.typedSourceNamespace ? TYPED_V11_ANALYSIS_PAGE_SIZE : PAGE_SIZE;
@@ -1062,11 +1068,13 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
     }
   }
   state.complete ||= state.dayIndex >= state.days.length;
-  state.previous = [...previous].map(([key,value]) => ({ key,...value }));
-  state.hazards = serializeHazards(hazards);
-  state.scalarBuckets = [...scalarBuckets].map(([key,value]) => ({ key,value }));
-  state.modelCosts = [...modelCosts].map(([key,value]) => ({ key,...value }));
-  state.poisoned = [...poisoned];
+  state.previous = state.commonRefusal?[]:[...previous].map(([key,value]) => ({ key,...value }));
+  state.hazards = state.commonRefusal||state.scalarRefusal?[]:serializeHazards(hazards);
+  state.scalarBuckets = state.commonRefusal||state.scalarRefusal?[]:
+    [...scalarBuckets].map(([key,value]) => ({ key,value }));
+  state.modelCosts = state.commonRefusal||state.modelRefusal?[]:
+    [...modelCosts].map(([key,value]) => ({ key,...value }));
+  state.poisoned = state.commonRefusal||state.modelRefusal?[]:[...poisoned];
   const sorted = sortedReduction(state);
   if (!validateV11UsageReductionCheckpoint(sorted)) throw new Error("v11 usage reduction successor invalid");
   return sorted;

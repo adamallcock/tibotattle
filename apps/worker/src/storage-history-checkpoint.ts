@@ -50,9 +50,13 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
   const acquisition={identity:control.identity,planAnchors:components.planAnchors??[],quotaRows:components.quotaRows??[]};
   if(!validateV11CompletedQuotaAcquisition(acquisition)
    ||Object.keys(components).some(k=>!['planAnchors','quotaRows',...V11_USAGE_REDUCTION_COMPONENTS].includes(k)))throw fail();
-  if(control.phase==='usage')return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
-   phase:'usage',acquisition,usage:decodeV11UsageReductionCheckpoint(control.usage,
-    Object.fromEntries(V11_USAGE_REDUCTION_COMPONENTS.map(name=>[name,components[name]??[]])))};
+  if(control.phase==='usage'){
+   const usage=decodeV11UsageReductionCheckpoint(control.usage,
+    Object.fromEntries(V11_USAGE_REDUCTION_COMPONENTS.map(name=>[name,components[name]??[]])));
+   if(!same(usage.identity,control.identity))throw fail();
+   return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
+    phase:'usage',acquisition,usage};
+  }
   if(Object.keys(components).some(k=>!['planAnchors','quotaRows'].includes(k)))throw fail();
   return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
    phase:'finish',acquisition};
