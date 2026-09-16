@@ -1,5 +1,7 @@
 import { decodeTypedTelemetryId, encodeTypedTelemetryId } from "./typed-telemetry-codec";
-import type { V11SourcePin } from "./telemetry-v11-domain";
+import { V11_DOMAIN_METHOD_VERSION, type V11SourcePin } from "./telemetry-v11-domain";
+import { canonicalJson } from "./canonical-json";
+import { sha256Hex } from "./crypto";
 
 /** The physical page is deliberately smaller than the compatibility reader's
  * public page. It bounds both the normalized joins and the decoder work that a
@@ -11,6 +13,27 @@ const MAX_TIME = 8_640_000_000_000_000;
 export interface V11QuotaPageCursor {
   observedAtMs: number;
   sourceRowId: number;
+}
+
+/**
+ * The immutable identity of one admitted v1.1 domain. The input revision and
+ * fingerprint are the values captured with the source pin; they deliberately
+ * are not compared with the current revision when this identity is resumed.
+ * The generation/domain rows and retained source journal are the authority for
+ * the physical records, while the fingerprint binds this closed identity to
+ * the original source-pin method.
+ */
+export interface V11GenerationSnapshot {
+  readonly source: "v1.1";
+  readonly sourceNamespace: string;
+  readonly participantId: string;
+  readonly generationId: string;
+  readonly deviceId: string;
+  readonly manifestDigest: string;
+  readonly fromDay: string;
+  readonly throughDay: string;
+  readonly inputRevision: number;
+  readonly fingerprint: string;
 }
 
 export interface V11QuotaSourceRow {
@@ -95,6 +118,79 @@ SELECT page.physical_id,page.source_row_id,page.observed_at_ms,
 FROM page LEFT JOIN active ON active.physical_id=page.physical_id
 ORDER BY page.observed_at_ms,page.source_row_id`;
 
+/**
+ * Read one retained generation directly from its immutable proof and manifest
+ * membership. Unlike the current-head query above, this does not join
+ * telemetry_v11_domain_heads. The snapshot CTE still requires the participant,
+ * device, owner revision and retained generation journal to be live. The page
+ * starts from the generation's manifest proofs, so a successor corpus cannot
+ * expand the physical scan or displace a prior snapshot's cursor.
+ */
+export const TYPED_V11_QUOTA_SNAPSHOT_PAGE_SQL = `WITH snapshot AS MATERIALIZED (
+  SELECT s.namespace_id,s.source_namespace,o.typed_owner_id,g.id AS generation_id,g.device_id
+  FROM typed_v11_admission_state s
+  JOIN typed_v11_owner_memberships o ON o.participant_id=?9
+  JOIN typed_telemetry_owners owner ON owner.id=o.typed_owner_id
+    AND owner.namespace_id=s.namespace_id AND owner.id=?2
+  JOIN telemetry_v11_domains g ON g.id=?8 AND g.participant_id=?9
+    AND g.manifest_digest=?13 AND g.from_day=?14 AND g.through_day=?15
+  JOIN participants participant ON participant.id=g.participant_id AND participant.state='active'
+  JOIN device_credentials generation_device ON generation_device.id=g.device_id
+    AND generation_device.participant_id=g.participant_id AND generation_device.state='active'
+  JOIN storage_v11_owner_links owner_link ON owner_link.participant_id=g.participant_id
+    AND owner_link.state='active'
+  JOIN storage_owner_revisions owner_revision ON owner_revision.owner_digest=owner_link.owner_digest
+    AND owner_revision.state='active'
+  WHERE s.id=1 AND s.runtime_contract_version=1 AND s.namespace_id=?1
+    AND s.source_namespace=?11
+    AND EXISTS (SELECT 1 FROM storage_v11_event_sources retained_source
+      WHERE retained_source.owner_digest=owner_link.owner_digest
+        AND retained_source.participant_id=g.participant_id
+        AND retained_source.generation_id=g.id)
+), page AS MATERIALIZED (
+  SELECT raw.id AS physical_id,raw.source_row_id,raw.observed_at_ms,
+    snapshot.device_id AS device_id,raw.provider_id,
+    proof.occurrence_id AS active_occurrence_id,proof.observed_at_ms AS proof_observed_at_ms,
+    domain_day.observed_day,provider.value AS provider,
+    plan.value AS plan_type,variant.value AS plan_variant,
+    lim.value AS limit_id,slot.value AS slot,q.used_percent,
+    q.window_duration_minutes,q.resets_at_ms,
+    attribution.account_basis,attribution.account_track,attribution.plan_basis,
+    attribution_plan.value AS attribution_plan_type,attribution.plan_era
+  FROM snapshot
+  CROSS JOIN telemetry_v11_domain_days domain_day
+  JOIN telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id
+    AND manifest.participant_id=?9 AND manifest.device_id=snapshot.device_id
+    AND manifest.chunk_day=domain_day.observed_day AND manifest.state='ready'
+  JOIN typed_v11_manifest_memberships membership ON membership.manifest_id=domain_day.manifest_id
+  JOIN typed_v11_record_proofs proof INDEXED BY typed_v11_manifest_observed
+    ON proof.manifest_key=membership.typed_manifest_id AND proof.stream_code=2
+  JOIN typed_telemetry_records raw ON raw.id=proof.typed_record_id
+    AND raw.namespace_id=snapshot.namespace_id AND raw.owner_id=snapshot.typed_owner_id
+    AND raw.format=11 AND raw.stream=2
+  JOIN typed_telemetry_devices current_device ON current_device.id=raw.device_id
+    AND current_device.namespace_id=?10 AND current_device.owner_id=?2
+    AND current_device.original_id=?12
+  JOIN typed_telemetry_quota q ON q.record_id=raw.id
+  JOIN typed_telemetry_quota_dimensions dimensions ON dimensions.id=q.dimensions_id
+  JOIN typed_telemetry_dictionary provider ON provider.id=raw.provider_id
+  JOIN typed_telemetry_dictionary plan ON plan.id=dimensions.plan_type_id
+  JOIN typed_telemetry_dictionary variant ON variant.id=dimensions.plan_variant_id
+  JOIN typed_telemetry_dictionary lim ON lim.id=q.limit_id
+  JOIN typed_telemetry_dictionary slot ON slot.id=q.slot_id
+  JOIN typed_telemetry_attributions attribution ON attribution.id=dimensions.attribution_id
+  JOIN typed_telemetry_dictionary attribution_plan ON attribution_plan.id=attribution.plan_type_id
+  WHERE domain_day.generation_id=snapshot.generation_id
+    AND raw.observed_at_ms>=?3 AND raw.observed_at_ms<?4
+    AND (raw.observed_at_ms,raw.source_row_id)>(?5,?6)
+  ORDER BY raw.observed_at_ms,raw.source_row_id LIMIT ?7
+)
+SELECT physical_id,source_row_id,observed_at_ms,
+  active_occurrence_id,proof_observed_at_ms,observed_day,device_id,provider,
+  plan_type,plan_variant,limit_id,slot,used_percent,window_duration_minutes,
+  resets_at_ms,account_basis,account_track,plan_basis,attribution_plan_type,plan_era
+FROM page ORDER BY observed_at_ms,source_row_id`;
+
 interface ReaderScope {
   sourceNamespace: string;
   namespaceId: number;
@@ -103,6 +199,18 @@ interface ReaderScope {
   generationId: string;
   deviceId: string;
   deviceIdBlob: ArrayBuffer;
+  snapshot: V11GenerationSnapshot;
+}
+
+interface ScopeMetadataRow {
+  namespace_id: number;
+  source_namespace: string;
+  typed_owner_id: number;
+  generation_id: string;
+  device_id: string;
+  manifest_digest: string;
+  from_day: string;
+  through_day: string;
 }
 
 interface RawRow extends Record<string, unknown> {
@@ -204,25 +312,159 @@ function cursor(value: V11QuotaPageCursor): void {
   integer(value.sourceRowId, 0, Number.MAX_SAFE_INTEGER);
 }
 
+function utcDay(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(value)
+    && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
+    && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
+}
+
+function validSnapshotShape(value: unknown): value is V11GenerationSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Record<string, unknown>;
+  if (Object.keys(snapshot).sort().join(",") !==
+      "deviceId,fingerprint,fromDay,generationId,inputRevision,manifestDigest,participantId,source,sourceNamespace,throughDay") {
+    return false;
+  }
+  if (snapshot.source !== "v1.1"
+      || [snapshot.sourceNamespace, snapshot.participantId, snapshot.generationId, snapshot.deviceId,
+        snapshot.manifestDigest, snapshot.fingerprint].some(value => typeof value !== "string" || value.length === 0)
+      || !/^[a-f0-9]{64}$/u.test(snapshot.manifestDigest as string)
+      || !/^[a-f0-9]{64}$/u.test(snapshot.fingerprint as string)
+      || !utcDay(snapshot.fromDay) || !utcDay(snapshot.throughDay)
+      || (snapshot.fromDay as string) > (snapshot.throughDay as string)
+      || typeof snapshot.inputRevision !== "number"
+      || !Number.isSafeInteger(snapshot.inputRevision) || snapshot.inputRevision < 0) return false;
+  try {
+    encodeTypedTelemetryId(snapshot.sourceNamespace as string);
+    encodeTypedTelemetryId(snapshot.participantId as string);
+    encodeTypedTelemetryId(snapshot.generationId as string);
+    encodeTypedTelemetryId(snapshot.deviceId as string);
+  } catch { return false; }
+  return true;
+}
+
+async function normalizeSnapshot(value: unknown, sourceNamespace: string): Promise<V11GenerationSnapshot> {
+  if (!validSnapshotShape(value) || value.sourceNamespace !== sourceNamespace) fail();
+  const expectedFingerprint = await sha256Hex(canonicalJson({
+    method: V11_DOMAIN_METHOD_VERSION,
+    participantId: value.participantId,
+    generationId: value.generationId,
+    manifestDigest: value.manifestDigest,
+    fromDay: value.fromDay,
+    throughDay: value.throughDay,
+    inputRevision: value.inputRevision,
+  }));
+  if (expectedFingerprint !== value.fingerprint) fail();
+  return Object.freeze({ ...value });
+}
+
+async function snapshotFromPin(sourceNamespace: string, pin: V11SourcePin, row: ScopeMetadataRow): Promise<V11GenerationSnapshot> {
+  if (row.source_namespace !== sourceNamespace || row.generation_id !== pin.generationId
+      || row.device_id.length === 0 || row.manifest_digest.length !== 64
+      || row.from_day !== pin.fromDay || row.through_day !== pin.throughDay) fail();
+  return normalizeSnapshot({
+    source: "v1.1", sourceNamespace, participantId: pin.participantId,
+    generationId: pin.generationId, deviceId: row.device_id,
+    manifestDigest: row.manifest_digest, fromDay: row.from_day, throughDay: row.through_day,
+    inputRevision: pin.inputRevision, fingerprint: pin.fingerprint,
+  }, sourceNamespace);
+}
+
 async function scopeFor(db: D1Database, sourceNamespace: string, pin: V11SourcePin): Promise<ReaderScope> {
   encodeTypedTelemetryId(sourceNamespace);
   const row = await db.prepare(`SELECT s.namespace_id,s.source_namespace,
-      o.typed_owner_id,h.generation_id,g.device_id
+      o.typed_owner_id,h.generation_id,g.device_id,g.manifest_digest,g.from_day,g.through_day
     FROM typed_v11_admission_state s
     JOIN typed_v11_owner_memberships o ON o.participant_id=?1
     JOIN typed_telemetry_owners owner ON owner.id=o.typed_owner_id AND owner.namespace_id=s.namespace_id
     JOIN telemetry_v11_domain_heads h ON h.participant_id=?1 AND h.generation_id=?2
     JOIN telemetry_v11_domains g ON g.id=h.generation_id AND g.participant_id=h.participant_id
+    JOIN participants participant ON participant.id=g.participant_id AND participant.state='active'
+    JOIN device_credentials generation_device ON generation_device.id=g.device_id
+      AND generation_device.participant_id=g.participant_id AND generation_device.state='active'
     WHERE s.id=1 AND s.runtime_contract_version=1 AND s.source_namespace=?3`)
     .bind(pin.participantId, pin.generationId, sourceNamespace)
-    .first<{namespace_id: number; source_namespace: string; typed_owner_id: number; generation_id: string; device_id: string}>();
+    .first<ScopeMetadataRow>();
   if (!row || row.source_namespace !== sourceNamespace || row.generation_id !== pin.generationId
       || typeof row.device_id !== "string" || row.device_id.length === 0) fail();
+  const snapshot = await snapshotFromPin(sourceNamespace, pin, row);
   const deviceIdBlob = Uint8Array.from(encodeTypedTelemetryId(row.device_id)).buffer;
   return { sourceNamespace, namespaceId: integer(row.namespace_id, 1, Number.MAX_SAFE_INTEGER),
     ownerId: integer(row.typed_owner_id, 1, Number.MAX_SAFE_INTEGER),
     participantId: pin.participantId, generationId: pin.generationId,
-    deviceId: row.device_id, deviceIdBlob };
+    deviceId: row.device_id, deviceIdBlob, snapshot };
+}
+
+async function scopeForSnapshot(db: D1Database, sourceNamespace: string, value: unknown): Promise<ReaderScope> {
+  const snapshot = await normalizeSnapshot(value, sourceNamespace);
+  const row = await db.prepare(`SELECT s.namespace_id,s.source_namespace,
+      o.typed_owner_id,g.id AS generation_id,g.device_id,g.manifest_digest,g.from_day,g.through_day
+    FROM typed_v11_admission_state s
+    JOIN typed_v11_owner_memberships o ON o.participant_id=?2
+    JOIN typed_telemetry_owners owner ON owner.id=o.typed_owner_id
+      AND owner.namespace_id=s.namespace_id
+    JOIN telemetry_v11_domains g ON g.id=?3 AND g.participant_id=?2
+      AND g.device_id=?4 AND g.manifest_digest=?5 AND g.from_day=?6 AND g.through_day=?7
+    JOIN participants participant ON participant.id=g.participant_id AND participant.state='active'
+    JOIN device_credentials generation_device ON generation_device.id=g.device_id
+      AND generation_device.participant_id=g.participant_id AND generation_device.state='active'
+    JOIN storage_v11_owner_links owner_link ON owner_link.participant_id=g.participant_id
+      AND owner_link.state='active'
+    JOIN storage_owner_revisions owner_revision ON owner_revision.owner_digest=owner_link.owner_digest
+      AND owner_revision.state='active'
+    WHERE s.id=1 AND s.runtime_contract_version=1 AND s.source_namespace=?1
+      AND EXISTS (SELECT 1 FROM storage_v11_event_sources retained_source
+        WHERE retained_source.owner_digest=owner_link.owner_digest
+          AND retained_source.participant_id=g.participant_id
+          AND retained_source.generation_id=g.id)`)
+    .bind(sourceNamespace, snapshot.participantId, snapshot.generationId, snapshot.deviceId,
+      snapshot.manifestDigest, snapshot.fromDay, snapshot.throughDay)
+    .first<ScopeMetadataRow>();
+  if (!row || row.source_namespace !== sourceNamespace || row.generation_id !== snapshot.generationId
+      || row.device_id !== snapshot.deviceId || row.manifest_digest !== snapshot.manifestDigest
+      || row.from_day !== snapshot.fromDay || row.through_day !== snapshot.throughDay) fail();
+  return { sourceNamespace, namespaceId: integer(row.namespace_id, 1, Number.MAX_SAFE_INTEGER),
+    ownerId: integer(row.typed_owner_id, 1, Number.MAX_SAFE_INTEGER),
+    participantId: snapshot.participantId, generationId: snapshot.generationId,
+    deviceId: snapshot.deviceId, deviceIdBlob: Uint8Array.from(encodeTypedTelemetryId(snapshot.deviceId)).buffer,
+    snapshot };
+}
+
+/** Recheck only live authority/retention state for a retained generation. */
+export async function assertTypedV11GenerationSnapshotLive(
+  db: D1Database, snapshot: V11GenerationSnapshot,
+): Promise<void> {
+  const normalized = await normalizeSnapshot(snapshot, snapshot.sourceNamespace);
+  const row = await db.prepare(`SELECT 1 AS live
+    FROM typed_v11_admission_state s
+    JOIN telemetry_v11_domains g ON g.id=?2 AND g.participant_id=?3
+      AND g.device_id=?4 AND g.manifest_digest=?5 AND g.from_day=?6 AND g.through_day=?7
+    JOIN participants participant ON participant.id=g.participant_id AND participant.state='active'
+    JOIN device_credentials generation_device ON generation_device.id=g.device_id
+      AND generation_device.participant_id=g.participant_id AND generation_device.state='active'
+    JOIN storage_v11_owner_links owner_link ON owner_link.participant_id=g.participant_id
+      AND owner_link.state='active'
+    JOIN storage_owner_revisions owner_revision ON owner_revision.owner_digest=owner_link.owner_digest
+      AND owner_revision.state='active'
+    WHERE s.id=1 AND s.runtime_contract_version=1 AND s.source_namespace=?1
+      AND EXISTS (SELECT 1 FROM storage_v11_event_sources retained_source
+        WHERE retained_source.owner_digest=owner_link.owner_digest
+          AND retained_source.participant_id=g.participant_id
+          AND retained_source.generation_id=g.id)`)
+    .bind(normalized.sourceNamespace, normalized.generationId, normalized.participantId, normalized.deviceId,
+      normalized.manifestDigest, normalized.fromDay, normalized.throughDay)
+    .first<{live: number}>();
+  if (!row || row.live !== 1) fail();
+}
+
+/** Capture a current source pin as a closed identity that can be resumed after
+ * a successor head is activated. The capture remains current-head strict. */
+export async function loadTypedV11GenerationSnapshot(
+  db: D1Database, options: {sourceNamespace: string; pin: V11SourcePin},
+): Promise<V11GenerationSnapshot> {
+  const scope = await scopeFor(db, options.sourceNamespace, options.pin);
+  await scopeForSnapshot(db, options.sourceNamespace, scope.snapshot);
+  return scope.snapshot;
 }
 
 function decodeRow(row: RawRow, scope: ReaderScope): V11QuotaPageRow {
@@ -258,31 +500,49 @@ function decodeRow(row: RawRow, scope: ReaderScope): V11QuotaPageRow {
 
 /** Resolve the active typed owner once, then spend exactly one bounded query
  * per page. The caller supplies the source pin and fences it before and after
- * acquisition; this reader never elects a domain or falls back to JSON. */
+ * acquisition; current pages use one bounded query, while retained pages
+ * recheck the live fence before their exact-generation query. This reader
+ * never elects a domain or falls back to JSON. */
 export async function createTypedV11QuotaPageReader(db: D1Database, options: {
   sourceNamespace: string;
-  pin: V11SourcePin;
+  pin?: V11SourcePin;
+  snapshot?: V11GenerationSnapshot;
   fromObservedAtMs: number;
   beforeObservedAtMs: number;
 }): Promise<{
   readonly pageSize: typeof TYPED_V11_QUOTA_PAGE_SIZE;
   readonly scope: Readonly<ReaderScope>;
+  readonly snapshot: V11GenerationSnapshot;
   readPage(cursor: V11QuotaPageCursor, limit?: number): Promise<V11QuotaPageRow[]>;
 }> {
   const from = integer(options.fromObservedAtMs, MIN_TIME, MAX_TIME);
   const before = integer(options.beforeObservedAtMs, MIN_TIME, MAX_TIME + 1);
   if (before <= from) fail();
-  const scope = await scopeFor(db, options.sourceNamespace, options.pin);
+  if (options.pin !== undefined && options.snapshot !== undefined) fail();
+  const retained = options.snapshot !== undefined;
+  if (!retained && options.pin === undefined) fail();
+  const scope = retained
+    ? await scopeForSnapshot(db, options.sourceNamespace, options.snapshot)
+    : await scopeFor(db, options.sourceNamespace, options.pin!);
   return {
     pageSize: TYPED_V11_QUOTA_PAGE_SIZE,
     scope,
+    snapshot: scope.snapshot,
     async readPage(after: V11QuotaPageCursor, limit = TYPED_V11_QUOTA_PAGE_SIZE) {
       cursor(after);
       const pageLimit = limitPage(limit);
-      const rows = (await db.prepare(TYPED_V11_QUOTA_PAGE_SQL).bind(
-        scope.namespaceId, scope.ownerId, from, before, after.observedAtMs, after.sourceRowId, pageLimit,
-        scope.generationId, scope.participantId, scope.namespaceId, scope.sourceNamespace, scope.deviceIdBlob,
-      ).all<RawRow>()).results;
+      if (retained) await assertTypedV11GenerationSnapshotLive(db, scope.snapshot);
+      const statement = db.prepare(retained ? TYPED_V11_QUOTA_SNAPSHOT_PAGE_SQL : TYPED_V11_QUOTA_PAGE_SQL);
+      const rows = (await (retained
+        ? statement.bind(
+          scope.namespaceId, scope.ownerId, from, before, after.observedAtMs, after.sourceRowId, pageLimit,
+          scope.generationId, scope.participantId, scope.namespaceId, scope.sourceNamespace, scope.deviceIdBlob,
+          scope.snapshot.manifestDigest, scope.snapshot.fromDay, scope.snapshot.throughDay,
+        )
+        : statement.bind(
+          scope.namespaceId, scope.ownerId, from, before, after.observedAtMs, after.sourceRowId, pageLimit,
+          scope.generationId, scope.participantId, scope.namespaceId, scope.sourceNamespace, scope.deviceIdBlob,
+        )).all<RawRow>()).results;
       if (rows.length > pageLimit) fail();
       let previous: V11QuotaPageCursor = after;
       return rows.map((row) => {
