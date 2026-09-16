@@ -9,6 +9,31 @@ function readOnly(){let queries=0;const source=new Proxy(db(),{get(database,key)
  if(!/^\s*(SELECT|WITH)\b/i.test(sql))throw new Error('synthetic source write refused');queries++;return database.prepare(sql);};
  const value=Reflect.get(database,key);return typeof value==='function'?value.bind(database):value;}});return {source,count:()=>queries};}
 describe('source-only resumable v1 historical composition',()=>{
+ it('groups acquisition with one source fence and preserves the single-page result',async()=>{
+  const fixture=await seedModelHistoryFixture(),input=await modelHistorySourceInput(fixture.participantId);
+  const args={participantId:fixture.participantId,day,sourcePin:input.sourcePin};
+  const single=readOnly();let checkpoint:StorageV1HistoryCheckpoint|null=null;
+  for(let pass=0;checkpoint?.phase!=='finish';pass++){
+   expect(pass).toBeLessThan(20);
+   const step=await advanceStorageV1HistoricalAnalysis({...args,source:single.source,budget:budget(),checkpoint});
+   if(step.status!=='deferred'||!step.checkpoint)throw new Error('expected acquisition checkpoint');
+   checkpoint=step.checkpoint;
+  }
+  const grouped=readOnly();
+  const step=await advanceStorageV1HistoricalAnalysis({...args,source:grouped.source,budget:budget(),maxPages:32});
+  expect(step).toEqual({status:'deferred',checkpoint});
+  expect(grouped.count()).toBeLessThan(single.count());
+  if(step.status!=='deferred')throw new Error('expected finish checkpoint');
+  const finished=await advanceStorageV1HistoricalAnalysis({...args,source:grouped.source,budget:budget(),checkpoint:step.checkpoint});
+  const baseline=await advanceStorageV1HistoricalAnalysis({...args,source:single.source,budget:budget(),checkpoint});
+  expect(finished).toEqual(baseline);
+  expect(finished).toMatchObject({status:'complete',analysis:{status:'ready'}});
+  for(const maxPages of [0,33,1.5]){
+   const refused=readOnly();
+   await expect(advanceStorageV1HistoricalAnalysis({...args,source:refused.source,budget:budget(),maxPages})).rejects.toThrow('CHECKPOINT_MISMATCH');
+   expect(refused.count()).toBe(0);
+  }
+ });
  it('resumes acquisition across query deadlines, retains finished evidence, and matches uninterrupted historical fitting',async()=>{
   const fixture=await seedModelHistoryFixture(),input=await modelHistorySourceInput(fixture.participantId),measured=readOnly();
   const args={source:measured.source,participantId:fixture.participantId,day,sourcePin:input.sourcePin};
