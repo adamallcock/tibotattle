@@ -3,7 +3,11 @@ import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
 import { encodeV1QuotaWorkCheckpoint,decodeV1QuotaWorkCheckpoint,createV1QuotaAcquisitionCheckpoint,
  validateV1CompletedQuotaAcquisition,V1_QUOTA_WORK_COMPONENTS,type V1QuotaWorkComponent } from './quota-analysis-v1-reader';
+import { createV11QuotaAcquisitionCheckpoint,decodeV11QuotaWorkCheckpoint,encodeV11QuotaWorkCheckpoint,
+ validateV11CompletedQuotaAcquisition,V11_QUOTA_WORK_COMPONENTS } from './quota-analysis-v11-reader';
 import type { StorageV1HistoryCheckpoint } from './storage-v1-history';
+import type { StorageV11HistoryCheckpoint } from './storage-v11-history';
+export type StorageHistoryCheckpoint=StorageV1HistoryCheckpoint|StorageV11HistoryCheckpoint;
 export const STORAGE_HISTORY_PART_BYTES=128*1024,STORAGE_HISTORY_CONTROL_BYTES=16*1024;
 export const STORAGE_HISTORY_MAX_PARTS=1024,STORAGE_HISTORY_MAX_WRITES=32;
 export interface StorageHistoryKey {sourceId:string;ownerDigest:string;day:string;dependencyDigest:string;sourceNamespace:string;method:string}
@@ -11,6 +15,7 @@ interface Part {component:string;sha256:string;bytes:number}
 interface Frame {control:string;manifest:Part[];parts:string[]}
 interface Stage {generation:string;expected_head:string|null;control_json:string;manifest_json:string;part_count:number;owner_revision:number;authority_epoch:number}
 export interface StorageHistoryLoadCursor {generation:string;parts:string[]}
+export interface StorageHistoryCheckpointHead {generation:string|null;retired:number}
 const encoder=new TextEncoder(),hash=/^[a-f0-9]{64}$/u;
 const fail=()=>new Error('STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE');
 const size=(text:string)=>encoder.encode(text).byteLength;
@@ -25,14 +30,28 @@ function keys(key:StorageHistoryKey){if(!key||Object.keys(key).sort().join(',')!
 function bounded(value:number,min:number,max:number){if(!Number.isSafeInteger(value)||value<min||value>max)throw fail();}
 function pin(value:string|null){if(value!==null&&!hash.test(value))throw fail();}
 async function keyDigest(key:StorageHistoryKey){keys(key);return sha256Hex(canonicalJson(key));}
-function decode(controlText:string,manifest:Part[],parts:string[]):StorageV1HistoryCheckpoint{
+function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistoryCheckpoint{
  const control=parse(controlText),components:Record<string,unknown[]>={};
  if(size(controlText)>STORAGE_HISTORY_CONTROL_BYTES||!control||control.version!==1||!['acquisition','finish'].includes(control.phase))throw fail();
- createV1QuotaAcquisitionCheckpoint(control.identity);
  for(let i=0;i<parts.length;i++){
   const part=parse(parts[i]!);if(!Array.isArray(part))throw fail();
   (components[manifest[i]!.component]??=[]).push(...part);
  }
+ if(control.source==='v1.1'){
+  createV11QuotaAcquisitionCheckpoint(control.identity);
+  if(control.phase==='acquisition'){
+   for(const name of V11_QUOTA_WORK_COMPONENTS)components[name]??=[];
+   return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
+    phase:'acquisition',acquisition:decodeV11QuotaWorkCheckpoint(control.identity,control.acquisition,components)};
+  }
+  const acquisition={identity:control.identity,planAnchors:components.planAnchors??[],quotaRows:components.quotaRows??[]};
+  if(!validateV11CompletedQuotaAcquisition(acquisition)
+   ||Object.keys(components).some(k=>!['planAnchors','quotaRows'].includes(k)))throw fail();
+  return {version:1,source:'v1.1',day:control.day,layout:control.layout,identity:control.identity,
+   phase:'finish',acquisition};
+ }
+ if(Object.hasOwn(control,'source'))throw fail();
+ createV1QuotaAcquisitionCheckpoint(control.identity);
  if(control.phase==='acquisition'){
   for(const name of V1_QUOTA_WORK_COMPONENTS)components[name]??=[];
   return {version:1,day:control.day,layout:control.layout,identity:control.identity,phase:'acquisition',
@@ -42,8 +61,32 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageV1Hist
  if(!validateV1CompletedQuotaAcquisition(acquisition)||Object.keys(components).some(k=>!['planAnchors','quotaRows'].includes(k)))throw fail();
  return {version:1,day:control.day,layout:control.layout,identity:control.identity,phase:'finish',acquisition};
 }
-async function frame(key:StorageHistoryKey,checkpoint:StorageV1HistoryCheckpoint):Promise<Frame>{
- if(checkpoint.version!==1||checkpoint.day!==key.day||checkpoint.layout!==`typed:${key.sourceNamespace}`&&checkpoint.layout!=='json')throw fail();
+async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):Promise<Frame>{
+ if(checkpoint.version!==1||checkpoint.day!==key.day)throw fail();
+ if('source'in checkpoint){
+  if(checkpoint.source!=='v1.1')throw fail();
+  if(checkpoint.layout!==`typed-v11:${key.sourceNamespace}`)throw fail();
+  createV11QuotaAcquisitionCheckpoint(checkpoint.identity);
+  const components:Record<string,unknown[]>=checkpoint.phase==='acquisition'
+   ?{...encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).components}
+   :{planAnchors:checkpoint.acquisition.planAnchors,quotaRows:checkpoint.acquisition.quotaRows};
+  const control=canonicalJson({version:1,source:'v1.1',day:checkpoint.day,layout:checkpoint.layout,
+   identity:checkpoint.identity,phase:checkpoint.phase,
+   acquisition:checkpoint.phase==='acquisition'?encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).control:null});
+  if(size(control)>STORAGE_HISTORY_CONTROL_BYTES)throw fail();
+  const manifest:Part[]=[],parts:string[]=[];
+  for(const component of Object.keys(components).sort()){
+   const entries=components[component];if(!Array.isArray(entries))throw fail();let chunk:unknown[]=[],bytes=2;
+   const emit=async()=>{const text=canonicalJson(chunk);parts.push(text);manifest.push({component,sha256:await sha256Hex(text),bytes:size(text)});
+    if(parts.length>STORAGE_HISTORY_MAX_PARTS)throw fail();chunk=[];bytes=2;};
+   for(const entry of entries){const length=size(canonicalJson(entry));if(length+2>STORAGE_HISTORY_PART_BYTES)throw fail();
+    if(bytes+length+(chunk.length?1:0)>STORAGE_HISTORY_PART_BYTES)await emit();bytes+=length+(chunk.length?1:0);chunk.push(entry);}
+   if(chunk.length)await emit();
+  }
+  if(size(canonicalJson(manifest))>STORAGE_HISTORY_PART_BYTES)throw fail();
+  const roundtrip=decode(control,manifest,parts);if(!same(roundtrip,checkpoint))throw fail();return {control,manifest,parts};
+ }
+ if(checkpoint.layout!==`typed:${key.sourceNamespace}`&&checkpoint.layout!=='json')throw fail();
  createV1QuotaAcquisitionCheckpoint(checkpoint.identity);
  const components:Record<string,unknown[]>=checkpoint.phase==='acquisition'?{...encodeV1QuotaWorkCheckpoint(checkpoint.acquisition).components}
   :{planAnchors:checkpoint.acquisition.planAnchors,quotaRows:checkpoint.acquisition.quotaRows};
@@ -64,11 +107,18 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageV1HistoryCheckpoint
 }
 const ACTIVE=`EXISTS(SELECT 1 FROM analytics_owner_state o WHERE o.source_id=s.source_id AND o.owner_digest=s.owner_digest
  AND o.state='active' AND o.authority_epoch=s.authority_epoch)`;
-async function current(target:D1Database,id:string){return target.prepare('SELECT generation,retired FROM analytics_history_checkpoint_heads WHERE key_digest=?').bind(id).first<{generation:string|null;retired:number}>();}
+async function current(target:D1Database,id:string){return target.prepare('SELECT generation,retired FROM analytics_history_checkpoint_heads WHERE key_digest=?').bind(id).first<StorageHistoryCheckpointHead>();}
+/** Read only the exact durable head for a checkpoint key. A malformed row is
+ * unavailable, rather than evidence of a concurrent promotion. */
+export async function readStorageHistoryCheckpointHead(input:{target:D1Database;key:StorageHistoryKey}):Promise<StorageHistoryCheckpointHead|null>{
+ const id=await keyDigest({...input.key}),head=await current(input.target,id);
+ if(head!==null&&(![0,1].includes(head.retired)||head.generation!==null&&!hash.test(head.generation)))throw fail();
+ return head;
+}
 /** The target key is a private dependency identity, not authorization. Caller
  * must prove source eligibility before saving and before promoting final fits.
  * Each call writes at most32 statements; replay sends the same immutable input. */
-export async function saveStorageHistoryCheckpoint(input:{target:D1Database;key:StorageHistoryKey;checkpoint:StorageV1HistoryCheckpoint;expectedHead:string|null;maxWrites?:number}){
+export async function saveStorageHistoryCheckpoint(input:{target:D1Database;key:StorageHistoryKey;checkpoint:StorageHistoryCheckpoint;expectedHead:string|null;maxWrites?:number}){
  const {target}=input,key={...input.key},expected=input.expectedHead,max=input.maxWrites??32;bounded(max,3,32);pin(expected);
  const id=await keyDigest(key),f=await frame(key,structuredClone(input.checkpoint)),manifest=canonicalJson(f.manifest);
  const owner=await target.prepare("SELECT revision,authority_epoch FROM analytics_owner_state WHERE source_id=? AND owner_digest=? AND state='active'").bind(key.sourceId,key.ownerDigest).first<{revision:number;authority_epoch:number}>();

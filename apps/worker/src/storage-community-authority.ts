@@ -58,6 +58,40 @@ export function sameStorageCommunityAuthority(a: StorageCommunityAuthority, b: S
     && (!exactInputs || (a.sequence === b.sequence && a.sourceEpoch === b.sourceEpoch));
 }
 
+/** Per-owner calculations are identified by their exact source pin and input
+ * revision. Unrelated owners may therefore advance the global publication
+ * epochs without invalidating completed private work. Policy and collection
+ * changes remain calculation-wide fences; publication retains the full global
+ * authority comparison below. */
+export function sameStorageCommunityCalculationAuthority(a: StorageCommunityAuthority,
+  b: StorageCommunityAuthority): boolean {
+  return a.sourceId === b.sourceId && a.sourceNamespace === b.sourceNamespace
+    && a.policyRevision === b.policyRevision && a.collectionRevision === b.collectionRevision;
+}
+
+/** Lightweight final fence for private per-owner work. This deliberately does
+ * not scan the ingestion journal or compare global owner mutation epochs. The
+ * caller must also assert its exact owner source pin. */
+export async function storageCommunityCalculationAuthorityIsCurrent(source:D1Database,
+  snapshot:StorageCommunityAuthority):Promise<boolean> {
+  const controls=await readCollectionControls(source);
+  if(!controls.publication)throw unavailable();
+  const row=await source.prepare(`SELECT s.source_id AS sourceId,a.source_namespace AS sourceNamespace,
+    i.policy_revision AS policyRevision,c.revision AS collectionRevision
+    FROM storage_source_state s
+    JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
+    JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 AND b.source_namespace=a.source_namespace
+    JOIN ingestion_analytics_separation i ON i.id=1
+    JOIN collection_controls c ON c.singleton=1 AND c.publication_enabled=1
+    JOIN community_public_source_bootstrap p ON p.singleton=1 AND p.completed=1 AND p.policy_version=?
+    WHERE s.singleton=1`).bind(COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION).first<Pick<StorageCommunityAuthority,
+      'sourceId'|'sourceNamespace'|'policyRevision'|'collectionRevision'>>();
+  return !!row&&row.collectionRevision===controls.revision
+    &&typeof row.sourceId==='string'&&typeof row.sourceNamespace==='string'
+    &&count(row.policyRevision)&&row.policyRevision>=1&&count(row.collectionRevision)&&row.collectionRevision>=1
+    &&sameStorageCommunityCalculationAuthority(snapshot,{...snapshot,...row});
+}
+
 /** The final source read is the operation's authority linearization point.
  * Append-only data may leave an older published revision visible. Revocation,
  * deletion, exclusions, policy or collection changes may not. */

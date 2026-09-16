@@ -14,7 +14,9 @@ import { sha256Hex } from "../src/crypto";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
-import { captureStorageGraphScope, computeStorageGraphResult, readStorageGraphResult } from "../src/storage-community-graph";
+import { captureStorageGraphScope, computeStorageGraphResult, readStorageGraphResult,
+  storageGraphDependencyDigest,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,
+  STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD } from "../src/storage-community-graph";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
@@ -61,24 +63,50 @@ async function stage(db:D1Database,f:Fixture,prepared:Prepared,isTyped:boolean){
   return registerTelemetryV11DayManifest(db,f,prepared.manifest);
 }
 async function activate(db:D1Database,f:Fixture,prepared:Prepared,isTyped:boolean){
-  const candidate=await stage(db,f,prepared,isTyped);
+  return activateDays(db,f,[prepared],isTyped);
+}
+async function activateDays(db:D1Database,f:Fixture,prepared:Prepared[],isTyped:boolean){
+  const candidates=[];
+  for(const value of prepared)candidates.push(await stage(db,f,value,isTyped));
+  return activateCandidates(db,f,candidates);
+}
+async function activateCandidates(db:D1Database,f:Fixture,candidates:Awaited<ReturnType<typeof stage>>[]){
+  candidates.sort((left,right)=>left.day.localeCompare(right.day));
   const prior=await createTelemetryV11DomainPredecessor(db,f);
   const manifest:TelemetryV11DomainManifest={schemaVersion:"telemetry-domain-manifest-v1.1",
-    fromDay:day(),throughDay:day(),predecessor:{token:prior.token,previousGenerationId:prior.previousGenerationId,
-      legacyFingerprint:prior.legacyFingerprint},days:[{day:day(),manifestId:candidate.manifestId,
-      manifestDigest:candidate.manifestDigest}],manifestDigest:"0".repeat(64)};
+    fromDay:candidates[0]!.day,throughDay:candidates.at(-1)!.day,
+    predecessor:{token:prior.token,previousGenerationId:prior.previousGenerationId,
+      legacyFingerprint:prior.legacyFingerprint},days:candidates.map(candidate=>({day:candidate.day,
+      manifestId:candidate.manifestId,manifestDigest:candidate.manifestDigest})),manifestDigest:"0".repeat(64)};
   manifest.manifestDigest=await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
   return activateTelemetryV11Domain(db,f,manifest);
 }
-function evidence(){
-  const start=Date.parse(day()+"T01:00:00.000Z");
+function observePreparedSql(database:D1Database){
+  const queries:string[]=[];
+  return {queries,database:new Proxy(database,{get(value,key){
+    if(key==='prepare')return(sql:string)=>{queries.push(sql);return value.prepare(sql)};
+    const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+  }})};
+}
+function loseFirstBatchResponse(database:D1Database){let losses=0;
+  return {losses:()=>losses,database:new Proxy(database,{get(value,key){
+    if(key==='batch')return async(statements:D1PreparedStatement[])=>{
+      const result=await value.batch(statements);if(losses++===0)throw new Error('synthetic committed checkpoint response loss');
+      return result;
+    };
+    const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+  }})};
+}
+function evidence(quotaCount=9,observedDay=day(),label="synthetic"){
+  const start=Date.parse(observedDay+"T01:00:00.000Z");
+  const interval=quotaCount===9?300000:1000;
   const attribution={accountBasis:"same_source" as const,accountTrackId:"account-track:v2:"+"a".repeat(64),
     planBasis:"same_source_occurrence" as const,planType:"pro" as const,planEraId:null};
-  const quota:TelemetryV11QuotaObservation[]=Array.from({length:9},(_,i)=>({schemaVersion:"quota-observation-v1.1",
-    observationId:`quota:synthetic:${i}`,observedTime:new Date(start+i*300000).toISOString(),provider:"openai_codex",
-    planType:"pro",planVariant:"unknown",limitId:"codex",slot:"seven_day",usedPercent:10+i*5,
+  const quota:TelemetryV11QuotaObservation[]=Array.from({length:quotaCount},(_,i)=>({schemaVersion:"quota-observation-v1.1",
+    observationId:`quota:${label}:${i}`,observedTime:new Date(start+i*interval).toISOString(),provider:"openai_codex",
+    planType:"pro",planVariant:"unknown",limitId:"codex",slot:"seven_day",usedPercent:quotaCount===9?10+i*5:10+i%19*5,
     windowDurationMinutes:10080,resetsAt:new Date(start+7*86400000).toISOString(),accountPlanAttribution:{...attribution}}));
-  const usage=Array.from({length:8},(_,i)=>v11UsageRecord(day(),"a",{eventId:`event:synthetic:${i}`,
+  const usage=Array.from({length:8},(_,i)=>v11UsageRecord(observedDay,"a",{eventId:`event:${label}:${i}`,
     eventTime:new Date(start+i*300000+150000).toISOString(),accountPlanAttribution:{...attribution}}));
   return {quota,usage};
 }
@@ -215,20 +243,142 @@ describe("typed active-domain analytical reads",()=>{
     await activate(typed(),f,await makeV11Day(day(),evidence()),true);
     const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
     const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:"fits",sourceId:namespace,sourceNamespace:namespace});
+    expect(await computeStorageGraphResult(bindings,scope)).toEqual({state:'deferred',reason:'v11_owner_pending'});
+    expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
     const computed=await computeStorageGraphResult(bindings,scope);
     expect(computed.state).toBe("complete");
     if(computed.state!=="complete")throw new Error("synthetic fit did not complete");
     expect(computed.result.fits!.length).toBeGreaterThan(0);
     expect(computed.result.fits!.every(fit=>fit.participantId===owner.ownerDigest)).toBe(true);
     expect(computed.reused).toBe(false);
+    expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+      WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
+       STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n')).toBe(1);
+    const modelScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:"model",sourceId:namespace,sourceNamespace:namespace});
+    const model=await computeStorageGraphResult(bindings,modelScope);
+    expect(model.state).toBe('complete');
+    if(model.state!=='complete')throw new Error('synthetic model did not complete');
+    expect(model.result.composition?.status).toBe('ready');
+    expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
+      WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
+       STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).first<number>('n')).toBe(1);
     const meter=createD1InvocationBudget(20);
     const repeated=await computeStorageGraphResult({...bindings,source:meter.wrap(typed()),target:meter.wrap(bindings.target)},scope);
     expect(repeated.state==="complete"&&repeated.reused).toBe(true);
     expect(await typed().prepare("SELECT count(*) FROM community_allowance_fit_cache").first("count(*)")).toBe(0);
     expect(await typed().prepare("SELECT count(*) FROM telemetry_v11_records").first("count(*)")).toBe(0);
-    expect(await bindings.target.prepare("SELECT count(*) FROM analytics_community_graph_results").first("count(*)")).toBe(1);
+    expect(await bindings.target.prepare("SELECT count(*) FROM analytics_community_graph_results").first("count(*)")).toBe(2);
     await typed().prepare("UPDATE collection_controls SET publication_enabled=0,control_state='degraded',revision=revision+1 WHERE singleton=1").run();
     await expect(readStorageGraphResult(bindings,scope)).rejects.toThrow();
     expect(await typed().prepare("SELECT count(*) FROM typed_telemetry_records").first("count(*)")).toBe(17);
   });
+
+  it("keeps the last promoted v1.1 page when the invocation query meter exhausts",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    await activate(typed(),f,await makeV11Day(day(),evidence(2048)),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    const observed=observePreparedSql(typed()),targetObserved=observePreparedSql(bindings.target);
+    expect(await computeStorageGraphResult({...bindings,source:observed.database,target:targetObserved.database},scope,{maxQueries:80}))
+      .toEqual({state:'deferred',reason:'v11_checkpoint'});
+    const staged=await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_heads h
+      JOIN analytics_history_checkpoint_stages s ON s.key_digest=h.key_digest AND s.generation=h.generation
+      WHERE s.source_id=? AND s.owner_digest=? AND s.method=? AND h.retired=0`)
+      .bind(namespace,owner.ownerDigest,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n');
+    expect(staged).toBe(1);
+    const control=await bindings.target.prepare(`SELECT s.control_json FROM analytics_history_checkpoint_heads h
+      JOIN analytics_history_checkpoint_stages s ON s.key_digest=h.key_digest AND s.generation=h.generation
+      WHERE s.source_id=? AND s.owner_digest=? AND s.method=? AND h.retired=0`)
+      .bind(namespace,owner.ownerDigest,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<string>('control_json');
+    expect(JSON.parse(control!).phase).toBe('finish');
+    expect(observed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s')).length).toBe(1);
+    expect(observed.queries.filter(sql=>sql.includes('r.id AS physical_id'))).toHaveLength(9);
+    expect(observed.queries.length).toBeLessThanOrEqual(15);
+    expect(targetObserved.queries.length).toBeLessThanOrEqual(22);
+    expect(observed.queries.length+targetObserved.queries.length).toBeLessThanOrEqual(40);
+    const completed=await computeStorageGraphResult(bindings,scope,{maxQueries:900});
+    expect(completed.state).toBe('complete');
+    expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_community_graph_results
+      WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind(namespace,owner.ownerDigest).first<number>('n')).toBe(1);
+  },120_000);
+
+  it("resumes a grouped v1.1 acquisition after the promoted response is lost without rereading source pages",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    await activate(typed(),f,await makeV11Day(day(),evidence(2048)),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    const lost=loseFirstBatchResponse(bindings.target);
+    await expect(computeStorageGraphResult({...bindings,target:lost.database},scope,{maxQueries:80}))
+      .rejects.toMatchObject({stage:'graph_checkpoint_save',reason:'application'});
+    expect(lost.losses()).toBe(1);
+    expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads WHERE retired=0')
+      .first<number>('n')).toBe(1);
+    const resumed=observePreparedSql(typed());
+    expect((await computeStorageGraphResult({...bindings,source:resumed.database},scope,{maxQueries:900})).state).toBe('complete');
+    expect(resumed.queries.filter(sql=>sql.includes('r.id AS physical_id'))).toHaveLength(0);
+    expect(resumed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s'))).toHaveLength(0);
+    expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_community_graph_results
+      WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind(namespace,owner.ownerDigest).first<number>('n')).toBe(1);
+  },120_000);
+
+  it("resumes a closed v1.1 window across an outside append and rejects changed or erased evidence",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    const historyDay=new Date(Date.parse(day()+"T00:00:00.000Z")-86400000).toISOString().slice(0,10);
+    const selected=await stage(typed(),f,await makeV11Day(historyDay,evidence(2048,historyDay,"history")),true);
+    const current=await stage(typed(),f,await makeV11Day(day(),evidence(1,day(),"current")),true);
+    await activateCandidates(typed(),f,[selected,current]);
+    let owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const initial=await captureStorageGraphScope(typed(),{owner,day:historyDay,metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    expect(await computeStorageGraphResult(bindings,initial,{maxQueries:80}))
+      .toEqual({state:'deferred',reason:'v11_checkpoint'});
+
+    // A later-day activation increments the whole-owner input revision even
+    // when the selected closed day vector is unchanged. Reproduce that exact
+    // pin change without changing the closed manifests under test.
+    await typed().prepare(`UPDATE community_analytical_input_versions
+      SET revision=revision+1 WHERE participant_id=?`).bind(participantId).run();
+    owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    const outside=await captureStorageGraphScope(typed(),{owner,day:historyDay,metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    expect(outside.dependencyDigest).toBe(initial.dependencyDigest);
+    expect('source'in outside.pin&&'source'in initial.pin&&outside.pin.fingerprint).not.toBe(
+      'source'in initial.pin?initial.pin.fingerprint:null);
+    expect((await computeStorageGraphResult(bindings,outside,{maxQueries:900})).state).toBe('complete');
+
+    const changedDigest=await storageGraphDependencyDigest({authority:outside.authority,
+      ownerDigest:owner.ownerDigest!,source:'v1.1',metric:'fits',day:historyDay,
+      dependency:[{observed_day:historyDay,manifest_digest:'f'.repeat(64),id:'changed',device_id:'changed'}]});
+    expect(changedDigest).not.toBe(outside.dependencyDigest);
+
+    await typed().prepare("UPDATE participants SET state='deleting' WHERE id=?").bind(participantId).run();
+    await expect(computeStorageGraphResult(bindings,outside,{maxQueries:900})).rejects.toThrow();
+  },180_000);
 });

@@ -1,11 +1,15 @@
 import {env,reset,applyD1Migrations,type D1Migration} from 'cloudflare:test';
 import {beforeEach,describe,it,expect} from 'vitest';
 import {saveStorageHistoryCheckpoint as save,loadStorageHistoryCheckpoint as load,retireStorageHistoryCheckpoint as retire,
- type StorageHistoryKey,type StorageHistoryLoadCursor} from '../src/storage-history-checkpoint';
+ type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor} from '../src/storage-history-checkpoint';
 import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reader';
+import {createV11QuotaAcquisitionCheckpoint,type V11QuotaAcquisitionIdentity} from '../src/quota-analysis-v11-reader';
 import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
+import type {StorageV11HistoryCheckpoint} from '../src/storage-v11-history';
 import {MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
 import {retireStorageGraphPage} from '../src/storage-graph-retirement';
+import {STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_METHOD,
+ STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD} from '../src/storage-community-graph';
 const bindings=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_ANALYTICS_MIGRATIONS:D1Migration[]};
 const target=()=>bindings.STORAGE_ANALYTICS_DB;
 const key:StorageHistoryKey={sourceId:'synthetic-history-source',ownerDigest:'a'.repeat(64),day:'2026-09-05',dependencyDigest:'b'.repeat(64),sourceNamespace:'synthetic-origin',method:'synthetic-graph-v1'};
@@ -19,14 +23,59 @@ function checkpoint(count=0,finish=false):StorageV1HistoryCheckpoint{
  if(finish)return {...base,phase:'finish',acquisition:{planAnchors:anchors,quotaRows:[]}};
  const acquisition=createV1QuotaAcquisitionCheckpoint(identity);acquisition.plan.anchors=anchors;return {...base,phase:'acquisition',acquisition};
 }
-async function drain(value:StorageV1HistoryCheckpoint,expectedHead:string|null=null){for(let i=0;i<100;i++){
- const result=await save({target:target(),key,checkpoint:value,expectedHead,maxWrites:4});if(result.status==='saved')return result.headDigest;}
+async function drain(value:StorageHistoryCheckpoint,expectedHead:string|null=null,storageKey=key){for(let i=0;i<100;i++){
+ const result=await save({target:target(),key:storageKey,checkpoint:value,expectedHead,maxWrites:4});if(result.status==='saved')return result.headDigest;}
  throw new Error('synthetic staging did not finish');}
-async function read(){let cursor:StorageHistoryLoadCursor|undefined;for(let i=0;i<140;i++){
- const result=await load({target:target(),key,cursor,maxParts:2});if(result.status!=='deferred')return result;cursor=result.cursor;}
+async function read(storageKey=key){let cursor:StorageHistoryLoadCursor|undefined;for(let i=0;i<140;i++){
+ const result=await load({target:target(),key:storageKey,cursor,maxParts:2});if(result.status!=='deferred')return result;cursor=result.cursor;}
  throw new Error('synthetic load did not finish');}
 function batchAdapter(batch:D1Database['batch']):D1Database{return new Proxy(target(),{get(db,p){if(p==='batch')return batch;const v=Reflect.get(db,p);return typeof v==='function'?v.bind(db):v;}});}
 describe('private paged historical checkpoint store',()=>{
+ it('roundtrips v1.1 acquisition and finish generations under a distinct exact key',async()=>{
+  const identity:V11QuotaAcquisitionIdentity={participantId:'synthetic-v11-participant',inputFingerprint:'e'.repeat(64),
+   sourceMethodVersion:'synthetic-v11-reader-1',observedAtCutoff:'2026-05-28T00:00:00.000Z',
+   resetsAtCutoff:'2026-06-04T00:00:00.000Z',windowMinutes:10080,maxQuotaRows:60000};
+  const v11Key={...key,method:STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD},acquisition:StorageV11HistoryCheckpoint={version:1,source:'v1.1',
+   day:key.day,layout:`typed-v11:${key.sourceNamespace}`,identity,phase:'acquisition',
+   acquisition:createV11QuotaAcquisitionCheckpoint(identity)};
+  const first=await drain(acquisition,null,v11Key);
+  expect(await read(v11Key)).toEqual({status:'ready',headDigest:first,checkpoint:acquisition});
+  expect(await read()).toEqual({status:'absent'});
+  const large=structuredClone(acquisition);large.acquisition.plan.observations=Array.from({length:30000},(_,index)=>({
+   contextKey:'openai_codex|codex',observedAtMs:Date.parse(identity.observedAtCutoff)+index,planType:'pro',
+   planVariant:'unknown',continuityId:null,conflicted:false,accountScopeId:null,planBasis:null}));
+  expect((await save({target:target(),key:v11Key,checkpoint:large,expectedHead:first,maxWrites:4})).status).toBe('staging');
+  expect(await read(v11Key)).toEqual({status:'ready',headDigest:first,checkpoint:acquisition});
+  const largeHead=await drain(large,first,v11Key);expect(await read(v11Key)).toEqual({status:'ready',headDigest:largeHead,checkpoint:large});
+  const finish:StorageV11HistoryCheckpoint={...acquisition,phase:'finish',acquisition:{identity,planAnchors:[],quotaRows:[]}};
+  const second=await drain(finish,largeHead,v11Key);
+  expect(second).not.toBe(largeHead);expect(await read(v11Key)).toEqual({status:'ready',headDigest:second,checkpoint:finish});
+  for(let i=0;i<10;i++)if((await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).state==='idle')break;
+  const insert=async(metric:'fits'|'model')=>target().prepare(`INSERT INTO analytics_community_graph_results
+   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(v11Key.sourceId,v11Key.ownerDigest,metric,v11Key.day,
+    STORAGE_GRAPH_METHOD,v11Key.dependencyDigest,1,'c'.repeat(64),'{}','d'.repeat(64),'{}',Date.now(),'v1.1').run();
+  await insert('model');expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z')))
+   .toEqual({state:'idle',deleted:0});
+  expect(await read(v11Key)).toMatchObject({status:'ready',headDigest:second});
+  await insert('fits');expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z')))
+   .toEqual({state:'retiring',deleted:0});
+  expect(await read(v11Key)).toEqual({status:'absent'});
+ },30000);
+ it('retires current-fit checkpoints only after their exact semantic fit result exists',async()=>{
+  const currentKey={...key,method:STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD};
+  await drain(checkpoint(),null,currentKey);
+  const insert=async(metric:'fits'|'model')=>target().prepare(`INSERT INTO analytics_community_graph_results
+   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(currentKey.sourceId,currentKey.ownerDigest,metric,currentKey.day,
+    STORAGE_GRAPH_METHOD,currentKey.dependencyDigest,1,'c'.repeat(64),'{}','d'.repeat(64),'{}',Date.now(),'v1').run();
+  await insert('model');
+  expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).toEqual({state:'idle',deleted:0});
+  expect(await load({target:target(),key:currentKey})).toMatchObject({status:'ready'});
+  await insert('fits');
+  expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).toEqual({state:'retiring',deleted:0});
+  expect(await load({target:target(),key:currentKey})).toEqual({status:'absent'});
+  expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_results
+   WHERE source_id=? AND owner_digest=?`).bind(key.sourceId,key.ownerDigest).first('n')).toBe(2);
+ });
  it('keeps an in-flight successor then removes superseded checkpoint generations after promotion',async()=>{
   const old=await drain(checkpoint(10000)),next=checkpoint(18000);
   expect((await save({target:target(),key,checkpoint:next,expectedHead:old,maxWrites:4})).status).toBe('staging');

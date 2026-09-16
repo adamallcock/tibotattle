@@ -13,7 +13,8 @@ import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
 import { STORAGE_GRAPH_METHOD, storageGraphDependencyDigest } from './storage-community-graph';
 import { modelHistoryWindow } from './model-history-window';
 import { MAX_V1_SOURCE_CHUNKS, selectV1SourceDayDependencies, type V1SourceChunk } from './telemetry-v1-source-selection';
-import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuthority, readStorageCommunityOwnerPage, sameStorageCommunityAuthority,
+import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuthority, readStorageCommunityOwnerPage,
+  sameStorageCommunityAuthority, sameStorageCommunityCalculationAuthority,
   storageCommunityAuthorityIsCurrent, type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import type { PublicAllowanceBreakdownsCacheRow } from './public-allowance-breakdowns';
@@ -198,7 +199,13 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
         ||!Number.isSafeInteger(row.input_revision)||row.input_revision<0||row.source_kind!==source
         ||(metric==='model'&&row.input_revision!==owner.inputRevision&&revalidated?.get(owner.ownerDigest!)!==row.dependency_digest)
         ||!/^[a-f0-9]{64}$/.test(row.dependency_digest)
-        ||!rowAuthority||!sameStorageCommunityAuthority(rowAuthority,authority)
+        ||!rowAuthority||!sameStorageCommunityCalculationAuthority(rowAuthority,authority)
+        // A closed historical result can prove its exact old window below.
+        // A stale current fit is reusable only across append-only churn under
+        // the same global hard authority; hard changes require a current owner
+        // input before the aggregate can be published.
+        ||(metric==='fits'&&row.input_revision!==owner.inputRevision
+          &&!sameStorageCommunityAuthority(rowAuthority,authority))
         ||!Number.isSafeInteger(rowAuthority.sourceEpoch)||rowAuthority.sourceEpoch<0||rowAuthority.sourceEpoch>authority.sourceEpoch
         ||!Number.isSafeInteger(rowAuthority.sequence)||rowAuthority.sequence<0||rowAuthority.sequence>authority.sequence
         ||!Number.isSafeInteger(row.computed_ms)||row.computed_ms<0||row.computed_ms>Date.now()+300_000

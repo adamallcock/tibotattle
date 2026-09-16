@@ -5,17 +5,19 @@ import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowa
 import { COMMUNITY_MODEL_CACHE_MAX_BYTES, COMMUNITY_MODEL_CACHE_MAX_PAGES } from './community-allowance';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { validStorageModelPublication, type StorageModelPublicationValue } from './storage-community-publication-value';
-import { withStorageGraphFailureStage, type StorageGraphFailureFields } from './storage-analytics-failure';
+import { StorageGraphOperationError, withStorageGraphFailureStage,
+ type StorageGraphFailureFields } from './storage-analytics-failure';
 
 const fail=()=>new Error('STORAGE_GRAPH_WORK_UNAVAILABLE');
 const CURRENT_FIT_CACHE_PAGE=64;
-type CachedCurrentFit={owner_digest:string;source_kind:'v0.2'|'v1'|'v1.1'|'mixed'};
+const SCOPE_RETRY_HEADROOM_MS=4_000;
+type CachedGraphResult={owner_digest:string;source_kind:'v0.2'|'v1'|'v1.1'|'mixed'};
 export interface StorageGraphWorkProgress {
  state:'complete'|'reused'|'deferred'|'idle';metric?:'fits'|'model';day?:string;reason?:string;
  failure?:StorageGraphFailureFields;
 }
 
-function ownerSource(owner:StorageCommunityOwner):CachedCurrentFit['source_kind'] {
+function ownerSource(owner:StorageCommunityOwner):CachedGraphResult['source_kind'] {
  return owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
 }
 
@@ -24,14 +26,14 @@ function ownerSource(owner:StorageCommunityOwner):CachedCurrentFit['source_kind'
  * The graph kernel and publisher retain their full input and authority checks. */
 async function nextMissingCurrentFitPosition(target:D1Database,sourceId:string,owners:StorageCommunityOwner[],
  position:number,day:string):Promise<number> {
- const cached=new Map<string,CachedCurrentFit['source_kind']>();
+ const cached=new Map<string,CachedGraphResult['source_kind']>();
  const digests=owners.flatMap(owner=>owner.ownerDigest?[owner.ownerDigest]:[]);
  for(let offset=0;offset<digests.length;offset+=CURRENT_FIT_CACHE_PAGE) {
   const page=digests.slice(offset,offset+CURRENT_FIT_CACHE_PAGE);
   const rows=(await target.prepare(`SELECT owner_digest,source_kind FROM analytics_community_graph_results
    WHERE source_id=? AND metric='fits' AND day=? AND method=?
      AND owner_digest IN(${page.map(()=>'?').join(',')}) ORDER BY owner_digest LIMIT ?`)
-   .bind(sourceId,day,STORAGE_GRAPH_METHOD,...page,page.length+1).all<CachedCurrentFit>()).results;
+   .bind(sourceId,day,STORAGE_GRAPH_METHOD,...page,page.length+1).all<CachedGraphResult>()).results;
   if(rows.length>page.length)throw fail();
   const expected=new Set(page);
   for(const row of rows) {
@@ -43,6 +45,34 @@ async function nextMissingCurrentFitPosition(target:D1Database,sourceId:string,o
  for(let offset=0;offset<owners.length;offset++) {
   const index=(start+offset)%owners.length,owner=owners[index]!;
   if(!owner.ownerDigest||cached.get(owner.ownerDigest)!==ownerSource(owner))return index*2;
+ }
+ return position;
+}
+
+/** Historical model results have the same bounded, advisory cache contract as
+ * current fits. A missing result is a useful place to resume an existing
+ * checkpoint, but it never proves that the checkpoint or its source inputs are
+ * valid; the graph kernel still loads and fences the exact dependency key. */
+async function nextMissingHistoricalModelPosition(target:D1Database,sourceId:string,owners:StorageCommunityOwner[],
+ position:number,day:string):Promise<number> {
+ const cached=new Map<string,CachedGraphResult['source_kind']>();
+ const digests=owners.flatMap(owner=>owner.ownerDigest?[owner.ownerDigest]:[]);
+ for(let offset=0;offset<digests.length;offset+=CURRENT_FIT_CACHE_PAGE) {
+  const page=digests.slice(offset,offset+CURRENT_FIT_CACHE_PAGE);
+  const rows=(await target.prepare(`SELECT owner_digest,source_kind FROM analytics_community_graph_results
+   WHERE source_id=? AND metric='model' AND day=? AND method=?
+     AND owner_digest IN(${page.map(()=>'?').join(',')}) ORDER BY owner_digest LIMIT ?`)
+   .bind(sourceId,day,STORAGE_GRAPH_METHOD,...page,page.length+1).all<CachedGraphResult>()).results;
+  if(rows.length>page.length)throw fail();
+  const expected=new Set(page);
+  for(const row of rows) {
+   if(!expected.has(row.owner_digest)||!['v0.2','v1','v1.1','mixed'].includes(row.source_kind))throw fail();
+   cached.set(row.owner_digest,row.source_kind);
+  }
+ }
+ for(let offset=0;offset<owners.length;offset++) {
+  const index=(position+offset)%owners.length,owner=owners[index]!;
+  if(!owner.ownerDigest||cached.get(owner.ownerDigest)!==ownerSource(owner))return index;
  }
  return position;
 }
@@ -85,8 +115,6 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   :scan.history_position%owners.length;
  const today=new Date(nowMs).toISOString().slice(0,10);
  if(current&&position%2===0)position=await nextMissingCurrentFitPosition(options.target,options.sourceId,owners,position,today);
- const owner=owners[current?Math.floor(position/2):position%owners.length]!;
- const metric=current&&position%2===0?'fits':'model';
  let day:string|null=today;
  if(!current) {
   const authority=await captureStorageCommunityAuthority(options.source,options);
@@ -102,14 +130,27 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
    if(!completed.has(candidate)){day=candidate;break;}
   }
  }
+ if(!current&&day!==null)position=await nextMissingHistoricalModelPosition(options.target,options.sourceId,owners,position,day);
+ const owner=owners[current?Math.floor(position/2):position%owners.length]!;
+ const metric=current&&position%2===0?'fits':'model';
  const claimed=await options.target.prepare(`UPDATE analytics_community_graph_scan SET revision=revision+1,
   tick=(tick+1)%3,current_position=?,history_position=?,updated_ms=? WHERE source_id=? AND revision=?`)
   .bind(current?position+1:scan.current_position,current?scan.history_position:position+1,nowMs,options.sourceId,scan.revision).run();
  if(claimed.meta.changes!==1)return {state:'deferred',reason:'claim_changed'};
  if(day===null)return {state:'idle'};
  if(!owner.ownerDigest)return {state:'deferred',metric,day,reason:'source_bootstrap_pending'};
- const scope=await withStorageGraphFailureStage('graph_scope',()=>captureStorageGraphScope(options.source,{owner,day,metric,
+ const capture=()=>withStorageGraphFailureStage('graph_scope',()=>captureStorageGraphScope(options.source,{owner,day,metric,
   sourceId:options.sourceId,sourceNamespace:options.sourceNamespace}));
+ let scope:Awaited<ReturnType<typeof capture>>;
+ try {scope=await capture()}
+ catch(error) {
+  // A concurrent owner-authority change invalidates the first captured scope.
+  // Retry that exact claimed owner once from a fresh authority snapshot. Every
+  // source/input/final fence still runs; a second race remains a closed error.
+  if(!(error instanceof StorageGraphOperationError)||error.reason!=='source_changed'
+    ||Date.now()+SCOPE_RETRY_HEADROOM_MS>=(options.deadlineMs??Date.now()+20_000))throw error;
+  scope=await capture();
+ }
  const result=await withStorageGraphFailureStage(metric==='fits'?'graph_current_fit_compute':'graph_model_compute',
   ()=>computeStorageGraphResult(options,scope,{maxQueries:Math.max(1,(options.remainingQueries??900)-40),deadlineMs:options.deadlineMs}));
  return result.state==='complete'?{state:result.reused?'reused':'complete',metric,day}
