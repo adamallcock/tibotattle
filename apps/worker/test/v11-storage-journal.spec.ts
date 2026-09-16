@@ -83,6 +83,53 @@ describe('optional baseline v1.1 storage journal bridge', () => {
       .bind(fixture.deviceId).first('state')).toBe('active');
     expect((await changes()).map((item) => item.kind)).toEqual(['owner-active']);
   });
+  it('refuses opt-out atomically when the marker exists before the final retention bridge', async () => {
+    await reset();
+    await applyD1Migrations(db(), bindings.TEST_MIGRATIONS);
+    await applyD1Migrations(db(), bindings.TEST_TYPED_INGESTION_MIGRATIONS.filter((item) => item.name.startsWith('0002_')));
+    await applyD1Migrations(db(), bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
+    await initializeStorageSource(db(), sourceId);
+    await db().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();
+    const fixture = await accountlessFixture(); await activate(fixture);
+    await expect(revokeAccountlessEnrollment(db(), fixture.deviceId, 'user_opt_out', Date.now()))
+      .rejects.toMatchObject({ code: 'BACKEND_STORAGE_UNAVAILABLE' });
+    expect(await db().prepare('SELECT state FROM accountless_enrollment_ledger WHERE device_id=?')
+      .bind(fixture.deviceId).first('state')).toBe('active');
+    expect(await db().prepare('SELECT count(*) n FROM accountless_public_history_retention').first('n')).toBe(0);
+    expect(await db().prepare('SELECT state FROM storage_v11_owner_links WHERE participant_id=?')
+      .bind(fixture.participantId).first('state')).toBe('active');
+    expect((await changes()).map((item) => item.kind)).toEqual(['owner-active']);
+  });
+  it('revokes an accountless opt-out without a head before the retention bridge exists', async () => {
+    await reset();
+    await applyD1Migrations(db(), bindings.TEST_MIGRATIONS);
+    await applyD1Migrations(db(), bindings.TEST_TYPED_INGESTION_MIGRATIONS.filter((item) => item.name.startsWith('0002_')));
+    await applyD1Migrations(db(), bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
+    await initializeStorageSource(db(), sourceId);
+    await db().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();
+    const fixture = await accountlessFixture();
+    expect(await revokeAccountlessEnrollment(db(), fixture.deviceId, 'user_opt_out', Date.now())).toBe(true);
+    expect(await db().prepare('SELECT state FROM accountless_enrollment_ledger WHERE device_id=?')
+      .bind(fixture.deviceId).first('state')).toBe('revoked');
+    expect(await db().prepare('SELECT state FROM accountless_upload_owners WHERE enrollment_device_id=?')
+      .bind(fixture.deviceId).first('state')).toBe('revoked');
+  });
+  it('retains a head activated before the revoke batch even when activation races its setup', async () => {
+    const fixture = await accountlessFixture();
+    let activated: Awaited<ReturnType<typeof activate>> | null = null;
+    const racing = withBatch(db(), (async statements => {
+      activated = await activate(fixture);
+      return db().batch(statements);
+    }) as D1Database['batch']);
+    expect(await revokeAccountlessEnrollment(racing, fixture.deviceId, 'user_opt_out', Date.now())).toBe(true);
+    const event = (await changes())[0]!;
+    expect(activated).not.toBeNull();
+    expect(await db().prepare('SELECT generation_id,head_revision FROM accountless_public_history_retention WHERE participant_id=?')
+      .bind(fixture.participantId).first()).toMatchObject({ generation_id: activated!.result.generationId, head_revision: 1 });
+    expect(await db().prepare('SELECT state FROM storage_v11_owner_links WHERE participant_id=?')
+      .bind(fixture.participantId).first('state')).toBe('active');
+    expect(await lookupV11StorageSource(db(), event)).toMatchObject({ disposition: 'generation', generationId: activated!.result.generationId });
+  });
   it('batches active terminal and metadata reads and refuses a truncated response', async () => {
     const fixture = await createV11DeviceFixture(db(), { grant: true }); await activate(fixture);
     const event = (await changes())[0]!;
@@ -178,6 +225,20 @@ describe('optional baseline v1.1 storage journal bridge', () => {
       .bind(fixture.participantId).first('state')).toBe('active');
     await expect(authenticateDevice(db(),fixture.authorization)).rejects.toMatchObject({code:'DEVICE_AUTH_INVALID'});
     await revokeAccountlessEnrollment(db(), fixture.deviceId, 'user_opt_out', Date.now()); expect(await changes()).toHaveLength(1);
+  });
+  it('fails closed when an accepted head is not in the public-owner view', async () => {
+    const fixture = await accountlessFixture(); await activate(fixture);
+    await db().prepare('DROP VIEW community_public_source_owners').run();
+    await db().prepare(`CREATE VIEW community_public_source_owners(participant_id, owner_kind, device_id)
+      AS SELECT NULL, NULL, NULL WHERE 0`).run();
+    await expect(revokeAccountlessEnrollment(db(), fixture.deviceId, 'user_opt_out', Date.now()))
+      .rejects.toMatchObject({ code: 'BACKEND_STORAGE_UNAVAILABLE' });
+    expect(await db().prepare('SELECT state FROM accountless_enrollment_ledger WHERE device_id=?')
+      .bind(fixture.deviceId).first('state')).toBe('active');
+    expect(await db().prepare('SELECT count(*) n FROM accountless_public_history_retention').first('n')).toBe(0);
+    expect(await db().prepare('SELECT state FROM storage_v11_owner_links WHERE participant_id=?')
+      .bind(fixture.participantId).first('state')).toBe('active');
+    expect((await changes()).map((item) => item.kind)).toEqual(['owner-active']);
   });
   it('keeps containment a hard terminal withdrawal with no history marker', async () => {
     const fixture = await accountlessFixture(); await activate(fixture);const event=(await changes())[0]!;

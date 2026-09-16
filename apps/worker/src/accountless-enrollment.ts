@@ -388,18 +388,34 @@ export async function revokeAccountlessEnrollment(
   }
   try {
     const now = new Date(nowEpoch).toISOString();
+    // Read the head in the same batch as revocation. A missing final bridge
+    // makes an existing head fail the marker's NOT NULL contract; no head
+    // produces no marker row and remains a valid no-history disconnect.
     const retainHistory = reason === "user_opt_out" ? [db.prepare(`
       INSERT INTO accountless_public_history_retention (
         participant_id, enrollment_device_id, device_credential_id,
         generation_id, head_revision, retained_at
       )
       SELECT owner.participant_id, owner.enrollment_device_id,
-             owner.device_credential_id, head.generation_id, head.revision, ?
+             owner.device_credential_id,
+             CASE WHEN (
+               SELECT COUNT(*) = 5
+                 FROM sqlite_schema
+                WHERE type = 'trigger'
+                  AND name IN (
+                    'accountless_public_history_retention_withdraw_delete',
+                    'storage_v11_ledger_withdraw_update',
+                    'storage_v11_owner_withdraw_update',
+                    'storage_v11_grant_withdraw_update',
+                    'storage_v11_device_withdraw_update'
+                  )
+                  AND (
+                    name = 'accountless_public_history_retention_withdraw_delete'
+                    OR instr(sql, 'accountless_public_history_retention') > 0
+                  )
+             ) THEN head.generation_id ELSE NULL END,
+             head.revision, ?
         FROM accountless_upload_owners owner
-        JOIN community_public_source_owners public_owner
-          ON public_owner.participant_id = owner.participant_id
-         AND public_owner.owner_kind = 'accountless'
-         AND public_owner.device_id = owner.device_credential_id
         JOIN telemetry_v11_domain_heads head
           ON head.participant_id = owner.participant_id
        WHERE owner.enrollment_device_id = ?
