@@ -26,7 +26,11 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv)
   // Give ordered delivery its own bounded opportunity before expensive graph
   // work. Both sequential phases share one actual-statement meter; this does
   // not create competing cursor writers or two independent query allowances.
-  const started=Date.now(),deadlineMs=started+40_000;
+  // Use the minute schedule's available work window. The same 900-statement
+  // meter bounds both phases, and graph checkpoints reserve their own final
+  // save time. A slow in-flight query can overrun this cooperative deadline;
+  // subsequent work must still stop rather than receive a fresh allowance.
+  const started=Date.now(),deadlineMs=started+55_000;
   const delivery=publishCommunity?await runStorageAnalyticsPass({...bindings,publishCommunity:false,
    maxSteps:32,maxQueries:175,deadlineMs:started+10_000}):null;
   if(Date.now()>=deadlineMs){
@@ -34,7 +38,8 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv)
     queriesUsed:meter.queriesUsed}));return;
   }
   const result=await runStorageAnalyticsPass({...bindings,publishCommunity,maxQueries:meter.remainingQueries,
-   deadlineMs:publishCommunity?Math.min(deadlineMs,Date.now()+20_000):started+20_000});
+   ...(publishCommunity?{maxSteps:32}:{}),
+   deadlineMs:publishCommunity?deadlineMs:started+20_000});
   console.log(JSON.stringify({event:'storage_analytics_schedule',...result,
    steps:result.steps+(delivery?.steps??0),recordsRead:result.recordsRead+(delivery?.recordsRead??0),
    queriesUsed:meter.queriesUsed}));

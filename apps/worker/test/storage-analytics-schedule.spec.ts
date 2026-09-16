@@ -21,7 +21,7 @@ describe('ordered ingestion before public analytics',()=>{
    for(let i=0;i<175;i++)await options.source.prepare('SELECT 1').run();
    return {...result,steps:16,recordsRead:3200,queriesUsed:175};
   }).mockImplementationOnce(async options=>{
-   expect(options).toMatchObject({publishCommunity:true,maxQueries:725,deadlineMs:21000});
+   expect(options).toMatchObject({publishCommunity:true,maxSteps:32,maxQueries:725,deadlineMs:56000});
    await options.target.prepare('SELECT 1').run();
    return {...result,recordsRead:4,graphCalculations:1};
   });
@@ -35,10 +35,20 @@ describe('ordered ingestion before public analytics',()=>{
   expect(pass).toHaveBeenCalledTimes(1);
  });
  it('does not start another phase when an in-flight query overran the overall deadline',async()=>{
-  pass.mockImplementationOnce(async()=>{vi.setSystemTime(42000);return {...result,state:'deferred',reason:'deadline'};});
+  pass.mockImplementationOnce(async()=>{vi.setSystemTime(57000);return {...result,state:'deferred',reason:'deadline'};});
   await runStorageAnalyticsSchedule(environment());
   expect(pass).toHaveBeenCalledTimes(1);
   expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({state:'deferred',reason:'deadline'});
+ });
+ it('does not extend the shared deadline after slow delivery',async()=>{
+  pass.mockImplementationOnce(async()=>{vi.setSystemTime(42000);return result;})
+   .mockImplementationOnce(async options=>{
+    expect(options.deadlineMs).toBe(56000);
+    expect(options.deadlineMs!-Date.now()).toBe(14000);
+    return result;
+   });
+  await runStorageAnalyticsSchedule(environment());
+  expect(pass).toHaveBeenCalledTimes(2);
  });
  it('keeps publication-disabled delivery as one bounded pass',async()=>{
   pass.mockResolvedValue(result);
