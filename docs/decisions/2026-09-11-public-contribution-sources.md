@@ -23,9 +23,12 @@ are separate gates; the checklist below records their actual state.
 - Accountless admission requires the exact durable active owner, enrollment,
   device, and v1.1 authorization chain, including its versioned policy and bound
   source device. Do not create social sign-in, consent, or legacy cohort grants.
-- Upload credential expiry stops new uploads. It does not withdraw already
-  accepted data. Explicit authority revocation or erasure immediately fences
-  published generations and in-flight cache writes before background rebuilding.
+- Upload credential expiry, ordinary opt-out, and device disconnect stop new
+  uploads without withdrawing already accepted data. The owner clarified the
+  opt-out rule on 2026-09-15 in the
+  [upload-only opt-out decision](./2026-09-15-opt-out-stops-future-uploads.md).
+  Security containment and explicit private owner erasure remain separate
+  operations; ordinary opt-out does not invoke them.
 - Preserve persistent opt-out and the existing installation transition notices.
   The [sharing-default decision](./2026-09-04-accountless-sharing-policy.md)
   remains authoritative for local permission and scheduling behavior.

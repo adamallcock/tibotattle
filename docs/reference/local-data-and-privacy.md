@@ -46,12 +46,16 @@ credentials and while-open scheduling to the encrypted v1.1 upload transport.
 Enrollment alone grants no upload permission: the server separately binds an
 accountless owner and current versioned authorization to that installation.
 Usage and quota records retain the same owner, provider/account track and
-domain-generation boundaries. Revocation blocks future admission and immediately
-withdraws the source from current public calculations; it is separate from
-private owner erasure of previously accepted records. The
-[shared public sample](../decisions/2026-09-11-public-contribution-sources.md)
-admits active, device-bound accountless v1.1 sources alongside signed-in sources.
-Renewable upload expiry alone does not withdraw retained accepted evidence.
+domain-generation boundaries. The accepted
+[upload-only opt-out policy](../decisions/2026-09-15-opt-out-stops-future-uploads.md)
+requires ordinary opt-out and device disconnect to stop future admission while
+retaining accepted evidence in public calculations. They do not erase history
+or restart historical work. Upload expiry has the same retention boundary.
+Security containment and explicit private owner erasure are separate operations.
+The [shared public sample](../decisions/2026-09-11-public-contribution-sources.md)
+admits device-bound accountless v1.1 sources alongside signed-in sources. The
+opt-out decision records implementation and deployment evidence; the policy
+statement alone does not establish that a deployed service has been corrected.
 Public counts describe contribution sources, not unique people or verified
 provider accounts; separate installations can supply overlapping history.
 Sealed legacy weekly snapshots retain their original cohort rules.
