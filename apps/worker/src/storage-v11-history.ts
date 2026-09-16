@@ -25,13 +25,16 @@ function sameIdentity(left:V11QuotaAcquisitionIdentity,right:V11QuotaAcquisition
  * promotion still performs the independent source/privacy fence. */
 export async function advanceStorageV11Analysis(input:{source:D1Database;sourceNamespace:string;
  participantId:string;day:string;metric:'fits'|'model';nowMs:number;sourcePin:V11SourcePin;
+ closedDependencyDigest:string;
  budget:V11QuotaInvocationBudget;checkpoint?:StorageV11HistoryCheckpoint|null}):Promise<StorageV11HistoryResult>{
  const {source,sourceNamespace,participantId,day,metric,nowMs,budget}=input,sourcePin=structuredClone(input.sourcePin);
  if(sourcePin.source!=='v1.1'||sourcePin.participantId!==participantId
   ||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(day)||new Date(`${day}T00:00:00.000Z`).toISOString().slice(0,10)!==day
   ||!Number.isSafeInteger(nowMs)||!Number.isSafeInteger(budget.remainingQueries)||budget.remainingQueries<0
   ||!Number.isFinite(budget.deadlineMs))throw fail();
- const identity=createV11QuotaAcquisitionIdentity(sourcePin,nowMs),layout=`typed-v11:${sourceNamespace}`;
+ if(!/^[0-9a-f]{64}$/.test(input.closedDependencyDigest))throw fail();
+ const liveIdentity=createV11QuotaAcquisitionIdentity(sourcePin,nowMs),
+  identity={...liveIdentity,inputFingerprint:input.closedDependencyDigest},layout=`typed-v11:${sourceNamespace}`;
  const prior=input.checkpoint?structuredClone(input.checkpoint):null;
  if(prior&&(prior.version!==1||prior.source!=='v1.1'||prior.day!==day||prior.layout!==layout
   ||!['acquisition','finish'].includes(prior.phase)||!sameIdentity(prior.identity,identity)))throw fail();
@@ -66,7 +69,11 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
    acquisition:{identity:step.result.identity,planAnchors:step.result.planAnchors,quotaRows:step.result.quotaRows}};
   return {status:'deferred',checkpoint};
  }
- const options={nowMs,sourcePin,quotaAcquisition:checkpoint.acquisition};
+ // The durable acquisition is identified by the exact selected historical
+ // manifest vector, so a new domain generation outside this closed window can
+ // reuse it. The maintained finisher still accepts only a live-pin identity;
+ // rebind after the current-pin assertion above, without changing evidence.
+ const options={nowMs,sourcePin,quotaAcquisition:{...checkpoint.acquisition,identity:liveIdentity}};
  const analysis=metric==='fits'
   ?await accountScopedQuotaAnalysisV11(source,participantId,options)
   :await accountScopedModelCompositionV11(source,participantId,options);

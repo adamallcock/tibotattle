@@ -41,6 +41,7 @@ const MAX_RESULT_BYTES = 1024 * 1024;
 // batch, otherwise a deadline-limited pass can discard the page it acquired.
 const STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS = 6_000;
 const STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM = 10;
+const STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM = 32;
 const fail = () => new Error('STORAGE_GRAPH_RESULT_UNAVAILABLE');
 const scopeChanged = () => new Error('storage graph scope changed');
 export type StorageGraphSource = 'v0.2' | 'v1' | 'v1.1' | 'mixed';
@@ -228,9 +229,10 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       }
       break;
     }
-    for(let page=0;page<STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM;page++){
+    for(let page=0;page<STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM;page++){
       const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
-        participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,checkpoint,
+        participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
+        closedDependencyDigest:scope.dependencyDigest,checkpoint,
         budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
       if(next.status==='complete')return {state:'complete',analysis:next.analysis};
       if(!next.checkpoint)return {state:'deferred',reason:'v11_checkpoint'};
