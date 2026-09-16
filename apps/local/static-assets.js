@@ -33,6 +33,10 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "data-client.js",
     type: "text/javascript; charset=utf-8",
   }),
+  "/desktop-appearance.js": Object.freeze({
+    file: "desktop-appearance.js",
+    type: "text/javascript; charset=utf-8",
+  }),
   "/desktop-shell.js": Object.freeze({
     file: "desktop-shell.js",
     type: "text/javascript; charset=utf-8",
