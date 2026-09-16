@@ -1,4 +1,5 @@
-import { captureStorageGraphScope, computeStorageGraphResult, STORAGE_GRAPH_METHOD } from './storage-community-graph';
+import { captureSelectedStorageGraphScope,captureStorageGraphScope,computeStorageGraphResult,
+ STORAGE_GRAPH_METHOD,STORAGE_GRAPH_V11_CHECKPOINT_METHOD,type StorageGraphScope } from './storage-community-graph';
 import { readStorageCommunityOwnerPage, captureStorageCommunityAuthority,
  type StorageCommunityOwner } from './storage-community-authority';
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowance';
@@ -7,6 +8,12 @@ import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { validStorageModelPublication, type StorageModelPublicationValue } from './storage-community-publication-value';
 import { StorageGraphOperationError, withStorageGraphFailureStage,
  type StorageGraphFailureFields } from './storage-analytics-failure';
+import {loadTypedV11GenerationSnapshot} from './typed-v11-quota-reader';
+import {storageHistoryKeyDigest,type StorageHistoryKey} from './storage-history-checkpoint';
+import {claimStorageGraphWorkSelection,completeStorageGraphWorkSelection,ensureStorageGraphWorkSelection,
+ loadLiveStorageGraphWorkSelection,readStorageGraphWorkSelection,releaseStorageGraphWorkSelection,
+ type StorageGraphWorkEnvelope,type StorageGraphWorkSelection,type StorageGraphSelectionKey}
+ from './storage-community-graph-selection';
 
 const fail=()=>new Error('STORAGE_GRAPH_WORK_UNAVAILABLE');
 const CURRENT_FIT_CACHE_PAGE=64;
@@ -141,18 +148,90 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  if(!owner.ownerDigest)return {state:'deferred',metric,day,reason:'source_bootstrap_pending'};
  const capture=()=>withStorageGraphFailureStage('graph_scope',()=>captureStorageGraphScope(options.source,{owner,day,metric,
   sourceId:options.sourceId,sourceNamespace:options.sourceNamespace}));
- let scope:Awaited<ReturnType<typeof capture>>;
- try {scope=await capture()}
- catch(error) {
-  // A concurrent owner-authority change invalidates the first captured scope.
-  // Retry that exact claimed owner once from a fresh authority snapshot. Every
-  // source/input/final fence still runs; a second race remains a closed error.
-  if(!(error instanceof StorageGraphOperationError)||error.reason!=='source_changed'
+ const captureLatest=async()=>{
+  try{return await capture();}
+  catch(error){
+   // A concurrent owner-authority change invalidates the first captured scope.
+   // Retry that exact claimed owner once from a fresh authority snapshot. Every
+   // source/input/final fence still runs; a second race remains a closed error.
+   if(!(error instanceof StorageGraphOperationError)||error.reason!=='source_changed'
     ||Date.now()+SCOPE_RETRY_HEADROOM_MS>=(options.deadlineMs??Date.now()+20_000))throw error;
-  scope=await capture();
+   return capture();
+  }
+ };
+ let scope:StorageGraphScope,selection:StorageGraphWorkSelection|null=null,claimToken:string|null=null;
+ if(owner.hasV11){
+  const key:StorageGraphSelectionKey={sourceId:options.sourceId,ownerDigest:owner.ownerDigest,day,metric};
+  const existing=await withStorageGraphFailureStage('graph_scope',()=>readStorageGraphWorkSelection(options.target,key));
+  if(existing&&existing.state!=='complete'){
+   const live=await withStorageGraphFailureStage('graph_scope',()=>loadLiveStorageGraphWorkSelection({
+    source:options.source,target:options.target,key,nowMs}));
+   if(!live)return {state:'deferred',metric,day,reason:'selection_invalidated'};
+   selection=live;
+  }else{
+   const latest=await captureLatest();
+   if(latest.source!=='v1.1'||!('source'in latest.pin))throw fail();
+   const pin=latest.pin;
+   const snapshot=await withStorageGraphFailureStage('graph_scope',()=>loadTypedV11GenerationSnapshot(options.source,
+    {sourceNamespace:options.sourceNamespace,pin}));
+   const ownerAuthorityEpoch=await options.target.prepare(`SELECT authority_epoch FROM analytics_owner_state
+    WHERE source_id=? AND owner_digest=? AND state='active'`).bind(options.sourceId,owner.ownerDigest)
+    .first<number>('authority_epoch');
+   if(!Number.isSafeInteger(ownerAuthorityEpoch)||ownerAuthorityEpoch!<1)
+    return {state:'deferred',metric,day,reason:'v11_owner_pending'};
+   const authorityEpoch=ownerAuthorityEpoch as number;
+   scope={...latest,snapshot,ownerAuthorityEpoch:authorityEpoch,owner:{...latest.owner,inputRevision:snapshot.inputRevision}};
+   const checkpointKey:StorageHistoryKey={sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
+    ownerDigest:owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
+    method:STORAGE_GRAPH_V11_CHECKPOINT_METHOD};
+   const envelope:StorageGraphWorkEnvelope={version:1,source:'v1.1',sourceId:options.sourceId,
+    sourceNamespace:options.sourceNamespace,ownerDigest:owner.ownerDigest,day:scope.day,metric,
+    fixedNow:scope.fixedNow,dependencyDigest:scope.dependencyDigest,
+    checkpointDependencyDigest:scope.checkpointDependencyDigest,checkpointMethod:checkpointKey.method,
+    checkpointKeyDigest:await storageHistoryKeyDigest(checkpointKey),targetAuthorityEpoch:authorityEpoch,snapshot};
+   const ensured=await withStorageGraphFailureStage('graph_scope',()=>ensureStorageGraphWorkSelection({
+    source:options.source,target:options.target,envelope,...(existing?{expectedRevision:existing.revision}:{}),nowMs}));
+   if(!('selection'in ensured)||!ensured.selection||ensured.status==='conflict')
+    return {state:'deferred',metric,day,reason:'selection_changed'};
+   selection=ensured.selection;
+  }
+  const token=crypto.randomUUID();claimToken=token;
+  const claimed=await withStorageGraphFailureStage('graph_scope',()=>claimStorageGraphWorkSelection({
+   source:options.source,target:options.target,selection:selection!,claimToken:token,nowMs}));
+  if(claimed.status!=='claimed'||!claimed.selection)
+   return {state:'deferred',metric,day,reason:claimed.status==='busy'?'selection_busy':'selection_changed'};
+  selection=claimed.selection;
+  try{
+   scope=await withStorageGraphFailureStage('graph_scope',()=>captureSelectedStorageGraphScope(options.source,{owner,day,metric,
+    snapshot:selection!.envelope.snapshot,ownerAuthorityEpoch:selection!.envelope.targetAuthorityEpoch,
+    sourceId:options.sourceId,sourceNamespace:options.sourceNamespace}));
+   const checkpointKey:StorageHistoryKey={sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
+    ownerDigest:owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
+    method:STORAGE_GRAPH_V11_CHECKPOINT_METHOD};
+   const envelope=selection.envelope;
+   if(envelope.day!==scope.day||envelope.metric!==scope.metric||envelope.fixedNow!==scope.fixedNow
+    ||envelope.dependencyDigest!==scope.dependencyDigest
+    ||envelope.checkpointDependencyDigest!==scope.checkpointDependencyDigest
+    ||envelope.checkpointMethod!==checkpointKey.method
+    ||envelope.checkpointKeyDigest!==await storageHistoryKeyDigest(checkpointKey))throw fail();
+  }catch(error){
+   try{await releaseStorageGraphWorkSelection({target:options.target,selection,claimToken:token});}catch{/* Preserve the scope failure. */}
+   selection=null;claimToken=null;throw error;
+  }
+ }else scope=await captureLatest();
+ try{
+  const result=await withStorageGraphFailureStage(metric==='fits'?'graph_current_fit_compute':'graph_model_compute',
+   ()=>computeStorageGraphResult(options,scope,{maxQueries:Math.max(1,(options.remainingQueries??900)-40),deadlineMs:options.deadlineMs}));
+  if(result.state==='complete'&&selection&&claimToken){
+   const finished=await completeStorageGraphWorkSelection({target:options.target,selection,claimToken});
+   if(finished.status!=='completed')return {state:'deferred',metric,day,reason:'selection_changed'};
+   selection=null;
+  }
+  return result.state==='complete'?{state:result.reused?'reused':'complete',metric,day}
+   :{state:'deferred',metric,day,reason:result.reason,...(result.failure?{failure:result.failure}:{})};
+ }finally{
+  if(selection&&claimToken){
+   try{await releaseStorageGraphWorkSelection({target:options.target,selection,claimToken});}catch{/* Preserve the graph failure. */}
+  }
  }
- const result=await withStorageGraphFailureStage(metric==='fits'?'graph_current_fit_compute':'graph_model_compute',
-  ()=>computeStorageGraphResult(options,scope,{maxQueries:Math.max(1,(options.remainingQueries??900)-40),deadlineMs:options.deadlineMs}));
- return result.state==='complete'?{state:result.reused?'reused':'complete',metric,day}
-  :{state:'deferred',metric,day,reason:result.reason,...(result.failure?{failure:result.failure}:{})};
 }

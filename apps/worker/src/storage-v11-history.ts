@@ -33,6 +33,7 @@ function pinForSnapshot(snapshot:V11GenerationSnapshot,current:V11SourcePin):V11
  * promotion still performs the independent source/privacy fence. */
 export async function advanceStorageV11Analysis(input:{source:D1Database;sourceNamespace:string;
  participantId:string;day:string;metric:'fits'|'model';nowMs:number;sourcePin:V11SourcePin;
+ generationSnapshot?:V11GenerationSnapshot;
  closedDependencyDigest:string;
  budget:V11QuotaInvocationBudget;checkpoint?:StorageV11HistoryCheckpoint|null;maxPages?:number}):Promise<StorageV11HistoryResult>{
  const {source,sourceNamespace,participantId,day,metric,nowMs,budget}=input,sourcePin=structuredClone(input.sourcePin);
@@ -52,7 +53,8 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  // the actual statement authority.
  if(budget.remainingQueries<8||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:prior};
  budget.remainingQueries-=7;
- const snapshot=prior?.snapshot??await loadTypedV11GenerationSnapshot(source,{sourceNamespace,pin:sourcePin});
+ const snapshot=prior?.snapshot??input.generationSnapshot
+  ??await loadTypedV11GenerationSnapshot(source,{sourceNamespace,pin:sourcePin});
  await assertTypedV11GenerationSnapshotLive(source,snapshot);
  const analysisPin=pinForSnapshot(snapshot,sourcePin),liveIdentity=createV11QuotaAcquisitionIdentity(analysisPin,nowMs),
   identity={...liveIdentity,inputFingerprint:input.closedDependencyDigest};

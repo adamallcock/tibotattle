@@ -32,7 +32,7 @@ function keys(key:StorageHistoryKey){if(!key||Object.keys(key).sort().join(',')!
  try{encodeTypedTelemetryId(key.sourceNamespace);}catch{throw fail();}}
 function bounded(value:number,min:number,max:number){if(!Number.isSafeInteger(value)||value<min||value>max)throw fail();}
 function pin(value:string|null){if(value!==null&&!hash.test(value))throw fail();}
-async function keyDigest(key:StorageHistoryKey){keys(key);return sha256Hex(canonicalJson(key));}
+export async function storageHistoryKeyDigest(key:StorageHistoryKey){keys(key);return sha256Hex(canonicalJson(key));}
 function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistoryCheckpoint{
  const control=parse(controlText),components:Record<string,unknown[]>={};
  if(size(controlText)>STORAGE_HISTORY_CONTROL_BYTES||!control||control.version!==1
@@ -132,7 +132,7 @@ async function current(target:D1Database,id:string){return target.prepare('SELEC
 /** Read only the exact durable head for a checkpoint key. A malformed row is
  * unavailable, rather than evidence of a concurrent promotion. */
 export async function readStorageHistoryCheckpointHead(input:{target:D1Database;key:StorageHistoryKey}):Promise<StorageHistoryCheckpointHead|null>{
- const id=await keyDigest({...input.key}),head=await current(input.target,id);
+ const id=await storageHistoryKeyDigest({...input.key}),head=await current(input.target,id);
  if(head!==null&&(![0,1].includes(head.retired)||head.generation!==null&&!hash.test(head.generation)))throw fail();
  return head;
 }
@@ -141,7 +141,7 @@ export async function readStorageHistoryCheckpointHead(input:{target:D1Database;
  * Each call writes at most32 statements; replay sends the same immutable input. */
 export async function saveStorageHistoryCheckpoint(input:{target:D1Database;key:StorageHistoryKey;checkpoint:StorageHistoryCheckpoint;expectedHead:string|null;maxWrites?:number}){
  const {target}=input,key={...input.key},expected=input.expectedHead,max=input.maxWrites??32;bounded(max,3,32);pin(expected);
- const id=await keyDigest(key),f=await frame(key,structuredClone(input.checkpoint)),manifest=canonicalJson(f.manifest);
+ const id=await storageHistoryKeyDigest(key),f=await frame(key,structuredClone(input.checkpoint)),manifest=canonicalJson(f.manifest);
  const owner=await target.prepare("SELECT revision,authority_epoch FROM analytics_owner_state WHERE source_id=? AND owner_digest=? AND state='active'").bind(key.sourceId,key.ownerDigest).first<{revision:number;authority_epoch:number}>();
  if(!owner)throw fail();
  const generation=await sha256Hex(canonicalJson({key,expectedHead:expected,authorityEpoch:owner.authority_epoch,control:f.control,manifest:f.manifest}));
@@ -180,7 +180,7 @@ export async function saveStorageHistoryCheckpoint(input:{target:D1Database;key:
 /** At most8 payload reads per call. In-memory cursor is private and bound to a
  * single promoted generation; every payload is rehashed before final decode. */
 export async function loadStorageHistoryCheckpoint(input:{target:D1Database;key:StorageHistoryKey;cursor?:StorageHistoryLoadCursor;maxParts?:number}){
- const {target}=input,key={...input.key},max=input.maxParts??8;bounded(max,1,8);const id=await keyDigest(key),head=await current(target,id);
+ const {target}=input,key={...input.key},max=input.maxParts??8;bounded(max,1,8);const id=await storageHistoryKeyDigest(key),head=await current(target,id);
  if(!head?.generation||head.retired)return {status:'absent' as const};
  const stage=await target.prepare(`SELECT s.* FROM analytics_history_checkpoint_stages s WHERE s.key_digest=? AND s.generation=? AND ${ACTIVE}`)
  .bind(id,head.generation).first<Stage>();if(!stage)return {status:'absent' as const,headDigest:head.generation};
@@ -202,7 +202,7 @@ export async function loadStorageHistoryCheckpoint(input:{target:D1Database;key:
 /** Retire exactly this dependency key, never other days/owners. Head tombstone
  * prevents a delayed writer resurrecting it; payload deletion stays paged. */
 export async function retireStorageHistoryCheckpoint(input:{target:D1Database;key:StorageHistoryKey;expectedHead:string|null;maxWrites?:number}){
- const {target}=input,max=input.maxWrites??32;bounded(max,2,32);pin(input.expectedHead);const id=await keyDigest({...input.key}),head=await current(target,id);
+ const {target}=input,max=input.maxWrites??32;bounded(max,2,32);pin(input.expectedHead);const id=await storageHistoryKeyDigest({...input.key}),head=await current(target,id);
  if(head&&!head.retired&&head.generation!==input.expectedHead||!head&&input.expectedHead!==null)throw fail();
  await target.prepare(`INSERT INTO analytics_history_checkpoint_heads(key_digest,generation,retired) VALUES(?,NULL,1)
  ON CONFLICT(key_digest) DO UPDATE SET retired=1,generation=NULL WHERE analytics_history_checkpoint_heads.retired=1 OR analytics_history_checkpoint_heads.generation IS ?`).bind(id,input.expectedHead).run();

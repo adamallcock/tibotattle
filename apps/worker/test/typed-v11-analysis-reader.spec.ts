@@ -23,7 +23,10 @@ import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggr
 import { readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
 import { readPublishedStorageCommunityGraph } from "../src/storage-community-graph-publication";
 import { readStorageCommunityProgress } from "../src/storage-community-progress";
-import { loadStorageHistoryCheckpoint } from "../src/storage-history-checkpoint";
+import {loadStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,
+  type StorageHistoryKey,type StorageHistoryLoadCursor} from "../src/storage-history-checkpoint";
+import {advanceStorageV11Analysis,type StorageV11HistoryCheckpoint} from '../src/storage-v11-history';
+import {loadTypedV11GenerationSnapshot} from '../src/typed-v11-quota-reader';
 import { handleRequest } from "../src/index";
 import { runBackendLifecycle } from "../src/retention";
 import { reconcilePendingQuarantineObjects } from "../src/quarantine-reconciliation";
@@ -111,6 +114,14 @@ function evidence(quotaCount=9,observedDay=day(),label="synthetic"){
   const usage=Array.from({length:8},(_,i)=>v11UsageRecord(observedDay,"a",{eventId:`event:${label}:${i}`,
     eventTime:new Date(start+i*300000+150000).toISOString(),accountPlanAttribution:{...attribution}}));
   return {quota,usage};
+}
+async function loadedCheckpoint(key:StorageHistoryKey):Promise<StorageV11HistoryCheckpoint>{
+ let cursor:StorageHistoryLoadCursor|undefined;
+ for(;;){const loaded=await loadStorageHistoryCheckpoint({target:b.STORAGE_ANALYTICS_DB,key,cursor});
+  if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
+  if(loaded.status!=='ready'||!('source'in loaded.checkpoint))throw new Error('synthetic v1.1 checkpoint unavailable');
+  return loaded.checkpoint;
+ }
 }
 
 describe("typed active-domain analytical reads",()=>{
@@ -459,6 +470,106 @@ describe("typed active-domain analytical reads",()=>{
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_community_graph_results
       WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind(namespace,owner.ownerDigest).first<number>('n')).toBe(1);
   },120_000);
+
+  it("finishes a persisted quota acquisition on its selected generation after a successor upload",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    const selected=await stage(typed(),f,await makeV11Day(day(),evidence(2048,day(),'quota-selected')),true);
+    await activateCandidates(typed(),f,[selected]);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    const epoch=await typed().prepare(`SELECT authority_epoch FROM storage_owner_revisions WHERE owner_digest=?`)
+      .bind(owner.ownerDigest).first<number>('authority_epoch');
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,?,'active')")
+      .bind(namespace,owner.ownerDigest,epoch).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    if(!('source'in scope.pin))throw new Error('synthetic v1.1 pin unavailable');
+    const snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin:scope.pin});
+    const key:StorageHistoryKey={sourceId:namespace,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day:scope.day,
+      dependencyDigest:scope.checkpointDependencyDigest,method:STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD};
+    const nowMs=Date.parse(scope.fixedNow);
+    const first=await advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+      day:scope.day,metric:'fits',nowMs,sourcePin:scope.pin,generationSnapshot:snapshot,
+      closedDependencyDigest:scope.checkpointDependencyDigest,maxPages:1,
+      budget:{remainingQueries:900,deadlineMs:Date.now()+120_000}});
+    expect(first).toMatchObject({status:'deferred',checkpoint:{phase:'acquisition',snapshot:{fingerprint:snapshot.fingerprint}}});
+    if(first.status!=='deferred'||!first.checkpoint)throw new Error('synthetic quota checkpoint unavailable');
+    expect((await saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:first.checkpoint,expectedHead:null})).status).toBe('saved');
+
+    const nextDay=new Date(Date.parse(day()+'T00:00:00.000Z')+86400000).toISOString().slice(0,10);
+    const successor=await stage(typed(),f,await makeV11Day(nextDay,evidence(1,nextDay,'quota-successor')),true);
+    await activateCandidates(typed(),f,[selected,successor]);
+    const currentPin=await loadV11SourcePin(typed(),participantId);if(!currentPin)throw new Error('synthetic successor pin unavailable');
+    expect(currentPin.fingerprint).not.toBe(snapshot.fingerprint);
+    let checkpoint=await loadedCheckpoint(key),complete=false;
+    for(let pass=0;pass<6&&!complete;pass++){
+      const advanced=await advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+        day:scope.day,metric:'fits',nowMs,sourcePin:currentPin,closedDependencyDigest:scope.checkpointDependencyDigest,
+        checkpoint,maxPages:32,budget:{remainingQueries:900,deadlineMs:Date.now()+120_000}});
+      if(advanced.status==='complete'){complete=true;break;}
+      if(!advanced.checkpoint)throw new Error('synthetic resumed quota checkpoint unavailable');
+      checkpoint=advanced.checkpoint;
+    }
+    expect(complete).toBe(true);expect(checkpoint.snapshot?.fingerprint).toBe(snapshot.fingerprint);
+  },180_000);
+
+  it("finishes a persisted usage reduction on its selected generation after a successor upload",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true}),records=evidence();
+    const start=Date.parse(day()+'T01:00:00.000Z'),attribution=records.quota[0]!.accountPlanAttribution;
+    records.usage=Array.from({length:5003},(_,index)=>v11UsageRecord(day(),'a',{
+      eventId:`event:usage-selected:${index}`,eventTime:new Date(start+index*1000).toISOString(),
+      sessionUuid:`00000000-0000-4000-8000-${String(index).padStart(12,'0')}`,
+      accountPlanAttribution:{...attribution}}));
+    const selected=await stage(typed(),f,await makeV11Day(day(),records),true);await activateCandidates(typed(),f,[selected]);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    const epoch=await typed().prepare(`SELECT authority_epoch FROM storage_owner_revisions WHERE owner_digest=?`)
+      .bind(owner.ownerDigest).first<number>('authority_epoch');
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,?,'active')")
+      .bind(namespace,owner.ownerDigest,epoch).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'model',sourceId:namespace,sourceNamespace:namespace});
+    if(!('source'in scope.pin))throw new Error('synthetic v1.1 pin unavailable');
+    const snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin:scope.pin});
+    const key:StorageHistoryKey={sourceId:namespace,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,day:scope.day,
+      dependencyDigest:scope.checkpointDependencyDigest,method:STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD};
+    const nowMs=Date.parse(scope.fixedNow),advance=(checkpoint:StorageV11HistoryCheckpoint|null,maxPages:number,pin=scope.pin)=>
+      advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,day:scope.day,metric:'model',nowMs,
+        sourcePin:pin as Extract<typeof scope.pin,{source:'v1.1'}>,generationSnapshot:snapshot,
+        closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages,
+        budget:{remainingQueries:900,deadlineMs:Date.now()+120_000}});
+    const acquired=await advance(null,32);if(acquired.status!=='deferred'||!acquired.checkpoint)
+      throw new Error('synthetic quota phase unavailable');
+    const reduced=await advance(acquired.checkpoint,1);expect(reduced).toMatchObject({status:'deferred',
+      checkpoint:{phase:'usage',usage:{complete:false},snapshot:{fingerprint:snapshot.fingerprint}}});
+    if(reduced.status!=='deferred'||!reduced.checkpoint)throw new Error('synthetic usage checkpoint unavailable');
+    expect((await saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:reduced.checkpoint,expectedHead:null})).status).toBe('saved');
+
+    const nextDay=new Date(Date.parse(day()+'T00:00:00.000Z')+86400000).toISOString().slice(0,10);
+    const successor=await stage(typed(),f,await makeV11Day(nextDay,evidence(1,nextDay,'usage-successor')),true);
+    await activateCandidates(typed(),f,[selected,successor]);
+    const currentPin=await loadV11SourcePin(typed(),participantId);if(!currentPin)throw new Error('synthetic successor pin unavailable');
+    let checkpoint=await loadedCheckpoint(key),complete=false;
+    for(let pass=0;pass<4&&!complete;pass++){
+      const advanced=await advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+        day:scope.day,metric:'model',nowMs,sourcePin:currentPin,closedDependencyDigest:scope.checkpointDependencyDigest,
+        checkpoint,maxPages:32,budget:{remainingQueries:900,deadlineMs:Date.now()+120_000}});
+      if(advanced.status==='complete'){complete=true;break;}
+      if(!advanced.checkpoint)throw new Error('synthetic resumed usage checkpoint unavailable');
+      checkpoint=advanced.checkpoint;
+    }
+    expect(complete).toBe(true);expect(checkpoint.snapshot?.fingerprint).toBe(snapshot.fingerprint);
+  },240_000);
 
   it("resumes a closed v1.1 window across an outside append and rejects changed or erased evidence",async()=>{
     await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);

@@ -4,7 +4,8 @@ import { accountScopedQuotaAnalysis } from './quota-analysis';
 import { accountScopedQuotaAnalysisV1, accountScopedHistoricalModelCompositionV1,
   MODEL_HISTORY_METHOD_VERSION, type V1ModelCompositionResult } from './quota-analysis-v1';
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
-import { assertV11SourcePinCurrent } from './telemetry-v11-domain';
+import { assertV11SourcePinCurrent,type V11SourcePin } from './telemetry-v11-domain';
+import { assertTypedV11GenerationSnapshotLive,type V11GenerationSnapshot } from './typed-v11-quota-reader';
 import { assertV1SourcePinCurrent, loadV1SourcePin } from './telemetry-v1-source-selection';
 import { modelHistoryWindow } from './model-history-window';
 import { communityAnalysisCacheVersion, loadCommunitySourcePin, parsedCachedFits,
@@ -52,6 +53,10 @@ export interface StorageGraphScope {
   authority: StorageCommunityAuthority; owner: StorageCommunityOwner & {ownerDigest:string};
   source: Source; pin: Pin; day: string; fixedNow: string; metric:'fits'|'model';
   dependencyDigest:string; checkpointDependencyDigest:string;
+  /** Graph-only immutable v1.1 generation selected before newer source work. */
+  snapshot?:V11GenerationSnapshot;
+  /** Target owner epoch captured by the work-selection CAS. */
+  ownerAuthorityEpoch?:number;
 }
 export interface StorageGraphResult {
   scope:StorageGraphScope; fits:CommunityAllowanceFit[] | null; composition:V1ModelCompositionResult | null;
@@ -128,14 +133,65 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
     day:history.day,fixedNow:history.fixedNow,metric:options.metric,dependencyDigest,checkpointDependencyDigest};
 }
 
+/** Reconstruct a graph scope from one retained v1.1 generation selected before
+ * a newer head was admitted. Dependency identities are recomputed from that
+ * immutable generation; callers cannot supply or weaken them. */
+export async function captureSelectedStorageGraphScope(sourceDb:D1Database,options:{
+ owner:StorageCommunityOwner;day:string;metric:'fits'|'model';snapshot:V11GenerationSnapshot;
+ ownerAuthorityEpoch:number;sourceId?:string;sourceNamespace?:string;
+}):Promise<StorageGraphScope>{
+ const owner={...options.owner},history=modelHistoryWindow(options.day),snapshot=structuredClone(options.snapshot);
+ if(!owner.ownerDigest||!/^[a-f0-9]{64}$/u.test(owner.ownerDigest)||!owner.hasV11
+  ||owner.participantId!==snapshot.participantId||!Number.isSafeInteger(options.ownerAuthorityEpoch)
+  ||options.ownerAuthorityEpoch<1||snapshot.sourceNamespace!==options.sourceNamespace)throw fail();
+ const authority=await captureStorageCommunityAuthority(sourceDb,options);
+ await assertTypedV11GenerationSnapshotLive(sourceDb,snapshot);
+ const rows=(await sourceDb.prepare(`SELECT d.observed_day,m.id,m.manifest_digest,m.device_id
+   FROM telemetry_v11_domain_days d JOIN telemetry_v11_day_manifests m ON m.id=d.manifest_id
+   WHERE d.generation_id=? AND d.observed_day>=? AND d.observed_day<=?
+   ORDER BY d.observed_day LIMIT 102`).bind(snapshot.generationId,history.fromDay,history.day)
+   .all<Record<string,unknown>>()).results;
+ if(rows.length>101)throw fail();
+ const dependencyDigest=await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest,
+  source:'v1.1',metric:options.metric,day:history.day,dependency:rows});
+ const checkpointDependencyDigest=await storageGraphCheckpointDependencyDigest({authority,
+  ownerDigest:owner.ownerDigest,source:'v1.1',day:history.day,dependency:rows});
+ const pin:V11SourcePin={source:'v1.1',participantId:snapshot.participantId,generationId:snapshot.generationId,
+  fromDay:snapshot.fromDay,throughDay:snapshot.throughDay,inputRevision:snapshot.inputRevision,
+  mutationEpoch:authority.sourceEpoch,fingerprint:snapshot.fingerprint};
+ if(!await storageCommunityCalculationAuthorityIsCurrent(sourceDb,authority))throw scopeChanged();
+ return {authority,owner:{...owner,inputRevision:snapshot.inputRevision,ownerDigest:owner.ownerDigest},source:'v1.1',pin,
+  day:history.day,fixedNow:history.fixedNow,metric:options.metric,dependencyDigest,checkpointDependencyDigest,
+  snapshot,ownerAuthorityEpoch:options.ownerAuthorityEpoch};
+}
+
+async function selectedOwnerAuthorityIsCurrent(source:D1Database,scope:StorageGraphScope):Promise<boolean>{
+ if(scope.ownerAuthorityEpoch===undefined)return true;
+ const row=await source.prepare(`SELECT 1 AS ready FROM storage_v11_owner_links l
+  JOIN storage_owner_revisions r ON r.owner_digest=l.owner_digest AND r.state='active' AND r.authority_epoch=?
+  WHERE l.participant_id=? AND l.owner_digest=? AND l.state='active'`).bind(scope.ownerAuthorityEpoch,
+   scope.owner.participantId,scope.owner.ownerDigest).first<number>('ready');
+ return row===1;
+}
+
 async function current(source:D1Database,scope:StorageGraphScope):Promise<boolean> {
-  if('source' in scope.pin)await assertV11SourcePinCurrent(source,scope.pin);
+  if(scope.snapshot)await assertTypedV11GenerationSnapshotLive(source,scope.snapshot);
+  else if('source' in scope.pin)await assertV11SourcePinCurrent(source,scope.pin);
   else await assertV1SourcePinCurrent(source,scope.pin);
-  return storageCommunityCalculationAuthorityIsCurrent(source,scope.authority);
+  return await selectedOwnerAuthorityIsCurrent(source,scope)
+    &&storageCommunityCalculationAuthorityIsCurrent(source,scope.authority);
 }
 async function targetReady(target:D1Database,scope:StorageGraphScope):Promise<void> {
+  if(scope.snapshot&&(scope.source!=='v1.1'||!('source'in scope.pin)
+    ||scope.snapshot.participantId!==scope.owner.participantId
+    ||scope.snapshot.sourceNamespace!==scope.authority.sourceNamespace
+    ||scope.snapshot.fingerprint!==scope.pin.fingerprint))throw fail();
   if(!await target.prepare(`SELECT 1 FROM analytics_runtime_sources WHERE source_id=?
     AND source_namespace=? AND contract_version=1`).bind(scope.authority.sourceId,scope.authority.sourceNamespace).first())throw fail();
+  if(scope.ownerAuthorityEpoch!==undefined&&(!Number.isSafeInteger(scope.ownerAuthorityEpoch)
+    ||scope.ownerAuthorityEpoch<0||!await target.prepare(`SELECT 1 FROM analytics_owner_state
+      WHERE source_id=? AND owner_digest=? AND state='active' AND authority_epoch=?`)
+      .bind(scope.authority.sourceId,scope.owner.ownerDigest,scope.ownerAuthorityEpoch).first()))throw fail();
 }
 function decoded(row:{payload_json:string;payload_fingerprint:string;source_kind:StorageGraphSource},scope:StorageGraphScope):StorageGraphResult|null {
   if(row.source_kind!==scope.source)return null;
@@ -200,6 +256,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     expectedHead:string|null,reason:string):Promise<
     {state:'saved';head:string}|{state:'deferred';reason:string;failure?:StorageGraphFailureFields}>=>{
     if(!await current(source,scope))return {state:'deferred',reason};
+    await targetReady(bindings.target,scope);
     try{
       while(meter.remainingQueries>=40&&now()<deadlineMs){
         const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
@@ -247,6 +304,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     // or promotion fails, the last durable head remains the replay point.
     const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
       participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
+      generationSnapshot:scope.snapshot,
       closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
       budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
     if(next.status==='complete'){
@@ -265,6 +323,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       if(staged.phase!=='finish'&&!(staged.phase==='usage'&&staged.usage.complete))break;
       const advanced=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
         participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
+        generationSnapshot:scope.snapshot,
         closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint:staged,
         maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
         budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
@@ -415,6 +474,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
   if(!payload)throw fail();
   if(new TextEncoder().encode(payload).byteLength>MAX_RESULT_BYTES)return {state:'deferred',reason:'result_size_limit'};
   if(!await current(source,scope))return {state:'deferred',reason:'authority_changed'};
+  await targetReady(bindings.target,scope);
   const hash=await sha256Hex(payload);
   await bindings.target.prepare(`INSERT INTO analytics_community_graph_results
     (source_id,owner_digest,metric,day,method,dependency_digest,input_revision,payload_fingerprint,
