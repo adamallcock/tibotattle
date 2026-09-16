@@ -803,8 +803,11 @@ describe("accountless owner-to-v1.1 transport", () => {
           owner_kind: "accountless",
           device_id: deviceId,
         });
-      // The current publication generation is retired for a bounded rebuild,
-      // while its source, accepted records, and fit cache remain retained.
+      // This encrypted-transport fixture keeps the legacy single-database
+      // publication helpers. Their withdrawal triggers are removed by
+      // isolation 0001 in production; isolated publication retention is covered
+      // by the typed projection and storage journal suites. Keep the legacy
+      // refusal assertions here without claiming this checkpoint is retained.
       expect(await readCapturedCommunityPublication(db(), publicationTime, {
         budget: { remainingQueries: 64, deadlineMs: Date.now() + 30_000 },
       })).toBeNull();
@@ -844,7 +847,7 @@ describe("accountless owner-to-v1.1 transport", () => {
 
       // The direct authority root was already revoked by the device opt-out.
       // Operator erasure removes the retained participant subtree and the
-      // captured generation after the ordinary opt-out retention period.
+      // captured generation as a separate action after ordinary opt-out.
       const erased = await eraseParticipantAsOwner(
         runtime(),
         "e".repeat(64),
