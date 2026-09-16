@@ -128,6 +128,17 @@ composition validator rejects for a model day. The model history now receives
 the bare composition refusal (`status`, `reason`, `tracks`) that the maintained
 finisher returns, so the day publishes with that owner as a refusal count.
 
+With the refusal shape fixed, 2026-09-15 published as the first model day, but
+two of the next six passes ended in `exceededMemory` on that owner's other days:
+staging a near-limit acquisition held the decoded checkpoint, a defensive deep
+copy of it, its part payloads, a second deep copy for framing, the round-trip
+decode and two full canonical serializations at once. The load now hashes the
+stage row instead of re-framing the decoded object and releases the part
+payloads, the advance and the frame no longer deep-copy the checkpoint (the
+encoders only read it; a cut group returns no checkpoint and the input is
+consumed), and the frame round-trip compares digests one serialization at a
+time.
+
 Still open: the acquisition checkpoint itself (up to 60,000 quota rows per
 owner) is the structural cost; a compact representation is the next step if a
 group plus its save does not fit one window at production latency.

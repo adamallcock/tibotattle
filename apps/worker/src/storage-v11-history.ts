@@ -14,9 +14,10 @@ export type StorageV11HistoryCheckpoint={version:1;source:'v1.1';day:string;layo
  {phase:'finish';acquisition:V11CompletedQuotaAcquisition}|
  {phase:'usage';acquisition:V11CompletedQuotaAcquisition;usage:V11UsageReductionCheckpoint});
 /** A `cut` deferral consumed fewer source pages than the requested group
- * because the invocation budget or deadline stopped it. It returns the prior
- * checkpoint unchanged: a partial group is not a deterministic successor, and
- * staging one would give every invocation a different generation to abandon. */
+ * because the invocation budget or deadline stopped it. It returns no
+ * checkpoint: a partial group is not a deterministic successor, and staging one
+ * would give every invocation a different generation to abandon. The input
+ * checkpoint is advanced in place and must not be reused after a cut. */
 export type StorageV11HistoryResult={status:'deferred';checkpoint:StorageV11HistoryCheckpoint|null;cut?:true}|
  {status:'complete';analysis:object};
 
@@ -50,7 +51,10 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   ||!Number.isFinite(budget.deadlineMs))throw fail();
  if(!/^[0-9a-f]{64}$/.test(input.closedDependencyDigest))throw fail();
  if(input.maxPages!==undefined&&(!Number.isSafeInteger(input.maxPages)||input.maxPages<1||input.maxPages>32))throw fail();
- const prior=input.checkpoint?structuredClone(input.checkpoint):null;
+ // The acquisition advances the given checkpoint in place: a defensive deep
+ // copy of a 60,000-row acquisition can exhaust the isolate on its own. The
+ // caller treats the input as consumed; a cut group returns no checkpoint.
+ const prior=input.checkpoint??null;
  const layout=`typed-v11:${sourceNamespace}`;
  if(prior&&(prior.version!==1||prior.source!=='v1.1'||prior.day!==day||prior.layout!==layout
   ||!['acquisition','finish','usage'].includes(prior.phase)))throw fail();
@@ -58,7 +62,7 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  // Reader scope1 + source pre/post2 + successor checks are fixed per group.
  // Preserve a bounded local reserve before starting a group; the outer D1 meter remains
  // the actual statement authority.
- if(budget.remainingQueries<8||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:prior,cut:true};
+ if(budget.remainingQueries<8||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:null,cut:true};
  budget.remainingQueries-=7;
  const maxPages=input.maxPages??1;
  const snapshot=prior?.snapshot??input.generationSnapshot
@@ -88,7 +92,7 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   // The acquisition reads one physical page per statement and only defers
   // when the budget, the deadline or the page bound stops it, so fewer than
   // `maxPages` pages means a budget cut rather than a natural group boundary.
-  if(result.status==='deferred')return before-budget.remainingQueries<maxPages?{status:'deferred',checkpoint:prior,cut:true}
+  if(result.status==='deferred')return before-budget.remainingQueries<maxPages?{status:'deferred',checkpoint:null,cut:true}
    :{status:'deferred',checkpoint:{...checkpoint,snapshot,acquisition:result.checkpoint}};
   // A refused acquisition is a complete, publishable result in the shape the
   // metric's maintained finisher would return: the bare composition refusal
@@ -120,7 +124,7 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  // The reducer spends one statement to initialize a fresh reduction and one
  // per day page; an incomplete reduction that read fewer than `maxPages` pages
  // was cut by the budget or deadline, not by the end of its selected days.
- if(!usage.complete&&before-budget.remainingQueries-(resumed?0:1)<maxPages)return {status:'deferred',checkpoint:prior,cut:true};
+ if(!usage.complete&&before-budget.remainingQueries-(resumed?0:1)<maxPages)return {status:'deferred',checkpoint:null,cut:true};
  return {status:'deferred',checkpoint:{version:1,source:'v1.1',day,layout,identity,snapshot,phase:'usage',
   acquisition:checkpoint.acquisition,usage}};
 }

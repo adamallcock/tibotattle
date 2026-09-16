@@ -307,6 +307,8 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         if(!('source'in loaded.checkpoint)||loaded.checkpoint.source!=='v1.1')throw fail();
         checkpoint=loaded.checkpoint;
       }
+      // Release the loaded part payloads before the group runs and stages.
+      cursor=undefined;
       break;
     }
     // Resolve and fence the source once around a bounded page group, then
@@ -373,7 +375,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
        if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
        head=loaded.headDigest??null;if(loaded.status==='ready'){
         if('source'in loaded.checkpoint)throw fail();checkpoint=loaded.checkpoint;
-       }break;
+       }cursor=undefined;break;
       }
       const pin=scope.pin;
       const advance=(savedCheckpoint:typeof checkpoint,maxPages:number)=>advanceStorageV1CurrentFitAnalysis({
@@ -467,6 +469,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
             if(loaded.status==='ready'){
               if('source'in loaded.checkpoint)throw fail();checkpoint=loaded.checkpoint;
             }
+            cursor=undefined;
             break;
           }
           const pin=scope.pin;

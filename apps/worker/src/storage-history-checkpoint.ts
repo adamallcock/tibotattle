@@ -35,6 +35,10 @@ const fail=()=>new Error('STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE');
 const size=(text:string)=>encoder.encode(text).byteLength;
 const parse=(text:string):any=>{try{return JSON.parse(text);}catch{throw fail();}};
 const same=(a:unknown,b:unknown)=>canonicalJson(a)===canonicalJson(b);
+// A multi-megabyte checkpoint is compared by digest so only one canonical
+// serialization is alive at a time; the isolate has 128 MiB for the decoded
+// object, its parts and this check together.
+async function sameByDigest(a:unknown,b:unknown){return await sha256Hex(canonicalJson(a))===await sha256Hex(canonicalJson(b));}
 function keys(key:StorageHistoryKey){if(!key||Object.keys(key).sort().join(',')!=='day,dependencyDigest,method,ownerDigest,sourceId,sourceNamespace'
  ||!hash.test(key.ownerDigest)||!hash.test(key.dependencyDigest)||!/^\d{4}-\d{2}-\d{2}$/.test(key.day)
  ||new Date(`${key.day}T00:00:00.000Z`).toISOString().slice(0,10)!==key.day
@@ -121,7 +125,7 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):
    if(chunk.length)await emit();
   }
   if(size(canonicalJson(manifest))>STORAGE_HISTORY_PART_BYTES)throw fail();
-  const roundtrip=decode(control,manifest,parts);if(!same(roundtrip,checkpoint))throw fail();return {control,manifest,parts};
+  if(!await sameByDigest(decode(control,manifest,parts),checkpoint))throw fail();return {control,manifest,parts};
  }
  if(checkpoint.layout!==`typed:${key.sourceNamespace}`&&checkpoint.layout!=='json')throw fail();
  createV1QuotaAcquisitionCheckpoint(checkpoint.identity);
@@ -142,7 +146,7 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):
   if(chunk.length)await emit();
  }
  if(size(canonicalJson(manifest))>STORAGE_HISTORY_PART_BYTES)throw fail();
- const roundtrip=decode(control,manifest,parts);if(!same(roundtrip,checkpoint))throw fail();return {control,manifest,parts};
+ if(!await sameByDigest(decode(control,manifest,parts),checkpoint))throw fail();return {control,manifest,parts};
 }
 const ACTIVE=`EXISTS(SELECT 1 FROM analytics_owner_state o WHERE o.source_id=s.source_id AND o.owner_digest=s.owner_digest
  AND o.state='active' AND o.authority_epoch=s.authority_epoch)`;
@@ -154,14 +158,16 @@ export async function readStorageHistoryCheckpointHead(input:{target:D1Database;
  if(head!==null&&(![0,1].includes(head.retired)||head.generation!==null&&!hash.test(head.generation)))throw fail();
  return head;
 }
-// Framing a multi-megabyte checkpoint clones, encodes, hashes and round-trips
-// it. One invocation stages the same immutable object across several bounded
-// writes, so the frame is memoized per object for its exact day and namespace.
+// Framing a multi-megabyte checkpoint encodes, hashes and round-trips it. One
+// invocation stages the same immutable object across several bounded writes,
+// so the frame is memoized per object for its exact day and namespace. The
+// encoders only read the checkpoint, so it is framed in place: a defensive
+// deep copy of a 60,000-row acquisition alone can exhaust the isolate.
 const frames=new WeakMap<object,{day:string;sourceNamespace:string;frame:Frame}>();
 async function framed(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):Promise<Frame>{
  const cached=frames.get(checkpoint);
  if(cached&&cached.day===key.day&&cached.sourceNamespace===key.sourceNamespace)return cached.frame;
- const f=await frame(key,structuredClone(checkpoint));
+ const f=await frame(key,checkpoint);
  frames.set(checkpoint,{day:key.day,sourceNamespace:key.sourceNamespace,frame:f});return f;
 }
 /** The target key is a private dependency identity, not authorization. Caller
@@ -244,8 +250,11 @@ export async function loadStorageHistoryCheckpoint(input:{target:D1Database;key:
   ||size(row.payload_json)!==row.payload_bytes||await sha256Hex(row.payload_json)!==row.sha256)throw fail();parts.push(row.payload_json);}
  if(parts.length<manifest.length){if(!rows.length)throw fail();return {status:'deferred' as const,cursor:{generation,parts,stage}};}
  for(let i=0;i<parts.length;i++)if(size(parts[i]!)!==manifest[i]!.bytes||await sha256Hex(parts[i]!)!==manifest[i]!.sha256)throw fail();
- const checkpoint=decode(stage.control_json,manifest,parts),f=await frame(key,checkpoint);
- if(await sha256Hex(canonicalJson({key,expectedHead:stage.expected_head,authorityEpoch:stage.authority_epoch,control:f.control,manifest:f.manifest}))!==generation)throw fail();
+ // The generation is the hash of the exact stage row that produced these
+ // verified parts, so it is recomputed from the row itself; re-framing the
+ // decoded object would only repeat that hash at a full extra copy in memory.
+ if(await sha256Hex(canonicalJson({key,expectedHead:stage.expected_head,authorityEpoch:stage.authority_epoch,control:stage.control_json,manifest}))!==generation)throw fail();
+ const checkpoint=decode(stage.control_json,manifest,parts);parts.length=0;
  const final=await target.prepare(`SELECT h.generation FROM analytics_history_checkpoint_heads h JOIN analytics_history_checkpoint_stages s
  ON s.key_digest=h.key_digest AND s.generation=h.generation WHERE h.key_digest=? AND h.retired=0 AND ${ACTIVE}`).bind(id).first<string>('generation');
  if(final!==generation)throw fail();return {status:'ready' as const,headDigest:generation,checkpoint};
