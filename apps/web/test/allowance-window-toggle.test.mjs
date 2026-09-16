@@ -159,13 +159,19 @@ test("seven-day is preferred, with five-hour as the honest evidence fallback", a
 });
 
 test("the Allowance page exposes one real two-state window control", async () => {
-  const [html, appSource] = await Promise.all([
+  const [html, appSource, styles] = await Promise.all([
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
   ]);
 
   assert.match(html, /id="allowance-window-controls"[^>]*role="group"/u);
   assert.match(html, /data-window-minutes="300"/u);
+  assert.match(
+    styles,
+    /\.allowance-window-toggle button \{[\s\S]*?white-space: nowrap;[\s\S]*?\}/u,
+    "the five-hour label stays on one line",
+  );
   assert.match(
     html,
     /data-window-minutes="10080" class="active" aria-pressed="true"/u,

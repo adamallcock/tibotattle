@@ -7226,10 +7226,14 @@ function lineChart({
           : `${item.className} chart-point chart-point-hit-target`);
         const timestamp = point.timestamp ?? point.date;
         const heading = chartSeriesCaption(item.label, format(value));
-        const detail = [
-          item.detail ? chartText(item.detail(point), "series detail") : null,
-          timestamp ? formatChartTimestamp(timestamp) : null,
-        ].filter(Boolean).join(" · ");
+        const timestampDetail = timestamp ? formatChartTimestamp(timestamp) : null;
+        const seriesDetail = item.detail
+          ? chartText(item.detail(point), "series detail")
+          : null;
+        const detail = (item.timestampFirst
+          ? [timestampDetail, seriesDetail]
+          : [seriesDetail, timestampDetail]
+        ).filter(Boolean).join(" · ");
         const caption = [heading, detail].filter(Boolean).join(" · ");
         // Deliberately no native <title> on a point: the styled hover shows
         // this caption immediately, and the browser's delayed grey tooltip
@@ -7635,6 +7639,7 @@ function renderAllowanceHistoryChart(
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        timestampFirst: true,
         pointFilter: (point) => point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
       },
@@ -7646,6 +7651,7 @@ function renderAllowanceHistoryChart(
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        timestampFirst: true,
         pointFilter: (point) => !point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
