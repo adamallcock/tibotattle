@@ -22,6 +22,16 @@
     "src/telemetry-v1-contribution-store.ts",
     "src/postgres-telemetry-v1-contribution-store.ts",
     "src/telemetry-v1-contribution-reader.ts",
-    "src/postgres-telemetry-v1-contribution-reader.ts"
+    "src/postgres-telemetry-v1-contribution-reader.ts",
+    "src/telemetry-v1-sync-store.ts",
+    "src/postgres-telemetry-v1-sync-store.ts",
+    "src/telemetry-v1-backend.ts",
+    "src/postgres-telemetry-v1-backend.ts",
+    "src/quota-fit-projection-contract.ts",
+    "src/postgres-quota-fit-projection.ts",
+    "src/participant-erasure-store.ts",
+    "src/participant-erasure-ledger-contract.ts",
+    "src/postgres-participant-erasure-store.ts",
+    "src/gcs-erasure-object-store.ts"
   ]
 }

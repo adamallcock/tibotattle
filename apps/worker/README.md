@@ -384,8 +384,11 @@ records the first real-GCS qualification; it is not deployment evidence.
 
 ### Experimental PostgreSQL contribution lane
 
-`createExperimentalPostgresTelemetryV1ContributionStore` accepts an injected
-pool through a structural interface. Production continues to compose D1.
+`createExperimentalPostgresTelemetryV1Backend` accepts an injected pool through
+a structural interface and returns matching contribution, replay-reader and
+sync adapters. `createD1TelemetryV1Backend` supplies the production equivalents.
+Select the factory explicitly at the composition root; there is no environment
+variable that silently switches production databases.
 The candidate calls a function in the deliberately named `tibotattle_v1_test`
 schema; `postgres-test/schema.sql` is a disposable fixture, not a deployment
 migration. The `pg` driver is a pinned development dependency only.
@@ -400,8 +403,9 @@ PG_TEST_SOCKET=/private/tmp/tibotattle-pg-<unique>/socket npm run test:postgres
 
 Set `PG_TEST_PORT` if the socket uses a port other than 5432. This explicit lane
 refuses an absent or unsafe socket path and does not accept a connection URL.
-It creates a random database, checks pre-schema refusal, installs only the test
-schema, and drops only that newly created database in teardown. Stop the
+It creates random primary and independent ledger databases, checks pre-schema
+refusal, installs only the test schemas, and drops only those newly created
+databases in teardown. Stop the
 disposable server afterwards. A forcibly interrupted run can leave its random
 test database behind; inspect ownership before cleanup. The normal Worker test
 lane excludes these tests and does not need PostgreSQL.
@@ -419,13 +423,43 @@ this preserves a committed object's reference even if a later correction has
 superseded it. The PostgreSQL lane tests the same receipt construction after an
 uncertain commit, but does not yet compose the full HTTP/auth/quarantine flow.
 
-The test schema performs actual model-history dependency invalidation and
-composition-day eviction for append/correction. Other projection families remain
-dirty requests; graph preservation, publication, deletion ledger, quarantine
-reconciliation and account-scoped v1.1 transport remain open.
+The test schema performs model-history dependency invalidation, composition-day
+eviction, analytical revision increments, current-analysis and daily-rebuild
+queue changes, prepared-source invalidation/counters, graph-preservation checks
+and hard cache invalidation in the contribution transaction. These are concrete
+state transitions. Computation and publication workers still need their own
+provider adapters; queued work is not a published result.
+
+The quota-fit candidate supplies trigger-maintained eligibility, finite high-water
+backfill with transactional cursor advancement, and bounded raw-source/fit page
+reads. Sync shares digest and manifest construction with D1. Qualification SQL
+is split between `schema.sql`, `projections.sql`, `quota-fit.sql`, and the
+`erasure.sql` lifecycle extension. `erasure-ledger.sql` is installed only in the
+separate ledger database.
+
+Owner erasure now runs through `ParticipantErasurePrimaryStore`,
+`ParticipantErasureLedgerStore` and `ParticipantErasureObjectStore`. D1 retains
+its existing owner/CSRF/audit entrypoint and R2 composition. The PostgreSQL
+candidate erases the same canonical participant, chunk and record tables used
+by the writer. Tests retain the independent ledger while restoring primary
+source rows, then repeat the explicit erasure workflow. This does not implement
+a PostgreSQL startup/restore admission gate or automatic suppression service.
+
+`GcsErasureObjectStore` checks exact object generations and retained soft-deleted
+history, and refuses to finalize when purge cannot be verified. Its mock tests
+are not live-GCS erasure evidence. A deployment must provide exclusive ownership
+of quarantine keys, writer quiescence, history-listing permissions, independent
+ledger durability and the existing identity/enrollment hooks.
+
+The experimental lane is not a complete Cloud Run application. Authorization,
+account-scoped v1.1 transport, the prepared-source reader, aggregate computation
+and publication still have D1-specific composition. The shared graph epoch also
+retains global serialization; this work does not prove unlimited write scaling.
 
 See the [qualification record](../../docs/plans/2026-09-15-postgres-contribution-qualification.md)
 for the first transaction evidence and the
 [read/projection follow-up](../../docs/plans/2026-09-15-postgres-replay-projections.md)
-for subsequent qualification. No GCP database or runtime is configured by this
-lane.
+for subsequent qualification, and the
+[remaining-adapter plan](../../docs/plans/2026-09-15-postgres-remaining-adapters.md)
+for the current integration and its evidence. No GCP database or runtime is
+configured by this lane.

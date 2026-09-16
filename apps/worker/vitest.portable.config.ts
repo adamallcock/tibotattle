@@ -4,7 +4,11 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["portable-test/**/*.spec.ts", "test/gcs-release-object-store.spec.ts"],
+    include: [
+      "portable-test/**/*.spec.ts",
+      "test/gcs-release-object-store.spec.ts",
+      "test/gcs-erasure-object-store.spec.ts",
+    ],
     fileParallelism: false,
   },
 });

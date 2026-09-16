@@ -1,6 +1,6 @@
-import { createD1TelemetryV1ContributionStore } from "./d1-telemetry-v1-contribution-store";
+import { createD1TelemetryV1Backend } from "./d1-telemetry-v1-backend";
+import type { TelemetryV1Backend } from "./telemetry-v1-backend";
 import type { TelemetryV1ContributionStore } from "./telemetry-v1-contribution-store";
-import { createD1TelemetryV1ContributionReader } from "./d1-telemetry-v1-contribution-reader";
 import type {
   StoredTelemetryV1Chunk,
   TelemetryV1ContributionReader,
@@ -9,6 +9,7 @@ import {
   buildTelemetryV1ReplayReceipt,
   resolveTelemetryV1Replay,
 } from "./telemetry-v1-contribution-reader";
+import type { TelemetryV1SyncStore } from "./telemetry-v1-sync-store";
 import { allowanceReconstructionMode } from "./allowance-reconstruction";
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
@@ -293,14 +294,9 @@ function quarantineObjectStore(env: Env): QuarantineObjectStore {
   return createR2QuarantineObjectStore(env.QUARANTINE);
 }
 
-/** Select the provider for the atomic v1 contribution write at composition. */
-function telemetryV1ContributionStore(env: Env): TelemetryV1ContributionStore {
-  return createD1TelemetryV1ContributionStore(env.USAGE_MONITOR_DB);
-}
-
-/** Select the provider for v1 replay/current metadata reads at composition. */
-function telemetryV1ContributionReader(env: Env): TelemetryV1ContributionReader {
-  return createD1TelemetryV1ContributionReader(env.USAGE_MONITOR_DB);
+/** Explicit v1 provider composition; authorization remains at the route boundary. */
+function telemetryV1Backend(env: Env): TelemetryV1Backend {
+  return createD1TelemetryV1Backend(env.USAGE_MONITOR_DB);
 }
 
 /**
@@ -365,15 +361,13 @@ import {
   validateTelemetryV1Envelope,
 } from "./telemetry-v1";
 import {
-  MAX_SYNC_MANIFEST_RANGE_DAYS,
   telemetryV1ChunkAdmission,
   telemetryV1ChunkAdmissionError,
   telemetryV1ChunkCount,
   telemetryV1DeviceConsentCurrent,
   telemetryV1DeviceForUploadAuthorization,
-  telemetryV1SyncManifest,
-  telemetryV1SyncState,
 } from "./telemetry-v1-repository";
+import { MAX_TELEMETRY_V1_SYNC_MANIFEST_RANGE_DAYS } from "./telemetry-v1-sync-store";
 import {
   readPublishedCommunityDailyAggregatesWithAllowanceState,
   isCurrentCommunityAllowancePublication,
@@ -2789,19 +2783,18 @@ async function deviceSyncPrincipal(
 async function handleDeviceSyncState(
   request: Request,
   env: Env,
+  sync: TelemetryV1SyncStore,
 ): Promise<Response> {
   const device = await deviceSyncPrincipal(request, env);
   if (device.authorityKind !== "social") {
     throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
   }
   const [state, admission] = await Promise.all([
-    telemetryV1SyncState(
-      env.USAGE_MONITOR_DB,
+    sync.state(
       device.participantId,
       device.deviceId,
     ),
-    telemetryV1ChunkAdmission(
-      env.USAGE_MONITOR_DB,
+    sync.admission(
       device.participantId,
       device.deviceId,
     ),
@@ -2870,6 +2863,7 @@ async function handleTelemetryV11Domain(request: Request, env: Env, activate: bo
 async function handleDeviceSyncManifest(
   request: Request,
   env: Env,
+  sync: TelemetryV1SyncStore,
 ): Promise<Response> {
   const device = await deviceSyncPrincipal(request, env);
   if (device.authorityKind !== "social") {
@@ -2889,11 +2883,10 @@ async function handleDeviceSyncManifest(
     throw new ApiError(400, "BODY_INVALID");
   }
   if ((toEpoch - fromEpoch) / DAY_MILLISECONDS + 1
-      > MAX_SYNC_MANIFEST_RANGE_DAYS) {
+      > MAX_TELEMETRY_V1_SYNC_MANIFEST_RANGE_DAYS) {
     throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
   }
-  return jsonResponse(await telemetryV1SyncManifest(
-    env.USAGE_MONITOR_DB,
+  return jsonResponse(await sync.manifest(
     device.participantId,
     device.deviceId,
     fromDay,
@@ -2966,6 +2959,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     await assertTelemetryTransportWriteAllowed(env.USAGE_MONITOR_DB,
       { participantId: participant.id, deviceId: sourceDeviceId },
       telemetryTransportSchemaForEnvelope(declaredEnvelopeVersion));
+    const v1Backend = telemetryV1Backend(env);
     const response = declaredEnvelopeVersion === "telemetry-envelope-v0.1"
       ? await handleTelemetryContribution(request, body, participant, claimed, env, quarantine)
       : declaredEnvelopeVersion === TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION
@@ -2975,8 +2969,8 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
           claimed,
           env,
           quarantine,
-          telemetryV1ContributionStore(env),
-          telemetryV1ContributionReader(env),
+          v1Backend.contributions,
+          v1Backend.reader,
         )
         : declaredEnvelopeVersion === TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION
           ? await handleTelemetryV11Contribution(body, participant, sourceDeviceId, claimed.authorizationId, env, quarantine)
@@ -3834,9 +3828,9 @@ async function routeApi(
     case "device_credential_renew":
       return handleDeviceCredentialRenew(request, env);
     case "device_sync_state":
-      return handleDeviceSyncState(request, env);
+      return handleDeviceSyncState(request, env, telemetryV1Backend(env).sync);
     case "device_sync_manifest":
-      return handleDeviceSyncManifest(request, env);
+      return handleDeviceSyncManifest(request, env, telemetryV1Backend(env).sync);
     case "device_sync_capabilities":
       return handleDeviceSyncCapabilities(request, env);
     case "telemetry_v11_consent":

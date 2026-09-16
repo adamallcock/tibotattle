@@ -10,16 +10,29 @@ import {
   type TelemetryV1Record,
   type TelemetryV1Stream,
 } from "./telemetry-v1";
+import {
+  buildTelemetryV1SyncAdmission,
+  buildTelemetryV1SyncManifest,
+  buildTelemetryV1SyncState,
+  TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY as SYNC_LAUNCH_WEEK_CHUNKS_PER_DAY,
+  TELEMETRY_V1_LAUNCH_WEEK_MILLISECONDS as SYNC_LAUNCH_WEEK_MILLISECONDS,
+  TELEMETRY_V1_STEADY_STATE_CHUNKS_PER_DAY as SYNC_STEADY_STATE_CHUNKS_PER_DAY,
+  MAX_TELEMETRY_V1_SYNC_MANIFEST_RANGE_DAYS,
+  MAX_TELEMETRY_V1_SYNC_MANIFEST_CHUNKS,
+  MAX_TELEMETRY_V1_SYNC_STATE_CHUNKS,
+  type TelemetryV1SyncChunkDigest,
+  type TelemetryV1SyncManifest,
+  type TelemetryV1SyncAdmission,
+  type TelemetryV1SyncState,
+} from "./telemetry-v1-sync-store";
 
-export const TELEMETRY_V1_STEADY_STATE_CHUNKS_PER_DAY = 2_000;
-export const TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY = 20_000;
-export const TELEMETRY_V1_LAUNCH_WEEK_MILLISECONDS = 7 * 24 * 60 * 60 * 1000;
-// Bounded scan guards. The admission budget bounds journal growth to at most
-// 2,000 current chunks per device-day in steady state; these limits exist so
-// a sync read can never become an unbounded table scan.
-const MAX_SYNC_STATE_CHUNKS = 100_000;
-const MAX_SYNC_MANIFEST_CHUNKS = 10_000;
-export const MAX_SYNC_MANIFEST_RANGE_DAYS = 31;
+// Compatibility exports retained for upload/admission callers while the
+// calculation itself lives in the neutral sync port.
+export const TELEMETRY_V1_STEADY_STATE_CHUNKS_PER_DAY = SYNC_STEADY_STATE_CHUNKS_PER_DAY;
+export const TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY = SYNC_LAUNCH_WEEK_CHUNKS_PER_DAY;
+export const TELEMETRY_V1_LAUNCH_WEEK_MILLISECONDS = SYNC_LAUNCH_WEEK_MILLISECONDS;
+// Compatibility export retained for existing route validation callers.
+export const MAX_SYNC_MANIFEST_RANGE_DAYS = MAX_TELEMETRY_V1_SYNC_MANIFEST_RANGE_DAYS;
 
 export interface TelemetryV1ChunkRow {
   id: string;
@@ -41,16 +54,7 @@ export interface TelemetryV1ChunkRow {
   created_at: string;
 }
 
-export interface TelemetryV1ChunkAdmission {
-  schemaVersion: "telemetry-chunk-admission-v1.0";
-  state: "available" | "exhausted";
-  windowDay: string;
-  budget: "launch_week" | "steady_state";
-  acceptedChunks: number;
-  remainingChunks: number;
-  maximumChunks: number;
-  retryAt: string;
-}
+export type TelemetryV1ChunkAdmission = TelemetryV1SyncAdmission;
 
 export function telemetryV1ChunkId(row: TelemetryV1ChunkRow): string {
   return `${row.stream}:${row.chunk_day}:${row.chunk_seq}`;
@@ -94,12 +98,6 @@ export async function telemetryV1DeviceForUploadAuthorization(
   return row?.issued_by_device_id ?? null;
 }
 
-function nextUtcMidnight(nowEpoch: number): string {
-  const next = new Date(nowEpoch);
-  next.setUTCHours(24, 0, 0, 0);
-  return next.toISOString();
-}
-
 /**
  * Per-device daily admission: a circuit breaker against a resend-looping
  * client or a script running up the storage bill, deliberately generous to
@@ -129,30 +127,10 @@ export async function telemetryV1ChunkAdmission(
     device_issued_at: string;
   }>();
   if (!row) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
-  const issuedEpoch = Date.parse(row.device_issued_at);
-  const launchWeek = Number.isFinite(issuedEpoch)
-    && nowEpoch - issuedEpoch < TELEMETRY_V1_LAUNCH_WEEK_MILLISECONDS;
-  const maximumChunks = launchWeek
-    ? TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY
-    : TELEMETRY_V1_STEADY_STATE_CHUNKS_PER_DAY;
-  const acceptedChunks = Math.max(
-    0,
-    Math.min(
-      TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY,
-      Number(row.accepted_count ?? 0),
-    ),
-  );
-  const remainingChunks = Math.max(0, maximumChunks - acceptedChunks);
-  return {
-    schemaVersion: "telemetry-chunk-admission-v1.0",
-    state: remainingChunks > 0 ? "available" : "exhausted",
-    windowDay,
-    budget: launchWeek ? "launch_week" : "steady_state",
-    acceptedChunks,
-    remainingChunks,
-    maximumChunks,
-    retryAt: nextUtcMidnight(nowEpoch),
-  };
+  return buildTelemetryV1SyncAdmission({
+    acceptedChunks: row.accepted_count,
+    deviceIssuedAt: row.device_issued_at,
+  }, nowEpoch);
 }
 
 export function telemetryV1ChunkAdmissionError(
@@ -246,6 +224,7 @@ export async function telemetryV1AcknowledgedThroughDay(
   return row?.through_day ?? null;
 }
 
+/** Read current v1 chunk metadata in the stable sync cursor order. */
 interface CurrentChunkDigestRow {
   chunk_day: string;
   stream: TelemetryV1Stream;
@@ -255,13 +234,13 @@ interface CurrentChunkDigestRow {
   record_count: number;
 }
 
-async function currentChunkDigests(
+export async function readTelemetryV1SyncChunkDigests(
   db: D1Database,
   participantId: string,
   deviceId: string,
   range: { fromDay: string; toDay: string } | null,
   maximumRows: number,
-): Promise<CurrentChunkDigestRow[]> {
+): Promise<TelemetryV1SyncChunkDigest[]> {
   const rangePredicate = range ? "AND chunk_day >= ? AND chunk_day <= ?" : "";
   const bindings = range
     ? [participantId, deviceId, range.fromDay, range.toDay, maximumRows + 1]
@@ -277,90 +256,31 @@ async function currentChunkDigests(
   if (result.results.length > maximumRows) {
     throw new ApiError(503, "LIFECYCLE_BOUNDS_EXCEEDED");
   }
-  return result.results;
+  return result.results.map((row) => ({
+    chunkDay: row.chunk_day,
+    stream: row.stream,
+    chunkSeq: row.chunk_seq,
+    chunkDigest: row.chunk_digest,
+    revision: row.revision,
+    recordCount: row.record_count,
+  }));
 }
 
-/**
- * Day digest: SHA-256 over the concatenated current chunk digests of the day
- * ordered by (stream, seq); history digest: SHA-256 over the concatenated
- * day digests ordered by day. Both sides derive these from the same
- * deterministic partition, so equality proves the accepted range matches the
- * local index without transporting any content.
- */
-async function dayDigests(
-  rows: readonly CurrentChunkDigestRow[],
-): Promise<Array<{
-  day: string;
-  dayDigest: string;
-  chunks: CurrentChunkDigestRow[];
-}>> {
-  const byDay = new Map<string, CurrentChunkDigestRow[]>();
-  for (const row of rows) {
-    const day = byDay.get(row.chunk_day);
-    if (day) day.push(row);
-    else byDay.set(row.chunk_day, [row]);
-  }
-  const days = [...byDay.entries()].sort(
-    ([left], [right]) => left.localeCompare(right),
-  );
-  return Promise.all(days.map(async ([day, chunks]) => ({
-    day,
-    dayDigest: await sha256Hex(
-      chunks.map((chunk) => chunk.chunk_digest).join(""),
-    ),
-    chunks,
-  })));
-}
-
-export interface TelemetryV1SyncState {
-  schemaVersion: "device-sync-state-v1.0";
-  contractVersion: typeof TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION;
-  acknowledgedThroughDay: string | null;
-  historyDigest: string | null;
-  dayCount: number;
-  chunkCount: number;
-}
+export type { TelemetryV1SyncManifest, TelemetryV1SyncState } from "./telemetry-v1-sync-store";
 
 export async function telemetryV1SyncState(
   db: D1Database,
   participantId: string,
   deviceId: string,
 ): Promise<TelemetryV1SyncState> {
-  const rows = await currentChunkDigests(
+  const rows = await readTelemetryV1SyncChunkDigests(
     db,
     participantId,
     deviceId,
     null,
-    MAX_SYNC_STATE_CHUNKS,
+    MAX_TELEMETRY_V1_SYNC_STATE_CHUNKS,
   );
-  const days = await dayDigests(rows);
-  return {
-    schemaVersion: "device-sync-state-v1.0",
-    contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
-    acknowledgedThroughDay: days.at(-1)?.day ?? null,
-    historyDigest: days.length === 0
-      ? null
-      : await sha256Hex(days.map((day) => day.dayDigest).join("")),
-    dayCount: days.length,
-    chunkCount: rows.length,
-  };
-}
-
-export interface TelemetryV1SyncManifest {
-  schemaVersion: "device-sync-manifest-v1.0";
-  contractVersion: typeof TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION;
-  fromDay: string;
-  toDay: string;
-  days: Array<{
-    day: string;
-    dayDigest: string;
-    chunks: Array<{
-      chunkId: string;
-      revision: number;
-      chunkDigest: string;
-      recordCount: number;
-    }>;
-  }>;
+  return buildTelemetryV1SyncState(rows);
 }
 
 export async function telemetryV1SyncManifest(
@@ -370,30 +290,14 @@ export async function telemetryV1SyncManifest(
   fromDay: string,
   toDay: string,
 ): Promise<TelemetryV1SyncManifest> {
-  const rows = await currentChunkDigests(
+  const rows = await readTelemetryV1SyncChunkDigests(
     db,
     participantId,
     deviceId,
     { fromDay, toDay },
-    MAX_SYNC_MANIFEST_CHUNKS,
+    MAX_TELEMETRY_V1_SYNC_MANIFEST_CHUNKS,
   );
-  const days = await dayDigests(rows);
-  return {
-    schemaVersion: "device-sync-manifest-v1.0",
-    contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
-    fromDay,
-    toDay,
-    days: days.map((day) => ({
-      day: day.day,
-      dayDigest: day.dayDigest,
-      chunks: day.chunks.map((chunk) => ({
-        chunkId: `${chunk.stream}:${chunk.chunk_day}:${chunk.chunk_seq}`,
-        revision: chunk.revision,
-        chunkDigest: chunk.chunk_digest,
-        recordCount: chunk.record_count,
-      })),
-    })),
-  };
+  return buildTelemetryV1SyncManifest(rows, fromDay, toDay);
 }
 
 export async function telemetryV1ChunkCount(

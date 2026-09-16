@@ -3,24 +3,33 @@ import { readFile, lstat, realpath } from 'node:fs/promises';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import pg from 'pg';
+import { eraseParticipantWithStore } from '../src/participant-erasure-store.ts';
+import { createExperimentalPostgresParticipantErasureStores } from '../src/postgres-participant-erasure-store.ts';
+import { registerParticipantErasureTests } from './erasure-fixtures.mjs';
+import { registerSyncTests } from './sync-fixtures.mjs';
+import { registerQuotaFitTests } from './quota-fit-fixtures.mjs';
+import { registerProjectionTests, projectionTables, resetProjectionState } from './projection-fixtures.mjs';
 import { registerModelHistoryTests } from './model-history-fixtures.mjs';
 import { createExperimentalPostgresTelemetryV1ContributionStore } from '../src/postgres-telemetry-v1-contribution-store.ts';
 import { createExperimentalPostgresTelemetryV1ContributionReader } from '../src/postgres-telemetry-v1-contribution-reader.ts';
+import { createExperimentalPostgresTelemetryV1Backend } from '../src/postgres-telemetry-v1-backend.ts';
 import { buildTelemetryV1ReplayReceipt, resolveTelemetryV1Replay } from '../src/telemetry-v1-contribution-reader.ts';
 import { parseTelemetryV1Chunk } from '../src/telemetry-v1.ts';
 import { canonicalJson } from '../src/canonical-json.ts';
 
 const schema = 'tibotattle_v1_test';
 const database = `tibotattle_pg_test_${randomBytes(12).toString('hex')}`;
-const tables = ['community_model_history_dependencies','community_model_composition_days','records','chunks','authorizations','consents','devices','admission_windows',
-  'input_versions','projection_requests','pending_objects','participants'];
+const ledgerDatabase = `tibotattle_pg_test_${randomBytes(12).toString('hex')}`;
+const tables = ['accountless_upload_owners','admin_action_audit','web_sessions','device_upload_authorizations',
+  'device_pairings','device_credentials','contributions','telemetry_contributions','telemetry_v11_chunks','telemetry_v1_quota_fit_rows','telemetry_v1_quota_fit_backfill',...projectionTables,'community_model_history_dependencies','community_model_composition_days','records','chunks','authorizations','consents','devices','admission_windows',
+  'input_versions','pending_objects','participants'];
 const pid = 'synthetic-participant', did = 'synthetic-device';
 const day = '2026-09-01';
 const consent = {telemetrySchemaVersion:'telemetry-contribution-v1.0',
   fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',
   privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'};
 const digest = value => createHash('sha256').update(canonicalJson(value)).digest('hex');
-let admin, pool, store, reader, created = false;
+let admin, pool, ledgerPool, store, reader, backend, created = false, ledgerCreated = false;
 
 beforeAll(async () => {
   const socket = process.env.PG_TEST_SOCKET;
@@ -47,17 +56,26 @@ beforeAll(async () => {
   expect(Number((await admin.query('SHOW server_version_num')).rows[0].server_version_num)).toBeGreaterThanOrEqual(160000);
   await admin.query(`CREATE DATABASE "${database}"`);
   created = true;
+  await admin.query(`CREATE DATABASE "${ledgerDatabase}"`);
+  ledgerCreated = true;
+  ledgerPool = new pg.Pool({...options, database: ledgerDatabase});
   pool = new pg.Pool({...options, database});
-  store = createExperimentalPostgresTelemetryV1ContributionStore(pool);
-  reader = createExperimentalPostgresTelemetryV1ContributionReader(pool);
+  backend = createExperimentalPostgresTelemetryV1Backend(pool);
+  store = backend.contributions;
+  reader = backend.reader;
   // Qualification cannot silently succeed before its schema is installed.
   await expect(store.insert(await input())).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   await expect(reader.byEnvelope(pid,'synthetic-missing')).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
   await pool.query(await readFile(new URL('./schema.sql', import.meta.url),'utf8'));
+  await pool.query(await readFile(new URL('./projections.sql', import.meta.url),'utf8'));
+  await pool.query(await readFile(new URL('./quota-fit.sql', import.meta.url),'utf8'));
+  await pool.query(await readFile(new URL('./erasure.sql', import.meta.url),'utf8'));
+  await ledgerPool.query(await readFile(new URL('./erasure-ledger.sql', import.meta.url),'utf8'));
 });
 afterAll(async () => {
   try {
-    await pool?.end();
+    await Promise.all([pool?.end(), ledgerPool?.end()]);
+    if (ledgerCreated) await admin.query(`DROP DATABASE "${ledgerDatabase}"`);
     if (created) await admin.query(`DROP DATABASE "${database}"`);
   } finally {
     await admin?.end();
@@ -66,6 +84,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await pool.query(`TRUNCATE ${tables.map(name=>`${schema}.${name}`).join(', ')} CASCADE`);
+  await resetProjectionState(pool,schema);
   await pool.query(`INSERT INTO ${schema}.participants(id,state,owner_kind) VALUES($1,'active','social')`,[pid]);
   await pool.query(`INSERT INTO ${schema}.devices VALUES($1,$2,'active',clock_timestamp()-interval '30 days',clock_timestamp()+interval '1 day')`,[did,pid]);
   await pool.query(`INSERT INTO ${schema}.consents VALUES($1,$2,$3,$4,$5)`,[pid,did,...Object.values(consent)]);
@@ -125,7 +144,7 @@ async function race(a,b) {
   } finally {await blocker.query('ROLLBACK');blocker.release();await outcomes;}
 }
 
-it.each(['usage','quota','session'])('commits %s records, authorization, admission and dirty journal atomically',async stream=> {
+it.each(['usage','quota','session'])('commits %s records, authorization, admission and projection effects atomically',async stream=> {
   const value = await grant(await input({stream,count:3}));
   await expect(store.insert(value)).resolves.toEqual({acceptedRecords:3});
   expect(await rows('chunks')).toHaveLength(1);
@@ -134,8 +153,8 @@ it.each(['usage','quota','session'])('commits %s records, authorization, admissi
   expect((await rows('authorizations'))[0]).toMatchObject({state:'consumed',lease_expires_at:null,consumed_contribution_id:value.chunkId});
   expect((await rows('admission_windows'))[0].accepted_count).toBe(1);
   expect((await rows('input_versions'))[0].revision).toBe('1');
-  expect((await rows('projection_requests')).map(r=>r.projection).sort()).toEqual([
-    'current_analysis','daily_aggregate','model_history','prepared_source','public_graph','quota_fit']);
+  expect((await rows('current_queue'))[0]).toMatchObject({participant_id:pid,dirty_generation:'1',pending:true});
+  expect((await rows('daily_rebuilds'))[0]).toMatchObject({day,requested_epoch:'1'});
   expect(await rows('pending_objects')).toHaveLength(1);
 });
 it('inserts a maximum-size chunk in one bulk record operation',async()=> {
@@ -333,4 +352,73 @@ it('acknowledges the maximum current day without inferring contiguous coverage',
   const first=await grant(await input());await store.insert(first);
   const later=await grant(await input({chunkDay:'2026-09-03'}));await store.insert(later);
   expect(await reader.acknowledgedThroughDay(pid,did)).toBe('2026-09-03');
+});
+
+registerProjectionTests({pool:()=>pool,store:()=>store,input,grant,rows,snapshot,schema,pid,did});
+
+registerSyncTests({syncStore:()=>backend.sync,contributionStore:()=>store,input,grant,pid,did});
+registerQuotaFitTests({pool:()=>pool,rows,schema,pid,did});
+
+registerParticipantErasureTests({primaryPool:()=>pool,ledgerPool:()=>ledgerPool,schema});
+
+it('erases actual accepted v1 data and preserves the independent ledger across a primary restore',async()=>{
+  const value=await grant(await input());await store.insert(value);
+  const retainedTables=['participants','devices','consents','authorizations','chunks','records','pending_objects'];
+  const retained={};
+  for(const table of retainedTables) retained[table]=await rows(table);
+  const adapters=createExperimentalPostgresParticipantErasureStores(pool,ledgerPool,{primarySchema:schema});
+  const deleted=[];
+  const dependencies={...adapters,objects:{async deleteBatch(refs){deleted.push(...refs.map(ref=>ref.key));}},
+    hooks:{async revokeAccountlessEnrollment(){},async assertIdentityConfiguration(){},async recordIdentityCooldown(){}}};
+  const now=Date.now();
+  expect(await eraseParticipantWithStore(dependencies,pid,randomUUID(),now)).toMatchObject({deleted:true,contributionsDeleted:1});
+  for(const table of retainedTables) expect(await rows(table)).toEqual([]);
+  expect(await adapters.ledger.hasTombstone(pid,now)).toBe(true);
+  expect(deleted).toEqual([value.objectKey]);
+  expect(await eraseParticipantWithStore(dependencies,pid,randomUUID(),now)).toEqual({deleted:true,alreadyDeleted:true,contributionsDeleted:null});
+  // Rehearse restoration of primary source rows only. The external ledger
+  // deliberately remains intact and is consulted before repeating erasure.
+  for(const table of retainedTables) {
+    await pool.query(`INSERT INTO ${schema}.${table} SELECT * FROM jsonb_populate_recordset(NULL::${schema}.${table},$1::jsonb)`,[JSON.stringify(retained[table])]);
+  }
+  expect(await adapters.ledger.hasTombstone(pid,now)).toBe(true);
+  expect(await reader.byEnvelope(pid,value.envelopeDigest)).not.toBeNull();
+  expect(await eraseParticipantWithStore(dependencies,pid,randomUUID(),now+1000)).toMatchObject({deleted:true,contributionsDeleted:1});
+  for(const table of retainedTables) expect(await rows(table)).toEqual([]);
+  expect(await adapters.ledger.hasTombstone(pid,now+1000)).toBe(true);
+});
+
+it('rolls back failed erasure finalization and retries from the durable ledger and source rows',async()=>{
+  const value=await grant(await input());await store.insert(value);
+  const adapters=createExperimentalPostgresParticipantErasureStores(pool,ledgerPool);
+  const dependencies={...adapters,objects:{async deleteBatch(){}},
+    hooks:{async revokeAccountlessEnrollment(){},async assertIdentityConfiguration(){},async recordIdentityCooldown(){}}};
+  await pool.query(`CREATE FUNCTION ${schema}.synthetic_erasure_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'synthetic provider failure'; END; $$;
+    CREATE TRIGGER synthetic_erasure_failure BEFORE DELETE ON ${schema}.participants
+    FOR EACH ROW EXECUTE FUNCTION ${schema}.synthetic_erasure_failure()`);
+  try {
+    await expect(eraseParticipantWithStore(dependencies,pid,randomUUID())).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+    expect((await rows('participants'))[0].state).toBe('deleting');
+    expect(await rows('records')).toHaveLength(1);
+    expect(await rows('chunks')).toHaveLength(1);
+    expect(await rows('pending_objects')).toHaveLength(1);
+    expect(await adapters.ledger.hasTombstone(pid,Date.now())).toBe(true);
+  } finally {
+    await pool.query(`DROP TRIGGER synthetic_erasure_failure ON ${schema}.participants; DROP FUNCTION ${schema}.synthetic_erasure_failure()`);
+  }
+  expect(await eraseParticipantWithStore(dependencies,pid,randomUUID())).toMatchObject({deleted:true,contributionsDeleted:1});
+  expect(await rows('participants')).toEqual([]);
+  expect(await rows('records')).toEqual([]);
+});
+
+it('bounds PostgreSQL erasure reads while a primary table is locked',async()=>{
+  const blocker=await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query(`LOCK TABLE ${schema}.participants IN ACCESS EXCLUSIVE MODE`);
+    const adapters=createExperimentalPostgresParticipantErasureStores(pool,ledgerPool,
+      {statementTimeoutMilliseconds:100,lockTimeoutMilliseconds:50});
+    await expect(adapters.primary.readParticipant(pid)).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  } finally {await blocker.query('ROLLBACK');blocker.release();}
 });

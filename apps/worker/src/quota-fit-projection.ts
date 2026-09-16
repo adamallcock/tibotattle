@@ -6,9 +6,16 @@ import type {
   V1ResetCursor,
   V1TimeCursor,
 } from "./quota-analysis-v1-reader";
-
-export const V1_QUOTA_PROJECTION_BACKFILL_PAGE_SIZE = 4_096;
-export const V1_QUOTA_PROJECTION_BACKFILL_MAX_PAGES = 16;
+import {
+  V1_QUOTA_PROJECTION_BACKFILL_MAX_PAGES,
+  V1_QUOTA_PROJECTION_BACKFILL_PAGE_SIZE,
+  V1QuotaFitProjectionUnavailableError,
+} from "./quota-fit-projection-contract";
+export {
+  V1_QUOTA_PROJECTION_BACKFILL_MAX_PAGES,
+  V1_QUOTA_PROJECTION_BACKFILL_PAGE_SIZE,
+  V1QuotaFitProjectionUnavailableError,
+} from "./quota-fit-projection-contract";
 const MAX_READER_PAGE_SIZE = 1_024;
 
 interface BackfillState {
@@ -16,11 +23,6 @@ interface BackfillState {
   last_record_id: number;
   is_complete: number;
   typed_present?:number;
-}
-
-export class V1QuotaFitProjectionUnavailableError extends Error {
-  readonly code = "V1_QUOTA_FIT_PROJECTION_UNAVAILABLE";
-  constructor() { super("v1 quota fit projection unavailable"); }
 }
 
 function validState(value: BackfillState | null): value is BackfillState {

@@ -1,45 +1,37 @@
-import {storageErasureBindings,prepareStorageParticipantErasure,requireStorageParticipantErasureComplete} from './storage-erasure';
+import {
+  prepareStorageParticipantErasure,
+  requireStorageParticipantErasureComplete,
+  storageErasureBindings,
+} from "./storage-erasure";
 import { beginAdminOperation, finishAdminOperation } from "./admin-operations";
 import { revokeAccountlessEnrollment } from "./accountless-enrollment";
-import { MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT } from "./constants";
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
+import {
+  createD1ParticipantErasureLedger,
+  createD1ParticipantErasureStore,
+} from "./d1-participant-erasure-store";
+import { createQuarantineParticipantErasureObjectStore } from "./erasure-object-store";
 import { assertPinnedIdentityLinkSecretConfiguration } from "./identity-link-configuration";
 import { identityRequired } from "./identity-oidc";
 import {
-  assertDeletionOwner,
-  finishParticipantDeletion,
-  listContributions,
-  markParticipantDeleting,
-  participantIdentityLinkKeyForDeletion,
-} from "./repository";
-import {
-  hasDeletionTombstone,
   identityReenrollmentCooldownDigest,
-  recordDeletionTombstone,
   recordIdentityReenrollmentCooldownFromDigest,
   recordPrimaryIdentityReenrollmentCooldown,
 } from "./retention";
 import {
-  telemetryContributionCount,
-  telemetryContributionR2KeyPage,
-} from "./telemetry-repository";
-import {
-  telemetryV1ChunkCount,
-  telemetryV1ChunkR2KeyPage,
-} from "./telemetry-v1-repository";
-import { telemetryV11ChunkCount, telemetryV11ChunkR2KeyPage } from "./telemetry-v11-repository";
+  eraseParticipantWithStore,
+  type ParticipantErasureDependencies,
+  type ParticipantErasureResult,
+} from "./participant-erasure-store";
 import type { QuarantineObjectStore } from "./quarantine-object-store";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const PARTICIPANT_ID_PATTERN = new RegExp(`^participant:${UUID_PATTERN.source.slice(1)}`, "u");
 const AUDIT_TARGET_DOMAIN = "app-usagemonitor/admin-participant-erasure/v1\0";
-const ERASURE_ATTEMPT_LEASE_MILLISECONDS = 5 * 60 * 1_000;
 
-type ErasureResult =
-  | { deleted: true; alreadyDeleted: false; contributionsDeleted: number }
-  | { deleted: true; alreadyDeleted: true; contributionsDeleted: null };
+type ErasureResult = ParticipantErasureResult;
 
 export function parseParticipantErasureRequest(value: unknown): string {
   if (typeof value !== "object" || value === null || Array.isArray(value)
@@ -72,162 +64,60 @@ async function eraseParticipantData(
   participantId: string,
   operationId: string,
 ): Promise<ErasureResult> {
-  const storage=await storageErasureBindings(env);
-  const participant = await env.USAGE_MONITOR_DB.prepare(
-    `SELECT participant.state,
-            participant.deletion_session_id,
-            participant.owner_kind,
-            owner.enrollment_device_id
-       FROM participants participant
-       LEFT JOIN accountless_upload_owners owner
-         ON owner.participant_id = participant.id AND owner.state = 'active'
-      WHERE participant.id = ?`,
-  ).bind(participantId).first<{
-    state: string;
-    deletion_session_id: string | null;
-    owner_kind: "social" | "accountless";
-    enrollment_device_id: string | null;
-  }>();
-  if (participant === null) {
-    if (!await hasDeletionTombstone(env.DELETION_LEDGER, participantId)) {
-      throw new ApiError(404, "NOT_FOUND");
-    }
-    await requireStorageParticipantErasureComplete(env.DELETION_LEDGER,participantId,storage);
-    // A lost response can be retried, but the removed rows cannot provide a
-    // historical contribution count. Unknown is not zero.
-    return { deleted: true, alreadyDeleted: true, contributionsDeleted: null };
-  }
-  if (participant.state !== "active" && participant.state !== "deleting") {
-    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-  }
-  // An accountless owner has no social session or consent to revoke. Its
-  // enrollment ledger is the authority root, so revoke it before entering the
-  // deletion state; that batched cascade revokes the owner, direct v1.1 grant,
-  // device credential, and any pending device-upload authorizations.
-  if (participant.owner_kind === "accountless"
-      && typeof participant.enrollment_device_id === "string") {
-    await revokeAccountlessEnrollment(
-      env.USAGE_MONITOR_DB,
-      participant.enrollment_device_id,
-      "security_reset",
-    );
-  }
-  if (identityRequired(env)) {
-    await assertPinnedIdentityLinkSecretConfiguration(
-      env.USAGE_MONITOR_DB,
-      Reflect.get(env, "IDENTITY_LINK_SECRET"),
-      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
-    );
-  }
-  let deletionFence = participant.deletion_session_id;
-  if (participant.state === "active") {
-    deletionFence = operationId;
-    await markParticipantDeleting(env.USAGE_MONITOR_DB, participantId, deletionFence);
-  } else {
-    // Restore replay owns the NULL fence, including an interrupted replay.
-    // Let its existing maintenance retry finish rather than taking it over.
-    if (deletionFence === null) throw new ApiError(409, "PARTICIPANT_DELETING");
-    if (typeof deletionFence !== "string" || !UUID_PATTERN.test(deletionFence)) {
-      throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-    }
-    const claimed = await env.USAGE_MONITOR_DB.prepare(
-      `UPDATE participants SET deletion_session_id = ?
-        WHERE id = ? AND state = 'deleting' AND deletion_session_id = ?
-          AND NOT EXISTS (
-            SELECT 1 FROM admin_action_audit
-             WHERE operation_id = ? AND outcome = 'started' AND created_at > ?
-          )`,
-    ).bind(
-      operationId,
-      participantId,
-      deletionFence,
-      deletionFence,
-      new Date(Date.now() - ERASURE_ATTEMPT_LEASE_MILLISECONDS).toISOString(),
-    ).run();
-    if (claimed.meta.changes !== 1) throw new ApiError(409, "PARTICIPANT_DELETING");
-    deletionFence = operationId;
-  }
-  if (typeof deletionFence !== "string" || !UUID_PATTERN.test(deletionFence)) {
-    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-  }
-  await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-  // A legacy deleting participant may still have its old deletion-only web
-  // session. The owner procedure no longer needs to preserve that capability.
-  await env.USAGE_MONITOR_DB.prepare(
-    `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
-      WHERE participant_id = ? AND state = 'active'
-        AND EXISTS (
-          SELECT 1 FROM participants
-           WHERE id = ? AND state = 'deleting' AND deletion_session_id = ?
-        )`,
-  ).bind(new Date().toISOString(), participantId, participantId, deletionFence).run();
-  await recordDeletionTombstone(env.DELETION_LEDGER, participantId);
-  if(storage)await prepareStorageParticipantErasure(storage,participantId);
-  const identityLinkKey = await participantIdentityLinkKeyForDeletion(
-    env.USAGE_MONITOR_DB, participantId, deletionFence,
-  );
-  if (identityLinkKey !== null) {
-    const secret: unknown = Reflect.get(env, "IDENTITY_LINK_SECRET");
-    if (typeof secret !== "string" || secret.length < 32) {
-      if (identityRequired(env)) throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
-    } else {
-      const digest = await identityReenrollmentCooldownDigest(secret, identityLinkKey);
-      await recordPrimaryIdentityReenrollmentCooldown(env.USAGE_MONITOR_DB, digest);
-      await recordIdentityReenrollmentCooldownFromDigest(env.DELETION_LEDGER, digest);
-    }
-  }
-  const contributions = await listContributions(env.USAGE_MONITOR_DB, participantId);
-  if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT) {
-    throw new ApiError(500, "INTERNAL_ERROR");
-  }
-  const telemetryTotal = await telemetryContributionCount(env.USAGE_MONITOR_DB, participantId);
-  const telemetryV1Total = await telemetryV1ChunkCount(env.USAGE_MONITOR_DB, participantId);
-  const telemetryV11Total = await telemetryV11ChunkCount(env.USAGE_MONITOR_DB, participantId);
-  if (contributions.length > 0) {
-    await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-    await quarantine.deleteMany(contributions.map((row) => row.r2_key));
-  }
-  let cursor: { createdAt: string; contributionId: string } | null = null;
-  do {
-    const page = await telemetryContributionR2KeyPage(env.USAGE_MONITOR_DB, participantId, cursor);
-    if (page.rows.length > 0) {
-      await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-      await quarantine.deleteMany(page.rows.map((row) => row.r2Key));
-    }
-    cursor = page.nextCursor;
-  } while (cursor);
-  let chunkCursor: { createdAt: string; chunkRowId: string } | null = null;
-  do {
-    const page = await telemetryV1ChunkR2KeyPage(env.USAGE_MONITOR_DB, participantId, chunkCursor);
-    if (page.rows.length > 0) {
-      await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-      await quarantine.deleteMany(page.rows.map((row) => row.r2Key));
-    }
-    chunkCursor = page.nextCursor;
-  } while (chunkCursor);
-  let stagedCursor: { createdAt: string; chunkRowId: string } | null = null;
-  do {
-    const page = await telemetryV11ChunkR2KeyPage(env.USAGE_MONITOR_DB, participantId, stagedCursor);
-    if (page.rows.length > 0) {
-      await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
-      await quarantine.deleteMany(page.rows.map((row) => row.r2Key));
-    }
-    stagedCursor = page.nextCursor;
-  } while (stagedCursor);
-  const currentTelemetryTotal = await telemetryContributionCount(env.USAGE_MONITOR_DB, participantId);
-  const currentTelemetryV1Total = await telemetryV1ChunkCount(env.USAGE_MONITOR_DB, participantId);
-  const currentTelemetryV11Total = await telemetryV11ChunkCount(env.USAGE_MONITOR_DB, participantId);
-  if (currentTelemetryTotal !== telemetryTotal || currentTelemetryV1Total !== telemetryV1Total
-      || currentTelemetryV11Total !== telemetryV11Total) {
-    throw new ApiError(409, "UPLOAD_IN_PROGRESS");
-  }
-  await finishParticipantDeletion(env.USAGE_MONITOR_DB, participantId, deletionFence);
-  await requireStorageParticipantErasureComplete(env.DELETION_LEDGER,participantId,storage);
-  return {
-    deleted: true,
-    alreadyDeleted: false,
-    contributionsDeleted: contributions.length + telemetryTotal + telemetryV1Total + telemetryV11Total,
+  const storage = await storageErasureBindings(env);
+  const dependencies: ParticipantErasureDependencies = {
+    primary: createD1ParticipantErasureStore(env.USAGE_MONITOR_DB),
+    ledger: createD1ParticipantErasureLedger(env.DELETION_LEDGER),
+    objects: createQuarantineParticipantErasureObjectStore(quarantine),
+    hooks: {
+      revokeAccountlessEnrollment: async (enrollmentDeviceId) => {
+        await revokeAccountlessEnrollment(
+          env.USAGE_MONITOR_DB,
+          enrollmentDeviceId,
+          "security_reset",
+        );
+      },
+      assertIdentityConfiguration: async () => {
+        if (identityRequired(env)) {
+          await assertPinnedIdentityLinkSecretConfiguration(
+            env.USAGE_MONITOR_DB,
+            Reflect.get(env, "IDENTITY_LINK_SECRET"),
+            Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+          );
+        }
+      },
+      recordIdentityCooldown: async (identityLinkKey) => {
+        const secret: unknown = Reflect.get(env, "IDENTITY_LINK_SECRET");
+        if (typeof secret !== "string" || secret.length < 32) {
+          if (identityRequired(env)) throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+          return;
+        }
+        const digest = await identityReenrollmentCooldownDigest(secret, identityLinkKey);
+        await recordPrimaryIdentityReenrollmentCooldown(env.USAGE_MONITOR_DB, digest);
+        await recordIdentityReenrollmentCooldownFromDigest(env.DELETION_LEDGER, digest);
+      },
+      afterLedgerTombstone: async () => {
+        if (storage !== null) {
+          await prepareStorageParticipantErasure(storage, participantId);
+        }
+      },
+      afterPrimaryFinish: async () => {
+        await requireStorageParticipantErasureComplete(
+          env.DELETION_LEDGER,
+          participantId,
+          storage,
+        );
+      },
+      afterAlreadyDeleted: async () => {
+        await requireStorageParticipantErasureComplete(
+          env.DELETION_LEDGER,
+          participantId,
+          storage,
+        );
+      },
+    },
   };
+  return eraseParticipantWithStore(dependencies, participantId, operationId);
 }
 
 /** Not a participant API: the caller must have passed the existing admin gate. */

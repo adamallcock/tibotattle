@@ -1,7 +1,13 @@
 import {prepareStorageParticipantErasure,requireStorageParticipantErasureComplete,advanceStorageErasureJobs,type StorageErasureBindings} from './storage-erasure';
-import { participantDeletionDigest } from "./participant-deletion-digest";
-export { participantDeletionDigest } from "./participant-deletion-digest";
 import { revokeAccountlessEnrollment } from "./accountless-enrollment";
+import {
+  DELETION_TOMBSTONE_RETENTION_MILLISECONDS,
+  participantDeletionDigest,
+} from "./participant-erasure-ledger-contract";
+export {
+  DELETION_TOMBSTONE_RETENTION_MILLISECONDS,
+  participantDeletionDigest,
+} from "./participant-erasure-ledger-contract";
 import { ApiError } from "./errors";
 import { finishParticipantDeletion } from "./repository";
 import { telemetryV1ChunkR2KeyPage } from "./telemetry-v1-repository";
@@ -10,7 +16,6 @@ import { QUARANTINE_RETENTION_MILLISECONDS } from "./constants";
 import type { QuarantineObjectStore } from "./quarantine-object-store";
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
-export const DELETION_TOMBSTONE_RETENTION_MILLISECONDS = 400 * DAY_MILLISECONDS;
 /**
  * A deleted hosted identity may not immediately mint a fresh participant.
  * This is intentionally a short, fixed anti-reissue window rather than a
@@ -112,8 +117,6 @@ function identityLinkSecret(value: unknown): string {
   }
   return value;
 }
-
-
 
 /**
  * Derives the short-lived anti-reissue marker from the already pseudonymous
