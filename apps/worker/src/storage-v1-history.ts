@@ -4,12 +4,14 @@ import { loadTypedV1AnalysisScope } from './typed-v1-analysis-reader';
 import { assertV1SourcePinCurrent,V1_SOURCE_SELECTION_METHOD_VERSION,type V1SourcePin } from './telemetry-v1-source-selection';
 import { advanceV1QuotaAcquisition,createV1QuotaAcquisitionCheckpoint,type V1QuotaAcquisitionIdentity,
  type V1QuotaAcquisitionCheckpoint,type V1CompletedQuotaAcquisition,type V1QuotaInvocationBudget } from './quota-analysis-v1-reader';
-import { finishAccountScopedQuotaAnalysisV1,finishHistoricalModelCompositionV1,MODEL_HISTORY_METHOD_VERSION,
- V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,type V1ModelCompositionResult } from './quota-analysis-v1';
+import { finishHistoricalModelCompositionV1,MODEL_HISTORY_METHOD_VERSION,
+ V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,advanceV1UsageReduction,type V1ModelCompositionResult,
+ type V1UsageReductionCheckpoint } from './quota-analysis-v1';
 import { withStorageGraphFailureStage } from './storage-analytics-failure';
 
 export type StorageV1HistoryCheckpoint={version:1;day:string;layout:string;identity:V1QuotaAcquisitionIdentity}&(
- {phase:'acquisition';acquisition:V1QuotaAcquisitionCheckpoint}|{phase:'finish';acquisition:V1CompletedQuotaAcquisition});
+ {phase:'acquisition';acquisition:V1QuotaAcquisitionCheckpoint}|{phase:'finish';acquisition:V1CompletedQuotaAcquisition}|
+ {phase:'usage';acquisition:V1CompletedQuotaAcquisition;usage:V1UsageReductionCheckpoint});
 export type StorageV1HistoryResult={status:'deferred';checkpoint:StorageV1HistoryCheckpoint|null}|
  {status:'complete';analysis:V1ModelCompositionResult};
 export type StorageV1CurrentFitResult={status:'deferred';checkpoint:StorageV1HistoryCheckpoint|null}|
@@ -80,7 +82,7 @@ export async function advanceStorageV1CurrentFitAnalysis(input:{source:D1Databas
   sourceMethodVersion:V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,observedAtCutoff:window.observedAtCutoff,
   resetsAtCutoff:new Date(Date.parse(window.observedAtCutoff)+7*86400000).toISOString(),windowMinutes:10080,maxQuotaRows:60000};
  const prior=input.checkpoint?structuredClone(input.checkpoint):null;
- if(prior&&(prior.version!==1||prior.day!==day||!['acquisition','finish'].includes(prior.phase)
+ if(prior&&(prior.version!==1||prior.day!==day||!['acquisition','finish','usage'].includes(prior.phase)
   ||Object.keys(prior.identity).length!==Object.keys(identity).length
   ||Object.entries(identity).some(([key,value])=>Reflect.get(prior.identity,key)!==value)))throw fail();
  if(!Number.isSafeInteger(budget.remainingQueries)||budget.remainingQueries<0||!Number.isFinite(budget.deadlineMs))throw fail();
@@ -108,8 +110,9 @@ export async function advanceStorageV1CurrentFitAnalysis(input:{source:D1Databas
     acquisition:{planAnchors:result.planAnchors,quotaRows:result.quotaRows}};
    return {status:'deferred',checkpoint};
   }
-  const finished=await finishAccountScopedQuotaAnalysisV1(source,participantId,
-   {identity,acquisition:checkpoint.acquisition},budget,{nowMs:Date.parse(window.fixedNow),sourcePin});
-  return finished.status==='deferred'?{status:'deferred',checkpoint}:finished;
+  const usage=await advanceV1UsageReduction(source,participantId,{identity,acquisition:checkpoint.acquisition},budget,
+   {nowMs:Date.parse(window.fixedNow),sourcePin},checkpoint.phase==='usage'?checkpoint.usage:null,input.maxPages??1);
+  if(usage.status==='deferred')return {status:'deferred',checkpoint:{...checkpoint,phase:'usage',usage:usage.checkpoint}};
+  return usage;
  });
 }
