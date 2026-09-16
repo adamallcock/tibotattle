@@ -6505,6 +6505,11 @@ test("weekly points carry measured ranges with pointer and keyboard detail", asy
   )?.[1] ?? "";
   assert.match(weeklyChart, /tooltip: false,/u);
   assert.match(weeklyChart, /detail: weeklyPointDetail,/u);
+  assert.equal(
+    [...weeklyChart.matchAll(/timestampFirst: true,/gu)].length,
+    2,
+    "both allowance point styles keep the observed date ahead of long diagnostic detail",
+  );
   assert.match(appSource, /weekly\.point\.detail/u);
   assert.match(appSource, /if \(errorBars\.tooltip !== false\)/u);
   assert.match(styles, /\.chart-error-bar-weekly \.chart-error-bar-line/u);
@@ -6542,6 +6547,8 @@ test("lineChart DOM interactions cover default points, median, band, and narrow 
       label: { key: "series.observedAllowance" },
       pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
       format: (value) => `$${value}`,
+      detail: () => ({ key: "series.pointDetail" }),
+      timestampFirst: true,
     }],
     secondarySeries: [{
       key: "remaining",
@@ -6567,6 +6574,11 @@ test("lineChart DOM interactions cover default points, median, band, and narrow 
   assert.match(markers[0].getAttribute("aria-label"), /series\.observedAllowance/);
   markers[0].dispatchEvent({ type: "pointerenter" });
   assert.equal(svg.querySelector(".chart-hover-tooltip").getAttribute("visibility"), "visible");
+  assert.equal(
+    svg.querySelector(".chart-tooltip-detail").textContent,
+    "2026-01-01T00:00:00.000Z · [series.pointDetail]",
+    "date remains visible before longer per-point detail",
+  );
   markers[0].dispatchEvent({ type: "pointerleave" });
   assert.equal(svg.querySelector(".chart-hover-tooltip").getAttribute("visibility"), "hidden");
   markers[0].focus();

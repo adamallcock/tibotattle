@@ -375,7 +375,10 @@ body.native-dashboard #setup-card { display: none !important; }
   white-space: nowrap;
 }
 .allowance-window-toggle { width: min(100%, 220px); }
-.allowance-window-toggle button { flex: 1 1 0; }
+.allowance-window-toggle button {
+  flex: 1 1 0;
+  white-space: nowrap;
+}
 .allowance-window-toggle button:disabled {
   cursor: not-allowed;
   opacity: .46;
