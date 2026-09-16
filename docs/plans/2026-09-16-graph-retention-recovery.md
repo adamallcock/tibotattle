@@ -93,3 +93,31 @@ then the full Worker gate. Production acceptance additionally requires the
 migration applied before the code deploy, both Workers deployed, and observing
 the 245 daily heads and the 69 model days regrow without any published day
 disappearing across a new upload.
+
+## 2026-09-16 evening: graph lane checkpoint starvation
+
+With the daily queue drained (332 days published), the history lane still
+published no model day. Live inspection showed model day 2026-09-15 at 18 of 19
+owner results; the missing owner is a v1.1 owner with a year of history whose
+shared acquisition checkpoint head holds 235 parts (30.4 MB), re-selected every
+pass (selection revision climbing by two per minute) with two abandoned partial
+successor stages. The cause is input/output volume against D1 round-trip
+latency, not the analysis kernel: loading paged 8 parts per statement with a
+head and stage read per page (about 90 statements), the page group was cut by
+the remaining budget so every pass produced a different successor generation,
+and the 6-second save headroom could not finish eight 30-part batches. A pass
+therefore made no durable progress, and `publishStorageCommunityModelDay`
+withholds a day while any owner result is missing.
+
+| Change | Where | Effect |
+|---|---|---|
+| Load pages carry the promoted stage | `loadStorageHistoryCheckpoint` | 16 parts per statement by default (32 at most); resumed pages issue one read each and the final head/stage fence still authorizes the assembly |
+| Save resume cursor and memoized frame | `saveStorageHistoryCheckpoint`, `persistCheckpoint` in `storage-community-graph.ts` | Later writes of one generation issue one part batch and one head read; the frame of an immutable checkpoint is computed once per invocation; the part-insert trigger and head CAS remain the durable fences |
+| Whole deterministic page groups | `advanceStorageV11Analysis` | An acquisition or usage group cut by the budget or deadline returns the prior checkpoint marked `cut`; the graph kernel stages nothing (`v11_checkpoint_group_budget`), so the next pass reproduces the identical generation and resumes its staged parts |
+| Save headroom | `STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS` | 12 seconds reserved for the resumable save batches |
+| Lane order | `runStorageAnalyticsPass` (`graphLaneFirst`) | The public phase alternates by minute which lane opens, so a live daily queue and a resumable graph checkpoint share the scheduled windows instead of one starving the other |
+| Abandoned successor sweep | existing `retireStorageGraphPage` | Verified by test: once a different successor promotes, partial stages that expected the old head are removed in bounded pages |
+
+Still open: the acquisition checkpoint itself (up to 60,000 quota rows per
+owner) is the structural cost; a compact representation is the next step if a
+group plus its save does not fit one window at production latency.

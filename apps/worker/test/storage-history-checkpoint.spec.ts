@@ -31,6 +31,20 @@ async function read(storageKey=key){let cursor:StorageHistoryLoadCursor|undefine
  const result=await load({target:target(),key:storageKey,cursor,maxParts:2});if(result.status!=='deferred')return result;cursor=result.cursor;}
  throw new Error('synthetic load did not finish');}
 function batchAdapter(batch:D1Database['batch']):D1Database{return new Proxy(target(),{get(db,p){if(p==='batch')return batch;const v=Reflect.get(db,p);return typeof v==='function'?v.bind(db):v;}});}
+/** Counts D1 round trips: one per executed statement and one per batch. */
+function countRoundTrips(db:D1Database){
+ const counts={reads:0,batches:0};
+ const statement=(s:D1PreparedStatement):D1PreparedStatement=>new Proxy(s,{get(base,p){
+  const v=Reflect.get(base,p);if(typeof v!=='function')return v;
+  if(p==='bind')return (...args:unknown[])=>statement((v as (...a:unknown[])=>D1PreparedStatement).apply(base,args));
+  if(p==='first'||p==='all'||p==='run'||p==='raw')return (...args:unknown[])=>{counts.reads++;return (v as (...a:unknown[])=>unknown).apply(base,args);};
+  return v.bind(base);}});
+ const database=new Proxy(db,{get(base,p){
+  if(p==='batch')return async(statements:D1PreparedStatement[])=>{counts.batches++;return base.batch(statements);};
+  if(p==='prepare')return (sql:string)=>statement(base.prepare(sql));
+  const v=Reflect.get(base,p);return typeof v==='function'?v.bind(base):v;}});
+ return {database,counts};
+}
 describe('private paged historical checkpoint store',()=>{
  it('roundtrips v1.1 acquisition, compact usage, and shared-result generations under a distinct exact key',async()=>{
   const identity:V11QuotaAcquisitionIdentity={participantId:'synthetic-v11-participant',inputFingerprint:'e'.repeat(64),
@@ -96,6 +110,63 @@ describe('private paged historical checkpoint store',()=>{
   for(let n=0;n<10;n++)if((await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).state==='idle')break;
   expect(await read()).toEqual({status:'ready',headDigest:current,checkpoint:next});
   expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(1);
+ });
+ it('resumes a staged generation from its private cursor with one part batch and one head read per call',async()=>{
+  const old=await drain(checkpoint()),large=checkpoint(18000);
+  const first=await save({target:target(),key,checkpoint:large,expectedHead:old,maxWrites:4});
+  expect(first.status).toBe('staging');if(first.status!=='staging')throw new Error('expected staging');
+  const observed=countRoundTrips(target());let cursor=first.cursor,result=first;
+  for(let i=0;i<100&&result.status==='staging';i++){
+   const before={...observed.counts};
+   result=await save({target:observed.database,key,checkpoint:large,expectedHead:old,maxWrites:4,cursor});
+   expect(observed.counts.batches-before.batches).toBe(1);expect(observed.counts.reads-before.reads).toBe(1);
+   if(result.status==='staging')cursor=result.cursor;
+  }
+  expect(result.status).toBe('saved');if(result.status!=='saved')throw new Error('expected saved');
+  expect(await read()).toEqual({status:'ready',headDigest:result.headDigest,checkpoint:large});
+  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(2);
+  // A cursor binds its exact key, expected head, control and manifest: another
+  // checkpoint, another expected head or another key cannot borrow it.
+  const staged=checkpoint(18001),second=await save({target:target(),key,checkpoint:staged,expectedHead:result.headDigest,maxWrites:4});
+  expect(second.status).toBe('staging');if(second.status!=='staging')throw new Error('expected staging');
+  await expect(save({target:target(),key,checkpoint:checkpoint(18002),expectedHead:result.headDigest,maxWrites:4,cursor:second.cursor}))
+   .rejects.toThrow('CHECKPOINT_UNAVAILABLE');
+  await expect(save({target:target(),key,checkpoint:staged,expectedHead:old,maxWrites:4,cursor:second.cursor}))
+   .rejects.toThrow('CHECKPOINT_UNAVAILABLE');
+  await expect(save({target:target(),key:{...key,day:'2026-09-04'},checkpoint:staged,expectedHead:result.headDigest,maxWrites:4,cursor:second.cursor}))
+   .rejects.toThrow();
+  expect(await read()).toMatchObject({status:'ready',headDigest:result.headDigest});
+ });
+ it('loads a promoted generation with one read per resumed page and a final head fence',async()=>{
+  const large=checkpoint(18000),head=await drain(large);
+  const partCount=await target().prepare('SELECT part_count FROM analytics_history_checkpoint_stages WHERE generation=?').bind(head).first<number>('part_count');
+  expect(partCount!).toBeGreaterThan(8);
+  const observed=countRoundTrips(target());let cursor:StorageHistoryLoadCursor|undefined,pages=0;
+  for(let i=0;i<200;i++){
+   const before=observed.counts.reads,result=await load({target:observed.database,key,cursor,maxParts:4});pages++;
+   if(result.status==='deferred'){expect(observed.counts.reads-before).toBe(cursor?1:3);cursor=result.cursor;continue;}
+   expect(result).toEqual({status:'ready',headDigest:head,checkpoint:large});expect(observed.counts.reads-before).toBe(2);break;
+  }
+  expect(pages).toBe(Math.ceil(partCount!/4));expect(observed.counts.reads).toBe(pages+3);expect(observed.counts.batches).toBe(0);
+  expect((await load({target:target(),key,maxParts:32})).status).toBe(partCount!>32?'deferred':'ready');
+  await expect(load({target:target(),key,maxParts:33})).rejects.toThrow('CHECKPOINT_UNAVAILABLE');
+ });
+ it('removes an abandoned partial successor once a different successor promotes',async()=>{
+  const old=await drain(checkpoint(10000)),abandoned=checkpoint(18000),next=checkpoint(18500);
+  expect((await save({target:target(),key,checkpoint:abandoned,expectedHead:old,maxWrites:4})).status).toBe('staging');
+  expect((await save({target:target(),key,checkpoint:next,expectedHead:old,maxWrites:4})).status).toBe('staging');
+  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(3);
+  // Both partial successors still expect the standing head, so neither is
+  // disposable until one of them promotes.
+  expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).toMatchObject({state:'idle'});
+  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(3);
+  const current=await drain(next,old);
+  let idle=false;
+  for(let n=0;n<40;n++)if((await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).state==='idle'){idle=true;break;}
+  expect(idle).toBe(true);
+  expect(await read()).toEqual({status:'ready',headDigest:current,checkpoint:next});
+  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(1);
+  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_parts WHERE generation!=?').bind(current).first('n')).toBe(0);
  });
  it('retires erased-owner checkpoint payloads in bounded pages without deleting another owner or allowing resurrection',async()=>{
   const head=await drain(checkpoint(18000,true));

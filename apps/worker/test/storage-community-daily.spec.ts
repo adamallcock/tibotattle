@@ -440,6 +440,35 @@ describe('independent public daily publication',()=>{
     expect(Number(await target().prepare('SELECT revision FROM analytics_community_graph_scan WHERE source_id=?').bind(sourceId).first('revision')))
       .toBeGreaterThanOrEqual(1);
   });
+  it('opens the graph lane before the daily lane when a pass pins that order, and after it otherwise',async()=>{
+    const order:string[]=[];
+    const observed=new Proxy(target(),{get(value,key){
+      if(key==='prepare')return(sql:string)=>{
+        if(/UPDATE analytics_community_graph_scan/.test(sql))order.push('graph');
+        if(/INSERT INTO analytics_community_daily_publications/.test(sql))order.push('daily');
+        return value.prepare(sql);
+      };
+      const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+    }});
+    const pass=(graphLaneFirst:boolean)=>runStorageAnalyticsPass({...options(),target:observed,publishCommunity:true,publicOnly:true,
+      maxSteps:1,maxQueries:900,deadlineMs:Date.now()+55_000,graphLaneFirst});
+    // Projection delivery queues the uploaded day; the pass then has both a
+    // queued daily rebuild and claimable graph work.
+    await fixture();await ready();
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue').first('n')).toBe(1);
+    expect((await pass(true)).dailyPublications).toBe(1);
+    expect(order.indexOf('graph')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('daily')).toBeGreaterThan(order.indexOf('graph'));
+    // A second owner changes the cohort; the daily-first order publishes it
+    // before the graph lane claims its next owner-day.
+    order.length=0;await fixture();await ready();
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue').first('n')).toBe(1);
+    expect((await pass(false)).dailyPublications).toBe(1);
+    expect(order.indexOf('daily')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('graph')).toBeGreaterThan(order.indexOf('daily'));
+    await expect(runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,
+      graphLaneFirst:'yes' as unknown as boolean})).rejects.toThrow();
+  });
   it('keeps complete totals and unknown-price counts when more than a hundred model cells are displayed',async()=>{
     await fixture(101,n=>({modelId:`unknown-a-${String(n).padStart(3,'0')}`}));
     await fixture(101,n=>({modelId:`unknown-b-${String(n).padStart(3,'0')}`}));await ready();await publish();

@@ -616,4 +616,51 @@ describe("typed active-domain analytical reads",()=>{
     await typed().prepare("UPDATE participants SET state='deleting' WHERE id=?").bind(participantId).run();
     await expect(computeStorageGraphResult(bindings,outside,{maxQueries:900})).rejects.toThrow();
   },180_000);
+
+  it("stages only whole deterministic v1.1 page groups so a cut pass leaves nothing to abandon",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    await activate(typed(),f,await makeV11Day(day(),evidence(2048)),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    if(!('source'in scope.pin))throw new Error('synthetic v1.1 pin unavailable');
+    const pin=scope.pin,snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin});
+    const nowMs=Date.parse(scope.fixedNow);
+    const advance=(remainingQueries:number)=>advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+      day:scope.day,metric:'fits',nowMs,sourcePin:pin,generationSnapshot:snapshot,
+      closedDependencyDigest:scope.checkpointDependencyDigest,maxPages:32,
+      budget:{remainingQueries,deadlineMs:Date.now()+120_000}});
+    // Nine physical pages per acquisition phase. Seven fixed statements plus a
+    // five-page budget cannot finish the group: the prior (empty) checkpoint
+    // comes back marked cut, so nothing is staged for a different generation.
+    expect(await advance(12)).toEqual({status:'deferred',checkpoint:null,cut:true});
+    expect(await advance(0)).toEqual({status:'deferred',checkpoint:null,cut:true});
+    // The same head and budget reproduce a byte-identical successor, which is
+    // what lets a later pass resume the parts an earlier pass already staged.
+    const first=await advance(900),second=await advance(900);
+    expect(first).toMatchObject({status:'deferred',checkpoint:{phase:'finish'}});
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+    expect(Reflect.has(first,'cut')).toBe(false);
+    // Every invocation meter too small for the whole 16-statement group is a
+    // deferral that stages no generation: first the read guard, then the cut
+    // group. The first meter that affords the group stages its successor, and
+    // a later pass with a whole budget completes from the same head.
+    const reasons=new Set<string>();
+    for(let maxQueries=44;maxQueries<=80;maxQueries+=2){
+      const result=await computeStorageGraphResult(bindings,scope,{maxQueries});
+      if(result.state!=='deferred'||!['v11_checkpoint_read_budget','v11_checkpoint_group_budget'].includes(result.reason))break;
+      reasons.add(result.reason);
+      expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
+    }
+    expect([...reasons].sort()).toEqual(['v11_checkpoint_group_budget','v11_checkpoint_read_budget']);
+    expect((await computeStorageGraphResult(bindings,scope,{maxQueries:900})).state).toBe('complete');
+  },180_000);
 });

@@ -19,7 +19,8 @@ import { createD1InvocationBudget } from './d1-invocation-budget';
 import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis,type StorageV1HistoryCheckpoint } from './storage-v1-history';
 import { advanceStorageV11Analysis,type StorageV11HistoryCheckpoint } from './storage-v11-history';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
-  type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor } from './storage-history-checkpoint';
+  type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor,
+  type StorageHistorySaveCursor } from './storage-history-checkpoint';
 import { caughtStorageGraphFailureFields, withStorageGraphFailureStage,
   type StorageGraphFailureFields } from './storage-analytics-failure';
 
@@ -39,9 +40,12 @@ export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECK
 const STORAGE_GRAPH_DIRECT_HISTORY_READER_REVISION = 'typed-v1-direct-cross-1';
 const MAX_RESULT_BYTES = 1024 * 1024;
 // Acquisition may consume its cooperative work deadline exactly. Keep an
-// outer window for the final source proof and one bounded checkpoint-save
-// batch, otherwise a deadline-limited pass can discard the page it acquired.
-const STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS = 6_000;
+// outer window for the final source proof and the resumable checkpoint-save
+// batches, otherwise a deadline-limited pass can discard the group it acquired.
+// A multi-megabyte v1.1 acquisition stages several 30-part batches at a few
+// hundred milliseconds of D1 round trip each; staging left unfinished here is
+// continued by the next pass because the group successor is deterministic.
+const STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS = 12_000;
 const STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM = 32;
 const STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM = 32;
 const fail = () => new Error('STORAGE_GRAPH_RESULT_UNAVAILABLE');
@@ -258,10 +262,16 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     if(!await current(source,scope))return {state:'deferred',reason};
     await targetReady(bindings.target,scope);
     try{
+      // The first write reads the owner, head and retained parts; later writes
+      // of the same generation continue from the private cursor with one part
+      // batch and one head read each. The part-insert trigger and the head
+      // CAS still fence every batch against a concurrent promotion.
+      let cursor:StorageHistorySaveCursor|undefined;
       while(meter.remainingQueries>=40&&now()<deadlineMs){
         const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
-          ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint,expectedHead}));
+          ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint,expectedHead,...(cursor?{cursor}:{})}));
         if(saved.status==='saved')return {state:'saved',head:saved.headDigest};
+        cursor=saved.cursor;
       }
     }catch(error){
       const failure=caughtStorageGraphFailureFields('graph_checkpoint_save',error);
@@ -311,6 +321,9 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       v11CompletedFingerprint=checkpoint?.snapshot?.fingerprint??pin.fingerprint;
       return {state:'complete',analysis:next.analysis};
     }
+    // A budget-cut group is not staged: the next pass recomputes the same
+    // deterministic successor from this head and resumes any staged parts.
+    if(next.cut)return {state:'deferred',reason:'v11_checkpoint_group_budget'};
     if(!next.checkpoint)return {state:'deferred',reason:'v11_checkpoint'};
     const saved=await persistCheckpoint(key,next.checkpoint,head,'v11_checkpoint');
     if(saved.state==='deferred')return saved;
@@ -331,7 +344,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         v11CompletedFingerprint=staged.snapshot?.fingerprint??pin.fingerprint;
         return {state:'complete',analysis:advanced.analysis};
       }
-      if(!advanced.checkpoint)break;
+      if(advanced.cut||!advanced.checkpoint)break;
       const promoted=await persistCheckpoint(key,advanced.checkpoint,stagedHead,'v11_checkpoint');
       if(promoted.state==='deferred')return promoted;
       if(promoted.head===stagedHead)break;

@@ -13,7 +13,11 @@ export type StorageV11HistoryCheckpoint={version:1;source:'v1.1';day:string;layo
  {phase:'acquisition';acquisition:V11QuotaAcquisitionCheckpoint}|
  {phase:'finish';acquisition:V11CompletedQuotaAcquisition}|
  {phase:'usage';acquisition:V11CompletedQuotaAcquisition;usage:V11UsageReductionCheckpoint});
-export type StorageV11HistoryResult={status:'deferred';checkpoint:StorageV11HistoryCheckpoint|null}|
+/** A `cut` deferral consumed fewer source pages than the requested group
+ * because the invocation budget or deadline stopped it. It returns the prior
+ * checkpoint unchanged: a partial group is not a deterministic successor, and
+ * staging one would give every invocation a different generation to abandon. */
+export type StorageV11HistoryResult={status:'deferred';checkpoint:StorageV11HistoryCheckpoint|null;cut?:true}|
  {status:'complete';analysis:object};
 
 const fail=()=>new Error('STORAGE_V11_HISTORY_CHECKPOINT_MISMATCH');
@@ -51,8 +55,9 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  // Reader scope1 + source pre/post2 + successor checks are fixed per group.
  // Preserve a bounded local reserve before starting a group; the outer D1 meter remains
  // the actual statement authority.
- if(budget.remainingQueries<8||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:prior};
+ if(budget.remainingQueries<8||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:prior,cut:true};
  budget.remainingQueries-=7;
+ const maxPages=input.maxPages??1;
  const snapshot=prior?.snapshot??input.generationSnapshot
   ??await loadTypedV11GenerationSnapshot(source,{sourceNamespace,pin:sourcePin});
  await assertTypedV11GenerationSnapshotLive(source,snapshot);
@@ -75,11 +80,13 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   const reader=await createTypedV11QuotaPageReader(source,{sourceNamespace,snapshot,fenceSnapshotPages:false,
    fromObservedAtMs:Date.parse(window.start),beforeObservedAtMs:Date.parse(window.end)});
   const before=budget.remainingQueries;
-  const result=await advanceV11QuotaAcquisition(reader,identity,budget,checkpoint.acquisition,
-   {maxPages:input.maxPages??1});
+  const result=await advanceV11QuotaAcquisition(reader,identity,budget,checkpoint.acquisition,{maxPages});
   await assertTypedV11GenerationSnapshotLive(source,snapshot);
-  if(result.status==='deferred')return {status:'deferred',checkpoint:before===budget.remainingQueries?prior:
-   {...checkpoint,snapshot,acquisition:result.checkpoint}};
+  // The acquisition reads one physical page per statement and only defers
+  // when the budget, the deadline or the page bound stops it, so fewer than
+  // `maxPages` pages means a budget cut rather than a natural group boundary.
+  if(result.status==='deferred')return before-budget.remainingQueries<maxPages?{status:'deferred',checkpoint:prior,cut:true}
+   :{status:'deferred',checkpoint:{...checkpoint,snapshot,acquisition:result.checkpoint}};
   if(result.status==='not_testable')return {status:'complete',analysis:{
    schemaVersion:'account-scoped-quota-analysis-v0.1',status:'not_testable',reason:result.reason,tracks:[]}};
   checkpoint={version:1,source:'v1.1',day,layout,identity,snapshot,phase:'finish',
@@ -97,9 +104,14 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   await assertTypedV11GenerationSnapshotLive(source,snapshot);
   return {status:'complete',analysis:await finishV11UsageReduction(source,analysisPin,options,checkpoint.usage,metric,identity)};
  }
+ const resumed=checkpoint.phase==='usage',before=budget.remainingQueries;
  const usage=await advanceV11UsageReduction(source,analysisPin,options,budget,
-  checkpoint.phase==='usage'?checkpoint.usage:null,input.maxPages??1,identity);
+  checkpoint.phase==='usage'?checkpoint.usage:null,maxPages,identity);
  await assertTypedV11GenerationSnapshotLive(source,snapshot);
+ // The reducer spends one statement to initialize a fresh reduction and one
+ // per day page; an incomplete reduction that read fewer than `maxPages` pages
+ // was cut by the budget or deadline, not by the end of its selected days.
+ if(!usage.complete&&before-budget.remainingQueries-(resumed?0:1)<maxPages)return {status:'deferred',checkpoint:prior,cut:true};
  return {status:'deferred',checkpoint:{version:1,source:'v1.1',day,layout,identity,snapshot,phase:'usage',
   acquisition:checkpoint.acquisition,usage}};
 }

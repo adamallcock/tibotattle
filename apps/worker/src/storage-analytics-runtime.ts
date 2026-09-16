@@ -200,12 +200,18 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  maxSteps?:number;deadlineMs?:number;maxQueries?:number;signal?:AbortSignal;
  publishCommunity?:boolean;publicOnly?:boolean;
   ledger?:D1Database;skipV1PrefixProbe?:boolean;
+ /** Public lane order. The daily and graph lanes each need most of one
+  * scheduled window when both have work, so passes alternate which lane opens
+  * by wall-clock minute unless the caller pins the order. */
+ graphLaneFirst?:boolean;
 }):Promise<StorageAnalyticsPass> {
  const maxSteps=options.maxSteps??8,deadlineMs=options.deadlineMs??Date.now()+20_000;
  if(!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||!Number.isFinite(deadlineMs)
    ||(options.publicOnly!==undefined&&typeof options.publicOnly!=='boolean')
    ||(options.publicOnly===true&&options.publishCommunity!==true)
+   ||(options.graphLaneFirst!==undefined&&typeof options.graphLaneFirst!=='boolean')
    ||(options.skipV1PrefixProbe!==undefined&&typeof options.skipV1PrefixProbe!=='boolean'))throw invalid();
+ const graphLaneFirst=options.graphLaneFirst??Math.floor(Date.now()/60_000)%2===1;
  const meter=createD1InvocationBudget(options.maxQueries??900);
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,graphFailure:StorageGraphFailureFields|undefined;
@@ -294,42 +300,48 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    if(options.publishCommunity && meter.remainingQueries>=100 && Date.now()<deadlineMs
      && (await readCollectionControls(scoped.source)).publication) {
     // Recover several already prepared days without consuming the graph's
-    // 550-statement admission floor. Stale published heads receive three of
-    // four selection slots while a durable queue exists, and both selectors
-    // fall back to the other lane when their preferred lane is empty.
-    const dailyAllowance=Math.min(90,Math.max(0,meter.remainingQueries-560));
-    let dailyIdle=false;
-    const dailyTimeRemaining=deadlineMs-Date.now();
-    if(dailyAllowance>0&&dailyTimeRemaining>=5_000){
-     const dailyMeter=createD1InvocationBudget(dailyAllowance);
-     const dailyScoped={...scoped,source:dailyMeter.wrap(scoped.source),target:dailyMeter.wrap(scoped.target)};
-     // A normal 20-second direct pass has already spent part of its deadline
-     // on setup. Admit one bounded day there; only longer passes batch days.
-     const dailyAttempts=dailyTimeRemaining>20_000?4:1;
-     const skipDays:string[]=[];
-     try{
-      for(let attempt=0;attempt<dailyAttempts&&deadlineMs-Date.now()>=(attempt===0?5_000:15_000);attempt++){
-       const slot=Math.floor(Date.now()/60_000)+attempt;
-       const daily=await advanceNextStorageCommunityDaily({...dailyScoped,preferStaleHead:slot%4!==3,skipDays});
-       if(daily.state==='published')dailyPublications++;
-       if(daily.state==='idle'){dailyIdle=true;break;}
-       // A day waiting on a pending projection or on capacity yields to the
-       // next candidate within this pass; one blocked day cannot hold the lane.
-       if(daily.state==='deferred'&&daily.reason!=='source_changed')skipDays.push(daily.day);
-       if(daily.state==='deferred'&&daily.reason==='source_changed')break;
+    // 550-statement admission floor while the graph lane is still to run.
+    // Stale published heads receive three of four selection slots while a
+    // durable queue exists, and both selectors fall back to the other lane
+    // when their preferred lane is empty.
+    let graphRan=false;
+    const runDailyLane=async():Promise<boolean>=>{
+     const dailyAllowance=Math.min(90,Math.max(0,meter.remainingQueries-(graphRan?100:560)));
+     let dailyIdle=false;
+     const dailyTimeRemaining=deadlineMs-Date.now();
+     if(dailyAllowance>0&&dailyTimeRemaining>=5_000){
+      const dailyMeter=createD1InvocationBudget(dailyAllowance);
+      const dailyScoped={...scoped,source:dailyMeter.wrap(scoped.source),target:dailyMeter.wrap(scoped.target)};
+      // A normal 20-second direct pass has already spent part of its deadline
+      // on setup. Admit one bounded day there; only longer passes batch days.
+      const dailyAttempts=dailyTimeRemaining>20_000?4:1;
+      const skipDays:string[]=[];
+      try{
+       for(let attempt=0;attempt<dailyAttempts&&deadlineMs-Date.now()>=(attempt===0?5_000:15_000);attempt++){
+        const slot=Math.floor(Date.now()/60_000)+attempt;
+        const daily=await advanceNextStorageCommunityDaily({...dailyScoped,preferStaleHead:slot%4!==3,skipDays});
+        if(daily.state==='published')dailyPublications++;
+        if(daily.state==='idle'){dailyIdle=true;break;}
+        // A day waiting on a pending projection or on capacity yields to the
+        // next candidate within this pass; one blocked day cannot hold the lane.
+        if(daily.state==='deferred'&&daily.reason!=='source_changed')skipDays.push(daily.day);
+        if(daily.state==='deferred'&&daily.reason==='source_changed')break;
+       }
+      }catch(error){
+       if(error instanceof D1InvocationBudgetExceededError)dailyIdle=false;
+       else laneFailure('daily_publish',error);
       }
-     }catch(error){
-      if(error instanceof D1InvocationBudgetExceededError)dailyIdle=false;
-      else laneFailure('daily_publish',error);
      }
-    }
-    publicIdle=dailyIdle;
-    try{await retireStorageCommunityDailyPage(scoped);}catch(error){laneFailure('daily_publish',error);}
+     try{await retireStorageCommunityDailyPage(scoped);}catch(error){laneFailure('daily_publish',error);}
+     return dailyIdle;
+    };
     // A graph attempt that failed or was deferred with a recorded failure has
     // already spent this isolate's memory on one heavy owner-day read. Do not
     // start another heavy calculation in the same invocation; the next
     // scheduled pass retries from its durable checkpoint and selection.
-    if(meter.remainingQueries>=550 && Date.now()<deadlineMs && !graphExhausted) {
+    const runGraphLane=async():Promise<boolean>=>{
+     if(!(meter.remainingQueries>=550 && Date.now()<deadlineMs && !graphExhausted))return graphExhausted;
+     graphRan=true;
      let graph:StorageGraphWorkProgress={state:'deferred',reason:'graph_failure'};
      try{
       graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs});
@@ -342,8 +354,14 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
       if(meter.remainingQueries>=30)await retireStorageCommunityGraphPublications(scoped);
      }catch(error){laneFailure('graph_work',error);}
      if(graph.failure||graph.reason==='graph_failure')graphExhausted=true;
-     publicIdle=publicIdle&&graph.state==='idle';
-    } else if(!graphExhausted)publicIdle=false;
+     return graph.state==='idle';
+    };
+    // Both lanes need most of one scheduled window when both have work. The
+    // opening lane alternates by minute so a long daily queue cannot starve a
+    // resumable graph checkpoint for hours, and vice versa; an idle lane costs
+    // a few statements and hands the rest of the window to the other.
+    if(graphLaneFirst){const graphIdle=await runGraphLane();const dailyIdle=await runDailyLane();publicIdle=dailyIdle&&graphIdle;}
+    else {const dailyIdle=await runDailyLane();const graphIdle=await runGraphLane();publicIdle=dailyIdle&&graphIdle;}
    }
    if(step.state==='idle'&&v11.state==='idle'&&v1.state==='idle'&&retiredGraph.state==='idle'&&publicIdle)return result('idle','complete');
   }
