@@ -19,8 +19,9 @@ import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { createD1InvocationBudget } from './d1-invocation-budget';
 import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis,type StorageV1HistoryCheckpoint } from './storage-v1-history';
 import { V1_QUOTA_ACQUISITION_VERSION } from './quota-analysis-v1-reader';
-import { advanceStorageV11Analysis,STORAGE_V11_PREPARED_FOLD,
+import { advanceStorageV11Analysis,loadStorageV11PreparedDays,STORAGE_V11_PREPARED_FOLD,
   type StorageV11HistoryCheckpoint } from './storage-v11-history';
+import type { GraphDayProjection } from './graph-day-projection-values';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
   storageHistoryCheckpointParts,
   type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor,
@@ -480,6 +481,14 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     // journal event reaches the analytics target. Do not read or stage private
     // evidence until the target has the matching active owner authority.
     const measuredFromMs=now(),measuredFromQueries=meter.queriesUsed;
+    // The prepared days for this whole window, loaded once per claim. A window
+    // the store does not hold completely yields nothing and the paged path
+    // runs: the fold PUBLISHES its refusal rather than falling back, so an
+    // incomplete set would write a wrong answer under an unchanged result
+    // identity. The kernel's own coverage assertion is a backstop, not this
+    // decision.
+    let preparedDays:readonly GraphDayProjection[]|undefined;
+    let preparedLoaded=false;
     const ownerReady=await bindings.target.prepare(`SELECT 1 AS ready FROM analytics_owner_state
       WHERE source_id=? AND owner_digest=? AND state='active'`).bind(bindings.sourceId,scope.owner.ownerDigest)
       .first<number>('ready');
@@ -530,10 +539,20 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         ?bound.maxPages:0;
       const mode=partialPages>=1?'partial':'whole';
       const maxPages=mode==='partial'?partialPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM;
+      if(STORAGE_V11_PREPARED_FOLD&&!preparedLoaded){
+        preparedLoaded=true;
+        const loaded=await withStorageGraphFailureStage('graph_prepared_days',
+          ()=>loadStorageV11PreparedDays({source,target:bindings.target,sourceId:bindings.sourceId,
+            sourceNamespace:bindings.sourceNamespace,ownerDigest:scope.owner.ownerDigest,
+            snapshot:scope.snapshot!,sourcePin:pin,nowMs,
+            budget:{remainingQueries:meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}}));
+        preparedDays=loaded.days;
+      }
       const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
         participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
         generationSnapshot:scope.snapshot,
         closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages,
+        ...(preparedDays!==undefined?{preparedDays}:{}),
         ...(mode==='partial'?{partialGroup:true}:{}),
         budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
       if(next.status==='complete'){

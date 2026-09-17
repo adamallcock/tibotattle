@@ -5,6 +5,8 @@ import { advanceV11QuotaAcquisition,createV11QuotaAcquisitionCheckpoint,foldV11Q
   type V11CompletedQuotaAcquisition,type V11QuotaAcquisitionCheckpoint,
   type V11QuotaAcquisitionIdentity,type V11QuotaInvocationBudget } from './quota-analysis-v11-reader';
 import { validGraphDayProjection,type GraphDayProjection } from './graph-day-projection-values';
+import { readGraphDayProjection,GRAPH_DAY_PROJECTION_MAX_LOAD_PARTS,
+  type GraphDayProjectionKey,type GraphDayProjectionLoadCursor } from './graph-day-projection';
 import type { V11SourcePin } from './telemetry-v11-domain';
 import { assertTypedV11GenerationSnapshotLive,createTypedV11QuotaPageReader,
   loadTypedV11GenerationSnapshot,type V11GenerationSnapshot } from './typed-v11-quota-reader';
@@ -53,19 +55,87 @@ export function storageV11FoldsPreparedDays(preparedDays:readonly GraphDayProjec
  return enabled&&preparedDays!==undefined;
 }
 
+/** Statements one prepared-day read costs: the head row, then one per page
+ * call. A day's artifact is a handful of kilobytes, so it is one page call in
+ * practice and this is the measured bound rather than an estimate. */
+export const STORAGE_V11_PREPARED_DAY_QUERIES=2;
+/** Reserve left for the group and its promotion after the load. A load that
+ * cannot finish inside it defers to the paged path rather than half-reading. */
+export const STORAGE_V11_PREPARED_LOAD_RESERVE=120;
+
+export type StorageV11PreparedDayLoad=
+ {status:'ready';days:readonly GraphDayProjection[];statements:number}|
+ /** `incomplete` is the safety case: the store does not hold every day this
+  * window expects, so the caller MUST take the paged path. Folding a partial
+  * set publishes a smaller, complete-looking result under an unchanged result
+  * identity, and the fold refuses rather than falling back, so the refusal
+  * itself would be published. The kernel's coverage assertion stays a
+  * fail-closed backstop; this is the decision. */
+ {status:'incomplete'|'budget'|'off';days:undefined;statements:number};
+
+/** Load every prepared day this window expects, or nothing.
+ *
+ * `enabled` defaults to the deployment flag; it is a parameter so the rule can
+ * be exercised without the flag being on. */
+export async function loadStorageV11PreparedDays(input:{source:D1Database;target:D1Database;
+ sourceId:string;sourceNamespace:string;ownerDigest:string;snapshot:V11GenerationSnapshot;
+ sourcePin:V11SourcePin;nowMs:number;
+ budget:{remainingQueries:number;deadlineMs:number;now?:()=>number};
+ enabled?:boolean}):Promise<StorageV11PreparedDayLoad>{
+ if(!(input.enabled??STORAGE_V11_PREPARED_FOLD))return {status:'off',days:undefined,statements:0};
+ const now=input.budget.now??Date.now;
+ const analysisPin=pinForSnapshot(input.snapshot,input.sourcePin);
+ const window=v11AnalysisWindow(analysisPin,input.nowMs);
+ if(Date.parse(window.end)<=Date.parse(window.start))return {status:'off',days:undefined,statements:0};
+ if(input.budget.remainingQueries<STORAGE_V11_PREPARED_LOAD_RESERVE||now()>=input.budget.deadlineMs){
+  return {status:'budget',days:undefined,statements:0};
+ }
+ const manifests=await v11WindowDayManifests(input.source,input.snapshot,window);
+ let statements=1;
+ const days:GraphDayProjection[]=[];
+ for(const manifest of manifests){
+  const key:GraphDayProjectionKey={sourceId:input.sourceId,sourceLayout:'typed-v11',
+   sourceNamespace:input.sourceNamespace,ownerDigest:input.ownerDigest,deviceId:manifest.deviceId,
+   manifestId:manifest.manifestId,manifestDigest:manifest.manifestDigest,day:manifest.day};
+  let cursor:GraphDayProjectionLoadCursor|undefined;
+  for(;;){
+   if(input.budget.remainingQueries-statements<STORAGE_V11_PREPARED_LOAD_RESERVE||now()>=input.budget.deadlineMs){
+    return {status:'budget',days:undefined,statements};
+   }
+   const read=await readGraphDayProjection({target:input.target,key,cursor,
+    maxParts:GRAPH_DAY_PROJECTION_MAX_LOAD_PARTS});
+   statements+=1;
+   if(read.status==='absent')return {status:'incomplete',days:undefined,statements};
+   if(read.status==='ready'){
+    if(!validGraphDayProjection(read.projection))throw fail();
+    days.push(read.projection);
+    break;
+   }
+   cursor=read.cursor;
+  }
+ }
+ return {status:'ready',days,statements};
+}
+
 /** The generation's own observed days inside this analysis window, which is
  * the exact day set a prepared fold must be given. Derived from the same
  * immutable snapshot the acquisition reads, so a lane that has not finished
  * building, or a day the builder refused, is a missing day here rather than a
  * silently smaller result. */
+async function v11WindowDayManifests(source:D1Database,snapshot:V11GenerationSnapshot,
+ window:{start:string;end:string}):Promise<Array<{day:string;deviceId:string;manifestId:string;manifestDigest:string}>>{
+ const rows=(await source.prepare(`SELECT d.observed_day,m.id,m.manifest_digest,m.device_id
+  FROM telemetry_v11_domain_days d JOIN telemetry_v11_day_manifests m ON m.id=d.manifest_id
+  WHERE d.generation_id=? AND d.observed_day>=? AND d.observed_day<? ORDER BY d.observed_day LIMIT 103`)
+  .bind(snapshot.generationId,window.start.slice(0,10),window.end.slice(0,10))
+  .all<{observed_day:string;id:string;manifest_digest:string;device_id:string}>()).results;
+ if(rows.length>102)throw fail();
+ return rows.map(row=>({day:row.observed_day,deviceId:row.device_id,
+  manifestId:String(row.id),manifestDigest:row.manifest_digest}));
+}
 async function v11WindowDays(source:D1Database,snapshot:V11GenerationSnapshot,
  window:{start:string;end:string}):Promise<string[]>{
- const rows=(await source.prepare(`SELECT observed_day FROM telemetry_v11_domain_days
-  WHERE generation_id=? AND observed_day>=? AND observed_day<? ORDER BY observed_day LIMIT 103`)
-  .bind(snapshot.generationId,window.start.slice(0,10),window.end.slice(0,10))
-  .all<{observed_day:string}>()).results;
- if(rows.length>102)throw fail();
- return rows.map(row=>row.observed_day);
+ return (await v11WindowDayManifests(source,snapshot,window)).map(row=>row.day);
 }
 
 const fail=()=>new Error('STORAGE_V11_HISTORY_CHECKPOINT_MISMATCH');
