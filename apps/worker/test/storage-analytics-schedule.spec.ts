@@ -83,7 +83,7 @@ describe('long graph-only pass on the single minute schedule',()=>{
    pass.mockReset();log.mockReset();vi.setSystemTime(at(minute));
    pass.mockImplementationOnce(deliveryPhase(5)).mockImplementationOnce(async options=>{
     expect(options).toMatchObject({publishCommunity:true,publicOnly:true,graphOnly:true,maxSteps:32,
-     maxQueries:895,deadlineMs:at(minute)+9*60_000,graphLeaseMs:12*60_000});
+     maxQueries:895,deadlineMs:at(minute)+8*60_000,graphLeaseMs:570_000});
     await options.target.prepare('SELECT 1').run();
     return {...result,steps:3,queriesUsed:99,graphCalculations:1};
    });
@@ -116,7 +116,7 @@ describe('long graph-only pass on the single minute schedule',()=>{
   expect(JSON.parse(log.mock.calls[0]![0] as string).event).toBe('storage_analytics_schedule');
   pass.mockReset();log.mockReset();pass.mockResolvedValue(result);
   await runStorageAnalyticsSchedule(environment(),{cron:STORAGE_ANALYTICS_MINUTE_CRON,nowMs:at(20)});
-  expect(pass.mock.calls[1]![0]).toMatchObject({graphOnly:true,graphLeaseMs:12*60_000});
+  expect(pass.mock.calls[1]![0]).toMatchObject({graphOnly:true,graphLeaseMs:570_000});
   expect(JSON.parse(log.mock.calls[0]![0] as string).event).toBe('storage_analytics_long_schedule');
   // With no named instant the invocation's own clock decides.
   pass.mockReset();log.mockReset();pass.mockResolvedValue(result);

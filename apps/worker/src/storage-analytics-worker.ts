@@ -23,16 +23,21 @@ export interface StorageAnalyticsWorkerEnv {
 export const STORAGE_ANALYTICS_MINUTE_CRON='* * * * *';
 /** Every tenth UTC minute gives the graph lane the long window. */
 export const STORAGE_ANALYTICS_LONG_PASS_MINUTES=10;
-/** Nine minutes of the fifteen-minute cron wall-clock allowance, leaving the
- * kernel's own save headroom and this invocation's final release inside it.
- * The deployed Worker must set limits.cpu_ms to 300000 for this window. */
-const LONG_PASS_WINDOW_MS=9*60_000;
-/** The graph claim must outlive the whole long window and its release, so a
- * concurrent minute pass treats the owner-day as busy for the entire time, and
- * must stay within one cron invocation's fifteen-minute wall clock so an
- * abandoned claim recovers by the next long schedule. The pass validates both
- * bounds against its own deadline. */
-const LONG_PASS_GRAPH_LEASE_MS=12*60_000;
+/** Eight minutes, well inside the fifteen-minute cron wall-clock allowance and
+ * leaving the kernel's own save headroom and this invocation's final release
+ * inside it. The shared meter binds first in any case: the graph phase starts
+ * with roughly 725 statements once delivery has taken its share, which is about
+ * four to five minutes of paged reads at production latency. The window is also
+ * kept short enough that a lease outliving it still expires before the next
+ * long tick. The deployed Worker must set limits.cpu_ms to 300000. */
+const LONG_PASS_WINDOW_MS=8*60_000;
+/** Nine and a half minutes: longer than the window, so a pass that works for
+ * its whole window still holds its claim at the end and no concurrent pass
+ * forks the same owner-day; and shorter than the ten-minute long-pass cadence,
+ * so a claim abandoned by a killed isolate has expired before the next long
+ * pass and that owner-day is skipped once rather than twice. Both bounds are
+ * validated by the pass against its own deadline. */
+const LONG_PASS_GRAPH_LEASE_MS=570_000;
 /** Do not expose account identifiers, SQL, credentials or a stored record in
  * diagnostics. Retain the durable cursor and make scheduler failure visible.
  * Internal failure constants are closed uppercase identifiers; provider or

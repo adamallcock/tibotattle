@@ -194,6 +194,11 @@ composition already clusters pool identity within
 | Direct-path parity | `QUOTA_SQL`/`TYPED_V11_QUOTA_SQL`, `collapseDirectQuotaRows` | The SQL eligibility pre-filter is gone; the direct read re-derives eligibility, collapse and spacing through the same primitives, so both paths agree by construction; its `maximum + 1` refusal stays on the pre-cluster rows |
 | Version | `V11_QUOTA_ACQUISITION_VERSION` = `v11-quota-acquisition-2` | Every v1.1 checkpoint and result is recomputed |
 
-The v1 reader (the second dense owner is v1) follows the same design in a
-separate change. Still open: the acquisition checkpoint itself (up to 60,000
-quota rows per owner) remains the structural cost.
+The clusters sub-phase is a fourth full pass over the window, about a third
+more round trips per fold, which partly offsets the page-size gain; and the
+graph phase of a long pass starts with roughly 725 statements after delivery,
+so a partial group's page bound is about a quarter smaller than the 900 the
+earlier arithmetic assumed. The v1 reader (the second dense owner is v1)
+follows the same design in a separate change. Still open: the acquisition
+checkpoint itself (up to 60,000 quota rows per owner) remains the structural
+cost.

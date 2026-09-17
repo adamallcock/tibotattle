@@ -483,7 +483,7 @@ describe('independent public daily publication',()=>{
     const matching=(pattern:RegExp)=>seen.filter(sql=>pattern.test(sql));
     const watched={source:watch(source(),'source'),target:watch(target(),'target'),ledger:watch(b.DELETION_LEDGER,'ledger')};
     const result=await runStorageAnalyticsPass({...options(),...watched,publishCommunity:true,publicOnly:true,graphOnly:true,
-      maxSteps:1,maxQueries:900,deadlineMs:Date.now()+9*60_000,graphLeaseMs:12*60_000});
+      maxSteps:1,maxQueries:900,deadlineMs:Date.now()+8*60_000,graphLeaseMs:570_000});
     expect(result.dailyPublications).toBe(0);
     expect(result.graphFailure).toBeUndefined();
     // The queued rebuild is untouched and still waiting for the minute schedule.
@@ -522,7 +522,7 @@ describe('independent public daily publication',()=>{
       const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
     }}) as D1Database;
     const result=await runStorageAnalyticsPass({...options(),target:failing,publishCommunity:true,publicOnly:true,
-      graphOnly:true,maxSteps:4,maxQueries:900,deadlineMs:Date.now()+9*60_000,graphLeaseMs:12*60_000});
+      graphOnly:true,maxSteps:4,maxQueries:900,deadlineMs:Date.now()+8*60_000,graphLeaseMs:570_000});
     expect(result.graphFailure).toEqual({phase:'graph_work',reason:'application'});
     expect(result).toMatchObject({state:'deferred',reason:'step_limit',graphCalculations:0,dailyPublications:0});
   });
@@ -541,10 +541,10 @@ describe('independent public daily publication',()=>{
       {graphOnly:true,publicOnly:true,publishCommunity:true,graphLeaseMs:9*60_000,deadlineMs:Date.now()+10*60_000}]) {
       await expect(runStorageAnalyticsPass({...options(),maxSteps:1,maxQueries:900,...invalid})).rejects.toThrow();
     }
-    // The long schedule's own twelve-minute lease over a nine-minute window is
-    // inside both bounds and is admitted.
+    // The long schedule's own nine-and-a-half-minute lease over an eight-minute
+    // window is inside both bounds and is admitted.
     await expect(runStorageAnalyticsPass({...options(),maxSteps:1,maxQueries:900,publishCommunity:true,publicOnly:true,
-      graphOnly:true,graphLeaseMs:12*60_000,deadlineMs:Date.now()+9*60_000})).resolves.toMatchObject({dailyPublications:0});
+      graphOnly:true,graphLeaseMs:570_000,deadlineMs:Date.now()+8*60_000})).resolves.toMatchObject({dailyPublications:0});
   });
   it('keeps complete totals and unknown-price counts when more than a hundred model cells are displayed',async()=>{
     await fixture(101,n=>({modelId:`unknown-a-${String(n).padStart(3,'0')}`}));
