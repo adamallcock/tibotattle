@@ -149,7 +149,9 @@ function renderDemoForecast(demo, t) {
   const dry = scenario.dryHours > 0;
   const set = (selector,value) => {card.querySelector(selector).textContent=value;};
   card.classList.toggle('is-over-pace',dry); card.classList.toggle('is-critical',scenario.ratio>=2);
-  set('[data-forecast-badge]',t(`site.features.${demo.dataset.pace}`));
+  const badge = card.querySelector('[data-forecast-badge]');
+  badge.dataset.i18n = `site.features.${demo.dataset.pace}`;
+  badge.textContent = t(badge.dataset.i18n);
   set('[data-forecast-title]',t(dry?'site.features.headline':'site.features.spare',{duration:duration(scenario.coveredHours)}));
   set('[data-forecast-copy]',dry?t('site.features.forecastCopy',{ratio:scenario.ratio,gap:duration(scenario.dryHours)}):t('site.features.underCopy'));
   set('[data-forecast-gap]',t(dry?'site.features.dry':'site.features.until',{duration:duration(scenario.dryHours)}));

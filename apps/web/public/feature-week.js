@@ -32,7 +32,7 @@ export function mountExampleWeek(root, t) {
   const doc=root.ownerDocument, data=exampleWeek();
   const money=value=>new Intl.NumberFormat(doc.documentElement.lang,{style:'currency',currency:'USD',maximumFractionDigits:0}).format(value);
   const percent=value=>new Intl.NumberFormat(doc.documentElement.lang,{maximumFractionDigits:0}).format(value)+'%';
-  const view=mountTrendsHorizon(root,{t,locale:doc.documentElement.lang,timeZone:'America/New_York',formatMoney:money,formatPercent:percent,formatDuration:()=> '1h'});
+  const view=mountTrendsHorizon(root,{t,locale:doc.documentElement.lang,timeZone:'America/New_York',formatMoney:money,formatPercent:percent,formatDuration:ms=>t('site.features.weekSpan',{hours:Math.max(1,Math.round(ms/3600000))})});
   view.setAllowanceSamples(data.points);
   view.setSpendLookup(at=>{const point=data.points[Math.min(168,Math.max(0,Math.floor((at-data.domain.startMs)/3600000)))];return {allowanceWeightedUsd:point.usage,measuredSpanMs:3600000};});
   const svgNode=(tag,attrs,text)=>{const el=doc.createElementNS('http://www.w3.org/2000/svg',tag);for(const [key,value] of Object.entries(attrs))el.setAttribute(key,value);if(text!=null)el.textContent=text;return el;};

@@ -2555,3 +2555,41 @@ test("the install card refuses a partially injected release", () => {
     );
   }
 });
+
+// Every interactive panel in the feature tour is fed synthetic input. The
+// labels that say so are the only thing separating a demonstration from an
+// implied measurement, so they are pinned in both the served markup and the
+// catalog entry the markup points at.
+test("the feature tour labels every demonstration as synthetic in markup and catalog", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  for (const [label, key] of [
+    ["Synthetic demonstration", "site.features.insightExample"],
+    ["not measured results", "site.features.insightExample"],
+    ["Illustrative scenario · not a live allowance", "site.features.example"],
+    ["Synthetic example week", "site.features.weekExample"],
+  ]) {
+    assert.ok(html.includes(label), `served markup states "${label}"`);
+    assert.ok(
+      translate(key, {}, "en-US").includes(label),
+      `${key} states "${label}"`,
+    );
+    assert.ok(
+      html.includes(`data-i18n="${key}"`),
+      `${key} is wired for translation`,
+    );
+  }
+  // The pace demonstration ships pre-rendered in its "way over pace" state:
+  // the badge, the verdict copy and the pressed control must agree before any
+  // script runs, and none of them may be untranslated literals.
+  assert.match(html, /data-pace-demo data-pace="way"/u);
+  assert.match(html, /data-demo-verdict data-i18n="site\.features\.wayCopy"/u);
+  assert.match(html, /data-forecast-badge data-i18n="site\.features\.way"/u);
+  assert.match(
+    html,
+    /data-demo-pace="way" aria-pressed="true"/u,
+  );
+  assert.match(
+    html,
+    /id="week-demo"[^>]*data-i18n-aria-label="site\.features\.weekLabel"/u,
+  );
+});

@@ -78,6 +78,8 @@ export const EN_US_CATALOG = Object.freeze({
   "site.features.speedCopy": "Compare output speed and time to first token. Select a model, change the period, and inspect the distribution behind each median.",
 
   "site.features.weekExample": "Synthetic example week · explore the chart or select a reset marker",
+  "site.features.weekLabel": "Illustrative usage history",
+  "site.features.weekSpan": "{hours}h",
   "trends.mixPurpose": "Models and speeds recorded in this period, valued at API-equivalent prices. Use this to investigate the gap; it does not establish its cause.",
   "trends.mixRetry": "Retry breakdown",
   "trends.mixRetained": "The latest breakdown could not be loaded. The previous result is still shown.",
@@ -774,6 +776,8 @@ export const ZH_HANS_CATALOG = Object.freeze({
   "site.features.speedCopy": "比较输出速度和首个 token 延迟。选择模型、切换时间范围，查看中位数背后的分布。",
 
   "site.features.weekExample": "合成示例周 · 探索图表或选择重置标记",
+  "site.features.weekLabel": "示例使用历史",
+  "site.features.weekSpan": "{hours} 小时",
   "trends.mixPurpose": "此时段记录的模型与速度，按 API 等值价格估算。可用于调查差距，但不能确定差距的原因。",
   "trends.mixRetry": "重试明细",
   "trends.mixRetained": "无法加载最新明细。仍显示上次结果。",
@@ -1470,6 +1474,8 @@ export const ES_CATALOG = Object.freeze({
   "site.features.speedCopy": "Compara la velocidad de salida y el tiempo al primer token. Selecciona un modelo, cambia el periodo y explora la distribución de cada mediana.",
 
   "site.features.weekExample": "Semana de ejemplo sintética · explora el gráfico o selecciona un reinicio",
+  "site.features.weekLabel": "Historial de uso ilustrativo",
+  "site.features.weekSpan": "{hours} h",
   "trends.mixPurpose": "Modelos y velocidades registrados en este período, valorados a precios equivalentes de API. Ayudan a investigar la diferencia, pero no determinan su causa.",
   "trends.mixRetry": "Reintentar desglose",
   "trends.mixRetained": "No se pudo cargar el desglose más reciente. Se conserva el resultado anterior.",

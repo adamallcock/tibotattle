@@ -259,3 +259,15 @@
  .community-site .week-demo .trends-horizon { height: auto; }
  .community-site .pace-showcase { padding: 18px; }
 }
+
+/* No-script degradation. Every demonstration below is drawn by the tour
+   modules into an empty host; with scripts unavailable those hosts stay
+   empty and would otherwise render as blank framed panels. Hide only the
+   empty frame -- each row's heading, prose and the recorded app preview
+   remain visible, so the page still reads as intended. Browsers without
+   :has() keep the previous behavior rather than hiding rendered content. */
+[data-cache-demo]:empty, [data-speeds-demo]:empty {display:none;}
+.insight-demo:has([data-cache-demo]:empty),
+.insight-demo:has([data-speeds-demo]:empty) {display:none;}
+.week-demo:has(#allowance-timeline-chart:empty) {display:none;}
+.demo-forecast:has([data-forecast-title]:empty) {display:none;}
