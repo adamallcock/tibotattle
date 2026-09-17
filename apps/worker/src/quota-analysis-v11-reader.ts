@@ -11,6 +11,20 @@ import type {
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import {
+  addQuotaFragmentValue,
+  addQuotaReset,
+  collapseQuotaEndpoint,
+  createQuotaResetClusterState,
+  finishQuotaEndpoints,
+  quotaFragmentEligible,
+  quotaResetClusterEntries,
+  quotaResetRepresentativeMs,
+  validQuotaResetClusterEntries,
+  type QuotaEndpointRun,
+  type QuotaFragmentStats,
+  type QuotaResetClusterEntry,
+} from "./quota-endpoint-collapse";
+import {
   TYPED_V11_QUOTA_PAGE_SIZE,
   type V11QuotaPageCursor,
   type V11QuotaPageRow,
@@ -20,7 +34,7 @@ import {
 /** A private acquisition protocol. It is deliberately separate from the
  * public attribution adapter version: changing its page/checkpoint contract
  * must invalidate an in-flight acquisition without relabelling old evidence. */
-export const V11_QUOTA_ACQUISITION_VERSION = "v11-quota-acquisition-1";
+export const V11_QUOTA_ACQUISITION_VERSION = "v11-quota-acquisition-2";
 export const V11_QUOTA_ACQUISITION_PAGE_SIZE = TYPED_V11_QUOTA_PAGE_SIZE;
 export const V11_PLAN_ANCHOR_LIMIT = 120_000;
 export const V11_QUOTA_ENDPOINT_LIMIT = 60_000;
@@ -85,24 +99,17 @@ interface PlanRun {
 }
 const IDENTITY_FIELDS = ["participantId", "inputFingerprint", "sourceMethodVersion",
   "observedAtCutoff", "resetsAtCutoff", "windowMinutes", "maxQuotaRows"] as const;
-interface FragmentStats {
-  values: number[];
-  minimum: number;
-  maximum: number;
-}
+type FragmentStats = QuotaFragmentStats;
 interface Endpoint {
   id: number;
   row: V11AcquiredQuotaRow;
 }
-interface EndpointRun {
-  firstId: number;
-  last: Endpoint;
-}
+type EndpointRun = QuotaEndpointRun<Endpoint>;
 
 export interface V11QuotaAcquisitionCheckpoint {
   version: typeof V11_QUOTA_ACQUISITION_VERSION;
   identity: V11QuotaAcquisitionIdentity;
-  phase: "plan" | "fitability" | "endpoints";
+  phase: "plan" | "clusters" | "fitability" | "endpoints";
   cursor: V11QuotaPageCursor;
   plan: {
     timeMs: number | null;
@@ -110,6 +117,9 @@ export interface V11QuotaAcquisitionCheckpoint {
     runs: Array<[string, PlanRun]>;
     observations: V11PlanAnchor[];
   };
+  /** Pool hulls per plan era, built by the `clusters` sub-phase over every
+   * valid quota row before any key is derived from a reset instant. */
+  clusters: QuotaResetClusterEntry[];
   stats: Array<[string, FragmentStats]>;
   eligible: string[];
   runs: Array<[string, EndpointRun]>;
@@ -117,7 +127,7 @@ export interface V11QuotaAcquisitionCheckpoint {
 }
 
 export const V11_QUOTA_WORK_COMPONENTS = [
-  "plan-observations", "plan-runs", "plan-equal-time", "fit-stats", "eligible",
+  "plan-observations", "plan-runs", "plan-equal-time", "reset-clusters", "fit-stats", "eligible",
   "endpoint-runs", "endpoints",
 ] as const;
 export type V11QuotaWorkComponent = typeof V11_QUOTA_WORK_COMPONENTS[number];
@@ -133,6 +143,7 @@ export interface V11QuotaWorkComponents {
   "plan-observations": V11PlanAnchor[];
   "plan-runs": Array<[string, PlanRun]>;
   "plan-equal-time": V11PlanAnchor[];
+  "reset-clusters": QuotaResetClusterEntry[];
   "fit-stats": Array<[string, FragmentStats]>;
   eligible: string[];
   "endpoint-runs": Array<[string, EndpointRun]>;
@@ -321,7 +332,13 @@ function validStats(value: unknown): value is FragmentStats {
       && number <= (value.maximum as number));
 }
 function validEndpointRun(value: unknown): value is EndpointRun {
-  return closed(value, ["firstId", "last"]) && positiveId(value.firstId) && validEndpoint(value.last);
+  return closed(value, ["firstId", "last", "keptAtMs", "keptValues", "pending"]) && positiveId(value.firstId)
+    && validEndpoint(value.last) && safeTime(value.keptAtMs) && Array.isArray(value.keptValues)
+    && value.keptValues.length >= 1
+    && value.keptValues.length <= QUOTA_CALIBRATION_POLICY.minimumBoundaries
+    && value.keptValues.every(percent)
+    && new Set(value.keptValues).size === value.keptValues.length
+    && (value.pending === null || validEndpoint(value.pending));
 }
 
 export function validateV11CompletedQuotaAcquisition(value: unknown): value is V11CompletedQuotaAcquisition {
@@ -342,6 +359,9 @@ export function validateV11QuotaWorkPart(component: V11QuotaWorkComponent, value
       return value.length <= PLAN_ATTRIBUTION_POLICY.maxContexts && value.every((entry: unknown) =>
         Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string"
         && validPlanRun(entry[1]) && entry[0] === planGroup(entry[1].first));
+    case "reset-clusters":
+      return validQuotaResetClusterEntries(value)
+        && value.every((entry: unknown) => validEraKey((entry as unknown[])[0]));
     case "fit-stats":
       return value.length <= PLAN_ATTRIBUTION_POLICY.maxEras && value.every((entry: unknown) =>
         Array.isArray(entry) && entry.length === 2 && validStatsKey(entry[0]) && validStats(entry[1]));
@@ -362,7 +382,7 @@ export function validateV11QuotaWorkPart(component: V11QuotaWorkComponent, value
 export function validateV11QuotaWorkControl(value: unknown): value is V11QuotaWorkControl {
   return closed(value, ["version", "phase", "cursor", "planTimeMs"])
     && value.version === V11_QUOTA_ACQUISITION_VERSION
-    && ["plan", "fitability", "endpoints"].includes(value.phase as string)
+    && ["plan", "clusters", "fitability", "endpoints"].includes(value.phase as string)
     && cursorValid(value.cursor) && (value.planTimeMs === null || safeTime(value.planTimeMs));
 }
 
@@ -377,8 +397,9 @@ function validateCheckpoint(state: V11QuotaAcquisitionCheckpoint, identity: V11Q
     && state.identity.maxQuotaRows === identity.maxQuotaRows;
   if (!sameIdentity
       || state.version !== V11_QUOTA_ACQUISITION_VERSION
-      || !["plan", "fitability", "endpoints"].includes(state.phase)
+      || !["plan", "clusters", "fitability", "endpoints"].includes(state.phase)
       || !cursorValid(state.cursor) || !closed(state.plan, ["timeMs", "equalTime", "runs", "observations"])
+      || !Array.isArray(state.clusters)
       || (state.plan.timeMs !== null && !safeTime(state.plan.timeMs))
       || !Array.isArray(state.plan.equalTime) || !Array.isArray(state.plan.runs)
       || !Array.isArray(state.plan.observations) || !Array.isArray(state.stats)
@@ -392,13 +413,17 @@ function validateCheckpoint(state: V11QuotaAcquisitionCheckpoint, identity: V11Q
       || !validateV11QuotaWorkPart("plan-observations", state.plan.observations)
       || !validateV11QuotaWorkPart("plan-equal-time", state.plan.equalTime)
       || !validateV11QuotaWorkPart("plan-runs", state.plan.runs)
+      || !validateV11QuotaWorkPart("reset-clusters", state.clusters)
       || !validateV11QuotaWorkPart("fit-stats", state.stats)
       || !validateV11QuotaWorkPart("eligible", state.eligible)
       || !validateV11QuotaWorkPart("endpoint-runs", state.runs)
       || !validateV11QuotaWorkPart("endpoints", state.endpoints)) {
     invalid();
   }
-  if (state.phase === "plan" && (state.stats.length > 0 || state.eligible.length > 0
+  if (state.phase === "plan" && (state.clusters.length > 0 || state.stats.length > 0
+      || state.eligible.length > 0 || state.runs.length > 0 || state.endpoints.length > 0)) invalid();
+  if (state.phase === "clusters" && (state.plan.timeMs !== null || state.plan.equalTime.length > 0
+      || state.plan.runs.length > 0 || state.stats.length > 0 || state.eligible.length > 0
       || state.runs.length > 0 || state.endpoints.length > 0)) invalid();
   if (state.phase === "fitability" && (state.plan.timeMs !== null || state.plan.equalTime.length > 0
       || state.plan.runs.length > 0 || state.eligible.length > 0 || state.runs.length > 0
@@ -427,7 +452,7 @@ export function createV11QuotaAcquisitionCheckpoint(
     version: V11_QUOTA_ACQUISITION_VERSION, identity: { ...identity }, phase: "plan",
     cursor: { observedAtMs: Date.parse(identity.observedAtCutoff), sourceRowId: 0 },
     plan: { timeMs: null, equalTime: [], runs: [], observations: [] },
-    stats: [], eligible: [], runs: [], endpoints: [],
+    clusters: [], stats: [], eligible: [], runs: [], endpoints: [],
   };
 }
 
@@ -440,6 +465,7 @@ export function encodeV11QuotaWorkCheckpoint(state: V11QuotaAcquisitionCheckpoin
       "plan-observations": state.plan.observations,
       "plan-runs": state.plan.runs,
       "plan-equal-time": state.plan.equalTime,
+      "reset-clusters": state.clusters,
       "fit-stats": state.stats,
       eligible: state.eligible,
       "endpoint-runs": state.runs,
@@ -461,6 +487,7 @@ export function decodeV11QuotaWorkCheckpoint(identity: V11QuotaAcquisitionIdenti
     version: control.version, identity: { ...identity }, phase: control.phase, cursor: control.cursor,
     plan: { timeMs: control.planTimeMs, equalTime: values["plan-equal-time"],
       runs: values["plan-runs"], observations: values["plan-observations"] },
+    clusters: values["reset-clusters"],
     stats: values["fit-stats"], eligible: values.eligible,
     runs: values["endpoint-runs"], endpoints: values.endpoints,
   };
@@ -599,8 +626,16 @@ export async function advanceV11QuotaAcquisition(
   const stats = new Map(state.stats);
   const eligible = new Set(state.eligible);
   const endpointRuns = new Map<string, EndpointRun>(state.runs);
+  const clusters = createQuotaResetClusterState(state.clusters);
   state.plan.runs = [];
   state.runs = [];
+  state.clusters = [];
+  const endpointView = (value: Endpoint) => ({ id: value.id,
+    observedAtMs: Date.parse(value.row.observed_at), usedPercent: value.row.used_percent });
+  const emitEndpoint = (value: Endpoint) => {
+    state.endpoints.push(value);
+    return state.endpoints.length <= identity.maxQuotaRows;
+  };
   let index: PlanAttributionIndex | null = state.phase === "plan"
     ? null : buildPlanAttributionIndex(state.plan.observations);
   if (index?.status !== undefined && index.status !== "ready") return refusal("plan_attribution_limit_exceeded");
@@ -637,8 +672,7 @@ export async function advanceV11QuotaAcquisition(
   };
   const finishStats = (): boolean => {
     for (const [key, stat] of stats) {
-      if (stat.values.length >= QUOTA_CALIBRATION_POLICY.minimumBoundaries
-          && stat.maximum - stat.minimum >= QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp) {
+      if (quotaFragmentEligible(stat)) {
         eligible.add(key);
         if (eligible.size * QUOTA_CALIBRATION_POLICY.minimumBoundaries > identity.maxQuotaRows) return false;
       }
@@ -646,17 +680,11 @@ export async function advanceV11QuotaAcquisition(
     stats.clear();
     return true;
   };
-  const finishRuns = (): boolean => {
-    for (const run of endpointRuns.values()) {
-      if (run.last.id !== run.firstId) state.endpoints.push(run.last);
-      if (state.endpoints.length > identity.maxQuotaRows) return false;
-    }
-    endpointRuns.clear();
-    return true;
-  };
+  const finishRuns = (): boolean => finishQuotaEndpoints(endpointRuns, endpointView, emitEndpoint);
   const defer = (): V11QuotaAcquisitionStep => {
     state.plan.runs = [...planRuns];
     state.plan.equalTime = [...equalTime.values()];
+    state.clusters = quotaResetClusterEntries(clusters);
     state.stats = [...stats];
     state.eligible = [...eligible];
     state.runs = [...endpointRuns];
@@ -710,39 +738,33 @@ export async function advanceV11QuotaAcquisition(
       if (match.status !== "matched" || active.planType !== match.era.planType
           || active.planVariant !== match.era.planVariant) continue;
       const eraKey = match.era.eraKey;
-      if (state.phase === "fitability") {
-        const key = statsKey(active.resetsAt, eraKey);
-        let stat = stats.get(key);
-        if (!stat) {
-          stat = { values: [], minimum: active.usedPercent, maximum: active.usedPercent };
-          stats.set(key, stat);
+      // Pool identity, not the restated instant. The `clusters` sub-phase sees
+      // every valid quota row before any key is derived, so both the fitable
+      // stats and the endpoint runs are keyed by a settled pool.
+      if (state.phase === "clusters") {
+        if (!addQuotaReset(clusters, eraKey, Date.parse(active.resetsAt))) {
+          return refusal("downsampled_quota_limit_exceeded");
         }
-        stat.minimum = Math.min(stat.minimum, active.usedPercent);
-        stat.maximum = Math.max(stat.maximum, active.usedPercent);
-        if (stat.values.length < QUOTA_CALIBRATION_POLICY.minimumBoundaries
-            && !stat.values.includes(active.usedPercent)) stat.values.push(active.usedPercent);
         continue;
       }
-      const key = statsKey(active.resetsAt, eraKey);
+      const representative = quotaResetRepresentativeMs(clusters, eraKey, Date.parse(active.resetsAt));
+      if (representative === null) throw new Error("v11 quota reset cluster missing");
+      const reset = new Date(representative).toISOString();
+      const key = statsKey(reset, eraKey);
+      if (state.phase === "fitability") {
+        addQuotaFragmentValue(stats, key, active.usedPercent);
+        continue;
+      }
       if (!eligible.has(key)) continue;
       if (active.slot === null || !SLOTS.has(active.slot)) continue;
       const output = acquiredRow(active, eraKey);
       if (output === null) continue;
+      // The representative is the pool's largest restated instant, so it stays
+      // strictly after this observation exactly as the raw instant was.
+      output.resets_at = reset;
       const endpoint: Endpoint = { id: pageRow.sourceRowId, row: output };
-      const runKey = endpointKey(eraKey, output.slot, output.resets_at);
-      const run = endpointRuns.get(runKey);
-      if (!run) {
-        state.endpoints.push(endpoint);
-        if (state.endpoints.length > identity.maxQuotaRows) return refusal("downsampled_quota_limit_exceeded");
-        endpointRuns.set(runKey, { firstId: endpoint.id, last: endpoint });
-      } else if (run.last.row.used_percent === output.used_percent) {
-        run.last = endpoint;
-      } else {
-        if (run.last.id !== run.firstId) state.endpoints.push(run.last);
-        state.endpoints.push(endpoint);
-        if (state.endpoints.length > identity.maxQuotaRows) return refusal("downsampled_quota_limit_exceeded");
-        endpointRuns.set(runKey, { firstId: endpoint.id, last: endpoint });
-      }
+      if (!collapseQuotaEndpoint(endpointRuns, endpointKey(eraKey, output.slot, reset), endpoint,
+        endpointView, emitEndpoint)) return refusal("downsampled_quota_limit_exceeded");
     }
     state.cursor = previous;
     if (rows.length === reader.pageSize) continue;
@@ -750,11 +772,17 @@ export async function advanceV11QuotaAcquisition(
       if (!finishPlan()) return refusal("plan_attribution_limit_exceeded");
       index = buildPlanAttributionIndex(state.plan.observations);
       if (index.status !== "ready") return refusal("plan_attribution_limit_exceeded");
-      state.phase = "fitability";
+      state.phase = "clusters";
       state.plan.timeMs = null;
       state.plan.equalTime = [];
       state.plan.runs = [];
       planRuns.clear();
+      state.cursor = initialCursor(identity);
+      if (options.stopAtPhaseBoundary) return defer();
+      continue;
+    }
+    if (state.phase === "clusters") {
+      state.phase = "fitability";
       state.cursor = initialCursor(identity);
       if (options.stopAtPhaseBoundary) return defer();
       continue;

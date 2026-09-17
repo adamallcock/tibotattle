@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildPlanAttributionIndex, planEraForInterval } from "@app-usagemonitor/quota-analysis";
+import { QUOTA_CALIBRATION_POLICY } from "@app-usagemonitor/quota-analysis";
 import {
   advanceV11QuotaAcquisition,
   createV11QuotaAcquisitionCheckpoint,
@@ -88,15 +89,22 @@ describe("resumable v1.1 quota acquisition", () => {
       }
     }
     expect(rows.length).toBeGreaterThan(V11_QUOTA_ACQUISITION_PAGE_SIZE);
-    const expected = rows.filter((row, index) => index % repeats === 0 || index % repeats === repeats - 1)
-      .map((row) => row.active!.occurrenceId);
+    // Run collapse keeps each flat run's first and last row until the key holds
+    // the boundaries the calibration refuses below; after that the runs are one
+    // second apart, so endpoint spacing keeps only the key's final endpoint.
+    const expected = [
+      ...Array.from({ length: QUOTA_CALIBRATION_POLICY.minimumBoundaries - 1 },
+        (_, level) => [level * repeats, (level + 1) * repeats - 1]).flat(),
+      (QUOTA_CALIBRATION_POLICY.minimumBoundaries - 1) * repeats,
+      rows.length - 1,
+    ].map((index) => rows[index]!.active!.occurrenceId);
     const { result, phases, calls } = await finish(rows);
     expect(result.status).toBe("complete");
     if (result.status !== "complete") throw new Error("expected complete");
     expect(result.quotaRows.map((row) => row.occurrence_id)).toEqual(expected);
     expect(result.attributionIndex.eras).toHaveLength(1);
-    expect([...phases].sort()).toEqual(["endpoints", "fitability", "plan"]);
-    expect(calls).toBe(6);
+    expect([...phases].sort()).toEqual(["clusters", "endpoints", "fitability", "plan"]);
+    expect(calls).toBe(8);
   });
 
   it("ends a group on every deterministic sub-phase boundary when the caller stages it", async () => {
@@ -113,17 +121,26 @@ describe("resumable v1.1 quota acquisition", () => {
       { maxPages: 32, stopAtPhaseBoundary: true });
     expect(plan.status).toBe("deferred");
     if (plan.status !== "deferred") throw new Error("expected deferred");
-    expect(plan.checkpoint.phase).toBe("fitability");
+    expect(plan.checkpoint.phase).toBe("clusters");
     expect(stopped.calls).toBe(2);
     // The checkpoint is advanced in place, so each successor is captured
     // before the next group mutates it.
     const planJson = JSON.stringify(plan);
+    const clusters = await advanceV11QuotaAcquisition(stopped.reader, IDENTITY, budget(), stoppedState,
+      { maxPages: 32, stopAtPhaseBoundary: true });
+    expect(clusters.status).toBe("deferred");
+    if (clusters.status !== "deferred") throw new Error("expected deferred");
+    expect(clusters.checkpoint.phase).toBe("fitability");
+    expect(stopped.calls).toBe(4);
+    // Pools are settled before any key is derived from a reset instant.
+    expect(clusters.checkpoint.clusters).toHaveLength(1);
+    const clustersJson = JSON.stringify(clusters);
     const fitability = await advanceV11QuotaAcquisition(stopped.reader, IDENTITY, budget(), stoppedState,
       { maxPages: 32, stopAtPhaseBoundary: true });
     expect(fitability.status).toBe("deferred");
     if (fitability.status !== "deferred") throw new Error("expected deferred");
     expect(fitability.checkpoint.phase).toBe("endpoints");
-    expect(stopped.calls).toBe(4);
+    expect(stopped.calls).toBe(6);
     // A boundary stop never reads an endpoint row, which is what keeps the
     // staged successor compact.
     expect(fitability.checkpoint.endpoints).toEqual([]);
@@ -134,13 +151,15 @@ describe("resumable v1.1 quota acquisition", () => {
     const bounded = fixtureReader(rows), boundedState = createV11QuotaAcquisitionCheckpoint(IDENTITY);
     const boundedPlan = await advanceV11QuotaAcquisition(bounded.reader, IDENTITY, budget(), boundedState, { maxPages: 2 });
     expect(JSON.stringify(boundedPlan)).toBe(planJson);
+    const boundedClusters = await advanceV11QuotaAcquisition(bounded.reader, IDENTITY, budget(), boundedState, { maxPages: 2 });
+    expect(JSON.stringify(boundedClusters)).toBe(clustersJson);
     const boundedFitability = await advanceV11QuotaAcquisition(bounded.reader, IDENTITY, budget(), boundedState, { maxPages: 2 });
     expect(JSON.stringify(boundedFitability)).toBe(fitabilityJson);
     // Without the option the same page bound carries a sub-phase's accumulated
     // state into the next one, which is the growth a staged group must avoid.
     const crossing = fixtureReader(rows);
     const crossingResult = await advanceV11QuotaAcquisition(crossing.reader, IDENTITY, budget(),
-      createV11QuotaAcquisitionCheckpoint(IDENTITY), { maxPages: 5 });
+      createV11QuotaAcquisitionCheckpoint(IDENTITY), { maxPages: 7 });
     expect(crossingResult.status).toBe("deferred");
     if (crossingResult.status !== "deferred") throw new Error("expected deferred");
     expect(crossingResult.checkpoint.phase).toBe("endpoints");
@@ -159,7 +178,9 @@ describe("resumable v1.1 quota acquisition", () => {
     expect(result.status).toBe("complete");
     if (result.status !== "complete") throw new Error("expected complete");
     expect(result.quotaRows).toHaveLength(9);
-    expect(calls).toBe(9);
+    // Four sub-phases now scan the owner stream: plan, clusters, fitability
+    // and endpoints, three physical pages each.
+    expect(calls).toBe(12);
   });
 
   it("matches the shared plan builder at equal-time plan changes", async () => {

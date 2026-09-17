@@ -133,8 +133,12 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  // manifest vector, so a new domain generation outside this closed window can
  // reuse it. The maintained finisher still accepts only a live-pin identity;
  // rebind after the current-pin assertion above, without changing evidence.
+ // The kernel rebuilds the acquisition identity from its own bound, so a
+ // lowered bound has to reach the finisher too or the completed evidence is
+ // rejected as belonging to a different acquisition.
  const acquisition={...checkpoint.acquisition,identity:liveIdentity},options={nowMs,sourcePin:analysisPin,
   typedSourceNamespace:sourceNamespace,generationSnapshot:snapshot,generationSnapshotFenced:true,
+  ...(input.maxQuotaRows!==undefined?{maxDownsampledQuotaRows:input.maxQuotaRows}:{}),
   quotaAcquisition:acquisition};
  if(checkpoint.phase==='usage'&&checkpoint.usage.complete){
   await assertTypedV11GenerationSnapshotLive(source,snapshot);

@@ -149,6 +149,31 @@ function evidence(quotaCount=9,observedDay=day(),label="synthetic"){
     eventTime:new Date(start+i*300000+150000).toISOString(),accountPlanAttribution:{...attribution}}));
   return {quota,usage};
 }
+/** Two interleaved pools of one owner, each restating `resets_at` with
+ * seconds-level jitter: a five-hour pool that respawns every five hours and a
+ * weekly pool. Raw reset instants fragment both; clustered they are two pools. */
+function jitteryEvidence(observedDay=day(),cadenceSeconds=300,spanHours=20){
+  const start=Date.parse(observedDay+"T00:00:00.000Z");
+  const attribution={accountBasis:"same_source" as const,accountTrackId:"account-track:v2:"+"a".repeat(64),
+    planBasis:"same_source_occurrence" as const,planType:"pro" as const,planEraId:null};
+  const quota:TelemetryV11QuotaObservation[]=[];
+  const steps=Math.floor(spanHours*3600/cadenceSeconds);
+  for(let step=0;step<steps;step++){
+    const at=start+step*cadenceSeconds*1000;
+    const cycle=Math.floor((at-start)/(5*3600_000));
+    const pools=[['five_hour',start+(cycle+1)*5*3600_000+(step%137)*1000] as const,
+      ['seven_day',start+7*86400_000+(step%211)*1000] as const];
+    for(const [slot,resets] of pools)quota.push({schemaVersion:"quota-observation-v1.1",
+      observationId:`quota:jitter:${slot}:${step}`,observedTime:new Date(at).toISOString(),
+      provider:"openai_codex",planType:"pro",planVariant:"unknown",limitId:"codex",slot,
+      usedPercent:Math.min(99,Math.floor(step/5)%100),windowDurationMinutes:10080,
+      resetsAt:new Date(resets).toISOString(),accountPlanAttribution:{...attribution}});
+  }
+  const usage=Array.from({length:8},(_,index)=>v11UsageRecord(observedDay,"a",{
+    eventId:`event:jitter:${index}`,eventTime:new Date(start+index*3600_000).toISOString(),
+    accountPlanAttribution:{...attribution}}));
+  return {quota,usage};
+}
 async function loadedCheckpoint(key:StorageHistoryKey):Promise<StorageV11HistoryCheckpoint>{
  let cursor:StorageHistoryLoadCursor|undefined;
  for(;;){const loaded=await loadStorageHistoryCheckpoint({target:b.STORAGE_ANALYTICS_DB,key,cursor});
@@ -300,11 +325,11 @@ describe("typed active-domain analytical reads",()=>{
     expect(computed.result.fits!.length).toBeGreaterThan(0);
     expect(computed.result.fits!.every(fit=>fit.participantId===owner.ownerDigest)).toBe(true);
     expect(computed.reused).toBe(false);
-    // Four promoted generations: the acquisition stops durably on each
-    // sub-phase boundary, then completes, then reduces usage.
+    // Five promoted generations: the acquisition stops durably on each of its
+    // three sub-phase boundaries, then completes, then reduces usage.
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
       WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
-       STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n')).toBe(4);
+       STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n')).toBe(5);
     const modelScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:"model",sourceId:namespace,sourceNamespace:namespace});
     expect(modelScope.dependencyDigest).not.toBe(scope.dependencyDigest);
     expect(modelScope.checkpointDependencyDigest).toBe(scope.checkpointDependencyDigest);
@@ -316,7 +341,7 @@ describe("typed active-domain analytical reads",()=>{
     // The model metric shares that exact checkpoint key and stages nothing new.
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
       WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
-       STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).first<number>('n')).toBe(4);
+       STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).first<number>('n')).toBe(5);
     expect(modelReads.queries.filter(sql=>sql.includes("stream='usage'")
       ||sql.includes("stream = 'usage'")||sql.includes("stream=3"))).toHaveLength(0);
     const shared=await loadStorageHistoryCheckpoint({target:bindings.target,key:{sourceId:namespace,
@@ -394,11 +419,11 @@ describe("typed active-domain analytical reads",()=>{
     // whole grouped read; it must not repeat the authority query per page.
     expect(observed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s')).length).toBe(5);
     // One physical page per acquisition sub-phase: 2,048 observations fit
-    // inside a single 4,096-row page, so plan, fitability and endpoints cost
-    // one statement each instead of the three a 1,024-row page charged.
+    // inside a single 4,096-row page, so plan, clusters, fitability and
+    // endpoints cost one statement each.
     const sourcePages=(queries:string[])=>queries.filter(sql=>sql.includes('AS physical_id')
       &&sql.includes('typed_telemetry_owner_time'));
-    expect(sourcePages(observed.queries)).toHaveLength(3);
+    expect(sourcePages(observed.queries)).toHaveLength(4);
     expect(observed.queries.length).toBeLessThanOrEqual(25);
     expect(targetObserved.queries.length).toBeLessThanOrEqual(40);
     expect(observed.queries.length+targetObserved.queries.length).toBeLessThanOrEqual(65);
@@ -706,7 +731,7 @@ describe("typed active-domain analytical reads",()=>{
     // is nothing half-staged to reproduce.
     const partial=await advance(9,true);
     expect(partial).toMatchObject({status:'deferred',
-      checkpoint:{phase:'acquisition',acquisition:{phase:'fitability'}}});
+      checkpoint:{phase:'acquisition',acquisition:{phase:'clusters'}}});
     expect(Reflect.has(partial,'cut')).toBe(false);
     // A partial group that could not read a single page is still a cut: there
     // is no progress to promote and nothing to distinguish from a replay.
@@ -739,8 +764,8 @@ describe("typed active-domain analytical reads",()=>{
     // successor can only be resumed by reproducing it exactly.
     const staged=await advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
       day:scope.day,metric:'fits',nowMs:Date.parse(scope.fixedNow),sourcePin:pin,generationSnapshot:snapshot,
-      closedDependencyDigest:scope.checkpointDependencyDigest,maxPages:4,
-      budget:{remainingQueries:11,deadlineMs:Date.now()+120_000}});
+      closedDependencyDigest:scope.checkpointDependencyDigest,maxPages:6,
+      budget:{remainingQueries:13,deadlineMs:Date.now()+120_000}});
     if(staged.status!=='deferred'||!staged.checkpoint)throw new Error('synthetic endpoints checkpoint unavailable');
     expect(staged.checkpoint).toMatchObject({phase:'acquisition',acquisition:{phase:'endpoints'}});
     expect((await saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:staged.checkpoint,
@@ -781,11 +806,12 @@ describe("typed active-domain analytical reads",()=>{
       {maxQueries:900,now:()=>fixed,deadlineMs:fixed+16_400});
     expect(result.state).toBe('complete');
     expect(observed.queries.filter(sql=>sql.includes('AS physical_id')
-      &&sql.includes('typed_telemetry_owner_time'))).toHaveLength(3);
-    // Four successors promoted in one call: the two partial acquisition pages,
-    // the endpoints sub-phase back on the fixed whole group, and the usage
-    // reduction. The previous two-transition rule stopped after the first.
-    expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(4);
+      &&sql.includes('typed_telemetry_owner_time'))).toHaveLength(4);
+    // Five successors promoted in one call: the three partial acquisition
+    // sub-phase boundaries, the endpoints sub-phase back on the fixed whole
+    // group, and the usage reduction. The previous two-transition rule stopped
+    // after the first.
+    expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(5);
     expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads WHERE retired=0').first('n')).toBe(1);
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_community_graph_results
       WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind(namespace,owner.ownerDigest).first<number>('n')).toBe(1);
@@ -829,10 +855,10 @@ describe("typed active-domain analytical reads",()=>{
       .all<{control_json:string}>()).results;
     expect(first).toHaveLength(1);
     expect(JSON.parse(first[0]!.control_json)).toMatchObject({phase:'acquisition',acquisition:{phase:'plan'}});
-    // Nine pages for the three sub-phases and not one read twice: the claim
+    // Twelve pages for the four sub-phases and not one read twice: the claim
     // never spent its window on pages it then had to discard.
     expect(observed.queries.filter(sql=>sql.includes('AS physical_id')
-      &&sql.includes('typed_telemetry_owner_time'))).toHaveLength(9);
+      &&sql.includes('typed_telemetry_owner_time'))).toHaveLength(12);
   },180_000);
 
   it("stages no abandoned v1.1 generation at any invocation budget",async()=>{
@@ -869,6 +895,86 @@ describe("typed active-domain analytical reads",()=>{
     expect(advanced).toBeGreaterThan(1);
     expect([...reasons].sort()).toEqual(['v11_checkpoint','v11_checkpoint_group_budget','v11_checkpoint_read_budget']);
   },180_000);
+
+  it("acquires a jittery interleaved owner exactly as the direct read does",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    await activate(typed(),f,await makeV11Day(day(),jitteryEvidence()),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    for(const metric of ['fits','model'] as const){
+      const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric,sourceId:namespace,sourceNamespace:namespace});
+      if(!('source'in scope.pin))throw new Error('synthetic v1.1 pin unavailable');
+      const pin=scope.pin,nowMs=Date.parse(scope.fixedNow);
+      const snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin});
+      let checkpoint:StorageV11HistoryCheckpoint|null=null,acquired:object|null=null;
+      for(let pass=0;pass<24&&acquired===null;pass++){
+        const advanced=await advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+          day:scope.day,metric,nowMs,sourcePin:pin,generationSnapshot:snapshot,
+          closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages:32,
+          budget:{remainingQueries:900,deadlineMs:Date.now()+120_000}});
+        if(advanced.status==='complete'){acquired=advanced.analysis;break;}
+        if(!advanced.checkpoint)throw new Error('synthetic jittery acquisition stalled');
+        checkpoint=advanced.checkpoint;
+      }
+      expect(acquired).not.toBeNull();
+      // The paged acquisition and the single direct read cluster the same
+      // pools, apply the same fitable refusal and collapse the same runs.
+      const direct=metric==='fits'
+        ? await accountScopedQuotaAnalysisV11(typed(),participantId,{nowMs,sourcePin:pin,typedSourceNamespace:namespace})
+        : await accountScopedModelCompositionV11(typed(),participantId,{nowMs,sourcePin:pin,typedSourceNamespace:namespace});
+      expect(acquired).toEqual(direct);
+    }
+  },240_000);
+
+  it("keeps a dense jittery owner under a downsampled bound that raw endpoints break",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    // Seven-second polling for six hours over two jittery interleaved pools.
+    const prepared=jitteryEvidence(day(),7,6);
+    await activate(typed(),f,await makeV11Day(day(),prepared),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    if(!('source'in scope.pin))throw new Error('synthetic v1.1 pin unavailable');
+    const pin=scope.pin,nowMs=Date.parse(scope.fixedNow);
+    const snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin});
+    // Raw keys would retain one run endpoint pair per displayed change per
+    // restated instant, which is what breaks this bound.
+    const rawKeys=new Set(prepared.quota.map(row=>`${row.slot}|${row.resetsAt}`));
+    const rawRuns=prepared.quota.filter((row,index)=>index<2
+      ||prepared.quota[index-2]!.usedPercent!==row.usedPercent).length;
+    expect(rawKeys.size).toBeGreaterThan(200);
+    expect(rawRuns).toBeGreaterThan(200);
+    let checkpoint:StorageV11HistoryCheckpoint|null=null,analysis:{status?:string}|null=null;
+    for(let pass=0;pass<32&&analysis===null;pass++){
+      const advanced=await advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+        day:scope.day,metric:'fits',nowMs,sourcePin:pin,generationSnapshot:snapshot,
+        closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages:32,maxQuotaRows:200,
+        budget:{remainingQueries:900,deadlineMs:Date.now()+120_000}});
+      if(advanced.status==='complete'){analysis=advanced.analysis as {status?:string};break;}
+      if(!advanced.checkpoint)throw new Error('synthetic dense acquisition stalled');
+      checkpoint=advanced.checkpoint;
+    }
+    // Clustered pools plus endpoint spacing keep the same owner inside the
+    // bound its raw run endpoints would have refused, and it still fits.
+    expect(analysis).not.toBeNull();
+    expect(analysis!.status).toBe('ready');
+  },240_000);
 
   it("bounds a partial v1.1 group by the measured round trip, the window and the meter",()=>{
     const acquisition=(phase:'plan'|'fitability'|'endpoints')=>({version:1,source:'v1.1',day:'2026-09-05',

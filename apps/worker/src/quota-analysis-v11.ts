@@ -28,6 +28,15 @@ import {
   priceChunkUsageRecord,
 } from "./quota-analysis-v1";
 import type { V1ModelCompositionResult } from "./quota-analysis-v1";
+import {
+  addQuotaFragmentValue,
+  addQuotaReset,
+  collapseQuotaEndpointStream,
+  createQuotaResetClusterState,
+  quotaFragmentEligible,
+  quotaResetRepresentativeMs,
+  type QuotaFragmentStats,
+} from "./quota-endpoint-collapse";
 import { sha256Hex } from "./crypto";
 import { parseStoredRecordJson } from "./stored-record";
 import { assertV11SourcePinCurrent, loadV11SourcePin } from "./telemetry-v11-domain";
@@ -241,15 +250,9 @@ const QUOTA_SQL = `WITH markers AS MATERIALIZED (
     SELECT a.*, m.plan_era_key FROM assigned a JOIN markers m ON m.ordinal = a.assigned_era
     WHERE a.is_marker = 0 AND a.plan_type = m.plan_type AND a.plan_variant = m.plan_variant
       AND a.observed_at >= m.lower_bound AND (m.upper_bound IS NULL OR a.observed_at <= m.upper_bound)
-  ), fitable AS (
-    SELECT plan_era_key, window_duration_minutes, resets_at FROM scoped
-    GROUP BY plan_era_key, window_duration_minutes, resets_at
-    HAVING COUNT(DISTINCT used_percent) >= ? AND MAX(used_percent) - MIN(used_percent) >= ?
-  ), surviving AS (
-    SELECT s.* FROM scoped s JOIN fitable f USING (plan_era_key, window_duration_minutes, resets_at)
   ), marked AS (
     SELECT *, LAG(used_percent) OVER win AS previous, LEAD(used_percent) OVER win AS next
-    FROM surviving WINDOW win AS (
+    FROM scoped WINDOW win AS (
       PARTITION BY plan_era_key, window_duration_minutes, resets_at, slot ORDER BY observed_at, id
     )
   ) SELECT occurrence_id, observed_at, provider, account_scope_id, limit_id,
@@ -313,6 +316,53 @@ export function createV11QuotaAcquisitionIdentity(
     windowMinutes: SEVEN_DAY_WINDOW_MINUTES, maxQuotaRows };
 }
 
+/** The direct read returns run endpoints collapsed by the restated instant,
+ * because SQL cannot cluster pools. Re-derive exactly what the paged
+ * acquisition derives: pool hulls over every valid row, the fitable refusal on
+ * the clustered key (the `fitable` stage this SQL no longer carries), then run
+ * collapse and endpoint spacing through the same shared primitives. Bounding
+ * happens before this on the pre-cluster rows, so a very dense owner still
+ * refuses here and reaches the paged acquisition instead. */
+function collapseDirectQuotaRows(rows: readonly QuotaRow[], index: PlanAttributionIndex): QuotaRow[] {
+  interface Candidate { row: QuotaRow; id: number; eraKey: string; resetMs: number; observedAtMs: number }
+  const valid: Candidate[] = [];
+  let id = 0;
+  for (const row of rows) {
+    id += 1;
+    const observedAtMs = Date.parse(row.observed_at), resetMs = Date.parse(row.resets_at);
+    if (!TOKEN.test(row.provider) || row.limit_id !== "codex" || !TOKEN.test(row.plan_type)
+        || !TOKEN.test(row.plan_variant) || !SLOTS.has(row.slot) || resetMs <= observedAtMs
+        || typeof row.used_percent !== "number" || !Number.isFinite(row.used_percent)
+        || row.used_percent < 0 || row.used_percent > 100) continue;
+    const accountScopeId = row.account_scope_id || null;
+    const match = planEraForInterval(index, {
+      contextKey: planAttributionContextKey(row.provider, row.limit_id), accountScopeId, observedAtMs,
+    });
+    if (match.status !== "matched" || match.era.eraKey !== row.plan_era_key
+        || match.era.planType !== row.plan_type || match.era.planVariant !== row.plan_variant) continue;
+    valid.push({ row, id, eraKey: row.plan_era_key, resetMs, observedAtMs });
+  }
+  const clusters = createQuotaResetClusterState();
+  for (const entry of valid) if (!addQuotaReset(clusters, entry.eraKey, entry.resetMs)) return [];
+  const settled = valid.map((entry) => {
+    const representative = quotaResetRepresentativeMs(clusters, entry.eraKey, entry.resetMs);
+    if (representative === null) throw new Error("v11 quota reset cluster missing");
+    return { ...entry, reset: new Date(representative).toISOString() };
+  });
+  const stats = new Map<string, QuotaFragmentStats>();
+  for (const entry of settled) {
+    addQuotaFragmentValue(stats, JSON.stringify([entry.reset, entry.eraKey]), entry.row.used_percent);
+  }
+  const eligible = new Set([...stats].filter(([, stat]) => quotaFragmentEligible(stat)).map(([key]) => key));
+  const candidates = settled
+    .filter((entry) => eligible.has(JSON.stringify([entry.reset, entry.eraKey])))
+    .map((entry) => ({ ...entry, row: { ...entry.row, resets_at: entry.reset } }));
+  return collapseQuotaEndpointStream(candidates,
+    (entry) => JSON.stringify([entry.eraKey, entry.row.slot, entry.reset]),
+    (entry) => ({ id: entry.id, observedAtMs: entry.observedAtMs, usedPercent: entry.row.used_percent }))
+    .map((entry) => entry.row);
+}
+
 async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11AnalysisOptions): Promise<Context | Refusal> {
   const nowMs = options.nowMs ?? Date.now();
   const window = v11AnalysisWindow(pin, nowMs);
@@ -362,11 +412,10 @@ async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11Analy
     if (index.status !== "ready") return refused("plan_attribution_limit_exceeded");
     const result = await db.prepare(typed ? TYPED_V11_QUOTA_SQL : QUOTA_SQL).bind(
       markers(index), ...typedBindings, SEVEN_DAY_WINDOW_MINUTES,
-      window.resetsAtCutoff,
-      QUOTA_CALIBRATION_POLICY.minimumBoundaries, QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, maximum + 1,
+      window.resetsAtCutoff, maximum + 1,
     ).all<QuotaRow>();
     if (result.results.length > maximum) return refused("downsampled_quota_limit_exceeded");
-    quotaRows = result.results;
+    quotaRows = collapseDirectQuotaRows(result.results, index);
   }
   const datasetId = "dataset:v1:" + await sha256Hex(pin.participantId + "|" + pin.generationId);
   const seeds = new Map<string, Seed>();

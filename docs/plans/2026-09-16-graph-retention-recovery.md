@@ -158,13 +158,21 @@ and ~300 ms per D1 round trip, one day-window cost about 40 minutes and the
 | Many groups per claim | `computeV11` loop | After each promoted successor the claim continues from the object in memory while the meter and deadline allow; each phase successor is still promoted before more work |
 | Long-window pass | `STORAGE_ANALYTICS_LONG_CRON` (`*/10 * * * *`), `runStorageAnalyticsPass({graphOnly, graphLeaseMs})` | A graph-only pass with a nine-minute deadline, a 900-statement meter and a twelve-minute claim lease; it skips delivery, erasure jobs, retirement pages and the daily lane, which the per-minute pass keeps; owner-day claims exclude each other, so the two passes work different owner-days |
 
-The private production config for the analytics Worker must carry both crons
-(`* * * * *` and `*/10 * * * *`) and `limits.cpu_ms` 300000; the in-repo
-example config stays as the maintenance provider's strict-JSON contract expects
-(an empty `triggers.crons`, no `limits`; the provider itself pins the minute
-cron), so that provider does not yet deploy the long pass. The binding constraint of a long pass is the 1,000-statement invocation
-cap, not wall time: about 860 statements reach one claim, roughly four minutes
-of reads at production latency.
+Deployed 2026-09-17 01:03 UTC with both triggers registered, the platform
+delivered exactly one invocation at 01:10, 01:20 and 01:30, each carrying the
+minute expression: overlapping Cron Triggers coalesce, so a pass selected by
+cron string never ran. The long pass is therefore selected by the scheduled
+instant (`STORAGE_ANALYTICS_LONG_PASS_MINUTES`: every tenth UTC minute) on the
+single minute trigger, and keeps the bounded delivery phase first so ingestion
+never skips a minute; the second trigger was removed. Note that `wrangler
+versions deploy` does not sync cron triggers; `wrangler triggers deploy` does.
+The private production config carries the minute cron and `limits.cpu_ms`
+300000; the in-repo example config stays as the maintenance provider's
+strict-JSON contract expects (an empty `triggers.crons`, no `limits`; the
+provider itself pins the minute cron). The binding constraint of a long pass is
+the 1,000-statement invocation cap, not wall time: about 725 statements reach
+the graph phase after delivery, roughly four minutes of reads at production
+latency.
 
 Still open: the acquisition checkpoint itself (up to 60,000 quota rows per
 owner) is the structural cost; a compact representation, or a `resets_at`
