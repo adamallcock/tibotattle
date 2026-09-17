@@ -19,7 +19,8 @@ import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { createD1InvocationBudget } from './d1-invocation-budget';
 import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis,type StorageV1HistoryCheckpoint } from './storage-v1-history';
 import { V1_QUOTA_ACQUISITION_VERSION } from './quota-analysis-v1-reader';
-import { advanceStorageV11Analysis,type StorageV11HistoryCheckpoint } from './storage-v11-history';
+import { advanceStorageV11Analysis,STORAGE_V11_PREPARED_FOLD,
+  type StorageV11HistoryCheckpoint } from './storage-v11-history';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
   storageHistoryCheckpointParts,
   type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor,
@@ -34,15 +35,45 @@ export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate
 // a repaired reader from making new resumable progress.
 export const STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':checkpoint-store-3';
 export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':current-fit-checkpoint-2';
-export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-3';
-export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
-export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
+// -4: the v1.1 acquisition can now be settled by folding prepared per-day
+// projections instead of paging the owner's whole window once per sub-phase.
+// The RESULT identity is deliberately unchanged, because the fold is proven
+// byte-identical by the parity oracle and an identical result must not retire
+// a computed day; the checkpoint FORMAT is what a resumed acquisition would
+// mix, so only this separate namespace moves. In-flight parts under -3 are
+// abandoned, which is the documented purpose of this namespace.
+export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-4';
+/** The v1.1 checkpoint namespaces, as a pure rule so both branches can be
+ * proven rather than described.
+ *
+ * The metrics share one usage reduction until the prepared-day fold is on.
+ * Once it is, the model metric runs that reduction WITHOUT its scalar half, so
+ * a model successor is not one a fits claim may resume and the two must not
+ * share a key. Until then they still run the identical reduction, and splitting
+ * would only throw away the reuse a fits claim and a model claim get from one
+ * shared successor — doubling v1.1 usage checkpoint work in exactly the
+ * configuration this change is meant to deploy inert. So the split is gated on
+ * the same flag as the fold, and the shared base is the live method while it is
+ * off. Switching the flag abandons in-flight v1.1 checkpoints, which is already
+ * what switching the fold on does. */
+export function storageGraphV11CheckpointMethods(foldEnabled: boolean): {
+  fits: string; model: string; live: readonly string[];
+} {
+  const fits = foldEnabled ? STORAGE_GRAPH_V11_CHECKPOINT_METHOD + ':fits-1'
+    : STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
+  const model = foldEnabled ? STORAGE_GRAPH_V11_CHECKPOINT_METHOD + ':model-1'
+    : STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
+  return { fits, model, live: [...new Set([fits, model])] };
+}
+const V11_CHECKPOINT_METHODS = storageGraphV11CheckpointMethods(STORAGE_V11_PREPARED_FOLD);
+export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD = V11_CHECKPOINT_METHODS.fits;
+export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = V11_CHECKPOINT_METHODS.model;
 /** Every checkpoint method a live reader can build a key with. Retirement
  * reclaims any stage under another method on sight, so a new method must be
  * registered here before a reader starts writing under it. */
 export const STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS = Object.freeze([
   STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD, STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
-  STORAGE_GRAPH_V11_CHECKPOINT_METHOD] as const);
+  ...V11_CHECKPOINT_METHODS.live]);
 // Execution-only revision for the single optimistic direct historical read.
 // This is deliberately absent from result/checkpoint identities: a reader fix
 // may reopen one direct attempt without changing the analysis semantics.
@@ -224,13 +255,22 @@ export async function storageGraphDependencyDigest(options:{
 
 async function storageGraphCheckpointDependencyDigest(options:{
  authority:Pick<StorageCommunityAuthority,'sourceId'|'sourceNamespace'>;ownerDigest:string;
- source:StorageGraphSource;day:string;dependency:unknown;
+ source:StorageGraphSource;metric:'fits'|'model';day:string;dependency:unknown;
 }):Promise<string>{
  const history=modelHistoryWindow(options.day);
  // Only v1.1 owners hold this key, so the acquisition version is always part
- // of it: a resumed checkpoint must never mix two acquisition contracts.
+ // of it: a resumed checkpoint must never mix two acquisition contracts. The
+ // usage reduction is no longer shared between the metrics — the model metric
+ // runs it without the scalar half — so the metric is part of the identity as
+ // well as of the method, and neither metric can load the other's successor.
  return sha256Hex(canonicalJson([options.authority.sourceId,options.authority.sourceNamespace,
-  options.ownerDigest,options.source,'shared-v11-usage',history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency,
+  options.ownerDigest,options.source,
+  // Gated on the same flag as the method, so the deploy is inert: while the
+  // fold is off the metrics run the identical reduction and keep sharing one
+  // successor, and only the fold's model-only mode makes them incompatible.
+  STORAGE_V11_PREPARED_FOLD
+    ?(options.metric==='fits'?'v11-usage:fits-1':'v11-usage:model-1'):'shared-v11-usage',
+  history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency,
   V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]));
 }
 
@@ -278,7 +318,7 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
   const dependencyDigest=await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest,
     source,metric:options.metric,day:history.day,dependency});
   const checkpointDependencyDigest=source==='v1.1'?await storageGraphCheckpointDependencyDigest({authority,
-    ownerDigest:owner.ownerDigest,source,day:history.day,dependency}):dependencyDigest;
+    ownerDigest:owner.ownerDigest,source,metric:options.metric,day:history.day,dependency}):dependencyDigest;
   if(!await storageCommunityCalculationAuthorityIsCurrent(sourceDb,authority))throw scopeChanged();
   return {authority,owner:owner as StorageGraphScope['owner'],source,pin:loaded.sourcePin,
     day:history.day,fixedNow:history.fixedNow,metric:options.metric,dependencyDigest,checkpointDependencyDigest};
@@ -306,7 +346,7 @@ export async function captureSelectedStorageGraphScope(sourceDb:D1Database,optio
  const dependencyDigest=await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest,
   source:'v1.1',metric:options.metric,day:history.day,dependency:rows});
  const checkpointDependencyDigest=await storageGraphCheckpointDependencyDigest({authority,
-  ownerDigest:owner.ownerDigest,source:'v1.1',day:history.day,dependency:rows});
+  ownerDigest:owner.ownerDigest,source:'v1.1',metric:options.metric,day:history.day,dependency:rows});
  const pin:V11SourcePin={source:'v1.1',participantId:snapshot.participantId,generationId:snapshot.generationId,
   fromDay:snapshot.fromDay,throughDay:snapshot.throughDay,inputRevision:snapshot.inputRevision,
   mutationEpoch:authority.sourceEpoch,fingerprint:snapshot.fingerprint};

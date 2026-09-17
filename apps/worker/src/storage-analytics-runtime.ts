@@ -8,6 +8,8 @@ import { advanceLegacyStorageAcknowledgement } from './legacy-storage-journal';
 import { advanceNextStorageCommunityDaily, retireStorageCommunityDailyPage } from './storage-community-daily';
 import { advanceStorageCommunityGraphWork, type StorageGraphWorkProgress } from './storage-community-graph-work';
 import { retireStorageGraphPage } from './storage-graph-retirement';
+import { advanceGraphDayProjectionLane, retireGraphDayProjectionPage,
+ type GraphDayProjectionBuild } from './graph-day-projection';
 import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview,
  retireStorageCommunityGraphPublications, storageCommunityGraphPreviewReadyHint } from './storage-community-graph-publication';
 import { readCollectionControls } from './collection-controls';
@@ -25,6 +27,26 @@ const invalid=()=>new Error('STORAGE_ANALYTICS_CONTRACT_UNAVAILABLE');
  * reserves only one small group plus the kernel's continue guard; a floor sized
  * for the other pass would end its window with most of the meter unspent. */
 const GRAPH_LANE_ADMISSION_QUERIES=550,GRAPH_ONLY_ADMISSION_QUERIES=120;
+/** The prepared-graph-day builder's whole allowance. It is a small carve-out
+ * on purpose: the lane prepares reusable input for a fold that is not live yet,
+ * so it must never reduce the graph lane below its 550-statement floor and must
+ * never open inside a graph-only long pass, which exists to give ONE resumable
+ * owner-day claim a whole window. */
+const GRAPH_DAY_PROJECTION_LANE_QUERIES=60;
+/** The lane's allowance covers BOTH databases. The build reads the source,
+ * which the lane's own sub-meter does not wrap, so half the carve-out is
+ * reserved for it explicitly; otherwise the build's pages, its snapshot
+ * resolution and its fences would be drawn straight from the outer meter and
+ * could eat the graph lane's floor on the next step. */
+const GRAPH_DAY_PROJECTION_SOURCE_SHARE=2;
+/** Deployment switch for the prepared-graph-day builder. Default OFF: the fold
+ * does not read these rows yet, so building them must be an explicit operator
+ * decision and not a consequence of deploying this code. The pass option is the
+ * second, independent gate. */
+export function graphDayProjectionBuildEnabled(env:unknown):boolean{
+ if(!env||typeof env!=='object')return false;
+ return Reflect.get(env,'GRAPH_DAY_PROJECTION_BUILD')==='enabled';
+}
 const SOURCE_IDENTITY_SQL=`SELECT s.source_id,a.source_namespace AS v1_namespace,b.source_namespace AS v11_namespace
   FROM storage_source_state s JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
   JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 WHERE s.singleton=1`;
@@ -220,6 +242,12 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  /** Graph claim lease. The caller sets it above this pass's own deadline so a
   * concurrent scheduled pass sees the owner-day as busy for the whole window. */
  graphLeaseMs?:number;
+ /** Prepared-graph-day builder lane. BOTH gates must be open: the deployment
+  * switch (`graphDayProjectionBuildEnabled`) and this pass option, which also
+  * carries the day builder. With either absent the lane opens no statement. */
+ buildGraphDayProjections?:boolean;
+ graphDayProjectionBuild?:GraphDayProjectionBuild;
+ graphDayProjectionFromDay?:string;
 }):Promise<StorageAnalyticsPass> {
  const maxSteps=options.maxSteps??8,deadlineMs=options.deadlineMs??Date.now()+20_000;
  if(!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||!Number.isFinite(deadlineMs)
@@ -237,7 +265,10 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    // scheduled attempt can recover it.
    ||(options.graphLeaseMs!==undefined&&(!Number.isSafeInteger(options.graphLeaseMs)||options.graphLeaseMs<60_000
     ||options.graphLeaseMs>15*60_000||options.graphLeaseMs<=deadlineMs-Date.now()))
-   ||(options.skipV1PrefixProbe!==undefined&&typeof options.skipV1PrefixProbe!=='boolean'))throw invalid();
+   ||(options.skipV1PrefixProbe!==undefined&&typeof options.skipV1PrefixProbe!=='boolean')
+   ||(options.buildGraphDayProjections!==undefined&&typeof options.buildGraphDayProjections!=='boolean')
+   ||(options.graphDayProjectionBuild!==undefined&&typeof options.graphDayProjectionBuild!=='function')
+   ||(options.graphDayProjectionFromDay!==undefined&&typeof options.graphDayProjectionFromDay!=='string'))throw invalid();
  const graphLaneFirst=options.graphLaneFirst??Math.floor(Date.now()/60_000)%2===1;
  const graphAdmission=options.graphOnly?GRAPH_ONLY_ADMISSION_QUERIES:GRAPH_LANE_ADMISSION_QUERIES;
  const meter=createD1InvocationBudget(options.maxQueries??900);
@@ -272,6 +303,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    await retireV11DailyProjectionPage(scoped.target,options.sourceId);
    await retireV1DailyProjectionPage(scoped.target,options.sourceId);
    await retireStorageGraphPage(scoped.target,options.sourceId);
+   await retireGraphDayProjectionPage(scoped.target,options.sourceId);
    await retireStorageCommunityDailyPage(scoped);
    await retireStorageCommunityGraphPublications(scoped);
    return result('deferred','capacity');
@@ -300,7 +332,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   // pass continues with the other lanes. Budget and deadline exhaustion keep
   // their deferred semantics, so one failing owner-day or one malformed row
   // can no longer stall daily activity and graph work for every minute.
-  let graphExhausted=false;
+  let graphExhausted=false,projectionExhausted=false;
   const laneFailure=(stage:'daily_publish'|'graph_work',error:unknown):void=>{
    if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError)throw error;
    const fields=caughtStorageGraphFailureFields(stage,error);
@@ -348,7 +380,15 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    const v11=options.graphOnly?idlePage:await retireV11DailyProjectionPage(scoped.target,options.sourceId);
    const v1=options.graphOnly?idlePage:await retireV1DailyProjectionPage(scoped.target,options.sourceId);
    const retiredGraph=options.graphOnly?idlePage:await retireStorageGraphPage(scoped.target,options.sourceId);
-   let publicIdle=true;
+   // The prepared-graph-day sweep costs statements in the hot loop, so it runs
+   // only where its rows can exist: with the builder lane switched on. The two
+   // paths that must never depend on that switch keep it unconditional —
+   // owner erasure, which is a privacy guarantee, and the capacity branch,
+   // which must be able to reclaim space whatever the lane is doing.
+   const projectionLane=options.buildGraphDayProjections===true&&!options.graphOnly;
+   const retiredProjection=projectionLane
+    ?await retireGraphDayProjectionPage(scoped.target,options.sourceId):idlePage;
+   let publicIdle=true,graphRan=false;
    if(options.publishCommunity && meter.remainingQueries>=100 && Date.now()<deadlineMs
      && (await readCollectionControls(scoped.source)).publication) {
     // Recover several already prepared days without consuming the graph's
@@ -356,7 +396,6 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     // Stale published heads receive three of four selection slots while a
     // durable queue exists, and both selectors fall back to the other lane
     // when their preferred lane is empty.
-    let graphRan=false;
     const runDailyLane=async():Promise<boolean>=>{
      const dailyAllowance=Math.min(90,Math.max(0,meter.remainingQueries-(graphRan?100:560)));
      let dailyIdle=false;
@@ -417,7 +456,43 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     else if(graphLaneFirst){const graphIdle=await runGraphLane();const dailyIdle=await runDailyLane();publicIdle=dailyIdle&&graphIdle;}
     else {const dailyIdle=await runDailyLane();const graphIdle=await runGraphLane();publicIdle=dailyIdle&&graphIdle;}
    }
-   if(step.state==='idle'&&v11.state==='idle'&&v1.state==='idle'&&retiredGraph.state==='idle'&&publicIdle)
+   // The prepared-graph-day builder. It is the last lane on purpose: it prepares
+   // reusable input for a fold that is not live yet, so it may only spend what
+   // the publication lanes left, may never open in a graph-only long pass, and
+   // reserves the graph lane's own admission floor whenever that lane has not
+   // already run in this iteration.
+   let projectionIdle=true;
+   if(projectionLane&&options.graphDayProjectionBuild&&!projectionExhausted&&Date.now()<deadlineMs){
+    const floor=(graphRan?0:GRAPH_LANE_ADMISSION_QUERIES)+100;
+    const allowance=Math.min(GRAPH_DAY_PROJECTION_LANE_QUERIES,Math.max(0,meter.remainingQueries-floor));
+    const sourceQueries=Math.floor(allowance/GRAPH_DAY_PROJECTION_SOURCE_SHARE);
+    const targetQueries=allowance-sourceQueries;
+    if(targetQueries>=8&&sourceQueries>=8&&deadlineMs-Date.now()>=5_000){
+     const laneMeter=createD1InvocationBudget(targetQueries);
+     try{
+      const lane=await advanceGraphDayProjectionLane({target:laneMeter.wrap(scoped.target),
+       sourceId:options.sourceId,build:options.graphDayProjectionBuild,deadlineMs,sourceQueries,
+       remainingQueries:laneMeter.remainingQueries,
+       ...(options.graphDayProjectionFromDay===undefined?{}:{fromDay:options.graphDayProjectionFromDay})});
+      projectionIdle=lane.state==='idle';
+     }catch(error){
+      if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError){
+       projectionIdle=false;
+      }else{
+       // Isolated exactly like the other lanes: a failing builder records its
+       // closed stage, stops for the rest of this pass, and cannot stall
+       // delivery, the daily lane or the graph lane.
+       projectionExhausted=true;
+       console.log(JSON.stringify({event:'storage_analytics_lane_failure',lane:'graph_day_projection',
+        phase:null,reason:'graph_day_projection_failure',detail:storageGraphFailureDetail(error)??null}));
+      }
+     }
+     // No allowance and no time is not pending work: reporting it as busy would
+     // keep an under-budget pass looping until it burned its step limit.
+    }
+   }
+   if(step.state==='idle'&&v11.state==='idle'&&v1.state==='idle'&&retiredGraph.state==='idle'
+     &&retiredProjection.state==='idle'&&publicIdle&&projectionIdle)
     return graphOnlyStalled()?result('deferred','step_limit'):result('idle','complete');
   }
   return graphOnlyStalled()?result('deferred','step_limit'):result('progress','step_limit');

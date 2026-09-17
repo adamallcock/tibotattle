@@ -2,7 +2,11 @@ import { beforeEach,afterEach,describe,expect,it,vi } from 'vitest';
 import { runStorageAnalyticsPass } from '../src/storage-analytics-runtime';
 import { runStorageAnalyticsSchedule,STORAGE_ANALYTICS_LONG_PASS_MINUTES,STORAGE_ANALYTICS_MINUTE_CRON,
  type StorageAnalyticsWorkerEnv } from '../src/storage-analytics-worker';
-vi.mock('../src/storage-analytics-runtime',()=>({runStorageAnalyticsPass:vi.fn()}));
+vi.mock('../src/storage-analytics-runtime',()=>({runStorageAnalyticsPass:vi.fn(),
+ // The scheduler reads the builder's deployment switch from this module; the
+ // mock keeps the real predicate so these passes stay builder-free by default.
+ graphDayProjectionBuildEnabled:(env:unknown)=>!!env&&typeof env==='object'
+  &&Reflect.get(env,'GRAPH_DAY_PROJECTION_BUILD')==='enabled'}));
 const pass=vi.mocked(runStorageAnalyticsPass);
 const log=vi.fn(),errorLog=vi.fn();
 const result={state:'progress' as const,reason:'step_limit' as const,steps:1,recordsRead:0,queriesUsed:0,dailyPublications:0,graphCalculations:0};

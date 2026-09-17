@@ -1,3 +1,6 @@
+// Type-only: the artifact module reads this one's bounds, so a runtime import
+// back would be an initialization cycle.
+import type { GraphDayUsageFragments } from "./graph-day-projection-values";
 import {
   MODEL_COMPOSITION_POLICY,
   PLAN_ATTRIBUTION_POLICY,
@@ -37,7 +40,7 @@ import {
   quotaResetRepresentativeMs,
   type QuotaFragmentStats,
 } from "./quota-endpoint-collapse";
-import { invalidV11QuotaAcquisition } from "./quota-analysis-v11-reader";
+import { assertV11PreparedDayCoverage,invalidV11QuotaAcquisition } from "./quota-analysis-v11-reader";
 import { sha256Hex } from "./crypto";
 import { parseStoredRecordJson } from "./stored-record";
 import { assertV11SourcePinCurrent, loadV11SourcePin } from "./telemetry-v11-domain";
@@ -53,6 +56,7 @@ import {
   validateV11CompletedQuotaAcquisition,
 } from "./quota-analysis-v11-reader";
 import type {
+  V11AcquiredQuotaRow,
   V11CompletedQuotaAcquisition,
   V11QuotaAcquisitionIdentity,
 } from "./quota-analysis-v11-reader";
@@ -105,6 +109,16 @@ export interface V11AnalysisOptions {
    * is skipped; the caller remains responsible for source-pin fences and any
    * resumable checkpoint durability. */
   quotaAcquisition?: V11CompletedQuotaAcquisition;
+  /** Compute the scalar fit half of the usage reduction. Default true.
+   *
+   * `false` is the model-only mode the v1 historical path already takes
+   * (`quota-analysis-v1.ts`, `scalarRequested` -> `scalarReason` -> prepared
+   * bins): the traversal still resolves sessions and prices events, but it
+   * builds no `usageScalarBuckets` and no attribution hazards, which is where
+   * essentially all of a v1.1 usage checkpoint's bytes are. The model half is
+   * untouched, so a `model` result computed either way is identical; a `fits`
+   * result computed this way is a refusal and must never be published. */
+  scalarRequested?: boolean;
 }
 
 export interface V11AnalysisWindow {
@@ -134,7 +148,7 @@ interface QuotaRow extends PlanRow {
   plan_era_key: string;
 }
 
-interface UsageRow {
+export interface UsageRow {
   occurrence_id: string;
   observed_at: string;
   provider: string;
@@ -852,6 +866,11 @@ export interface V11UsageReductionCheckpoint {
   rowsRead: number;
   complete: boolean;
   commonRefusal: string | null;
+  /** Whether this reduction computed the scalar half at all. It is part of the
+   * checkpoint because the fit and model metrics share one usage reduction: a
+   * successor staged without the scalar half is not a successor a `fits` claim
+   * may resume, and a resume that disagrees fails closed. */
+  scalarReduced: boolean;
   scalarRefusal: string | null;
   modelRefusal: string | null;
   previous: Array<{ key: string; time: number; scope: string | null }>;
@@ -905,8 +924,13 @@ export function validateV11UsageReductionCheckpoint(value: unknown): value is V1
   const row = value as V11UsageReductionCheckpoint;
   if (Object.keys(row).sort().join(",") !== ["attributionUnresolved","commonRefusal","complete","cursorOccurrence",
     "cursorTime","dayIndex","days","hazards","modelCosts","modelRefusal","poisoned","previous","rowsRead",
-    "scalarBuckets","scalarRefusal","unpricedUsageEventCount","usageEventCount","version","identity"].sort().join(",")
+    "scalarBuckets","scalarReduced","scalarRefusal","unpricedUsageEventCount","usageEventCount","version",
+    "identity"].sort().join(",")
       || row.version !== 1 || !row.identity || typeof row.identity!=="object"
+      || typeof row.scalarReduced !== "boolean"
+      // A model-only reduction stages neither half of the scalar state, so a
+      // successor that carries either was not built in that mode.
+      || (!row.scalarReduced && (row.scalarBuckets?.length > 0 || row.hazards?.length > 0))
       || !Array.isArray(row.days) || row.days.length > MAX_USAGE_DAYS
       || row.days.some((day, index) => !/^\d{4}-\d{2}-\d{2}$/u.test(day)
         || index > 0 && row.days[index - 1]! >= day)
@@ -979,8 +1003,21 @@ async function usageDays(db: D1Database, context: Context): Promise<string[] | R
   return rows.length > MAX_USAGE_DAYS ? refused("usage_day_limit_exceeded") : rows.map(row => row.observed_day);
 }
 
-async function usageEvent(context: Context, previous: Map<string, { time: number; scope: string | null }>,
-  row: UsageRow): Promise<UsageEvidence | Refusal | null> {
+/** Everything about one usage row that is decided by the row itself, in the
+ * exact order the reduction decides it: provider token, stored record,
+ * attribution, scope, instant, session admission, price. The order is the
+ * contract — a row that both exceeds the session bound and cannot be priced
+ * refuses rather than being skipped — so it lives here once and every caller
+ * drives it, rather than being restated anywhere else.
+ *
+ * `session` is the one stateful step. It is a callback because the reduction
+ * admits sessions against its own window-wide map while a prepared day admits
+ * them against its own day-local one; it returns a refusal to reject the row
+ * at exactly this point, and nothing otherwise. */
+async function usageRowEvidence(row: UsageRow,
+  session: (sessionKey: string | null, observedAtMs: number, scope: string | null) => Promise<Refusal | null>,
+): Promise<{ attribution: TelemetryV11Attribution; scope: string | null; end: number;
+  priced: NonNullable<ReturnType<typeof priceChunkUsageRecord>> } | Refusal | null> {
   if (!TOKEN.test(row.provider)) return null;
   const record = parseStoredRecordJson(row.record_json);
   if (!record) return refused("invalid_attribution_record");
@@ -990,24 +1027,127 @@ async function usageEvent(context: Context, previous: Map<string, { time: number
   const scope = attribution.accountBasis === "same_source" ? attribution.accountTrackId : null;
   const end = Date.parse(row.observed_at);
   if (!Number.isSafeInteger(end)) return refused("invalid_attribution_record");
-  const session = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
-  const prior = session === null ? undefined : previous.get(session);
-  if (session !== null) {
-    if (!previous.has(session) && previous.size >= MAX_SESSIONS) return refused("session_interval_scope_limit_exceeded");
-    previous.set(session, { time: end, scope });
-  }
+  const sessionKey = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
+  const rejected = await session(sessionKey, end, scope);
+  if (rejected) return rejected;
   const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
   if (priced === null) return null;
+  return { attribution, scope, end, priced };
+}
+
+/** One usage row reduced to what a prepared day stores, or the reason it is
+ * not stored at all. Everything here is decided by the row; `accountBreak` and
+ * the window era are not, and are left to the day builder and the fold.
+ *
+ * The session is surfaced only as an opaque digest the caller computes, so no
+ * raw `session_uuid` can reach a stored artifact through this boundary. */
+export interface V11PreparedUsageDayRow {
+  readonly provider: string;
+  readonly accountScopeId: string | null;
+  readonly planBasis: TelemetryV11Attribution["planBasis"];
+  readonly planType: string | null;
+  readonly planEraId: string | null;
+  readonly observedAtMs: number;
+  /** Null when the row carries no session; such a row can never break account. */
+  readonly sessionDigest: string | null;
+  /** Null unless the event priced fully. A null model carries no cost and
+   * poisons its whole model-composition bin. */
+  readonly model: string | null;
+  readonly costNanousd: number;
+}
+/** The carry a row advanced even though the reduction stored nothing for it.
+ * `usagePrevious` is updated at the session step, before pricing, so a row the
+ * reduction drops still moves its session's tail — and the day's carry-out has
+ * to move with it, or the fold decides the next day's first account break from
+ * a stale scope and disagrees with the streaming path exactly once per affected
+ * session boundary. */
+export interface V11PreparedUsageDaySession {
+  readonly sessionDigest: string;
+  readonly observedAtMs: number;
+  readonly accountScopeId: string | null;
+}
+export type V11PreparedUsageDayResult =
+  | { status: "row"; row: V11PreparedUsageDayRow }
+  /** `session` is non-null exactly when the row reached the session step
+   * carrying a session, which is exactly when it advanced the carry. */
+  | { status: "skipped"; session: V11PreparedUsageDaySession | null }
+  | { status: "refused"; reason: string };
+
+/** Map one page row from `readTypedV11UsageAnalysisPage` for a prepared day.
+ *
+ * `sessionDigest` is the caller's own opaque derivation over the provider and
+ * the raw session identifier; it is awaited at exactly the point the reduction
+ * admits a session, and `sessions` is the caller's day-local admission set, so
+ * the bound is applied in the same place with the same order. */
+export async function v11PreparedUsageDayRow(row: UsageRow,
+  sessionDigest: (provider: string, sessionUuid: string) => Promise<string>,
+  sessions: Set<string> = new Set(), maxSessions = MAX_SESSIONS,
+): Promise<V11PreparedUsageDayResult> {
+  let digest: string | null = null, touched: V11PreparedUsageDaySession | null = null;
+  const evidence = await usageRowEvidence(row, async (sessionKey, observedAtMs, accountScopeId) => {
+    if (sessionKey === null) return null;
+    digest = await sessionDigest(row.provider, row.session_uuid!);
+    if (!sessions.has(digest) && sessions.size >= maxSessions) {
+      return refused("session_interval_scope_limit_exceeded");
+    }
+    sessions.add(digest);
+    touched = { sessionDigest: digest, observedAtMs, accountScopeId };
+    return null;
+  });
+  if (evidence === null) return { status: "skipped", session: touched };
+  if ("status" in evidence) return { status: "refused", reason: evidence.reason };
+  const fully = evidence.priced.pricingStatus === "fully_priced";
+  return { status: "row", row: { provider: row.provider, accountScopeId: evidence.scope,
+    planBasis: evidence.attribution.planBasis, planType: evidence.attribution.planType,
+    planEraId: evidence.attribution.planEraId, observedAtMs: evidence.end, sessionDigest: digest,
+    model: fully ? evidence.priced.modelId ?? "unknown" : null,
+    costNanousd: fully ? evidence.priced.costNanousd : 0 } };
+}
+
+/** The window era one usage event resolves to, or null when it resolves to
+ * none: an account break, a plan the era contradicts, or no covering era. The
+ * only window-scoped decision in a usage event, held here so the streaming
+ * reduction and the prepared-day fold cannot decide it differently. */
+export function v11UsageEventEra(index: PlanAttributionIndex, event: {
+  provider: string; accountScopeId: string | null;
+  /** Nullable because a prepared day carries the anchor's basis, which a
+   * malformed source may leave unstated; the comparisons below treat it as
+   * neither conflicted nor same-source, exactly as the stream does. */
+  planBasis: TelemetryV11Attribution["planBasis"] | null;
+  planType: string | null; planEraId: string | null;
+  observedAtMs: number; accountBreak: boolean; priorObservedAtMs?: number;
+}): string | null {
+  const match = planEraForInterval(index, { contextKey: planAttributionContextKey(event.provider, "codex"),
+    accountScopeId: event.accountScopeId, observedAtMs: event.observedAtMs,
+    ...(event.priorObservedAtMs !== undefined ? { intervalStartMs: event.priorObservedAtMs } : {}) });
+  const planConflict = event.planBasis === "conflicted"
+    || match.status === "matched" && event.planBasis === "same_source_occurrence"
+      && event.planType !== match.era.planType
+    || match.status === "matched" && event.planEraId !== null
+      && event.planEraId !== match.era.continuityId;
+  return !event.accountBreak && !planConflict && match.status === "matched" ? match.era.eraKey : null;
+}
+
+async function usageEvent(context: Context, previous: Map<string, { time: number; scope: string | null }>,
+  row: UsageRow): Promise<UsageEvidence | Refusal | null> {
+  let prior: { time: number; scope: string | null } | undefined;
+  const evidence = await usageRowEvidence(row, async (session, end, scope) => {
+    if (session === null) return null;
+    prior = previous.get(session);
+    if (!previous.has(session) && previous.size >= MAX_SESSIONS) {
+      return refused("session_interval_scope_limit_exceeded");
+    }
+    previous.set(session, { time: end, scope });
+    return null;
+  });
+  if (evidence === null) return null;
+  if ("status" in evidence) return evidence;
+  const { attribution, scope, end, priced } = evidence;
   const accountBreak = prior !== undefined && prior.scope !== scope;
-  const match = planEraForInterval(context.index, { contextKey: planAttributionContextKey(row.provider, "codex"),
-    accountScopeId: scope, observedAtMs: end, ...(prior ? { intervalStartMs: prior.time } : {}) });
-  const planConflict = attribution.planBasis === "conflicted"
-    || match.status === "matched" && attribution.planBasis === "same_source_occurrence"
-      && attribution.planType !== match.era.planType
-    || match.status === "matched" && attribution.planEraId !== null
-      && attribution.planEraId !== match.era.continuityId;
   return { provider: row.provider, scope, accountBreak,
-    eraKey: !accountBreak && !planConflict && match.status === "matched" ? match.era.eraKey : null,
+    eraKey: v11UsageEventEra(context.index, { provider: row.provider, accountScopeId: scope,
+      planBasis: attribution.planBasis, planType: attribution.planType, planEraId: attribution.planEraId,
+      observedAtMs: end, accountBreak, ...(prior ? { priorObservedAtMs: prior.time } : {}) }),
     interval: { start: prior?.time ?? end, end }, priced };
 }
 
@@ -1018,12 +1158,21 @@ interface UsageReductionRuntime {
   modelRefusal:string|null;
 }
 
+/** Whether the model composition is computable at all for this window, and why
+ * not when it is not. The metric is admitted only for one era, one account and
+ * one plan, which is exactly what makes a prepared-day fold of it exact: that
+ * single era is unbounded in both directions, so no event's era depends on the
+ * interval it is matched over and a 2-hour cell can resolve it once. */
+export function v11UsageModelRefusal(index:PlanAttributionIndex,seedCount:number):string|null{
+ const plans=new Set(index.eras.map(era=>era.planType));
+ const accounts=new Set(index.eras.map(era=>era.accountScopeId));
+ return plans.size>1||index.conflicts.length>0?"multi_plan_window_unsupported"
+  :accounts.size>1?"multi_account_window_unsupported":index.eras.length>1?"multi_era_window_unsupported"
+  :seedCount===0?"supported_quota_track_unavailable":null;
+}
+
 function usageReductionRuntime(context:Context):UsageReductionRuntime{
- const plans=new Set(context.index.eras.map(era=>era.planType));
- const accounts=new Set(context.index.eras.map(era=>era.accountScopeId));
- const modelRefusal=plans.size>1||context.index.conflicts.length>0?"multi_plan_window_unsupported"
-  :accounts.size>1?"multi_account_window_unsupported":context.index.eras.length>1?"multi_era_window_unsupported"
-  :context.seeds.size===0?"supported_quota_track_unavailable":null;
+ const modelRefusal=v11UsageModelRefusal(context.index,context.seeds.size);
  return {knownTargets:new Set([...context.seeds.values()].filter(seed=>seed.accountScopeId!==null).map(seed=>seed.provider)),
   unknownTargets:new Set([...context.seeds.values()].filter(seed=>seed.accountScopeId===null).map(seed=>seed.provider)),
   modelSeed:context.seeds.values().next().value as Seed|undefined,modelRefusal};
@@ -1063,35 +1212,167 @@ function reduceScalar(context: Context, runtime:UsageReductionRuntime,state: V11
   }
 }
 
-function reduceModel(context: Context, runtime:UsageReductionRuntime,state: V11UsageReductionCheckpoint,
-  costs: Map<string, { observedAtMs: number; model: string; costNanousd: number }>, poisoned: Set<number>,
-  event: UsageEvidence): void {
+/** The model half of a usage reduction, as its own value. The streaming
+ * traversal and the prepared-day fold both accumulate into this, so the two
+ * cannot decide poisoning, counting, attribution or a refusal differently. */
+export interface V11UsageModelState {
+  modelRefusal: string | null;
+  attributionUnresolved: boolean;
+  usageEventCount: number;
+  unpricedUsageEventCount: number;
+  costs: Map<string, { observedAtMs: number; model: string; costNanousd: number }>;
+  poisoned: Set<number>;
+}
+export interface V11UsageModelSeed {
+  provider: string;
+  accountScopeId: string | null;
+  planEraKey: string;
+}
+export function createV11UsageModelState(): V11UsageModelState {
+  return { modelRefusal: null, attributionUnresolved: false, usageEventCount: 0,
+    unpricedUsageEventCount: 0, costs: new Map(), poisoned: new Set() };
+}
+
+/** Offer one contribution to the model composition.
+ *
+ * `events` is what the contribution stands for: one streamed event, or a
+ * prepared cell's `eventCount`. Every decision below is constant across a
+ * prepared cell by construction — one bin, one attribution, one account-break
+ * state, one model — so a cell takes exactly the branch each of its events
+ * would have taken, and the counters and the cost are additive.
+ *
+ * The cost bound is the one place the two differ in form: a stream checks each
+ * event and then the running total, a fold checks the cell's sum and then the
+ * running total. Costs are non-negative, so a sum inside the bound implies
+ * every event was, and a sum beyond it is beyond the running total too — the
+ * same refusal either way, and a refusal makes the counters unobservable. */
+export function reduceV11UsageModelEvent(state: V11UsageModelState, seed: V11UsageModelSeed | null,
+  runtimeRefusal: string | null, event: { provider: string; scope: string | null; accountBreak: boolean;
+    eraKey: string | null; observedAtMs: number; fullyPriced: boolean; model: string;
+    costNanousd: number; events: number }): void {
   if (state.modelRefusal) return;
-  const seed=runtime.modelSeed;
-  if(runtime.modelRefusal||!seed){state.modelRefusal=runtime.modelRefusal??"supported_quota_track_unavailable";return;}
+  if (runtimeRefusal || !seed) { state.modelRefusal = runtimeRefusal ?? "supported_quota_track_unavailable"; return; }
   if (event.provider !== seed.provider) return;
   if (event.scope !== null && seed.accountScopeId !== null && event.scope !== seed.accountScopeId
       && !event.accountBreak && event.eraKey !== null) return;
   if (event.scope !== seed.accountScopeId || event.accountBreak || event.eraKey !== seed.planEraKey) {
     state.attributionUnresolved = true; return;
   }
-  const observedAtMs = Math.floor(event.interval.end / MODEL_COMPOSITION_POLICY.grainMs) * MODEL_COMPOSITION_POLICY.grainMs;
-  if (event.priced.pricingStatus !== "fully_priced") {
-    poisoned.add(observedAtMs); state.unpricedUsageEventCount += 1;
-    if(poisoned.size>MAX_USAGE_BUCKETS)state.modelRefusal="reduced_usage_limit_exceeded";
+  const observedAtMs = Math.floor(event.observedAtMs / MODEL_COMPOSITION_POLICY.grainMs)
+    * MODEL_COMPOSITION_POLICY.grainMs;
+  if (!event.fullyPriced) {
+    state.poisoned.add(observedAtMs); state.unpricedUsageEventCount += event.events;
+    if (state.poisoned.size > MAX_USAGE_BUCKETS) state.modelRefusal = "reduced_usage_limit_exceeded";
     return;
   }
-  state.usageEventCount += 1;
-  if (!Number.isSafeInteger(event.priced.costNanousd) || event.priced.costNanousd > 90_000_000_000_000) {
+  state.usageEventCount += event.events;
+  if (!Number.isSafeInteger(event.costNanousd) || event.costNanousd > 90_000_000_000_000) {
     state.modelRefusal = "usage_cost_limit_exceeded"; return;
   }
-  const model = event.priced.modelId ?? "unknown", key = JSON.stringify([observedAtMs, model]);
-  const existing = costs.get(key);
+  const key = JSON.stringify([observedAtMs, event.model]);
+  const existing = state.costs.get(key);
   if (existing) {
-    existing.costNanousd += event.priced.costNanousd;
-    if (!Number.isSafeInteger(existing.costNanousd) || existing.costNanousd > 90_000_000_000_000) state.modelRefusal = "usage_cost_limit_exceeded";
-  } else costs.set(key, { observedAtMs, model, costNanousd: event.priced.costNanousd });
-  if (costs.size > MAX_USAGE_BUCKETS) state.modelRefusal = "reduced_usage_limit_exceeded";
+    existing.costNanousd += event.costNanousd;
+    if (!Number.isSafeInteger(existing.costNanousd) || existing.costNanousd > 90_000_000_000_000) {
+      state.modelRefusal = "usage_cost_limit_exceeded";
+    }
+  } else state.costs.set(key, { observedAtMs, model: event.model, costNanousd: event.costNanousd });
+  if (state.costs.size > MAX_USAGE_BUCKETS) state.modelRefusal = "reduced_usage_limit_exceeded";
+}
+
+function reduceModel(context: Context, runtime:UsageReductionRuntime,state: V11UsageReductionCheckpoint,
+  costs: Map<string, { observedAtMs: number; model: string; costNanousd: number }>, poisoned: Set<number>,
+  event: UsageEvidence): void {
+  void context;
+  const model: V11UsageModelState = { modelRefusal: state.modelRefusal,
+    attributionUnresolved: state.attributionUnresolved, usageEventCount: state.usageEventCount,
+    unpricedUsageEventCount: state.unpricedUsageEventCount, costs, poisoned };
+  reduceV11UsageModelEvent(model, runtime.modelSeed ?? null, runtime.modelRefusal, {
+    provider: event.provider, scope: event.scope, accountBreak: event.accountBreak, eraKey: event.eraKey,
+    observedAtMs: event.interval.end, fullyPriced: event.priced.pricingStatus === "fully_priced",
+    model: event.priced.modelId ?? "unknown", costNanousd: event.priced.costNanousd, events: 1 });
+  state.modelRefusal = model.modelRefusal;
+  state.attributionUnresolved = model.attributionUnresolved;
+  state.usageEventCount = model.usageEventCount;
+  state.unpricedUsageEventCount = model.unpricedUsageEventCount;
+}
+
+/**
+ * Fold prepared per-day usage into the model half, in day order.
+ *
+ * A cell is an exact `(2-hour bin, attribution, accountBreak, model)` aggregate
+ * and composes by construction. A session's first event in a day is an
+ * `opener` because its account break needs the carry from earlier days, which
+ * the days' `sessions` tails supply — those tails ARE `usagePrevious`. Events
+ * the reduction drops entirely still advanced that carry, which is why the
+ * builder records them there and nowhere else.
+ *
+ * The single admitted era is unbounded in both directions (see
+ * `v11UsageModelRefusal`), so an event's era never depends on the interval it
+ * is matched over and a whole cell resolves it once.
+ */
+export function foldV11UsageModel(days: readonly { usage: GraphDayUsageFragments }[],
+  index: PlanAttributionIndex, seeds: readonly V11UsageModelSeed[]): V11UsageModelState {
+  const runtimeRefusal = v11UsageModelRefusal(index, seeds.length);
+  const seed = seeds[0] ?? null;
+  const state = createV11UsageModelState();
+  const carry = new Map<string, { lastObservedAtMs: number; lastAccountScopeId: string | null }>();
+  for (const day of days) {
+    interface Contribution {
+      binStartMs: number; order: number; accountBreak: boolean; model: string | null;
+      costNanousd: number; events: number; priorObservedAtMs?: number;
+      provider: string; accountScopeId: string | null;
+      planBasis: TelemetryV11Attribution["planBasis"] | null;
+      planType: string | null; planEraId: string | null;
+    }
+    const contributions: Contribution[] = [];
+    for (const opener of day.usage.openers) {
+      const prior = carry.get(opener.sessionDigest);
+      contributions.push({ binStartMs: opener.binStartMs, order: opener.observedAtMs,
+        accountBreak: prior !== undefined && prior.lastAccountScopeId !== opener.accountScopeId,
+        model: opener.model, costNanousd: opener.costNanousd, events: 1,
+        ...(prior ? { priorObservedAtMs: prior.lastObservedAtMs } : {}),
+        provider: opener.provider, accountScopeId: opener.accountScopeId, planBasis: opener.planBasis,
+        planType: opener.planType, planEraId: opener.planEraId });
+    }
+    for (const cell of day.usage.cells) {
+      contributions.push({ binStartMs: cell.binStartMs, order: cell.binStartMs,
+        accountBreak: cell.accountBreak, model: cell.model, costNanousd: cell.costNanousd,
+        events: cell.eventCount, provider: cell.provider, accountScopeId: cell.accountScopeId,
+        planBasis: cell.planBasis, planType: cell.planType, planEraId: cell.planEraId });
+    }
+    contributions.sort((left, right) => left.order - right.order || left.binStartMs - right.binStartMs);
+    for (const contribution of contributions) {
+      const eraKey = v11UsageEventEra(index, { provider: contribution.provider,
+        accountScopeId: contribution.accountScopeId, planBasis: contribution.planBasis,
+        planType: contribution.planType, planEraId: contribution.planEraId,
+        observedAtMs: contribution.binStartMs, accountBreak: contribution.accountBreak,
+        ...(contribution.priorObservedAtMs !== undefined
+          ? { priorObservedAtMs: contribution.priorObservedAtMs } : {}) });
+      reduceV11UsageModelEvent(state, seed, runtimeRefusal, { provider: contribution.provider,
+        scope: contribution.accountScopeId, accountBreak: contribution.accountBreak, eraKey,
+        observedAtMs: contribution.binStartMs, fullyPriced: contribution.model !== null,
+        model: contribution.model ?? "unknown", costNanousd: contribution.costNanousd,
+        events: contribution.events });
+    }
+    for (const session of day.usage.sessions) {
+      carry.set(session.sessionDigest, { lastObservedAtMs: session.lastObservedAtMs,
+        lastAccountScopeId: session.lastAccountScopeId });
+    }
+  }
+  return state;
+}
+
+/** The model half in the shape a completed reduction carries it, canonically
+ * ordered exactly as `sortedReduction` orders a streamed one. */
+export function v11UsageModelHalf(state: V11UsageModelState): Pick<V11UsageReductionCheckpoint,
+  "modelRefusal" | "modelCosts" | "poisoned" | "usageEventCount" | "unpricedUsageEventCount"
+  | "attributionUnresolved"> {
+  return { modelRefusal: state.modelRefusal, attributionUnresolved: state.attributionUnresolved,
+    usageEventCount: state.usageEventCount, unpricedUsageEventCount: state.unpricedUsageEventCount,
+    modelCosts: [...state.costs].map(([key, value]) => ({ key, ...value }))
+      .sort((left, right) => left.key.localeCompare(right.key)),
+    poisoned: [...state.poisoned].sort((left, right) => left - right) };
 }
 
 /** Advance at most maxPages physical usage pages. The returned checkpoint is a
@@ -1109,7 +1390,8 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
   const context = await quotaContext(db, pin, options);
   if ("status" in context) {
     return { version:1, identity:structuredClone(reductionIdentity),days:[], dayIndex:0, cursorTime:options.quotaAcquisition.identity.observedAtCutoff,
-      cursorOccurrence:"", rowsRead:0, complete:true, commonRefusal:context.reason, scalarRefusal:null,
+      cursorOccurrence:"", rowsRead:0, complete:true, commonRefusal:context.reason,
+      scalarReduced:options.scalarRequested!==false, scalarRefusal:null,
       modelRefusal:null, previous:[], hazards:[], scalarBuckets:[], modelCosts:[], poisoned:[],
       usageEventCount:0, unpricedUsageEventCount:0, attributionUnresolved:false };
   }
@@ -1117,22 +1399,28 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
   const checkpointByteLimit=options.maxUsageCheckpointBytes??MAX_V11_USAGE_CHECKPOINT_BYTES;
   if(!Number.isSafeInteger(checkpointByteLimit)||checkpointByteLimit<64*1024
     ||checkpointByteLimit>MAX_V11_USAGE_CHECKPOINT_BYTES)throw new Error("v11 usage reduction checkpoint byte limit invalid");
+  const scalarReduced = options.scalarRequested !== false;
   let state = prior ? structuredClone(prior) : null;
   if (state && (!validateV11UsageReductionCheckpoint(state)
       ||!v11QuotaAcquisitionIdentityMatches(state.identity,reductionIdentity)))
     throw new Error("v11 usage reduction checkpoint invalid");
+  // The fit and model metrics share one reduction and one checkpoint key, so a
+  // successor staged without the scalar half must never be resumed as one that
+  // has it. Fail closed rather than publish a refusal the evidence never made.
+  if (state && state.scalarReduced !== scalarReduced) throw new Error("v11 usage reduction scalar mode mismatch");
   const now = budget.now ?? Date.now;
   if (!state) {
     if (budget.remainingQueries < 1 || now() >= budget.deadlineMs) throw new Error("v11 usage reduction initialization unavailable");
     budget.remainingQueries -= 1;
     const selected = await usageDays(db, context);
     if (!Array.isArray(selected)) return { version:1,identity:structuredClone(reductionIdentity),days:[], dayIndex:0, cursorTime:context.start,
-      cursorOccurrence:"", rowsRead:0, complete:true, commonRefusal:selected.reason, scalarRefusal:null,
+      cursorOccurrence:"", rowsRead:0, complete:true, commonRefusal:selected.reason,
+      scalarReduced, scalarRefusal:null,
       modelRefusal:null, previous:[], hazards:[], scalarBuckets:[], modelCosts:[], poisoned:[],
       usageEventCount:0, unpricedUsageEventCount:0, attributionUnresolved:false };
     state = { version:1,identity:structuredClone(reductionIdentity),days:selected, dayIndex:0, cursorTime:selected[0] ? `${selected[0]}T00:00:00.000Z` : context.start,
-      cursorOccurrence:"", rowsRead:0, complete:selected.length===0, commonRefusal:null,
-      scalarRefusal:context.seeds.size===0?"supported_quota_track_unavailable":null,
+      cursorOccurrence:"", rowsRead:0, complete:selected.length===0, commonRefusal:null, scalarReduced,
+      scalarRefusal:!scalarReduced||context.seeds.size===0?"supported_quota_track_unavailable":null,
       modelRefusal:runtime.modelRefusal,
       previous:[], hazards:[], scalarBuckets:[], modelCosts:[], poisoned:[], usageEventCount:0,
       unpricedUsageEventCount:0, attributionUnresolved:false };
@@ -1195,7 +1483,10 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
 }
 
 async function scalarFromReduction(context: Context, state: V11UsageReductionCheckpoint): Promise<object> {
-  const reason = state.commonRefusal ?? state.scalarRefusal;
+  // A model-only reduction never built the scalar evidence; it refuses here
+  // rather than reporting an empty fit as a measured one.
+  const reason = state.commonRefusal ?? (state.scalarReduced ? state.scalarRefusal
+    : state.scalarRefusal ?? "supported_quota_track_unavailable");
   if (reason) return refused(reason);
   const hazards = reductionHazards(state), eventsByEra = new Map<string, QuotaUsageEventInput[]>();
   const seedByEra = new Map([...context.seeds.values()].map(seed => [seed.planEraKey,seed]));
@@ -1222,22 +1513,132 @@ async function scalarFromReduction(context: Context, state: V11UsageReductionChe
   return {schemaVersion:"account-scoped-quota-analysis-v0.1",status:"ready",fragmentSelection:"unselected_diagnostics",tracks};
 }
 
+/** The model composition over one settled model half. Pure: the same evidence
+ * gives the same bytes whether the half was streamed or folded, which is what
+ * the parity oracle compares. */
+export function v11ModelCompositionFromModelHalf(input: {
+  reason: string | null;
+  half: Pick<V11UsageReductionCheckpoint, "modelRefusal" | "modelCosts" | "poisoned"
+    | "usageEventCount" | "unpricedUsageEventCount" | "attributionUnresolved">;
+  quota: readonly V11AcquiredQuotaRow[];
+  /** Null when the window settled no supported quota track. There is then no
+   * plan to report a composition for and no quota row to measure against, so
+   * this refuses explicitly rather than reporting a composition of nothing.
+   * The reduction runtime already refuses that window, so in practice the
+   * reason above is set first; this is the decision, not a fallback. */
+  planType: string | null;
+  inputFingerprint: string;
+}): V1ModelCompositionResult {
+  const half = input.half;
+  const reason = input.reason ?? half.modelRefusal
+    ?? (half.attributionUnresolved ? "usage_attribution_unresolved" : null)
+    ?? (input.planType === null || input.quota.length === 0 ? "supported_quota_track_unavailable" : null);
+  if (reason) return refused(reason) as V1ModelCompositionResult;
+  const planType = input.planType!;
+  const quotaRows: CompositionQuotaRow[] = input.quota.map(row => ({ observedAtMs: Date.parse(row.observed_at),
+    resetsAtMs: Date.parse(row.resets_at), usedPercent: row.used_percent, planType: row.plan_type }));
+  const poisoned = new Set(half.poisoned), usageRows: CompositionUsageRow[] = half.modelCosts
+    .filter(row => row.costNanousd > 0 && !poisoned.has(row.observedAtMs))
+    .map(row => ({ observedAtMs: row.observedAtMs, model: row.model, costUsd: row.costNanousd / 1_000_000_000 }));
+  const corpus = buildCompositionObservations({ quotaRows, usageRows });
+  return { status: "ready", planType,
+    fit: calibrateCompositionCapacities(corpus.observations),
+    voidedBinCount: corpus.voidedBinCount, poolCount: corpus.poolCount, quotaRowCount: quotaRows.length,
+    usageEventCount: half.usageEventCount, unpricedUsageEventCount: half.unpricedUsageEventCount,
+    poisonedBinCount: poisoned.size,
+    latestQuotaObservedAt: input.quota[input.quota.length - 1]!.observed_at,
+    attributionStatus: "legacy_conditional", attributionMethod: V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+    inputFingerprint: input.inputFingerprint };
+}
+
 function modelFromReduction(context: Context, state: V11UsageReductionCheckpoint): V1ModelCompositionResult {
-  const reason=state.commonRefusal??state.modelRefusal??(state.attributionUnresolved?"usage_attribution_unresolved":null);
-  if(reason)return refused(reason);
-  const seed=context.seeds.values().next().value! as Seed;
-  const quotaRows:CompositionQuotaRow[]=context.quota.map(row=>({observedAtMs:Date.parse(row.observed_at),
-    resetsAtMs:Date.parse(row.resets_at),usedPercent:row.used_percent,planType:row.plan_type}));
-  const poisoned=new Set(state.poisoned),usageRows:CompositionUsageRow[]=state.modelCosts
-    .filter(row=>row.costNanousd>0&&!poisoned.has(row.observedAtMs))
-    .map(row=>({observedAtMs:row.observedAtMs,model:row.model,costUsd:row.costNanousd/1_000_000_000}));
-  const corpus=buildCompositionObservations({quotaRows,usageRows});
-  return {status:"ready",planType:seed.planType,fit:calibrateCompositionCapacities(corpus.observations),
-    voidedBinCount:corpus.voidedBinCount,poolCount:corpus.poolCount,quotaRowCount:quotaRows.length,
-    usageEventCount:state.usageEventCount,unpricedUsageEventCount:state.unpricedUsageEventCount,
-    poisonedBinCount:poisoned.size,latestQuotaObservedAt:context.quota[context.quota.length-1]!.observed_at,
-    attributionStatus:"legacy_conditional",attributionMethod:V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
-    inputFingerprint:context.pin.fingerprint};
+  // The seed is read WITHOUT asserting it exists: a window with no supported
+  // quota track has none, and the refusal above is what that window gets.
+  const seed = context.seeds.values().next().value as Seed | undefined;
+  return v11ModelCompositionFromModelHalf({ reason: state.commonRefusal, half: state,
+    quota: context.quota, planType: seed?.planType ?? null, inputFingerprint: context.pin.fingerprint });
+}
+
+/** The source rows a folded window read, summed over the days' own meters.
+ * This is the exact quantity the streaming reduction accumulates into
+ * `rowsRead`: counted before the mapper, so a row it skipped, refused, or
+ * dropped after advancing its session counts here too. The artifact's own
+ * validator refuses a day whose `rowsRead` is below the lower bound its
+ * components imply, so an understated meter cannot reach this. */
+export function v11FoldedUsageRowCount(days: readonly {usage:GraphDayUsageFragments}[]): number {
+  let rows = 0;
+  for (const day of days) rows += day.usage.rowsRead;
+  return rows;
+}
+
+/**
+ * The streaming reduction's window bounds, applied to a folded window.
+ *
+ * - `usage_day_limit_exceeded` is measured on the folded days whose usage read
+ *   returned a row, which is the closest available analogue of the stream's
+ *   "days carrying a usage chunk". Neither can fire at the current bound: the
+ *   window is at most `V1_ANALYSIS_WINDOW_DAYS + 1` days and so is either set.
+ * - `session_interval_scope_limit_exceeded` is exact: the union of the days'
+ *   session tails is `usagePrevious`, and it includes every session a dropped
+ *   row touched.
+ * - `windowed_usage_limit_exceeded` is exact: the days meter the rows their
+ *   own usage read returned, before the mapper, which is what the stream
+ *   accumulates into `rowsRead`.
+ *
+ * NOT applied: the 8 MiB checkpoint bound. It is measured on accumulated
+ * reduction state — dominated by the scalar buckets this mode does not build —
+ * and a folded state is a few thousand cells, so there is no equivalent
+ * quantity to measure. **Enabling the fold can therefore turn that refusal into
+ * a result for an owner near the bound.** That is a known consequence of
+ * switching the fold on, not an oversight.
+ */
+export function v11FoldedUsageWindowRefusal(days: readonly {usage:GraphDayUsageFragments}[],
+  maxWindowedUsageRows = MAX_WINDOWED_USAGE_ROWS): string | null {
+  if (days.filter((day) => day.usage.rowsRead > 0).length > MAX_USAGE_DAYS) {
+    return "usage_day_limit_exceeded";
+  }
+  const sessions = new Set<string>();
+  for (const day of days) for (const session of day.usage.sessions) sessions.add(session.sessionDigest);
+  if (sessions.size > MAX_SESSIONS) return "session_interval_scope_limit_exceeded";
+  if (v11FoldedUsageRowCount(days) > maxWindowedUsageRows) return "windowed_usage_limit_exceeded";
+  return null;
+}
+
+/**
+ * Settle the usage reduction for the MODEL metric from prepared days, without
+ * reading a usage row.
+ *
+ * The scalar half is not built — that is the model-only mode — so the returned
+ * successor carries `scalarReduced:false` and is not a successor a `fits` claim
+ * may resume; the two metrics keep separate checkpoint namespaces for exactly
+ * that reason.
+ *
+ * Window bounds: see `v11FoldedUsageWindowRefusal`. Three of the streaming
+ * reduction's four are applied there; the fourth is stated there as a
+ * deliberate refusal-boundary change.
+ */
+export async function foldV11UsageModelReduction(db:D1Database,pin:V11SourcePin,
+  options:V11AnalysisOptions & {quotaAcquisition:V11CompletedQuotaAcquisition},
+  days:readonly {day:string;usage:GraphDayUsageFragments}[],
+  expectedDays:readonly string[],
+  reductionIdentity:V11QuotaAcquisitionIdentity=options.quotaAcquisition.identity,
+):Promise<V11UsageReductionCheckpoint>{
+  // A window with a day missing folds to a complete-looking model composition
+  // with that day's usage absent, under an unchanged result identity.
+  assertV11PreparedDayCoverage(days,expectedDays);
+  const base:V11UsageReductionCheckpoint={version:1,identity:structuredClone(reductionIdentity),
+    days:[],dayIndex:0,cursorTime:reductionIdentity.observedAtCutoff,cursorOccurrence:"",
+    rowsRead:0,complete:true,scalarReduced:false,commonRefusal:null,
+    scalarRefusal:"supported_quota_track_unavailable",modelRefusal:null,
+    previous:[],hazards:[],scalarBuckets:[],modelCosts:[],poisoned:[],
+    usageEventCount:0,unpricedUsageEventCount:0,attributionUnresolved:false};
+  const bounded=v11FoldedUsageWindowRefusal(days,options.maxWindowedUsageRows);
+  if(bounded)return {...base,commonRefusal:bounded};
+  const context=await quotaContext(db,pin,options);
+  if("status" in context)return {...base,commonRefusal:context.reason};
+  const state={...base,...v11UsageModelHalf(foldV11UsageModel(days,context.index,[...context.seeds.values()]))};
+  if(!validateV11UsageReductionCheckpoint(state))throw new Error("v11 usage model fold invalid");
+  return state;
 }
 
 /** Derive either result without touching usage rows after a completed reduction. */

@@ -1,9 +1,10 @@
 import { canonicalJson } from './canonical-json';
 import { advanceV11UsageReduction,createV11QuotaAcquisitionIdentity,finishV11UsageReduction,
-  v11AnalysisWindow,type V11UsageReductionCheckpoint } from './quota-analysis-v11';
-import { advanceV11QuotaAcquisition,createV11QuotaAcquisitionCheckpoint,
+  foldV11UsageModelReduction,v11AnalysisWindow,type V11UsageReductionCheckpoint } from './quota-analysis-v11';
+import { advanceV11QuotaAcquisition,createV11QuotaAcquisitionCheckpoint,foldV11QuotaAcquisition,
   type V11CompletedQuotaAcquisition,type V11QuotaAcquisitionCheckpoint,
   type V11QuotaAcquisitionIdentity,type V11QuotaInvocationBudget } from './quota-analysis-v11-reader';
+import { validGraphDayProjection,type GraphDayProjection } from './graph-day-projection-values';
 import type { V11SourcePin } from './telemetry-v11-domain';
 import { assertTypedV11GenerationSnapshotLive,createTypedV11QuotaPageReader,
   loadTypedV11GenerationSnapshot,type V11GenerationSnapshot } from './typed-v11-quota-reader';
@@ -32,6 +33,41 @@ export type StorageV11HistoryCheckpoint={version:1;source:'v1.1';day:string;layo
 export type StorageV11HistoryResult={status:'deferred';checkpoint:StorageV11HistoryCheckpoint|null;cut?:true}|
  {status:'complete';analysis:object};
 
+/** Whether a caller's prepared per-day projections may settle the acquisition
+ * instead of paging the owner's window once per sub-phase.
+ *
+ * OFF. The fold is proven byte-identical against the paged path by the parity
+ * oracle, and the acquisition checkpoint method has moved to `-4` so an
+ * in-flight `-3` generation cannot be resumed under it — but the prepared-day
+ * lane that builds the artifacts is not yet producing them, and the switch is
+ * meant to be thrown at the start of a graph-only long pass, not on deploy.
+ * Turning this on without prepared days changes nothing: the paged path still
+ * serves every group whose caller supplies none. */
+export const STORAGE_V11_PREPARED_FOLD=false;
+
+/** The gate, as a pure rule so it can be proven rather than described: a group
+ * folds prepared days only when the caller supplied them AND the switch above
+ * is on. Nothing supplies them today, so this is off twice over. */
+export function storageV11FoldsPreparedDays(preparedDays:readonly GraphDayProjection[]|undefined,
+ enabled:boolean=STORAGE_V11_PREPARED_FOLD):boolean{
+ return enabled&&preparedDays!==undefined;
+}
+
+/** The generation's own observed days inside this analysis window, which is
+ * the exact day set a prepared fold must be given. Derived from the same
+ * immutable snapshot the acquisition reads, so a lane that has not finished
+ * building, or a day the builder refused, is a missing day here rather than a
+ * silently smaller result. */
+async function v11WindowDays(source:D1Database,snapshot:V11GenerationSnapshot,
+ window:{start:string;end:string}):Promise<string[]>{
+ const rows=(await source.prepare(`SELECT observed_day FROM telemetry_v11_domain_days
+  WHERE generation_id=? AND observed_day>=? AND observed_day<? ORDER BY observed_day LIMIT 103`)
+  .bind(snapshot.generationId,window.start.slice(0,10),window.end.slice(0,10))
+  .all<{observed_day:string}>()).results;
+ if(rows.length>102)throw fail();
+ return rows.map(row=>row.observed_day);
+}
+
 const fail=()=>new Error('STORAGE_V11_HISTORY_CHECKPOINT_MISMATCH');
 function sameIdentity(left:V11QuotaAcquisitionIdentity,right:V11QuotaAcquisitionIdentity):boolean{
  return canonicalJson(left)===canonicalJson(right);
@@ -57,7 +93,11 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  partialGroup?:boolean;
  /** Kernel downsampled-quota bound; part of the acquisition identity. Tests
   * lower it to reach the refusal path; production keeps the kernel default. */
- maxQuotaRows?:number}):Promise<StorageV11HistoryResult>{
+ maxQuotaRows?:number;
+ /** The window's prepared per-day projections, in ascending day order. Honoured
+  * only while `STORAGE_V11_PREPARED_FOLD` is on; otherwise the paged
+  * acquisition serves exactly as before. */
+ preparedDays?:readonly GraphDayProjection[]}):Promise<StorageV11HistoryResult>{
  const {source,sourceNamespace,participantId,day,metric,nowMs,budget}=input,sourcePin=structuredClone(input.sourcePin);
  if(sourcePin.source!=='v1.1'||sourcePin.participantId!==participantId
   ||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(day)||new Date(`${day}T00:00:00.000Z`).toISOString().slice(0,10)!==day
@@ -70,7 +110,7 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  // The acquisition advances the given checkpoint in place: a defensive deep
  // copy of a 60,000-row acquisition can exhaust the isolate on its own. The
  // caller treats the input as consumed; a cut group returns no checkpoint.
- const prior=input.checkpoint??null;
+ const prior=input.checkpoint??null,preparedDays=input.preparedDays;
  const layout=`typed-v11:${sourceNamespace}`;
  if(prior&&(prior.version!==1||prior.source!=='v1.1'||prior.day!==day||prior.layout!==layout
   ||!['acquisition','finish','usage'].includes(prior.phase)))throw fail();
@@ -99,6 +139,23 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
    await assertTypedV11GenerationSnapshotLive(source,snapshot);
    return {status:'deferred',checkpoint:{version:1,source:'v1.1',day,layout,identity,snapshot,phase:'finish',
     acquisition:{identity,planAnchors:[],quotaRows:[]}}};
+  }
+  if(storageV11FoldsPreparedDays(preparedDays)&&preparedDays!==undefined){
+   // A prepared fold reads no source page, so the whole window is settled in
+   // one step. The days are still fenced by the same live-generation proof the
+   // paged path takes, and every day must be inside this analysis window and
+   // structurally valid before the kernel sees it.
+   if(preparedDays.length>102||!preparedDays.every(prepared=>validGraphDayProjection(prepared)
+    &&prepared.day>=window.start.slice(0,10)&&`${prepared.day}T00:00:00.000Z`<window.end))throw fail();
+   const folded=foldV11QuotaAcquisition(identity,preparedDays,
+    await v11WindowDays(source,snapshot,window));
+   await assertTypedV11GenerationSnapshotLive(source,snapshot);
+   if(folded.status==='not_testable')return {status:'complete',analysis:metric==='model'
+    ?{status:'not_testable',reason:folded.reason,tracks:[]}
+    :{schemaVersion:'account-scoped-quota-analysis-v0.1',status:'not_testable',reason:folded.reason,tracks:[]}};
+   if(folded.status!=='complete')throw fail();
+   return {status:'deferred',checkpoint:{version:1,source:'v1.1',day,layout,identity,snapshot,phase:'finish',
+    acquisition:{identity:folded.identity,planAnchors:folded.planAnchors,quotaRows:folded.quotaRows}}};
   }
   const reader=await createTypedV11QuotaPageReader(source,{sourceNamespace,snapshot,fenceSnapshotPages:false,
    fromObservedAtMs:Date.parse(window.start),beforeObservedAtMs:Date.parse(window.end)});
@@ -139,10 +196,35 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  const acquisition={...checkpoint.acquisition,identity:liveIdentity},options={nowMs,sourcePin:analysisPin,
   typedSourceNamespace:sourceNamespace,generationSnapshot:snapshot,generationSnapshotFenced:true,
   ...(input.maxQuotaRows!==undefined?{maxDownsampledQuotaRows:input.maxQuotaRows}:{}),
+  // The model metric needs no scalar fit half, and that half is where a v1.1
+  // usage checkpoint's bytes are. The two metrics therefore no longer share a
+  // reduction, which is why they no longer share a checkpoint namespace.
+  //
+  // GATED ON THE FOLD, deliberately. Dropping the scalar half also drops the
+  // hazard and bucket state the SHARED `reduced_usage_limit_exceeded` refusal
+  // is measured on, so applying it to the paged reduction could turn a model
+  // result that refused into one that is ready under an unchanged result
+  // dependency digest — a heterogeneous published corpus. With the fold off
+  // the paged reduction is byte-unchanged.
+  scalarRequested:!(metric==='model'&&storageV11FoldsPreparedDays(preparedDays)),
   quotaAcquisition:acquisition};
  if(checkpoint.phase==='usage'&&checkpoint.usage.complete){
   await assertTypedV11GenerationSnapshotLive(source,snapshot);
   return {status:'complete',analysis:await finishV11UsageReduction(source,analysisPin,options,checkpoint.usage,metric,identity)};
+ }
+ if(storageV11FoldsPreparedDays(preparedDays)&&preparedDays!==undefined&&metric==='model'
+  &&checkpoint.phase!=='usage'){
+  // The model composition needs no scalar half and no usage row: the prepared
+  // days carry exact 2-hour cells, the sessions that cross midnight and the
+  // openers whose account break only carry-in can decide. The day set is the
+  // generation's own, so a window with a day still unbuilt refuses here rather
+  // than folding to a smaller composition.
+  const usageWindow=v11AnalysisWindow(analysisPin,nowMs);
+  const usage=await foldV11UsageModelReduction(source,analysisPin,options,preparedDays,
+   await v11WindowDays(source,snapshot,usageWindow),identity);
+  await assertTypedV11GenerationSnapshotLive(source,snapshot);
+  return {status:'deferred',checkpoint:{version:1,source:'v1.1',day,layout,identity,snapshot,phase:'usage',
+   acquisition:checkpoint.acquisition,usage}};
  }
  const resumed=checkpoint.phase==='usage',before=budget.remainingQueries;
  const usage=await advanceV11UsageReduction(source,analysisPin,options,budget,

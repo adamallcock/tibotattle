@@ -86,7 +86,7 @@ describe('private paged historical checkpoint store',()=>{
   expect(second).not.toBe(largeHead);
   expect(await read(v11Key)).toEqual({status:'ready',headDigest:second,partCount:await parts(second),checkpoint:finish});
   const reduced:V11UsageReductionCheckpoint={version:1,identity,days:[],dayIndex:0,cursorTime:identity.observedAtCutoff,
-   cursorOccurrence:'',rowsRead:0,complete:true,commonRefusal:'supported_quota_track_unavailable',scalarRefusal:null,
+   cursorOccurrence:'',rowsRead:0,complete:true,scalarReduced:true,commonRefusal:'supported_quota_track_unavailable',scalarRefusal:null,
    modelRefusal:null,previous:[],hazards:[],scalarBuckets:[],modelCosts:[],poisoned:[],usageEventCount:0,
    unpricedUsageEventCount:0,attributionUnresolved:false};
   const usage:StorageV11HistoryCheckpoint={...finish,phase:'usage',usage:reduced};
@@ -99,12 +99,15 @@ describe('private paged historical checkpoint store',()=>{
   await insert('model');expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z')))
    .toEqual({state:'idle',deleted:0});
   expect(await read(v11Key)).toMatchObject({status:'ready',headDigest:usageHead});
-  await insert('fits');expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z')))
-   .toEqual({state:'idle',deleted:0});
-  expect(await read(v11Key)).toMatchObject({status:'ready',headDigest:usageHead});
+  // The fit and model metrics no longer share a usage reduction or a
+  // checkpoint namespace, so a metric's own completed result is now what
+  // reclaims its checkpoint. The shared key could never be attributed to one
+  // metric and had to wait for the day horizon instead.
+  await insert('fits');
+  for(let i=0;i<10;i++)if((await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).state==='idle')break;
+  expect(await read(v11Key)).toEqual({status:'absent'});
   expect(await retireStorageGraphPage(target(),key.sourceId,Date.parse('2027-09-06T12:00:00Z')))
    .toEqual({state:'retiring',deleted:2});
-  expect(await read(v11Key)).toEqual({status:'absent'});
  },30000);
  it('retires a checkpoint whose method is no longer a live reader key',async()=>{
   const identity:V11QuotaAcquisitionIdentity={participantId:'synthetic-v11-participant',inputFingerprint:'e'.repeat(64),

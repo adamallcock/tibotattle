@@ -327,3 +327,238 @@ corpus. Switch at the start of a `minute % 10 === 0` long pass.
 - The 541-page figure for the top owner. The page SQL in this checkout filters
   `r.stream = 2`, giving 299 quota pages for its 1,221,945 quota rows; 541 corresponds
   to its 2,221,354 rows across both streams. Confirm which the deployed reader does.
+
+---
+
+## Addendum: the usage phase
+
+Read-only investigation, 2026-09-17, checkout
+`claude/analytics-last-good-recovery-20260916`. Source line numbers for
+`graph-day-projection-values.ts` and `storage-v11-history.ts` are from the
+working tree while Phase A is being written and will move. Volume claims are
+aggregate `SELECT` against production ingestion and analytics D1 today; no owner
+digest, participant identifier or payload content was read.
+
+Phase A assumed the usage half could reuse `prepareUsagePage`'s 2-hour
+`MODEL_COMPOSITION_POLICY.grainMs` fragments. **The assumption is half true, and
+the half that fails is not the half the plan worried about.** Two of the five
+v1.1 usage components are already exactly that shape. One of them —
+`usageScalarBuckets` — is keyed on a quota grid that production shows is 1:1
+with usage instants, so it does not compress at all, at any grain.
+
+### Measured: the usage phase is now the binding cost
+
+100-day window (`observed_day >= 20612`), `typed_telemetry_records`, `stream=1`:
+
+| | usage rows | owner-days | usage pages at 5,000, paged per day | heaviest owner |
+|---|---|---|---|---|
+| format 11 (v1.1) | 1,020,831 | 213 | 366 | 254 pages / 999,398 rows / 101 days |
+| format 10 (v1) | 1,647,664 | 762 | 919 | 186 pages / 675,619 rows / 102 days |
+
+2,668,495 rows over 975 owner-days. The reducer pages **per day**
+(`quota-analysis-v11.ts:1136-1140`), so the heaviest v1.1 owner costs 254 usage
+pages per model-day, not the 201 the plan estimated.
+
+In-flight `analytics_history_checkpoint_stages` joined to `_parts`, by
+`json_extract(control_json,'$.phase')`:
+
+| phase | stages | parts | payload bytes | max parts |
+|---|---|---|---|---|
+| `usage` | 33 | 791 | 88,754,312 | 59 |
+| `acquisition` | 5 | 25 | 1,295,659 | 10 |
+
+**98.6% of all in-flight checkpoint payload is the usage phase**, and a single
+usage successor already frames 59 parts (~7.5 MB against the 8 MB
+`MAX_V11_USAGE_CHECKPOINT_BYTES`, `quota-analysis-v11.ts:73`). Completed
+`analytics_community_graph_results` for v1.1: 38 `model` (19 ready, 12
+`multi_plan_window_unsupported`, 7 `supported_quota_track_unavailable`) against
+**6 `fits`**.
+
+Today's quota page is 16,384 (`a40ffb3b`) and the usage page is 5,000
+(`typed-v11-analysis-reader.ts:9`), so per heavy v1.1 owner-day the split is
+**300 quota pages against 254 usage pages**. The quota enlargement that shipped
+today banked most of the quota win; that is precisely why usage now binds.
+
+### 1. What the usage phase computes
+
+One traversal, `advanceV11UsageReduction` (`quota-analysis-v11.ts:1102`),
+serves **both** metrics; `advanceStorageV11Analysis` runs it for
+`metric:'fits'` and `metric:'model'` alike (`storage-v11-history.ts:190`).
+There is no model-only mode.
+
+| # | component | key | inputs | composability |
+|---|---|---|---|---|
+| 1 | `usagePrevious` (`:857`) | `[provider, session_uuid]` | `row.session_uuid`, `observed_at`, `attribution.accountBasis` (`:993-998`) | **per-day + bounded carry** — the per-session tail `{time, scope}` |
+| 2 | `usageHazards` (`:858`) | `all\|P`, `known\|P`, `unknown\|P`, `[P,scope]` | interval `[prior.time ?? end, end]` (`:1036-1042`) | **per-day + the same carry** — see below |
+| 3 | `usageScalarBuckets` (`:859`) | `[provider, scope, eraKey, exact, anchor]` (`:1050`) | window-wide `eraKey` and window-wide quota grid (`:492`, `:1048`) | **genuinely window-scoped** |
+| 4 | `usageModelCosts` (`:860`) | `[floor(end/grainMs)*grainMs, model]` (`:1088`) | 2-hour bin, priced model | **pure per-day aggregate** |
+| 5 | `usagePoisoned` (`:861`) | 2-hour bin instant (`:1080`) | unpriced event | **pure per-day aggregate** |
+
+Plus control counters (`usageEventCount`, `unpricedUsageEventCount`,
+`attributionUnresolved`, three refusal slots).
+
+**Hazards are a union, not a sequence.** `Hazards.add` (`:605`) merges only
+against the bucket tail because usage arrives in end-time order, but
+`overlaps` (`:620`) re-sorts and rebuilds prefix maxima at query time, so the
+answer depends only on the *set* of intervals. Union is commutative and
+associative, so hazards compose per day exactly. The one order-dependence is
+`intervalCount` -> `exceeded` (`:617`).
+
+**Why 3 is window-scoped, twice over.** `eraKey` embeds the era's first observed
+instant (`packages/quota-analysis/src/plan-attribution.js:235-237`), so the
+oldest era's key changes every time the 100-day window slides; and the first
+era's `lowerBoundMs` is `null` only while the window stays single-plan
+(`:239`, `:259-261`). Independently, `anchor = ceiling(grid.ordered, end)` over
+every quota `observed_at` in the window (`:492`, `:1048`).
+
+**4 and 5 are already gated to the easy case.** `usageReductionRuntime:1024`
+refuses the model metric unless the window has exactly one era, one account and
+one plan. In that case every event matches the same era, and the only remaining
+per-event decision is `accountBreak`, which is the session carry.
+
+### 2. Is a sufficient per-day usage artifact possible?
+
+**For components 1, 2, 4 and 5: yes, cheaply, and byte-identically.** Carry-out
+per day: the per-session `{time, scope}` tail (`usagePrevious` itself) and each
+session's *first* event in the day held individually so the fold can form its
+interval once carry-in is known. Everything else folds by union (2), integer sum
+(4) and set union (5). Measured cost:
+
+- distinct `(2-hour bin, model)` cells per owner-day: **9,338 across all 975
+  owner-days** (2,428 v1.1 + 6,910 v1), mean 9-11, max 46. That is a **286-fold
+  row reduction**.
+- distinct sessions per owner-day: 25,688 total, mean 21-44, max 444 — far under
+  `MAX_SESSIONS` = 100,000 (`:70`).
+
+At ~150 B/cell and ~60 B/session that is **about 4 KB per owner-day**, ~10 KB at
+the measured maximum, **~4 MB for the whole 975-owner-day corpus**. A heavy
+owner's whole 100-day window fits in *one* 256 KiB page.
+
+**For component 3: technically yes, practically no.** The sound unit is per day,
+per `(provider, scope)`, per attribution signature
+(`planBasis, planType, planEraId`), split at every quota instant where the
+day-local plan signature changes or an equal-time conflict occurs — the same
+rule `prepareQuotaPage` uses (`prepared-v1-day.ts:39`) — with a tail bucket for
+events after the day's last quota instant, resolved against the next day's
+first. Nothing is lost and the fold is byte-identical up to the refusal
+thresholds. But it buys nothing, because:
+
+- distinct quota instants per owner-day: 661,311 (v1.1), mean 3,104, max 21,652;
+- distinct usage instants per owner-day: 661,474 (v1.1), mean 3,105, max 21,652.
+
+**Quota and usage records share observation instants to within 0.03%.** So
+`grid.exact.has(end)` is true for essentially every event, `anchor = end`, and
+there is roughly **one scalar bucket per usage event**. The artifact would be
+~340 KB per owner-day, ~330 MB for the corpus, ~30 MB for the heavy owner's
+single window — the same order as the 8 MB checkpoint it replaces, times the
+parts already framing it.
+
+Residual inexactness, for every component: the refusal thresholds are
+order-sensitive exactly as `QUOTA_RESET_CLUSTER_LIMIT` is —
+`MAX_HAZARD_INTERVALS` (`:617`), `MAX_USAGE_BUCKETS` (`:71`), the 8 MB byte
+limit (`:1160-1163`) and `MAX_WINDOWED_USAGE_ROWS` (`:1141`). Fold in strict day
+order and fixture at each bound.
+
+### 3. Can the existing v1.1 reusable day values serve instead?
+
+**No, and the gap is one specific field.** `analytics_v11_reusable_values`
+(`0004`) and `analytics_v11_value_pages` (`0013`) store
+`V11DailyProjectionValues` (`v11-daily-projection-values.ts:22-29`): whole-day
+`counts`, `tokens`, `pricing`, up to 200 `(provider, modelId)` cells and an
+`omitted` subtotal. **There is no time dimension inside the day at all.**
+
+Missing, in order of severity:
+
+1. **The 2-hour bin.** Without it there are no `usageModelCosts` keys.
+2. **Per-bin poisoning.** The daily values carry a day-level `unpriced` count per
+   cell; `usagePoisoned` needs *which bin instants* an unpriced event landed in,
+   because one unpriced event voids the whole bin (`:1080`). A day-level count
+   cannot reconstruct that. This alone is fatal.
+3. `firstObservedAt` / `firstOccurrenceId` per cell, which
+   `V1PreparedUsageFragment.cells` carries.
+
+Could the daily lane emit them without changing the daily series? The page fold
+`mergeV11DailyProjectionValues` is already associative and pages are disjoint,
+so a sibling `bins` array would fold correctly. But `values_json` is closed
+(`validateV11DailyProjectionValues:81`), so adding it bumps
+`V11_DAILY_VALUES_SCHEMA`; `schema_version` is inside `value_key`
+(`v11-daily-projection.ts:129-135`), so **every reusable day value in the corpus
+misses and the whole daily lane rebuilds**, and `0013`'s CHECK pins the literal
+`'v11-daily-projection-values-v2'` so it needs a migration too. Cheaper to emit
+a sibling artifact than to widen this one.
+
+### 4. The v1 side — where this is already solved
+
+**The v1 graph history path has no usage phase.**
+`advanceStorageV1HistoricalAnalysis` (`storage-v1-history.ts:25`) goes
+`acquisition` -> `finish`; only `advanceStorageV1CurrentFitAnalysis` (`:75`) has
+a `'usage'` phase, and the graph lane calls the former
+(`storage-community-graph.ts:662`). The usage read happens inside
+`finishHistoricalModelCompositionV1` (`quota-analysis-v1.ts:667`), which passes
+`scalarRequested = false` -> `scalarReason` is set at `:2547` -> **`useBins` is
+enabled at `:2590`**, reading `community_prepared_usage_bins` at 256 fragments
+per statement (`:2599`) instead of 5,000 events.
+
+So v1 already does exactly what this addendum recommends for v1.1: it asks for
+model composition only, and folds 2-hour prepared bins built by
+`prepareUsagePage` (`prepared-v1-day.ts:94`) into
+`community_prepared_usage_bins` (`prepared-v1-evidence.ts:18-19`).
+`analytics_v1_chunk_values` (`0005`) is the v1 *daily* projection and has the
+same no-time-grain problem as `0004`; it is not the relevant artifact.
+
+The asymmetry is the whole finding: **v1 splits the scalar and model halves and
+folds the model half; v1.1 fuses them into one reduction that always computes
+all five components for both metrics.**
+
+### 5. Revised speedup arithmetic
+
+Group cost, from `storage-community-graph.ts:59-118`: 8 pages + 4 fences + 6
+pre-checks + 37 first save = **55 statements per claim**, plus 32 per extra save
+batch beyond 30 parts. Lane rate ~10,000 statements/hour (this plan's measured
+baseline). Heaviest v1.1 owner; whole v1.1 lane is 5 owners.
+
+| case | pages / heavy owner-day | v1.1 statements / model-day | 69 model-days |
+|---|---|---|---|
+| do nothing | 300 quota + 254 usage = **554** | ~2,200 quota + ~3,270 usage = **5,470** | **~38 h** |
+| quota-only fold (Phase A today) | ~70 artifact + 254 usage = **324** | ~150 + ~3,270 = **3,420** | **~24 h (1.6x)** |
+| quota + usage fold (model half) | ~70 + ~2 = **72** | ~150 + ~60 = **210** | **~1.5 h (26x)** |
+
+Usage is **52% of the heavy owner's statements today** and ~96% of what
+quota-only folding leaves behind. Phase A's "~20x" was computed against the
+4,096-row quota page and against a whole-lane statement total this addendum does
+not re-derive; on the v1.1 lane with today's 16,384-row page, **quota-only
+folding is ~1.6x**. The v1 lane is unchanged in all three cases: it has no usage
+phase and already folds bins.
+
+### Recommendation
+
+**Extend Phase A to cover usage — but only the model half, by giving the v1.1
+reduction the model-only mode v1 already has.** Concretely: a `scalarRequested`
+flag on `advanceV11UsageReduction` mirroring `quota-analysis-v1.ts:2547`, so
+`metric:'model'` folds components 4 and 5 from the `usage` fragments the Phase A
+artifact **already carries and does not use**
+(`graph-day-projection-values.ts:148-153`; `foldV11QuotaAcquisition` consumes
+only the quota components, and `storage-v11-history.ts:189-201` still pages
+usage unchanged), plus the per-session carry. That is ~4 KB per owner-day, one
+page per owner-window, and it recovers the full 26x.
+
+**Do not fold `usageScalarBuckets`.** It is sound but pointless: production shows
+one bucket per usage event. Leave `metric:'fits'` on the paged reduction — six
+v1.1 `fits` results exist in the whole corpus — and treat its cost as a separate
+question about whether that metric is affordable at all for a dense owner.
+
+Do not reuse `analytics_v11_reusable_values`: per-bin poisoning is
+unreconstructible from it, and widening it rebuilds the entire daily corpus.
+
+### The single biggest unknown
+
+Whether the heaviest v1.1 owner's scalar reduction is already destined to refuse
+with `reduced_usage_limit_exceeded`. Its window implies roughly **640,000
+distinct anchors** against `MAX_USAGE_BUCKETS` = 120,000 and an 8 MB checkpoint
+cap that its 59-part successors are already near. If it is, the 33 in-flight
+usage stages and 88.75 MB of parts are buying a refusal on one metric and a
+2-hour-bin result on the other, and the fix is the model-only mode rather than
+any fold. This is arithmetic, not observation: **no `fits` result for that owner
+exists to confirm it.** Establish it before building anything — a single
+instrumented replay of that owner's reduction against a copy settles it, and it
+decides whether this is a throughput change or a refusal-boundary change.

@@ -7,6 +7,7 @@ import {lookupV11StorageSource} from './v11-storage-journal';
 import {prepareV1ProjectionOwnerFence,retireV1DailyProjectionPage} from './v1-daily-projection';
 import {retireV11DailyProjectionPage} from './v11-daily-projection';
 import {retireStorageGraphPage} from './storage-graph-retirement';
+import {retireGraphDayProjectionPage} from './graph-day-projection';
 import {retireStorageCommunityDailyPage} from './storage-community-daily';
 import {retireStorageCommunityGraphPublications} from './storage-community-graph-publication';
 import type {StorageAnalyticsBindings} from './analytics-delivery';
@@ -53,6 +54,8 @@ const payloadAbsence=`
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_value_pages WHERE source_id=?1 AND owner_digest=?2)
+ AND NOT EXISTS(SELECT 1 FROM analytics_graph_day_values WHERE source_id=?1 AND owner_digest=?2)
+ AND NOT EXISTS(SELECT 1 FROM analytics_graph_day_pages WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_results WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_execution WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_history_checkpoint_stages WHERE source_id=?1 AND owner_digest=?2)
@@ -123,6 +126,11 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
  await retireV1DailyProjectionPage(b.target,b.sourceId);
  await retireV11DailyProjectionPage(b.target,b.sourceId);
  await retireStorageGraphPage(b.target,b.sourceId);
+ // Prepared graph payload is derived input, not a result cache: without this
+ // page the absence list above could never clear and erasure would never
+ // complete, and without the absence list erasure would complete while the
+ // owner's prepared days survived.
+ await retireGraphDayProjectionPage(b.target,b.sourceId);
  await retireStorageCommunityDailyPage(b);
  await retireStorageCommunityGraphPublications(b);
  await b.target.prepare(`INSERT INTO analytics_storage_erasure_receipts(source_id,owner_digest,terminal_event_digest,payload_contract)

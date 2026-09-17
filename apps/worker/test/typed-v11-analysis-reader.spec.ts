@@ -337,6 +337,10 @@ describe("typed active-domain analytical reads",()=>{
        STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n')).toBe(5);
     const modelScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:"model",sourceId:namespace,sourceNamespace:namespace});
     expect(modelScope.dependencyDigest).not.toBe(scope.dependencyDigest);
+    // The metric split of the checkpoint identity is gated on the prepared-day
+    // fold, which is off, so the two metrics still run the identical reduction
+    // and still share one successor. That reuse is the whole reason the split
+    // is gated rather than unconditional.
     expect(modelScope.checkpointDependencyDigest).toBe(scope.checkpointDependencyDigest);
     const modelReads=observePreparedSql(typed());
     const model=await computeStorageGraphResult({...bindings,source:modelReads.database},modelScope);
@@ -470,7 +474,15 @@ describe("typed active-domain analytical reads",()=>{
     const encoded=JSON.stringify(loaded.checkpoint.usage);
     expect(encoded).not.toContain('record_json');expect(encoded).not.toContain('event:reduction:');
     expect(new TextEncoder().encode(encoded).byteLength).toBeLessThan(250_000);
+    // With the fold off the model metric still builds the scalar half, so the
+    // shared `reduced_usage_limit_exceeded` bound stays measured on the same
+    // state and a model result cannot become ready where it used to refuse.
+    expect(loaded.checkpoint.usage.scalarReduced).toBe(true);
+    // And the metrics still share this successor, so the model metric reads no
+    // usage row at all. Both halves of that reuse are gated on the fold.
     const modelScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'model',sourceId:namespace,sourceNamespace:namespace});
+    expect(modelScope.checkpointDependencyDigest).toBe(fitScope.checkpointDependencyDigest);
+    expect(STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).toBe(STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD);
     const reads=observePreparedSql(typed());
     expect((await computeStorageGraphResult({...bindings,source:reads.database},modelScope,{maxQueries:900})).state).toBe('complete');
     expect(reads.queries.filter(sql=>sql.includes("stream='usage'")||sql.includes("stream = 'usage'"))).toHaveLength(0);
@@ -1040,7 +1052,11 @@ describe("typed active-domain analytical reads",()=>{
     const snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin:scope.pin});
     // A head the previous acquisition contract left behind, under its own
     // method and its own dependency identity.
-    const staleMethod=STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD.replace(/3$/,'2');
+    // Derived from the live method rather than pinned to its current revision,
+    // so bumping the checkpoint namespace cannot silently make this fixture
+    // equal to the live key and stop testing anything.
+    const staleMethod=STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD
+      .replace(/-(\d+)$/u,(_match,revision:string)=>`-${Number(revision)-1}`);
     expect(staleMethod).not.toBe(STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD);
     const staleKey:StorageHistoryKey={sourceId:namespace,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,
       day:scope.day,dependencyDigest:'d'.repeat(64),method:staleMethod};

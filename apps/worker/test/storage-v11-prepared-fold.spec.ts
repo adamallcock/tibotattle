@@ -1,0 +1,200 @@
+import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test";
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  loadStorageHistoryCheckpoint,
+  saveStorageHistoryCheckpoint,
+  type StorageHistoryKey,
+} from "../src/storage-history-checkpoint";
+import { createV11QuotaAcquisitionCheckpoint } from "../src/quota-analysis-v11-reader";
+import type { StorageV11HistoryCheckpoint } from "../src/storage-v11-history";
+import { STORAGE_V11_PREPARED_FOLD, storageV11FoldsPreparedDays } from "../src/storage-v11-history";
+import {
+  STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
+  STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
+  STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS,
+  STORAGE_GRAPH_METHOD,
+  STORAGE_GRAPH_V11_CHECKPOINT_METHOD,
+  STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,
+  STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD,
+  storageGraphV11CheckpointMethods,
+} from "../src/storage-community-graph";
+import { V11_QUOTA_ACQUISITION_VERSION } from "../src/quota-analysis-v11-reader";
+import {
+  V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+  V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+} from "../src/quota-analysis-v11";
+import { communityAnalysisCacheVersion } from "../src/community-allowance";
+import {
+  validateV11UsageReductionCheckpoint,
+  type V11UsageReductionCheckpoint,
+} from "../src/quota-analysis-v11";
+import type { GraphDayProjection } from "../src/graph-day-projection-values";
+
+describe("prepared-day fold rollout gate", () => {
+  it("is off, and a caller's prepared days do nothing while it is", () => {
+    // The paged acquisition still serves every group. The fold is proven by
+    // the parity oracle; the switch is thrown at the start of a graph-only
+    // long pass, not by deploying this change.
+    expect(STORAGE_V11_PREPARED_FOLD).toBe(false);
+    const days = [] as unknown as readonly GraphDayProjection[];
+    expect(storageV11FoldsPreparedDays(days)).toBe(false);
+    expect(storageV11FoldsPreparedDays(undefined)).toBe(false);
+    // Both halves are required: the switch alone folds nothing, and days
+    // supplied to a build whose switch is off fold nothing either.
+    expect(storageV11FoldsPreparedDays(undefined, true)).toBe(false);
+    expect(storageV11FoldsPreparedDays(days, true)).toBe(true);
+  });
+});
+
+describe("prepared-day fold identity boundary", () => {
+  it("moves the acquisition checkpoint namespace and nothing else", () => {
+    // The fold is byte-identical, so adopting it must not retire a computed
+    // day. Only the checkpoint FORMAT changes, and that namespace exists
+    // precisely so an in-flight generation can be abandoned without touching
+    // published evidence. These are exact strings on purpose: a reviewer can
+    // see from the diff of this file alone which identities moved.
+    expect(STORAGE_GRAPH_V11_CHECKPOINT_METHOD).toBe(`${STORAGE_GRAPH_METHOD}:v11-shared-checkpoint-4`);
+    // While the fold is off both metrics run the IDENTICAL reduction, so
+    // splitting the namespace would only throw away the reuse one shared
+    // successor gives them. The split is therefore gated on the same flag, and
+    // this deploy is inert: the live method is the shared one.
+    const off = storageGraphV11CheckpointMethods(false);
+    expect(off.fits).toBe(STORAGE_GRAPH_V11_CHECKPOINT_METHOD);
+    expect(off.model).toBe(STORAGE_GRAPH_V11_CHECKPOINT_METHOD);
+    expect(off.live).toEqual([STORAGE_GRAPH_V11_CHECKPOINT_METHOD]);
+    // Once the fold is on the model metric drops the scalar half, so a model
+    // successor is not one a fits claim may resume and the two must not share.
+    const on = storageGraphV11CheckpointMethods(true);
+    expect(on.fits).toBe(`${STORAGE_GRAPH_V11_CHECKPOINT_METHOD}:fits-1`);
+    expect(on.model).toBe(`${STORAGE_GRAPH_V11_CHECKPOINT_METHOD}:model-1`);
+    expect(on.live).toEqual([on.fits, on.model]);
+    // The live constants follow the flag, which is off.
+    expect(STORAGE_V11_PREPARED_FOLD).toBe(false);
+    expect(STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).toBe(off.fits);
+    expect(STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).toBe(off.model);
+    // A reader may only build a key under a registered method; retirement
+    // reclaims anything else on sight.
+    expect([...STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS]).toEqual([
+      STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD, STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
+      STORAGE_GRAPH_V11_CHECKPOINT_METHOD]);
+  });
+
+  it("leaves every result identity the fold could have retired unchanged", () => {
+    // `V11_QUOTA_ACQUISITION_VERSION` feeds the resumable adapter version,
+    // which feeds the per-owner graph dependency digest; `STORAGE_GRAPH_METHOD`
+    // feeds every source's. A bump to either would recompute days the oracle
+    // proves are already correct.
+    expect(V11_QUOTA_ACQUISITION_VERSION).toBe("v11-quota-acquisition-2");
+    expect(V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION)
+      .toBe(`${V11_PLAN_ATTRIBUTION_ADAPTER_VERSION}:${V11_QUOTA_ACQUISITION_VERSION}`);
+    expect(STORAGE_GRAPH_METHOD).toBe(`${communityAnalysisCacheVersion()}:separate-results-1`);
+    // And the checkpoint namespace is a suffix of the result method, not a
+    // component of it: reading one never changes the other.
+    expect(STORAGE_GRAPH_V11_CHECKPOINT_METHOD.startsWith(`${STORAGE_GRAPH_METHOD}:`)).toBe(true);
+    expect(STORAGE_GRAPH_METHOD.includes("v11-shared-checkpoint")).toBe(false);
+  });
+});
+
+describe("model-only usage reduction", () => {
+  const identity = {
+    participantId: "synthetic-mode-participant", inputFingerprint: "c".repeat(64),
+    sourceMethodVersion: "synthetic-mode", observedAtCutoff: "2026-05-01T00:00:00.000Z",
+    resetsAtCutoff: "2026-05-01T00:00:00.000Z", windowMinutes: 10_080, maxQuotaRows: 60_000,
+  };
+  const reduction = (scalarReduced: boolean,
+    patch: Partial<V11UsageReductionCheckpoint> = {}): V11UsageReductionCheckpoint => ({
+    version: 1, identity, days: [], dayIndex: 0, cursorTime: identity.observedAtCutoff,
+    cursorOccurrence: "", rowsRead: 0, complete: true, scalarReduced,
+    commonRefusal: null, scalarRefusal: scalarReduced ? null : "supported_quota_track_unavailable",
+    modelRefusal: null, previous: [], hazards: [], scalarBuckets: [], modelCosts: [], poisoned: [],
+    usageEventCount: 0, unpricedUsageEventCount: 0, attributionUnresolved: false, ...patch,
+  });
+
+  it("marks which half a successor carries, and refuses one that lies about it", () => {
+    // The belt-and-braces guard behind the namespace split: even handed a
+    // model-only successor, nothing can mistake it for a scalar reduction.
+    expect(validateV11UsageReductionCheckpoint(reduction(true))).toBe(true);
+    expect(validateV11UsageReductionCheckpoint(reduction(false))).toBe(true);
+    // A model-only reduction never built either scalar component, so a
+    // successor carrying one was not built in that mode.
+    expect(validateV11UsageReductionCheckpoint(reduction(false, {
+      scalarBuckets: [{ key: "k", value: { provider: "openai_codex", scope: null, eraKey: "e",
+        placement: 0, costNanousd: 0, fullyPriced: true } }] }))).toBe(false);
+    expect(validateV11UsageReductionCheckpoint(reduction(false, {
+      hazards: [{ key: "all|openai_codex", intervals: [{ start: 0, end: 1 }] }] }))).toBe(false);
+    // And the field itself is required, so an older successor cannot be
+    // decoded as either mode by omission.
+    const { scalarReduced: _omitted, ...without } = reduction(true);
+    expect(validateV11UsageReductionCheckpoint(without)).toBe(false);
+  });
+
+  it("keeps a fits successor and a model successor in different namespaces once the fold is on", () => {
+    // The structural half of the same guarantee. While the fold is off the two
+    // metrics run the identical reduction and deliberately SHARE one
+    // successor, which is the reuse the split would otherwise throw away.
+    const key = (method: string) => JSON.stringify(["source", "namespace", "owner", "2026-05-01", method]);
+    const off = storageGraphV11CheckpointMethods(false);
+    expect(key(off.fits)).toBe(key(off.model));
+    const on = storageGraphV11CheckpointMethods(true);
+    expect(on.fits).not.toBe(on.model);
+    expect(key(on.fits)).not.toBe(key(on.model));
+  });
+});
+
+describe("a fits claim and a model claim cannot read each other's successor", () => {
+  const bindings = env as Env & { STORAGE_ANALYTICS_DB: D1Database; TEST_ANALYTICS_MIGRATIONS: D1Migration[] };
+  const target = () => bindings.STORAGE_ANALYTICS_DB;
+  const sourceId = "synthetic-metric-split-source", ownerDigest = "a".repeat(64);
+  const identity = {
+    participantId: "synthetic-metric-split", inputFingerprint: "d".repeat(64),
+    sourceMethodVersion: "synthetic-metric-split", observedAtCutoff: "2026-05-01T00:00:00.000Z",
+    resetsAtCutoff: "2026-05-01T00:00:00.000Z", windowMinutes: 10_080, maxQuotaRows: 60_000,
+  };
+  const keyFor = (method: string): StorageHistoryKey => ({ sourceId, ownerDigest, day: "2026-09-05",
+    dependencyDigest: "b".repeat(64), sourceNamespace: "synthetic-origin", method });
+  const checkpoint = (): StorageV11HistoryCheckpoint => ({ version: 1, source: "v1.1", day: "2026-09-05",
+    layout: "typed-v11:synthetic-origin", identity, phase: "acquisition",
+    acquisition: createV11QuotaAcquisitionCheckpoint(identity) });
+
+  beforeEach(async () => {
+    await reset();
+    await applyD1Migrations(target(), bindings.TEST_ANALYTICS_MIGRATIONS);
+    await target().prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(sourceId, ownerDigest).run();
+  });
+
+  const stage = async (method: string) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const result = await saveStorageHistoryCheckpoint({ target: target(), key: keyFor(method),
+        checkpoint: checkpoint(), expectedHead: null, maxWrites: 4 });
+      if (result.status === "saved") return result.headDigest;
+    }
+    throw new Error("synthetic staging did not finish");
+  };
+  const read = async (method: string) => {
+    for (let attempt = 0; attempt < 140; attempt += 1) {
+      const result = await loadStorageHistoryCheckpoint({ target: target(), key: keyFor(method), maxParts: 8 });
+      if (result.status !== "deferred") return result;
+    }
+    throw new Error("synthetic load did not finish");
+  };
+
+  it("stages under one metric's method and finds nothing under the other's", async () => {
+    // Once the fold is on the model metric's reduction has no scalar half, so
+    // its successor must be unreachable from a fits claim and the reverse. The
+    // two claims build different keys, so the successor is simply not there —
+    // the `scalarReduced` fence behind it never has to fire. Driven from the
+    // rule rather than the live constants, which follow the flag.
+    const on = storageGraphV11CheckpointMethods(true);
+    await stage(on.model);
+    expect((await read(on.model)).status).toBe("ready");
+    expect((await read(on.fits)).status).toBe("absent");
+
+    await stage(on.fits);
+    expect((await read(on.fits)).status).toBe("ready");
+    // Staging the fits successor did not disturb the model one.
+    expect((await read(on.model)).status).toBe("ready");
+    // And nothing is reachable under the shared base they split from.
+    expect((await read(STORAGE_GRAPH_V11_CHECKPOINT_METHOD)).status).toBe("absent");
+  });
+});

@@ -20,10 +20,69 @@ import {
   quotaResetClusterEntries,
   quotaResetRepresentativeMs,
   validQuotaResetClusterEntries,
+  mergeQuotaFragmentStats,
+  mergeQuotaResetHulls,
   type QuotaEndpointRun,
   type QuotaFragmentStats,
   type QuotaResetClusterEntry,
+  type QuotaResetInterval,
 } from "./quota-endpoint-collapse";
+// Type-only: the prepared-day artifact module imports this one for its own
+// bounds and validators, so a runtime import back would be an initialization
+// cycle. The caller validates a day with `validGraphDayProjection`.
+import type { GraphDayProjection } from "./graph-day-projection-values";
+// The shared half of the acquisition contract, in a module that imports only
+// packages and the collapse kernel. The artifact module depends on it too, so
+// neither side depends on the other and the graph stays acyclic. Everything
+// the reader used to own is re-exported below, so its callers are unchanged.
+import {
+  ACCOUNT_TRACK,
+  MAX_TIME,
+  MIN_TIME,
+  OPAQUE_ID,
+  PLAN_ERA,
+  PLAN_TYPES,
+  SAFE_TOKEN,
+  SLOTS,
+  V11_PLAN_ANCHOR_LIMIT,
+  V11_QUOTA_ENDPOINT_LIMIT,
+  V11_QUOTA_WORK_COMPONENTS,
+  accountScope,
+  boundedToken,
+  canonicalTuple,
+  closed,
+  endpointKey,
+  instant,
+  numberOrder,
+  percent,
+  planGroup,
+  planSignature,
+  planSort,
+  positiveId,
+  safeTime,
+  statsKey,
+  textOrder,
+  validEraKey,
+  validPlanAnchor,
+  validQuotaRow,
+  validateV11QuotaWorkPart,
+  type Endpoint,
+  type EndpointRun,
+  type FragmentStats,
+  type PlanRun,
+  type V11AcquiredQuotaRow,
+  type V11PlanAnchor,
+  type V11QuotaWorkComponent,
+} from "./quota-analysis-v11-contract";
+export {
+  V11_PLAN_ANCHOR_LIMIT,
+  V11_QUOTA_ENDPOINT_LIMIT,
+  V11_QUOTA_WORK_COMPONENTS,
+  validateV11QuotaWorkPart,
+  type V11QuotaWorkComponent,
+  type V11AcquiredQuotaRow,
+  type V11PlanAnchor,
+} from "./quota-analysis-v11-contract";
 import {
   TYPED_V11_QUOTA_PAGE_SIZE,
   type V11QuotaPageCursor,
@@ -36,46 +95,7 @@ import {
  * must invalidate an in-flight acquisition without relabelling old evidence. */
 export const V11_QUOTA_ACQUISITION_VERSION = "v11-quota-acquisition-2";
 export const V11_QUOTA_ACQUISITION_PAGE_SIZE = TYPED_V11_QUOTA_PAGE_SIZE;
-export const V11_PLAN_ANCHOR_LIMIT = 120_000;
-export const V11_QUOTA_ENDPOINT_LIMIT = 60_000;
-const SAFE_TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
-const OPAQUE_ID = /^[A-Za-z0-9._:-]{8,128}$/u;
-const ACCOUNT_TRACK = /^account-track:v2:[0-9a-f]{64}$/u;
-const PLAN_ERA = /^plan-era:v1:[0-9a-f]{64}$/u;
-const PLAN_TYPES = new Set<string>(TELEMETRY_PLAN_TYPES);
-const SLOTS = new Set(["primary", "secondary", "five_hour", "seven_day", "other", "unknown"]);
-const MIN_TIME = -8_640_000_000_000_000;
-const MAX_TIME = 8_640_000_000_000_000;
 
-export interface V11PlanAnchor extends PlanAttributionObservation {
-  contextKey: string;
-  observedAtMs: number;
-  planType: string | null;
-  planVariant: string;
-  continuityId: string | null;
-  conflicted: boolean;
-  accountScopeId: string | null;
-  /** Retained to make DISTINCT/LAG semantics stable when a malformed source
-   * records two otherwise identical labels with different basis metadata. */
-  planBasis: V11QuotaSourceRow["planBasis"];
-}
-
-export interface V11AcquiredQuotaRow {
-  occurrence_id: string;
-  observed_at: string;
-  provider: string;
-  account_scope_id: string | null;
-  limit_id: string;
-  plan_type: string;
-  plan_variant: string;
-  continuity_id: string | null;
-  plan_basis: V11QuotaSourceRow["planBasis"];
-  slot: string;
-  used_percent: number;
-  window_duration_minutes: number;
-  resets_at: string;
-  plan_era_key: string;
-}
 
 export interface V11QuotaPageReader {
   readonly pageSize: typeof V11_QUOTA_ACQUISITION_PAGE_SIZE;
@@ -92,19 +112,8 @@ export interface V11QuotaAcquisitionIdentity {
   maxQuotaRows: number;
 }
 
-interface PlanRun {
-  first: V11PlanAnchor;
-  last: V11PlanAnchor;
-  signature: string;
-}
 const IDENTITY_FIELDS = ["participantId", "inputFingerprint", "sourceMethodVersion",
   "observedAtCutoff", "resetsAtCutoff", "windowMinutes", "maxQuotaRows"] as const;
-type FragmentStats = QuotaFragmentStats;
-interface Endpoint {
-  id: number;
-  row: V11AcquiredQuotaRow;
-}
-type EndpointRun = QuotaEndpointRun<Endpoint>;
 
 export interface V11QuotaAcquisitionCheckpoint {
   version: typeof V11_QUOTA_ACQUISITION_VERSION;
@@ -140,11 +149,6 @@ export interface V11QuotaAcquisitionCheckpoint {
  * distinct count is bounded only by the row count, where the representative key
  * is bounded by `QUOTA_RESET_CLUSTER_LIMIT` pools: a mid-`clusters` successor
  * would fail its own `maxEras` part bound on a dense owner. */
-export const V11_QUOTA_WORK_COMPONENTS = [
-  "plan-observations", "plan-runs", "plan-equal-time", "reset-clusters", "fit-stats", "eligible",
-  "endpoint-runs", "endpoints",
-] as const;
-export type V11QuotaWorkComponent = typeof V11_QUOTA_WORK_COMPONENTS[number];
 
 export interface V11QuotaWorkControl {
   version: typeof V11_QUOTA_ACQUISITION_VERSION;
@@ -185,39 +189,6 @@ function invalid(): never { throw new Error("v11 quota acquisition checkpoint in
 /** The one coded failure for a structurally impossible acquisition state. The
  * direct reader shares it so both quota paths fail with the same code. */
 export function invalidV11QuotaAcquisition(): never { invalid(); }
-function textOrder(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
-function numberOrder(left: number, right: number): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
-function closed(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
-}
-function instant(value: unknown): value is string {
-  return typeof value === "string" && value.length <= 27 && Number.isFinite(Date.parse(value))
-    && new Date(value).toISOString() === value;
-}
-function safeTime(value: unknown): value is number {
-  return Number.isSafeInteger(value) && (value as number) >= MIN_TIME && (value as number) <= MAX_TIME;
-}
-function positiveId(value: unknown): value is number {
-  return Number.isSafeInteger(value) && (value as number) > 0;
-}
-function percent(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100;
-}
-function boundedToken(value: unknown): value is string {
-  return typeof value === "string" && SAFE_TOKEN.test(value);
-}
-function canonicalTuple(value: unknown, length: number, maximum = 1024): unknown[] | null {
-  if (typeof value !== "string" || value.length > maximum) return null;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return Array.isArray(parsed) && parsed.length === length && JSON.stringify(parsed) === value ? parsed : null;
-  } catch { return null; }
-}
 function cursorValid(value: unknown): value is V11QuotaPageCursor {
   return closed(value, ["observedAtMs", "sourceRowId"])
     && safeTime(value.observedAtMs) && Number.isSafeInteger(value.sourceRowId)
@@ -247,121 +218,6 @@ export function v11QuotaAcquisitionIdentityMatches(
 ): actual is V11QuotaAcquisitionIdentity {
   return identityValid(actual) && IDENTITY_FIELDS.every((field) => actual[field] === expected[field]);
 }
-function accountScope(value: unknown): value is string | null {
-  return value === null || (typeof value === "string" && ACCOUNT_TRACK.test(value));
-}
-function validEraKey(value: unknown): value is string {
-  const fields = canonicalTuple(value, 5) ?? canonicalTuple(value, 6);
-  const context = typeof fields?.[0] === "string" ? fields[0].split("|") : [];
-  if (!fields || context.length !== 2 || !boundedToken(context[0]!) || context[1] !== "codex"
-      || fields[1] !== null && !ACCOUNT_TRACK.test(String(fields[1]))
-      || typeof fields[2] !== "string" || !PLAN_TYPES.has(fields[2])
-      || !boundedToken(fields[3]) || !safeTime(fields[4])) return false;
-  return fields.length === 5
-    ? true
-    : typeof fields[5] === "string" && PLAN_ERA.test(fields[5]);
-}
-function validPlanAnchor(value: unknown): value is V11PlanAnchor {
-  if (!closed(value, ["contextKey", "observedAtMs", "planType", "planVariant", "continuityId",
-    "conflicted", "accountScopeId", "planBasis"])) return false;
-  if (typeof value.contextKey !== "string" || value.contextKey.length === 0
-      || !safeTime(value.observedAtMs) || (value.planType !== null && !PLAN_TYPES.has(value.planType as string))
-      || !boundedToken(value.planVariant) || (value.continuityId !== null && !PLAN_ERA.test(value.continuityId as string))
-      || typeof value.conflicted !== "boolean" || !accountScope(value.accountScopeId)
-      || ![null, "unavailable", "same_source_occurrence", "provisional_marker", "conflicted"]
-        .includes(value.planBasis as string | null)) return false;
-  const [provider, limit] = value.contextKey.split("|");
-  return provider !== undefined && limit === "codex" && boundedToken(provider);
-}
-function validQuotaRow(value: unknown): value is V11AcquiredQuotaRow {
-  if (!closed(value, ["occurrence_id", "observed_at", "provider", "account_scope_id", "limit_id",
-    "plan_type", "plan_variant", "continuity_id", "plan_basis", "slot", "used_percent",
-    "window_duration_minutes", "resets_at", "plan_era_key"])) return false;
-  const occurrence = value.occurrence_id;
-  const observed = value.observed_at;
-  const provider = value.provider;
-  const account = value.account_scope_id;
-  const planType = value.plan_type;
-  const planVariant = value.plan_variant;
-  const continuity = value.continuity_id;
-  const basis = value.plan_basis;
-  const slot = value.slot;
-  const used = value.used_percent;
-  const window = value.window_duration_minutes;
-  const resets = value.resets_at;
-  const validWindow = typeof window === "number" && Number.isSafeInteger(window)
-    && window >= 1 && window <= 527_040;
-  return typeof occurrence === "string" && OPAQUE_ID.test(occurrence)
-    && instant(observed) && boundedToken(provider) && accountScope(account)
-    && value.limit_id === "codex" && typeof planType === "string" && PLAN_TYPES.has(planType)
-    && boundedToken(planVariant) && (continuity === null || typeof continuity === "string" && PLAN_ERA.test(continuity))
-    && [null, "unavailable", "same_source_occurrence", "provisional_marker", "conflicted"]
-      .includes(basis as string | null)
-    && typeof slot === "string" && SLOTS.has(slot) && percent(used)
-    && validWindow && instant(resets)
-    && Date.parse(resets) > Date.parse(observed) && validEraKey(value.plan_era_key);
-}
-function planSignature(row: V11PlanAnchor): string {
-  return JSON.stringify([row.planType, row.planVariant, row.continuityId, row.planBasis]);
-}
-function planGroup(row: V11PlanAnchor): string {
-  return JSON.stringify([row.contextKey, row.accountScopeId]);
-}
-function planSort(left: V11PlanAnchor, right: V11PlanAnchor): number {
-  return textOrder(planGroup(left), planGroup(right)) || textOrder(planSignature(left), planSignature(right));
-}
-function samePlan(left: V11PlanAnchor, right: V11PlanAnchor): boolean {
-  return planSignature(left) === planSignature(right);
-}
-function statsKey(reset: string, era: string): string { return JSON.stringify([reset, era]); }
-function endpointKey(era: string, slot: string, reset: string): string {
-  return JSON.stringify([era, slot, reset]);
-}
-function validStatsKey(value: unknown): value is string {
-  const fields = canonicalTuple(value, 2);
-  return !!fields && instant(fields[0]) && validEraKey(fields[1]);
-}
-function validEligibleKey(value: unknown): value is string {
-  return validStatsKey(value);
-}
-function validEndpointKey(value: unknown): value is string {
-  const fields = canonicalTuple(value, 3);
-  return !!fields && validEraKey(fields[0]) && typeof fields[1] === "string"
-    && SLOTS.has(fields[1]) && instant(fields[2]);
-}
-function validEndpoint(value: unknown): value is Endpoint {
-  return closed(value, ["id", "row"]) && positiveId(value.id) && validQuotaRow(value.row);
-}
-function validPlanRun(value: unknown): value is PlanRun {
-  return closed(value, ["first", "last", "signature"]) && validPlanAnchor(value.first)
-    && validPlanAnchor(value.last) && typeof value.signature === "string"
-    && value.signature === planSignature(value.first) && value.signature === planSignature(value.last)
-    && value.first.contextKey === value.last.contextKey
-    && value.first.accountScopeId === value.last.accountScopeId
-    && value.first.observedAtMs <= value.last.observedAtMs;
-}
-function validStats(value: unknown): value is FragmentStats {
-  return closed(value, ["values", "minimum", "maximum"]) && Array.isArray(value.values)
-    && value.values.length >= 1 && value.values.length <= QUOTA_CALIBRATION_POLICY.minimumBoundaries
-    && value.values.every(percent) && new Set(value.values).size === value.values.length
-    && percent(value.minimum) && percent(value.maximum) && value.minimum <= value.maximum
-    && value.values.every((number: number) => number >= (value.minimum as number)
-      && number <= (value.maximum as number));
-}
-function validEndpointRun(value: unknown): value is EndpointRun {
-  return closed(value, ["firstId", "last", "keptAtMs", "keptValues", "keptMinimum", "keptMaximum",
-    "holdMinimum", "holdMaximum", "pending"])
-    && positiveId(value.firstId) && percent(value.keptMinimum) && percent(value.keptMaximum)
-    && (value.keptMinimum as number) <= (value.keptMaximum as number)
-    && (value.holdMinimum === null || validEndpoint(value.holdMinimum))
-    && (value.holdMaximum === null || validEndpoint(value.holdMaximum))
-    && validEndpoint(value.last) && safeTime(value.keptAtMs) && Array.isArray(value.keptValues)
-    && value.keptValues.length >= 1
-    && value.keptValues.length <= QUOTA_CALIBRATION_POLICY.minimumBoundaries
-    && value.keptValues.every(percent)
-    && new Set(value.keptValues).size === value.keptValues.length
-    && (value.pending === null || validEndpoint(value.pending));
-}
 
 export function validateV11CompletedQuotaAcquisition(value: unknown): value is V11CompletedQuotaAcquisition {
   if (!closed(value, ["identity", "planAnchors", "quotaRows"]) || !identityValid(value.identity)
@@ -372,34 +228,6 @@ export function validateV11CompletedQuotaAcquisition(value: unknown): value is V
   return new Set(value.quotaRows.map((row) => row.occurrence_id)).size === value.quotaRows.length;
 }
 
-export function validateV11QuotaWorkPart(component: V11QuotaWorkComponent, value: unknown): boolean {
-  if (!Array.isArray(value)) return false;
-  switch (component) {
-    case "plan-observations": case "plan-equal-time":
-      return value.length <= V11_PLAN_ANCHOR_LIMIT && value.every(validPlanAnchor);
-    case "plan-runs":
-      return value.length <= PLAN_ATTRIBUTION_POLICY.maxContexts && value.every((entry: unknown) =>
-        Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string"
-        && validPlanRun(entry[1]) && entry[0] === planGroup(entry[1].first));
-    case "reset-clusters":
-      return validQuotaResetClusterEntries(value)
-        && value.every((entry: unknown) => validEraKey((entry as unknown[])[0]));
-    case "fit-stats":
-      return value.length <= PLAN_ATTRIBUTION_POLICY.maxEras && value.every((entry: unknown) =>
-        Array.isArray(entry) && entry.length === 2 && validStatsKey(entry[0]) && validStats(entry[1]));
-    case "eligible":
-      return value.length <= V11_QUOTA_ENDPOINT_LIMIT && value.every(validEligibleKey);
-    case "endpoint-runs":
-      return value.length <= V11_QUOTA_ENDPOINT_LIMIT && value.every((entry: unknown) =>
-        Array.isArray(entry) && entry.length === 2 && validEndpointKey(entry[0]) && validEndpointRun(entry[1])
-        && entry[1].last.row.plan_era_key === JSON.parse(entry[0] as string)[0]
-        && entry[1].last.row.slot === JSON.parse(entry[0] as string)[1]
-        && entry[1].last.row.resets_at === JSON.parse(entry[0] as string)[2]);
-    case "endpoints":
-      return value.length <= V11_QUOTA_ENDPOINT_LIMIT && value.every(validEndpoint);
-    default: return false;
-  }
-}
 
 export function validateV11QuotaWorkControl(value: unknown): value is V11QuotaWorkControl {
   return closed(value, ["version", "phase", "cursor", "planTimeMs"])
@@ -608,6 +436,155 @@ function acquiredRow(row: V11QuotaSourceRow, eraKey: string): V11AcquiredQuotaRo
   };
 }
 
+/** The `plan` sub-phase's run collapse, held in one place so the paged
+ * acquisition and the prepared-day fold cannot settle different anchors.
+ * Anchors are offered in non-decreasing observation order; the ties at one
+ * instant accumulate and are flushed in a canonical order when the instant
+ * moves, because the attribution index reads an equal-time contradiction from
+ * the whole tie rather than from the order it arrived in. `observations` is
+ * the caller's own array so a resumed acquisition keeps appending to the one
+ * it already staged. */
+function createV11PlanFold(observations: V11PlanAnchor[], seed: {
+  timeMs: number | null; runs: ReadonlyArray<[string, PlanRun]>; equalTime: readonly V11PlanAnchor[];
+} = { timeMs: null, runs: [], equalTime: [] }) {
+  const runs = new Map(seed.runs);
+  const ties = new Map(seed.equalTime.map((row) => [JSON.stringify([planGroup(row), planSignature(row)]), row]));
+  let timeMs = seed.timeMs;
+  const append = (anchor: V11PlanAnchor): boolean => {
+    const group = planGroup(anchor);
+    const signature = planSignature(anchor);
+    const run = runs.get(group);
+    if (!run || run.signature !== signature) {
+      if (run && run.last.observedAtMs !== run.first.observedAtMs) observations.push(run.last);
+      if (observations.length >= V11_PLAN_ANCHOR_LIMIT) return false;
+      observations.push(anchor);
+      runs.set(group, { first: anchor, last: anchor, signature });
+    } else {
+      run.last = anchor;
+    }
+    return observations.length <= V11_PLAN_ANCHOR_LIMIT;
+  };
+  const flushTime = (): boolean => {
+    const ordered = [...ties.values()].sort(planSort);
+    for (const anchor of ordered) if (!append(anchor)) return false;
+    ties.clear();
+    return true;
+  };
+  return {
+    runs, ties,
+    get timeMs(): number | null { return timeMs; },
+    accept(anchor: V11PlanAnchor): boolean {
+      if (timeMs !== null && timeMs !== anchor.observedAtMs && !flushTime()) return false;
+      timeMs = anchor.observedAtMs;
+      ties.set(JSON.stringify([planGroup(anchor), planSignature(anchor)]), anchor);
+      return observations.length + ties.size <= V11_PLAN_ANCHOR_LIMIT;
+    },
+    finish(): boolean {
+      if (!flushTime()) return false;
+      for (const run of runs.values()) {
+        if (run.last.observedAtMs !== run.first.observedAtMs) observations.push(run.last);
+        if (observations.length > V11_PLAN_ANCHOR_LIMIT) return false;
+      }
+      observations.sort((left, right) => left.observedAtMs - right.observedAtMs
+        || textOrder(planGroup(left), planGroup(right)) || textOrder(planSignature(left), planSignature(right)));
+      timeMs = null;
+      return true;
+    },
+    clear(): void { runs.clear(); ties.clear(); timeMs = null; },
+  };
+}
+
+/** Every rejection an acquired row would face, applied once for all three
+ * source-reading sub-phases and for the fold: a row that can never be emitted
+ * must not shape a pool hull or an eligibility decision either, or the direct
+ * read, which rejects them up front, would settle different pools. */
+export interface V11AdmittedQuotaRow {
+  provider: string; accountScopeId: string | null; resetsAt: string; resetsAtMs: number;
+  usedPercent: number; slot: string; planType: string; planVariant: string;
+}
+export interface V11QuotaAdmissionBounds {
+  observedCutoffMs: number; resetsCutoffMs: number; windowMinutes: number;
+}
+function admissionBounds(identity: V11QuotaAcquisitionIdentity): V11QuotaAdmissionBounds {
+  return { observedCutoffMs: Date.parse(identity.observedAtCutoff),
+    resetsCutoffMs: Date.parse(identity.resetsAtCutoff), windowMinutes: identity.windowMinutes };
+}
+function foldableQuotaRow(active: V11QuotaSourceRow, bounds: V11QuotaAdmissionBounds):
+  V11AdmittedQuotaRow | null {
+  if (active.observedAtMs < bounds.observedCutoffMs
+      || active.resetsAt === null || Date.parse(active.resetsAt) < bounds.resetsCutoffMs
+      || active.windowDurationMinutes !== bounds.windowMinutes || active.usedPercent === null) return null;
+  const accountScopeId = active.accountBasis === "same_source" ? active.accountTrackId : null;
+  const provider = active.provider;
+  if (provider === null || active.limitId !== "codex" || !SAFE_TOKEN.test(provider)
+      || (accountScopeId !== null && !ACCOUNT_TRACK.test(accountScopeId))) return null;
+  if (active.planType === null || active.planVariant === null || active.slot === null
+      || !PLAN_TYPES.has(active.planType) || !SAFE_TOKEN.test(active.planVariant)
+      || !SLOTS.has(active.slot) || !percent(active.usedPercent)
+      || Date.parse(active.resetsAt) <= active.observedAtMs) return null;
+  return { provider, accountScopeId, resetsAt: active.resetsAt, resetsAtMs: Date.parse(active.resetsAt),
+    usedPercent: active.usedPercent, slot: active.slot, planType: active.planType,
+    planVariant: active.planVariant };
+}
+
+/** The window era one admitted quota row belongs to, or null when the index
+ * has no era covering it or the era disagrees with the row's own plan. */
+function quotaRowEraKey(index: PlanAttributionIndex, active: V11QuotaSourceRow,
+  admitted: { provider: string; accountScopeId: string | null }): string | null {
+  const match = planEraForInterval(index, {
+    contextKey: planAttributionContextKey(admitted.provider, active.limitId!),
+    accountScopeId: admitted.accountScopeId, observedAtMs: active.observedAtMs,
+  });
+  if (match.status !== "matched" || active.planType !== match.era.planType
+      || active.planVariant !== match.era.planVariant) return null;
+  return validEraKey(match.era.eraKey) ? match.era.eraKey : null;
+}
+
+/** Settle which clustered groups the calibration will accept, and refuse when
+ * admitting them could not fit the caller's downsampled-row bound. Shared so
+ * the fold cannot admit a group the paged path refused. */
+function settleQuotaEligibility(stats: Map<string, FragmentStats>, eligible: Set<string>,
+  maxQuotaRows: number): boolean {
+  for (const [key, stat] of stats) {
+    if (quotaFragmentEligible(stat)) {
+      eligible.add(key);
+      if (eligible.size * QUOTA_CALIBRATION_POLICY.minimumBoundaries > maxQuotaRows) return false;
+    }
+  }
+  stats.clear();
+  return true;
+}
+
+/** One source row reduced to what a prepared day stores, or the parts of it a
+ * prepared day stores. The admission applied here is exactly the paged path's
+ * own, minus the two predicates a day cannot know: the window's observation
+ * start, which is day-aligned and therefore decided by which days are folded,
+ * and the reset horizon, which moves with every model-day and is applied by the
+ * fold. `windowMinutes` is a fixed kernel constant of the caller's analysis and
+ * is applied here, because it is NOT part of the day's collapse key and a row
+ * of another window duration would otherwise share a run with one of this. */
+export interface V11PreparedDayRow {
+  sourceRowId: number;
+  observedAtMs: number;
+  anchor: V11PlanAnchor | null;
+  row: Omit<V11AcquiredQuotaRow, "plan_era_key"> | null;
+}
+export function v11PreparedDayRow(pageRow: V11QuotaPageRow, windowMinutes: number): V11PreparedDayRow {
+  const active = pageRow.active;
+  if (active === null) {
+    return { sourceRowId: pageRow.sourceRowId, observedAtMs: pageRow.observedAtMs, anchor: null, row: null };
+  }
+  const admitted = foldableQuotaRow(active,
+    { observedCutoffMs: MIN_TIME, resetsCutoffMs: MIN_TIME, windowMinutes });
+  const row = admitted === null ? null : acquiredRow(active, PREPARED_DAY_PROBE_ERA_KEY);
+  if (row !== null) delete (row as Partial<V11AcquiredQuotaRow>).plan_era_key;
+  return { sourceRowId: pageRow.sourceRowId, observedAtMs: pageRow.observedAtMs,
+    anchor: sourceAnchor(active), row };
+}
+/** Only ever used to satisfy `acquiredRow`'s own era-key check while building a
+ * day-local row; the fold assigns the window era and this value never escapes. */
+const PREPARED_DAY_PROBE_ERA_KEY = JSON.stringify(["openai_codex|codex", null, "pro", "unknown", 0]);
+
 function initialCursor(identity: V11QuotaAcquisitionIdentity): V11QuotaPageCursor {
   return { observedAtMs: Date.parse(identity.observedAtCutoff), sourceRowId: 0 };
 }
@@ -646,10 +623,8 @@ export async function advanceV11QuotaAcquisition(
   const now = budget.now ?? Date.now;
   if (budget.remainingQueries === 0 || now() >= budget.deadlineMs) return { status: "deferred", checkpoint: state };
 
-  const planRuns = new Map(state.plan.runs);
-  const equalTime = new Map(state.plan.equalTime.map((row) => [
-    JSON.stringify([planGroup(row), planSignature(row)]), row,
-  ]));
+  const plan = createV11PlanFold(state.plan.observations, { timeMs: state.plan.timeMs,
+    runs: state.plan.runs, equalTime: state.plan.equalTime });
   const stats = new Map(state.stats);
   const eligible = new Set(state.eligible);
   const endpointRuns = new Map<string, EndpointRun>(state.runs);
@@ -663,54 +638,17 @@ export async function advanceV11QuotaAcquisition(
     state.endpoints.push(value);
     return state.endpoints.length <= identity.maxQuotaRows;
   };
+  const bounds = admissionBounds(identity);
   let index: PlanAttributionIndex | null = state.phase === "plan"
     ? null : buildPlanAttributionIndex(state.plan.observations);
   if (index?.status !== undefined && index.status !== "ready") return refusal("plan_attribution_limit_exceeded");
 
-  const appendPlan = (anchor: V11PlanAnchor): boolean => {
-    const group = planGroup(anchor);
-    const signature = planSignature(anchor);
-    const run = planRuns.get(group);
-    if (!run || run.signature !== signature) {
-      if (run && run.last.observedAtMs !== run.first.observedAtMs) state.plan.observations.push(run.last);
-      if (state.plan.observations.length >= V11_PLAN_ANCHOR_LIMIT) return false;
-      state.plan.observations.push(anchor);
-      planRuns.set(group, { first: anchor, last: anchor, signature });
-    } else {
-      run.last = anchor;
-    }
-    return state.plan.observations.length <= V11_PLAN_ANCHOR_LIMIT;
-  };
-  const flushPlanTime = (): boolean => {
-    const ordered = [...equalTime.values()].sort(planSort);
-    for (const anchor of ordered) if (!appendPlan(anchor)) return false;
-    equalTime.clear();
-    return true;
-  };
-  const finishPlan = (): boolean => {
-    if (!flushPlanTime()) return false;
-    for (const run of planRuns.values()) {
-      if (run.last.observedAtMs !== run.first.observedAtMs) state.plan.observations.push(run.last);
-      if (state.plan.observations.length > V11_PLAN_ANCHOR_LIMIT) return false;
-    }
-    state.plan.observations.sort((left, right) => left.observedAtMs - right.observedAtMs
-      || textOrder(planGroup(left), planGroup(right)) || textOrder(planSignature(left), planSignature(right)));
-    return true;
-  };
-  const finishStats = (): boolean => {
-    for (const [key, stat] of stats) {
-      if (quotaFragmentEligible(stat)) {
-        eligible.add(key);
-        if (eligible.size * QUOTA_CALIBRATION_POLICY.minimumBoundaries > identity.maxQuotaRows) return false;
-      }
-    }
-    stats.clear();
-    return true;
-  };
+  const finishStats = (): boolean => settleQuotaEligibility(stats, eligible, identity.maxQuotaRows);
   const finishRuns = (): boolean => finishQuotaEndpoints(endpointRuns, endpointView, emitEndpoint);
   const defer = (): V11QuotaAcquisitionStep => {
-    state.plan.runs = [...planRuns];
-    state.plan.equalTime = [...equalTime.values()];
+    state.plan.timeMs = plan.timeMs;
+    state.plan.runs = [...plan.runs];
+    state.plan.equalTime = [...plan.ties.values()];
     state.clusters = quotaResetClusterEntries(clusters);
     state.stats = [...stats];
     state.eligible = [...eligible];
@@ -741,58 +679,32 @@ export async function advanceV11QuotaAcquisition(
       if (state.phase === "plan") {
         const anchor = sourceAnchor(active);
         if (anchor === null) continue;
-        if (state.plan.timeMs !== null && state.plan.timeMs !== anchor.observedAtMs
-            && !flushPlanTime()) return refusal("plan_attribution_limit_exceeded");
-        state.plan.timeMs = anchor.observedAtMs;
-        equalTime.set(JSON.stringify([planGroup(anchor), planSignature(anchor)]), anchor);
-        if (state.plan.observations.length + equalTime.size > V11_PLAN_ANCHOR_LIMIT) {
-          return refusal("plan_attribution_limit_exceeded");
-        }
+        if (!plan.accept(anchor)) return refusal("plan_attribution_limit_exceeded");
         continue;
       }
-      if (active.observedAtMs < Date.parse(identity.observedAtCutoff)
-          || active.resetsAt === null || Date.parse(active.resetsAt) < Date.parse(identity.resetsAtCutoff)
-          || active.windowDurationMinutes !== identity.windowMinutes || active.usedPercent === null) continue;
       if (index === null) throw new Error("v11 quota attribution index missing");
-      const accountScopeId = active.accountBasis === "same_source" ? active.accountTrackId : null;
-      const provider = active.provider;
-      if (provider === null || active.limitId !== "codex" || !SAFE_TOKEN.test(provider)
-          || (accountScopeId !== null && !ACCOUNT_TRACK.test(accountScopeId))) continue;
-      // Every rejection an acquired row would face, applied once for all three
-      // source-reading sub-phases: a row that can never be emitted must not
-      // shape a pool hull or an eligibility decision either, or the direct
-      // read, which rejects them up front, would settle different pools.
-      if (active.planType === null || active.planVariant === null || active.slot === null
-          || !PLAN_TYPES.has(active.planType) || !SAFE_TOKEN.test(active.planVariant)
-          || !SLOTS.has(active.slot) || !percent(active.usedPercent)
-          || Date.parse(active.resetsAt) <= active.observedAtMs) continue;
-      const match = planEraForInterval(index, {
-        contextKey: planAttributionContextKey(provider, active.limitId), accountScopeId,
-        observedAtMs: active.observedAtMs,
-      });
-      if (match.status !== "matched" || active.planType !== match.era.planType
-          || active.planVariant !== match.era.planVariant) continue;
-      const eraKey = match.era.eraKey;
-      if (!validEraKey(eraKey)) continue;
+      const admitted = foldableQuotaRow(active, bounds);
+      if (admitted === null) continue;
+      const eraKey = quotaRowEraKey(index, active, admitted);
+      if (eraKey === null) continue;
       // Pool identity, not the restated instant. The `clusters` sub-phase sees
       // every valid quota row before any key is derived, so both the fitable
       // stats and the endpoint runs are keyed by a settled pool.
       if (state.phase === "clusters") {
-        if (!addQuotaReset(clusters, eraKey, Date.parse(active.resetsAt))) {
+        if (!addQuotaReset(clusters, eraKey, admitted.resetsAtMs)) {
           return refusal("downsampled_quota_limit_exceeded");
         }
         continue;
       }
-      const representative = quotaResetRepresentativeMs(clusters, eraKey, Date.parse(active.resetsAt));
+      const representative = quotaResetRepresentativeMs(clusters, eraKey, admitted.resetsAtMs);
       if (representative === null) invalid();
       const reset = new Date(representative).toISOString();
       const key = statsKey(reset, eraKey);
       if (state.phase === "fitability") {
-        addQuotaFragmentValue(stats, key, active.usedPercent);
+        addQuotaFragmentValue(stats, key, admitted.usedPercent);
         continue;
       }
       if (!eligible.has(key)) continue;
-      if (active.slot === null || !SLOTS.has(active.slot)) continue;
       const output = acquiredRow(active, eraKey);
       if (output === null) continue;
       // The representative is the pool's largest restated instant, so it stays
@@ -805,14 +717,14 @@ export async function advanceV11QuotaAcquisition(
     state.cursor = previous;
     if (rows.length === reader.pageSize) continue;
     if (state.phase === "plan") {
-      if (!finishPlan()) return refusal("plan_attribution_limit_exceeded");
+      if (!plan.finish()) return refusal("plan_attribution_limit_exceeded");
       index = buildPlanAttributionIndex(state.plan.observations);
       if (index.status !== "ready") return refusal("plan_attribution_limit_exceeded");
       state.phase = "clusters";
       state.plan.timeMs = null;
       state.plan.equalTime = [];
       state.plan.runs = [];
-      planRuns.clear();
+      plan.clear();
       state.cursor = initialCursor(identity);
       if (options.stopAtPhaseBoundary) return defer();
       continue;
@@ -849,4 +761,222 @@ export async function advanceV11QuotaAcquisitionPage(
   const before = budget.remainingQueries;
   const result = await advanceV11QuotaAcquisition(reader, identity, budget, state, { maxPages: 1 });
   return { result, checkpoint: before === budget.remainingQueries || result.status === "not_testable" ? null : state };
+}
+
+/** A prepared day cannot be folded without losing evidence the paged path
+ * used. Distinct from `invalid()` so an operator can tell an artifact this
+ * layer cannot express from a corrupt checkpoint. */
+function ambiguousPreparedDay(): never {
+  throw new Error("v11 quota prepared day ambiguous");
+}
+
+/** The supplied days are not the window's days. A fold over a window with a
+ * day missing settles a smaller, complete-LOOKING acquisition under the same
+ * result identity, so it is refused rather than folded: the caller supplies
+ * every day of the generation's window or none of them. Distinct from the
+ * ambiguity failure so an operator can tell a lane that has not finished
+ * building from an artifact that cannot be placed. */
+export function incompleteV11PreparedDays(): never {
+  throw new Error("v11 quota prepared day set incomplete");
+}
+
+/** Refuse unless `days` is exactly `expected`, in order. Shared by the quota
+ * and usage folds so one rule decides completeness for both. */
+export function assertV11PreparedDayCoverage(days: readonly { day: string }[],
+  expected: readonly string[]): void {
+  if (days.length !== expected.length) incompleteV11PreparedDays();
+  for (let index = 0; index < days.length; index += 1) {
+    if (days[index]!.day !== expected[index]) incompleteV11PreparedDays();
+  }
+}
+
+/**
+ * Fold prepared per-day projections into the same `V11CompletedQuotaAcquisition`
+ * the paged path settles on, without reading a source page.
+ *
+ * Days must arrive in ascending UTC-day order, must be EXACTLY `expectedDays`
+ * — the generation's own days for this window — and must already have passed
+ * `validGraphDayProjection`; the caller owns that last check, because the
+ * artifact module imports this one and a runtime import back would be a cycle.
+ *
+ * What composes, and why this is the same result:
+ *
+ * - **Plan anchors.** Each day's retained run boundaries are replayed through
+ *   the shared `createV11PlanFold`, which is the same collapse the `plan`
+ *   sub-phase runs. Replaying a run's own boundaries is idempotent, and a run
+ *   crossing midnight is rejoined because the fold sees both days' boundaries
+ *   in order, so the settled observations are the paged path's own.
+ * - **Pools.** `mergeQuotaResetHulls` reaches the same single-linkage partition
+ *   as inserting every raw instant, so the representative is resolved here,
+ *   after all days merge, and never day-locally.
+ * - **Fitability.** Minimum and maximum fold, and the capped distinct-value set
+ *   reaches the cap exactly when the pool's true distinct count does, so
+ *   `quotaFragmentEligible` decides the same groups.
+ * - **Spacing stays here.** The days carry run endpoints with no spacing; the
+ *   fold feeds them, in day order, through the unmodified
+ *   `collapseQuotaEndpoint` / `finishQuotaEndpoints`.
+ *
+ * Evidence a prepared day cannot place is refused loudly rather than folded
+ * approximately: a day-local RUN whose retained endpoints do not all resolve to
+ * one window era, or a hull or fit fragment for a run the day retained no
+ * endpoint for. Both are structurally impossible in a day this layer built —
+ * `validGraphDayProjection` enforces the second — so reaching either means the
+ * artifact is not the one the fold's composition argument applies to.
+ *
+ * The one inexactness that is not detectable here is the cluster bound: the
+ * merge refuses on the count settled at each day boundary, which is one-sided
+ * (a refusing merge proves the direct insertion refused too) but misses a
+ * transient peak inside a single day that the day's own hull set no longer
+ * shows.
+ */
+export function foldV11QuotaAcquisition(identity: V11QuotaAcquisitionIdentity,
+  days: readonly GraphDayProjection[], expectedDays: readonly string[]): V11QuotaAcquisitionStep {
+  if (!identityValid(identity)) invalid();
+  // Completeness first: ordering and the cutoff say nothing about a day that
+  // is simply absent, and an absent day folds silently.
+  assertV11PreparedDayCoverage(days, expectedDays);
+  const bounds = admissionBounds(identity);
+  // The window's observation start is a UTC day boundary, so it selects whole
+  // days and never splits one. That is what lets a day's aggregates be folded
+  // at all: a straddling observation cutoff would need per-row evidence the
+  // aggregates no longer carry. Enforced rather than assumed.
+  const cutoffDay = identity.observedAtCutoff.slice(0, 10);
+  if (Date.parse(`${cutoffDay}T00:00:00.000Z`) !== bounds.observedCutoffMs) invalid();
+  let previousDay = "";
+  for (const day of days) {
+    if (typeof day.day !== "string" || day.day <= previousDay || day.day < cutoffDay) invalid();
+    previousDay = day.day;
+  }
+
+  const observations: V11PlanAnchor[] = [];
+  const plan = createV11PlanFold(observations);
+  let anchorAtMs = -Infinity;
+  for (const day of days) {
+    for (const anchor of day.planAnchors.anchors) {
+      if (!validPlanAnchor(anchor) || anchor.observedAtMs < anchorAtMs) invalid();
+      anchorAtMs = anchor.observedAtMs;
+      if (!plan.accept(anchor)) return refusal("plan_attribution_limit_exceeded");
+    }
+  }
+  if (!plan.finish()) return refusal("plan_attribution_limit_exceeded");
+  const index = buildPlanAttributionIndex(observations);
+  if (index.status !== "ready") return refusal("plan_attribution_limit_exceeded");
+
+  /** The window era one day-local signature resolves to at one instant, or
+   * null when every row carrying it is one the paged path would skip. */
+  const signatureEra = (signature: string, observedAtMs: number): string | null => {
+    const fields = canonicalTuple(signature, 6, 2_048);
+    if (fields === null) ambiguousPreparedDay();
+    const [contextKey, accountScopeId, planType, planVariant] = fields;
+    if (typeof contextKey !== "string" || (accountScopeId !== null && typeof accountScopeId !== "string")
+        || typeof planType !== "string" || typeof planVariant !== "string") return null;
+    const match = planEraForInterval(index, { contextKey,
+      accountScopeId: accountScopeId as string | null, observedAtMs });
+    if (match.status !== "matched" || planType !== match.era.planType
+        || planVariant !== match.era.planVariant) return null;
+    return validEraKey(match.era.eraKey) ? match.era.eraKey : null;
+  };
+  // One era per day-local RUN, proven over every retained endpoint of that run
+  // in that day. A run is closed at every signature change and at every
+  // equal-time conflict, which are exactly the instants the index can place a
+  // boundary at, so a run cannot span two eras and a signature interrupted
+  // inside a day keeps its two runs' evidence apart.
+  const dayEras = days.map((day) => {
+    const eras = new Map<string, Map<number, string | null>>();
+    for (const endpoint of day.runEndpoints.endpoints) {
+      const era = signatureEra(endpoint.signature, endpoint.observedAtMs);
+      let runs = eras.get(endpoint.signature);
+      if (runs === undefined) { runs = new Map(); eras.set(endpoint.signature, runs); }
+      if (!runs.has(endpoint.runFirstObservedAtMs)) runs.set(endpoint.runFirstObservedAtMs, era);
+      else if (runs.get(endpoint.runFirstObservedAtMs) !== era) ambiguousPreparedDay();
+    }
+    return eras;
+  });
+  const eraFor = (dayIndex: number, signature: string, runFirstObservedAtMs: number): string | null => {
+    const runs = dayEras[dayIndex]!.get(signature);
+    if (runs === undefined || !runs.has(runFirstObservedAtMs)) ambiguousPreparedDay();
+    return runs.get(runFirstObservedAtMs)!;
+  };
+
+  /** Every raw reset instant the day admitted, per run: the fit fragments are
+   * keyed by `(run, raw reset)` and the projection emits one for every admitted
+   * row, so they enumerate exactly the instants the day's hulls were built
+   * from. That is what makes `resetsAtCutoff` applicable here — the paged path
+   * drops a row below the horizon BEFORE it clusters, and a hull is an interval
+   * whose members are gone, so a straddling pool cannot be split after the
+   * fact. Rebuilding from the surviving members is exact where trimming an
+   * interval is not. `resetHulls` is consequently not read by the fold; it
+   * remains the store's own record of the same evidence. */
+  const clusters = createQuotaResetClusterState();
+  for (const [dayIndex, day] of days.entries()) {
+    const settled = createQuotaResetClusterState();
+    for (const fragment of day.fitFragments.fragments) {
+      if (fragment.resetsAtMs < bounds.resetsCutoffMs) continue;
+      const era = eraFor(dayIndex, fragment.signature, fragment.runFirstObservedAtMs);
+      if (era === null) continue;
+      if (!addQuotaReset(settled, era, fragment.resetsAtMs)) {
+        return refusal("downsampled_quota_limit_exceeded");
+      }
+    }
+    if (!mergeQuotaResetHulls(clusters, quotaResetClusterEntries(settled))) {
+      return refusal("downsampled_quota_limit_exceeded");
+    }
+  }
+
+  const stats = new Map<string, FragmentStats>();
+  for (const [dayIndex, day] of days.entries()) {
+    for (const fragment of day.fitFragments.fragments) {
+      if (fragment.resetsAtMs < bounds.resetsCutoffMs) continue;
+      const era = eraFor(dayIndex, fragment.signature, fragment.runFirstObservedAtMs);
+      if (era === null) continue;
+      const representative = quotaResetRepresentativeMs(clusters, era, fragment.resetsAtMs);
+      if (representative === null) invalid();
+      mergeQuotaFragmentStats(stats, statsKey(new Date(representative).toISOString(), era),
+        { values: [...fragment.values], minimum: fragment.minimum, maximum: fragment.maximum });
+    }
+  }
+  const eligible = new Set<string>();
+  if (!settleQuotaEligibility(stats, eligible, identity.maxQuotaRows)) {
+    return refusal("downsampled_quota_limit_exceeded");
+  }
+
+  const endpointRuns = new Map<string, EndpointRun>();
+  const emitted: Endpoint[] = [];
+  const endpointView = (value: Endpoint) => ({ id: value.id,
+    observedAtMs: Date.parse(value.row.observed_at), usedPercent: value.row.used_percent });
+  const emitEndpoint = (value: Endpoint) => {
+    emitted.push(value);
+    return emitted.length <= identity.maxQuotaRows;
+  };
+  let previous: V11QuotaPageCursor = { observedAtMs: -Infinity, sourceRowId: 0 };
+  for (const [dayIndex, day] of days.entries()) {
+    for (const value of day.runEndpoints.endpoints) {
+      if (!positiveId(value.sourceRowId) || !safeTime(value.observedAtMs)
+          || value.observedAtMs < previous.observedAtMs
+          || value.observedAtMs === previous.observedAtMs && value.sourceRowId <= previous.sourceRowId) invalid();
+      previous = { observedAtMs: value.observedAtMs, sourceRowId: value.sourceRowId };
+      const era = eraFor(dayIndex, value.signature, value.runFirstObservedAtMs);
+      if (era === null) continue;
+      // The window predicates of the paged path's own row filter. A prepared
+      // day is window-agnostic, so they are applied here, once.
+      if (value.observedAtMs < bounds.observedCutoffMs || value.resetsAtMs < bounds.resetsCutoffMs
+          || value.row.window_duration_minutes !== bounds.windowMinutes) continue;
+      const representative = quotaResetRepresentativeMs(clusters, era, value.resetsAtMs);
+      if (representative === null) invalid();
+      const reset = new Date(representative).toISOString();
+      if (!eligible.has(statsKey(reset, era))) continue;
+      const row: V11AcquiredQuotaRow = { ...value.row, resets_at: reset, plan_era_key: era };
+      if (!collapseQuotaEndpoint(endpointRuns, endpointKey(era, row.slot, reset),
+        { id: value.sourceRowId, row }, endpointView, emitEndpoint)) {
+        return refusal("downsampled_quota_limit_exceeded");
+      }
+    }
+  }
+  if (!finishQuotaEndpoints(endpointRuns, endpointView, emitEndpoint)) {
+    return refusal("downsampled_quota_limit_exceeded");
+  }
+  emitted.sort((left, right) => numberOrder(Date.parse(left.row.observed_at), Date.parse(right.row.observed_at))
+    || left.id - right.id);
+  return { status: "complete", attributionIndex: index, identity: { ...identity },
+    planAnchors: observations, quotaRows: emitted.map(({ row }) => row) };
 }

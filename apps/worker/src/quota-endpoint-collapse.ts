@@ -96,6 +96,56 @@ export function addQuotaReset(state: QuotaResetClusterState, group: string, rese
   return true;
 }
 
+/** Merge a whole hull set into another, which is what lets one window's pools
+ * be folded from per-day hull sets instead of from every raw instant.
+ *
+ * Single-linkage in one dimension is exactly the maximal runs of the sorted
+ * instants whose consecutive gaps are within tolerance, so a pool is the closed
+ * hull of such a run and the partition depends only on the set of instants.
+ * Two hulls belong to one run exactly when the later hull's minimum is within
+ * tolerance of the earlier hull's maximum: every instant between them is a
+ * member of one of the two hulls, and a hull's own extremes are members. One
+ * ascending sweep over the combined hulls therefore reaches the fixpoint of
+ * `H2.min - H1.max <= tolerance`, and the result is the same partition
+ * `addQuotaReset` settles on when every raw instant is inserted directly.
+ *
+ * Only `min <= max` is required of each incoming hull: the sweep sorts, so a
+ * group may be offered several unordered hull sets at once, which is what lets
+ * two day-local plan runs that resolve to one era be merged in one call.
+ *
+ * The bound is checked on the count this merge would settle on, and nothing is
+ * committed when it is exceeded, so a refusing merge leaves the state usable
+ * for a diagnostic. Because a hull count can only grow by one per inserted
+ * instant, any count above the limit was also reached by the direct insertion
+ * order: a merge that refuses proves the direct path refused too. The converse
+ * is not true, which is the one inexactness folding carries — see the fold's
+ * own note. */
+export function mergeQuotaResetHulls(state: QuotaResetClusterState,
+  entries: readonly QuotaResetClusterEntry[], limit = QUOTA_RESET_CLUSTER_LIMIT): boolean {
+  const merged = new Map<string, QuotaResetInterval[]>();
+  let count = state.count;
+  for (const [group, intervals] of entries) {
+    if (intervals.length === 0) continue;
+    const existing = merged.get(group) ?? state.groups.get(group) ?? [];
+    const combined = [...existing, ...intervals]
+      .map((interval) => [interval[0], interval[1]] as QuotaResetInterval)
+      .sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+    const folded: QuotaResetInterval[] = [];
+    for (const interval of combined) {
+      const open = folded[folded.length - 1];
+      if (open !== undefined && interval[0] - open[1] <= QUOTA_RESET_CLUSTER_TOLERANCE_MS) {
+        if (interval[1] > open[1]) open[1] = interval[1];
+      } else folded.push(interval);
+    }
+    count += folded.length - existing.length;
+    merged.set(group, folded);
+  }
+  if (count > limit) return false;
+  for (const [group, intervals] of merged) state.groups.set(group, intervals);
+  state.count = count;
+  return true;
+}
+
 /** The pool's representative instant: the largest reset any member restated.
  * Every member was observed strictly before its own reset, so the maximum is
  * strictly after every observation in the pool and the acquired row keeps the
@@ -150,6 +200,29 @@ export function addQuotaFragmentValue(stats: Map<string, QuotaFragmentStats>, ke
   if (usedPercent > stat.maximum) stat.maximum = usedPercent;
   if (stat.values.length < QUOTA_CALIBRATION_POLICY.minimumBoundaries
       && !stat.values.includes(usedPercent)) stat.values.push(usedPercent);
+}
+
+/** Merge one prepared fragment into a group's running statistic. The only
+ * consumer is `quotaFragmentEligible`, which reads the count of retained
+ * values and the span. Both fold exactly: the extremes are monotone, and the
+ * retained count reaches `minimumBoundaries` here exactly when the group's
+ * true distinct count does, because either some part already saturated the cap
+ * or every part carried its complete distinct set and the union is complete.
+ * Which values a saturated part retained is therefore unobservable. */
+export function mergeQuotaFragmentStats(stats: Map<string, QuotaFragmentStats>, key: string,
+  incoming: QuotaFragmentStats): void {
+  const stat = stats.get(key);
+  if (stat === undefined) {
+    stats.set(key, { values: incoming.values.slice(0, QUOTA_CALIBRATION_POLICY.minimumBoundaries),
+      minimum: incoming.minimum, maximum: incoming.maximum });
+    return;
+  }
+  if (incoming.minimum < stat.minimum) stat.minimum = incoming.minimum;
+  if (incoming.maximum > stat.maximum) stat.maximum = incoming.maximum;
+  for (const value of incoming.values) {
+    if (stat.values.length >= QUOTA_CALIBRATION_POLICY.minimumBoundaries) return;
+    if (!stat.values.includes(value)) stat.values.push(value);
+  }
 }
 
 /** The exact refusal the direct SQL used to apply in its `fitable` stage. It

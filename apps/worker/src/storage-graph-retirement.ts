@@ -9,7 +9,9 @@ import { STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_LIVE_CHECKPOI
  *
  * A stage whose method is no longer a live constant is retired on sight: no
  * reader can build that key any more, so its parts are unreachable evidence
- * rather than a resumable generation. Without this a retired method's payloads
+ * rather than a resumable generation. That is what reclaims every stage left
+ * under the former shared v1.1 usage method once the fit and model metrics
+ * took separate namespaces. Without this a retired method's payloads
  * would sit until the day horizon, because a v1.1 stage carries the checkpoint
  * dependency digest while a result carries the result dependency digest, so the
  * result-exists branch can never match one. */
@@ -43,13 +45,13 @@ export async function retireStorageGraphPage(target:D1Database,sourceId:string,n
   h.generation AS head FROM analytics_history_checkpoint_stages s LEFT JOIN analytics_history_checkpoint_heads h USING(key_digest)
   WHERE s.source_id=? AND (s.day<? OR s.owner_digest=? OR h.retired=1
    OR s.method NOT IN (${STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS.map(()=>'?').join(',')})
-   OR (s.method!=? AND EXISTS(
+   OR EXISTS(
    SELECT 1 FROM analytics_community_graph_results r WHERE r.source_id=s.source_id AND r.owner_digest=s.owner_digest
-    AND r.metric=CASE WHEN s.method=? THEN 'fits' ELSE 'model' END
-    AND r.day=s.day AND r.dependency_digest=s.dependency_digest)))
+    AND r.metric=CASE WHEN s.method IN (?,?) THEN 'fits' ELSE 'model' END
+    AND r.day=s.day AND r.dependency_digest=s.dependency_digest))
   ORDER BY s.owner_digest,s.day,s.key_digest,s.generation LIMIT 1`)
   .bind(sourceId,oldest,erased?.owner_digest??null,...STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS,
-   STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD)
+   STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD)
   .first<{source_id:string;owner_digest:string;day:string;dependency_digest:string;source_namespace:string;method:string;head:string|null}>();
  if(stage) {
   const key:StorageHistoryKey={sourceId:stage.source_id,ownerDigest:stage.owner_digest,day:stage.day,

@@ -1,4 +1,5 @@
-import { runStorageAnalyticsPass } from './storage-analytics-runtime';
+import { graphDayProjectionBuildEnabled, runStorageAnalyticsPass } from './storage-analytics-runtime';
+import { createGraphDayProjectionSourceBuild } from './graph-day-projection';
 import { createD1InvocationBudget } from './d1-invocation-budget';
 import { publicAnalyticsEnabled } from './public-analytics-gate';
 import { storageGraphFailureFields } from './storage-analytics-failure';
@@ -13,6 +14,10 @@ export interface StorageAnalyticsWorkerEnv {
  STORAGE_INGESTION_DB?:D1Database;
  STORAGE_ANALYTICS_DB?:D1Database;
  DELETION_LEDGER?:D1Database;
+ /** Deployment switch for the prepared-graph-day builder. Default OFF: the
+  * fold does not read these rows yet, so building them is an explicit operator
+  * decision and never a consequence of deploying this code. */
+ GRAPH_DAY_PROJECTION_BUILD?:'disabled'|'enabled';
 }
 /** One deployed trigger drives both passes. A second, ten-minute trigger does
  * not produce a second invocation: with both registered, the platform delivered
@@ -84,7 +89,14 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
     deliveryQueriesUsed:delivery?.queriesUsed??0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0,
     queriesUsed:meter.queriesUsed}));return;
   }
-  const result=await runStorageAnalyticsPass({...bindings,publishCommunity,
+  // The builder lane opens only on this second pass: the delivery phase has
+  // 175 statements and the long pass is graph-only. Both switches must be open,
+  // and the build reads the SAME metered source binding as everything else.
+  const buildProjections=graphDayProjectionBuildEnabled(env);
+  const projectionOptions=buildProjections?{buildGraphDayProjections:true,
+   graphDayProjectionBuild:createGraphDayProjectionSourceBuild({source:bindings.source,
+    sourceNamespace:bindings.sourceNamespace})}:{};
+  const result=await runStorageAnalyticsPass({...bindings,...projectionOptions,publishCommunity,
    ...(publishCommunity?{publicOnly:true}:{}),maxQueries:meter.remainingQueries,
    ...(publishCommunity?{maxSteps:32}:{}),
    // Erasure and the retirement pages already had their bounded opportunity
