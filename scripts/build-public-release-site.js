@@ -235,7 +235,9 @@ function usage() {
     "    Intel requires the same canonical cross-platform release manifest as Apple silicon.",
     "    [--electron-publication-plan /absolute/plan.json --electron-publication-root /absolute/artifacts",
     "     --electron-approved-plan-sha256 <reviewed identityDigest(plan)>]",
-    "    Electron mode requires a copy of the 1024x1024 public brand icon as --social-image.",
+    "    --social-image is the og:image/twitter:image. Use a rendered 1200x630 homepage",
+    "    card from `npm run product:social-preview`; Electron mode also accepts an exact",
+    "    copy of the 1024x1024 public brand icon, which downgrades to a summary card.",
     "    Electron mode excludes native installer arguments; final trust is separately reviewed.",
     "    [--replace]",
   ].join("\n");
@@ -774,7 +776,7 @@ async function regularFile(path, label, maximumBytes = Number.MAX_SAFE_INTEGER) 
   return stats;
 }
 
-function inspectPng(bytes, { electronIcon = false } = {}) {
+function inspectPng(bytes, { electronRelease = false } = {}) {
   const signature = Buffer.from([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
   ]);
@@ -817,10 +819,19 @@ function inspectPng(bytes, { electronIcon = false } = {}) {
   if (!sawIdat || !sawIend) {
     throw new TypeError("Social preview must contain PNG image data and an end marker");
   }
-  if (electronIcon ? width !== 1024 || height !== 1024 : width !== 1200 || height !== 630) {
-    throw new TypeError(electronIcon ? "Electron social preview must be the 1024x1024 brand icon" : "Social preview must be exactly 1200x630 pixels");
+  // The rendered 1200x630 homepage card is the reviewed shape everywhere.
+  // Electron mode additionally accepts the reviewed 1024x1024 public brand icon
+  // as the fallback for a publication with no fresh render; the caller then pins
+  // those bytes to tibotattle-icon.png and downgrades the card metadata, so a
+  // stale hand-copied screenshot still cannot reach the site either way.
+  const renderedCard = width === 1200 && height === 630;
+  const brandIcon = electronRelease && width === 1024 && height === 1024;
+  if (!renderedCard && !brandIcon) {
+    throw new TypeError(electronRelease
+      ? "Electron social preview must be the 1024x1024 brand icon or a rendered 1200x630 card"
+      : "Social preview must be exactly 1200x630 pixels");
   }
-  return { width, height };
+  return { width, height, brandIcon };
 }
 
 function htmlAttribute(value) {
@@ -988,7 +999,9 @@ function injectReleaseMetadata(html, values, canonicalUrl) {
   ]) {
     output = replaceExactlyOnce(output, token, replacement, label);
   }
-  if (values.electronRelease) {
+  // Only the square brand-icon fallback loses the large card; a rendered
+  // 1200x630 homepage card keeps the reviewed summary_large_image tags.
+  if (values.electronRelease && values.socialBrandIconCard) {
     output = output.replace('<meta property="og:image:width" content="1200">', '<meta property="og:image:width" content="1024">')
       .replace('<meta property="og:image:height" content="630">', '<meta property="og:image:height" content="1024">')
       .replace('<meta name="twitter:card" content="summary_large_image">', '<meta name="twitter:card" content="summary">');
@@ -1249,7 +1262,8 @@ async function verifyPublishedSourceClosure({
           `Public auxiliary page ${expected.path}`,
         );
       if (expected.path === SITE_INDEX_SOURCE_BASENAME && releaseValues.electronRelease) {
-        rendered = renderElectronSiteDownloads(rendered, releaseValues.electronRelease);
+        rendered = renderElectronSiteDownloads(rendered, releaseValues.electronRelease,
+          { brandIconCard: releaseValues.socialBrandIconCard });
       }
       if (expected.path === SITE_INDEX_SOURCE_BASENAME
           && rendered !== releaseHtml) {
@@ -1633,8 +1647,8 @@ export async function buildPublicReleaseSite(rawArgs, {
     MAXIMUM_SOCIAL_PREVIEW_BYTES,
   );
   const socialBytes = await readFile(options.socialImage);
-  const socialDimensions = inspectPng(socialBytes, { electronIcon: electronRelease !== null });
-  if (electronRelease) {
+  const socialDimensions = inspectPng(socialBytes, { electronRelease: electronRelease !== null });
+  if (socialDimensions.brandIcon) {
     const brandIcon = await readFile(join(options.source, 'tibotattle-icon.png'));
     if (!socialBytes.equals(brandIcon)) throw new TypeError('Electron social preview must match the reviewed public brand icon');
   }
@@ -1642,6 +1656,7 @@ export async function buildPublicReleaseSite(rawArgs, {
   const releaseValues = {
     ...options,
     electronRelease,
+    socialBrandIconCard: socialDimensions.brandIcon,
     installerBytes: installerEvidence?.artifact.bytes ?? null,
     installerSha256: installerEvidence?.artifact.sha256 ?? null,
     intelInstaller: intelInstallerEvidence ? {
@@ -1655,7 +1670,10 @@ export async function buildPublicReleaseSite(rawArgs, {
     releaseValues,
     canonicalUrlBySourceBasename.get(SITE_INDEX_SOURCE_BASENAME),
   );
-  if (electronRelease) releaseHtml = renderElectronSiteDownloads(releaseHtml, electronRelease);
+  if (electronRelease) {
+    releaseHtml = renderElectronSiteDownloads(releaseHtml, electronRelease,
+      { brandIconCard: releaseValues.socialBrandIconCard });
+  }
 
   if (await pathExists(options.output)) {
     if (!options.replace) {
