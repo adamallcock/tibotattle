@@ -1,3 +1,5 @@
+import { mountExampleInsights } from "./feature-insights.js";
+import { mountExampleWeek } from "./feature-week.js";
 // Entry point for the public website.
 //
 // The website introduces the Mac app, offers its verified installer, and
@@ -10,6 +12,7 @@
 // Every rendering routine below is imported, not copied: the install card and
 // the community view are the same modules the in-app dashboard entry uses.
 
+import { wireFeaturePreviews, wirePaceDemo } from "./feature-tour.js";
 import { PublicCommunityClient, normalizeCommunityDailySeries } from "./community-data.js";
 import { createCommunityRefresh } from "./community-refresh.js";
 import {
@@ -608,6 +611,10 @@ export function selectCommunityAllowancePayload(previous, payload) {
 }
 
 if (typeof document !== "undefined") {
+  wireFeaturePreviews(document, window, t);
+  wirePaceDemo(document, t);
+  mountExampleInsights(document, t);
+  mountExampleWeek(document.querySelector("#week-demo"), t);
   renderPublicInstallerJourney();
   wirePublicPlatformSelector();
   wireHomebrewInstallCommand();

@@ -63,6 +63,9 @@
     <link rel="icon" type="image/png" href="./tibotattle-icon.png">
     <link rel="apple-touch-icon" href="./tibotattle-icon.png">
     <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./feature-tour.css">
+    <link rel="stylesheet" href="./cache-reuse-matrix.css">
+    <link rel="stylesheet" href="./model-performance.css">
     <script type="module" src="./community.js"></script>
   </head>
   <body class="community-site" data-i18n-root data-i18n-legacy-root>
@@ -473,6 +476,7 @@
             </div>
           </div>
         </section>
+
       </section>
 
       <section
@@ -500,6 +504,92 @@
         </details>
       </section>
 
+      <section id="features" class="feature-tour" aria-labelledby="feature-tour-title">
+      <p class="tour-eyebrow" data-i18n="site.features.eyebrow">A clearer picture of every session</p>
+      <h2 id="feature-tour-title" data-i18n="site.features.heading">There is more to usage than a percentage.</h2>
+      <p class="tour-intro" data-i18n="site.features.intro">Follow the pace. Explore the patterns. See what your allowance makes possible.</p>
+      <article class="tour-row tour-quota">
+      <div class="tour-copy">
+      <p class="tour-eyebrow" data-i18n="site.features.quota">01 / ALLOWANCE & PACE</p>
+      <h3 data-i18n="site.features.quotaTitle">See the limit coming.</h3>
+      <p data-i18n="site.features.quotaCopy">Living fuel tanks show your remaining allowance. The forecast turns your recent pace into a run-out estimate, with the time until reset right beside it.</p>
+      </div>
+<div class="pace-showcase" data-pace-demo data-pace="way">
+<div class="pace-demo-copy"><p class="tour-eyebrow" data-i18n="site.features.demo">Interactive demonstration</p><h4  data-i18n="site.features.demoTitle">Same allowance. A different pace.</h4><p  data-i18n="site.features.demoCopy">Try a pace below. The level shows what is left; the flow shows how quickly you are using it.</p><div class="pace-options" role="group" aria-label="Interactive demonstration" data-i18n-aria-label="site.features.demo"><button type="button" data-demo-pace="under" aria-pressed="false" data-i18n="site.features.under">Under pace</button><button type="button" data-demo-pace="over" aria-pressed="false" data-i18n="site.features.over">Over pace</button><button type="button" data-demo-pace="way" aria-pressed="true" data-i18n="site.features.way">Way over pace</button></div>
+<div class="pace-verdict" aria-live="polite"><p data-demo-verdict data-i18n="site.features.underCopy">Room to keep going. Recent use is below the pace the window can sustain.</p></div></div>
+<div class="pace-apparatus" aria-hidden="true"><canvas width="320" height="418"></canvas><div class="tank-reading"><strong>33<span>%</span></strong><span data-i18n="site.features.remaining">remaining</span></div></div>
+<aside class="weekly-pace-forecast demo-forecast is-over-pace is-critical" data-demo-forecast data-motion="running" aria-live="polite">
+<div class="weekly-pace-forecast-heading"><p class="panel-kicker"><img src="./codex-color.svg" width="18" height="18" alt=""><span data-i18n="site.features.forecast">Codex · weekly forecast</span></p><span class="evidence-chip weekly-pace-forecast-state-chip" data-forecast-badge>Way over pace</span></div>
+<h4 class="weekly-pace-forecast-title" data-forecast-title></h4><p class="weekly-pace-forecast-copy" data-forecast-copy></p>
+<div class="weekly-pace-track" data-forecast-track><div class="weekly-pace-track-labels"><div class="weekly-pace-track-runout" data-forecast-runout><span data-i18n="site.features.runout">Estimated run-out</span><time class="allowance-timestamp" data-runout-time tabindex="0"></time></div><div class="weekly-pace-track-reset"><span data-i18n="site.features.reset">Allowance resets</span><time class="allowance-timestamp" data-reset-time tabindex="0"></time></div></div><div class="weekly-pace-track-bar"><div class="weekly-pace-track-covered" data-forecast-covered></div><div class="weekly-pace-track-mark" data-forecast-mark></div></div><div class="weekly-pace-track-scale"><span data-i18n="site.features.now">Now</span><span class="weekly-pace-track-gap" data-forecast-gap></span></div></div>
+<details class="weekly-pace-details"><summary data-i18n="site.features.basis">Forecast basis and assumptions</summary><p data-i18n="site.features.assumptions">Illustrative scenario with 33% remaining and a reset in 5d 20h. Assumes the selected pace continues. Hover the times for example timestamps.</p></details></aside>
+<div class="pace-demo-footer"><span  data-i18n="site.features.example">Illustrative scenario · not a live allowance</span><button type="button" data-demo-motion aria-pressed="false" data-i18n="site.features.pause">Pause preview</button></div></div>
+
+      </article>
+<details class="tour-recording"><summary  data-i18n="site.features.actual">See it in the app</summary>      <figure class="feature-media feature-video" data-feature-preview>
+       <video muted loop playsinline preload="none" poster="./feature-allowance.jpg" width="960" height="768" aria-label="App preview · example usage" data-i18n-aria-label="site.features.preview">
+      <source src="./feature-allowance.mp4" type="video/mp4">
+      </video>
+       <figcaption>
+      <span data-i18n="site.features.preview">App preview · example usage</span>
+      <button type="button" data-preview-toggle hidden data-i18n="site.features.play">Play preview</button>
+      </figcaption>
+      </figure></details>
+      <article class="tour-row tour-history">
+      <div class="tour-copy">
+      <p class="tour-eyebrow" data-i18n="site.features.history">02 / USAGE HISTORY</p>
+      <h3 data-i18n="site.features.historyTitle">Watch your week unfold.</h3>
+      <p data-i18n="site.features.historyCopy">Replay your activity through day and night. Compare recorded usage with allowance movement, and inspect reset events without losing the bigger picture.</p>
+      </div>
+<section id="week-demo" class="week-demo" aria-label="Illustrative usage history">
+<p class="week-demo-label" data-i18n="site.features.demo">Interactive demonstration</p>          <div class="trends-horizon">
+            <div class="trends-sky" aria-hidden="true"><div class="trends-stars"></div><div class="trends-clouds"></div><div class="trends-sun"></div><div class="trends-moon"></div><div class="trends-ridge"></div></div>
+            <div class="trends-clock-content"><span class="trends-clock-label" data-i18n="trends.localClock">Local clock · selected time</span><span id="trends-date" data-i18n-skip>—</span><strong id="trends-clock" data-i18n-skip>—</strong></div>
+            <div class="trends-live-metrics">
+              <div><span data-i18n="trends.headerAllowance">Allowance remaining</span><strong id="trends-allowance-value" data-i18n-skip>—</strong><small data-i18n="trends.headerObserved">Latest observation at this time</small></div>
+              <div><span data-i18n="trends.headerSpend">API equivalent / hour</span><strong id="trends-spend-value" data-i18n-skip>—</strong><small id="trends-spend-basis" data-i18n-skip>—</small></div>
+            </div>
+          </div>
+          <div class="trends-time-controls"><button id="trends-replay" class="button button-quiet compact" type="button" aria-pressed="false" disabled data-i18n="trends.play">Play history</button><input id="trends-time" type="range" aria-label="Explore history" data-i18n-aria-label="trends.explore" disabled><button id="trends-latest" class="button button-quiet compact" type="button" data-i18n="trends.latest">Latest</button></div>
+<div class="week-demo-charts"><p data-i18n="trends.headerAllowance">Allowance remaining</p><div id="allowance-timeline-chart"></div><div class="trends-reset-legend"><span id="trends-reset-count"></span></div><p id="trends-event-detail" hidden></p><p data-i18n="trends.headerSpend">API equivalent / hour</p><div id="usage-timeline-chart"></div></div><p class="week-demo-label" data-i18n="site.features.weekExample">Synthetic example week · explore the chart or select a reset marker</p></section>
+      </article>
+      <article class="tour-row tour-cache">
+      <div class="tour-copy">
+      <p class="tour-eyebrow" data-i18n="site.features.cache">03 / CACHE CONTINUITY</p>
+      <h3 data-i18n="site.features.cacheTitle">How long does the memory last?</h3>
+      <p data-i18n="site.features.cacheCopy">See cache reuse across time gaps, from under a minute to 24 hours and beyond. Every illuminated cell represents checked follow-ups; the percentages show how often more than half was reused.</p>
+      </div>
+<div class="insight-demo" id="cache-demo"><p class="insight-demo-label" data-i18n="site.features.insightExample">Synthetic demonstration · not measured results or a model benchmark</p><div data-cache-demo></div></div>
+      </article>
+<article class="tour-row tour-speeds"><div class="tour-copy"><h3 data-i18n="site.features.speedTitle">How fast does your model actually respond?</h3><p data-i18n="site.features.speedCopy">Compare output speed and time to first token. Select a model, change the period, and inspect the distribution behind each median.</p></div><section class="insight-demo" id="speeds-demo"><p class="insight-demo-label" data-i18n="site.features.insightExample">Synthetic demonstration · not measured results or a model benchmark</p><div data-speeds-demo></div></section></article>      <article class="tour-row tour-value">
+      <div class="tour-copy">
+      <p class="tour-eyebrow" data-i18n="site.features.value">04 / ALLOWANCE VALUE</p>
+      <h3 data-i18n="site.features.valueTitle">Put a value on your allowance.</h3>
+      <p data-i18n="site.features.valueCopy">Explore API-price-equivalent estimates across observed resets, with the variation visible. A useful comparison, not your subscription bill or a promised limit.</p>
+      </div>
+      <figure class="feature-media">
+      <img src="./feature-value.jpg" width="1000" height="728" loading="lazy" alt="Put a value on your allowance." data-i18n-alt="site.features.valueTitle">
+      <figcaption>
+      <span data-i18n="site.features.preview">App preview · example usage</span>
+      </figcaption>
+      </figure>
+      </article>
+      <div class="tour-bottom">
+      <article>
+      <p class="tour-route" data-i18n="site.features.cost">Tokens → Models → Projects → Threads</p>
+      <h3 data-i18n="site.features.projectsTitle">Follow the tokens to the work.</h3>
+      <p data-i18n="site.features.projectsCopy">Drill into projects and threads. Compare models, token mix and API-equivalent cost to understand what drives your recorded usage.</p>
+      </article>
+      <article>
+      <div class="tour-local" aria-hidden="true">◎</div>
+      <p class="tour-eyebrow" data-i18n="site.features.local">On your device</p>
+      <h3 data-i18n="site.features.privacyTitle">Personal by design.</h3>
+      <p data-i18n="site.features.privacyCopy">Your personal analysis runs locally. Community sharing is optional and content-free: prompts, responses, credentials and private paths stay on your device.</p>
+      </article>
+      </div>
+      </section>
+
+<section class="tour-cta"><h2  data-i18n="site.features.cta">Get the full picture of your Codex usage.</h2><a href="#download" data-i18n="site.features.ctaLink">Choose your download →</a></section>
       <section
         class="feature-strip"
         id="how-it-works"

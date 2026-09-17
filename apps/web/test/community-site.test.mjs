@@ -1303,8 +1303,7 @@ test("the community allowance surface leads the product hero with honest labelin
   assert.match(html, /id="community-allowance-result"/u);
   assert.match(html, /id="community-allowance-state"/u);
   assert.match(html, /id="community-allowance-range-controls"/u);
-  // The allowance figure occupies the hero. The compact daily-activity
-  // disclosure follows it, before the supporting feature strip.
+  // Community evidence remains in the original hero; app features follow.
   const heroIndex = html.indexOf('class="product-hero"');
   const featureIndex = html.indexOf('id="how-it-works"');
   const communityIndex = html.indexOf('id="community"');

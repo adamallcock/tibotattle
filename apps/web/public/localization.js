@@ -170,8 +170,11 @@ export const WEB_MESSAGES = Object.freeze({
     .filter((key) => key.startsWith("contribution.")
       || key.startsWith("performance.")
       || key.startsWith("appearance.")
+      || key.startsWith("site.features.")
+      || key.startsWith("accounting.cacheContinuity.matrix.")
+      || key.startsWith("trends.")
       || key.startsWith("electron.")
-      || key.startsWith("weekly.controls.")
+      || key.startsWith("weekly.")
       || key.startsWith("accounting.cacheImpact.bullet"))
     .map((key) => [key, SUPPORTED_LOCALES.map((locale) => CATALOGS[locale][key])])),
   "dashboard.title": ["Usage overview", "使用概览", "Resumen de uso"],

@@ -64,3 +64,16 @@ export function modelThemeIcon(documentRef, theme) {
   icon.append(path);
   return icon;
 }
+
+export function compareModelPresentation(left, right) {
+  const rank = (id) => {
+    const aliases = { "gpt-5.5-codex": "gpt-5.5", "gpt-5.6-sol-wm": "gpt-5.6-sol" };
+    const index = MODEL_PRESENTATION_ORDER.indexOf(aliases[id] ?? id);
+    return index < 0
+      ? MODEL_PRESENTATION_ORDER.length + (modelUsagePresentation(id).theme === "generic" ? 1 : 0)
+      : index;
+  };
+  return rank(left) - rank(right)
+    || (right.startsWith(`${left}-`) ? -1 : left.startsWith(`${right}-`) ? 1 : 0)
+    || right.localeCompare(left, "en", { numeric: true });
+}
