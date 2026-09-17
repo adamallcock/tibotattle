@@ -14,11 +14,15 @@ import { validCompleteCachedComposition,validCompleteScalarAnalysis } from "../s
 import { readTypedV11UsageAnalysisPage, readTypedV11ChunkRecords, TYPED_V11_USAGE_PAGE_SQL } from "../src/typed-v11-analysis-reader";
 import { typedTelemetryReadNamespace } from "../src/typed-telemetry-read-layout";
 import { sha256Hex } from "../src/crypto";
+import { canonicalJson } from "../src/canonical-json";
+import { modelHistoryWindow } from "../src/model-history-window";
+import { V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v11";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
 import { captureStorageGraphScope, computeStorageGraphResult, readStorageGraphResult,
   storageGraphDependencyDigest,storageGraphV11GroupMode,storageGraphV11PartialGroupPages,
+  STORAGE_GRAPH_METHOD,
   storageGraphV11SaveAffordable,STORAGE_GRAPH_V11_GROUP_QUERY_COSTS,STORAGE_GRAPH_V11_MAX_SAVE_BATCHES,
   STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,
   STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD } from "../src/storage-community-graph";
@@ -975,6 +979,84 @@ describe("typed active-domain analytical reads",()=>{
     expect(analysis).not.toBeNull();
     expect(analysis!.status).toBe('ready');
   },240_000);
+
+  it("binds only the v1.1 result identity to the acquisition contract",async()=>{
+    const authority={sourceId:namespace,sourceNamespace:namespace},ownerDigest='a'.repeat(64);
+    const target=day(),history=modelHistoryWindow(target),dependency=[{observed_day:target}];
+    const digest=(source:'v1'|'v1.1',extra:readonly unknown[])=>sha256Hex(canonicalJson([
+      authority.sourceId,authority.sourceNamespace,ownerDigest,source,'fits',history.day,history.fromDay,
+      STORAGE_GRAPH_METHOD,dependency,...extra]));
+    const computed=(source:'v1'|'v1.1')=>storageGraphDependencyDigest({authority,ownerDigest,source,
+      metric:'fits',day:target,dependency});
+    // A change to how v1.1 evidence is acquired retires v1.1 results only.
+    expect(await computed('v1.1')).toBe(await digest('v1.1',[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]));
+    expect(await computed('v1.1')).not.toBe(await digest('v1.1',[]));
+    expect(await computed('v1')).toBe(await digest('v1',[]));
+  });
+
+  it("does not reuse a v1.1 result stored under the previous acquisition identity",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    await activate(typed(),f,await makeV11Day(day(),evidence()),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    expect((await computeStorageGraphResult(bindings,scope,{maxQueries:900})).state).toBe('complete');
+    expect(await readStorageGraphResult(bindings,scope)).not.toBeNull();
+    // Relabel the completed payload with the identity the previous acquisition
+    // contract would have given it: a pre-clustering result is not reused.
+    await bindings.target.prepare(`UPDATE analytics_community_graph_results SET dependency_digest=?
+      WHERE source_id=? AND owner_digest=? AND metric='fits'`)
+      .bind('c'.repeat(64),namespace,owner.ownerDigest).run();
+    expect(await readStorageGraphResult(bindings,scope)).toBeNull();
+  },180_000);
+
+  it("starts v1.1 checkpoint work under a new key when the acquisition contract changes",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    await activate(typed(),f,await makeV11Day(day(),evidence(2048)),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    if(!('source'in scope.pin))throw new Error('synthetic v1.1 pin unavailable');
+    const snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin:scope.pin});
+    // A head the previous acquisition contract left behind, under its own
+    // method and its own dependency identity.
+    const staleMethod=STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD.replace(/3$/,'2');
+    expect(staleMethod).not.toBe(STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD);
+    const staleKey:StorageHistoryKey={sourceId:namespace,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,
+      day:scope.day,dependencyDigest:'d'.repeat(64),method:staleMethod};
+    const stale=await advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+      day:scope.day,metric:'fits',nowMs:Date.parse(scope.fixedNow),sourcePin:scope.pin,generationSnapshot:snapshot,
+      closedDependencyDigest:'d'.repeat(64),maxPages:1,
+      budget:{remainingQueries:900,deadlineMs:Date.now()+120_000}});
+    if(stale.status!=='deferred'||!stale.checkpoint)throw new Error('synthetic stale checkpoint unavailable');
+    expect((await saveStorageHistoryCheckpoint({target:bindings.target,key:staleKey,
+      checkpoint:stale.checkpoint,expectedHead:null})).status).toBe('saved');
+    // The stale head neither blocks nor is read by work under the new key.
+    expect((await computeStorageGraphResult(bindings,scope,{maxQueries:900})).state).toBe('complete');
+    const byMethod=async(method:string)=>bindings.target.prepare(`SELECT count(*) n
+      FROM analytics_history_checkpoint_heads h JOIN analytics_history_checkpoint_stages s
+      ON s.key_digest=h.key_digest AND s.generation=h.generation
+      WHERE s.source_id=? AND s.owner_digest=? AND s.method=? AND h.retired=0`)
+      .bind(namespace,owner.ownerDigest,method).first<number>('n');
+    expect(await byMethod(staleMethod)).toBe(1);
+    expect(await byMethod(STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD)).toBe(1);
+  },180_000);
 
   it("bounds a partial v1.1 group by the measured round trip, the window and the meter",()=>{
     const acquisition=(phase:'plan'|'fitability'|'endpoints')=>({version:1,source:'v1.1',day:'2026-09-05',

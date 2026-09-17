@@ -90,13 +90,14 @@ describe("resumable v1.1 quota acquisition", () => {
     }
     expect(rows.length).toBeGreaterThan(V11_QUOTA_ACQUISITION_PAGE_SIZE);
     // Run collapse keeps each flat run's first and last row until the key holds
-    // the boundaries the calibration refuses below; after that the runs are one
-    // second apart, so endpoint spacing keeps only the key's final endpoint.
+    // the boundaries the calibration refuses below. After that the runs are one
+    // second apart, so the spacing keeps only the key's final endpoint, which
+    // here also carries the highest displayed value.
+    const boundaries = QUOTA_CALIBRATION_POLICY.minimumBoundaries;
     const expected = [
-      ...Array.from({ length: QUOTA_CALIBRATION_POLICY.minimumBoundaries - 1 },
+      ...Array.from({ length: boundaries - 1 },
         (_, level) => [level * repeats, (level + 1) * repeats - 1]).flat(),
-      (QUOTA_CALIBRATION_POLICY.minimumBoundaries - 1) * repeats,
-      rows.length - 1,
+      (boundaries - 1) * repeats, rows.length - 1,
     ].map((index) => rows[index]!.active!.occurrenceId);
     const { result, phases, calls } = await finish(rows);
     expect(result.status).toBe("complete");

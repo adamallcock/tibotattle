@@ -18,7 +18,7 @@ import type {
   QuotaSnapshotInput,
   QuotaUsageEventInput,
 } from "@app-usagemonitor/quota-analysis";
-import { parseTelemetryV11Attribution } from "@app-usagemonitor/telemetry-contract";
+import { parseTelemetryV11Attribution, TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import type { TelemetryV11Attribution } from "@app-usagemonitor/telemetry-contract";
 import {
   MAX_DOWNSAMPLED_QUOTA_ROWS,
@@ -72,6 +72,15 @@ const MAX_HAZARD_INTERVALS = 240_000;
 export const MAX_V11_USAGE_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 const TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
 const SLOTS = new Set(["primary", "secondary", "five_hour", "seven_day", "other", "unknown"]);
+const DIRECT_PLAN_TYPES = new Set<string>(TELEMETRY_PLAN_TYPES);
+/** The direct read collapses runs by the restated instant, so its SQL returns
+ * more rows than the clustered, spaced result it feeds. It gets its own
+ * pre-collapse bound at this multiple of the downsampled bound: the refusal an
+ * owner sees is still the clustered one, measured after the collapse, while a
+ * genuinely unbounded read is cut off before it is decoded. Four times the
+ * kernel default is 240,000 rows, tens of megabytes of D1 result in the worst
+ * case — the paged acquisition is the path for anyone who reaches it. */
+const QUOTA_DIRECT_PRECOLLAPSE_FACTOR = 4;
 
 export interface V11AnalysisOptions {
   nowMs?: number;
@@ -323,14 +332,15 @@ export function createV11QuotaAcquisitionIdentity(
  * collapse and endpoint spacing through the same shared primitives. Bounding
  * happens before this on the pre-cluster rows, so a very dense owner still
  * refuses here and reaches the paged acquisition instead. */
-function collapseDirectQuotaRows(rows: readonly QuotaRow[], index: PlanAttributionIndex): QuotaRow[] {
+function collapseDirectQuotaRows(rows: readonly QuotaRow[],
+  index: PlanAttributionIndex): QuotaRow[] | null {
   interface Candidate { row: QuotaRow; id: number; eraKey: string; resetMs: number; observedAtMs: number }
   const valid: Candidate[] = [];
   let id = 0;
   for (const row of rows) {
     id += 1;
     const observedAtMs = Date.parse(row.observed_at), resetMs = Date.parse(row.resets_at);
-    if (!TOKEN.test(row.provider) || row.limit_id !== "codex" || !TOKEN.test(row.plan_type)
+    if (!TOKEN.test(row.provider) || row.limit_id !== "codex" || !DIRECT_PLAN_TYPES.has(row.plan_type)
         || !TOKEN.test(row.plan_variant) || !SLOTS.has(row.slot) || resetMs <= observedAtMs
         || typeof row.used_percent !== "number" || !Number.isFinite(row.used_percent)
         || row.used_percent < 0 || row.used_percent > 100) continue;
@@ -343,7 +353,9 @@ function collapseDirectQuotaRows(rows: readonly QuotaRow[], index: PlanAttributi
     valid.push({ row, id, eraKey: row.plan_era_key, resetMs, observedAtMs });
   }
   const clusters = createQuotaResetClusterState();
-  for (const entry of valid) if (!addQuotaReset(clusters, entry.eraKey, entry.resetMs)) return [];
+  // Past the pool bound this owner's evidence is unavailable, not absent: the
+  // caller refuses rather than publishing a result built from no rows.
+  for (const entry of valid) if (!addQuotaReset(clusters, entry.eraKey, entry.resetMs)) return null;
   const settled = valid.map((entry) => {
     const representative = quotaResetRepresentativeMs(clusters, entry.eraKey, entry.resetMs);
     if (representative === null) throw new Error("v11 quota reset cluster missing");
@@ -412,10 +424,17 @@ async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11Analy
     if (index.status !== "ready") return refused("plan_attribution_limit_exceeded");
     const result = await db.prepare(typed ? TYPED_V11_QUOTA_SQL : QUOTA_SQL).bind(
       markers(index), ...typedBindings, SEVEN_DAY_WINDOW_MINUTES,
-      window.resetsAtCutoff, maximum + 1,
+      window.resetsAtCutoff, maximum * QUOTA_DIRECT_PRECOLLAPSE_FACTOR + 1,
     ).all<QuotaRow>();
-    if (result.results.length > maximum) return refused("downsampled_quota_limit_exceeded");
-    quotaRows = collapseDirectQuotaRows(result.results, index);
+    if (result.results.length > maximum * QUOTA_DIRECT_PRECOLLAPSE_FACTOR) {
+      return refused("downsampled_quota_limit_exceeded");
+    }
+    const collapsed = collapseDirectQuotaRows(result.results, index);
+    // The bound both paths report is the one on the clustered, spaced rows.
+    if (collapsed === null || collapsed.length > maximum) {
+      return refused("downsampled_quota_limit_exceeded");
+    }
+    quotaRows = collapsed;
   }
   const datasetId = "dataset:v1:" + await sha256Hex(pin.participantId + "|" + pin.generationId);
   const seeds = new Map<string, Seed>();

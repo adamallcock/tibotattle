@@ -1,10 +1,11 @@
 import { MODEL_COMPOSITION_POLICY, QUOTA_CALIBRATION_POLICY } from "@app-usagemonitor/quota-analysis";
 
 /** Quota pools restate `resets_at` with seconds-to-minutes jitter and spawn a
- * fresh pool hours to days away. The maintained composition already clusters
- * pool identity at this tolerance, so the acquisition readers reuse it: a fit,
- * a composition and an acquisition then all see the same pools instead of one
- * fragment per restated instant. */
+ * fresh pool hours to days away. Only the tolerance is shared with the
+ * maintained composition, which groups by `planType` and labels a pool by its
+ * cluster start; the acquisition groups by `eraKey`, a refinement of that, and
+ * labels a pool by its cluster maximum so an acquired row keeps `resets_at`
+ * after `observed_at`. Both then stop fragmenting one pool per instant. */
 export const QUOTA_RESET_CLUSTER_TOLERANCE_MS = MODEL_COMPOSITION_POLICY.poolToleranceMs;
 /** A dense owner restates `used_percent` every few tens of seconds, so run
  * endpoints alone outgrow every downsampling bound. Retained endpoints are
@@ -167,6 +168,10 @@ export interface QuotaEndpointRun<E> {
   last: E;
   keptAtMs: number;
   keptValues: number[];
+  keptMinimum: number;
+  keptMaximum: number;
+  holdMinimum: E | null;
+  holdMaximum: E | null;
   pending: E | null;
 }
 export interface QuotaEndpointView {
@@ -179,11 +184,29 @@ function offer<E>(run: QuotaEndpointRun<E>, candidate: E, view: (value: E) => Qu
   emit: (value: E) => boolean, spacingMs: number, minimumRetained: number): boolean {
   const seen = view(candidate);
   if (run.keptValues.length >= minimumRetained && seen.observedAtMs - run.keptAtMs < spacingMs) {
+    // Fitability admitted this pool on the displayed span of every row, so the
+    // rows carrying the extremes must survive the thinning or the calibration
+    // measures a narrower span than the eligibility decision was made on.
+    // Holding only the current extremes, rather than emitting every new one,
+    // keeps a monotone pool thinned: a quota that only rises would otherwise
+    // make every run boundary an extreme and never thin at all.
     run.pending = candidate;
+    if (seen.usedPercent < run.keptMinimum
+        && (run.holdMinimum === null || seen.usedPercent < view(run.holdMinimum).usedPercent)) {
+      run.holdMinimum = candidate;
+    }
+    if (seen.usedPercent > run.keptMaximum
+        && (run.holdMaximum === null || seen.usedPercent > view(run.holdMaximum).usedPercent)) {
+      run.holdMaximum = candidate;
+    }
     return true;
   }
   if (!emit(candidate)) return false;
   run.keptAtMs = seen.observedAtMs;
+  if (seen.usedPercent < run.keptMinimum) run.keptMinimum = seen.usedPercent;
+  if (seen.usedPercent > run.keptMaximum) run.keptMaximum = seen.usedPercent;
+  if (run.holdMinimum !== null && view(run.holdMinimum).usedPercent >= run.keptMinimum) run.holdMinimum = null;
+  if (run.holdMaximum !== null && view(run.holdMaximum).usedPercent <= run.keptMaximum) run.holdMaximum = null;
   if (run.keptValues.length < minimumRetained && !run.keptValues.includes(seen.usedPercent)) {
     run.keptValues.push(seen.usedPercent);
   }
@@ -202,7 +225,8 @@ export function collapseQuotaEndpoint<E>(runs: Map<string, QuotaEndpointRun<E>>,
   if (run === undefined) {
     if (!emit(endpoint)) return false;
     runs.set(key, { firstId: seen.id, last: endpoint, keptAtMs: seen.observedAtMs,
-      keptValues: [seen.usedPercent], pending: null });
+      keptValues: [seen.usedPercent], keptMinimum: seen.usedPercent, keptMaximum: seen.usedPercent,
+      holdMinimum: null, holdMaximum: null, pending: null });
     return true;
   }
   if (view(run.last).usedPercent === seen.usedPercent) {
@@ -225,10 +249,16 @@ export function finishQuotaEndpoints<E>(runs: Map<string, QuotaEndpointRun<E>>,
   for (const run of runs.values()) {
     if (view(run.last).id !== run.firstId
         && !offer(run, run.last, view, emit, spacingMs, minimumRetained)) return false;
-    if (run.pending !== null) {
-      if (!emit(run.pending)) return false;
-      run.pending = null;
+    // The key's final endpoint and the rows carrying its displayed extremes,
+    // each emitted once however many of those roles one row holds.
+    const closing: E[] = [];
+    for (const held of [run.pending, run.holdMinimum, run.holdMaximum]) {
+      if (held !== null && !closing.some((value) => view(value).id === view(held).id)) closing.push(held);
     }
+    run.pending = null;
+    run.holdMinimum = null;
+    run.holdMaximum = null;
+    for (const value of closing) if (!emit(value)) return false;
   }
   runs.clear();
   return true;

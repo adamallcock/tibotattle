@@ -3,7 +3,8 @@ import { sha256Hex } from './crypto';
 import { accountScopedQuotaAnalysis } from './quota-analysis';
 import { accountScopedQuotaAnalysisV1, accountScopedHistoricalModelCompositionV1,
   MODEL_HISTORY_METHOD_VERSION, type V1ModelCompositionResult } from './quota-analysis-v1';
-import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
+import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+  V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
 import { assertV11SourcePinCurrent,type V11SourcePin } from './telemetry-v11-domain';
 import { assertTypedV11GenerationSnapshotLive,type V11GenerationSnapshot } from './typed-v11-quota-reader';
 import { assertV1SourcePinCurrent, loadV1SourcePin } from './telemetry-v1-source-selection';
@@ -32,7 +33,7 @@ export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate
 // a repaired reader from making new resumable progress.
 export const STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':checkpoint-store-2';
 export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':current-fit-checkpoint-1';
-export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-2';
+export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-3';
 export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
 export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
 // Execution-only revision for the single optimistic direct historical read.
@@ -175,8 +176,12 @@ export async function storageGraphDependencyDigest(options:{
   source:StorageGraphSource;metric:'fits'|'model';day:string;dependency:unknown;
 }):Promise<string> {
   const history=modelHistoryWindow(options.day);
+  // The v1.1 acquisition version is part of only the v1.1 identity. A change to
+  // how v1.1 evidence is acquired must retire v1.1 results, and must not
+  // discard v1 or v0.2 results that were computed by untouched readers.
   return sha256Hex(canonicalJson([options.authority.sourceId,options.authority.sourceNamespace,
-    options.ownerDigest,options.source,options.metric,history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency]));
+    options.ownerDigest,options.source,options.metric,history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency,
+    ...(options.source==='v1.1'?[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]:[])]));
 }
 
 async function storageGraphCheckpointDependencyDigest(options:{
@@ -184,8 +189,11 @@ async function storageGraphCheckpointDependencyDigest(options:{
  source:StorageGraphSource;day:string;dependency:unknown;
 }):Promise<string>{
  const history=modelHistoryWindow(options.day);
+ // Only v1.1 owners hold this key, so the acquisition version is always part
+ // of it: a resumed checkpoint must never mix two acquisition contracts.
  return sha256Hex(canonicalJson([options.authority.sourceId,options.authority.sourceNamespace,
-  options.ownerDigest,options.source,'shared-v11-usage',history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency]));
+  options.ownerDigest,options.source,'shared-v11-usage',history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency,
+  V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]));
 }
 
 /** The cache key is the exact selected evidence in this window, not the newest

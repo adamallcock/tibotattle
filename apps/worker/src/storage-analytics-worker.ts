@@ -71,7 +71,7 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   // never skips a minute. Both sequential phases share one actual-statement
   // meter; this does not create competing cursor writers or two independent
   // query allowances. The second phase then uses the rest of this invocation's
-  // work window: the minute schedule's, or the long pass's nine minutes. Graph
+  // work window: the minute schedule's, or the long pass's eight minutes. Graph
   // checkpoints reserve their own final save time. A slow in-flight query can
   // overrun this cooperative deadline; subsequent work must still stop rather
   // than receive a fresh allowance.

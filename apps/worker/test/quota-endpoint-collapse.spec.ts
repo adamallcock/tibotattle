@@ -10,7 +10,6 @@ import {
   quotaResetRepresentativeMs,
   validQuotaResetClusterEntries,
   QUOTA_ENDPOINT_MINIMUM_RETAINED,
-  QUOTA_ENDPOINT_MIN_SPACING_MS,
   QUOTA_RESET_CLUSTER_TOLERANCE_MS,
   type QuotaFragmentStats,
 } from "../src/quota-endpoint-collapse";
@@ -104,20 +103,42 @@ describe("quota endpoint collapse", () => {
     expect(collapse(rows).map((value) => value.id)).toEqual([1, 3, 4, 5]);
   });
 
-  it("thins dense changes to the spacing once the key holds its boundaries", () => {
-    // One change a minute. The first `minimumBoundaries` distinct displayed
-    // values are kept exactly, because fitability admitted the pool on them;
-    // after that only the spacing and the final endpoint survive.
-    const rows = Array.from({ length: 60 }, (_, index) => row(index + 1, index, 10 + index));
-    const kept = collapse(rows).map((value) => value.id);
-    expect(kept.slice(0, QUOTA_ENDPOINT_MINIMUM_RETAINED))
+  it("thins a dense non-monotone burst but keeps its span exactly", () => {
+    // Eight distinct values establish the boundaries fitability admitted the
+    // pool on, then forty minutes of values already seen, then a new low and a
+    // new high. The thinned result must still carry the raw span, because the
+    // calibration measures the span the eligibility decision was made on.
+    const values = [
+      ...Array.from({ length: QUOTA_ENDPOINT_MINIMUM_RETAINED }, (_, index) => 10 + index * 2),
+      ...Array.from({ length: 40 }, (_, index) => (index % 2 === 0 ? 15 : 17)),
+      5, 17, 95, 15, 17,
+    ];
+    const rows = values.map((usedPercent, index) => row(index + 1, index, usedPercent));
+    const kept = collapse(rows);
+    const span = (list: readonly Row[]) => Math.max(...list.map((value) => value.usedPercent))
+      - Math.min(...list.map((value) => value.usedPercent));
+    expect(span(kept)).toBe(span(rows));
+    expect(kept.map((value) => value.usedPercent)).toContain(5);
+    expect(kept.map((value) => value.usedPercent)).toContain(95);
+    // The first boundaries and the key's final endpoint are exact; the forty
+    // repeated minutes between them collapse to the spacing.
+    expect(kept.slice(0, QUOTA_ENDPOINT_MINIMUM_RETAINED).map((value) => value.id))
       .toEqual(Array.from({ length: QUOTA_ENDPOINT_MINIMUM_RETAINED }, (_, index) => index + 1));
-    expect(kept).toContain(rows.at(-1)!.id);
+    expect(kept.at(-1)!.id).toBe(rows.at(-1)!.id);
+    expect(kept.length).toBeLessThan(rows.length / 2);
+  });
+
+  it("thins a dense strictly rising key and still keeps both its extremes", () => {
+    // Holding the current extremes rather than emitting every new one is what
+    // keeps a quota that only rises thinned at all: every run boundary of a
+    // monotone key is a new high.
+    const rows = Array.from({ length: 30 }, (_, index) => row(index + 1, index, 10 + index));
+    const kept = collapse(rows);
     expect(kept.length).toBeLessThan(rows.length);
-    const times = kept.map((id) => rows[id - 1]!.observedAtMs);
-    for (let index = QUOTA_ENDPOINT_MINIMUM_RETAINED; index < times.length - 1; index += 1) {
-      expect(times[index]! - times[index - 1]!).toBeGreaterThanOrEqual(QUOTA_ENDPOINT_MIN_SPACING_MS);
-    }
+    expect(kept.at(-1)).toEqual(rows.at(-1));
+    const percents = (list: readonly Row[]) => list.map((value) => value.usedPercent);
+    expect(Math.max(...percents(kept))).toBe(Math.max(...percents(rows)));
+    expect(Math.min(...percents(kept))).toBe(Math.min(...percents(rows)));
   });
 
   it("spaces each key independently and never merges two keys", () => {

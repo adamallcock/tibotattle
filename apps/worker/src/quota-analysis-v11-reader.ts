@@ -332,7 +332,12 @@ function validStats(value: unknown): value is FragmentStats {
       && number <= (value.maximum as number));
 }
 function validEndpointRun(value: unknown): value is EndpointRun {
-  return closed(value, ["firstId", "last", "keptAtMs", "keptValues", "pending"]) && positiveId(value.firstId)
+  return closed(value, ["firstId", "last", "keptAtMs", "keptValues", "keptMinimum", "keptMaximum",
+    "holdMinimum", "holdMaximum", "pending"])
+    && positiveId(value.firstId) && percent(value.keptMinimum) && percent(value.keptMaximum)
+    && (value.keptMinimum as number) <= (value.keptMaximum as number)
+    && (value.holdMinimum === null || validEndpoint(value.holdMinimum))
+    && (value.holdMaximum === null || validEndpoint(value.holdMaximum))
     && validEndpoint(value.last) && safeTime(value.keptAtMs) && Array.isArray(value.keptValues)
     && value.keptValues.length >= 1
     && value.keptValues.length <= QUOTA_CALIBRATION_POLICY.minimumBoundaries
@@ -428,6 +433,11 @@ function validateCheckpoint(state: V11QuotaAcquisitionCheckpoint, identity: V11Q
   if (state.phase === "fitability" && (state.plan.timeMs !== null || state.plan.equalTime.length > 0
       || state.plan.runs.length > 0 || state.eligible.length > 0 || state.runs.length > 0
       || state.endpoints.length > 0)) invalid();
+  // Derived state can only exist once the pools it was keyed by do. An owner
+  // with no valid quota row legitimately settles no pool at all.
+  if (["fitability", "endpoints"].includes(state.phase) && state.clusters.length === 0
+      && (state.stats.length > 0 || state.eligible.length > 0 || state.runs.length > 0
+        || state.endpoints.length > 0)) invalid();
   if (state.phase === "endpoints" && (state.plan.timeMs !== null || state.plan.equalTime.length > 0
       || state.plan.runs.length > 0 || state.stats.length > 0)) invalid();
   if (new Set(state.plan.observations.map((row) => JSON.stringify([
@@ -731,6 +741,14 @@ export async function advanceV11QuotaAcquisition(
       const provider = active.provider;
       if (provider === null || active.limitId !== "codex" || !SAFE_TOKEN.test(provider)
           || (accountScopeId !== null && !ACCOUNT_TRACK.test(accountScopeId))) continue;
+      // Every rejection an acquired row would face, applied once for all three
+      // source-reading sub-phases: a row that can never be emitted must not
+      // shape a pool hull or an eligibility decision either, or the direct
+      // read, which rejects them up front, would settle different pools.
+      if (active.planType === null || active.planVariant === null || active.slot === null
+          || !PLAN_TYPES.has(active.planType) || !SAFE_TOKEN.test(active.planVariant)
+          || !SLOTS.has(active.slot) || !percent(active.usedPercent)
+          || Date.parse(active.resetsAt) <= active.observedAtMs) continue;
       const match = planEraForInterval(index, {
         contextKey: planAttributionContextKey(provider, active.limitId), accountScopeId,
         observedAtMs: active.observedAtMs,
@@ -738,6 +756,7 @@ export async function advanceV11QuotaAcquisition(
       if (match.status !== "matched" || active.planType !== match.era.planType
           || active.planVariant !== match.era.planVariant) continue;
       const eraKey = match.era.eraKey;
+      if (!validEraKey(eraKey)) continue;
       // Pool identity, not the restated instant. The `clusters` sub-phase sees
       // every valid quota row before any key is derived, so both the fitable
       // stats and the endpoint runs are keyed by a settled pool.
@@ -748,7 +767,7 @@ export async function advanceV11QuotaAcquisition(
         continue;
       }
       const representative = quotaResetRepresentativeMs(clusters, eraKey, Date.parse(active.resetsAt));
-      if (representative === null) throw new Error("v11 quota reset cluster missing");
+      if (representative === null) invalid();
       const reset = new Date(representative).toISOString();
       const key = statsKey(reset, eraKey);
       if (state.phase === "fitability") {
