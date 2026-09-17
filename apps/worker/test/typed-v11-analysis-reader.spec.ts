@@ -18,7 +18,9 @@ import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
 import { captureStorageGraphScope, computeStorageGraphResult, readStorageGraphResult,
-  storageGraphDependencyDigest,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,
+  storageGraphDependencyDigest,storageGraphV11GroupMode,storageGraphV11PartialGroupPages,
+  storageGraphV11SaveAffordable,STORAGE_GRAPH_V11_GROUP_QUERY_COSTS,STORAGE_GRAPH_V11_MAX_SAVE_BATCHES,
+  STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,
   STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD } from "../src/storage-community-graph";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
@@ -95,6 +97,36 @@ function observePreparedSql(database:D1Database){
     const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
   }})};
 }
+/** Advances a caller-owned clock after every physical quota page statement,
+ * so a group can be cut by the checkpoint work deadline it is given. */
+function advanceClockAfterQuotaPages(database:D1Database,tick:()=>void){
+  const wrap=(statement:D1PreparedStatement):D1PreparedStatement=>new Proxy(statement,{get(base,key){
+    const value=Reflect.get(base,key);
+    if(typeof value!=='function')return value;
+    if(key==='bind')return(...args:unknown[])=>wrap((value as (...a:unknown[])=>D1PreparedStatement).apply(base,args));
+    if(['all','first','run','raw'].includes(String(key)))return async(...args:unknown[])=>{
+      const result=await (value as (...a:unknown[])=>Promise<unknown>).apply(base,args);tick();return result;};
+    return value.bind(base);
+  }});
+  return new Proxy(database,{get(db,key){
+    if(key==='prepare')return(sql:string)=>{const statement=db.prepare(sql);
+      return sql.includes('AS physical_id')&&sql.includes('typed_telemetry_owner_time')?wrap(statement):statement;};
+    const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+}
+// A staged generation is only legitimate while it is the live head or a head
+// that a later generation superseded. Anything else is a partial successor no
+// pass can reproduce, so no pass can ever resume it.
+const abandonedStages=(target:D1Database)=>target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages s
+  WHERE s.generation NOT IN (SELECT generation FROM analytics_history_checkpoint_heads WHERE generation IS NOT NULL)
+    AND s.generation NOT IN (SELECT expected_head FROM analytics_history_checkpoint_stages WHERE expected_head IS NOT NULL)
+    AND s.expected_head IS NOT (SELECT h.generation FROM analytics_history_checkpoint_heads h
+      WHERE h.key_digest=s.key_digest AND h.retired=0)`).first<number>('n');
+// Only one successor of the live head may ever be in flight: a second one
+// would prove a pass staged something no later pass can reproduce.
+const inFlightSuccessors=(target:D1Database)=>target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages s
+  WHERE s.expected_head IS (SELECT h.generation FROM analytics_history_checkpoint_heads h
+    WHERE h.key_digest=s.key_digest AND h.retired=0)`).first<number>('n');
 function loseFirstBatchResponse(database:D1Database){let losses=0;
   return {losses:()=>losses,database:new Proxy(database,{get(value,key){
     if(key==='batch')return async(statements:D1PreparedStatement[])=>{
@@ -268,9 +300,11 @@ describe("typed active-domain analytical reads",()=>{
     expect(computed.result.fits!.length).toBeGreaterThan(0);
     expect(computed.result.fits!.every(fit=>fit.participantId===owner.ownerDigest)).toBe(true);
     expect(computed.reused).toBe(false);
+    // Four promoted generations: the acquisition stops durably on each
+    // sub-phase boundary, then completes, then reduces usage.
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
       WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
-       STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n')).toBe(2);
+       STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<number>('n')).toBe(4);
     const modelScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:"model",sourceId:namespace,sourceNamespace:namespace});
     expect(modelScope.dependencyDigest).not.toBe(scope.dependencyDigest);
     expect(modelScope.checkpointDependencyDigest).toBe(scope.checkpointDependencyDigest);
@@ -279,9 +313,10 @@ describe("typed active-domain analytical reads",()=>{
     expect(model.state).toBe('complete');
     if(model.state!=='complete')throw new Error('synthetic model did not complete');
     expect(model.result.composition?.status).toBe('ready');
+    // The model metric shares that exact checkpoint key and stages nothing new.
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_history_checkpoint_stages
       WHERE source_id=? AND owner_digest=? AND method=?`).bind(namespace,owner.ownerDigest,
-       STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).first<number>('n')).toBe(2);
+       STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).first<number>('n')).toBe(4);
     expect(modelReads.queries.filter(sql=>sql.includes("stream='usage'")
       ||sql.includes("stream = 'usage'")||sql.includes("stream=3"))).toHaveLength(0);
     const shared=await loadStorageHistoryCheckpoint({target:bindings.target,key:{sourceId:namespace,
@@ -351,17 +386,27 @@ describe("typed active-domain analytical reads",()=>{
       JOIN analytics_history_checkpoint_stages s ON s.key_digest=h.key_digest AND s.generation=h.generation
       WHERE s.source_id=? AND s.owner_digest=? AND s.method=? AND h.retired=0`)
       .bind(namespace,owner.ownerDigest,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).first<string>('control_json');
+    // A meter this small cannot guarantee the promotion of a partial
+    // successor, so the claim takes the reproducible whole group and promotes
+    // the completed acquisition instead.
     expect(JSON.parse(control!).phase).toBe('finish');
     // Retained-generation work performs a fixed capture/live fence around the
     // whole grouped read; it must not repeat the authority query per page.
     expect(observed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s')).length).toBe(5);
-    expect(observed.queries.filter(sql=>sql.includes('AS physical_id')
-      &&sql.includes('typed_telemetry_owner_time'))).toHaveLength(9);
+    // One physical page per acquisition sub-phase: 2,048 observations fit
+    // inside a single 4,096-row page, so plan, fitability and endpoints cost
+    // one statement each instead of the three a 1,024-row page charged.
+    const sourcePages=(queries:string[])=>queries.filter(sql=>sql.includes('AS physical_id')
+      &&sql.includes('typed_telemetry_owner_time'));
+    expect(sourcePages(observed.queries)).toHaveLength(3);
     expect(observed.queries.length).toBeLessThanOrEqual(25);
     expect(targetObserved.queries.length).toBeLessThanOrEqual(40);
     expect(observed.queries.length+targetObserved.queries.length).toBeLessThanOrEqual(65);
-    const completed=await computeStorageGraphResult(bindings,scope,{maxQueries:900});
+    const finishing=observePreparedSql(typed());
+    const completed=await computeStorageGraphResult({...bindings,source:finishing.database},scope,{maxQueries:900});
     expect(completed.state).toBe('complete');
+    // The finishing pass resumes from that head and re-reads no source page.
+    expect(sourcePages(finishing.queries)).toHaveLength(0);
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_community_graph_results
       WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind(namespace,owner.ownerDigest).first<number>('n')).toBe(1);
   },120_000);
@@ -468,6 +513,8 @@ describe("typed active-domain analytical reads",()=>{
     const resumed=observePreparedSql(typed());
     expect((await computeStorageGraphResult({...bindings,source:resumed.database},scope,{maxQueries:900})).state).toBe('complete');
     expect(resumed.queries.filter(sql=>sql.includes('r.id AS physical_id'))).toHaveLength(0);
+    // One capture/live fence set per group: the resumed claim finishes the
+    // usage reduction and the analysis from the promoted head.
     expect(resumed.queries.filter(sql=>sql.includes('FROM typed_v11_admission_state s'))).toHaveLength(5);
     expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_community_graph_results
       WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind(namespace,owner.ownerDigest).first<number>('n')).toBe(1);
@@ -619,7 +666,7 @@ describe("typed active-domain analytical reads",()=>{
     await expect(computeStorageGraphResult(bindings,outside,{maxQueries:900})).rejects.toThrow();
   },180_000);
 
-  it("stages only whole deterministic v1.1 page groups so a cut pass leaves nothing to abandon",async()=>{
+  it("cuts a whole v1.1 page group and stages a partial one only when the caller asks",async()=>{
     await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
     await initializeTypedV1Admission(typed(),namespace);
     await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
@@ -636,14 +683,16 @@ describe("typed active-domain analytical reads",()=>{
     if(!('source'in scope.pin))throw new Error('synthetic v1.1 pin unavailable');
     const pin=scope.pin,snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin});
     const nowMs=Date.parse(scope.fixedNow);
-    const advance=(remainingQueries:number)=>advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+    const advance=(remainingQueries:number,partialGroup=false)=>advanceStorageV11Analysis({source:typed(),
+      sourceNamespace:namespace,participantId,
       day:scope.day,metric:'fits',nowMs,sourcePin:pin,generationSnapshot:snapshot,
-      closedDependencyDigest:scope.checkpointDependencyDigest,maxPages:32,
+      closedDependencyDigest:scope.checkpointDependencyDigest,maxPages:32,partialGroup,
       budget:{remainingQueries,deadlineMs:Date.now()+120_000}});
-    // Nine physical pages per acquisition phase. Seven fixed statements plus a
-    // five-page budget cannot finish the group: the prior (empty) checkpoint
-    // comes back marked cut, so nothing is staged for a different generation.
-    expect(await advance(12)).toEqual({status:'deferred',checkpoint:null,cut:true});
+    // Three physical pages per acquisition, one per sub-phase. Seven fixed
+    // statements plus a two-page budget cannot finish the group: the prior
+    // (empty) checkpoint comes back marked cut, so nothing is staged for a
+    // different generation.
+    expect(await advance(9)).toEqual({status:'deferred',checkpoint:null,cut:true});
     expect(await advance(0)).toEqual({status:'deferred',checkpoint:null,cut:true});
     // The same head and budget reproduce a byte-identical successor, which is
     // what lets a later pass resume the parts an earlier pass already staged.
@@ -651,20 +700,239 @@ describe("typed active-domain analytical reads",()=>{
     expect(first).toMatchObject({status:'deferred',checkpoint:{phase:'finish'}});
     expect(JSON.stringify(second)).toBe(JSON.stringify(first));
     expect(Reflect.has(first,'cut')).toBe(false);
-    // Every invocation meter too small for the whole 16-statement group is a
-    // deferral that stages no generation: first the read guard, then the cut
-    // group. The first meter that affords the group stages its successor, and
-    // a later pass with a whole budget completes from the same head.
-    const reasons=new Set<string>();
-    for(let maxQueries=44;maxQueries<=80;maxQueries+=2){
-      const result=await computeStorageGraphResult(bindings,scope,{maxQueries});
-      if(result.state!=='deferred'||!['v11_checkpoint_read_budget','v11_checkpoint_group_budget'].includes(result.reason))break;
-      reasons.add(result.reason);
-      expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
-    }
-    expect([...reasons].sort()).toEqual(['v11_checkpoint_group_budget','v11_checkpoint_read_budget']);
+    // The identical cut budget under `partialGroup` keeps what it did read,
+    // stopping on the first sub-phase boundary it reached. A caller may only
+    // ask for that when the successor is promoted or abandoned whole, so there
+    // is nothing half-staged to reproduce.
+    const partial=await advance(9,true);
+    expect(partial).toMatchObject({status:'deferred',
+      checkpoint:{phase:'acquisition',acquisition:{phase:'fitability'}}});
+    expect(Reflect.has(partial,'cut')).toBe(false);
+    // A partial group that could not read a single page is still a cut: there
+    // is no progress to promote and nothing to distinguish from a replay.
+    expect(await advance(0,true)).toEqual({status:'deferred',checkpoint:null,cut:true});
     expect((await computeStorageGraphResult(bindings,scope,{maxQueries:900})).state).toBe('complete');
   },180_000);
+
+  it("keeps the fixed whole group once a v1.1 checkpoint can no longer stage in one batch",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    // Two physical pages per acquisition sub-phase, so the endpoints group
+    // still has work left after the page that crosses the deadline below.
+    await activate(typed(),f,await makeV11Day(day(),evidence(6000)),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    if(!('source'in scope.pin))throw new Error('synthetic v1.1 pin unavailable');
+    const pin=scope.pin,snapshot=await loadTypedV11GenerationSnapshot(typed(),{sourceNamespace:namespace,pin});
+    const key:StorageHistoryKey={sourceId:namespace,sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,
+      day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,method:STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD};
+    // Promote a real acquisition standing in its endpoints sub-phase. That is
+    // where the checkpoint grows to hundreds of parts inside one group, so its
+    // successor can only be resumed by reproducing it exactly.
+    const staged=await advanceStorageV11Analysis({source:typed(),sourceNamespace:namespace,participantId,
+      day:scope.day,metric:'fits',nowMs:Date.parse(scope.fixedNow),sourcePin:pin,generationSnapshot:snapshot,
+      closedDependencyDigest:scope.checkpointDependencyDigest,maxPages:4,
+      budget:{remainingQueries:11,deadlineMs:Date.now()+120_000}});
+    if(staged.status!=='deferred'||!staged.checkpoint)throw new Error('synthetic endpoints checkpoint unavailable');
+    expect(staged.checkpoint).toMatchObject({phase:'acquisition',acquisition:{phase:'endpoints'}});
+    expect((await saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint:staged.checkpoint,
+      expectedHead:null})).status).toBe('saved');
+    const stages=()=>bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first<number>('n');
+    expect(await stages()).toBe(1);
+    // A clock that passes the checkpoint work deadline after the first source
+    // page cuts the fixed 32-page group. Nothing is staged, because only a
+    // byte-identical successor could resume this checkpoint's parts.
+    let clock=Date.now();
+    const cut=await computeStorageGraphResult({...bindings,source:advanceClockAfterQuotaPages(typed(),()=>{clock+=60_000;})},
+      scope,{maxQueries:900,now:()=>clock,deadlineMs:clock+20_000});
+    expect(cut).toEqual({state:'deferred',reason:'v11_checkpoint_group_budget'});
+    expect(await stages()).toBe(1);
+    expect((await computeStorageGraphResult(bindings,scope,{maxQueries:900})).state).toBe('complete');
+  },180_000);
+
+  it("spends one long claim on many promoted v1.1 groups instead of a single fixed group",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    await activate(typed(),f,await makeV11Day(day(),evidence(2048)),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    // A frozen clock measures no round trip, so the group is sized from the
+    // 400 ms default. A 400 ms window past the save reserve therefore affords
+    // exactly one page per partial group: every acquisition sub-phase, and the
+    // usage reduction, must be promoted separately inside this one claim.
+    const fixed=Date.now(),observed=observePreparedSql(typed());
+    const result=await computeStorageGraphResult({...bindings,source:observed.database},scope,
+      {maxQueries:900,now:()=>fixed,deadlineMs:fixed+16_400});
+    expect(result.state).toBe('complete');
+    expect(observed.queries.filter(sql=>sql.includes('AS physical_id')
+      &&sql.includes('typed_telemetry_owner_time'))).toHaveLength(3);
+    // Four successors promoted in one call: the two partial acquisition pages,
+    // the endpoints sub-phase back on the fixed whole group, and the usage
+    // reduction. The previous two-transition rule stopped after the first.
+    expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(4);
+    expect(await bindings.target.prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads WHERE retired=0').first('n')).toBe(1);
+    expect(await bindings.target.prepare(`SELECT count(*) n FROM analytics_community_graph_results
+      WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind(namespace,owner.ownerDigest).first<number>('n')).toBe(1);
+  },180_000);
+
+  it("promotes the successor of a meter-bound partial v1.1 group",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    // Three physical pages in the plan sub-phase alone, so a small group is
+    // bounded by the meter rather than by the end of the phase.
+    await activate(typed(),f,await makeV11Day(day(),evidence(8500)),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    // A frozen clock leaves the window unbounded, so the group is sized purely
+    // by the statements the meter still owes it: the cached-result read, the
+    // owner proof and the absent-head read leave 327, and the reserve for a
+    // group plus a worst-case eight-batch promotion takes 325 of those.
+    const fixed=Date.now(),observed=observePreparedSql(typed());
+    const result=await computeStorageGraphResult({...bindings,source:observed.database},scope,
+      {maxQueries:331,now:()=>fixed,deadlineMs:fixed+1_000_000});
+    expect(result.state).toBe('complete');
+    // The meter-bound partial group and the whole groups that followed it left
+    // nothing a later pass could not reproduce or resume.
+    expect(await abandonedStages(bindings.target)).toBe(0);
+    expect(await inFlightSuccessors(bindings.target)).toBeLessThanOrEqual(1);
+    // The first group was bounded to two pages by the meter and its successor
+    // was still promoted: a group allowed a third page would have finished the
+    // plan sub-phase and stopped on that boundary instead.
+    // Exactly one generation succeeded the absent head: the first group's.
+    const first=(await bindings.target.prepare(`SELECT control_json
+      FROM analytics_history_checkpoint_stages WHERE source_id=? AND owner_digest=? AND method=?
+      AND expected_head IS NULL`).bind(namespace,owner.ownerDigest,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD)
+      .all<{control_json:string}>()).results;
+    expect(first).toHaveLength(1);
+    expect(JSON.parse(first[0]!.control_json)).toMatchObject({phase:'acquisition',acquisition:{phase:'plan'}});
+    // Nine pages for the three sub-phases and not one read twice: the claim
+    // never spent its window on pages it then had to discard.
+    expect(observed.queries.filter(sql=>sql.includes('AS physical_id')
+      &&sql.includes('typed_telemetry_owner_time'))).toHaveLength(9);
+  },180_000);
+
+  it("stages no abandoned v1.1 generation at any invocation budget",async()=>{
+    await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await initializeTypedV1Admission(typed(),namespace);
+    await applyD1Migrations(typed(),b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+    await applyD1Migrations(b.STORAGE_ANALYTICS_DB,b.TEST_ANALYTICS_MIGRATIONS);
+    expect((await drainCommunityPublicSourceBootstrap(typed())).completed).toBe(true);
+    const bindings={source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace};
+    await initializeStorageAnalyticsRuntime(bindings);
+    const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
+    await activate(typed(),f,await makeV11Day(day(),evidence(8500)),true);
+    const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
+    await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+      .bind(namespace,owner.ownerDigest).run();
+    const scope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+    const abandoned=()=>abandonedStages(bindings.target),inFlight=()=>inFlightSuccessors(bindings.target);
+    const head=()=>bindings.target.prepare(`SELECT generation FROM analytics_history_checkpoint_heads
+      WHERE retired=0`).first<string>('generation');
+    const reasons=new Set<string>();let previous:string|null=null,advanced=0,completed=false;
+    for(let maxQueries=48;maxQueries<=260;maxQueries+=6){
+      const result=await computeStorageGraphResult(bindings,scope,{maxQueries});
+      expect(await abandoned()).toBe(0);
+      expect(await inFlight()).toBeLessThanOrEqual(1);
+      const current=await head();
+      if(current!==null&&current!==previous)advanced+=1;
+      previous=current;
+      if(result.state==='complete'){completed=true;break;}
+      reasons.add(result.reason);
+    }
+    expect(completed).toBe(true);
+    // Every budget below the one that finishes made durable progress or
+    // refused cheaply; the head advanced across several of them.
+    expect(advanced).toBeGreaterThan(1);
+    expect([...reasons].sort()).toEqual(['v11_checkpoint','v11_checkpoint_group_budget','v11_checkpoint_read_budget']);
+  },180_000);
+
+  it("bounds a partial v1.1 group by the measured round trip, the window and the meter",()=>{
+    const acquisition=(phase:'plan'|'fitability'|'endpoints')=>({version:1,source:'v1.1',day:'2026-09-05',
+      layout:'typed-v11:synthetic',identity:{},phase:'acquisition',
+      acquisition:{phase}} as unknown as StorageV11HistoryCheckpoint);
+    // A fresh key has no staged parts to reproduce, and a head that fits one
+    // save batch is promoted or abandoned whole. Only a multi-batch head or the
+    // endpoints sub-phase forces the fixed whole group back.
+    expect(storageGraphV11GroupMode({staged:false,singleBatch:false,checkpoint:null})).toBe('partial');
+    expect(storageGraphV11GroupMode({staged:true,singleBatch:false,checkpoint:acquisition('plan')})).toBe('whole');
+    expect(storageGraphV11GroupMode({staged:true,singleBatch:true,checkpoint:acquisition('endpoints')})).toBe('whole');
+    expect(storageGraphV11GroupMode({staged:true,singleBatch:true,checkpoint:acquisition('fitability')})).toBe('partial');
+    const pages=(input:{elapsedMs:number;statements:number;window?:number;remainingQueries?:number})=>
+      storageGraphV11PartialGroupPages({nowMs:0,deadlineMs:(input.window??604_000)+4_000,elapsedMs:input.elapsedMs,
+        statements:input.statements,remainingQueries:input.remainingQueries??900});
+    // Nothing measured falls back to an ordinary 400 ms D1 round trip.
+    expect(pages({elapsedMs:0,statements:0})).toEqual({estimateMs:400,maxPages:575});
+    expect(pages({elapsedMs:6_000,statements:0})).toMatchObject({estimateMs:400});
+    // A measured round trip is clamped so one outlier cannot size a claim.
+    expect(pages({elapsedMs:1,statements:100}).estimateMs).toBe(150);
+    expect(pages({elapsedMs:60_000,statements:2}).estimateMs).toBe(3_000);
+    expect(pages({elapsedMs:1_000,statements:2}).estimateMs).toBe(500);
+    // The window past the save reserve, the 1,024-page ceiling and the meter
+    // each bound the group, and a spent window still asks for one page.
+    expect(pages({elapsedMs:1_000,statements:2,window:5_000}).maxPages).toBe(10);
+    expect(pages({elapsedMs:1_000,statements:2,window:4_096_000,remainingQueries:1_400}).maxPages).toBe(1024);
+    expect(pages({elapsedMs:1_000,statements:2,window:5_000,remainingQueries:326}).maxPages).toBe(1);
+    expect(pages({elapsedMs:1_000,statements:2,window:0}).maxPages).toBe(1);
+    // A meter that cannot afford a group and its promotion reports no group at
+    // all, and the caller falls back to the reproducible whole group.
+    expect(pages({elapsedMs:1_000,statements:2,window:5_000,remainingQueries:325}).maxPages).toBe(0);
+    expect(pages({elapsedMs:1_000,statements:2,window:5_000,remainingQueries:51}).maxPages).toBe(0);
+    expect(pages({elapsedMs:1_000,statements:2,window:5_000,remainingQueries:0}).maxPages).toBe(0);
+    // Whatever the meter, the statements that survive a partial group can
+    // still promote the largest successor this store can hold, otherwise a
+    // claim reads a window of pages no later pass can reproduce or resume.
+    const costs=STORAGE_GRAPH_V11_GROUP_QUERY_COSTS;
+    const worstParts=STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS*STORAGE_GRAPH_V11_MAX_SAVE_BATCHES;
+    for(const remainingQueries of [326,400,600,900,953]){
+      const {maxPages}=storageGraphV11PartialGroupPages({nowMs:0,deadlineMs:10_000_000,elapsedMs:0,
+        statements:0,remainingQueries});
+      expect(maxPages).toBeGreaterThanOrEqual(1);
+      expect(storageGraphV11SaveAffordable({parts:worstParts,nowMs:0,deadlineMs:10_000_000,estimateMs:400,
+        remainingQueries:remainingQueries-maxPages-costs.fences})).toBe(true);
+    }
+    // The gate mirrors the save loop exactly: the loop admits a call only
+    // while the meter holds the guard, the first call costs at most firstSave
+    // and each resumed batch at most extraSave.
+    const affordable=(parts:number,remainingQueries:number,
+      extra:Partial<{nowMs:number;deadlineMs:number;estimateMs:number}>={})=>
+      storageGraphV11SaveAffordable({parts,remainingQueries,nowMs:0,deadlineMs:10_000_000,estimateMs:400,...extra});
+    expect(affordable(0,46)).toBe(true);
+    expect(affordable(30,46)).toBe(true);expect(affordable(30,45)).toBe(false);
+    expect(affordable(31,83)).toBe(true);expect(affordable(31,82)).toBe(false);
+    expect(affordable(60,83)).toBe(true);
+    expect(affordable(61,115)).toBe(true);expect(affordable(61,114)).toBe(false);
+    expect(affordable(worstParts,275)).toBe(true);expect(affordable(worstParts,274)).toBe(false);
+    // A batch is never assumed faster than a D1 round trip of its own payload,
+    // so a slow measured round trip lengthens the reserved save window.
+    expect(affordable(31,900,{deadlineMs:3_000})).toBe(true);
+    expect(affordable(31,900,{deadlineMs:2_999})).toBe(false);
+    expect(affordable(31,900,{deadlineMs:12_000,estimateMs:3_000})).toBe(true);
+    expect(affordable(31,900,{deadlineMs:11_999,estimateMs:3_000})).toBe(false);
+  });
 
   it("returns a refused v1.1 acquisition in the metric's own publishable result shape",async()=>{
     await applyD1Migrations(typed(),b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);

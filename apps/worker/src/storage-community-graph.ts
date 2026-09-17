@@ -19,6 +19,7 @@ import { createD1InvocationBudget } from './d1-invocation-budget';
 import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis,type StorageV1HistoryCheckpoint } from './storage-v1-history';
 import { advanceStorageV11Analysis,type StorageV11HistoryCheckpoint } from './storage-v11-history';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
+  storageHistoryCheckpointParts,
   type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor,
   type StorageHistorySaveCursor } from './storage-history-checkpoint';
 import { caughtStorageGraphFailureFields, withStorageGraphFailureStage,
@@ -48,7 +49,107 @@ const MAX_RESULT_BYTES = 1024 * 1024;
 const STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS = 12_000;
 const STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM = 32;
 const STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM = 32;
+// One save batch stages at most 30 parts, so a successor at or below that
+// bound is promoted or abandoned whole and never has to be reproduced to
+// resume its staged parts. Larger successors keep the fixed whole-group rule.
+export const STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS = 30;
+/** Statement costs of one v1.1 group and its promotion. A partial group is
+ * sized to leave all of them affordable, otherwise a claim can read a whole
+ * window of pages and then find it cannot stage the successor at all:
+ * `group` is the reserve `advanceStorageV11Analysis` takes from its own local
+ * budget (the meter itself pays only the pages and the fences, so this entry
+ * is conservatism rather than a meter cost),
+ * `fences` the source statements it issues around the pages (snapshot load,
+ * two live proofs and the reader scope), `persistPreChecks` the source and
+ * target proofs `persistCheckpoint` runs before its save loop,
+ * `saveLoopGuard` that loop's own admission bound, `firstSave` one save call
+ * (5 reads, a batch of at most 31 statements and the head read) and
+ * `extraSave` each resumed batch. Exported so the bound can be proven. */
+export const STORAGE_GRAPH_V11_GROUP_QUERY_COSTS = Object.freeze({
+  group: 7, fences: 4, persistPreChecks: 6, saveLoopGuard: 40, firstSave: 37, extraSave: 32, margin: 7 });
+// The largest successor this store can hold is 1,024 parts, but a v1.1 graph
+// checkpoint at its own byte limits frames to roughly 240 parts (30 MB), which
+// is eight save batches. A partial group is sized to leave that whole
+// promotion affordable, because a partial successor it cannot stage is work no
+// later pass can reproduce and therefore work simply thrown away.
+export const STORAGE_GRAPH_V11_MAX_SAVE_BATCHES = 8;
+const STORAGE_GRAPH_V11_PARTIAL_QUERY_RESERVE = STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.group
+  + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.fences + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.persistPreChecks
+  + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.saveLoopGuard + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.firstSave
+  + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.extraSave * (STORAGE_GRAPH_V11_MAX_SAVE_BATCHES - 1)
+  + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.margin;
+// A whole 32-page group spends about 42 statements, so a claim only starts
+// another one while the persist pre-checks and a first save batch still fit.
+const STORAGE_GRAPH_V11_CONTINUE_QUERIES = 100;
+// Leave the save of the successor a whole round trip and its batch.
+const STORAGE_GRAPH_V11_SAVE_RESERVE_MS = 4_000;
+// One save batch is a D1 round trip of a larger payload, so it is never
+// assumed faster than this nor faster than twice the measured round trip.
+const STORAGE_GRAPH_V11_SAVE_BATCH_MS = 1_500;
+// A single immeasurably fast or pathologically slow statement must not size a
+// whole claim, and an unmeasured compute assumes an ordinary D1 round trip.
+const STORAGE_GRAPH_V11_ROUND_TRIP_MIN_MS = 150, STORAGE_GRAPH_V11_ROUND_TRIP_MAX_MS = 3_000,
+  STORAGE_GRAPH_V11_ROUND_TRIP_DEFAULT_MS = 400;
+const STORAGE_GRAPH_V11_MAX_PARTIAL_PAGES = 1024;
 const fail = () => new Error('STORAGE_GRAPH_RESULT_UNAVAILABLE');
+
+/** Whether one claim may take a partial v1.1 group from this head. A partial
+ * group stages the successor a budget or deadline cut produced, which is only
+ * safe while that successor is promoted or abandoned whole: a fresh key has no
+ * staged parts to reproduce, and a head that fits one save batch cannot leave
+ * half a generation behind. The acquisition `endpoints` sub-phase is excluded
+ * because that is where a checkpoint grows to hundreds of parts inside one
+ * group, so its successor must stay the fixed, reproducible whole group. The
+ * caller still runs the whole group when the meter cannot afford any partial
+ * group, and the boundary stop inside the acquisition is what keeps a partial
+ * successor compact between sub-phases. Pure. */
+export function storageGraphV11GroupMode(input:{staged:boolean;singleBatch:boolean;
+ checkpoint:StorageV11HistoryCheckpoint|null}):'partial'|'whole'{
+ if(!input.staged)return 'partial';
+ if(!input.singleBatch)return 'whole';
+ const checkpoint=input.checkpoint;
+ return checkpoint!==null&&checkpoint.phase==='acquisition'&&checkpoint.acquisition.phase==='endpoints'
+  ?'whole':'partial';
+}
+
+/** Pure test of whether this invocation can certainly complete every batch of
+ * a successor's save, which is what makes staging a non-reproducible partial
+ * successor safe. It mirrors `persistCheckpoint`'s own admission rule exactly:
+ * the source and target proofs run first, then the save loop admits a call
+ * only while the meter still holds `saveLoopGuard`, the first call costs at
+ * most `firstSave` and each resumed batch at most `extraSave`. A batch is also
+ * never assumed faster than a D1 round trip of its own payload. */
+export function storageGraphV11SaveAffordable(input:{parts:number;remainingQueries:number;
+ nowMs:number;deadlineMs:number;estimateMs:number}):boolean{
+ const costs=STORAGE_GRAPH_V11_GROUP_QUERY_COSTS;
+ const batches=Math.max(1,Math.ceil(input.parts/STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS));
+ const queries=costs.persistPreChecks+costs.saveLoopGuard
+  +(batches>1?costs.firstSave+costs.extraSave*(batches-2):0);
+ const perBatchMs=Math.max(STORAGE_GRAPH_V11_SAVE_BATCH_MS,2*input.estimateMs);
+ return input.remainingQueries>=queries&&input.nowMs+batches*perBatchMs<=input.deadlineMs;
+}
+
+/** Pure page bound for one partial v1.1 group. The round trip is this compute's
+ * own measured D1 latency (elapsed milliseconds per statement it issued),
+ * clamped so one outlier cannot size the claim and defaulted when nothing was
+ * measured. The group then spends the window that remains before the
+ * checkpoint work deadline, minus the reserve its save needs, and never more
+ * pages than the invocation meter still owes the group. */
+export function storageGraphV11PartialGroupPages(input:{nowMs:number;deadlineMs:number;
+ elapsedMs:number;statements:number;remainingQueries:number}):{estimateMs:number;maxPages:number}{
+ const measured=Number.isSafeInteger(input.statements)&&input.statements>0
+  &&Number.isFinite(input.elapsedMs)&&input.elapsedMs>0?input.elapsedMs/input.statements:null;
+ const estimateMs=measured===null?STORAGE_GRAPH_V11_ROUND_TRIP_DEFAULT_MS
+  :Math.min(STORAGE_GRAPH_V11_ROUND_TRIP_MAX_MS,Math.max(STORAGE_GRAPH_V11_ROUND_TRIP_MIN_MS,measured));
+ const window=input.deadlineMs-input.nowMs-STORAGE_GRAPH_V11_SAVE_RESERVE_MS;
+ const byTime=Number.isFinite(window)?Math.floor(window/estimateMs):0;
+ const byQueries=Math.min(STORAGE_GRAPH_V11_MAX_PARTIAL_PAGES,
+  input.remainingQueries-STORAGE_GRAPH_V11_PARTIAL_QUERY_RESERVE);
+ // Below one page the claim cannot afford a group and the promotion of its
+ // successor together, so it reports no group at all rather than reading pages
+ // it would have to discard.
+ return {estimateMs,maxPages:byQueries<1?0:Math.max(1,Math.min(byTime,byQueries))};
+}
 const scopeChanged = () => new Error('storage graph scope changed');
 export type StorageGraphSource = 'v0.2' | 'v1' | 'v1.1' | 'mixed';
 type Source = StorageGraphSource;
@@ -258,19 +359,22 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
   const nowMs=Date.parse(scope.fixedNow),source=bindings.source;
   const persistCheckpoint=async(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint,
     expectedHead:string|null,reason:string):Promise<
-    {state:'saved';head:string}|{state:'deferred';reason:string;failure?:StorageGraphFailureFields}>=>{
+    {state:'saved';head:string;parts:number}|{state:'deferred';reason:string;failure?:StorageGraphFailureFields}>=>{
     if(!await current(source,scope))return {state:'deferred',reason};
     await targetReady(bindings.target,scope);
     try{
       // The first write reads the owner, head and retained parts; later writes
       // of the same generation continue from the private cursor with one part
       // batch and one head read each. The part-insert trigger and the head
-      // CAS still fence every batch against a concurrent promotion.
+      // CAS still fence every batch against a concurrent promotion. The framed
+      // part count is what a v1.1 caller needs, not the number of writes this
+      // call happened to make: a replayed save writes once for a generation of
+      // any size.
       let cursor:StorageHistorySaveCursor|undefined;
-      while(meter.remainingQueries>=40&&now()<deadlineMs){
+      while(meter.remainingQueries>=STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.saveLoopGuard&&now()<deadlineMs){
         const saved=await withStorageGraphFailureStage('graph_checkpoint_save',
           ()=>saveStorageHistoryCheckpoint({target:bindings.target,key,checkpoint,expectedHead,...(cursor?{cursor}:{})}));
-        if(saved.status==='saved')return {state:'saved',head:saved.headDigest};
+        if(saved.status==='saved')return {state:'saved',head:saved.headDigest,parts:saved.totalParts};
         cursor=saved.cursor;
       }
     }catch(error){
@@ -289,6 +393,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     // A typed domain can become source-visible before its ordered owner-active
     // journal event reaches the analytics target. Do not read or stage private
     // evidence until the target has the matching active owner authority.
+    const measuredFromMs=now(),measuredFromQueries=meter.queriesUsed;
     const ownerReady=await bindings.target.prepare(`SELECT 1 AS ready FROM analytics_owner_state
       WHERE source_id=? AND owner_digest=? AND state='active'`).bind(bindings.sourceId,scope.owner.ownerDigest)
       .first<number>('ready');
@@ -297,6 +402,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
       method:metric==='fits'?STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD:STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD};
     let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageV11HistoryCheckpoint|undefined;
+    let partCount:number|null=null;
     for(;;){
       if(meter.remainingQueries<50||now()>=checkpointWorkDeadlineMs)return {state:'deferred',reason:'v11_checkpoint_read_budget'};
       const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
@@ -305,54 +411,81 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
       head=loaded.headDigest??null;
       if(loaded.status==='ready'){
         if(!('source'in loaded.checkpoint)||loaded.checkpoint.source!=='v1.1')throw fail();
-        checkpoint=loaded.checkpoint;
+        checkpoint=loaded.checkpoint;partCount=loaded.partCount;
       }
       // Release the loaded part payloads before the group runs and stages.
       cursor=undefined;
       break;
     }
-    // Resolve and fence the source once around a bounded page group, then
-    // promote its deterministic successor once. If the read, final pin check,
-    // or promotion fails, the last durable head remains the replay point.
-    const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
-      participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
-      generationSnapshot:scope.snapshot,
-      closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
-      budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
-    if(next.status==='complete'){
-      v11CompletedFingerprint=checkpoint?.snapshot?.fingerprint??pin.fingerprint;
-      return {state:'complete',analysis:next.analysis};
-    }
-    // A budget-cut group is not staged: the next pass recomputes the same
-    // deterministic successor from this head and resumes any staged parts.
-    if(next.cut)return {state:'deferred',reason:'v11_checkpoint_group_budget'};
-    if(!next.checkpoint)return {state:'deferred',reason:'v11_checkpoint'};
-    const saved=await persistCheckpoint(key,next.checkpoint,head,'v11_checkpoint');
-    if(saved.state==='deferred')return saved;
-    if(saved.head===head)return {state:'deferred',reason:'v11_checkpoint'};
-    // Persist each phase boundary before doing more work. Small owners can
-    // acquire, reduce and finish in one invocation; large owners return after
-    // one compact usage successor and resume from its exact cursor.
-    let staged=next.checkpoint,stagedHead=saved.head;
-    for(let transition=0;transition<2;transition++){
-      if(staged.phase!=='finish'&&!(staged.phase==='usage'&&staged.usage.complete))break;
-      const advanced=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
+    // This compute's own D1 latency, measured over the owner proof and the
+    // checkpoint load. It sizes partial groups only; a wrong estimate costs a
+    // shorter or a cut group, never a different successor.
+    const measuredMs=now()-measuredFromMs,measuredQueries=meter.queriesUsed-measuredFromQueries;
+    let staged=head!==null,promoted=false,
+      singleBatch=partCount!==null&&partCount<=STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS;
+    // Resolve and fence the source once around each bounded page group, then
+    // promote its successor before starting another. If a read, a final pin
+    // check or a promotion fails, the last durable head remains the replay
+    // point. Groups keep running while this claim can still afford one and
+    // stage it, so a long scheduler window finishes a large owner's phase
+    // instead of spending a whole invocation on one fixed group.
+    for(;;){
+      const bound=storageGraphV11PartialGroupPages({nowMs:now(),deadlineMs:checkpointWorkDeadlineMs,
+        elapsedMs:measuredMs,statements:measuredQueries,remainingQueries:meter.remainingQueries});
+      // A partial group is only taken when this claim can also guarantee the
+      // promotion of its successor. Otherwise the fixed whole group runs: its
+      // successor is reproducible, so an unfinished save is resumed rather
+      // than abandoned, and a small meter still makes durable progress. The
+      // mode therefore depends on the meter as well as the head: a pass that
+      // arrives nearly exhausted may stage part of a whole-group successor
+      // that a later, well-funded pass supersedes with a partial one. The head
+      // only moves by exact-head CAS, so that stage is swept, never promoted.
+      const partialPages=storageGraphV11GroupMode({staged,singleBatch,checkpoint:checkpoint??null})==='partial'
+        ?bound.maxPages:0;
+      const mode=partialPages>=1?'partial':'whole';
+      const maxPages=mode==='partial'?partialPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM;
+      const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
         participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
         generationSnapshot:scope.snapshot,
-        closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint:staged,
-        maxPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM,
+        closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages,
+        ...(mode==='partial'?{partialGroup:true}:{}),
         budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
-      if(advanced.status==='complete'){
-        v11CompletedFingerprint=staged.snapshot?.fingerprint??pin.fingerprint;
-        return {state:'complete',analysis:advanced.analysis};
+      if(next.status==='complete'){
+        v11CompletedFingerprint=checkpoint?.snapshot?.fingerprint??pin.fingerprint;
+        return {state:'complete',analysis:next.analysis};
       }
-      if(advanced.cut||!advanced.checkpoint)break;
-      const promoted=await persistCheckpoint(key,advanced.checkpoint,stagedHead,'v11_checkpoint');
-      if(promoted.state==='deferred')return promoted;
-      if(promoted.head===stagedHead)break;
-      staged=advanced.checkpoint;stagedHead=promoted.head;
+      // A cut whole group is not staged: the next pass recomputes the same
+      // deterministic successor from this head and resumes any staged parts.
+      // A partial group only reports a cut when it read no source page at all.
+      // `v11_checkpoint_group_budget` stays the signal that this claim promoted
+      // nothing at all; a claim that already promoted reports the ordinary
+      // checkpoint deferral it resumes from.
+      if(next.cut)return {state:'deferred',reason:promoted?'v11_checkpoint':'v11_checkpoint_group_budget'};
+      if(!next.checkpoint)return {state:'deferred',reason:'v11_checkpoint'};
+      // Release the superseded checkpoint before the successor is framed:
+      // holding both multi-megabyte frames and a canonical serialization at
+      // once is what exhausts the isolate. `head` still carries the CAS.
+      const successor=next.checkpoint;checkpoint=successor;
+      if(mode==='partial'){
+        // A partial successor is not reproducible, so it may only be staged
+        // when this invocation can certainly finish every batch of its save.
+        // Framing here is free for the save: the frame is memoized per object.
+        const parts=await withStorageGraphFailureStage('graph_checkpoint_save',
+          ()=>storageHistoryCheckpointParts(key,successor));
+        if(!storageGraphV11SaveAffordable({parts,remainingQueries:meter.remainingQueries,
+          nowMs:now(),deadlineMs,estimateMs:bound.estimateMs}))
+          return {state:'deferred',reason:promoted?'v11_checkpoint':'v11_checkpoint_group_budget'};
+      }
+      const saved=await persistCheckpoint(key,successor,head,'v11_checkpoint');
+      if(saved.state==='deferred')return saved;
+      if(saved.head===head)return {state:'deferred',reason:'v11_checkpoint'};
+      // Continue from the promoted successor already in memory. Its own framed
+      // size, not the number of batches its save happened to take, decides
+      // whether the next group may be partial.
+      head=saved.head;staged=true;promoted=true;singleBatch=saved.parts<=STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS;
+      if(meter.remainingQueries<STORAGE_GRAPH_V11_CONTINUE_QUERIES||now()>=checkpointWorkDeadlineMs)
+        return {state:'deferred',reason:'v11_checkpoint'};
     }
-    return {state:'deferred',reason:'v11_checkpoint'};
   };
   let payload='';
   if(scope.metric==='fits') {

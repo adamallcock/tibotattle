@@ -139,6 +139,33 @@ encoders only read it; a cut group returns no checkpoint and the input is
 consumed), and the frame round-trip compares digests one serialization at a
 time.
 
+## 2026-09-16 night: long-window graph pass
+
+With every blocker cleared, throughput was the remaining problem. One owner's
+device reports quota roughly every seven seconds with a fresh `resets_at` on
+most observations (52,000 distinct values in 30 days), so the kernel's lossless
+run collapse cannot shrink it: 1.15 million quota rows and 0.95 million usage
+rows per 100-day window, refused at the 60,000 downsampled-row bound only after
+the whole fold. At 1,024 rows per page, one 32-page group per 55-second claim
+and ~300 ms per D1 round trip, one day-window cost about 40 minutes and the
+70-day preview window about two days.
+
+| Change | Where | Effect |
+|---|---|---|
+| Quota page 1,024 → 4,096 rows | `TYPED_V11_QUOTA_PAGE_SIZE` | Four times fewer round trips per fold; a page stays at 1–2 MB |
+| Partial groups for cheap successors | `advanceStorageV11Analysis({partialGroup})`, `advanceV11QuotaAcquisition({stopAtEndpoints})`, `storageGraphV11GroupMode` | While the head stages in one save batch (≤ 30 parts) and the acquisition is not in its `endpoints` sub-phase, a budget-cut group stages its partial successor; a partial group always ends at the deterministic transition into `endpoints`, and a partial successor is staged only when its whole save fits the remaining statements and time (`STORAGE_GRAPH_V11_GROUP_QUERY_COSTS`), otherwise nothing is staged; `endpoints` and multi-batch checkpoints keep the fixed, reproducible 32-page whole group |
+| Adaptive group size | `storageGraphV11PartialGroupPages`, `storageGraphV11SaveAffordable` | A partial group spends the window that remains before the checkpoint work deadline, sized from this compute's measured D1 latency (clamped 150–3,000 ms, default 400 ms), never more pages than the meter still owes after a reserve for an eight-batch save; a meter too small for any partial group falls back to the reproducible whole group |
+| Many groups per claim | `computeV11` loop | After each promoted successor the claim continues from the object in memory while the meter and deadline allow; each phase successor is still promoted before more work |
+| Long-window pass | `STORAGE_ANALYTICS_LONG_CRON` (`*/10 * * * *`), `runStorageAnalyticsPass({graphOnly, graphLeaseMs})` | A graph-only pass with a nine-minute deadline, a 900-statement meter and a twelve-minute claim lease; it skips delivery, erasure jobs, retirement pages and the daily lane, which the per-minute pass keeps; owner-day claims exclude each other, so the two passes work different owner-days |
+
+The private production config for the analytics Worker must carry both crons
+(`* * * * *` and `*/10 * * * *`) and `limits.cpu_ms` 300000; the in-repo
+example config stays as the maintenance provider's strict-JSON contract expects
+(an empty `triggers.crons`, no `limits`; the provider itself pins the minute
+cron), so that provider does not yet deploy the long pass. The binding constraint of a long pass is the 1,000-statement invocation
+cap, not wall time: about 860 statements reach one claim, roughly four minutes
+of reads at production latency.
+
 Still open: the acquisition checkpoint itself (up to 60,000 quota rows per
-owner) is the structural cost; a compact representation is the next step if a
-group plus its save does not fit one window at production latency.
+owner) is the structural cost; a compact representation, or a `resets_at`
+jitter-tolerant collapse (a fit method change), is the next step.

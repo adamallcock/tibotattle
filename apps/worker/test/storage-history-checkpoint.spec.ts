@@ -1,6 +1,7 @@
 import {env,reset,applyD1Migrations,type D1Migration} from 'cloudflare:test';
 import {beforeEach,describe,it,expect} from 'vitest';
 import {saveStorageHistoryCheckpoint as save,loadStorageHistoryCheckpoint as load,retireStorageHistoryCheckpoint as retire,
+ storageHistoryCheckpointParts,
  type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor} from '../src/storage-history-checkpoint';
 import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reader';
 import {createV11QuotaAcquisitionCheckpoint,type V11QuotaAcquisitionIdentity} from '../src/quota-analysis-v11-reader';
@@ -27,6 +28,11 @@ function checkpoint(count=0,finish=false):StorageV1HistoryCheckpoint{
 async function drain(value:StorageHistoryCheckpoint,expectedHead:string|null=null,storageKey=key){for(let i=0;i<100;i++){
  const result=await save({target:target(),key:storageKey,checkpoint:value,expectedHead,maxWrites:4});if(result.status==='saved')return result.headDigest;}
  throw new Error('synthetic staging did not finish');}
+/** The durable stage row's own part count, so a ready load is proven to report
+ * the exact manifest length callers size their save batches against. */
+async function parts(generation:string){
+ return target().prepare('SELECT part_count FROM analytics_history_checkpoint_stages WHERE generation=?')
+  .bind(generation).first<number>('part_count');}
 async function read(storageKey=key){let cursor:StorageHistoryLoadCursor|undefined;for(let i=0;i<140;i++){
  const result=await load({target:target(),key:storageKey,cursor,maxParts:2});if(result.status!=='deferred')return result;cursor=result.cursor;}
  throw new Error('synthetic load did not finish');}
@@ -53,25 +59,39 @@ describe('private paged historical checkpoint store',()=>{
   const v11Key={...key,method:STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD},acquisition:StorageV11HistoryCheckpoint={version:1,source:'v1.1',
    day:key.day,layout:`typed-v11:${key.sourceNamespace}`,identity,phase:'acquisition',
    acquisition:createV11QuotaAcquisitionCheckpoint(identity)};
-  const first=await drain(acquisition,null,v11Key);
-  expect(await read(v11Key)).toEqual({status:'ready',headDigest:first,checkpoint:acquisition});
+  const first=await drain(acquisition,null,v11Key),firstParts=await parts(first);
+  // An empty acquisition stages inside a single save batch, which is what
+  // makes its successor eligible for a partial group.
+  expect(firstParts!).toBeLessThanOrEqual(30);
+  expect(await read(v11Key)).toEqual({status:'ready',headDigest:first,partCount:firstParts,checkpoint:acquisition});
   expect(await read()).toEqual({status:'absent'});
   const large=structuredClone(acquisition);large.acquisition.plan.observations=Array.from({length:30000},(_,index)=>({
    contextKey:'openai_codex|codex',observedAtMs:Date.parse(identity.observedAtCutoff)+index,planType:'pro',
    planVariant:'unknown',continuityId:null,conflicted:false,accountScopeId:null,planBasis:null}));
   expect((await save({target:target(),key:v11Key,checkpoint:large,expectedHead:first,maxWrites:4})).status).toBe('staging');
-  expect(await read(v11Key)).toEqual({status:'ready',headDigest:first,checkpoint:acquisition});
-  const largeHead=await drain(large,first,v11Key);expect(await read(v11Key)).toEqual({status:'ready',headDigest:largeHead,checkpoint:large});
+  expect(await read(v11Key)).toEqual({status:'ready',headDigest:first,partCount:firstParts,checkpoint:acquisition});
+  const largeHead=await drain(large,first,v11Key),largeParts=await parts(largeHead);
+  // A 30,000-observation acquisition cannot be staged by one save batch, which
+  // is exactly what disqualifies it from partial groups.
+  expect(largeParts!).toBeGreaterThan(30);
+  // The framed part count needs no database access, and even the replay short
+  // circuit reports it, so a promoted many-part generation is never mistaken
+  // for the one-batch save its single write attempt would suggest.
+  expect(await storageHistoryCheckpointParts(v11Key,large)).toBe(largeParts);
+  expect(await save({target:target(),key:v11Key,checkpoint:large,expectedHead:first}))
+   .toEqual({status:'saved',headDigest:largeHead,totalParts:largeParts});
+  expect(await read(v11Key)).toEqual({status:'ready',headDigest:largeHead,partCount:largeParts,checkpoint:large});
   const finish:StorageV11HistoryCheckpoint={...acquisition,phase:'finish',acquisition:{identity,planAnchors:[],quotaRows:[]}};
   const second=await drain(finish,largeHead,v11Key);
-  expect(second).not.toBe(largeHead);expect(await read(v11Key)).toEqual({status:'ready',headDigest:second,checkpoint:finish});
+  expect(second).not.toBe(largeHead);
+  expect(await read(v11Key)).toEqual({status:'ready',headDigest:second,partCount:await parts(second),checkpoint:finish});
   const reduced:V11UsageReductionCheckpoint={version:1,identity,days:[],dayIndex:0,cursorTime:identity.observedAtCutoff,
    cursorOccurrence:'',rowsRead:0,complete:true,commonRefusal:'supported_quota_track_unavailable',scalarRefusal:null,
    modelRefusal:null,previous:[],hazards:[],scalarBuckets:[],modelCosts:[],poisoned:[],usageEventCount:0,
    unpricedUsageEventCount:0,attributionUnresolved:false};
   const usage:StorageV11HistoryCheckpoint={...finish,phase:'usage',usage:reduced};
   const usageHead=await drain(usage,second,v11Key);
-  expect(await read(v11Key)).toEqual({status:'ready',headDigest:usageHead,checkpoint:usage});
+  expect(await read(v11Key)).toEqual({status:'ready',headDigest:usageHead,partCount:await parts(usageHead),checkpoint:usage});
   for(let i=0;i<10;i++)if((await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).state==='idle')break;
   const insert=async(metric:'fits'|'model')=>target().prepare(`INSERT INTO analytics_community_graph_results
    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(v11Key.sourceId,v11Key.ownerDigest,metric,v11Key.day,
@@ -108,7 +128,7 @@ describe('private paged historical checkpoint store',()=>{
   expect(await read()).toMatchObject({headDigest:old});
   const current=await drain(next,old);
   for(let n=0;n<10;n++)if((await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).state==='idle')break;
-  expect(await read()).toEqual({status:'ready',headDigest:current,checkpoint:next});
+  expect(await read()).toEqual({status:'ready',headDigest:current,partCount:await parts(current),checkpoint:next});
   expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(1);
  });
  it('resumes a staged generation from its private cursor with one part batch and one head read per call',async()=>{
@@ -123,7 +143,7 @@ describe('private paged historical checkpoint store',()=>{
    if(result.status==='staging')cursor=result.cursor;
   }
   expect(result.status).toBe('saved');if(result.status!=='saved')throw new Error('expected saved');
-  expect(await read()).toEqual({status:'ready',headDigest:result.headDigest,checkpoint:large});
+  expect(await read()).toEqual({status:'ready',headDigest:result.headDigest,partCount:await parts(result.headDigest),checkpoint:large});
   expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(2);
   // A cursor binds its exact key, expected head, control and manifest: another
   // checkpoint, another expected head or another key cannot borrow it.
@@ -145,7 +165,7 @@ describe('private paged historical checkpoint store',()=>{
   for(let i=0;i<200;i++){
    const before=observed.counts.reads,result=await load({target:observed.database,key,cursor,maxParts:4});pages++;
    if(result.status==='deferred'){expect(observed.counts.reads-before).toBe(cursor?1:3);cursor=result.cursor;continue;}
-   expect(result).toEqual({status:'ready',headDigest:head,checkpoint:large});expect(observed.counts.reads-before).toBe(2);break;
+   expect(result).toEqual({status:'ready',headDigest:head,partCount,checkpoint:large});expect(observed.counts.reads-before).toBe(2);break;
   }
   expect(pages).toBe(Math.ceil(partCount!/4));expect(observed.counts.reads).toBe(pages+3);expect(observed.counts.batches).toBe(0);
   expect((await load({target:target(),key,maxParts:32})).status).toBe(partCount!>32?'deferred':'ready');
@@ -164,7 +184,7 @@ describe('private paged historical checkpoint store',()=>{
   let idle=false;
   for(let n=0;n<40;n++)if((await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).state==='idle'){idle=true;break;}
   expect(idle).toBe(true);
-  expect(await read()).toEqual({status:'ready',headDigest:current,checkpoint:next});
+  expect(await read()).toEqual({status:'ready',headDigest:current,partCount:await parts(current),checkpoint:next});
   expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(1);
   expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_parts WHERE generation!=?').bind(current).first('n')).toBe(0);
  });
@@ -198,7 +218,8 @@ describe('private paged historical checkpoint store',()=>{
   expect(await read()).toMatchObject({status:'ready',headDigest:oldHead,checkpoint:old});
   await target().prepare('UPDATE analytics_owner_state SET revision=2').run();
   expect(await read()).toMatchObject({status:'ready',headDigest:oldHead,checkpoint:old});
-  const next=await drain(large,oldHead);expect(next).not.toBe(oldHead);expect(await read()).toEqual({status:'ready',headDigest:next,checkpoint:large});
+  const next=await drain(large,oldHead);expect(next).not.toBe(oldHead);
+  expect(await read()).toEqual({status:'ready',headDigest:next,partCount:await parts(next),checkpoint:large});
   await expect(save({target:target(),key,checkpoint:checkpoint(1),expectedHead:oldHead})).rejects.toThrow('CHECKPOINT_UNAVAILABLE');
  });
  it('converges after committed response loss and rolls back a failed part page',async()=>{
@@ -209,7 +230,10 @@ describe('private paged historical checkpoint store',()=>{
   await expect(save({target:target(),key,checkpoint:large,expectedHead:null,maxWrites:4})).rejects.toThrow();
   expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_parts').first('n')).toBe(retained);
   await target().prepare('DROP TRIGGER synthetic_checkpoint_failure').run();const head=await drain(large);expect(await read()).toMatchObject({status:'ready',headDigest:head,checkpoint:large});
-  expect(await save({target:target(),key,checkpoint:large,expectedHead:null})).toEqual({status:'saved',headDigest:head});
+  const staged=await parts(head);
+  expect(await storageHistoryCheckpointParts(key,large)).toBe(staged);
+  expect(await save({target:target(),key,checkpoint:large,expectedHead:null}))
+   .toEqual({status:'saved',headDigest:head,totalParts:staged});
  });
  it('refuses corrupt cursors, cross-key reads, mutation and revoked authority; retirement stays bounded and prevents resurrection',async()=>{
   const value=checkpoint(10000),head=await drain(value);const page=await load({target:target(),key,maxParts:1});expect(page.status).toBe('deferred');

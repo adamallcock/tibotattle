@@ -91,6 +91,11 @@ async function nextMissingHistoricalModelPosition(target:D1Database,sourceId:str
  * day. Finish that cohort before opening another day's checkpoints. */
 export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsBindings & {
  nowMs?:number;remainingQueries?:number;deadlineMs?:number;
+ /** Claim lease for the owner-day this call selects. The caller sets it above
+  * its own deadline, so a pass that works for its whole window still holds the
+  * claim at the end and a concurrent pass sees the owner-day as busy. An
+  * abandoned claim still recovers on its own once the lease expires. */
+ leaseMs?:number;
 }):Promise<StorageGraphWorkProgress> {
  const nowMs=options.nowMs??Date.now();
  if(!Number.isFinite(nowMs))throw fail();
@@ -200,7 +205,8 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   }
   const token=crypto.randomUUID();claimToken=token;
   const claimed=await withStorageGraphFailureStage('graph_scope',()=>claimStorageGraphWorkSelection({
-   source:options.source,target:options.target,selection:selection!,claimToken:token,nowMs}));
+   source:options.source,target:options.target,selection:selection!,claimToken:token,nowMs,
+   ...(options.leaseMs===undefined?{}:{leaseMs:options.leaseMs})}));
   if(claimed.status!=='claimed'||!claimed.selection)
    return {state:'deferred',metric,day,reason:claimed.status==='busy'?'selection_busy':'selection_changed'};
   selection=claimed.selection;

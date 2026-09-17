@@ -1015,12 +1015,15 @@ function reduceModel(context: Context, runtime:UsageReductionRuntime,state: V11U
 }
 
 /** Advance at most maxPages physical usage pages. The returned checkpoint is a
- * deterministic successor and can be promoted with exact-head CAS. */
+ * deterministic successor and can be promoted with exact-head CAS. The page
+ * bound matches the acquisition group bound: a long-window scheduler pass
+ * spends its whole D1 statement allowance on one claim, while the budget and
+ * deadline still stop the group. */
 export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin,
   options: V11AnalysisOptions & { quotaAcquisition: V11CompletedQuotaAcquisition }, budget: V11UsageReductionBudget,
   prior?: V11UsageReductionCheckpoint | null, maxPages = 1,
   reductionIdentity:V11QuotaAcquisitionIdentity=options.quotaAcquisition.identity): Promise<V11UsageReductionCheckpoint> {
-  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 32 || !Number.isSafeInteger(budget.remainingQueries)
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 1024 || !Number.isSafeInteger(budget.remainingQueries)
       || budget.remainingQueries < 0 || !Number.isFinite(budget.deadlineMs)) throw new Error("v11 usage reduction budget invalid");
   createV11QuotaAcquisitionCheckpoint(reductionIdentity);
   const context = await quotaContext(db, pin, options);

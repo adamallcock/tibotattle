@@ -469,6 +469,83 @@ describe('independent public daily publication',()=>{
     await expect(runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,
       graphLaneFirst:'yes' as unknown as boolean})).rejects.toThrow();
   });
+  it('runs only the graph lane in a graph-only long pass and leaves the queued day for the minute pass',async()=>{
+    await fixture();await ready();
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue').first('n')).toBe(1);
+    const before=Number(await target().prepare('SELECT revision FROM analytics_community_graph_scan WHERE source_id=?')
+      .bind(sourceId).first('revision')??0);
+    // Observe every statement the pass actually issues, on all three databases.
+    const seen:string[]=[];
+    const watch=(db:D1Database,tag:string):D1Database=>new Proxy(db,{get(value,key){
+      if(key==='prepare')return(sql:string)=>{seen.push(`${tag}:${sql.replace(/\s+/g,' ')}`);return value.prepare(sql);};
+      const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+    }});
+    const matching=(pattern:RegExp)=>seen.filter(sql=>pattern.test(sql));
+    const watched={source:watch(source(),'source'),target:watch(target(),'target'),ledger:watch(b.DELETION_LEDGER,'ledger')};
+    const result=await runStorageAnalyticsPass({...options(),...watched,publishCommunity:true,publicOnly:true,graphOnly:true,
+      maxSteps:1,maxQueries:900,deadlineMs:Date.now()+9*60_000,graphLeaseMs:12*60_000});
+    expect(result.dailyPublications).toBe(0);
+    expect(result.graphFailure).toBeUndefined();
+    // The queued rebuild is untouched and still waiting for the minute schedule.
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue').first('n')).toBe(1);
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_publications').first('n')).toBe(0);
+    expect(Number(await target().prepare('SELECT revision FROM analytics_community_graph_scan WHERE source_id=?')
+      .bind(sourceId).first('revision'))).toBeGreaterThan(before);
+    // The whole window belongs to one claim: no erasure job, no projection or
+    // graph retirement page, and no cohort-sized preview hint ahead of it.
+    expect(matching(/^ledger:/)).toEqual([]);
+    expect(matching(/storage_erasure_jobs/)).toEqual([]);
+    expect(matching(/SELECT event_digest,owner_digest FROM analytics_v11_projection_work/)).toEqual([]);
+    expect(matching(/analytics_v1_owner_fences f JOIN analytics_v1_chunk_values c/)).toEqual([]);
+    expect(matching(/analytics_graph_erasure_receipts/)).toEqual([]);
+    expect(matching(/WITH members AS MATERIALIZED/)).toEqual([]);
+    expect(matching(/UPDATE analytics_community_graph_scan/)).toHaveLength(1);
+    // The same pass without graphOnly issues every one of them, so the absence
+    // above is the skip and not an unreachable statement.
+    seen.length=0;
+    await runStorageAnalyticsPass({...options(),...watched,publishCommunity:true,publicOnly:true,
+      maxSteps:1,maxQueries:900,deadlineMs:Date.now()+55_000});
+    for(const pattern of [/^ledger:.*storage_erasure_jobs/,/SELECT event_digest,owner_digest FROM analytics_v11_projection_work/,
+      /analytics_v1_owner_fences f JOIN analytics_v1_chunk_values c/,/analytics_graph_erasure_receipts/,
+      /WITH members AS MATERIALIZED/]) expect(matching(pattern).length).toBeGreaterThan(0);
+  });
+  it('reports a graph-only pass whose only lane failed as deferred, never as an idle cohort',async()=>{
+    await fixture();await ready();
+    // Refuse the graph lane's first durable statement. The lane records a closed
+    // failure and reports itself exhausted for the rest of the pass, so without
+    // the graph-only state rule the second iteration would look idle.
+    const failing=new Proxy(target(),{get(value,key){
+      if(key==='prepare')return(sql:string)=>{
+        if(/INSERT INTO analytics_community_graph_scan/.test(sql))throw new Error('synthetic graph lane failure');
+        return value.prepare(sql);
+      };
+      const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+    }}) as D1Database;
+    const result=await runStorageAnalyticsPass({...options(),target:failing,publishCommunity:true,publicOnly:true,
+      graphOnly:true,maxSteps:4,maxQueries:900,deadlineMs:Date.now()+9*60_000,graphLeaseMs:12*60_000});
+    expect(result.graphFailure).toEqual({phase:'graph_work',reason:'application'});
+    expect(result).toMatchObject({state:'deferred',reason:'step_limit',graphCalculations:0,dailyPublications:0});
+  });
+  it('refuses a graph-only pass whose claim lease cannot bound its own window',async()=>{
+    // A graph-only pass must publish community results from the public phase.
+    // The lease is recoverable only by expiry: below a minute or not longer
+    // than this pass's own window it admits a second claimant, and beyond one
+    // cron invocation it wedges the owner-day.
+    for(const invalid of [{graphOnly:true},{graphOnly:true,publishCommunity:true},
+      {graphOnly:'yes' as unknown as boolean,publicOnly:true,publishCommunity:true},
+      {graphOnly:true,publicOnly:true,publishCommunity:true,graphLeaseMs:59_999},
+      {graphOnly:true,publicOnly:true,publishCommunity:true,graphLeaseMs:60_000.5},
+      {graphOnly:true,publicOnly:true,publishCommunity:true,graphLeaseMs:15*60_000+1},
+      // A lease no longer than the window: the window is a full minute longer
+      // so the comparison cannot race the clock between here and the check.
+      {graphOnly:true,publicOnly:true,publishCommunity:true,graphLeaseMs:9*60_000,deadlineMs:Date.now()+10*60_000}]) {
+      await expect(runStorageAnalyticsPass({...options(),maxSteps:1,maxQueries:900,...invalid})).rejects.toThrow();
+    }
+    // The long schedule's own twelve-minute lease over a nine-minute window is
+    // inside both bounds and is admitted.
+    await expect(runStorageAnalyticsPass({...options(),maxSteps:1,maxQueries:900,publishCommunity:true,publicOnly:true,
+      graphOnly:true,graphLeaseMs:12*60_000,deadlineMs:Date.now()+9*60_000})).resolves.toMatchObject({dailyPublications:0});
+  });
   it('keeps complete totals and unknown-price counts when more than a hundred model cells are displayed',async()=>{
     await fixture(101,n=>({modelId:`unknown-a-${String(n).padStart(3,'0')}`}));
     await fixture(101,n=>({modelId:`unknown-b-${String(n).padStart(3,'0')}`}));await ready();await publish();

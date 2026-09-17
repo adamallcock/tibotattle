@@ -78,13 +78,17 @@ async function finish(rows: V11QuotaPageRow[], maxQuotaRows = IDENTITY.maxQuotaR
 
 describe("resumable v1.1 quota acquisition", () => {
   it("retains flat-run endpoints while paging the physical owner stream", async () => {
+    // Nine flat runs that together overflow one physical page, so every
+    // sub-phase is resumed across a checkpoint round trip mid-run.
+    const repeats = Math.ceil((V11_QUOTA_ACQUISITION_PAGE_SIZE + 1) / 9);
     const rows: V11QuotaPageRow[] = [];
     for (let level = 0; level < 9; level += 1) {
-      for (let repeat = 0; repeat < 150; repeat += 1) {
+      for (let repeat = 0; repeat < repeats; repeat += 1) {
         rows.push(sourceRow(rows.length + 1, level * 10));
       }
     }
-    const expected = rows.filter((row, index) => index % 150 === 0 || index % 150 === 149)
+    expect(rows.length).toBeGreaterThan(V11_QUOTA_ACQUISITION_PAGE_SIZE);
+    const expected = rows.filter((row, index) => index % repeats === 0 || index % repeats === repeats - 1)
       .map((row) => row.active!.occurrenceId);
     const { result, phases, calls } = await finish(rows);
     expect(result.status).toBe("complete");
@@ -93,6 +97,54 @@ describe("resumable v1.1 quota acquisition", () => {
     expect(result.attributionIndex.eras).toHaveLength(1);
     expect([...phases].sort()).toEqual(["endpoints", "fitability", "plan"]);
     expect(calls).toBe(6);
+  });
+
+  it("ends a group on every deterministic sub-phase boundary when the caller stages it", async () => {
+    const repeats = Math.ceil((V11_QUOTA_ACQUISITION_PAGE_SIZE + 1) / 9);
+    const rows: V11QuotaPageRow[] = [];
+    for (let level = 0; level < 9; level += 1) {
+      for (let repeat = 0; repeat < repeats; repeat += 1) rows.push(sourceRow(rows.length + 1, level * 10));
+    }
+    const budget = () => ({ remainingQueries: 32, deadlineMs: 1, now: () => 0 });
+    // Two physical pages per sub-phase, so each boundary stop really ended the
+    // group early instead of running out of pages.
+    const stopped = fixtureReader(rows), stoppedState = createV11QuotaAcquisitionCheckpoint(IDENTITY);
+    const plan = await advanceV11QuotaAcquisition(stopped.reader, IDENTITY, budget(), stoppedState,
+      { maxPages: 32, stopAtPhaseBoundary: true });
+    expect(plan.status).toBe("deferred");
+    if (plan.status !== "deferred") throw new Error("expected deferred");
+    expect(plan.checkpoint.phase).toBe("fitability");
+    expect(stopped.calls).toBe(2);
+    // The checkpoint is advanced in place, so each successor is captured
+    // before the next group mutates it.
+    const planJson = JSON.stringify(plan);
+    const fitability = await advanceV11QuotaAcquisition(stopped.reader, IDENTITY, budget(), stoppedState,
+      { maxPages: 32, stopAtPhaseBoundary: true });
+    expect(fitability.status).toBe("deferred");
+    if (fitability.status !== "deferred") throw new Error("expected deferred");
+    expect(fitability.checkpoint.phase).toBe("endpoints");
+    expect(stopped.calls).toBe(4);
+    // A boundary stop never reads an endpoint row, which is what keeps the
+    // staged successor compact.
+    expect(fitability.checkpoint.endpoints).toEqual([]);
+    const fitabilityJson = JSON.stringify(fitability);
+    // Both boundaries are byte-identical to the successor the same pages
+    // produce without the option: they are exactly where the budget would have
+    // stopped one iteration later.
+    const bounded = fixtureReader(rows), boundedState = createV11QuotaAcquisitionCheckpoint(IDENTITY);
+    const boundedPlan = await advanceV11QuotaAcquisition(bounded.reader, IDENTITY, budget(), boundedState, { maxPages: 2 });
+    expect(JSON.stringify(boundedPlan)).toBe(planJson);
+    const boundedFitability = await advanceV11QuotaAcquisition(bounded.reader, IDENTITY, budget(), boundedState, { maxPages: 2 });
+    expect(JSON.stringify(boundedFitability)).toBe(fitabilityJson);
+    // Without the option the same page bound carries a sub-phase's accumulated
+    // state into the next one, which is the growth a staged group must avoid.
+    const crossing = fixtureReader(rows);
+    const crossingResult = await advanceV11QuotaAcquisition(crossing.reader, IDENTITY, budget(),
+      createV11QuotaAcquisitionCheckpoint(IDENTITY), { maxPages: 5 });
+    expect(crossingResult.status).toBe("deferred");
+    if (crossingResult.status !== "deferred") throw new Error("expected deferred");
+    expect(crossingResult.checkpoint.phase).toBe("endpoints");
+    expect(crossingResult.checkpoint.endpoints.length).toBeGreaterThan(0);
   });
 
   it("keeps retired rows in the physical cursor and excludes them from evidence", async () => {

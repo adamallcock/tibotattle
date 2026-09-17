@@ -233,7 +233,9 @@ describe("resumable current-fit v1 usage reduction", () => {
     const saved = await saveStorageHistoryCheckpoint({ target: target(), key, checkpoint, expectedHead: null });
     expect(saved.status).toBe("saved");
     const loaded = await loadStorageHistoryCheckpoint({ target: target(), key });
-    expect(loaded).toEqual({ status: "ready", headDigest: expect.any(String), checkpoint });
+    const staged = await target().prepare("SELECT part_count FROM analytics_history_checkpoint_stages WHERE generation=?")
+      .bind(loaded.status === "ready" ? loaded.headDigest : null).first<number>("part_count");
+    expect(loaded).toEqual({ status: "ready", headDigest: expect.any(String), partCount: staged, checkpoint });
   });
 
   it("preserves the occurrence-selected interval when a session tie crosses a plan era", async () => {

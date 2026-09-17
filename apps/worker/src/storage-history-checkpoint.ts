@@ -170,11 +170,19 @@ async function framed(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint)
  const f=await frame(key,checkpoint);
  frames.set(checkpoint,{day:key.day,sourceNamespace:key.sourceNamespace,frame:f});return f;
 }
+/** The framed part count for this exact key and checkpoint, with no database
+ * access. The frame is memoized per checkpoint object, so a caller that sizes
+ * its save batches here does not pay to frame the same successor again. */
+export async function storageHistoryCheckpointParts(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):Promise<number>{
+ const target={...key};keys(target);return (await framed(target,checkpoint)).parts.length;
+}
 /** The target key is a private dependency identity, not authorization. Caller
  * must prove source eligibility before saving and before promoting final fits.
  * Each call writes at most32 statements; replay sends the same immutable input.
  * A returned staging cursor lets the same invocation continue that exact
- * generation with one batch and one head read per call. */
+ * generation with one batch and one head read per call. Every result reports
+ * the framed part count, including the replay short circuit, so a caller never
+ * mistakes an already-promoted many-part generation for a one-batch save. */
 export async function saveStorageHistoryCheckpoint(input:{target:D1Database;key:StorageHistoryKey;checkpoint:StorageHistoryCheckpoint;expectedHead:string|null;maxWrites?:number;cursor?:StorageHistorySaveCursor}){
  const {target}=input,key={...input.key},expected=input.expectedHead,max=input.maxWrites??32;bounded(max,3,32);pin(expected);
  const id=await storageHistoryKeyDigest(key),f=await framed(key,input.checkpoint),manifest=canonicalJson(f.manifest);
@@ -190,7 +198,7 @@ export async function saveStorageHistoryCheckpoint(input:{target:D1Database;key:
   if(!owner)throw fail();
   generation=await sha256Hex(canonicalJson({key,expectedHead:expected,authorityEpoch:owner.authority_epoch,control:f.control,manifest:f.manifest}));
   const head=await current(target,id);if(head?.retired)throw fail();
-  if(head?.generation===generation)return {status:'saved' as const,headDigest:generation};
+  if(head?.generation===generation)return {status:'saved' as const,headDigest:generation,totalParts:f.parts.length};
   if((head?.generation??null)!==expected)throw fail();
   await target.prepare(`INSERT INTO analytics_history_checkpoint_stages
   (key_digest,generation,source_id,owner_digest,day,dependency_digest,source_namespace,method,expected_head,owner_revision,authority_epoch,control_json,manifest_json,part_count)
@@ -218,14 +226,16 @@ export async function saveStorageHistoryCheckpoint(input:{target:D1Database;key:
  ON CONFLICT(key_digest) DO UPDATE SET generation=excluded.generation WHERE analytics_history_checkpoint_heads.retired=0 AND analytics_history_checkpoint_heads.generation IS ?`).bind(id,generation,expected));
  if(statements.length)await target.batch(statements);
  const head=await current(target,id);if(head?.retired)throw fail();
- if(head?.generation===generation)return {status:'saved' as const,headDigest:generation};
+ if(head?.generation===generation)return {status:'saved' as const,headDigest:generation,totalParts:f.parts.length};
  if((head?.generation??null)!==expected||complete)throw fail();
  const cursor:StorageHistorySaveCursor={generation,keyDigest:id,expectedHead:expected,control:f.control,manifest,present:[...present,...page]};
  return {status:'staging' as const,generation,storedParts:present.size+page.length,totalParts:f.parts.length,cursor};
 }
 /** At most32 payload reads per call (16 by default). The in-memory cursor is
  * private and bound to a single promoted generation whose immutable stage row
- * it carries; every payload is rehashed before the final decode and fence. */
+ * it carries; every payload is rehashed before the final decode and fence. A
+ * ready result reports the verified manifest length so a caller can size the
+ * save batches its own successor will need before choosing how much to do. */
 export async function loadStorageHistoryCheckpoint(input:{target:D1Database;key:StorageHistoryKey;cursor?:StorageHistoryLoadCursor;maxParts?:number}){
  const {target}=input,key={...input.key},max=input.maxParts??STORAGE_HISTORY_LOAD_PARTS;bounded(max,1,STORAGE_HISTORY_MAX_LOAD_PARTS);
  const id=await storageHistoryKeyDigest(key),cursor=input.cursor;
@@ -257,7 +267,7 @@ export async function loadStorageHistoryCheckpoint(input:{target:D1Database;key:
  const checkpoint=decode(stage.control_json,manifest,parts);parts.length=0;
  const final=await target.prepare(`SELECT h.generation FROM analytics_history_checkpoint_heads h JOIN analytics_history_checkpoint_stages s
  ON s.key_digest=h.key_digest AND s.generation=h.generation WHERE h.key_digest=? AND h.retired=0 AND ${ACTIVE}`).bind(id).first<string>('generation');
- if(final!==generation)throw fail();return {status:'ready' as const,headDigest:generation,checkpoint};
+ if(final!==generation)throw fail();return {status:'ready' as const,headDigest:generation,partCount:manifest.length,checkpoint};
 }
 /** Retire exactly this dependency key, never other days/owners. Head tombstone
  * prevents a delayed writer resurrecting it; payload deletion stays paged. */

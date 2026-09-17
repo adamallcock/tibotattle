@@ -3,10 +3,12 @@ import { V11_DOMAIN_METHOD_VERSION, type V11SourcePin } from "./telemetry-v11-do
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 
-/** The physical page is deliberately smaller than the compatibility reader's
- * public page. It bounds both the normalized joins and the decoder work that a
- * single resumable acquisition step can perform. */
-export const TYPED_V11_QUOTA_PAGE_SIZE = 1024;
+/** The physical page bounds both the normalized joins and the decoder work
+ * that a single resumable acquisition step can perform. It stays well under
+ * the compatibility reader's public page: one 4,096-row page decodes to a few
+ * megabytes of JSON at most, while a 100-day window of the densest observed
+ * owner costs a quarter of the D1 round trips a 1,024-row page charged. */
+export const TYPED_V11_QUOTA_PAGE_SIZE = 4096;
 const MIN_TIME = -8_640_000_000_000_000;
 const MAX_TIME = 8_640_000_000_000_000;
 

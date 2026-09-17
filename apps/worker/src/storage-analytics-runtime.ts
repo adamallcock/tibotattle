@@ -205,12 +205,32 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   * scheduled window when both have work, so passes alternate which lane opens
   * by wall-clock minute unless the caller pins the order. */
  graphLaneFirst?:boolean;
+ /** Long-window graph-only pass. A separate, less frequent schedule gives one
+  * owner-day claim a window many times the minute pass, so the kernel can
+  * advance many groups under a single claim. Ordered delivery, erasure, the
+  * admin snapshot, the bounded retirement pages and the daily lane stay on the
+  * minute schedule; the lane order is then irrelevant. */
+ graphOnly?:boolean;
+ /** Graph claim lease. The caller sets it above this pass's own deadline so a
+  * concurrent scheduled pass sees the owner-day as busy for the whole window. */
+ graphLeaseMs?:number;
 }):Promise<StorageAnalyticsPass> {
  const maxSteps=options.maxSteps??8,deadlineMs=options.deadlineMs??Date.now()+20_000;
  if(!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||!Number.isFinite(deadlineMs)
    ||(options.publicOnly!==undefined&&typeof options.publicOnly!=='boolean')
    ||(options.publicOnly===true&&options.publishCommunity!==true)
    ||(options.graphLaneFirst!==undefined&&typeof options.graphLaneFirst!=='boolean')
+   ||(options.graphOnly!==undefined&&typeof options.graphOnly!=='boolean')
+   // A graph-only pass publishes community results and opens no ordered
+   // journal step; any other combination is a caller contract error.
+   ||(options.graphOnly===true&&(options.publishCommunity!==true||options.publicOnly!==true))
+   // A claim is recoverable only by lease expiry. It must outlive this pass's
+   // own window, or a second claimant forks the same checkpoint key while this
+   // one is still writing; and it must stay inside one cron invocation's
+   // wall clock, or an abandoned claim wedges that owner-day for longer than a
+   // scheduled attempt can recover it.
+   ||(options.graphLeaseMs!==undefined&&(!Number.isSafeInteger(options.graphLeaseMs)||options.graphLeaseMs<60_000
+    ||options.graphLeaseMs>15*60_000||options.graphLeaseMs<=deadlineMs-Date.now()))
    ||(options.skipV1PrefixProbe!==undefined&&typeof options.skipV1PrefixProbe!=='boolean'))throw invalid();
  const graphLaneFirst=options.graphLaneFirst??Math.floor(Date.now()/60_000)%2===1;
  const meter=createD1InvocationBudget(options.maxQueries??900);
@@ -219,11 +239,20 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  const result=(state:StorageAnalyticsPass['state'],reason:StorageAnalyticsPass['reason']):StorageAnalyticsPass=>
   ({state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications,graphCalculations,
    ...(graphFailure?{graphFailure}:{})});
+ // A graph-only pass has exactly one lane, and an exhausted lane reports itself
+ // idle for the rest of the pass. Without this, a window that ended with its
+ // owner-day still unfinished would report an idle cohort or ordinary progress
+ // and read as "nothing to do" in the scheduler log while the same selection
+ // keeps failing. The minute pass keeps its existing lane semantics.
+ const graphOnlyStalled=():boolean=>options.graphOnly===true&&graphFailure!==undefined;
  try {
   if(Date.now()>=deadlineMs)return result('deferred','deadline');
   // Privacy cleanup is independent of publication and capacity admission for
   // new analytical work. The same invocation meter covers all three databases.
-  if(options.ledger)await advanceStorageErasureJobs({...scoped,ledger:meter.wrap(options.ledger)},{maxJobs:1});
+  // A graph-only pass runs beside the minute schedule, which keeps advancing
+  // erasure every minute. Leave that cleanup there rather than spending this
+  // window's meter on it twice.
+  if(options.ledger&&!options.graphOnly)await advanceStorageErasureJobs({...scoped,ledger:meter.wrap(options.ledger)},{maxJobs:1});
   // Physical use is an observed operating guard. This is not a distributed
   // allocation reservation; the operator keeps concurrent writers within budget.
   const probe=await scoped.target.prepare('SELECT 1 AS capacity_probe').run();
@@ -275,7 +304,11 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     reason:fields.reason,detail:storageGraphFailureDetail(error)??null}));
    if(stage==='graph_work')graphExhausted=true;
   };
-  if(options.publishCommunity&&meter.remainingQueries>=253&&deadlineMs-Date.now()>=5_000
+  // A graph-only pass skips this opportunistic publication: its cost scales
+  // with the cohort and could spend the graph lane's admission floor before any
+  // calculation starts. The minute pass still runs it every minute, and the
+  // graph lane publishes its own preview after a completed calculation.
+  if(options.publishCommunity&&!options.graphOnly&&meter.remainingQueries>=253&&deadlineMs-Date.now()>=5_000
     &&(await readCollectionControls(scoped.source)).publication) {
    options.signal?.throwIfAborted();
    try{
@@ -287,7 +320,10 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   for(;steps<maxSteps;) {
    options.signal?.throwIfAborted();
    if(Date.now()>=deadlineMs)return result('deferred','deadline');
-   if(meter.remainingQueries<100)return result('deferred','query_budget');
+   // A graph-only pass has no other lane to fall back on: once the shared meter
+   // can no longer admit the graph lane's admission floor, stop instead of
+   // spending the remaining steps on repeated control reads.
+   if(meter.remainingQueries<(options.graphOnly?550:100))return result('deferred','query_budget');
    // Publication-paused catch-up can combine a current typed-v1 prefix. The
    // scheduler's public-only phase never opens the ordered journal: its finite
    // steps count public iterations, leaving pending delivery for the next
@@ -298,10 +334,13 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    const step=options.publicOnly?{state:'idle' as const,recordsRead:0}
     :page&&page.events>0?page:await advanceStorageAnalytics({...scoped,maxV11PhysicalPages:v11Pages,deadlineMs});
    steps+=!options.publicOnly&&page&&page.events>0?page.events:1;recordsRead+=step.recordsRead;
-   // Retiring old generations cannot be starved by an always-busy journal.
-   const v11=await retireV11DailyProjectionPage(scoped.target,options.sourceId);
-   const v1=await retireV1DailyProjectionPage(scoped.target,options.sourceId);
-   const retiredGraph=await retireStorageGraphPage(scoped.target,options.sourceId);
+   // Retiring old generations cannot be starved by an always-busy journal. The
+   // graph-only pass leaves those bounded pages to the minute schedule, which
+   // keeps running them, and gives its whole window to one resumable claim.
+   const idlePage={state:'idle' as const};
+   const v11=options.graphOnly?idlePage:await retireV11DailyProjectionPage(scoped.target,options.sourceId);
+   const v1=options.graphOnly?idlePage:await retireV1DailyProjectionPage(scoped.target,options.sourceId);
+   const retiredGraph=options.graphOnly?idlePage:await retireStorageGraphPage(scoped.target,options.sourceId);
    let publicIdle=true;
    if(options.publishCommunity && meter.remainingQueries>=100 && Date.now()<deadlineMs
      && (await readCollectionControls(scoped.source)).publication) {
@@ -350,7 +389,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
      graphRan=true;
      let graph:StorageGraphWorkProgress={state:'deferred',reason:'graph_failure'};
      try{
-      graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs});
+      graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs,
+       ...(options.graphLeaseMs===undefined?{}:{leaseMs:options.graphLeaseMs})});
       if(graph.failure)graphFailure??=graph.failure;
       if(graph.state==='complete')graphCalculations++;
       if((graph.state==='complete'||graph.state==='reused')&&meter.remainingQueries>=250&&Date.now()<deadlineMs) {
@@ -366,12 +406,14 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     // opening lane alternates by minute so a long daily queue cannot starve a
     // resumable graph checkpoint for hours, and vice versa; an idle lane costs
     // a few statements and hands the rest of the window to the other.
-    if(graphLaneFirst){const graphIdle=await runGraphLane();const dailyIdle=await runDailyLane();publicIdle=dailyIdle&&graphIdle;}
+    if(options.graphOnly)publicIdle=await runGraphLane();
+    else if(graphLaneFirst){const graphIdle=await runGraphLane();const dailyIdle=await runDailyLane();publicIdle=dailyIdle&&graphIdle;}
     else {const dailyIdle=await runDailyLane();const graphIdle=await runGraphLane();publicIdle=dailyIdle&&graphIdle;}
    }
-   if(step.state==='idle'&&v11.state==='idle'&&v1.state==='idle'&&retiredGraph.state==='idle'&&publicIdle)return result('idle','complete');
+   if(step.state==='idle'&&v11.state==='idle'&&v1.state==='idle'&&retiredGraph.state==='idle'&&publicIdle)
+    return graphOnlyStalled()?result('deferred','step_limit'):result('idle','complete');
   }
-  return result('progress','step_limit');
+  return graphOnlyStalled()?result('deferred','step_limit'):result('progress','step_limit');
  }catch(error){
   if(error instanceof D1InvocationBudgetExceededError)return result('deferred','query_budget');
   if(error instanceof V11ProjectionDeadlineExceededError)return result('deferred','deadline');

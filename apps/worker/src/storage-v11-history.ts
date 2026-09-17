@@ -17,7 +17,18 @@ export type StorageV11HistoryCheckpoint={version:1;source:'v1.1';day:string;layo
  * because the invocation budget or deadline stopped it. It returns no
  * checkpoint: a partial group is not a deterministic successor, and staging one
  * would give every invocation a different generation to abandon. The input
- * checkpoint is advanced in place and must not be reused after a cut. */
+ * checkpoint is advanced in place and must not be reused after a cut.
+ *
+ * `partialGroup` returns that partial successor instead, and ends an
+ * acquisition group at each deterministic sub-phase boundary. It is only safe while the successor's whole save completes
+ * in the calling invocation: such a generation is promoted or lost whole, so a
+ * pass that reproduces a different successor abandons nothing. A successor
+ * needing several save batches must keep the whole-group rule, because
+ * resuming its staged parts requires every later pass to reproduce the
+ * identical successor, which only a fixed group size and a fixed head can
+ * guarantee; the caller checks that before staging. A group that consumed no
+ * source page returns a cut even under `partialGroup`: there is no progress to
+ * promote. */
 export type StorageV11HistoryResult={status:'deferred';checkpoint:StorageV11HistoryCheckpoint|null;cut?:true}|
  {status:'complete';analysis:object};
 
@@ -41,6 +52,9 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  generationSnapshot?:V11GenerationSnapshot;
  closedDependencyDigest:string;
  budget:V11QuotaInvocationBudget;checkpoint?:StorageV11HistoryCheckpoint|null;maxPages?:number;
+ /** Stage the partial successor of a budget- or deadline-cut group instead of
+  * discarding it. Only for callers that promote a single-batch successor. */
+ partialGroup?:boolean;
  /** Kernel downsampled-quota bound; part of the acquisition identity. Tests
   * lower it to reach the refusal path; production keeps the kernel default. */
  maxQuotaRows?:number}):Promise<StorageV11HistoryResult>{
@@ -50,7 +64,9 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   ||!Number.isSafeInteger(nowMs)||!Number.isSafeInteger(budget.remainingQueries)||budget.remainingQueries<0
   ||!Number.isFinite(budget.deadlineMs))throw fail();
  if(!/^[0-9a-f]{64}$/.test(input.closedDependencyDigest))throw fail();
- if(input.maxPages!==undefined&&(!Number.isSafeInteger(input.maxPages)||input.maxPages<1||input.maxPages>32))throw fail();
+ if(input.maxPages!==undefined&&(!Number.isSafeInteger(input.maxPages)||input.maxPages<1||input.maxPages>1024))throw fail();
+ if(input.partialGroup!==undefined&&typeof input.partialGroup!=='boolean')throw fail();
+ const partialGroup=input.partialGroup===true;
  // The acquisition advances the given checkpoint in place: a defensive deep
  // copy of a 60,000-row acquisition can exhaust the isolate on its own. The
  // caller treats the input as consumed; a cut group returns no checkpoint.
@@ -87,13 +103,20 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   const reader=await createTypedV11QuotaPageReader(source,{sourceNamespace,snapshot,fenceSnapshotPages:false,
    fromObservedAtMs:Date.parse(window.start),beforeObservedAtMs:Date.parse(window.end)});
   const before=budget.remainingQueries;
-  const result=await advanceV11QuotaAcquisition(reader,identity,budget,checkpoint.acquisition,{maxPages});
+  // A staged partial successor stops on each sub-phase boundary: a boundary
+  // successor is compact, while one cut mid-sub-phase carries that sub-phase's
+  // whole accumulated state and can reach hundreds of parts.
+  const result=await advanceV11QuotaAcquisition(reader,identity,budget,checkpoint.acquisition,
+   {maxPages,...(partialGroup?{stopAtPhaseBoundary:true}:{})});
   await assertTypedV11GenerationSnapshotLive(source,snapshot);
   // The acquisition reads one physical page per statement and only defers
   // when the budget, the deadline or the page bound stops it, so fewer than
   // `maxPages` pages means a budget cut rather than a natural group boundary.
-  if(result.status==='deferred')return before-budget.remainingQueries<maxPages?{status:'deferred',checkpoint:null,cut:true}
-   :{status:'deferred',checkpoint:{...checkpoint,snapshot,acquisition:result.checkpoint}};
+  if(result.status==='deferred'){
+   const pages=before-budget.remainingQueries,successor:StorageV11HistoryResult={status:'deferred',
+    checkpoint:{...checkpoint,snapshot,acquisition:result.checkpoint}};
+   return pages<maxPages&&!(partialGroup&&pages>0)?{status:'deferred',checkpoint:null,cut:true}:successor;
+  }
   // A refused acquisition is a complete, publishable result in the shape the
   // metric's maintained finisher would return: the bare composition refusal
   // for the model history, the scalar analysis refusal for fits. The cached
@@ -123,8 +146,11 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  await assertTypedV11GenerationSnapshotLive(source,snapshot);
  // The reducer spends one statement to initialize a fresh reduction and one
  // per day page; an incomplete reduction that read fewer than `maxPages` pages
- // was cut by the budget or deadline, not by the end of its selected days.
- if(!usage.complete&&before-budget.remainingQueries-(resumed?0:1)<maxPages)return {status:'deferred',checkpoint:null,cut:true};
+ // was cut by the budget or deadline, not by the end of its selected days. A
+ // fresh reduction that only selected its days still advanced the checkpoint.
+ const usagePages=before-budget.remainingQueries-(resumed?0:1);
+ if(!usage.complete&&usagePages<maxPages&&!(partialGroup&&(usagePages>0||!resumed)))
+  return {status:'deferred',checkpoint:null,cut:true};
  return {status:'deferred',checkpoint:{version:1,source:'v1.1',day,layout,identity,snapshot,phase:'usage',
   acquisition:checkpoint.acquisition,usage}};
 }

@@ -564,19 +564,29 @@ function refusal(reason: "plan_attribution_limit_exceeded" | "downsampled_quota_
 /** Advance only complete physical pages. The page cursor moves across every
  * owner row, including retired/non-quota rows; eligibility is residual JS
  * filtering. This is what prevents a dense irrelevant prefix from looking like
- * EOF and keeps a resume replayable after a deadline. */
+ * EOF and keeps a resume replayable after a deadline.
+ *
+ * `stopAtPhaseBoundary` ends the group on each deterministic sub-phase
+ * boundary, returning exactly the successor the budget would have produced one
+ * iteration later. Callers that stage a partial group use it so a single group
+ * cannot carry a whole sub-phase's accumulated state into the next one: a
+ * boundary successor is compact, while a successor cut in the middle of the
+ * fitability or endpoints sub-phase can reach hundreds of parts. */
 export async function advanceV11QuotaAcquisition(
   reader: V11QuotaPageReader,
   identity: V11QuotaAcquisitionIdentity,
   budget: V11QuotaInvocationBudget,
   state: V11QuotaAcquisitionCheckpoint = createV11QuotaAcquisitionCheckpoint(identity),
-  options: { maxPages?: number } = {},
+  options: { maxPages?: number; stopAtPhaseBoundary?: boolean } = {},
 ): Promise<V11QuotaAcquisitionStep> {
   if (reader.pageSize !== V11_QUOTA_ACQUISITION_PAGE_SIZE) throw new Error("v11 quota reader page policy invalid");
   validateCheckpoint(state, identity);
   if (!Number.isSafeInteger(budget.remainingQueries) || budget.remainingQueries < 0
       || !Number.isFinite(budget.deadlineMs)) throw new Error("v11 quota acquisition budget invalid");
   if (options.maxPages !== undefined && (!Number.isSafeInteger(options.maxPages) || options.maxPages < 1)) {
+    throw new Error("v11 quota acquisition page bound invalid");
+  }
+  if (options.stopAtPhaseBoundary !== undefined && typeof options.stopAtPhaseBoundary !== "boolean") {
     throw new Error("v11 quota acquisition page bound invalid");
   }
   const now = budget.now ?? Date.now;
@@ -746,12 +756,14 @@ export async function advanceV11QuotaAcquisition(
       state.plan.runs = [];
       planRuns.clear();
       state.cursor = initialCursor(identity);
+      if (options.stopAtPhaseBoundary) return defer();
       continue;
     }
     if (state.phase === "fitability") {
       if (!finishStats()) return refusal("downsampled_quota_limit_exceeded");
       state.phase = "endpoints";
       state.cursor = initialCursor(identity);
+      if (options.stopAtPhaseBoundary) return defer();
       continue;
     }
     if (!finishRuns()) return refusal("downsampled_quota_limit_exceeded");

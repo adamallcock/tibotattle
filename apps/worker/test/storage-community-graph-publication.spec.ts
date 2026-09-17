@@ -512,6 +512,30 @@ describe('isolated allowance graph publication',()=>{
   await expect(readStorageGraphWorkSelection(legacy(),{sourceId:namespace,ownerDigest:owner.ownerDigest!,
    day:today(),metric:'fits'})).rejects.toThrow();
  });
+ it('holds a long claim lease against a second claimant until it expires',async()=>{
+  await fixture('participant:selected-long-lease');
+  const {owner,envelope}=await selectedEnvelope('fits',today());
+  const ensured=await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,envelope,nowMs:10});
+  if(!('selection'in ensured)||!ensured.selection)throw new Error('synthetic selection unavailable');
+  // The long graph-only pass claims for twelve minutes so its own nine-minute
+  // window cannot end with another pass already holding the same owner-day.
+  const lease=12*60_000,key={sourceId:namespace,ownerDigest:owner.ownerDigest!,day:today(),metric:'fits' as const};
+  const claimed=await claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   selection:ensured.selection,claimToken:'synthetic-long-claim-a',nowMs:10,leaseMs:lease});
+  expect(claimed).toMatchObject({status:'claimed',selection:{state:'claimed',claimExpiresMs:10+lease}});
+  // Past the default five-minute lease the claim is still live, so a second
+  // claimant is refused instead of forking the same owner-day work.
+  expect(await loadLiveStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,key,nowMs:10+300_001}))
+   .toMatchObject({state:'claimed'});
+  expect((await claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   selection:claimed.selection!,claimToken:'synthetic-long-claim-b',nowMs:10+300_001,leaseMs:lease})).status).toBe('busy');
+  // An abandoned long claim still recovers on its own once the lease expires.
+  const recovered=await loadLiveStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,key,nowMs:11+lease});
+  expect(recovered).toMatchObject({state:'pending'});
+  expect(await claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,selection:recovered!,
+   claimToken:'synthetic-long-claim-c',nowMs:12+lease,leaseMs:lease}))
+   .toMatchObject({status:'claimed',selection:{envelopeSha256:ensured.selection.envelopeSha256}});
+ });
  it('repairs corrupt completed days instead of permanently skipping them',async()=>{
   await fixture();await compute('model');await compute('fits');
   await publishStorageCommunityModelDay(bindings(),{day:day()});

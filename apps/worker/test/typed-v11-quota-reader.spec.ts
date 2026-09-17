@@ -8,7 +8,7 @@ import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/
 import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor, loadV11SourcePin } from "../src/telemetry-v11-domain";
 import { sha256Hex } from "../src/crypto";
-import { createTypedV11QuotaPageReader } from "../src/typed-v11-quota-reader";
+import { createTypedV11QuotaPageReader, TYPED_V11_QUOTA_PAGE_SIZE } from "../src/typed-v11-quota-reader";
 import { createV11DeviceFixture, makeV11Day } from "./helpers/telemetry-v11";
 
 const bindings = env as Env & { STORAGE_INGESTION_A: D1Database; TEST_MIGRATIONS: D1Migration[];
@@ -89,17 +89,17 @@ describe("typed v1.1 quota physical reader", () => {
     expect(await reader.readPage({ observedAtMs: rest.at(-1)!.observedAtMs, sourceRowId: rest.at(-1)!.sourceRowId })).toEqual([]);
   }, 60_000);
 
-  it("keeps a 1024-row page bounded across the next physical cursor", async () => {
-    const pin = await stageAndActivate(2048);
+  it("keeps a whole physical page bounded across the next physical cursor", async () => {
+    const pin = await stageAndActivate(TYPED_V11_QUOTA_PAGE_SIZE * 2);
     const reader = await createTypedV11QuotaPageReader(database(), {
       sourceNamespace: SOURCE_NAMESPACE, pin, fromObservedAtMs: START, beforeObservedAtMs: START + 86_400_000,
     });
     const first = await reader.readPage({ observedAtMs: START, sourceRowId: 0 });
-    expect(first).toHaveLength(1024);
+    expect(first).toHaveLength(TYPED_V11_QUOTA_PAGE_SIZE);
     const second = await reader.readPage({ observedAtMs: first.at(-1)!.observedAtMs,
       sourceRowId: first.at(-1)!.sourceRowId });
-    expect(second).toHaveLength(1024);
-    expect(new Set([...first, ...second].map((row) => row.sourceRowId)).size).toBe(2048);
+    expect(second).toHaveLength(TYPED_V11_QUOTA_PAGE_SIZE);
+    expect(new Set([...first, ...second].map((row) => row.sourceRowId)).size).toBe(TYPED_V11_QUOTA_PAGE_SIZE * 2);
     expect(await reader.readPage({ observedAtMs: second.at(-1)!.observedAtMs,
       sourceRowId: second.at(-1)!.sourceRowId })).toEqual([]);
   }, 120_000);
