@@ -15,6 +15,7 @@ import type {
   V11QuotaAcquisitionIdentity,
   V11QuotaPageReader,
 } from "../src/quota-analysis-v11-reader";
+import { QUOTA_ENDPOINT_MIN_SPACING_MS } from "../src/quota-endpoint-collapse";
 import type { V11QuotaPageRow, V11QuotaSourceRow } from "../src/typed-v11-quota-reader";
 
 const BASE = Date.parse("2026-08-01T00:00:00.000Z");
@@ -90,14 +91,22 @@ describe("resumable v1.1 quota acquisition", () => {
     }
     expect(rows.length).toBeGreaterThan(V11_QUOTA_ACQUISITION_PAGE_SIZE);
     // Run collapse keeps each flat run's first and last row until the key holds
-    // the boundaries the calibration refuses below. After that the runs are one
-    // second apart, so the spacing keeps only the key's final endpoint, which
-    // here also carries the highest displayed value.
+    // the boundaries the calibration refuses below. After that the spacing
+    // keeps a run boundary only when it is at least the minimum spacing after
+    // the last kept endpoint. The rows are one second apart, so a run of
+    // `repeats` rows spans `repeats - 1` seconds: the run that carried the last
+    // boundary keeps its own final row exactly when that span reaches the
+    // spacing, while the next run's first row is one second later and is always
+    // held back. The key's final endpoint, which here also carries the highest
+    // displayed value, is emitted either way.
     const boundaries = QUOTA_CALIBRATION_POLICY.minimumBoundaries;
+    const spacedRun = (repeats - 1) * 1_000 >= QUOTA_ENDPOINT_MIN_SPACING_MS;
     const expected = [
       ...Array.from({ length: boundaries - 1 },
         (_, level) => [level * repeats, (level + 1) * repeats - 1]).flat(),
-      (boundaries - 1) * repeats, rows.length - 1,
+      (boundaries - 1) * repeats,
+      ...(spacedRun ? [boundaries * repeats - 1] : []),
+      rows.length - 1,
     ].map((index) => rows[index]!.active!.occurrenceId);
     const { result, phases, calls } = await finish(rows);
     expect(result.status).toBe("complete");

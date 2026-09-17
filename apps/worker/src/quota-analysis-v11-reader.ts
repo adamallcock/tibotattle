@@ -126,6 +126,20 @@ export interface V11QuotaAcquisitionCheckpoint {
   endpoints: Endpoint[];
 }
 
+/** `fitability` stays a scan of its own and does not fold into `clusters`.
+ * `QuotaFragmentStats` itself would survive the fold: hull merging partitions
+ * the raw resets, minimum/maximum fold exactly, and a union of per-raw value
+ * sets capped at `minimumBoundaries` reaches the cap exactly when the pool's
+ * true distinct count does, so `quotaFragmentEligible` is preserved. The phase
+ * merge is not safe for two reasons that have nothing to do with the statistic.
+ * A `clusters` checkpoint carries no stats by construction, and its cursor is
+ * the proof that the prefix before it was scanned for hulls only; a merged scan
+ * resuming there would accumulate stats over the suffix alone and settle a
+ * different `eligible` set, which only a new acquisition version could exclude.
+ * And stats accumulated during `clusters` must key on the raw reset, whose
+ * distinct count is bounded only by the row count, where the representative key
+ * is bounded by `QUOTA_RESET_CLUSTER_LIMIT` pools: a mid-`clusters` successor
+ * would fail its own `maxEras` part bound on a dense owner. */
 export const V11_QUOTA_WORK_COMPONENTS = [
   "plan-observations", "plan-runs", "plan-equal-time", "reset-clusters", "fit-stats", "eligible",
   "endpoint-runs", "endpoints",

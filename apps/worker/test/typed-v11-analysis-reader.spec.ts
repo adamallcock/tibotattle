@@ -35,7 +35,7 @@ import { readStorageCommunityProgress } from "../src/storage-community-progress"
 import {loadStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,
   type StorageHistoryKey,type StorageHistoryLoadCursor} from "../src/storage-history-checkpoint";
 import {advanceStorageV11Analysis,type StorageV11HistoryCheckpoint} from '../src/storage-v11-history';
-import {loadTypedV11GenerationSnapshot} from '../src/typed-v11-quota-reader';
+import {loadTypedV11GenerationSnapshot,TYPED_V11_QUOTA_PAGE_SIZE} from '../src/typed-v11-quota-reader';
 import { handleRequest } from "../src/index";
 import { runBackendLifecycle } from "../src/retention";
 import { reconcilePendingQuarantineObjects } from "../src/quarantine-reconciliation";
@@ -755,7 +755,7 @@ describe("typed active-domain analytical reads",()=>{
     const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
     // Two physical pages per acquisition sub-phase, so the endpoints group
     // still has work left after the page that crosses the deadline below.
-    await activate(typed(),f,await makeV11Day(day(),evidence(6000)),true);
+    await activate(typed(),f,await makeV11Day(day(),evidence(TYPED_V11_QUOTA_PAGE_SIZE+1904)),true);
     const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
     await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
       .bind(namespace,owner.ownerDigest).run();
@@ -833,7 +833,7 @@ describe("typed active-domain analytical reads",()=>{
     const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
     // Three physical pages in the plan sub-phase alone, so a small group is
     // bounded by the meter rather than by the end of the phase.
-    await activate(typed(),f,await makeV11Day(day(),evidence(8500)),true);
+    await activate(typed(),f,await makeV11Day(day(),evidence(2*TYPED_V11_QUOTA_PAGE_SIZE+308)),true);
     const owner=(await readStorageCommunityOwnerPage(typed()))[0]!;
     await bindings.target.prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
       .bind(namespace,owner.ownerDigest).run();

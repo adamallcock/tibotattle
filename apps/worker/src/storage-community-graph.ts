@@ -55,8 +55,25 @@ const MAX_RESULT_BYTES = 1024 * 1024;
 // hundred milliseconds of D1 round trip each; staging left unfinished here is
 // continued by the next pass because the group successor is deterministic.
 const STORAGE_GRAPH_CHECKPOINT_SAVE_HEADROOM_MS = 12_000;
+// The v1 readers keep the 1,024-row page and their own `maxPages<=32` bound.
 const STORAGE_GRAPH_CHECKPOINT_PAGES_PER_CLAIM = 32;
-const STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM = 32;
+/** Pages in the fixed whole v1.1 group, the fallback taken when a partial group
+ * is not permitted (a multi-batch successor, or the `endpoints` sub-phase) or
+ * not affordable. A whole group is all-or-nothing: a group that reads fewer
+ * pages than it asked for is a `cut`, and its successor is discarded rather
+ * than staged, so the group's wall clock has to fit the checkpoint work window
+ * or the claim makes no durable progress at all.
+ *
+ * The source page is now 16,384 rows rather than 4,096, so a page costs at
+ * most four times what it did. Eight pages therefore bound the group by the
+ * same 131,072 source rows and the same worst-case wall clock as the previous
+ * 32 pages of 4,096: no stage that finishes its group today can start being
+ * cut. The statement cost falls with the page count, so the same rows now cost
+ *   8 pages + 4 fences + 6 pre-checks + 37 first save = 55 statements
+ * instead of 32 + 4 + 6 + 37 = 79, which is 2,383 source rows per statement
+ * against 1,659, and lets one 900-statement claim run 15 whole groups where it
+ * previously ran 10. */
+export const STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM = 8;
 // One save batch stages at most 30 parts, so a successor at or below that
 // bound is promoted or abandoned whole and never has to be reproduced to
 // resume its staged parts. Larger successors keep the fixed whole-group rule.
@@ -86,9 +103,21 @@ const STORAGE_GRAPH_V11_PARTIAL_QUERY_RESERVE = STORAGE_GRAPH_V11_GROUP_QUERY_CO
   + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.saveLoopGuard + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.firstSave
   + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.extraSave * (STORAGE_GRAPH_V11_MAX_SAVE_BATCHES - 1)
   + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.margin;
-// A whole 32-page group spends about 42 statements, so a claim only starts
-// another one while the persist pre-checks and a first save batch still fit.
-const STORAGE_GRAPH_V11_CONTINUE_QUERIES = 100;
+/** A claim only starts another whole group while that group and the promotion
+ * of its successor both still fit the meter, so this is derived from the group
+ * rather than carried as a number that a page-count change would silently
+ * invalidate. The group itself spends its pages and its fences on the meter;
+ * `persistCheckpoint` then runs the source and target proofs, and its save loop
+ * admits a call only while `saveLoopGuard` statements remain, spending at most
+ * `firstSave` on that call:
+ *   8 pages + 4 fences + 6 persistPreChecks + 40 saveLoopGuard + 7 margin = 65
+ * After the group (12) and the pre-checks (6) the meter still holds 47, which
+ * is above the guard (40) and above one save (37). Larger successors are the
+ * whole-group rule's own business: they are reproducible from this head, so an
+ * unfinished save is resumed by the next pass instead of abandoned. */
+export const STORAGE_GRAPH_V11_CONTINUE_QUERIES = STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM
+  + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.fences + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.persistPreChecks
+  + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.saveLoopGuard + STORAGE_GRAPH_V11_GROUP_QUERY_COSTS.margin;
 // Leave the save of the successor a whole round trip and its batch.
 const STORAGE_GRAPH_V11_SAVE_RESERVE_MS = 4_000;
 // One save batch is a D1 round trip of a larger payload, so it is never

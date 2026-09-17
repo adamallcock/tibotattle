@@ -4,11 +4,49 @@ import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 
 /** The physical page bounds both the normalized joins and the decoder work
- * that a single resumable acquisition step can perform. It stays well under
- * the compatibility reader's public page: one 4,096-row page decodes to a few
- * megabytes of JSON at most, while a 100-day window of the densest observed
- * owner costs a quarter of the D1 round trips a 1,024-row page charged. */
-export const TYPED_V11_QUOTA_PAGE_SIZE = 4096;
+ * that a single resumable acquisition step can perform, and one page is the
+ * unit of D1 round trip a 100-day owner window is charged in. The densest
+ * observed owner holds 2,212,776 rows in that window, which the acquisition
+ * reads once per sub-phase, so the page size is the dominant throughput term.
+ *
+ * The bound is the 128 MiB isolate. One row of this page costs 2,415 bytes of
+ * retained heap at the peak of `readPage`, where the raw D1 result row and the
+ * decoded row are both live across `rows.map` (measured over the exact shapes
+ * `decodeRow` produces; the decoded row alone is 983 bytes once the raw rows
+ * are released). `V11_QUOTA_PAGE_SIZE_BUDGET` below states that arithmetic so it
+ * can be proven rather than asserted:
+ *
+ *   16,384 rows x 2,415 B  =  37.7 MiB transient page peak
+ *   worst-case in-memory acquisition checkpoint (60,000 interned endpoints,
+ *     the `maxQuotaRows` cap)                 =  22.3 MiB
+ *   worker module/runtime baseline (allowed)  =  15.0 MiB
+ *   page read peak                            =  75.0 MiB   (53 MiB spare)
+ *
+ * The checkpoint save peak is unaffected by this constant and already exceeds
+ * the page read peak: the page is released before `storageHistoryCheckpointParts`
+ * frames the successor, and that frame is 43.5 MiB for the same 60,000-endpoint
+ * checkpoint, so 22.3 + 43.5 + 15.0 = 80.8 MiB. Raising the page to 16,384
+ * therefore does not become the binding memory constraint. The next power of
+ * two would: 32,768 rows is a 75.3 MiB page peak, 112.6 MiB in total, which
+ * leaves 12% of the isolate and no room for an unusual row.
+ *
+ * This constant is deliberately absent from every acquisition identity,
+ * checkpoint key and dependency digest. A page cursor is a position in a
+ * totally ordered owner stream and end-of-input is a short page, so a
+ * checkpoint staged under any page size resumes correctly under any other. */
+export const TYPED_V11_QUOTA_PAGE_SIZE = 16_384;
+
+/** The measured terms behind the page size above, exported so the budget is a
+ * checked arithmetic statement instead of a comment. Bytes are retained heap.
+ * `pageRowBytes` was measured over a realistic page built through the exact
+ * shapes `decodeRow` returns, with the raw D1 rows still live. */
+export const V11_QUOTA_PAGE_SIZE_BUDGET = Object.freeze({
+  isolateBytes: 128 * 1024 * 1024,
+  pageRowBytes: 2_415,
+  checkpointBytes: 22.3 * 1024 * 1024,
+  checkpointFrameBytes: 43.5 * 1024 * 1024,
+  runtimeBaselineBytes: 15 * 1024 * 1024,
+});
 const MIN_TIME = -8_640_000_000_000_000;
 const MAX_TIME = 8_640_000_000_000_000;
 

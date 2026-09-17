@@ -31,7 +31,15 @@ export const V1_QUOTA_ACQUISITION_VERSION = "v1-quota-acquisition-2";
 export const V1_QUOTA_ACQUISITION_PAGE_SIZE = 1_024;
 /** The persisted phase vocabulary, in order. The pool sweep is a second leg of
  * `plan` rather than a phase of its own: the work stores pin this vocabulary in
- * a column CHECK, and settling hulls is not a durable phase boundary. */
+ * a column CHECK, and settling hulls is not a durable phase boundary.
+ *
+ * The sweep does not absorb `fitability` either, for the same two reasons the
+ * v1.1 reader records: a checkpoint parked mid-sweep carries no stats and its
+ * `clusterCursor` is the proof that only hulls were taken from the prefix, so a
+ * merged leg resuming there would decide eligibility on the suffix alone; and
+ * stats taken before the hulls settle must key on the raw restated instant,
+ * which this reset-major reader fragments further still, where the decoder
+ * bounds `fit-stats` by `maxEras`. */
 export const V1_QUOTA_ACQUISITION_PHASES = ["plan", "fitability", "endpoints"] as const;
 export const V1_PLAN_ANCHOR_LIMIT = 120_000;
 export const V1_QUOTA_ENDPOINT_LIMIT = 60_000;
