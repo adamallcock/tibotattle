@@ -198,7 +198,18 @@ The clusters sub-phase is a fourth full pass over the window, about a third
 more round trips per fold, which partly offsets the page-size gain; and the
 graph phase of a long pass starts with roughly 725 statements after delivery,
 so a partial group's page bound is about a quarter smaller than the 900 the
-earlier arithmetic assumed. The v1 reader (the second dense owner is v1)
+earlier arithmetic assumed.
+
+Deployed 2026-09-17 02:34 UTC (version 59a4a504). The retired-contract
+retirement reclaimed the pre-clustering v1.1 generations within the first
+passes (checkpoint parts fell from 147 MB to 14 MB) and the v1.1 corpus began
+recomputing at once. The first long pass exposed two gaps: it ended after 53
+seconds at the 550-statement admission floor with 548 statements left, so the
+eight-minute window went unused (the floor is sized for one heavy minute-pass
+attempt; a graph-only pass needs a lower one); and pre-deploy selection rows
+still carried envelopes with the previous checkpoint method and digests, so
+claiming them failed the post-claim consistency check as an application
+failure every pass instead of being replaced as superseded selections. The v1 reader (the second dense owner is v1)
 follows the same design in a separate change. Still open: the acquisition
 checkpoint itself (up to 60,000 quota rows per owner) remains the structural
 cost.

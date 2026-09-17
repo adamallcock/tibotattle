@@ -19,6 +19,12 @@ import { caughtStorageGraphFailureFields, storageGraphFailureDetail,
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 export type { StorageAnalyticsBindings } from './analytics-delivery';
 const invalid=()=>new Error('STORAGE_ANALYTICS_CONTRACT_UNAVAILABLE');
+/** Statements the graph lane refuses to open below. A pass that gets one graph
+ * attempt per invocation reserves a whole heavy attempt and its checkpoint
+ * save. A graph-only pass returns to the same lane for its whole window, so it
+ * reserves only one small group plus the kernel's continue guard; a floor sized
+ * for the other pass would end its window with most of the meter unspent. */
+const GRAPH_LANE_ADMISSION_QUERIES=550,GRAPH_ONLY_ADMISSION_QUERIES=120;
 const SOURCE_IDENTITY_SQL=`SELECT s.source_id,a.source_namespace AS v1_namespace,b.source_namespace AS v11_namespace
   FROM storage_source_state s JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
   JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 WHERE s.singleton=1`;
@@ -233,6 +239,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     ||options.graphLeaseMs>15*60_000||options.graphLeaseMs<=deadlineMs-Date.now()))
    ||(options.skipV1PrefixProbe!==undefined&&typeof options.skipV1PrefixProbe!=='boolean'))throw invalid();
  const graphLaneFirst=options.graphLaneFirst??Math.floor(Date.now()/60_000)%2===1;
+ const graphAdmission=options.graphOnly?GRAPH_ONLY_ADMISSION_QUERIES:GRAPH_LANE_ADMISSION_QUERIES;
  const meter=createD1InvocationBudget(options.maxQueries??900);
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,graphFailure:StorageGraphFailureFields|undefined;
@@ -323,7 +330,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    // A graph-only pass has no other lane to fall back on: once the shared meter
    // can no longer admit the graph lane's admission floor, stop instead of
    // spending the remaining steps on repeated control reads.
-   if(meter.remainingQueries<(options.graphOnly?550:100))return result('deferred','query_budget');
+   if(meter.remainingQueries<(options.graphOnly?graphAdmission:100))return result('deferred','query_budget');
    // Publication-paused catch-up can combine a current typed-v1 prefix. The
    // scheduler's public-only phase never opens the ordered journal: its finite
    // steps count public iterations, leaving pending delivery for the next
@@ -385,12 +392,12 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     // start another heavy calculation in the same invocation; the next
     // scheduled pass retries from its durable checkpoint and selection.
     const runGraphLane=async():Promise<boolean>=>{
-     if(!(meter.remainingQueries>=550 && Date.now()<deadlineMs && !graphExhausted))return graphExhausted;
+     if(!(meter.remainingQueries>=graphAdmission && Date.now()<deadlineMs && !graphExhausted))return graphExhausted;
      graphRan=true;
      let graph:StorageGraphWorkProgress={state:'deferred',reason:'graph_failure'};
      try{
       graph=await advanceStorageCommunityGraphWork({...scoped,remainingQueries:meter.remainingQueries,deadlineMs,
-       ...(options.graphLeaseMs===undefined?{}:{leaseMs:options.graphLeaseMs})});
+       admissionQueries:graphAdmission,...(options.graphLeaseMs===undefined?{}:{leaseMs:options.graphLeaseMs})});
       if(graph.failure)graphFailure??=graph.failure;
       if(graph.state==='complete')graphCalculations++;
       if((graph.state==='complete'||graph.state==='reused')&&meter.remainingQueries>=250&&Date.now()<deadlineMs) {

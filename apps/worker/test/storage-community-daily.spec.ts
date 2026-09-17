@@ -509,6 +509,37 @@ describe('independent public daily publication',()=>{
       /analytics_v1_owner_fences f JOIN analytics_v1_chunk_values c/,/analytics_graph_erasure_receipts/,
       /WITH members AS MATERIALIZED/]) expect(matching(pattern).length).toBeGreaterThan(0);
   });
+  it('keeps returning to the graph lane on a budget where the minute pass reserves a whole attempt',async()=>{
+    await fixture();await ready();
+    const watch=()=>{const seen:string[]=[];return {claims:()=>seen.filter(sql=>/UPDATE analytics_community_graph_scan/.test(sql)).length,
+      db:new Proxy(target(),{get(value,key){
+        if(key==='prepare')return(sql:string)=>{seen.push(sql.replace(/\s+/g,' '));return value.prepare(sql);};
+        const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+      }}) as D1Database};};
+    // Below the minute pass's whole-attempt reservation, above the graph-only
+    // floor: the long window spends the last of its meter resuming a claim.
+    const long=watch();
+    await runStorageAnalyticsPass({...options(),target:long.db,publishCommunity:true,publicOnly:true,graphOnly:true,
+      maxSteps:32,maxQueries:300,deadlineMs:Date.now()+8*60_000,graphLeaseMs:570_000});
+    expect(long.claims()).toBeGreaterThanOrEqual(1);
+    // The same budget in the minute pass still never opens the graph lane: it
+    // gets one attempt per invocation and reserves the whole attempt.
+    const minute=watch();
+    await runStorageAnalyticsPass({...options(),target:minute.db,publishCommunity:true,publicOnly:true,
+      maxSteps:32,maxQueries:300,deadlineMs:Date.now()+55_000});
+    expect(minute.claims()).toBe(0);
+    // Below the graph-only floor the pass stops instead of claiming.
+    const starved=watch();
+    expect(await runStorageAnalyticsPass({...options(),target:starved.db,publishCommunity:true,publicOnly:true,
+      graphOnly:true,maxSteps:32,maxQueries:119,deadlineMs:Date.now()+8*60_000,graphLeaseMs:570_000}))
+      .toMatchObject({state:'deferred',reason:'query_budget'});
+    expect(starved.claims()).toBe(0);
+    // A full meter returns to the lane rather than stopping after one attempt.
+    const full=watch();
+    await runStorageAnalyticsPass({...options(),target:full.db,publishCommunity:true,publicOnly:true,graphOnly:true,
+      maxSteps:4,maxQueries:900,deadlineMs:Date.now()+8*60_000,graphLeaseMs:570_000});
+    expect(full.claims()).toBeGreaterThan(1);
+  });
   it('reports a graph-only pass whose only lane failed as deferred, never as an idle cohort',async()=>{
     await fixture();await ready();
     // Refuse the graph lane's first durable statement. The lane records a closed

@@ -11,7 +11,8 @@ import { StorageGraphOperationError, withStorageGraphFailureStage,
  type StorageGraphFailureFields } from './storage-analytics-failure';
 import {loadTypedV11GenerationSnapshot} from './typed-v11-quota-reader';
 import {storageHistoryKeyDigest,type StorageHistoryKey} from './storage-history-checkpoint';
-import {claimStorageGraphWorkSelection,completeStorageGraphWorkSelection,ensureStorageGraphWorkSelection,
+import {claimStorageGraphWorkSelection,completeStorageGraphWorkSelection,discardStorageGraphWorkSelection,
+ ensureStorageGraphWorkSelection,
  loadLiveStorageGraphWorkSelection,readStorageGraphWorkSelection,releaseStorageGraphWorkSelection,
  type StorageGraphWorkEnvelope,type StorageGraphWorkSelection,type StorageGraphSelectionKey}
  from './storage-community-graph-selection';
@@ -96,10 +97,18 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   * claim at the end and a concurrent pass sees the owner-day as busy. An
   * abandoned claim still recovers on its own once the lease expires. */
  leaseMs?:number;
+ /** Statements this call refuses to start below. The default reserves one
+  * heavy attempt and its checkpoint save, which is what a pass that gets one
+  * graph attempt per invocation needs. A pass that keeps returning to this
+  * lane inside one window sets a smaller floor, so the last of its meter is
+  * spent resuming a claim rather than left unusable. */
+ admissionQueries?:number;
 }):Promise<StorageGraphWorkProgress> {
  const nowMs=options.nowMs??Date.now();
  if(!Number.isFinite(nowMs))throw fail();
- if((options.remainingQueries??900)<550 || Date.now()>=(options.deadlineMs??Date.now()+20_000)) {
+ const admissionQueries=options.admissionQueries??550;
+ if(!Number.isSafeInteger(admissionQueries)||admissionQueries<1||admissionQueries>1_000)throw fail();
+ if((options.remainingQueries??900)<admissionQueries || Date.now()>=(options.deadlineMs??Date.now()+20_000)) {
   return {state:'deferred',reason:'budget'};
  }
  const owners:StorageCommunityOwner[]=[];let after='',bytes=0;
@@ -210,6 +219,12 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   if(claimed.status!=='claimed'||!claimed.selection)
    return {state:'deferred',metric,day,reason:claimed.status==='busy'?'selection_busy':'selection_changed'};
   selection=claimed.selection;
+  // The scope is recomputed from the envelope's own pinned snapshot, so these
+  // fields are a deterministic function of that snapshot and of this build.
+  // They cannot drift with later uploads; a disagreement means the row was
+  // recorded by a build that derived digests or named the checkpoint method
+  // differently.
+  let superseded=false;
   try{
    scope=await withStorageGraphFailureStage('graph_scope',()=>captureSelectedStorageGraphScope(options.source,{owner,day,metric,
     snapshot:selection!.envelope.snapshot,ownerAuthorityEpoch:selection!.envelope.targetAuthorityEpoch,
@@ -218,14 +233,25 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
     ownerDigest:owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
     method:STORAGE_GRAPH_V11_CHECKPOINT_METHOD};
    const envelope=selection.envelope;
-   if(envelope.day!==scope.day||envelope.metric!==scope.metric||envelope.fixedNow!==scope.fixedNow
+   superseded=envelope.day!==scope.day||envelope.metric!==scope.metric||envelope.fixedNow!==scope.fixedNow
     ||envelope.dependencyDigest!==scope.dependencyDigest
     ||envelope.checkpointDependencyDigest!==scope.checkpointDependencyDigest
     ||envelope.checkpointMethod!==checkpointKey.method
-    ||envelope.checkpointKeyDigest!==await storageHistoryKeyDigest(checkpointKey))throw fail();
+    ||envelope.checkpointKeyDigest!==await storageHistoryKeyDigest(checkpointKey);
   }catch(error){
    try{await releaseStorageGraphWorkSelection({target:options.target,selection,claimToken:token});}catch{/* Preserve the scope failure. */}
    selection=null;claimToken=null;throw error;
+  }
+  if(superseded){
+   // Never throw here: a stale row would otherwise cost this lane its whole
+   // attempt on every pass that selects the owner-day. Remove the superseded
+   // row under this claim's revision; the next pass records a fresh selection
+   // from the current scope and resumes that owner-day normally.
+   try{await discardStorageGraphWorkSelection(options.target,selection);}
+   catch{try{await releaseStorageGraphWorkSelection({target:options.target,selection,claimToken:token});}
+    catch{/* The lease still expires on its own. */}}
+   selection=null;claimToken=null;
+   return {state:'deferred',metric,day,reason:'selection_changed'};
   }
  }else scope=await captureLatest();
  try{

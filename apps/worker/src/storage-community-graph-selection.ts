@@ -91,6 +91,13 @@ async function live(source:D1Database,target:D1Database,e:StorageGraphWorkEnvelo
 async function remove(target:D1Database,selection:StorageGraphWorkSelection){await target.prepare(`DELETE FROM analytics_community_graph_work_selection
  WHERE source_id=? AND owner_digest=? AND day=? AND metric=? AND selection_revision=?`).bind(...binds(selection.key),selection.revision).run()}
 
+/** Discard a selection at its exact revision. A recorded envelope that no
+ * longer matches the scope the current build computes is superseded work, not
+ * work in flight: removing the row lets the next pass record a fresh selection
+ * for the same owner-day. The revision fence leaves a concurrent claimant's
+ * row untouched, and removal is what a completed claim does as well. */
+export const discardStorageGraphWorkSelection=(target:D1Database,selection:StorageGraphWorkSelection)=>remove(target,selection);
+
 export async function loadLiveStorageGraphWorkSelection(options:{source:D1Database;target:D1Database;key:StorageGraphSelectionKey;nowMs?:number}){
  let selection=await load(options.target,options.key);if(!selection||selection.state==='complete')return null;
  const now=options.nowMs??Date.now();if(!safe(now))throw invalid();

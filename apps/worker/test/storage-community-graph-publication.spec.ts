@@ -512,6 +512,30 @@ describe('isolated allowance graph publication',()=>{
   await expect(readStorageGraphWorkSelection(legacy(),{sourceId:namespace,ownerDigest:owner.ownerDigest!,
    day:today(),metric:'fits'})).rejects.toThrow();
  });
+ it('replaces a selection pinned by an earlier build instead of failing that lane every pass',async()=>{
+  await fixture('participant:selected-retired-method');
+  const {owner,envelope}=await selectedEnvelope('fits',today());
+  const key={sourceId:namespace,ownerDigest:owner.ownerDigest!,day:today(),metric:'fits' as const};
+  // A row recorded before the checkpoint method and the dependency digests
+  // changed: well formed and still live, but pinning values this build no
+  // longer computes, so every claim of that owner-day used to fail the lane.
+  const stale={...envelope,checkpointMethod:'v11-shared-checkpoint-2',
+   dependencyDigest:'b'.repeat(64),checkpointDependencyDigest:'c'.repeat(64)};
+  expect((await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   envelope:stale,nowMs:10})).status).toBe('created');
+  const pin=()=>b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_scan
+   (source_id,revision,tick,current_position,history_position) VALUES(?,1,0,0,0)
+   ON CONFLICT(source_id) DO UPDATE SET revision=revision+1,tick=0,current_position=0`).bind(namespace).run();
+  await pin();
+  expect(await advanceStorageCommunityGraphWork(bindings()))
+   .toMatchObject({state:'deferred',metric:'fits',day:today(),reason:'selection_changed'});
+  expect(await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,key)).toBeNull();
+  await pin();
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({state:'complete',metric:'fits',day:today()});
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT count(*) n FROM analytics_community_graph_results
+   WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(namespace,owner.ownerDigest,today()).first('n')).toBe(1);
+  expect(await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,key)).toBeNull();
+ });
  it('holds a long claim lease against a second claimant until it expires',async()=>{
   await fixture('participant:selected-long-lease');
   const {owner,envelope}=await selectedEnvelope('fits',today());
