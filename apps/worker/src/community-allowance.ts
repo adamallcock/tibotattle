@@ -978,6 +978,13 @@ const SCALAR_CACHE_REFUSALS: Record<"v0.2" | "v1" | "v1.1", ReadonlySet<string>>
     "usage_cost_limit_exceeded", "reduced_usage_limit_exceeded"]),
 };
 
+/** The composition refusal vocabulary, exposed for owner-only progress
+ * counting. A reader that meets a reason outside this set must report it as
+ * unknown rather than widening the vocabulary or dropping the refusal. There
+ * is no fits counterpart: a current fit is cached as the selected-fit array,
+ * so a refused scalar analysis is stored as an empty array with no reason. */
+export const COMMUNITY_MODEL_REFUSAL_REASONS: ReadonlySet<string> = COMPOSITION_CACHE_REFUSALS;
+
 export function validCompleteScalarAnalysis(value: unknown, source: "v0.2" | "v1" | "v1.1", fingerprint: string,
   sourceOnly = false): boolean {
   if (!cacheObject(value)) return false;

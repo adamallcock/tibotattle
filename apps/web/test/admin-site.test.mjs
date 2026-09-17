@@ -262,6 +262,17 @@ function reconstructionText(documentRef) {
     .map((node) => node.textContent).filter(Boolean).join(" ");
 }
 
+// Attribute values and text together, so a check for leaked digests or paths
+// covers titles and labels as well as visible copy.
+function reconstructionMarkup(documentRef) {
+  const serialize = (node) => [
+    node.tag, node.className,
+    [...node.attributes].map(([name, value]) => `${name}="${value}"`).join(" "),
+    node.textContent, ...node.children.map(serialize),
+  ].join(" ");
+  return serialize(documentRef.byId.get("admin-reconstruction-details"));
+}
+
 function metricTexts(documentRef, id) {
   return documentRef.byId.get(id).children.map((card) => [
     card.children[0].children[0].textContent,
@@ -540,6 +551,139 @@ test("bounded or unavailable preparation counts stay unknown and legacy progress
     await documentRef.byId.get("refresh").listeners.get("click")();
     assert.match(reconstructionText(documentRef), /51 of 69 days resolved/u);
     assert.doesNotMatch(reconstructionText(documentRef), /Reusable source preparation|Preparation counters/u);
+  });
+});
+
+test("the graph rebuild window renders every day, refusal and lease without inventing a result", async () => {
+  const progress = await fixture("admin-reconstruction-graph-valid.json");
+  let progressReply = () => response(structuredClone(progress));
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? progressReply() : unavailableResponse(), async documentRef => {
+    const details = documentRef.byId.get("admin-reconstruction-details");
+    assert.equal(documentRef.byId.get("admin-reconstruction-title").textContent, "Graph rebuild");
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Rebuilding");
+    assert.equal(details.querySelectorAll(".admin-graph-day").length, 69);
+    assert.deepEqual([
+      details.querySelectorAll(".admin-graph-day.admin-graph-day-published").length,
+      details.querySelectorAll(".admin-graph-day.admin-graph-day-complete").length,
+      details.querySelectorAll(".admin-graph-day.admin-graph-day-partial").length,
+      details.querySelectorAll(".admin-graph-day.admin-graph-day-none").length,
+    ], [6, 2, 12, 49]);
+    const cells = details.querySelectorAll(".admin-graph-day");
+    assert.equal(cells[0].getAttribute("title"), "2026-07-10 · 0 ready · 0 refused · 0 unsupported · 19 missing · no results yet");
+    assert.equal(cells.at(-1).getAttribute("title"), "2026-09-16 · 10 ready · 8 refused · 1 unsupported · 0 missing · published 09:41 UTC");
+    assert.equal(details.querySelector(".admin-graph-strip").getAttribute("aria-label"),
+      "69 days from 2026-07-10 to 2026-09-16: 6 published, 2 complete awaiting publication, 12 with some results, 49 with no results yet");
+    assert.equal(details.querySelectorAll(".admin-graph-readout li").length, 69);
+    assert.deepEqual(details.querySelectorAll(".admin-graph-refusals li").map(node => node.getAttribute("title")), [
+      "multi_plan_window_unsupported", "supported_quota_track_unavailable",
+      "downsampled_quota_limit_exceeded", "newly_coded_upstream_reason",
+    ]);
+    const text = reconstructionText(documentRef);
+    assert.match(text, /6 of 69 days published · 2 complete, awaiting publication/u);
+    assert.match(text, /Published · 6 Complete, awaiting publication · 2 Some results · 12 No results yet · 49/u);
+    assert.match(text, /2026-09-11 · 10 ready · 8 refused · 1 unsupported · 0 missing · published 09:41 UTC/u);
+    assert.match(text, /Today's fits 7 ready · 9 without a usable fit · 3 missing of 19 owners/u);
+    assert.match(text, /A graph preview needs a result for every owner/u);
+    assert.match(text, /Owners 19 active/u);
+    assert.match(text, /Model graph · window spans more than one plan · 8 owners/u);
+    assert.match(text, /Model graph · no supported quota track · 1 owner\b/u);
+    assert.match(text, /Model graph · too many quota observations · 4 owners/u);
+    assert.match(text, /Model graph · newly_coded_upstream_reason · 2 owners/u);
+    assert.doesNotMatch(text, /Current fits · window spans|refused of 19 owners/u);
+    assert.match(text, /In progress model day 2026-09-04/u);
+    assert.match(text, /lease 4 min at last read · 3 selections pending · 1 claimed/u);
+    assert.match(text, /30 stages · 598 parts · 70 MiB/u);
+    assert.match(text, /Checkpoint phases: usage 12 stages, 240 parts · endpoints 10 stages, 210 parts · plan 8 stages, 148 parts/u);
+    assert.match(text, /Throughput 23 results in the last hour · 208 in 6 h/u);
+    assert.match(text, /1,042 results remaining/u);
+    assert.match(text, /Estimate only: about 30.1 h remaining at the 6-hour rate/u);
+    assert.match(text, /216 results from a previous build awaiting retirement/u);
+    assert.doesNotMatch(text, /Account progress not recorded|Preparation counters unavailable|Update trigger|not counted/u);
+    assert.doesNotMatch(reconstructionMarkup(documentRef), /[0-9a-f]{64}/iu, "no digest-like value reaches the markup");
+    // A stale pass keeps the rendered window and marks the failure explicitly.
+    progressReply = () => unavailableResponse();
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.match(reconstructionText(documentRef), /Progress refresh unavailable/u);
+    assert.equal(details.querySelectorAll(".admin-graph-day").length, 69);
+    assert.ok(reconstructionText(documentRef).includes(formatReportingTime(progress.generatedAt)));
+    // The lease is measured against the read instant, never the page clock.
+    progress.graph.work.leaseExpiresAt = "2026-09-17T11:50:00.000Z";
+    progressReply = () => response(structuredClone(progress));
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.match(reconstructionText(documentRef), /lease expired at last read · 3 selections pending/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /Progress refresh unavailable/u);
+  });
+});
+
+test("capped rebuild counters read as not counted rather than as zero", async () => {
+  const progress = await fixture("admin-reconstruction-graph-capped.json");
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? response(structuredClone(progress)) : unavailableResponse(), async documentRef => {
+    const details = documentRef.byId.get("admin-reconstruction-details");
+    assert.equal(details.querySelectorAll(".admin-graph-day").length, 69);
+    const text = reconstructionText(documentRef);
+    assert.match(text, /checkpoints not counted/u);
+    assert.match(text, /Throughput results in the last hour not counted · 6-hour total not counted/u);
+    assert.match(text, /1,042 results remaining/u);
+    assert.match(text, /Estimate only: no estimate yet/u);
+    assert.match(text, /retirement backlog not counted/u);
+    assert.doesNotMatch(text, /0 stages|0 results in the last hour|0 in 6 h|Checkpoint phases|0 results from a previous build/u);
+  });
+});
+
+test("a graph rebuild with no projection and no gap states that plainly instead of showing zeroes", async () => {
+  const progress = await fixture("admin-reconstruction-graph-valid.json");
+  progress.graph.throughput.estimatedHoursRemaining = null;
+  progress.graph.work = {
+    ...progress.graph.work, state: "queued", activeDay: null, activeMetric: null, leaseExpiresAt: null,
+  };
+  progress.graph.currentFits = { day: "2026-09-17", ready: 19, noFit: 0, missing: 0 };
+  progress.graph.refusals = [];
+  progress.graph.retirement.staleResults = 0;
+  let progressReply = () => response(structuredClone(progress));
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? progressReply() : unavailableResponse(), async documentRef => {
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Waiting for a pass");
+    const text = reconstructionText(documentRef);
+    assert.match(text, /Estimate only: no estimate yet/u);
+    assert.match(text, /In progress Nothing claimed/u);
+    assert.match(text, /no lease recorded/u);
+    assert.match(text, /No refusals recorded/u);
+    assert.match(text, /19 ready · 0 without a usable fit · 0 missing of 19 owners/u);
+    assert.doesNotMatch(text, /A graph preview needs a result for every owner/u);
+    assert.doesNotMatch(text, /awaiting retirement|retirement backlog not counted/u);
+    assert.doesNotMatch(text, /h remaining at the 6-hour rate|lease 0 min|about 0 h/u);
+    progress.graph.work.state = "idle";
+    progressReply = () => response(structuredClone(progress));
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Up to date");
+  });
+});
+
+test("legacy reconstruction payloads keep their own panel beside the graph rebuild view", async () => {
+  const graph = await fixture("admin-reconstruction-graph-valid.json");
+  const legacy = await fixture("admin-reconstruction-progress-valid.json");
+  const preparation = await fixture("admin-reconstruction-preparation-valid.json");
+  let progressReply = () => response(structuredClone(graph));
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? progressReply() : unavailableResponse(), async documentRef => {
+    const details = documentRef.byId.get("admin-reconstruction-details");
+    assert.equal(documentRef.byId.get("admin-reconstruction-title").textContent, "Graph rebuild");
+    for (const [payload, label] of [[legacy, "v1"], [preparation, "v2"]]) {
+      progressReply = () => response(structuredClone(payload));
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      const text = reconstructionText(documentRef);
+      assert.equal(documentRef.byId.get("admin-reconstruction-title").textContent, "Graph reconstruction", label);
+      assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Graph available · updating", label);
+      assert.equal(details.querySelectorAll(".admin-graph-day").length, 0, label);
+      assert.match(text, /51 of 69 days resolved/u, label);
+      assert.match(text, /8 of 15 account calculations complete/u, label);
+      assert.match(text, /Update trigger Contribution correction/u, label);
+      assert.match(text, /Restart reason: Inputs changed/u, label);
+      assert.match(text, /No time estimate is available/u, label);
+    }
+    assert.match(reconstructionText(documentRef), /Reusable source preparation 12 of 16 tracked source days complete/u);
+    progressReply = () => response(structuredClone(graph));
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(documentRef.byId.get("admin-reconstruction-title").textContent, "Graph rebuild");
+    assert.equal(details.querySelectorAll(".admin-graph-day").length, 69);
   });
 });
 
