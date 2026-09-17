@@ -209,7 +209,12 @@ eight-minute window went unused (the floor is sized for one heavy minute-pass
 attempt; a graph-only pass needs a lower one); and pre-deploy selection rows
 still carried envelopes with the previous checkpoint method and digests, so
 claiming them failed the post-claim consistency check as an application
-failure every pass instead of being replaced as superseded selections. The v1 reader (the second dense owner is v1)
+failure every pass instead of being replaced as superseded selections. Both
+are fixed in `f7549ac3` (admission floor per pass: 550 for the minute pass,
+120 under `graphOnly`; a selection pinned by an earlier build is discarded at
+its claimed revision and the pass defers as `selection_changed`), deployed
+2026-09-17 03:04 UTC as version 97965c2b from a clean detached worktree of
+that commit, so the shared worktree's in-progress v1 work was not bundled. The v1 reader (the second dense owner is v1)
 follows the same design in a separate change. Still open: the acquisition
 checkpoint itself (up to 60,000 quota rows per owner) remains the structural
 cost.
