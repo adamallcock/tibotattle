@@ -37,6 +37,7 @@ import {
   quotaResetRepresentativeMs,
   type QuotaFragmentStats,
 } from "./quota-endpoint-collapse";
+import { invalidV11QuotaAcquisition } from "./quota-analysis-v11-reader";
 import { sha256Hex } from "./crypto";
 import { parseStoredRecordJson } from "./stored-record";
 import { assertV11SourcePinCurrent, loadV11SourcePin } from "./telemetry-v11-domain";
@@ -73,14 +74,12 @@ export const MAX_V11_USAGE_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 const TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
 const SLOTS = new Set(["primary", "secondary", "five_hour", "seven_day", "other", "unknown"]);
 const DIRECT_PLAN_TYPES = new Set<string>(TELEMETRY_PLAN_TYPES);
-/** The direct read collapses runs by the restated instant, so its SQL returns
- * more rows than the clustered, spaced result it feeds. It gets its own
- * pre-collapse bound at this multiple of the downsampled bound: the refusal an
- * owner sees is still the clustered one, measured after the collapse, while a
- * genuinely unbounded read is cut off before it is decoded. Four times the
- * kernel default is 240,000 rows, tens of megabytes of D1 result in the worst
- * case — the paged acquisition is the path for anyone who reaches it. */
-const QUOTA_DIRECT_PRECOLLAPSE_FACTOR = 4;
+/** Mirror of the paged reader's account-scope rejection, kept local so the two
+ * quota paths can be compared without reading the other module. The reader's
+ * other residual check, `validEraKey`, is a structural validator for a decoded
+ * checkpoint; here the era key comes from the attribution index itself and is
+ * proven by the `match.era.eraKey === row.plan_era_key` equality below. */
+const DIRECT_ACCOUNT_TRACK = /^account-track:v2:[0-9a-f]{64}$/u;
 
 export interface V11AnalysisOptions {
   nowMs?: number;
@@ -334,7 +333,12 @@ export function createV11QuotaAcquisitionIdentity(
  * refuses here and reaches the paged acquisition instead. */
 function collapseDirectQuotaRows(rows: readonly QuotaRow[],
   index: PlanAttributionIndex): QuotaRow[] | null {
-  interface Candidate { row: QuotaRow; id: number; eraKey: string; resetMs: number; observedAtMs: number }
+  interface Candidate {
+    row: QuotaRow; id: number; eraKey: string; resetMs: number; observedAtMs: number; reset: string;
+  }
+  // One wrapper array over the decoded rows, settled and compacted in place.
+  // The pre-collapse page is already the direct read's memory budget, so no
+  // stage of this may copy it; only the rows the collapse retains are cloned.
   const valid: Candidate[] = [];
   let id = 0;
   for (const row of rows) {
@@ -345,34 +349,35 @@ function collapseDirectQuotaRows(rows: readonly QuotaRow[],
         || typeof row.used_percent !== "number" || !Number.isFinite(row.used_percent)
         || row.used_percent < 0 || row.used_percent > 100) continue;
     const accountScopeId = row.account_scope_id || null;
+    if (accountScopeId !== null && !DIRECT_ACCOUNT_TRACK.test(accountScopeId)) continue;
     const match = planEraForInterval(index, {
       contextKey: planAttributionContextKey(row.provider, row.limit_id), accountScopeId, observedAtMs,
     });
     if (match.status !== "matched" || match.era.eraKey !== row.plan_era_key
         || match.era.planType !== row.plan_type || match.era.planVariant !== row.plan_variant) continue;
-    valid.push({ row, id, eraKey: row.plan_era_key, resetMs, observedAtMs });
+    valid.push({ row, id, eraKey: row.plan_era_key, resetMs, observedAtMs, reset: "" });
   }
   const clusters = createQuotaResetClusterState();
   // Past the pool bound this owner's evidence is unavailable, not absent: the
   // caller refuses rather than publishing a result built from no rows.
   for (const entry of valid) if (!addQuotaReset(clusters, entry.eraKey, entry.resetMs)) return null;
-  const settled = valid.map((entry) => {
-    const representative = quotaResetRepresentativeMs(clusters, entry.eraKey, entry.resetMs);
-    if (representative === null) throw new Error("v11 quota reset cluster missing");
-    return { ...entry, reset: new Date(representative).toISOString() };
-  });
   const stats = new Map<string, QuotaFragmentStats>();
-  for (const entry of settled) {
+  for (const entry of valid) {
+    const representative = quotaResetRepresentativeMs(clusters, entry.eraKey, entry.resetMs);
+    if (representative === null) invalidV11QuotaAcquisition();
+    entry.reset = new Date(representative).toISOString();
     addQuotaFragmentValue(stats, JSON.stringify([entry.reset, entry.eraKey]), entry.row.used_percent);
   }
   const eligible = new Set([...stats].filter(([, stat]) => quotaFragmentEligible(stat)).map(([key]) => key));
-  const candidates = settled
-    .filter((entry) => eligible.has(JSON.stringify([entry.reset, entry.eraKey])))
-    .map((entry) => ({ ...entry, row: { ...entry.row, resets_at: entry.reset } }));
-  return collapseQuotaEndpointStream(candidates,
+  let kept = 0;
+  for (const entry of valid) {
+    if (eligible.has(JSON.stringify([entry.reset, entry.eraKey]))) valid[kept++] = entry;
+  }
+  valid.length = kept;
+  return collapseQuotaEndpointStream(valid,
     (entry) => JSON.stringify([entry.eraKey, entry.row.slot, entry.reset]),
     (entry) => ({ id: entry.id, observedAtMs: entry.observedAtMs, usedPercent: entry.row.used_percent }))
-    .map((entry) => entry.row);
+    .map((entry) => ({ ...entry.row, resets_at: entry.reset }));
 }
 
 async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11AnalysisOptions): Promise<Context | Refusal> {
@@ -424,13 +429,15 @@ async function quotaContext(db: D1Database, pin: V11SourcePin, options: V11Analy
     if (index.status !== "ready") return refused("plan_attribution_limit_exceeded");
     const result = await db.prepare(typed ? TYPED_V11_QUOTA_SQL : QUOTA_SQL).bind(
       markers(index), ...typedBindings, SEVEN_DAY_WINDOW_MINUTES,
-      window.resetsAtCutoff, maximum * QUOTA_DIRECT_PRECOLLAPSE_FACTOR + 1,
+      window.resetsAtCutoff, maximum + 1,
     ).all<QuotaRow>();
-    if (result.results.length > maximum * QUOTA_DIRECT_PRECOLLAPSE_FACTOR) {
-      return refused("downsampled_quota_limit_exceeded");
-    }
+    // This bound is a memory budget, not an analytical one: every row it
+    // admits is decoded into an object before anything is collapsed, so the
+    // direct read holds the whole pre-collapse page at once. The refusal an
+    // owner finally sees is the clustered one below; a denser owner belongs on
+    // the paged acquisition, which never holds more than one page.
+    if (result.results.length > maximum) return refused("downsampled_quota_limit_exceeded");
     const collapsed = collapseDirectQuotaRows(result.results, index);
-    // The bound both paths report is the one on the clustered, spaced rows.
     if (collapsed === null || collapsed.length > maximum) {
       return refused("downsampled_quota_limit_exceeded");
     }

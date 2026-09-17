@@ -1,7 +1,7 @@
 import {env,reset,applyD1Migrations,type D1Migration} from 'cloudflare:test';
 import {beforeEach,describe,it,expect} from 'vitest';
 import {saveStorageHistoryCheckpoint as save,loadStorageHistoryCheckpoint as load,retireStorageHistoryCheckpoint as retire,
- storageHistoryCheckpointParts,
+ storageHistoryCheckpointParts,storageHistoryKeyDigest,
  type StorageHistoryCheckpoint,type StorageHistoryKey,type StorageHistoryLoadCursor} from '../src/storage-history-checkpoint';
 import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reader';
 import {createV11QuotaAcquisitionCheckpoint,type V11QuotaAcquisitionIdentity} from '../src/quota-analysis-v11-reader';
@@ -10,11 +10,11 @@ import type {StorageV11HistoryCheckpoint} from '../src/storage-v11-history';
 import {MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
 import type {V11UsageReductionCheckpoint} from '../src/quota-analysis-v11';
 import {retireStorageGraphPage} from '../src/storage-graph-retirement';
-import {STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_METHOD,
- STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD} from '../src/storage-community-graph';
+import {STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
+ STORAGE_GRAPH_METHOD,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD} from '../src/storage-community-graph';
 const bindings=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_ANALYTICS_MIGRATIONS:D1Migration[]};
 const target=()=>bindings.STORAGE_ANALYTICS_DB;
-const key:StorageHistoryKey={sourceId:'synthetic-history-source',ownerDigest:'a'.repeat(64),day:'2026-09-05',dependencyDigest:'b'.repeat(64),sourceNamespace:'synthetic-origin',method:'synthetic-graph-v1'};
+const key:StorageHistoryKey={sourceId:'synthetic-history-source',ownerDigest:'a'.repeat(64),day:'2026-09-05',dependencyDigest:'b'.repeat(64),sourceNamespace:'synthetic-origin',method:STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD};
 beforeEach(async()=>{await reset();await applyD1Migrations(target(),bindings.TEST_ANALYTICS_MIGRATIONS);
  await target().prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')").bind(key.sourceId,key.ownerDigest).run();});
 function checkpoint(count=0,finish=false):StorageV1HistoryCheckpoint{
@@ -106,6 +106,30 @@ describe('private paged historical checkpoint store',()=>{
    .toEqual({state:'retiring',deleted:2});
   expect(await read(v11Key)).toEqual({status:'absent'});
  },30000);
+ it('retires a checkpoint whose method is no longer a live reader key',async()=>{
+  const identity:V11QuotaAcquisitionIdentity={participantId:'synthetic-v11-participant',inputFingerprint:'e'.repeat(64),
+   sourceMethodVersion:'synthetic-v11-reader-1',observedAtCutoff:'2026-05-28T00:00:00.000Z',
+   resetsAtCutoff:'2026-06-04T00:00:00.000Z',windowMinutes:10080,maxQuotaRows:60000};
+  const checkpoint:StorageHistoryCheckpoint={version:1,source:'v1.1',day:key.day,
+   layout:`typed-v11:${key.sourceNamespace}`,identity,phase:'acquisition',
+   acquisition:createV11QuotaAcquisitionCheckpoint(identity)};
+  // The same owner and day under a retired method and under the live one.
+  const retiredKey={...key,method:STORAGE_GRAPH_METHOD+':v11-shared-checkpoint-2'};
+  const liveKey={...key,method:STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD};
+  expect(retiredKey.method).not.toBe(liveKey.method);
+  await drain(checkpoint,null,retiredKey);
+  await drain(checkpoint,null,liveKey);
+  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(2);
+  let idle=false;
+  for(let n=0;n<40;n++)if((await retireStorageGraphPage(target(),key.sourceId,Date.parse('2026-09-06T12:00:00Z'))).state==='idle'){idle=true;break;}
+  expect(idle).toBe(true);
+  // No reader can build the retired key again, so its payload is unreachable
+  // evidence; the live key keeps its resumable generation.
+  expect(await load({target:target(),key:retiredKey})).toEqual({status:'absent'});
+  expect(await read(liveKey)).toMatchObject({status:'ready',checkpoint});
+  expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_parts WHERE key_digest=?')
+   .bind(await storageHistoryKeyDigest(retiredKey)).first('n')).toBe(0);
+ });
  it('retires current-fit checkpoints only after their exact semantic fit result exists',async()=>{
   const currentKey={...key,method:STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD};
   await drain(checkpoint(),null,currentKey);

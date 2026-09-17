@@ -168,6 +168,9 @@ export interface V11QuotaInvocationBudget {
 }
 
 function invalid(): never { throw new Error("v11 quota acquisition checkpoint invalid"); }
+/** The one coded failure for a structurally impossible acquisition state. The
+ * direct reader shares it so both quota paths fail with the same code. */
+export function invalidV11QuotaAcquisition(): never { invalid(); }
 function textOrder(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
