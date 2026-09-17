@@ -2,7 +2,9 @@ import {env,reset,applyD1Migrations,type D1Migration} from 'cloudflare:test';
 import {beforeEach,it,expect} from 'vitest';
 import {createV11DeviceFixture,v11UsageRecord} from './helpers/telemetry-v11';
 import {pricedModelHistoryUsage,MODEL_HISTORY_TEST_CAPACITIES} from './helpers/model-history';
-import {createV1QuotaAcquisitionCheckpoint} from '../src/quota-analysis-v1-reader';
+import {createV1QuotaAcquisitionCheckpoint,V1_QUOTA_ACQUISITION_VERSION} from '../src/quota-analysis-v1-reader';
+import {V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION} from '../src/quota-analysis-v11';
+import {modelHistoryWindow} from '../src/model-history-window';
 import {accountScopedQuotaAnalysisV1,MODEL_HISTORY_METHOD_VERSION} from '../src/quota-analysis-v1';
 import {selectCommunityAllowanceAnalysisFits} from '../src/community-allowance';
 import {authenticateDevice,createDeviceUploadAuthorization,claimDeviceUploadAuthorization} from '../src/device-auth';
@@ -17,12 +19,13 @@ import {initializeStorageSource} from '../src/analytics-delivery';
 import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics,runStorageAnalyticsPass} from '../src/storage-analytics-runtime';
 import {drainCommunityPublicSourceBootstrap} from '../src/community-daily-aggregates';
 import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
-import {captureStorageGraphScope,computeStorageGraphResult,storageGraphDependencyDigest,
+import {captureStorageGraphScope,computeStorageGraphResult,readStorageGraphResult,storageGraphDependencyDigest,
  STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
- STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
+ STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS,STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
 import {advanceStorageCommunityGraphWork} from '../src/storage-community-graph-work';
-import {loadStorageHistoryCheckpoint,retireStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,type StorageHistoryKey} from '../src/storage-history-checkpoint';
+import {loadStorageHistoryCheckpoint,retireStorageHistoryCheckpoint,saveStorageHistoryCheckpoint,
+ storageHistoryKeyDigest,type StorageHistoryKey} from '../src/storage-history-checkpoint';
 import type {StorageV1HistoryCheckpoint} from '../src/storage-v1-history';
 
 const b=env as Env&{STORAGE_ANALYTICS_DB:D1Database;TEST_MIGRATIONS:D1Migration[];
@@ -164,6 +167,12 @@ it('advances current v1 fits through a durable bounded acquisition before semant
  expect(await target().prepare(`SELECT method,dependency_digest FROM analytics_community_graph_results
   WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`).bind(sourceId,owner.ownerDigest,day).first())
   .toEqual({method:STORAGE_GRAPH_METHOD,dependency_digest:scope.dependencyDigest});
+ expect(await readStorageGraphResult(bindings(),scope)).not.toBeNull();
+ // Relabel the completed payload with the identity the previous v1 acquisition
+ // contract would have given it: a pre-clustering v1 result is not reused.
+ await target().prepare(`UPDATE analytics_community_graph_results SET dependency_digest=?
+  WHERE source_id=? AND owner_digest=? AND metric='fits'`).bind('c'.repeat(64),sourceId,owner.ownerDigest).run();
+ expect(await readStorageGraphResult(bindings(),scope)).toBeNull();
 },60000);
 
 it('persists and resumes the current-fit usage phase before publishing the equivalent fit',async()=>{
@@ -348,3 +357,38 @@ it('preserves a retired legacy tombstone while a repaired checkpoint generation 
  expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_execution
   WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,owner.ownerDigest,day).first('n')).toBe(1);
 },60000);
+
+it('binds only the v1 result identity to the v1 acquisition contract',async()=>{
+ const authority={sourceId:'synthetic-identity-source',sourceNamespace:'synthetic-identity-source'};
+ const ownerDigest='a'.repeat(64),target='2026-09-05',history=modelHistoryWindow(target);
+ const dependency=[{observed_day:target}];
+ const digest=(source:'v0.2'|'v1'|'v1.1'|'mixed',extra:readonly unknown[])=>sha256Hex(canonicalJson([
+  authority.sourceId,authority.sourceNamespace,ownerDigest,source,'fits',history.day,history.fromDay,
+  STORAGE_GRAPH_METHOD,dependency,...extra]));
+ const computed=(source:'v0.2'|'v1'|'v1.1'|'mixed')=>storageGraphDependencyDigest({authority,ownerDigest,
+  source,metric:'fits',day:target,dependency});
+ // A change to how v1 evidence is acquired retires v1 results only.
+ expect(await computed('v1')).toBe(await digest('v1',[V1_QUOTA_ACQUISITION_VERSION]));
+ expect(await computed('v1')).not.toBe(await digest('v1',[]));
+ expect(await computed('v1.1')).toBe(await digest('v1.1',[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]));
+ expect(await computed('v0.2')).toBe(await digest('v0.2',[]));
+ expect(await computed('mixed')).toBe(await digest('mixed',[]));
+});
+
+it('starts v1 checkpoint work under new keys when the acquisition contract changes',async()=>{
+ // Both v1 checkpoint methods carry acquisition state, so both moved with the
+ // contract, and both are registered as live so retirement keeps them.
+ expect(STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD).toBe(STORAGE_GRAPH_METHOD+':current-fit-checkpoint-2');
+ expect(STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD).toBe(STORAGE_GRAPH_METHOD+':checkpoint-store-3');
+ expect(STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS).toContain(STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD);
+ expect(STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS).toContain(STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD);
+ // A head left under either previous method is a different key digest, so no
+ // reader can load it and nothing it holds can block work under the new one.
+ const previous=[STORAGE_GRAPH_METHOD+':current-fit-checkpoint-1',STORAGE_GRAPH_METHOD+':checkpoint-store-2'];
+ for(const method of previous)expect(STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS).not.toContain(method);
+ const key=(method:string):StorageHistoryKey=>({sourceId:'synthetic-identity-source',sourceNamespace:'synthetic-identity-source',
+  ownerDigest:'a'.repeat(64),day:'2026-09-05',dependencyDigest:'b'.repeat(64),method});
+ const digests=await Promise.all([...previous,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
+  STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD].map(method=>storageHistoryKeyDigest(key(method))));
+ expect(new Set(digests).size).toBe(digests.length);
+});

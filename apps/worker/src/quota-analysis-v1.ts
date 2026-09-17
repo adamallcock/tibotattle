@@ -1,3 +1,18 @@
+import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
+import {
+  addQuotaFragmentValue,
+  addQuotaReset,
+  closeQuotaClusterSpacing,
+  createQuotaClusterSpacing,
+  createQuotaResetClusterState,
+  offerQuotaClusterEndpoint,
+  quotaFragmentEligible,
+  quotaResetRepresentativeMs,
+  type QuotaClusterSpacing,
+  type QuotaEndpointRun,
+  type QuotaFragmentStats,
+} from "./quota-endpoint-collapse";
+import { invalidV1QuotaAcquisition } from "./quota-analysis-v1-reader";
 import { loadTypedV1AnalysisScope, readTypedV1UsageAnalysisPage, type TypedV1AnalysisScope } from './typed-v1-analysis-reader';
 import {
   MODEL_COMPOSITION_POLICY,
@@ -984,6 +999,96 @@ function attributeSnapshot(
 // numbering across the CTE chain buys nothing. `scoped` is MATERIALIZED so its
 // winner-filtered index scan runs once rather than being re-evaluated by both
 // `fitable` and `survivors`.
+/** Mirrors of the paged reader's row rejections, kept local so the two v1
+ * quota paths can be compared without reading the other module. v1 carries no
+ * account scope, so the reader's account-track check has nothing to mirror,
+ * and v1 deliberately retains arbitrary slot tokens rather than a closed set. */
+const DIRECT_V1_SOURCE_TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
+const DIRECT_V1_PLAN_TYPES = new Set<string>(TELEMETRY_PLAN_TYPES);
+
+/** The direct read returns run endpoints collapsed by the restated instant,
+ * because SQL cannot cluster pools. Re-derive exactly what the paged
+ * acquisition derives: pool hulls over every valid row, the fitable refusal on
+ * the clustered key (the `fitable` stage this SQL no longer carries), then run
+ * collapse inside each restated instant's block and cluster-scoped spacing.
+ * The rows are first put into the reader's own `(resets_at, observed_at, id)`
+ * order, so both paths make the same greedy decisions; the SQL already orders
+ * by `(observed_at, id)` and the sort is stable, so ties keep that order.
+ * Null means the pool bound was exceeded: unavailable, not absent. */
+function collapseDirectV1QuotaRows(rows: readonly DownsampledQuotaRow[],
+  index: PlanAttributionIndex): DownsampledQuotaRow[] | null {
+  interface Candidate {
+    row: DownsampledQuotaRow; id: number; eraKey: string; resetsAt: string; resetMs: number;
+    observedAtMs: number; reset: string;
+  }
+  const valid: Candidate[] = [];
+  for (const row of rows) {
+    const observedAtMs = Date.parse(row.observed_at), resetMs = Date.parse(row.resets_at);
+    if (!SAFE_TOKEN.test(row.provider) || row.limit_id !== "codex"
+        || !DIRECT_V1_PLAN_TYPES.has(row.plan_type) || !SAFE_TOKEN.test(row.plan_variant)
+        || !DIRECT_V1_SOURCE_TOKEN.test(row.slot) || resetMs <= observedAtMs
+        || typeof row.used_percent !== "number" || !Number.isFinite(row.used_percent)
+        || row.used_percent < 0 || row.used_percent > 100) continue;
+    const match = planEraForInterval(index, {
+      contextKey: `${row.provider}|${row.limit_id}`, observedAtMs,
+    });
+    if (match.status !== "matched" || match.era.eraKey !== row.plan_era_key
+        || match.era.planType !== row.plan_type || match.era.planVariant !== row.plan_variant) continue;
+    valid.push({ row, id: 0, eraKey: row.plan_era_key, resetsAt: row.resets_at, resetMs,
+      observedAtMs, reset: "" });
+  }
+  valid.sort((left, right) => (left.resetsAt < right.resetsAt ? -1 : left.resetsAt > right.resetsAt ? 1 : 0)
+    || left.observedAtMs - right.observedAtMs);
+  for (let index = 0; index < valid.length; index += 1) valid[index]!.id = index + 1;
+  const clusters = createQuotaResetClusterState();
+  for (const entry of valid) if (!addQuotaReset(clusters, entry.eraKey, entry.resetMs)) return null;
+  const stats = new Map<string, QuotaFragmentStats>();
+  for (const entry of valid) {
+    const representative = quotaResetRepresentativeMs(clusters, entry.eraKey, entry.resetMs);
+    if (representative === null) invalidV1QuotaAcquisition();
+    entry.reset = new Date(representative).toISOString();
+    addQuotaFragmentValue(stats, JSON.stringify([entry.reset, entry.eraKey]), entry.row.used_percent);
+  }
+  const eligible = new Set([...stats].filter(([, stat]) => quotaFragmentEligible(stat)).map(([key]) => key));
+  const view = (entry: Candidate) => ({ id: entry.id, observedAtMs: entry.observedAtMs,
+    usedPercent: entry.row.used_percent });
+  // Runs stay keyed by the restated instant, the only stretch the reader
+  // delivers in observation order; the cluster spacing then rides on top.
+  const runs = new Map<string, QuotaEndpointRun<Candidate>>();
+  const spacing = new Map<string, QuotaClusterSpacing<Candidate>>();
+  const kept: Candidate[] = [];
+  const emit = (entry: Candidate) => { kept.push(entry); return true; };
+  const offer = (entry: Candidate): boolean => {
+    const key = JSON.stringify([entry.eraKey, entry.row.slot, entry.reset]);
+    let cluster = spacing.get(key);
+    if (!cluster) { cluster = createQuotaClusterSpacing(); spacing.set(key, cluster); }
+    return offerQuotaClusterEndpoint(cluster, entry, view, emit);
+  };
+  let block: string | null = null;
+  for (const entry of valid) {
+    if (!eligible.has(JSON.stringify([entry.reset, entry.eraKey]))) continue;
+    if (block !== null && block !== entry.resetsAt) {
+      for (const run of runs.values()) if (view(run.last).id !== run.firstId && !offer(run.last)) return null;
+      runs.clear();
+    }
+    block = entry.resetsAt;
+    const key = JSON.stringify([entry.eraKey, entry.row.slot]);
+    const run = runs.get(key);
+    if (run && view(run.last).usedPercent === entry.row.used_percent) run.last = entry;
+    else {
+      if (run && view(run.last).id !== run.firstId && !offer(run.last)) return null;
+      if (!offer(entry)) return null;
+      runs.set(key, { firstId: entry.id, last: entry, keptAtMs: 0, keptValues: [],
+        keptMinimum: 0, keptMaximum: 0, holdMinimum: null, holdMaximum: null, pending: null });
+    }
+  }
+  for (const run of runs.values()) if (view(run.last).id !== run.firstId && !offer(run.last)) return null;
+  for (const cluster of spacing.values()) if (!closeQuotaClusterSpacing(cluster, view, emit)) return null;
+  return kept
+    .sort((left, right) => left.observedAtMs - right.observedAtMs || left.id - right.id)
+    .map((entry) => ({ ...entry.row, resets_at: entry.reset }));
+}
+
 export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
     SELECT json_extract(e.value, '$[0]') AS provider,
       json_extract(e.value, '$[1]') AS limit_id,
@@ -1040,35 +1145,11 @@ export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
     WHERE a.is_marker = 0 AND a.plan_type = e.plan_type
       AND a.plan_variant = e.plan_variant AND a.observed_at >= e.lower_bound
       AND (e.upper_bound IS NULL OR a.observed_at <= e.upper_bound)
-  ), fragment_stats AS (
-    SELECT provider, plan_type, plan_variant, limit_id,
-           window_duration_minutes, resets_at, plan_era_key,
-           COUNT(DISTINCT used_percent) AS boundary_count,
-           MAX(used_percent) - MIN(used_percent) AS displayed_span,
-           MAX(observed_at) AS last_observed_at
-      FROM scoped
-     GROUP BY provider, plan_type, plan_variant, limit_id,
-              window_duration_minutes, resets_at, plan_era_key
-  ), fitable AS (
-    SELECT * FROM fragment_stats WHERE boundary_count >= ? AND displayed_span >= ?
-  ),
-  survivors AS (
-    SELECT s.*
-      FROM scoped s
-      JOIN fitable f
-        ON f.provider = s.provider
-       AND f.plan_type = s.plan_type
-       AND f.plan_variant = s.plan_variant
-       AND f.limit_id = s.limit_id
-       AND f.window_duration_minutes = s.window_duration_minutes
-       AND f.resets_at = s.resets_at
-       AND f.plan_era_key = s.plan_era_key
-  ),
-  marked AS (
-    SELECT survivors.*,
+  ), marked AS (
+    SELECT scoped.*,
            LAG(used_percent) OVER win AS prev_up,
            LEAD(used_percent) OVER win AS next_up
-      FROM survivors
+      FROM scoped
     WINDOW win AS (
       PARTITION BY provider, plan_type, plan_variant, limit_id,
                    window_duration_minutes, resets_at, slot, plan_era_key
@@ -2081,15 +2162,28 @@ async function analyzeAccountScopedQuotaV1(
     observedAtCutoff,
     resetsAtCutoff,
     SEVEN_DAY_WINDOW_MINUTES,
-    MINIMUM_BOUNDARIES,
-    MINIMUM_DISPLAYED_SPAN_PP,
     maxDownsampledQuotaRows + 1,...quotaQuery!.typedBindings,
   ).all<DownsampledQuotaRow>();
 
+  // The pre-collapse bound is a memory budget on the rows this statement
+  // decodes, not an analytical refusal, so overflowing it must not become a
+  // published `not_testable` day: `downsampled_quota_limit_exceeded` is a
+  // cacheable composition refusal. It is raised as unavailability instead, so
+  // the graph's next pass takes the resumable reader, which pages and can
+  // complete owners this single read cannot. The analytical bound is applied
+  // below, on the clustered rows, and means the same thing on both paths.
+  if (!prepared && quotaResult.results.length > maxDownsampledQuotaRows) {
+    throw new Error("v1 downsampled quota read unavailable");
+  }
   if (quotaResult.results.length > maxDownsampledQuotaRows) {
     return notTestable("downsampled_quota_limit_exceeded");
   }
-  if (quotaResult.results.length === 0) {
+  const quotaRows = prepared ? quotaResult.results
+    : collapseDirectV1QuotaRows(quotaResult.results, attributionIndex);
+  if (quotaRows === null || quotaRows.length > maxDownsampledQuotaRows) {
+    return notTestable("downsampled_quota_limit_exceeded");
+  }
+  if (quotaRows.length === 0) {
     return notTestable("supported_quota_track_unavailable");
   }
 
@@ -2097,7 +2191,7 @@ async function analyzeAccountScopedQuotaV1(
   const datasets = [{ datasetId, complete: true }];
   const accountTrackByProvider = new Map<string, string>();
   const quotaSnapshots: AttributedQuotaSnapshot[] = [];
-  for (const row of quotaResult.results) {
+  for (const row of quotaRows) {
     let accountTrackId = accountTrackByProvider.get(row.provider);
     if (accountTrackId === undefined) {
       accountTrackId = await v1AccountTrackId(participantId, row.provider);
@@ -2163,11 +2257,12 @@ export async function downsampleQuotaForTest(
     observedAtCutoff,
     resetsAtCutoff,
     SEVEN_DAY_WINDOW_MINUTES,
-    MINIMUM_BOUNDARIES,
-    MINIMUM_DISPLAYED_SPAN_PP,
     MAX_DOWNSAMPLED_QUOTA_ROWS + 1,...quotaQuery.typedBindings,
   ).all<DownsampledQuotaRow>();
-  return result.results;
+  const collapsed = collapseDirectV1QuotaRows(result.results, attributionIndex);
+  // Past the pool bound this owner's evidence is unavailable, not absent.
+  if (collapsed === null) throw new Error("v1 downsampled quota limit exceeded");
+  return collapsed;
 }
 
 /**
@@ -2647,11 +2742,20 @@ async function analyzeAccountScopedModelCompositionV1(
     ...(history?[history.observedAtBefore]:[]),
     resetsAtCutoff,
     SEVEN_DAY_WINDOW_MINUTES,
-    MINIMUM_BOUNDARIES,
-    MINIMUM_DISPLAYED_SPAN_PP,
     maxDownsampledQuotaRows + 1,...quotaQuery!.typedBindings,
   ).all<DownsampledQuotaRow>();
+  // Memory budget before the collapse, raised as unavailability so a day is
+  // never published as refused because one statement decoded too much; the
+  // clustered bound below is the analytical refusal.
+  if (!prepared && quotaResult.results.length > maxDownsampledQuotaRows) {
+    throw new Error("v1 downsampled quota read unavailable");
+  }
   if (quotaResult.results.length > maxDownsampledQuotaRows) {
+    return { status: "not_testable", reason: "downsampled_quota_limit_exceeded" };
+  }
+  const downsampled = prepared ? quotaResult.results
+    : collapseDirectV1QuotaRows(quotaResult.results, attributionIndex);
+  if (downsampled === null || downsampled.length > maxDownsampledQuotaRows) {
     return { status: "not_testable", reason: "downsampled_quota_limit_exceeded" };
   }
 
@@ -2663,7 +2767,7 @@ async function analyzeAccountScopedModelCompositionV1(
   const quotaRows: CompositionQuotaRow[] = [];
   const quotaProviders = new Set<string>();
   const planCounts = new Map<string, number>();
-  for (const row of quotaResult.results) {
+  for (const row of downsampled) {
     if (typeof row.observed_at !== "string" || typeof row.resets_at !== "string") continue;
     const observedAtMs = Date.parse(row.observed_at);
     const resetsAtMs = Date.parse(row.resets_at);

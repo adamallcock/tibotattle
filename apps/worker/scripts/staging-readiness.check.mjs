@@ -113,7 +113,7 @@ test("staging rejects missing, disabled, or unknown public analytics deployment 
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-19), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-20), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
@@ -133,6 +133,7 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
     "0059_accountless_upload_renewal.sql",
     "0060_public_contribution_sources.sql",
     "0061_accountless_history_retention.sql",
+    "0062_v1_acquisition_vocabulary.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -235,6 +236,7 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0058_accountless_upload_ownership.sql": "b435fd92d41e7ce8067cc183d7ac153359a9c130a971cba2e1b8b8c1c9cab61b",
     "0059_accountless_upload_renewal.sql": "98afb99dd91e56a96960e6d99096e44c41eec0cd52d5a1e2969dea4ddee3d312",
     "0061_accountless_history_retention.sql": "0d6d9d23390770aab5c2cb9b1bbb27586ed72b9921a420468efb05ee225435d6",
+    "0062_v1_acquisition_vocabulary.sql": "737851c99752b41fbbcc878e9855f139755bef8986e47753defb2c40c7df3ad4",
   };
   const legacyDigests = {
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
@@ -242,12 +244,12 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0048_accountless_upload_renewal.sql": "82297298f937489275756da93d9b116a7b83b280482000b0df51abd5c598d9b7",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 61);
+  assert.equal(names.length, 62);
   assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests).slice(0, 5));
-  assert.deepEqual(names.slice(56, 59), Object.keys(expectedDigests).slice(-4, -1));
+  assert.deepEqual(names.slice(56, 59), Object.keys(expectedDigests).slice(-5, -2));
   assert.equal(names.at(-1), Object.keys(expectedDigests).at(-1));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 61 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 62 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -2375,7 +2377,10 @@ test("current 0061 readiness binds the exact history-retention table and guards"
     const snapshot = () => Object.fromEntries(database.prepare(
       "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
     ).all().map(({ name, sql }) => [name, sql]));
-    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, -1)) {
+    // Everything before the migration under test, named rather than counted so
+    // a later migration does not silently change what this applies.
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0,
+      EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.indexOf("0061_accountless_history_retention.sql"))) {
       const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
       database.exec(name.startsWith("0058_") ? `BEGIN;${sql}COMMIT;` : sql);
     }

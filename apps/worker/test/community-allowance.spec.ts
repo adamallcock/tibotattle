@@ -1230,6 +1230,111 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     }
   });
 
+  it("acquires a jittery interleaved v1 owner exactly as the direct read does", async () => {
+    const participantId = await seedV1Participant("v1-jitter");
+    await seedV1Session(participantId, "v1-session-jitter");
+    await seedV1Device(participantId, "v1-device-jitter", "v1-session-jitter");
+    const nowMs = SCALE_NOW;
+    const baseMs = nowMs - 30 * DAY_MS;
+    const day = new Date(baseMs).toISOString().slice(0, 10);
+    // Two interleaved pools of one slot, each restating `resets_at` by seconds,
+    // over a corpus dense enough that spacing engages. A raw reset key would
+    // fragment both pools into dozens of one-row groups.
+    const quota: V1SeedRecord[] = [];
+    for (let step = 0; step < 240; step += 1) {
+      const observedAt = new Date(baseMs + step * 15_000).toISOString();
+      for (const [tag, resetMs] of [
+        ["weekly", baseMs + 7 * DAY_MS + (step % 53) * 1_000],
+        ["later", baseMs + 9 * DAY_MS + (step % 37) * 1_000],
+      ] as const) {
+        quota.push({ occurrence_id: `q-jitter-${tag}-${step}`, observed_at: observedAt,
+          provider: "openai_codex", plan_type: "pro", plan_variant: "unknown", limit_id: "codex",
+          slot: "seven_day", used_percent: 10 + Math.floor(step / 12) % 80,
+          window_duration_minutes: 10_080, resets_at: new Date(resetMs).toISOString() });
+      }
+    }
+    await seedChunkedRecords(participantId, "v1-device-jitter", "quota", day, quota);
+    const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_DAYS * DAY_MS).toISOString().slice(0, 10) + "T00:00:00.000Z";
+    const sourcePin = await loadV1SourcePin(db(), { participantId, fromDay: observedAtCutoff.slice(0, 10) });
+    const identity = { participantId, inputFingerprint: sourcePin.fingerprint,
+      sourceMethodVersion: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION, observedAtCutoff,
+      resetsAtCutoff: new Date(Date.parse(observedAtCutoff) + 7 * DAY_MS).toISOString(),
+      windowMinutes: 10_080, maxQuotaRows: MAX_DOWNSAMPLED_QUOTA_ROWS };
+    expect((await backfillV1QuotaFitProjection(db())).status).toBe("complete");
+    const reader = await createV1QuotaPageReader(db(), participantId);
+    const winners = new Map(sourcePin.winners.map(winner => [winner.observed_day, winner.device_id]));
+    const readBudget = { remainingQueries: 200, deadlineMs: Date.now() + 60_000 };
+    let checkpoint: V1QuotaAcquisitionCheckpoint | undefined;
+    let evidence: V1AcquiredQuotaEvidence | undefined;
+    for (let step = 0; step < 64 && !evidence; step += 1) {
+      const result = await advanceV1QuotaAcquisition(reader, identity, winners, readBudget, checkpoint);
+      if (result.status === "complete") {
+        evidence = { identity, acquisition: { planAnchors: result.planAnchors, quotaRows: result.quotaRows } };
+        break;
+      }
+      if (result.status !== "deferred") throw new Error("unexpected acquisition refusal");
+      checkpoint = result.checkpoint;
+    }
+    expect(evidence).toBeDefined();
+    // Both pools settle to one representative instant each, not one per
+    // restated instant, and the retained rows are far fewer than the raw ones.
+    const retained = evidence!.acquisition.quotaRows;
+    expect(new Set(retained.map((row) => row.resets_at)).size).toBe(2);
+    expect(retained.length).toBeLessThan(quota.length / 4);
+    // The paged acquisition and the single direct read cluster the same pools,
+    // apply the same fitable refusal and collapse the same runs.
+    const budget = { remainingQueries: 900, deadlineMs: Date.now() + 60_000 };
+    const scalar = await finishAccountScopedQuotaAnalysisV1(db(), participantId, evidence!, budget, { nowMs, sourcePin });
+    expect(scalar.status).toBe("complete");
+    if (scalar.status !== "complete") throw new Error("scalar unexpectedly deferred");
+    // The two paths label their adapter differently by design — the resumable
+    // one carries the acquisition contract in its method string — so that one
+    // field is compared separately and the evidence itself must match exactly.
+    const directScalar = await accountScopedQuotaAnalysisV1(db(), participantId, { nowMs, sourcePin }) as Record<string, unknown>;
+    expect((scalar.analysis as Record<string, unknown>).attributionMethod).toBe(V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION);
+    expect(scalar.analysis).toEqual({ ...directScalar, attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION });
+    const composition = await finishAccountScopedModelCompositionV1(db(), participantId, evidence!, budget, { nowMs, sourcePin });
+    expect(composition.status).toBe("complete");
+    if (composition.status !== "complete") throw new Error("composition unexpectedly deferred");
+    const directComposition = await accountScopedModelCompositionV1(db(), participantId, { nowMs, sourcePin });
+    expect(composition.analysis).toEqual(directComposition.status === "ready"
+      ? { ...directComposition, attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION }
+      : directComposition);
+
+    // The same owner under a bound its raw keys could never have met: every
+    // restated instant was its own fitable group and its own run, so the old
+    // behaviour refused here. Clustered pools plus spacing fit inside it.
+    const rawResets = new Set(quota.map((row) => row.resets_at)).size;
+    const bound = retained.length;
+    // Raw keys made every restated instant its own fitable group and its own
+    // run, so the retained set could not have been smaller than that count.
+    expect(rawResets).toBeGreaterThan(bound);
+    const boundedIdentity = { ...identity, maxQuotaRows: bound };
+    const boundedReader = await createV1QuotaPageReader(db(), participantId);
+    const boundedBudget = { remainingQueries: 200, deadlineMs: Date.now() + 60_000 };
+    let boundedCheckpoint: V1QuotaAcquisitionCheckpoint | undefined;
+    let boundedEvidence: V1AcquiredQuotaEvidence | undefined;
+    for (let step = 0; step < 64 && !boundedEvidence; step += 1) {
+      const result = await advanceV1QuotaAcquisition(boundedReader, boundedIdentity, winners,
+        boundedBudget, boundedCheckpoint);
+      if (result.status === "complete") {
+        boundedEvidence = { identity: boundedIdentity,
+          acquisition: { planAnchors: result.planAnchors, quotaRows: result.quotaRows } };
+        break;
+      }
+      if (result.status !== "deferred") throw new Error("bounded acquisition refused");
+      boundedCheckpoint = result.checkpoint;
+    }
+    expect(boundedEvidence).toBeDefined();
+    expect(boundedEvidence!.acquisition.quotaRows.length).toBeLessThanOrEqual(bound);
+    const boundedScalar = await finishAccountScopedQuotaAnalysisV1(db(), participantId, boundedEvidence!,
+      { remainingQueries: 900, deadlineMs: Date.now() + 60_000 },
+      { nowMs, sourcePin, maxDownsampledQuotaRows: bound });
+    expect(boundedScalar.status).toBe("complete");
+    if (boundedScalar.status !== "complete") throw new Error("bounded scalar deferred");
+    expect((boundedScalar.analysis as Record<string, unknown>).status).toBe("ready");
+  }, 60_000);
+
   it("collects fits from a v1-only participant and draws the day band", async () => {
     const participantId = await seedV1Participant("solo");
     await seedV1Session(participantId, "v1-session-solo");
@@ -1853,15 +1958,21 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     // Ingest admits finite0..100 (including zero), never the -1 absence sentinel.
     expect(oracle.filter((row) => row.used_percent === 0)).toHaveLength(16);
     expect(oracle.filter((row) => row.used_percent === 100)).toHaveLength(16);
-    for (const limit of [1, oracle.length - 1, oracle.length, oracle.length + 1]) {
-      const result = await db().prepare(QUOTA_DOWNSAMPLE_SQL).bind(JSON.stringify(markers), pin.winnersJson,
-        participantId, at(0), resetsAt, 10_080, QUOTA_CALIBRATION_POLICY.minimumBoundaries,
-        QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, limit).all();
-      expect(result.results).toEqual(oracle.slice(0, limit));
+    // The SQL no longer carries the fitable stage: it returns every scoped run
+    // endpoint in stream order, and the eligibility refusal is now decided in
+    // JS on the clustered key. The oracle is therefore the eligible subset of
+    // what the statement returns, and the LIMIT still slices it deterministically.
+    const rows = async (limit: number) => (await db().prepare(QUOTA_DOWNSAMPLE_SQL)
+      .bind(JSON.stringify(markers), pin.winnersJson, participantId, at(0), resetsAt, 10_080, limit).all()).results;
+    const all = await rows(oracle.length * 4);
+    for (const row of oracle) expect(all).toContainEqual(row);
+    expect(all.length).toBeGreaterThan(oracle.length);
+    // Exactly the rows the fitable stage used to drop, and nothing else.
+    expect(all.filter((row) => !oracle.some((kept) => kept.occurrence_id === (row as { occurrence_id: string }).occurrence_id))
+      .every((row) => (row as { occurrence_id: string }).occurrence_id.startsWith("neighbor-nonfit-"))).toBe(true);
+    for (const limit of [1, all.length - 1, all.length]) {
+      expect(await rows(limit)).toEqual(all.slice(0, limit));
     }
-    expect((await db().prepare(QUOTA_DOWNSAMPLE_SQL).bind(JSON.stringify(markers), pin.winnersJson,
-      participantId, at(0), resetsAt, 10_080, 1000,
-      QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, 1).all()).results).toEqual([]);
   });
 
   it("preserves exact dense quota run endpoints and fits after the query rollback", async () => {
@@ -1879,15 +1990,30 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     // resets on sparse partitions. Retain its exact-result regressions, but
     // do not require the rejected query shape or claim a memory bound here.
     const reducedRows = await downsampleQuotaForTest(db(), participantId, SCALE_NOW);
-    expect(reducedRows.map((row) => row.occurrence_id)).toEqual(
-      Array.from({ length: 17 }, (_, level) => [
+    const boundaries = QUOTA_CALIBRATION_POLICY.minimumBoundaries;
+    // Run collapse still retains exactly the first and last row of each flat
+    // run until the pool holds the boundaries the calibration refuses below.
+    // These snapshots are one second apart, so after that only the ten-minute
+    // spacing and the pool's own extremes survive.
+    expect(reducedRows.map((row) => row.occurrence_id).slice(0, (boundaries - 1) * 2)).toEqual(
+      Array.from({ length: boundaries - 1 }, (_, level) => [
         `q-quota-working-set-${level}-0`, `q-quota-working-set-${level}-299`,
       ]).flat(),
     );
+    expect(reducedRows.length).toBeLessThan(34);
+    // The retained window is still the pool's true window, which is what keeps
+    // the reset identity and displayed span exact below.
+    expect(reducedRows[0]!.occurrence_id).toBe("q-quota-working-set-0-0");
+    expect(reducedRows.at(-1)!.occurrence_id).toBe("q-quota-working-set-16-299");
     const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), participantId) as AnalysisLike;
     const actual = await accountScopedQuotaAnalysisV1(db(), participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
     expect(bandResets(actual)).toHaveLength(1);
-    expect(bandResets(actual)).toEqual(bandResets(reference));
+    // Identity, window, span and refusals are preserved exactly; only the
+    // interior boundary density, and so the capacity estimate, changes.
+    const { capacityNanousd: actualCapacity, ...actualRest } = bandResets(actual)[0]!;
+    const { capacityNanousd: referenceCapacity, ...referenceRest } = bandResets(reference)[0]!;
+    expect(actualRest).toEqual(referenceRest);
+    expect(Math.abs(actualCapacity! - referenceCapacity!) / referenceCapacity!).toBeLessThan(0.01);
   }, 20_000);
 
   it("preserves occurrence-first same-session intervals when insertion order disagrees", async () => {
@@ -2260,26 +2386,36 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     const referenceBand = bandResets(reference);
     const reducedBand = bandResets(reduced);
     expect(reducedBand.length).toBe(1);
-    expect(reducedBand).toEqual(referenceBand);
-    expect(reducedBand[0]!.capacityNanousd).toBeGreaterThan(0);
+    // The reduced path now thins run endpoints to a ten-minute spacing once a
+    // pool holds the eight boundaries the calibration refuses below, so a
+    // corpus this dense (15-second snapshots across 42 minutes) no longer
+    // yields a byte-identical capacity. What the spacing rule guarantees is
+    // preserved exactly, and is asserted exactly: the pool's identity, window,
+    // displayed span and refusals. Only the interior boundary density changes,
+    // which moves the capacity estimate by well under one percent.
+    const { capacityNanousd: reducedCapacity, ...reducedRest } = reducedBand[0]!;
+    const { capacityNanousd: referenceCapacity, ...referenceRest } = referenceBand[0]!;
+    expect(reducedRest).toEqual(referenceRest);
+    expect(reducedCapacity).toBeGreaterThan(0);
+    expect(Math.abs(reducedCapacity! - referenceCapacity!) / referenceCapacity!).toBeLessThan(0.01);
     expect(reducedBand[0]!.displayedSpanPp).toBe(80);
 
-    // Measure the collapse: 170 raw quota rows -> 34 retained (first + last of
-    // each of the 17 flat runs), and the retained rows are exactly those
-    // endpoints.
+    // Measure the collapse: 170 raw quota rows -> the run endpoints of the 17
+    // flat runs, thinned by the spacing. Every run's first and last row is a
+    // candidate; the first eight distinct displayed values are kept exactly,
+    // and after that only the spacing and the pool's own extremes survive.
     const downsampled = await downsampleQuotaForTest(db(), participantId, SCALE_NOW);
     expect(dense.quota.length).toBe(170);
-    expect(downsampled.length).toBe(34);
-    for (let level = 0; level < 17; level += 1) {
-      const runOccurrences = downsampled
-        .filter((row) => row.occurrence_id.startsWith(`q-dense-${level}-`))
-        .map((row) => row.occurrence_id)
-        .sort();
-      expect(runOccurrences).toEqual([
-        `q-dense-${level}-0`,
-        `q-dense-${level}-9`,
-      ]);
+    expect(downsampled.length).toBeLessThan(34);
+    const retained = (level: number) => downsampled
+      .filter((row) => row.occurrence_id.startsWith(`q-dense-${level}-`))
+      .map((row) => row.occurrence_id).sort();
+    for (let level = 0; level < QUOTA_CALIBRATION_POLICY.minimumBoundaries - 1; level += 1) {
+      expect(retained(level)).toEqual([`q-dense-${level}-0`, `q-dense-${level}-9`]);
     }
+    // The pool's earliest and latest retained rows are still its true window.
+    expect(retained(0)[0]).toBe("q-dense-0-0");
+    expect(downsampled.at(-1)!.occurrence_id).toBe("q-dense-16-9");
 
     // Noise handling: the reference fits the five-hour track as a window-300
     // estimate and forms a bengalfox track; the reduced path drops BOTH.
@@ -2514,21 +2650,27 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     await seedChunkedRecords(participantId, device, "quota", day, dense.quota);
     await seedChunkedRecords(participantId, device, "usage", day, dense.usage);
 
+    // 12 runs * 2 endpoints is what the statement decodes before anything is
+    // clustered or spaced; the bound the direct read enforces is a memory
+    // budget on exactly those rows.
+    const rawEndpointCount = 24;
     const downsampledCount =
       (await downsampleQuotaForTest(db(), participantId, SCALE_NOW)).length;
-    expect(downsampledCount).toBe(24); // 12 runs * 2 endpoints
+    // Spacing thins the interior of these 15-second runs once the pool holds
+    // its calibration boundaries, so the retained result is strictly smaller.
+    expect(downsampledCount).toBeLessThan(rawEndpointCount);
     const usageCount = dense.usage.length;
 
-    // Downsampled-quota cap.
-    const overQuota = await accountScopedQuotaAnalysisV1(db(), participantId, {
+    // Overflowing the pre-collapse budget is unavailability, not a refusal: a
+    // day must never be published as `not_testable` because one statement
+    // decoded too much, so the caller falls back to the paged reader.
+    await expect(accountScopedQuotaAnalysisV1(db(), participantId, {
       nowMs: SCALE_NOW,
-      maxDownsampledQuotaRows: downsampledCount - 1,
-    }) as AnalysisLike;
-    expect(overQuota.status).toBe("not_testable");
-    expect(overQuota.reason).toBe("downsampled_quota_limit_exceeded");
+      maxDownsampledQuotaRows: rawEndpointCount - 1,
+    })).rejects.toThrow("v1 downsampled quota read unavailable");
     const atQuota = await accountScopedQuotaAnalysisV1(db(), participantId, {
       nowMs: SCALE_NOW,
-      maxDownsampledQuotaRows: downsampledCount,
+      maxDownsampledQuotaRows: rawEndpointCount,
     }) as AnalysisLike;
     expect(atQuota.status).toBe("ready");
 

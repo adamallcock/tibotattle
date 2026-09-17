@@ -17,6 +17,7 @@ import { sha256Hex } from "../src/crypto";
 import { canonicalJson } from "../src/canonical-json";
 import { modelHistoryWindow } from "../src/model-history-window";
 import { V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v11";
+import { V1_QUOTA_ACQUISITION_VERSION } from "../src/quota-analysis-v1-reader";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
@@ -991,7 +992,10 @@ describe("typed active-domain analytical reads",()=>{
     // A change to how v1.1 evidence is acquired retires v1.1 results only.
     expect(await computed('v1.1')).toBe(await digest('v1.1',[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]));
     expect(await computed('v1.1')).not.toBe(await digest('v1.1',[]));
-    expect(await computed('v1')).toBe(await digest('v1',[]));
+    // v1 has its own acquisition contract in its own identity, and v0.2 has
+    // neither: a v1.1 change must not retire either of them.
+    expect(await computed('v1')).toBe(await digest('v1',[V1_QUOTA_ACQUISITION_VERSION]));
+    expect(await computed('v1')).not.toBe(await digest('v1',[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]));
   });
 
   it("does not reuse a v1.1 result stored under the previous acquisition identity",async()=>{

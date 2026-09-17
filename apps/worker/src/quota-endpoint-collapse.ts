@@ -278,3 +278,110 @@ export function collapseQuotaEndpointStream<E>(rows: readonly E[], key: (value: 
   return kept.sort((left, right) => view(left).observedAtMs - view(right).observedAtMs
     || view(left).id - view(right).id);
 }
+
+/** Cluster-scoped spacing for a reset-major stream.
+ *
+ * The v1 reader delivers rows ordered by `(resets_at, observed_at, id)`, so a
+ * pool's rows arrive as one monotone block per restated instant and the
+ * observation clock jumps backwards between blocks. Run collapse still works
+ * inside a block, but the ordered spacing above cannot: its `keptAtMs` assumes
+ * every candidate is later than the last kept one. This mode drops that
+ * assumption and asks the whole kept set instead, which makes the decision
+ * depend only on which rows are already kept and not on when they arrived.
+ *
+ * The retained set is a subset of the run endpoints, chosen greedily in reader
+ * order, in which no two kept rows of one cluster are closer than the spacing,
+ * and which always contains the cluster's earliest, latest, lowest and highest
+ * rows so the window and the displayed span stay exact.
+ *
+ * Only the four held rows are durable state. The kept instants, values and ids
+ * are rebuilt from the emitted endpoints themselves, which already carry the
+ * cluster's representative instant, so a resumed pass reconstructs the exact
+ * decisions of an uninterrupted one without carrying an unbounded index. */
+export interface QuotaClusterHold<E> {
+  earliest: E | null;
+  latest: E | null;
+  minimum: E | null;
+  maximum: E | null;
+}
+export interface QuotaClusterSpacing<E> extends QuotaClusterHold<E> {
+  instants: number[];
+  values: number[];
+  ids: Set<number>;
+}
+
+export function createQuotaClusterSpacing<E>(hold?: QuotaClusterHold<E>): QuotaClusterSpacing<E> {
+  return { instants: [], values: [], ids: new Set(),
+    earliest: hold?.earliest ?? null, latest: hold?.latest ?? null,
+    minimum: hold?.minimum ?? null, maximum: hold?.maximum ?? null };
+}
+export function quotaClusterHold<E>(state: QuotaClusterSpacing<E>): QuotaClusterHold<E> {
+  return { earliest: state.earliest, latest: state.latest,
+    minimum: state.minimum, maximum: state.maximum };
+}
+/** First index whose instant is not below `value`. */
+function lowerBound(instants: readonly number[], value: number): number {
+  let low = 0, high = instants.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (instants[middle]! < value) low = middle + 1; else high = middle;
+  }
+  return low;
+}
+/** Record an endpoint this cluster has already emitted. Replaying every
+ * emitted row through this rebuilds the whole decision index. */
+export function recordQuotaClusterEmitted<E>(state: QuotaClusterSpacing<E>, emitted: E,
+  view: (value: E) => QuotaEndpointView): void {
+  const seen = view(emitted);
+  state.instants.splice(lowerBound(state.instants, seen.observedAtMs), 0, seen.observedAtMs);
+  state.ids.add(seen.id);
+  if (state.values.length < QUOTA_ENDPOINT_MINIMUM_RETAINED && !state.values.includes(seen.usedPercent)) {
+    state.values.push(seen.usedPercent);
+  }
+}
+/** Rebuild a cluster's decision index from the endpoints it already emitted,
+ * in one pass rather than by repeated ordered insertion. */
+export function restoreQuotaClusterSpacing<E>(state: QuotaClusterSpacing<E>, emitted: readonly E[],
+  view: (value: E) => QuotaEndpointView): void {
+  for (const value of emitted) {
+    const seen = view(value);
+    state.instants.push(seen.observedAtMs);
+    state.ids.add(seen.id);
+    if (state.values.length < QUOTA_ENDPOINT_MINIMUM_RETAINED && !state.values.includes(seen.usedPercent)) {
+      state.values.push(seen.usedPercent);
+    }
+  }
+  state.instants.sort((left, right) => left - right);
+}
+/** Offer one run endpoint to its cluster. */
+export function offerQuotaClusterEndpoint<E>(state: QuotaClusterSpacing<E>, candidate: E,
+  view: (value: E) => QuotaEndpointView, emit: (value: E) => boolean,
+  spacingMs = QUOTA_ENDPOINT_MIN_SPACING_MS,
+  minimumRetained = QUOTA_ENDPOINT_MINIMUM_RETAINED): boolean {
+  const seen = view(candidate);
+  if (state.earliest === null || seen.observedAtMs < view(state.earliest).observedAtMs) state.earliest = candidate;
+  if (state.latest === null || seen.observedAtMs > view(state.latest).observedAtMs) state.latest = candidate;
+  if (state.minimum === null || seen.usedPercent < view(state.minimum).usedPercent) state.minimum = candidate;
+  if (state.maximum === null || seen.usedPercent > view(state.maximum).usedPercent) state.maximum = candidate;
+  if (state.values.length >= minimumRetained) {
+    const index = lowerBound(state.instants, seen.observedAtMs - spacingMs);
+    if (index < state.instants.length && state.instants[index]! <= seen.observedAtMs + spacingMs) return true;
+  }
+  if (!emit(candidate)) return false;
+  recordQuotaClusterEmitted(state, candidate, view);
+  return true;
+}
+/** Emit the rows that keep the cluster's window and span exact, once each. */
+export function closeQuotaClusterSpacing<E>(state: QuotaClusterSpacing<E>,
+  view: (value: E) => QuotaEndpointView, emit: (value: E) => boolean): boolean {
+  for (const held of [state.earliest, state.latest, state.minimum, state.maximum]) {
+    if (held === null || state.ids.has(view(held).id)) continue;
+    if (!emit(held)) return false;
+    recordQuotaClusterEmitted(state, held, view);
+  }
+  state.earliest = null;
+  state.latest = null;
+  state.minimum = null;
+  state.maximum = null;
+  return true;
+}

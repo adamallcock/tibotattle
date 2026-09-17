@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { QUOTA_CALIBRATION_POLICY } from "@app-usagemonitor/quota-analysis";
 import {
   addQuotaFragmentValue,
+  closeQuotaClusterSpacing,
+  createQuotaClusterSpacing,
+  offerQuotaClusterEndpoint,
   addQuotaReset,
   collapseQuotaEndpointStream,
   createQuotaResetClusterState,
@@ -10,6 +13,7 @@ import {
   quotaResetRepresentativeMs,
   validQuotaResetClusterEntries,
   QUOTA_ENDPOINT_MINIMUM_RETAINED,
+  QUOTA_ENDPOINT_MIN_SPACING_MS,
   QUOTA_RESET_CLUSTER_TOLERANCE_MS,
   type QuotaFragmentStats,
 } from "../src/quota-endpoint-collapse";
@@ -171,5 +175,69 @@ describe("quota fragment eligibility", () => {
     expect(stats.get("wide")!.values).toHaveLength(boundaries);
     expect(stats.get("wide")!.maximum - stats.get("wide")!.minimum)
       .toBeGreaterThanOrEqual(QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp);
+  });
+});
+
+describe("cluster-scoped spacing for a reset-major stream", () => {
+  // The v1 reader delivers a pool's rows as one monotone block per restated
+  // instant, so the observation clock jumps backwards between blocks. These
+  // build the same candidate set in both orders.
+  interface Candidate { id: number; observedAtMs: number; usedPercent: number; block: string }
+  const view = (value: Candidate) => ({ id: value.id, observedAtMs: value.observedAtMs,
+    usedPercent: value.usedPercent });
+  function candidates(): Candidate[] {
+    const rows: Candidate[] = [];
+    let id = 0;
+    for (let minute = 0; minute < 90; minute += 1) {
+      // Three restated instants of one pool, interleaved in time.
+      rows.push({ id: (id += 1), observedAtMs: BASE + minute * MINUTE,
+        usedPercent: 10 + (minute % 17), block: `reset-${minute % 3}` });
+    }
+    return rows;
+  }
+  const spaced = (rows: readonly Candidate[]) => {
+    const state = createQuotaClusterSpacing<Candidate>();
+    const kept: Candidate[] = [];
+    const emit = (value: Candidate) => { kept.push(value); return true; };
+    for (const row of rows) offerQuotaClusterEndpoint(state, row, view, emit);
+    closeQuotaClusterSpacing(state, view, emit);
+    return kept.sort((left, right) => left.observedAtMs - right.observedAtMs);
+  };
+  const resetMajor = (rows: readonly Candidate[]) => [...rows]
+    .sort((left, right) => (left.block < right.block ? -1 : left.block > right.block ? 1 : 0)
+      || left.observedAtMs - right.observedAtMs);
+
+  // The greedy rule picks different rows in the two orders — that is expected,
+  // and the reader's order is fixed — but the guarantees the calibration relies
+  // on hold either way, which is what makes the rule safe for a reset-major
+  // stream in the first place.
+  it("keeps the same guarantees whichever order the blocks arrive in", () => {
+    const rows = candidates();
+    for (const [name, ordered] of [["time order", rows], ["reset-major order", resetMajor(rows)]] as const) {
+      const kept = spaced(ordered);
+      const times = kept.map((value) => value.observedAtMs);
+      const percents = kept.map((value) => value.usedPercent);
+      // The pool's window and displayed span are exact in both orders.
+      expect(times[0], name).toBe(Math.min(...rows.map((value) => value.observedAtMs)));
+      expect(times.at(-1), name).toBe(Math.max(...rows.map((value) => value.observedAtMs)));
+      expect(Math.min(...percents), name).toBe(Math.min(...rows.map((value) => value.usedPercent)));
+      expect(Math.max(...percents), name).toBe(Math.max(...rows.map((value) => value.usedPercent)));
+      // The rule admits at most the calibration boundaries, one row per
+      // spacing slot across the window, and the four rows it holds to keep the
+      // window and span exact. Both orders land on the same count.
+      const window = times.at(-1)! - times[0]!;
+      expect(kept.length, name).toBeLessThanOrEqual(QUOTA_ENDPOINT_MINIMUM_RETAINED
+        + Math.ceil(window / QUOTA_ENDPOINT_MIN_SPACING_MS) + 4);
+      expect(kept.length, name).toBeLessThan(rows.length);
+    }
+  });
+
+  it("returns an already sparse pool unchanged in either order", () => {
+    // Every candidate is further apart than the spacing, so nothing is thinned
+    // and the retained set is byte-identical to the input.
+    const rows: Candidate[] = Array.from({ length: 10 }, (_, index) => ({ id: index + 1,
+      observedAtMs: BASE + index * 15 * MINUTE, usedPercent: 10 + index * 5, block: `reset-${index % 3}` }));
+    expect(spaced(rows)).toEqual(rows);
+    expect(spaced(resetMajor(rows))).toEqual(rows);
   });
 });

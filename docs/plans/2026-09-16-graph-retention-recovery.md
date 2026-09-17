@@ -218,3 +218,56 @@ that commit, so the shared worktree's in-progress v1 work was not bundled. The v
 follows the same design in a separate change. Still open: the acquisition
 checkpoint itself (up to 60,000 quota rows per owner) remains the structural
 cost.
+
+## 2026-09-17 morning: long-pass verification and the v1 half
+
+The 03:10 UTC long pass on version 97965c2b used its window: 6.7 minutes,
+850 of 900 statements over six graph iterations, one completed calculation,
+ending as `deferred/query_budget`. The 03:30 pass ended the same way after
+four minutes and 840 statements with no completed calculation: a long pass is
+bound by its statement meter, not by time, and partial-group progress is
+invisible in the pass counters. The checkpoint manifests show where the
+statements go: a heavy owner-day's `endpoints` component is about 7 MiB (60
+parts) and the usage phase carries the acquired `quotaRows` (about 3 MiB per
+stage), every partial save re-inserts every part, and every model day is a
+fresh 100-day acquisition of roughly 1,100 quota pages plus usage pages. By
+05:09 UTC the corpus had 39 new model results and 7 published model days
+(2026-09-10 to 2026-09-16) with 14 of 19 current fits.
+
+The v1 reader is the second half of the jitter repair (the second dense owner
+is v1). The v1 fit page is reset-major (`INDEXED BY typed_v1_quota_reset`),
+so runs stay keyed by the raw reset and flush per reset group; the pool hull
+sweep runs as a second leg of the `plan` phase with its own `clusterCursor`,
+stats and emitted `resets_at` use the cluster representative, and the
+10-minute spacing is cluster-scoped and order-independent (sorted kept
+instants rebuilt from the durable endpoints on resume, held extremes flushed
+at finish). The direct path drops the SQL eligibility pre-filter and re-derives
+eligibility, collapse and spacing through the shared primitives. Identity:
+`V1_QUOTA_ACQUISITION_VERSION` = `v1-quota-acquisition-2` folded into the v1
+branch of the dependency digest, `STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD`
+= `current-fit-checkpoint-2`, `STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD` =
+`checkpoint-store-3`; v1.1, v0.2 and mixed identities are untouched, and
+model publications survive because they key on the unchanged
+`STORAGE_GRAPH_METHOD`.
+
+The legacy JSON-mode work store (`community_analysis_work*`,
+`community_model_history_work*`) pins the part `component` vocabulary with
+CHECK constraints, so migration `0062_v1_acquisition_vocabulary.sql` rebuilds
+both families row-preservingly to admit `reset-clusters` and `endpoint-holds`
+(the phase vocabulary is unchanged; the sweep never writes a new phase name).
+Its writers are only reachable through the JSON-mode warmers in the upload
+Worker (`index.ts`, gated on `parseTelemetryStorageMode(env).kind === "json"`);
+the analytics Worker never imports them. Constraint: apply 0062 to the upload
+database before any Worker that runs the JSON-mode warmers is deployed with
+this code. The analytics Worker deploy does not depend on it.
+
+Independent review found and the change fixed before commit: the rebuilt
+`community_model_history_participant_state` trigger had been copied from 0048
+and lost 0059's `NEW.owner_kind='social'` predicate (an accountless owner's
+state change would have wiped every composition day); the work-store replay
+guard decided reset-major order by phase name and would have rejected the
+sweep's reset-group crossings as rewinds; a null pool-bound refusal was being
+converted to zero rows; and a direct-read overflow before collapse was
+published as a `not_testable` composition although the resumable reader
+completes such owners, so it now throws a coded error and the historical path
+falls back to the paged acquisition. Each has a regression test.

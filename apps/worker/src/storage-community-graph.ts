@@ -18,6 +18,7 @@ import { captureStorageCommunityAuthority, sameStorageCommunityCalculationAuthor
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { createD1InvocationBudget } from './d1-invocation-budget';
 import { advanceStorageV1CurrentFitAnalysis,advanceStorageV1HistoricalAnalysis,type StorageV1HistoryCheckpoint } from './storage-v1-history';
+import { V1_QUOTA_ACQUISITION_VERSION } from './quota-analysis-v1-reader';
 import { advanceStorageV11Analysis,type StorageV11HistoryCheckpoint } from './storage-v11-history';
 import { loadStorageHistoryCheckpoint, readStorageHistoryCheckpointHead, saveStorageHistoryCheckpoint,
   storageHistoryCheckpointParts,
@@ -31,8 +32,8 @@ export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate
 // result identity above. Bump only this namespace when a prior generation's
 // permanent anti-resurrection tombstones must remain valid but must not block
 // a repaired reader from making new resumable progress.
-export const STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':checkpoint-store-2';
-export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':current-fit-checkpoint-1';
+export const STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':checkpoint-store-3';
+export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':current-fit-checkpoint-2';
 export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-3';
 export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
 export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
@@ -182,12 +183,14 @@ export async function storageGraphDependencyDigest(options:{
   source:StorageGraphSource;metric:'fits'|'model';day:string;dependency:unknown;
 }):Promise<string> {
   const history=modelHistoryWindow(options.day);
-  // The v1.1 acquisition version is part of only the v1.1 identity. A change to
-  // how v1.1 evidence is acquired must retire v1.1 results, and must not
-  // discard v1 or v0.2 results that were computed by untouched readers.
+  // Each source's acquisition version is part of only that source's identity.
+  // A change to how v1.1 or v1 evidence is acquired must retire that source's
+  // results, and must not discard the other's, nor v0.2's, which were computed
+  // by readers the change never touched. `mixed` keeps the legacy identity.
   return sha256Hex(canonicalJson([options.authority.sourceId,options.authority.sourceNamespace,
     options.ownerDigest,options.source,options.metric,history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency,
-    ...(options.source==='v1.1'?[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]:[])]));
+    ...(options.source==='v1.1'?[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]:[]),
+    ...(options.source==='v1'?[V1_QUOTA_ACQUISITION_VERSION]:[])]));
 }
 
 async function storageGraphCheckpointDependencyDigest(options:{
