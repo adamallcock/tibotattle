@@ -174,6 +174,26 @@ the 1,000-statement invocation cap, not wall time: about 725 statements reach
 the graph phase after delivery, roughly four minutes of reads at production
 latency.
 
-Still open: the acquisition checkpoint itself (up to 60,000 quota rows per
-owner) is the structural cost; a compact representation, or a `resets_at`
-jitter-tolerant collapse (a fit method change), is the next step.
+## 2026-09-17: jittery quota resets
+
+Measured on the two densest owners (aggregates only): `resets_at` is restated
+with 2–60 s of jitter on roughly one transition in twelve and by more than a
+minute on a few, on top of genuine switches between interleaved pools, giving
+44,000 distinct values in 14 days for one owner and 85,000 in 98,000 rows for
+the other; the first also moves `used_percent` every ~35 s at 7-second
+polling. The readers' lossless run collapse keys stats and runs on the raw
+instant, so those owners fragment into hundreds of thousands of endpoints and
+are refused at the 60,000 bound after the whole fold, while the maintained
+composition already clusters pool identity within
+`MODEL_COMPOSITION_POLICY.poolToleranceMs` (3 h).
+
+| Change | Where | Effect |
+|---|---|---|
+| Clusters sub-phase | `advanceV11QuotaAcquisition` (plan → clusters → fitability → endpoints), `quota-endpoint-collapse.ts` | Reset instants are merged per plan era within the 3-hour tolerance (order-independent hull merge); stats and endpoint runs key on the cluster maximum, which keeps `resets_at` after every observation |
+| Endpoint spacing | `collapseQuotaEndpointStream` | After run collapse, endpoints stay ≥ 10 min apart per key once the pool holds the calibration's eight distinct displayed values; first and final endpoints stay exact; sparse owners are byte-identical |
+| Direct-path parity | `QUOTA_SQL`/`TYPED_V11_QUOTA_SQL`, `collapseDirectQuotaRows` | The SQL eligibility pre-filter is gone; the direct read re-derives eligibility, collapse and spacing through the same primitives, so both paths agree by construction; its `maximum + 1` refusal stays on the pre-cluster rows |
+| Version | `V11_QUOTA_ACQUISITION_VERSION` = `v11-quota-acquisition-2` | Every v1.1 checkpoint and result is recomputed |
+
+The v1 reader (the second dense owner is v1) follows the same design in a
+separate change. Still open: the acquisition checkpoint itself (up to 60,000
+quota rows per owner) remains the structural cost.
