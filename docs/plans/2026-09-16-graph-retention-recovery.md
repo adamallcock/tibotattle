@@ -271,3 +271,22 @@ converted to zero rows; and a direct-read overflow before collapse was
 published as a `not_testable` composition although the resumable reader
 completes such owners, so it now throws a coded error and the historical path
 falls back to the paged acquisition. Each has a regression test.
+
+Committed as `66c2d565` and deployed 2026-09-17 09:15 UTC as version
+42abd125 from a clean detached worktree at that commit. The pass log was
+clean from the first minute (no lane failures, one to three calculations per
+minute pass, eight in the 09:20 long pass). One consequence was not
+foreseen: `STORAGE_GRAPH_METHOD` is `communityAnalysisCacheVersion()`, whose
+`COMMUNITY_ATTRIBUTION_METHOD_VERSION` input folds
+`V1_QUOTA_ACQUISITION_VERSION`, so the v1 bump changed the method string of
+every graph result, checkpoint and model publication for every owner, not
+only the v1 ones. At 09:15 the seven published model days were retired
+under the `method` predicate, all previous results and checkpoints became
+retirable, and the corpus restarted from nothing, including the v1.1 owner's
+twelve finished days. The v1.1 bump the night before had not done this
+because the v1.1 acquisition version is not part of that string. The
+publications return day by day as all nineteen owners' results land under
+the new method. Rule going forward: before bumping any analysis constant,
+print the live `method` column (or `STORAGE_GRAPH_METHOD`) and confirm the
+constant is absent from it; if it is present, the change is a full-corpus
+recompute and must be scheduled as one.
