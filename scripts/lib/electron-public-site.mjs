@@ -84,7 +84,7 @@ function homebrewAction(panel, prefix, published) {
   if (!action) throw new TypeError('Missing exact Homebrew install action');
   return published ? action.replace(/^<div\b[^>]*>/u, tag => tag.replace(/\s+hidden(?=[\s>])/u, '')) : action;
 }
-export function renderElectronSiteDownloads(html, release) {
+export function renderElectronSiteDownloads(html, release, { brandIconCard = true } = {}) {
   if (!supportsAutomaticNativeReplacement(release.version)) fail();
   let output = html.replace('</head>', '<meta name="usage-monitor-electron-stable" content="true">\n</head>');
   const description = 'TiboTattle is a private desktop app for macOS, Windows and Linux that estimates your seven-day Codex allowance locally and shows delayed aggregate community activity when published.';
@@ -92,8 +92,12 @@ export function renderElectronSiteDownloads(html, release) {
   output = output.replace(/<meta\s+(property|name)="(og:description|twitter:description|description)"\s+content="[^"]*"\s*>/gu,
     (_match, attribute, name) => { descriptions++; return `<meta ${attribute}="${name}" content="${escape(description)}">`; });
   if (descriptions !== 3) throw new TypeError('Missing exact social description slots');
-  output = output.replace(/<meta property="og:image:alt" content="[^"]*">/u,
-    '<meta property="og:image:alt" content="TiboTattle logo">');
+  // The square fallback is a logo, so it describes itself as one.  A rendered
+  // 1200x630 card is a picture of this page and keeps the source-owned alt text.
+  if (brandIconCard) {
+    output = output.replace(/<meta property="og:image:alt" content="[^"]*">/u,
+      '<meta property="og:image:alt" content="TiboTattle logo">');
+  }
   for (const item of release.downloads) {
     const platform = { 'darwin-arm64': 'macos', 'darwin-x64': 'macos-intel', 'win32-x64': 'windows', 'linux-x64': 'linux' }[item.target];
     const mac = item.target.startsWith('darwin-');
