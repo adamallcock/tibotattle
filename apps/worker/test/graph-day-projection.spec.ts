@@ -665,6 +665,21 @@ describe('prepared graph day builder lane',()=>{
   const retried=await advanceGraphDayProjectionLane({target:target(),sourceId,build:refusing,
    deadlineMs:Date.now()+30_000,remainingQueries:900});
   expect(retried).toMatchObject({state:'progress',refused:1,candidates:1});
+  // An owner-scoped, transient failure is NOT recorded: it would exclude that
+  // owner's earliest days for good, with no retry short of re-uploading them.
+  await deliverDay('2026-09-12','1'.repeat(64),'manifest-4');
+  const unresolvable:GraphDayProjectionBuild=async()=>{
+   throw new GraphDayProjectionRefusedError('owner_source_unavailable');};
+  const before=await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_refusals').first<number>('n');
+  const transient=await advanceGraphDayProjectionLane({target:target(),sourceId,build:unresolvable,
+   deadlineMs:Date.now()+30_000,remainingQueries:900});
+  expect(transient).toMatchObject({state:'progress',built:0,refused:transient.candidates});
+  expect(transient.candidates).toBeGreaterThan(0);
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_refusals').first<number>('n')).toBe(before);
+  // So the same days are still selectable on the next pass.
+  const retry=await advanceGraphDayProjectionLane({target:target(),sourceId,build:unresolvable,
+   deadlineMs:Date.now()+30_000,remainingQueries:900});
+  expect(retry.candidates).toBe(transient.candidates);
   // And an erasure fence removes the marker with the rest of the owner state.
   await target().prepare(`INSERT INTO analytics_storage_erasure_fences
    (source_id,owner_digest,terminal_event_digest,terminal_sequence,terminal_revision,authority_epoch,public_authority_epoch)

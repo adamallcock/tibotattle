@@ -111,7 +111,9 @@ BEGIN SELECT RAISE(ABORT,'storage_owner_erased'); END;
 --
 -- The key carries the day manifest digest and the acquisition version, so a
 -- re-upload of that day or a kernel bump retries it automatically; nothing else
--- does, which is the point. No reason text beyond the closed vocabulary and no
+-- does, which is the point. Only reasons that are a function of the DAY's own
+-- inputs are in the vocabulary: an owner-scoped, transient condition recorded
+-- per day would exclude that owner's earliest days for good. No reason text beyond the closed vocabulary and no
 -- owner-scoped value beyond the existing owner digest is stored.
 CREATE TABLE analytics_graph_day_refusals (
   source_id TEXT NOT NULL,
@@ -121,7 +123,7 @@ CREATE TABLE analytics_graph_day_refusals (
   acquisition_version TEXT NOT NULL CHECK(acquisition_version IN ('graph-day-projection-v1')),
   reason TEXT NOT NULL CHECK(reason IN ('plan_anchor_limit_exceeded','run_endpoint_limit_exceeded',
     'usage_cost_limit_exceeded','usage_cell_limit_exceeded','usage_session_limit_exceeded',
-    'usage_row_refused','owner_source_unavailable')),
+    'usage_row_refused')),
   refused_ms INTEGER NOT NULL CHECK(refused_ms>=0),
   PRIMARY KEY(source_id,owner_digest,day,manifest_digest,acquisition_version)
 ) STRICT, WITHOUT ROWID;

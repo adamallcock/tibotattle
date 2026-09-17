@@ -475,6 +475,13 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
        remainingQueries:laneMeter.remainingQueries,
        ...(options.graphDayProjectionFromDay===undefined?{}:{fromDay:options.graphDayProjectionFromDay})});
       projectionIdle=lane.state==='idle';
+      // The lane's own meter wraps only the target. The build reads the SOURCE
+      // through the composition root's binding, so without this the number that
+      // gates the graph lane's 550 floor over-reports by the whole build spend
+      // and the outer 900-statement meter can trip inside the graph lane, where
+      // a budget error fails the entire schedule.
+      if(lane.sourceQueriesUsed>0)meter.reserveQueries=Math.min(meter.reserveQueries+lane.sourceQueriesUsed,
+       meter.reserveQueries+Math.max(0,meter.remainingQueries));
      }catch(error){
       if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError){
        projectionIdle=false;

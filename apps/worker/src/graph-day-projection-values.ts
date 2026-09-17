@@ -1,7 +1,13 @@
 import { MODEL_COMPOSITION_POLICY, QUOTA_CALIBRATION_POLICY } from "@app-usagemonitor/quota-analysis";
 import {
+  ACCOUNT_TRACK,
+  MAX_TIME,
+  MIN_TIME,
+  PLAN_ERA,
+  SAFE_TOKEN,
   V11_PLAN_ANCHOR_LIMIT,
   V11_QUOTA_ENDPOINT_LIMIT,
+  canonicalTuple,
   validateV11QuotaWorkPart,
   type V11AcquiredQuotaRow,
   type V11PlanAnchor,
@@ -46,12 +52,7 @@ export const GRAPH_DAY_USAGE_SESSION_LIMIT = 100_000;
 export const GRAPH_DAY_USAGE_COST_CEILING = 90_000_000_000_000;
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/u;
-const SAFE_TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
-const ACCOUNT_TRACK = /^account-track:v2:[0-9a-f]{64}$/u;
-const PLAN_ERA = /^plan-era:v1:[0-9a-f]{64}$/u;
 const HEX_DIGEST = /^[0-9a-f]{64}$/u;
-const MIN_TIME = -8_640_000_000_000_000;
-const MAX_TIME = 8_640_000_000_000_000;
 /** A structurally valid era key used only to reuse the acquisition reader's own
  * row validator for the fields a day-local row shares with an acquired row.
  * `validQuotaRow` checks `plan_era_key` independently of every other field, so
@@ -244,13 +245,6 @@ function percent(value: unknown): value is number {
 function instant(value: unknown): value is string {
   return typeof value === "string" && value.length <= 27 && Number.isFinite(Date.parse(value))
     && new Date(value).toISOString() === value;
-}
-function canonicalTuple(value: unknown, length: number, maximum = 2_048): unknown[] | null {
-  if (typeof value !== "string" || value.length > maximum) return null;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return Array.isArray(parsed) && parsed.length === length && JSON.stringify(parsed) === value ? parsed : null;
-  } catch { return null; }
 }
 export function validGraphDayLabel(value: unknown): value is string {
   return typeof value === "string" && DAY.test(value)
