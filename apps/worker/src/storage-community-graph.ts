@@ -36,6 +36,12 @@ export const STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD 
 export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-3';
 export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
 export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
+/** Every checkpoint method a live reader can build a key with. Retirement
+ * reclaims any stage under another method on sight, so a new method must be
+ * registered here before a reader starts writing under it. */
+export const STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS = Object.freeze([
+  STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD, STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
+  STORAGE_GRAPH_V11_CHECKPOINT_METHOD] as const);
 // Execution-only revision for the single optimistic direct historical read.
 // This is deliberately absent from result/checkpoint identities: a reader fix
 // may reopen one direct attempt without changing the analysis semantics.

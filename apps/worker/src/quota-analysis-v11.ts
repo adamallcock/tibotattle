@@ -76,9 +76,14 @@ const SLOTS = new Set(["primary", "secondary", "five_hour", "seven_day", "other"
 const DIRECT_PLAN_TYPES = new Set<string>(TELEMETRY_PLAN_TYPES);
 /** Mirror of the paged reader's account-scope rejection, kept local so the two
  * quota paths can be compared without reading the other module. The reader's
- * other residual check, `validEraKey`, is a structural validator for a decoded
- * checkpoint; here the era key comes from the attribution index itself and is
- * proven by the `match.era.eraKey === row.plan_era_key` equality below. */
+ * other residual check, `validEraKey`, is not mirrored as a regex: of the six
+ * fields it inspects, four are validated here independently (the context key
+ * by the provider token and `limit_id`, the account scope by this pattern,
+ * the plan type by the closed set, the plan variant by the token) and pinned
+ * to the era by the equalities below, and the remaining two (the era bound
+ * instant and the optional continuity id) are invariants of
+ * `buildPlanAttributionIndex`, which both paths consume, so neither path can
+ * see a value the other rejects. */
 const DIRECT_ACCOUNT_TRACK = /^account-track:v2:[0-9a-f]{64}$/u;
 
 export interface V11AnalysisOptions {

@@ -1,7 +1,7 @@
 import { retireStorageHistoryCheckpoint, type StorageHistoryKey } from './storage-history-checkpoint';
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowance';
-import { STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
- STORAGE_GRAPH_V11_CHECKPOINT_METHOD,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD } from './storage-community-graph';
+import { STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS,
+ STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD } from './storage-community-graph';
 
 /** One bounded payload page. Durable erased-owner state prevents new work;
  * retired checkpoint heads independently reject delayed immutable stage writes.
@@ -41,16 +41,15 @@ export async function retireStorageGraphPage(target:D1Database,sourceId:string,n
  const deleted=results.reduce((n,r)=>n+r.results.length,0);
  const stage=await target.prepare(`SELECT s.source_id,s.owner_digest,s.day,s.dependency_digest,s.source_namespace,s.method,
   h.generation AS head FROM analytics_history_checkpoint_stages s LEFT JOIN analytics_history_checkpoint_heads h USING(key_digest)
-  WHERE s.source_id=? AND (s.day<? OR s.owner_digest=? OR h.retired=1 OR s.method NOT IN (?,?,?)
+  WHERE s.source_id=? AND (s.day<? OR s.owner_digest=? OR h.retired=1
+   OR s.method NOT IN (${STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS.map(()=>'?').join(',')})
    OR (s.method!=? AND EXISTS(
    SELECT 1 FROM analytics_community_graph_results r WHERE r.source_id=s.source_id AND r.owner_digest=s.owner_digest
     AND r.metric=CASE WHEN s.method=? THEN 'fits' ELSE 'model' END
     AND r.day=s.day AND r.dependency_digest=s.dependency_digest)))
   ORDER BY s.owner_digest,s.day,s.key_digest,s.generation LIMIT 1`)
-  .bind(sourceId,oldest,erased?.owner_digest??null,
-   STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
-   STORAGE_GRAPH_V11_CHECKPOINT_METHOD,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,
-   STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD)
+  .bind(sourceId,oldest,erased?.owner_digest??null,...STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS,
+   STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD)
   .first<{source_id:string;owner_digest:string;day:string;dependency_digest:string;source_namespace:string;method:string;head:string|null}>();
  if(stage) {
   const key:StorageHistoryKey={sourceId:stage.source_id,ownerDigest:stage.owner_digest,day:stage.day,
