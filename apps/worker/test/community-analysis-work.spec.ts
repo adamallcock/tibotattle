@@ -99,7 +99,7 @@ describe("acquisition vocabulary schema", () => {
     // hulls as a second leg of `plan`, so no new phase name is ever written.
     await expect(db().prepare("UPDATE community_analysis_work SET phase='clusters'").run()).rejects.toThrow();
     await expect(db().prepare("UPDATE community_analysis_work SET phase='endpoints'").run()).resolves.toBeDefined();
-    // The rebuild carried the column 0052 added rather than resetting it.
+    // The parent is never rebuilt, so the column 0052 added is untouched.
     expect(await db().prepare("SELECT reader_policy FROM community_analysis_work").first("reader_policy"))
       .toBe("raw-source-pages-1");
   });
@@ -181,28 +181,69 @@ describe("acquisition vocabulary schema", () => {
     throw new Error("sweep did not finish");
   });
 
-  it("keeps the current withdrawal trigger body across the rebuild", async () => {
-    // 0062 rebuilds the model-history work table, so it must restore the
-    // trigger as 0059 left it, not as 0048 wrote it. Without 0059's
-    // `owner_kind='social'` predicate, any accountless owner's state change
-    // would wipe every derived composition day.
-    const day = async () => db().prepare(`INSERT OR REPLACE INTO community_model_composition_days
-      (day,payload_json,computed_at,history_method_version) VALUES ('2026-09-05','{}',?, 'synthetic-history-1')`)
-      .bind(NOW).run();
-    const days = () => db().prepare("SELECT count(*) n FROM community_model_composition_days").first("n");
-    // `state` admits only `active` and `deleting`; a deleting row needs a session.
-    const flip = (id: string) => db().prepare(
-      "UPDATE participants SET state='deleting',deletion_session_id=? WHERE id=?").bind(`session:${id}`, id).run();
-    await db().prepare(`INSERT INTO participants (id,access_token_id,access_token_hash,recovery_token_id,
-      recovery_token_hash,state,consent_version,consented_at,created_at,owner_kind)
-      VALUES (?,NULL,NULL,NULL,NULL,'active',NULL,NULL,?,'accountless')`)
-      .bind("participant-accountless", NOW).run();
-    await day();
-    await flip("participant-accountless");
-    expect(await days()).toBe(1);
-    // A social owner's state change still clears the derived series.
-    await flip(IDENTITY.participantId);
-    expect(await days()).toBe(0);
+  it("rebuilds only the part tables and leaves every other object untouched", async () => {
+    // 0062 rebuilds the two `*_parts` tables and nothing else. The databases
+    // this chain runs against do not all carry the same objects -- the typed
+    // upload database has no `community_model_history_participant_state`
+    // trigger -- so the migration must neither drop nor recreate anything on
+    // `participants`, and the parents it never rebuilds keep `reader_policy`
+    // and every other later column by construction rather than by a copy list.
+    const all = (env as TestBindings).TEST_MIGRATIONS;
+    const index = all.findIndex((entry) => entry.name.startsWith("0062"));
+    expect(index).toBeGreaterThan(0);
+    await reset();
+    await applyD1Migrations(db(), all.slice(0, index));
+    await participant();
+    const head = await saved(await begin());
+    const stage = (table: string, runId: string) => db().prepare(`INSERT INTO ${table}
+      (participant_id,run_id,stage_id,base_progress_revision,stage_revision,mode,target_phase,
+       target_control_json,target_manifest_json,write_manifest_json,target_state_sha256,replay_json,
+       write_offset,verified_offset,gc_component,gc_sha256,discard_input_revision,state_sha256)
+      VALUES (?,?,'synthetic-stage',0,0,'writing','plan','{}','[]','[]',?,'{}',0,0,'','',NULL,?)`)
+      .bind(IDENTITY.participantId, runId, "c".repeat(64), "d".repeat(64)).run();
+    await stage("community_analysis_work_stage", head.runId);
+    // The model-history family is rebuilt by the same migration, so it carries
+    // a parent, a part and a stage row across it too.
+    await db().prepare(`INSERT INTO community_model_history_work (participant_id,run_id,input_revision,
+      input_fingerprint,source_kind,source_method_version,fixed_now,observed_at_cutoff,resets_at_cutoff,
+      window_minutes,max_quota_rows,phase,progress_revision,control_json,manifest_json,state_sha256)
+      VALUES (?,'synthetic-history-run',0,?,'v1','synthetic-history-1',?,?,?,10080,60000,'plan',0,'{}','[]',?)`)
+      .bind(IDENTITY.participantId, "a".repeat(64), NOW, IDENTITY.observedAtCutoff,
+        IDENTITY.resetsAtCutoff, "b".repeat(64)).run();
+    await db().prepare(`INSERT INTO community_model_history_work_parts
+      (participant_id,run_id,component,payload_json,payload_sha256,payload_bytes)
+      VALUES (?,'synthetic-history-run','plan-anchors','[]',?,2)`)
+      .bind(IDENTITY.participantId, "e".repeat(64)).run();
+    await stage("community_model_history_work_stage", "synthetic-history-run");
+    const rows = async (sql: string) => (await db().prepare(sql).all()).results;
+    const snapshot = async () => ({
+      participantTriggers: await rows(`SELECT name,sql FROM sqlite_master
+        WHERE type='trigger' AND tbl_name='participants' ORDER BY name`),
+      analysisWork: await rows("SELECT * FROM community_analysis_work ORDER BY run_id"),
+      analysisStage: await rows("SELECT * FROM community_analysis_work_stage ORDER BY run_id"),
+      analysisParts: await payloads(),
+      historyWork: await rows("SELECT * FROM community_model_history_work ORDER BY run_id"),
+      historyStage: await rows("SELECT * FROM community_model_history_work_stage ORDER BY run_id"),
+      historyParts: await rows(`SELECT component,payload_sha256 FROM community_model_history_work_parts
+        ORDER BY component,payload_sha256`),
+    });
+    const before = await snapshot();
+    expect(before.participantTriggers.length).toBeGreaterThan(0);
+    await applyD1Migrations(db(), all.slice(index, index + 1));
+    // Same triggers on `participants`, same parent rows, same stage rows, same
+    // parts -- the only difference is the vocabulary the part tables accept.
+    expect(await snapshot()).toEqual(before);
+    const insert = (component: string, key: string) => db().prepare(`INSERT INTO community_analysis_work_parts
+      (participant_id,run_id,component,payload_json,payload_sha256,payload_bytes) VALUES (?,?,?,'[]',?,2)`)
+      .bind(IDENTITY.participantId, head.runId, component, key.repeat(64)).run();
+    await expect(insert("reset-clusters", "1")).resolves.toBeDefined();
+    await expect(insert("endpoint-holds", "2")).resolves.toBeDefined();
+    await expect(insert("pool-hulls", "3")).rejects.toThrow();
+    // Dropping a table drops its triggers, so both rebuilds restored theirs.
+    await expect(db().prepare("UPDATE community_analysis_work_parts SET payload_bytes=2").run())
+      .rejects.toThrow();
+    await expect(db().prepare("UPDATE community_model_history_work_parts SET payload_bytes=2").run())
+      .rejects.toThrow();
   });
 });
 

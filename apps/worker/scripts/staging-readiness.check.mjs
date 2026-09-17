@@ -236,7 +236,7 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0058_accountless_upload_ownership.sql": "b435fd92d41e7ce8067cc183d7ac153359a9c130a971cba2e1b8b8c1c9cab61b",
     "0059_accountless_upload_renewal.sql": "98afb99dd91e56a96960e6d99096e44c41eec0cd52d5a1e2969dea4ddee3d312",
     "0061_accountless_history_retention.sql": "0d6d9d23390770aab5c2cb9b1bbb27586ed72b9921a420468efb05ee225435d6",
-    "0062_v1_acquisition_vocabulary.sql": "737851c99752b41fbbcc878e9855f139755bef8986e47753defb2c40c7df3ad4",
+    "0062_v1_acquisition_vocabulary.sql": "50efab3fcea61ea4a425c4a88c57364a35bd2095d8bb748acebf5bff228df66b",
   };
   const legacyDigests = {
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
