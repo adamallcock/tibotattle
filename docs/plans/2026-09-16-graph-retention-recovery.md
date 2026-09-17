@@ -290,3 +290,17 @@ the new method. Rule going forward: before bumping any analysis constant,
 print the live `method` column (or `STORAGE_GRAPH_METHOD`) and confirm the
 constant is absent from it; if it is present, the change is a full-corpus
 recompute and must be scheduled as one.
+
+Migration 0062 was then reduced to the two part tables (commit `84cbee7a`):
+the typed upload database carries no `community_model_history_participant_state`
+trigger, so the earlier whole-family rebuild would have failed on its
+unconditional drop and, made conditional, would have added a composition-day
+deletion the typed schema deliberately lacks. It was applied to the production
+upload database on 2026-09-17 at 10:43 UTC through the `d1_storage_migrations`
+ledger with a time-travel bookmark recorded first; the readback shows both part
+tables widened, no carry tables, both immutability triggers, and the
+participants trigger set unchanged. The upload Worker was redeployed at 10:44
+UTC as version 974df1b1 from the same commit so that its admin readers, which
+filter previews and publications by their own graph method string, agree with
+the analytics Worker; the public daily endpoint served 48 days with the
+allowance band `temporarily_unavailable` pending republication.
