@@ -1568,10 +1568,10 @@ NOT EXISTS (
 // The current public-source probes retain all unaffected 0059 contracts. Every replaced or
 // new object is checked separately against exact stored DDL in a third bounded
 // metadata query, including the eligibility view and withdrawal/bootstrap guards.
-function unaffectedPublicSourceProbe(objects, historicalSocialNames = []) {
+function unaffectedPublicSourceProbe(objects, historicalSocialNames = [], omittedNames = []) {
   const replacements = Object.keys(PUBLIC_SOURCE_SCHEMA_SQL);
   const remainingSocialNames = historicalSocialNames.filter(name => !replacements.includes(name));
-  return exactStoredSchemaProbe(objects, [...replacements, ...historicalSocialNames])
+  return exactStoredSchemaProbe(objects, [...replacements, ...historicalSocialNames, ...omittedNames])
     + (remainingSocialNames.length ? ` AND ${socialOwnerGatedTriggerProbe(remainingSocialNames)}` : "");
 }
 const publicSourceComponentProbe = (objects, socialNames, field) =>
@@ -1634,10 +1634,47 @@ export const accountlessHistoryRetentionSchemaComplete = row =>
 // Migration 0061 is part of the current attribution contract. Folding its
 // exact three-object proof into the existing bounded query keeps release and
 // live staging gates aligned without an extra remote round trip.
-export const CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL =
+export const ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL =
   PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL.replace(
     " AS attribution_objects,",
     ` AND (${exactStoredSchemaProbe(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL)}) AS attribution_objects,`,
+  );
+// Migration 0062 widens the component vocabulary of the two part tables and
+// changes nothing else: the parents, the stage tables and the immutable
+// triggers keep the definitions every earlier proof already pins, so only
+// these two objects carry a new expectation. Each earlier readiness proof
+// keeps its own pre-0062 text rather than being rewritten in place.
+const widenedPartVocabulary = (sql) => sql.replace(
+  "'plan-anchors', 'plan-runs', 'plan-equal-time', 'fit-stats', 'eligible', 'endpoint-runs', 'endpoints'",
+  "'plan-anchors', 'plan-runs', 'plan-equal-time', 'reset-clusters', 'fit-stats', 'eligible', "
+    + "'endpoint-runs', 'endpoint-holds', 'endpoints'");
+export const V1_ACQUISITION_VOCABULARY_SCHEMA_SQL = Object.freeze({
+  community_analysis_work_parts:
+    widenedPartVocabulary(CURRENT_ANALYSIS_WORK_SCHEMA_SQL.community_analysis_work_parts),
+  community_model_history_work_parts:
+    widenedPartVocabulary(CURRENT_MODEL_HISTORY_SCHEMA_SQL.community_model_history_work_parts),
+});
+export const V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(V1_ACQUISITION_VOCABULARY_SCHEMA_SQL)}
+  AS v1_acquisition_vocabulary_objects
+`;
+export const v1AcquisitionVocabularySchemaComplete = row =>
+  row?.v1_acquisition_vocabulary_objects === 1;
+// The two part tables move, so the work and history component probes drop them
+// and the widened pair is proved once, exactly, alongside them.
+const V1_VOCABULARY_REPLACED_NAMES = Object.keys(V1_ACQUISITION_VOCABULARY_SCHEMA_SQL);
+export const CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL = ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL
+  .replace(COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL, `
+SELECT ${exactStoredSchemaProbe(CURRENT_ANALYSIS_WORK_SCHEMA_SQL, V1_VOCABULARY_REPLACED_NAMES)} AS community_analysis_work_schema
+`)
+  .replace(
+    publicSourceComponentProbe(CURRENT_MODEL_HISTORY_SCHEMA_SQL,
+      ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history, "community_model_history_schema"),
+    `SELECT ${unaffectedPublicSourceProbe(CURRENT_MODEL_HISTORY_SCHEMA_SQL,
+      ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history, V1_VOCABULARY_REPLACED_NAMES)} AS community_model_history_schema`)
+  .replace(
+    " AS attribution_objects,",
+    ` AND (${exactStoredSchemaProbe(V1_ACQUISITION_VOCABULARY_SCHEMA_SQL)}) AS attribution_objects,`,
   );
 export const CURRENT_SCALE_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL.replace(
   exactStoredSchemaProbe(SCALE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale)

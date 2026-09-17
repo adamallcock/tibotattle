@@ -340,7 +340,7 @@ test("fixed scale admission rejects unknown profiles, override dimensions and wr
   assert.equal(historical.migrations.USAGE_MONITOR_DB.pending.length, 3);
   assert.equal(historical.migrations.USAGE_MONITOR_DB.pending.at(-1).name, LOCAL_SCALE_PROFILE.throughMigration);
   const current = await inspectMigrationPrefix({ prefix: p });
-  assert.equal(current.migrations.USAGE_MONITOR_DB.pending.at(-1).name, "0061_accountless_history_retention.sql");
+  assert.equal(current.migrations.USAGE_MONITOR_DB.pending.at(-1).name, "0062_v1_acquisition_vocabulary.sql");
   assert.deepEqual(historical.migrations.DELETION_LEDGER.pending, []);
   assert.deepEqual(current.migrations.DELETION_LEDGER.pending.map(row => row.name), ["0003_storage_erasure_jobs.sql"]);
   await assert.rejects(inspectMigrationPrefix({ prefix: p, throughMigration: "0058_accountless_upload_ownership.sql" }), /REHEARSAL_TARGET_INVALID/);

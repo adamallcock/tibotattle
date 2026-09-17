@@ -6,9 +6,13 @@ import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import {
+  ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL,
   ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL,
   ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL,
   accountlessHistoryRetentionSchemaComplete,
+  V1_ACQUISITION_VOCABULARY_SCHEMA_SQL,
+  V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL,
+  v1AcquisitionVocabularySchemaComplete,
   assessStagingConfiguration,
   ATTRIBUTION_SCHEMA_COLUMNS,
   ATTRIBUTION_SCHEMA_OBJECTS,
@@ -2400,7 +2404,11 @@ test("current 0061 readiness binds the exact history-retention table and guards"
     assert.equal(accountlessHistoryRetentionSchemaComplete(
       database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
     ), true);
-    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    // 0061 completes its own point in the chain; the current contract needs 0062 too.
+    assert.equal(attributionSchemaComplete(
+      database.prepare(ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL).get(),
+    ), true);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
     for (const [name, sql] of Object.entries(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL)) {
       const type = /^CREATE (TABLE|TRIGGER)/u.exec(sql)[1];
       database.exec(`SAVEPOINT altered_history_retention; DROP ${type} ${name};`);
@@ -2414,12 +2422,76 @@ test("current 0061 readiness binds the exact history-retention table and guards"
       assert.equal(accountlessHistoryRetentionSchemaComplete(
         database.prepare(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL).get(),
       ), false, `altered ${name}`);
-      assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+      assert.equal(attributionSchemaComplete(
+        database.prepare(ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL).get(),
+      ), false);
       database.exec("ROLLBACK TO altered_history_retention; RELEASE altered_history_retention;");
     }
     for (const row of [undefined, {}, { accountless_history_retention_objects: true },
       { accountless_history_retention_objects: 0 }]) {
       assert.equal(accountlessHistoryRetentionSchemaComplete(row), false);
+    }
+  } finally { database.close(); }
+});
+
+test("current 0062 readiness binds the exact widened part vocabularies", async () => {
+  const { unstable_splitSqlQuery } = await import("wrangler");
+  const database = new DatabaseSync(":memory:");
+  try {
+    const snapshot = () => Object.fromEntries(database.prepare(
+      "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
+    ).all().map(({ name, sql }) => [name, sql]));
+    // Everything before the migration under test, named rather than counted so
+    // a later migration does not silently change what this applies.
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0,
+      EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.indexOf("0062_v1_acquisition_vocabulary.sql"))) {
+      const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
+      database.exec(name.startsWith("0058_") ? `BEGIN;${sql}COMMIT;` : sql);
+    }
+    const before = snapshot();
+    assert.equal(v1AcquisitionVocabularySchemaComplete(
+      database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+    ), false);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    for (const sql of unstable_splitSqlQuery(readFileSync(
+      join(workerDirectory, "migrations", "0062_v1_acquisition_vocabulary.sql"), "utf8",
+    ))) database.exec(sql);
+    // The two part tables are the only objects whose definition moves: the
+    // parents, the stage tables and both immutable triggers come back byte for
+    // byte, and nothing on `participants` is touched at all.
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)),
+      V1_ACQUISITION_VOCABULARY_SCHEMA_SQL,
+    );
+    assert.deepEqual(Object.keys(before).sort(), Object.keys(snapshot()).sort());
+    assert.ok(Buffer.byteLength(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL) < 100_000,
+      "one bounded metadata query");
+    assert.equal(v1AcquisitionVocabularySchemaComplete(
+      database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+    ), true);
+    assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    // A part table that is missing, narrowed back, or widened further fails.
+    for (const [name, sql] of Object.entries(V1_ACQUISITION_VOCABULARY_SCHEMA_SQL)) {
+      database.exec(`SAVEPOINT altered_vocabulary; DROP TABLE ${name};`);
+      assert.equal(v1AcquisitionVocabularySchemaComplete(
+        database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+      ), false, `missing ${name}`);
+      database.exec(before[name]);
+      assert.equal(v1AcquisitionVocabularySchemaComplete(
+        database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+      ), false, `narrowed ${name}`);
+      assert.equal(attributionSchemaComplete(database.prepare(CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+      database.exec("ROLLBACK TO altered_vocabulary; RELEASE altered_vocabulary;");
+      database.exec(`SAVEPOINT widened_vocabulary; DROP TABLE ${name};`);
+      database.exec(sql.replace("'endpoints'", "'endpoints', 'invented'"));
+      assert.equal(v1AcquisitionVocabularySchemaComplete(
+        database.prepare(V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL).get(),
+      ), false, `widened ${name}`);
+      database.exec("ROLLBACK TO widened_vocabulary; RELEASE widened_vocabulary;");
+    }
+    for (const row of [undefined, {}, { v1_acquisition_vocabulary_objects: true },
+      { v1_acquisition_vocabulary_objects: 0 }]) {
+      assert.equal(v1AcquisitionVocabularySchemaComplete(row), false);
     }
   } finally { database.close(); }
 });
