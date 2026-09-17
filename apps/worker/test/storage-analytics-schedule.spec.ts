@@ -1,6 +1,6 @@
 import { beforeEach,afterEach,describe,expect,it,vi } from 'vitest';
 import { runStorageAnalyticsPass } from '../src/storage-analytics-runtime';
-import { runStorageAnalyticsSchedule,STORAGE_ANALYTICS_LONG_CRON,STORAGE_ANALYTICS_MINUTE_CRON,
+import { runStorageAnalyticsSchedule,STORAGE_ANALYTICS_LONG_PASS_MINUTES,STORAGE_ANALYTICS_MINUTE_CRON,
  type StorageAnalyticsWorkerEnv } from '../src/storage-analytics-worker';
 vi.mock('../src/storage-analytics-runtime',()=>({runStorageAnalyticsPass:vi.fn()}));
 const pass=vi.mocked(runStorageAnalyticsPass);
@@ -13,17 +13,20 @@ function database():D1Database {
 function environment():StorageAnalyticsWorkerEnv{return {STORAGE_ANALYTICS_MODE:'enabled',PUBLIC_ANALYTICS_MODE:'enabled',
  STORAGE_SOURCE_ID:'synthetic-source',TELEMETRY_STORAGE_NAMESPACE:'synthetic-namespace',STORAGE_INGESTION_DB:database(),
  STORAGE_ANALYTICS_DB:database(),DELETION_LEDGER:database()};}
-beforeEach(()=>{vi.useFakeTimers();vi.setSystemTime(1000);pass.mockReset();log.mockReset();errorLog.mockReset();
+/** A fixed synthetic instant. Its UTC minute is not a multiple of ten, so an
+ * invocation that names no minute runs the ordinary two-phase pass. */
+const at=(minute:number)=>Date.UTC(2026,8,17,1,minute,0),NOW=at(7);
+beforeEach(()=>{vi.useFakeTimers();vi.setSystemTime(NOW);pass.mockReset();log.mockReset();errorLog.mockReset();
  vi.spyOn(console,'log').mockImplementation(log);vi.spyOn(console,'error').mockImplementation(errorLog);});
 afterEach(()=>{vi.restoreAllMocks();vi.useRealTimers();});
 describe('ordered ingestion before public analytics',()=>{
  it('reserves delivery time, then uses only the remaining invocation query budget',async()=>{
   pass.mockImplementationOnce(async options=>{
-   expect(options).toMatchObject({publishCommunity:false,maxSteps:32,maxQueries:175,deadlineMs:11000});
+   expect(options).toMatchObject({publishCommunity:false,maxSteps:32,maxQueries:175,deadlineMs:NOW+10_000});
    for(let i=0;i<175;i++)await options.source.prepare('SELECT 1').run();
    return {...result,steps:16,recordsRead:3200,queriesUsed:175};
   }).mockImplementationOnce(async options=>{
-   expect(options).toMatchObject({publishCommunity:true,publicOnly:true,maxSteps:32,maxQueries:725,deadlineMs:56000});
+   expect(options).toMatchObject({publishCommunity:true,publicOnly:true,maxSteps:32,maxQueries:725,deadlineMs:NOW+55_000});
    await options.target.prepare('SELECT 1').run();
    return {...result,steps:2,recordsRead:0,queriesUsed:1,graphCalculations:1};
   });
@@ -39,16 +42,16 @@ describe('ordered ingestion before public analytics',()=>{
   expect(pass).toHaveBeenCalledTimes(1);
  });
  it('does not start another phase when an in-flight query overran the overall deadline',async()=>{
-  pass.mockImplementationOnce(async()=>{vi.setSystemTime(57000);return {...result,state:'deferred',reason:'deadline'};});
+  pass.mockImplementationOnce(async()=>{vi.setSystemTime(NOW+57_000);return {...result,state:'deferred',reason:'deadline'};});
   await runStorageAnalyticsSchedule(environment());
   expect(pass).toHaveBeenCalledTimes(1);
   expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({state:'deferred',reason:'deadline',
    deliverySteps:1,deliveryRecordsRead:0,deliveryQueriesUsed:0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0});
  });
   it('does not extend the shared deadline after slow delivery',async()=>{
-  pass.mockImplementationOnce(async()=>{vi.setSystemTime(42000);return result;})
+  pass.mockImplementationOnce(async()=>{vi.setSystemTime(NOW+41_000);return result;})
    .mockImplementationOnce(async options=>{
-    expect(options.deadlineMs).toBe(56000);
+    expect(options.deadlineMs).toBe(NOW+55_000);
     expect(options.deadlineMs!-Date.now()).toBe(14000);
     expect(options).toMatchObject({publishCommunity:true,publicOnly:true});
     return result;
@@ -60,7 +63,7 @@ describe('ordered ingestion before public analytics',()=>{
   pass.mockResolvedValue(result);
   await runStorageAnalyticsSchedule({...environment(),PUBLIC_ANALYTICS_MODE:'disabled'});
   expect(pass).toHaveBeenCalledTimes(1);
-  expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:900,deadlineMs:21000});
+  expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:900,deadlineMs:NOW+20_000});
   expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({deliverySteps:1,deliveryRecordsRead:0,
    deliveryQueriesUsed:0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0});
  });
@@ -69,62 +72,90 @@ describe('ordered ingestion before public analytics',()=>{
   expect(pass).not.toHaveBeenCalled();
  });
 });
-describe('long graph-only schedule',()=>{
- it('runs one graph-only pass with its own window and claim lease, and no delivery phase',async()=>{
-  pass.mockImplementationOnce(async options=>{
-   expect(options).toMatchObject({publishCommunity:true,publicOnly:true,graphOnly:true,maxSteps:32,maxQueries:900,
-    deadlineMs:1000+9*60_000,graphLeaseMs:12*60_000});
-   // Ordered delivery, erasure and the daily lane stay on the minute schedule.
-   expect(options.ledger).toBeUndefined();
-   await options.target.prepare('SELECT 1').run();
-   return {...result,steps:4,recordsRead:0,queriesUsed:7,graphCalculations:2};
-  });
-  await runStorageAnalyticsSchedule(environment(),{cron:STORAGE_ANALYTICS_LONG_CRON});
-  expect(pass).toHaveBeenCalledTimes(1);
-  const logged=JSON.parse(log.mock.calls[0]![0] as string);
-  // The log reports the invocation's own measured statements, not the claim.
-  expect(logged).toMatchObject({event:'storage_analytics_long_schedule',state:'progress',reason:'step_limit',
-   steps:4,queriesUsed:1,dailyPublications:0,graphCalculations:2});
-  expect(logged.deliverySteps).toBeUndefined();
-  expect(log).toHaveBeenCalledTimes(1);
+describe('long graph-only pass on the single minute schedule',()=>{
+ const deliveryPhase=(spend:number)=>async(options:Parameters<typeof runStorageAnalyticsPass>[0])=>{
+  expect(options).toMatchObject({publishCommunity:false,maxSteps:32,maxQueries:175,deadlineMs:Date.now()+10_000});
+  for(let i=0;i<spend;i++)await options.source.prepare('SELECT 1').run();
+  return {...result,steps:2,recordsRead:64,queriesUsed:spend};
+ };
+ it('gives every tenth UTC minute the long window, after the same bounded delivery phase',async()=>{
+  for(const minute of [0,10,20,30,40,50]) {
+   pass.mockReset();log.mockReset();vi.setSystemTime(at(minute));
+   pass.mockImplementationOnce(deliveryPhase(5)).mockImplementationOnce(async options=>{
+    expect(options).toMatchObject({publishCommunity:true,publicOnly:true,graphOnly:true,maxSteps:32,
+     maxQueries:895,deadlineMs:at(minute)+9*60_000,graphLeaseMs:12*60_000});
+    await options.target.prepare('SELECT 1').run();
+    return {...result,steps:3,queriesUsed:99,graphCalculations:1};
+   });
+   await runStorageAnalyticsSchedule(environment(),{cron:STORAGE_ANALYTICS_MINUTE_CRON,nowMs:at(minute)});
+   expect(pass).toHaveBeenCalledTimes(2);
+   // One invocation, one meter: the long phase receives what delivery left.
+   expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({event:'storage_analytics_long_schedule',
+    state:'progress',reason:'step_limit',steps:5,deliverySteps:2,deliveryRecordsRead:64,deliveryQueriesUsed:5,
+    publicIterations:3,queriesUsed:6,graphCalculations:1,dailyPublications:0});
+  }
  });
- it('leaves the minute cron and an unnamed cron on the two-phase pass',async()=>{
+ it('keeps every other minute on the two-phase pass',async()=>{
+  for(const minute of [1,7,9,11,59]) {
+   pass.mockReset();log.mockReset();vi.setSystemTime(at(minute));pass.mockResolvedValue(result);
+   await runStorageAnalyticsSchedule(environment(),{cron:STORAGE_ANALYTICS_MINUTE_CRON,nowMs:at(minute)});
+   expect(pass).toHaveBeenCalledTimes(2);
+   expect(pass.mock.calls[1]![0]).toMatchObject({publishCommunity:true,publicOnly:true,deadlineMs:at(minute)+55_000});
+   expect(pass.mock.calls[1]![0]!.graphOnly).toBeUndefined();
+   expect(pass.mock.calls[1]![0]!.graphLeaseMs).toBeUndefined();
+   expect(JSON.parse(log.mock.calls[0]![0] as string).event).toBe('storage_analytics_schedule');
+  }
+ });
+ it('selects the pass from the scheduled minute and never from the delivered expression',async()=>{
+  // Overlapping triggers are coalesced into one invocation, so the expression
+  // the platform reports cannot decide which pass runs.
   pass.mockResolvedValue(result);
-  await runStorageAnalyticsSchedule(environment(),{cron:STORAGE_ANALYTICS_MINUTE_CRON});
+  vi.setSystemTime(at(20));
+  await runStorageAnalyticsSchedule(environment(),{cron:'*/10 * * * *',nowMs:at(7)});
+  expect(pass.mock.calls[1]![0]!.graphOnly).toBeUndefined();
+  expect(JSON.parse(log.mock.calls[0]![0] as string).event).toBe('storage_analytics_schedule');
+  pass.mockReset();log.mockReset();pass.mockResolvedValue(result);
+  await runStorageAnalyticsSchedule(environment(),{cron:STORAGE_ANALYTICS_MINUTE_CRON,nowMs:at(20)});
+  expect(pass.mock.calls[1]![0]).toMatchObject({graphOnly:true,graphLeaseMs:12*60_000});
+  expect(JSON.parse(log.mock.calls[0]![0] as string).event).toBe('storage_analytics_long_schedule');
+  // With no named instant the invocation's own clock decides.
+  pass.mockReset();log.mockReset();pass.mockResolvedValue(result);
   await runStorageAnalyticsSchedule(environment());
-  expect(pass).toHaveBeenCalledTimes(4);
-  for(const call of pass.mock.calls)expect(call[0]!.graphOnly).toBeUndefined();
-  expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:175,deadlineMs:11000});
-  expect(pass.mock.calls[1]![0]).toMatchObject({publishCommunity:true,publicOnly:true,deadlineMs:56000});
-  for(const call of log.mock.calls)expect(JSON.parse(call[0] as string).event).toBe('storage_analytics_schedule');
+  expect(pass.mock.calls[1]![0]).toMatchObject({graphOnly:true});
+  expect(STORAGE_ANALYTICS_LONG_PASS_MINUTES).toBe(10);
+ });
+ it('stays on the bounded pass at a tenth minute when publication is deployed off',async()=>{
+  vi.setSystemTime(at(30));pass.mockResolvedValue(result);
+  await runStorageAnalyticsSchedule({...environment(),PUBLIC_ANALYTICS_MODE:'disabled'},
+   {cron:STORAGE_ANALYTICS_MINUTE_CRON,nowMs:at(30)});
+  expect(pass).toHaveBeenCalledTimes(1);
+  expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:900,deadlineMs:at(30)+20_000});
+  expect(pass.mock.calls[0]![0]!.graphOnly).toBeUndefined();
+  expect(JSON.parse(log.mock.calls[0]![0] as string).event).toBe('storage_analytics_schedule');
  });
  it('does no long work when the scheduler is disabled',async()=>{
-  await runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:'disabled'},{cron:STORAGE_ANALYTICS_LONG_CRON});
+  vi.setSystemTime(at(0));
+  await runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:'disabled'},{nowMs:at(0)});
   expect(pass).not.toHaveBeenCalled();expect(log).not.toHaveBeenCalled();
  });
- it('does no long work when public analytics is deployed off',async()=>{
-  await runStorageAnalyticsSchedule({...environment(),PUBLIC_ANALYTICS_MODE:'disabled'},{cron:STORAGE_ANALYTICS_LONG_CRON});
-  expect(pass).not.toHaveBeenCalled();expect(log).not.toHaveBeenCalled();
- });
- it('refuses an incomplete binding configuration on the long cron',async()=>{
-  await expect(runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:'enabled',PUBLIC_ANALYTICS_MODE:'enabled'},
-   {cron:STORAGE_ANALYTICS_LONG_CRON})).rejects.toThrow('STORAGE_ANALYTICS_CONFIGURATION_INVALID');
-  expect(pass).not.toHaveBeenCalled();
- });
- it('refuses a cron that is not a string before any database work',async()=>{
-  await expect(runStorageAnalyticsSchedule(environment(),{cron:600 as unknown as string}))
-   .rejects.toThrow('STORAGE_ANALYTICS_CONFIGURATION_INVALID');
+ it('refuses a cron or a scheduled instant of the wrong shape before any database work',async()=>{
+  for(const invalid of [{cron:600 as unknown as string},{nowMs:'2026-09-17' as unknown as number},
+   {nowMs:1.5},{nowMs:-1}]) {
+   await expect(runStorageAnalyticsSchedule(environment(),invalid))
+    .rejects.toThrow('STORAGE_ANALYTICS_CONFIGURATION_INVALID');
+  }
   expect(pass).not.toHaveBeenCalled();expect(log).not.toHaveBeenCalled();expect(errorLog).not.toHaveBeenCalled();
  });
  it('reports a long-pass failure as a closed code and never as a provider message',async()=>{
-  pass.mockRejectedValueOnce(new Error('STORAGE_GRAPH_WORK_UNAVAILABLE'));
-  await expect(runStorageAnalyticsSchedule(environment(),{cron:STORAGE_ANALYTICS_LONG_CRON}))
+  vi.setSystemTime(at(40));
+  pass.mockImplementationOnce(deliveryPhase(0)).mockRejectedValueOnce(new Error('STORAGE_GRAPH_WORK_UNAVAILABLE'));
+  await expect(runStorageAnalyticsSchedule(environment(),{nowMs:at(40)}))
    .rejects.toThrow('STORAGE_ANALYTICS_UNAVAILABLE');
   expect(JSON.parse(errorLog.mock.calls[0]![0] as string))
    .toEqual({event:'storage_analytics_long_schedule',state:'unavailable',code:'STORAGE_GRAPH_WORK_UNAVAILABLE'});
-  errorLog.mockReset();
-  pass.mockRejectedValueOnce(new Error('D1_ERROR: near "SELECT": owner_digest=0123'));
-  await expect(runStorageAnalyticsSchedule(environment(),{cron:STORAGE_ANALYTICS_LONG_CRON}))
+  errorLog.mockReset();pass.mockReset();
+  pass.mockImplementationOnce(deliveryPhase(0)).mockRejectedValueOnce(new Error('D1_ERROR: near "SELECT": owner_digest=0123'));
+  await expect(runStorageAnalyticsSchedule(environment(),{nowMs:at(40)}))
    .rejects.toThrow('STORAGE_ANALYTICS_UNAVAILABLE');
   const hidden=errorLog.mock.calls[0]![0] as string;
   expect(JSON.parse(hidden)).toEqual({event:'storage_analytics_long_schedule',state:'unavailable'});
