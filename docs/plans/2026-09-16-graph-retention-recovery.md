@@ -304,3 +304,16 @@ UTC as version 974df1b1 from the same commit so that its admin readers, which
 filter previews and publications by their own graph method string, agree with
 the analytics Worker; the public daily endpoint served 48 days with the
 allowance band `temporarily_unavailable` pending republication.
+
+## 2026-09-17 afternoon: admin console and release-check pins
+
+Migration 0062 also had to be pinned in five upload-Worker release checks
+(`5082ef68`); `npm run scripts:check` in `apps/worker` is the gate that
+catches a new migration and must run before any deploy that adds one. The
+admin console's "Graph reconstruction" panel showed "not recorded" and
+"unavailable" under typed storage because its reader returned nulls; it now
+returns schemaVersion 3 with a `graph` section and the page renders a
+"Graph rebuild" panel from it (`ddc611f2`), deployed as upload Worker
+version 55eeaa81 at 13:37 UTC. The live refusal picture it exposes: nine
+owners are refused on every day as `multi_plan_window_unsupported`, so only
+ten owners feed the graph.
