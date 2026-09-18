@@ -26,7 +26,8 @@ import { captureStorageGraphScope, computeStorageGraphResult, readStorageGraphRe
   STORAGE_GRAPH_METHOD,
   storageGraphV11SaveAffordable,STORAGE_GRAPH_V11_GROUP_QUERY_COSTS,STORAGE_GRAPH_V11_MAX_SAVE_BATCHES,
   STORAGE_GRAPH_V11_SINGLE_BATCH_PARTS,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,
-  STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD } from "../src/storage-community-graph";
+  STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD,
+  storageGraphV11CheckpointMethod } from "../src/storage-community-graph";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
@@ -483,6 +484,19 @@ describe("typed active-domain analytical reads",()=>{
     const modelScope=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'model',sourceId:namespace,sourceNamespace:namespace});
     expect(modelScope.checkpointDependencyDigest).toBe(fitScope.checkpointDependencyDigest);
     expect(STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).toBe(STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD);
+    // And the companion the deployment actually runs: with the fold ON the
+    // model metric drops the scalar half, so it must NOT land on the key a fits
+    // claim resumes. A scope captured under the deployed switch is the only
+    // place that can be proven, because the switch is a deployment value and
+    // not the module default this file otherwise runs under.
+    const foldedFit=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'fits',
+      sourceId:namespace,sourceNamespace:namespace,preparedFold:true});
+    const foldedModel=await captureStorageGraphScope(typed(),{owner,day:day(),metric:'model',
+      sourceId:namespace,sourceNamespace:namespace,preparedFold:true});
+    expect(foldedModel.checkpointDependencyDigest).not.toBe(foldedFit.checkpointDependencyDigest);
+    expect(foldedFit.checkpointDependencyDigest).not.toBe(fitScope.checkpointDependencyDigest);
+    expect(storageGraphV11CheckpointMethod('model',true))
+      .not.toBe(storageGraphV11CheckpointMethod('fits',true));
     const reads=observePreparedSql(typed());
     expect((await computeStorageGraphResult({...bindings,source:reads.database},modelScope,{maxQueries:900})).state).toBe('complete');
     expect(reads.queries.filter(sql=>sql.includes("stream='usage'")||sql.includes("stream = 'usage'"))).toHaveLength(0);

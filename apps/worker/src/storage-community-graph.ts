@@ -66,15 +66,45 @@ export function storageGraphV11CheckpointMethods(foldEnabled: boolean): {
     : STORAGE_GRAPH_V11_CHECKPOINT_METHOD;
   return { fits, model, live: [...new Set([fits, model])] };
 }
-const V11_CHECKPOINT_METHODS = storageGraphV11CheckpointMethods(STORAGE_V11_PREPARED_FOLD);
-export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD = V11_CHECKPOINT_METHODS.fits;
-export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD = V11_CHECKPOINT_METHODS.model;
+/** The method one metric's key is built with, under the fold configuration this
+ * caller actually runs. The fold is a DEPLOYMENT switch, so the namespace it
+ * governs must follow the same runtime value as the behaviour it governs: a
+ * reader that drops the scalar half while still naming the shared method would
+ * stage a model-only successor under the key a fits claim resumes. The scalar
+ * mode fence then fails that resume closed, and the finisher degrades a fits
+ * claim to `supported_quota_track_unavailable` under an unchanged result
+ * identity, publishing a refusal the evidence never made. Defaulting to the
+ * module constant keeps every caller that has no switch on the shared base. */
+export function storageGraphV11CheckpointMethod(metric: 'fits' | 'model',
+  foldEnabled: boolean = STORAGE_V11_PREPARED_FOLD): string {
+  const methods = storageGraphV11CheckpointMethods(foldEnabled);
+  return metric === 'fits' ? methods.fits : methods.model;
+}
+/** The method names under the MODULE DEFAULT configuration, for callers and
+ * tests that hold no deployment switch. Production readers must not use these:
+ * they name a namespace the deployment may have moved, which is the defect
+ * `storageGraphV11CheckpointMethod` exists to prevent. */
+export const STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD =
+  storageGraphV11CheckpointMethod('fits');
+export const STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD =
+  storageGraphV11CheckpointMethod('model');
+/** The v1.1 methods a `fits` claim can have staged work under, across both fold
+ * configurations. Retirement maps a stage's method back to its metric, and a
+ * stage written before a flag flip is still that metric's. */
+export const STORAGE_GRAPH_V11_FITS_CHECKPOINT_METHODS = Object.freeze([
+  storageGraphV11CheckpointMethods(false).fits, storageGraphV11CheckpointMethods(true).fits]);
 /** Every checkpoint method a live reader can build a key with. Retirement
  * reclaims any stage under another method on sight, so a new method must be
- * registered here before a reader starts writing under it. */
+ * registered here before a reader starts writing under it.
+ *
+ * BOTH fold configurations are registered, unconditionally. The switch can be
+ * thrown in either direction while stages are in flight, and the stages the
+ * other configuration wrote must age out through the ordinary result-backed
+ * path rather than be reclaimed on sight the moment the flag moves. */
 export const STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS = Object.freeze([
   STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD, STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
-  ...V11_CHECKPOINT_METHODS.live]);
+  ...new Set([...storageGraphV11CheckpointMethods(false).live,
+    ...storageGraphV11CheckpointMethods(true).live])]);
 // Execution-only revision for the single optimistic direct historical read.
 // This is deliberately absent from result/checkpoint identities: a reader fix
 // may reopen one direct attempt without changing the analysis semantics.
@@ -257,6 +287,7 @@ export async function storageGraphDependencyDigest(options:{
 async function storageGraphCheckpointDependencyDigest(options:{
  authority:Pick<StorageCommunityAuthority,'sourceId'|'sourceNamespace'>;ownerDigest:string;
  source:StorageGraphSource;metric:'fits'|'model';day:string;dependency:unknown;
+ preparedFold?:boolean;
 }):Promise<string>{
  const history=modelHistoryWindow(options.day);
  // Only v1.1 owners hold this key, so the acquisition version is always part
@@ -266,10 +297,12 @@ async function storageGraphCheckpointDependencyDigest(options:{
  // well as of the method, and neither metric can load the other's successor.
  return sha256Hex(canonicalJson([options.authority.sourceId,options.authority.sourceNamespace,
   options.ownerDigest,options.source,
-  // Gated on the same flag as the method, so the deploy is inert: while the
-  // fold is off the metrics run the identical reduction and keep sharing one
-  // successor, and only the fold's model-only mode makes them incompatible.
-  STORAGE_V11_PREPARED_FOLD
+  // Gated on the same flag as the method, and on the RUNTIME value of it: while
+  // the fold is off the metrics run the identical reduction and keep sharing one
+  // successor, and only the fold's model-only mode makes them incompatible. A
+  // digest that read the module constant here would keep the metrics sharing a
+  // key in exactly the deployed configuration that makes them incompatible.
+  (options.preparedFold??STORAGE_V11_PREPARED_FOLD)
     ?(options.metric==='fits'?'v11-usage:fits-1':'v11-usage:model-1'):'shared-v11-usage',
   history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency,
   V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]));
@@ -281,6 +314,9 @@ async function storageGraphCheckpointDependencyDigest(options:{
 export async function captureStorageGraphScope(sourceDb:D1Database, options:{
   owner:StorageCommunityOwner; day:string; metric:'fits'|'model';
   sourceId?:string; sourceNamespace?:string;
+  /** The pass's own fold switch. It names the checkpoint namespace this scope's
+   * work will be staged under, so it must be the value the compute will run. */
+  preparedFold?:boolean;
 }):Promise<StorageGraphScope> {
   const owner={...options.owner}, history=modelHistoryWindow(options.day);
   if(!owner.ownerDigest || !/^[a-f0-9]{64}$/.test(owner.ownerDigest)
@@ -319,7 +355,8 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
   const dependencyDigest=await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest,
     source,metric:options.metric,day:history.day,dependency});
   const checkpointDependencyDigest=source==='v1.1'?await storageGraphCheckpointDependencyDigest({authority,
-    ownerDigest:owner.ownerDigest,source,metric:options.metric,day:history.day,dependency}):dependencyDigest;
+    ownerDigest:owner.ownerDigest,source,metric:options.metric,day:history.day,dependency,
+    ...(options.preparedFold===undefined?{}:{preparedFold:options.preparedFold})}):dependencyDigest;
   if(!await storageCommunityCalculationAuthorityIsCurrent(sourceDb,authority))throw scopeChanged();
   return {authority,owner:owner as StorageGraphScope['owner'],source,pin:loaded.sourcePin,
     day:history.day,fixedNow:history.fixedNow,metric:options.metric,dependencyDigest,checkpointDependencyDigest};
@@ -331,6 +368,9 @@ export async function captureStorageGraphScope(sourceDb:D1Database, options:{
 export async function captureSelectedStorageGraphScope(sourceDb:D1Database,options:{
  owner:StorageCommunityOwner;day:string;metric:'fits'|'model';snapshot:V11GenerationSnapshot;
  ownerAuthorityEpoch:number;sourceId?:string;sourceNamespace?:string;
+ /** As `captureStorageGraphScope`. A recomputed scope must name the same
+  * namespace the envelope recorded, or the selection is correctly superseded. */
+ preparedFold?:boolean;
 }):Promise<StorageGraphScope>{
  const owner={...options.owner},history=modelHistoryWindow(options.day),snapshot=structuredClone(options.snapshot);
  if(!owner.ownerDigest||!/^[a-f0-9]{64}$/u.test(owner.ownerDigest)||!owner.hasV11
@@ -347,7 +387,8 @@ export async function captureSelectedStorageGraphScope(sourceDb:D1Database,optio
  const dependencyDigest=await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest,
   source:'v1.1',metric:options.metric,day:history.day,dependency:rows});
  const checkpointDependencyDigest=await storageGraphCheckpointDependencyDigest({authority,
-  ownerDigest:owner.ownerDigest,source:'v1.1',metric:options.metric,day:history.day,dependency:rows});
+  ownerDigest:owner.ownerDigest,source:'v1.1',metric:options.metric,day:history.day,dependency:rows,
+  ...(options.preparedFold===undefined?{}:{preparedFold:options.preparedFold})});
  const pin:V11SourcePin={source:'v1.1',participantId:snapshot.participantId,generationId:snapshot.generationId,
   fromDay:snapshot.fromDay,throughDay:snapshot.throughDay,inputRevision:snapshot.inputRevision,
   mutationEpoch:authority.sourceEpoch,fingerprint:snapshot.fingerprint};
@@ -500,7 +541,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     if(ownerReady!==1)return {state:'deferred',reason:'v11_owner_pending'};
     const key:StorageHistoryKey={sourceId:bindings.sourceId,sourceNamespace:bindings.sourceNamespace,
       ownerDigest:scope.owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
-      method:metric==='fits'?STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD:STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD};
+      method:storageGraphV11CheckpointMethod(metric,preparedFold)};
     let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageV11HistoryCheckpoint|undefined;
     let partCount:number|null=null;
     for(;;){

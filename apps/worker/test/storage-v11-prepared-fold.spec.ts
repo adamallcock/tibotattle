@@ -7,7 +7,8 @@ import {
 } from "../src/storage-history-checkpoint";
 import { createV11QuotaAcquisitionCheckpoint } from "../src/quota-analysis-v11-reader";
 import type { StorageV11HistoryCheckpoint } from "../src/storage-v11-history";
-import { STORAGE_V11_PREPARED_FOLD, storageV11FoldsPreparedDays } from "../src/storage-v11-history";
+import { STORAGE_V11_PREPARED_FOLD, storageV11FoldsPreparedDays,
+  storageV11PreparedFoldEnabled } from "../src/storage-v11-history";
 import {
   STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
   STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
@@ -16,7 +17,9 @@ import {
   STORAGE_GRAPH_V11_CHECKPOINT_METHOD,
   STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,
   STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD,
+  storageGraphV11CheckpointMethod,
   storageGraphV11CheckpointMethods,
+  STORAGE_GRAPH_V11_FITS_CHECKPOINT_METHODS,
 } from "../src/storage-community-graph";
 import { V11_QUOTA_ACQUISITION_VERSION } from "../src/quota-analysis-v11-reader";
 import {
@@ -68,15 +71,20 @@ describe("prepared-day fold identity boundary", () => {
     expect(on.fits).toBe(`${STORAGE_GRAPH_V11_CHECKPOINT_METHOD}:fits-1`);
     expect(on.model).toBe(`${STORAGE_GRAPH_V11_CHECKPOINT_METHOD}:model-1`);
     expect(on.live).toEqual([on.fits, on.model]);
-    // The live constants follow the flag, which is off.
+    // The module-default constants follow the module default, which is off.
+    // Production readers do not use them: the deployment switch names their
+    // namespace, and `storageGraphV11CheckpointMethod` is what reads it.
     expect(STORAGE_V11_PREPARED_FOLD).toBe(false);
     expect(STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD).toBe(off.fits);
     expect(STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD).toBe(off.model);
     // A reader may only build a key under a registered method; retirement
-    // reclaims anything else on sight.
+    // reclaims anything else on sight. BOTH configurations are registered,
+    // because the switch is a deployment value that can move in either
+    // direction while stages are in flight — registering only the current
+    // side would reclaim the other side's in-flight work the moment it moved.
     expect([...STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS]).toEqual([
       STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD, STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
-      STORAGE_GRAPH_V11_CHECKPOINT_METHOD]);
+      STORAGE_GRAPH_V11_CHECKPOINT_METHOD, on.fits, on.model]);
   });
 
   it("leaves every result identity the fold could have retired unchanged", () => {
@@ -196,5 +204,60 @@ describe("a fits claim and a model claim cannot read each other's successor", ()
     expect((await read(on.model)).status).toBe("ready");
     // And nothing is reachable under the shared base they split from.
     expect((await read(STORAGE_GRAPH_V11_CHECKPOINT_METHOD)).status).toBe("absent");
+  });
+});
+
+describe("the fold's namespace follows the same input as the fold's behaviour", () => {
+  it("splits the namespace exactly when the model metric drops the scalar half", () => {
+    // THE REGRESSION THIS FILE MISSED. Every other assertion here drives the
+    // rule with a literal argument and then checks the module constant, so a
+    // deployment that turns the fold on through the ENVIRONMENT satisfied all
+    // of them while running the one configuration none of them described:
+    // `scalarRequested` followed the runtime flag, the namespace followed the
+    // module default, and a model-only successor was staged under the key a
+    // fits claim resumes. The scalar-mode fence then failed that resume
+    // closed, and the finisher degraded the fits claim to a refusal under an
+    // unchanged result identity.
+    //
+    // So the invariant is stated over the two rules together: for ANY input,
+    // the namespace splits if and only if the metrics' reductions diverge.
+    const days = [] as unknown as readonly GraphDayProjection[];
+    for (const foldEnabled of [false, true]) {
+      const modelDropsScalar = storageV11FoldsPreparedDays(days, foldEnabled);
+      const namespacesSplit =
+        storageGraphV11CheckpointMethod("fits", foldEnabled)
+          !== storageGraphV11CheckpointMethod("model", foldEnabled);
+      expect(namespacesSplit).toBe(modelDropsScalar);
+    }
+  });
+
+  it("reads the deployment switch, not the module default", () => {
+    // The env value is the one production sets, so it is the one the namespace
+    // rule must be composed with.
+    expect(storageV11PreparedFoldEnabled({ GRAPH_DAY_PROJECTION_FOLD: "enabled" })).toBe(true);
+    expect(storageV11PreparedFoldEnabled({})).toBe(STORAGE_V11_PREPARED_FOLD);
+    const deployed = storageV11PreparedFoldEnabled({ GRAPH_DAY_PROJECTION_FOLD: "enabled" });
+    expect(storageGraphV11CheckpointMethod("fits", deployed))
+      .not.toBe(storageGraphV11CheckpointMethod("model", deployed));
+  });
+
+  it("keeps both configurations' methods live so a flip abandons no stage", () => {
+    // Retirement reclaims any stage under an unregistered method ON SIGHT. The
+    // switch can move in either direction while stages are in flight, so the
+    // methods of BOTH configurations stay registered and those stages age out
+    // through the ordinary result-backed path instead.
+    for (const foldEnabled of [false, true]) {
+      for (const metric of ["fits", "model"] as const) {
+        expect(STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS)
+          .toContain(storageGraphV11CheckpointMethod(metric, foldEnabled));
+      }
+    }
+    // And a fits stage written under either configuration is still a fits
+    // stage when retirement maps its method back to a metric.
+    expect([...STORAGE_GRAPH_V11_FITS_CHECKPOINT_METHODS].sort())
+      .toEqual([storageGraphV11CheckpointMethod("fits", false),
+        storageGraphV11CheckpointMethod("fits", true)].sort());
+    expect(STORAGE_GRAPH_V11_FITS_CHECKPOINT_METHODS)
+      .not.toContain(storageGraphV11CheckpointMethod("model", true));
   });
 });

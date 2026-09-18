@@ -1,11 +1,16 @@
 import { captureSelectedStorageGraphScope,captureStorageGraphScope,computeStorageGraphResult,
- STORAGE_GRAPH_METHOD,STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD,
+ STORAGE_GRAPH_METHOD,storageGraphV11CheckpointMethod,
  type StorageGraphScope } from './storage-community-graph';
-/** The same ternary the write site uses, so the durable envelope names the key
+import { STORAGE_V11_PREPARED_FOLD } from './storage-v11-history';
+/** The same rule the write site uses, so the durable envelope names the key
  * work is actually staged under rather than the namespace they were split
- * from — and so a fits envelope and a model envelope record different digests. */
-const v11CheckpointMethod=(metric:'fits'|'model'):string=>
- metric==='fits'?STORAGE_GRAPH_V11_FIT_CHECKPOINT_METHOD:STORAGE_GRAPH_V11_MODEL_CHECKPOINT_METHOD;
+ * from — and so a fits envelope and a model envelope record different digests.
+ *
+ * It takes this pass's own fold switch for the same reason the write site does:
+ * the namespace has to follow the configuration the compute will actually run
+ * in, not a module default the deployment has overridden. */
+const v11CheckpointMethod=(metric:'fits'|'model',preparedFold?:boolean):string=>
+ storageGraphV11CheckpointMethod(metric,preparedFold??STORAGE_V11_PREPARED_FOLD);
 import { readStorageCommunityOwnerPage, captureStorageCommunityAuthority,
  readStorageCommunityDeliveredTerminalEpoch, readStorageCommunitySourceTerminalEpoch,
  type StorageCommunityOwner } from './storage-community-authority';
@@ -174,7 +179,8 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  if(day===null)return {state:'idle'};
  if(!owner.ownerDigest)return {state:'deferred',metric,day,reason:'source_bootstrap_pending'};
  const capture=()=>withStorageGraphFailureStage('graph_scope',()=>captureStorageGraphScope(options.source,{owner,day,metric,
-  sourceId:options.sourceId,sourceNamespace:options.sourceNamespace}));
+  sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
+  ...(options.preparedFold===undefined?{}:{preparedFold:options.preparedFold})}));
  const captureLatest=async()=>{
   try{return await capture();}
   catch(error){
@@ -210,7 +216,7 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
    scope={...latest,snapshot,ownerAuthorityEpoch:authorityEpoch,owner:{...latest.owner,inputRevision:snapshot.inputRevision}};
    const checkpointKey:StorageHistoryKey={sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
     ownerDigest:owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
-    method:v11CheckpointMethod(metric)};
+    method:v11CheckpointMethod(metric,options.preparedFold)};
    const envelope:StorageGraphWorkEnvelope={version:1,source:'v1.1',sourceId:options.sourceId,
     sourceNamespace:options.sourceNamespace,ownerDigest:owner.ownerDigest,day:scope.day,metric,
     fixedNow:scope.fixedNow,dependencyDigest:scope.dependencyDigest,
@@ -238,10 +244,11 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   try{
    scope=await withStorageGraphFailureStage('graph_scope',()=>captureSelectedStorageGraphScope(options.source,{owner,day,metric,
     snapshot:selection!.envelope.snapshot,ownerAuthorityEpoch:selection!.envelope.targetAuthorityEpoch,
-    sourceId:options.sourceId,sourceNamespace:options.sourceNamespace}));
+    sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
+    ...(options.preparedFold===undefined?{}:{preparedFold:options.preparedFold})}));
    const checkpointKey:StorageHistoryKey={sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
     ownerDigest:owner.ownerDigest,day:scope.day,dependencyDigest:scope.checkpointDependencyDigest,
-    method:v11CheckpointMethod(scope.metric)};
+    method:v11CheckpointMethod(scope.metric,options.preparedFold)};
    const envelope=selection.envelope;
    superseded=envelope.day!==scope.day||envelope.metric!==scope.metric||envelope.fixedNow!==scope.fixedNow
     ||envelope.dependencyDigest!==scope.dependencyDigest
