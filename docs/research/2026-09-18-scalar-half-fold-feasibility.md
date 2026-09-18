@@ -51,16 +51,33 @@ Against the 120,000 ceiling, at the live 100-day window the three densest
 owners are 5.6x, 5.3x and 2.2x over. The plan's estimate of ~640,000 anchors
 for the heaviest owner was accurate (637,711 measured).
 
-Production agrees. `analytics_community_graph_results` for `metric='fits'`
-holds populated results for **18 owners** and an empty array for **2**.
+## CORRECTION — production does not show the refusal this predicts
 
-## What this means, stated carefully
+An earlier revision of this document concluded that the band excludes its
+densest contributors. **That was wrong, and production refutes it.**
 
-The allowance band is **not** uncomputable. It draws from the eighteen owners
-whose windows fit. What it does is **exclude the densest contributors**, which
-is a bias in the published number rather than an absence of one — and it
-excludes exactly the users whose allowance behaviour the band is most often
-asked to describe.
+Grouping `analytics_community_graph_results` by owner rather than by result:
+**18 of 19 owners produce populated fits**, and those 18 include all three
+owners held in the prepared store — including the densest, at 933,123 usage
+rows. Exactly one owner has never produced a fit, and it is not one of the
+dense ones. The live public band agrees: 17 participants and 40 fits on the
+most recent day.
+
+The earlier "2 owners empty" figure counted *results*, not owners; a single
+owner contributes both empty and populated results on different days.
+
+So the instant counts above are real, but the inference from them is not. The
+bucket count is evidently lower than the instant count in practice — candidates
+include the `eraKey === null` early return at `:1194`, which creates no bucket,
+and an effective window narrower than the nominal one. **The mechanism is
+unconfirmed and should not be cited until someone reaches it.** An independent
+attempt to drive the 100-day reduction offline could not reach it either: the
+read failed first with D1 error 7429 (CPU limit) at the third statement, before
+a single usage row was priced.
+
+The lesson is the one this repository already states: use direct runtime
+inspection to establish live state, and do not let a measured input stand in
+for an observed outcome.
 
 ## Does folding the scalar half help?
 
@@ -69,7 +86,7 @@ not on how the rows reaching it are read. A folded artifact would hand the
 reduction the same instants and refuse at the same point. Folding changes the
 statement cost of getting there, nothing else.
 
-And the statement cost it would save is no longer the binding constraint:
+And the statement cost it would save is not the binding constraint:
 
 - the model metric already folds, and its long pass now completes six
   calculations reading zero raw rows;
@@ -77,12 +94,14 @@ And the statement cost it would save is no longer the binding constraint:
   no `:fits-1` checkpoint stages are accumulating, which is what a fits claim
   struggling to finish inside a pass would look like.
 
-So the ~330 MB artifact would buy a saving on work that already finishes, for
-the owners who are not the problem, and would not move the two who are.
+So the ~330 MB artifact would buy a saving on work that already finishes — and
+with 18 of 19 owners producing fits today, there is no observed population it
+would rescue.
 
-## What would actually address the bias
+## If a ceiling refusal is ever observed
 
-Three levers, none free, and this is an owner decision:
+Three levers, none free, and this is an owner decision. None of them is
+warranted until the refusal is actually observed:
 
 1. **A shorter window for the fits metric only.** All four owners fit at seven
    days; owner 1 sits at 98% of the ceiling, so it is not comfortable. Note
@@ -100,6 +119,9 @@ Three levers, none free, and this is an owner decision:
 
 ## Recommendation
 
-Do not fold the scalar half. Treat the bucket ceiling as the real finding and
-decide the window-versus-ceiling-versus-grain trade on its own terms, with the
-bias above as the thing being bought.
+Do not fold the scalar half. It addresses no observed problem: the fits metric
+completes for 18 of 19 owners today, including the densest.
+
+Treat the instant counts as a standing hazard to revisit if a
+`reduced_usage_limit_exceeded` refusal is ever observed in production, not as
+evidence of one now.
