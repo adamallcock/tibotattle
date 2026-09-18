@@ -54,6 +54,18 @@ const GRAPH_DAY_PROJECTION_OPEN_QUERIES=250;
  * goes idle by itself once coverage is complete. This reserve is the ordinary
  * delivery and retirement headroom the pass needs whatever else happens. */
 const GRAPH_DAY_PROJECTION_OPEN_RESERVE=100;
+/** The long pass, while coverage is incomplete. The budget stopped binding once
+ * the slot was funded: a day costs about six source statements but each read
+ * takes roughly a second, so an eight-second slice one minute in five runs the
+ * job at a ~1.6% duty cycle — over a day for ~270 days of about six seconds
+ * each. The eight-minute graph-only pass is the only window with real clock in
+ * it. Six of those eight minutes at ~6s per day is ~60 days of clock, and the
+ * statement half admits 32, so a long pass prepares about 32 days and the whole
+ * backlog takes ~9 of them, roughly ninety minutes. The graph lane keeps the
+ * remaining two minutes, and when the selection finds no candidates this costs
+ * one statement and the long pass is exactly what it is today. */
+const GRAPH_DAY_PROJECTION_LONG_SLICE_MS=6*60_000;
+const GRAPH_DAY_PROJECTION_LONG_QUERIES=780,GRAPH_DAY_PROJECTION_LONG_DAYS=32;
 /** The lane's allowance covers BOTH databases. The build reads the source,
  * which the lane's own sub-meter does not wrap, so half the carve-out is
  * reserved for it explicitly; otherwise the build's pages, its snapshot
@@ -263,7 +275,8 @@ export interface StorageAnalyticsPass {
  reason:'complete'|'step_limit'|'deadline'|'query_budget'|'capacity'|'format_boundary';
 }
 export interface StorageGraphDayProjectionFields {
- opened:boolean;built:number;refused:number;skipped:number;candidates:number;
+ opened:boolean;slot:'opening'|'trailing'|'long';sliceMs:number|null;elapsedMs:number;
+ built:number;refused:number;skipped:number;candidates:number;
  sourceQueriesUsed:number;state:'idle'|'progress'|'deferred'|'failed';
  reason:'complete'|'deadline'|'query_budget'|'day_limit'|'not_admitted'|'lane_failure';
 }
@@ -304,6 +317,10 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  /** Pin the builder's opening slot instead of selecting it by wall-clock
   * minute. Tests use it; production lets the minute decide. */
  projectionLaneFirst?:boolean;
+ /** Let the builder take the bulk of the graph-only long pass while coverage is
+  * incomplete. Its own switch, revertible independently of the builder and the
+  * fold, and self-limiting: an empty selection costs one statement. */
+ graphDayProjectionLongPass?:boolean;
 }):Promise<StorageAnalyticsPass> {
  const maxSteps=options.maxSteps??8,deadlineMs=options.deadlineMs??Date.now()+20_000;
  if(!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||!Number.isFinite(deadlineMs)
@@ -326,7 +343,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    ||(options.graphDayProjectionBuild!==undefined&&typeof options.graphDayProjectionBuild!=='function')
    ||(options.graphDayProjectionFromDay!==undefined&&typeof options.graphDayProjectionFromDay!=='string')
    ||(options.foldGraphDayProjections!==undefined&&typeof options.foldGraphDayProjections!=='boolean')
-   ||(options.projectionLaneFirst!==undefined&&typeof options.projectionLaneFirst!=='boolean'))throw invalid();
+   ||(options.projectionLaneFirst!==undefined&&typeof options.projectionLaneFirst!=='boolean')
+   ||(options.graphDayProjectionLongPass!==undefined&&typeof options.graphDayProjectionLongPass!=='boolean'))throw invalid();
  const graphLaneFirst=options.graphLaneFirst??Math.floor(Date.now()/60_000)%2===1;
  const projectionLaneFirst=options.projectionLaneFirst
   ??Math.floor(Date.now()/60_000)%GRAPH_DAY_PROJECTION_OPEN_EVERY===GRAPH_DAY_PROJECTION_OPEN_MINUTE;
@@ -446,23 +464,32 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    // paths that must never depend on that switch keep it unconditional —
    // owner erasure, which is a privacy guarantee, and the capacity branch,
    // which must be able to reclaim space whatever the lane is doing.
-   const projectionLane=options.buildGraphDayProjections===true&&!options.graphOnly;
-   const retiredProjection=projectionLane
+   // The long-pass build is the one case where the lane runs in a graph-only
+   // pass. The bounded retirement sweep stays off there, as before.
+   const longPassBuild=options.graphOnly===true&&options.graphDayProjectionLongPass===true
+    &&options.buildGraphDayProjections===true;
+   const projectionLane=options.buildGraphDayProjections===true&&(!options.graphOnly||longPassBuild);
+   const retiredProjection=projectionLane&&!options.graphOnly
     ?await retireGraphDayProjectionPage(scoped.target,options.sourceId):idlePage;
    let publicIdle=true,graphRan=false;
    let projectionIdle=true,projectionRan=false;
-   const runProjectionLane=async(sliceMs:number|null):Promise<void>=>{
+   const runProjectionLane=async(slot:'opening'|'trailing'|'long'):Promise<void>=>{
+    const sliceMs=slot==='trailing'?null
+     :slot==='long'?GRAPH_DAY_PROJECTION_LONG_SLICE_MS:GRAPH_DAY_PROJECTION_OPEN_SLICE_MS;
     const build=options.graphDayProjectionBuild;
     if(!(projectionLane&&build&&!projectionExhausted&&!projectionRan&&Date.now()<deadlineMs))return;
     projectionRan=true;
     const opening=sliceMs!==null;
+    const startedMs=Date.now();
     // The trailing slot still reserves the graph lane's whole admission floor.
     // The opening slot reserves only the pass's ordinary headroom, which is the
     // explicit trade above: at most `GRAPH_DAY_PROJECTION_OPEN_QUERIES` and one
     // 8-second slice, one minute in five.
-    const floor=opening?GRAPH_DAY_PROJECTION_OPEN_RESERVE
+    const floor=slot==='long'?GRAPH_ONLY_ADMISSION_QUERIES
+     :opening?GRAPH_DAY_PROJECTION_OPEN_RESERVE
      :(graphRan?0:GRAPH_LANE_ADMISSION_QUERIES)+100;
-    const allowance=Math.min(opening?GRAPH_DAY_PROJECTION_OPEN_QUERIES:GRAPH_DAY_PROJECTION_LANE_QUERIES,
+    const allowance=Math.min(slot==='long'?GRAPH_DAY_PROJECTION_LONG_QUERIES
+      :opening?GRAPH_DAY_PROJECTION_OPEN_QUERIES:GRAPH_DAY_PROJECTION_LANE_QUERIES,
      Math.max(0,meter.remainingQueries-floor));
     // Both halves bind: a day costs `4 + maxWrites` target statements to write
     // and one reader scope, its pages and two fences to read. An even split
@@ -471,7 +498,12 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     const sourceQueries=allowance-targetQueries;
     // An opening slice needs enough window to be worth taking AND must leave
     // the rest to the other lanes; a trailing run takes whatever is left.
-    const required=sliceMs===null?5_000:sliceMs+5_000;
+    // The opening slot must leave the rest of a minute pass to the other lanes,
+    // so it asks for its whole slice plus their margin. The long slot is meant
+    // to take the bulk of its window, so it asks only to be worth starting; its
+    // own deadline below still caps it at the slice and never overruns the
+    // pass, which leaves the graph lane the remainder of the long window.
+    const required=slot==='long'||sliceMs===null?5_000:sliceMs+5_000;
     const laneDeadline=sliceMs===null?deadlineMs:Math.min(deadlineMs,Date.now()+sliceMs);
     if(targetQueries>=8&&sourceQueries>=8&&deadlineMs-Date.now()>=required){
      const laneMeter=createD1InvocationBudget(targetQueries);
@@ -479,12 +511,21 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
       const lane=await advanceGraphDayProjectionLane({target:laneMeter.wrap(scoped.target),
        sourceId:options.sourceId,build:build,deadlineMs:laneDeadline,sourceQueries,
        remainingQueries:laneMeter.remainingQueries,
-       ...(opening?{maxDays:GRAPH_DAY_PROJECTION_OPEN_DAYS}:{}),
+       ...(slot==='long'?{maxDays:GRAPH_DAY_PROJECTION_LONG_DAYS}
+        :opening?{maxDays:GRAPH_DAY_PROJECTION_OPEN_DAYS}:{}),
        ...(options.graphDayProjectionFromDay===undefined?{}:{fromDay:options.graphDayProjectionFromDay})});
       projectionIdle=lane.state==='idle';
-      graphDayProjection={opened:true,built:lane.built,refused:lane.refused,skipped:lane.skipped,
-       candidates:lane.candidates,sourceQueriesUsed:lane.sourceQueriesUsed,state:lane.state,
-       reason:lane.reason};
+      // A pass runs several iterations, so the counters ACCUMULATE. Reporting
+      // only the last one hides the work: a pass that built its whole selection
+      // in the first iteration then reports zero candidates from the second.
+      graphDayProjection={opened:true,slot,sliceMs,
+       elapsedMs:(graphDayProjection?.elapsedMs??0)+(Date.now()-startedMs),
+       built:(graphDayProjection?.built??0)+lane.built,
+       refused:(graphDayProjection?.refused??0)+lane.refused,
+       skipped:(graphDayProjection?.skipped??0)+lane.skipped,
+       candidates:(graphDayProjection?.candidates??0)+lane.candidates,
+       sourceQueriesUsed:(graphDayProjection?.sourceQueriesUsed??0)+lane.sourceQueriesUsed,
+       state:lane.state,reason:lane.reason};
       // The lane's own meter wraps only the target. The build reads the SOURCE
       // through the composition root's binding, so without this the number that
       // gates the graph lane's 550 floor over-reports by the whole build spend
@@ -495,30 +536,31 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
      }catch(error){
       if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError){
        projectionIdle=false;
-       graphDayProjection={opened:true,built:0,refused:0,skipped:0,candidates:0,sourceQueriesUsed:0,
-        state:'deferred',reason:'query_budget'};
+       graphDayProjection={opened:true,slot,sliceMs,elapsedMs:Date.now()-startedMs,built:0,refused:0,
+        skipped:0,candidates:0,sourceQueriesUsed:0,state:'deferred',reason:'query_budget'};
       }else{
        // Isolated exactly like the other lanes: a failing builder records its
        // closed stage, stops for the rest of this pass, and cannot stall
        // delivery, the daily lane or the graph lane.
        projectionExhausted=true;
-       graphDayProjection={opened:true,built:0,refused:0,skipped:0,candidates:0,sourceQueriesUsed:0,
-        state:'failed',reason:'lane_failure'};
+       graphDayProjection={opened:true,slot,sliceMs,elapsedMs:Date.now()-startedMs,built:0,refused:0,
+        skipped:0,candidates:0,sourceQueriesUsed:0,state:'failed',reason:'lane_failure'};
        console.log(JSON.stringify({event:'storage_analytics_lane_failure',lane:'graph_day_projection',
         phase:null,reason:'graph_day_projection_failure',detail:storageGraphFailureDetail(error)??null}));
       }
      }
      // No allowance and no time is not pending work: reporting it as busy would
      // keep an under-budget pass looping until it burned its step limit.
-    }else graphDayProjection??={opened:false,built:0,refused:0,skipped:0,candidates:0,
-     sourceQueriesUsed:0,state:'deferred',reason:'not_admitted'};
+    }else graphDayProjection??={opened:false,slot,sliceMs,elapsedMs:0,built:0,refused:0,skipped:0,
+     candidates:0,sourceQueriesUsed:0,state:'deferred',reason:'not_admitted'};
    };
    // On its opening minute the builder takes a bounded slice BEFORE the
    // publication lanes. Running last is what stalled it in production: in
    // steady state the graph lane consumes the whole window, so a lane needing
    // five seconds of remaining clock never opened, and the graph lane stayed
    // slow because nothing built the days that would speed it up.
-   if(projectionLaneFirst)await runProjectionLane(GRAPH_DAY_PROJECTION_OPEN_SLICE_MS);
+   if(longPassBuild)await runProjectionLane('long');
+   else if(projectionLaneFirst)await runProjectionLane('opening');
 
    if(options.publishCommunity && meter.remainingQueries>=100 && Date.now()<deadlineMs
      && (await readCollectionControls(scoped.source)).publication) {
@@ -593,7 +635,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    // the publication lanes left, may never open in a graph-only long pass, and
    // reserves the graph lane's own admission floor whenever that lane has not
    // already run in this iteration.
-   await runProjectionLane(null);
+   await runProjectionLane('trailing');
    if(step.state==='idle'&&v11.state==='idle'&&v1.state==='idle'&&retiredGraph.state==='idle'
      &&retiredProjection.state==='idle'&&publicIdle&&projectionIdle)
     return graphOnlyStalled()?result('deferred','step_limit'):result('idle','complete');

@@ -936,6 +936,44 @@ describe('production builder over the real source readers',()=>{
   expect(ordinary.graphDayProjection).toMatchObject({opened:false,built:0,sourceQueriesUsed:0});
   expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(0);
  });
+ it('takes the bulk of the long pass while coverage is incomplete, and nothing once it is not',async()=>{
+  const f=await source(3);
+  expect(f.days).toHaveLength(3);
+  const build=createGraphDayProjectionSourceBuild({source:sourceDb(),sourceNamespace});
+  const long=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   graphOnly:true,graphLeaseMs:570_000,buildGraphDayProjections:true,graphDayProjectionLongPass:true,
+   graphDayProjectionBuild:build,maxSteps:2,maxQueries:900,deadlineMs:Date.now()+30_000});
+  // The counters carry the split, so one line says how much of the long pass
+  // each lane got.
+  expect(long.graphDayProjection).toMatchObject({opened:true,slot:'long',sliceMs:6*60_000});
+  // The counters accumulate across the pass's iterations rather than reporting
+  // only the last, so a pass that finished its selection early still shows it.
+  expect(long.graphDayProjection!.built).toBe(3);
+  expect(long.graphDayProjection!.candidates).toBe(3);
+  expect(long.graphDayProjection!.sourceQueriesUsed).toBeGreaterThan(0);
+  expect(long.graphDayProjection!.elapsedMs).toBeLessThan(30_000);
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(3);
+  // Coverage complete: the lane costs one selection statement and the long pass
+  // reverts to what it does today, so this ends by itself.
+  const done=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   graphOnly:true,graphLeaseMs:570_000,buildGraphDayProjections:true,graphDayProjectionLongPass:true,
+   graphDayProjectionBuild:build,maxSteps:2,maxQueries:900,deadlineMs:Date.now()+30_000});
+  expect(done.graphDayProjection).toMatchObject({opened:true,slot:'long',built:0,candidates:0,
+   state:'idle',reason:'complete',sourceQueriesUsed:0});
+ });
+ it('never opens the builder in a long pass without its own switch',async()=>{
+  const f=await source(2);
+  expect(f.days).toHaveLength(2);
+  let called=0;
+  const build=createGraphDayProjectionSourceBuild({source:sourceDb(),sourceNamespace});
+  const pass=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   graphOnly:true,graphLeaseMs:570_000,buildGraphDayProjections:true,maxSteps:2,maxQueries:900,
+   graphDayProjectionBuild:async(candidate,budget)=>{called+=1;return build(candidate,budget);},
+   deadlineMs:Date.now()+30_000});
+  expect(called).toBe(0);
+  expect(pass.graphDayProjection).toBeUndefined();
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(0);
+ });
  it('does not open the builder twice in one iteration',async()=>{
   const f=await source(1);
   expect(f.days).toHaveLength(1);

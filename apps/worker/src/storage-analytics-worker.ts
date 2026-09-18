@@ -23,6 +23,9 @@ export interface StorageAnalyticsWorkerEnv {
   * the artifacts can be built and verified for as long as wanted before any
   * result is computed from them, and so the fold can be reverted on its own. */
  GRAPH_DAY_PROJECTION_FOLD?:'disabled'|'enabled';
+ /** Let the builder take the bulk of the graph-only long pass while coverage is
+  * incomplete. Revertible independently of the builder and the fold. */
+ GRAPH_DAY_PROJECTION_LONG_PASS?:'disabled'|'enabled';
 }
 /** One deployed trigger drives both passes. A second, ten-minute trigger does
  * not produce a second invocation: with both registered, the platform delivered
@@ -104,7 +107,9 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   const projectionOptions={...(buildProjections?{buildGraphDayProjections:true,
    graphDayProjectionBuild:createGraphDayProjectionSourceBuild({source:bindings.source,
     sourceNamespace:bindings.sourceNamespace})}:{}),
-   ...(foldProjections?{foldGraphDayProjections:true}:{})};
+   ...(foldProjections?{foldGraphDayProjections:true}:{}),
+   ...(buildProjections&&env.GRAPH_DAY_PROJECTION_LONG_PASS==='enabled'
+    ?{graphDayProjectionLongPass:true}:{})};
   const result=await runStorageAnalyticsPass({...bindings,...projectionOptions,publishCommunity,
    ...(publishCommunity?{publicOnly:true}:{}),maxQueries:meter.remainingQueries,
    ...(publishCommunity?{maxSteps:32}:{}),
@@ -120,7 +125,9 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
    ...(projection?{projectionOpened:projection.opened,projectionBuilt:projection.built,
     projectionRefused:projection.refused,projectionSkipped:projection.skipped,
     projectionCandidates:projection.candidates,projectionSourceQueries:projection.sourceQueriesUsed,
-    projectionState:projection.state,projectionReason:projection.reason}:{}),
+    projectionState:projection.state,projectionReason:projection.reason,
+    projectionSlot:projection.slot,projectionSliceMs:projection.sliceMs,
+    projectionElapsedMs:projection.elapsedMs}:{}),
    steps:result.steps+(delivery?.steps??0),recordsRead:result.recordsRead+(delivery?.recordsRead??0),
    deliverySteps:publishCommunity?delivery?.steps??0:result.steps,
    deliveryRecordsRead:publishCommunity?delivery?.recordsRead??0:result.recordsRead,
