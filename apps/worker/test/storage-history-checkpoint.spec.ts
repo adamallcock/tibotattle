@@ -194,7 +194,7 @@ describe('private paged historical checkpoint store',()=>{
    if(result.status==='deferred'){expect(observed.counts.reads-before).toBe(cursor?1:3);cursor=result.cursor;continue;}
    expect(result).toEqual({status:'ready',headDigest:head,partCount,checkpoint:large});expect(observed.counts.reads-before).toBe(2);break;
   }
-  expect(pages).toBe(Math.ceil(partCount!/4));expect(observed.counts.reads).toBe(pages+3);expect(observed.counts.batches).toBe(0);
+  expect(pages).toBe(Math.ceil((partCount!)/4));expect(observed.counts.reads).toBe(pages+3);expect(observed.counts.batches).toBe(0);
   expect((await load({target:target(),key,maxParts:32})).status).toBe(partCount!>32?'deferred':'ready');
   await expect(load({target:target(),key,maxParts:33})).rejects.toThrow('CHECKPOINT_UNAVAILABLE');
  });

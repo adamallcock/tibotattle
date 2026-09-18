@@ -789,7 +789,11 @@ describe('production builder over the real source readers',()=>{
   // single write batch at the default `maxWrites` of 8 and the lane's per-day
   // estimate of 3 + maxWrites statements holds with usage included.
   const parts=await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_pages').first<number>('n');
-  expect(parts!/3).toBeLessThanOrEqual(7);
+  // Parenthesised deliberately. A non-null assertion immediately followed by a
+  // division reads as the start of a regex literal to the ESM lexer
+  // `tool-inventory` scans test files with, which then fails to parse the whole
+  // module and takes that gate down with it.
+  expect((parts!)/3).toBeLessThanOrEqual(7);
   const prepared=(await target().prepare(`SELECT source_layout,source_namespace,owner_digest,device_id,
     manifest_id,manifest_digest,day FROM analytics_graph_day_values ORDER BY day`).all<Record<string,string>>()).results;
   expect(prepared.map(row=>row.day)).toEqual(fixture.days);
