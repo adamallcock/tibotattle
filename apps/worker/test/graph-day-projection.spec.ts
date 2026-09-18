@@ -33,6 +33,7 @@ import {
 import {graphDayProjectionBuildEnabled,advanceStorageAnalytics,initializeStorageAnalyticsRuntime,
  runStorageAnalyticsPass} from '../src/storage-analytics-runtime';
 import {runStorageAnalyticsSchedule} from '../src/storage-analytics-worker';
+import {runGraphDayProjectionSchedule} from '../src/graph-day-projection-worker';
 import {initializeStorageSource,readIngestionChanges} from '../src/analytics-delivery';
 import {initializeTypedV11Admission,persistTypedV11StagedChunk} from '../src/typed-v11-admission';
 import {initializeTypedV1Admission} from '../src/typed-v1-admission';
@@ -972,6 +973,54 @@ describe('production builder over the real source readers',()=>{
    deadlineMs:Date.now()+30_000});
   expect(called).toBe(0);
   expect(pass.graphDayProjection).toBeUndefined();
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(0);
+ });
+ it('runs as its own scheduled Worker, and does nothing with the switch unset',async()=>{
+  const f=await source(3);
+  const env={STORAGE_SOURCE_ID:sourceId,TELEMETRY_STORAGE_NAMESPACE:sourceNamespace,
+   STORAGE_INGESTION_DB:sourceDb(),STORAGE_ANALYTICS_DB:target()};
+  await runGraphDayProjectionSchedule(env);
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(0);
+  await runGraphDayProjectionSchedule({...env,GRAPH_DAY_PROJECTION_BUILD:'disabled'});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(0);
+  await runGraphDayProjectionSchedule({...env,GRAPH_DAY_PROJECTION_BUILD:'enabled'});
+  const days=(await target().prepare('SELECT day FROM analytics_graph_day_values ORDER BY day')
+   .all<{day:string}>()).results.map(row=>row.day);
+  expect(days).toEqual(f.days);
+ });
+ it('shards deterministically so two instances never select the same day',async()=>{
+  const f=await source(3);
+  const env={GRAPH_DAY_PROJECTION_BUILD:'enabled' as const,STORAGE_SOURCE_ID:sourceId,
+   TELEMETRY_STORAGE_NAMESPACE:sourceNamespace,STORAGE_INGESTION_DB:sourceDb(),STORAGE_ANALYTICS_DB:target()};
+  // Two shards partition the owners, so exactly one of them holds this one and
+  // the other prepares nothing; together they cover every day.
+  const built=async(shard:string)=>{
+   await runGraphDayProjectionSchedule({...env,GRAPH_DAY_PROJECTION_SHARDS:'2',GRAPH_DAY_PROJECTION_SHARD:shard});
+   return (await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n'))!;
+  };
+  const afterZero=await built('0');
+  const afterOne=await built('1');
+  expect(afterOne).toBe(f.days.length);
+  expect([0,f.days.length]).toContain(afterZero);
+  // A shard index outside its count is a configuration error, not a silent
+  // pass that would leave those owners unreachable.
+  await expect(runGraphDayProjectionSchedule({...env,GRAPH_DAY_PROJECTION_SHARDS:'2',
+   GRAPH_DAY_PROJECTION_SHARD:'2'})).rejects.toThrow('GRAPH_DAY_PROJECTION_CONFIGURATION_INVALID');
+ });
+ it('leaves the analytics pass a no-op when its build switch is off',async()=>{
+  const f=await source(2);
+  expect(f.days).toHaveLength(2);
+  // Both slots in the analytics Worker revert cleanly: with the build switch
+  // off there, neither the opening slot nor the long-pass slot does anything.
+  for(const pinned of [true,false]){
+   const pass=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+    projectionLaneFirst:pinned,maxSteps:1,maxQueries:900,deadlineMs:Date.now()+30_000});
+   expect(pass.graphDayProjection).toBeUndefined();
+  }
+  const long=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   graphOnly:true,graphLeaseMs:570_000,graphDayProjectionLongPass:true,maxSteps:1,maxQueries:900,
+   deadlineMs:Date.now()+30_000});
+  expect(long.graphDayProjection).toBeUndefined();
   expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(0);
  });
  it('does not open the builder twice in one iteration',async()=>{

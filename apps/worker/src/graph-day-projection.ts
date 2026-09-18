@@ -41,6 +41,10 @@ export const GRAPH_DAY_PROJECTION_PART_BYTES = 192 * 1024;
 export const GRAPH_DAY_PROJECTION_MAX_PARTS = 4_096;
 export const GRAPH_DAY_PROJECTION_LOAD_PARTS = 8, GRAPH_DAY_PROJECTION_MAX_LOAD_PARTS = 32;
 export const GRAPH_DAY_PROJECTION_MAX_WRITES = 32;
+/** Owner buckets, and therefore the most shards that can be distinct. The two
+ * leading hex characters of the owner digest give 256 uniformly distributed
+ * buckets, which is more instances than this corpus will ever need. */
+export const GRAPH_DAY_PROJECTION_MAX_SHARDS = 256;
 
 const HASH = /^[a-f0-9]{64}$/u;
 const encoder = new TextEncoder();
@@ -995,9 +999,19 @@ export async function advanceGraphDayProjectionLane(options: {
    * statements the lane's own meter covers. The build reads the source, which
    * the lane does not wrap, so its cost is bounded here or not at all. */
   sourceQueries?: number;
+  /** Deterministic owner sharding, so a second instance is a configuration
+   * change rather than a redesign. Every owner digest falls in exactly one of
+   * 256 buckets by its first two hex characters, and the bucket decides the
+   * shard, so two instances can never select the same day and no day is
+   * unreachable. Default: one shard, index 0. */
+  shardIndex?: number;
+  shardCount?: number;
 }): Promise<GraphDayProjectionLaneResult> {
   const { target, sourceId, build } = options;
   const maxDays = options.maxDays ?? 4, maxWrites = options.maxWrites ?? 8;
+  const shardCount = options.shardCount ?? 1, shardIndex = options.shardIndex ?? 0;
+  bounded(shardCount, 1, GRAPH_DAY_PROJECTION_MAX_SHARDS);
+  bounded(shardIndex, 0, shardCount - 1);
   bounded(maxDays, 1, 64);
   bounded(maxWrites, 2, GRAPH_DAY_PROJECTION_MAX_WRITES);
   if (typeof build !== "function" || !Number.isFinite(options.deadlineMs)
@@ -1028,8 +1042,10 @@ export async function advanceGraphDayProjectionLane(options: {
       AND NOT EXISTS(SELECT 1 FROM analytics_graph_day_refusals r
         WHERE r.source_id=v.source_id AND r.owner_digest=v.owner_digest AND r.day=v.day
           AND r.manifest_digest=v.manifest_digest AND r.acquisition_version=?3)
+      AND (?5=1 OR ((instr('0123456789abcdef',substr(v.owner_digest,1,1))-1)*16
+        +(instr('0123456789abcdef',substr(v.owner_digest,2,1))-1))%?5=?6)
     ORDER BY v.day,v.owner_digest,v.device_id LIMIT ?4`)
-    .bind(sourceId, options.fromDay ?? null, GRAPH_DAY_PROJECTION_VERSION, maxDays)
+    .bind(sourceId, options.fromDay ?? null, GRAPH_DAY_PROJECTION_VERSION, maxDays, shardCount, shardIndex)
     .all<{ source_id: string; source_layout: string; source_namespace: string; owner_digest: string;
       device_id: string; manifest_id: string; manifest_digest: string; day: string }>()).results;
   if (!candidates.length) {
