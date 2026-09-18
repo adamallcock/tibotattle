@@ -1620,7 +1620,10 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     "Turns counted",
     "All tokens counted",
   ]);
-  assert.deepEqual(values, ["Aug 7, 2026", "—", "240", "3K"]);
+  // "240" and "3.0K" rather than "240" and "3K": the headline stat cards carry
+  // at least two significant figures, so a million-odd turns cannot render as
+  // a bare "1M" that reads like a placeholder and hides a two-to-one range.
+  assert.deepEqual(values, ["Aug 7, 2026", "—", "240", "3.0K"]);
   assert.deepEqual(details, [
     "Most recent community day",
     "API-equivalent spend unavailable; not an actual bill",
