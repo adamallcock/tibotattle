@@ -2,6 +2,9 @@ import { beforeEach,afterEach,describe,expect,it,vi } from 'vitest';
 import { runStorageAnalyticsPass } from '../src/storage-analytics-runtime';
 import { runStorageAnalyticsSchedule,STORAGE_ANALYTICS_LONG_PASS_MINUTES,STORAGE_ANALYTICS_MINUTE_CRON,
  type StorageAnalyticsWorkerEnv } from '../src/storage-analytics-worker';
+vi.mock('../src/storage-v11-history',()=>({
+ storageV11PreparedFoldEnabled:(env:unknown)=>!!env&&typeof env==='object'
+  &&Reflect.get(env,'GRAPH_DAY_PROJECTION_FOLD')==='enabled'}));
 vi.mock('../src/storage-analytics-runtime',()=>({runStorageAnalyticsPass:vi.fn(),
  // The scheduler reads the builder's deployment switch from this module; the
  // mock keeps the real predicate so these passes stay builder-free by default.
@@ -70,6 +73,18 @@ describe('ordered ingestion before public analytics',()=>{
   expect(pass.mock.calls[0]![0]).toMatchObject({publishCommunity:false,maxQueries:900,deadlineMs:NOW+20_000});
   expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({deliverySteps:1,deliveryRecordsRead:0,
    deliveryQueriesUsed:0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0});
+ });
+ it('forwards the prepared-fold switch to the pass only when it is enabled',async()=>{
+  pass.mockResolvedValue(result);
+  // Unset, then explicitly disabled: the graph lane keeps paging the source.
+  await runStorageAnalyticsSchedule(environment());
+  expect(pass.mock.calls.at(-1)![0]).not.toHaveProperty('foldGraphDayProjections');
+  await runStorageAnalyticsSchedule({...environment(),GRAPH_DAY_PROJECTION_FOLD:'disabled'});
+  expect(pass.mock.calls.at(-1)![0]).not.toHaveProperty('foldGraphDayProjections');
+  // Enabled: forwarded, and independent of the builder switch.
+  await runStorageAnalyticsSchedule({...environment(),GRAPH_DAY_PROJECTION_FOLD:'enabled'});
+  expect(pass.mock.calls.at(-1)![0]).toMatchObject({foldGraphDayProjections:true});
+  expect(pass.mock.calls.at(-1)![0]).not.toHaveProperty('buildGraphDayProjections');
  });
  it('does no work when the scheduler is disabled',async()=>{
   await runStorageAnalyticsSchedule({STORAGE_ANALYTICS_MODE:'disabled'});

@@ -7,6 +7,7 @@ import {
  GRAPH_DAY_PROJECTION_PART_BYTES,
  advanceGraphDayProjectionLane,
  createGraphDayProjectionBuild,
+ createGraphDayProjectionSourceBuild,
  GraphDayProjectionRefusedError,
  graphDayUsageSessionDigest,
  type GraphDayProjectionBuild,
@@ -29,7 +30,8 @@ import {
  validGraphDayPlanSignature,
  validGraphDayProjection,
 } from '../src/graph-day-projection-values';
-import {graphDayProjectionBuildEnabled,advanceStorageAnalytics,initializeStorageAnalyticsRuntime} from '../src/storage-analytics-runtime';
+import {graphDayProjectionBuildEnabled,advanceStorageAnalytics,initializeStorageAnalyticsRuntime,
+ runStorageAnalyticsPass} from '../src/storage-analytics-runtime';
 import {runStorageAnalyticsSchedule} from '../src/storage-analytics-worker';
 import {initializeStorageSource,readIngestionChanges} from '../src/analytics-delivery';
 import {initializeTypedV11Admission,persistTypedV11StagedChunk} from '../src/typed-v11-admission';
@@ -829,6 +831,37 @@ describe('production builder over the real source readers',()=>{
   if(stored.status!=='ready')throw new Error('unreachable');
   expect(canonicalJson(stored.projection)).toBe(canonicalJson(
    await build(key,{deadlineMs:Date.now()+60_000,remainingQueries:256})));
+ });
+ it('builds on its opening minute, and still leaves the graph lane a window',async()=>{
+  // Running last is what stalled the builder in production: in steady state the
+  // graph lane consumed the whole window, so a lane needing five seconds of
+  // remaining clock never opened. On its opening minute it takes a bounded
+  // slice first instead.
+  const f=await source(1);
+  expect(f.days).toHaveLength(1);
+  const build=createGraphDayProjectionSourceBuild({source:sourceDb(),sourceNamespace});
+  const started=Date.now();
+  const pass=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   buildGraphDayProjections:true,graphDayProjectionBuild:build,projectionLaneFirst:true,
+   maxSteps:1,maxQueries:900,deadlineMs:started+30_000});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(1);
+  // The slice is bounded, so the rest of the window and the meter survive it.
+  expect(Date.now()-started).toBeLessThan(25_000);
+  expect(pass.queriesUsed).toBeLessThan(900-550);
+  expect(pass.reason).not.toBe('query_budget');
+ });
+ it('does not open the builder twice in one iteration',async()=>{
+  const f=await source(1);
+  expect(f.days).toHaveLength(1);
+  let calls=0;
+  const build=createGraphDayProjectionSourceBuild({source:sourceDb(),sourceNamespace});
+  await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   buildGraphDayProjections:true,projectionLaneFirst:true,maxSteps:1,maxQueries:900,
+   graphDayProjectionBuild:async(candidate,budget)=>{calls+=1;return build(candidate,budget);},
+   deadlineMs:Date.now()+30_000});
+  // One day, one build: the opening slot replaces the trailing run rather than
+  // adding to it, so the lane cannot take two slices from one iteration.
+  expect(calls).toBe(1);
  });
  it('builds a day from the scheduler only when the deployment switch is set',async()=>{
   const fixture=await source(1);

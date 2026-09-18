@@ -103,6 +103,10 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   * claim at the end and a concurrent pass sees the owner-day as busy. An
   * abandoned claim still recovers on its own once the lease expires. */
  leaseMs?:number;
+ /** Whether this pass may fold prepared days for a v1.1 owner. Threaded from
+  * the composition root's `GRAPH_DAY_PROJECTION_FOLD` switch; absent means the
+  * module constant, which is off. */
+ preparedFold?:boolean;
  /** Statements this call refuses to start below. The default reserves one
   * heavy attempt and its checkpoint save, which is what a pass that gets one
   * graph attempt per invocation needs. A pass that keeps returning to this
@@ -262,7 +266,9 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  }else scope=await captureLatest();
  try{
   const result=await withStorageGraphFailureStage(metric==='fits'?'graph_current_fit_compute':'graph_model_compute',
-   ()=>computeStorageGraphResult(options,scope,{maxQueries:Math.max(1,(options.remainingQueries??900)-40),deadlineMs:options.deadlineMs}));
+   ()=>computeStorageGraphResult(options,scope,{maxQueries:Math.max(1,(options.remainingQueries??900)-40),
+    deadlineMs:options.deadlineMs,
+    ...(options.preparedFold!==undefined?{preparedFold:options.preparedFold}:{})}));
   if(result.state==='complete'&&selection&&claimToken){
    const finished=await completeStorageGraphWorkSelection({target:options.target,selection,claimToken});
    if(finished.status!=='completed')return {state:'deferred',metric,day,reason:'selection_changed'};

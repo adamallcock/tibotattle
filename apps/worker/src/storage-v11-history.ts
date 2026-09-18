@@ -47,6 +47,14 @@ export type StorageV11HistoryResult={status:'deferred';checkpoint:StorageV11Hist
  * serves every group whose caller supplies none. */
 export const STORAGE_V11_PREPARED_FOLD=false;
 
+/** The deployment switch, mirroring the builder's `GRAPH_DAY_PROJECTION_BUILD`.
+ * Enabling the fold is then a configuration change on a deploy and revertible
+ * the same way, rather than a source edit. Unset means off. */
+export function storageV11PreparedFoldEnabled(env:unknown):boolean{
+ if(!env||typeof env!=='object')return STORAGE_V11_PREPARED_FOLD;
+ return Reflect.get(env,'GRAPH_DAY_PROJECTION_FOLD')==='enabled';
+}
+
 /** The gate, as a pure rule so it can be proven rather than described: a group
  * folds prepared days only when the caller supplied them AND the switch above
  * is on. Nothing supplies them today, so this is off twice over. */
@@ -167,7 +175,11 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  /** The window's prepared per-day projections, in ascending day order. Honoured
   * only while `STORAGE_V11_PREPARED_FOLD` is on; otherwise the paged
   * acquisition serves exactly as before. */
- preparedDays?:readonly GraphDayProjection[]}):Promise<StorageV11HistoryResult>{
+ preparedDays?:readonly GraphDayProjection[];
+ /** Whether this call may fold the prepared days it was given. Absent means
+  * the module constant, so every existing caller and test is unchanged; the
+  * composition root passes the deployment switch. */
+ preparedFold?:boolean}):Promise<StorageV11HistoryResult>{
  const {source,sourceNamespace,participantId,day,metric,nowMs,budget}=input,sourcePin=structuredClone(input.sourcePin);
  if(sourcePin.source!=='v1.1'||sourcePin.participantId!==participantId
   ||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(day)||new Date(`${day}T00:00:00.000Z`).toISOString().slice(0,10)!==day
@@ -181,6 +193,8 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
  // copy of a 60,000-row acquisition can exhaust the isolate on its own. The
  // caller treats the input as consumed; a cut group returns no checkpoint.
  const prior=input.checkpoint??null,preparedDays=input.preparedDays;
+ if(input.preparedFold!==undefined&&typeof input.preparedFold!=='boolean')throw fail();
+ const preparedFold=input.preparedFold??STORAGE_V11_PREPARED_FOLD;
  const layout=`typed-v11:${sourceNamespace}`;
  if(prior&&(prior.version!==1||prior.source!=='v1.1'||prior.day!==day||prior.layout!==layout
   ||!['acquisition','finish','usage'].includes(prior.phase)))throw fail();
@@ -210,7 +224,7 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
    return {status:'deferred',checkpoint:{version:1,source:'v1.1',day,layout,identity,snapshot,phase:'finish',
     acquisition:{identity,planAnchors:[],quotaRows:[]}}};
   }
-  if(storageV11FoldsPreparedDays(preparedDays)&&preparedDays!==undefined){
+  if(storageV11FoldsPreparedDays(preparedDays,preparedFold)&&preparedDays!==undefined){
    // A prepared fold reads no source page, so the whole window is settled in
    // one step. The days are still fenced by the same live-generation proof the
    // paged path takes, and every day must be inside this analysis window and
@@ -276,13 +290,13 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   // result that refused into one that is ready under an unchanged result
   // dependency digest — a heterogeneous published corpus. With the fold off
   // the paged reduction is byte-unchanged.
-  scalarRequested:!(metric==='model'&&storageV11FoldsPreparedDays(preparedDays)),
+  scalarRequested:!(metric==='model'&&storageV11FoldsPreparedDays(preparedDays,preparedFold)),
   quotaAcquisition:acquisition};
  if(checkpoint.phase==='usage'&&checkpoint.usage.complete){
   await assertTypedV11GenerationSnapshotLive(source,snapshot);
   return {status:'complete',analysis:await finishV11UsageReduction(source,analysisPin,options,checkpoint.usage,metric,identity)};
  }
- if(storageV11FoldsPreparedDays(preparedDays)&&preparedDays!==undefined&&metric==='model'
+ if(storageV11FoldsPreparedDays(preparedDays,preparedFold)&&preparedDays!==undefined&&metric==='model'
   &&checkpoint.phase!=='usage'){
   // The model composition needs no scalar half and no usage row: the prepared
   // days carry exact 2-hour cells, the sessions that cross midnight and the

@@ -424,7 +424,11 @@ export async function readStorageGraphResult(bindings:StorageAnalyticsBindings,s
  * completed, validated output is persisted in analytics. A target failure has
  * no transaction, cache write or backpressure hook in ingestion. */
 export async function computeStorageGraphResult(bindings:StorageAnalyticsBindings,scope:StorageGraphScope,
-  options:{maxQueries?:number;deadlineMs?:number;now?:()=>number}={}):Promise<
+  options:{maxQueries?:number;deadlineMs?:number;now?:()=>number;
+    /** Whether this pass may fold prepared days for a v1.1 owner. Absent means
+     * the module constant, so the deploy is inert until the composition root
+     * passes the deployment switch. */
+    preparedFold?:boolean}={}):Promise<
   {state:'complete';result:StorageGraphResult;reused:boolean}
   |{state:'deferred';reason:string;failure?:StorageGraphFailureFields}> {
   if(bindings.source===bindings.target)throw fail();
@@ -489,6 +493,7 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
     // decision.
     let preparedDays:readonly GraphDayProjection[]|undefined;
     let preparedLoaded=false;
+    const preparedFold=options?.preparedFold??STORAGE_V11_PREPARED_FOLD;
     const ownerReady=await bindings.target.prepare(`SELECT 1 AS ready FROM analytics_owner_state
       WHERE source_id=? AND owner_digest=? AND state='active'`).bind(bindings.sourceId,scope.owner.ownerDigest)
       .first<number>('ready');
@@ -539,20 +544,21 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         ?bound.maxPages:0;
       const mode=partialPages>=1?'partial':'whole';
       const maxPages=mode==='partial'?partialPages:STORAGE_GRAPH_V11_CHECKPOINT_PAGES_PER_CLAIM;
-      if(STORAGE_V11_PREPARED_FOLD&&!preparedLoaded){
+      if(preparedFold&&!preparedLoaded){
         preparedLoaded=true;
         const loaded=await withStorageGraphFailureStage('graph_prepared_days',
           ()=>loadStorageV11PreparedDays({source,target:bindings.target,sourceId:bindings.sourceId,
             sourceNamespace:bindings.sourceNamespace,ownerDigest:scope.owner.ownerDigest,
             snapshot:scope.snapshot!,sourcePin:pin,nowMs,
-            budget:{remainingQueries:meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}}));
+            budget:{remainingQueries:meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now},
+            enabled:preparedFold}));
         preparedDays=loaded.days;
       }
       const next=await advanceStorageV11Analysis({source,sourceNamespace:bindings.sourceNamespace,
         participantId:scope.owner.participantId,day:scope.day,metric,nowMs,sourcePin:pin,
         generationSnapshot:scope.snapshot,
         closedDependencyDigest:scope.checkpointDependencyDigest,checkpoint,maxPages,
-        ...(preparedDays!==undefined?{preparedDays}:{}),
+        ...(preparedDays!==undefined?{preparedDays,preparedFold}:{}),
         ...(mode==='partial'?{partialGroup:true}:{}),
         budget:{remainingQueries:Math.max(0,meter.remainingQueries-40),deadlineMs:checkpointWorkDeadlineMs,now}});
       if(next.status==='complete'){

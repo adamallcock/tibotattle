@@ -1,4 +1,5 @@
 import { graphDayProjectionBuildEnabled, runStorageAnalyticsPass } from './storage-analytics-runtime';
+import { storageV11PreparedFoldEnabled } from './storage-v11-history';
 import { createGraphDayProjectionSourceBuild } from './graph-day-projection';
 import { createD1InvocationBudget } from './d1-invocation-budget';
 import { publicAnalyticsEnabled } from './public-analytics-gate';
@@ -18,6 +19,10 @@ export interface StorageAnalyticsWorkerEnv {
   * fold does not read these rows yet, so building them is an explicit operator
   * decision and never a consequence of deploying this code. */
  GRAPH_DAY_PROJECTION_BUILD?:'disabled'|'enabled';
+ /** Switches the prepared-day FOLD on. Separate from the builder's switch so
+  * the artifacts can be built and verified for as long as wanted before any
+  * result is computed from them, and so the fold can be reverted on its own. */
+ GRAPH_DAY_PROJECTION_FOLD?:'disabled'|'enabled';
 }
 /** One deployed trigger drives both passes. A second, ten-minute trigger does
  * not produce a second invocation: with both registered, the platform delivered
@@ -93,9 +98,13 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   // 175 statements and the long pass is graph-only. Both switches must be open,
   // and the build reads the SAME metered source binding as everything else.
   const buildProjections=graphDayProjectionBuildEnabled(env);
-  const projectionOptions=buildProjections?{buildGraphDayProjections:true,
+  const foldProjections=storageV11PreparedFoldEnabled(env);
+  // The two switches are independent: building fills the store, folding reads
+  // it, and either can be turned on or reverted without the other.
+  const projectionOptions={...(buildProjections?{buildGraphDayProjections:true,
    graphDayProjectionBuild:createGraphDayProjectionSourceBuild({source:bindings.source,
-    sourceNamespace:bindings.sourceNamespace})}:{};
+    sourceNamespace:bindings.sourceNamespace})}:{}),
+   ...(foldProjections?{foldGraphDayProjections:true}:{})};
   const result=await runStorageAnalyticsPass({...bindings,...projectionOptions,publishCommunity,
    ...(publishCommunity?{publicOnly:true}:{}),maxQueries:meter.remainingQueries,
    ...(publishCommunity?{maxSteps:32}:{}),
