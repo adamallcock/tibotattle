@@ -11,6 +11,7 @@ import { assertV1SourcePinCurrent, loadV1SourcePin } from './telemetry-v1-source
 import { modelHistoryWindow } from './model-history-window';
 import { communityAnalysisCacheVersion, loadCommunitySourcePin, parsedCachedFits,
   selectCommunityAllowanceAnalysisFits, validCompleteCachedComposition, validCompleteScalarAnalysis,
+  COMMUNITY_ALLOWANCE_FIT_METHOD,
   type CommunityAllowanceFit } from './community-allowance';
 import { captureStorageCommunityAuthority, sameStorageCommunityCalculationAuthority,
   storageCommunityCalculationAuthorityIsCurrent,
@@ -280,6 +281,12 @@ export async function storageGraphDependencyDigest(options:{
   // by readers the change never touched. `mixed` keeps the legacy identity.
   return sha256Hex(canonicalJson([options.authority.sourceId,options.authority.sourceNamespace,
     options.ownerDigest,options.source,options.metric,history.day,history.fromDay,STORAGE_GRAPH_METHOD,options.dependency,
+    // The fit gates and the reset-evidence method beneath them, on the FITS
+    // identity only. `buildResetEvidence` is reached solely from the scalar
+    // half, so a change there cannot alter a model composition — and folding
+    // this into STORAGE_GRAPH_METHOD instead would retire the whole by-model
+    // corpus to recompute a statistic the model metric does not contain.
+    ...(options.metric==='fits'?[COMMUNITY_ALLOWANCE_FIT_METHOD]:[]),
     ...(options.source==='v1.1'?[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]:[]),
     ...(options.source==='v1'?[V1_QUOTA_ACQUISITION_VERSION]:[])]));
 }

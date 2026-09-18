@@ -574,8 +574,8 @@ export function projectAdminAllowancePreview(value) {
       || preview.basis !== ADMIN_ALLOWANCE_PREVIEW_BASIS
       || preview.referencePlanType !== "pro"
       || preview.trailingDays !== 30
-      || preview.qualification !== "shared_reset_fit_gates_40pp_span_floor"
-      || preview.spanFloorPp !== 40) {
+      || preview.qualification !== "shared_reset_fit_gates_25pp_span_floor"
+      || preview.spanFloorPp !== 25) {
     invalid(code);
   }
   const from = calendarDay(preview.from, code);

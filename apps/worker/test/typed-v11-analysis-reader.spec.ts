@@ -1,3 +1,4 @@
+import { COMMUNITY_ALLOWANCE_FIT_METHOD } from "../src/community-allowance";
 import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest,
@@ -1010,9 +1011,11 @@ describe("typed active-domain analytical reads",()=>{
   it("binds only the v1.1 result identity to the acquisition contract",async()=>{
     const authority={sourceId:namespace,sourceNamespace:namespace},ownerDigest='a'.repeat(64);
     const target=day(),history=modelHistoryWindow(target),dependency=[{observed_day:target}];
+    // `metric:'fits'` carries the fit-gate discriminator; see the metric-scoped
+    // identity test in storage-graph-history-integration.spec.ts.
     const digest=(source:'v1'|'v1.1',extra:readonly unknown[])=>sha256Hex(canonicalJson([
       authority.sourceId,authority.sourceNamespace,ownerDigest,source,'fits',history.day,history.fromDay,
-      STORAGE_GRAPH_METHOD,dependency,...extra]));
+      STORAGE_GRAPH_METHOD,dependency,COMMUNITY_ALLOWANCE_FIT_METHOD,...extra]));
     const computed=(source:'v1'|'v1.1')=>storageGraphDependencyDigest({authority,ownerDigest,source,
       metric:'fits',day:target,dependency});
     // A change to how v1.1 evidence is acquired retires v1.1 results only.

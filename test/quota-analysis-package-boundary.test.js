@@ -64,10 +64,18 @@ const SOURCE_HASHES = Object.freeze({
   "quota-rolling.js":
     "2afca11d40c61c463524cc8f4d267c128dbe427c72fb6c2e3ed68b056ca70977",
   "quota-tracks.js":
-    // Re-pinned for the reviewed 5pp noise tolerance and running-maximum
-    // boundary correction. The executable kernel changed in ea84c35 while
-    // this byte-identity receipt remained on the pre-correction digest.
-    "d15a78931e10c8bccf82ea262f722ea84b5fd02d0cb3c9fd37b18dbd169fa3f0",
+    // Re-pinned 2026-09-18 for the reviewed cycle-restart split and
+    // duplicate-instant collapse. Two refusals became repairs: an instant a
+    // source reported more than once now settles to its highest reading rather
+    // than refusing the cycle, and a fall past the 5pp jitter tolerance now
+    // SPLITS the reset group into the cycles inside it rather than discarding
+    // both. The 5pp tolerance itself is unchanged — measured, it sits in the
+    // valley between jitter and genuine restarts. Both refusal codes remain
+    // emitted as fail-closed guards for a caller that bypasses the repairs.
+    // Both the split and its guard compare WITHIN a slot: `slot` is absent from
+    // the group key, so a cross-slot comparison split healthy groups on the
+    // primary/secondary crossover.
+    "922350e53fd58920fd9f9a9354db1a67b131cb302490b898cb4a5ca8379f9645",
   "quota-windows.js":
     // Re-pinned for the reviewed local-only quota display-name contract:
     // bounded provider copy cannot affect identity, calibration, or export,

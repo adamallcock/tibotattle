@@ -502,7 +502,7 @@ describe("summarizeCommunityAllowanceDay", () => {
     expect(summary.trailingDays).toBe(30);
     expect(summary.windowDurationMinutes).toBe(10_080);
     expect(summary.limitId).toBe("codex");
-    expect(summary.spanFloorPp).toBe(40);
+    expect(summary.spanFloorPp).toBe(25);
   });
 
   it("publishes the honest empty summary for a day with no qualifying fits", () => {
@@ -660,8 +660,8 @@ describe("community allowance in the daily aggregate", () => {
         "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
       referencePlanType: "pro",
       normalization: "pro_x1_prolite_x4_plus_x20",
-      qualification: "shared_reset_fit_gates_40pp_span_floor",
-      spanFloorPp: 40,
+      qualification: "shared_reset_fit_gates_25pp_span_floor",
+      spanFloorPp: 25,
       fitCount: 1,
       participantCount: 1,
       band80Usd: null,
@@ -1386,15 +1386,31 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     expect(summary.centralUsd!).toBeGreaterThan(0);
   });
 
-  it("returns no fits when v1 resets fall below the 40pp span floor", async () => {
+  it("returns no fits when v1 resets fall below the 25pp span floor", async () => {
     const participantId = await seedV1Participant("shortspan");
     await seedV1Session(participantId, "v1-session-shortspan");
     await seedV1Device(participantId, "v1-device-shortspan",
       "v1-session-shortspan");
-    // step 4pp over nine snapshots => 32pp displayed span: calibrates, but is
-    // below the community 40pp floor, so it publishes an honest null.
-    await seedThreeV1Resets(participantId, "v1-device-shortspan", 4, "short");
+    // step 3pp over nine snapshots => 24pp displayed span: calibrates, but is
+    // below the community floor, so it publishes an honest null.
+    await seedThreeV1Resets(participantId, "v1-device-shortspan", 3, "short");
     expect(await collectCommunityAllowanceFits(db())).toHaveLength(0);
+  });
+
+  it("admits a span the previous 40pp floor refused", async () => {
+    // The floor moved to 25pp because the estimator's error follows a clean
+    // `error ~ 300/span %` decay with no bias from 20pp up, and 40 was an
+    // arbitrary point on that decay rather than a knee. A 32pp span sits
+    // between the old floor and the new one, so it is the case the change is
+    // FOR: it refused before and qualifies now.
+    const participantId = await seedV1Participant("midspan");
+    await seedV1Session(participantId, "v1-session-midspan");
+    await seedV1Device(participantId, "v1-device-midspan",
+      "v1-session-midspan");
+    await seedThreeV1Resets(participantId, "v1-device-midspan", 4, "mid");
+    const fits = await collectCommunityAllowanceFits(db());
+    expect(fits.length).toBeGreaterThan(0);
+    expect(fits.every((fit) => fit.capacityNanousd > 0)).toBe(true);
   });
 
   it("drops out-of-domain v1 quota rows without throwing the collector", async () => {

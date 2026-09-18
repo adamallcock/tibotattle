@@ -31,8 +31,8 @@ export function createAdminAllowancePreviewPayload() {
     basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
     referencePlanType: "pro",
     trailingDays: 30,
-    qualification: "shared_reset_fit_gates_40pp_span_floor",
-    spanFloorPp: 40,
+    qualification: "shared_reset_fit_gates_25pp_span_floor",
+    spanFloorPp: 25,
     plans: [
       { planType: "pro", label: "Pro 20x", multiplier: 1 },
       { planType: "prolite", label: "Pro 5x", multiplier: 4 },

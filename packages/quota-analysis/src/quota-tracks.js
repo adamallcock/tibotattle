@@ -226,13 +226,82 @@ function orderedRefusals(values) {
   return REFUSAL_ORDER.filter((code) => unique.has(code));
 }
 
-function buildOneReset(rows, allUsage, datasetStatus) {
-  const ordered = [...new Map(rows.map((row) => [quotaObservationKey(row), row])).values()]
-    .sort((left, right) => (
-      left.observedAt.localeCompare(right.observedAt)
-      || left.slot.localeCompare(right.slot)
-      || left.snapshotId.localeCompare(right.snapshotId)
-    ));
+/** Collapse an instant a source reported more than once.
+ *
+ * A rollout that inherits history replays its ancestor's records carrying the
+ * ancestor's OLD rate-limit reading (see `log-normalization.js`). A parallel
+ * fan-out emits several of those at one instant with several stale values, and
+ * the reading that is NOT stale is the highest: used percent only climbs within
+ * a window. Measured in the production corpus, the busiest single millisecond
+ * carried 524 occurrences at one slot with five distinct used percents.
+ *
+ * Taking the max is the same rule `runningMaxPercent` applies to the climb, and
+ * the same one `contradicts()` encodes when it treats the LOWER reading as the
+ * stale one. It is safe because grouping by `resetKey` has already separated
+ * pools: a replayed reading high enough to beat the true one would have to come
+ * from a DIFFERENT pool, and a different pool carries a different `resets_at`,
+ * so it lands in another group and never reaches here. Refusing the whole reset cycle instead — which is what
+ * `ambiguous_quota_observation` used to do here — discarded a cycle over a
+ * disagreement typically smaller than the jitter `MAX_BACKWARD_NOISE_PP`
+ * tolerates everywhere else. */
+function collapseDuplicateInstants(rows) {
+  const best = new Map();
+  for (const row of rows) {
+    const key = JSON.stringify([row.observedAt, row.slot]);
+    const previous = best.get(key);
+    if (!previous || row.usedPercent > previous.usedPercent
+        || (row.usedPercent === previous.usedPercent
+          && row.snapshotId.localeCompare(previous.snapshotId) < 0)) best.set(key, row);
+  }
+  return [...best.values()];
+}
+
+/** Split one `resetsAt` group into the cycles actually inside it.
+ *
+ * The provider re-reports the same `resets_at` across a pool refresh, so
+ * `resetKey` does not separate consecutive cycles: a group can hold a climb to
+ * 90%, a refresh, and a fresh climb from 2%. The fall between them is a real
+ * boundary, not noise — measured over the production corpus, 90 of 110 falls
+ * above the noise tolerance are followed by a series that climbs on from the
+ * low rather than bouncing back.
+ *
+ * Refusing the group, which is what `backward_quota_observation` used to do,
+ * discarded both cycles. Splitting keeps both, each fitted from its own origin.
+ * The threshold is unchanged: below it the population is measurement jitter
+ * (falls of 1pp outnumber 2pp tenfold and are spent by 4pp), and raising it
+ * would merge genuine restarts and overstate capacity. */
+function splitAtCycleRestarts(ordered) {
+  const segments = [[]];
+  // Compared WITHIN a slot, never across. `slot` is absent from `keyParts`, so
+  // one reset group holds both the primary and the secondary series; the
+  // adjacent row in observation order is frequently the other slot at a quite
+  // different used percent, and treating that as a fall would split a healthy
+  // group on every interleave. A cycle restarts per slot, so the previous
+  // reading of the SAME slot is the only meaningful comparison.
+  let previousBySlot = new Map();
+  for (const row of ordered) {
+    const previous = previousBySlot.get(row.slot);
+    if (previous && previous.usedPercent - row.usedPercent > MAX_BACKWARD_NOISE_PP) {
+      segments.push([]);
+      previousBySlot = new Map();
+    }
+    segments.at(-1).push(row);
+    previousBySlot.set(row.slot, row);
+  }
+  return segments.filter((segment) => segment.length > 0);
+}
+
+function orderQuotaRows(rows) {
+  return collapseDuplicateInstants(
+    [...new Map(rows.map((row) => [quotaObservationKey(row), row])).values()],
+  ).sort((left, right) => (
+    left.observedAt.localeCompare(right.observedAt)
+    || left.slot.localeCompare(right.slot)
+    || left.snapshotId.localeCompare(right.snapshotId)
+  ));
+}
+
+function buildOneReset(ordered, allUsage, datasetStatus) {
   const first = ordered[0];
   const firstObservedMs = Date.parse(first.observedAt);
   const lastObservedMs = Date.parse(ordered.at(-1).observedAt);
@@ -248,7 +317,7 @@ function buildOneReset(rows, allUsage, datasetStatus) {
   if (first.accountTrackId === "unattributed") refusals.push("unattributed_account");
 
   const referencedDatasets = new Set([
-    ...rows.map((row) => row.datasetId),
+    ...ordered.map((row) => row.datasetId),
     ...matchedUsage.map((row) => row.datasetId),
   ]);
   if ([...referencedDatasets].some((id) => datasetStatus.get(id) !== true)) {
@@ -259,6 +328,10 @@ function buildOneReset(rows, allUsage, datasetStatus) {
     refusals.push("mixed_track_fields");
   }
 
+  // `collapseDuplicateInstants` has already settled each (observedAt, slot) to
+  // one row, so this can no longer fire. It stays as a fail-closed guard: a
+  // future caller that bypasses the collapse must still refuse rather than fit
+  // two contradictory readings of one instant.
   const byTimestampAndSlot = new Map();
   for (const row of ordered) {
     const key = `${row.observedAt}\0${row.slot}`;
@@ -273,10 +346,21 @@ function buildOneReset(rows, allUsage, datasetStatus) {
     const lag = Date.parse(row.receivedAt) - Date.parse(row.observedAt);
     return lag < 0 || lag > MAX_RECEIPT_LAG_MS;
   })) refusals.push("stale_quota_observation");
-  if (ordered.some((row, index) => (
-    index > 0
-    && ordered[index - 1].usedPercent - row.usedPercent > MAX_BACKWARD_NOISE_PP
-  ))) refusals.push("backward_quota_observation");
+  // `splitAtCycleRestarts` has already cut the series at every fall this size,
+  // so this can no longer fire, and for the same reason it is kept: a segment
+  // that still contains one is not a single cycle and must not be fitted as one.
+  //
+  // It compares within a slot for exactly the reason the splitter does. A group
+  // carries both slots, so a cross-slot comparison refused any group whose two
+  // pools sat at different levels — which the splitter deliberately does not
+  // split, so leaving this cross-slot would refuse what the splitter just
+  // declared healthy.
+  const previousInSlot = new Map();
+  if (ordered.some((row) => {
+    const previous = previousInSlot.get(row.slot);
+    previousInSlot.set(row.slot, row);
+    return previous && previous.usedPercent - row.usedPercent > MAX_BACKWARD_NOISE_PP;
+  })) refusals.push("backward_quota_observation");
   if (matchedUsage.some((row) => row.pricingStatus !== "fully_priced")) {
     refusals.push("incomplete_server_pricing");
   }
@@ -373,7 +457,8 @@ export function buildResetEvidence(input) {
     groups.set(key, values);
   }
   const resets = [...groups.values()]
-    .map((rows) => buildOneReset(rows, usage, datasetStatus))
+    .flatMap((rows) => splitAtCycleRestarts(orderQuotaRows(rows))
+      .map((segment) => buildOneReset(segment, usage, datasetStatus)))
     .sort((left, right) => (
       left.firstObservedAt.localeCompare(right.firstObservedAt)
       || left.resetKey.localeCompare(right.resetKey)

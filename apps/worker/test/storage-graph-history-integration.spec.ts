@@ -19,6 +19,7 @@ import {initializeStorageSource} from '../src/analytics-delivery';
 import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics,runStorageAnalyticsPass} from '../src/storage-analytics-runtime';
 import {drainCommunityPublicSourceBootstrap} from '../src/community-daily-aggregates';
 import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
+import {COMMUNITY_ALLOWANCE_FIT_METHOD} from '../src/community-allowance';
 import {captureStorageGraphScope,computeStorageGraphResult,readStorageGraphResult,storageGraphDependencyDigest,
  STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
  STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS,STORAGE_GRAPH_METHOD} from '../src/storage-community-graph';
@@ -362,17 +363,41 @@ it('binds only the v1 result identity to the v1 acquisition contract',async()=>{
  const authority={sourceId:'synthetic-identity-source',sourceNamespace:'synthetic-identity-source'};
  const ownerDigest='a'.repeat(64),target='2026-09-05',history=modelHistoryWindow(target);
  const dependency=[{observed_day:target}];
- const digest=(source:'v0.2'|'v1'|'v1.1'|'mixed',extra:readonly unknown[])=>sha256Hex(canonicalJson([
-  authority.sourceId,authority.sourceNamespace,ownerDigest,source,'fits',history.day,history.fromDay,
-  STORAGE_GRAPH_METHOD,dependency,...extra]));
- const computed=(source:'v0.2'|'v1'|'v1.1'|'mixed')=>storageGraphDependencyDigest({authority,ownerDigest,
-  source,metric:'fits',day:target,dependency});
+ const digest=(source:'v0.2'|'v1'|'v1.1'|'mixed',extra:readonly unknown[],metric:'fits'|'model'='fits')=>
+  sha256Hex(canonicalJson([
+   authority.sourceId,authority.sourceNamespace,ownerDigest,source,metric,history.day,history.fromDay,
+   STORAGE_GRAPH_METHOD,dependency,...(metric==='fits'?[COMMUNITY_ALLOWANCE_FIT_METHOD]:[]),...extra]));
+ const computed=(source:'v0.2'|'v1'|'v1.1'|'mixed',metric:'fits'|'model'='fits')=>
+  storageGraphDependencyDigest({authority,ownerDigest,source,metric,day:target,dependency});
  // A change to how v1 evidence is acquired retires v1 results only.
  expect(await computed('v1')).toBe(await digest('v1',[V1_QUOTA_ACQUISITION_VERSION]));
  expect(await computed('v1')).not.toBe(await digest('v1',[]));
  expect(await computed('v1.1')).toBe(await digest('v1.1',[V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]));
  expect(await computed('v0.2')).toBe(await digest('v0.2',[]));
  expect(await computed('mixed')).toBe(await digest('mixed',[]));
+});
+
+it('binds the fit gates to the fits identity and leaves model compositions alone',async()=>{
+ // The fit gates and the reset-evidence method beneath them decide what a FIT
+ // is. `buildResetEvidence` is reached only from the scalar half, so a model
+ // composition cannot contain that statistic and must not be retired to
+ // recompute it. Folding this into STORAGE_GRAPH_METHOD instead would discard
+ // the entire by-model corpus on every gate change — which is the whole reason
+ // this discriminator is metric-scoped rather than method-scoped.
+ const authority={sourceId:'synthetic-identity-source',sourceNamespace:'synthetic-identity-source'};
+ const ownerDigest='b'.repeat(64),target='2026-09-05',history=modelHistoryWindow(target);
+ const dependency=[{observed_day:target}];
+ const withoutFitMethod=(metric:'fits'|'model')=>sha256Hex(canonicalJson([
+  authority.sourceId,authority.sourceNamespace,ownerDigest,'v1.1',metric,history.day,history.fromDay,
+  STORAGE_GRAPH_METHOD,dependency,V11_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION]));
+ const computed=(metric:'fits'|'model')=>storageGraphDependencyDigest({authority,ownerDigest,
+  source:'v1.1',metric,day:target,dependency});
+ // The model identity is exactly what it was before the discriminator existed.
+ expect(await computed('model')).toBe(await withoutFitMethod('model'));
+ // The fits identity is not, so every fit recomputes under the new gates.
+ expect(await computed('fits')).not.toBe(await withoutFitMethod('fits'));
+ // And the two metrics never collide.
+ expect(await computed('fits')).not.toBe(await computed('model'));
 });
 
 it('starts v1 checkpoint work under new keys when the acquisition contract changes',async()=>{
