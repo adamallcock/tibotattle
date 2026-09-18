@@ -33,6 +33,16 @@ const GRAPH_LANE_ADMISSION_QUERIES=550,GRAPH_ONLY_ADMISSION_QUERIES=120;
  * never open inside a graph-only long pass, which exists to give ONE resumable
  * owner-day claim a whole window. */
 const GRAPH_DAY_PROJECTION_LANE_QUERIES=60;
+/** The OPENING slot's allowance, which is a different problem from the
+ * trailing one. A day's build costs source statements — one reader scope, one
+ * page per 16,384 quota rows, one per 5,000 usage rows, two generation fences,
+ * plus three to resolve a new owner — and the trailing slot's 60, halved, left
+ * about 18. That is under the cost of one dense day, so the lane started a day,
+ * exhausted its allowance part way through, discarded the work and did the same
+ * thing next pass: a livelock, not a stall. The opening slot runs before the
+ * publication lanes with the graph lane's floor already reserved, so it can
+ * have what is left above that floor without taking anything from it. */
+const GRAPH_DAY_PROJECTION_OPEN_QUERIES=250;
 /** The lane's allowance covers BOTH databases. The build reads the source,
  * which the lane's own sub-meter does not wrap, so half the carve-out is
  * reserved for it explicitly; otherwise the build's pages, its snapshot
@@ -50,6 +60,12 @@ const GRAPH_DAY_PROJECTION_OPEN_EVERY=5,GRAPH_DAY_PROJECTION_OPEN_MINUTE=2;
  * still leaves the graph and daily lanes a usable window. The lane stops
  * cleanly at its own deadline and never half-writes a day. */
 const GRAPH_DAY_PROJECTION_OPEN_SLICE_MS=8_000;
+/** Days one opening slot may prepare. At a 250-statement allowance the target
+ * half (125) affords `floor(124 / 12)` = 10 writes, and the source half (125)
+ * affords about 20 days at the measured 5-6 statements each, so the target
+ * half is the binding bound rather than a hope. The trailing slot keeps its
+ * default of 4. */
+const GRAPH_DAY_PROJECTION_OPEN_DAYS=10;
 /** Deployment switch for the prepared-graph-day builder. Default OFF: the fold
  * does not read these rows yet, so building them must be an explicit operator
  * decision and not a consequence of deploying this code. The pass option is the
@@ -432,9 +448,14 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     // not already run in this iteration, so opening first cannot take its
     // statements; only its own bounded slice of the clock changes hands.
     const floor=(graphRan?0:GRAPH_LANE_ADMISSION_QUERIES)+100;
-    const allowance=Math.min(GRAPH_DAY_PROJECTION_LANE_QUERIES,Math.max(0,meter.remainingQueries-floor));
-    const sourceQueries=Math.floor(allowance/GRAPH_DAY_PROJECTION_SOURCE_SHARE);
-    const targetQueries=allowance-sourceQueries;
+    const opening=sliceMs!==null;
+    const allowance=Math.min(opening?GRAPH_DAY_PROJECTION_OPEN_QUERIES:GRAPH_DAY_PROJECTION_LANE_QUERIES,
+     Math.max(0,meter.remainingQueries-floor));
+    // Both halves bind: a day costs `4 + maxWrites` target statements to write
+    // and one reader scope, its pages and two fences to read. An even split
+    // keeps either from being the reason the other cannot finish a day.
+    const targetQueries=allowance-Math.floor(allowance/GRAPH_DAY_PROJECTION_SOURCE_SHARE);
+    const sourceQueries=allowance-targetQueries;
     // An opening slice needs enough window to be worth taking AND must leave
     // the rest to the other lanes; a trailing run takes whatever is left.
     const required=sliceMs===null?5_000:sliceMs+5_000;
@@ -445,6 +466,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
       const lane=await advanceGraphDayProjectionLane({target:laneMeter.wrap(scoped.target),
        sourceId:options.sourceId,build:build,deadlineMs:laneDeadline,sourceQueries,
        remainingQueries:laneMeter.remainingQueries,
+       ...(opening?{maxDays:GRAPH_DAY_PROJECTION_OPEN_DAYS}:{}),
        ...(options.graphDayProjectionFromDay===undefined?{}:{fromDay:options.graphDayProjectionFromDay})});
       projectionIdle=lane.state==='idle';
       graphDayProjection={opened:true,built:lane.built,refused:lane.refused,skipped:lane.skipped,

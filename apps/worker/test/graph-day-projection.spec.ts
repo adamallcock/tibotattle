@@ -872,6 +872,35 @@ describe('production builder over the real source readers',()=>{
    maxSteps:1,maxQueries:900,deadlineMs:Date.now()+30_000});
   expect(off.graphDayProjection).toBeUndefined();
  });
+ it('measures one day of source statements and completes many days per opening slot',async()=>{
+  // The livelock was an opening slot whose source half was about 18 statements,
+  // under the cost of one dense day: the lane started a day, exhausted the
+  // allowance part way through and discarded the work, every pass.
+  const f=await source(4);
+  const build=createGraphDayProjectionSourceBuild({source:sourceDb(),sourceNamespace});
+  const first=await advanceGraphDayProjectionLane({target:target(),sourceId,build,
+   deadlineMs:Date.now()+60_000,remainingQueries:900,sourceQueries:900,maxDays:1});
+  expect(first.built).toBe(1);
+  // One day: a reader scope, one page per 16,384 quota and 5,000 usage rows,
+  // and two generation fences; the first day of an owner adds four more to
+  // resolve its link, pin and snapshot.
+  const firstDay=first.sourceQueriesUsed;
+  const second=await advanceGraphDayProjectionLane({target:target(),sourceId,build,
+   deadlineMs:Date.now()+60_000,remainingQueries:900,sourceQueries:900,maxDays:1});
+  expect(second.built).toBe(1);
+  const perDay=second.sourceQueriesUsed;
+  console.log(JSON.stringify({firstDayWithOwnerResolution:firstDay,perDayAfterwards:perDay}));
+  expect(firstDay).toBe(perDay+4);
+  expect(perDay).toBe(5);
+  // The opening slot's source half at a 250-statement allowance.
+  const slot=await advanceGraphDayProjectionLane({target:target(),sourceId,build,
+   deadlineMs:Date.now()+60_000,remainingQueries:125,sourceQueries:125,maxDays:8});
+  expect(slot.built).toBe(2);
+  expect(slot.state).toBe('progress');
+  // Nothing is discarded: every day it started, it finished.
+  expect(slot.staged).toBe(0);
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(4);
+ });
  it('does not open the builder twice in one iteration',async()=>{
   const f=await source(1);
   expect(f.days).toHaveLength(1);
