@@ -43,6 +43,17 @@ const GRAPH_DAY_PROJECTION_LANE_QUERIES=60;
  * publication lanes with the graph lane's floor already reserved, so it can
  * have what is left above that floor without taking anything from it. */
 const GRAPH_DAY_PROJECTION_OPEN_QUERIES=250;
+/** What the opening slot leaves behind, which is NOT the graph lane's 550
+ * floor. Reserving that floor first is what made the slot unfundable: the
+ * public pass starts with the worker meter's remainder after delivery, often
+ * 500-700 rather than 900, so `remaining - 650` reached zero before the 250
+ * ceiling ever bound and the slot got no source budget at all. On its one
+ * minute in five the builder takes its bounded slice FIRST and the graph lane
+ * may not open that minute. That is a deliberate yield, not an oversight: the
+ * graph lane is busy precisely because nothing is prepared, and the builder
+ * goes idle by itself once coverage is complete. This reserve is the ordinary
+ * delivery and retirement headroom the pass needs whatever else happens. */
+const GRAPH_DAY_PROJECTION_OPEN_RESERVE=100;
 /** The lane's allowance covers BOTH databases. The build reads the source,
  * which the lane's own sub-meter does not wrap, so half the carve-out is
  * reserved for it explicitly; otherwise the build's pages, its snapshot
@@ -444,11 +455,13 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     const build=options.graphDayProjectionBuild;
     if(!(projectionLane&&build&&!projectionExhausted&&!projectionRan&&Date.now()<deadlineMs))return;
     projectionRan=true;
-    // The graph lane's admission floor stays reserved whenever that lane has
-    // not already run in this iteration, so opening first cannot take its
-    // statements; only its own bounded slice of the clock changes hands.
-    const floor=(graphRan?0:GRAPH_LANE_ADMISSION_QUERIES)+100;
     const opening=sliceMs!==null;
+    // The trailing slot still reserves the graph lane's whole admission floor.
+    // The opening slot reserves only the pass's ordinary headroom, which is the
+    // explicit trade above: at most `GRAPH_DAY_PROJECTION_OPEN_QUERIES` and one
+    // 8-second slice, one minute in five.
+    const floor=opening?GRAPH_DAY_PROJECTION_OPEN_RESERVE
+     :(graphRan?0:GRAPH_LANE_ADMISSION_QUERIES)+100;
     const allowance=Math.min(opening?GRAPH_DAY_PROJECTION_OPEN_QUERIES:GRAPH_DAY_PROJECTION_LANE_QUERIES,
      Math.max(0,meter.remainingQueries-floor));
     // Both halves bind: a day costs `4 + maxWrites` target statements to write

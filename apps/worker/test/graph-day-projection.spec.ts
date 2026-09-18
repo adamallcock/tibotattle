@@ -901,6 +901,41 @@ describe('production builder over the real source readers',()=>{
   expect(slot.staged).toBe(0);
   expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(4);
  });
+ it('funds the opening slot on a meter too small for the graph floor, and not otherwise',async()=>{
+  // Production symptom: the public pass starts with the worker meter's
+  // remainder, so reserving the graph lane's 550 floor first left the opening
+  // slot with no source budget and it selected candidates it could never fund.
+  const f=await source(2);
+  expect(f.days).toHaveLength(2);
+  const build=createGraphDayProjectionSourceBuild({source:sourceDb(),sourceNamespace});
+  const opening=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   buildGraphDayProjections:true,graphDayProjectionBuild:build,projectionLaneFirst:true,
+   maxSteps:1,maxQueries:500,deadlineMs:Date.now()+30_000});
+  // 500 is well under the 650 the trailing slot would reserve, yet the slice is
+  // funded and days are built.
+  expect(opening.graphDayProjection).toMatchObject({opened:true,state:'progress'});
+  expect(opening.graphDayProjection!.sourceQueriesUsed).toBeGreaterThan(0);
+  expect(opening.graphDayProjection!.built).toBeGreaterThan(0);
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n'))
+   .toBe(opening.graphDayProjection!.built);
+  // The slice stays bounded even though the floor is not reserved ahead of it.
+  expect(opening.graphDayProjection!.sourceQueriesUsed).toBeLessThanOrEqual(125);
+ });
+ it('leaves the graph lane its whole floor on an ordinary minute',async()=>{
+  const f=await source(2);
+  expect(f.days).toHaveLength(2);
+  let built=0;
+  const build=createGraphDayProjectionSourceBuild({source:sourceDb(),sourceNamespace});
+  const ordinary=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   buildGraphDayProjections:true,projectionLaneFirst:false,maxSteps:1,maxQueries:500,
+   graphDayProjectionBuild:async(candidate,budget)=>{built+=1;return build(candidate,budget);},
+   deadlineMs:Date.now()+30_000});
+  // On a trailing minute the graph lane's 550 floor is still reserved first, so
+  // a 500-statement pass funds no builder slice at all and nothing is spent.
+  expect(built).toBe(0);
+  expect(ordinary.graphDayProjection).toMatchObject({opened:false,built:0,sourceQueriesUsed:0});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_values').first<number>('n')).toBe(0);
+ });
  it('does not open the builder twice in one iteration',async()=>{
   const f=await source(1);
   expect(f.days).toHaveLength(1);
