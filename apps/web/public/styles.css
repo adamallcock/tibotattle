@@ -3821,6 +3821,19 @@ footer p { margin: 0; }
 }
 .community-site .allowance-legend-button { min-height: 26px; padding: 2px 6px; font-size: .72rem; }
 
+/* Closed, this is one quiet line — it inherited the journey card treatment and
+   stood 105px tall shut, which is worse than the prose it replaced. */
+.community-site .snapshot-disclosure-details { margin: 6px 0 2px; border: 0; padding: 0; background: none; }
+.community-site .snapshot-disclosure-details > summary {
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+  padding: 0; margin: 0; list-style: none;
+  font-size: .68rem; color: var(--muted); text-decoration: underline dotted;
+}
+.community-site .snapshot-disclosure-details > summary::-webkit-details-marker { display: none; }
+.community-site .snapshot-disclosure-details > summary:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.community-site .snapshot-disclosure-details[open] > summary { margin-bottom: 4px; }
+.community-site .snapshot-disclosure-details .snapshot-disclosure { margin: 0 0 4px; font-size: .68rem; }
+
 /* (5) Small multiples: one panel per plan, each with its own value axis. */
 .allowance-small-multiples { display: grid; gap: 10px; margin-top: 10px; }
 .allowance-panel { min-width: 0; }

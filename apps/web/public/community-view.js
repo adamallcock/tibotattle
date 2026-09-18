@@ -927,7 +927,7 @@ function usdFormatter(maximumFractionDigits = 0) {
  * per-render closure over the document, so it is passed in rather than
  * reached for. */
 function sourceDisclosureDetails(node, t, extraKeys = []) {
-  const details = node("details", "journey-disclosure snapshot-disclosure-details");
+  const details = node("details", "snapshot-disclosure-details");
   const summary = node("summary");
   summary.append(node("span", "", t("community.sample.sourcesSummary")));
   details.append(summary);
