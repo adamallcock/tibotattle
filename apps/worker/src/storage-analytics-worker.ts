@@ -69,6 +69,10 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   ||(options?.cron!==undefined&&typeof options.cron!=='string')
   ||(options?.nowMs!==undefined&&(!Number.isSafeInteger(options.nowMs)||options.nowMs<0)))throw new Error('STORAGE_ANALYTICS_CONFIGURATION_INVALID');
  const publishCommunity=publicAnalyticsEnabled(env);
+ // Once the publication worker is live this worker stops publishing, so the two
+ // never share a 55-second window. Unset means this worker keeps the lane, so
+ // deploying the split changes nothing until both switches are thrown.
+ const skipPublication=Reflect.get(env,'PUBLICATION_LANE_EXTERNAL')==='enabled';
  // Which pass runs is a property of the scheduled minute, not of the delivered
  // cron expression. With publication deployed off there is no graph lane at
  // all, so every invocation stays on the ordinary bounded pass.
@@ -111,6 +115,7 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
    ...(buildProjections&&env.GRAPH_DAY_PROJECTION_LONG_PASS==='enabled'
     ?{graphDayProjectionLongPass:true}:{})};
   const result=await runStorageAnalyticsPass({...bindings,...projectionOptions,publishCommunity,
+   ...(skipPublication?{skipPublication:true}:{}),
    ...(publishCommunity?{publicOnly:true}:{}),maxQueries:meter.remainingQueries,
    ...(publishCommunity?{maxSteps:32}:{}),
    // Erasure and the retirement pages already had their bounded opportunity

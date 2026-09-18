@@ -297,6 +297,12 @@ export interface StorageAnalyticsCatchupMetrics {
 export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  maxSteps?:number;deadlineMs?:number;maxQueries?:number;signal?:AbortSignal;
  publishCommunity?:boolean;publicOnly?:boolean;
+ /** Run the publication lanes and never the graph lane. The publication worker
+  * sets this; it is the inverse of `graphOnly`. */
+ publicationOnly?:boolean;
+ /** Run every lane EXCEPT publication. The analytics worker sets this once the
+  * publication worker is live, so the two never contend for the same window. */
+ skipPublication?:boolean;
   ledger?:D1Database;skipV1PrefixProbe?:boolean;
  /** Public lane order. The daily and graph lanes each need most of one
   * scheduled window when both have work, so passes alternate which lane opens
@@ -339,6 +345,14 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    // A graph-only pass publishes community results and opens no ordered
    // journal step; any other combination is a caller contract error.
    ||(options.graphOnly===true&&(options.publishCommunity!==true||options.publicOnly!==true))
+   ||(options.publicationOnly!==undefined&&typeof options.publicationOnly!=='boolean')
+   ||(options.skipPublication!==undefined&&typeof options.skipPublication!=='boolean')
+   // The two halves of the split are mutually exclusive, and each needs the
+   // publication phase's own preconditions. A pass that claimed both would run
+   // no lane at all and report itself idle, which is the failure mode this
+   // split exists to make impossible.
+   ||(options.publicationOnly===true&&(options.skipPublication===true||options.graphOnly===true
+     ||options.publishCommunity!==true||options.publicOnly!==true))
    // A claim is recoverable only by lease expiry. It must outlive this pass's
    // own window, or a second claimant forks the same checkpoint key while this
    // one is still writing; and it must stay inside one cron invocation's
@@ -442,7 +456,11 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   // with the cohort and could spend the graph lane's admission floor before any
   // calculation starts. The minute pass still runs it every minute, and the
   // graph lane publishes its own preview after a completed calculation.
-  if(options.publishCommunity&&!options.graphOnly&&meter.remainingQueries>=253&&deadlineMs-Date.now()>=5_000
+  // The standing preview refresh is publication work, so it travels with the
+  // publication lane. A graph completion still publishes its own result inside
+  // `runGraphLane`, which is the graph's own output rather than this sweep.
+  if(options.publishCommunity&&!options.graphOnly&&!options.skipPublication
+    &&meter.remainingQueries>=253&&deadlineMs-Date.now()>=5_000
     &&(await readCollectionControls(scoped.source)).publication) {
    options.signal?.throwIfAborted();
    try{
@@ -594,7 +612,16 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     // durable queue exists, and both selectors fall back to the other lane
     // when their preferred lane is empty.
     const runDailyLane=async():Promise<boolean>=>{
-     const dailyAllowance=Math.min(90,Math.max(0,meter.remainingQueries-(graphRan?100:560)));
+     // Once publication runs in its own worker this lane is that worker's, and
+     // leaving it here would put the two in the same 55-second window competing
+     // for the same wall clock — which is the whole reason for the split.
+     if(options.skipPublication)return true;
+     // A publication-only pass has no graph lane to reserve for, so the whole
+     // remaining meter is available rather than everything above the graph's
+     // 560-statement admission floor.
+     const dailyAllowance=options.publicationOnly
+      ?Math.min(90,Math.max(0,meter.remainingQueries-100))
+      :Math.min(90,Math.max(0,meter.remainingQueries-(graphRan?100:560)));
      let dailyIdle=false;
      const dailyTimeRemaining=deadlineMs-Date.now();
      if(dailyAllowance>0&&dailyTimeRemaining>=5_000){
@@ -628,6 +655,10 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     // start another heavy calculation in the same invocation; the next
     // scheduled pass retries from its durable checkpoint and selection.
     const runGraphLane=async():Promise<boolean>=>{
+     // The publication worker never computes a graph result. Reporting the lane
+     // exhausted rather than idle stops the loop waiting on a lane that is not
+     // going to run in this worker at all.
+     if(options.publicationOnly)return true;
      if(!(meter.remainingQueries>=graphAdmission && Date.now()<deadlineMs && !graphExhausted))return graphExhausted;
      graphRan=true;
      let graph:StorageGraphWorkProgress={state:'deferred',reason:'graph_failure'};
