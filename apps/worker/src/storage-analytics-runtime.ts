@@ -266,6 +266,14 @@ async function advanceStorageAnalyticsV1Page(options:StorageAnalyticsBindings&{
 export interface StorageAnalyticsPass {
  state:'idle'|'progress'|'deferred';steps:number;recordsRead:number;queriesUsed:number;
  dailyPublications:number;graphCalculations:number;
+ /** Statements the three retirement sweeps took, and how often each found work.
+  * They run on every iteration of the hot loop regardless of whether the pass's
+  * own lane did anything, so without these a pass that spent its whole meter
+  * reclaiming space is indistinguishable from one that was simply idle.
+  *
+  * Absent on a lane that does not run them, such as the catch-up pass. */
+ sweepQueries?:number;sweepIterations?:number;
+ sweepV11Worked?:number;sweepV1Worked?:number;sweepGraphWorked?:number;
  graphFailure?:StorageGraphFailureFields;
  /** The prepared-day builder, closed and content-free. Absent means the lane is
   * switched off. Present with `opened:false` means it was switched on but never
@@ -353,8 +361,16 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,graphFailure:StorageGraphFailureFields|undefined;
  let graphDayProjection:StorageGraphDayProjectionFields|undefined;
+ // The three retirement sweeps run on EVERY iteration of the hot loop,
+ // including a public-only pass whose own step is a no-op. A pass that
+ // published nothing can still spend most of its meter here, which is
+ // indistinguishable in the summary from a pass that had nothing to do — and
+ // that ambiguity hid the graph lane being starved. These attribute the spend.
+ const sweep={queries:0,v11Worked:0,v1Worked:0,graphWorked:0,iterations:0};
  const result=(state:StorageAnalyticsPass['state'],reason:StorageAnalyticsPass['reason']):StorageAnalyticsPass=>
   ({state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications,graphCalculations,
+   sweepQueries:sweep.queries,sweepIterations:sweep.iterations,
+   sweepV11Worked:sweep.v11Worked,sweepV1Worked:sweep.v1Worked,sweepGraphWorked:sweep.graphWorked,
    ...(graphFailure?{graphFailure}:{}),...(graphDayProjection?{graphDayProjection}:{})});
  // A graph-only pass has exactly one lane, and an exhausted lane reports itself
  // idle for the rest of the pass. Without this, a window that ended with its
@@ -456,9 +472,17 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    // graph-only pass leaves those bounded pages to the minute schedule, which
    // keeps running them, and gives its whole window to one resumable claim.
    const idlePage={state:'idle' as const};
+   const sweepBefore=meter.queriesUsed;
    const v11=options.graphOnly?idlePage:await retireV11DailyProjectionPage(scoped.target,options.sourceId);
    const v1=options.graphOnly?idlePage:await retireV1DailyProjectionPage(scoped.target,options.sourceId);
    const retiredGraph=options.graphOnly?idlePage:await retireStorageGraphPage(scoped.target,options.sourceId);
+   if(!options.graphOnly){
+    sweep.queries+=meter.queriesUsed-sweepBefore;
+    sweep.iterations+=1;
+    if(v11.state!=='idle')sweep.v11Worked+=1;
+    if(v1.state!=='idle')sweep.v1Worked+=1;
+    if(retiredGraph.state!=='idle')sweep.graphWorked+=1;
+   }
    // The prepared-graph-day sweep costs statements in the hot loop, so it runs
    // only where its rows can exist: with the builder lane switched on. The two
    // paths that must never depend on that switch keep it unconditional —

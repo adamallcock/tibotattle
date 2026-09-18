@@ -134,6 +134,12 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
    deliveryQueriesUsed:publishCommunity?delivery?.queriesUsed??0:result.queriesUsed,
    publicIterations:publishCommunity?result.steps:0,
    publicRecordsRead:publishCommunity?result.recordsRead:0,publicQueriesUsed:publishCommunity?result.queriesUsed:0,
+   // Where the public phase's statements actually went. A high `publicQueriesUsed`
+   // with `dailyPublications:0` reads as a stuck publisher; if `sweepQueries`
+   // accounts for most of it the publisher is fine and the retirement sweeps are
+   // the ones consuming the meter the graph lane needs.
+   sweepQueries:result.sweepQueries??0,sweepIterations:result.sweepIterations??0,
+   sweepWorked:(result.sweepV11Worked??0)+(result.sweepV1Worked??0)+(result.sweepGraphWorked??0),
    queriesUsed:meter.queriesUsed}));
  }catch (error) {reportScheduleFailure(event,error);}
 }
