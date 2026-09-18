@@ -113,7 +113,14 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
    // the next minute, which is one minute in ten.
    ...(longPass?{graphOnly:true,graphLeaseMs:LONG_PASS_GRAPH_LEASE_MS}:{}),
    deadlineMs:publishCommunity?deadlineMs:started+20_000});
+  // One line of tail must say which of "never opened", "opened and selected
+  // nothing" and "selected and prepared nothing" the builder is in.
+  const projection=result.graphDayProjection;
   console.log(JSON.stringify({event,...result,
+   ...(projection?{projectionOpened:projection.opened,projectionBuilt:projection.built,
+    projectionRefused:projection.refused,projectionSkipped:projection.skipped,
+    projectionCandidates:projection.candidates,projectionSourceQueries:projection.sourceQueriesUsed,
+    projectionState:projection.state,projectionReason:projection.reason}:{}),
    steps:result.steps+(delivery?.steps??0),recordsRead:result.recordsRead+(delivery?.recordsRead??0),
    deliverySteps:publishCommunity?delivery?.steps??0:result.steps,
    deliveryRecordsRead:publishCommunity?delivery?.recordsRead??0:result.recordsRead,

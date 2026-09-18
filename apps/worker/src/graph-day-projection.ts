@@ -963,9 +963,14 @@ export interface GraphDayProjectionLaneResult {
   reason: "complete" | "deadline" | "query_budget" | "day_limit";
   built: number;
   staged: number;
-  /** Days this pass could not prepare at all. They are skipped, not retried in
-   * this pass, and they never stall the other candidates. */
+  /** Days refused for a reason recorded against the day's own inputs, so the
+   * next selection excludes them. */
   refused: number;
+  /** Days refused for a transient, owner-scoped reason, which is deliberately
+   * NOT recorded — so the same days are selected again next pass. A pass whose
+   * candidates are all skipped makes no progress and repeats forever, which is
+   * indistinguishable from "never opened" without this counter. */
+  skipped: number;
   candidates: number;
   /** Source statements the build spent. The lane's own meter wraps only the
    * target, so the caller deducts this from the pass meter; otherwise the
@@ -1003,11 +1008,11 @@ export async function advanceGraphDayProjectionLane(options: {
     if (!Number.isFinite(value)) throw fail();
     return value;
   };
-  let built = 0, staged = 0, refused = 0;
+  let built = 0, staged = 0, refused = 0, skipped = 0;
   // One selection statement plus, per day, a read-back, its write batch and the
   // promotion check. Refuse to open the lane below that.
-  if (options.remainingQueries < 4) return { state: "deferred", reason: "query_budget", built, staged, refused, candidates: 0, sourceQueriesUsed: 0 };
-  if (now() >= options.deadlineMs) return { state: "deferred", reason: "deadline", built, staged, refused, candidates: 0, sourceQueriesUsed: 0 };
+  if (options.remainingQueries < 4) return { state: "deferred", reason: "query_budget", built, staged, refused, skipped, candidates: 0, sourceQueriesUsed: 0 };
+  if (now() >= options.deadlineMs) return { state: "deferred", reason: "deadline", built, staged, refused, skipped, candidates: 0, sourceQueriesUsed: 0 };
   const candidates = (await target.prepare(`SELECT DISTINCT v.source_id,v.source_layout,v.source_namespace,
       v.owner_digest,v.device_id,v.manifest_id,v.manifest_digest,v.day
     FROM analytics_v11_reusable_values v
@@ -1028,7 +1033,7 @@ export async function advanceGraphDayProjectionLane(options: {
     .all<{ source_id: string; source_layout: string; source_namespace: string; owner_digest: string;
       device_id: string; manifest_id: string; manifest_digest: string; day: string }>()).results;
   if (!candidates.length) {
-    return { state: "idle", reason: "complete", built, staged, refused, candidates: 0,
+    return { state: "idle", reason: "complete", built, staged, refused, skipped, candidates: 0,
       sourceQueriesUsed: 0 };
   }
   // One day costs at most a values read, a staged-parts read, one write batch
@@ -1046,12 +1051,12 @@ export async function advanceGraphDayProjectionLane(options: {
   for (const row of candidates) {
     if (affordable < perDay) {
       return { state: built + staged ? "progress" : "deferred", reason: "query_budget", built, staged,
-        refused, candidates: candidates.length, sourceQueriesUsed: spent() };
+        refused, skipped, candidates: candidates.length, sourceQueriesUsed: spent() };
     }
     affordable -= perDay;
     if (now() >= options.deadlineMs) {
       return { state: built + staged ? "progress" : "deferred", reason: "deadline", built, staged,
-        refused, candidates: candidates.length, sourceQueriesUsed: spent() };
+        refused, skipped, candidates: candidates.length, sourceQueriesUsed: spent() };
     }
     if (row.source_id !== sourceId) throw fail();
     const candidate: GraphDayProjectionCandidate = { sourceId, sourceLayout: row.source_layout as "typed-v11",
@@ -1068,13 +1073,14 @@ export async function advanceGraphDayProjectionLane(options: {
         // Record it before moving on. A refusal that is only skipped is
         // rediscovered every pass, and enough of them at the earliest dates
         // stall the oldest-first selection permanently.
-        refused += 1;
         if (!GRAPH_DAY_PROJECTION_RECORDED_REFUSALS.has(error.reason)) {
+          skipped += 1;
           // Transient and owner-scoped: the pass's own memo already makes the
           // rest of this owner's days free, and the next pass retries it.
           console.log(JSON.stringify({ event: "graph_day_projection_skipped", reason: error.reason }));
           continue;
         }
+        refused += 1;
         await target.prepare(`INSERT INTO analytics_graph_day_refusals
           (source_id,owner_digest,day,manifest_digest,acquisition_version,reason,refused_ms)
           VALUES(?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`)
@@ -1085,7 +1091,7 @@ export async function advanceGraphDayProjectionLane(options: {
       }
       if (!(error instanceof GraphDayProjectionDeferredError)) throw error;
       return { state: built + staged ? "progress" : "deferred", reason: error.reason, built, staged,
-        refused, candidates: candidates.length, sourceQueriesUsed: spent() };
+        refused, skipped, candidates: candidates.length, sourceQueriesUsed: spent() };
     }
     const result = await writeGraphDayProjection({ target, key: candidate, projection, maxWrites });
     if (result.status === "stored") built += 1; else staged += 1;
@@ -1093,5 +1099,5 @@ export async function advanceGraphDayProjectionLane(options: {
   // A pass that only refused still advanced: it recorded refusals the next
   // selection excludes. Reporting idle there would claim the lane is complete.
   return { state: "progress", reason: candidates.length < maxDays ? "complete" : "day_limit",
-    built, staged, refused, candidates: candidates.length, sourceQueriesUsed: spent() };
+    built, staged, refused, skipped, candidates: candidates.length, sourceQueriesUsed: spent() };
 }

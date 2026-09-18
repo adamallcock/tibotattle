@@ -228,7 +228,17 @@ export interface StorageAnalyticsPass {
  state:'idle'|'progress'|'deferred';steps:number;recordsRead:number;queriesUsed:number;
  dailyPublications:number;graphCalculations:number;
  graphFailure?:StorageGraphFailureFields;
+ /** The prepared-day builder, closed and content-free. Absent means the lane is
+  * switched off. Present with `opened:false` means it was switched on but never
+  * admitted; `candidates` with no `built` and no `refused` means it selected
+  * days and could not prepare any of them. One line of log then says which. */
+ graphDayProjection?:StorageGraphDayProjectionFields;
  reason:'complete'|'step_limit'|'deadline'|'query_budget'|'capacity'|'format_boundary';
+}
+export interface StorageGraphDayProjectionFields {
+ opened:boolean;built:number;refused:number;skipped:number;candidates:number;
+ sourceQueriesUsed:number;state:'idle'|'progress'|'deferred'|'failed';
+ reason:'complete'|'deadline'|'query_budget'|'day_limit'|'not_admitted'|'lane_failure';
 }
 export interface StorageAnalyticsCatchupMetrics {
  decodedBytes:number;sourceReadMs:number;foldMs:number;sourceRecheckMs:number;targetWriteMs:number;pageDurationMs:number;
@@ -297,9 +307,10 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  const meter=createD1InvocationBudget(options.maxQueries??900);
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,graphFailure:StorageGraphFailureFields|undefined;
+ let graphDayProjection:StorageGraphDayProjectionFields|undefined;
  const result=(state:StorageAnalyticsPass['state'],reason:StorageAnalyticsPass['reason']):StorageAnalyticsPass=>
   ({state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications,graphCalculations,
-   ...(graphFailure?{graphFailure}:{})});
+   ...(graphFailure?{graphFailure}:{}),...(graphDayProjection?{graphDayProjection}:{})});
  // A graph-only pass has exactly one lane, and an exhausted lane reports itself
  // idle for the rest of the pass. Without this, a window that ended with its
  // owner-day still unfinished would report an idle cohort or ordinary progress
@@ -436,6 +447,9 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
        remainingQueries:laneMeter.remainingQueries,
        ...(options.graphDayProjectionFromDay===undefined?{}:{fromDay:options.graphDayProjectionFromDay})});
       projectionIdle=lane.state==='idle';
+      graphDayProjection={opened:true,built:lane.built,refused:lane.refused,skipped:lane.skipped,
+       candidates:lane.candidates,sourceQueriesUsed:lane.sourceQueriesUsed,state:lane.state,
+       reason:lane.reason};
       // The lane's own meter wraps only the target. The build reads the SOURCE
       // through the composition root's binding, so without this the number that
       // gates the graph lane's 550 floor over-reports by the whole build spend
@@ -446,18 +460,23 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
      }catch(error){
       if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError){
        projectionIdle=false;
+       graphDayProjection={opened:true,built:0,refused:0,skipped:0,candidates:0,sourceQueriesUsed:0,
+        state:'deferred',reason:'query_budget'};
       }else{
        // Isolated exactly like the other lanes: a failing builder records its
        // closed stage, stops for the rest of this pass, and cannot stall
        // delivery, the daily lane or the graph lane.
        projectionExhausted=true;
+       graphDayProjection={opened:true,built:0,refused:0,skipped:0,candidates:0,sourceQueriesUsed:0,
+        state:'failed',reason:'lane_failure'};
        console.log(JSON.stringify({event:'storage_analytics_lane_failure',lane:'graph_day_projection',
         phase:null,reason:'graph_day_projection_failure',detail:storageGraphFailureDetail(error)??null}));
       }
      }
      // No allowance and no time is not pending work: reporting it as busy would
      // keep an under-budget pass looping until it burned its step limit.
-    }
+    }else graphDayProjection??={opened:false,built:0,refused:0,skipped:0,candidates:0,
+     sourceQueriesUsed:0,state:'deferred',reason:'not_admitted'};
    };
    // On its opening minute the builder takes a bounded slice BEFORE the
    // publication lanes. Running last is what stalled it in production: in

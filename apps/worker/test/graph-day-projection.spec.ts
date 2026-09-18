@@ -652,7 +652,7 @@ describe('prepared graph day builder lane',()=>{
   const first=await advanceGraphDayProjectionLane({target:target(),sourceId,build:refusing,
    deadlineMs:Date.now()+30_000,remainingQueries:900});
   // A pass that refused still advanced: it recorded what the next one excludes.
-  expect(first).toMatchObject({state:'progress',built:1,refused:1,candidates:2});
+  expect(first).toMatchObject({state:'progress',built:1,refused:1,skipped:0,candidates:2});
   const recorded=await target().prepare(`SELECT day,reason,acquisition_version FROM analytics_graph_day_refusals`)
    .first<{day:string;reason:string;acquisition_version:string}>();
   expect(recorded).toMatchObject({day:DAY,reason:'usage_row_refused',
@@ -660,7 +660,7 @@ describe('prepared graph day builder lane',()=>{
   // The refused day is gone from selection, so the lane is genuinely complete.
   const second=await advanceGraphDayProjectionLane({target:target(),sourceId,build:refusing,
    deadlineMs:Date.now()+30_000,remainingQueries:900});
-  expect(second).toMatchObject({state:'idle',reason:'complete',candidates:0,refused:0});
+  expect(second).toMatchObject({state:'idle',reason:'complete',candidates:0,refused:0,skipped:0});
   // A re-upload of that day restates its manifest digest, which is part of the
   // refusal key, so the day is retried without any operator action.
   await deliverDay(DAY,'9'.repeat(64),'manifest-3');
@@ -675,7 +675,9 @@ describe('prepared graph day builder lane',()=>{
   const before=await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_refusals').first<number>('n');
   const transient=await advanceGraphDayProjectionLane({target:target(),sourceId,build:unresolvable,
    deadlineMs:Date.now()+30_000,remainingQueries:900});
-  expect(transient).toMatchObject({state:'progress',built:0,refused:transient.candidates});
+  // Skipped, not refused: the counters keep the two apart, which is what says
+  // "selected days and prepared none of them" rather than "never opened".
+  expect(transient).toMatchObject({state:'progress',built:0,refused:0,skipped:transient.candidates});
   expect(transient.candidates).toBeGreaterThan(0);
   expect(await target().prepare('SELECT COUNT(*) n FROM analytics_graph_day_refusals').first<number>('n')).toBe(before);
   // So the same days are still selectable on the next pass.
@@ -849,6 +851,26 @@ describe('production builder over the real source readers',()=>{
   expect(Date.now()-started).toBeLessThan(25_000);
   expect(pass.queriesUsed).toBeLessThan(900-550);
   expect(pass.reason).not.toBe('query_budget');
+ });
+ it('reports the lane in the pass summary, including when it prepares nothing',async()=>{
+  const f=await source(1);
+  expect(f.days).toHaveLength(1);
+  const build=createGraphDayProjectionSourceBuild({source:sourceDb(),sourceNamespace});
+  const built=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   buildGraphDayProjections:true,graphDayProjectionBuild:build,projectionLaneFirst:true,
+   maxSteps:1,maxQueries:900,deadlineMs:Date.now()+30_000});
+  expect(built.graphDayProjection).toMatchObject({opened:true,built:1,refused:0,skipped:0,candidates:1});
+  expect(built.graphDayProjection!.sourceQueriesUsed).toBeGreaterThan(0);
+  // Selected days and prepared none of them: distinguishable from never opening.
+  const stalled=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   buildGraphDayProjections:true,projectionLaneFirst:true,maxSteps:1,maxQueries:900,
+   graphDayProjectionBuild:async()=>{throw new GraphDayProjectionRefusedError('owner_source_unavailable');},
+   graphDayProjectionFromDay:'2020-01-01',deadlineMs:Date.now()+30_000});
+  expect(stalled.graphDayProjection).toMatchObject({opened:true,built:0,refused:0});
+  // Switched off entirely: no field at all, so absence is unambiguous.
+  const off=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   maxSteps:1,maxQueries:900,deadlineMs:Date.now()+30_000});
+  expect(off.graphDayProjection).toBeUndefined();
  });
  it('does not open the builder twice in one iteration',async()=>{
   const f=await source(1);
