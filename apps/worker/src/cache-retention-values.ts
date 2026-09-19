@@ -421,7 +421,7 @@ export function reduceCacheRetentionDay(input: {
     if (item.observedAtMs < dayStartMs || item.observedAtMs >= dayEndMs) {
       throw new TypeError("CACHE_RETENTION_EVENT_INVALID");
     }
-    const order = `${String(item.observedAtMs).padStart(16, "0")} ${item.orderKey}`;
+    const order = `${String(item.observedAtMs).padStart(16, "0")}\0${item.orderKey}`;
     if (order <= lastOrder) throw new TypeError("CACHE_RETENTION_ORDER_INVALID");
     lastOrder = order;
     if (!readable) {
