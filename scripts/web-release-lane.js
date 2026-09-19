@@ -1,7 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
+import { checkI18nBrowserMirror } from "./generate-i18n-browser-mirror.js";
 import {
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
   PUBLIC_RELEASE_SOURCE_COMMIT_PATTERN,
@@ -13,6 +16,19 @@ export const WEB_RELEASE_OUTPUT_DIRECTORY =
   ".release-build/public-release-site";
 export const WEB_RELEASE_MANIFEST_PATH =
   `${WEB_RELEASE_OUTPUT_DIRECTORY}/release-site-manifest.json`;
+
+/**
+ * The public site renders its copy through the canonical catalogue, so a copy
+ * change lands there and the browser catalogue is regenerated from it. These
+ * are the only two catalogue paths the lane admits; no other `packages/` file
+ * becomes permissible.
+ */
+export const I18N_CANONICAL_PATH = "packages/i18n/index.js";
+export const I18N_BROWSER_MIRROR_PATH = "apps/web/public/i18n.generated.js";
+
+/** A literal top-level catalogue entry: `  "some.key": "some value",`. */
+const I18N_CATALOG_ENTRY_PATTERN =
+  /^ {2}"[A-Za-z][A-Za-z0-9._-]*": "(?:[^"\\]|\\.)*",$/u;
 
 const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
   "apple.svg",
@@ -235,13 +251,104 @@ function assertPackageJsonScope({ repositoryRoot, baseCommit, sourceCommit, git 
   }
 }
 
-/** Only literal Electron-site catalog entries may change in the shared i18n file. */
-export function assertElectronSiteCatalogScope({ repositoryRoot, baseCommit, sourceCommit, git }) {
-  const strip = value => value.split("\n").filter(line =>
-    !/^  "electron\.site\.[A-Za-z0-9.-]+": "(?:[^"\\]|\\.)*",$/u.test(line)).join("\n");
-  const before = git(repositoryRoot, ["show", `${baseCommit}:packages/i18n/index.js`]);
-  const after = git(repositoryRoot, ["show", `${sourceCommit}:packages/i18n/index.js`]);
-  if (strip(before) !== strip(after)) throw new Error("Web-only release changed i18n outside Electron site copy.");
+/**
+ * Only literal catalogue entries may change in the shared canonical i18n file:
+ * runtime code, negotiation, formatting and the exported completeness contract
+ * must stay byte-identical to the reviewed deployed base.
+ */
+export function assertI18nCatalogScope({ repositoryRoot, baseCommit, sourceCommit, git }) {
+  const strip = (value) => value.split("\n")
+    .filter((line) => !I18N_CATALOG_ENTRY_PATTERN.test(line))
+    .join("\n");
+  const before = git(repositoryRoot, ["show", `${baseCommit}:${I18N_CANONICAL_PATH}`]);
+  const after = git(repositoryRoot, ["show", `${sourceCommit}:${I18N_CANONICAL_PATH}`]);
+  if (strip(before) !== strip(after)) {
+    throw new Error("Web-only release changed i18n runtime code, not only catalogue copy.");
+  }
+}
+
+/** The canonical catalogue and its generated mirror only ever move together. */
+function assertI18nPairing(changedPaths) {
+  const canonical = changedPaths.has(I18N_CANONICAL_PATH);
+  const mirror = changedPaths.has(I18N_BROWSER_MIRROR_PATH);
+  if (canonical && !mirror) {
+    throw new Error(
+      `Web-only release changed ${I18N_CANONICAL_PATH} without its regenerated ${I18N_BROWSER_MIRROR_PATH}.`,
+    );
+  }
+  if (mirror && !canonical) {
+    throw new Error(
+      `Web-only release changed ${I18N_BROWSER_MIRROR_PATH} without a matching ${I18N_CANONICAL_PATH} change.`,
+    );
+  }
+}
+
+function blobAtCommit(repositoryRoot, commit, path, git) {
+  try {
+    return git(repositoryRoot, ["show", `${commit}:${path}`]);
+  } catch {
+    throw new Error(`Web-only release candidate does not carry ${path}.`);
+  }
+}
+
+/**
+ * Prove the candidate's browser catalogue was actually regenerated from its
+ * canonical source, and that every shipped locale is still complete. The mirror
+ * comparison is the generator's own `--check`, not a restatement of it, and the
+ * completeness contract is the i18n package's own exported validator taken from
+ * the candidate itself - whose runtime `assertI18nCatalogScope` has already
+ * proven identical to the reviewed base.
+ */
+export async function verifyWebReleaseI18nProof({
+  repositoryRoot,
+  scope,
+  git = runGit,
+}) {
+  const changedPaths = new Set((scope?.changes ?? []).map((change) => change.path));
+  if (!changedPaths.has(I18N_CANONICAL_PATH) && !changedPaths.has(I18N_BROWSER_MIRROR_PATH)) {
+    return null;
+  }
+  const root = resolve(repositoryRoot);
+  const canonical = blobAtCommit(root, scope.sourceCommit, I18N_CANONICAL_PATH, git);
+  const mirror = blobAtCommit(root, scope.sourceCommit, I18N_BROWSER_MIRROR_PATH, git);
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-web-release-i18n-"));
+  try {
+    const sourceFile = join(directory, "canonical.mjs");
+    const outputFile = join(directory, "mirror.mjs");
+    await writeFile(sourceFile, canonical, { encoding: "utf8", mode: 0o600 });
+    await writeFile(outputFile, mirror, { encoding: "utf8", mode: 0o600 });
+    try {
+      await checkI18nBrowserMirror({ outputFile, sourceFile });
+    } catch {
+      throw new Error(
+        `Web-only release candidate ${I18N_BROWSER_MIRROR_PATH} was not regenerated from ${I18N_CANONICAL_PATH}.`,
+      );
+    }
+    const catalogue = await import(pathToFileURL(sourceFile).href);
+    if (typeof catalogue.assertCatalogCompleteness !== "function") {
+      throw new Error(
+        `Web-only release candidate ${I18N_CANONICAL_PATH} does not export the catalogue completeness contract.`,
+      );
+    }
+    let completeness;
+    try {
+      completeness = catalogue.assertCatalogCompleteness();
+    } catch (error) {
+      throw new Error(
+        `Web-only release candidate i18n locales are incomplete: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    return Object.freeze({
+      canonicalSha256: sha256(canonical),
+      mirrorSha256: sha256(mirror),
+      locales: completeness.locales,
+      keyCount: completeness.keyCount,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -285,8 +392,13 @@ export function inspectWebReleaseScope({
       `Web-only release candidate changed an unsupported path: ${unsupported.path}`,
     );
   }
-  if (changes.some((change) => change.path === "packages/i18n/index.js")) {
-    assertElectronSiteCatalogScope({ repositoryRoot: root, baseCommit, sourceCommit, git });
+  // A rename away from either path is still a change to it, so the pairing
+  // check reads both sides of every change.
+  assertI18nPairing(new Set(changes.flatMap((change) =>
+    change.from === undefined ? [change.path] : [change.path, change.from],
+  )));
+  if (changes.some((change) => change.path === I18N_CANONICAL_PATH)) {
+    assertI18nCatalogScope({ repositoryRoot: root, baseCommit, sourceCommit, git });
   }
   if (changes.some((change) => change.path === "package.json")) {
     assertPackageJsonScope({
@@ -383,6 +495,7 @@ export async function writeWebReleaseReceipt({
   receiptPath = expectedReceiptPath(repositoryRoot),
   replace = false,
   preparedAt = new Date().toISOString(),
+  git = runGit,
 }) {
   if (scope === null || typeof scope !== "object"
       || !PUBLIC_RELEASE_SOURCE_COMMIT_PATTERN.test(scope.baseCommit ?? "")
@@ -393,6 +506,7 @@ export async function writeWebReleaseReceipt({
   }
   const repository = resolve(repositoryRoot);
   const target = assertReceiptPath(repository, receiptPath);
+  await verifyWebReleaseI18nProof({ repositoryRoot: repository, scope, git });
   let existing = null;
   try {
     existing = await lstat(target);
@@ -484,6 +598,7 @@ export async function verifyWebReleaseReceipt({
       || JSON.stringify(scope.changes) !== JSON.stringify(receipt.sourceDiff.changes)) {
     throw new Error("Web-only release receipt no longer matches the candidate diff.");
   }
+  await verifyWebReleaseI18nProof({ repositoryRoot: repository, scope, git });
   const site = await releaseManifestForCandidate({
     repositoryRoot: repository,
   });

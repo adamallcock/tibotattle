@@ -43,12 +43,46 @@ dependency update, or Wrangler configuration change.
   can serve.
 - The generator, provenance/staging/deployment guards, their focused tests, and
   the release-lane runbooks.
+- The canonical message catalogue `packages/i18n/index.js`, paired with its
+  regenerated browser mirror `apps/web/public/i18n.generated.js`.
 
 It rejects every other path, including `apps/macos/`, Worker source/runtime
-code, migrations, package-lock files, and deployment configuration. If
-`package.json` appears in the candidate, the guard also requires every package
-field and unrelated script to remain semantically unchanged; only the exact
-release-lane script entries are allowed.
+code, migrations, package-lock files, and deployment configuration. No other
+file under `packages/` is admitted: not `packages/i18n/index.d.ts`, not the
+package manifest, and no other workspace package. If `package.json` appears in
+the candidate, the guard also requires every package field and unrelated script
+to remain semantically unchanged; only the exact release-lane script entries are
+allowed.
+
+### Site copy changes
+
+Site copy lives in the canonical catalogue, so a copy change edits
+`packages/i18n/index.js` first, updates every shipped locale, and then
+regenerates the mirror with `npm run i18n:browser:generate`. Never hand-edit
+`apps/web/public/i18n.generated.js`: the generator overwrites it and the lane
+refuses it. Commit both files in the same candidate.
+
+The lane proves that pairing rather than trusting it. It refuses a candidate
+that:
+
+- changes `packages/i18n/index.js` without its regenerated mirror, or the mirror
+  without a matching canonical change;
+- ships a mirror that does not match the canonical source, checked by running
+  the generator's own `--check` comparison against both blobs at the candidate
+  commit, not by a restatement of it;
+- leaves a shipped locale incomplete, checked with the i18n package's own
+  exported `assertCatalogCompleteness` contract: every locale carries the exact
+  canonical key set, non-blank values, and the same placeholder names;
+- changes anything in `packages/i18n/index.js` other than literal top-level
+  catalogue entries. Negotiation, formatting, interpolation and the completeness
+  contract itself must stay byte-identical to the deployed base, so runtime code
+  cannot ride along with copy.
+
+These proofs run at both ends of the receipt: preparation cannot write a receipt
+without them, and `product:web-release:deploy` repeats them before it delegates
+to the production guard. A change to i18n runtime code, the package typings, or
+any other workspace package is not a web-only release; take it through the
+normal review and release path.
 
 ## 2. Reuse the existing installer evidence
 
@@ -95,10 +129,14 @@ Run the focused checks from the candidate worktree:
 ```bash
 npm run product:release-site:test
 npm run product:web-release:test
+npm run i18n:browser:check
 node apps/worker/scripts/stage-production-assets.mjs
 git diff --check
 git status --porcelain=v1 --untracked-files=all
 ```
+
+`i18n:browser:check` covers the checked-out mirror whether or not this candidate
+touched it; the lane's own proof is scoped to the candidate diff.
 
 The final `git status` must print nothing; generated `.release-build` output is
 ignored. Inspect the generated page with the normal local preview workflow and
@@ -182,11 +220,11 @@ preview using the frozen local bytes. Such output displays a preview warning
 and records `publishedInstallersVerified: false`; it is not a production
 publication receipt. The ordinary CLI always uses real HTTPS verification.
 
-The web-only scope admits the explicit Electron intake helper/test and the
-canonical i18n file only for literal `electron.site.*` catalog entries; runtime
-code or unrelated translations in that shared file still fail admission.
-The generated mirror remains subject to the i18n mirror check. A local-preview
-manifest is refused by the web-release receipt writer.
+The web-only scope admits the explicit Electron intake helper/test. The
+`electron.site.*` download strings are ordinary catalogue copy and follow the
+canonical-then-regenerate rule above, with the same paired mirror and
+completeness proofs; runtime code in that shared file still fails admission. A
+local-preview manifest is refused by the web-release receipt writer.
 
 Refresh the social share card before an Electron-mode build. It is the
 og:image/twitter:image for every link preview of the site, and its headline

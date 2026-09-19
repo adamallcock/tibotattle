@@ -9,7 +9,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -26,12 +27,16 @@ import {
 } from "../scripts/deploy-web-release.js";
 import {
   inspectWebReleaseScope,
-  assertElectronSiteCatalogScope,
+  assertI18nCatalogScope,
   isAllowedWebReleasePath,
+  verifyWebReleaseI18nProof,
   verifyWebReleaseReceipt,
+  I18N_BROWSER_MIRROR_PATH,
+  I18N_CANONICAL_PATH,
   WEB_RELEASE_OUTPUT_DIRECTORY,
   writeWebReleaseReceipt,
 } from "../scripts/web-release-lane.js";
+import { buildI18nBrowserMirror } from "../scripts/generate-i18n-browser-mirror.js";
 
 function git(root, arguments_) {
   return execFileSync("/usr/bin/git", ["-C", root, ...arguments_], {
@@ -322,17 +327,21 @@ test("web-only preparation refuses a receipt path redirected through a symlink",
 });
 
 
-test("web-only Electron catalog admission permits copy only and refuses runtime or unrelated catalog changes", () => {
+test("web-only catalogue admission permits copy only and refuses runtime changes", () => {
   const before = 'export const CATALOG = Object.freeze({\n  "old.key": "old",\n});\nexport const runtime = 1;';
-  const edited = before.replace('  "old.key"', '  "electron.site.download.linux": "Download Linux",\n  "old.key"');
-  const check = after => assertElectronSiteCatalogScope({ repositoryRoot: "/fixture", baseCommit: "before", sourceCommit: "after",
+  const edited = before.replace('  "old.key"', '  "site.hero.title": "Know your usage",\n  "electron.site.download.linux": "Download Linux",\n  "old.key"');
+  const check = after => assertI18nCatalogScope({ repositoryRoot: "/fixture", baseCommit: "before", sourceCommit: "after",
     git: (_root, args) => args[1].startsWith("before:") ? before : after });
   assert.doesNotThrow(() => check(edited));
-  assert.throws(() => check(edited.replace('runtime = 1', 'runtime = 2')), /outside Electron site copy/u);
-  assert.throws(() => check(edited.replace('"old"', '"changed"')), /outside Electron site copy/u);
-  assert.throws(() => check(edited.replace('"Download Linux"', 'runCode()')), /outside Electron site copy/u);
-  for (const path of ['scripts/lib/electron-public-site.mjs', 'test/electron-public-site.test.js', 'packages/i18n/index.js']) assert.equal(isAllowedWebReleasePath(path), true);
-  for (const path of ['packages/i18n/other.js', 'apps/worker/src/index.ts', 'config/electron-production-distribution.cjs']) assert.equal(isAllowedWebReleasePath(path), false);
+  assert.doesNotThrow(() => check(edited.replace('"old"', '"changed"')));
+  assert.throws(() => check(edited.replace('runtime = 1', 'runtime = 2')), /changed i18n runtime code/u);
+  assert.throws(() => check(edited.replace('"Download Linux"', 'runCode()')), /changed i18n runtime code/u);
+  assert.throws(() => check(`${edited}\nexport function weakenedValidator() {}`), /changed i18n runtime code/u);
+  for (const path of ['scripts/lib/electron-public-site.mjs', 'test/electron-public-site.test.js',
+    I18N_CANONICAL_PATH, I18N_BROWSER_MIRROR_PATH]) assert.equal(isAllowedWebReleasePath(path), true);
+  for (const path of ['packages/i18n/other.js', 'packages/i18n/index.d.ts', 'packages/i18n/package.json',
+    'packages/i18n/AGENTS.md', 'packages/accounting/index.js', 'packages/quota-analysis/index.js',
+    'apps/worker/src/index.ts', 'config/electron-production-distribution.cjs']) assert.equal(isAllowedWebReleasePath(path), false);
 });
 
 test("web-only release receipt refuses an explicitly local Electron preview", async (t) => {
@@ -359,4 +368,210 @@ test("web-only release admits exact public evidence controls, never general conf
   for (const path of ['config/deployment-endpoints.js', 'config/release-manifest.js',
     'apps/worker/src/index.ts', 'apps/worker/wrangler.jsonc', 'apps/electron/main.js',
     'schemas/unrelated.json']) assert.equal(isAllowedWebReleasePath(path), false);
+});
+
+
+const CATALOG_MARKERS = ["EN_US_CATALOG", "ZH_HANS_CATALOG", "ES_CATALOG"];
+const FIXTURE_KEY = "site.releaseLaneFixture";
+const FIXTURE_COPY = ["Fixture copy", "Fixture copy zh", "Fixture copy es"];
+
+/**
+ * Insert one literal catalogue entry into the locale catalogs of the real
+ * canonical source. A `null` value deliberately skips that locale so a test can
+ * prove an incomplete locale is refused.
+ */
+function withCatalogKey(source, key, values) {
+  let result = source;
+  for (const [index, marker] of CATALOG_MARKERS.entries()) {
+    if (values[index] === null) continue;
+    const start = result.indexOf(`export const ${marker} = Object.freeze({\n`);
+    assert.notEqual(start, -1, `${marker} is present in the canonical source`);
+    const end = result.indexOf("\n});\n", start);
+    assert.notEqual(end, -1, `${marker} is closed in the canonical source`);
+    result = `${result.slice(0, end)}\n  "${key}": "${values[index]}",${result.slice(end)}`;
+  }
+  return result;
+}
+
+const addFixtureCopy = (values = FIXTURE_COPY) =>
+  (source) => withCatalogKey(source, FIXTURE_KEY, values);
+
+/**
+ * A candidate carrying the real canonical catalogue and its real generated
+ * mirror, so the lane's proof runs against reviewed code rather than a
+ * simplified stand-in.
+ */
+async function i18nCandidateFixture({
+  canonicalEdit = null,
+  mirrorEdit = null,
+  regenerateMirror = true,
+  renameMirrorTo = null,
+} = {}) {
+  const baseCanonical = await readFile(
+    fileURLToPath(new URL("../packages/i18n/index.js", import.meta.url)),
+    "utf8",
+  );
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-web-release-i18n-lane-"));
+  const publicSource = join(root, "apps", "web", "public");
+  const canonicalPath = join(root, I18N_CANONICAL_PATH);
+  const mirrorPath = join(root, I18N_BROWSER_MIRROR_PATH);
+  await mkdir(publicSource, { recursive: true });
+  await mkdir(dirname(canonicalPath), { recursive: true });
+  await writeFile(join(root, ".gitignore"), ".release-build/\n");
+  await writeFile(
+    join(publicSource, "community.html"),
+    '<!doctype html><script type="module" src="./community.js"></script>\n',
+  );
+  await writeFile(join(publicSource, "community.js"), "export const version = 1;\n");
+  await writeFile(canonicalPath, baseCanonical);
+  const baseMirror = await buildI18nBrowserMirror({ sourceFile: canonicalPath });
+  await writeFile(mirrorPath, baseMirror);
+  git(root, ["init", "--quiet"]);
+  git(root, ["config", "user.email", "test@example.invalid"]);
+  git(root, ["config", "user.name", "Web release lane test"]);
+  git(root, ["add", ".gitignore", "apps/web/public", "packages"]);
+  git(root, ["commit", "--quiet", "-m", "deployed base"]);
+  const baseCommit = git(root, ["rev-parse", "HEAD"]);
+
+  await writeFile(canonicalPath, canonicalEdit ? canonicalEdit(baseCanonical) : baseCanonical);
+  let candidateMirror = regenerateMirror
+    ? await buildI18nBrowserMirror({ sourceFile: canonicalPath })
+    : baseMirror;
+  if (mirrorEdit) candidateMirror = mirrorEdit(candidateMirror);
+  await writeFile(mirrorPath, candidateMirror);
+  if (renameMirrorTo) git(root, ["mv", I18N_BROWSER_MIRROR_PATH, renameMirrorTo]);
+  git(root, ["add", "--all", "packages", "apps/web/public"]);
+  git(root, ["commit", "--quiet", "-m", "candidate copy change"]);
+
+  return {
+    baseCommit,
+    output: join(root, WEB_RELEASE_OUTPUT_DIRECTORY),
+    publicSource,
+    root,
+    sourceCommit: git(root, ["rev-parse", "HEAD"]),
+  };
+}
+
+test("web-only release admits a canonical copy change with its regenerated mirror", async (t) => {
+  const value = await i18nCandidateFixture({ canonicalEdit: addFixtureCopy() });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  const scope = inspectWebReleaseScope({
+    repositoryRoot: value.root,
+    baseCommit: value.baseCommit,
+  });
+  assert.deepEqual(
+    scope.changes.map((change) => change.path),
+    [I18N_BROWSER_MIRROR_PATH, I18N_CANONICAL_PATH],
+  );
+  const proof = await verifyWebReleaseI18nProof({
+    repositoryRoot: value.root,
+    scope,
+  });
+  assert.deepEqual(proof.locales, ["en-US", "zh-Hans", "es"]);
+  assert.equal(proof.keyCount > 0, true);
+  assert.match(proof.canonicalSha256, /^[a-f0-9]{64}$/u);
+  assert.match(proof.mirrorSha256, /^[a-f0-9]{64}$/u);
+});
+
+test("web-only release refuses a canonical copy change without its regenerated mirror", async (t) => {
+  const value = await i18nCandidateFixture({
+    canonicalEdit: addFixtureCopy(),
+    regenerateMirror: false,
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed packages\/i18n\/index\.js without its regenerated apps\/web\/public\/i18n\.generated\.js/u,
+  );
+});
+
+test("web-only release refuses a hand-edited mirror with no canonical change", async (t) => {
+  const value = await i18nCandidateFixture({
+    mirrorEdit: (mirror) => mirror.replace('"app.name": "TiboTattle"', '"app.name": "Hand edit"'),
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed apps\/web\/public\/i18n\.generated\.js without a matching packages\/i18n\/index\.js change/u,
+  );
+});
+
+test("web-only release refuses a mirror renamed away from the public site", async (t) => {
+  const value = await i18nCandidateFixture({ renameMirrorTo: "apps/web/public/ui-format.js" });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed apps\/web\/public\/i18n\.generated\.js without a matching packages\/i18n\/index\.js change/u,
+  );
+});
+
+test("web-only release refuses a mirror that was not regenerated from its canonical source", async (t) => {
+  const value = await i18nCandidateFixture({
+    canonicalEdit: addFixtureCopy(),
+    mirrorEdit: (mirror) => mirror.replace(
+      `  "${FIXTURE_KEY}": "${FIXTURE_COPY[0]}",`,
+      `  "${FIXTURE_KEY}": "Hand edited copy",`,
+    ),
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  const scope = inspectWebReleaseScope({
+    repositoryRoot: value.root,
+    baseCommit: value.baseCommit,
+  });
+  await assert.rejects(
+    verifyWebReleaseI18nProof({ repositoryRoot: value.root, scope }),
+    /i18n\.generated\.js was not regenerated from packages\/i18n\/index\.js/u,
+  );
+  await writeBoundManifest({ root: value.root, publicSource: value.publicSource });
+  await assert.rejects(
+    writeWebReleaseReceipt({ repositoryRoot: value.root, scope, replace: true }),
+    /was not regenerated from/u,
+    "the receipt writer cannot be reached past the mirror proof",
+  );
+});
+
+test("web-only release refuses copy that leaves a shipped locale incomplete", async (t) => {
+  const value = await i18nCandidateFixture({
+    canonicalEdit: addFixtureCopy([FIXTURE_COPY[0], FIXTURE_COPY[1], null]),
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  const scope = inspectWebReleaseScope({
+    repositoryRoot: value.root,
+    baseCommit: value.baseCommit,
+  });
+  await assert.rejects(
+    verifyWebReleaseI18nProof({ repositoryRoot: value.root, scope }),
+    /locales are incomplete: The es catalog is missing 1 canonical key\(s\): site\.releaseLaneFixture/u,
+  );
+});
+
+test("web-only release refuses runtime code smuggled beside a catalogue copy change", async (t) => {
+  const value = await i18nCandidateFixture({
+    canonicalEdit: (source) =>
+      `${addFixtureCopy()(source)}\nexport const smuggledRuntime = () => 1;\n`,
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed i18n runtime code, not only catalogue copy/u,
+  );
 });

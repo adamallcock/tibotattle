@@ -2344,3 +2344,101 @@ export function formatDate(value, locale = DEFAULT_LOCALE, options) {
     options === undefined ? DEFAULT_DATE_FORMAT_OPTIONS : options,
   ).format(date);
 }
+
+function placeholderNames(value) {
+  return [...value.matchAll(PLACEHOLDER_PATTERN)]
+    .map(([, doubleName, singleName]) => doubleName ?? singleName)
+    .sort();
+}
+
+function assertCatalogShape(catalog, locale) {
+  if (catalog === null || typeof catalog !== "object" || Array.isArray(catalog)) {
+    throw new TypeError(`The ${locale} catalog must be an object keyed by message key`);
+  }
+}
+
+function assertCatalogValue(value, locale, key) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`The ${locale} catalog has a blank or non-string value for ${key}`);
+  }
+}
+
+function sampleKeys(keys) {
+  return keys.length > 5 ? `${keys.slice(0, 5).join(", ")}, ...` : keys.join(", ");
+}
+
+/**
+ * The package's own locale-completeness contract: every shipped locale carries
+ * the exact canonical key set, non-blank values, and the same placeholder names
+ * as the default locale. Surfaces and release gates call this rather than
+ * restating a weaker approximation. Returns the validated locale list and
+ * canonical key count; throws on the first gap.
+ */
+export function assertCatalogCompleteness({
+  catalogs = CATALOGS,
+  supportedLocales = SUPPORTED_LOCALES,
+  defaultLocale = DEFAULT_LOCALE,
+} = {}) {
+  if (catalogs === null || typeof catalogs !== "object" || Array.isArray(catalogs)) {
+    throw new TypeError("Catalogs must be an object keyed by locale");
+  }
+  if (!Array.isArray(supportedLocales) || supportedLocales.length === 0) {
+    throw new TypeError("At least one supported locale is required");
+  }
+  if (typeof defaultLocale !== "string" || !supportedLocales.includes(defaultLocale)) {
+    throw new TypeError("The default locale must be one of the supported locales");
+  }
+  const absent = supportedLocales.filter((locale) => !hasOwn(catalogs, locale));
+  if (absent.length > 0) {
+    throw new Error(`Missing a catalog for shipped locale: ${absent.join(", ")}`);
+  }
+  const unshipped = Object.keys(catalogs)
+    .filter((locale) => !supportedLocales.includes(locale));
+  if (unshipped.length > 0) {
+    throw new Error(`Catalog present for an unshipped locale: ${unshipped.join(", ")}`);
+  }
+
+  const canonical = catalogs[defaultLocale];
+  assertCatalogShape(canonical, defaultLocale);
+  const canonicalKeys = Object.keys(canonical);
+  if (canonicalKeys.length === 0) {
+    throw new Error(`The ${defaultLocale} catalog carries no messages`);
+  }
+  const canonicalPlaceholders = new Map();
+  for (const key of canonicalKeys) {
+    assertCatalogValue(canonical[key], defaultLocale, key);
+    canonicalPlaceholders.set(key, placeholderNames(canonical[key]).join(","));
+  }
+
+  for (const locale of supportedLocales) {
+    const catalog = catalogs[locale];
+    assertCatalogShape(catalog, locale);
+    const missing = canonicalKeys.filter((key) => !hasOwn(catalog, key));
+    if (missing.length > 0) {
+      throw new Error(
+        `The ${locale} catalog is missing ${missing.length} canonical key(s): ${sampleKeys(missing)}`,
+      );
+    }
+    const unexpected = Object.keys(catalog).filter((key) => !hasOwn(canonical, key));
+    if (unexpected.length > 0) {
+      throw new Error(
+        `The ${locale} catalog carries ${unexpected.length} key(s) the ${defaultLocale} catalog does not define: ${sampleKeys(unexpected)}`,
+      );
+    }
+    for (const key of canonicalKeys) {
+      assertCatalogValue(catalog[key], locale, key);
+      const expected = canonicalPlaceholders.get(key);
+      const actual = placeholderNames(catalog[key]).join(",");
+      if (expected !== actual) {
+        throw new Error(
+          `The ${locale} catalog changes the placeholders for ${key}: expected [${expected}], found [${actual}]`,
+        );
+      }
+    }
+  }
+
+  return Object.freeze({
+    locales: Object.freeze([...supportedLocales]),
+    keyCount: canonicalKeys.length,
+  });
+}
