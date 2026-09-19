@@ -224,6 +224,73 @@ describe('prepared-day load is the safety gate',()=>{
  });
 });
 
+/** Step one owner-day until it first stages a `usage` phase, under an explicit
+ * fold setting and with no prepared days supplied. */
+async function firstUsage(f:Fixture,preparedFold:boolean,maxPages=64){
+ let checkpoint=null as Parameters<typeof advanceStorageV11Analysis>[0]['checkpoint'];
+ for(let step=0;step<400;step++){
+  const result=await advanceStorageV11Analysis({source:source(),sourceNamespace,
+   participantId:f.pin.participantId,day:f.today,metric:'model',nowMs:Date.parse(`${f.today}T23:00:00.000Z`),
+   sourcePin:f.pin,generationSnapshot:f.snapshot,closedDependencyDigest:DEPENDENCY,
+   budget:{remainingQueries:100_000,deadlineMs:Date.now()+120_000},checkpoint,maxPages,preparedFold});
+  if(result.status!=='deferred')throw new Error(`settled before staging a usage phase: ${result.status}`);
+  checkpoint=result.checkpoint;
+  if(checkpoint===null)throw new Error('cut without progress');
+  if(checkpoint.phase==='usage')return checkpoint;
+ }
+ throw new Error('never reached the usage phase');
+}
+
+describe('the scalar mode a group runs is fixed by its namespace',()=>{
+ it('drops the scalar half on a folded model pass that loaded no prepared days',async()=>{
+  // THE PRODUCTION DEFECT. The namespace split on the fold switch alone while
+  // the mode also required the prepared days to be in hand, and the loader
+  // returns none until the builder has produced that window. So a model day
+  // claimed ahead of its artifacts staged a scalar reduction under the
+  // model-only key, and the reducer's fence then refused every later resume.
+  const f=await fixture(3);
+  const staged=await firstUsage(f,true);
+  expect(staged.phase).toBe('usage');
+  expect(staged.usage.scalarReduced).toBe(false);
+  // And with the fold off the same pass keeps the shared reduction, which is
+  // what makes the fold-off corpus byte-unchanged.
+  await reset();
+  const off=await fixture(3);
+  expect((await firstUsage(off,false)).usage.scalarReduced).toBe(true);
+ });
+
+ it('re-acquires a successor staged under the other mode instead of throwing',async()=>{
+  // The healing half, end to end: seven such keys existed in production and
+  // each one stopped its claim in the same place forever. Handing the fence
+  // that successor must now cost a re-acquisition, not the lane.
+  const f=await fixture(3);
+  // One page at a time, so the successor handed back is PARTWAY through its
+  // reduction — which is the only shape the fence can reject. A completed one
+  // goes straight to the finisher and never reaches it, so a test that staged
+  // a complete reduction would pass against the wedge it is meant to catch.
+  const staged=await firstUsage(f,false,1);
+  expect(staged.usage.scalarReduced).toBe(true);
+  expect(staged.usage.complete).toBe(false);
+  let checkpoint=staged as Parameters<typeof advanceStorageV11Analysis>[0]['checkpoint'];
+  for(let step=0;step<400;step++){
+   const result=await advanceStorageV11Analysis({source:source(),sourceNamespace,
+    participantId:f.pin.participantId,day:f.today,metric:'model',nowMs:Date.parse(`${f.today}T23:00:00.000Z`),
+    sourcePin:f.pin,generationSnapshot:f.snapshot,closedDependencyDigest:DEPENDENCY,
+    budget:{remainingQueries:100_000,deadlineMs:Date.now()+120_000},checkpoint,maxPages:64,preparedFold:true});
+   if(result.status==='complete'){
+    expect((result.analysis as {status?:string}).status).toBe('ready');
+    return;
+   }
+   checkpoint=result.checkpoint;
+   if(checkpoint===null)throw new Error('cut without progress');
+   // The mismatched successor is gone: whatever is staged now runs the mode
+   // this namespace declares.
+   if(checkpoint.phase==='usage')expect(checkpoint.usage.scalarReduced).toBe(false);
+  }
+  throw new Error('the discarded successor never re-acquired');
+ });
+});
+
 describe('prepared days equal the paged path over real source rows',()=>{
  it('loads exactly the days the builder prepared from the same generation',async()=>{
   const f=await fixture(4);

@@ -8,7 +8,8 @@ import {
 import { createV11QuotaAcquisitionCheckpoint } from "../src/quota-analysis-v11-reader";
 import type { StorageV11HistoryCheckpoint } from "../src/storage-v11-history";
 import { STORAGE_V11_PREPARED_FOLD, storageV11FoldsPreparedDays,
-  storageV11PreparedFoldEnabled } from "../src/storage-v11-history";
+  storageV11ModelDropsScalar, storageV11PreparedFoldEnabled,
+  storageV11UsageSuccessorResumable } from "../src/storage-v11-history";
 import {
   STORAGE_GRAPH_CURRENT_FIT_CHECKPOINT_METHOD,
   STORAGE_GRAPH_HISTORY_CHECKPOINT_METHOD,
@@ -136,6 +137,34 @@ describe("model-only usage reduction", () => {
     expect(validateV11UsageReductionCheckpoint(without)).toBe(false);
   });
 
+  it("drops a successor staged under the other mode instead of wedging on it", () => {
+    // The healing half. A key whose scalar mode was not fixed by the key
+    // itself could already hold a successor in the wrong mode, and the
+    // reducer's fence throws on it rather than resuming — so every pass that
+    // claimed that row failed in the same place with nothing able to clear it.
+    // Seven such model keys reached production and stopped the model lane for
+    // twenty hours, because the fence is a correctness backstop and has no
+    // recovery path of its own.
+    //
+    // The caller therefore decides first: a reduction is derived state, so a
+    // mode that disagrees is discarded and re-acquired. Redoing pages is a
+    // cost; a lane that can never advance is not.
+    const modelWantsScalar = !storageV11ModelDropsScalar("model", true);
+    expect(modelWantsScalar).toBe(false);
+    // The exact production shape: staged with the scalar half, claimed by a
+    // folded model pass that has none.
+    expect(storageV11UsageSuccessorResumable(reduction(true), modelWantsScalar)).toBe(false);
+    // The same successor is still perfectly resumable by the claim that built
+    // it, so healing costs nothing when the modes agree.
+    expect(storageV11UsageSuccessorResumable(reduction(true), true)).toBe(true);
+    expect(storageV11UsageSuccessorResumable(reduction(false), false)).toBe(true);
+    // And the reverse direction, which a flag flipped back would produce.
+    expect(storageV11UsageSuccessorResumable(reduction(false), true)).toBe(false);
+    // Nothing staged is not a mismatch, it is simply a fresh acquisition.
+    expect(storageV11UsageSuccessorResumable(null, false)).toBe(false);
+    expect(storageV11UsageSuccessorResumable(undefined, true)).toBe(false);
+  });
+
   it("keeps a fits successor and a model successor in different namespaces once the fold is on", () => {
     // The structural half of the same guarantee. While the fold is off the two
     // metrics run the identical reduction and deliberately SHARE one
@@ -221,13 +250,42 @@ describe("the fold's namespace follows the same input as the fold's behaviour", 
     //
     // So the invariant is stated over the two rules together: for ANY input,
     // the namespace splits if and only if the metrics' reductions diverge.
-    const days = [] as unknown as readonly GraphDayProjection[];
     for (const foldEnabled of [false, true]) {
-      const modelDropsScalar = storageV11FoldsPreparedDays(days, foldEnabled);
+      const modelDropsScalar = storageV11ModelDropsScalar("model", foldEnabled);
       const namespacesSplit =
         storageGraphV11CheckpointMethod("fits", foldEnabled)
           !== storageGraphV11CheckpointMethod("model", foldEnabled);
       expect(namespacesSplit).toBe(modelDropsScalar);
+      // The fits metric keeps its scalar half under every configuration, so
+      // its mode cannot be what splits the namespace.
+      expect(storageV11ModelDropsScalar("fits", foldEnabled)).toBe(false);
+    }
+  });
+
+  it("does not let a pass's prepared-day availability decide the scalar mode", () => {
+    // THE SECOND REGRESSION, and the one that reached production. The rule
+    // above was already stated, but it was driven with a DEFINED day array, so
+    // the one input that breaks it was never supplied: `preparedDays` is
+    // `undefined` whenever the builder has not produced that window yet
+    // (`incomplete`) or the pass ran short (`budget`). The namespace followed
+    // the switch alone while the mode followed the switch AND that per-pass
+    // availability, so a model key staged scalar-on before its days existed
+    // and resumed scalar-off once they did. The fence then failed every later
+    // resume closed and the model lane stopped for good.
+    //
+    // So the mode must be a function of the same two inputs as the key, and
+    // nothing else. Availability is allowed to change how a group is READ, and
+    // never which reduction it is.
+    const built = [] as unknown as readonly GraphDayProjection[];
+    for (const foldEnabled of [false, true]) {
+      const expected = storageV11ModelDropsScalar("model", foldEnabled);
+      for (const days of [undefined, built]) {
+        expect(storageV11ModelDropsScalar("model", foldEnabled)).toBe(expected);
+        // The fold gate still reads availability — that is its job — which is
+        // exactly why the two rules must not be the same call.
+        expect(storageV11FoldsPreparedDays(days, foldEnabled))
+          .toBe(foldEnabled && days !== undefined);
+      }
     }
   });
 

@@ -63,6 +63,46 @@ export function storageV11FoldsPreparedDays(preparedDays:readonly GraphDayProjec
  return enabled&&preparedDays!==undefined;
 }
 
+/** Whether the model metric runs its usage reduction WITHOUT the scalar half.
+ *
+ * This is the same function of `(metric, preparedFold)` that
+ * `storageGraphV11CheckpointMethod` uses to pick the checkpoint namespace, and
+ * it must stay that way: the reducer's scalar-mode fence refuses to resume a
+ * successor staged under the other mode, so a key whose mode is not fixed by
+ * the key itself is bistable and wedges the lane for good.
+ *
+ * It deliberately does NOT consult `preparedDays`. Whether a pass actually
+ * loaded the prepared artifacts varies per pass — the load returns
+ * `incomplete` until the builder has produced that window, and `budget` when
+ * the pass is short — so gating the mode on it made one model key stage
+ * scalar-on before its days existed and resume scalar-off afterwards. That is
+ * the defect this rule exists to remove; a group that has no prepared days
+ * still takes the paged reduction, now with the mode its namespace declares.
+ *
+ * The cost is the one the fold already accepted: under the fold, a model
+ * result is measured without the shared `reduced_usage_limit_exceeded` bucket
+ * state, so a day that refused under the fold-off corpus can be ready under
+ * the fold-on one. Flipping the switch already does that; what this removes is
+ * the corpus being heterogeneous WITHIN a single fold setting. */
+export function storageV11ModelDropsScalar(metric:'fits'|'model',
+ preparedFold:boolean=STORAGE_V11_PREPARED_FOLD):boolean{
+ return metric==='model'&&preparedFold;
+}
+
+/** Whether a staged usage reduction may be resumed by a claim running
+ * `scalarRequested`.
+ *
+ * The reducer fails closed on a mode it did not stage, so the caller has to
+ * decide first. A successor whose mode disagrees is not corrupt and not a
+ * conflict to resolve: it is derived state built under a rule that has since
+ * changed, and the only way past it is to drop it and re-acquire. Returning
+ * `false` is therefore a decision to redo work, never to publish anything the
+ * evidence did not support. */
+export function storageV11UsageSuccessorResumable(
+ staged:V11UsageReductionCheckpoint|null|undefined,scalarRequested:boolean):boolean{
+ return staged!==null&&staged!==undefined&&staged.scalarReduced===scalarRequested;
+}
+
 /** Statements one prepared-day read costs: the head row, then one per page
  * call. A day's artifact is a handful of kilobytes, so it is one page call in
  * practice and this is the measured bound rather than an estimate. */
@@ -284,20 +324,35 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   // usage checkpoint's bytes are. The two metrics therefore no longer share a
   // reduction, which is why they no longer share a checkpoint namespace.
   //
-  // GATED ON THE FOLD, deliberately. Dropping the scalar half also drops the
-  // hazard and bucket state the SHARED `reduced_usage_limit_exceeded` refusal
-  // is measured on, so applying it to the paged reduction could turn a model
-  // result that refused into one that is ready under an unchanged result
-  // dependency digest — a heterogeneous published corpus. With the fold off
-  // the paged reduction is byte-unchanged.
-  scalarRequested:!(metric==='model'&&storageV11FoldsPreparedDays(preparedDays,preparedFold)),
+  // Gated on the fold ALONE, so that this is the same function of the metric
+  // and the switch that picks the namespace. See `storageV11ModelDropsScalar`.
+  // With the fold off the paged reduction is byte-unchanged.
+  scalarRequested:!storageV11ModelDropsScalar(metric,preparedFold),
   quotaAcquisition:acquisition};
- if(checkpoint.phase==='usage'&&checkpoint.usage.complete){
+ // A staged usage reduction carries the scalar mode it was built under, and
+ // the reducer fails closed rather than resume one built under the other. A
+ // key whose mode was not fixed by the key itself could hold such a
+ // successor — model keys staged before `storageV11ModelDropsScalar` existed
+ // did, whenever the prepared days had not been built yet — and every later
+ // pass then threw on the same row for good, with nothing able to clear it.
+ //
+ // The reduction is derived state that any pass can rebuild, so a mode that
+ // disagrees discards it and re-acquires from the phase start. That costs the
+ // pages already spent once; a wedged key costs the lane forever. The fence
+ // inside the reducer stays as the backstop for a mode changing mid-group.
+ const stagedUsage=checkpoint.phase==='usage'?checkpoint.usage:null;
+ const usagePrior=storageV11UsageSuccessorResumable(stagedUsage,options.scalarRequested!==false)
+  ?stagedUsage:null;
+ if(usagePrior!==null&&usagePrior.complete){
   await assertTypedV11GenerationSnapshotLive(source,snapshot);
-  return {status:'complete',analysis:await finishV11UsageReduction(source,analysisPin,options,checkpoint.usage,metric,identity)};
+  return {status:'complete',analysis:await finishV11UsageReduction(source,analysisPin,options,usagePrior,metric,identity)};
  }
+ // Gated on there being no RESUMABLE reduction rather than on the phase: a
+ // staged successor this pass had to discard leaves the phase at `usage` with
+ // nothing to continue, and re-paging a hundred-day window is exactly the work
+ // the prepared days settle in one step.
  if(storageV11FoldsPreparedDays(preparedDays,preparedFold)&&preparedDays!==undefined&&metric==='model'
-  &&checkpoint.phase!=='usage'){
+  &&usagePrior===null){
   // The model composition needs no scalar half and no usage row: the prepared
   // days carry exact 2-hour cells, the sessions that cross midnight and the
   // openers whose account break only carry-in can decide. The day set is the
@@ -310,9 +365,13 @@ export async function advanceStorageV11Analysis(input:{source:D1Database;sourceN
   return {status:'deferred',checkpoint:{version:1,source:'v1.1',day,layout,identity,snapshot,phase:'usage',
    acquisition:checkpoint.acquisition,usage}};
  }
- const resumed=checkpoint.phase==='usage',before=budget.remainingQueries;
+ // `resumed` follows the checkpoint actually handed to the reducer, not the
+ // phase: a discarded successor spends the initialization statement again and
+ // the cut accounting below has to reserve it, or a fresh reduction reads as a
+ // budget cut and the group is thrown away every pass.
+ const resumed=usagePrior!==null,before=budget.remainingQueries;
  const usage=await advanceV11UsageReduction(source,analysisPin,options,budget,
-  checkpoint.phase==='usage'?checkpoint.usage:null,maxPages,identity);
+  usagePrior,maxPages,identity);
  await assertTypedV11GenerationSnapshotLive(source,snapshot);
  // The reducer spends one statement to initialize a fresh reduction and one
  // per day page; an incomplete reduction that read fewer than `maxPages` pages
