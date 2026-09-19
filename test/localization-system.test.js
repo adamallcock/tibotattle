@@ -256,7 +256,11 @@ test("shipped static web copy has a complete translated inventory and localizabl
     "TiboTattle",
     "brew install --cask adamallcock/tap/tibotattle",
   ]);
-  const neutralGlyph = /^[+$·＋−—⇢→←\d\s.]+$/u;
+  // `%` joins `$` here: the percent sign is written identically in zh-Hans and
+  // es, so a bare one is a unit symbol rather than untranslated copy. The tank
+  // reading's "33%" splits the number and the sign into separate nodes, which
+  // is what surfaced it.
+  const neutralGlyph = /^[+$%·＋−—⇢→←◎\d\s.]+$/u;
 
   for (const [index, source] of sourceFiles.entries()) {
     assert.match(source, /<body\b[^>]*\bdata-i18n-root\b/u, staticPages[index]);
