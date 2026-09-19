@@ -396,6 +396,7 @@ export const CLIENT_PACKAGE_FILES = Object.freeze([
   "packages/telemetry-contract/src/constants.js",
   "packages/telemetry-contract/src/envelope.js",
   "packages/telemetry-contract/src/errors.js",
+  "packages/telemetry-contract/src/model-catalog-contract.js",
   "packages/telemetry-contract/src/model-catalog.js",
   "packages/telemetry-contract/src/primitives.js",
   "packages/telemetry-contract/src/telemetry-v0.1.js",

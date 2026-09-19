@@ -871,3 +871,88 @@ test("web-only release refuses contract code smuggled beside a reviewed model ro
     /changed model catalogue contract code, not only reviewed identity rows/u,
   );
 });
+
+/** Append a new reviewed identity: legal row shape, but a vocabulary change. */
+const addModelIdentity = (source) => {
+  const result = source.replace(
+    '  ["gpt-4.1", "GPT-4.1"],',
+    '  ["gpt-4.1", "GPT-4.1"],\n  ["gpt-6-nova", "GPT-6 Nova"],',
+  );
+  assert.notEqual(result, source, "the reviewed catalogue carries the anchor row");
+  return result;
+};
+
+/** Drop an explicit alias's pricing columns: legal row shape, different vocabulary. */
+const repriceModelIdentity = (source) => {
+  const result = source.replace(
+    '  ["gpt-5.5-codex", "GPT-5.5 Codex", "assumed_alias", "gpt-5.5"],',
+    '  ["gpt-5.5-codex", "GPT-5.5 Codex"],',
+  );
+  assert.notEqual(result, source, "the reviewed catalogue carries the alias row");
+  return result;
+};
+
+/** Move a row into the other provider's array: legal row shape, different provider. */
+const moveModelBetweenProviders = (id) => (source) => {
+  const row = source.match(new RegExp(`^ {2}\\["${id}", "[^"]*"\\],$`, "mu"));
+  assert.notEqual(row, null, `${id} is a reviewed identity row`);
+  const result = source
+    .replace(`${row[0]}\n`, "")
+    .replace(
+      "const reviewedOpenAiModelRows = [\n",
+      `const reviewedOpenAiModelRows = [\n${row[0]}\n`,
+    );
+  assert.notEqual(result, source, "the reviewed catalogue carries both provider arrays");
+  return result;
+};
+
+for (const [name, canonicalEdit] of [
+  ["adds a reviewed identity", addModelIdentity],
+  ["reprices an explicit alias", repriceModelIdentity],
+  ["moves an identity between providers", moveModelBetweenProviders("claude-sonnet-5")],
+]) {
+  test(`web-only release refuses a candidate that ${name}`, async (t) => {
+    const value = await modelCatalogCandidateFixture({ canonicalEdit });
+    t.after(() => rm(value.root, { recursive: true, force: true }));
+
+    // The row shape and both regenerated mirrors are genuinely correct here;
+    // only the package's own vocabulary contract catches the change.
+    const scope = inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    });
+    await assert.rejects(
+      verifyWebReleaseModelCatalogProof({ repositoryRoot: value.root, scope }),
+      /changed the reviewed model identity vocabulary, not only its site-visible labels/u,
+    );
+    await writeBoundManifest({ root: value.root, publicSource: value.publicSource });
+    await assert.rejects(
+      writeWebReleaseReceipt({ repositoryRoot: value.root, scope, replace: true }),
+      /reviewed model identity vocabulary/u,
+      "the receipt writer cannot be reached past the vocabulary proof",
+    );
+  });
+}
+
+test("web-only release refuses a candidate whose model vocabulary is itself incomplete", async (t) => {
+  const value = await modelCatalogCandidateFixture({
+    canonicalEdit: (source) => {
+      const result = source.replace(
+        '  ["gpt-4.1", "GPT-4.1"],',
+        '  ["gpt-4.1", "GPT-4.1"],\n  ["gpt-4.1", "GPT-4.1 Duplicate"],',
+      );
+      assert.notEqual(result, source, "the reviewed catalogue carries the anchor row");
+      return result;
+    },
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  const scope = inspectWebReleaseScope({
+    repositoryRoot: value.root,
+    baseCommit: value.baseCommit,
+  });
+  await assert.rejects(
+    verifyWebReleaseModelCatalogProof({ repositoryRoot: value.root, scope }),
+    /candidate model vocabulary is incomplete: .*is listed more than once/u,
+  );
+});

@@ -823,7 +823,7 @@ topology and calibration policy.
 
 #### `@app-usagemonitor/telemetry-contract` — 63 public symbols
 
-- Reviewed model catalog: `REVIEWED_MODEL_CATALOG_VERSION`, `REVIEWED_MODEL_CATALOG`, `REVIEWED_CODEX_MODEL_IDS`, `REVIEWED_CLAUDE_MODEL_IDS`, `reviewedModelIdentity`, `codexRequestReasoningEffort`, `codexCacheReasoningConfiguration`.
+- Reviewed model catalog: `REVIEWED_MODEL_CATALOG_VERSION`, `REVIEWED_MODEL_CATALOG`, `REVIEWED_CODEX_MODEL_IDS`, `REVIEWED_CLAUDE_MODEL_IDS`, `reviewedModelIdentity`, `assertReviewedModelCatalogCompleteness`, `codexRequestReasoningEffort`, `codexCacheReasoningConfiguration`.
 - Admin model history: `ADMIN_MODEL_CONFIG`, `ADMIN_MODEL_HISTORY_CATALOG_VERSION`, `LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION`, `projectAdminModelHistoryDay`, `expandAdminModelHistoryDay`.
 - Constants: `ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION`, `ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION`, `ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION`, `MAX_TELEMETRY_BROWSER_BYTES`, `TELEMETRY_CONTRIBUTION_SCHEMA_VERSION`, `TELEMETRY_ENVELOPE_SCHEMA_VERSION`, `TELEMETRY_MODEL_IDS`, `TELEMETRY_PLAN_DISPLAY_NAMES`, `TELEMETRY_PLAN_TYPES`, `TELEMETRY_SCHEMA_VERSION`, `TELEMETRY_TOOL_CLASSES`.
 - Errors: `TELEMETRY_CONTRACT_ERROR_CODES`, `TelemetryContractError`, `isTelemetryContractError`.

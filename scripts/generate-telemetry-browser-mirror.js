@@ -40,6 +40,12 @@ const CANONICAL_MODULES = Object.freeze([
     basename: "model-catalog.js",
     expectedImports: Object.freeze([]),
   }),
+  // Ordered after the catalog it validates and after the public slice, so the
+  // public model mirror carries the vocabulary alone.
+  Object.freeze({
+    basename: "model-catalog-contract.js",
+    expectedImports: Object.freeze(["./model-catalog.js"]),
+  }),
   Object.freeze({
     basename: "admin-model-history.js",
     expectedImports: Object.freeze(["./model-catalog.js"]),

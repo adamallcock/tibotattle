@@ -105,6 +105,14 @@ lane admits it anyway, because a candidate that regenerated only the public
 mirror would leave the shared one stale and fail `telemetry:browser:check`.
 Commit all three files in the same candidate.
 
+Admitting an app-only file into a web-only candidate is deliberate, not an
+oversight to tidy away. It is contained: the mirror is admitted only as a proven
+paired regeneration, it moves only alongside a canonical change that is itself
+restricted to literal reviewed rows, its bytes are checked by the generator, and
+it remains unpublishable by two independent guards. It therefore carries nothing
+the canonical module did not already carry. Removing it would not tighten the
+lane - it would only send model-name changes back outside it.
+
 The lane proves that pairing rather than trusting it. It refuses a candidate
 that:
 
@@ -120,17 +128,30 @@ that:
   pricing projections, and the reasoning-effort runtime must stay byte-identical
   to the deployed base, so contract code cannot ride along with a site-visible
   model name. A label is literal text with no quote or escape, so presentation
-  cannot carry an expression.
+  cannot carry an expression;
+- leaves the reviewed vocabulary incomplete, or moves it at all. Both the
+  candidate and the deployed base are validated with the telemetry-contract
+  package's own exported `assertReviewedModelCatalogCompleteness`, and their
+  identity projections must match exactly.
 
-Unlike i18n, the telemetry-contract package exposes no catalogue or vocabulary
-completeness validator, so the lane cannot prove one. The reviewed identity set
-is bound to the accounting price cards, `src/export/registries.js` and the
-closed v0.2 `modelId` enum by `test/reviewed-model-catalog.test.js`, and those
-inputs are outside the web-only scope. Treat a change to the identity *set*
-- adding, removing or re-providering a model id - as a normal review and release
-change, not a web-only one, and confirm it with `npm test` before a release
-candidate is cut. A site-visible relabel of an already-reviewed identity is what
-this lane carries.
+That last refusal is the boundary of this lane. A **label** is site-visible
+copy and may change. The **vocabulary** - a model id, its provider, allowance
+track, pricing status, price identity, or its position in the catalogue - is
+reviewed against the accounting price cards, `src/export/registries.js` and the
+closed v0.2 `modelId` enum, none of which are in the web-only scope. Adding,
+removing, repricing or re-providering an identity is a normal review and release
+change; it also needs the v0.2 `usage-event.schema.json` enum updated and
+`npm test` run, so the lane refuses it by name rather than letting it ship
+half-bound.
+
+`packages/telemetry-contract/src/model-catalog-contract.js` holds that validator
+and is deliberately *not* an admissible candidate path, so a candidate cannot
+weaken the contract it is judged by. It is mirrored into the app-only
+`telemetry-shared.generated.js`, which carries the whole package contract, but
+deliberately not into the public `model-catalog.generated.js`, which carries the
+vocabulary alone: gate-time validation is never served to the public site. A
+deployed base that predates the contract cannot be used for a model-catalogue
+candidate; the lane says so rather than skipping the proof.
 
 ## 2. Reuse the existing installer evidence
 

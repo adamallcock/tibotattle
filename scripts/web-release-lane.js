@@ -58,6 +58,7 @@ const MODEL_CATALOG_MIRROR_PATHS = Object.freeze([
 ]);
 const TELEMETRY_CANONICAL_SOURCE_PREFIX = "packages/telemetry-contract/src/";
 const MODEL_CATALOG_BASENAME = "model-catalog.js";
+const MODEL_CATALOG_CONTRACT_BASENAME = "model-catalog-contract.js";
 /** The reviewed source directory is a small flat module set; refuse a tree that grew. */
 const MAXIMUM_TELEMETRY_CANONICAL_MODULES = 64;
 
@@ -457,6 +458,37 @@ async function writeTelemetryCanonicalSource({
   return written;
 }
 
+/**
+ * Run the telemetry-contract package's own exported vocabulary contract against
+ * one materialised canonical source tree. This is the package's validator, not
+ * a lane-local restatement, and it is taken from the tree being judged.
+ */
+async function reviewedModelVocabulary(sourceDirectory, label) {
+  const module = `${TELEMETRY_CANONICAL_SOURCE_PREFIX}${MODEL_CATALOG_CONTRACT_BASENAME}`;
+  let contract;
+  try {
+    contract = await import(
+      pathToFileURL(join(sourceDirectory, MODEL_CATALOG_CONTRACT_BASENAME)).href
+    );
+  } catch {
+    throw new Error(`Web-only release ${label} does not carry ${module}.`);
+  }
+  if (typeof contract.assertReviewedModelCatalogCompleteness !== "function") {
+    throw new Error(
+      `Web-only release ${label} ${module} does not export the model vocabulary completeness contract.`,
+    );
+  }
+  try {
+    return contract.assertReviewedModelCatalogCompleteness();
+  } catch (error) {
+    throw new Error(
+      `Web-only release ${label} model vocabulary is incomplete: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
 async function assertRegeneratedMirror({
   mirrorPath,
   outputFile,
@@ -484,12 +516,14 @@ async function assertRegeneratedMirror({
  * default build covering the app-only shared mirror that embeds the same
  * module.
  *
- * The telemetry-contract package exposes no catalogue/vocabulary completeness
- * validator (the reviewed set is bound to the accounting price cards, the
- * export registries and the closed v0.2 enum by `test/reviewed-model-catalog.test.js`,
- * not by an exported contract), so the lane deliberately proves regeneration
- * and the reviewed row shape only. It does not certify that a changed identity
- * set is complete; `assertModelCatalogScope` keeps that risk to literal rows.
+ * Both the candidate and the deployed base are then validated by the
+ * telemetry-contract package's own exported
+ * `assertReviewedModelCatalogCompleteness`, and their identity projections must
+ * match. A web-only release may move a site-visible label; it may not move the
+ * vocabulary itself, which is reviewed against the accounting price cards, the
+ * export registries and the closed v0.2 `modelId` enum - none of which are in
+ * this lane's scope. That contract module is not an admissible candidate path,
+ * so a candidate cannot weaken the validator it is judged by.
  */
 export async function verifyWebReleaseModelCatalogProof({
   repositoryRoot,
@@ -510,12 +544,20 @@ export async function verifyWebReleaseModelCatalogProof({
   );
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-web-release-model-catalog-"));
   try {
-    const sourceDirectory = join(directory, "canonical");
+    const sourceDirectory = join(directory, "candidate");
+    const baseDirectory = join(directory, "base");
     await mkdir(sourceDirectory, { recursive: true, mode: 0o700 });
+    await mkdir(baseDirectory, { recursive: true, mode: 0o700 });
     const canonical = await writeTelemetryCanonicalSource({
       repositoryRoot: root,
       commit: scope.sourceCommit,
       sourceDirectory,
+      git,
+    });
+    await writeTelemetryCanonicalSource({
+      repositoryRoot: root,
+      commit: scope.baseCommit,
+      sourceDirectory: baseDirectory,
       git,
     });
     const browserMirrorFile = join(directory, "model-catalog.generated.js");
@@ -534,7 +576,20 @@ export async function verifyWebReleaseModelCatalogProof({
       sourceDirectory,
       buildMirror: buildTelemetryBrowserMirror,
     });
+    const vocabulary = await reviewedModelVocabulary(sourceDirectory, "candidate");
+    const deployed = await reviewedModelVocabulary(baseDirectory, "deployed base");
+    // The catalog version is already a non-row line that `assertModelCatalogScope`
+    // pins, but the proof is reachable with a caller-supplied scope, so it stands
+    // on its own evidence here.
+    if (deployed.version !== vocabulary.version
+        || JSON.stringify(deployed.identities) !== JSON.stringify(vocabulary.identities)) {
+      throw new Error(
+        "Web-only release candidate changed the reviewed model identity vocabulary, not only its site-visible labels.",
+      );
+    }
     return Object.freeze({
+      catalogVersion: vocabulary.version,
+      identityCount: vocabulary.identityCount,
       canonicalSha256: sha256(canonical.get(MODEL_CATALOG_BASENAME)),
       browserMirrorSha256: browser.sha256,
       browserMirrorBytes: browser.byteLength,
