@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  copyFile,
   mkdtemp,
   mkdir,
+  readdir,
   readFile,
   rm,
   symlink,
@@ -28,15 +30,24 @@ import {
 import {
   inspectWebReleaseScope,
   assertI18nCatalogScope,
+  assertModelCatalogScope,
   isAllowedWebReleasePath,
   verifyWebReleaseI18nProof,
+  verifyWebReleaseModelCatalogProof,
   verifyWebReleaseReceipt,
   I18N_BROWSER_MIRROR_PATH,
   I18N_CANONICAL_PATH,
+  MODEL_CATALOG_BROWSER_MIRROR_PATH,
+  MODEL_CATALOG_CANONICAL_PATH,
+  TELEMETRY_SHARED_MIRROR_PATH,
   WEB_RELEASE_OUTPUT_DIRECTORY,
   writeWebReleaseReceipt,
 } from "../scripts/web-release-lane.js";
 import { buildI18nBrowserMirror } from "../scripts/generate-i18n-browser-mirror.js";
+import {
+  buildPublicModelCatalogMirror,
+  buildTelemetryBrowserMirror,
+} from "../scripts/generate-telemetry-browser-mirror.js";
 
 function git(root, arguments_) {
   return execFileSync("/usr/bin/git", ["-C", root, ...arguments_], {
@@ -573,5 +584,290 @@ test("web-only release refuses runtime code smuggled beside a catalogue copy cha
       baseCommit: value.baseCommit,
     }),
     /changed i18n runtime code, not only catalogue copy/u,
+  );
+});
+
+
+const TELEMETRY_CANONICAL_SOURCE = "packages/telemetry-contract/src";
+const FIXTURE_MODEL_ID = "gpt-4.1";
+const FIXTURE_MODEL_LABEL = "GPT-4.1 Site Label";
+
+/** Rename one reviewed identity's site-visible label in the real canonical module. */
+const relabelModel = (id = FIXTURE_MODEL_ID, label = FIXTURE_MODEL_LABEL) => (source) => {
+  const result = source.replace(
+    new RegExp(`^ {2}\\["${id}", "[^"]*"\\],$`, "mu"),
+    `  ["${id}", "${label}"],`,
+  );
+  assert.notEqual(result, source, `${id} is a reviewed identity row in the canonical module`);
+  return result;
+};
+
+/**
+ * A candidate carrying the real canonical model catalogue and both really
+ * generated mirrors, so the lane's proof runs against the reviewed generator
+ * rather than a simplified stand-in.
+ */
+async function modelCatalogCandidateFixture({
+  canonicalEdit = null,
+  browserMirrorEdit = null,
+  sharedMirrorEdit = null,
+  regenerateBrowserMirror = true,
+  regenerateSharedMirror = true,
+  renameBrowserMirrorTo = null,
+} = {}) {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-web-release-model-catalog-lane-"));
+  const publicSource = join(root, "apps", "web", "public");
+  const sourceDirectory = join(root, TELEMETRY_CANONICAL_SOURCE);
+  const canonicalPath = join(root, MODEL_CATALOG_CANONICAL_PATH);
+  const browserMirrorPath = join(root, MODEL_CATALOG_BROWSER_MIRROR_PATH);
+  const sharedMirrorPath = join(root, TELEMETRY_SHARED_MIRROR_PATH);
+  await mkdir(publicSource, { recursive: true });
+  await mkdir(sourceDirectory, { recursive: true });
+  await writeFile(join(root, ".gitignore"), ".release-build/\n");
+  await writeFile(
+    join(publicSource, "community.html"),
+    '<!doctype html><script type="module" src="./community.js"></script>\n',
+  );
+  await writeFile(join(publicSource, "community.js"), "export const version = 1;\n");
+  const reviewedSource = fileURLToPath(
+    new URL(`../${TELEMETRY_CANONICAL_SOURCE}`, import.meta.url),
+  );
+  for (const basename of await readdir(reviewedSource)) {
+    await copyFile(join(reviewedSource, basename), join(sourceDirectory, basename));
+  }
+  const baseCanonical = await readFile(canonicalPath, "utf8");
+  const baseBrowserMirror = await buildPublicModelCatalogMirror({ sourceDirectory });
+  const baseSharedMirror = await buildTelemetryBrowserMirror({ sourceDirectory });
+  await writeFile(browserMirrorPath, baseBrowserMirror);
+  await writeFile(sharedMirrorPath, baseSharedMirror);
+  git(root, ["init", "--quiet"]);
+  git(root, ["config", "user.email", "test@example.invalid"]);
+  git(root, ["config", "user.name", "Web release lane test"]);
+  git(root, ["add", ".gitignore", "apps/web/public", "packages"]);
+  git(root, ["commit", "--quiet", "-m", "deployed base"]);
+  const baseCommit = git(root, ["rev-parse", "HEAD"]);
+
+  await writeFile(canonicalPath, canonicalEdit ? canonicalEdit(baseCanonical) : baseCanonical);
+  let candidateBrowserMirror = regenerateBrowserMirror
+    ? await buildPublicModelCatalogMirror({ sourceDirectory })
+    : baseBrowserMirror;
+  if (browserMirrorEdit) candidateBrowserMirror = browserMirrorEdit(candidateBrowserMirror);
+  await writeFile(browserMirrorPath, candidateBrowserMirror);
+  let candidateSharedMirror = regenerateSharedMirror
+    ? await buildTelemetryBrowserMirror({ sourceDirectory })
+    : baseSharedMirror;
+  if (sharedMirrorEdit) candidateSharedMirror = sharedMirrorEdit(candidateSharedMirror);
+  await writeFile(sharedMirrorPath, candidateSharedMirror);
+  if (renameBrowserMirrorTo) {
+    git(root, ["mv", MODEL_CATALOG_BROWSER_MIRROR_PATH, renameBrowserMirrorTo]);
+  }
+  git(root, ["add", "--all", "packages", "apps/web/public"]);
+  git(root, ["commit", "--quiet", "-m", "candidate model vocabulary change"]);
+
+  return {
+    baseCommit,
+    output: join(root, WEB_RELEASE_OUTPUT_DIRECTORY),
+    publicSource,
+    root,
+    sourceCommit: git(root, ["rev-parse", "HEAD"]),
+  };
+}
+
+test("web-only model catalogue admission permits reviewed rows only and refuses contract changes", () => {
+  const before = [
+    'export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-09-03.1";',
+    "const reviewedOpenAiModelRows = [",
+    '  ["gpt-5.5", "GPT-5.5"],',
+    "];",
+    'export const track = (id) => id === "gpt-5.3-codex-spark" ? "spark" : "primary";',
+  ].join("\n");
+  const edited = before.replace(
+    '  ["gpt-5.5", "GPT-5.5"],',
+    '  ["gpt-5.5", "GPT-5.5"],\n  ["gpt-6-nova", "GPT-6 Nova", "unpriced", null],',
+  );
+  const check = (after) => assertModelCatalogScope({
+    repositoryRoot: "/fixture",
+    baseCommit: "before",
+    sourceCommit: "after",
+    git: (_root, args) => (args[1].startsWith("before:") ? before : after),
+  });
+  assert.doesNotThrow(() => check(edited));
+  assert.doesNotThrow(() => check(before.replace('"GPT-5.5"]', '"GPT-5.5 Renamed"]')));
+  assert.throws(
+    () => check(edited.replace("2026-09-03.1", "2026-09-19.1")),
+    /model catalogue contract code/u,
+  );
+  assert.throws(
+    () => check(edited.replace('"spark" : "primary"', '"primary" : "primary"')),
+    /model catalogue contract code/u,
+  );
+  assert.throws(
+    () => check(edited.replace('"unpriced", null]', '"unpriced", null, runCode()]')),
+    /model catalogue contract code/u,
+  );
+  assert.throws(
+    () => check(`${edited}\nexport function weakenedIdentity() {}`),
+    /model catalogue contract code/u,
+  );
+  for (const path of [MODEL_CATALOG_CANONICAL_PATH, MODEL_CATALOG_BROWSER_MIRROR_PATH,
+    TELEMETRY_SHARED_MIRROR_PATH]) assert.equal(isAllowedWebReleasePath(path), true);
+  for (const path of ["packages/telemetry-contract/src/constants.js",
+    "packages/telemetry-contract/src/telemetry-v1.1.js", "packages/telemetry-contract/index.js",
+    "packages/telemetry-contract/index.d.ts", "packages/telemetry-contract/package.json",
+    "packages/telemetry-contract/AGENTS.md",
+    "packages/telemetry-contract/schemas/v0.2/usage-event.schema.json",
+  ]) assert.equal(isAllowedWebReleasePath(path), false);
+});
+
+test("web-only release admits a reviewed model relabel with both regenerated mirrors", async (t) => {
+  const value = await modelCatalogCandidateFixture({ canonicalEdit: relabelModel() });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  const scope = inspectWebReleaseScope({
+    repositoryRoot: value.root,
+    baseCommit: value.baseCommit,
+  });
+  assert.deepEqual(
+    scope.changes.map((change) => change.path),
+    [
+      MODEL_CATALOG_BROWSER_MIRROR_PATH,
+      TELEMETRY_SHARED_MIRROR_PATH,
+      MODEL_CATALOG_CANONICAL_PATH,
+    ],
+  );
+  const proof = await verifyWebReleaseModelCatalogProof({
+    repositoryRoot: value.root,
+    scope,
+  });
+  for (const digest of [proof.canonicalSha256, proof.browserMirrorSha256,
+    proof.sharedMirrorSha256]) assert.match(digest, /^[a-f0-9]{64}$/u);
+  assert.equal(proof.browserMirrorBytes > 0, true);
+  assert.equal(proof.sharedMirrorBytes > proof.browserMirrorBytes, true);
+
+  await writeBoundManifest({ root: value.root, publicSource: value.publicSource });
+  const written = await writeWebReleaseReceipt({
+    repositoryRoot: value.root,
+    scope,
+    replace: true,
+  });
+  assert.equal(written.receipt.sourceCommit, value.sourceCommit);
+  const verified = await verifyWebReleaseReceipt({ repositoryRoot: value.root });
+  assert.equal(verified.scope.sha256, scope.sha256);
+});
+
+test("web-only release refuses a hand-edited app-only telemetry mirror", async (t) => {
+  const value = await modelCatalogCandidateFixture({
+    sharedMirrorEdit: (mirror) => mirror.replace('"GPT-4.1"]', '"Hand edited"]'),
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed apps\/web\/public\/telemetry-shared\.generated\.js without a matching packages\/telemetry-contract\/src\/model-catalog\.js change/u,
+  );
+});
+
+test("web-only release refuses a catalogue change without its regenerated public mirror", async (t) => {
+  const value = await modelCatalogCandidateFixture({
+    canonicalEdit: relabelModel(),
+    regenerateBrowserMirror: false,
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed packages\/telemetry-contract\/src\/model-catalog\.js without its regenerated apps\/web\/public\/model-catalog\.generated\.js/u,
+  );
+});
+
+test("web-only release refuses a catalogue change that leaves the shared mirror stale", async (t) => {
+  const value = await modelCatalogCandidateFixture({
+    canonicalEdit: relabelModel(),
+    regenerateSharedMirror: false,
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed packages\/telemetry-contract\/src\/model-catalog\.js without its regenerated apps\/web\/public\/telemetry-shared\.generated\.js/u,
+  );
+});
+
+test("web-only release refuses a hand-edited model mirror with no canonical change", async (t) => {
+  const value = await modelCatalogCandidateFixture({
+    browserMirrorEdit: (mirror) => mirror.replace('"GPT-4.1"]', '"Hand edited"]'),
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed apps\/web\/public\/model-catalog\.generated\.js without a matching packages\/telemetry-contract\/src\/model-catalog\.js change/u,
+  );
+});
+
+test("web-only release refuses a model mirror renamed away from the public site", async (t) => {
+  const value = await modelCatalogCandidateFixture({
+    renameBrowserMirrorTo: "apps/web/public/ui-format.js",
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed apps\/web\/public\/model-catalog\.generated\.js without a matching packages\/telemetry-contract\/src\/model-catalog\.js change/u,
+  );
+});
+
+test("web-only release refuses a model mirror that was not regenerated from its canonical source", async (t) => {
+  const value = await modelCatalogCandidateFixture({
+    canonicalEdit: relabelModel(),
+    browserMirrorEdit: (mirror) =>
+      mirror.replace(`"${FIXTURE_MODEL_LABEL}"]`, '"Hand edited label"]'),
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  const scope = inspectWebReleaseScope({
+    repositoryRoot: value.root,
+    baseCommit: value.baseCommit,
+  });
+  await assert.rejects(
+    verifyWebReleaseModelCatalogProof({ repositoryRoot: value.root, scope }),
+    /model-catalog\.generated\.js was not regenerated from packages\/telemetry-contract\/src\/model-catalog\.js/u,
+  );
+  await writeBoundManifest({ root: value.root, publicSource: value.publicSource });
+  await assert.rejects(
+    writeWebReleaseReceipt({ repositoryRoot: value.root, scope, replace: true }),
+    /was not regenerated from/u,
+    "the receipt writer cannot be reached past the mirror proof",
+  );
+});
+
+test("web-only release refuses contract code smuggled beside a reviewed model row", async (t) => {
+  const value = await modelCatalogCandidateFixture({
+    canonicalEdit: (source) =>
+      `${relabelModel()(source)}\nexport const smuggledIdentity = () => 1;\n`,
+  });
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+
+  assert.throws(
+    () => inspectWebReleaseScope({
+      repositoryRoot: value.root,
+      baseCommit: value.baseCommit,
+    }),
+    /changed model catalogue contract code, not only reviewed identity rows/u,
   );
 });

@@ -45,14 +45,19 @@ dependency update, or Wrangler configuration change.
   the release-lane runbooks.
 - The canonical message catalogue `packages/i18n/index.js`, paired with its
   regenerated browser mirror `apps/web/public/i18n.generated.js`.
+- The canonical model catalogue `packages/telemetry-contract/src/model-catalog.js`,
+  paired with both mirrors regenerated from it:
+  `apps/web/public/model-catalog.generated.js` and
+  `apps/web/public/telemetry-shared.generated.js`.
 
 It rejects every other path, including `apps/macos/`, Worker source/runtime
 code, migrations, package-lock files, and deployment configuration. No other
-file under `packages/` is admitted: not `packages/i18n/index.d.ts`, not the
-package manifest, and no other workspace package. If `package.json` appears in
-the candidate, the guard also requires every package field and unrelated script
-to remain semantically unchanged; only the exact release-lane script entries are
-allowed.
+file under `packages/` is admitted: not `packages/i18n/index.d.ts`, not
+`packages/telemetry-contract/index.js`, its typings, package manifest, JSON
+schemas or any other module under `packages/telemetry-contract/src/`, and no
+other workspace package. If `package.json` appears in the candidate, the guard
+also requires every package field and unrelated script to remain semantically
+unchanged; only the exact release-lane script entries are allowed.
 
 ### Site copy changes
 
@@ -83,6 +88,49 @@ without them, and `product:web-release:deploy` repeats them before it delegates
 to the production guard. A change to i18n runtime code, the package typings, or
 any other workspace package is not a web-only release; take it through the
 normal review and release path.
+
+### Model vocabulary changes
+
+Model names shown on the public site come from the reviewed identity
+vocabulary, so a change edits
+`packages/telemetry-contract/src/model-catalog.js` first and then regenerates
+the mirrors with `npm run telemetry:browser:generate`. Never hand-edit
+`apps/web/public/model-catalog.generated.js`.
+
+That generator writes two mirrors from the same canonical module. Only
+`model-catalog.generated.js` is a public site asset;
+`telemetry-shared.generated.js` is app-only and is never published - the
+release-site build and the production staging guard both refuse it by name. The
+lane admits it anyway, because a candidate that regenerated only the public
+mirror would leave the shared one stale and fail `telemetry:browser:check`.
+Commit all three files in the same candidate.
+
+The lane proves that pairing rather than trusting it. It refuses a candidate
+that:
+
+- changes the canonical module without either regenerated mirror, or changes a
+  mirror without a matching canonical change, including a rename away from any
+  of the three paths;
+- ships a mirror that does not match the canonical source, checked by running
+  the telemetry generator's own `--check` against the candidate's canonical
+  source tree - `buildPublicModelCatalogMirror` for the public model mirror and
+  the default build for the shared mirror - not by a restatement of it;
+- changes anything in the canonical module other than literal reviewed identity
+  rows. The catalogue version, the derived exports, the allowance-track and
+  pricing projections, and the reasoning-effort runtime must stay byte-identical
+  to the deployed base, so contract code cannot ride along with a site-visible
+  model name. A label is literal text with no quote or escape, so presentation
+  cannot carry an expression.
+
+Unlike i18n, the telemetry-contract package exposes no catalogue or vocabulary
+completeness validator, so the lane cannot prove one. The reviewed identity set
+is bound to the accounting price cards, `src/export/registries.js` and the
+closed v0.2 `modelId` enum by `test/reviewed-model-catalog.test.js`, and those
+inputs are outside the web-only scope. Treat a change to the identity *set*
+- adding, removing or re-providering a model id - as a normal review and release
+change, not a web-only one, and confirm it with `npm test` before a release
+candidate is cut. A site-visible relabel of an already-reviewed identity is what
+this lane carries.
 
 ## 2. Reuse the existing installer evidence
 
@@ -130,13 +178,15 @@ Run the focused checks from the candidate worktree:
 npm run product:release-site:test
 npm run product:web-release:test
 npm run i18n:browser:check
+npm run telemetry:browser:check
 node apps/worker/scripts/stage-production-assets.mjs
 git diff --check
 git status --porcelain=v1 --untracked-files=all
 ```
 
-`i18n:browser:check` covers the checked-out mirror whether or not this candidate
-touched it; the lane's own proof is scoped to the candidate diff.
+`i18n:browser:check` and `telemetry:browser:check` cover the checked-out mirrors
+whether or not this candidate touched them; the lane's own proofs are scoped to
+the candidate diff.
 
 The final `git status` must print nothing; generated `.release-build` output is
 ignored. Inspect the generated page with the normal local preview workflow and
