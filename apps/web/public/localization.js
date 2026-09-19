@@ -1404,6 +1404,13 @@ export const WEB_MESSAGES = Object.freeze({
   "community.daily.seriesAvailable": ["Daily series available", "每日序列可用", "Serie diaria disponible"],
   "community.daily.seriesUnavailable": ["Daily series unavailable", "每日序列不可用", "Serie diaria no disponible"],
   "community.daily.noneYet": ["No daily activity published yet", "尚未发布每日活动", "Aún no se ha publicado actividad diaria"],
+  // Retained-evidence copy, shared by every community view that can serve a
+  // payload this browser already received. It states the age and says plainly
+  // that nothing was estimated, because a reader must never be unable to tell
+  // retained figures from current ones.
+  "community.daily.seriesCached": ["Cached daily series", "缓存的每日序列", "Serie diaria en caché"],
+  "community.cached.chip": ["Showing cached figures", "显示缓存数据", "Mostrando cifras en caché"],
+  "community.cached.notice": ["The service could not be reached, so these are the figures this browser last received, {age}. They are not current, and nothing has been estimated to fill the gap.", "无法连接服务，因此这里显示的是此浏览器上次收到的数据，时间为{age}。这些数据不是最新的，也没有通过估算来填补缺口。", "No se pudo contactar con el servicio, así que estas son las cifras que este navegador recibió por última vez, {age}. No están actualizadas y no se ha estimado nada para rellenar el hueco."],
   "community.daily.failedLoad": ["The daily community series could not be loaded. Nothing is inferred from a failed request.", "无法加载每日社区序列。失败的请求不会推断任何结果。", "No se pudo cargar la serie comunitaria diaria. No se infiere nada de una solicitud fallida."],
   "community.daily.activitySummary": ["See community activity", "查看社区活动", "Ver la actividad de la comunidad"],
   "community.daily.activityHeading": ["Community activity over time", "社区活动趋势", "Actividad de la comunidad a lo largo del tiempo"],

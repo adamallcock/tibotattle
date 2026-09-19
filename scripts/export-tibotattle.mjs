@@ -323,6 +323,7 @@ export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/index.html",
   "apps/web/public/i18n.generated.js",
   "apps/web/public/install-cta.js",
+  "apps/web/public/last-known-good.js",
   "apps/web/public/lib.js",
   "apps/web/public/localization.js",
   "apps/web/public/model-catalog.generated.js",

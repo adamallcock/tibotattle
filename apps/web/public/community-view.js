@@ -12,6 +12,7 @@ import {
   compactPrecise,
   createDomHelpers,
   dateTimeFormatter,
+  formatAge,
   formatUtcCalendarDay,
   numberFormatter,
 } from "./ui-format.js";
@@ -35,6 +36,31 @@ const COMMUNITY_DAILY_STATE_KEYS = Object.freeze({
   unsupported_schema: "community.daily.state.unsupportedSchema",
   none_published: "community.daily.state.nonePublished",
 });
+
+/**
+ * Retained-evidence provenance, as the last-known-good store reports it.
+ *
+ * A view is handed this only when it is rendering a payload that genuinely
+ * arrived earlier and could not be refreshed. It is validated here rather
+ * than trusted, because an unusable age would turn a truthful "from two hours
+ * ago" into a claim nobody checked. Anything unusable renders as live-state
+ * copy for a live payload, never as an unlabelled stale one.
+ */
+function cachedEvidence(cache) {
+  const ageMs = cache?.ageMs;
+  return typeof cache?.fetchedAt === "string"
+    && typeof ageMs === "number"
+    && Number.isFinite(ageMs)
+    && ageMs >= 0
+    ? { fetchedAt: cache.fetchedAt, ageMs }
+    : null;
+}
+
+function cachedEvidenceNotice(node, t, retained) {
+  return node("p", "annotation", t("community.cached.notice", {
+    age: formatAge(retained.ageMs / 1000),
+  }));
+}
 
 const COMMUNITY_DAILY_COLUMN_KEYS = Object.freeze([
   "community.daily.day",
@@ -747,6 +773,7 @@ export function renderCommunityDailySeries({
   container,
   stateNode = null,
   payload,
+  cache = null,
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
@@ -755,14 +782,21 @@ export function renderCommunityDailySeries({
   dailyDisclosureByContainer.delete(container);
   clear(container);
   const series = normalizeCommunityDailySeries(payload);
+  const retained = cachedEvidence(cache);
   if (stateNode) {
-    stateNode.textContent = series.state === "published"
-      ? t("community.daily.seriesAvailable")
-      : t("community.daily.seriesUnavailable");
-    stateNode.className = series.state === "published"
+    stateNode.textContent = retained !== null
+      ? t("community.cached.chip")
+      : series.state === "published"
+        ? t("community.daily.seriesAvailable")
+        : t("community.daily.seriesUnavailable");
+    // Retained figures never take the live chip. The neutral chip and the
+    // notice below carry the same claim, so neither a glance nor a read can
+    // mistake them for current evidence.
+    stateNode.className = series.state === "published" && retained === null
       ? "evidence-chip"
       : "evidence-chip neutral";
   }
+  if (retained !== null) container.append(cachedEvidenceNotice(node, t, retained));
   if (series.state !== "published") {
     container.append(node("p", "", t(COMMUNITY_DAILY_STATE_KEYS[series.state])));
     return series.state;
@@ -1326,6 +1360,7 @@ export function renderCommunityAllowanceSection({
   payload,
   rangeDays = null,
   view = "aggregate",
+  cache = null,
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
@@ -1336,11 +1371,15 @@ export function renderCommunityAllowanceSection({
   allowanceInspectionByContainer.delete(container);
   clear(container);
   const series = normalizeCommunityDailySeries(payload);
+  const retained = cachedEvidence(cache);
   const setChip = (labelKey, published) => {
     if (!stateNode) return;
-    stateNode.textContent = t(labelKey);
-    stateNode.className = published ? "evidence-chip" : "evidence-chip neutral";
+    stateNode.textContent = t(retained === null ? labelKey : "community.cached.chip");
+    stateNode.className = published && retained === null
+      ? "evidence-chip"
+      : "evidence-chip neutral";
   };
+  if (retained !== null) container.append(cachedEvidenceNotice(node, t, retained));
   if (series.state !== "published") {
     setChip("community.allowance.unavailable", false);
     container.append(

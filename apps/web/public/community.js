@@ -13,8 +13,14 @@ import { mountExampleWeek } from "./feature-week.js";
 // the community view are the same modules the in-app dashboard entry uses.
 
 import { wireFeaturePreviews, wirePaceDemo } from "./feature-tour.js";
-import { PublicCommunityClient, normalizeCommunityDailySeries } from "./community-data.js";
+import {
+  COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY,
+  PublicCommunityClient,
+  normalizeCommunityDailySeries,
+  projectCommunityDailyPayloadForCache,
+} from "./community-data.js";
 import { createCommunityRefresh } from "./community-refresh.js";
+import { createLastKnownGoodStore } from "./last-known-good.js";
 import {
   renderCommunityAllowanceSection,
   renderCommunityDailySeries,
@@ -62,6 +68,10 @@ const publicRequestIdPattern =
 let lastCommunityDailyPayload = null;
 let lastCommunityAllowancePayload = null;
 let lastCommunityDailyFailure = null;
+// Retained-evidence provenance for whatever each section is currently
+// showing, or null when it is showing a live answer.
+let lastCommunityDailyCache = null;
+let lastCommunityAllowanceCache = null;
 let communityDailySettled = false;
 // The allowance range selection: 30 calendar days or null for the whole
 // published series. Re-rendering is purely client-side — the year window is
@@ -70,6 +80,27 @@ let allowanceRangeDays = 30;
 let allowanceView = "aggregate";
 let allowanceDialogReturnFocus = null;
 const communityClient = new PublicCommunityClient();
+// One request feeds both community views, so one cache serves both. The
+// projection stores only what this reader already validated and rendered, and
+// the schema identity refuses a payload written by a deploy whose contracts
+// differ from this one's.
+const communityPayloadCache = createLastKnownGoodStore({
+  key: "community-daily",
+  schemaVersion: COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY,
+  project: projectCommunityDailyPayloadForCache,
+});
+
+/**
+ * The age a view states is computed when it renders, not when the payload was
+ * published to it: a range, view or language change re-renders minutes later,
+ * and an age frozen at publish time would then be a wrong one.
+ */
+function currentCacheProvenance(cache) {
+  const fetchedMs = Date.parse(cache?.fetchedAt ?? "");
+  return Number.isFinite(fetchedMs)
+    ? { fetchedAt: cache.fetchedAt, ageMs: Math.max(0, Date.now() - fetchedMs) }
+    : null;
+}
 
 function normalizePublicPlatform(candidate) {
   if (typeof candidate !== "string") return null;
@@ -248,14 +279,24 @@ function publicRequestId(candidate) {
  */
 export function setPublicDailyPresentation(documentRef, state, {
   failed = false,
+  cached = false,
 } = {}) {
   const hero = documentRef.querySelector("#community-daily-hero");
-  const presentation = failed || state === "service_unavailable"
-    ? [t("community.daily.seriesUnavailable"), false]
-    : {
-      published: [t("community.daily.seriesAvailable"), true],
-      none_published: [t("community.daily.noneYet"), false],
-    }[state] ?? [t("community.daily.seriesUnavailable"), false];
+  // Retained evidence is neither live nor absent, so it gets its own compact
+  // label. It never claims the series is unavailable while figures from it are
+  // on the page, and it never claims the series is available either.
+  const presentation = cached
+    ? [t(state === "published"
+      ? "community.daily.seriesCached"
+      : state === "none_published"
+        ? "community.daily.noneYet"
+        : "community.daily.seriesUnavailable"), false]
+    : failed || state === "service_unavailable"
+      ? [t("community.daily.seriesUnavailable"), false]
+      : {
+        published: [t("community.daily.seriesAvailable"), true],
+        none_published: [t("community.daily.noneYet"), false],
+      }[state] ?? [t("community.daily.seriesUnavailable"), false];
   if (hero) hero.textContent = presentation[0];
   // The hero dot's green heartbeat means "live evidence loaded", so it keys
   // off the same presentation truthiness as the detailed disclosure.
@@ -419,7 +460,7 @@ function wireInstallerChecksumCopy(prefix = "") {
   });
 }
 
-function renderCommunityAllowanceResult(payload) {
+function renderCommunityAllowanceResult(payload, cache = lastCommunityAllowanceCache) {
   const container = $("#community-allowance-result");
   if (!container) return "service_unavailable";
   const state = renderCommunityAllowanceSection({
@@ -429,15 +470,16 @@ function renderCommunityAllowanceResult(payload) {
     payload,
     rangeDays: allowanceRangeDays,
     view: allowanceView,
+    cache: currentCacheProvenance(cache),
   });
   updateAllowanceDialogAvailability(state);
   if ($("#community-allowance-dialog")?.open) {
-    renderCommunityAllowanceDialogResult(payload);
+    renderCommunityAllowanceDialogResult(payload, cache);
   }
   return state;
 }
 
-function renderCommunityAllowanceDialogResult(payload) {
+function renderCommunityAllowanceDialogResult(payload, cache = lastCommunityAllowanceCache) {
   const container = $("#community-allowance-dialog-result");
   if (!container) return "service_unavailable";
   return renderCommunityAllowanceSection({
@@ -446,6 +488,7 @@ function renderCommunityAllowanceDialogResult(payload) {
     payload,
     rangeDays: allowanceRangeDays,
     view: allowanceView,
+    cache: currentCacheProvenance(cache),
   });
 }
 
@@ -555,7 +598,9 @@ function wireAllowanceDialog() {
   });
 }
 
-function renderCommunityDailyResult({ payload, failure = null, refreshAllowance = true }) {
+function renderCommunityDailyResult({
+  payload, failure = null, cache = null, refreshAllowance = true,
+}) {
   if (refreshAllowance) renderCommunityAllowanceResult(lastCommunityAllowancePayload);
   const container = $("#community-daily-result");
   const state = renderCommunityDailySeries({
@@ -563,20 +608,27 @@ function renderCommunityDailyResult({ payload, failure = null, refreshAllowance 
     container,
     stateNode: $("#community-daily-state"),
     payload,
+    cache: currentCacheProvenance(cache),
   });
   $("#community").dataset.communityState = state;
-  setPublicDailyPresentation(document, state, { failed: failure !== null });
+  setPublicDailyPresentation(document, state, {
+    failed: failure !== null,
+    cached: cache !== null,
+  });
   if (failure === null) return state;
   // Only the fixed, content-free identifiers the service itself returned are
   // repeated back. This page files no diagnostic note: there is no local
   // companion here to file one with.
   const code = publicErrorCode(failure?.code);
   const requestId = publicRequestId(failure?.requestId);
-  const sentences = [
-    t("community.daily.failedLoad"),
-  ];
+  // With retained figures on screen the renderer has already led with the
+  // notice that says so; repeating "could not be loaded" above a rendered
+  // chart would read as a contradiction. The service's own identifiers are
+  // still repeated back either way.
+  const sentences = cache === null ? [t("community.daily.failedLoad")] : [];
   if (code !== "") sentences.push(t("community.reportedCause", { code: code.replace(/_/gu, " ") }));
   if (requestId !== "") sentences.push(t("community.serviceReference", { reference: requestId }));
+  if (sentences.length === 0) return state;
   const note = document.createElement("p");
   note.className = "annotation";
   note.textContent = sentences.join(" ");
@@ -585,20 +637,45 @@ function renderCommunityDailyResult({ payload, failure = null, refreshAllowance 
 }
 
 function publishCommunityDailySeries({ payload, failure }) {
-  if (communityDailySettled && failure === null && lastCommunityDailyFailure === null
-      && JSON.stringify(payload) === JSON.stringify(lastCommunityDailyPayload)) return;
+  // Three states, resolved once for both views: a live answer (remembered
+  // here whether or not it changed anything, so the recorded moment means
+  // "last confirmed live"), the payload this browser already holds, or an
+  // honest nothing. Nothing is inferred on any of the three paths.
+  const resolved = communityPayloadCache.resolve({ payload, failure });
+  const cache = resolved.state === "cached"
+    ? { fetchedAt: resolved.fetchedAt }
+    : null;
+  // Only a live answer may repeat itself unchanged. Retained figures re-render
+  // because their stated age has moved on, and an age that stops moving is a
+  // false claim about how old they are.
+  if (resolved.state === "live" && communityDailySettled
+      && lastCommunityDailyCache === null
+      && resolved.failure === null && lastCommunityDailyFailure === null
+      && JSON.stringify(resolved.payload) === JSON.stringify(lastCommunityDailyPayload)) return;
   // A null payload renders the fixed "service unavailable" state, which is
   // separate from a service that answered and has published nothing yet. Keep
   // the settled failure too so a language switch rerenders its safe copy.
   const nextAllowance = selectCommunityAllowancePayload(
-    lastCommunityAllowancePayload, payload,
+    lastCommunityAllowancePayload, resolved.payload,
   );
-  const refreshAllowance = !communityDailySettled || nextAllowance !== lastCommunityAllowancePayload;
-  lastCommunityDailyPayload = payload;
+  // Provenance travels with the observation it describes: when the
+  // activity-only rule keeps the previous allowance answer, that answer keeps
+  // its own freshness label rather than inheriting this response's.
+  const nextAllowanceCache = nextAllowance === resolved.payload
+    ? cache
+    : lastCommunityAllowanceCache;
+  const refreshAllowance = !communityDailySettled
+    || nextAllowance !== lastCommunityAllowancePayload
+    || nextAllowanceCache !== lastCommunityAllowanceCache;
+  lastCommunityDailyPayload = resolved.payload;
   lastCommunityAllowancePayload = nextAllowance;
-  lastCommunityDailyFailure = failure;
+  lastCommunityAllowanceCache = nextAllowanceCache;
+  lastCommunityDailyCache = cache;
+  lastCommunityDailyFailure = resolved.failure;
   communityDailySettled = true;
-  renderCommunityDailyResult({ payload, failure, refreshAllowance });
+  renderCommunityDailyResult({
+    payload: resolved.payload, failure: resolved.failure, cache, refreshAllowance,
+  });
 }
 
 // An activity-only fallback is not proof that the allowance was withdrawn.
@@ -657,6 +734,7 @@ if (typeof document !== "undefined") {
       renderCommunityDailyResult({
         payload: lastCommunityDailyPayload,
         failure: lastCommunityDailyFailure,
+        cache: lastCommunityDailyCache,
       });
     }
     localization.localizeTree();
