@@ -440,7 +440,8 @@ export async function readCacheRetentionDay(input: { target: D1Database; key: Ca
     const rows = (await target.prepare(`SELECT band,adjacencies,reused_more_than_half,
         matched_or_exceeded,unordered_ties,excluded_insufficient_evidence,
         excluded_context_contracted,sessions
-      FROM analytics_cache_retention_day_bands WHERE value_key=? LIMIT 8`).bind(value.value_key)
+      FROM analytics_cache_retention_day_bands WHERE value_key=?
+      LIMIT ${CACHE_RETENTION_BAND_IDS.length + 1}`).bind(value.value_key)
       .all<Record<string, string | number>>()).results;
     if (rows.length !== CACHE_RETENTION_BAND_IDS.length) throw fail();
     const byBand = new Map(rows.map((row) => [String(row.band), row]));

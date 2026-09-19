@@ -41,8 +41,9 @@ export interface CacheRetentionBand {
   readonly startMs: number;
   readonly endMs: number;
 }
-export type CacheRetentionBandId = "under_one_minute" | "one_to_five_minutes"
-  | "five_to_thirty_minutes" | "thirty_minutes_to_one_hour" | "one_to_six_hours"
+export type CacheRetentionBandId = "under_one_minute" | "one_to_two_minutes"
+  | "two_to_five_minutes" | "five_to_ten_minutes" | "ten_to_thirty_minutes"
+  | "thirty_minutes_to_one_hour" | "one_to_two_hours" | "two_to_six_hours"
   | "six_to_twenty_four_hours" | "over_twenty_four_hours";
 
 /** The bounded lens. 7 days is the local
@@ -51,12 +52,28 @@ export type CacheRetentionBandId = "under_one_minute" | "one_to_five_minutes"
 const LOOKBACK_DAYS = 7;
 const MAXIMUM_GAP_MS = LOOKBACK_DAYS * 86_400_000;
 
-export const CACHE_RETENTION_BANDS: readonly CacheRetentionBand[] = Object.freeze([
+export /** Ten bands, matching the local dashboard's nine plus a split of its 1-6h
+ * bucket into 1-2h and 2-6h.
+ *
+ * The seven-band first cut was too coarse where the curve actually bends. The
+ * local corpus puts the interesting decay between one and thirty minutes —
+ * 99.2% at 1-2m, 97.6% at 2-5m, 95.7% at 5-10m, 86.4% at 10-30m — and a single
+ * `one_to_five_minutes` bucket averages the first two together while
+ * `five_to_thirty_minutes` averages the next two. Both distinctions are lost
+ * exactly where a reader is trying to see the shape.
+ *
+ * The extra 1-2h/2-6h split has no local counterpart: it is there because
+ * retention falls off a cliff somewhere in that range and a six-hour bucket
+ * cannot say where. Bands are half-open [startMs, endMs). */
+const CACHE_RETENTION_BANDS: readonly CacheRetentionBand[] = Object.freeze([
   Object.freeze({ id: "under_one_minute" as const, startMs: 0, endMs: 60_000 }),
-  Object.freeze({ id: "one_to_five_minutes" as const, startMs: 60_000, endMs: 5 * 60_000 }),
-  Object.freeze({ id: "five_to_thirty_minutes" as const, startMs: 5 * 60_000, endMs: 30 * 60_000 }),
+  Object.freeze({ id: "one_to_two_minutes" as const, startMs: 60_000, endMs: 2 * 60_000 }),
+  Object.freeze({ id: "two_to_five_minutes" as const, startMs: 2 * 60_000, endMs: 5 * 60_000 }),
+  Object.freeze({ id: "five_to_ten_minutes" as const, startMs: 5 * 60_000, endMs: 10 * 60_000 }),
+  Object.freeze({ id: "ten_to_thirty_minutes" as const, startMs: 10 * 60_000, endMs: 30 * 60_000 }),
   Object.freeze({ id: "thirty_minutes_to_one_hour" as const, startMs: 30 * 60_000, endMs: 60 * 60_000 }),
-  Object.freeze({ id: "one_to_six_hours" as const, startMs: 60 * 60_000, endMs: 6 * 60 * 60_000 }),
+  Object.freeze({ id: "one_to_two_hours" as const, startMs: 60 * 60_000, endMs: 2 * 60 * 60_000 }),
+  Object.freeze({ id: "two_to_six_hours" as const, startMs: 2 * 60 * 60_000, endMs: 6 * 60 * 60_000 }),
   Object.freeze({ id: "six_to_twenty_four_hours" as const, startMs: 6 * 60 * 60_000, endMs: 86_400_000 }),
   Object.freeze({ id: "over_twenty_four_hours" as const, startMs: 86_400_000, endMs: MAXIMUM_GAP_MS }),
 ]);
@@ -77,7 +94,7 @@ export const CACHE_RETENTION_BAND_IDS: readonly CacheRetentionBandId[] =
  * widened to admit it.
  */
 export const CACHE_RETENTION_METHOD = Object.freeze({
-  version: "cache-retention-v1",
+  version: "cache-retention-v2",
   metric: CACHE_RETENTION_METRIC_ID,
   /** Positive-input requests only: quota-only and bookkeeping rows must not
    * consume an adjacency boundary. */

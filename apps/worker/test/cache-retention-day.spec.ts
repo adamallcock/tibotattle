@@ -134,8 +134,8 @@ describe('the cache-retention method contract',()=>{
   // a separate constant named the key -- and this is what makes that
   // impossible here.
   expect(await sha256Hex(canonicalJson(CACHE_RETENTION_METHOD)))
-   .toBe('bd30ff0b9513f4ce3ce84f2f300afc6747e5f60fb59ee3d9269a83fef75b7b88');
-  expect(CACHE_RETENTION_METHOD.version).toBe('cache-retention-v1');
+   .toBe('52e81da46d7b09607d1382ddd9f375f4a8e08689d6d6ff06f1d3dfb92938748e');
+  expect(CACHE_RETENTION_METHOD.version).toBe('cache-retention-v2');
   expect(CACHE_RETENTION_METHOD.merge).toBe('pooled');
   expect(CACHE_RETENTION_METHOD.lookbackDays).toBe(7);
   expect(CACHE_RETENTION_METHOD.minimumGapMs).toBe(0);
@@ -155,14 +155,26 @@ describe('the cache-retention method contract',()=>{
   const other=await cacheRetentionCarryDigest(carryFor(DAY,{[cacheRetentionLookbackDays(DAY)[0]!]:MANIFEST}));
   expect(await cacheRetentionDayMarkKey(key(),other)).not.toBe(await cacheRetentionDayMarkKey(key(),carryDigest));
  });
- it('cuts the same seven bands the local lens cuts',()=>{
-  expect(CACHE_RETENTION_BAND_IDS).toEqual(['under_one_minute','one_to_five_minutes',
-   'five_to_thirty_minutes','thirty_minutes_to_one_hour','one_to_six_hours',
+ it('cuts the local lens\'s nine bands, plus a split of its 1-6h bucket',()=>{
+  // The vocabulary is the local dashboard's nine, with 1-6h split at two hours.
+  // The seven-band first cut merged 1-2m with 2-5m and 5-10m with 10-30m, which
+  // is precisely where the measured curve bends, so it reported their mean and
+  // hid the bend.
+  expect(CACHE_RETENTION_BAND_IDS).toEqual(['under_one_minute','one_to_two_minutes',
+   'two_to_five_minutes','five_to_ten_minutes','ten_to_thirty_minutes',
+   'thirty_minutes_to_one_hour','one_to_two_hours','two_to_six_hours',
    'six_to_twenty_four_hours','over_twenty_four_hours']);
+  // Half-open [start, end): a boundary instant belongs to the band it opens.
   expect(cacheRetentionBandFor(0)).toBe('under_one_minute');
   expect(cacheRetentionBandFor(59_999)).toBe('under_one_minute');
-  expect(cacheRetentionBandFor(60_000)).toBe('one_to_five_minutes');
+  expect(cacheRetentionBandFor(60_000)).toBe('one_to_two_minutes');
+  expect(cacheRetentionBandFor(2*60_000)).toBe('two_to_five_minutes');
+  expect(cacheRetentionBandFor(5*60_000)).toBe('five_to_ten_minutes');
+  expect(cacheRetentionBandFor(10*60_000)).toBe('ten_to_thirty_minutes');
   expect(cacheRetentionBandFor(30*60_000)).toBe('thirty_minutes_to_one_hour');
+  expect(cacheRetentionBandFor(60*60_000)).toBe('one_to_two_hours');
+  expect(cacheRetentionBandFor(2*60*60_000)).toBe('two_to_six_hours');
+  expect(cacheRetentionBandFor(6*60*60_000)).toBe('six_to_twenty_four_hours');
   expect(cacheRetentionBandFor(86_400_000)).toBe('over_twenty_four_hours');
   // The lens is bounded by the same 7 days the local display maximum uses, and
   // a gap outside it is outside the lens rather than folded into the last band.
@@ -187,9 +199,9 @@ describe('the cache-retention reduction',()=>{
   expect(aggregate.groups[0]).toMatchObject({model:'gpt-5.6-sol',effort:'high',adjacencies:3,sessions:1});
   expect(bandOf(aggregate,'under_one_minute')).toMatchObject({adjacencies:1,
    reusedMoreThanHalf:1,matchedOrExceeded:1,unorderedTies:0,sessions:1});
-  expect(bandOf(aggregate,'five_to_thirty_minutes')).toMatchObject({adjacencies:1,
+  expect(bandOf(aggregate,'ten_to_thirty_minutes')).toMatchObject({adjacencies:1,
    reusedMoreThanHalf:1,matchedOrExceeded:0});
-  expect(bandOf(aggregate,'one_to_six_hours')).toMatchObject({adjacencies:1,
+  expect(bandOf(aggregate,'two_to_six_hours')).toMatchObject({adjacencies:1,
    reusedMoreThanHalf:0,matchedOrExceeded:0});
   expect(validCacheRetentionDayAggregate(aggregate)).toBe(true);
  });
@@ -260,7 +272,7 @@ describe('the cache-retention reduction',()=>{
   const previous:CacheRetentionEvent={...ev(0,{cacheReadTokens:1_000}),
    observedAtMs:DAY_MS-2*3_600_000};
   const aggregate=reduce([ev(0,{cacheReadTokens:900})],[previous]);
-  expect(bandOf(aggregate,'one_to_six_hours')).toMatchObject({adjacencies:1,reusedMoreThanHalf:1});
+  expect(bandOf(aggregate,'two_to_six_hours')).toMatchObject({adjacencies:1,reusedMoreThanHalf:1});
  });
  it('drops a pair whose gap is outside the bounded lookback',()=>{
   const previous:CacheRetentionEvent={...ev(0,{cacheReadTokens:1_000}),
@@ -350,7 +362,7 @@ describe('the community merge',()=>{
  it('returns every band, and null rather than zero where there is no evidence',()=>{
   const merged=mergeCacheRetentionBands([row('1'.repeat(64),'under_one_minute',10,9)]);
   expect(merged.map(band=>band.band)).toEqual([...CACHE_RETENTION_BAND_IDS]);
-  const empty=merged.find(band=>band.band==='one_to_six_hours')!;
+  const empty=merged.find(band=>band.band==='two_to_six_hours')!;
   expect(empty.adjacencies).toBe(0);
   expect(empty.contributors).toBe(0);
   expect(empty.reusedMoreThanHalfRate).toBeNull();
@@ -379,7 +391,7 @@ describe('the prepared cache-retention store',()=>{
   expect(canonicalJson(read.aggregate)).toBe(canonicalJson(built));
   const rows=await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_bands`)
    .first<number>('n');
-  expect(rows).toBe(14);
+  expect(rows).toBe(20);
   expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_carry')
    .first<number>('n')).toBe(7);
  });
@@ -398,11 +410,16 @@ describe('the prepared cache-retention store',()=>{
  });
  it('resumes a day cut mid-write and promotes the identical aggregate',async()=>{
   const carry=carryFor(),built=aggregate();
-  const cut=await writeCacheRetentionDay({target:target(),key:key(),carry,aggregate:built,maxWrites:16});
+  // Enough for the carry plus exactly ONE values row and its band set, so the
+  // second is deliberately cut and must resume. Derived, because a values row
+  // costs `bands + 1` writes and the vocabulary is not fixed.
+  // carry upserts + the reserved mark insert + one values row and its bands.
+  const oneRow=CACHE_RETENTION_METHOD.lookbackDays+1+CACHE_RETENTION_BAND_IDS.length+1;
+  const cut=await writeCacheRetentionDay({target:target(),key:key(),carry,aggregate:built,maxWrites:oneRow});
   expect(cut).toMatchObject({status:'staging',storedValues:1,totalValues:2});
   // Nothing is readable while the day is partial: no mark authorizes it.
   expect((await readCacheRetentionDay({target:target(),key:key(),carry})).status).toBe('absent');
-  const done=await writeCacheRetentionDay({target:target(),key:key(),carry,aggregate:built,maxWrites:16});
+  const done=await writeCacheRetentionDay({target:target(),key:key(),carry,aggregate:built,maxWrites:oneRow});
   expect(done).toMatchObject({status:'stored',valueCount:2});
   const read=await readCacheRetentionDay({target:target(),key:key(),carry});
   if(read.status!=='ready')throw new Error('unreachable');
@@ -471,7 +488,7 @@ describe('the prepared cache-retention store',()=>{
     unordered_ties,excluded_insufficient_evidence,excluded_context_contracted,sessions)
     VALUES(?,'one_to_two_minutes',?,?,?,'cache-retention-v1',0,0,0,0,0,0,0)`)
    .bind(valueKey,sourceId,OWNER,DAY).run()).rejects.toThrow();
-  await expect(insertMark({method_version:'cache-retention-v2'})).rejects.toThrow();
+  await expect(insertMark({method_version:'cache-retention-v3'})).rejects.toThrow();
  });
  it('fences every tier against an erased owner',async()=>{
   await target().prepare(`INSERT INTO analytics_storage_erasure_fences(source_id,owner_digest,
@@ -489,11 +506,11 @@ describe('the prepared cache-retention store',()=>{
   // Still delivered under the current method: nothing to retire.
   expect(await retireCacheRetentionDayPage(target(),sourceId)).toMatchObject({state:'idle'});
   // A method bump misses every key.
-  const bumped=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:'cache-retention-v2'});
+  const bumped=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:'cache-retention-v3'});
   expect(bumped).toMatchObject({state:'retiring',marks:1});
-  let page=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:'cache-retention-v2'});
+  let page=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:'cache-retention-v3'});
   for(let attempt=0;attempt<8&&page.state!=='idle';attempt+=1){
-   page=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:'cache-retention-v2'});
+   page=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:'cache-retention-v3'});
   }
   for(const table of ['marks','carry','values','bands']){
    expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_${table}`)
@@ -607,10 +624,21 @@ describe('the cache-retention lane',()=>{
    .toMatchObject({state:'deferred',reason:'deadline',built:0});
   expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_marks')
    .first<number>('n')).toBe(0);
-  // A day costs 5 statements plus its write batches, so 30 affords exactly one
-  // of the two and the lane stops rather than opening a day it cannot finish.
+  // A day costs 5 statements plus its write batches. A batch carries one values
+  // row and its whole band set, so widening the vocabulary from 7 bands to 10
+  // widened the batch with it; the budget that afforded exactly one day is
+  // derived from the vocabulary rather than frozen, so it cannot rot the next
+  // time the bands move.
+
+  // TWO budgets bound a day, and the test is about the query one. A day's write
+  // batch is the carry upserts, the reserved mark insert and one values row with
+  // its whole band set, so it grows with the vocabulary: at seven bands 16
+  // writes was enough and at ten it is not, which silently turned this into a
+  // test of a partial write instead. The write budget is therefore derived and
+  // generous, leaving the query budget as the only thing under test.
+  const dayWrites=CACHE_RETENTION_METHOD.lookbackDays+1+CACHE_RETENTION_BAND_IDS.length+1;
   const partial=await advanceCacheRetentionDayLane({target:target(),sourceId,build,
-   deadlineMs:Date.now()+30_000,remainingQueries:30,maxWrites:16});
+   deadlineMs:Date.now()+30_000,remainingQueries:30,maxWrites:dayWrites});
   expect(partial).toMatchObject({state:'progress',reason:'query_budget',built:1,staged:0,candidates:2});
  });
  it('ignores an erased owner and a day outside its floor',async()=>{
@@ -737,7 +765,10 @@ describe('the cache-retention builder over the real source readers',()=>{
    expect(group).toMatchObject({model:'gpt-5.6-sol',effort:'high',sessions:1});
    expect(group.bands.find(band=>band.band==='under_one_minute'))
     .toMatchObject({adjacencies:1,reusedMoreThanHalf:1,matchedOrExceeded:1});
-   expect(group.bands.find(band=>band.band==='one_to_six_hours'))
+   // Under two hours, so the new split puts it in `one_to_two_hours` where the
+   // old six-hour bucket would have absorbed it. This is the contrast the
+   // widened vocabulary exists to show.
+   expect(group.bands.find(band=>band.band==='one_to_two_hours'))
     .toMatchObject({adjacencies:1,reusedMoreThanHalf:1,matchedOrExceeded:0});
    // The second day pairs its first request against the previous day's last
    // one through the bounded lookback, so it holds one more adjacency than the
