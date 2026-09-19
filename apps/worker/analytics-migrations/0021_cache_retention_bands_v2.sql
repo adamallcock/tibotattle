@@ -61,6 +61,36 @@ DROP TABLE IF EXISTS analytics_cache_retention_day_marks;
 -- selection would re-select it every pass forever. That is the same
 -- head-of-line stall 0019's refusal table exists to prevent; here the day is
 -- not refused, it is simply empty, so the mark records the empty result.
+-- Field notes for the statement below. They sit ABOVE it, never inside it:
+-- D1 applies a migration one statement at a time and its splitter drops a
+-- comment from within one, so an inline note makes the applied DDL differ
+-- from the same file imported whole. `npm run scripts:check` fails that.
+-- `carry_days`:
+-- Calendar days of bounded lookback the carry digest covers. Fixed by the
+-- method, restated here so a row says what it depended on without a join.
+-- `value_count`:
+-- Values rows this day promoted, one per (model, effort) that produced at
+-- least one same-configuration adjacency. Zero is a valid, recorded day.
+-- `events_read`:
+-- Usage rows the day's read returned, including rows the mapper skipped.
+-- An empty day that was READ is distinguishable from one that was not.
+-- `unreadable_events`:
+-- Rows that broke a session chain because they could not be read at all.
+-- Explicit rather than folded into `events_read`: unreadable evidence is
+-- neither absence nor zero.
+-- `refusal`:
+-- A day that cannot be represented within the method's bounds is recorded
+-- here rather than rediscovered, for exactly the reason 0019 grew a refusal
+-- table: the oldest-day-first selection would otherwise re-select it every
+-- pass and, once enough accumulate at the earliest dates, the lane never
+-- advances again while reporting itself complete. The mark's own identity
+-- already carries the day manifest digest and the carry digest, so a
+-- re-upload of the day OR of any day it depended on retries it
+-- automatically and nothing else does. Only reasons that are a function of
+-- the day's own inputs are in the vocabulary: an owner-scoped transient
+-- condition recorded per day would exclude that owner's earliest days for
+-- good, so it stays a skip in the lane instead.
+--
 CREATE TABLE analytics_cache_retention_day_marks (
   mark_key TEXT PRIMARY KEY CHECK(length(mark_key)=64 AND mark_key NOT GLOB '*[^0-9a-f]*'),
   source_id TEXT NOT NULL,
@@ -73,31 +103,11 @@ CREATE TABLE analytics_cache_retention_day_marks (
   day TEXT NOT NULL CHECK(length(day)=10 AND day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
   method_version TEXT NOT NULL CHECK(method_version IN ('cache-retention-v1','cache-retention-v2')),
   carry_digest TEXT NOT NULL CHECK(length(carry_digest)=64 AND carry_digest NOT GLOB '*[^0-9a-f]*'),
-  -- Calendar days of bounded lookback the carry digest covers. Fixed by the
-  -- method, restated here so a row says what it depended on without a join.
   carry_days INTEGER NOT NULL CHECK(carry_days>=0 AND carry_days<=31),
-  -- Values rows this day promoted, one per (model, effort) that produced at
-  -- least one same-configuration adjacency. Zero is a valid, recorded day.
   value_count INTEGER NOT NULL CHECK(value_count>=0 AND value_count<=4096),
-  -- Usage rows the day's read returned, including rows the mapper skipped.
-  -- An empty day that was READ is distinguishable from one that was not.
   events_read INTEGER NOT NULL CHECK(events_read>=0),
-  -- Rows that broke a session chain because they could not be read at all.
-  -- Explicit rather than folded into `events_read`: unreadable evidence is
-  -- neither absence nor zero.
   unreadable_events INTEGER NOT NULL CHECK(unreadable_events>=0 AND unreadable_events<=events_read),
   values_digest TEXT NOT NULL CHECK(length(values_digest)=64 AND values_digest NOT GLOB '*[^0-9a-f]*'),
-  -- A day that cannot be represented within the method's bounds is recorded
-  -- here rather than rediscovered, for exactly the reason 0019 grew a refusal
-  -- table: the oldest-day-first selection would otherwise re-select it every
-  -- pass and, once enough accumulate at the earliest dates, the lane never
-  -- advances again while reporting itself complete. The mark's own identity
-  -- already carries the day manifest digest and the carry digest, so a
-  -- re-upload of the day OR of any day it depended on retries it
-  -- automatically and nothing else does. Only reasons that are a function of
-  -- the day's own inputs are in the vocabulary: an owner-scoped transient
-  -- condition recorded per day would exclude that owner's earliest days for
-  -- good, so it stays a skip in the lane instead.
   refusal TEXT CHECK(refusal IS NULL OR refusal IN ('group_limit_exceeded',
     'session_limit_exceeded','usage_row_refused','day_page_limit_exceeded')),
   CHECK(refusal IS NULL OR (value_count=0 AND events_read=0 AND unreadable_events=0)),
@@ -117,14 +127,20 @@ CREATE INDEX analytics_cache_retention_day_retirement
 -- the empty digest, so a day that is delivered LATER is as detectable as one
 -- that is restated: both change the recorded digest and both must retire the
 -- dependent day. The digest alone could not be checked in SQL; these rows can.
+-- Field notes for the statement below. They sit ABOVE it, never inside it:
+-- D1 applies a migration one statement at a time and its splitter drops a
+-- comment from within one, so an inline note makes the applied DDL differ
+-- from the same file imported whole. `npm run scripts:check` fails that.
+-- `manifest_digest`:
+-- The delivered manifest digest for that day, or '' when nothing was
+-- delivered. Never a guess, never a zero.
+--
 CREATE TABLE analytics_cache_retention_day_carry (
   mark_key TEXT NOT NULL CHECK(length(mark_key)=64 AND mark_key NOT GLOB '*[^0-9a-f]*'),
   day TEXT NOT NULL CHECK(length(day)=10 AND day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
   source_id TEXT NOT NULL,
   owner_digest TEXT NOT NULL CHECK(length(owner_digest)=64 AND owner_digest NOT GLOB '*[^0-9a-f]*'),
   device_id TEXT NOT NULL CHECK(length(device_id) BETWEEN 1 AND 256),
-  -- The delivered manifest digest for that day, or '' when nothing was
-  -- delivered. Never a guess, never a zero.
   manifest_digest TEXT NOT NULL CHECK(length(manifest_digest)=0
     OR (length(manifest_digest)=64 AND manifest_digest NOT GLOB '*[^0-9a-f]*')),
   PRIMARY KEY(mark_key,day)
@@ -146,6 +162,15 @@ CREATE INDEX analytics_cache_retention_day_carry_owner
 -- FILTERS on the pair rather than dimensions, exactly as the local lens treats
 -- them, so a pair whose speed mode or surface changed is not an adjacency at
 -- all and never reaches a row.
+-- Field notes for the statement below. They sit ABOVE it, never inside it:
+-- D1 applies a migration one statement at a time and its splitter drops a
+-- comment from within one, so an inline note makes the applied DDL differ
+-- from the same file imported whole. `npm run scripts:check` fails that.
+-- `adjacencies`:
+-- Comparable adjacencies: same configuration, both sides' token components
+-- observed, previous cache read > 0, and the prompt large enough to have
+-- held the previous prefix. The two exclusions are counted per band.
+--
 CREATE TABLE analytics_cache_retention_day_values (
   value_key TEXT PRIMARY KEY CHECK(length(value_key)=64 AND value_key NOT GLOB '*[^0-9a-f]*'),
   mark_key TEXT NOT NULL CHECK(length(mark_key)=64 AND mark_key NOT GLOB '*[^0-9a-f]*'),
@@ -156,9 +181,6 @@ CREATE TABLE analytics_cache_retention_day_values (
   carry_digest TEXT NOT NULL CHECK(length(carry_digest)=64 AND carry_digest NOT GLOB '*[^0-9a-f]*'),
   model TEXT NOT NULL CHECK(length(model) BETWEEN 1 AND 64 AND model NOT GLOB '*[^A-Za-z0-9._:-]*'),
   effort TEXT NOT NULL CHECK(length(effort) BETWEEN 1 AND 64 AND effort NOT GLOB '*[^A-Za-z0-9._:-]*'),
-  -- Comparable adjacencies: same configuration, both sides' token components
-  -- observed, previous cache read > 0, and the prompt large enough to have
-  -- held the previous prefix. The two exclusions are counted per band.
   adjacencies INTEGER NOT NULL CHECK(adjacencies>=0),
   sessions INTEGER NOT NULL CHECK(sessions>=0),
   bands_digest TEXT NOT NULL CHECK(length(bands_digest)=64 AND bands_digest NOT GLOB '*[^0-9a-f]*'),
@@ -173,6 +195,18 @@ CREATE INDEX analytics_cache_retention_day_values_owner
 -- Seven closed bands per values row, the same seven the local lens uses, so a
 -- reader cannot silently compare a hosted band against a differently cut one.
 -- Integers only: a rate is computed by the merge, never stored rounded.
+-- Field notes for the statement below. They sit ABOVE it, never inside it:
+-- D1 applies a migration one statement at a time and its splitter drops a
+-- comment from within one, so an inline note makes the applied DDL differ
+-- from the same file imported whole. `npm run scripts:check` fails that.
+-- `unordered_ties`:
+-- Adjacencies whose two events share an observed instant. There is no
+-- defensible order between them and no uploaded field supplies one, so they
+-- are counted and reported rather than hidden or re-ordered by guess.
+-- table constraint:
+-- `matched_or_exceeded` implies `reused_more_than_half` because the previous
+-- cache read is strictly positive on every comparable adjacency.
+--
 CREATE TABLE analytics_cache_retention_day_bands (
   value_key TEXT NOT NULL CHECK(length(value_key)=64 AND value_key NOT GLOB '*[^0-9a-f]*'),
   band TEXT NOT NULL CHECK(band IN ('under_one_minute','one_to_two_minutes','two_to_five_minutes',
@@ -185,15 +219,10 @@ CREATE TABLE analytics_cache_retention_day_bands (
   adjacencies INTEGER NOT NULL CHECK(adjacencies>=0),
   reused_more_than_half INTEGER NOT NULL CHECK(reused_more_than_half>=0),
   matched_or_exceeded INTEGER NOT NULL CHECK(matched_or_exceeded>=0),
-  -- Adjacencies whose two events share an observed instant. There is no
-  -- defensible order between them and no uploaded field supplies one, so they
-  -- are counted and reported rather than hidden or re-ordered by guess.
   unordered_ties INTEGER NOT NULL CHECK(unordered_ties>=0),
   excluded_insufficient_evidence INTEGER NOT NULL CHECK(excluded_insufficient_evidence>=0),
   excluded_context_contracted INTEGER NOT NULL CHECK(excluded_context_contracted>=0),
   sessions INTEGER NOT NULL CHECK(sessions>=0),
-  -- `matched_or_exceeded` implies `reused_more_than_half` because the previous
-  -- cache read is strictly positive on every comparable adjacency.
   CHECK(reused_more_than_half<=adjacencies AND matched_or_exceeded<=reused_more_than_half
     AND unordered_ties<=adjacencies AND sessions<=adjacencies),
   PRIMARY KEY(value_key,band)
@@ -246,12 +275,18 @@ BEGIN SELECT RAISE(ABORT,'analytics_cache_retention_day_band_retained'); END;
 -- scope, and its own totals agree with them. `sessions` is a distinct count and
 -- does not sum across bands, so it is bounded by them rather than equated: at
 -- least the largest band's, at most their sum.
+-- Field notes for the statement below. They sit ABOVE it, never inside it:
+-- D1 applies a migration one statement at a time and its splitter drops a
+-- comment from within one, so an inline note makes the applied DDL differ
+-- from the same file imported whole. `npm run scripts:check` fails that.
+-- `SELECT`:
+-- Ten bands now, not seven. A values row is only admitted once its whole
+-- band set is present, so this count IS the vocabulary size and has to move
+-- with it; leaving it at 7 would have refused every v2 row.
+--
 CREATE TRIGGER analytics_cache_retention_day_bands_complete
 BEFORE INSERT ON analytics_cache_retention_day_values
 BEGIN
-  -- Ten bands now, not seven. A values row is only admitted once its whole
-  -- band set is present, so this count IS the vocabulary size and has to move
-  -- with it; leaving it at 7 would have refused every v2 row.
   SELECT CASE WHEN (SELECT COUNT(*) FROM analytics_cache_retention_day_bands WHERE value_key=NEW.value_key)!=10
     OR COALESCE((SELECT SUM(adjacencies) FROM analytics_cache_retention_day_bands
       WHERE value_key=NEW.value_key),0)!=NEW.adjacencies
