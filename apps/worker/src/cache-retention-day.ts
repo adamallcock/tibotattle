@@ -571,9 +571,16 @@ export function cacheRetentionEventFromRecord(input: { sessionDigest: string; ob
   if (!record || record.schemaVersion !== "usage-event-v1.1") return unreadable;
   const components = record.components;
   if (!components || typeof components !== "object" || Array.isArray(components)) return unreadable;
-  const { modelId, reasoningEffort, speedMode, surface } = record;
+  const { modelId, reasoningEffort, speedMode, surface, agentScope } = record;
   if (!validCacheRetentionToken(modelId) || !validCacheRetentionToken(reasoningEffort)
-    || !validCacheRetentionToken(speedMode) || !validCacheRetentionToken(surface)) return unreadable;
+    || !validCacheRetentionToken(speedMode) || !validCacheRetentionToken(surface)
+    || !validCacheRetentionToken(agentScope)) return unreadable;
+  // Out of population, not a break: a subagent or scheduled-task request is a
+  // different conversation with its own prefix, so the root requests either
+  // side of it stay adjacent. Dropping it is what makes that true. An
+  // `unknown` scope is not proof of root, so it is dropped as well rather than
+  // admitted on the assumption that it probably was.
+  if (agentScope !== CACHE_RETENTION_METHOD.agentScope) return null;
   const parts = components as Record<string, unknown>;
   const cacheReadTokens = TOKENS(parts.inputCacheReadTokens);
   const uncachedTokens = TOKENS(parts.inputUncachedTokens);

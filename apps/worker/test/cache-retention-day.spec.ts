@@ -134,9 +134,10 @@ describe('the cache-retention method contract',()=>{
   // a separate constant named the key -- and this is what makes that
   // impossible here.
   expect(await sha256Hex(canonicalJson(CACHE_RETENTION_METHOD)))
-   .toBe('52e81da46d7b09607d1382ddd9f375f4a8e08689d6d6ff06f1d3dfb92938748e');
-  expect(CACHE_RETENTION_METHOD.version).toBe('cache-retention-v2');
+   .toBe('6d9e5786476624564231381dc903482eba3df789a37163df44ae09d4b8cdf5a1');
+  expect(CACHE_RETENTION_METHOD.version).toBe('cache-retention-v3');
   expect(CACHE_RETENTION_METHOD.merge).toBe('pooled');
+  expect(CACHE_RETENTION_METHOD.agentScope).toBe('root');
   expect(CACHE_RETENTION_METHOD.lookbackDays).toBe(7);
   expect(CACHE_RETENTION_METHOD.minimumGapMs).toBe(0);
  });
@@ -316,6 +317,27 @@ describe('the cache-retention reduction',()=>{
   expect(cacheRetentionEventFromRecord({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-2',
    recordJson:JSON.stringify({...record,components:{...record.components,inputUncachedTokens:0,
     inputCacheReadTokens:0,inputCacheWriteTokens:0}})})).toBeNull();
+  // Outside the population for the same reason, and the one that matters to
+  // the published number: a subagent or scheduled-task request is
+  // machine-driven, so nobody was waiting on it. It is dropped rather than
+  // made a break, which is what keeps the root requests either side of a
+  // subagent burst genuinely adjacent.
+  for(const scope of ['subagent','automation']){
+   expect(cacheRetentionEventFromRecord({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-3',
+    recordJson:JSON.stringify({...record,agentScope:scope})})).toBeNull();
+  }
+  // `unknown` is not proof of root. Admitting it would be inferring the
+  // attribution the contract declined to make.
+  expect(cacheRetentionEventFromRecord({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-4',
+   recordJson:JSON.stringify({...record,agentScope:'unknown'})})).toBeNull();
+  // A MALFORMED scope is different from a known non-root one: the contract
+  // requires the field, so its absence is a storage-integrity failure and
+  // breaks the chain rather than silently dropping a request that did happen.
+  for(const scope of [undefined,null,'a scope with spaces','']){
+   expect(cacheRetentionEventFromRecord({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-5',
+    recordJson:JSON.stringify({...record,agentScope:scope})}))
+    .toEqual({sessionDigest:SESSION_A,observedAtMs:DAY_MS,orderKey:'occ-5',unreadable:true});
+  }
   // Unreadable configuration is a break, never a guess.
   for(const broken of ['not json',JSON.stringify({schemaVersion:'usage-event-v1.0'}),
    JSON.stringify({...record,modelId:'a model with spaces'}),
@@ -455,7 +477,7 @@ describe('the prepared cache-retention store',()=>{
    `INSERT INTO analytics_cache_retention_day_values(value_key,mark_key,source_id,owner_digest,day,
      method_version,carry_digest,model,effort,adjacencies,sessions,bands_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
    .bind(...Object.values({value_key:valueKey,mark_key:markKey,source_id:sourceId,owner_digest:OWNER,
-    day:DAY,method_version:'cache-retention-v1',carry_digest:carryDigest,model:'gpt-5.6-sol',
+    day:DAY,method_version:'cache-retention-v2',carry_digest:carryDigest,model:'gpt-5.6-sol',
     effort:'high',adjacencies:0,sessions:0,bands_digest:'d'.repeat(64),...overrides})).run();
   // No bands at all.
   await expect(insertValue()).rejects.toThrow('analytics_cache_retention_day_bands_incomplete');
@@ -464,7 +486,7 @@ describe('the prepared cache-retention store',()=>{
      owner_digest,day,method_version,adjacencies,reused_more_than_half,matched_or_exceeded,
      unordered_ties,excluded_insufficient_evidence,excluded_context_contracted,sessions)
      VALUES(?,?,?,?,?,?,0,0,0,0,0,0,0)`)
-    .bind(valueKey,band,sourceId,OWNER,DAY,'cache-retention-v1').run();
+    .bind(valueKey,band,sourceId,OWNER,DAY,'cache-retention-v2').run();
   }
   // Bands present but the totals disagree.
   await expect(insertValue({adjacencies:3})).rejects.toThrow('analytics_cache_retention_day_bands_incomplete');
@@ -476,7 +498,7 @@ describe('the prepared cache-retention store',()=>{
      value_count,events_read,unreadable_events,values_digest,refusal) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
    .bind(...Object.values({mark_key:markKey,source_id:sourceId,source_layout:'typed-v11',
     source_namespace:sourceNamespace,owner_digest:OWNER,device_id:'device-1',manifest_id:'manifest-1',
-    manifest_digest:MANIFEST,day:DAY,method_version:'cache-retention-v1',carry_digest:carryDigest,
+    manifest_digest:MANIFEST,day:DAY,method_version:'cache-retention-v2',carry_digest:carryDigest,
     carry_days:7,value_count:1,events_read:0,unreadable_events:0,values_digest:'e'.repeat(64),
     refusal:null,...overrides})).run();
   await expect(insertMark()).rejects.toThrow('analytics_cache_retention_day_values_incomplete');
@@ -486,7 +508,7 @@ describe('the prepared cache-retention store',()=>{
   await expect(target().prepare(`INSERT INTO analytics_cache_retention_day_bands(value_key,band,
     source_id,owner_digest,day,method_version,adjacencies,reused_more_than_half,matched_or_exceeded,
     unordered_ties,excluded_insufficient_evidence,excluded_context_contracted,sessions)
-    VALUES(?,'one_to_two_minutes',?,?,?,'cache-retention-v1',0,0,0,0,0,0,0)`)
+    VALUES(?,'one_to_two_minutes',?,?,?,'cache-retention-v2',0,0,0,0,0,0,0)`)
    .bind(valueKey,sourceId,OWNER,DAY).run()).rejects.toThrow();
   await expect(insertMark({method_version:'cache-retention-v3'})).rejects.toThrow();
  });
@@ -505,12 +527,16 @@ describe('the prepared cache-retention store',()=>{
   await writeCacheRetentionDay({target:target(),key:key(),carry,aggregate:aggregate()});
   // Still delivered under the current method: nothing to retire.
   expect(await retireCacheRetentionDayPage(target(),sourceId)).toMatchObject({state:'idle'});
-  // A method bump misses every key.
-  const bumped=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:'cache-retention-v3'});
+  // A method bump misses every key. Derived from the live version rather than
+  // written out, because a literal successor becomes the CURRENT version on
+  // the next bump and the assertion then silently tests nothing: this test
+  // asserted against `cache-retention-v3` until v3 shipped.
+  const successor=`${CACHE_RETENTION_METHOD.version}-successor`;
+  const bumped=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:successor});
   expect(bumped).toMatchObject({state:'retiring',marks:1});
-  let page=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:'cache-retention-v3'});
+  let page=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:successor});
   for(let attempt=0;attempt<8&&page.state!=='idle';attempt+=1){
-   page=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:'cache-retention-v3'});
+   page=await retireCacheRetentionDayPage(target(),sourceId,{methodVersion:successor});
   }
   for(const table of ['marks','carry','values','bands']){
    expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_${table}`)
