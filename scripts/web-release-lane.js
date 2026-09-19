@@ -34,6 +34,7 @@ const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
   "apple.svg",
   "community-data.js",
   "community-refresh.js",
+  "last-known-good.js",
   "community-view.js",
   "model-visuals.js",
   "community.html",
