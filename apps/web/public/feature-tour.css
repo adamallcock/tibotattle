@@ -13,10 +13,19 @@
 .tour-cache { grid-template-columns: minmax(0,1.3fr) minmax(0,.7fr); }
 .tour-cache .tour-copy { order: 2; }
 .tour-cache .feature-media { order: 1; }
-.tour-bottom { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin: 80px 0; }
-.tour-bottom article { background: #e7ede5; border: 1px solid #bccbbd; border-radius: 22px; padding: clamp(24px, 4vw, 46px); }
-.tour-route { color: #2c6a57; font-size: 13px; font-weight: 650; padding-block: 22px; border-bottom: 1px solid #b8ccbf; }
-.tour-local { float: right; font-size: 58px; line-height: 1; color: #367b63; }
+/* The two closing cards are one component pair. Each is header row, title,
+   body in that order; the shared three-row grid (subgrid where available)
+   lines their titles and body copy up across the columns instead of letting
+   the taller header and the wrapped title drift apart. Browsers without
+   subgrid keep the plain stacked card. */
+.tour-bottom { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto auto; gap: 0 28px; margin: 80px 0; }
+.tour-bottom article { grid-row: span 3; display: grid; grid-template-rows: subgrid; align-content: start; background: #e7ede5; border: 1px solid #bccbbd; border-radius: 22px; padding: clamp(24px, 4vw, 46px); }
+.tour-bottom-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 44px; margin-bottom: 18px; border-bottom: 1px solid #b8ccbf; }
+.tour-bottom-head > p { margin: 0; }
+.tour-bottom article h3 { margin: 0 0 16px; }
+.tour-bottom article > p:last-child { margin: 0; }
+.tour-route { color: #2c6a57; font-size: 13px; font-weight: 650; }
+.tour-local { flex: none; font-size: 26px; line-height: 1; color: #367b63; }
 @media (max-width: 850px) {
  .tour-row, .tour-cache { grid-template-columns: 1fr; margin-block: 55px; }
  .tour-cache .tour-copy, .tour-cache .feature-media { order: initial; }
@@ -24,7 +33,10 @@
  .feature-tour { margin-top: 35px; padding-top: 35px; }
 }
 @media (max-width: 560px) {
- .tour-bottom { grid-template-columns: 1fr; }
+ /* Stacked, the cards have nothing to align with, so the shared row grid is
+    withdrawn and the column gap becomes the gap between the two cards. */
+ .tour-bottom { grid-template-columns: 1fr; grid-template-rows: none; row-gap: 28px; }
+ .tour-bottom article { grid-row: auto; display: block; }
  .feature-media { border-radius: 14px; }
  .feature-media figcaption { padding: 10px 12px; font-size: 11px; }
 }
@@ -223,6 +235,12 @@
 .community-site .feature-tour .tour-row { margin-block: 48px; gap: 32px; }
 .community-site .feature-tour .tour-copy h3 { font-size: clamp(27px, 2.5vw, 36px); margin: 10px 0 14px; }
 .community-site .feature-tour .tour-copy > p:last-child { font-size: 15px; line-height: 1.6; }
+/* Half-width cards carry the tour-row heading size badly: it wraps the longer
+   title onto a second line and leaves the shorter card half empty. Sized to
+   the card, both titles hold one line and the two bodies match. */
+.community-site .tour-bottom { margin-block: 48px; }
+.community-site .tour-bottom article h3 { font-size: clamp(22px, 2.2vw, 30px); line-height: 1.16; letter-spacing: -.02em; text-wrap: balance; }
+.community-site .tour-bottom article > p:last-child { font-size: 15px; line-height: 1.6; }
 .community-site .tour-cache { padding-block: 0; }
 .community-site .pace-showcase { min-height: 0; padding: 26px; }
 .community-site .pace-demo-copy h4 { font-size: 32px; }

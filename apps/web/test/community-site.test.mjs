@@ -527,7 +527,10 @@ test("the first visit leads with the product, platform choice, and daily communi
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
   assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
   assert.match(html, /src="\.\/apple\.svg"/u);
-  assert.match(html, /<section class="community-window" aria-labelledby="community-allowance-heading">/u);
+  assert.match(
+    html,
+    /<section class="community-window" id="allowance" tabindex="-1" aria-labelledby="community-allowance-heading">/u,
+  );
   assert.match(html, /Community view/u);
   assert.match(html, /id="community-allowance-figure"/u);
   assert.doesNotMatch(
@@ -2595,4 +2598,209 @@ test("the feature tour labels every demonstration as synthetic in markup and cat
     html,
     /id="week-demo"[^>]*data-i18n-aria-label="site\.features\.weekLabel"/u,
   );
+});
+
+/**
+ * Reports whether `index` in `html` falls inside a `<details>` element that
+ * ships without the `open` attribute. A link that scrolls to content a
+ * closed disclosure is hiding is worse than no link, so every published
+ * anchor is checked against this rather than against a rendered page.
+ */
+function insideClosedDetails(html, index) {
+  const tags = /<details\b([^>]*)>|<\/details>/gu;
+  const open = [];
+  for (let match = tags.exec(html); match !== null; match = tags.exec(html)) {
+    if (match.index >= index) break;
+    if (match[0].startsWith("</")) open.pop();
+    else open.push(/\bopen\b/u.test(match[1]));
+  }
+  // A closing tag before `index` pops its frame, so anything still on the
+  // stack encloses the position.
+  return open.some((isOpen) => isOpen === false);
+}
+
+test("the cache chart carries a quiet brand mark behind its origin", async () => {
+  const styles = await readFile(
+    new URL("../public/cache-reuse-matrix.css", import.meta.url),
+    "utf8",
+  );
+  const rule = styles.match(/\.cache-matrix-view::before \{([\s\S]*?)\}/u);
+  assert.ok(rule, "the plot view carries a watermark pseudo-element");
+  const declarations = rule[1];
+  // The empty alternative text is what keeps generated content out of the
+  // accessible tree; plain `content: "TiboTattle"` would be announced.
+  assert.match(declarations, /content:\s*"TiboTattle"\s*\/\s*"";/u);
+  assert.match(declarations, /pointer-events:\s*none;/u);
+  assert.match(declarations, /user-select:\s*none;/u);
+  // Negative z-index inside the stage's isolated stacking context puts the
+  // mark behind the plot and its cells, above the stage background.
+  assert.match(declarations, /z-index:\s*-1;/u);
+  assert.match(declarations, /position:\s*absolute;/u);
+  // Toward the origin: bottom-left, and logical so it follows writing mode.
+  assert.match(declarations, /inset-block-end:\s*62px;/u);
+  assert.match(declarations, /inset-inline-start:\s*16px;/u);
+  assert.doesNotMatch(declarations, /inset-block-start|inset-inline-end/u);
+  // It must read as the instrument's own furniture, not as a stamp.
+  assert.match(declarations, /color:\s*rgb\(236 246 234 \/ 7%\);/u);
+  assert.match(declarations, /font-family:\s*var\(--serif/u);
+  // The renderer switches to its stacked layout on the plot's own measured
+  // width, so the mark follows the same measurement rather than a viewport
+  // breakpoint that only happens to line up on one page.
+  const renderer = await readFile(
+    new URL("../public/cache-reuse-matrix.js", import.meta.url),
+    "utf8",
+  );
+  const narrowAt = renderer.match(/const narrow = w < (\d+);/u);
+  assert.ok(narrowAt, "the renderer states the width at which it stacks rows");
+  assert.match(styles, /\.cache-matrix-view \{[^}]*container-type: inline-size;/u);
+  assert.match(declarations, /font-size:\s*clamp\(21px, 5\.4cqi, 44px\);/u);
+  assert.match(
+    styles,
+    new RegExp(
+      `@container \\(max-width: ${Number(narrowAt[1]) - 1}px\\) \\{\\s*\\.cache-matrix-view::before \\{[^}]*inset-block-end: 24px;`,
+      "u",
+    ),
+    "the stacked layout moves the mark into the corner at the renderer's own threshold",
+  );
+  const viewportBlock = styles.match(/@media \(max-width: 540px\) \{([\s\S]*?)\n\}/u);
+  assert.ok(viewportBlock, "the instrument keeps its narrow viewport rules");
+  assert.doesNotMatch(
+    viewportBlock[1],
+    /cache-matrix-view::before/u,
+    "the mark does not also answer to a viewport breakpoint",
+  );
+  // Forced palettes would paint it solid, so it withdraws instead.
+  assert.match(
+    styles,
+    /@media \(forced-colors: active\) \{[\s\S]*?\.cache-matrix-view::before \{ content: none; \}/u,
+  );
+});
+
+test("the community band opens on its four figures", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  // The disclosure stays -- the published-site contract pins its summary --
+  // but it no longer hides the page's community evidence behind a click.
+  assert.match(html, /<details class="community-method" open>/u);
+  assert.match(
+    html,
+    /<summary id="community-method-summary"[^>]*>See community activity<\/summary>/u,
+  );
+  assert.equal(
+    insideClosedDetails(html, html.indexOf('id="community-daily-result"')),
+    false,
+    "the figures the daily renderer writes are not behind a closed disclosure",
+  );
+  // The figures lead the band at a size a reader takes in at a glance.
+  const figure = styles.match(
+    /\.community-site \.community-proof \.snapshot-quality-grid dd \{([\s\S]*?)\}/u,
+  );
+  assert.ok(figure, "the community figures carry their own type scale");
+  assert.match(figure[1], /font-size:\s*clamp\(1\.22rem, 2vw, 1\.6rem\);/u);
+  assert.match(figure[1], /font-family:\s*var\(--serif\);/u);
+  assert.match(figure[1], /font-variant-numeric:\s*tabular-nums;/u);
+  // Open by default, the summary is the band's rule, so the heading below it
+  // does not draw a second one.
+  assert.match(
+    styles,
+    /\.community-site \.community-method\[open\] > summary \{[^}]*border-bottom: 1px solid var\(--line\);/u,
+  );
+  assert.match(
+    styles,
+    /\.community-site \.community-method\[open\] \.activity-heading \{[^}]*border-top: 0;/u,
+  );
+});
+
+test("the page's major sections carry stable, reachable anchors", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const anchors = [
+    "install",
+    "allowance",
+    "community",
+    "features",
+    "pace",
+    "usage-history",
+    "cache-continuity",
+    "model-speeds",
+    "allowance-value",
+    "how-it-works",
+  ];
+  for (const anchor of anchors) {
+    const index = html.indexOf(`id="${anchor}"`);
+    assert.ok(index >= 0, `#${anchor} is published`);
+    assert.equal(
+      html.indexOf(`id="${anchor}"`, index + 1),
+      -1,
+      `#${anchor} is defined once`,
+    );
+    assert.equal(
+      insideClosedDetails(html, index),
+      false,
+      `#${anchor} is not inside a disclosure that starts closed`,
+    );
+  }
+  // The sticky header is cleared by the root scroll padding, once, for every
+  // target. A per-anchor scroll margin would stack on top of it and drop each
+  // destination about a header's height too low.
+  assert.match(styles, /html \{ scroll-behavior: smooth; scroll-padding-top: 95px; \}/u);
+  assert.doesNotMatch(styles, /\.community-site #[a-z-]+,\s*\n/u);
+  // A pasted link must move the keyboard as well as the viewport.
+  for (const anchor of ["allowance", "pace", "usage-history", "cache-continuity", "model-speeds", "allowance-value"]) {
+    assert.match(
+      html,
+      new RegExp(`id="${anchor}" tabindex="-1"`, "u"),
+      `#${anchor} takes programmatic focus`,
+    );
+  }
+  // The established destinations keep their names: the app and the header
+  // already link to them.
+  assert.match(html, /<a href="#how-it-works">/u);
+  assert.match(html, /<a href="#community">/u);
+});
+
+test("the two closing tour cards are one component pair", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const styles = await readFile(new URL("../public/feature-tour.css", import.meta.url), "utf8");
+  const section = html.slice(
+    html.indexOf('<div class="tour-bottom">'),
+    html.indexOf('<section class="tour-cta">'),
+  );
+  assert.ok(section.includes("Follow the tokens to the work."));
+  assert.ok(section.includes("Personal by design."));
+  // Identical header structure: both cards lead with the same head row.
+  assert.equal(
+    section.match(/<div class="tour-bottom-head">/gu)?.length,
+    2,
+    "both cards open with the same header row",
+  );
+  // The device mark rides inside that row instead of floating out of flow.
+  assert.match(
+    section,
+    /<div class="tour-bottom-head">\s*<p class="tour-eyebrow" data-i18n="site\.features\.local">On your device<\/p>\s*<span class="tour-local" aria-hidden="true">◎<\/span>\s*<\/div>/u,
+  );
+  assert.doesNotMatch(section, /<div class="tour-local"/u);
+  // Copy is unchanged: this was a layout repair, not a rewrite.
+  assert.match(section, /data-i18n="site\.features\.cost">Tokens → Models → Projects → Threads<\/p>/u);
+  assert.match(section, /data-i18n="site\.features\.projectsCopy">Drill into projects and threads\./u);
+  assert.match(section, /data-i18n="site\.features\.privacyCopy">Your personal analysis runs locally\./u);
+  // A shared row grid is what lines the titles and bodies up across columns.
+  assert.match(styles, /\.tour-bottom \{[^}]*grid-template-rows: auto auto auto;[^}]*gap: 0 28px;/u);
+  assert.match(styles, /\.tour-bottom article \{[^}]*grid-row: span 3;[^}]*grid-template-rows: subgrid;/u);
+  // Stacked, there is nothing to align with, so the shared grid withdraws and
+  // the gap between the two cards comes back.
+  assert.match(
+    styles,
+    /@media \(max-width: 560px\) \{[\s\S]*?\.tour-bottom \{ grid-template-columns: 1fr; grid-template-rows: none; row-gap: 28px; \}[\s\S]*?\.tour-bottom article \{ grid-row: auto; display: block; \}/u,
+  );
+  // The header row, the title and the body keep one rhythm in both cards.
+  assert.match(styles, /\.tour-bottom-head \{[^}]*min-height: 44px;[^}]*margin-bottom: 18px;/u);
+  assert.match(styles, /\.tour-bottom article h3 \{ margin: 0 0 16px; \}/u);
+  // The half-width card gets a title sized to itself, so neither heading has
+  // to wrap while the other sits on one line.
+  assert.match(
+    styles,
+    /\.community-site \.tour-bottom article h3 \{[^}]*font-size: clamp\(22px, 2\.2vw, 30px\);/u,
+  );
+  assert.doesNotMatch(styles, /\.tour-local \{[^}]*float:/u);
 });

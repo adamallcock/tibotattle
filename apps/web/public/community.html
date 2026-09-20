@@ -415,7 +415,7 @@
           </a>
         </div>
 
-        <section class="community-window" aria-labelledby="community-allowance-heading">
+        <section class="community-window" id="allowance" tabindex="-1" aria-labelledby="community-allowance-heading">
           <div class="community-window-bar">
             <span class="community-window-brand">
               <img src="./tibotattle-icon.png" alt="" width="32" height="32">
@@ -485,7 +485,13 @@
         data-community-state="checking"
         aria-labelledby="community-method-summary"
       >
-        <details class="community-method">
+        <!--
+          Open by default. These four figures are the page's community proof, so
+          they must be readable without a click; the disclosure stays so the
+          band can still be folded away, and its summary keeps the exact label
+          the published-site contract pins.
+        -->
+        <details class="community-method" open>
           <summary id="community-method-summary" data-i18n="community.daily.activitySummary">See community activity</summary>
           <div class="community-method-body">
             <div class="activity-heading">
@@ -508,7 +514,7 @@
       <p class="tour-eyebrow" data-i18n="site.features.eyebrow">A clearer picture of every session</p>
       <h2 id="feature-tour-title" data-i18n="site.features.heading">There is more to usage than a percentage.</h2>
       <p class="tour-intro" data-i18n="site.features.intro">Follow the pace. Explore the patterns. See what your allowance makes possible.</p>
-      <article class="tour-row tour-quota">
+      <article class="tour-row tour-quota" id="pace" tabindex="-1">
       <div class="tour-copy">
       <p class="tour-eyebrow" data-i18n="site.features.quota">01 / ALLOWANCE & PACE</p>
       <h3 data-i18n="site.features.quotaTitle">See the limit coming.</h3>
@@ -535,7 +541,7 @@
       </figcaption>
       </figure></details>
       </article>
-      <article class="tour-row tour-history">
+      <article class="tour-row tour-history" id="usage-history" tabindex="-1">
       <div class="tour-copy">
       <p class="tour-eyebrow" data-i18n="site.features.history">02 / USAGE HISTORY</p>
       <h3 data-i18n="site.features.historyTitle">Watch your week unfold.</h3>
@@ -553,7 +559,7 @@
           <div class="trends-time-controls"><button id="trends-replay" class="button button-quiet compact" type="button" aria-pressed="false" disabled data-i18n="trends.play">Play history</button><input id="trends-time" type="range" aria-label="Explore history" data-i18n-aria-label="trends.explore" disabled><button id="trends-latest" class="button button-quiet compact" type="button" data-i18n="trends.latest">Latest</button></div>
 <div class="week-demo-charts"><p data-i18n="trends.headerAllowance">Allowance remaining</p><div id="allowance-timeline-chart"></div><div class="trends-reset-legend"><span id="trends-reset-count"></span></div><p id="trends-event-detail" hidden></p><p data-i18n="trends.headerSpend">API equivalent / hour</p><div id="usage-timeline-chart"></div></div><p class="week-demo-label" data-i18n="site.features.weekExample">Synthetic example week · explore the chart or select a reset marker</p></section>
       </article>
-      <article class="tour-row tour-cache">
+      <article class="tour-row tour-cache" id="cache-continuity" tabindex="-1">
       <div class="tour-copy">
       <p class="tour-eyebrow" data-i18n="site.features.cache">03 / CACHE CONTINUITY</p>
       <h3 data-i18n="site.features.cacheTitle">How long does the memory last?</h3>
@@ -561,7 +567,7 @@
       </div>
 <div class="insight-demo" id="cache-demo"><p class="insight-demo-label" data-i18n="site.features.insightExample">Synthetic demonstration · not measured results or a model benchmark</p><div data-cache-demo></div></div>
       </article>
-<article class="tour-row tour-speeds"><div class="tour-copy"><h3 data-i18n="site.features.speedTitle">How fast does your model actually respond?</h3><p data-i18n="site.features.speedCopy">Compare output speed and time to first token. Select a model, change the period, and inspect the distribution behind each median.</p></div><section class="insight-demo" id="speeds-demo"><p class="insight-demo-label" data-i18n="site.features.insightExample">Synthetic demonstration · not measured results or a model benchmark</p><div data-speeds-demo></div></section></article>      <article class="tour-row tour-value">
+<article class="tour-row tour-speeds" id="model-speeds" tabindex="-1"><div class="tour-copy"><h3 data-i18n="site.features.speedTitle">How fast does your model actually respond?</h3><p data-i18n="site.features.speedCopy">Compare output speed and time to first token. Select a model, change the period, and inspect the distribution behind each median.</p></div><section class="insight-demo" id="speeds-demo"><p class="insight-demo-label" data-i18n="site.features.insightExample">Synthetic demonstration · not measured results or a model benchmark</p><div data-speeds-demo></div></section></article>      <article class="tour-row tour-value" id="allowance-value" tabindex="-1">
       <div class="tour-copy">
       <p class="tour-eyebrow" data-i18n="site.features.value">04 / ALLOWANCE VALUE</p>
       <h3 data-i18n="site.features.valueTitle">Put a value on your allowance.</h3>
@@ -574,15 +580,25 @@
       </figcaption>
       </figure>
       </article>
+      <!--
+        One component pair, not two layouts: each card is header row, title,
+        body in that order, so the shared row grid can line their baselines up
+        across the two columns. The device mark rides in the right card's
+        header row rather than floating out of the text flow.
+      -->
       <div class="tour-bottom">
       <article>
+      <div class="tour-bottom-head">
       <p class="tour-route" data-i18n="site.features.cost">Tokens → Models → Projects → Threads</p>
+      </div>
       <h3 data-i18n="site.features.projectsTitle">Follow the tokens to the work.</h3>
       <p data-i18n="site.features.projectsCopy">Drill into projects and threads. Compare models, token mix and API-equivalent cost to understand what drives your recorded usage.</p>
       </article>
       <article>
-      <div class="tour-local" aria-hidden="true">◎</div>
+      <div class="tour-bottom-head">
       <p class="tour-eyebrow" data-i18n="site.features.local">On your device</p>
+      <span class="tour-local" aria-hidden="true">◎</span>
+      </div>
       <h3 data-i18n="site.features.privacyTitle">Personal by design.</h3>
       <p data-i18n="site.features.privacyCopy">Your personal analysis runs locally. Community sharing is optional and content-free: prompts, responses, credentials and private paths stay on your device.</p>
       </article>

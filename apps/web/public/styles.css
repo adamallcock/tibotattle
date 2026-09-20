@@ -105,6 +105,10 @@
 }
 
 * { box-sizing: border-box; }
+/* This padding is what every in-page anchor lands against, so the sticky
+   header never covers the top of a section a pasted link points at. Targets
+   must not add a `scroll-margin-top` of their own: it stacks on this and
+   drops each destination about a header's height too low. */
 html { scroll-behavior: smooth; scroll-padding-top: 95px; }
 body {
   margin: 0;
@@ -3624,6 +3628,19 @@ footer p { margin: 0; }
 .community-site .community-method-body {
   padding: 2px 18px 20px;
 }
+/*
+ * Open is the default state, so the summary reads as the band's own rule and
+ * the activity heading does not repeat it. Collapsed, the heading keeps the
+ * separator it needs when the summary has no bottom edge of its own.
+ */
+.community-site .community-method[open] > summary {
+  padding-bottom: 13px;
+  border-bottom: 1px solid var(--line);
+}
+.community-site .community-method[open] .activity-heading {
+  padding-top: 14px;
+  border-top: 0;
+}
 .community-site .activity-heading {
   display: flex;
   justify-content: space-between;
@@ -3655,12 +3672,39 @@ footer p { margin: 0; }
 .community-site .snapshot-quality-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
+/*
+ * The four community figures are this page's social evidence, so the band
+ * opens on them and sets them at a size a reader takes in at a glance. They
+ * are the first thing the daily renderer writes into the result container,
+ * which is why promoting the band promotes them.
+ */
+.community-site .community-proof .snapshot-quality-grid {
+  gap: 10px;
+  /* The result container already carries the gap below the band's intro; a
+     second margin here only pushes the figures further down the page. */
+  margin: 4px 0 0;
+}
+.community-site .community-proof .snapshot-quality-grid > div {
+  padding: 13px 15px;
+  border-radius: var(--radius-md);
+  background: var(--surface-quiet);
+}
+.community-site .community-proof .snapshot-quality-grid dt {
+  font-size: .58rem;
+  letter-spacing: .07em;
+}
 .community-site .community-proof .snapshot-quality-grid dd {
-  font-size: .9rem;
+  margin-top: 7px;
+  font-family: var(--serif);
+  font-size: clamp(1.22rem, 2vw, 1.6rem);
+  font-weight: var(--weight-regular);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em;
+  line-height: 1.08;
 }
 .community-site .community-proof .snapshot-quality-grid small {
   display: block;
-  margin-top: 5px;
+  margin-top: 6px;
   color: var(--muted);
   font-size: .61rem;
   line-height: 1.35;
