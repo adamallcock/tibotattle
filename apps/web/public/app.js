@@ -822,6 +822,7 @@ function setCommunitySession(value) {
 
 let activeInformationPopover = null;
 let nextInformationPopoverId = 1;
+let suppressInformationPopoverFocus = false;
 
 function positionInformationPopover(popover, button) {
   const anchor = button.getBoundingClientRect();
@@ -847,12 +848,17 @@ function closeInformationPopover({ restoreFocus = false } = {}) {
   current.button.setAttribute("aria-expanded", "false");
   current.button.removeAttribute("aria-describedby");
   activeInformationPopover = null;
-  if (restoreFocus && current.button.isConnected) current.button.focus();
+  if (restoreFocus && current.button.isConnected) {
+    suppressInformationPopoverFocus = true;
+    current.button.focus();
+    suppressInformationPopoverFocus = false;
+  }
 }
 
-function openInformationPopover(button) {
+function openInformationPopover(button, { pinned = false } = {}) {
   if (activeInformationPopover?.button === button) {
-    closeInformationPopover({ restoreFocus: false });
+    activeInformationPopover.pinned ||= pinned;
+    positionInformationPopover(activeInformationPopover.popover, button);
     return;
   }
   closeInformationPopover();
@@ -864,7 +870,7 @@ function openInformationPopover(button) {
   document.body.append(popover);
   button.setAttribute("aria-expanded", "true");
   button.setAttribute("aria-describedby", id);
-  activeInformationPopover = { button, popover };
+  activeInformationPopover = { button, popover, pinned };
   positionInformationPopover(popover, button);
 }
 
@@ -878,9 +884,29 @@ function informationLabel(label, explanation, accessibleLabel = label) {
     label: accessibleLabel,
   }));
   button.setAttribute("aria-expanded", "false");
+  button.addEventListener("mouseenter", () => openInformationPopover(button));
+  button.addEventListener("mouseleave", () => {
+    if (activeInformationPopover?.button === button
+        && !activeInformationPopover.pinned
+        && document.activeElement !== button)
+      closeInformationPopover();
+  });
+  button.addEventListener("focus", () => {
+    if (!suppressInformationPopoverFocus) openInformationPopover(button);
+  });
+  button.addEventListener("blur", () => {
+    if (activeInformationPopover?.button === button
+        && !activeInformationPopover.pinned)
+      closeInformationPopover();
+  });
   button.addEventListener("click", (event) => {
     event.stopPropagation();
-    openInformationPopover(button);
+    if (activeInformationPopover?.button === button
+        && activeInformationPopover.pinned) {
+      closeInformationPopover();
+      return;
+    }
+    openInformationPopover(button, { pinned: true });
   });
   fragment.append(button);
   return fragment;

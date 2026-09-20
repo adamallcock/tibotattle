@@ -6705,15 +6705,20 @@ test("timeline drag suppresses selection only during the chart gesture", async (
   assert.equal(shell.releasedPointerId, 7);
 });
 
-test("metric information controls open an accessible popover instead of relying on title hover", async () => {
+test("information controls open an accessible popover on hover, focus, or click", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 
-  assert.match(appSource, /function openInformationPopover\(button\)/u);
+  assert.match(appSource, /function openInformationPopover\(button, \{ pinned = false \} = \{\}\)/u);
   assert.match(appSource, /popover\.setAttribute\("role", "tooltip"\)/u);
   assert.match(appSource, /button\.setAttribute\("aria-expanded", "true"\)/u);
   assert.match(appSource, /button\.setAttribute\("aria-describedby", id\)/u);
+  assert.match(appSource, /button\.addEventListener\("mouseenter", \(\) => openInformationPopover\(button\)\)/u);
+  assert.match(appSource, /button\.addEventListener\("mouseleave", \(\) => \{/u);
+  assert.match(appSource, /button\.addEventListener\("focus", \(\) => \{/u);
+  assert.match(appSource, /button\.addEventListener\("blur", \(\) => \{/u);
   assert.match(appSource, /button\.addEventListener\("click", \(event\) => \{/u);
+  assert.match(appSource, /openInformationPopover\(button, \{ pinned: true \}\)/u);
   assert.match(appSource, /document\.addEventListener\("keydown", \(event\) => \{/u);
   assert.match(appSource, /event\.key !== "Escape"/u);
   assert.match(appSource, /document\.addEventListener\("click", \(event\) => \{/u);
