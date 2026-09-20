@@ -774,6 +774,15 @@ export function renderCommunityDailySeries({
   stateNode = null,
   payload,
   cache = null,
+  /** Where the four headline figures go, when they belong somewhere other than
+   * at the top of `container`.
+   *
+   * They are the community's contribution totals and read as social proof, so
+   * the page may want them in the hero while the chart and tables stay in the
+   * band below. Absent, they stay exactly where they were. The node is
+   * emptied before the grid is placed, so a re-render replaces rather than
+   * accumulates -- `container` is rebuilt each time and this one is not. */
+  summaryContainer = null,
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
@@ -841,7 +850,14 @@ export function renderCommunityDailySeries({
     );
     quality.append(item);
   }
-  container.append(quality);
+  // A separate host is emptied first: `container` is rebuilt on every render
+  // but a hero node outside it is not, so appending blindly would stack a
+  // second copy of the figures under the first on the next refresh.
+  if (summaryContainer) {
+    summaryContainer.replaceChildren(quality);
+  } else {
+    container.append(quality);
+  }
 
   appendCommunityDailyChart({ documentRef, container, series, t });
 

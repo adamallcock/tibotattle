@@ -609,6 +609,9 @@ function renderCommunityDailyResult({
     stateNode: $("#community-daily-state"),
     payload,
     cache: currentCacheProvenance(cache),
+    // Null until the hero host exists, which keeps the figures in place on any
+    // page that does not offer one.
+    summaryContainer: $("#community-contribution-summary"),
   });
   $("#community").dataset.communityState = state;
   setPublicDailyPresentation(document, state, {

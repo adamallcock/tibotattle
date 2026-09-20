@@ -50,15 +50,67 @@ export function cacheReuseMatrixBuckets(impact) {
 
 // Keep volume comparable between model selections. The unit is chosen from
 // the whole selected reporting period, never from the active model alone.
-export function chooseCacheReuseMatrixUnit(impact) {
+/** The unit used to be chosen so the tallest bucket fitted at the BASE cell
+ * size, which is why a hosted corpus broke the chart: with 818,269 sub-minute
+ * adjacencies against 692 in one-to-two hours, that unit left every later
+ * bucket with a fraction of a single light and the decay the chart exists to
+ * show was invisible. Letting the tall bucket draw SMALLER lights instead
+ * keeps "1 light = N follow-ups" exactly true across every bucket while
+ * freeing the unit to be ~25x finer. */
+/** Below this a light stops reading as a light. A column that would need to go
+ * smaller is drawn at this size and clipped, which the caller reports. */
+export const CACHE_REUSE_MATRIX_MINIMUM_CELL = 1.3;
+/** The tallest a bucket's stack is drawn, in light-rows. Caps the plot so one
+ * enormous bucket cannot push the rest of the chart below the fold. */
+const MAX_PIXEL_ROWS = 46;
+
+/** Lights the tallest bucket can physically hold, at the smallest cell size a
+ * light is still legible at. This is the real constraint and it is worth
+ * stating: with one shared unit, a fixed box and a 1,200:1 spread between the
+ * tallest and shortest bucket, NO unit shows both a full stack in the tallest
+ * and several lights in the shortest. Something has to give, so the unit is
+ * set by what can actually be drawn, which maximises the lights every other
+ * bucket gets. */
+export const CACHE_REUSE_MATRIX_STACK_CAPACITY = 4_400;
+
+export function chooseCacheReuseMatrixUnit(impact, capacity = CACHE_REUSE_MATRIX_STACK_CAPACITY) {
   const rows = cacheReuseMatrixBuckets(impact);
   if (!rows) return 1;
-  const raw = Math.max(1, impact.comparableReturns / 900,
-    ...rows.map((row) => row.comparableReturns / 360));
+  const populated = rows.map((row) => row.comparableReturns).filter((count) => count > 0);
+  if (populated.length === 0) return 1;
+  // The TALLEST bucket sets the unit, because it is the one that can overflow
+  // the box. Every shorter bucket then gets as many lights as that allows,
+  // which is what makes the later columns readable at all.
+  const raw = Math.max(1, Math.max(...populated) / capacity);
   const magnitude = 10 ** Math.floor(Math.log10(raw));
   const scaled = raw / magnitude;
+  // Round UP: rounding down would put the tallest bucket back over capacity,
+  // which is the constraint being solved here.
   const nice = [1, 2, 5, 10].find((value) => value >= scaled) ?? 10;
   return nice * magnitude;
+}
+
+/** The cell size a bucket is drawn at, given the space every bucket shares.
+ *
+ * All buckets share ONE unit, so a tall bucket has genuinely more lights and
+ * has to draw them smaller to fit. The count stays exact; what varies is the
+ * size of a light. Cross-column ink area is therefore no longer comparable --
+ * the column labels and `n=` carry volume instead -- and that is the trade the
+ * alternative (a per-column unit) would have made silently and in the numbers
+ * rather than visibly and in the geometry. */
+export function cacheReuseMatrixCellScale(lights, { width, height, cell, gap }) {
+  if (!Number.isFinite(lights) || lights <= 0) return 1;
+  const perRow = Math.max(1, Math.floor((width + gap) / (cell + gap)));
+  if (Math.ceil(lights / perRow) * (cell + gap) - gap <= height) return 1;
+  // Solve for the largest scale that fits, then floor it at a visible size.
+  let low = CACHE_REUSE_MATRIX_MINIMUM_CELL / cell, high = 1;
+  for (let step = 0; step < 24; step += 1) {
+    const mid = (low + high) / 2;
+    const fitted = Math.max(1, Math.floor((width + gap * mid) / (cell * mid + gap * mid)));
+    if (Math.ceil(lights / fitted) * (cell * mid + gap * mid) - gap * mid <= height) low = mid;
+    else high = mid;
+  }
+  return low;
 }
 
 export function cacheReuseMatrixLights(summary, unit) {
@@ -202,17 +254,25 @@ export function createCacheReuseMatrix({
     buttons = [];
     const narrow = w < 520;
     const columns = narrow ? Math.max(10, Math.floor((w - 125) / 6.4)) : 7;
-    const cw = narrow ? 3.8 : Math.min(4.8, ((w - 32) / 9 - 18 - (columns - 1) * 2) / columns);
-    const ch = narrow ? 3.8 : 4.8;
+    const baseCw = narrow ? 3.8 : Math.min(4.8, ((w - 32) / 9 - 18 - (columns - 1) * 2) / columns);
+    const baseCh = narrow ? 3.8 : 4.8;
+    const ch = baseCh;
     const gap = narrow ? 1.8 : 2;
     const pitch = ch + gap;
+    const narrowStackHeight = 96;
     const gridWidth = columns * cw + (columns - 1) * gap;
     const wholeRows = cacheReuseMatrixBuckets(impact) ?? rows;
-    const maxRows = Math.max(1, ...wholeRows.map((row) => Math.ceil(Math.ceil(row.comparableReturns / unit) / columns)));
-    const baseline = 86 + Math.max(115, maxRows * pitch);
+    // The plot's height is FIXED rather than following the tallest bucket.
+    // One unit across every bucket means the tall one has genuinely more
+    // lights, and it now draws them smaller to fit instead of stretching the
+    // chart past the fold and squeezing every other bucket into a fraction of
+    // one light.
+    const stackRows = Math.min(MAX_PIXEL_ROWS,
+      Math.max(1, ...wholeRows.map((row) => Math.ceil(Math.ceil(row.comparableReturns / unit) / columns))));
+    const stackHeight = Math.max(115, stackRows * pitch);
+    const baseline = 86 + stackHeight;
     let height = baseline + 66;
-    if (narrow) height = rows.reduce((total, row) => total
-      + Math.max(67, Math.ceil(Math.ceil(row.comparableReturns / unit) / columns) * pitch + 35), 26) + 40;
+    if (narrow) height = rows.length * (narrowStackHeight + 35) + 26 + 40;
     plot.setAttribute("viewBox", `0 0 ${w} ${height}`);
     plot.style.height = `${height}px`;
     view.style.minHeight = `${height}px`;
@@ -230,8 +290,17 @@ export function createCacheReuseMatrix({
     let cursor = 26;
     rows.forEach((row, index) => {
       const lights = cacheReuseMatrixLights(row, unit);
-      const pixelRows = Math.ceil(lights.length / columns);
-      const pixelHeight = Math.max(ch, pixelRows * pitch - gap);
+      // Per-bucket, because the unit is shared: a bucket with more lights
+      // draws them smaller. `n=` above each column carries the volume the ink
+      // no longer can.
+      const stackBox = narrow ? narrowStackHeight : stackHeight;
+      const scale = cacheReuseMatrixCellScale(lights.length,
+        { width: gridWidth, height: stackBox, cell: ch, gap });
+      const cw = baseCw * scale, ch2 = baseCh * scale, gap2 = gap * scale;
+      const pitch2 = ch2 + gap2;
+      const columns2 = Math.max(1, Math.floor((gridWidth + gap2) / (cw + gap2)));
+      const pixelRows = Math.ceil(lights.length / columns2);
+      const pixelHeight = Math.max(ch2, pixelRows * pitch2 - gap2);
       let gx, gy, box;
       if (narrow) {
         const rowHeight = Math.max(67, pixelHeight + 35);
@@ -254,11 +323,13 @@ export function createCacheReuseMatrix({
       }
       const cells = svgEl("g", { class: "cache-matrix-cells" });
       lights.forEach((light, i) => {
-        const x = gx + (i % columns) * (cw + gap);
-        const y = narrow ? gy + Math.floor(i / columns) * pitch : baseline - ch - Math.floor(i / columns) * pitch;
+        const x = gx + (i % columns2) * (cw + gap2);
+        const y = narrow ? gy + Math.floor(i / columns2) * pitch2
+          : baseline - ch2 - Math.floor(i / columns2) * pitch2;
         for (const [key, offset] of [["more", 0], ["less", light.more]]) {
           if (light[key] > 0) cells.append(svgEl("rect", {
-            x: x + offset * cw, y, width: cw * light[key], height: ch, rx: .55, class: `cache-matrix-cell-${key}`,
+            x: x + offset * cw, y, width: cw * light[key], height: ch2,
+            rx: Math.min(.55, ch2 / 4), class: `cache-matrix-cell-${key}`,
           }));
         }
       });
