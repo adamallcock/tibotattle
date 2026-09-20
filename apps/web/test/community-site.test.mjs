@@ -2970,3 +2970,80 @@ test("the community's contribution figures sit in the hero, below the download",
   assert.match(detail[1], /display: block;/u);
   assert.doesNotMatch(detail[1], /display: none|visibility: hidden|content-visibility/u);
 });
+
+test("the cache chart's unit noun is the same measurement in every locale", async () => {
+  // The chart counts requests that followed a previous one, not user turns.
+  // Two locales said "turn" while English said "follow-up", which described a
+  // different measurement to a reader who could not check the English.
+  const { EN_US_CATALOG, ZH_HANS_CATALOG, ES_CATALOG } = await import(
+    "../public/i18n.generated.js"
+  );
+  const family = Object.keys(EN_US_CATALOG)
+    .filter((key) => key.startsWith("accounting.cacheContinuity.matrix."));
+  assert.ok(family.length > 20, "the matrix family is present in the mirror");
+
+  const counted = family.filter((key) => /follow-up/u.test(EN_US_CATALOG[key]));
+  assert.ok(counted.length >= 5, "several keys name what the chart counts");
+  for (const key of counted) {
+    assert.doesNotMatch(ZH_HANS_CATALOG[key], /轮次/u, `${key} (zh-Hans) says turn`);
+    assert.match(ZH_HANS_CATALOG[key], /后续请求/u, `${key} (zh-Hans) names the request`);
+    assert.doesNotMatch(ES_CATALOG[key], /turnos?\b/u, `${key} (es) says turn`);
+    // Singular and plural both, so `unitOne` cannot drift from `unit`.
+    assert.match(
+      ES_CATALOG[key],
+      /solicitud(?:es)? posterior(?:es)?/u,
+      `${key} (es) names the request`,
+    );
+  }
+  // No key in the family may reintroduce it anywhere else either.
+  for (const key of family) {
+    assert.doesNotMatch(ZH_HANS_CATALOG[key], /轮次/u, `${key} (zh-Hans)`);
+    assert.doesNotMatch(ES_CATALOG[key], /turnos?\b/u, `${key} (es)`);
+    assert.doesNotMatch(EN_US_CATALOG[key], /\bturns?\b/u, `${key} (en-US)`);
+  }
+});
+
+test("the measured cache section styles its period control and its caveat", async () => {
+  const styles = await readFile(new URL("../public/feature-tour.css", import.meta.url), "utf8");
+  const source = await readFile(
+    new URL("../public/feature-insights.js", import.meta.url),
+    "utf8",
+  );
+  // Both are inserted above the plot once measured evidence arrives, so both
+  // have to be styled for that position rather than left unstyled.
+  assert.match(source, /className='insight-demo-periods'/u);
+  assert.match(source, /className='insight-demo-ties'/u);
+  assert.match(source, /className='insight-demo-period-note'/u);
+
+  // The period control reads as interactive: a pressed state, a hover, a
+  // focus ring, and a target tall enough to hit.
+  const button = styles.match(/\.insight-demo-periods button \{([^}]*)\}/u);
+  assert.ok(button, "the period buttons are styled as controls");
+  assert.match(button[1], /cursor:pointer/u);
+  const minHeight = Number(button[1].match(/min-height:(\d+)px/u)?.[1]);
+  assert.ok(minHeight >= 24, `period buttons meet the 24px target (got ${minHeight})`);
+  assert.match(styles, /\.insight-demo-periods button\[aria-pressed="true"\] \{[^}]*background:#1d4b3e;/u);
+  assert.match(styles, /\.insight-demo-periods button:hover \{/u);
+  assert.match(styles, /\.insight-demo-periods button:focus-visible \{[^}]*outline:/u);
+
+  // The caveat reads as a caveat: quieter than the section label above it,
+  // held to a readable measure, and not dressed as a warning.
+  const label = styles.match(/\.insight-demo-label \{([^}]*)\}/u);
+  const ties = styles.match(/\.insight-demo-ties \{([^}]*)\}/u);
+  assert.ok(label && ties, "the label and the caveat are both styled");
+  const size = (rule) => Number(rule.match(/font-size:(\d+(?:\.\d+)?)px/u)?.[1]);
+  assert.ok(
+    size(ties[1]) < size(label[1]),
+    `the caveat sits below the label's weight (${size(ties[1])} vs ${size(label[1])})`,
+  );
+  assert.match(ties[1], /max-width:\d+ch/u, "the caveat is held to a readable measure");
+  assert.doesNotMatch(ties[1], /background|border|font-weight:\s*(6|7|8)/u);
+  // An empty period is an absence of evidence, so it is not painted in the
+  // caveat's tone: the two say different things.
+  const note = styles.match(/\.insight-demo-period-note \{([^}]*)\}/u);
+  assert.ok(note, "an empty period states itself");
+  assert.notEqual(
+    note[1].match(/color:([^;]+);/u)?.[1],
+    ties[1].match(/color:([^;]+);/u)?.[1],
+  );
+});
